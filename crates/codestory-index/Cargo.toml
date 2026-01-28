@@ -1,0 +1,35 @@
+[package]
+name = "codestory-index"
+version = "0.1.0"
+edition = "2024"
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+tempfile = { workspace = true }
+
+[dependencies]
+codestory-core = { workspace = true }
+codestory-storage = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-graph = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-rust.workspace = true
+# Add others as needed
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+streaming-iterator = { workspace = true }
+tree-sitter-java.workspace = true
+tree-sitter-cpp.workspace = true
+tree-sitter-c.workspace = true
+ignore = { workspace = true }
+rayon = { workspace = true }
+crossbeam-channel = { workspace = true }
+codestory-events = { workspace = true }
+codestory-project = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+rusqlite = { workspace = true }
+parking_lot = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "codestory-project"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+codestory-core = { workspace = true }
+codestory-storage = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+walkdir = { workspace = true }
+glob = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

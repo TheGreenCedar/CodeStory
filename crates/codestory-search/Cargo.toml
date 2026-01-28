@@ -1,0 +1,12 @@
+[package]
+name = "codestory-search"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+codestory-core = { workspace = true }
+nucleo-matcher = { workspace = true }
+tantivy = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+feature-probe = { workspace = true }  # often needed for tantivy

@@ -1,0 +1,25 @@
+[package]
+name = "codestory-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+codestory-index = { workspace = true }
+codestory-storage = { workspace = true }
+codestory-core = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-java = { workspace = true }
+tree-sitter-cpp = { workspace = true }
+tree-sitter-c = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+clap = { workspace = true }
+walkdir = { workspace = true }
+ignore = { workspace = true }
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing = { workspace = true }
+rayon = { workspace = true }
+crossbeam-channel = { workspace = true }

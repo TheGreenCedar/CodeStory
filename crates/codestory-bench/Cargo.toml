@@ -1,0 +1,25 @@
+[package]
+name = "codestory-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+codestory-core = { workspace = true }
+codestory-index = { workspace = true }
+codestory-storage = { workspace = true }
+codestory-graph = { workspace = true }
+criterion = { workspace = true }
+tempfile = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+codestory-events = { workspace = true }
+codestory-project = { workspace = true }
+
+[[bench]]
+name = "indexing"
+harness = false
+
+[[bench]]
+name = "graph_layout"
+harness = false

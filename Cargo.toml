@@ -1,0 +1,104 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/codestory-core",
+    "crates/codestory-storage",
+    "crates/codestory-index",
+    "crates/codestory-search",
+    "crates/codestory-graph",
+    "crates/codestory-gui",
+    "crates/codestory-cli",
+    "crates/codestory-events",
+    "crates/codestory-project",
+    "crates/codestory-bench",
+]
+
+[workspace.dependencies]
+# Internal crates
+codestory-core = { path = "crates/codestory-core" }
+codestory-storage = { path = "crates/codestory-storage" }
+codestory-index = { path = "crates/codestory-index" }
+codestory-search = { path = "crates/codestory-search" }
+codestory-graph = { path = "crates/codestory-graph" }
+codestory-events = { path = "crates/codestory-events" }
+codestory-project = { path = "crates/codestory-project" }
+codestory-bench = { path = "crates/codestory-bench" }
+
+# Parsing (tree-sitter) - Aligning to 0.24 for tree-sitter-graph 0.12
+
+# Parsing (tree-sitter) - Aligning to 0.24 for tree-sitter-graph 0.12
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23.3"
+tree-sitter-python = "0.23.6"
+tree-sitter-java = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-javascript = "0.23.1"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23.4"
+
+# Semantic Analysis
+tree-sitter-graph = "0.12"
+streaming-iterator = "0.1"
+
+# GUI
+eframe = "0.33"
+egui = "0.33"
+egui_extras = "0.33"
+
+# Graph
+
+
+# Storage
+rusqlite = { version = "0.38", features = ["bundled"] }
+
+# Search
+nucleo-matcher = "0.3"
+tantivy = "0.25"
+
+# Utilities
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+rayon = "1.11"
+thiserror = "2.0"
+tracing = "0.1"
+walkdir = "2"
+notify = "8"
+ignore = "0.4"
+tracing-subscriber = "0.3"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6.0.0"
+dirs = "6.0.0"
+rfd = "0.17.2"
+glob = "0.3"
+egui_dock = "0.18.0"
+egui-notify = "0.21"
+egui-file-dialog = "0.12.0"
+egui_plot = "0.34"
+egui_code_editor = "0.2"
+egui-snarl = "0.9"
+sysinfo = "0.38"
+feature-probe = "0.1.1"
+tempfile = "3.10"
+
+# Experimental Layout
+oak-visualize = "0.0.1"
+
+criterion = "0.5"
+proptest = "1.5"
+
+[profile.dev]
+opt-level = 0      # keep your code fast-to-compile
+debug = 1          # or 2 if you want full debug symbols
+incremental = true
+
+# This is the key: optimize *all dependencies* in dev builds
+[profile.dev.package."*"]
+opt-level = 3
+debug = false # optional: reduces compile time + binary size for deps

@@ -1,0 +1,17 @@
+[package]
+name = "codestory-graph"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+codestory-core = { workspace = true }
+codestory-events = { workspace = true }
+
+oak-visualize = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
