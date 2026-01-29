@@ -14,7 +14,7 @@ use egui_snarl::{
     ui::{PinPlacement, SnarlStyle},
     NodeId as SnarlNodeId, Snarl,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
@@ -59,6 +59,7 @@ pub struct NodeGraphView {
     pub pending_pan_to_node: Option<NodeId>,
     view_version: u64,
     theme_flavor: catppuccin_egui::Theme,
+    initial_layout_done: bool,
 }
 
 impl NodeGraphView {
@@ -171,6 +172,7 @@ impl NodeGraphView {
             pending_pan_to_node: None,
             view_version: 0,
             theme_flavor: catppuccin_egui::MOCHA,
+            initial_layout_done: false,
         }
     }
 
@@ -465,6 +467,11 @@ impl NodeGraphView {
             self.is_calculating = false;
             self.cached_positions = Some(positions.clone());
             self.rebuild_graph(settings);
+
+            if !self.initial_layout_done {
+                self.initial_layout_done = true;
+                self.view_version = self.view_version.wrapping_add(1);
+            }
         }
 
         if self.is_calculating {
@@ -519,71 +526,89 @@ impl NodeGraphView {
             rebuild_needed = true;
         }
 
-        ui.horizontal(|ui| {
-            // Left: Vertical toolbar (Req 9.1)
+        let full_rect = ui.available_rect_before_wrap();
+        // Force the ui to take up the whole remaining space
+        ui.allocate_rect(full_rect, egui::Sense::hover());
+
+        let toolbar_width = 130.0;
+        let toolbar_rect = egui::Rect::from_min_size(
+            full_rect.min,
+            egui::vec2(toolbar_width, full_rect.height()),
+        );
+        let graph_rect = egui::Rect::from_min_max(
+            egui::pos2(full_rect.min.x + toolbar_width, full_rect.min.y),
+            full_rect.max,
+        );
+
+        // Left: Vertical toolbar (Req 9.1)
+        ui.allocate_ui_at_rect(toolbar_rect, |ui| {
             rebuild_needed |= self.ui_toolbar(ui, settings);
+        });
 
-            ui.separator();
+        // Draw separator line manually
+        ui.painter().vline(
+            toolbar_rect.max.x,
+            full_rect.y_range(),
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
 
-            // Right: Graph viewport
-            ui.vertical(|ui| {
-                let (snarl_rect, _) =
-                    ui.allocate_at_least(ui.available_size(), egui::Sense::hover());
-                let mut child_ui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(snarl_rect)
-                        .layout(egui::Layout::top_down(egui::Align::Min)),
-                );
+        // Right: Graph viewport
+        ui.allocate_ui_at_rect(graph_rect, |ui| {
+            let snarl_rect = ui.available_rect_before_wrap();
+            let mut child_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(snarl_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
 
-                // Clear cached screen rects before new frame rendering
-                self.adapter.node_rects.clear();
+            // Clear cached screen rects before new frame rendering
+            self.adapter.node_rects.clear();
 
-                // Provide viewport info for culling (Req 10.1, 10.4)
-                self.adapter.viewport_rect = snarl_rect;
-                self.adapter.total_node_count = self.snarl.node_ids().count();
+            // Provide viewport info for culling (Req 10.1, 10.4)
+            self.adapter.viewport_rect = snarl_rect;
+            self.adapter.total_node_count = self.snarl.node_ids().count();
 
-                self.snarl.show(
-                    &mut self.adapter,
-                    &self.style,
-                    ("node_graph", self.view_version),
-                    &mut child_ui,
-                );
+            self.snarl.show(
+                &mut self.adapter,
+                &self.style,
+                ("node_graph", self.view_version),
+                &mut child_ui,
+            );
 
-                // Render custom edges - curves and arrowheads in foreground
-                let snarl_id = ui.make_persistent_id(("node_graph", self.view_version));
-                let fg_layer = egui::LayerId::new(egui::Order::Foreground, snarl_id);
-                let mut fg_painter = ui.ctx().layer_painter(fg_layer);
-                fg_painter.set_clip_rect(snarl_rect);
+            // Render custom edges - curves and arrowheads in foreground
+            let snarl_id = ui.make_persistent_id(("node_graph", self.view_version));
+            let fg_layer = egui::LayerId::new(egui::Order::Foreground, snarl_id);
+            let mut fg_painter = ui.ctx().layer_painter(fg_layer);
+            fg_painter.set_clip_rect(snarl_rect);
 
-                // Supply node labels from snarl graph for edge tooltip display
-                {
-                    let mut labels = HashMap::new();
-                    for (snarl_id, _node) in self.snarl.node_ids() {
-                        let uml = &self.snarl[snarl_id];
-                        labels.insert(uml.id, uml.label.clone());
-                    }
-                    self.edge_overlay.set_node_labels(labels);
+            // Supply node labels from snarl graph for edge tooltip display
+            {
+                let mut labels = HashMap::new();
+                for (snarl_id, _node) in self.snarl.node_ids() {
+                    let uml = &self.snarl[snarl_id];
+                    labels.insert(uml.id, uml.label.clone());
                 }
+                self.edge_overlay.set_node_labels(labels);
+            }
 
-                self.edge_overlay.render(
-                    ui,
-                    &fg_painter,
-                    &fg_painter,
-                    &self.current_edges,
-                    &self.adapter.node_rects,
-                    snarl_rect,
-                    self.adapter.current_transform,
-                    node_inner_margin,
-                );
+            self.edge_overlay.render(
+                ui,
+                &fg_painter,
+                &fg_painter,
+                &self.current_edges,
+                &self.adapter.node_rects,
+                snarl_rect,
+                self.adapter.current_transform,
+                node_inner_margin,
+            );
 
-                if settings.show_minimap {
-                    self.ui_minimap(ui, snarl_rect, settings);
-                }
+            if settings.show_minimap {
+                self.ui_minimap(ui, snarl_rect, settings);
+            }
 
-                if settings.show_legend {
-                    self.ui_legend(ui, snarl_rect);
-                }
-            });
+            if settings.show_legend {
+                self.ui_legend(ui, snarl_rect);
+            }
         });
 
         if rebuild_needed {
@@ -823,7 +848,7 @@ impl NodeGraphView {
     }
 
     fn ui_minimap(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
         parent_rect: egui::Rect,
         _settings: &crate::settings::NodeGraphSettings,
@@ -834,26 +859,48 @@ impl NodeGraphView {
             minimap_size,
         );
 
-        ui.painter()
-            .rect_filled(minimap_rect, 5.0, self.theme_flavor.mantle);
-        ui.painter().rect_stroke(
+        // Render on Tooltip layer to ensure it stays on top of graph nodes and edges
+        let mut painter = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            ui.id().with("minimap"),
+        ));
+        painter.set_clip_rect(parent_rect);
+
+        painter.rect_filled(minimap_rect, 5.0, self.theme_flavor.mantle);
+        painter.rect_stroke(
             minimap_rect,
             5.0,
             (1.0, self.theme_flavor.overlay0),
             egui::StrokeKind::Middle,
         );
 
-        // Find bounds of snarl nodes
+        // Sync visible nodes to cache to handle manual movement
+        let positions_cache = self.cached_positions.get_or_insert_with(HashMap::new);
+        
+        // 1. Update positions for currently visible/rendered nodes
+        for (pos, node) in self.snarl.nodes_pos() {
+            positions_cache.insert(node.id, pos);
+        }
+
+        // 2. Prune nodes that no longer exist in the graph (e.g. filtered/deleted)
+        // This prevents "ghost nodes" from appearing in the minimap
+        let valid_ids: HashSet<NodeId> = self.snarl.node_ids()
+            .map(|(_, node)| node.id)
+            .collect();
+        positions_cache.retain(|id, _| valid_ids.contains(id));
+
         let mut min = egui::pos2(f32::INFINITY, f32::INFINITY);
         let mut max = egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY);
-
         let mut has_nodes = false;
-        for (pos, _) in self.snarl.nodes_pos() {
-            has_nodes = true;
-            min.x = min.x.min(pos.x);
-            min.y = min.y.min(pos.y);
-            max.x = max.x.max(pos.x + 100.0); // Rough node size
-            max.y = max.y.max(pos.y + 100.0);
+
+        if let Some(positions) = &self.cached_positions {
+            for pos in positions.values() {
+                has_nodes = true;
+                min.x = min.x.min(pos.x);
+                min.y = min.y.min(pos.y);
+                max.x = max.x.max(pos.x + 100.0);
+                max.y = max.y.max(pos.y + 100.0);
+            }
         }
 
         if !has_nodes {
@@ -866,14 +913,16 @@ impl NodeGraphView {
             .min(1.0);
         let offset = minimap_rect.center() - bounds.center() * scale;
 
-        for (pos, _) in self.snarl.nodes_pos() {
-            let map_pos = pos * scale + offset;
-            let size = egui::vec2(100.0, 40.0) * scale;
-            ui.painter().rect_filled(
-                egui::Rect::from_min_size(map_pos, size),
-                1.0,
-                egui::Color32::from_white_alpha(100),
-            );
+        if let Some(positions) = &self.cached_positions {
+            for pos in positions.values() {
+                let map_pos = *pos * scale + offset;
+                let size = egui::vec2(100.0, 40.0) * scale;
+                painter.rect_filled(
+                    egui::Rect::from_min_size(map_pos, size),
+                    1.0,
+                    egui::Color32::from_white_alpha(100),
+                );
+            }
         }
     }
 
