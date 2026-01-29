@@ -20,7 +20,10 @@ proptest! {
             event_bus: codestory_events::EventBus::new(),
             node_rects: std::collections::HashMap::new(),
             current_transform: egui::emath::TSTransform::default(),
+            current_zoom: 1.0,
             pin_info: std::collections::HashMap::new(),
+            viewport_rect: egui::Rect::NOTHING,
+            total_node_count: 0,
         };
 
         let member_id = NodeId(member_id_val);
@@ -68,7 +71,10 @@ proptest! {
             event_bus: codestory_events::EventBus::new(),
             node_rects: std::collections::HashMap::new(),
             current_transform: egui::emath::TSTransform::default(),
+            current_zoom: 1.0,
             pin_info: std::collections::HashMap::new(),
+            viewport_rect: egui::Rect::NOTHING,
+            total_node_count: 0,
         };
 
         // Map index to a NodeKind roughly

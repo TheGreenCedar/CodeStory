@@ -286,15 +286,20 @@ mod tests {
     #[test]
     fn test_add_tab() {
         let mut state = DockState::new();
+        // Metrics is now included in the default layout
+        assert!(state.is_tab_open(&TabId::Metrics));
+
+        // Adding an already-open tab should be a no-op
+        let count_before = state.open_tabs.len();
+        state.add_tab(TabId::Metrics);
+        assert_eq!(state.open_tabs.len(), count_before);
+
+        // Remove and re-add to test the add path
+        state.open_tabs.retain(|t| t != &TabId::Metrics);
         assert!(!state.is_tab_open(&TabId::Metrics));
 
         state.add_tab(TabId::Metrics);
         assert!(state.is_tab_open(&TabId::Metrics));
-
-        // Adding again should be a no-op
-        let count_before = state.open_tabs.len();
-        state.add_tab(TabId::Metrics);
-        assert_eq!(state.open_tabs.len(), count_before);
     }
 
     #[test]

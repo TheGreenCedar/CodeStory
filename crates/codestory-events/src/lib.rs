@@ -277,6 +277,10 @@ pub enum Event {
     OpenCustomTrailDialog,
     /// Zoom to fit the entire graph
     ZoomToFit,
+    /// Zoom in the graph viewport
+    ZoomIn,
+    /// Zoom out the graph viewport
+    ZoomOut,
     /// Set the graph layout method
     SetLayoutMethod(LayoutAlgorithm),
     /// Set the graph layout direction (Horizontal or Vertical)

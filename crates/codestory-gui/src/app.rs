@@ -1489,7 +1489,7 @@ impl codestory_events::EventListener for CodeStoryApp {
             Event::SearchFailed { error } => {
                 self.status_message = format!("Search failed: {}", error);
             }
-            Event::ZoomToFit => {
+            Event::ZoomToFit | Event::ZoomIn | Event::ZoomOut => {
                 // Handled via handle_event in NodeGraphView
             }
             Event::SetTrailDepth(depth) => {

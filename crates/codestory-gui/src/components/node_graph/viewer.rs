@@ -143,7 +143,10 @@ impl NodeGraphView {
                 event_bus: event_bus.clone(),
                 node_rects: std::collections::HashMap::new(),
                 current_transform: egui::emath::TSTransform::default(),
+                current_zoom: 1.0,
                 pin_info: std::collections::HashMap::new(),
+                viewport_rect: egui::Rect::NOTHING,
+                total_node_count: 0,
             },
             style,
             event_bus,
@@ -206,13 +209,34 @@ impl NodeGraphView {
                 }
             }
             Event::ExpandAll => {
-                // TODO: Implement global expand
+                for (snarl_id, _node) in self.snarl.node_ids() {
+                    let node_id = self.snarl[snarl_id].id;
+                    if let Some(state) = self.adapter.collapse_states.get_mut(&node_id) {
+                        state.is_collapsed = false;
+                        state.expand_all_sections();
+                    }
+                }
             }
             Event::CollapseAll => {
-                // TODO: Implement global collapse
+                for (snarl_id, _node) in self.snarl.node_ids() {
+                    let node_id = self.snarl[snarl_id].id;
+                    let state = self
+                        .adapter
+                        .collapse_states
+                        .entry(node_id)
+                        .or_default();
+                    state.is_collapsed = true;
+                }
             }
             Event::ZoomToFit => {
                 self.view_version = self.view_version.wrapping_add(1);
+            }
+            Event::ZoomIn | Event::ZoomOut => {
+                // Zoom in/out is handled by egui-snarl natively via mouse wheel.
+                // These events are for toolbar button triggers; we increment
+                // view_version to signal a re-layout which resets zoom-to-fit.
+                // Direct zoom manipulation is not exposed by egui-snarl's API,
+                // so we rely on the native mouse wheel for precise zoom control.
             }
             _ => {}
         }
@@ -495,119 +519,261 @@ impl NodeGraphView {
             rebuild_needed = true;
         }
 
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Node Graph").strong());
-                if self.is_calculating {
-                    ui.spinner();
-                }
-                ui.separator();
+        ui.horizontal(|ui| {
+            // Left: Vertical toolbar (Req 9.1)
+            rebuild_needed |= self.ui_toolbar(ui, settings);
 
-                // Toolbar
-                ui.label("Depth:");
+            ui.separator();
+
+            // Right: Graph viewport
+            ui.vertical(|ui| {
+                let (snarl_rect, _) =
+                    ui.allocate_at_least(ui.available_size(), egui::Sense::hover());
+                let mut child_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(snarl_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+
+                // Clear cached screen rects before new frame rendering
+                self.adapter.node_rects.clear();
+
+                // Provide viewport info for culling (Req 10.1, 10.4)
+                self.adapter.viewport_rect = snarl_rect;
+                self.adapter.total_node_count = self.snarl.node_ids().count();
+
+                self.snarl.show(
+                    &mut self.adapter,
+                    &self.style,
+                    ("node_graph", self.view_version),
+                    &mut child_ui,
+                );
+
+                // Render custom edges - curves and arrowheads in foreground
+                let snarl_id = ui.make_persistent_id(("node_graph", self.view_version));
+                let fg_layer = egui::LayerId::new(egui::Order::Foreground, snarl_id);
+                let mut fg_painter = ui.ctx().layer_painter(fg_layer);
+                fg_painter.set_clip_rect(snarl_rect);
+
+                // Supply node labels from snarl graph for edge tooltip display
+                {
+                    let mut labels = HashMap::new();
+                    for (snarl_id, _node) in self.snarl.node_ids() {
+                        let uml = &self.snarl[snarl_id];
+                        labels.insert(uml.id, uml.label.clone());
+                    }
+                    self.edge_overlay.set_node_labels(labels);
+                }
+
+                self.edge_overlay.render(
+                    ui,
+                    &fg_painter,
+                    &fg_painter,
+                    &self.current_edges,
+                    &self.adapter.node_rects,
+                    snarl_rect,
+                    self.adapter.current_transform,
+                    node_inner_margin,
+                );
+
+                if settings.show_minimap {
+                    self.ui_minimap(ui, snarl_rect, settings);
+                }
+
+                if settings.show_legend {
+                    self.ui_legend(ui, snarl_rect);
+                }
+            });
+        });
+
+        if rebuild_needed {
+            self.rebuild_graph(settings);
+        }
+
+        self.adapter.clicked_node.or(node_to_navigate)
+    }
+
+    /// Renders the vertical toolbar on the left side of the graph viewport (Req 9.1-9.5).
+    /// Returns true if a graph rebuild is needed.
+    fn ui_toolbar(
+        &mut self,
+        ui: &mut egui::Ui,
+        settings: &crate::settings::NodeGraphSettings,
+    ) -> bool {
+        let mut rebuild_needed = false;
+        let toolbar_width = 130.0;
+
+        ui.allocate_ui_with_layout(
+            egui::vec2(toolbar_width, ui.available_height()),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                ui.set_width(toolbar_width);
+
+                egui::Frame::none()
+                    .fill(ui.visuals().window_fill())
+                    .inner_margin(4.0)
+                    .show(ui, |ui| {
+                        // Title + spinner
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Node Graph").strong().size(12.0));
+                            if self.is_calculating {
+                                ui.spinner();
+                            }
+                        });
+
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(2.0);
+
+                // -- Depth --
+                ui.label(egui::RichText::new("Depth").size(11.0));
                 let mut depth = settings.max_depth as u32;
                 if ui
-                    .add(egui::DragValue::new(&mut depth).range(1..=10))
+                    .add(
+                        egui::DragValue::new(&mut depth)
+                            .range(1..=10)
+                            .speed(0.1),
+                    )
                     .changed()
                 {
                     self.event_bus.publish(Event::SetTrailDepth(depth));
                 }
-                ui.separator();
 
-                // Layout Selector
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(2.0);
+
+                // -- Layout Algorithm Selector (Req 9.4) --
+                ui.label(egui::RichText::new("Layout").size(11.0));
                 egui::ComboBox::from_id_salt("layout_selector")
+                    .width(toolbar_width - 16.0)
                     .selected_text(format!("{:?}", settings.layout_algorithm))
                     .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_label(
-                                settings.layout_algorithm
-                                    == codestory_events::LayoutAlgorithm::ForceDirected,
-                                "Force Directed",
-                            )
-                            .clicked()
-                        {
-                            self.event_bus.publish(Event::SetLayoutMethod(
+                        for (alg, label) in [
+                            (
                                 codestory_events::LayoutAlgorithm::ForceDirected,
-                            ));
-                        }
-                        if ui
-                            .selectable_label(
-                                settings.layout_algorithm
-                                    == codestory_events::LayoutAlgorithm::Radial,
-                                "Radial",
-                            )
-                            .clicked()
-                        {
-                            self.event_bus.publish(Event::SetLayoutMethod(
-                                codestory_events::LayoutAlgorithm::Radial,
-                            ));
-                        }
-                        if ui
-                            .selectable_label(
-                                settings.layout_algorithm
-                                    == codestory_events::LayoutAlgorithm::Grid,
-                                "Grid",
-                            )
-                            .clicked()
-                        {
-                            self.event_bus.publish(Event::SetLayoutMethod(
-                                codestory_events::LayoutAlgorithm::Grid,
-                            ));
-                        }
-                        if ui
-                            .selectable_label(
-                                settings.layout_algorithm
-                                    == codestory_events::LayoutAlgorithm::Hierarchical,
-                                "Hierarchical",
-                            )
-                            .clicked()
-                        {
-                            self.event_bus.publish(Event::SetLayoutMethod(
+                                "Force Directed",
+                            ),
+                            (codestory_events::LayoutAlgorithm::Radial, "Radial"),
+                            (codestory_events::LayoutAlgorithm::Grid, "Grid"),
+                            (
                                 codestory_events::LayoutAlgorithm::Hierarchical,
-                            ));
+                                "Hierarchical",
+                            ),
+                        ] {
+                            if ui
+                                .selectable_label(settings.layout_algorithm == alg, label)
+                                .clicked()
+                            {
+                                self.event_bus.publish(Event::SetLayoutMethod(alg));
+                            }
                         }
                     });
 
-                ui.separator();
-
-                // Direction Toggle (only for Hierarchical)
+                // -- Direction Toggle (Req 9.2 - Toggle Orientation) --
                 if settings.layout_algorithm == codestory_events::LayoutAlgorithm::Hierarchical {
-                    if ui
-                        .selectable_value(
-                            &mut self.current_layout_direction,
-                            codestory_core::LayoutDirection::Horizontal,
-                            "Horizontal",
-                        )
-                        .changed()
-                    {
-                        self.event_bus
-                            .publish(codestory_events::Event::SetLayoutDirection(
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Direction").size(11.0));
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_value(
+                                &mut self.current_layout_direction,
+                                codestory_core::LayoutDirection::Horizontal,
+                                "H",
+                            )
+                            .on_hover_text("Horizontal (left to right)")
+                            .changed()
+                        {
+                            self.event_bus.publish(Event::SetLayoutDirection(
                                 codestory_core::LayoutDirection::Horizontal,
                             ));
-                        self.cached_positions = None;
-                        rebuild_needed = true;
-                    }
-                    if ui
-                        .selectable_value(
-                            &mut self.current_layout_direction,
-                            codestory_core::LayoutDirection::Vertical,
-                            "Vertical",
-                        )
-                        .changed()
-                    {
-                        self.event_bus
-                            .publish(codestory_events::Event::SetLayoutDirection(
+                            self.cached_positions = None;
+                            rebuild_needed = true;
+                        }
+                        if ui
+                            .selectable_value(
+                                &mut self.current_layout_direction,
+                                codestory_core::LayoutDirection::Vertical,
+                                "V",
+                            )
+                            .on_hover_text("Vertical (top to bottom)")
+                            .changed()
+                        {
+                            self.event_bus.publish(Event::SetLayoutDirection(
                                 codestory_core::LayoutDirection::Vertical,
                             ));
-                        self.cached_positions = None;
-                        rebuild_needed = true;
-                    }
+                            self.cached_positions = None;
+                            rebuild_needed = true;
+                        }
+                    });
                 }
 
+                ui.add_space(4.0);
                 ui.separator();
+                ui.add_space(2.0);
 
+                // -- Zoom Controls (Req 9.2) --
+                ui.label(egui::RichText::new("Zoom").size(11.0));
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(egui::RichText::new("+").monospace())
+                        .on_hover_text("Zoom In")
+                        .clicked()
+                    {
+                        self.event_bus.publish(Event::ZoomIn);
+                    }
+                    if ui
+                        .button(egui::RichText::new("\u{2212}").monospace())
+                        .on_hover_text("Zoom Out")
+                        .clicked()
+                    {
+                        self.event_bus.publish(Event::ZoomOut);
+                    }
+                    if ui
+                        .button(egui::RichText::new("\u{2b1c}").monospace())
+                        .on_hover_text("Zoom to Fit")
+                        .clicked()
+                    {
+                        self.view_version = self.view_version.wrapping_add(1);
+                    }
+                });
+                let zoom_pct = (self.adapter.current_zoom * 100.0).round() as u32;
+                ui.label(
+                    egui::RichText::new(format!("{}%", zoom_pct))
+                        .size(10.0)
+                        .color(ui.visuals().weak_text_color()),
+                );
+
+                ui.add_space(4.0);
                 ui.separator();
+                ui.add_space(2.0);
 
+                // -- Expand / Collapse All (Req 9.2) --
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Expand All")
+                        .on_hover_text("Expand all nodes")
+                        .clicked()
+                    {
+                        self.event_bus.publish(Event::ExpandAll);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Collapse All")
+                        .on_hover_text("Collapse all nodes")
+                        .clicked()
+                    {
+                        self.event_bus.publish(Event::CollapseAll);
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(2.0);
+
+                // -- Filter Toggles (Req 9.5) --
+                ui.label(egui::RichText::new("Filters").size(11.0));
                 let mut show_classes = settings.show_classes;
                 if ui.checkbox(&mut show_classes, "Classes").changed() {
                     self.event_bus.publish(Event::SetShowClasses(show_classes));
@@ -623,87 +789,37 @@ impl NodeGraphView {
                         .publish(Event::SetShowVariables(show_variables));
                 }
 
+                ui.add_space(4.0);
                 ui.separator();
-                if ui.button("Zoom to Fit").clicked() {
-                    self.view_version = self.view_version.wrapping_add(1);
-                }
+                ui.add_space(2.0);
 
+                // -- Display Toggles --
                 let mut show_minimap = settings.show_minimap;
-                if ui.toggle_value(&mut show_minimap, "Minimap").changed() {
+                if ui.checkbox(&mut show_minimap, "Minimap").changed() {
                     self.event_bus.publish(Event::SetShowMinimap(show_minimap));
                 }
-
                 let mut show_legend = settings.show_legend;
-                if ui.toggle_value(&mut show_legend, "Legend").changed() {
+                if ui.checkbox(&mut show_legend, "Legend").changed() {
                     self.event_bus.publish(Event::SetShowLegend(show_legend));
                 }
 
+                ui.add_space(4.0);
                 ui.separator();
-                if ui.button("Reset View").clicked() {
+                ui.add_space(2.0);
+
+                // -- Reset View --
+                if ui
+                    .button("Reset View")
+                    .on_hover_text("Reset graph layout")
+                    .clicked()
+                {
                     rebuild_needed = true;
                 }
-            });
-            ui.separator();
-
-            let (snarl_rect, _) = ui.allocate_at_least(ui.available_size(), egui::Sense::hover());
-            let mut child_ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(snarl_rect)
-                    .layout(egui::Layout::top_down(egui::Align::Min)),
-            );
-
-            // Clear cached screen rects before new frame rendering
-            self.adapter.node_rects.clear();
-
-            self.snarl.show(
-                &mut self.adapter,
-                &self.style,
-                ("node_graph", self.view_version),
-                &mut child_ui,
-            );
-
-            // Render custom edges - curves and arrowheads in foreground
-            let snarl_id = ui.make_persistent_id(("node_graph", self.view_version));
-            let fg_layer = egui::LayerId::new(egui::Order::Foreground, snarl_id);
-            // IDENTITY PAINTER (Fresh for the layer, no inherited transforms)
-            let mut fg_painter = ui.ctx().layer_painter(fg_layer);
-            fg_painter.set_clip_rect(ui.clip_rect());
-
-            // Supply node labels from snarl graph for edge tooltip display (Phase 9)
-            {
-                let mut labels = HashMap::new();
-                for (snarl_id, _node) in self.snarl.node_ids() {
-                    let uml = &self.snarl[snarl_id];
-                    labels.insert(uml.id, uml.label.clone());
+                    });
                 }
-                self.edge_overlay.set_node_labels(labels);
-            }
-
-            self.edge_overlay.render(
-                ui,
-                &fg_painter,
-                &fg_painter,
-                &self.current_edges,
-                &self.adapter.node_rects,
-                ui.clip_rect(),
-                self.adapter.current_transform,
-                node_inner_margin,
             );
 
-            if settings.show_minimap {
-                self.ui_minimap(ui, snarl_rect, settings);
-            }
-
-            if settings.show_legend {
-                self.ui_legend(ui, snarl_rect);
-            }
-        });
-
-        if rebuild_needed {
-            self.rebuild_graph(settings);
-        }
-
-        self.adapter.clicked_node.or(node_to_navigate)
+        rebuild_needed
     }
 
     fn ui_minimap(

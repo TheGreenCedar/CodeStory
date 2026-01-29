@@ -39,12 +39,20 @@ pub struct NodeGraphAdapter {
     pub event_bus: codestory_events::EventBus,
     pub node_rects: std::collections::HashMap<codestory_core::NodeId, egui::Rect>,
     pub current_transform: egui::emath::TSTransform,
+    /// Current zoom level extracted from the transform (for simplified rendering)
+    pub current_zoom: f32,
     /// Pin information for UmlNode (inputs and outputs per node)
     /// Stored separately since UmlNode doesn't have pin fields
     pub pin_info: std::collections::HashMap<
         codestory_core::NodeId,
         (Vec<codestory_graph::node_graph::NodeGraphPin>, Vec<codestory_graph::node_graph::NodeGraphPin>),
     >,
+    /// The visible viewport rectangle in screen coordinates (for culling).
+    /// Updated each frame before snarl rendering.
+    pub viewport_rect: egui::Rect,
+    /// Total number of nodes in the current graph. When >= 50, viewport culling
+    /// is applied to skip detailed rendering for off-screen nodes (Req 10.1).
+    pub total_node_count: usize,
 }
 
 impl SnarlViewer<UmlNode> for NodeGraphAdapter {
@@ -61,6 +69,18 @@ impl SnarlViewer<UmlNode> for NodeGraphAdapter {
         snarl: &mut Snarl<UmlNode>,
     ) {
         let node = &snarl[node_id];
+
+        // Viewport culling: if we previously recorded this node's screen rect
+        // and it's outside the visible area, render a minimal placeholder instead
+        // of the full container content (Req 10.1, 10.4, Property 25).
+        if let Some(prev_rect) = self.node_rects.get(&node.id) {
+            if !self.is_node_visible(*prev_rect) {
+                // Render minimal label only – avoids expensive member/section rendering
+                ui.label(egui::RichText::new(&node.label).color(self.theme.subtext0).size(10.0));
+                return;
+            }
+        }
+
         let label = if let Some(info) = &node.bundle_info {
             format!("{} ({})", node.label, info.count)
         } else {
@@ -205,8 +225,13 @@ impl SnarlViewer<UmlNode> for NodeGraphAdapter {
                 .map(|s| s.is_collapsed)
                 .unwrap_or(false);
 
-            // Only render members if node is not collapsed
-            if !is_collapsed && !node.visibility_sections.is_empty() {
+            // Only render members if node is not collapsed and zoom is above 50%
+            // When zoom < 0.5, simplify rendering by hiding member details (Req 7.5, Property 24)
+            let show_members = !is_collapsed
+                && !node.visibility_sections.is_empty()
+                && self.current_zoom >= 0.5;
+
+            if show_members {
                 ui.add_space(4.0);
 
                 // Render pre-grouped visibility sections from UmlNode
@@ -217,6 +242,23 @@ impl SnarlViewer<UmlNode> for NodeGraphAdapter {
 
                     self.render_visibility_section(ui, node.id, section);
                     ui.add_space(4.0);
+                }
+            } else if !is_collapsed
+                && !node.visibility_sections.is_empty()
+                && self.current_zoom < 0.5
+            {
+                // At low zoom, show a compact summary instead of full members
+                let total_members: usize = node
+                    .visibility_sections
+                    .iter()
+                    .map(|s| s.members.len())
+                    .sum();
+                if total_members > 0 {
+                    ui.label(
+                        egui::RichText::new(format!("{} members", total_members))
+                            .color(self.theme.subtext0)
+                            .size(ui_constants::SECTION_HEADER_SIZE),
+                    );
                 }
             }
         });
@@ -315,10 +357,25 @@ impl SnarlViewer<UmlNode> for NodeGraphAdapter {
         _snarl: &mut Snarl<UmlNode>,
     ) {
         self.current_transform = *to_global;
+        self.current_zoom = to_global.scaling;
     }
 }
 
 impl NodeGraphAdapter {
+    /// Check if a node at the given screen-space rect is within the visible
+    /// viewport (expanded by the culling margin). Returns `true` if culling
+    /// is disabled (fewer than 50 nodes) or the node intersects the viewport.
+    ///
+    /// **Validates: Requirements 10.1, 10.4, Property 25**
+    fn is_node_visible(&self, screen_rect: egui::Rect) -> bool {
+        if self.total_node_count < codestory_graph::uml_types::VIEWPORT_CULL_THRESHOLD {
+            return true;
+        }
+        let margin = codestory_graph::uml_types::VIEWPORT_CULL_MARGIN;
+        let expanded = self.viewport_rect.expand(margin);
+        expanded.intersects(screen_rect)
+    }
+
     /// Render diagonal hatching pattern overlay for non-indexed nodes
     ///
     /// This method draws a diagonal striped pattern over the node background

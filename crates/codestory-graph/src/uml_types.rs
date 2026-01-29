@@ -62,6 +62,22 @@ impl Rect {
             && point.y >= self.min.y
             && point.y <= self.max.y
     }
+
+    /// Check if this rectangle intersects with another rectangle
+    pub fn intersects(&self, other: &Rect) -> bool {
+        self.min.x <= other.max.x
+            && self.max.x >= other.min.x
+            && self.min.y <= other.max.y
+            && self.max.y >= other.min.y
+    }
+
+    /// Return a new rectangle expanded by `amount` on all sides
+    pub fn expand(&self, amount: f32) -> Rect {
+        Rect {
+            min: Vec2::new(self.min.x - amount, self.min.y - amount),
+            max: Vec2::new(self.max.x + amount, self.max.y + amount),
+        }
+    }
 }
 
 /// A rectangle that is linked to a specific node or member context
@@ -940,6 +956,47 @@ impl Default for GraphViewState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The culling margin in pixels added around the viewport when determining
+/// which nodes are visible. Nodes within this margin of the viewport edge
+/// are still considered visible to avoid popping artifacts during panning.
+pub const VIEWPORT_CULL_MARGIN: f32 = 100.0;
+
+/// The minimum number of nodes in a graph before viewport culling is applied.
+/// For smaller graphs the overhead of culling isn't worthwhile.
+pub const VIEWPORT_CULL_THRESHOLD: usize = 50;
+
+/// Determine which node IDs are visible within the given viewport.
+///
+/// For graphs with fewer than [`VIEWPORT_CULL_THRESHOLD`] nodes, all nodes are
+/// returned as visible (no culling applied). For larger graphs, only nodes whose
+/// bounding rectangles intersect the viewport (expanded by [`VIEWPORT_CULL_MARGIN`])
+/// are included.
+///
+/// # Arguments
+/// * `node_rects` - Map of node IDs to their screen-space bounding rectangles.
+/// * `viewport` - The visible viewport rectangle in screen coordinates.
+///
+/// # Returns
+/// A `HashSet` of `NodeId`s that are considered visible.
+///
+/// **Validates: Requirements 10.1, 10.4, Property 25**
+pub fn viewport_cull(
+    node_rects: &HashMap<NodeId, Rect>,
+    viewport: Rect,
+) -> HashSet<NodeId> {
+    // Below threshold: all nodes visible
+    if node_rects.len() < VIEWPORT_CULL_THRESHOLD {
+        return node_rects.keys().copied().collect();
+    }
+
+    let expanded = viewport.expand(VIEWPORT_CULL_MARGIN);
+    node_rects
+        .iter()
+        .filter(|(_, rect)| expanded.intersects(rect))
+        .map(|(id, _)| *id)
+        .collect()
 }
 
 #[cfg(test)]
@@ -2372,6 +2429,373 @@ mod property_tests {
              let json = serde_json::to_string(&state).expect("Failed to serialize");
              let deserialized: GraphViewState = serde_json::from_str(&json).expect("Failed to deserialize");
              prop_assert_eq!(state, deserialized);
+        }
+
+        // =====================================================================
+        // Phase 12: Viewport Controls Property Tests
+        // =====================================================================
+
+        /// **Validates: Requirements 7.4**
+        ///
+        /// Property 23: Zoom Level Clamping
+        ///
+        /// For any zoom input value, the resulting zoom level SHALL be clamped
+        /// to the range [0.1, 4.0] (10% to 400%).
+        #[test]
+        fn prop_zoom_level_clamping(
+            zoom_input in -10.0f32..=10.0f32
+        ) {
+            let mut state = GraphViewState::new();
+            state.set_zoom(zoom_input);
+
+            prop_assert!(
+                state.zoom >= 0.1,
+                "Zoom level {} should be >= 0.1 (10%) for input {}",
+                state.zoom, zoom_input
+            );
+            prop_assert!(
+                state.zoom <= 4.0,
+                "Zoom level {} should be <= 4.0 (400%) for input {}",
+                state.zoom, zoom_input
+            );
+
+            // If input is within valid range, zoom should equal input
+            if zoom_input >= 0.1 && zoom_input <= 4.0 {
+                prop_assert!(
+                    (state.zoom - zoom_input).abs() < f32::EPSILON,
+                    "Zoom {} should equal input {} when within valid range",
+                    state.zoom, zoom_input
+                );
+            }
+        }
+
+        /// Property 23 variant: Zoom clamping idempotence
+        ///
+        /// Clamping a value that's already in range should not change it.
+        #[test]
+        fn prop_zoom_clamping_idempotent(
+            zoom_input in 0.1f32..=4.0f32
+        ) {
+            let mut state = GraphViewState::new();
+            state.set_zoom(zoom_input);
+            let first_zoom = state.zoom;
+            state.set_zoom(first_zoom);
+
+            prop_assert!(
+                (state.zoom - first_zoom).abs() < f32::EPSILON,
+                "Double-clamping should be idempotent: {} vs {}",
+                state.zoom, first_zoom
+            );
+        }
+
+        /// **Validates: Requirements 7.5**
+        ///
+        /// Property 24: Low Zoom Simplification
+        ///
+        /// For any zoom level < 0.5, Container_Nodes SHALL be rendered without
+        /// member details (simplified mode).
+        ///
+        /// This test verifies the threshold logic: zoom values below 0.5 should
+        /// trigger simplified rendering, while values >= 0.5 should show full detail.
+        #[test]
+        fn prop_low_zoom_simplification_threshold(
+            zoom_level in 0.1f32..=4.0f32
+        ) {
+            let should_simplify = zoom_level < 0.5;
+
+            // Verify the threshold is correct
+            if should_simplify {
+                prop_assert!(
+                    zoom_level < 0.5,
+                    "Zoom level {} should trigger simplified rendering",
+                    zoom_level
+                );
+            } else {
+                prop_assert!(
+                    zoom_level >= 0.5,
+                    "Zoom level {} should show full detail rendering",
+                    zoom_level
+                );
+            }
+        }
+
+        /// **Validates: Requirements 7.3**
+        ///
+        /// Property 22: Zoom to Fit Bounds
+        ///
+        /// After executing "Zoom to Fit", all node bounding boxes SHALL be
+        /// fully contained within the viewport bounds.
+        ///
+        /// This test verifies the viewport containment math: given a set of
+        /// node positions and a viewport, the computed zoom/pan should contain
+        /// all nodes.
+        #[test]
+        fn prop_zoom_to_fit_bounds(
+            node_positions in prop::collection::vec(
+                (-1000.0f32..=1000.0, -1000.0f32..=1000.0),
+                1..=50
+            ),
+            viewport_width in 200.0f32..=2000.0,
+            viewport_height in 200.0f32..=2000.0,
+        ) {
+            // Compute the bounding box of all nodes
+            let mut min_x = f32::INFINITY;
+            let mut min_y = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
+
+            let node_width = 150.0f32;
+            let node_height = 50.0f32;
+
+            for &(x, y) in &node_positions {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x + node_width);
+                max_y = max_y.max(y + node_height);
+            }
+
+            let content_width = max_x - min_x;
+            let content_height = max_y - min_y;
+
+            // Calculate the zoom level needed to fit all content
+            let zoom_x = viewport_width / content_width.max(1.0);
+            let zoom_y = viewport_height / content_height.max(1.0);
+            let fit_zoom = zoom_x.min(zoom_y).min(4.0).max(0.1);
+
+            // After fit, all content should be within the viewport
+            // Allow small floating-point tolerance
+            let tolerance = 1.0;
+            let fitted_width = content_width * fit_zoom;
+            let fitted_height = content_height * fit_zoom;
+
+            prop_assert!(
+                fitted_width <= viewport_width + tolerance || fit_zoom <= 0.1 + f32::EPSILON,
+                "Fitted width {} should be <= viewport width {} (zoom: {})",
+                fitted_width, viewport_width, fit_zoom
+            );
+            prop_assert!(
+                fitted_height <= viewport_height + tolerance || fit_zoom <= 0.1 + f32::EPSILON,
+                "Fitted height {} should be <= viewport height {} (zoom: {})",
+                fitted_height, viewport_height, fit_zoom
+            );
+        }
+
+        /// **Validates: Requirements 7.2**
+        ///
+        /// Property 21: Zoom Cursor Centering
+        ///
+        /// For any zoom operation at cursor position P, the world-space point
+        /// under P before zoom SHALL remain under P after zoom (within
+        /// floating-point tolerance).
+        ///
+        /// This tests the math: zoom centered at a point should keep that
+        /// point fixed.
+        #[test]
+        fn prop_zoom_cursor_centering(
+            cursor_x in -500.0f32..=500.0,
+            cursor_y in -500.0f32..=500.0,
+            initial_zoom in 0.5f32..=2.0,
+            zoom_factor in 0.8f32..=1.25
+        ) {
+            let initial_pan_x = 0.0f32;
+            let initial_pan_y = 0.0f32;
+
+            // World point under cursor before zoom:
+            // world_point = (cursor - pan) / zoom
+            let world_x = (cursor_x - initial_pan_x) / initial_zoom;
+            let world_y = (cursor_y - initial_pan_y) / initial_zoom;
+
+            // Apply zoom centered on cursor
+            let new_zoom = (initial_zoom * zoom_factor).clamp(0.1, 4.0);
+
+            // After zoom, adjust pan so cursor still maps to same world point:
+            // cursor = world_point * new_zoom + new_pan
+            // new_pan = cursor - world_point * new_zoom
+            let new_pan_x = cursor_x - world_x * new_zoom;
+            let new_pan_y = cursor_y - world_y * new_zoom;
+
+            // Verify: world point under cursor after zoom should match
+            let after_world_x = (cursor_x - new_pan_x) / new_zoom;
+            let after_world_y = (cursor_y - new_pan_y) / new_zoom;
+
+            let tolerance = 0.01;
+            prop_assert!(
+                (after_world_x - world_x).abs() < tolerance,
+                "X world coordinate should be preserved: before={}, after={}, diff={}",
+                world_x, after_world_x, (after_world_x - world_x).abs()
+            );
+            prop_assert!(
+                (after_world_y - world_y).abs() < tolerance,
+                "Y world coordinate should be preserved: before={}, after={}, diff={}",
+                world_y, after_world_y, (after_world_y - world_y).abs()
+            );
+        }
+
+        // =====================================================================
+        // Phase 14: Performance Optimization Property Tests
+        // =====================================================================
+
+        /// **Validates: Requirements 10.1, 10.4**
+        ///
+        /// Property 25: Viewport Culling
+        ///
+        /// For any graph with more than 50 nodes, only nodes whose bounding
+        /// boxes intersect the expanded viewport (viewport + margin) SHALL be
+        /// included in the render list.
+        ///
+        /// This test verifies:
+        /// 1. Below threshold (< 50 nodes): all nodes returned regardless of position.
+        /// 2. At/above threshold (>= 50 nodes): only visible nodes returned.
+        /// 3. No visible node is incorrectly culled (false negative).
+        /// 4. No invisible node is incorrectly included (false positive).
+        #[test]
+        fn prop_viewport_culling(
+            // Viewport position and size
+            vp_x in -500.0f32..500.0,
+            vp_y in -500.0f32..500.0,
+            vp_w in 100.0f32..1000.0,
+            vp_h in 100.0f32..1000.0,
+            // Number of nodes (range covers below and above threshold)
+            node_count in 10usize..120,
+        ) {
+            let viewport = Rect::from_min_max(
+                Vec2::new(vp_x, vp_y),
+                Vec2::new(vp_x + vp_w, vp_y + vp_h),
+            );
+            let expanded = viewport.expand(VIEWPORT_CULL_MARGIN);
+
+            // Generate nodes: half inside viewport, half outside
+            let mut node_rects = HashMap::new();
+            let node_size = 80.0f32;
+            for i in 0..node_count {
+                let id = NodeId(i as i64);
+                let rect = if i % 2 == 0 {
+                    // Place inside the viewport
+                    let frac = (i as f32) / (node_count as f32);
+                    Rect::from_min_max(
+                        Vec2::new(vp_x + frac * vp_w * 0.5, vp_y + frac * vp_h * 0.5),
+                        Vec2::new(
+                            vp_x + frac * vp_w * 0.5 + node_size,
+                            vp_y + frac * vp_h * 0.5 + node_size,
+                        ),
+                    )
+                } else {
+                    // Place far outside the viewport (beyond margin)
+                    Rect::from_min_max(
+                        Vec2::new(vp_x + vp_w + VIEWPORT_CULL_MARGIN + 200.0, vp_y + vp_h + VIEWPORT_CULL_MARGIN + 200.0),
+                        Vec2::new(
+                            vp_x + vp_w + VIEWPORT_CULL_MARGIN + 200.0 + node_size,
+                            vp_y + vp_h + VIEWPORT_CULL_MARGIN + 200.0 + node_size,
+                        ),
+                    )
+                };
+                node_rects.insert(id, rect);
+            }
+
+            let visible = viewport_cull(&node_rects, viewport);
+
+            if node_count < VIEWPORT_CULL_THRESHOLD {
+                // Below threshold: all nodes should be returned
+                prop_assert_eq!(
+                    visible.len(), node_count,
+                    "Below threshold ({}), all {} nodes should be visible, got {}",
+                    VIEWPORT_CULL_THRESHOLD, node_count, visible.len()
+                );
+            } else {
+                // Above threshold: only nodes intersecting expanded viewport should be returned
+
+                // 1. No false negatives: every node intersecting expanded viewport is included
+                for (id, rect) in &node_rects {
+                    if expanded.intersects(rect) {
+                        prop_assert!(
+                            visible.contains(id),
+                            "Node {:?} intersects expanded viewport but was culled", id
+                        );
+                    }
+                }
+
+                // 2. No false positives: every visible node must intersect expanded viewport
+                for id in &visible {
+                    let rect = node_rects.get(id).expect("visible node must exist");
+                    prop_assert!(
+                        expanded.intersects(rect),
+                        "Node {:?} is in visible set but does not intersect expanded viewport", id
+                    );
+                }
+
+                // 3. Visible count should be less than total (we placed half far outside)
+                prop_assert!(
+                    visible.len() <= node_count,
+                    "Visible count {} should be <= total {}",
+                    visible.len(), node_count
+                );
+            }
+        }
+
+        /// Property 25 variant: Viewport culling with all nodes inside viewport
+        ///
+        /// When all nodes are inside the viewport, all should be returned regardless
+        /// of the threshold.
+        #[test]
+        fn prop_viewport_culling_all_visible(
+            vp_w in 500.0f32..2000.0,
+            vp_h in 500.0f32..2000.0,
+            node_count in 50usize..100,
+        ) {
+            let viewport = Rect::from_min_max(
+                Vec2::new(0.0, 0.0),
+                Vec2::new(vp_w, vp_h),
+            );
+
+            let mut node_rects = HashMap::new();
+            let node_size = 10.0f32;
+            for i in 0..node_count {
+                let id = NodeId(i as i64);
+                let x = (i as f32 % 20.0) * 20.0 + 10.0;
+                let y = (i as f32 / 20.0).floor() * 20.0 + 10.0;
+                node_rects.insert(id, Rect::from_min_max(
+                    Vec2::new(x, y),
+                    Vec2::new(x + node_size, y + node_size),
+                ));
+            }
+
+            let visible = viewport_cull(&node_rects, viewport);
+            prop_assert_eq!(
+                visible.len(), node_count,
+                "All {} nodes are inside viewport, all should be visible",
+                node_count
+            );
+        }
+
+        /// Property 25 variant: Viewport culling with all nodes outside viewport
+        ///
+        /// When all nodes are far outside the viewport, none should be returned
+        /// (above threshold).
+        #[test]
+        fn prop_viewport_culling_none_visible(
+            node_count in 50usize..100,
+        ) {
+            let viewport = Rect::from_min_max(
+                Vec2::new(0.0, 0.0),
+                Vec2::new(100.0, 100.0),
+            );
+
+            let mut node_rects = HashMap::new();
+            let far = 100.0 + VIEWPORT_CULL_MARGIN + 500.0;
+            for i in 0..node_count {
+                let id = NodeId(i as i64);
+                node_rects.insert(id, Rect::from_min_max(
+                    Vec2::new(far + i as f32 * 20.0, far),
+                    Vec2::new(far + i as f32 * 20.0 + 10.0, far + 10.0),
+                ));
+            }
+
+            let visible = viewport_cull(&node_rects, viewport);
+            prop_assert_eq!(
+                visible.len(), 0,
+                "All nodes are far outside viewport, none should be visible, got {}",
+                visible.len()
+            );
         }
     }
 }

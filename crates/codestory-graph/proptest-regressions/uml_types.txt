@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 41f70f0fb323721d5bf42202b10546a4742c8bd1e5547cfd7aa7b1bf069abd66 # shrinks to (node, _section_info) = (UmlNode { id: NodeId(1), kind: CLASS, label: "TestClass", parent_id: None, is_indexed: true, visibility_sections: [VisibilitySection { kind: Public, members: [], is_collapsed: false }], is_collapsed: false, collapsed_sections: {}, computed_rect: Rect { min: Vec2 { x: 0.0, y: 0.0 }, max: Vec2 { x: 0.0, y: 0.0 } }, member_rects: {}, bundle_info: None }, [(0, false)])
+cc 6d57531f6d1db78267a7e1fa692ce7fcd9880bc712c722f92c9bc91f5e61e7b1 # shrinks to node_positions = [(0.0, 726.13104), (0.0, -903.6724)], viewport_width = 200.0, viewport_height = 238.73259

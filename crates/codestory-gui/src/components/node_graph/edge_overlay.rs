@@ -254,7 +254,7 @@ impl EdgeOverlay {
                 .push(edge);
         }
 
-        let mouse_pos = ui.ctx().pointer_hover_pos();
+        let mouse_pos = ui.ctx().pointer_hover_pos().filter(|pos| visible_rect.contains(*pos));
 
         for ((source, target), bundle) in &bundles {
             if let (Some(source_rect_graph), Some(target_rect_graph)) =
