@@ -1,5 +1,6 @@
 use super::snarl_adapter::NodeGraphAdapter;
 use crate::components::node_graph::edge_overlay::EdgeOverlay;
+use crate::components::node_graph::style_resolver::StyleResolver;
 use codestory_core::{Edge, Node, NodeId, NodeKind, TrailConfig, TrailDirection};
 use codestory_events::Event;
 use codestory_graph::converter::NodeGraphConverter;
@@ -139,7 +140,7 @@ impl NodeGraphView {
                 node_to_focus: None,
                 node_to_hide: None,
                 node_to_navigate: None,
-                theme: catppuccin_egui::MOCHA,
+                style_resolver: StyleResolver::new(catppuccin_egui::MOCHA),
                 collapse_states: std::collections::HashMap::new(),
                 event_bus: event_bus.clone(),
                 node_rects: std::collections::HashMap::new(),
@@ -420,7 +421,7 @@ impl NodeGraphView {
         theme: catppuccin_egui::Theme,
     ) -> Option<NodeId> {
         self.theme_flavor = theme;
-        self.adapter.theme = theme;
+        self.adapter.style_resolver.set_theme(theme);
 
         // Sync collapse states from settings (persistence)
         self.adapter.collapse_states = settings.view_state.collapse_states.clone();
@@ -600,6 +601,7 @@ impl NodeGraphView {
                 snarl_rect,
                 self.adapter.current_transform,
                 node_inner_margin,
+                &self.adapter.style_resolver,
             );
 
             if settings.show_minimap {
@@ -634,7 +636,7 @@ impl NodeGraphView {
             |ui| {
                 ui.set_width(toolbar_width);
 
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(ui.visuals().window_fill())
                     .inner_margin(4.0)
                     .show(ui, |ui| {
@@ -657,7 +659,7 @@ impl NodeGraphView {
                     .add(
                         egui::DragValue::new(&mut depth)
                             .range(1..=10)
-                            .speed(0.1),
+                            .speed(1.0),
                     )
                     .changed()
                 {

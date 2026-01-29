@@ -1,4 +1,5 @@
 use super::snarl_adapter::NodeGraphAdapter;
+use crate::components::node_graph::style_resolver::StyleResolver;
 use codestory_core::{EdgeKind, NodeId, NodeKind};
 use codestory_graph::uml_types::MemberItem;
 use proptest::prelude::*;
@@ -15,7 +16,7 @@ proptest! {
             node_to_focus: None,
             node_to_hide: None,
             node_to_navigate: None,
-            theme: catppuccin_egui::MOCHA,
+            style_resolver: StyleResolver::new(catppuccin_egui::MOCHA),
             collapse_states: std::collections::HashMap::new(),
             event_bus: codestory_events::EventBus::new(),
             node_rects: std::collections::HashMap::new(),
@@ -66,7 +67,7 @@ proptest! {
             node_to_focus: None,
             node_to_hide: None,
             node_to_navigate: None,
-            theme: catppuccin_egui::MOCHA,
+            style_resolver: StyleResolver::new(catppuccin_egui::MOCHA),
             collapse_states: std::collections::HashMap::new(),
             event_bus: codestory_events::EventBus::new(),
             node_rects: std::collections::HashMap::new(),

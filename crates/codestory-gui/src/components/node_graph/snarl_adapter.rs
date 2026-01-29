@@ -25,12 +25,14 @@ mod ui_constants {
     pub const SECTION_HEADER_SIZE: f32 = 10.0;
 }
 
+use crate::components::node_graph::style_resolver::StyleResolver;
+
 pub struct NodeGraphAdapter {
     pub clicked_node: Option<codestory_core::NodeId>,
     pub node_to_focus: Option<codestory_core::NodeId>,
     pub node_to_hide: Option<codestory_core::NodeId>,
     pub node_to_navigate: Option<codestory_core::NodeId>,
-    pub theme: catppuccin_egui::Theme,
+    pub style_resolver: StyleResolver,
     /// Collapse states for nodes (persisted across graph rebuilds)
     pub collapse_states: std::collections::HashMap<
         codestory_core::NodeId,
@@ -75,8 +77,8 @@ impl SnarlViewer<UmlNode> for NodeGraphAdapter {
         // of the full container content (Req 10.1, 10.4, Property 25).
         if let Some(prev_rect) = self.node_rects.get(&node.id) {
             if !self.is_node_visible(*prev_rect) {
-                // Render minimal label only – avoids expensive member/section rendering
-                ui.label(egui::RichText::new(&node.label).color(self.theme.subtext0).size(10.0));
+                // Render minimal label only – avoids expensive member rendering
+                ui.label(egui::RichText::new(&node.label).color(self.style_resolver.resolve_text_color(Color32::TRANSPARENT)).size(10.0));
                 return;
             }
         }
@@ -87,31 +89,13 @@ impl SnarlViewer<UmlNode> for NodeGraphAdapter {
             node.label.clone()
         };
 
-        let color = match node.kind {
-            codestory_core::NodeKind::CLASS => self.theme.blue,
-            codestory_core::NodeKind::STRUCT => self.theme.teal,
-            codestory_core::NodeKind::INTERFACE => self.theme.sky,
-            codestory_core::NodeKind::FUNCTION => self.theme.yellow,
-            codestory_core::NodeKind::METHOD => self.theme.peach,
-            codestory_core::NodeKind::MODULE | codestory_core::NodeKind::NAMESPACE => {
-                self.theme.mauve
-            }
-            codestory_core::NodeKind::VARIABLE | codestory_core::NodeKind::FIELD => {
-                self.theme.text // Or maybe subtext1 for less emphasis
-            }
-            _ => {
-                if node.bundle_info.is_some() {
-                    self.theme.overlay1
-                } else {
-                    self.theme.overlay2
-                }
-            }
-        };
+        let bg_color = self.style_resolver.resolve_node_color(node.kind);
+        let text_color = self.style_resolver.resolve_text_color(bg_color);
 
         let response = ui.vertical(|ui| {
             // Render colored header (Title only)
             let header_frame = egui::Frame::default()
-                .fill(color)
+                .fill(bg_color)
                 .inner_margin(8.0)
                 .corner_radius(egui::CornerRadius::same(5));
 
@@ -128,10 +112,10 @@ impl SnarlViewer<UmlNode> for NodeGraphAdapter {
                                 .unwrap_or(false);
 
                             let collapse_icon = if is_collapsed { "▶" } else { "▼" };
-                            ui.label(egui::RichText::new(collapse_icon).color(Color32::BLACK));
+                            ui.label(egui::RichText::new(collapse_icon).color(text_color));
                         }
 
-                        ui.label(egui::RichText::new(&label).color(Color32::BLACK).strong());
+                        ui.label(egui::RichText::new(&label).color(text_color).strong());
 
                         // Show member count badge if collapsed
                         if has_members {
@@ -147,7 +131,7 @@ impl SnarlViewer<UmlNode> for NodeGraphAdapter {
                                     .sum();
                                 ui.label(
                                     egui::RichText::new(format!("[{}]", member_count))
-                                        .color(Color32::BLACK)
+                                        .color(text_color)
                                         .size(10.0),
                                 );
                             }
@@ -155,7 +139,7 @@ impl SnarlViewer<UmlNode> for NodeGraphAdapter {
 
                         if node.bundle_info.is_some()
                             && ui
-                                .button(egui::RichText::new("⊕").color(Color32::BLACK))
+                                .button(egui::RichText::new("⊕").color(text_color))
                                 .clicked()
                         {
                             // Expand bundle logic
@@ -256,7 +240,7 @@ impl SnarlViewer<UmlNode> for NodeGraphAdapter {
                 if total_members > 0 {
                     ui.label(
                         egui::RichText::new(format!("{} members", total_members))
-                            .color(self.theme.subtext0)
+                            .color(self.style_resolver.resolve_text_color(Color32::TRANSPARENT))
                             .size(ui_constants::SECTION_HEADER_SIZE),
                     );
                 }
@@ -302,19 +286,19 @@ impl SnarlViewer<UmlNode> for NodeGraphAdapter {
         let (inputs, _) = self.pin_info.get(&node.id).unwrap_or(&default_pins);
 
         if let Some(pin_data) = inputs.get(pin.id.input) {
-            ui.label(egui::RichText::new(&pin_data.label).color(self.theme.text));
+            ui.label(egui::RichText::new(&pin_data.label).color(self.style_resolver.theme.text));
 
             let color = match pin_data.pin_type {
-                PinType::Inheritance => self.theme.blue,
-                PinType::Composition => self.theme.yellow,
-                PinType::Standard => self.theme.green,
+                PinType::Inheritance => self.style_resolver.theme.blue,
+                PinType::Composition => self.style_resolver.theme.yellow,
+                PinType::Standard => self.style_resolver.theme.green,
             };
 
             PinInfo::square().with_fill(color)
         } else {
             // Fallback if pin not found
-            ui.label(egui::RichText::new("?").color(self.theme.text));
-            PinInfo::square().with_fill(self.theme.overlay0)
+            ui.label(egui::RichText::new("?").color(self.style_resolver.theme.text));
+            PinInfo::square().with_fill(self.style_resolver.theme.overlay0)
         }
     }
 
@@ -332,22 +316,22 @@ impl SnarlViewer<UmlNode> for NodeGraphAdapter {
 
         if let Some(pin_data) = outputs.get(pin.id.output) {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(&pin_data.label).color(self.theme.text));
+                ui.label(egui::RichText::new(&pin_data.label).color(self.style_resolver.theme.text));
             });
 
             let color = match pin_data.pin_type {
-                PinType::Inheritance => self.theme.blue,
-                PinType::Composition => self.theme.yellow,
-                PinType::Standard => self.theme.red,
+                PinType::Inheritance => self.style_resolver.theme.blue,
+                PinType::Composition => self.style_resolver.theme.yellow,
+                PinType::Standard => self.style_resolver.theme.red,
             };
 
             PinInfo::circle().with_fill(color)
         } else {
             // Fallback if pin not found
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new("?").color(self.theme.text));
+                ui.label(egui::RichText::new("?").color(self.style_resolver.theme.text));
             });
-            PinInfo::circle().with_fill(self.theme.overlay0)
+            PinInfo::circle().with_fill(self.style_resolver.theme.overlay0)
         }
     }
 
@@ -454,7 +438,7 @@ impl NodeGraphAdapter {
         node_id: codestory_core::NodeId,
         section: &VisibilitySection,
     ) {
-        let bg_color = self.theme.mantle;
+        let bg_color = self.style_resolver.theme.mantle;
         let id = ui.make_persistent_id(format!("section_{:?}_{:?}", node_id, section.kind));
 
         let is_expanded = !self
@@ -474,13 +458,13 @@ impl NodeGraphAdapter {
                     ui.label(
                         egui::RichText::new(icon)
                             .size(ui_constants::SECTION_HEADER_SIZE)
-                            .color(self.theme.subtext0),
+                            .color(self.style_resolver.theme.subtext0),
                     );
 
                     ui.label(
                         egui::RichText::new(section.kind.label())
                             .size(ui_constants::SECTION_HEADER_SIZE)
-                            .color(self.theme.subtext0)
+                            .color(self.style_resolver.theme.subtext0)
                             .strong(),
                     );
 
@@ -488,7 +472,7 @@ impl NodeGraphAdapter {
                         ui.label(
                             egui::RichText::new(format!("[{}]", section.members.len()))
                                 .size(ui_constants::SECTION_HEADER_SIZE)
-                                .color(self.theme.subtext0),
+                                .color(self.style_resolver.theme.subtext0),
                         );
                     }
                 }).response;
@@ -553,7 +537,7 @@ impl NodeGraphAdapter {
 
             ui.label(
                 egui::RichText::new(&member.name)
-                    .color(self.theme.text)
+                    .color(self.style_resolver.theme.text)
                     .size(ui_constants::MEMBER_TEXT_SIZE),
             );
 
@@ -563,7 +547,7 @@ impl NodeGraphAdapter {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(member_icons::OUTGOING_EDGE)
-                            .color(self.theme.subtext0)
+                            .color(self.style_resolver.resolve_outgoing_edge_indicator_color())
                             .size(ui_constants::MEMBER_TEXT_SIZE),
                     );
                 });
@@ -625,13 +609,13 @@ impl NodeGraphAdapter {
         match kind {
             codestory_core::NodeKind::FUNCTION
             | codestory_core::NodeKind::METHOD
-            | codestory_core::NodeKind::MACRO => (member_icons::FUNCTION, self.theme.peach),
+            | codestory_core::NodeKind::MACRO => (member_icons::FUNCTION, self.style_resolver.theme.peach),
             codestory_core::NodeKind::FIELD
             | codestory_core::NodeKind::VARIABLE
             | codestory_core::NodeKind::GLOBAL_VARIABLE
             | codestory_core::NodeKind::CONSTANT
-            | codestory_core::NodeKind::ENUM_CONSTANT => (member_icons::VARIABLE, self.theme.blue),
-            _ => (member_icons::OTHER, self.theme.overlay0),
+            | codestory_core::NodeKind::ENUM_CONSTANT => (member_icons::VARIABLE, self.style_resolver.theme.blue),
+            _ => (member_icons::OTHER, self.style_resolver.theme.overlay0),
         }
     }
 }

@@ -4,6 +4,7 @@ use codestory_graph::style::{self, get_edge_kind_label};
 use codestory_graph::DummyEdge;
 use eframe::egui::{self, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke, Vec2};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use crate::components::node_graph::style_resolver::StyleResolver;
 
 fn to_graph_rect(r: Rect) -> codestory_graph::uml_types::Rect {
     codestory_graph::uml_types::Rect {
@@ -227,6 +228,7 @@ impl EdgeOverlay {
     /// * `visible_rect` - The visible area of the viewport in screen coordinates (for culling).
     /// * `transform` - Graph-space to screen-space transform.
     /// * `node_inner_margin` - Inner margin of node frames (for rect expansion).
+    /// * `style_resolver` - The style resolver for determining edge colors.
     pub fn render(
         &mut self,
         ui: &egui::Ui,
@@ -237,6 +239,7 @@ impl EdgeOverlay {
         visible_rect: Rect,
         transform: egui::emath::TSTransform,
         node_inner_margin: egui::Margin,
+        style_resolver: &StyleResolver,
     ) {
         // Clear per-frame data
         self.bundle_midpoints.clear();
@@ -296,6 +299,7 @@ impl EdgeOverlay {
                     transform,
                     key,
                     is_expanded,
+                    style_resolver,
                 );
             }
         }
@@ -375,11 +379,11 @@ impl EdgeOverlay {
         // Draw hover highlight overlay on hovered edge (Task 9.2)
         if let Some(idx) = self.hovered_edge_index {
             let info = &self.edge_hit_infos[idx];
-            let c = style::get_edge_color(info.kind);
+            let base_color = style_resolver.resolve_edge_color(info.kind);
             let highlight_color = Color32::from_rgba_unmultiplied(
-                c.r.saturating_add(60),
-                c.g.saturating_add(60),
-                c.b.saturating_add(60),
+                base_color.r().saturating_add(60),
+                base_color.g().saturating_add(60),
+                base_color.b().saturating_add(60),
                 255,
             );
             let highlight_stroke = Stroke::new(4.0, highlight_color);
@@ -476,6 +480,7 @@ impl EdgeOverlay {
         transform: egui::emath::TSTransform,
         key: BundleKey,
         is_expanded: bool,
+        style_resolver: &StyleResolver,
     ) {
         let count = bundle.len();
         if count == 0 {
@@ -505,8 +510,7 @@ impl EdgeOverlay {
                 .route_edge(to_graph_rect(source_rect), to_graph_rect(target_rect));
 
             // Use proper color and width from style system (logarithmic thickness)
-            let c = style::get_edge_color(dominant_kind);
-            let color = Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a);
+            let color = style_resolver.resolve_edge_color(dominant_kind);
             let width = style::edge_width(dominant_kind, count);
             let stroke = Stroke::new(width, color);
 
@@ -575,8 +579,7 @@ impl EdgeOverlay {
                     .router
                     .route_edge(to_graph_rect(source_rect), to_graph_rect(target_rect));
 
-                let c = style::get_edge_color(edge.kind);
-                let color = Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a);
+                let color = style_resolver.resolve_edge_color(edge.kind);
                 let width = style::edge_width(edge.kind, 1);
                 let stroke = Stroke::new(width, color);
 
@@ -638,8 +641,7 @@ impl EdgeOverlay {
                         _ => 0,
                     })
                     .unwrap_or(codestory_core::EdgeKind::MEMBER);
-                let c = style::get_edge_color(dominant_kind);
-                let color = Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a);
+                let color = style_resolver.resolve_edge_color(dominant_kind);
 
                 self.draw_count_badge(fg_painter, midpoint, count, color);
 
