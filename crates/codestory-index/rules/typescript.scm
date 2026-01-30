@@ -11,7 +11,19 @@
 }
 
 (class_declaration
-  name: (identifier) @name)
+  name: (type_identifier) @name)
+{
+  node @name.node
+  attr (@name.node) kind = "CLASS"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+}
+
+(interface_declaration
+  name: (type_identifier) @name)
 {
   node @name.node
   attr (@name.node) kind = "CLASS"
@@ -23,7 +35,7 @@
 }
 
 (method_definition
-  name: (property_identifier) @name) @def
+  name: (_) @name) @def
 {
   node @name.node
   attr (@name.node) kind = "FUNCTION"
@@ -36,29 +48,12 @@
 
 ;; Membership
 (class_declaration
-  name: (identifier) @class_name
+  name: (type_identifier) @class_name
   body: (class_body
-    (method_definition name: (property_identifier) @method_name)))
+    (method_definition name: (_) @method_name)))
 {
   edge @class_name.node -> @method_name.node
   attr (@class_name.node -> @method_name.node) kind = "MEMBER"
-}
-
-;; Inheritance
-(class_declaration
-  name: (identifier) @class_name
-  (class_heritage (_) @parent_name))
-{
-  node @parent_name.node
-  attr (@parent_name.node) kind = "CLASS"
-  attr (@parent_name.node) name = (source-text @parent_name)
-  attr (@parent_name.node) start_row = (start-row @parent_name)
-  attr (@parent_name.node) start_col = (start-column @parent_name)
-  attr (@parent_name.node) end_row = (end-row @parent_name)
-  attr (@parent_name.node) end_col = (end-column @parent_name)
-
-  edge @class_name.node -> @parent_name.node
-  attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
 }
 
 ;; Calls (function -> identifier)
@@ -86,7 +81,7 @@
   name: (identifier) @caller
   body: (statement_block
     (expression_statement
-      (call_expression function: (member_expression property: (property_identifier) @callee) @call))))
+      (call_expression function: (member_expression property: (_) @callee) @call))))
 {
   node @callee.node
   attr (@callee.node) kind = "UNKNOWN"
@@ -103,7 +98,7 @@
 
 ;; Calls (method -> identifier)
 (method_definition
-  name: (property_identifier) @caller
+  name: (_) @caller
   body: (statement_block
     (expression_statement
       (call_expression function: (identifier) @callee) @call)))
@@ -123,10 +118,10 @@
 
 ;; Calls (method -> member)
 (method_definition
-  name: (property_identifier) @caller
+  name: (_) @caller
   body: (statement_block
     (expression_statement
-      (call_expression function: (member_expression property: (property_identifier) @callee) @call))))
+      (call_expression function: (member_expression property: (_) @callee) @call))))
 {
   node @callee.node
   attr (@callee.node) kind = "UNKNOWN"
@@ -191,21 +186,6 @@
   (import_clause
     (named_imports
       (import_specifier name: (identifier) @module))))
-{
-  node @module.node
-  attr (@module.node) kind = "MODULE"
-  attr (@module.node) name = (source-text @module)
-  attr (@module.node) start_row = (start-row @module)
-  attr (@module.node) start_col = (start-column @module)
-  attr (@module.node) end_row = (end-row @module)
-  attr (@module.node) end_col = (end-column @module)
-
-  edge @module.node -> @module.node
-  attr (@module.node -> @module.node) kind = "IMPORT"
-}
-
-;; Fallback import capture (ensures module imports are represented)
-(import_statement) @module
 {
   node @module.node
   attr (@module.node) kind = "MODULE"

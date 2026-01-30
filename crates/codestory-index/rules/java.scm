@@ -1,15 +1,216 @@
 (method_declaration
-  name: (identifier) @name) @method
+  name: (identifier) @name) @def
 {
-  node @method.node
-  attr (@method.node) kind = "METHOD"
-  attr (@method.node) name = (source-text @name)
+  node @name.node
+  attr (@name.node) kind = "FUNCTION"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
 }
 
 (class_declaration
-  name: (identifier) @name) @class
+  name: (identifier) @name)
 {
-  node @class.node
-  attr (@class.node) kind = "CLASS"
-  attr (@class.node) name = (source-text @name)
+  node @name.node
+  attr (@name.node) kind = "CLASS"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+}
+
+(interface_declaration
+  name: (identifier) @name)
+{
+  node @name.node
+  attr (@name.node) kind = "CLASS"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+}
+
+(field_declaration
+  (variable_declarator name: (identifier) @name))
+{
+  node @name.node
+  attr (@name.node) kind = "VARIABLE"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+}
+
+(package_declaration
+  (scoped_identifier) @name) @def
+{
+  node @name.node
+  attr (@name.node) kind = "MODULE"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
+(package_declaration
+  (identifier) @name) @def
+{
+  node @name.node
+  attr (@name.node) kind = "MODULE"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
+(module_declaration
+  name: (scoped_identifier) @name) @def
+{
+  node @name.node
+  attr (@name.node) kind = "MODULE"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
+(module_declaration
+  name: (identifier) @name) @def
+{
+  node @name.node
+  attr (@name.node) kind = "MODULE"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
+;; Membership (methods)
+(class_declaration
+  name: (identifier) @class_name
+  body: (class_body
+    (method_declaration name: (identifier) @method_name)))
+{
+  edge @class_name.node -> @method_name.node
+  attr (@class_name.node -> @method_name.node) kind = "MEMBER"
+}
+
+;; Membership (fields)
+(class_declaration
+  name: (identifier) @class_name
+  body: (class_body
+    (field_declaration (variable_declarator name: (identifier) @field_name))))
+{
+  edge @class_name.node -> @field_name.node
+  attr (@class_name.node -> @field_name.node) kind = "MEMBER"
+}
+
+;; Package membership
+(program
+  (package_declaration (scoped_identifier) @package_name)
+  (class_declaration name: (identifier) @class_name))
+{
+  edge @package_name.node -> @class_name.node
+  attr (@package_name.node -> @class_name.node) kind = "MEMBER"
+}
+
+(program
+  (package_declaration (identifier) @package_name)
+  (class_declaration name: (identifier) @class_name))
+{
+  edge @package_name.node -> @class_name.node
+  attr (@package_name.node -> @class_name.node) kind = "MEMBER"
+}
+
+(program
+  (package_declaration (scoped_identifier) @package_name)
+  (interface_declaration name: (identifier) @class_name))
+{
+  edge @package_name.node -> @class_name.node
+  attr (@package_name.node -> @class_name.node) kind = "MEMBER"
+}
+
+(program
+  (package_declaration (identifier) @package_name)
+  (interface_declaration name: (identifier) @class_name))
+{
+  edge @package_name.node -> @class_name.node
+  attr (@package_name.node -> @class_name.node) kind = "MEMBER"
+}
+
+;; Inheritance (extends)
+(class_declaration
+  name: (identifier) @class_name
+  superclass: (superclass (type_identifier) @parent_name))
+{
+  node @parent_name.node
+  attr (@parent_name.node) kind = "CLASS"
+  attr (@parent_name.node) name = (source-text @parent_name)
+  attr (@parent_name.node) start_row = (start-row @parent_name)
+  attr (@parent_name.node) start_col = (start-column @parent_name)
+  attr (@parent_name.node) end_row = (end-row @parent_name)
+  attr (@parent_name.node) end_col = (end-column @parent_name)
+
+  edge @class_name.node -> @parent_name.node
+  attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
+}
+
+;; Calls
+(method_declaration
+  name: (identifier) @caller
+  body: (block
+    (expression_statement
+      (method_invocation name: (identifier) @callee) @call)))
+{
+  node @callee.node
+  attr (@callee.node) kind = "UNKNOWN"
+  attr (@callee.node) name = (source-text @callee)
+  attr (@callee.node) start_row = (start-row @callee)
+  attr (@callee.node) start_col = (start-column @callee)
+  attr (@callee.node) end_row = (end-row @callee)
+  attr (@callee.node) end_col = (end-column @callee)
+
+  edge @caller.node -> @callee.node
+  attr (@caller.node -> @callee.node) kind = "CALL"
+  attr (@caller.node -> @callee.node) line = (start-row @call)
+}
+
+;; Imports
+(import_declaration
+  (scoped_identifier) @module)
+{
+  node @module.node
+  attr (@module.node) kind = "MODULE"
+  attr (@module.node) name = (source-text @module)
+  attr (@module.node) start_row = (start-row @module)
+  attr (@module.node) start_col = (start-column @module)
+  attr (@module.node) end_row = (end-row @module)
+  attr (@module.node) end_col = (end-column @module)
+
+  edge @module.node -> @module.node
+  attr (@module.node -> @module.node) kind = "IMPORT"
+}
+
+(import_declaration
+  (identifier) @module)
+{
+  node @module.node
+  attr (@module.node) kind = "MODULE"
+  attr (@module.node) name = (source-text @module)
+  attr (@module.node) start_row = (start-row @module)
+  attr (@module.node) start_col = (start-column @module)
+  attr (@module.node) end_row = (end-row @module)
+  attr (@module.node) end_col = (end-column @module)
+
+  edge @module.node -> @module.node
+  attr (@module.node -> @module.node) kind = "IMPORT"
 }

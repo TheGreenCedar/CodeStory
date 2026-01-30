@@ -3,7 +3,7 @@ use codestory_core::{
     Occurrence, OccurrenceKind, TrailConfig, TrailDirection, TrailResult,
 };
 use parking_lot::RwLock;
-use rusqlite::{Connection, Result, params};
+use rusqlite::{Connection, Result, Row, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -87,7 +87,15 @@ impl Storage {
             "CREATE TABLE IF NOT EXISTS node (
                 id INTEGER PRIMARY KEY,
                 kind INTEGER NOT NULL,
-                serialized_name TEXT NOT NULL
+                serialized_name TEXT NOT NULL,
+                qualified_name TEXT,
+                canonical_id TEXT,
+                file_node_id INTEGER,
+                start_line INTEGER,
+                start_col INTEGER,
+                end_line INTEGER,
+                end_col INTEGER,
+                FOREIGN KEY(file_node_id) REFERENCES node(id)
             )",
             [],
         )?;
@@ -98,8 +106,16 @@ impl Storage {
                 source_node_id INTEGER NOT NULL,
                 target_node_id INTEGER NOT NULL,
                 kind INTEGER NOT NULL,
+                file_node_id INTEGER,
+                line INTEGER,
+                resolved_source_node_id INTEGER,
+                resolved_target_node_id INTEGER,
+                confidence REAL,
                 FOREIGN KEY(source_node_id) REFERENCES node(id),
-                FOREIGN KEY(target_node_id) REFERENCES node(id)
+                FOREIGN KEY(target_node_id) REFERENCES node(id),
+                FOREIGN KEY(file_node_id) REFERENCES node(id),
+                FOREIGN KEY(resolved_source_node_id) REFERENCES node(id),
+                FOREIGN KEY(resolved_target_node_id) REFERENCES node(id)
             )",
             [],
         )?;
@@ -209,13 +225,81 @@ impl Storage {
             [],
         )?;
 
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_node_file ON node(file_node_id)",
+            [],
+        )?;
+
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_node_qualified_name ON node(qualified_name)",
+            [],
+        )?;
+
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_edge_resolved_source ON edge(resolved_source_node_id)",
+            [],
+        )?;
+
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_edge_resolved_target ON edge(resolved_target_node_id)",
+            [],
+        )?;
+
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_edge_line ON edge(line)",
+            [],
+        )?;
+
         Ok(())
+    }
+
+    fn node_from_row(row: &Row) -> Result<Node, StorageError> {
+        let kind_int: i32 = row.get(1)?;
+        Ok(Node {
+            id: NodeId(row.get(0)?),
+            kind: NodeKind::try_from(kind_int)?,
+            serialized_name: row.get(2)?,
+            qualified_name: row.get(3)?,
+            canonical_id: row.get(4)?,
+            file_node_id: row.get::<_, Option<i64>>(5)?.map(NodeId),
+            start_line: row.get(6)?,
+            start_col: row.get(7)?,
+            end_line: row.get(8)?,
+            end_col: row.get(9)?,
+        })
+    }
+
+    fn edge_from_row(row: &Row) -> Result<Edge, StorageError> {
+        let kind_int: i32 = row.get(3)?;
+        Ok(Edge {
+            id: codestory_core::EdgeId(row.get(0)?),
+            source: NodeId(row.get(1)?),
+            target: NodeId(row.get(2)?),
+            kind: EdgeKind::try_from(kind_int)?,
+            file_node_id: row.get::<_, Option<i64>>(4)?.map(NodeId),
+            line: row.get(5)?,
+            resolved_source: row.get::<_, Option<i64>>(6)?.map(NodeId),
+            resolved_target: row.get::<_, Option<i64>>(7)?.map(NodeId),
+            confidence: row.get(8)?,
+        })
     }
 
     pub fn insert_node(&self, node: &Node) -> Result<(), StorageError> {
         self.conn.execute(
-            "INSERT INTO node (id, kind, serialized_name) VALUES (?1, ?2, ?3) ON CONFLICT(id) DO NOTHING",
-            params![node.id.0, node.kind as i32, node.serialized_name],
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(id) DO NOTHING",
+            params![
+                node.id.0,
+                node.kind as i32,
+                node.serialized_name,
+                node.qualified_name,
+                node.canonical_id,
+                node.file_node_id.map(|id| id.0),
+                node.start_line,
+                node.start_col,
+                node.end_line,
+                node.end_col
+            ],
         )?;
         // Update cache
         self.cache.nodes.write().insert(node.id, node.clone());
@@ -224,8 +308,19 @@ impl Storage {
 
     pub fn insert_edge(&self, edge: &Edge) -> Result<(), StorageError> {
         self.conn.execute(
-            "INSERT INTO edge (id, source_node_id, target_node_id, kind) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(id) DO NOTHING",
-            params![edge.id.0, edge.source.0, edge.target.0, edge.kind as i32],
+            "INSERT INTO edge (id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO NOTHING",
+            params![
+                edge.id.0,
+                edge.source.0,
+                edge.target.0,
+                edge.kind as i32,
+                edge.file_node_id.map(|id| id.0),
+                edge.line,
+                edge.resolved_source.map(|id| id.0),
+                edge.resolved_target.map(|id| id.0),
+                edge.confidence
+            ],
         )?;
         Ok(())
     }
@@ -234,10 +329,38 @@ impl Storage {
     pub fn insert_nodes_batch(&mut self, nodes: &[Node]) -> Result<(), StorageError> {
         let tx = self.conn.transaction()?;
         {
-            let mut stmt =
-                tx.prepare("INSERT INTO node (id, kind, serialized_name) VALUES (?1, ?2, ?3) ON CONFLICT(id) DO NOTHING")?;
-            for node in nodes {
-                stmt.execute(params![node.id.0, node.kind as i32, node.serialized_name])?;
+            let mut stmt = tx.prepare(
+                "INSERT INTO node (id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(id) DO NOTHING",
+            )?;
+            // Insert FILE nodes first so foreign keys to file_node_id are satisfied.
+            for node in nodes.iter().filter(|node| node.kind == NodeKind::FILE) {
+                stmt.execute(params![
+                    node.id.0,
+                    node.kind as i32,
+                    node.serialized_name,
+                    node.qualified_name,
+                    node.canonical_id,
+                    node.file_node_id.map(|id| id.0),
+                    node.start_line,
+                    node.start_col,
+                    node.end_line,
+                    node.end_col
+                ])?;
+            }
+            for node in nodes.iter().filter(|node| node.kind != NodeKind::FILE) {
+                stmt.execute(params![
+                    node.id.0,
+                    node.kind as i32,
+                    node.serialized_name,
+                    node.qualified_name,
+                    node.canonical_id,
+                    node.file_node_id.map(|id| id.0),
+                    node.start_line,
+                    node.start_col,
+                    node.end_line,
+                    node.end_col
+                ])?;
             }
         }
         tx.commit()?;
@@ -255,14 +378,20 @@ impl Storage {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO edge (id, source_node_id, target_node_id, kind) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(id) DO NOTHING"
+                "INSERT INTO edge (id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO NOTHING"
             )?;
             for edge in edges {
                 stmt.execute(params![
                     edge.id.0,
                     edge.source.0,
                     edge.target.0,
-                    edge.kind as i32
+                    edge.kind as i32,
+                    edge.file_node_id.map(|id| id.0),
+                    edge.line,
+                    edge.resolved_source.map(|id| id.0),
+                    edge.resolved_target.map(|id| id.0),
+                    edge.confidence
                 ])?;
             }
         }
@@ -309,16 +438,11 @@ impl Storage {
     pub fn get_nodes(&self) -> Result<Vec<Node>, StorageError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, kind, serialized_name FROM node")?;
+            .prepare("SELECT id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col FROM node")?;
         let mut nodes = Vec::new();
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
-            let kind_int: i32 = row.get(1)?;
-            nodes.push(Node {
-                id: NodeId(row.get(0)?),
-                kind: NodeKind::try_from(kind_int)?,
-                serialized_name: row.get(2)?,
-            });
+            nodes.push(Self::node_from_row(row)?);
         }
         Ok(nodes)
     }
@@ -326,17 +450,11 @@ impl Storage {
     pub fn get_edges(&self) -> Result<Vec<Edge>, StorageError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, source_node_id, target_node_id, kind FROM edge")?;
+            .prepare("SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence FROM edge")?;
         let mut edges = Vec::new();
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
-            let kind_int: i32 = row.get(3)?;
-            edges.push(Edge {
-                id: codestory_core::EdgeId(row.get(0)?),
-                source: NodeId(row.get(1)?),
-                target: NodeId(row.get(2)?),
-                kind: EdgeKind::try_from(kind_int)?,
-            });
+            edges.push(Self::edge_from_row(row)?);
         }
         Ok(edges)
     }
@@ -404,33 +522,22 @@ impl Storage {
         {
             let mut stmt = self
                 .conn
-                .prepare("SELECT id, kind, serialized_name FROM node WHERE id = ?1")?;
+                .prepare("SELECT id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col FROM node WHERE id = ?1")?;
             let mut rows = stmt.query(params![center_id.0])?;
 
             if let Some(row) = rows.next()? {
-                let kind_int: i32 = row.get(1)?;
-                nodes.push(Node {
-                    id: NodeId(row.get(0)?),
-                    kind: NodeKind::try_from(kind_int)?,
-                    serialized_name: row.get(2)?,
-                });
+                nodes.push(Self::node_from_row(row)?);
             }
         }
 
         let mut edges = Vec::new();
         {
             let mut stmt = self.conn.prepare(
-                "SELECT id, source_node_id, target_node_id, kind FROM edge WHERE source_node_id = ?1 OR target_node_id = ?1"
+                "SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence FROM edge WHERE source_node_id = ?1 OR target_node_id = ?1"
             )?;
             let mut rows = stmt.query(params![center_id.0])?;
             while let Some(row) = rows.next()? {
-                let kind_int: i32 = row.get(3)?;
-                edges.push(Edge {
-                    id: codestory_core::EdgeId(row.get(0)?),
-                    source: NodeId(row.get(1)?),
-                    target: NodeId(row.get(2)?),
-                    kind: EdgeKind::try_from(kind_int)?,
-                });
+                edges.push(Self::edge_from_row(row)?);
             }
         }
 
@@ -447,16 +554,11 @@ impl Storage {
         for nid in neighbor_ids {
             let mut stmt = self
                 .conn
-                .prepare("SELECT id, kind, serialized_name FROM node WHERE id = ?1")?;
+                .prepare("SELECT id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col FROM node WHERE id = ?1")?;
             let mut rows = stmt.query(params![nid.0])?;
 
             if let Some(row) = rows.next()? {
-                let kind_int: i32 = row.get(1)?;
-                nodes.push(Node {
-                    id: NodeId(row.get(0)?),
-                    kind: NodeKind::try_from(kind_int)?,
-                    serialized_name: row.get(2)?,
-                });
+                nodes.push(Self::node_from_row(row)?);
             }
         }
 
@@ -470,16 +572,11 @@ impl Storage {
 
         let mut stmt = self
             .conn
-            .prepare("SELECT id, kind, serialized_name FROM node WHERE id = ?1")?;
+            .prepare("SELECT id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col FROM node WHERE id = ?1")?;
         let mut rows = stmt.query(params![id.0])?;
 
         if let Some(row) = rows.next()? {
-            let kind_int: i32 = row.get(1)?;
-            let node = Node {
-                id: NodeId(row.get(0)?),
-                kind: NodeKind::try_from(kind_int)?,
-                serialized_name: row.get(2)?,
-            };
+            let node = Self::node_from_row(row)?;
             self.cache.nodes.write().insert(node.id, node.clone());
             Ok(Some(node))
         } else {
@@ -617,24 +714,16 @@ impl Storage {
         line: u32,
     ) -> Result<Vec<Node>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT n.id, n.kind, n.serialized_name FROM node n
+            "SELECT n.id, n.kind, n.serialized_name, n.qualified_name, n.canonical_id, n.file_node_id, n.start_line, n.start_col, n.end_line, n.end_col FROM node n
              JOIN occurrence o ON n.id = o.element_id
              JOIN file f ON o.file_node_id = f.id
              WHERE f.path = ?1 AND ?2 >= o.start_line AND ?2 <= o.end_line",
         )?;
-
-        let nodes = stmt
-            .query_map(params![path, line], |row| {
-                let kind_int: i32 = row.get(1)?;
-                Ok(Node {
-                    id: NodeId(row.get(0)?),
-                    kind: codestory_core::NodeKind::try_from(kind_int)
-                        .unwrap_or(codestory_core::NodeKind::UNKNOWN),
-                    serialized_name: row.get(2)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
-
+        let mut nodes = Vec::new();
+        let mut rows = stmt.query(params![path, line])?;
+        while let Some(row) = rows.next()? {
+            nodes.push(Self::node_from_row(row)?);
+        }
         Ok(nodes)
     }
 
@@ -656,49 +745,35 @@ impl Storage {
     /// Get symbols that have no parent (root namespaces, top-level classes, etc.)
     pub fn get_root_symbols(&self) -> Result<Vec<Node>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, kind, serialized_name FROM node 
+            "SELECT id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col FROM node 
              WHERE id NOT IN (SELECT target_node_id FROM edge WHERE kind = ?1)
              AND kind != ?2", // Exclude files from symbol tree roots for now
         )?;
         let kind_member = codestory_core::EdgeKind::MEMBER as i32;
         let kind_file = codestory_core::NodeKind::FILE as i32;
 
-        let nodes = stmt
-            .query_map(params![kind_member, kind_file], |row| {
-                let kind_int: i32 = row.get(1)?;
-                Ok(Node {
-                    id: NodeId(row.get(0)?),
-                    kind: codestory_core::NodeKind::try_from(kind_int)
-                        .unwrap_or(codestory_core::NodeKind::UNKNOWN),
-                    serialized_name: row.get(2)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
+        let mut nodes = Vec::new();
+        let mut rows = stmt.query(params![kind_member, kind_file])?;
+        while let Some(row) = rows.next()? {
+            nodes.push(Self::node_from_row(row)?);
+        }
         Ok(nodes)
     }
 
     /// Get children symbols for a parent symbol (members of a class/namespace)
     pub fn get_children_symbols(&self, parent_id: NodeId) -> Result<Vec<Node>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT n.id, n.kind, n.serialized_name FROM node n
+            "SELECT n.id, n.kind, n.serialized_name, n.qualified_name, n.canonical_id, n.file_node_id, n.start_line, n.start_col, n.end_line, n.end_col FROM node n
              JOIN edge e ON n.id = e.target_node_id
              WHERE e.source_node_id = ?1 AND e.kind = ?2",
         )?;
         let kind_member = codestory_core::EdgeKind::MEMBER as i32;
 
-        let nodes = stmt
-            .query_map(params![parent_id.0, kind_member], |row| {
-                let kind_int: i32 = row.get(1)?;
-                Ok(Node {
-                    id: NodeId(row.get(0)?),
-                    kind: codestory_core::NodeKind::try_from(kind_int)
-                        .unwrap_or(codestory_core::NodeKind::UNKNOWN),
-                    serialized_name: row.get(2)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
+        let mut nodes = Vec::new();
+        let mut rows = stmt.query(params![parent_id.0, kind_member])?;
+        while let Some(row) = rows.next()? {
+            nodes.push(Self::node_from_row(row)?);
+        }
         Ok(nodes)
     }
 
@@ -994,13 +1069,13 @@ impl Storage {
     ) -> Result<Vec<Edge>, StorageError> {
         let query = match direction {
             TrailDirection::Outgoing => {
-                "SELECT id, source_node_id, target_node_id, kind FROM edge WHERE source_node_id = ?1"
+                "SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence FROM edge WHERE source_node_id = ?1"
             }
             TrailDirection::Incoming => {
-                "SELECT id, source_node_id, target_node_id, kind FROM edge WHERE target_node_id = ?1"
+                "SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence FROM edge WHERE target_node_id = ?1"
             }
             TrailDirection::Both => {
-                "SELECT id, source_node_id, target_node_id, kind FROM edge WHERE source_node_id = ?1 OR target_node_id = ?1"
+                "SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence FROM edge WHERE source_node_id = ?1 OR target_node_id = ?1"
             }
         };
 
@@ -1009,20 +1084,15 @@ impl Storage {
         let mut rows = stmt.query(params![node_id.0])?;
 
         while let Some(row) = rows.next()? {
-            let kind_int: i32 = row.get(3)?;
-            let kind = EdgeKind::try_from(kind_int)?;
+            let edge = Self::edge_from_row(row)?;
+            let kind = edge.kind;
 
             // Apply edge filter if specified
             if !edge_filter.is_empty() && !edge_filter.contains(&kind) {
                 continue;
             }
 
-            edges.push(Edge {
-                id: codestory_core::EdgeId(row.get(0)?),
-                source: NodeId(row.get(1)?),
-                target: NodeId(row.get(2)?),
-                kind,
-            });
+            edges.push(edge);
         }
         Ok(edges)
     }
@@ -1047,11 +1117,13 @@ mod tests {
                 id: NodeId(1),
                 kind: NodeKind::FUNCTION,
                 serialized_name: "func1".to_string(),
+                ..Default::default()
             },
             Node {
                 id: NodeId(2),
                 kind: NodeKind::CLASS,
                 serialized_name: "Class1".to_string(),
+                ..Default::default()
             },
         ];
 
@@ -1072,11 +1144,13 @@ mod tests {
                 id: NodeId(10),
                 kind: NodeKind::FILE,
                 serialized_name: "file.rs".to_string(),
+                ..Default::default()
             },
             Node {
                 id: NodeId(11),
                 kind: NodeKind::FUNCTION,
                 serialized_name: "foo".to_string(),
+                ..Default::default()
             },
         ];
         storage.insert_nodes_batch(&nodes)?;
@@ -1152,6 +1226,7 @@ mod tests {
             id: NodeId(1),
             kind: NodeKind::FUNCTION,
             serialized_name: "test_node".to_string(),
+            ..Default::default()
         };
         storage.insert_node(&node)?;
         {
@@ -1181,6 +1256,7 @@ mod tests {
             id: NodeId(100),
             kind: NodeKind::FUNCTION,
             serialized_name: "my_function".to_string(),
+            ..Default::default()
         };
         storage.insert_node(&node)?;
 
@@ -1260,16 +1336,19 @@ mod tests {
                 id: NodeId(1),
                 kind: NodeKind::FUNCTION,
                 serialized_name: "A".to_string(),
+                ..Default::default()
             },
             Node {
                 id: NodeId(2),
                 kind: NodeKind::FUNCTION,
                 serialized_name: "B".to_string(),
+                ..Default::default()
             },
             Node {
                 id: NodeId(3),
                 kind: NodeKind::FUNCTION,
                 serialized_name: "C".to_string(),
+                ..Default::default()
             },
         ];
         storage.insert_nodes_batch(&nodes)?;
@@ -1280,12 +1359,14 @@ mod tests {
                 source: NodeId(1),
                 target: NodeId(2),
                 kind: EdgeKind::CALL,
+                ..Default::default()
             },
             Edge {
                 id: codestory_core::EdgeId(2),
                 source: NodeId(2),
                 target: NodeId(3),
                 kind: EdgeKind::CALL,
+                ..Default::default()
             },
         ];
         storage.insert_edges_batch(&edges)?;
@@ -1325,6 +1406,7 @@ mod tests {
             id: NodeId(1),
             kind: NodeKind::ENUM_CONSTANT,
             serialized_name: "test".to_string(),
+            ..Default::default()
         };
         storage.insert_nodes_batch(&[node])?;
 
@@ -1337,6 +1419,7 @@ mod tests {
             source: NodeId(1),
             target: NodeId(1),
             kind: EdgeKind::ANNOTATION_USAGE,
+            ..Default::default()
         }];
         storage.insert_edges_batch(&edges)?;
 

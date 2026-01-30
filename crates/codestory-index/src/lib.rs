@@ -1,13 +1,12 @@
 use anyhow::{Result, anyhow};
 use codestory_core::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind, Occurrence, SourceLocation};
 use codestory_storage::Storage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use codestory_events::{Event, EventBus};
 use rayon::prelude::*;
 use std::sync::Arc;
-use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Parser};
 use tree_sitter_graph::ast::File as GraphFile;
 use tree_sitter_graph::functions::Functions;
@@ -16,7 +15,7 @@ use tree_sitter_graph::{ExecutionConfig, NoCancellation, Variables};
 pub mod cancellation;
 pub mod compilation_database;
 pub mod intermediate_storage;
-pub mod post_processing;
+pub mod resolution;
 pub mod symbol_table;
 pub use cancellation::CancellationToken;
 use intermediate_storage::IntermediateStorage;
@@ -198,6 +197,14 @@ impl WorkspaceIndexer {
                 .map_err(|e| anyhow!("Storage error: {:?}", e))?;
         }
 
+        // 3.5 Resolve call/import edges post-pass
+        if !final_storage.edges.is_empty() {
+            let resolver = resolution::ResolutionPass::new();
+            resolver
+                .run(storage)
+                .map_err(|e| anyhow!("Resolution error: {:?}", e))?;
+        }
+
         // Write errors
         for error in final_storage.errors {
             storage
@@ -214,156 +221,6 @@ impl WorkspaceIndexer {
 
         event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
         Ok(())
-    }
-}
-
-struct RelationshipQuery {
-    query: &'static str,
-    kind: EdgeKind,
-}
-
-fn get_relationship_queries(language_name: &str) -> Vec<RelationshipQuery> {
-    match language_name {
-        "python" => vec![
-            RelationshipQuery {
-                query: "(class_definition name: (identifier) @c body: (block (function_definition name: (identifier) @m)))",
-                kind: EdgeKind::MEMBER,
-            },
-            RelationshipQuery {
-                query: "(class_definition name: (identifier) @c superclasses: (argument_list (_) @p))",
-                kind: EdgeKind::INHERITANCE,
-            },
-            RelationshipQuery {
-                query: "(call function: [
-                    (identifier) @f
-                    (attribute attribute: (identifier) @f)
-                ])",
-                kind: EdgeKind::CALL,
-            },
-            RelationshipQuery {
-                query: "(attribute object: (identifier) @obj attribute: (identifier) @attr)",
-                kind: EdgeKind::MEMBER,
-            },
-            // Decorators (Enhanced)
-            RelationshipQuery {
-                query: "(decorated_definition (decorator (identifier) @d) definition: [ (class_definition name: (identifier) @c) (function_definition name: (identifier) @c) ])",
-                kind: EdgeKind::USAGE,
-            },
-            // Imports (Simplified)
-            RelationshipQuery {
-                query: "(import_from_statement [module_name: (dotted_name) @m name: (dotted_name) @m (dotted_name (identifier) @m)])",
-                kind: EdgeKind::USAGE,
-            },
-            RelationshipQuery {
-                query: "(import_statement name: (dotted_name) @m)",
-                kind: EdgeKind::USAGE,
-            },
-        ],
-        "javascript" | "typescript" => vec![
-            RelationshipQuery {
-                query: "(class_declaration name: (_) @c body: (class_body (method_definition name: (_) @m)))",
-                kind: EdgeKind::MEMBER,
-            },
-            RelationshipQuery {
-                query: "(class_declaration name: (_) @c heritage: (extends_clause value: (_) @p))",
-                kind: EdgeKind::INHERITANCE,
-            },
-            RelationshipQuery {
-                query: "(interface_declaration name: (_) @c body: (object_type (property_signature name: (_) @m)))",
-                kind: EdgeKind::MEMBER,
-            },
-            RelationshipQuery {
-                query: "(call_expression function: [
-                    (identifier) @f
-                    (member_expression property: (property_identifier) @f)
-                ])",
-                kind: EdgeKind::CALL,
-            },
-        ],
-        "java" => vec![
-            RelationshipQuery {
-                query: "(class_declaration name: (identifier) @c body: (class_body (method_declaration name: (_) @m)))",
-                kind: EdgeKind::MEMBER,
-            },
-            RelationshipQuery {
-                query: "(class_declaration name: (identifier) @c body: (class_body (field_declaration (variable_declarator name: (identifier) @m))))",
-                kind: EdgeKind::MEMBER,
-            },
-            RelationshipQuery {
-                query: "(class_declaration name: (identifier) @c superclass: (superclass (type_identifier) @p))",
-                kind: EdgeKind::INHERITANCE,
-            },
-            RelationshipQuery {
-                query: "(class_declaration name: (identifier) @c interfaces: (interface_type_list (type_identifier) @p))",
-                kind: EdgeKind::INHERITANCE,
-            },
-            RelationshipQuery {
-                query: "(method_invocation name: (identifier) @f)",
-                kind: EdgeKind::CALL,
-            },
-            RelationshipQuery {
-                query: "(marker_annotation name: (identifier) @d)",
-                kind: EdgeKind::USAGE,
-            },
-        ],
-        "cpp" | "c" => vec![
-            // Namespace Membership
-            RelationshipQuery {
-                query: "(namespace_definition name: (_) @c body: (declaration_list [ (class_specifier name: (_) @m) (function_definition declarator: (function_declarator declarator: (_) @m)) (namespace_definition name: (_) @m) ]))",
-                kind: EdgeKind::MEMBER,
-            },
-            // Class Member (Function)
-            RelationshipQuery {
-                query: "(class_specifier name: (_) @c body: (field_declaration_list (function_definition declarator: (function_declarator declarator: (_) @m))))",
-                kind: EdgeKind::MEMBER,
-            },
-            // Class Member (Field)
-            RelationshipQuery {
-                query: "(class_specifier name: (_) @c body: (field_declaration_list (field_declaration declarator: (field_identifier) @m)))",
-                kind: EdgeKind::MEMBER,
-            },
-            // Inheritance (most generic)
-            RelationshipQuery {
-                query: "(class_specifier name: (type_identifier) @c (base_class_clause (base_specifier (type_identifier) @p)))",
-                kind: EdgeKind::INHERITANCE,
-            },
-            RelationshipQuery {
-                query: "(class_specifier name: (type_identifier) @c (base_class_clause (base_specifier (access_specifier) (type_identifier) @p)))",
-                kind: EdgeKind::INHERITANCE,
-            },
-            // Calls
-            RelationshipQuery {
-                query: "(call_expression function: (identifier) @f)",
-                kind: EdgeKind::CALL,
-            },
-            RelationshipQuery {
-                query: "(call_expression function: (field_expression field: (field_identifier) @f))",
-                kind: EdgeKind::CALL,
-            },
-        ],
-        "rust" => vec![
-            RelationshipQuery {
-                query: "(impl_item trait: (type_identifier) @p type: (type_identifier) @c)",
-                kind: EdgeKind::INHERITANCE,
-            },
-            RelationshipQuery {
-                query: "(impl_item type: (type_identifier) @c body: (declaration_list (function_item name: (identifier) @m)))",
-                kind: EdgeKind::MEMBER,
-            },
-            RelationshipQuery {
-                query: "(struct_item name: (type_identifier) @s body: (field_declaration_list (field_declaration name: (field_identifier) @f)))",
-                kind: EdgeKind::MEMBER,
-            },
-            RelationshipQuery {
-                query: "(call_expression function: (identifier) @f)",
-                kind: EdgeKind::CALL,
-            },
-            RelationshipQuery {
-                query: "(macro_invocation macro: (identifier) @m)",
-                kind: EdgeKind::USAGE,
-            },
-        ],
-        _ => vec![],
     }
 }
 
@@ -412,10 +269,16 @@ pub fn index_file(
     // 0. Create File Node
     let file_name = path.to_string_lossy().to_string();
     let file_id = NodeId(generate_id(&file_name));
+    let line_count = source.lines().count() as u32;
+    let file_end_line = if line_count == 0 { 1 } else { line_count };
     result_nodes.push(Node {
         id: file_id,
         kind: NodeKind::FILE,
-        serialized_name: file_name,
+        serialized_name: file_name.clone(),
+        start_line: Some(1),
+        start_col: Some(1),
+        end_line: Some(file_end_line),
+        ..Default::default()
     });
 
     // 1. First pass: Create nodes and a temporary mapping from GraphNodeId -> OurNodeId
@@ -427,6 +290,10 @@ pub fn index_file(
 
         let mut kind_str = String::new();
         let mut name_str = String::new();
+        let mut start_row: Option<u32> = None;
+        let mut start_col: Option<u32> = None;
+        let mut end_row: Option<u32> = None;
+        let mut end_col: Option<u32> = None;
 
         for (attr, val) in node_data.attributes.iter() {
             if attr.as_str() == "kind" {
@@ -434,6 +301,18 @@ pub fn index_file(
             }
             if attr.as_str() == "name" {
                 name_str = val.as_str().unwrap_or("").to_string();
+            }
+            if attr.as_str() == "start_row" {
+                start_row = val.as_integer().ok().map(|v| v as u32);
+            }
+            if attr.as_str() == "start_col" {
+                start_col = val.as_integer().ok().map(|v| v as u32);
+            }
+            if attr.as_str() == "end_row" {
+                end_row = val.as_integer().ok().map(|v| v as u32);
+            }
+            if attr.as_str() == "end_col" {
+                end_col = val.as_integer().ok().map(|v| v as u32);
             }
         }
 
@@ -448,8 +327,9 @@ pub fn index_file(
                 _ => NodeKind::UNKNOWN,
             };
 
-            let id = generate_id(&name_str);
-            let nid = NodeId(id);
+            let start_line = start_row.map(|v| v + 1).unwrap_or(1);
+            let canonical_seed = format!("{}:{}:{}", file_name, name_str, start_line);
+            let nid = NodeId(generate_id(&canonical_seed));
             graph_to_node_id.insert(node_id, nid);
 
             unique_nodes.insert(
@@ -458,6 +338,11 @@ pub fn index_file(
                     id: nid,
                     kind,
                     serialized_name: name_str,
+                    start_line: Some(start_line),
+                    start_col: start_col.map(|v| v + 1),
+                    end_line: end_row.map(|v| v + 1),
+                    end_col: end_col.map(|v| v + 1),
+                    ..Default::default()
                 },
             );
 
@@ -471,257 +356,74 @@ pub fn index_file(
         result_nodes.extend(unique_nodes.values().cloned());
     }
 
-    // 2. Second pass: Create edges using registered tree-sitter queries
-    let rel_queries = get_relationship_queries(language_name);
-    let mut discovered_nodes = HashMap::new();
+    // 2. Second pass: Create edges using tree-sitter-graph output
+    let mut edge_keys: HashSet<(NodeId, NodeId, EdgeKind)> = HashSet::new();
 
-    for rel in rel_queries {
-        let query = tree_sitter::Query::new(&language, rel.query)
-            .unwrap_or_else(|_| tree_sitter::Query::new(&language, "").unwrap());
-        let mut cursor = tree_sitter::QueryCursor::new();
-        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    for source_ref in graph.iter_nodes() {
+        let Some(source_id) = graph_to_node_id.get(&source_ref) else {
+            continue;
+        };
+        let graph_node = &graph[source_ref];
+        for (sink_ref, edge) in graph_node.iter_edges() {
+            let Some(target_id) = graph_to_node_id.get(&sink_ref) else {
+                continue;
+            };
 
-        while let Some(m) = matches.next() {
-            // We assume capture 0 is source, capture 1 is target
-            let s_node = m.nodes_for_capture_index(0).next();
-            let t_node = m.nodes_for_capture_index(1).next();
+            let mut kind: Option<EdgeKind> = None;
+            let mut line: Option<u32> = None;
 
-            if let (Some(s), Some(t)) = (s_node, t_node) {
-                let s_name = s.utf8_text(source.as_bytes()).unwrap_or("");
-                let t_name = t.utf8_text(source.as_bytes()).unwrap_or("");
-
-                if !s_name.is_empty() && !t_name.is_empty() {
-                    let s_id = NodeId(generate_id(s_name));
-                    let t_id = NodeId(generate_id(t_name));
-
-                    // ... (node discovery logic) ...
-                    let mut s_kind = NodeKind::UNKNOWN;
-                    if let Some(kind) = unique_nodes.get(&s_id).map(|n| n.kind) {
-                        s_kind = kind;
-                    } else if let Some(st) = &symbol_table
-                        && let Some(kind) = st.get(s_id.0)
-                    {
-                        s_kind = kind;
-                    }
-
-                    if s_kind == NodeKind::UNKNOWN && !discovered_nodes.contains_key(&s_id) {
-                        discovered_nodes.insert(
-                            s_id,
-                            Node {
-                                id: s_id,
-                                kind: NodeKind::UNKNOWN,
-                                serialized_name: s_name.to_string(),
-                            },
-                        );
-                        if let Some(st) = &symbol_table {
-                            st.insert(s_id.0, NodeKind::UNKNOWN);
+            for (attr, val) in edge.attributes.iter() {
+                match attr.as_str() {
+                    "kind" => {
+                        if let Ok(kind_str) = val.as_str() {
+                            kind = edge_kind_from_str(kind_str);
                         }
                     }
-
-                    let mut t_kind = NodeKind::UNKNOWN;
-                    if let Some(kind) = unique_nodes.get(&t_id).map(|n| n.kind) {
-                        t_kind = kind;
-                    } else if let Some(st) = &symbol_table
-                        && let Some(kind) = st.get(t_id.0)
-                    {
-                        t_kind = kind;
-                    }
-
-                    if t_kind == NodeKind::UNKNOWN && !discovered_nodes.contains_key(&t_id) {
-                        discovered_nodes.insert(
-                            t_id,
-                            Node {
-                                id: t_id,
-                                kind: NodeKind::UNKNOWN,
-                                serialized_name: t_name.to_string(),
-                            },
-                        );
-                        if let Some(st) = &symbol_table {
-                            st.insert(t_id.0, NodeKind::UNKNOWN);
+                    "line" | "start_row" => {
+                        if let Ok(row) = val.as_integer() {
+                            line = Some(row + 1);
                         }
                     }
-
-                    let edge_pk = generate_edge_id(s_id.0, t_id.0, rel.kind);
-                    result_edges.push(Edge {
-                        id: EdgeId(edge_pk),
-                        source: s_id,
-                        target: t_id,
-                        kind: rel.kind,
-                    });
-
-                    // Determine Occurrence Kinds
-                    let (s_kind, t_kind) = match rel.kind {
-                        codestory_core::EdgeKind::MEMBER => (
-                            codestory_core::OccurrenceKind::DEFINITION,
-                            codestory_core::OccurrenceKind::DEFINITION,
-                        ),
-                        codestory_core::EdgeKind::INHERITANCE => (
-                            codestory_core::OccurrenceKind::DEFINITION,
-                            codestory_core::OccurrenceKind::REFERENCE,
-                        ),
-                        codestory_core::EdgeKind::CALL => (
-                            codestory_core::OccurrenceKind::DEFINITION,
-                            codestory_core::OccurrenceKind::REFERENCE,
-                        ),
-                        _ => (
-                            codestory_core::OccurrenceKind::UNKNOWN,
-                            codestory_core::OccurrenceKind::UNKNOWN,
-                        ),
-                    };
-
-                    // Collect Occurrences
-                    let s_range = s.range();
-                    result_occurrences.push(Occurrence {
-                        element_id: s_id.0,
-                        kind: s_kind,
-                        location: SourceLocation {
-                            file_node_id: file_id,
-                            start_line: s_range.start_point.row as u32 + 1,
-                            start_col: s_range.start_point.column as u32 + 1,
-                            end_line: s_range.end_point.row as u32 + 1,
-                            end_col: s_range.end_point.column as u32 + 1,
-                        },
-                    });
-
-                    let t_range = t.range();
-                    result_occurrences.push(Occurrence {
-                        element_id: t_id.0,
-                        kind: t_kind,
-                        location: SourceLocation {
-                            file_node_id: file_id,
-                            start_line: t_range.start_point.row as u32 + 1,
-                            start_col: t_range.start_point.column as u32 + 1,
-                            end_line: t_range.end_point.row as u32 + 1,
-                            end_col: t_range.end_point.column as u32 + 1,
-                        },
-                    });
-                }
-            } else if let Some(t) = s_node {
-                // Single capture case (e.g. CALL)
-                // For a call query: (call_expression function: (identifier) @f)
-                // We typically need a "Caller".
-                // In tree-sitter queries, "Caller" is implicitly the function enclosing the call.
-                // WE MUST FIND THE ENCLOSING FUNCTION here, otherwise we don't have a source!
-                // The current code just handles Target (Capture 0).
-
-                // CRITICAL FIX: To handle standard Call Graph, we need Source (enclosing function) -> Target (callee).
-                // tree-sitter can't easily capture "enclosing function" in a simple query without recursive matches or code logic.
-                // However, we can traverse UP from the match to find the nearest function definition.
-
-                let t_name = t.utf8_text(source.as_bytes()).unwrap_or("");
-                if !t_name.is_empty() {
-                    let t_id = NodeId(generate_id(t_name));
-
-                    // Identify Source (Helper function needed)
-                    // We walk up from `t` until we find a function/method node.
-                    let mut parent = t.parent();
-                    let mut s_node: Option<tree_sitter::Node> = None;
-
-                    while let Some(p) = parent {
-                        let kind = p.kind();
-                        if kind.contains("function") || kind.contains("method") {
-                            // This is a naive heuristic, but works for most languages
-                            // Need to extract NAME of that function to generate ID.
-                            // This is language specific...
-                            // To fix this PROPERLY without massive refactor: assumption:
-                            // The graph construction pass (Pass 1) created nodes for functions.
-                            // We need to find the name of `p`.
-
-                            // Let's use `p`'s child that is an identifier?
-                            // Too complex for generic.
-
-                            // Alternative: Just ignore CALL edges if we can't find source?
-                            // No, user wants CALL graph.
-
-                            // HACK: Use tree-sitter child-by-field-name("name") or similar if possible.
-                            if let Some(name_node) = p.child_by_field_name("name").or_else(|| {
-                                p.child_by_field_name("declarator")
-                                    .and_then(|d| d.child_by_field_name("declarator"))
-                            })
-                            // C++ junk
-                            {
-                                s_node = Some(name_node);
-                            }
-                            break;
-                        }
-                        parent = p.parent();
-                    }
-
-                    if let Some(s) = s_node {
-                        let s_name = s.utf8_text(source.as_bytes()).unwrap_or("");
-                        let s_id = NodeId(generate_id(s_name));
-
-                        let mut s_kind = NodeKind::UNKNOWN;
-                        if let Some(kind) = unique_nodes.get(&s_id).map(|n| n.kind) {
-                            s_kind = kind;
-                        } else if let Some(st) = &symbol_table
-                            && let Some(kind) = st.get(s_id.0)
-                        {
-                            s_kind = kind;
-                        }
-
-                        if s_kind == NodeKind::UNKNOWN && !discovered_nodes.contains_key(&s_id) {
-                            discovered_nodes.insert(
-                                s_id,
-                                Node {
-                                    id: s_id,
-                                    kind: NodeKind::UNKNOWN,
-                                    serialized_name: s_name.to_string(),
-                                },
-                            );
-                            if let Some(st) = &symbol_table {
-                                st.insert(s_id.0, NodeKind::UNKNOWN);
-                            }
-                        }
-
-                        let mut t_kind = NodeKind::UNKNOWN;
-                        if let Some(kind) = unique_nodes.get(&t_id).map(|n| n.kind) {
-                            t_kind = kind;
-                        } else if let Some(st) = &symbol_table
-                            && let Some(kind) = st.get(t_id.0)
-                        {
-                            t_kind = kind;
-                        }
-
-                        if t_kind == NodeKind::UNKNOWN && !discovered_nodes.contains_key(&t_id) {
-                            discovered_nodes.insert(
-                                t_id,
-                                Node {
-                                    id: t_id,
-                                    kind: NodeKind::UNKNOWN,
-                                    serialized_name: t_name.to_string(),
-                                },
-                            );
-                            if let Some(st) = &symbol_table {
-                                st.insert(t_id.0, NodeKind::UNKNOWN);
-                            }
-                        }
-
-                        let edge_pk = generate_edge_id(s_id.0, t_id.0, rel.kind);
-                        result_edges.push(Edge {
-                            id: EdgeId(edge_pk),
-                            source: s_id,
-                            target: t_id,
-                            kind: rel.kind,
-                        });
-
-                        // Occurrences for Source is redundant if function def already has it?
-                        // Yes, typically. Only add occurrence for target (call site).
-                        let t_range = t.range();
-                        result_occurrences.push(Occurrence {
-                            element_id: t_id.0,
-                            kind: codestory_core::OccurrenceKind::REFERENCE,
-                            location: SourceLocation {
-                                file_node_id: file_id,
-                                start_line: t_range.start_point.row as u32 + 1,
-                                start_col: t_range.start_point.column as u32 + 1,
-                                end_line: t_range.end_point.row as u32 + 1,
-                                end_col: t_range.end_point.column as u32 + 1,
-                            },
-                        });
-                    }
+                    _ => {}
                 }
             }
+
+            let Some(kind) = kind else {
+                continue;
+            };
+
+            if !edge_keys.insert((*source_id, *target_id, kind)) {
+                continue;
+            }
+
+            let edge_pk = generate_edge_id(source_id.0, target_id.0, kind);
+            result_edges.push(Edge {
+                id: EdgeId(edge_pk),
+                source: *source_id,
+                target: *target_id,
+                kind,
+                file_node_id: Some(file_id),
+                line,
+                ..Default::default()
+            });
+        }
+    }
+
+    for node in unique_nodes.values() {
+        if let (Some(start_line), Some(start_col), Some(end_line), Some(end_col)) =
+            (node.start_line, node.start_col, node.end_line, node.end_col)
+        {
+            result_occurrences.push(Occurrence {
+                element_id: node.id.0,
+                kind: codestory_core::OccurrenceKind::DEFINITION,
+                location: SourceLocation {
+                    file_node_id: file_id,
+                    start_line,
+                    start_col,
+                    end_line,
+                    end_col,
+                },
+            });
         }
     }
 
@@ -743,11 +445,6 @@ pub fn index_file(
     // Let's assume high-level nodes are roots or attached to File.
 
     // We need to update result_nodes.
-    // Merge discovered_nodes into result_nodes
-    if !discovered_nodes.is_empty() {
-        result_nodes.extend(discovered_nodes.into_values());
-    }
-
     // Let's map NodeId -> Node for easy update
     let mut node_map: HashMap<NodeId, Node> = result_nodes.into_iter().map(|n| (n.id, n)).collect();
 
@@ -789,7 +486,55 @@ pub fn index_file(
     }
 
     // Reconstruct result_nodes
-    let final_nodes = node_map.into_values().collect();
+    let mut final_nodes: Vec<Node> = node_map.into_values().collect();
+
+    // 4. Canonicalize node IDs (file:qualified:start_line) and remap edges/occurrences
+    let mut id_remap: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in final_nodes.iter_mut() {
+        let qualified_name = node.serialized_name.clone();
+        node.qualified_name = Some(qualified_name.clone());
+
+        let start_line = node.start_line.unwrap_or(1);
+        let canonical_id = format!("{}:{}:{}", file_name, qualified_name, start_line);
+        let new_id = NodeId(generate_id(&canonical_id));
+
+        node.canonical_id = Some(canonical_id);
+        id_remap.insert(node.id, new_id);
+        node.id = new_id;
+    }
+
+    let new_file_id = id_remap.get(&file_id).copied().unwrap_or(file_id);
+    for node in final_nodes.iter_mut() {
+        node.file_node_id = Some(new_file_id);
+    }
+
+    for edge in result_edges.iter_mut() {
+        if let Some(new_id) = id_remap.get(&edge.source) {
+            edge.source = *new_id;
+        }
+        if let Some(new_id) = id_remap.get(&edge.target) {
+            edge.target = *new_id;
+        }
+        edge.file_node_id = Some(new_file_id);
+        edge.id = EdgeId(generate_edge_id(edge.source.0, edge.target.0, edge.kind));
+    }
+
+    for occ in result_occurrences.iter_mut() {
+        if let Some(new_id) = id_remap.get(&NodeId(occ.element_id)) {
+            occ.element_id = new_id.0;
+        }
+        if let Some(new_file_id) = id_remap.get(&occ.location.file_node_id) {
+            occ.location.file_node_id = *new_file_id;
+        }
+    }
+
+    apply_line_range_call_attribution(&final_nodes, &mut result_edges);
+
+    if let Some(st) = &symbol_table {
+        for node in &final_nodes {
+            st.insert(node.id.0, node.kind);
+        }
+    }
 
     Ok(IndexResult {
         nodes: final_nodes,
@@ -803,163 +548,37 @@ pub fn get_language_for_ext(ext: &str) -> Option<(Language, &'static str, &'stat
         "py" => Some((
             tree_sitter_python::LANGUAGE.into(),
             "python",
-            r#"
-(class_definition name: (identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "CLASS"
-  attr (@name.node) name = (source-text @name)
-}
-(function_definition name: (identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "FUNCTION"
-  attr (@name.node) name = (source-text @name)
-}
-(assignment left: (identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "VARIABLE"
-  attr (@name.node) name = (source-text @name)
-}
-(decorator (identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "FUNCTION"
-  attr (@name.node) name = (source-text @name)
-}
-"#,
+            include_str!("../rules/python.scm"),
         )),
         "java" => Some((
             tree_sitter_java::LANGUAGE.into(),
             "java",
-            r#"
-(class_declaration name: (identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "CLASS"
-  attr (@name.node) name = (source-text @name)
-}
-(interface_declaration name: (identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "CLASS"
-  attr (@name.node) name = (source-text @name)
-}
-(method_declaration name: (identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "FUNCTION"
-  attr (@name.node) name = (source-text @name)
-}
-(field_declaration (variable_declarator name: (identifier) @name)) {
-  node @name.node
-  attr (@name.node) kind = "VARIABLE"
-  attr (@name.node) name = (source-text @name)
-}
-"#,
+            include_str!("../rules/java.scm"),
         )),
         "rs" => Some((
             tree_sitter_rust::LANGUAGE.into(),
             "rust",
-            r#"
-(struct_item name: (type_identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "CLASS"
-  attr (@name.node) name = (source-text @name)
-}
-(enum_item name: (type_identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "CLASS"
-  attr (@name.node) name = (source-text @name)
-}
-(function_item name: (identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "FUNCTION"
-  attr (@name.node) name = (source-text @name)
-}
-(trait_item name: (type_identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "CLASS"
-  attr (@name.node) name = (source-text @name)
-}
-(field_declaration name: (field_identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "FIELD"
-  attr (@name.node) name = (source-text @name)
-}
-"#,
+            include_str!("../rules/rust.scm"),
         )),
         "js" => Some((
             tree_sitter_javascript::LANGUAGE.into(),
             "javascript",
-            r#"
-(class_declaration name: (identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "CLASS"
-  attr (@name.node) name = (source-text @name)
-}
-(function_declaration name: (identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "FUNCTION"
-  attr (@name.node) name = (source-text @name)
-}
-"#,
+            include_str!("../rules/javascript.scm"),
         )),
         "ts" | "tsx" => Some((
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             "typescript",
-            r#"
-(class_declaration name: (type_identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "CLASS"
-  attr (@name.node) name = (source-text @name)
-}
-(interface_declaration name: (type_identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "CLASS"
-  attr (@name.node) name = (source-text @name)
-}
-(function_declaration name: (identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "FUNCTION"
-  attr (@name.node) name = (source-text @name)
-}
-"#,
+            include_str!("../rules/typescript.scm"),
         )),
         "cpp" | "cc" | "cxx" | "h" | "hpp" => Some((
             tree_sitter_cpp::LANGUAGE.into(),
             "cpp",
-            r#"
-(namespace_definition name: (_) @name) {
-  node @name.node
-  attr (@name.node) kind = "MODULE"
-  attr (@name.node) name = (source-text @name)
-}
-(class_specifier name: (_) @name) {
-  node @name.node
-  attr (@name.node) kind = "CLASS"
-  attr (@name.node) name = (source-text @name)
-}
-(function_definition
-  declarator: (function_declarator
-    declarator: (_) @name)) {
-  node @name.node
-  attr (@name.node) kind = "FUNCTION"
-  attr (@name.node) name = (source-text @name)
-}
-(field_declaration declarator: (field_identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "VARIABLE"
-  attr (@name.node) name = (source-text @name)
-}
-"#,
+            include_str!("../rules/cpp.scm"),
         )),
         "c" => Some((
             tree_sitter_c::LANGUAGE.into(),
             "cpp",
-            r#"
-(function_definition
-  declarator: (function_declarator
-    declarator: (identifier) @name)) {
-  node @name.node
-  attr (@name.node) kind = "FUNCTION"
-  attr (@name.node) name = (source-text @name)
-}
-"#,
+            include_str!("../rules/c.scm"),
         )),
         _ => None,
     }
@@ -972,6 +591,92 @@ pub fn generate_id(name: &str) -> i64 {
         h = h.wrapping_mul(0x01000193);
     }
     h as i64
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FunctionRange {
+    id: NodeId,
+    start: u32,
+    end: u32,
+}
+
+fn apply_line_range_call_attribution(nodes: &[Node], edges: &mut Vec<Edge>) {
+    let mut functions_by_file: HashMap<NodeId, Vec<FunctionRange>> = HashMap::new();
+
+    for node in nodes {
+        if !matches!(
+            node.kind,
+            NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+        ) {
+            continue;
+        }
+        let (Some(file_id), Some(start), Some(end)) =
+            (node.file_node_id, node.start_line, node.end_line)
+        else {
+            continue;
+        };
+        if start > end {
+            continue;
+        }
+        functions_by_file
+            .entry(file_id)
+            .or_default()
+            .push(FunctionRange {
+                id: node.id,
+                start,
+                end,
+            });
+    }
+
+    for ranges in functions_by_file.values_mut() {
+        ranges.sort_by_key(|range| (range.end - range.start, range.start));
+    }
+
+    let mut dedup: HashSet<(NodeId, NodeId, EdgeKind)> = HashSet::new();
+    let mut updated_edges = Vec::with_capacity(edges.len());
+
+    for edge in edges.iter_mut() {
+        if edge.kind == EdgeKind::CALL {
+            if let (Some(file_id), Some(line)) = (edge.file_node_id, edge.line) {
+                if let Some(ranges) = functions_by_file.get(&file_id) {
+                    if let Some(best) = ranges
+                        .iter()
+                        .filter(|range| line >= range.start && line <= range.end)
+                        .min_by_key(|range| (range.end - range.start, range.start))
+                    {
+                        edge.source = best.id;
+                    }
+                }
+            }
+            edge.id = EdgeId(generate_edge_id(edge.source.0, edge.target.0, edge.kind));
+        }
+
+        let key = (edge.source, edge.target, edge.kind);
+        if dedup.insert(key) {
+            updated_edges.push(edge.clone());
+        }
+    }
+
+    *edges = updated_edges;
+}
+
+fn edge_kind_from_str(kind: &str) -> Option<EdgeKind> {
+    match kind {
+        "MEMBER" => Some(EdgeKind::MEMBER),
+        "TYPE_USAGE" => Some(EdgeKind::TYPE_USAGE),
+        "USAGE" => Some(EdgeKind::USAGE),
+        "CALL" => Some(EdgeKind::CALL),
+        "INHERITANCE" => Some(EdgeKind::INHERITANCE),
+        "OVERRIDE" => Some(EdgeKind::OVERRIDE),
+        "TYPE_ARGUMENT" => Some(EdgeKind::TYPE_ARGUMENT),
+        "TEMPLATE_SPECIALIZATION" => Some(EdgeKind::TEMPLATE_SPECIALIZATION),
+        "INCLUDE" => Some(EdgeKind::INCLUDE),
+        "IMPORT" => Some(EdgeKind::IMPORT),
+        "MACRO_USAGE" => Some(EdgeKind::MACRO_USAGE),
+        "ANNOTATION_USAGE" => Some(EdgeKind::ANNOTATION_USAGE),
+        "UNKNOWN" => Some(EdgeKind::UNKNOWN),
+        _ => None,
+    }
 }
 
 fn generate_edge_id(source: i64, target: i64, kind: codestory_core::EdgeKind) -> i64 {
@@ -995,7 +700,6 @@ mod tests {
     #[test]
     fn test_index_python_semantics() -> Result<()> {
         let _ = tracing_subscriber::fmt::try_init();
-        use tree_sitter_python;
 
         let python_code = r#"
 class Parent:
@@ -1005,24 +709,13 @@ class MyClass(Parent):
     def my_method(self):
         pass
 "#;
-        let graph_query = r#"
-(class_definition name: (identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "CLASS"
-  attr (@name.node) name = (source-text @name)
-}
-(function_definition name: (identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "FUNCTION"
-  attr (@name.node) name = (source-text @name)
-}
-"#;
+        let (lang, lang_name, graph_query) = get_language_for_ext("py").unwrap();
 
         let result = index_file(
             Path::new("test.py"),
             python_code,
-            tree_sitter_python::LANGUAGE.into(),
-            "python",
+            lang,
+            lang_name,
             graph_query,
             None,
             None,
@@ -1043,32 +736,19 @@ class MyClass(Parent):
 
     #[test]
     fn test_index_java_semantics() -> Result<()> {
-        use tree_sitter_java;
-
         let java_code = r#"
 class Parent {}
 class MyClass extends Parent {
     void myMethod() {}
 }
 "#;
-        let graph_query = r#"
-(class_declaration name: (identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "CLASS"
-  attr (@name.node) name = (source-text @name)
-}
-(method_declaration name: (identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "FUNCTION"
-  attr (@name.node) name = (source-text @name)
-}
-"#;
+        let (lang, lang_name, graph_query) = get_language_for_ext("java").unwrap();
 
         let result = index_file(
             Path::new("Test.java"),
             java_code,
-            tree_sitter_java::LANGUAGE.into(),
-            "java",
+            lang,
+            lang_name,
             graph_query,
             None,
             None,
@@ -1087,32 +767,19 @@ class MyClass extends Parent {
 
     #[test]
     fn test_index_rust_semantics() -> Result<()> {
-        use tree_sitter_rust;
-
         let rust_code = r#"
 struct MyStruct { field: i32 }
 impl MyStruct {
     fn my_fn(&self) {}
 }
 "#;
-        let graph_query = r#"
-(struct_item name: (type_identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "CLASS"
-  attr (@name.node) name = (source-text @name)
-}
-(function_item name: (identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "FUNCTION"
-  attr (@name.node) name = (source-text @name)
-}
-"#;
+        let (lang, lang_name, graph_query) = get_language_for_ext("rs").unwrap();
 
         let result = index_file(
             Path::new("main.rs"),
             rust_code,
-            tree_sitter_rust::LANGUAGE.into(),
-            "rust",
+            lang,
+            lang_name,
             graph_query,
             None,
             None,
@@ -1127,32 +794,18 @@ impl MyStruct {
 
     #[test]
     fn test_index_cpp_semantics() -> Result<()> {
-        use tree_sitter_cpp;
-
         let cpp_code = r#"
 class MyClass {
     void myMethod() {}
 };
 "#;
-        let graph_query = r#"
-(class_specifier name: (type_identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "CLASS"
-  attr (@name.node) name = (source-text @name)
-}
-(function_definition
-  declarator: (field_identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "FUNCTION"
-  attr (@name.node) name = (source-text @name)
-}
-"#;
+        let (lang, lang_name, graph_query) = get_language_for_ext("cpp").unwrap();
 
         let result = index_file(
             Path::new("test.cpp"),
             cpp_code,
-            tree_sitter_cpp::LANGUAGE.into(),
-            "cpp",
+            lang,
+            lang_name,
             graph_query,
             None,
             None,
@@ -1167,33 +820,19 @@ class MyClass {
 
     #[test]
     fn test_index_typescript_semantics() -> Result<()> {
-        use tree_sitter_typescript;
-
         let ts_code = r#"
 class MyClass {
     myMethod() {}
 }
 function globalFunc() {}
 "#;
-
-        let graph_query = r#"
-(class_declaration name: (type_identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "CLASS"
-  attr (@name.node) name = (source-text @name)
-}
-(function_declaration name: (identifier) @name) {
-  node @name.node
-  attr (@name.node) kind = "FUNCTION"
-  attr (@name.node) name = (source-text @name)
-}
-"#;
+        let (lang, lang_name, graph_query) = get_language_for_ext("ts").unwrap();
 
         let result = index_file(
             Path::new("test.ts"),
             ts_code,
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            "typescript",
+            lang,
+            lang_name,
             graph_query,
             None,
             None,
@@ -1285,7 +924,6 @@ function globalFunc() {}
 
     #[test]
     fn test_index_cpp_advanced() -> Result<()> {
-        use tree_sitter_cpp;
         let code = r#"
 class Base {};
 class Derived : public Base {
@@ -1296,8 +934,8 @@ class Derived : public Base {
         let result = index_file(
             Path::new("test.cpp"),
             code,
-            tree_sitter_cpp::LANGUAGE.into(),
-            "cpp",
+            get_language_for_ext("cpp").unwrap().0,
+            get_language_for_ext("cpp").unwrap().1,
             get_language_for_ext("cpp").unwrap().2,
             None,
             None,
@@ -1325,7 +963,6 @@ class Derived : public Base {
 
     #[test]
     fn test_index_python_advanced() -> Result<()> {
-        use tree_sitter_python;
         let code = r#"
 from os import path
 @decorator
@@ -1335,8 +972,8 @@ class MyClass:
         let result = index_file(
             Path::new("test.py"),
             code,
-            tree_sitter_python::LANGUAGE.into(),
-            "python",
+            get_language_for_ext("py").unwrap().0,
+            get_language_for_ext("py").unwrap().1,
             get_language_for_ext("py").unwrap().2,
             None,
             None,
@@ -1349,14 +986,15 @@ class MyClass:
                 .iter()
                 .any(|n| n.serialized_name == "x" && n.kind == NodeKind::VARIABLE)
         );
-        // Verify USAGE for import/decorator
+        // Verify IMPORT for import statement
+        assert!(result.edges.iter().any(|e| e.kind == EdgeKind::IMPORT));
+        // Verify USAGE for decorator
         assert!(result.edges.iter().any(|e| e.kind == EdgeKind::USAGE));
         Ok(())
     }
 
     #[test]
     fn test_index_rust_advanced() -> Result<()> {
-        use tree_sitter_rust;
         let code = r#"
 trait MyTrait {}
 struct MyStruct;
@@ -1368,8 +1006,8 @@ fn main() {
         let result = index_file(
             Path::new("main.rs"),
             code,
-            tree_sitter_rust::LANGUAGE.into(),
-            "rust",
+            get_language_for_ext("rs").unwrap().0,
+            get_language_for_ext("rs").unwrap().1,
             get_language_for_ext("rs").unwrap().2,
             None,
             None,
@@ -1390,10 +1028,7 @@ fn main() {
     }
 
     #[test]
-    fn test_robust_call_graph_missing_caller_definition() -> Result<()> {
-        use tree_sitter_java;
-
-        // A method 'caller' calls 'callee'
+    fn test_call_edges_from_graph() -> Result<()> {
         let java_code = r#"
 class Test {
     void caller() {
@@ -1402,39 +1037,31 @@ class Test {
     void callee() {}
 }
 "#;
-        // Intentionally BROKEN graph query (Pass 1) that finds NOTHING.
-        // This simulates a case where Pass 1 fails to identify the function,
-        // but Pass 2 (Call Graph) still finds the call.
-        let graph_query = "";
-
+        let (lang, lang_name, graph_query) = get_language_for_ext("java").unwrap();
         let result = index_file(
             Path::new("Test.java"),
             java_code,
-            tree_sitter_java::LANGUAGE.into(),
-            "java",
+            lang,
+            lang_name,
             graph_query,
             None,
             None,
         )?;
 
-        // Pass 2 should find the CALL.
-        // It detects 'callee()' is called.
-        // It walks up and finds 'caller' is the enclosing function.
-        // It MUST create a node for 'caller' since Pass 1 didn't.
-
-        let caller_node = result.nodes.iter().find(|n| n.serialized_name == "caller");
         assert!(
-            caller_node.is_some(),
-            "Caller node should have been auto-generated by Pass 2"
+            result
+                .nodes
+                .iter()
+                .any(|n| n.serialized_name.ends_with(".caller") && n.kind == NodeKind::FUNCTION),
+            "Caller node not found"
         );
-        assert_eq!(caller_node.unwrap().kind, NodeKind::UNKNOWN); // We default to UNKNOWN in the fix
-
-        let callee_node = result.nodes.iter().find(|n| n.serialized_name == "callee");
         assert!(
-            callee_node.is_some(),
-            "Callee node should have been auto-generated by Pass 2"
+            result
+                .nodes
+                .iter()
+                .any(|n| n.serialized_name.ends_with(".callee") && n.kind == NodeKind::FUNCTION),
+            "Callee node not found"
         );
-
         assert!(
             result.edges.iter().any(|e| e.kind == EdgeKind::CALL),
             "CALL edge not found"
@@ -1442,4 +1069,45 @@ class Test {
 
         Ok(())
     }
+
+    #[test]
+    fn test_call_attribution_line_range() -> Result<()> {
+        let java_code = r#"
+class Test {
+    void first() {}
+    void second() {
+        first();
+    }
 }
+"#;
+        let (lang, lang_name, graph_query) = get_language_for_ext("java").unwrap();
+        let result = index_file(
+            Path::new("Test.java"),
+            java_code,
+            lang,
+            lang_name,
+            graph_query,
+            None,
+            None,
+        )?;
+
+        let caller = result
+            .nodes
+            .iter()
+            .find(|n| n.serialized_name.ends_with(".second"))
+            .expect("second() node not found");
+
+        let call_edge = result
+            .edges
+            .iter()
+            .find(|e| e.kind == EdgeKind::CALL)
+            .expect("CALL edge not found");
+
+        assert_eq!(call_edge.source, caller.id);
+        Ok(())
+    }
+}
+
+
+
+

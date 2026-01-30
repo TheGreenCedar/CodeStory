@@ -40,6 +40,7 @@ pub struct EdgeHitInfo {
     /// The bezier curve in screen space (for hit testing)
     pub screen_curve: CubicBezier,
     /// Whether this edge is part of a bundle
+    #[allow(dead_code)]
     pub is_bundled: bool,
 }
 
@@ -55,8 +56,10 @@ pub struct SelectedEdgeInfo {
     /// Target node ID
     pub target: NodeId,
     /// Source node label
+    #[allow(dead_code)]
     pub source_label: String,
     /// Target node label
+    #[allow(dead_code)]
     pub target_label: String,
 }
 
@@ -168,11 +171,13 @@ impl EdgeOverlay {
     /// Get the currently selected edge info, if any.
     ///
     /// **Validates: Requirement 8.3**
+    #[allow(dead_code)]
     pub fn get_selected_edge(&self) -> Option<&SelectedEdgeInfo> {
         self.selected_edge.as_ref()
     }
 
     /// Clear the currently selected edge.
+    #[allow(dead_code)]
     pub fn clear_selection(&mut self) {
         self.selected_edge = None;
     }

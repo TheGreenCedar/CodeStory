@@ -542,7 +542,7 @@ impl NodeGraphView {
         );
 
         // Left: Vertical toolbar (Req 9.1)
-        ui.allocate_ui_at_rect(toolbar_rect, |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(toolbar_rect), |ui| {
             rebuild_needed |= self.ui_toolbar(ui, settings);
         });
 
@@ -554,7 +554,7 @@ impl NodeGraphView {
         );
 
         // Right: Graph viewport
-        ui.allocate_ui_at_rect(graph_rect, |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(graph_rect), |ui| {
             let snarl_rect = ui.available_rect_before_wrap();
             let mut child_ui = ui.new_child(
                 egui::UiBuilder::new()

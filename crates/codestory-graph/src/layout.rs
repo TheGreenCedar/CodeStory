@@ -1422,6 +1422,7 @@ mod tests {
                 id: NodeId(i as i64),
                 kind: NodeKind::FUNCTION,
                 serialized_name: format!("N{}", i),
+                ..Default::default()
             });
         }
         for i in 0..n.saturating_sub(1) {
@@ -1430,6 +1431,7 @@ mod tests {
                 source: NodeId(i as i64),
                 target: NodeId((i + 1) as i64),
                 kind: EdgeKind::CALL,
+                ..Default::default()
             });
         }
         model
@@ -1443,6 +1445,7 @@ mod tests {
                 id: NodeId(*i),
                 kind: NodeKind::FUNCTION,
                 serialized_name: name.to_string(),
+                ..Default::default()
             });
         }
         let edges = [(0, 1), (0, 2), (1, 3), (2, 3)];
@@ -1452,6 +1455,7 @@ mod tests {
                 source: NodeId(*s),
                 target: NodeId(*t),
                 kind: EdgeKind::CALL,
+                ..Default::default()
             });
         }
         model
@@ -1606,6 +1610,7 @@ mod tests {
             id: NodeId(1),
             kind: NodeKind::FUNCTION,
             serialized_name: "Solo".to_string(),
+            ..Default::default()
         });
         let layouter = HierarchicalLayouter::default();
         let positions = layouter.execute(&model);
@@ -1674,6 +1679,7 @@ mod tests {
                 id: NodeId(i),
                 kind: NodeKind::UNKNOWN,
                 serialized_name: format!("N{}", i),
+                ..Default::default()
             });
         }
 
@@ -1699,17 +1705,20 @@ mod tests {
             id: NodeId(1),
             kind: NodeKind::FUNCTION,
             serialized_name: "A".to_string(),
+            ..Default::default()
         });
         model.add_node(Node {
             id: NodeId(2),
             kind: NodeKind::FUNCTION,
             serialized_name: "B".to_string(),
+            ..Default::default()
         });
         model.add_edge(Edge {
             id: codestory_core::EdgeId(1),
             source: NodeId(1),
             target: NodeId(2),
             kind: EdgeKind::CALL,
+            ..Default::default()
         });
         model.rebuild_hierarchy();
 
@@ -1758,17 +1767,20 @@ mod tests {
             id: NodeId(1),
             kind: NodeKind::FUNCTION,
             serialized_name: "A".to_string(),
+            ..Default::default()
         });
         model.add_node(Node {
             id: NodeId(2),
             kind: NodeKind::FUNCTION,
             serialized_name: "B".to_string(),
+            ..Default::default()
         });
         model.add_edge(Edge {
             id: codestory_core::EdgeId(1),
             source: NodeId(1),
             target: NodeId(2),
             kind: EdgeKind::CALL,
+            ..Default::default()
         });
 
         // Test Horizontal (default)
@@ -1822,6 +1834,7 @@ mod property_tests {
                 id: NodeId(i as i64),
                 kind: NodeKind::FUNCTION,
                 serialized_name: format!("N{}", i),
+                ..Default::default()
             });
         }
         for (idx, (s, t)) in edges.iter().enumerate() {
@@ -1833,6 +1846,7 @@ mod property_tests {
                     source: NodeId(src as i64),
                     target: NodeId(tgt as i64),
                     kind: EdgeKind::CALL,
+                    ..Default::default()
                 });
             }
         }

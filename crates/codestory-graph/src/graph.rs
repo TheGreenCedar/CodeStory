@@ -346,11 +346,13 @@ mod tests {
             id: NodeId(1),
             kind: NodeKind::CLASS,
             serialized_name: "C1".to_string(),
+            ..Default::default()
         };
         let n2 = Node {
             id: NodeId(2),
             kind: NodeKind::METHOD,
             serialized_name: "M1".to_string(),
+            ..Default::default()
         };
 
         model.add_node(n1);
@@ -361,6 +363,7 @@ mod tests {
             source: NodeId(1),
             target: NodeId(2),
             kind: EdgeKind::MEMBER,
+            ..Default::default()
         };
         model.add_edge(e1);
 

@@ -13,6 +13,7 @@ fn bench_grid_layout_1000_nodes(c: &mut Criterion) {
             id: NodeId(i as i64),
             kind: NodeKind::CLASS,
             serialized_name: format!("Node_{}", i),
+            ..Default::default()
         });
     }
 

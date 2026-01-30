@@ -157,6 +157,7 @@ impl StyleResolver {
     }
     
     /// Get the icon color (usually same as node color or slightly different)
+    #[allow(dead_code)]
     pub fn resolve_icon_color(&self, kind: NodeKind) -> Color32 {
         self.resolve_node_color(kind)
     }
@@ -170,8 +171,8 @@ impl StyleResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use catppuccin_egui::Theme;
-    use egui::Color32;
+    
+    
 
     // We can't easily construct a full Theme manually without the crate's constructor if it's private fields,
     // but catppuccin_egui exposes constants like MOCHA, LATTE.

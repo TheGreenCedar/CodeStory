@@ -168,14 +168,59 @@ pub struct Node {
     pub id: NodeId,
     pub kind: NodeKind,
     pub serialized_name: String, // e.g., "n:my_namespace.c:MyClass"
+    pub qualified_name: Option<String>,
+    pub canonical_id: Option<String>,
+    pub file_node_id: Option<NodeId>,
+    pub start_line: Option<u32>,
+    pub start_col: Option<u32>,
+    pub end_line: Option<u32>,
+    pub end_col: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Edge {
     pub id: EdgeId,
     pub source: NodeId,
     pub target: NodeId,
     pub kind: EdgeKind,
+    pub file_node_id: Option<NodeId>,
+    pub line: Option<u32>,
+    pub resolved_source: Option<NodeId>,
+    pub resolved_target: Option<NodeId>,
+    pub confidence: Option<f32>,
+}
+
+impl Default for Node {
+    fn default() -> Self {
+        Self {
+            id: NodeId(0),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: String::new(),
+            qualified_name: None,
+            canonical_id: None,
+            file_node_id: None,
+            start_line: None,
+            start_col: None,
+            end_line: None,
+            end_col: None,
+        }
+    }
+}
+
+impl Default for Edge {
+    fn default() -> Self {
+        Self {
+            id: EdgeId(0),
+            source: NodeId(0),
+            target: NodeId(0),
+            kind: EdgeKind::UNKNOWN,
+            file_node_id: None,
+            line: None,
+            resolved_source: None,
+            resolved_target: None,
+            confidence: None,
+        }
+    }
 }
 
 /// Represents a location in a source file.
@@ -315,7 +360,7 @@ impl Default for TrailConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TrailResult {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,

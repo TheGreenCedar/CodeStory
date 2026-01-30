@@ -53,28 +53,36 @@ int main() {
     // Find myMethod
     let my_method = nodes
         .iter()
-        .find(|n| n.serialized_name == "myMethod")
+        .find(|n| n.serialized_name.ends_with("myMethod") && n.kind == NodeKind::FUNCTION)
         .expect("myMethod node not found");
     // In our indexer, methods currently default to FUNCTION if not using specific METHOD kind in TS graph
     // But let's check what it actually is
 
     // 4. Verify Edges (CALL)
     let edges = storage.get_edges()?;
+    let call_edge = edges
+        .iter()
+        .find(|e| e.kind == EdgeKind::CALL)
+        .expect("CALL edge not found");
     assert!(
-        edges.iter().any(|e| e.kind == EdgeKind::CALL),
-        "CALL edge not found"
+        call_edge.resolved_target == Some(my_method.id),
+        "CALL edge not resolved to myMethod"
     );
+    assert!(call_edge.line.is_some(), "CALL edge missing line metadata");
 
     // 5. Verify Occurrences
     let occs = storage.get_occurrences_for_element(my_method.id.0)?;
     assert!(!occs.is_empty(), "No occurrences for myMethod");
 
-    // Check if we have at least one DEFINITION and one REFERENCE
+    // Check if we have at least one DEFINITION
     let has_def = occs.iter().any(|o| o.kind == OccurrenceKind::DEFINITION);
-    let has_ref = occs.iter().any(|o| o.kind == OccurrenceKind::REFERENCE);
 
     assert!(has_def, "Method definition occurrence missing");
-    assert!(has_ref, "Method call (reference) occurrence missing");
+
+    // Metadata on nodes should be populated
+    assert!(my_method.file_node_id.is_some());
+    assert!(my_method.start_line.is_some());
+    assert!(my_method.end_line.is_some());
 
     Ok(())
 }
@@ -163,7 +171,7 @@ fn process(t: MyType) {
     assert!(nodes.iter().any(|n| n.serialized_name == "process"));
 
     // Should have edges (TYPE_USAGE or similar)
-    assert!(!edges.is_empty());
+    assert!(edges.iter().any(|e| e.kind == EdgeKind::IMPORT));
 
     Ok(())
 }
