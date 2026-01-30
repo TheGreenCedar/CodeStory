@@ -304,9 +304,12 @@ impl CodeStoryApp {
                 self.node_names.clear();
                 let mut search_nodes = Vec::new();
                 for node in nodes {
-                    self.node_names
-                        .insert(node.id, node.serialized_name.clone());
-                    search_nodes.push((node.id, node.serialized_name));
+                    let display_name = node
+                        .qualified_name
+                        .clone()
+                        .unwrap_or_else(|| node.serialized_name.clone());
+                    self.node_names.insert(node.id, display_name.clone());
+                    search_nodes.push((node.id, display_name));
                 }
                 if let Some(engine) = &mut self.search_engine {
                     let _ = engine.index_nodes(search_nodes);
@@ -1440,9 +1443,12 @@ impl codestory_events::EventListener for CodeStoryApp {
                         let mut search_nodes = Vec::new();
                         self.node_names.clear();
                         for node in nodes {
-                            search_nodes.push((node.id, node.serialized_name.clone()));
-                            self.node_names
-                                .insert(node.id, node.serialized_name.clone());
+                            let display_name = node
+                                .qualified_name
+                                .clone()
+                                .unwrap_or_else(|| node.serialized_name.clone());
+                            search_nodes.push((node.id, display_name.clone()));
+                            self.node_names.insert(node.id, display_name.clone());
                             // Also update error panel's file name cache for file nodes
                             if node.kind == codestory_core::NodeKind::FILE {
                                 self.error_panel

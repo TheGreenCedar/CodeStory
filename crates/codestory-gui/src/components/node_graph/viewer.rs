@@ -327,7 +327,12 @@ impl NodeGraphView {
 
         let filtered_ids: Vec<NodeId> = filtered_nodes.iter().map(|n| n.id).collect();
 
-        let filtered_edges: Vec<Edge> = edges
+        let effective_edges: Vec<Edge> = edges
+            .iter()
+            .map(|edge| edge.with_effective_endpoints())
+            .collect();
+
+        let filtered_edges: Vec<Edge> = effective_edges
             .iter()
             .filter(|e| filtered_ids.contains(&e.source) && filtered_ids.contains(&e.target))
             .cloned()

@@ -190,6 +190,27 @@ pub struct Edge {
     pub confidence: Option<f32>,
 }
 
+impl Edge {
+    pub fn effective_source(&self) -> NodeId {
+        self.resolved_source.unwrap_or(self.source)
+    }
+
+    pub fn effective_target(&self) -> NodeId {
+        self.resolved_target.unwrap_or(self.target)
+    }
+
+    pub fn effective_endpoints(&self) -> (NodeId, NodeId) {
+        (self.effective_source(), self.effective_target())
+    }
+
+    pub fn with_effective_endpoints(&self) -> Self {
+        let mut edge = self.clone();
+        edge.source = self.effective_source();
+        edge.target = self.effective_target();
+        edge
+    }
+}
+
 impl Default for Node {
     fn default() -> Self {
         Self {

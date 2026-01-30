@@ -530,24 +530,16 @@ impl Storage {
             }
         }
 
-        let mut edges = Vec::new();
-        {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence FROM edge WHERE source_node_id = ?1 OR target_node_id = ?1"
-            )?;
-            let mut rows = stmt.query(params![center_id.0])?;
-            while let Some(row) = rows.next()? {
-                edges.push(Self::edge_from_row(row)?);
-            }
-        }
+        let edges = self.get_edges_for_node(center_id, &TrailDirection::Both, &[])?;
 
         let mut neighbor_ids = HashSet::new();
         for edge in &edges {
-            if edge.source != center_id {
-                neighbor_ids.insert(edge.source);
+            let (eff_source, eff_target) = edge.effective_endpoints();
+            if eff_source != center_id {
+                neighbor_ids.insert(eff_source);
             }
-            if edge.target != center_id {
-                neighbor_ids.insert(edge.target);
+            if eff_target != center_id {
+                neighbor_ids.insert(eff_target);
             }
         }
 
@@ -1042,7 +1034,12 @@ impl Storage {
                 for edge in edges {
                     result.edges.push(edge.clone());
 
-                    let neighbor_id = if edge.source == current_id {
+                    let (eff_source, eff_target) = edge.effective_endpoints();
+                    let neighbor_id = if eff_source == current_id {
+                        eff_target
+                    } else if eff_target == current_id {
+                        eff_source
+                    } else if edge.source == current_id {
                         edge.target
                     } else {
                         edge.source
@@ -1069,13 +1066,13 @@ impl Storage {
     ) -> Result<Vec<Edge>, StorageError> {
         let query = match direction {
             TrailDirection::Outgoing => {
-                "SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence FROM edge WHERE source_node_id = ?1"
+                "SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence FROM edge WHERE source_node_id = ?1 OR resolved_source_node_id = ?1"
             }
             TrailDirection::Incoming => {
-                "SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence FROM edge WHERE target_node_id = ?1"
+                "SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence FROM edge WHERE target_node_id = ?1 OR resolved_target_node_id = ?1"
             }
             TrailDirection::Both => {
-                "SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence FROM edge WHERE source_node_id = ?1 OR target_node_id = ?1"
+                "SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence FROM edge WHERE source_node_id = ?1 OR target_node_id = ?1 OR resolved_source_node_id = ?1 OR resolved_target_node_id = ?1"
             }
         };
 
@@ -1092,7 +1089,15 @@ impl Storage {
                 continue;
             }
 
-            edges.push(edge);
+            let (eff_source, eff_target) = edge.effective_endpoints();
+            let matches_node = match direction {
+                TrailDirection::Outgoing => eff_source == node_id,
+                TrailDirection::Incoming => eff_target == node_id,
+                TrailDirection::Both => eff_source == node_id || eff_target == node_id,
+            };
+            if matches_node {
+                edges.push(edge);
+            }
         }
         Ok(edges)
     }

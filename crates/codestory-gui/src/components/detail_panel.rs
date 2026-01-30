@@ -73,14 +73,15 @@ impl DetailPanel {
                             theme::info_box(ui, "No relationships found for this node.");
                         } else {
                             for edge in &self.edges {
+                                let (eff_source, eff_target) = edge.effective_endpoints();
                                 // Determine direction relative to center
-                                let is_source = edge.source == node.id;
+                                let is_source = eff_source == node.id;
                                 let (direction, direction_color) = if is_source {
                                     ("→", egui::Color32::LIGHT_GREEN)
                                 } else {
                                     ("←", ui.visuals().selection.bg_fill)
                                 };
-                                let other_id = if is_source { edge.target } else { edge.source };
+                                let other_id = if is_source { eff_target } else { eff_source };
 
                                 ui.horizontal(|ui| {
                                     theme::badge(

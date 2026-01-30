@@ -161,8 +161,9 @@ impl CodebaseMetrics {
                     || edge.kind == codestory_core::EdgeKind::INCLUDE
                     || edge.kind == codestory_core::EdgeKind::CALL
                 {
-                    *deps.entry(edge.source.0).or_insert(0) += 1;
-                    *dependents.entry(edge.target.0).or_insert(0) += 1;
+                    let (eff_source, eff_target) = edge.effective_endpoints();
+                    *deps.entry(eff_source.0).or_insert(0) += 1;
+                    *dependents.entry(eff_target.0).or_insert(0) += 1;
                 }
             }
 

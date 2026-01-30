@@ -231,14 +231,15 @@ impl GraphModel {
     }
 
     pub fn add_edge(&mut self, edge: Edge) {
+        let (source_id, target_id) = edge.effective_endpoints();
         if let (Some(&src), Some(&target)) = (
-            self.node_map.get(&edge.source),
-            self.node_map.get(&edge.target),
+            self.node_map.get(&source_id),
+            self.node_map.get(&target_id),
         ) {
             let dummy = DummyEdge {
                 id: edge.id,
-                source: edge.source,
-                target: edge.target,
+                source: source_id,
+                target: target_id,
                 kind: edge.kind,
                 visible: true,
                 active: false,
@@ -248,18 +249,18 @@ impl GraphModel {
             self.graph.add_edge(src, target, dummy);
         } else {
             // Debug logging for missing nodes
-            if !self.node_map.contains_key(&edge.source) {
+            if !self.node_map.contains_key(&source_id) {
                 tracing::warn!(
                     "Dropping edge {:?} because source node {} is missing from graph model",
                     edge.id,
-                    edge.source.0
+                    source_id.0
                 );
             }
-            if !self.node_map.contains_key(&edge.target) {
+            if !self.node_map.contains_key(&target_id) {
                 tracing::warn!(
                     "Dropping edge {:?} because target node {} is missing from graph model",
                     edge.id,
-                    edge.target.0
+                    target_id.0
                 );
             }
         }
