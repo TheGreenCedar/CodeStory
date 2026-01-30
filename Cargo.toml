@@ -25,8 +25,6 @@ codestory-project = { path = "crates/codestory-project" }
 codestory-bench = { path = "crates/codestory-bench" }
 
 # Parsing (tree-sitter) - Aligning to 0.24 for tree-sitter-graph 0.12
-
-# Parsing (tree-sitter) - Aligning to 0.24 for tree-sitter-graph 0.12
 tree-sitter = "0.24"
 tree-sitter-rust = "0.23.3"
 tree-sitter-python = "0.23.6"
