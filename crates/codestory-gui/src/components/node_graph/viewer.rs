@@ -1,7 +1,7 @@
 use super::snarl_adapter::NodeGraphAdapter;
 use crate::components::node_graph::edge_overlay::EdgeOverlay;
 use crate::components::node_graph::style_resolver::StyleResolver;
-use codestory_core::{Edge, Node, NodeId, NodeKind, TrailConfig, TrailDirection};
+use codestory_core::{Edge, EdgeKind, Node, NodeId, NodeKind, TrailConfig, TrailDirection};
 use codestory_events::Event;
 use codestory_graph::converter::NodeGraphConverter;
 use codestory_graph::uml_types::UmlNode;
@@ -295,6 +295,54 @@ impl NodeGraphView {
 
         let center_node_id = *center_node_id;
 
+        // Build member -> parent map from MEMBER edges so we can keep members
+        // visible for structural parents even when filters hide their kinds.
+        let mut member_parent: HashMap<NodeId, NodeId> = HashMap::new();
+        for edge in edges {
+            if edge.kind == EdgeKind::MEMBER {
+                let (source, target) = edge.effective_endpoints();
+                member_parent.entry(target).or_insert(source);
+            }
+        }
+
+        let is_structural_kind = |kind: NodeKind| {
+            matches!(
+                kind,
+                NodeKind::CLASS
+                    | NodeKind::STRUCT
+                    | NodeKind::INTERFACE
+                    | NodeKind::UNION
+                    | NodeKind::ENUM
+                    | NodeKind::MODULE
+                    | NodeKind::NAMESPACE
+                    | NodeKind::PACKAGE
+            )
+        };
+
+        let mut allowed_structural: HashSet<NodeId> = HashSet::new();
+        for node in nodes {
+            if self.hidden_nodes.contains(&node.id) {
+                continue;
+            }
+            if node.id == center_node_id {
+                allowed_structural.insert(node.id);
+                continue;
+            }
+            if is_structural_kind(node.kind) {
+                let include = match node.kind {
+                    NodeKind::CLASS
+                    | NodeKind::STRUCT
+                    | NodeKind::INTERFACE
+                    | NodeKind::UNION
+                    | NodeKind::ENUM => settings.show_classes,
+                    _ => true,
+                };
+                if include {
+                    allowed_structural.insert(node.id);
+                }
+            }
+        }
+
         // Filter nodes
         let filtered_nodes: Vec<Node> = nodes
             .iter()
@@ -304,6 +352,11 @@ impl NodeGraphView {
                 } // Always show center
                 if self.hidden_nodes.contains(&n.id) {
                     return false;
+                }
+                if let Some(parent) = member_parent.get(&n.id) {
+                    if allowed_structural.contains(parent) {
+                        return true;
+                    }
                 }
                 match n.kind {
                     NodeKind::CLASS
@@ -417,6 +470,9 @@ impl NodeGraphView {
 
         let mut overlay_edges = Vec::new();
         for edge in &bundled_edges {
+            if edge.kind == EdgeKind::MEMBER {
+                continue;
+            }
             let source = match resolve_visible(edge.source) {
                 Some(id) => id,
                 None => continue,

@@ -486,22 +486,57 @@ pub fn index_file(
     }
 
     // Reconstruct result_nodes
-    let mut final_nodes: Vec<Node> = node_map.into_values().collect();
+    let final_nodes: Vec<Node> = node_map.into_values().collect();
 
-    // 4. Canonicalize node IDs (file:qualified:start_line) and remap edges/occurrences
+    // 4. Canonicalize node IDs (file:qualified[:start_line]) and remap edges/occurrences.
+    // For type-like nodes, we intentionally de-duplicate by qualified name so Rust impls
+    // and declarations collapse into a single symbol.
+    let is_type_like = |kind: NodeKind| {
+        matches!(
+            kind,
+            NodeKind::CLASS
+                | NodeKind::STRUCT
+                | NodeKind::INTERFACE
+                | NodeKind::UNION
+                | NodeKind::ENUM
+                | NodeKind::TYPEDEF
+                | NodeKind::TYPE_PARAMETER
+                | NodeKind::BUILTIN_TYPE
+                | NodeKind::ANNOTATION
+        )
+    };
+
     let mut id_remap: HashMap<NodeId, NodeId> = HashMap::new();
-    for node in final_nodes.iter_mut() {
+    let mut canonical_owner: HashMap<String, NodeId> = HashMap::new();
+    let mut deduped_nodes = Vec::with_capacity(final_nodes.len());
+
+    for mut node in final_nodes {
         let qualified_name = node.serialized_name.clone();
         node.qualified_name = Some(qualified_name.clone());
 
-        let start_line = node.start_line.unwrap_or(1);
-        let canonical_id = format!("{}:{}:{}", file_name, qualified_name, start_line);
-        let new_id = NodeId(generate_id(&canonical_id));
+        let canonical_id = if is_type_like(node.kind) {
+            format!("{}:{}", file_name, qualified_name)
+        } else {
+            let start_line = node.start_line.unwrap_or(1);
+            format!("{}:{}:{}", file_name, qualified_name, start_line)
+        };
 
-        node.canonical_id = Some(canonical_id);
+        if is_type_like(node.kind) {
+            if let Some(existing_id) = canonical_owner.get(&canonical_id) {
+                id_remap.insert(node.id, *existing_id);
+                continue;
+            }
+        }
+
+        let new_id = NodeId(generate_id(&canonical_id));
+        node.canonical_id = Some(canonical_id.clone());
         id_remap.insert(node.id, new_id);
         node.id = new_id;
+        canonical_owner.insert(canonical_id, new_id);
+        deduped_nodes.push(node);
     }
+
+    let mut final_nodes = deduped_nodes;
 
     let new_file_id = id_remap.get(&file_id).copied().unwrap_or(file_id);
     for node in final_nodes.iter_mut() {

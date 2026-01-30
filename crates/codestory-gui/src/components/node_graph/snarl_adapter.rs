@@ -23,6 +23,7 @@ mod ui_constants {
     pub const ICON_SIZE: f32 = 10.0;
     pub const MEMBER_TEXT_SIZE: f32 = 12.0;
     pub const SECTION_HEADER_SIZE: f32 = 10.0;
+    pub const EXPANDER_SIZE: f32 = 9.0;
 }
 
 use crate::components::node_graph::style_resolver::StyleResolver;
@@ -111,8 +112,12 @@ impl SnarlViewer<UmlNode> for NodeGraphAdapter {
                                 .map(|s| s.is_collapsed)
                                 .unwrap_or(false);
 
-                            let collapse_icon = if is_collapsed { "▶" } else { "▼" };
-                            ui.label(egui::RichText::new(collapse_icon).color(text_color));
+                            let collapse_icon = if is_collapsed { ">" } else { "v" };
+                            ui.label(
+                                egui::RichText::new(collapse_icon)
+                                    .color(text_color)
+                                    .size(ui_constants::EXPANDER_SIZE),
+                            );
                         }
 
                         ui.label(egui::RichText::new(&label).color(text_color).strong());
@@ -454,10 +459,10 @@ impl NodeGraphAdapter {
             .show(ui, |ui| {
                 // Manual Header
                 let header_response = ui.horizontal(|ui| {
-                    let icon = if is_expanded { "▼" } else { "▶" };
+                    let icon = if is_expanded { "v" } else { ">" };
                     ui.label(
                         egui::RichText::new(icon)
-                            .size(ui_constants::SECTION_HEADER_SIZE)
+                            .size(ui_constants::EXPANDER_SIZE)
                             .color(self.style_resolver.theme.subtext0),
                     );
 

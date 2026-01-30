@@ -543,9 +543,23 @@ impl EdgeOverlay {
             self.draw_scaled_arrowhead(fg_painter, end, tangent, color, 8.0, 4.0);
 
             // --- Count badge (Req 14.2, Property 30) ---
-            // Place badge at the midpoint of the curve (t=0.5)
+            // Place badge at the midpoint of the curve (t=0.5), but
+            // nudge it away if it overlaps the node bodies.
             let midpoint = to_screen(curve.sample(0.5));
-            self.draw_count_badge(fg_painter, midpoint, count, color);
+            let source_rect_screen = transform * source_rect;
+            let target_rect_screen = transform * target_rect;
+            let badge_center = self.resolve_badge_center(
+                fg_painter,
+                midpoint,
+                count,
+                start,
+                cp1,
+                cp2,
+                end,
+                source_rect_screen,
+                target_rect_screen,
+            );
+            self.draw_count_badge(fg_painter, badge_center, count, color);
 
             // Store midpoint for hover/click detection
             let relationships: Vec<(codestory_core::EdgeKind, String, String)> = bundle
@@ -559,7 +573,7 @@ impl EdgeOverlay {
                 })
                 .collect();
             self.bundle_midpoints
-                .insert(key, (midpoint, count, relationships));
+                .insert(key, (badge_center, count, relationships));
 
             // Store hit info for the bundled edge (as a single hit target)
             let screen_curve = CubicBezier {
@@ -634,6 +648,10 @@ impl EdgeOverlay {
                     .router
                     .route_edge(to_graph_rect(source_rect), to_graph_rect(target_rect));
                 let midpoint = to_screen(curve.sample(0.5));
+                let start = to_screen(curve.start);
+                let cp1 = to_screen(curve.control1);
+                let cp2 = to_screen(curve.control2);
+                let end = to_screen(curve.end);
 
                 // Draw a smaller badge with a collapse hint
                 let dominant_kind = bundle
@@ -648,7 +666,20 @@ impl EdgeOverlay {
                     .unwrap_or(codestory_core::EdgeKind::MEMBER);
                 let color = style_resolver.resolve_edge_color(dominant_kind);
 
-                self.draw_count_badge(fg_painter, midpoint, count, color);
+                let source_rect_screen = transform * source_rect;
+                let target_rect_screen = transform * target_rect;
+                let badge_center = self.resolve_badge_center(
+                    fg_painter,
+                    midpoint,
+                    count,
+                    start,
+                    cp1,
+                    cp2,
+                    end,
+                    source_rect_screen,
+                    target_rect_screen,
+                );
+                self.draw_count_badge(fg_painter, badge_center, count, color);
 
                 // Store midpoint for interaction
                 let relationships: Vec<(codestory_core::EdgeKind, String, String)> = bundle
@@ -662,9 +693,81 @@ impl EdgeOverlay {
                     })
                     .collect();
                 self.bundle_midpoints
-                    .insert(key, (midpoint, count, relationships));
+                    .insert(key, (badge_center, count, relationships));
             }
         }
+    }
+
+    fn resolve_badge_center(
+        &self,
+        painter: &Painter,
+        center: Pos2,
+        count: usize,
+        start: Pos2,
+        cp1: Pos2,
+        cp2: Pos2,
+        end: Pos2,
+        source_rect: Rect,
+        target_rect: Rect,
+    ) -> Pos2 {
+        let badge_rect = self.compute_badge_rect(painter, center, count);
+        let union_rect = source_rect.union(target_rect);
+        if !badge_rect.intersects(source_rect) && !badge_rect.intersects(target_rect) {
+            return center;
+        }
+
+        let t = 0.5;
+        let mt = 1.0 - t;
+
+        let tangent = (cp1 - start) * (3.0 * mt * mt)
+            + (cp2 - cp1) * (6.0 * mt * t)
+            + (end - cp2) * (3.0 * t * t);
+
+        let mut normal = egui::vec2(-tangent.y, tangent.x);
+        let normal_len = normal.length();
+        if normal_len > 0.001 {
+            normal /= normal_len;
+        } else {
+            normal = egui::vec2(0.0, -1.0);
+        }
+
+        let base_offset = badge_rect.size().max_elem() * 0.6 + 6.0;
+        for step in 1..=4 {
+            let offset = base_offset * step as f32;
+            for dir in [1.0, -1.0] {
+                let candidate = center + normal * (offset * dir);
+                let candidate_rect = self.compute_badge_rect(painter, candidate, count);
+                if !candidate_rect.intersects(source_rect)
+                    && !candidate_rect.intersects(target_rect)
+                {
+                    return candidate;
+                }
+            }
+        }
+
+        // Fallback: place the badge just outside the union of both nodes.
+        Pos2::new(
+            union_rect.max.x + badge_rect.width() / 2.0 + 6.0,
+            union_rect.min.y - badge_rect.height() / 2.0 - 6.0,
+        )
+    }
+
+    fn compute_badge_rect(&self, painter: &Painter, center: Pos2, count: usize) -> Rect {
+        let text = format!("{}", count);
+        let font_id = FontId::proportional(10.0);
+        let text_color = Color32::WHITE;
+
+        // Measure text
+        let galley = painter.layout_no_wrap(text, font_id, text_color);
+        let text_size = galley.size();
+        let badge_padding = 4.0;
+        let badge_width = text_size.x + badge_padding * 2.0;
+        let badge_height = text_size.y + badge_padding * 2.0;
+
+        Rect::from_center_size(
+            center,
+            Vec2::new(badge_width.max(badge_height), badge_height),
+        )
     }
 
     /// Draw a count badge showing the number of bundled edges.
@@ -680,17 +783,9 @@ impl EdgeOverlay {
 
         // Measure text
         let galley = painter.layout_no_wrap(text, font_id, text_color);
-
         let text_size = galley.size();
-        let badge_padding = 4.0;
-        let badge_width = text_size.x + badge_padding * 2.0;
-        let badge_height = text_size.y + badge_padding * 2.0;
-        let badge_radius = badge_height / 2.0;
-
-        let badge_rect = Rect::from_center_size(
-            center,
-            Vec2::new(badge_width.max(badge_height), badge_height),
-        );
+        let badge_rect = self.compute_badge_rect(painter, center, count);
+        let badge_radius = badge_rect.height() / 2.0;
 
         // Draw badge background (darker version of edge color)
         let bg_color = Color32::from_rgba_unmultiplied(
