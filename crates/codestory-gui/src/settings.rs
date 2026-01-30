@@ -17,6 +17,11 @@ pub struct AppSettings {
     #[serde(default = "default_animation_speed")]
     pub animation_speed: f32,
 
+    #[serde(default = "default_auto_open_last_project")]
+    pub auto_open_last_project: bool,
+    #[serde(default)]
+    pub last_opened_project: Option<std::path::PathBuf>,
+
     #[serde(default)]
     pub recent_projects: Vec<std::path::PathBuf>,
 
@@ -63,6 +68,9 @@ fn default_show_icons() -> bool {
 fn default_animation_speed() -> f32 {
     1.0
 }
+fn default_auto_open_last_project() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ThemeMode {
@@ -86,6 +94,8 @@ impl Default for AppSettings {
             show_icons: true,
             compact_mode: false,
             animation_speed: 1.0,
+            auto_open_last_project: true,
+            last_opened_project: None,
             recent_projects: Vec::new(),
             notifications: NotificationSettings::default(),
             file_dialog: FileDialogSettings::default(),

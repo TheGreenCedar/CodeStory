@@ -20,6 +20,7 @@ impl PreferencesDialog {
             return;
         }
 
+        let mut should_close = false;
         egui::Window::new("Preferences")
             .open(&mut open)
             .resizable(false)
@@ -48,6 +49,10 @@ impl PreferencesDialog {
                             .text("Font Size"),
                     );
                     ui.checkbox(&mut self.temp_settings.show_tooltips, "Show Tooltips");
+                    ui.checkbox(
+                        &mut self.temp_settings.auto_open_last_project,
+                        "Open last project on launch",
+                    );
 
                     ui.separator();
                     ui.label("Appearance:");
@@ -165,11 +170,14 @@ impl PreferencesDialog {
                         self.apply_theme(ctx, settings);
                     }
                     if ui.button("Close").clicked() {
-                        open = false;
+                        should_close = true;
                     }
                 });
             });
 
+        if should_close {
+            open = false;
+        }
         self.open = open;
     }
 

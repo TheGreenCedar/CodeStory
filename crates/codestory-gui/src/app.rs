@@ -113,6 +113,7 @@ pub struct CodeStoryApp {
 
     // Initialization flag - ensures theme is applied on first update() frame
     needs_initial_theme_apply: bool,
+    auto_open_attempted: bool,
 }
 
 impl CodeStoryApp {
@@ -203,6 +204,7 @@ impl CodeStoryApp {
             metrics_panel: MetricsPanel::new(),
             activation_controller: ActivationController::new(event_bus),
             needs_initial_theme_apply: true,
+            auto_open_attempted: false,
         }
     }
 
@@ -219,6 +221,7 @@ impl CodeStoryApp {
         self.recent_files.add(path.clone());
         let _ = self.recent_files.save();
 
+        self.settings.last_opened_project = Some(path.clone());
         self.settings.recent_projects = self
             .recent_files
             .get_recent()
@@ -633,6 +636,44 @@ impl CodeStoryApp {
             }
         }
     }
+
+    fn try_auto_open_last_project(&mut self) {
+        if !self.settings.auto_open_last_project {
+            return;
+        }
+        if self.project_path.is_some() {
+            return;
+        }
+
+        let mut candidate = self.settings.last_opened_project.clone();
+        if candidate.is_none() {
+            candidate = self.settings.recent_projects.first().cloned();
+        }
+
+        if candidate.is_none() {
+            return;
+        }
+
+        let mut best = None;
+        if let Some(path) = candidate {
+            if path.exists() && path.join("codestory.db").exists() {
+                best = Some(path);
+            }
+        }
+
+        if best.is_none() {
+            for path in &self.settings.recent_projects {
+                if path.exists() && path.join("codestory.db").exists() {
+                    best = Some(path.clone());
+                    break;
+                }
+            }
+        }
+
+        if let Some(path) = best {
+            self.open_project(path);
+        }
+    }
 }
 
 impl eframe::App for CodeStoryApp {
@@ -677,6 +718,11 @@ impl eframe::App for CodeStoryApp {
             self.theme.apply(ctx);
             ctx.set_pixels_per_point(self.settings.ui_scale);
             self.needs_initial_theme_apply = false;
+        }
+
+        if !self.auto_open_attempted {
+            self.auto_open_attempted = true;
+            self.try_auto_open_last_project();
         }
 
         // rect tracking removed
