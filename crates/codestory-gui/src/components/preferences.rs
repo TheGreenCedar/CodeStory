@@ -165,7 +165,7 @@ impl PreferencesDialog {
                         self.apply_theme(ctx, settings);
                     }
                     if ui.button("Close").clicked() {
-                        self.open = false;
+                        open = false;
                     }
                 });
             });
