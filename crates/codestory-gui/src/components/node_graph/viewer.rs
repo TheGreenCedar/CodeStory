@@ -387,8 +387,51 @@ impl NodeGraphView {
         let (uml_nodes, _graph_edges, pin_info) =
             converter.convert_dummies_to_uml(&bundled_nodes, &bundled_edges);
 
-        // Store edges for EdgeOverlay
-        self.current_edges = bundled_edges;
+        // Store edges for EdgeOverlay, remapping member endpoints to visible hosts.
+        let mut parent_map = HashMap::new();
+        for node in &bundled_nodes {
+            if let Some(parent) = node.parent {
+                parent_map.insert(node.id, parent);
+            }
+        }
+        let visible_ids: HashSet<NodeId> = uml_nodes.iter().map(|n| n.id).collect();
+
+        let resolve_visible = |start: NodeId| -> Option<NodeId> {
+            let mut current = start;
+            let mut guard = 0;
+            loop {
+                if visible_ids.contains(&current) {
+                    return Some(current);
+                }
+                if let Some(parent) = parent_map.get(&current) {
+                    current = *parent;
+                } else {
+                    return None;
+                }
+                guard += 1;
+                if guard > 64 {
+                    return None;
+                }
+            }
+        };
+
+        let mut overlay_edges = Vec::new();
+        for edge in &bundled_edges {
+            let source = match resolve_visible(edge.source) {
+                Some(id) => id,
+                None => continue,
+            };
+            let target = match resolve_visible(edge.target) {
+                Some(id) => id,
+                None => continue,
+            };
+            let mut edge = edge.clone();
+            edge.source = source;
+            edge.target = target;
+            overlay_edges.push(edge);
+        }
+
+        self.current_edges = overlay_edges;
 
         // Store pin_info in adapter
         self.adapter.pin_info = pin_info;
