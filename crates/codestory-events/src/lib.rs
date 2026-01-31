@@ -190,6 +190,10 @@ pub enum Event {
         node_id: NodeId,
         category_id: i64,
     },
+    /// Add a bookmark to the default category, creating it if needed.
+    BookmarkAddDefault {
+        node_id: NodeId,
+    },
     BookmarkRemove {
         id: i64,
     },

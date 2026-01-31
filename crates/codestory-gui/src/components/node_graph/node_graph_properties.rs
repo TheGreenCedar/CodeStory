@@ -1,51 +1,8 @@
-use super::snarl_adapter::NodeGraphAdapter;
-use crate::components::node_graph::style_resolver::StyleResolver;
 use codestory_core::{EdgeKind, NodeId, NodeKind};
 use codestory_graph::uml_types::MemberItem;
 use proptest::prelude::*;
 
 proptest! {
-    #[test]
-    fn prop_test_member_click_event(
-        member_id_val in 1i64..1000,
-        member_name in "[a-zA-Z][a-zA-Z0-9_]*",
-    ) {
-        // Setup mock environment
-        let mut _adapter = NodeGraphAdapter {
-            clicked_node: None,
-            node_to_focus: None,
-            node_to_hide: None,
-            node_to_navigate: None,
-            style_resolver: StyleResolver::new(catppuccin_egui::MOCHA),
-            collapse_states: std::collections::HashMap::new(),
-            event_bus: codestory_events::EventBus::new(),
-            node_rects: std::collections::HashMap::new(),
-            current_transform: egui::emath::TSTransform::default(),
-            current_zoom: 1.0,
-            pin_info: std::collections::HashMap::new(),
-            viewport_rect: egui::Rect::NOTHING,
-            total_node_count: 0,
-        };
-
-        let member_id = NodeId(member_id_val);
-        let _member = MemberItem::new(member_id, NodeKind::METHOD, member_name.clone());
-        let _parent_id = NodeId(1001); // Arbitrary parent ID
-
-        // We can't easily simulate a full egui UI click in a unit test without a TestContext
-        // that supports interaction simulation which is complex.
-        // Instead, we verify the logic state changes if we manually trigger the condition
-        // or unit test the `render_member_row` logic if extracted.
-
-        // However, since `render_member_row` is tightly coupled with `ui`, we might rely on
-        // manual verification for the *UI interaction* part, but we can verify the state logic.
-
-        // Let's test the helper method `get_member_icon_and_color` which is logic-pure.
-        // And we can test `group_members_into_sections`.
-
-        // For actual PBT of click handling, we'd need an Egui test harness.
-        // Assuming we can't do full UI PBT here easily, we will focus on the data transformations.
-    }
-
     #[test]
     fn prop_test_outgoing_edge_indicator(
         has_outgoing in proptest::bool::ANY,
@@ -56,40 +13,6 @@ proptest! {
         // Verify setting has_outgoing works
         member.set_has_outgoing_edges(has_outgoing);
         assert_eq!(member.has_outgoing_edges, has_outgoing);
-    }
-
-    #[test]
-    fn prop_test_get_member_icon_and_color(
-        kind_idx in 0usize..20
-    ) {
-        let _adapter = NodeGraphAdapter {
-            clicked_node: None,
-            node_to_focus: None,
-            node_to_hide: None,
-            node_to_navigate: None,
-            style_resolver: StyleResolver::new(catppuccin_egui::MOCHA),
-            collapse_states: std::collections::HashMap::new(),
-            event_bus: codestory_events::EventBus::new(),
-            node_rects: std::collections::HashMap::new(),
-            current_transform: egui::emath::TSTransform::default(),
-            current_zoom: 1.0,
-            pin_info: std::collections::HashMap::new(),
-            viewport_rect: egui::Rect::NOTHING,
-            total_node_count: 0,
-        };
-
-        // Map index to a NodeKind roughly
-        // We can use a match or just cast/transmute if safe, but safe construction is better.
-        // Let's just test a few key known ones.
-        let _kind = match kind_idx % 3 {
-            0 => NodeKind::METHOD,
-            1 => NodeKind::FIELD,
-            _ => NodeKind::CLASS,
-        };
-
-        // We can't access private methods from here unless we make them pub or pub(crate).
-        // `get_member_icon_and_color` is likely private.
-        // I'll check visibility of methods in `snarl_adapter.rs`.
     }
 
     /// **Validates: Property 13: Edge Hover Highlighting**

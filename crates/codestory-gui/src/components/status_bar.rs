@@ -1,5 +1,6 @@
 use crate::theme::{self, badge};
 use eframe::egui;
+use egui_phosphor::regular as ph;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 pub struct StatusBar {
@@ -60,7 +61,7 @@ impl StatusBar {
 
             if error_count > 0 {
                 ui.separator();
-                let error_text = format!("ⓧ {} Errors", error_count);
+                let error_text = format!("{} {} Errors", ph::WARNING_CIRCLE, error_count);
                 if ui
                     .button(egui::RichText::new(error_text).color(ui.visuals().error_fg_color))
                     .clicked()

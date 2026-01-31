@@ -1,23 +1,23 @@
-use super::snarl_adapter::NodeGraphAdapter;
+use super::graph_canvas::{GraphCanvas, GraphCanvasAction, GraphCanvasNode};
 use crate::components::node_graph::edge_overlay::EdgeOverlay;
 use crate::components::node_graph::style_resolver::StyleResolver;
+use crate::settings::ThemeMode;
 use codestory_core::{Edge, EdgeKind, Node, NodeId, NodeKind, TrailConfig, TrailDirection};
 use codestory_events::Event;
 use codestory_graph::converter::NodeGraphConverter;
-use codestory_graph::uml_types::UmlNode;
+use codestory_graph::uml_types::{CollapseState, GraphViewState, MemberItem, UmlNode, VisibilityKind};
 use codestory_graph::{
     DummyEdge, ForceDirectedLayouter, GraphModel, GridLayouter, Layouter, NestingLayouter,
     RadialLayouter,
 };
 use codestory_storage::Storage;
 use eframe::egui;
-use egui_snarl::{
-    ui::{PinPlacement, SnarlStyle},
-    NodeId as SnarlNodeId, Snarl,
-};
+use egui_phosphor::regular as ph;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::time::{Duration, Instant};
 use std::thread;
+use fontdue::layout::{CoordinateSystem, Layout, LayoutSettings, TextStyle};
 
 type LayoutRequest = (
     Option<NodeId>,
@@ -27,13 +27,28 @@ type LayoutRequest = (
     codestory_core::LayoutDirection,
 );
 
+type EdgeKey = (NodeId, NodeId, EdgeKind);
+
+#[derive(Clone)]
+struct EdgeContextMenu {
+    pos: egui::Pos2,
+    info: crate::components::node_graph::edge_overlay::EdgeHitInfo,
+}
+
 pub struct NodeGraphView {
-    pub snarl: Snarl<UmlNode>,
-    adapter: NodeGraphAdapter,
-    style: SnarlStyle,
+    style_resolver: StyleResolver,
     event_bus: codestory_events::EventBus,
     edge_overlay: EdgeOverlay,
     current_edges: Vec<DummyEdge>,
+    graph_canvas: GraphCanvas,
+
+    uml_nodes: Vec<UmlNode>,
+    fallback_positions: HashMap<NodeId, egui::Pos2>,
+    node_lookup: HashMap<NodeId, Node>,
+    hidden_edge_keys: HashSet<(NodeId, NodeId, EdgeKind)>,
+    edge_context_menu: Option<EdgeContextMenu>,
+    last_node_rects_graph: HashMap<NodeId, egui::Rect>,
+    last_view_state: GraphViewState,
 
     // Data Cache for rebuilding
     cached_data: Option<(NodeId, Vec<Node>, Vec<Edge>)>,
@@ -43,11 +58,13 @@ pub struct NodeGraphView {
     layout_tx: Sender<LayoutRequest>,
     layout_rx: Receiver<HashMap<NodeId, egui::Pos2>>,
     is_calculating: bool,
+    anim_start_positions: Option<HashMap<NodeId, egui::Pos2>>,
+    anim_target_positions: Option<HashMap<NodeId, egui::Pos2>>,
+    anim_started_at: Option<Instant>,
+    anim_duration: Duration,
 
     // Local Filter State
-    // Removed local state in favor of settings
     hidden_nodes: std::collections::HashSet<NodeId>,
-    node_map: HashMap<NodeId, SnarlNodeId>,
 
     // State tracking
     last_auto_layout: bool,
@@ -56,11 +73,25 @@ pub struct NodeGraphView {
     _last_settings_version: u64, // To track changes (reserved for future use)
 
     // UI Features
-    // Removed local state
     pub pending_pan_to_node: Option<NodeId>,
     view_version: u64,
-    theme_flavor: catppuccin_egui::Theme,
     initial_layout_done: bool,
+    current_transform: egui::emath::TSTransform,
+    current_zoom: f32,
+    clicked_node: Option<NodeId>,
+    node_to_focus: Option<NodeId>,
+    node_to_hide: Option<NodeId>,
+    node_to_navigate: Option<NodeId>,
+    pending_zoom_to_fit: bool,
+    pending_zoom_steps: i32,
+    pending_expand_all: bool,
+    pending_collapse_all: bool,
+    show_toolbar_panel: bool,
+}
+
+pub struct NodeGraphViewResponse {
+    pub clicked_node: Option<NodeId>,
+    pub view_state_dirty: bool,
 }
 
 impl NodeGraphView {
@@ -88,8 +119,26 @@ impl NodeGraphView {
 
                 let positions = match algorithm {
                     codestory_events::LayoutAlgorithm::ForceDirected => {
-                        let layouter = ForceDirectedLayouter::default();
-                        layouter.execute(&model)
+                        let mut layouter = ForceDirectedLayouter::default();
+                        let mut stages = Vec::new();
+                        let final_iterations = layouter.iterations;
+                        let iteration_steps = [30, 80, 160, final_iterations];
+                        for &iterations in &iteration_steps {
+                            layouter.iterations = iterations.max(1);
+                            stages.push(layouter.execute(&model));
+                        }
+                        if stages.len() > 1 {
+                            for positions in stages.iter().take(stages.len() - 1) {
+                                let mut result = HashMap::new();
+                                for (idx, (x, y)) in positions {
+                                    if let Some(node) = model.graph.node_weight(*idx) {
+                                        result.insert(node.id, egui::pos2(*x, *y));
+                                    }
+                                }
+                                let _ = res_tx.send(result);
+                            }
+                        }
+                        stages.pop().unwrap_or_default()
                     }
                     codestory_events::LayoutAlgorithm::Radial => {
                         let layouter = RadialLayouter::default();
@@ -120,50 +169,32 @@ impl NodeGraphView {
             }
         });
 
-        let style = SnarlStyle {
-            pin_placement: Some(PinPlacement::Outside { margin: -12.0 }),
-            pin_size: Some(8.0),
-            header_frame: Some(egui::Frame::NONE.inner_margin(egui::Margin {
-                left: 16,
-                right: 16,
-                top: 4,
-                bottom: 4,
-            })),
-            node_layout: None,
-            ..Default::default()
-        };
-
         Self {
-            snarl: Snarl::new(),
-            adapter: NodeGraphAdapter {
-                clicked_node: None,
-                node_to_focus: None,
-                node_to_hide: None,
-                node_to_navigate: None,
-                style_resolver: StyleResolver::new(catppuccin_egui::MOCHA),
-                collapse_states: std::collections::HashMap::new(),
-                event_bus: event_bus.clone(),
-                node_rects: std::collections::HashMap::new(),
-                current_transform: egui::emath::TSTransform::default(),
-                current_zoom: 1.0,
-                pin_info: std::collections::HashMap::new(),
-                viewport_rect: egui::Rect::NOTHING,
-                total_node_count: 0,
-            },
-            style,
+            style_resolver: StyleResolver::new(ThemeMode::Bright),
             event_bus,
             edge_overlay: EdgeOverlay::new(),
             current_edges: Vec::new(),
+            graph_canvas: GraphCanvas::new(),
+            uml_nodes: Vec::new(),
+            fallback_positions: HashMap::new(),
+            node_lookup: HashMap::new(),
+            hidden_edge_keys: HashSet::new(),
+            edge_context_menu: None,
+            last_node_rects_graph: HashMap::new(),
+            last_view_state: GraphViewState::default(),
             cached_data: None,
             cached_positions: None,
             layout_tx: req_tx,
             layout_rx: res_rx,
             is_calculating: false,
+            anim_start_positions: None,
+            anim_target_positions: None,
+            anim_started_at: None,
+            anim_duration: Duration::from_millis(0),
             // show_classes: true,
             // show_functions: true,
             // show_variables: true,
             hidden_nodes: std::collections::HashSet::new(),
-            node_map: HashMap::new(),
             last_auto_layout: true,
             current_layout_algorithm: codestory_events::LayoutAlgorithm::default(),
             current_layout_direction: codestory_core::LayoutDirection::default(),
@@ -172,8 +203,18 @@ impl NodeGraphView {
             // show_legend: false,
             pending_pan_to_node: None,
             view_version: 0,
-            theme_flavor: catppuccin_egui::MOCHA,
             initial_layout_done: false,
+            current_transform: egui::emath::TSTransform::default(),
+            current_zoom: 1.0,
+            clicked_node: None,
+            node_to_focus: None,
+            node_to_hide: None,
+            node_to_navigate: None,
+            pending_zoom_to_fit: false,
+            pending_zoom_steps: 0,
+            pending_expand_all: false,
+            pending_collapse_all: false,
+            show_toolbar_panel: false,
         }
     }
 
@@ -212,34 +253,19 @@ impl NodeGraphView {
                 }
             }
             Event::ExpandAll => {
-                for (snarl_id, _node) in self.snarl.node_ids() {
-                    let node_id = self.snarl[snarl_id].id;
-                    if let Some(state) = self.adapter.collapse_states.get_mut(&node_id) {
-                        state.is_collapsed = false;
-                        state.expand_all_sections();
-                    }
-                }
+                self.pending_expand_all = true;
             }
             Event::CollapseAll => {
-                for (snarl_id, _node) in self.snarl.node_ids() {
-                    let node_id = self.snarl[snarl_id].id;
-                    let state = self
-                        .adapter
-                        .collapse_states
-                        .entry(node_id)
-                        .or_default();
-                    state.is_collapsed = true;
-                }
+                self.pending_collapse_all = true;
             }
             Event::ZoomToFit => {
-                self.view_version = self.view_version.wrapping_add(1);
+                self.pending_zoom_to_fit = true;
             }
-            Event::ZoomIn | Event::ZoomOut => {
-                // Zoom in/out is handled by egui-snarl natively via mouse wheel.
-                // These events are for toolbar button triggers; we increment
-                // view_version to signal a re-layout which resets zoom-to-fit.
-                // Direct zoom manipulation is not exposed by egui-snarl's API,
-                // so we rely on the native mouse wheel for precise zoom control.
+            Event::ZoomIn => {
+                self.pending_zoom_steps += 1;
+            }
+            Event::ZoomOut => {
+                self.pending_zoom_steps -= 1;
             }
             _ => {}
         }
@@ -289,11 +315,15 @@ impl NodeGraphView {
 
     fn rebuild_graph(&mut self, settings: &crate::settings::NodeGraphSettings) {
         let Some((center_node_id, nodes, edges)) = &self.cached_data else {
-            self.snarl = Snarl::new();
+            self.uml_nodes.clear();
+            self.fallback_positions.clear();
+            self.current_edges.clear();
+            self.node_lookup.clear();
             return;
         };
 
         let center_node_id = *center_node_id;
+        self.node_lookup = nodes.iter().cloned().map(|node| (node.id, node)).collect();
 
         // Build member -> parent map from MEMBER edges so we can keep members
         // visible for structural parents even when filters hide their kinds.
@@ -410,9 +440,6 @@ impl NodeGraphView {
         // Re-extract nodes and edges after bundling
         let (bundled_nodes, bundled_edges) = model.get_dummy_data();
 
-        // Clear current graph
-        self.snarl = Snarl::new();
-
         tracing::debug!(
             "Rebuilding node graph: {} nodes, {} edges (after bundling)",
             bundled_nodes.len(),
@@ -437,7 +464,7 @@ impl NodeGraphView {
 
         // Build Snarl nodes immediately using new UmlNode converter
         let converter = NodeGraphConverter::new();
-        let (uml_nodes, _graph_edges, pin_info) =
+        let (uml_nodes, _graph_edges, _pin_info) =
             converter.convert_dummies_to_uml(&bundled_nodes, &bundled_edges);
 
         // Store edges for EdgeOverlay, remapping member endpoints to visible hosts.
@@ -481,6 +508,10 @@ impl NodeGraphView {
                 Some(id) => id,
                 None => continue,
             };
+            let key = (source, target, edge.kind);
+            if self.hidden_edge_keys.contains(&key) {
+                continue;
+            }
             let mut edge = edge.clone();
             edge.source = source;
             edge.target = target;
@@ -489,17 +520,22 @@ impl NodeGraphView {
 
         self.current_edges = overlay_edges;
 
-        // Store pin_info in adapter
-        self.adapter.pin_info = pin_info;
+        self.uml_nodes = uml_nodes;
+        self.fallback_positions.clear();
 
-        self.node_map.clear();
-
-        for (i, node) in uml_nodes.into_iter().enumerate() {
+        for (i, node) in self.uml_nodes.iter().enumerate() {
             let id = node.id;
-
-            // Use cached position or default circular layout while loading
             let pos = if let Some(positions) = &self.cached_positions {
-                positions.get(&id).copied().unwrap_or(egui::pos2(0.0, 0.0))
+                positions.get(&id).copied().unwrap_or_else(|| {
+                    if id == center_node_id {
+                        egui::pos2(0.0, 0.0)
+                    } else {
+                        let angle = (i as f32)
+                            * (std::f32::consts::PI * 2.0 / (bundled_nodes.len() as f32));
+                        let radius = 250.0;
+                        egui::pos2(angle.cos() * radius, angle.sin() * radius)
+                    }
+                })
             } else if id == center_node_id {
                 egui::pos2(0.0, 0.0)
             } else {
@@ -509,11 +545,8 @@ impl NodeGraphView {
                 egui::pos2(angle.cos() * radius, angle.sin() * radius)
             };
 
-            let handle = self.snarl.insert_node(pos, node);
-            self.node_map.insert(id, handle);
+            self.fallback_positions.insert(id, pos);
         }
-
-        // We do NOT add connections to Snarl anymore because we render edges manually via EdgeOverlay.
 
         self.last_auto_layout = settings.auto_layout;
     }
@@ -521,16 +554,13 @@ impl NodeGraphView {
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
-        settings: &crate::settings::NodeGraphSettings,
-        theme: catppuccin_egui::Theme,
-    ) -> Option<NodeId> {
-        self.theme_flavor = theme;
-        self.adapter.style_resolver.set_theme(theme);
+        settings: &mut crate::settings::NodeGraphSettings,
+        theme: ThemeMode,
+        animation_speed: f32,
+    ) -> NodeGraphViewResponse {
+        self.style_resolver.set_theme_mode(theme);
+        self.graph_canvas.sync_from_view_state(&settings.view_state);
 
-        // Sync collapse states from settings (persistence)
-        self.adapter.collapse_states = settings.view_state.collapse_states.clone();
-
-        // Update node_frame colors based on current theme
         let node_inner_margin = egui::Margin {
             left: 16,
             right: 16,
@@ -538,44 +568,121 @@ impl NodeGraphView {
             bottom: 8,
         };
 
-        self.style.node_frame = Some(
-            egui::Frame::NONE
-                .fill(theme.surface0)
-                .stroke(egui::Stroke::new(1.0, theme.overlay0))
-                .corner_radius(6)
-                .inner_margin(node_inner_margin),
-        );
-
         let mut node_to_navigate = None;
+        let mut view_state_dirty = false;
+        let mut copy_text: Option<String> = None;
+        let mut copy_image: Option<egui::ColorImage> = None;
+        let mut export_image = false;
+        let mut open_folder: Option<String> = None;
+        let mut open_in_ide: Option<String> = None;
+        let mut scroll_to: Option<(String, u32)> = None;
+        let mut show_info: Option<String> = None;
 
-        if let Some(node_id) = self.adapter.node_to_focus {
-            self.adapter.node_to_focus = None;
+        if let Some(node_id) = self.node_to_focus {
+            self.node_to_focus = None;
             node_to_navigate = Some(node_id);
         }
 
-        if let Some(node_id) = self.adapter.node_to_navigate {
-            self.adapter.node_to_navigate = None;
+        if let Some(node_id) = self.node_to_navigate {
+            self.node_to_navigate = None;
             node_to_navigate = Some(node_id);
         }
 
-        if let Some(node_id) = self.adapter.node_to_hide {
-            self.adapter.node_to_hide = None;
+        if let Some(node_id) = self.node_to_hide {
+            self.node_to_hide = None;
             self.hidden_nodes.insert(node_id);
             self.rebuild_graph(settings);
         }
 
-        self.adapter.clicked_node = None;
+        self.clicked_node = None;
+
+        if self.pending_expand_all {
+            self.pending_expand_all = false;
+            for node in &self.uml_nodes {
+                let mut state = settings.view_state.get_collapse_state(node.id);
+                state.is_collapsed = false;
+                state.expand_all_sections();
+                settings.view_state.set_collapse_state(node.id, state);
+            }
+            view_state_dirty = true;
+        }
+
+        if self.pending_collapse_all {
+            self.pending_collapse_all = false;
+            for node in &self.uml_nodes {
+                let mut state = settings.view_state.get_collapse_state(node.id);
+                state.is_collapsed = true;
+                settings.view_state.set_collapse_state(node.id, state);
+            }
+            view_state_dirty = true;
+        }
 
         // Poll for layout results
         // Apply Layout Results
         while let Ok(positions) = self.layout_rx.try_recv() {
             self.is_calculating = false;
-            self.cached_positions = Some(positions.clone());
-            self.rebuild_graph(settings);
-
+            let anim_speed = animation_speed.max(0.0);
+            let duration_ms = if anim_speed <= 0.01 {
+                0
+            } else {
+                (600.0 / anim_speed).round() as u64
+            };
+            if duration_ms == 0 {
+                self.cached_positions = Some(positions.clone());
+                self.anim_start_positions = None;
+                self.anim_target_positions = None;
+                self.anim_started_at = None;
+                self.anim_duration = Duration::from_millis(0);
+            } else {
+                let start = self
+                    .cached_positions
+                    .clone()
+                    .unwrap_or_else(|| positions.clone());
+                self.anim_start_positions = Some(start);
+                self.anim_target_positions = Some(positions);
+                self.anim_started_at = Some(Instant::now());
+                self.anim_duration = Duration::from_millis(duration_ms);
+            }
             if !self.initial_layout_done {
                 self.initial_layout_done = true;
                 self.view_version = self.view_version.wrapping_add(1);
+            }
+        }
+
+        if let (Some(start), Some(target), Some(started)) = (
+            &self.anim_start_positions,
+            &self.anim_target_positions,
+            self.anim_started_at,
+        ) {
+            if self.anim_duration.as_millis() == 0 {
+                self.cached_positions = Some(target.clone());
+                self.anim_start_positions = None;
+                self.anim_target_positions = None;
+                self.anim_started_at = None;
+            } else {
+                let elapsed = started.elapsed();
+                let t = (elapsed.as_secs_f32() / self.anim_duration.as_secs_f32()).clamp(0.0, 1.0);
+                let eased = t * (2.0 - t);
+                let mut interpolated = HashMap::new();
+                for (id, target_pos) in target {
+                    let start_pos = start.get(id).copied().unwrap_or(*target_pos);
+                    let pos = egui::pos2(
+                        start_pos.x + (target_pos.x - start_pos.x) * eased,
+                        start_pos.y + (target_pos.y - start_pos.y) * eased,
+                    );
+                    interpolated.insert(*id, pos);
+                }
+                for (id, custom) in &settings.view_state.custom_positions {
+                    interpolated.insert(*id, egui::pos2(custom.x, custom.y));
+                }
+                self.cached_positions = Some(interpolated);
+                if t >= 1.0 {
+                    self.anim_start_positions = None;
+                    self.anim_target_positions = None;
+                    self.anim_started_at = None;
+                } else {
+                    ui.ctx().request_repaint();
+                }
             }
         }
 
@@ -635,7 +742,7 @@ impl NodeGraphView {
         // Force the ui to take up the whole remaining space
         ui.allocate_rect(full_rect, egui::Sense::hover());
 
-        let toolbar_width = 130.0;
+        let toolbar_width = 56.0;
         let toolbar_rect = egui::Rect::from_min_size(
             full_rect.min,
             egui::vec2(toolbar_width, full_rect.height()),
@@ -666,47 +773,208 @@ impl NodeGraphView {
                     .layout(egui::Layout::top_down(egui::Align::Min)),
             );
 
-            // Clear cached screen rects before new frame rendering
-            self.adapter.node_rects.clear();
-
-            // Provide viewport info for culling (Req 10.1, 10.4)
-            self.adapter.viewport_rect = snarl_rect;
-            self.adapter.total_node_count = self.snarl.node_ids().count();
-
-            self.snarl.show(
-                &mut self.adapter,
-                &self.style,
-                ("node_graph", self.view_version),
-                &mut child_ui,
-            );
-
-            // Render custom edges - curves and arrowheads in foreground
-            let snarl_id = ui.make_persistent_id(("node_graph", self.view_version));
-            let fg_layer = egui::LayerId::new(egui::Order::Foreground, snarl_id);
-            let mut fg_painter = ui.ctx().layer_painter(fg_layer);
-            fg_painter.set_clip_rect(snarl_rect);
-
-            // Supply node labels from snarl graph for edge tooltip display
-            {
-                let mut labels = HashMap::new();
-                for (snarl_id, _node) in self.snarl.node_ids() {
-                    let uml = &self.snarl[snarl_id];
-                    labels.insert(uml.id, uml.label.clone());
+            let positions = self.build_positions(settings);
+            let mut nodes = Vec::new();
+            let mut labels = HashMap::new();
+            for uml in &self.uml_nodes {
+                labels.insert(uml.id, uml.label.clone());
+                if let Some(pos) = positions.get(&uml.id) {
+                    nodes.push(GraphCanvasNode { uml, pos: *pos });
                 }
-                self.edge_overlay.set_node_labels(labels);
             }
 
-            self.edge_overlay.render(
-                ui,
-                &fg_painter,
-                &fg_painter,
-                &self.current_edges,
-                &self.adapter.node_rects,
+            if self.pending_zoom_steps != 0 {
+                let steps = self.pending_zoom_steps;
+                self.pending_zoom_steps = 0;
+                let zoom_delta = if steps > 0 { 1.15 } else { 1.0 / 1.15 };
+                for _ in 0..steps.abs() {
+                    self.graph_canvas.zoom_by(zoom_delta, snarl_rect.center());
+                }
+            }
+
+            if self.pending_zoom_to_fit {
+                self.pending_zoom_to_fit = false;
+                if let Some(bounds) = self.positions_bounds(&positions) {
+                    self.graph_canvas.zoom_to_fit(bounds, snarl_rect, 24.0);
+                }
+            }
+
+            let view_state_snapshot = settings.view_state.clone();
+            let graph_settings = settings.clone();
+            let output = self.graph_canvas.show(
+                &mut child_ui,
                 snarl_rect,
-                self.adapter.current_transform,
-                node_inner_margin,
-                &self.adapter.style_resolver,
+                &nodes,
+                &self.current_edges,
+                &view_state_snapshot,
+                &mut settings.view_state.custom_positions,
+                &graph_settings,
+                &self.style_resolver,
             );
+            self.current_zoom = self.graph_canvas.zoom();
+            self.current_transform = output.transform;
+            self.last_node_rects_graph = output.node_rects_graph.clone();
+            self.last_view_state = view_state_snapshot.clone();
+            if self.graph_canvas.apply_to_view_state(&mut settings.view_state) {
+                view_state_dirty = true;
+            }
+            if let Some(node_id) = output.interaction.toggle_node {
+                let mut state = settings.view_state.get_collapse_state(node_id);
+                state.toggle_collapsed();
+                settings.view_state.set_collapse_state(node_id, state);
+                view_state_dirty = true;
+            }
+            if let Some((node_id, kind)) = output.interaction.toggle_section {
+                let mut state = settings.view_state.get_collapse_state(node_id);
+                state.toggle_section(kind);
+                settings.view_state.set_collapse_state(node_id, state);
+                view_state_dirty = true;
+            }
+            if output.interaction.clicked_node.is_some() {
+                self.clicked_node = output.interaction.clicked_node;
+            }
+            if let Some(action) = output.interaction.action {
+                match action {
+                    GraphCanvasAction::Focus(id) => self.node_to_focus = Some(id),
+                    GraphCanvasAction::Navigate(id) => self.node_to_navigate = Some(id),
+                    GraphCanvasAction::Hide(id) => self.node_to_hide = Some(id),
+                    GraphCanvasAction::OpenInNewTab(id) => {
+                        self.event_bus.publish(Event::TabOpen { token_id: Some(id) });
+                    }
+                    GraphCanvasAction::ShowDefinition(id) => {
+                        self.event_bus.publish(Event::ActivateNode {
+                            id,
+                            origin: codestory_events::ActivationOrigin::Graph,
+                        });
+                    }
+                    GraphCanvasAction::ShowInCode(id) => {
+                        let path = self.node_file_path(id);
+                        let line = self.node_start_line(id).unwrap_or(1);
+                        if let Some(path) = path {
+                            scroll_to = Some((path, line));
+                        } else {
+                            self.event_bus.publish(Event::ActivateNode {
+                                id,
+                                origin: codestory_events::ActivationOrigin::Graph,
+                            });
+                        }
+                    }
+                    GraphCanvasAction::ShowInIde(id) => {
+                        if let Some(path) = self.node_file_path(id) {
+                            open_in_ide = Some(path);
+                        } else {
+                            show_info = Some("No file path available for this node.".to_string());
+                        }
+                    }
+                    GraphCanvasAction::Bookmark(id) => {
+                        self.event_bus.publish(Event::BookmarkAddDefault { node_id: id });
+                    }
+                    GraphCanvasAction::CopyName(id) => {
+                        let name = self
+                            .node_display_name(id)
+                            .unwrap_or_else(|| format!("Node {}", id.0));
+                        copy_text = Some(name);
+                    }
+                    GraphCanvasAction::CopyPath(id) => {
+                        if let Some(path) = self.node_file_path(id) {
+                            copy_text = Some(path);
+                        } else {
+                            show_info = Some("No file path available for this node.".to_string());
+                        }
+                    }
+                    GraphCanvasAction::OpenContainingFolder(id) => {
+                        if let Some(path) = self.node_file_path(id) {
+                            open_folder = Some(path);
+                        } else {
+                            show_info = Some("No file path available for this node.".to_string());
+                        }
+                    }
+                    GraphCanvasAction::CopyGraphImage => {
+                        copy_image = self.build_graph_image();
+                        if copy_image.is_none() {
+                            show_info = Some("No graph data available to copy.".to_string());
+                        }
+                    }
+                    GraphCanvasAction::ExportGraphImage => {
+                        export_image = true;
+                    }
+                    GraphCanvasAction::HistoryBack => {
+                        self.event_bus.publish(Event::HistoryBack);
+                    }
+                    GraphCanvasAction::HistoryForward => {
+                        self.event_bus.publish(Event::HistoryForward);
+                    }
+                }
+            }
+
+            // Render edges via EdgeOverlay using GraphCanvas rects and transform
+            if output.edge_overlay_enabled {
+                let bg_layer = egui::LayerId::new(egui::Order::Background, ui.layer_id().id);
+                let mut bg_painter = ui.ctx().layer_painter(bg_layer);
+                bg_painter.set_clip_rect(snarl_rect);
+                self.edge_overlay.set_node_labels(labels);
+                self.edge_overlay.render(
+                    ui,
+                    &bg_painter,
+                    &bg_painter,
+                    &self.current_edges,
+                    &output.node_rects_graph,
+                    snarl_rect,
+                    output.transform,
+                    node_inner_margin,
+                    &self.style_resolver,
+                );
+            } else {
+                self.edge_overlay.clear_frame_state();
+            }
+
+            if ui.input(|i| i.pointer.secondary_clicked())
+                && ui
+                    .input(|i| i.pointer.interact_pos())
+                    .is_some_and(|pos| snarl_rect.contains(pos))
+            {
+                if let Some(info) = self.edge_overlay.hovered_edge_info().cloned() {
+                    let pos = ui
+                        .input(|i| i.pointer.interact_pos())
+                        .unwrap_or(snarl_rect.center());
+                    self.edge_context_menu = Some(EdgeContextMenu { pos, info });
+                } else {
+                    self.edge_context_menu = None;
+                }
+            }
+
+            if let Some(menu) = self.edge_context_menu.clone() {
+                let mut close_menu = false;
+                let menu_key: EdgeKey = (menu.info.source, menu.info.target, menu.info.kind);
+                let label = codestory_graph::style::get_edge_kind_label(menu.info.kind);
+                let edge_label =
+                    format!("{} {} {}", menu.info.source_label, label, menu.info.target_label);
+
+                egui::Area::new("edge_context_menu".into())
+                    .fixed_pos(menu.pos)
+                    .order(egui::Order::Foreground)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.label(&edge_label);
+                            ui.separator();
+                            if ui.button("Copy Edge").clicked() {
+                                copy_text = Some(edge_label.clone());
+                                close_menu = true;
+                            }
+                            if ui.button("Hide Edge").clicked() {
+                                self.hidden_edge_keys.insert(menu_key);
+                                self.rebuild_graph(settings);
+                                close_menu = true;
+                            }
+                        });
+                    });
+
+                if close_menu {
+                    self.edge_context_menu = None;
+                }
+            }
+
+            self.ui_trail_cluster(ui, snarl_rect);
 
             if settings.show_minimap {
                 self.ui_minimap(ui, snarl_rect, settings);
@@ -721,7 +989,131 @@ impl NodeGraphView {
             self.rebuild_graph(settings);
         }
 
-        self.adapter.clicked_node.or(node_to_navigate)
+        if let Some(text) = copy_text {
+            ui.ctx().copy_text(text);
+        }
+
+        if let Some(image) = copy_image {
+            ui.ctx().copy_image(image);
+            show_info = Some("Graph image copied to clipboard.".to_string());
+        }
+
+        if let Some((path, line)) = scroll_to {
+            self.event_bus.publish(Event::ScrollToLine {
+                file: std::path::PathBuf::from(path),
+                line: line as usize,
+            });
+        }
+
+        if export_image {
+            if let Some(image) = self.build_graph_image() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Export Graph Image")
+                    .set_file_name("codestory-graph.png")
+                    .save_file()
+                {
+                    let path = ensure_png_extension(path);
+                    match write_color_image_png(&path, &image) {
+                        Ok(()) => {
+                            show_info =
+                                Some(format!("Exported graph image to {}.", path.display()));
+                        }
+                        Err(err) => {
+                            show_info = Some(format!("Export failed: {}", err));
+                        }
+                    }
+                }
+            } else {
+                show_info = Some("No graph data available to export.".to_string());
+            }
+        }
+
+        if let Some(path) = open_folder {
+            if !open_containing_folder(&path) {
+                show_info = Some("Unable to open containing folder.".to_string());
+            }
+        }
+
+        if let Some(path) = open_in_ide {
+            if !open_in_default_app(&path) {
+                show_info = Some("Unable to open file in IDE.".to_string());
+            }
+        }
+
+        if let Some(message) = show_info {
+            self.event_bus.publish(Event::ShowInfo { message });
+        }
+
+        NodeGraphViewResponse {
+            clicked_node: self.clicked_node.or(node_to_navigate),
+            view_state_dirty,
+        }
+    }
+
+    fn build_positions(
+        &self,
+        settings: &crate::settings::NodeGraphSettings,
+    ) -> HashMap<NodeId, egui::Pos2> {
+        let mut positions = HashMap::new();
+        if let Some(cached) = &self.cached_positions {
+            positions.extend(cached.iter().map(|(k, v)| (*k, *v)));
+        }
+        for (id, pos) in &self.fallback_positions {
+            positions.entry(*id).or_insert(*pos);
+        }
+        for (id, custom) in &settings.view_state.custom_positions {
+            positions.insert(*id, egui::pos2(custom.x, custom.y));
+        }
+        positions
+    }
+
+    fn positions_bounds(&self, positions: &HashMap<NodeId, egui::Pos2>) -> Option<egui::Rect> {
+        if self.uml_nodes.is_empty() {
+            return None;
+        }
+        let mut min = egui::pos2(f32::INFINITY, f32::INFINITY);
+        let mut max = egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY);
+        let node_size = egui::vec2(160.0, 80.0);
+        for node in &self.uml_nodes {
+            let Some(pos) = positions.get(&node.id) else {
+                continue;
+            };
+            min.x = min.x.min(pos.x);
+            min.y = min.y.min(pos.y);
+            max.x = max.x.max(pos.x + node_size.x);
+            max.y = max.y.max(pos.y + node_size.y);
+        }
+        if !min.x.is_finite() || !min.y.is_finite() || !max.x.is_finite() || !max.y.is_finite() {
+            None
+        } else {
+            Some(egui::Rect::from_min_max(min, max))
+        }
+    }
+
+    fn node_display_name(&self, id: NodeId) -> Option<String> {
+        self.node_lookup.get(&id).map(|node| {
+            node.qualified_name
+                .clone()
+                .unwrap_or_else(|| node.serialized_name.clone())
+        })
+    }
+
+    fn node_file_path(&self, id: NodeId) -> Option<String> {
+        let node = self.node_lookup.get(&id)?;
+        if node.kind == NodeKind::FILE {
+            return Some(node.serialized_name.clone());
+        }
+        if let Some(file_id) = node.file_node_id {
+            return self
+                .node_lookup
+                .get(&file_id)
+                .map(|file_node| file_node.serialized_name.clone());
+        }
+        None
+    }
+
+    fn node_start_line(&self, id: NodeId) -> Option<u32> {
+        self.node_lookup.get(&id).and_then(|node| node.start_line)
     }
 
     /// Renders the vertical toolbar on the left side of the graph viewport (Req 9.1-9.5).
@@ -732,308 +1124,756 @@ impl NodeGraphView {
         settings: &crate::settings::NodeGraphSettings,
     ) -> bool {
         let mut rebuild_needed = false;
-        let toolbar_width = 130.0;
+        let toolbar_width = 56.0;
+        let palette = self.style_resolver.palette();
+        let button_size = egui::vec2(36.0, 36.0);
+        let is_light = is_light_color(palette.background);
+        let toolbar_fill = adjust_color(palette.background, is_light, if is_light { 0.08 } else { 0.24 });
+        let toolbar_stroke =
+            adjust_color(palette.node_section_border, is_light, if is_light { 0.30 } else { 0.45 });
 
         ui.allocate_ui_with_layout(
             egui::vec2(toolbar_width, ui.available_height()),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
                 ui.set_width(toolbar_width);
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
 
-                egui::Frame::NONE
-                    .fill(ui.visuals().window_fill())
-                    .inner_margin(4.0)
-                    .show(ui, |ui| {
-                        // Title + spinner
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Node Graph").strong().size(12.0));
-                            if self.is_calculating {
-                                ui.spinner();
-                            }
-                        });
+                let frame = egui::Frame::NONE
+                    .fill(toolbar_fill)
+                    .inner_margin(6.0)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .stroke(egui::Stroke::new(1.0, toolbar_stroke));
 
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(2.0);
-
-                // -- Depth --
-                ui.label(egui::RichText::new("Depth").size(11.0));
-                let mut depth = settings.max_depth as u32;
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut depth)
-                            .range(1..=10)
-                            .speed(1.0),
+                frame.show(ui, |ui| {
+                    if rail_button(
+                        ui,
+                        button_size,
+                        palette,
+                        RailButtonContent::Text(ph::HOUSE),
+                        false,
                     )
-                    .changed()
-                {
-                    self.event_bus.publish(Event::SetTrailDepth(depth));
-                }
+                    .on_hover_text("Reset graph layout")
+                    .clicked()
+                    {
+                        rebuild_needed = true;
+                    }
 
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(2.0);
+                    if rail_button(
+                        ui,
+                        button_size,
+                        palette,
+                        RailButtonContent::Text(ph::ARROWS_OUT_SIMPLE),
+                        false,
+                    )
+                    .on_hover_text("Zoom to Fit")
+                    .clicked()
+                    {
+                        self.event_bus.publish(Event::ZoomToFit);
+                    }
 
-                // -- Layout Algorithm Selector (Req 9.4) --
-                ui.label(egui::RichText::new("Layout").size(11.0));
-                egui::ComboBox::from_id_salt("layout_selector")
-                    .width(toolbar_width - 16.0)
-                    .selected_text(format!("{:?}", settings.layout_algorithm))
-                    .show_ui(ui, |ui| {
-                        for (alg, label) in [
-                            (
-                                codestory_events::LayoutAlgorithm::ForceDirected,
-                                "Force Directed",
-                            ),
-                            (codestory_events::LayoutAlgorithm::Radial, "Radial"),
-                            (codestory_events::LayoutAlgorithm::Grid, "Grid"),
-                            (
-                                codestory_events::LayoutAlgorithm::Hierarchical,
-                                "Hierarchical",
-                            ),
-                        ] {
-                            if ui
-                                .selectable_label(settings.layout_algorithm == alg, label)
-                                .clicked()
-                            {
-                                self.event_bus.publish(Event::SetLayoutMethod(alg));
-                            }
-                        }
-                    });
-
-                // -- Direction Toggle (Req 9.2 - Toggle Orientation) --
-                if settings.layout_algorithm == codestory_events::LayoutAlgorithm::Hierarchical {
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new("Direction").size(11.0));
-                    ui.horizontal(|ui| {
-                        if ui
-                            .selectable_value(
-                                &mut self.current_layout_direction,
-                                codestory_core::LayoutDirection::Horizontal,
-                                "H",
-                            )
-                            .on_hover_text("Horizontal (left to right)")
-                            .changed()
-                        {
-                            self.event_bus.publish(Event::SetLayoutDirection(
-                                codestory_core::LayoutDirection::Horizontal,
-                            ));
-                            self.cached_positions = None;
-                            rebuild_needed = true;
-                        }
-                        if ui
-                            .selectable_value(
-                                &mut self.current_layout_direction,
-                                codestory_core::LayoutDirection::Vertical,
-                                "V",
-                            )
-                            .on_hover_text("Vertical (top to bottom)")
-                            .changed()
-                        {
-                            self.event_bus.publish(Event::SetLayoutDirection(
-                                codestory_core::LayoutDirection::Vertical,
-                            ));
-                            self.cached_positions = None;
-                            rebuild_needed = true;
-                        }
-                    });
-                }
-
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(2.0);
-
-                // -- Zoom Controls (Req 9.2) --
-                ui.label(egui::RichText::new("Zoom").size(11.0));
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(egui::RichText::new("+").monospace())
-                        .on_hover_text("Zoom In")
-                        .clicked()
+                    if rail_button(
+                        ui,
+                        button_size,
+                        palette,
+                        RailButtonContent::Text(ph::MAGNIFYING_GLASS_PLUS),
+                        false,
+                    )
+                    .on_hover_text("Zoom In")
+                    .clicked()
                     {
                         self.event_bus.publish(Event::ZoomIn);
                     }
-                    if ui
-                        .button(egui::RichText::new("\u{2212}").monospace())
-                        .on_hover_text("Zoom Out")
-                        .clicked()
+                    if rail_button(
+                        ui,
+                        button_size,
+                        palette,
+                        RailButtonContent::Text(ph::MAGNIFYING_GLASS_MINUS),
+                        false,
+                    )
+                    .on_hover_text("Zoom Out")
+                    .clicked()
                     {
                         self.event_bus.publish(Event::ZoomOut);
                     }
-                    if ui
-                        .button(egui::RichText::new("\u{2b1c}").monospace())
-                        .on_hover_text("Zoom to Fit")
-                        .clicked()
+
+                    ui.add_space(6.0);
+
+                    let depth = settings.max_depth as u32;
+                    let clamped_depth = depth.clamp(1, 10);
+                    ui.label(
+                        egui::RichText::new(clamped_depth.to_string())
+                            .size(12.0)
+                            .color(palette.node_default_text),
+                    );
+                    ui.scope(|ui| {
+                        let slider_rect =
+                            ui.allocate_exact_size(egui::vec2(button_size.x, 96.0), egui::Sense::hover()).0;
+                        let response = ui.interact(
+                            slider_rect,
+                            ui.id().with("trail_depth_slider"),
+                            egui::Sense::click_and_drag(),
+                        );
+                        let inner_rect = slider_rect.shrink(6.0);
+                        let knob_height = inner_rect.width().clamp(16.0, inner_rect.height());
+                        let travel = (inner_rect.height() - knob_height).max(1.0);
+                        let t = (clamped_depth.saturating_sub(1) as f32) / 9.0;
+                        let knob_y = inner_rect.top() + t * travel;
+                        let knob_rect = egui::Rect::from_min_size(
+                            egui::pos2(inner_rect.left(), knob_y),
+                            egui::vec2(inner_rect.width(), knob_height),
+                        );
+
+                        ui.painter().rect_filled(
+                            slider_rect,
+                            8.0,
+                            adjust_color(toolbar_fill, is_light, 0.12),
+                        );
+                        ui.painter().rect_stroke(
+                            slider_rect,
+                            8.0,
+                            egui::Stroke::new(1.0, toolbar_stroke),
+                            egui::StrokeKind::Middle,
+                        );
+
+                        let track_width = inner_rect.width() * 0.35;
+                        let track_rect = egui::Rect::from_min_max(
+                            egui::pos2(inner_rect.center().x - track_width * 0.5, inner_rect.top()),
+                            egui::pos2(inner_rect.center().x + track_width * 0.5, inner_rect.bottom()),
+                        );
+                        ui.painter().rect_filled(
+                            track_rect,
+                            track_width * 0.5,
+                            adjust_color(palette.node_default_fill, is_light, 0.18),
+                        );
+
+                        let knob_fill = if response.hovered() {
+                            adjust_color(palette.node_default_fill, is_light, 0.28)
+                        } else {
+                            adjust_color(palette.node_default_fill, is_light, 0.22)
+                        };
+                        ui.painter().rect_filled(knob_rect, 6.0, knob_fill);
+                        ui.painter().rect_stroke(
+                            knob_rect,
+                            6.0,
+                            egui::Stroke::new(1.2, toolbar_stroke),
+                            egui::StrokeKind::Middle,
+                        );
+
+                        if response.dragged() || response.clicked() {
+                            if let Some(pos) = response.interact_pointer_pos() {
+                                let target_y = (pos.y - knob_height * 0.5)
+                                    .clamp(inner_rect.top(), inner_rect.bottom() - knob_height);
+                                let t = (target_y - inner_rect.top()) / travel;
+                                let new_depth = (1.0 + t * 9.0).round() as u32;
+                                let new_depth = new_depth.clamp(1, 10);
+                                if new_depth != clamped_depth {
+                                    self.event_bus.publish(Event::SetTrailDepth(new_depth));
+                                }
+                            }
+                        }
+                    });
+
+                    ui.add_space(6.0);
+
+                    let mut group_ns = settings.group_by_namespace;
+                    if rail_button(
+                        ui,
+                        button_size,
+                        palette,
+                        RailButtonContent::Glyph(RailGlyph::Namespace),
+                        group_ns,
+                    )
+                    .on_hover_text("Group by namespace")
+                    .clicked()
                     {
-                        self.view_version = self.view_version.wrapping_add(1);
+                        group_ns = !group_ns;
+                        self.event_bus.publish(Event::SetGroupByNamespace(group_ns));
+                    }
+
+                    let mut group_file = settings.group_by_file;
+                    if rail_button(
+                        ui,
+                        button_size,
+                        palette,
+                        RailButtonContent::Glyph(RailGlyph::File),
+                        group_file,
+                    )
+                    .on_hover_text("Group by file")
+                    .clicked()
+                    {
+                        group_file = !group_file;
+                        self.event_bus.publish(Event::SetGroupByFile(group_file));
+                    }
+
+                    let mut show_legend = settings.show_legend;
+                    if rail_button(
+                        ui,
+                        button_size,
+                        palette,
+                        RailButtonContent::Text(ph::QUESTION),
+                        show_legend,
+                    )
+                    .on_hover_text("Toggle legend")
+                    .clicked()
+                    {
+                        show_legend = !show_legend;
+                        self.event_bus.publish(Event::SetShowLegend(show_legend));
+                    }
+
+                    let mut show_minimap = settings.show_minimap;
+                    if rail_button(
+                        ui,
+                        button_size,
+                        palette,
+                        RailButtonContent::Glyph(RailGlyph::Minimap),
+                        show_minimap,
+                    )
+                    .on_hover_text("Toggle minimap")
+                    .clicked()
+                    {
+                        show_minimap = !show_minimap;
+                        self.event_bus.publish(Event::SetShowMinimap(show_minimap));
+                    }
+
+                    if rail_button(
+                        ui,
+                        button_size,
+                        palette,
+                        RailButtonContent::Text(ph::GEAR),
+                        self.show_toolbar_panel,
+                    )
+                    .on_hover_text("Graph settings")
+                    .clicked()
+                    {
+                        self.show_toolbar_panel = !self.show_toolbar_panel;
+                    }
+
+                    if self.is_calculating {
+                        ui.add_space(4.0);
+                        ui.spinner();
                     }
                 });
-                let zoom_pct = (self.adapter.current_zoom * 100.0).round() as u32;
-                ui.label(
-                    egui::RichText::new(format!("{}%", zoom_pct))
-                        .size(10.0)
-                        .color(ui.visuals().weak_text_color()),
-                );
+            },
+        );
 
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(2.0);
+        if self.show_toolbar_panel {
+            egui::Window::new("Graph Settings")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut self.show_toolbar_panel)
+                .show(ui.ctx(), |ui| {
+                    ui.label("Layout");
+                    egui::ComboBox::from_id_salt("layout_selector")
+                        .selected_text(format!("{:?}", settings.layout_algorithm))
+                        .show_ui(ui, |ui| {
+                            for (alg, label) in [
+                                (codestory_events::LayoutAlgorithm::ForceDirected, "Force Directed"),
+                                (codestory_events::LayoutAlgorithm::Radial, "Radial"),
+                                (codestory_events::LayoutAlgorithm::Grid, "Grid"),
+                                (codestory_events::LayoutAlgorithm::Hierarchical, "Hierarchical"),
+                            ] {
+                                if ui
+                                    .selectable_label(settings.layout_algorithm == alg, label)
+                                    .clicked()
+                                {
+                                    self.event_bus.publish(Event::SetLayoutMethod(alg));
+                                }
+                            }
+                        });
 
-                // -- Expand / Collapse All (Req 9.2) --
-                ui.horizontal(|ui| {
-                    if ui
-                        .button("Expand All")
-                        .on_hover_text("Expand all nodes")
-                        .clicked()
+                    if settings.layout_algorithm
+                        == codestory_events::LayoutAlgorithm::Hierarchical
                     {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_value(
+                                    &mut self.current_layout_direction,
+                                    codestory_core::LayoutDirection::Horizontal,
+                                    "H",
+                                )
+                                .changed()
+                            {
+                                self.event_bus.publish(Event::SetLayoutDirection(
+                                    codestory_core::LayoutDirection::Horizontal,
+                                ));
+                                self.cached_positions = None;
+                                rebuild_needed = true;
+                            }
+                            if ui
+                                .selectable_value(
+                                    &mut self.current_layout_direction,
+                                    codestory_core::LayoutDirection::Vertical,
+                                    "V",
+                                )
+                                .changed()
+                            {
+                                self.event_bus.publish(Event::SetLayoutDirection(
+                                    codestory_core::LayoutDirection::Vertical,
+                                ));
+                                self.cached_positions = None;
+                                rebuild_needed = true;
+                            }
+                        });
+                    }
+
+                    ui.separator();
+                    ui.label("Filters");
+                    let mut show_classes = settings.show_classes;
+                    if ui.checkbox(&mut show_classes, "Classes").changed() {
+                        self.event_bus.publish(Event::SetShowClasses(show_classes));
+                    }
+                    let mut show_functions = settings.show_functions;
+                    if ui.checkbox(&mut show_functions, "Functions").changed() {
+                        self.event_bus
+                            .publish(Event::SetShowFunctions(show_functions));
+                    }
+                    let mut show_variables = settings.show_variables;
+                    if ui.checkbox(&mut show_variables, "Variables").changed() {
+                        self.event_bus
+                            .publish(Event::SetShowVariables(show_variables));
+                    }
+
+                    ui.separator();
+                    if ui.button("Expand All").clicked() {
                         self.event_bus.publish(Event::ExpandAll);
                     }
-                });
-                ui.horizontal(|ui| {
-                    if ui
-                        .button("Collapse All")
-                        .on_hover_text("Collapse all nodes")
-                        .clicked()
-                    {
+                    if ui.button("Collapse All").clicked() {
                         self.event_bus.publish(Event::CollapseAll);
                     }
                 });
-
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(2.0);
-
-                // -- Filter Toggles (Req 9.5) --
-                ui.label(egui::RichText::new("Filters").size(11.0));
-                let mut show_classes = settings.show_classes;
-                if ui.checkbox(&mut show_classes, "Classes").changed() {
-                    self.event_bus.publish(Event::SetShowClasses(show_classes));
-                }
-                let mut show_functions = settings.show_functions;
-                if ui.checkbox(&mut show_functions, "Functions").changed() {
-                    self.event_bus
-                        .publish(Event::SetShowFunctions(show_functions));
-                }
-                let mut show_variables = settings.show_variables;
-                if ui.checkbox(&mut show_variables, "Variables").changed() {
-                    self.event_bus
-                        .publish(Event::SetShowVariables(show_variables));
-                }
-
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(2.0);
-
-                // -- Display Toggles --
-                let mut show_minimap = settings.show_minimap;
-                if ui.checkbox(&mut show_minimap, "Minimap").changed() {
-                    self.event_bus.publish(Event::SetShowMinimap(show_minimap));
-                }
-                let mut show_legend = settings.show_legend;
-                if ui.checkbox(&mut show_legend, "Legend").changed() {
-                    self.event_bus.publish(Event::SetShowLegend(show_legend));
-                }
-
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(2.0);
-
-                // -- Reset View --
-                if ui
-                    .button("Reset View")
-                    .on_hover_text("Reset graph layout")
-                    .clicked()
-                {
-                    rebuild_needed = true;
-                }
-                    });
-                }
-            );
+        }
 
         rebuild_needed
+    }
+
+    fn ui_trail_cluster(&mut self, ui: &mut egui::Ui, parent_rect: egui::Rect) {
+        let palette = self.style_resolver.palette();
+        let button_size = egui::vec2(26.0, 26.0);
+        let cluster_pos = parent_rect.min + egui::vec2(10.0, 10.0);
+
+        egui::Area::new("trail_cluster".into())
+            .order(egui::Order::Foreground)
+            .fixed_pos(cluster_pos)
+            .show(ui.ctx(), |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                ui.horizontal(|ui| {
+                    if rail_button(
+                        ui,
+                        button_size,
+                        palette,
+                        RailButtonContent::Glyph(RailGlyph::TrailBack),
+                        false,
+                    )
+                    .on_hover_text("Back")
+                    .clicked()
+                    {
+                        self.event_bus.publish(Event::HistoryBack);
+                    }
+
+                    if rail_button(
+                        ui,
+                        button_size,
+                        palette,
+                        RailButtonContent::Glyph(RailGlyph::TrailForward),
+                        false,
+                    )
+                    .on_hover_text("Forward")
+                    .clicked()
+                    {
+                        self.event_bus.publish(Event::HistoryForward);
+                    }
+
+                    if rail_button(
+                        ui,
+                        button_size,
+                        palette,
+                        RailButtonContent::Glyph(RailGlyph::TrailCustom),
+                        false,
+                    )
+                    .on_hover_text("Custom trail")
+                    .clicked()
+                    {
+                        self.event_bus.publish(Event::OpenCustomTrailDialog);
+                    }
+                });
+            });
     }
 
     fn ui_minimap(
         &mut self,
         ui: &mut egui::Ui,
         parent_rect: egui::Rect,
-        _settings: &crate::settings::NodeGraphSettings,
+        settings: &crate::settings::NodeGraphSettings,
     ) {
+        let palette = self.style_resolver.palette();
         let minimap_size = egui::vec2(150.0, 100.0);
         let minimap_rect = egui::Rect::from_min_size(
             parent_rect.right_bottom() - minimap_size - egui::vec2(10.0, 10.0),
             minimap_size,
         );
 
-        // Render on Tooltip layer to ensure it stays on top of graph nodes and edges
-        let mut painter = ui.ctx().layer_painter(egui::LayerId::new(
-            egui::Order::Tooltip,
-            ui.id().with("minimap"),
-        ));
-        painter.set_clip_rect(parent_rect);
+        // Render within the graph layer so it stays above the graph but below global UI.
+        let painter = ui.painter_at(parent_rect);
 
-        painter.rect_filled(minimap_rect, 5.0, self.theme_flavor.mantle);
+        painter.rect_filled(minimap_rect, 5.0, palette.minimap_background);
         painter.rect_stroke(
             minimap_rect,
             5.0,
-            (1.0, self.theme_flavor.overlay0),
+            (1.0, palette.minimap_border),
             egui::StrokeKind::Middle,
         );
-
-        // Sync visible nodes to cache to handle manual movement
-        let positions_cache = self.cached_positions.get_or_insert_with(HashMap::new);
-        
-        // 1. Update positions for currently visible/rendered nodes
-        for (pos, node) in self.snarl.nodes_pos() {
-            positions_cache.insert(node.id, pos);
-        }
-
-        // 2. Prune nodes that no longer exist in the graph (e.g. filtered/deleted)
-        // This prevents "ghost nodes" from appearing in the minimap
-        let valid_ids: HashSet<NodeId> = self.snarl.node_ids()
-            .map(|(_, node)| node.id)
-            .collect();
-        positions_cache.retain(|id, _| valid_ids.contains(id));
-
-        let mut min = egui::pos2(f32::INFINITY, f32::INFINITY);
-        let mut max = egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY);
-        let mut has_nodes = false;
-
-        if let Some(positions) = &self.cached_positions {
-            for pos in positions.values() {
-                has_nodes = true;
-                min.x = min.x.min(pos.x);
-                min.y = min.y.min(pos.y);
-                max.x = max.x.max(pos.x + 100.0);
-                max.y = max.y.max(pos.y + 100.0);
-            }
-        }
-
-        if !has_nodes {
+        let positions = self.build_positions(settings);
+        let Some(bounds) = self.positions_bounds(&positions) else {
             return;
-        }
+        };
 
-        let bounds = egui::Rect::from_min_max(min, max);
         let scale = (minimap_size.x / bounds.width())
             .min(minimap_size.y / bounds.height())
             .min(1.0);
         let offset = minimap_rect.center() - bounds.center() * scale;
 
-        if let Some(positions) = &self.cached_positions {
-            for pos in positions.values() {
-                let map_pos = *pos * scale + offset;
-                let size = egui::vec2(100.0, 40.0) * scale;
-                painter.rect_filled(
-                    egui::Rect::from_min_size(map_pos, size),
-                    1.0,
-                    egui::Color32::from_white_alpha(100),
-                );
-            }
+        for node in &self.uml_nodes {
+            let Some(pos) = positions.get(&node.id) else {
+                continue;
+            };
+            let map_pos = *pos * scale + offset;
+            let size = egui::vec2(100.0, 40.0) * scale;
+            painter.rect_filled(
+                egui::Rect::from_min_size(map_pos, size),
+                1.0,
+                palette.minimap_node,
+            );
         }
     }
 
+    fn build_graph_image(&self) -> Option<egui::ColorImage> {
+        if self.last_node_rects_graph.is_empty() {
+            return None;
+        }
+
+        let mut screen_rects: HashMap<NodeId, egui::Rect> = HashMap::new();
+        let mut bounds: Option<egui::Rect> = None;
+        for (node_id, rect) in &self.last_node_rects_graph {
+            let screen_rect = self.current_transform.mul_rect(*rect);
+            screen_rects.insert(*node_id, screen_rect);
+            bounds = Some(if let Some(existing) = bounds {
+                existing.union(screen_rect)
+            } else {
+                screen_rect
+            });
+        }
+        let bounds = bounds?;
+
+        let palette = self.style_resolver.palette();
+        let padding = 40.0;
+        let max_dim = 4000.0;
+        let hard_max_dim = 12000.0;
+        let width = bounds.width().max(1.0);
+        let height = bounds.height().max(1.0);
+        let export_font = load_export_font();
+        let zoom = self.current_zoom.max(0.1);
+
+        let base_header_font = 13.0 * zoom;
+        let mut scale = (max_dim / width).min(max_dim / height).max(0.1);
+        if base_header_font > 0.0 {
+            let min_font_px = 10.0;
+            let min_scale = min_font_px / base_header_font;
+            let max_scale = (hard_max_dim / width).min(hard_max_dim / height).max(0.1);
+            scale = scale.max(min_scale).min(max_scale);
+        }
+
+        let img_width = ((width * scale) + padding * 2.0)
+            .ceil()
+            .max(1.0) as usize;
+        let img_height = ((height * scale) + padding * 2.0)
+            .ceil()
+            .max(1.0) as usize;
+        let mut image = egui::ColorImage::filled([img_width, img_height], palette.background);
+
+        let origin = bounds.min;
+        let map_pos = |pos: egui::Pos2| -> (i32, i32) {
+            let x = ((pos.x - origin.x) * scale + padding).round() as i32;
+            let y = ((pos.y - origin.y) * scale + padding).round() as i32;
+            (x, y)
+        };
+        let map_pos_f = |pos: egui::Pos2| -> (f32, f32) {
+            let x = (pos.x - origin.x) * scale + padding;
+            let y = (pos.y - origin.y) * scale + padding;
+            (x, y)
+        };
+        let map_rect = |rect: egui::Rect| -> (i32, i32, i32, i32) {
+            let (x0, y0) = map_pos(rect.min);
+            let (x1, y1) = map_pos(rect.max);
+            let min_x = x0.min(x1);
+            let mut max_x = x0.max(x1);
+            let min_y = y0.min(y1);
+            let mut max_y = y0.max(y1);
+            if max_x == min_x {
+                max_x += 1;
+            }
+            if max_y == min_y {
+                max_y += 1;
+            }
+            (min_x, min_y, max_x, max_y)
+        };
+
+        let thickness = ((2.0 * scale).round() as i32).max(1);
+        let uml_lookup: std::collections::HashMap<NodeId, &UmlNode> = self
+            .uml_nodes
+            .iter()
+            .map(|uml| (uml.id, uml))
+            .collect();
+
+        for edge in &self.current_edges {
+            let (Some(src_rect), Some(dst_rect)) = (
+                screen_rects.get(&edge.source),
+                screen_rects.get(&edge.target),
+            ) else {
+                continue;
+            };
+            let source_rect = to_uml_rect(*src_rect);
+            let target_rect = to_uml_rect(*dst_rect);
+            let curve = self.edge_overlay.router.route_edge(source_rect, target_rect);
+            let color = self.style_resolver.resolve_edge_color(edge.kind);
+            let dist = ((curve.end.x - curve.start.x).powi(2) + (curve.end.y - curve.start.y).powi(2))
+                .sqrt();
+            let samples = ((dist / 40.0).ceil() as usize).clamp(12, 64);
+            let mut prev: Option<(i32, i32)> = None;
+            for i in 0..=samples {
+                let t = i as f32 / samples as f32;
+                let p = curve.sample(t);
+                let (x, y) = map_pos_f(egui::pos2(p.x, p.y));
+                let x = x.round() as i32;
+                let y = y.round() as i32;
+                if let Some((px, py)) = prev {
+                    draw_line(&mut image, px, py, x, y, color, thickness);
+                }
+                prev = Some((x, y));
+            }
+        }
+
+        for (node_id, rect) in &screen_rects {
+            let Some(uml) = uml_lookup.get(node_id) else {
+                continue;
+            };
+            let collapse_state = self.last_view_state.get_collapse_state(*node_id);
+            let layout = export_layout_for_node(uml, *rect, &collapse_state, zoom);
+
+            let (min_x, min_y, max_x, max_y) = map_rect(*rect);
+            draw_rect_filled(&mut image, min_x, min_y, max_x, max_y, palette.node_default_fill);
+            draw_rect_stroke(
+                &mut image,
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+                palette.node_default_border,
+                thickness.max(1),
+            );
+
+            let header_color = self.style_resolver.resolve_node_color(uml.kind);
+            let header_text_color = self.style_resolver.resolve_text_color(header_color);
+            let (hx0, hy0, hx1, hy1) = map_rect(layout.header_rect);
+            draw_rect_filled(&mut image, hx0, hy0, hx1, hy1, header_color);
+
+            let header_label = export_header_label(uml);
+            let header_font = 13.0 * zoom * scale;
+            if export_font.is_some() {
+                let header_x = layout.header_rect.min.x + 10.0 * zoom;
+                let header_y = layout.header_rect.center().y;
+                let (text_x, center_y_px) = map_pos_f(egui::pos2(header_x, header_y));
+                let max_header_width =
+                    (layout.header_rect.width() - 20.0 * zoom).max(10.0) * scale;
+                let header_font = fit_text_size(
+                    &export_font,
+                    &header_label,
+                    header_font,
+                    max_header_width,
+                    6.0,
+                );
+                draw_text(
+                    &mut image,
+                    &export_font,
+                    &header_label,
+                    header_font,
+                    text_x,
+                    center_y_px,
+                    header_text_color,
+                );
+
+                if collapse_state.is_collapsed {
+                    let total_members: usize = uml
+                        .visibility_sections
+                        .iter()
+                        .map(|section| section.members.len())
+                        .sum();
+                    if total_members > 0 {
+                        let badge = format!("[{}]", total_members);
+                        let badge_width =
+                            measure_text_width(&export_font, &badge, 10.0 * zoom * scale)
+                                .unwrap_or(0.0);
+                        let badge_x = layout.header_rect.max.x - 10.0 * zoom;
+                        let badge_y = layout.header_rect.center().y;
+                        let (badge_right_px, badge_center_px) =
+                            map_pos_f(egui::pos2(badge_x, badge_y));
+                        let bx = badge_right_px - badge_width;
+                        draw_text(
+                            &mut image,
+                            &export_font,
+                            &badge,
+                            10.0 * zoom * scale,
+                            bx,
+                            badge_center_px,
+                            header_text_color,
+                        );
+                    }
+                }
+            }
+
+            if collapse_state.is_collapsed {
+                continue;
+            }
+
+            let section_font = 9.5 * zoom * scale;
+            let member_font = 10.5 * zoom * scale;
+
+            for section in &layout.sections {
+                let (sx0, sy0, sx1, sy1) = map_rect(section.header_rect);
+                draw_rect_filled(&mut image, sx0, sy0, sx1, sy1, palette.node_section_fill);
+                draw_rect_stroke(
+                    &mut image,
+                    sx0,
+                    sy0,
+                    sx1,
+                    sy1,
+                    palette.node_section_border,
+                    thickness.max(1),
+                );
+
+                let label = section.kind.label();
+                let label_width =
+                    measure_text_width(&export_font, label, section_font).unwrap_or(0.0);
+                let chip_padding = egui::vec2(6.0 * zoom, 2.0 * zoom);
+                let chip_size = egui::vec2(
+                    label_width / scale + chip_padding.x * 2.0,
+                    section.header_rect.height() - 4.0 * zoom,
+                );
+                let chip_rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        section.header_rect.min.x + 4.0 * zoom,
+                        section.header_rect.min.y + 2.0 * zoom,
+                    ),
+                    chip_size,
+                );
+                let (cx0, cy0, cx1, cy1) = map_rect(chip_rect);
+                draw_pill(&mut image, cx0, cy0, cx1, cy1, palette.section_label_fill);
+
+                let mut text_offset_x = chip_padding.x;
+                if let Some(icon_kind) = export_section_icon_kind(section.kind) {
+                    let icon_size = 8.0 * zoom;
+                    let icon_center = egui::pos2(
+                        chip_rect.min.x + chip_padding.x + icon_size * 0.5,
+                        chip_rect.center().y,
+                    );
+                    let (ix, iy) = map_pos_f(icon_center);
+                    let icon_radius = (icon_size * 0.5 * scale).max(1.0);
+                    let icon_color = self.style_resolver.resolve_icon_color(uml.kind);
+                    match icon_kind {
+                        ExportSectionIcon::Public => {
+                            draw_circle_stroke(
+                                &mut image,
+                                ix,
+                                iy,
+                                icon_radius,
+                                (1.2 * zoom * scale).max(1.0),
+                                icon_color,
+                            );
+                        }
+                        ExportSectionIcon::Private => {
+                            let size = (icon_size * 0.8) * scale;
+                            let min = egui::pos2(ix - size * 0.5, iy - size * 0.5);
+                            let max = egui::pos2(ix + size * 0.5, iy + size * 0.5);
+                            let (px0, py0) = (min.x.round() as i32, min.y.round() as i32);
+                            let (px1, py1) = (max.x.round() as i32, max.y.round() as i32);
+                            draw_rect_filled(&mut image, px0, py0, px1, py1, icon_color);
+                        }
+                    }
+                    text_offset_x += icon_size + 4.0 * zoom;
+                }
+
+                let text_pos =
+                    egui::pos2(chip_rect.min.x + text_offset_x, chip_rect.center().y);
+                let (tx, center_py) = map_pos_f(text_pos);
+                draw_text(
+                    &mut image,
+                    &export_font,
+                    label,
+                    section_font,
+                    tx,
+                    center_py,
+                    palette.section_label_text,
+                );
+
+                for (member, member_rect) in &section.members {
+                    let member_label = export_member_label(member);
+                    let label_width =
+                        measure_text_width(&export_font, &member_label, member_font)
+                            .unwrap_or(0.0);
+                    let pill_padding = egui::vec2(6.0 * zoom, 3.0 * zoom);
+                    let pill_height = member_rect.height() - 6.0 * zoom;
+                    let pill_width = label_width / scale + pill_padding.x * 2.0;
+                    let pill_rect = egui::Rect::from_min_size(
+                        egui::pos2(
+                            member_rect.min.x + 4.0 * zoom,
+                            member_rect.center().y - pill_height * 0.5,
+                        ),
+                        egui::vec2(pill_width, pill_height),
+                    );
+                    let (px0, py0, px1, py1) = map_rect(pill_rect);
+                    let pill_color = self.style_resolver.resolve_node_color(member.kind);
+                    let pill_text = self.style_resolver.resolve_text_color(pill_color);
+                    draw_pill(&mut image, px0, py0, px1, py1, pill_color);
+
+                    let (mx, center_py) = map_pos_f(egui::pos2(
+                        pill_rect.min.x + pill_padding.x,
+                        pill_rect.center().y,
+                    ));
+                    draw_text(
+                        &mut image,
+                        &export_font,
+                        &member_label,
+                        member_font,
+                        mx,
+                        center_py,
+                        pill_text,
+                    );
+
+                    if member.has_outgoing_edges {
+                        let arrow_center = egui::pos2(
+                            member_rect.max.x - 12.0 * zoom,
+                            member_rect.min.y + 8.0 * zoom,
+                        );
+                        let (ax, ay) = map_pos_f(arrow_center);
+                        draw_arrow_right(
+                            &mut image,
+                            ax,
+                            ay,
+                            6.0 * zoom * scale,
+                            self.style_resolver.resolve_outgoing_edge_indicator_color(),
+                            (1.2 * zoom * scale).max(1.0),
+                        );
+                    }
+                }
+            }
+        }
+
+        Some(image)
+    }
+
     fn ui_legend(&self, ui: &mut egui::Ui, parent_rect: egui::Rect) {
-        let legend_size = egui::vec2(120.0, 150.0);
+        let palette = self.style_resolver.palette();
+        let legend_size = egui::vec2(150.0, 230.0);
         let legend_rect = egui::Rect::from_min_size(
             parent_rect.left_bottom() - egui::vec2(0.0, legend_size.y + 10.0)
                 + egui::vec2(10.0, 0.0),
@@ -1045,20 +1885,20 @@ impl NodeGraphView {
             .collapsible(false)
             .resizable(false)
             .title_bar(false)
-            .frame(egui::Frame::window(ui.style()).fill(self.theme_flavor.crust))
+            .frame(egui::Frame::window(ui.style()).fill(palette.legend_background))
             .show(ui.ctx(), |ui| {
                 ui.label(egui::RichText::new("Legend").strong());
                 ui.separator();
 
-                let items = [
-                    ("Class", self.theme_flavor.blue),
-                    ("Struct", self.theme_flavor.teal),
-                    ("Function", self.theme_flavor.yellow),
-                    ("Module", self.theme_flavor.mauve),
-                    ("Variable", self.theme_flavor.text),
+                let node_items = [
+                    ("Class", palette.type_fill),
+                    ("Struct", palette.type_fill),
+                    ("Function", palette.function_fill),
+                    ("Module", palette.namespace_fill),
+                    ("Variable", palette.variable_fill),
                 ];
 
-                for (name, color) in items {
+                for (name, color) in node_items {
                     ui.horizontal(|ui| {
                         let (rect, _) =
                             ui.allocate_at_least(egui::vec2(10.0, 10.0), egui::Sense::hover());
@@ -1066,6 +1906,764 @@ impl NodeGraphView {
                         ui.label(name);
                     });
                 }
+
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Edges").strong());
+                ui.separator();
+
+                let edge_items = [
+                    ("Call", self.style_resolver.resolve_edge_color(EdgeKind::CALL)),
+                    ("Use", self.style_resolver.resolve_edge_color(EdgeKind::USAGE)),
+                    ("Override", self.style_resolver.resolve_edge_color(EdgeKind::OVERRIDE)),
+                    (
+                        "Type",
+                        self.style_resolver.resolve_edge_color(EdgeKind::TYPE_USAGE),
+                    ),
+                    ("Include", self.style_resolver.resolve_edge_color(EdgeKind::INCLUDE)),
+                    (
+                        "Bundled",
+                        self.style_resolver.resolve_bundled_edge_color(),
+                    ),
+                ];
+
+                for (name, color) in edge_items {
+                    ui.horizontal(|ui| {
+                        let (rect, _) =
+                            ui.allocate_at_least(egui::vec2(18.0, 10.0), egui::Sense::hover());
+                        let mid = rect.center().y;
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(rect.left(), mid),
+                                egui::pos2(rect.right(), mid),
+                            ],
+                            egui::Stroke::new(1.6, color),
+                        );
+                        ui.label(name);
+                    });
+                }
             });
+    }
+}
+
+struct ExportSectionLayout<'a> {
+    kind: VisibilityKind,
+    header_rect: egui::Rect,
+    members: Vec<(&'a MemberItem, egui::Rect)>,
+}
+
+struct ExportNodeLayout<'a> {
+    header_rect: egui::Rect,
+    sections: Vec<ExportSectionLayout<'a>>,
+}
+
+#[derive(Clone, Copy)]
+enum RailButtonContent<'a> {
+    Text(&'a str),
+    Glyph(RailGlyph),
+}
+
+#[derive(Clone, Copy)]
+enum RailGlyph {
+    Namespace,
+    File,
+    Minimap,
+    TrailBack,
+    TrailForward,
+    TrailCustom,
+}
+
+fn rail_button(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    palette: crate::components::node_graph::style_resolver::GraphPalette,
+    content: RailButtonContent<'_>,
+    selected: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let is_light = is_light_color(palette.background);
+    let mut fill = palette.node_default_fill;
+    if selected {
+        fill = adjust_color(fill, is_light, 0.18);
+    }
+    if response.hovered() {
+        fill = adjust_color(fill, is_light, 0.12);
+    }
+    if response.is_pointer_button_down_on() {
+        fill = adjust_color(fill, is_light, 0.28);
+    }
+    let stroke = if selected {
+        palette.node_default_border
+    } else {
+        palette.node_section_border
+    };
+
+    ui.painter().rect_filled(rect, 5.0, fill);
+    ui.painter().rect_stroke(
+        rect,
+        5.0,
+        egui::Stroke::new(1.0, stroke),
+        egui::StrokeKind::Middle,
+    );
+    match content {
+        RailButtonContent::Text(label) => {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(12.0),
+                palette.node_default_text,
+            );
+        }
+        RailButtonContent::Glyph(glyph) => {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                glyph_label(glyph),
+                egui::FontId::proportional(12.0),
+                palette.node_default_text,
+            );
+        }
+    }
+
+    response
+}
+
+fn glyph_label(glyph: RailGlyph) -> &'static str {
+    match glyph {
+        RailGlyph::Namespace => ph::BRACKETS_CURLY,
+        RailGlyph::File => ph::FILE,
+        RailGlyph::Minimap => ph::MAP_TRIFOLD,
+        RailGlyph::TrailBack => ph::ARROW_LEFT,
+        RailGlyph::TrailForward => ph::ARROW_RIGHT,
+        RailGlyph::TrailCustom => ph::PATH,
+    }
+}
+
+fn adjust_color(color: egui::Color32, is_light: bool, amount: f32) -> egui::Color32 {
+    let target = if is_light {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    };
+    mix_color(color, target, amount)
+}
+
+fn mix_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let (ar, ag, ab, aa) = a.to_tuple();
+    let (br, bg, bb, ba) = b.to_tuple();
+    let lerp = |x: u8, y: u8| -> u8 {
+        ((x as f32 * (1.0 - t) + y as f32 * t).round() as i32)
+            .clamp(0, 255) as u8
+    };
+    egui::Color32::from_rgba_unmultiplied(
+        lerp(ar, br),
+        lerp(ag, bg),
+        lerp(ab, bb),
+        lerp(aa, ba),
+    )
+}
+
+fn to_uml_rect(rect: egui::Rect) -> codestory_graph::uml_types::Rect {
+    codestory_graph::uml_types::Rect {
+        min: codestory_graph::Vec2 {
+            x: rect.min.x,
+            y: rect.min.y,
+        },
+        max: codestory_graph::Vec2 {
+            x: rect.max.x,
+            y: rect.max.y,
+        },
+    }
+}
+
+fn is_light_color(color: egui::Color32) -> bool {
+    let (r, g, b, _) = color.to_tuple();
+    let luminance = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+    luminance > 140.0
+}
+
+#[derive(Clone, Copy)]
+enum ExportSectionIcon {
+    Public,
+    Private,
+}
+
+fn export_section_icon_kind(kind: VisibilityKind) -> Option<ExportSectionIcon> {
+    match kind {
+        VisibilityKind::Public => Some(ExportSectionIcon::Public),
+        VisibilityKind::Private => Some(ExportSectionIcon::Private),
+        _ => None,
+    }
+}
+
+fn export_member_label(member: &MemberItem) -> String {
+    if let Some(signature) = &member.signature {
+        format!("{}{}", member.name, signature)
+    } else {
+        member.name.clone()
+    }
+}
+
+fn export_header_label(node: &UmlNode) -> String {
+    if let Some(bundle) = &node.bundle_info {
+        format!("{} ({})", node.label, bundle.count)
+    } else {
+        node.label.clone()
+    }
+}
+
+fn export_layout_for_node<'a>(
+    node: &'a UmlNode,
+    rect: egui::Rect,
+    collapse_state: &CollapseState,
+    zoom: f32,
+) -> ExportNodeLayout<'a> {
+    let header_height = 32.0 * zoom;
+    let section_header_height = 20.0 * zoom;
+    let member_row_height = 22.0 * zoom;
+    let padding = 12.0 * zoom;
+
+    let header_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), header_height));
+    let mut sections = Vec::new();
+
+    let mut cursor_y = header_rect.max.y + padding * 0.2;
+    if !collapse_state.is_collapsed {
+        for section in &node.visibility_sections {
+            if section.members.is_empty() {
+                continue;
+            }
+            let section_rect = egui::Rect::from_min_size(
+                egui::pos2(rect.min.x + padding * 0.5, cursor_y),
+                egui::vec2(rect.width() - padding, section_header_height),
+            );
+            cursor_y += section_header_height;
+
+            let mut members = Vec::new();
+            if !collapse_state.is_section_collapsed(section.kind) {
+                for member in &section.members {
+                    let member_rect = egui::Rect::from_min_size(
+                        egui::pos2(rect.min.x + padding * 0.6, cursor_y),
+                        egui::vec2(rect.width() - padding, member_row_height),
+                    );
+                    members.push((member, member_rect));
+                    cursor_y += member_row_height;
+                }
+            }
+            cursor_y += padding * 0.2;
+            sections.push(ExportSectionLayout {
+                kind: section.kind,
+                header_rect: section_rect,
+                members,
+            });
+        }
+    }
+
+    ExportNodeLayout {
+        header_rect,
+        sections,
+    }
+}
+
+fn load_export_font() -> Option<fontdue::Font> {
+    let font_dir = find_sourcetrail_fonts_dir()?;
+    let path = font_dir.join("SourceCodePro-Regular.otf");
+    let bytes = std::fs::read(path).ok()?;
+    fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).ok()
+}
+
+fn find_sourcetrail_fonts_dir() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("CODESTORY_FONT_DIR") {
+        let path = std::path::PathBuf::from(dir);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    if let Ok(dir) = std::env::var("CODESTORY_SOURCETRAIL_DIR") {
+        let path = std::path::PathBuf::from(dir)
+            .join("bin")
+            .join("app")
+            .join("data")
+            .join("fonts");
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let mut current = std::env::current_dir().ok()?;
+    for _ in 0..6 {
+        let candidate = current
+            .join("Sourcetrail")
+            .join("bin")
+            .join("app")
+            .join("data")
+            .join("fonts");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn measure_text_width(
+    font: &Option<fontdue::Font>,
+    text: &str,
+    size: f32,
+) -> Option<f32> {
+    let font = font.as_ref()?;
+    let mut layout = Layout::new(CoordinateSystem::PositiveYDown);
+    let mut settings = LayoutSettings::default();
+    settings.x = 0.0;
+    settings.y = 0.0;
+    layout.reset(&settings);
+    layout.append(&[font], &TextStyle::new(text, size, 0));
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    for glyph in layout.glyphs() {
+        min_x = min_x.min(glyph.x);
+        max_x = max_x.max(glyph.x + glyph.width as f32);
+    }
+    if min_x.is_finite() && max_x.is_finite() {
+        Some((max_x - min_x).max(0.0))
+    } else {
+        Some(0.0)
+    }
+}
+
+fn fit_text_size(
+    font: &Option<fontdue::Font>,
+    text: &str,
+    size: f32,
+    max_width: f32,
+    min_size: f32,
+) -> f32 {
+    if max_width <= 0.0 {
+        return size;
+    }
+    let width = measure_text_width(font, text, size).unwrap_or(0.0);
+    if width <= max_width || width <= 0.0 {
+        return size;
+    }
+    let scaled = size * (max_width / width);
+    scaled.max(min_size)
+}
+
+fn draw_text(
+    image: &mut egui::ColorImage,
+    font: &Option<fontdue::Font>,
+    text: &str,
+    size: f32,
+    x: f32,
+    center_y: f32,
+    color: egui::Color32,
+) {
+    let Some(font) = font.as_ref() else {
+        return;
+    };
+    let mut layout = Layout::new(CoordinateSystem::PositiveYDown);
+    let mut settings = LayoutSettings::default();
+    if let Some(metrics) = font.horizontal_line_metrics(size) {
+        let baseline = center_y + (metrics.ascent + metrics.descent) * 0.5;
+        settings.y = baseline - metrics.ascent;
+    } else {
+        settings.y = center_y - size * 0.5;
+    }
+    settings.x = x;
+    layout.reset(&settings);
+    layout.append(&[font], &TextStyle::new(text, size, 0));
+
+    for glyph in layout.glyphs() {
+        if glyph.width == 0 || glyph.height == 0 {
+            continue;
+        }
+        let (metrics, bitmap) = font.rasterize_indexed(glyph.key.glyph_index, glyph.key.px);
+        blend_glyph(
+            image,
+            glyph.x,
+            glyph.y,
+            metrics.width,
+            metrics.height,
+            &bitmap,
+            color,
+        );
+    }
+}
+
+fn blend_glyph(
+    image: &mut egui::ColorImage,
+    x: f32,
+    y: f32,
+    width: usize,
+    height: usize,
+    bitmap: &[u8],
+    color: egui::Color32,
+) {
+    let start_x = x.floor() as i32;
+    let start_y = y.floor() as i32;
+    for row in 0..height {
+        for col in 0..width {
+            let alpha = bitmap[row * width + col];
+            if alpha == 0 {
+                continue;
+            }
+            let px = start_x + col as i32;
+            let py = start_y + row as i32;
+            blend_pixel(image, px, py, color, alpha);
+        }
+    }
+}
+
+fn draw_pill(
+    image: &mut egui::ColorImage,
+    min_x: i32,
+    min_y: i32,
+    max_x: i32,
+    max_y: i32,
+    color: egui::Color32,
+) {
+    let width = (max_x - min_x).max(1);
+    let height = (max_y - min_y).max(1);
+    let radius = (height / 2).min(width / 2).max(1);
+    let mid_left = min_x + radius;
+    let mid_right = max_x - radius;
+    draw_rect_filled(image, mid_left, min_y, mid_right, max_y, color);
+    draw_circle_filled(
+        image,
+        mid_left as f32,
+        (min_y + max_y) as f32 * 0.5,
+        radius as f32,
+        color,
+    );
+    draw_circle_filled(
+        image,
+        mid_right as f32,
+        (min_y + max_y) as f32 * 0.5,
+        radius as f32,
+        color,
+    );
+}
+
+fn draw_circle_filled(
+    image: &mut egui::ColorImage,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    color: egui::Color32,
+) {
+    let r = radius.max(1.0);
+    let r_sq = r * r;
+    let min_x = (cx - r).floor() as i32;
+    let max_x = (cx + r).ceil() as i32;
+    let min_y = (cy - r).floor() as i32;
+    let max_y = (cy + r).ceil() as i32;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            if dx * dx + dy * dy <= r_sq {
+                set_pixel(image, x, y, color);
+            }
+        }
+    }
+}
+
+fn draw_circle_stroke(
+    image: &mut egui::ColorImage,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    thickness: f32,
+    color: egui::Color32,
+) {
+    let r = radius.max(1.0);
+    let t = thickness.max(1.0);
+    let outer = r;
+    let inner = (r - t).max(0.0);
+    let outer_sq = outer * outer;
+    let inner_sq = inner * inner;
+    let min_x = (cx - outer).floor() as i32;
+    let max_x = (cx + outer).ceil() as i32;
+    let min_y = (cy - outer).floor() as i32;
+    let max_y = (cy + outer).ceil() as i32;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            let dist_sq = dx * dx + dy * dy;
+            if dist_sq <= outer_sq && dist_sq >= inner_sq {
+                set_pixel(image, x, y, color);
+            }
+        }
+    }
+}
+
+fn draw_arrow_right(
+    image: &mut egui::ColorImage,
+    cx: f32,
+    cy: f32,
+    size: f32,
+    color: egui::Color32,
+    thickness: f32,
+) {
+    let half = size * 0.5;
+    let line_thickness = thickness.max(1.0).round() as i32;
+    draw_line(
+        image,
+        (cx - half).round() as i32,
+        cy.round() as i32,
+        (cx + half).round() as i32,
+        cy.round() as i32,
+        color,
+        line_thickness,
+    );
+    draw_line(
+        image,
+        (cx + half).round() as i32,
+        cy.round() as i32,
+        (cx + half - size * 0.35).round() as i32,
+        (cy - size * 0.35).round() as i32,
+        color,
+        line_thickness,
+    );
+    draw_line(
+        image,
+        (cx + half).round() as i32,
+        cy.round() as i32,
+        (cx + half - size * 0.35).round() as i32,
+        (cy + size * 0.35).round() as i32,
+        color,
+        line_thickness,
+    );
+}
+
+fn blend_pixel(
+    image: &mut egui::ColorImage,
+    x: i32,
+    y: i32,
+    color: egui::Color32,
+    alpha: u8,
+) {
+    let width = image.size[0] as i32;
+    let height = image.size[1] as i32;
+    if x < 0 || y < 0 || x >= width || y >= height {
+        return;
+    }
+    let idx = (y * width + x) as usize;
+    if let Some(pixel) = image.pixels.get_mut(idx) {
+        let (r, g, b, a) = pixel.to_tuple();
+        let alpha_f = alpha as f32 / 255.0;
+        let src_a = (color.a() as f32 / 255.0) * alpha_f;
+        let inv = 1.0 - src_a;
+        let out_r = (color.r() as f32 * src_a + r as f32 * inv).round() as u8;
+        let out_g = (color.g() as f32 * src_a + g as f32 * inv).round() as u8;
+        let out_b = (color.b() as f32 * src_a + b as f32 * inv).round() as u8;
+        let out_a = ((color.a() as f32 * src_a + a as f32 * inv).round() as u8).max(a);
+        *pixel = egui::Color32::from_rgba_unmultiplied(out_r, out_g, out_b, out_a);
+    }
+}
+
+fn open_containing_folder(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+
+    #[cfg(target_os = "windows")]
+    {
+        let target = path.to_string_lossy().to_string();
+        return std::process::Command::new("explorer")
+            .arg("/select,")
+            .arg(target)
+            .spawn()
+            .is_ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        return std::process::Command::new("open")
+            .arg(parent)
+            .spawn()
+            .is_ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        return std::process::Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .is_ok();
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn open_in_default_app(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+
+    #[cfg(target_os = "windows")]
+    {
+        let target = path.to_string_lossy().to_string();
+        return std::process::Command::new("cmd")
+            .args(["/C", "start", "", &target])
+            .spawn()
+            .is_ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .is_ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .is_ok();
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn ensure_png_extension(path: std::path::PathBuf) -> std::path::PathBuf {
+    if path.extension().is_some() {
+        path
+    } else {
+        path.with_extension("png")
+    }
+}
+
+fn write_color_image_png(
+    path: &std::path::Path,
+    image: &egui::ColorImage,
+) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(image.pixels.len() * 4);
+    for pixel in &image.pixels {
+        let (r, g, b, a) = pixel.to_tuple();
+        bytes.extend_from_slice(&[r, g, b, a]);
+    }
+    image::save_buffer(
+        path,
+        &bytes,
+        image.size[0] as u32,
+        image.size[1] as u32,
+        image::ColorType::Rgba8,
+    )
+    .map_err(|err| err.to_string())
+}
+
+fn draw_rect_filled(
+    image: &mut egui::ColorImage,
+    min_x: i32,
+    min_y: i32,
+    max_x: i32,
+    max_y: i32,
+    color: egui::Color32,
+) {
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            set_pixel(image, x, y, color);
+        }
+    }
+}
+
+fn draw_rect_stroke(
+    image: &mut egui::ColorImage,
+    min_x: i32,
+    min_y: i32,
+    max_x: i32,
+    max_y: i32,
+    color: egui::Color32,
+    thickness: i32,
+) {
+    let thickness = thickness.max(1);
+    for offset in 0..thickness {
+        let y_top = min_y + offset;
+        let y_bottom = max_y - 1 - offset;
+        for x in min_x..max_x {
+            set_pixel(image, x, y_top, color);
+            set_pixel(image, x, y_bottom, color);
+        }
+        let x_left = min_x + offset;
+        let x_right = max_x - 1 - offset;
+        for y in min_y..max_y {
+            set_pixel(image, x_left, y, color);
+            set_pixel(image, x_right, y, color);
+        }
+    }
+}
+
+fn draw_line(
+    image: &mut egui::ColorImage,
+    mut x0: i32,
+    mut y0: i32,
+    x1: i32,
+    y1: i32,
+    color: egui::Color32,
+    thickness: i32,
+) {
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    loop {
+        draw_thick_point(image, x0, y0, color, thickness);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+fn draw_thick_point(
+    image: &mut egui::ColorImage,
+    x: i32,
+    y: i32,
+    color: egui::Color32,
+    thickness: i32,
+) {
+    let radius = (thickness.max(1) - 1) / 2;
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            set_pixel(image, x + dx, y + dy, color);
+        }
+    }
+}
+
+fn set_pixel(image: &mut egui::ColorImage, x: i32, y: i32, color: egui::Color32) {
+    let width = image.size[0] as i32;
+    let height = image.size[1] as i32;
+    if x < 0 || y < 0 || x >= width || y >= height {
+        return;
+    }
+    let idx = (y * width + x) as usize;
+    if let Some(pixel) = image.pixels.get_mut(idx) {
+        *pixel = color;
     }
 }

@@ -2,6 +2,7 @@ use codestory_core::{ErrorFilter, NodeId};
 use codestory_events::{Event, EventBus};
 use codestory_storage::Storage;
 use eframe::egui;
+use egui_phosphor::regular as ph;
 use std::collections::HashMap;
 
 pub struct ErrorPanel {
@@ -67,7 +68,7 @@ impl ErrorPanel {
                     ui.vertical_centered(|ui| {
                         ui.add_space(20.0);
                         ui.label(
-                            egui::RichText::new("✓ No errors found.")
+                            egui::RichText::new(format!("{} No errors found.", ph::CHECK))
                                 .color(egui::Color32::LIGHT_GREEN),
                         );
                     });

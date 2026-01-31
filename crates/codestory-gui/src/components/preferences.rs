@@ -1,4 +1,4 @@
-use crate::settings::{AppSettings, ThemeMode};
+use crate::settings::{AppSettings, PhosphorVariant, ThemeMode, UiFontFamily};
 use eframe::egui;
 
 pub struct PreferencesDialog {
@@ -30,6 +30,8 @@ impl PreferencesDialog {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         ui.label("Theme:");
+                        ui.radio_value(&mut self.temp_settings.theme, ThemeMode::Bright, "Bright");
+                        ui.radio_value(&mut self.temp_settings.theme, ThemeMode::Dark, "Dark");
                         ui.radio_value(&mut self.temp_settings.theme, ThemeMode::Latte, "Latte");
                         ui.radio_value(&mut self.temp_settings.theme, ThemeMode::Frappe, "Frappé");
                         ui.radio_value(
@@ -48,6 +50,60 @@ impl PreferencesDialog {
                         egui::Slider::new(&mut self.temp_settings.font_size, 8.0..=24.0)
                             .text("Font Size"),
                     );
+                    ui.horizontal(|ui| {
+                        ui.label("UI Font:");
+                        egui::ComboBox::from_id_salt("ui_font_family")
+                            .selected_text(format!("{:?}", self.temp_settings.ui_font_family))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.temp_settings.ui_font_family,
+                                    UiFontFamily::SourceCodePro,
+                                    "Source Code Pro",
+                                );
+                                ui.selectable_value(
+                                    &mut self.temp_settings.ui_font_family,
+                                    UiFontFamily::FiraSans,
+                                    "Fira Sans",
+                                );
+                                ui.selectable_value(
+                                    &mut self.temp_settings.ui_font_family,
+                                    UiFontFamily::Roboto,
+                                    "Roboto",
+                                );
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Phosphor Style:");
+                        egui::ComboBox::from_id_salt("phosphor_variant")
+                            .selected_text(format!("{:?}", self.temp_settings.phosphor_variant))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.temp_settings.phosphor_variant,
+                                    PhosphorVariant::Regular,
+                                    "Regular",
+                                );
+                                ui.selectable_value(
+                                    &mut self.temp_settings.phosphor_variant,
+                                    PhosphorVariant::Bold,
+                                    "Bold",
+                                );
+                                ui.selectable_value(
+                                    &mut self.temp_settings.phosphor_variant,
+                                    PhosphorVariant::Fill,
+                                    "Fill",
+                                );
+                                ui.selectable_value(
+                                    &mut self.temp_settings.phosphor_variant,
+                                    PhosphorVariant::Light,
+                                    "Light",
+                                );
+                                ui.selectable_value(
+                                    &mut self.temp_settings.phosphor_variant,
+                                    PhosphorVariant::Thin,
+                                    "Thin",
+                                );
+                            });
+                    });
                     ui.checkbox(&mut self.temp_settings.show_tooltips, "Show Tooltips");
                     ui.checkbox(
                         &mut self.temp_settings.auto_open_last_project,
@@ -61,6 +117,35 @@ impl PreferencesDialog {
                     ui.add(
                         egui::Slider::new(&mut self.temp_settings.animation_speed, 0.0..=2.0)
                             .text("Animation Speed"),
+                    );
+
+                    ui.separator();
+                    ui.label("Graph:");
+                    ui.checkbox(
+                        &mut self.temp_settings.node_graph.show_graph_stats,
+                        "Show graph stats overlay",
+                    );
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.temp_settings.node_graph.lod_points_zoom,
+                            0.1..=0.9,
+                        )
+                        .text("LOD point cloud zoom"),
+                    );
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.temp_settings.node_graph.lod_simplified_zoom,
+                            0.2..=1.5,
+                        )
+                        .text("LOD simplified zoom"),
+                    );
+                    ui.add(
+                        egui::DragValue::new(
+                            &mut self.temp_settings.node_graph.max_full_nodes,
+                        )
+                        .range(50..=20000)
+                        .speed(10)
+                        .prefix("Max full nodes: "),
                     );
                 });
 
@@ -150,7 +235,7 @@ impl PreferencesDialog {
                                 .range(400.0..=1200.0)
                                 .suffix("px"),
                             );
-                            ui.label("×");
+                            ui.label("x");
                             ui.add(
                                 egui::DragValue::new(
                                     &mut self.temp_settings.file_dialog.default_height,
@@ -188,15 +273,7 @@ impl PreferencesDialog {
     fn apply_theme(&self, ctx: &egui::Context, settings: &AppSettings) {
         ctx.set_pixels_per_point(settings.ui_scale);
 
-        // Convert settings to Theme and apply
-        let flavor = match settings.theme {
-            crate::settings::ThemeMode::Latte => catppuccin_egui::LATTE,
-            crate::settings::ThemeMode::Frappe => catppuccin_egui::FRAPPE,
-            crate::settings::ThemeMode::Macchiato => catppuccin_egui::MACCHIATO,
-            crate::settings::ThemeMode::Mocha => catppuccin_egui::MOCHA,
-        };
-
-        let mut theme = crate::theme::Theme::new(flavor);
+        let mut theme = crate::theme::Theme::new(settings.theme);
 
         theme.font_size_base = settings.font_size;
         theme.font_size_small = settings.font_size * 0.85;
@@ -204,6 +281,8 @@ impl PreferencesDialog {
         theme.show_icons = settings.show_icons;
         theme.compact_mode = settings.compact_mode;
         theme.animation_speed = settings.animation_speed;
+        theme.ui_font_family = settings.ui_font_family;
+        theme.phosphor_variant = settings.phosphor_variant;
 
         theme.apply(ctx);
     }

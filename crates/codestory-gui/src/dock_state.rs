@@ -5,6 +5,7 @@
 //! and tab reordering.
 
 use egui_dock::{DockState as EguiDockState, NodeIndex};
+use egui_phosphor::regular as ph;
 use serde::{Deserialize, Serialize};
 
 /// Tab identifier for CodeStory panels.
@@ -55,16 +56,16 @@ impl TabId {
     /// Get the icon for this tab.
     pub fn icon(&self) -> &'static str {
         match self {
-            TabId::Code => "📄",
-            TabId::Graph => "🔀",
-            TabId::Details => "ℹ️",
-            TabId::Errors => "⚠️",
-            TabId::Bookmarks => "🔖",
-            TabId::Metrics => "📊",
-            TabId::ProjectTree => "📁",
-            TabId::TrailControls => "🛤️",
-            TabId::Overview => "👁️",
-            TabId::Snippets => "📑",
+            TabId::Code => ph::FILE_CODE,
+            TabId::Graph => ph::GRAPH,
+            TabId::Details => ph::INFO,
+            TabId::Errors => ph::WARNING,
+            TabId::Bookmarks => ph::BOOKMARK,
+            TabId::Metrics => ph::CHART_BAR,
+            TabId::ProjectTree => ph::FOLDER,
+            TabId::TrailControls => ph::PATH,
+            TabId::Overview => ph::EYE,
+            TabId::Snippets => ph::NOTE,
         }
     }
 
@@ -317,7 +318,7 @@ mod tests {
     #[test]
     fn test_tab_display() {
         assert_eq!(TabId::Code.title(), "Code");
-        assert_eq!(TabId::Code.icon(), "📄");
+        assert_eq!(TabId::Code.icon(), ph::FILE_CODE);
         assert!(TabId::Code.display_title().contains("Code"));
     }
 }

@@ -1,6 +1,7 @@
 use crate::theme::{self, badge};
 use codestory_core::NodeId;
 use eframe::egui;
+use egui_phosphor::regular as ph;
 
 /// A search result item for autocomplete
 #[derive(Debug, Clone)]
@@ -80,7 +81,7 @@ impl SearchBar {
         let mut input_rect = egui::Rect::NOTHING;
 
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("🔍").color(ui.visuals().selection.bg_fill));
+            ui.label(egui::RichText::new(ph::MAGNIFYING_GLASS).color(ui.visuals().selection.bg_fill));
 
             // Text input
             let response = ui.add(
@@ -272,7 +273,7 @@ impl SearchBar {
                                                     .min(5);
                                                 if stars > 0 {
                                                     ui.label(
-                                                        egui::RichText::new("★".repeat(stars))
+                                                        egui::RichText::new(ph::STAR.repeat(stars))
                                                             .small()
                                                             .color(ui.visuals().warn_fg_color),
                                                     );

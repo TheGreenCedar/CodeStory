@@ -66,7 +66,7 @@ pub struct SelectedEdgeInfo {
 /// Renders edges as a custom overlay on top (or behind) the graph nodes.
 ///
 /// This component is responsible for drawing bezier curves, arrowheads, and
-/// handling edge bundling visualization. It bypasses the built-in snarl wire
+/// handling edge bundling visualization. It bypasses the default wire rendering
 /// rendering to provide Sourcetrail-like visuals.
 ///
 /// Phase 8 additions:
@@ -125,7 +125,7 @@ pub struct EdgeOverlay {
     /// **Validates: Requirement 11.2**
     pub hit_tolerance: f32,
 
-    /// Node name lookup populated each frame from the snarl graph.
+    /// Node name lookup populated each frame from the graph data.
     /// Maps NodeId to the display label for tooltips.
     node_labels: HashMap<NodeId, String>,
 }
@@ -180,6 +180,19 @@ impl EdgeOverlay {
     #[allow(dead_code)]
     pub fn clear_selection(&mut self) {
         self.selected_edge = None;
+    }
+
+    pub fn hovered_edge_info(&self) -> Option<&EdgeHitInfo> {
+        self.hovered_edge_index
+            .and_then(|idx| self.edge_hit_infos.get(idx))
+    }
+
+    pub fn clear_frame_state(&mut self) {
+        self.bundle_midpoints.clear();
+        self.hovered_bundle = None;
+        self.edge_hit_infos.clear();
+        self.highlighted_nodes.clear();
+        self.hovered_edge_index = None;
     }
 
     /// Hit test: find the closest edge to the given screen-space point.
@@ -515,8 +528,10 @@ impl EdgeOverlay {
                 .route_edge(to_graph_rect(source_rect), to_graph_rect(target_rect));
 
             // Use proper color and width from style system (logarithmic thickness)
-            let color = style_resolver.resolve_edge_color(dominant_kind);
-            let width = style::edge_width(dominant_kind, count);
+            let edge_color = style_resolver.resolve_edge_color(dominant_kind);
+            let bundle_color = style_resolver.resolve_bundled_edge_color();
+            let color = mix_color(edge_color, bundle_color, 0.35);
+            let width = style::edge_width(dominant_kind, count) * style_resolver.edge_width_scale();
             let stroke = Stroke::new(width, color);
 
             // Project to screen space
@@ -540,7 +555,7 @@ impl EdgeOverlay {
                 x: end.x - t_start.x,
                 y: end.y - t_start.y,
             };
-            self.draw_scaled_arrowhead(fg_painter, end, tangent, color, 8.0, 4.0);
+            self.draw_scaled_arrowhead(fg_painter, end, tangent, color, 7.0, 3.0);
 
             // --- Count badge (Req 14.2, Property 30) ---
             // Place badge at the midpoint of the curve (t=0.5), but
@@ -559,7 +574,7 @@ impl EdgeOverlay {
                 source_rect_screen,
                 target_rect_screen,
             );
-            self.draw_count_badge(fg_painter, badge_center, count, color);
+            self.draw_count_badge(fg_painter, badge_center, count, bundle_color);
 
             // Store midpoint for hover/click detection
             let relationships: Vec<(codestory_core::EdgeKind, String, String)> = bundle
@@ -599,7 +614,8 @@ impl EdgeOverlay {
                     .route_edge(to_graph_rect(source_rect), to_graph_rect(target_rect));
 
                 let color = style_resolver.resolve_edge_color(edge.kind);
-                let width = style::edge_width(edge.kind, 1);
+                let width =
+                    style::edge_width(edge.kind, 1) * style_resolver.edge_width_scale();
                 let stroke = Stroke::new(width, color);
 
                 let start = to_screen(curve.start);
@@ -622,7 +638,7 @@ impl EdgeOverlay {
                     x: end.x - t_start.x,
                     y: end.y - t_start.y,
                 };
-                self.draw_scaled_arrowhead(fg_painter, end, tangent, color, 8.0, 4.0);
+                self.draw_scaled_arrowhead(fg_painter, end, tangent, color, 7.0, 3.0);
 
                 // Store hit info for this individual edge (Task 9.1)
                 let screen_curve = CubicBezier {
@@ -664,7 +680,9 @@ impl EdgeOverlay {
                         _ => 0,
                     })
                     .unwrap_or(codestory_core::EdgeKind::MEMBER);
-                let color = style_resolver.resolve_edge_color(dominant_kind);
+                let edge_color = style_resolver.resolve_edge_color(dominant_kind);
+                let bundle_color = style_resolver.resolve_bundled_edge_color();
+                let color = mix_color(edge_color, bundle_color, 0.35);
 
                 let source_rect_screen = transform * source_rect;
                 let target_rect_screen = transform * target_rect;
@@ -776,7 +794,13 @@ impl EdgeOverlay {
     /// placed at the midpoint of the bundled edge curve.
     ///
     /// **Validates: Requirements 14.2, Property 30: Edge Bundle Count Badge**
-    fn draw_count_badge(&self, painter: &Painter, center: Pos2, count: usize, edge_color: Color32) {
+    fn draw_count_badge(
+        &self,
+        painter: &Painter,
+        center: Pos2,
+        count: usize,
+        badge_color: Color32,
+    ) {
         let text = format!("{}", count);
         let font_id = FontId::proportional(10.0);
         let text_color = Color32::WHITE;
@@ -789,9 +813,9 @@ impl EdgeOverlay {
 
         // Draw badge background (darker version of edge color)
         let bg_color = Color32::from_rgba_unmultiplied(
-            (edge_color.r() as f32 * 0.5) as u8,
-            (edge_color.g() as f32 * 0.5) as u8,
-            (edge_color.b() as f32 * 0.5) as u8,
+            (badge_color.r() as f32 * 0.5) as u8,
+            (badge_color.g() as f32 * 0.5) as u8,
+            (badge_color.b() as f32 * 0.5) as u8,
             220,
         );
 
@@ -799,7 +823,7 @@ impl EdgeOverlay {
         painter.rect_stroke(
             badge_rect,
             badge_radius,
-            Stroke::new(1.0, edge_color),
+            Stroke::new(1.0, badge_color),
             egui::StrokeKind::Outside,
         );
 
@@ -829,6 +853,22 @@ impl EdgeOverlay {
             Stroke::NONE,
         ));
     }
+}
+
+fn mix_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let (ar, ag, ab, aa) = a.to_tuple();
+    let (br, bg, bb, ba) = b.to_tuple();
+    let lerp = |x: u8, y: u8| -> u8 {
+        ((x as f32 * (1.0 - t) + y as f32 * t).round() as i32)
+            .clamp(0, 255) as u8
+    };
+    Color32::from_rgba_unmultiplied(
+        lerp(ar, br),
+        lerp(ag, bg),
+        lerp(ab, bb),
+        lerp(aa, ba),
+    )
 }
 
 #[cfg(test)]

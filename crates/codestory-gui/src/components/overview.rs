@@ -1,6 +1,7 @@
 use crate::theme::spacing;
 use codestory_storage::StorageStats;
 use eframe::egui;
+use egui_phosphor::regular as ph;
 
 pub struct ProjectOverview {
     pub project_name: String,
@@ -37,10 +38,10 @@ impl ProjectOverview {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 20.0;
 
-                    self.stat_card(ui, "📄", "Files", stats.file_count);
-                    self.stat_card(ui, "🧬", "Symbols", stats.node_count);
-                    self.stat_card(ui, "🔗", "Edges", stats.edge_count);
-                    self.stat_card(ui, "⚠️", "Errors", stats.error_count);
+                    self.stat_card(ui, ph::FILE, "Files", stats.file_count);
+                    self.stat_card(ui, ph::ATOM, "Symbols", stats.node_count);
+                    self.stat_card(ui, ph::LINK, "Edges", stats.edge_count);
+                    self.stat_card(ui, ph::WARNING, "Errors", stats.error_count);
                 });
             } else {
                 ui.spinner();
@@ -53,15 +54,24 @@ impl ProjectOverview {
                 ui.heading("Quick Actions");
                 ui.add_space(spacing::ITEM_SPACING);
 
-                if ui.button("🔍 Search Symbols (Ctrl+P)").clicked() {
+                if ui
+                    .button(format!("{} Search Symbols (Ctrl+P)", ph::MAGNIFYING_GLASS))
+                    .clicked()
+                {
                     // This could trigger an event
                 }
 
-                if ui.button("🗂 Browse Symbol Hierarchy").clicked() {
+                if ui
+                    .button(format!("{} Browse Symbol Hierarchy", ph::TREE_VIEW))
+                    .clicked()
+                {
                     // This could trigger an event
                 }
 
-                if ui.button("🛠 Project Settings").clicked() {
+                if ui
+                    .button(format!("{} Project Settings", ph::GEAR))
+                    .clicked()
+                {
                     // This could trigger an event
                 }
             });

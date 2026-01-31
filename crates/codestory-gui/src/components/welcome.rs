@@ -1,6 +1,7 @@
 use crate::components::file_dialog::{FileDialogManager, FileDialogPresets};
 use crate::theme::{self, spacing};
 use eframe::egui;
+use egui_phosphor::regular as ph;
 use std::path::PathBuf;
 
 pub struct WelcomeScreen {
@@ -35,13 +36,14 @@ impl WelcomeScreen {
                 egui::RichText::new("Modern Source Code Explorer").color(ui.visuals().text_color()),
             );
             ui.add_space(20.0);
-            ui.add(theme::large_icon_button("ℹ"))
+            ui.add(theme::large_icon_button(ph::INFO))
                 .on_hover_text("About CodeStory");
             ui.add_space(10.0);
 
+            let open_label = format!("{} Open Project Folder", ph::FOLDER_OPEN);
             if ui
                 .add(
-                    theme::primary_button(ui, "📂 Open Project Folder")
+                    theme::primary_button(ui, &open_label)
                         .min_size(egui::vec2(200.0, 40.0)),
                 )
                 .clicked()
@@ -63,7 +65,7 @@ impl WelcomeScreen {
                 if self.recent_projects.is_empty() {
                     theme::empty_state(
                         ui,
-                        "📂",
+                        ph::FOLDER_OPEN,
                         "No Recent Projects",
                         "Open a project folder to get started",
                     );
@@ -76,7 +78,8 @@ impl WelcomeScreen {
 
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new("📁").color(ui.visuals().selection.bg_fill),
+                                egui::RichText::new(ph::FOLDER)
+                                    .color(ui.visuals().selection.bg_fill),
                             );
                             if ui.link(&display_name).clicked() {
                                 action = Some(WelcomeAction::OpenRecent(path.clone()));

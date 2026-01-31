@@ -7,6 +7,10 @@ pub struct AppSettings {
     pub theme: ThemeMode,
     pub ui_scale: f32,
     pub font_size: f32,
+    #[serde(default = "default_ui_font_family")]
+    pub ui_font_family: UiFontFamily,
+    #[serde(default = "default_phosphor_variant")]
+    pub phosphor_variant: PhosphorVariant,
     pub show_tooltips: bool,
     pub auto_save_interval_secs: u64,
     // Theme customization
@@ -72,23 +76,26 @@ fn default_auto_open_last_project() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThemeMode {
     #[serde(alias = "Light")]
+    Bright,
+    #[serde(alias = "Dark")]
+    Dark,
     Latte,
     Frappe,
     Macchiato,
-    #[default]
-    #[serde(alias = "Dark")]
     Mocha,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            theme: ThemeMode::Mocha,
+            theme: ThemeMode::Bright,
             ui_scale: 1.0,
             font_size: 14.0,
+            ui_font_family: UiFontFamily::SourceCodePro,
+            phosphor_variant: PhosphorVariant::Regular,
             show_tooltips: true,
             auto_save_interval_secs: 30,
             show_icons: true,
@@ -104,6 +111,30 @@ impl Default for AppSettings {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UiFontFamily {
+    SourceCodePro,
+    FiraSans,
+    Roboto,
+}
+
+fn default_ui_font_family() -> UiFontFamily {
+    UiFontFamily::SourceCodePro
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PhosphorVariant {
+    Regular,
+    Bold,
+    Fill,
+    Light,
+    Thin,
+}
+
+fn default_phosphor_variant() -> PhosphorVariant {
+    PhosphorVariant::Regular
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeGraphSettings {
     pub max_depth: usize,
@@ -111,6 +142,14 @@ pub struct NodeGraphSettings {
     pub show_connection_labels: bool,
     pub group_by_file: bool,
     pub group_by_namespace: bool,
+    #[serde(default = "default_lod_points_zoom")]
+    pub lod_points_zoom: f32,
+    #[serde(default = "default_lod_simplified_zoom")]
+    pub lod_simplified_zoom: f32,
+    #[serde(default = "default_max_full_nodes")]
+    pub max_full_nodes: usize,
+    #[serde(default)]
+    pub show_graph_stats: bool,
     #[serde(default)]
     pub layout_algorithm: codestory_events::LayoutAlgorithm,
     #[serde(default)]
@@ -138,6 +177,18 @@ fn default_true() -> bool {
     true
 }
 
+fn default_lod_points_zoom() -> f32 {
+    0.4
+}
+
+fn default_lod_simplified_zoom() -> f32 {
+    0.8
+}
+
+fn default_max_full_nodes() -> usize {
+    800
+}
+
 // LayoutAlgorithm moved to codestory-events
 
 impl Default for NodeGraphSettings {
@@ -148,6 +199,10 @@ impl Default for NodeGraphSettings {
             show_connection_labels: true,
             group_by_file: true,
             group_by_namespace: true,
+            lod_points_zoom: default_lod_points_zoom(),
+            lod_simplified_zoom: default_lod_simplified_zoom(),
+            max_full_nodes: default_max_full_nodes(),
+            show_graph_stats: false,
             layout_algorithm: codestory_events::LayoutAlgorithm::default(),
             layout_direction: LayoutDirection::default(),
             show_classes: true,

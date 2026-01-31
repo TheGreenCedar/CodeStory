@@ -1,6 +1,7 @@
 //! Metrics Panel - Visualizations for codebase metrics using egui_plot
 
 use eframe::egui;
+use egui_phosphor::regular as ph;
 use egui_plot::{Bar, BarChart, Legend, Plot, PlotPoints};
 use serde::{Deserialize, Serialize};
 
@@ -224,22 +225,30 @@ impl MetricsPanel {
     pub fn render(&mut self, ui: &mut egui::Ui) {
         // View selector
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.current_view, MetricView::Overview, "📊 Overview");
+            ui.selectable_value(
+                &mut self.current_view,
+                MetricView::Overview,
+                format!("{} Overview", ph::CHART_BAR),
+            );
             ui.selectable_value(
                 &mut self.current_view,
                 MetricView::FileSizes,
-                "📄 File Sizes",
+                format!("{} File Sizes", ph::FILE),
             );
             ui.selectable_value(
                 &mut self.current_view,
                 MetricView::Complexity,
-                "🔀 Complexity",
+                format!("{} Complexity", ph::GRAPH),
             );
-            ui.selectable_value(&mut self.current_view, MetricView::Coupling, "🔗 Coupling");
+            ui.selectable_value(
+                &mut self.current_view,
+                MetricView::Coupling,
+                format!("{} Coupling", ph::LINK),
+            );
             ui.selectable_value(
                 &mut self.current_view,
                 MetricView::Distribution,
-                "📈 Distribution",
+                format!("{} Distribution", ph::CHART_LINE_UP),
             );
         });
 
@@ -422,7 +431,13 @@ impl MetricsPanel {
                 for file in coupled_files {
                     ui.horizontal(|ui| {
                         ui.label(Self::shorten_path(&file.file_path, 40));
-                        ui.label(format!("→{} ←{}", file.dependencies, file.dependents));
+                        ui.label(format!(
+                            "{}{} {}{}",
+                            ph::ARROW_RIGHT,
+                            file.dependencies,
+                            ph::ARROW_LEFT,
+                            file.dependents
+                        ));
                     });
                 }
             });

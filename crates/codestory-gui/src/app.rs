@@ -2,9 +2,11 @@ use codestory_core::{NodeId, NodeKind, SourceLocation};
 use codestory_search::SearchEngine;
 use codestory_storage::Storage;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::components::{
     bookmark_panel::BookmarkPanel,
+    code_view::CodeViewMode,
     code_view::enhanced::EnhancedCodeView,
     code_view::multi_file::MultiFileCodeView,
     commands::{AppState, CommandHistory},
@@ -40,6 +42,7 @@ use crate::theme::Theme;
 use codestory_events::EventListener;
 use codestory_events::{ActivationOrigin, Event, EventBus};
 use egui_dock::DockArea;
+use egui_phosphor::regular as ph;
 
 struct SearchResultItem {
     id: NodeId,
@@ -83,6 +86,7 @@ pub struct CodeStoryApp {
     search_bar: SearchBar,
     sidebar: Sidebar,
     code_view: EnhancedCodeView,
+    code_view_mode: CodeViewMode,
     snippet_view: MultiFileCodeView,
     node_graph_view: NodeGraphView,
     detail_panel: DetailPanel,
@@ -114,21 +118,16 @@ pub struct CodeStoryApp {
     // Initialization flag - ensures theme is applied on first update() frame
     needs_initial_theme_apply: bool,
     auto_open_attempted: bool,
+    last_settings_save: Instant,
 }
 
 impl CodeStoryApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let settings = AppSettings::load();
 
-        let flavor = match settings.theme {
-            crate::settings::ThemeMode::Latte => catppuccin_egui::LATTE,
-            crate::settings::ThemeMode::Frappe => catppuccin_egui::FRAPPE,
-            crate::settings::ThemeMode::Macchiato => catppuccin_egui::MACCHIATO,
-            crate::settings::ThemeMode::Mocha => catppuccin_egui::MOCHA,
-        };
-        let mut theme = Theme::new(flavor);
+        let mut theme = Theme::new(settings.theme);
         tracing::info!(
-            "Applying initial theme flavor: {:?} with scale {} and font {}",
+            "Applying initial theme mode: {:?} with scale {} and font {}",
             settings.theme,
             settings.ui_scale,
             settings.font_size
@@ -139,6 +138,8 @@ impl CodeStoryApp {
         theme.show_icons = settings.show_icons;
         theme.compact_mode = settings.compact_mode;
         theme.animation_speed = settings.animation_speed;
+        theme.ui_font_family = settings.ui_font_family;
+        theme.phosphor_variant = settings.phosphor_variant;
 
         theme.apply(&_cc.egui_ctx);
         tracing::info!("Theme applied to context");
@@ -174,6 +175,7 @@ impl CodeStoryApp {
                 cv.event_bus = Some(event_bus.clone());
                 cv
             },
+            code_view_mode: CodeViewMode::SingleFile,
             snippet_view: MultiFileCodeView::new(),
             node_graph_view: NodeGraphView::new(event_bus.clone()),
             detail_panel: DetailPanel::new(),
@@ -205,6 +207,7 @@ impl CodeStoryApp {
             activation_controller: ActivationController::new(event_bus),
             needs_initial_theme_apply: true,
             auto_open_attempted: false,
+            last_settings_save: Instant::now(),
         }
     }
 
@@ -394,7 +397,7 @@ impl CodeStoryApp {
                 let label = if file_label.is_empty() {
                     format!("{} ({})", name, kind_label)
                 } else {
-                    format!("{} ({}) — {}", name, kind_label, file_label)
+                    format!("{} ({}) - {}", name, kind_label, file_label)
                 };
 
                 SearchResultItem { id, label }
@@ -586,16 +589,21 @@ impl CodeStoryApp {
             // Update Code View
             match storage.get_occurrences_for_node(id) {
                 Ok(occs) => {
-                    self.reference_list.set_data(occs.clone());
+                    let active_occ = occs
+                        .iter()
+                        .find(|occ| matches!(occ.kind, codestory_core::OccurrenceKind::DEFINITION))
+                        .cloned()
+                        .or_else(|| occs.first().cloned());
+                    let active_file = active_occ.as_ref().map(|occ| occ.location.file_node_id);
 
-                    if let Some(occ) = occs.first() {
-                        let file_id = occ.location.file_node_id;
+                    self.reference_list.set_data(occs.clone(), active_file);
 
-                        // Filter locations for the target file (for highlighting)
-                        let file_locs: Vec<_> = occs
+                    if let Some(active_occ) = active_occ.as_ref() {
+                        let file_id = active_occ.location.file_node_id;
+                        let file_occs: Vec<_> = occs
                             .iter()
                             .filter(|o| o.location.file_node_id == file_id)
-                            .map(|o| o.location.clone())
+                            .cloned()
                             .collect();
 
                         match storage.get_node(file_id) {
@@ -606,19 +614,12 @@ impl CodeStoryApp {
                                         self.code_view.set_file(
                                             path_str,
                                             content,
-                                            occ.location.start_line as usize,
+                                            active_occ.location.start_line as usize,
                                         );
 
-                                        // TODO: Load only occurrences for the SELECTED symbol, not all
-                                        // file occurrences. Commented out until proper filtering is added.
-                                        // if let Ok(all_file_occs) =
-                                        //     storage.get_occurrences_for_file(file_id)
-                                        // {
-                                        //     self.code_view.set_occurrences(all_file_occs);
-                                        // }
-
-                                        // Also highlight the location
-                                        self.code_view.active_locations = file_locs;
+                                        self.code_view.active_locations =
+                                            vec![active_occ.location.clone()];
+                                        self.code_view.occurrences = file_occs;
                                         self.sidebar.set_selected_path(std::path::PathBuf::from(
                                             &self.code_view.path,
                                         ));
@@ -630,6 +631,51 @@ impl CodeStoryApp {
                             Ok(None) => tracing::warn!("File node not found for id {}", file_id),
                             Err(e) => tracing::error!("Error fetching file node: {}", e),
                         }
+                    }
+
+                    self.snippet_view.clear();
+                    if !occs.is_empty() {
+                        let mut file_paths: HashMap<NodeId, std::path::PathBuf> = HashMap::new();
+                        for occ in &occs {
+                            let file_id = occ.location.file_node_id;
+                            if !file_paths.contains_key(&file_id) {
+                                if let Ok(Some(file_node)) = storage.get_node(file_id) {
+                                    let path = std::path::PathBuf::from(
+                                        file_node.serialized_name.clone(),
+                                    );
+                                    if path.exists()
+                                        && let Ok(content) = std::fs::read_to_string(&path)
+                                    {
+                                        self.snippet_view.add_file(
+                                            path.clone(),
+                                            content,
+                                            Some(file_id),
+                                        );
+                                        file_paths.insert(file_id, path);
+                                    }
+                                }
+                            }
+
+                            if let Some(path) = file_paths.get(&file_id) {
+                                self.snippet_view.add_occurrence(path, occ.clone());
+                            }
+                        }
+
+                        if let Some(active_occ) = active_occ.as_ref() {
+                            self.snippet_view.set_focus(active_occ.location.clone());
+                        }
+
+                        if let Ok(errors) = storage.get_errors(None) {
+                            let mut counts = HashMap::new();
+                            for error in errors {
+                                if let Some(file_id) = error.file_id {
+                                    *counts.entry(file_id).or_insert(0) += 1;
+                                }
+                            }
+                            self.snippet_view.set_error_counts(counts);
+                        }
+
+                        self.snippet_view.sort_files_by_references();
                     }
                 }
                 Err(e) => tracing::error!("Failed to get occurrences: {}", e),
@@ -685,6 +731,7 @@ impl eframe::App for CodeStoryApp {
                 let _ = std::fs::write(state_path, data);
             }
         }
+        self.settings.save();
 
         // Log panel state
         tracing::info!("Exiting with DockState: {:?}", self.dock_state.open_tabs());
@@ -695,19 +742,12 @@ impl eframe::App for CodeStoryApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Theme Management - apply on first frame or when flavor changes
-        let target_flavor = match self.settings.theme {
-            crate::settings::ThemeMode::Latte => catppuccin_egui::LATTE,
-            crate::settings::ThemeMode::Frappe => catppuccin_egui::FRAPPE,
-            crate::settings::ThemeMode::Macchiato => catppuccin_egui::MACCHIATO,
-            crate::settings::ThemeMode::Mocha => catppuccin_egui::MOCHA,
-        };
-
-        if self.needs_initial_theme_apply || self.theme.flavor != target_flavor {
+        if self.needs_initial_theme_apply || self.theme.mode != self.settings.theme {
             tracing::info!(
-                "Applying theme on first frame or flavor change: {:?}",
+                "Applying theme on first frame or mode change: {:?}",
                 self.settings.theme
             );
-            self.theme = Theme::new(target_flavor);
+            self.theme = Theme::new(self.settings.theme);
             // Sync all settings to theme
             self.theme.font_size_base = self.settings.font_size;
             self.theme.font_size_small = self.settings.font_size * 0.85;
@@ -715,6 +755,7 @@ impl eframe::App for CodeStoryApp {
             self.theme.show_icons = self.settings.show_icons;
             self.theme.compact_mode = self.settings.compact_mode;
             self.theme.animation_speed = self.settings.animation_speed;
+            self.theme.ui_font_family = self.settings.ui_font_family;
             self.theme.apply(ctx);
             ctx.set_pixels_per_point(self.settings.ui_scale);
             self.needs_initial_theme_apply = false;
@@ -750,6 +791,20 @@ impl eframe::App for CodeStoryApp {
                 || (i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Z))
         }) {
             self.event_bus.publish(Event::Redo);
+        }
+        let f3_pressed = ctx.input(|i| i.key_pressed(egui::Key::F3));
+        if f3_pressed {
+            let reverse = ctx.input(|i| i.modifiers.shift);
+            let occ = if reverse {
+                self.reference_list.prev_occurrence()
+            } else {
+                self.reference_list.next_occurrence()
+            };
+            if let Some(occ) = occ {
+                self.event_bus.publish(Event::ShowReference {
+                    location: occ.location,
+                });
+            }
         }
         for i in 0..9 {
             let key = match i {
@@ -819,7 +874,14 @@ impl eframe::App for CodeStoryApp {
         // (Panels are now in the DockArea)
 
         // Custom Trail Dialog
-        if self.custom_trail_dialog.is_open && self.custom_trail_dialog.ui(ctx, &self.event_bus) {
+        if self.custom_trail_dialog.is_open
+            && self.custom_trail_dialog.ui(
+                ctx,
+                &self.event_bus,
+                self.search_engine.as_mut(),
+                self.storage.as_ref(),
+            )
+        {
             // User clicked "Start Trail"
             if let Some(config) = self.custom_trail_dialog.build_config() {
                 // Start the trail
@@ -983,7 +1045,7 @@ impl eframe::App for CodeStoryApp {
                             self.tab_manager
                                 .active_tab()
                                 .is_some_and(|t| t.history.can_go_back()),
-                            egui::Button::new("⬅"),
+                            egui::Button::new(ph::ARROW_LEFT),
                         )
                         .clicked()
                     {
@@ -994,11 +1056,53 @@ impl eframe::App for CodeStoryApp {
                             self.tab_manager
                                 .active_tab()
                                 .is_some_and(|t| t.history.can_go_forward()),
-                            egui::Button::new("➡"),
+                            egui::Button::new(ph::ARROW_RIGHT),
                         )
                         .clicked()
                     {
                         self.event_bus.publish(Event::HistoryForward);
+                    }
+
+                    let mut jump_to_index = None;
+                    if let Some(tab) = self.tab_manager.active_tab_mut() {
+                        let history_response =
+                            ui.menu_button(ph::CLOCK_COUNTER_CLOCKWISE, |ui| {
+                                let entries = tab.history.entries();
+                                let current = tab.history.current_index();
+                                if entries.is_empty() {
+                                    ui.label("No history yet");
+                                    return;
+                                }
+                                for (idx, entry) in entries.iter().enumerate() {
+                                    let label = entry
+                                        .node_ids
+                                        .first()
+                                        .and_then(|id| self.node_names.get(id))
+                                        .cloned()
+                                        .unwrap_or_else(|| "Unknown".to_string());
+                                    if ui
+                                        .selectable_label(current == Some(idx), label)
+                                        .clicked()
+                                    {
+                                        jump_to_index = Some(idx);
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        history_response
+                            .response
+                            .on_hover_text("History");
+
+                        if let Some(index) = jump_to_index {
+                            if let Some(entry) = tab.history.jump_to(index)
+                                && let Some(node_id) = entry.node_ids.first().cloned()
+                            {
+                                self.event_bus.publish(Event::ActivateNode {
+                                    id: node_id,
+                                    origin: ActivationOrigin::Search,
+                                });
+                            }
+                        }
                     }
                 });
 
@@ -1036,6 +1140,18 @@ impl eframe::App for CodeStoryApp {
                         self.search_bar.clear_suggestions();
                     }
                     SearchAction::None => {}
+                }
+
+                ui.separator();
+                if ui
+                    .button(ph::ARROW_CLOCKWISE)
+                    .on_hover_text("Refresh Index")
+                    .clicked()
+                {
+                    self.start_indexing();
+                }
+                if ui.button(ph::EYE).on_hover_text("Overview").clicked() {
+                    self.dock_state.focus_tab(crate::dock_state::TabId::Overview);
                 }
             });
 
@@ -1125,9 +1241,11 @@ impl eframe::App for CodeStoryApp {
 
         // Right Panel and Central Panel replaced by DockArea
         egui::CentralPanel::default().show(ctx, |ui| {
+            let mut settings_dirty = false;
             let mut tab_viewer = CodeStoryTabViewer {
                 theme: &self.theme,
                 code_view: &mut self.code_view,
+                code_view_mode: &mut self.code_view_mode,
                 snippet_view: &mut self.snippet_view,
                 detail_panel: &mut self.detail_panel,
                 bookmark_panel: &mut self.bookmark_panel,
@@ -1141,12 +1259,18 @@ impl eframe::App for CodeStoryApp {
                 event_bus: &self.event_bus,
                 metrics_panel: &mut self.metrics_panel,
                 node_graph_view: &mut self.node_graph_view,
-                settings: &self.settings,
+                settings: &mut self.settings,
+                settings_dirty: &mut settings_dirty,
             };
 
             DockArea::new(self.dock_state.dock_state_mut())
                 .style(crate::theme::dock_style(ctx))
                 .show_inside(ui, &mut tab_viewer);
+
+            if settings_dirty && self.last_settings_save.elapsed() >= Duration::from_millis(500) {
+                self.settings.save();
+                self.last_settings_save = Instant::now();
+            }
         });
 
         // Execute navigation if any removed (handled by events)
@@ -1173,6 +1297,7 @@ impl codestory_events::EventListener for CodeStoryApp {
                     settings,
                     &mut self.tab_manager,
                     &mut self.code_view,
+                    &mut self.snippet_view,
                     &mut self.node_graph_view,
                     &mut self.detail_panel,
                     &mut self.reference_list,
@@ -1262,6 +1387,26 @@ impl codestory_events::EventListener for CodeStoryApp {
                     self.select_node(id);
                 }
             }
+            Event::ShowReference { location } => {
+                if let Some(storage) = &self.storage {
+                    let file_id = location.file_node_id;
+                    if let Ok(Some(file_node)) = storage.get_node(file_id) {
+                        let path = std::path::PathBuf::from(file_node.serialized_name.clone());
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            self.code_view.show_location(
+                                file_node.serialized_name,
+                                content,
+                                location.clone(),
+                            );
+                            self.code_view.occurrences =
+                                self.reference_list.occurrences_for_file(file_id);
+                            self.reference_list.set_active_file(Some(file_id));
+                            self.snippet_view.set_focus(location.clone());
+                            self.sidebar.set_selected_path(path);
+                        }
+                    }
+                }
+            }
             Event::ScrollToLine { file, line } => {
                 if let Ok(content) = std::fs::read_to_string(file) {
                     let location = SourceLocation {
@@ -1276,6 +1421,8 @@ impl codestory_events::EventListener for CodeStoryApp {
                         content,
                         location,
                     );
+                    self.reference_list.set_active_file(None);
+                    self.sidebar.set_selected_path(file.clone());
                 }
             }
             Event::TooltipShow { info, x, y } => {
@@ -1319,9 +1466,12 @@ impl codestory_events::EventListener for CodeStoryApp {
                     }
                 }
             }
+            Event::BookmarkAddDefault { node_id } => {
+                self.bookmark_panel.add_bookmark_to_default(*node_id);
+            }
             Event::TrailModeEnter { root_id } => {
                 self.show_trail_view = true;
-                self.trail_controls.activate(*root_id);
+                self.trail_controls.activate_from_event(*root_id);
                 if let Some(storage) = &self.storage
                     && let Some(config) = self.trail_controls.config.to_trail_config()
                 {
@@ -1416,7 +1566,7 @@ impl codestory_events::EventListener for CodeStoryApp {
                 }
             }
             Event::GraphNodeMove { .. } => {
-                // Handled via Snarl within NodeGraphView
+                // Handled within NodeGraphView
             }
             Event::GraphNodeExpand { id, expand } => {
                 let mut state = self.settings.node_graph.view_state.get_collapse_state(*id);
@@ -1609,6 +1759,14 @@ impl codestory_events::EventListener for CodeStoryApp {
                 self.settings.node_graph.show_legend = *visible;
                 self.settings.save();
                 // No need to reload data for legend toggle
+            }
+            Event::OpenCustomTrailDialog => {
+                if let Some(id) = self.tab_manager.active_tab().and_then(|t| t.active_node) {
+                    let name = self.node_names.get(&id).cloned();
+                    self.custom_trail_dialog.open_with_root(id, name);
+                } else {
+                    self.custom_trail_dialog.open();
+                }
             }
             Event::NavigateToNode(id) => {
                 self.select_node(*id);

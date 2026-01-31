@@ -63,9 +63,14 @@ impl TrailViewControls {
 
     /// Activate trail mode from a specific node
     pub fn activate(&mut self, root_id: NodeId) {
+        self.activate_from_event(root_id);
+        self.event_bus.publish(Event::TrailModeEnter { root_id });
+    }
+
+    /// Activate trail mode from an already-dispatched event
+    pub fn activate_from_event(&mut self, root_id: NodeId) {
         self.config.root_id = Some(root_id);
         self.active = true;
-        self.event_bus.publish(Event::TrailModeEnter { root_id });
     }
 
     /// Deactivate trail mode

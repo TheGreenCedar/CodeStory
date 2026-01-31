@@ -6,6 +6,7 @@ use crate::theme::{self, card, empty_state, spacing};
 use codestory_core::{Bookmark, BookmarkCategory, NodeId};
 use codestory_events::{ActivationOrigin, Event, EventBus};
 use eframe::egui;
+use egui_phosphor::regular as ph;
 
 pub struct BookmarkPanel {
     pub categories: Vec<BookmarkCategory>,
@@ -83,7 +84,7 @@ impl BookmarkPanel {
 
         // Categories and bookmarks
         if self.categories.is_empty() {
-            empty_state(ui, "🔖", "No Bookmark Categories", "Click + to create one");
+            empty_state(ui, ph::BOOKMARK, "No Bookmark Categories", "Click + to create one");
             return;
         }
 
@@ -111,7 +112,11 @@ impl BookmarkPanel {
 
         // Category header
         let header_response = ui.horizontal(|ui| {
-            let icon = if is_expanded { "v" } else { ">" };
+            let icon = if is_expanded {
+                ph::CARET_DOWN
+            } else {
+                ph::CARET_RIGHT
+            };
             if ui.small_button(icon).clicked() {
                 if is_expanded {
                     self.expanded_categories.remove(&category.id);

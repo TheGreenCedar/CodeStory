@@ -5,6 +5,10 @@
 
 use eframe::egui::{self, Color32, Vec2};
 use egui_dock::Style as DockStyle;
+use egui_phosphor::regular as ph;
+use std::path::{Path, PathBuf};
+
+use crate::settings::{PhosphorVariant, ThemeMode, UiFontFamily};
 
 // Re-export specific colors if needed by legacy code, but mapped to empty structs or similar
 // actually, for backward compatibility during refactor, I'll try to keep the module structure
@@ -37,6 +41,7 @@ pub mod radius {
 /// Application theme configuration
 #[derive(Debug, Clone)]
 pub struct Theme {
+    pub mode: ThemeMode,
     pub flavor: catppuccin_egui::Theme,
 
     /// Font customization fields
@@ -46,25 +51,40 @@ pub struct Theme {
     pub show_icons: bool,
     pub compact_mode: bool,
     pub animation_speed: f32,
+    pub ui_font_family: UiFontFamily,
+    pub phosphor_variant: PhosphorVariant,
 }
 
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            flavor: catppuccin_egui::MOCHA,
+            mode: ThemeMode::Bright,
+            flavor: catppuccin_egui::LATTE,
             font_size_base: 13.0,
             font_size_small: 11.0,
             font_size_heading: 16.0,
             show_icons: true,
             compact_mode: false,
             animation_speed: 1.0,
+            ui_font_family: UiFontFamily::SourceCodePro,
+            phosphor_variant: PhosphorVariant::Regular,
         }
     }
 }
 
 impl Theme {
-    pub fn new(flavor: catppuccin_egui::Theme) -> Self {
+    pub fn new(mode: ThemeMode) -> Self {
+        let flavor = match mode {
+            ThemeMode::Latte => catppuccin_egui::LATTE,
+            ThemeMode::Frappe => catppuccin_egui::FRAPPE,
+            ThemeMode::Macchiato => catppuccin_egui::MACCHIATO,
+            ThemeMode::Mocha => catppuccin_egui::MOCHA,
+            ThemeMode::Bright => catppuccin_egui::LATTE,
+            ThemeMode::Dark => catppuccin_egui::MOCHA,
+        };
+
         Self {
+            mode,
             flavor,
             ..Default::default()
         }
@@ -72,13 +92,59 @@ impl Theme {
 
     /// Apply theme to egui context
     pub fn apply(&self, ctx: &egui::Context) {
-        catppuccin_egui::set_theme(ctx, self.flavor);
+        match self.mode {
+            ThemeMode::Bright | ThemeMode::Dark => apply_sourcetrail_visuals(ctx, self.mode),
+            _ => catppuccin_egui::set_theme(ctx, self.flavor),
+        }
         self.setup_fonts(ctx);
     }
 
     fn setup_fonts(&self, ctx: &egui::Context) {
-        // Load default fonts (custom fonts can be added here if available)
-        let fonts = egui::FontDefinitions::default();
+        let mut fonts = egui::FontDefinitions::default();
+
+        // Load Sourcetrail fonts if available
+        if let Some(font_dir) = find_sourcetrail_fonts_dir() {
+            load_font(&mut fonts, "SourceCodePro-Regular", &font_dir, "SourceCodePro-Regular.otf");
+            load_font(&mut fonts, "SourceCodePro-Medium", &font_dir, "SourceCodePro-Medium.otf");
+            load_font(&mut fonts, "SourceCodePro-Bold", &font_dir, "SourceCodePro-Bold.otf");
+            load_font(&mut fonts, "FiraSans-Regular", &font_dir, "FiraSans-Regular.otf");
+            load_font(&mut fonts, "FiraSans-SemiBold", &font_dir, "FiraSans-SemiBold.otf");
+            load_font(&mut fonts, "Roboto-Regular", &font_dir, "Roboto-Regular.ttf");
+            load_font(&mut fonts, "Roboto-Bold", &font_dir, "Roboto-Bold.ttf");
+        }
+
+        let phosphor_variant = match self.phosphor_variant {
+            PhosphorVariant::Regular => egui_phosphor::Variant::Regular,
+            PhosphorVariant::Bold => egui_phosphor::Variant::Bold,
+            PhosphorVariant::Fill => egui_phosphor::Variant::Fill,
+            PhosphorVariant::Light => egui_phosphor::Variant::Light,
+            PhosphorVariant::Thin => egui_phosphor::Variant::Thin,
+        };
+        egui_phosphor::add_to_fonts(&mut fonts, phosphor_variant);
+
+        // Set primary UI font
+        let ui_font = match self.ui_font_family {
+            UiFontFamily::SourceCodePro => "SourceCodePro-Regular",
+            UiFontFamily::FiraSans => "FiraSans-Regular",
+            UiFontFamily::Roboto => "Roboto-Regular",
+        };
+
+        if fonts.font_data.contains_key(ui_font) {
+            if let Some(family) = fonts
+                .families
+                .get_mut(&egui::FontFamily::Proportional)
+            {
+                family.insert(0, ui_font.to_string());
+            }
+        }
+
+        // Force Source Code Pro for monospace if available
+        if fonts.font_data.contains_key("SourceCodePro-Regular") {
+            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                family.insert(0, "SourceCodePro-Regular".to_string());
+            }
+        }
+
         ctx.set_fonts(fonts);
 
         // Set style
@@ -109,6 +175,128 @@ impl Theme {
         style.interaction.show_tooltips_only_when_still = false;
 
         ctx.set_style(style);
+    }
+}
+
+fn apply_sourcetrail_visuals(ctx: &egui::Context, mode: ThemeMode) {
+    let mut visuals = match mode {
+        ThemeMode::Bright => egui::Visuals::light(),
+        ThemeMode::Dark => egui::Visuals::dark(),
+        _ => egui::Visuals::dark(),
+    };
+
+    let (window_bg, separator, dock_bg, dock_text, button_bg, button_border, button_hover) =
+        match mode {
+            ThemeMode::Bright => (
+                hex_color("#FFFFFF"),
+                hex_color("#A2A2A2"),
+                hex_color("#E0E0E0"),
+                hex_color("#000000"),
+                hex_color("#FFFFFF"),
+                hex_color("#AAAAAA"),
+                hex_color("#F0F0F0"),
+            ),
+            ThemeMode::Dark => (
+                hex_color("#272728"),
+                hex_color("#CCCCCC"),
+                hex_color("#555555"),
+                hex_color("#F7F7F7"),
+                hex_color("#3A3A3A"),
+                hex_color("#C5C5C5"),
+                hex_color("#404040"),
+            ),
+            _ => (
+                hex_color("#272728"),
+                hex_color("#CCCCCC"),
+                hex_color("#555555"),
+                hex_color("#F7F7F7"),
+                hex_color("#3A3A3A"),
+                hex_color("#C5C5C5"),
+                hex_color("#404040"),
+            ),
+        };
+
+    visuals.window_fill = window_bg;
+    visuals.panel_fill = window_bg;
+    visuals.widgets.noninteractive.bg_fill = dock_bg;
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, separator);
+    visuals.widgets.noninteractive.fg_stroke.color = dock_text;
+
+    visuals.widgets.inactive.bg_fill = button_bg;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, button_border);
+    visuals.widgets.inactive.fg_stroke.color = dock_text;
+
+    visuals.widgets.hovered.bg_fill = button_hover;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, separator);
+    visuals.widgets.hovered.fg_stroke.color = dock_text;
+
+    visuals.widgets.active.bg_fill = button_bg;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, separator);
+    visuals.widgets.active.fg_stroke.color = dock_text;
+
+    visuals.override_text_color = Some(dock_text);
+    visuals.window_stroke = egui::Stroke::new(1.0, separator);
+    visuals.selection.bg_fill = separator;
+
+    ctx.set_visuals(visuals);
+}
+
+fn hex_color(hex: &str) -> Color32 {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() == 6 {
+        let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
+        let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
+        let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
+        Color32::from_rgb(r, g, b)
+    } else if hex.len() == 8 {
+        let a = u8::from_str_radix(&hex[0..2], 16).unwrap_or(255);
+        let r = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
+        let g = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
+        let b = u8::from_str_radix(&hex[6..8], 16).unwrap_or(0);
+        Color32::from_rgba_unmultiplied(r, g, b, a)
+    } else {
+        Color32::WHITE
+    }
+}
+
+fn find_sourcetrail_fonts_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("CODESTORY_FONT_DIR") {
+        let path = PathBuf::from(dir);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    if let Ok(dir) = std::env::var("CODESTORY_SOURCETRAIL_DIR") {
+        let path = PathBuf::from(dir).join("bin").join("app").join("data").join("fonts");
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let mut current = std::env::current_dir().ok()?;
+    for _ in 0..6 {
+        let candidate = current
+            .join("Sourcetrail")
+            .join("bin")
+            .join("app")
+            .join("data")
+            .join("fonts");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn load_font(fonts: &mut egui::FontDefinitions, name: &str, dir: &Path, file: &str) {
+    let path = dir.join(file);
+    if let Ok(bytes) = std::fs::read(path) {
+        fonts
+            .font_data
+            .insert(name.to_string(), egui::FontData::from_owned(bytes).into());
     }
 }
 
@@ -208,7 +396,7 @@ pub fn info_box(ui: &mut egui::Ui, message: &str) {
 
     frame.show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("ℹ").color(fg));
+            ui.label(egui::RichText::new(ph::INFO).color(fg));
             ui.label(message);
         });
     });
@@ -226,7 +414,7 @@ pub fn warning_box(ui: &mut egui::Ui, message: &str) {
 
     frame.show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("⚠").color(fg));
+            ui.label(egui::RichText::new(ph::WARNING).color(fg));
             ui.label(message);
         });
     });
@@ -244,7 +432,7 @@ pub fn error_box(ui: &mut egui::Ui, message: &str) {
 
     frame.show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("❌").color(fg));
+            ui.label(egui::RichText::new(ph::X_CIRCLE).color(fg));
             ui.label(message);
         });
     });

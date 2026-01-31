@@ -6,6 +6,7 @@ use codestory_project::{
     Language, LanguageSpecificSettings, LanguageStandard, ProjectSettings, SourceGroupSettings,
 };
 use eframe::egui;
+use egui_phosphor::regular as ph;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -339,7 +340,7 @@ impl ProjectWizard {
         for (i, pattern) in self.exclude_patterns.iter().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(pattern).color(ui.visuals().text_color()));
-                if ui.add(theme::icon_button("×")).clicked() {
+                if ui.add(theme::icon_button(ph::X)).clicked() {
                     to_remove = Some(i);
                 }
             });

@@ -1,6 +1,7 @@
 use codestory_core::SourceLocation;
 use eframe::egui;
 use egui_code_editor::{CodeEditor, ColorTheme, Syntax};
+use egui_phosphor::regular as ph;
 use std::ops::Range;
 
 /// Language syntax types supported
@@ -166,13 +167,25 @@ impl EnhancedCodeView {
 
                 // --- 2. Handle Highlights ---
                 let painter = ui.painter();
-                let active_color = ui.visuals().selection.bg_fill;
-                let occurrence_color = ui.visuals().selection.bg_fill.linear_multiply(0.3);
+                let selection_color = ui.visuals().selection.bg_fill;
+                let active_color = egui::Color32::from_rgba_unmultiplied(
+                    selection_color.r(),
+                    selection_color.g(),
+                    selection_color.b(),
+                    80,
+                );
+                let occurrence_color = egui::Color32::from_rgba_unmultiplied(
+                    selection_color.r(),
+                    selection_color.g(),
+                    selection_color.b(),
+                    45,
+                );
 
                 // Search Matches Highlight
                 if self.search_active && !self.search_query.is_empty() {
                     let query = &self.search_query.to_lowercase();
-                    let match_color = egui::Color32::from_rgba_premultiplied(255, 255, 0, 40); // Yellow tint
+                    let match_color =
+                        egui::Color32::from_rgba_premultiplied(255, 255, 0, 28); // Yellow tint
 
                     for (i, line) in self.content.lines().enumerate() {
                         let line_lower = line.to_lowercase();
@@ -278,7 +291,7 @@ impl EnhancedCodeView {
                     egui::Frame::popup(ui.style())
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label("🔍");
+                                ui.label(ph::MAGNIFYING_GLASS);
                                 let res = ui.text_edit_singleline(&mut self.search_query);
                                 if res.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
                                 {

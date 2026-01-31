@@ -53,7 +53,7 @@ cargo bench -p codestory-bench
 | `codestory-project` | Project lifecycle, glob-based file discovery, `RefreshInfo` for incremental updates. |
 | `codestory-search` | Fuzzy search via `nucleo-matcher`, full-text via `tantivy`. |
 | `codestory-graph` | Graph layout algorithms (`ForceDirectedLayouter`, `RadialLayouter`, `NestingLayouter`, `GridLayouter`), `GraphModel` for in-memory representation, `NodeBundler` for edge bundling. Uses `oak-visualize` for some layouts. |
-| `codestory-gui` | Main application. `CodeStoryApp` holds all state. Components in `src/components/`. Uses `egui_dock` for docking, `egui-snarl` for node graph visualization. |
+| `codestory-gui` | Main application. `CodeStoryApp` holds all state. Components in `src/components/`. Uses `egui_dock` for docking and a custom graph canvas for node graph visualization. |
 
 ### Key Patterns
 

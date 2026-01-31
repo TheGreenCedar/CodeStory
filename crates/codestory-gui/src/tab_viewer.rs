@@ -4,8 +4,10 @@
 //! with CodeStory's panel components.
 
 use crate::dock_state::TabId;
+use crate::components::code_view::{ClickAction, CodeViewMode};
 use eframe::egui;
 use egui_dock::tab_viewer::{OnCloseResponse, TabViewer};
+use egui_phosphor::regular as ph;
 
 /// Tab viewer that renders CodeStory panels within dock tabs.
 ///
@@ -30,6 +32,9 @@ pub struct CodeStoryTabViewer<'a> {
 
     /// Code viewer component
     pub code_view: &'a mut crate::components::code_view::enhanced::EnhancedCodeView,
+
+    /// Code view mode
+    pub code_view_mode: &'a mut CodeViewMode,
 
     /// Detail panel component
     pub detail_panel: &'a mut crate::components::detail_panel::DetailPanel,
@@ -71,7 +76,8 @@ pub struct CodeStoryTabViewer<'a> {
     pub snippet_view: &'a mut crate::components::code_view::multi_file::MultiFileCodeView,
 
     /// Application settings
-    pub settings: &'a crate::settings::AppSettings,
+    pub settings: &'a mut crate::settings::AppSettings,
+    pub settings_dirty: &'a mut bool,
 }
 
 impl<'a> TabViewer for CodeStoryTabViewer<'a> {
@@ -85,33 +91,110 @@ impl<'a> TabViewer for CodeStoryTabViewer<'a> {
         match tab {
             TabId::Code => {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.group(|ui| {
-                        ui.set_min_height(300.0);
-                        ui.set_min_height(300.0);
-                        self.code_view.show(ui, self.theme);
-                    });
-                    ui.separator();
-                    ui.group(|ui| {
-                        if let Some(occ) = self.reference_list.ui(ui, self.node_names) {
-                            self.event_bus
-                                .publish(codestory_events::Event::ActivateNode {
-                                    id: codestory_core::NodeId(occ.element_id),
-                                    origin: codestory_events::ActivationOrigin::Code,
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(self.code_view_mode, CodeViewMode::SingleFile, "File");
+                        ui.selectable_value(self.code_view_mode, CodeViewMode::Snippets, "Snippets");
+                        ui.separator();
+                        if ui
+                            .button(ph::WARNING_CIRCLE)
+                            .on_hover_text("Show Errors")
+                            .clicked()
+                        {
+                            self.event_bus.publish(codestory_events::Event::ErrorPanelToggle);
+                        }
+                        ui.separator();
+                        let ref_label = self.reference_list.position_label();
+                        let refs = self.reference_list.filtered_len();
+                        let prev_clicked = ui
+                            .button(ph::CARET_UP)
+                            .on_hover_text("Previous Reference")
+                            .clicked();
+                        let next_clicked = ui
+                            .button(ph::CARET_DOWN)
+                            .on_hover_text("Next Reference")
+                            .clicked();
+                        ui.label(format!("Refs {}", ref_label));
+                        if refs == 0 {
+                            ui.add_space(6.0);
+                        }
+
+                        if prev_clicked {
+                            if let Some(occ) = self.reference_list.prev_occurrence() {
+                                self.event_bus.publish(codestory_events::Event::ShowReference {
+                                    location: occ.location,
                                 });
+                            }
+                        }
+                        if next_clicked {
+                            if let Some(occ) = self.reference_list.next_occurrence() {
+                                self.event_bus.publish(codestory_events::Event::ShowReference {
+                                    location: occ.location,
+                                });
+                            }
                         }
                     });
+                    ui.separator();
+
+                    match *self.code_view_mode {
+                        CodeViewMode::SingleFile => {
+                            ui.group(|ui| {
+                                ui.set_min_height(300.0);
+                                ui.set_min_height(300.0);
+                                self.code_view.show(ui, self.theme);
+                            });
+                            ui.separator();
+                            ui.group(|ui| {
+                                if let Some(occ) =
+                                    self.reference_list.ui(ui, self.node_names)
+                                {
+                                    self.event_bus.publish(
+                                        codestory_events::Event::ShowReference {
+                                            location: occ.location,
+                                        },
+                                    );
+                                }
+                            });
+                        }
+                        CodeViewMode::Snippets => {
+                            if let Some(action) = self.snippet_view.ui(ui) {
+                                match action {
+                                    ClickAction::NavigateToLocation(location) => {
+                                        self.event_bus.publish(
+                                            codestory_events::Event::ShowReference { location },
+                                        );
+                                    }
+                                    ClickAction::NavigateToLine(path, line) => {
+                                        self.event_bus.publish(
+                                            codestory_events::Event::ScrollToLine { file: path, line },
+                                        );
+                                    }
+                                    ClickAction::OpenFile(path) => {
+                                        self.event_bus.publish(
+                                            codestory_events::Event::ScrollToLine { file: path, line: 1 },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 });
             }
             TabId::Graph => {
-                if let Some(clicked_id) =
-                    self.node_graph_view
-                        .show(ui, &self.settings.node_graph, self.theme.flavor)
-                {
+                let response = self.node_graph_view.show(
+                    ui,
+                    &mut self.settings.node_graph,
+                    self.theme.mode,
+                    self.settings.animation_speed,
+                );
+                if let Some(clicked_id) = response.clicked_node {
                     self.event_bus
                         .publish(codestory_events::Event::ActivateNode {
                             id: clicked_id,
                             origin: codestory_events::ActivationOrigin::Graph,
                         });
+                }
+                if response.view_state_dirty {
+                    *self.settings_dirty = true;
                 }
             }
             TabId::Details => {
@@ -140,7 +223,52 @@ impl<'a> TabViewer for CodeStoryTabViewer<'a> {
                 }
             }
             TabId::Snippets => {
-                self.snippet_view.ui(ui);
+                ui.horizontal(|ui| {
+                    let ref_label = self.reference_list.position_label();
+                    let prev_clicked = ui
+                        .button(ph::CARET_UP)
+                        .on_hover_text("Previous Reference")
+                        .clicked();
+                    let next_clicked = ui
+                        .button(ph::CARET_DOWN)
+                        .on_hover_text("Next Reference")
+                        .clicked();
+                    ui.label(format!("Refs {}", ref_label));
+
+                    if prev_clicked {
+                        if let Some(occ) = self.reference_list.prev_occurrence() {
+                            self.event_bus
+                                .publish(codestory_events::Event::ShowReference { location: occ.location });
+                        }
+                    }
+                    if next_clicked {
+                        if let Some(occ) = self.reference_list.next_occurrence() {
+                            self.event_bus
+                                .publish(codestory_events::Event::ShowReference { location: occ.location });
+                        }
+                    }
+                });
+                ui.separator();
+                if let Some(action) = self.snippet_view.ui(ui) {
+                    match action {
+                        ClickAction::NavigateToLocation(location) => {
+                            self.event_bus
+                                .publish(codestory_events::Event::ShowReference { location });
+                        }
+                        ClickAction::NavigateToLine(path, line) => {
+                            self.event_bus.publish(codestory_events::Event::ScrollToLine {
+                                file: path,
+                                line,
+                            });
+                        }
+                        ClickAction::OpenFile(path) => {
+                            self.event_bus.publish(codestory_events::Event::ScrollToLine {
+                                file: path,
+                                line: 1,
+                            });
+                        }
+                    }
+                }
             }
         }
     }

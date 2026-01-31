@@ -60,6 +60,27 @@ impl NavigationHistory {
     pub fn can_go_forward(&self) -> bool {
         !self.entries.is_empty() && self.current < self.entries.len() - 1
     }
+
+    pub fn entries(&self) -> &[NavigationEntry] {
+        &self.entries
+    }
+
+    pub fn current_index(&self) -> Option<usize> {
+        if self.entries.is_empty() {
+            None
+        } else {
+            Some(self.current)
+        }
+    }
+
+    pub fn jump_to(&mut self, index: usize) -> Option<&NavigationEntry> {
+        if index < self.entries.len() {
+            self.current = index;
+            Some(&self.entries[self.current])
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

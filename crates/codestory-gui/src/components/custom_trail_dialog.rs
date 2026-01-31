@@ -7,10 +7,14 @@
 //! - Node type filters
 //! - Edge type filters
 
-use crate::theme::to_egui_color;
+use crate::components::search_bar::SearchMatch;
+use crate::theme::{badge, to_egui_color};
 use codestory_core::{EdgeKind, NodeId, NodeKind, TrailConfig, TrailDirection};
 use codestory_events::{Event, EventBus};
 use codestory_graph::{get_edge_kind_label, get_edge_style, get_kind_label, get_node_colors};
+use codestory_search::SearchEngine;
+use codestory_storage::Storage;
+use egui_phosphor::regular as ph;
 
 macro_rules! impl_toggle_methods {
     ($($field:ident),* $(,)?) => {
@@ -58,6 +62,13 @@ pub struct CustomTrailDialog {
     /// Whether to show search results
     show_from_search: bool,
     show_to_search: bool,
+
+    from_suggestions: Vec<SearchMatch>,
+    to_suggestions: Vec<SearchMatch>,
+    from_selected_index: usize,
+    to_selected_index: usize,
+    last_from_query: String,
+    last_to_query: String,
 }
 
 /// Node type filter checkboxes
@@ -244,7 +255,31 @@ impl CustomTrailDialog {
             to_search: String::new(),
             show_from_search: false,
             show_to_search: false,
+            from_suggestions: Vec::new(),
+            to_suggestions: Vec::new(),
+            from_selected_index: 0,
+            to_selected_index: 0,
+            last_from_query: String::new(),
+            last_to_query: String::new(),
         }
+    }
+
+    /// Open the dialog
+    pub fn open(&mut self) {
+        self.is_open = true;
+    }
+
+    /// Open the dialog and prefill the "From" node
+    pub fn open_with_root(&mut self, root_id: NodeId, name: Option<String>) {
+        self.is_open = true;
+        self.from_node = Some(root_id);
+        if let Some(label) = name {
+            self.from_node_name = label.clone();
+            self.from_search = label;
+        }
+        self.show_from_search = false;
+        self.from_suggestions.clear();
+        self.from_selected_index = 0;
     }
 
     /// Close the dialog
@@ -274,15 +309,26 @@ impl CustomTrailDialog {
 
     /// Render the dialog
     /// Returns true if the "Start Trail" button was clicked
-    pub fn ui(&mut self, ctx: &egui::Context, event_bus: &EventBus) -> bool {
+    pub fn ui(
+        &mut self,
+        ctx: &egui::Context,
+        event_bus: &EventBus,
+        search_engine: Option<&mut SearchEngine>,
+        storage: Option<&Storage>,
+    ) -> bool {
         if !self.is_open {
             return false;
         }
 
         let mut start_trail = false;
         let mut should_close = false;
+        let mut search_engine = search_engine;
+
+        let mut from_input_rect = None;
+        let mut to_input_rect = None;
 
         egui::Window::new("Custom Trail")
+            .order(egui::Order::Tooltip)
             .resizable(true)
             .default_width(450.0)
             .show(ctx, |ui| {
@@ -292,7 +338,7 @@ impl CustomTrailDialog {
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add(crate::theme::small_icon_button("✕"))
+                            .add(crate::theme::small_icon_button(ph::X))
                             .on_hover_text("Close")
                             .clicked()
                         {
@@ -311,15 +357,44 @@ impl CustomTrailDialog {
                         ui.label("From:");
                         ui.horizontal(|ui| {
                             let response = ui.text_edit_singleline(&mut self.from_search);
+                            from_input_rect = Some(response.rect);
                             if response.changed() {
-                                self.show_from_search = !self.from_search.is_empty();
+                                let query = self.from_search.clone();
+                                update_suggestions(
+                                    &query,
+                                    &mut self.last_from_query,
+                                    &mut self.from_suggestions,
+                                    &mut self.from_selected_index,
+                                    &mut self.show_from_search,
+                                    search_engine.as_deref_mut(),
+                                    storage,
+                                );
+                            }
+                            if response.has_focus() {
+                                handle_search_keys(
+                                    ui,
+                                    &mut self.from_selected_index,
+                                    &mut self.show_from_search,
+                                    self.from_suggestions.len(),
+                                );
+                                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                    if let Some(match_) = self
+                                        .from_suggestions
+                                        .get(self.from_selected_index)
+                                        .cloned()
+                                    {
+                                        self.select_from_match(match_);
+                                    }
+                                }
                             }
                             if self.from_node.is_some()
-                                && ui.button("✕").on_hover_text("Clear").clicked()
+                                && ui.button(ph::X).on_hover_text("Clear").clicked()
                             {
                                 self.from_node = None;
                                 self.from_node_name.clear();
                                 self.from_search.clear();
+                                self.from_suggestions.clear();
+                                self.show_from_search = false;
                             }
                         });
                         ui.end_row();
@@ -327,15 +402,44 @@ impl CustomTrailDialog {
                         ui.label("To (optional):");
                         ui.horizontal(|ui| {
                             let response = ui.text_edit_singleline(&mut self.to_search);
+                            to_input_rect = Some(response.rect);
                             if response.changed() {
-                                self.show_to_search = !self.to_search.is_empty();
+                                let query = self.to_search.clone();
+                                update_suggestions(
+                                    &query,
+                                    &mut self.last_to_query,
+                                    &mut self.to_suggestions,
+                                    &mut self.to_selected_index,
+                                    &mut self.show_to_search,
+                                    search_engine.as_deref_mut(),
+                                    storage,
+                                );
+                            }
+                            if response.has_focus() {
+                                handle_search_keys(
+                                    ui,
+                                    &mut self.to_selected_index,
+                                    &mut self.show_to_search,
+                                    self.to_suggestions.len(),
+                                );
+                                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                    if let Some(match_) = self
+                                        .to_suggestions
+                                        .get(self.to_selected_index)
+                                        .cloned()
+                                    {
+                                        self.select_to_match(match_);
+                                    }
+                                }
                             }
                             if self.to_node.is_some()
-                                && ui.button("✕").on_hover_text("Clear").clicked()
+                                && ui.button(ph::X).on_hover_text("Clear").clicked()
                             {
                                 self.to_node = None;
                                 self.to_node_name.clear();
                                 self.to_search.clear();
+                                self.to_suggestions.clear();
+                                self.show_to_search = false;
                             }
                         });
                         ui.end_row();
@@ -351,17 +455,20 @@ impl CustomTrailDialog {
 
                 ui.horizontal(|ui| {
                     ui.label("Direction:");
+                    let outgoing_label = format!("{} Outgoing", ph::ARROW_RIGHT);
+                    let incoming_label = format!("{} Incoming", ph::ARROW_LEFT);
+                    let both_label = format!("{} Both", ph::ARROWS_LEFT_RIGHT);
                     ui.selectable_value(
                         &mut self.direction,
                         TrailDirection::Outgoing,
-                        "Outgoing →",
+                        outgoing_label,
                     );
                     ui.selectable_value(
                         &mut self.direction,
                         TrailDirection::Incoming,
-                        "← Incoming",
+                        incoming_label,
                     );
-                    ui.selectable_value(&mut self.direction, TrailDirection::Both, "↔ Both");
+                    ui.selectable_value(&mut self.direction, TrailDirection::Both, both_label);
                 });
 
                 ui.separator();
@@ -523,6 +630,36 @@ impl CustomTrailDialog {
                 });
             });
 
+        if let Some(rect) = from_input_rect {
+            if self.show_from_search && !self.from_suggestions.is_empty() {
+                let selected = render_search_dropdown(
+                    ctx,
+                    rect,
+                    &self.from_suggestions,
+                    &mut self.from_selected_index,
+                    "custom_trail_from_dropdown",
+                );
+                if let Some(match_) = selected {
+                    self.select_from_match(match_);
+                }
+            }
+        }
+
+        if let Some(rect) = to_input_rect {
+            if self.show_to_search && !self.to_suggestions.is_empty() {
+                let selected = render_search_dropdown(
+                    ctx,
+                    rect,
+                    &self.to_suggestions,
+                    &mut self.to_selected_index,
+                    "custom_trail_to_dropdown",
+                );
+                if let Some(match_) = selected {
+                    self.select_to_match(match_);
+                }
+            }
+        }
+
         if should_close {
             self.is_open = false;
         }
@@ -566,6 +703,220 @@ impl CustomTrailDialog {
             ui.label(get_edge_kind_label(kind));
         });
     }
+
+    fn select_from_match(&mut self, match_: SearchMatch) {
+        self.from_node = Some(match_.node_id);
+        self.from_node_name = match_.name.clone();
+        self.from_search = match_.name;
+        self.from_suggestions.clear();
+        self.show_from_search = false;
+        self.from_selected_index = 0;
+    }
+
+    fn select_to_match(&mut self, match_: SearchMatch) {
+        self.to_node = Some(match_.node_id);
+        self.to_node_name = match_.name.clone();
+        self.to_search = match_.name;
+        self.to_suggestions.clear();
+        self.show_to_search = false;
+        self.to_selected_index = 0;
+    }
+}
+
+fn update_suggestions(
+    query: &str,
+    last_query: &mut String,
+    suggestions: &mut Vec<SearchMatch>,
+    selected_index: &mut usize,
+    show_dropdown: &mut bool,
+    search_engine: Option<&mut SearchEngine>,
+    storage: Option<&Storage>,
+) {
+    if query.len() < 2 {
+        suggestions.clear();
+        *selected_index = 0;
+        *show_dropdown = false;
+        return;
+    }
+
+    let Some(engine) = search_engine else {
+        suggestions.clear();
+        *show_dropdown = false;
+        return;
+    };
+
+    if query == last_query {
+        *show_dropdown = !suggestions.is_empty();
+        return;
+    }
+
+    *last_query = query.to_string();
+    let ids = engine.search_symbol(query);
+    *suggestions = build_search_matches(ids, storage);
+    *selected_index = 0;
+    *show_dropdown = !suggestions.is_empty();
+}
+
+fn handle_search_keys(
+    ui: &egui::Ui,
+    selected_index: &mut usize,
+    show_dropdown: &mut bool,
+    len: usize,
+) {
+    if len == 0 {
+        return;
+    }
+    if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+        *selected_index = (*selected_index + 1) % len;
+    }
+    if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+        if *selected_index == 0 {
+            *selected_index = len - 1;
+        } else {
+            *selected_index -= 1;
+        }
+    }
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        *show_dropdown = false;
+    }
+}
+
+fn render_search_dropdown(
+    ctx: &egui::Context,
+    input_rect: egui::Rect,
+    suggestions: &[SearchMatch],
+    selected_index: &mut usize,
+    area_id: &str,
+) -> Option<SearchMatch> {
+    let mut selected_match = None;
+
+    egui::Area::new(egui::Id::new(area_id))
+        .fixed_pos(input_rect.left_bottom())
+        .order(egui::Order::Tooltip)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(input_rect.width().max(360.0));
+                ui.set_max_height(260.0);
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (idx, suggestion) in suggestions.iter().enumerate() {
+                        let is_selected = idx == *selected_index;
+                        let row_response = ui
+                            .push_id(idx, |ui| {
+                                let available_width = ui.available_width();
+                                let (rect, response) = ui.allocate_at_least(
+                                    egui::vec2(available_width, 22.0),
+                                    egui::Sense::click(),
+                                );
+
+                                let bg_color = if response.hovered() || is_selected {
+                                    ui.visuals().widgets.hovered.bg_fill
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+                                ui.painter().rect_filled(rect, 2.0, bg_color);
+
+                                let mut content_rect = rect;
+                                content_rect.min.x += 4.0;
+                                content_rect.max.x -= 4.0;
+                                let mut child_ui =
+                                    ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
+                                child_ui.horizontal(|ui| {
+                                    let kind_color = ui.visuals().selection.bg_fill;
+                                    badge(ui, &suggestion.kind, kind_color);
+                                    ui.label(egui::RichText::new(&suggestion.name).strong());
+                                    if suggestion.qualified_name != suggestion.name {
+                                        ui.label(
+                                            egui::RichText::new(&suggestion.qualified_name)
+                                                .small()
+                                                .weak(),
+                                        );
+                                    }
+                                });
+
+                                response
+                            })
+                            .inner;
+
+                        if row_response.clicked() {
+                            selected_match = Some(suggestion.clone());
+                        }
+
+                        if row_response.hovered() {
+                            *selected_index = idx;
+                        }
+                    }
+                });
+            });
+        });
+
+    selected_match
+}
+
+fn node_kind_label(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::MODULE => "mod",
+        NodeKind::NAMESPACE => "ns",
+        NodeKind::PACKAGE => "pkg",
+        NodeKind::FILE => "file",
+        NodeKind::STRUCT => "struct",
+        NodeKind::CLASS => "class",
+        NodeKind::INTERFACE => "iface",
+        NodeKind::ANNOTATION => "anno",
+        NodeKind::UNION => "union",
+        NodeKind::ENUM => "enum",
+        NodeKind::TYPEDEF => "typedef",
+        NodeKind::TYPE_PARAMETER => "typeparam",
+        NodeKind::BUILTIN_TYPE => "builtin",
+        NodeKind::FUNCTION => "fn",
+        NodeKind::METHOD => "method",
+        NodeKind::MACRO => "macro",
+        NodeKind::GLOBAL_VARIABLE => "gvar",
+        NodeKind::FIELD => "field",
+        NodeKind::VARIABLE => "var",
+        NodeKind::CONSTANT => "const",
+        NodeKind::ENUM_CONSTANT => "enumconst",
+        NodeKind::UNKNOWN => "sym",
+    }
+}
+
+fn build_search_matches(ids: Vec<NodeId>, storage: Option<&Storage>) -> Vec<SearchMatch> {
+    ids.into_iter()
+        .take(10)
+        .map(|id| {
+            let mut name = id.0.to_string();
+            let mut kind_str = "symbol".to_string();
+            let mut file_path = None;
+            let mut line = None;
+
+            if let Some(storage) = storage {
+                if let Ok(Some(node)) = storage.get_node(id) {
+                    name = node
+                        .qualified_name
+                        .clone()
+                        .unwrap_or_else(|| node.serialized_name.clone());
+                    kind_str = node_kind_label(node.kind).to_string();
+                }
+                if let Ok(occs) = storage.get_occurrences_for_node(id)
+                    && let Some(occ) = occs.first()
+                    && let Ok(Some(file_node)) = storage.get_node(occ.location.file_node_id)
+                {
+                    file_path = Some(file_node.serialized_name);
+                    line = Some(occ.location.start_line);
+                }
+            }
+
+            SearchMatch {
+                node_id: id,
+                name: name.clone(),
+                qualified_name: name,
+                kind: kind_str,
+                file_path,
+                line,
+                score: 1.0,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

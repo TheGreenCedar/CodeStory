@@ -8,6 +8,7 @@
 
 use codestory_core::{NodeId, SourceLocation};
 use eframe::egui;
+use egui_phosphor::regular as ph;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -140,6 +141,7 @@ pub struct MultiFileCodeView {
     /// Search state
     pub search_query: String,
     pub search_active: bool,
+    pub error_counts: HashMap<NodeId, usize>,
 }
 
 impl Default for MultiFileCodeView {
@@ -157,6 +159,7 @@ impl MultiFileCodeView {
             focused_location: None,
             search_query: String::new(),
             search_active: false,
+            error_counts: HashMap::new(),
         }
     }
 
@@ -165,6 +168,7 @@ impl MultiFileCodeView {
         self.files.clear();
         self.file_order.clear();
         self.focused_location = None;
+        self.error_counts.clear();
     }
 
     /// Add a file with its content
@@ -182,6 +186,19 @@ impl MultiFileCodeView {
         if let Some(snippet) = self.files.get_mut(path) {
             snippet.add_occurrence(occurrence, self.context_lines);
         }
+    }
+
+    pub fn set_error_counts(&mut self, counts: HashMap<NodeId, usize>) {
+        self.error_counts = counts;
+    }
+
+    pub fn sort_files_by_references(&mut self) {
+        self.file_order.sort_by_key(|path| {
+            self.files
+                .get(path)
+                .map(|snippet| usize::MAX - snippet.reference_count)
+                .unwrap_or(usize::MAX)
+        });
     }
 
     /// Set the focused location (will scroll to it)
@@ -238,9 +255,24 @@ impl MultiFileCodeView {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for path in &self.file_order.clone() {
+                    let error_count = self
+                        .files
+                        .get(path)
+                        .and_then(|snippet| {
+                            snippet
+                                .file_node_id
+                                .and_then(|id| self.error_counts.get(&id).copied())
+                        })
+                        .unwrap_or(0);
+
                     if let Some(snippet) = self.files.get_mut(path)
                         && let Some(click) =
-                            Self::render_file_section(ui, snippet, &self.focused_location)
+                            Self::render_file_section(
+                                ui,
+                                snippet,
+                                &self.focused_location,
+                                error_count,
+                            )
                     {
                         action = Some(click);
                     }
@@ -254,19 +286,18 @@ impl MultiFileCodeView {
         ui: &mut egui::Ui,
         snippet: &mut FileSnippet,
         focused: &Option<SourceLocation>,
+        error_count: usize,
     ) -> Option<ClickAction> {
         let mut action = None;
 
         // File header (collapsible)
         let header_id = ui.make_persistent_id(snippet.path.to_string_lossy().to_string());
-        let header_response = egui::CollapsingHeader::new(
-            egui::RichText::new(format!(
-                "{} ({} references)",
-                snippet.file_name(),
-                snippet.reference_count
-            ))
-            .strong(),
-        )
+        let mut title = format!("{} ({} references)", snippet.file_name(), snippet.reference_count);
+        if error_count > 0 {
+            title = format!("{} {} ({})", ph::WARNING_CIRCLE, title, error_count);
+        }
+
+        let header_response = egui::CollapsingHeader::new(egui::RichText::new(title).strong())
         .id_salt(header_id)
         .default_open(snippet.expanded)
         .show(ui, |ui| {
@@ -285,7 +316,10 @@ impl MultiFileCodeView {
                     // Separator between non-contiguous ranges
                     ui.horizontal(|ui| {
                         ui.add_space(20.0);
-                        ui.label(egui::RichText::new("⋮").color(egui::Color32::DARK_GRAY));
+                        ui.label(
+                            egui::RichText::new(ph::DOTS_THREE_VERTICAL)
+                                .color(egui::Color32::DARK_GRAY),
+                        );
                     });
                 }
 

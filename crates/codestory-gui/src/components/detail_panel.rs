@@ -1,6 +1,7 @@
 use crate::theme::{self, empty_state, labeled_separator, spacing};
 use codestory_core::{Edge, Node};
 use eframe::egui;
+use egui_phosphor::regular as ph;
 
 pub struct DetailPanel {
     pub selected_node: Option<Node>,
@@ -35,7 +36,7 @@ impl DetailPanel {
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
-                                .small_button("🔖")
+                                .small_button(ph::BOOKMARK)
                                 .on_hover_text("Quick Bookmark")
                                 .clicked()
                             {
@@ -77,9 +78,9 @@ impl DetailPanel {
                                 // Determine direction relative to center
                                 let is_source = eff_source == node.id;
                                 let (direction, direction_color) = if is_source {
-                                    ("→", egui::Color32::LIGHT_GREEN)
+                                    (ph::ARROW_RIGHT, egui::Color32::LIGHT_GREEN)
                                 } else {
-                                    ("←", ui.visuals().selection.bg_fill)
+                                    (ph::ARROW_LEFT, ui.visuals().selection.bg_fill)
                                 };
                                 let other_id = if is_source { eff_target } else { eff_source };
 
@@ -96,7 +97,7 @@ impl DetailPanel {
                         }
                     });
             } else {
-                empty_state(ui, "📊", "No Selection", "Select a node to view details");
+                empty_state(ui, ph::INFO, "No Selection", "Select a node to view details");
             }
         });
     }

@@ -2,6 +2,7 @@ use crate::theme::{empty_state, spacing};
 use codestory_core::{Node, NodeId};
 use codestory_storage::Storage;
 use eframe::egui;
+use egui_phosphor::regular as ph;
 use std::path::{Path, PathBuf};
 
 /// Maximum number of symbol nodes to cache children for.
@@ -144,7 +145,12 @@ impl Sidebar {
                             });
                     } else {
                         ui.add_space(spacing::SECTION_SPACING);
-                        empty_state(ui, "📂", "No Project", "Open a folder to get started");
+                        empty_state(
+                            ui,
+                            ph::FOLDER_OPEN,
+                            "No Project",
+                            "Open a folder to get started",
+                        );
                     }
                 }
                 SidebarTab::Symbols => {
@@ -165,7 +171,12 @@ impl Sidebar {
                             });
                     } else {
                         ui.add_space(spacing::SECTION_SPACING);
-                        empty_state(ui, "🧬", "No Symbols", "Open a project to index symbols");
+                        empty_state(
+                            ui,
+                            ph::ATOM,
+                            "No Symbols",
+                            "Open a project to index symbols",
+                        );
                     }
                 }
             }
@@ -181,17 +192,17 @@ impl Sidebar {
     ) -> Option<NodeId> {
         let mut selected = None;
         let icon = match node.kind {
-            codestory_core::NodeKind::NAMESPACE | codestory_core::NodeKind::PACKAGE => "{} ",
-            codestory_core::NodeKind::CLASS | codestory_core::NodeKind::STRUCT => "C ",
-            codestory_core::NodeKind::INTERFACE => "I ",
-            codestory_core::NodeKind::ENUM => "E ",
-            codestory_core::NodeKind::METHOD | codestory_core::NodeKind::FUNCTION => "m ",
-            codestory_core::NodeKind::FIELD => "f ",
-            _ => "○ ",
+            codestory_core::NodeKind::NAMESPACE | codestory_core::NodeKind::PACKAGE => "{}",
+            codestory_core::NodeKind::CLASS | codestory_core::NodeKind::STRUCT => "C",
+            codestory_core::NodeKind::INTERFACE => "I",
+            codestory_core::NodeKind::ENUM => "E",
+            codestory_core::NodeKind::METHOD | codestory_core::NodeKind::FUNCTION => "m",
+            codestory_core::NodeKind::FIELD => "f",
+            _ => ph::CIRCLE,
         };
 
         let is_selected = self.selected_node == Some(node.id);
-        let label_text = format!("{}{}", icon, node.serialized_name);
+        let label_text = format!("{} {}", icon, node.serialized_name);
 
         // Check if node is a container type that can have children
         let is_container = matches!(
@@ -267,7 +278,7 @@ impl Sidebar {
             )
             .show_header(ui, |ui| {
                 ui.label(
-                    egui::RichText::new(format!("📁 {}", file_name))
+                    egui::RichText::new(format!("{} {}", ph::FOLDER, file_name))
                         .color(ui.visuals().hyperlink_color),
                 );
             })
@@ -301,7 +312,7 @@ impl Sidebar {
             };
             let resp = ui.selectable_label(
                 is_selected,
-                egui::RichText::new(format!("📄 {}", file_name)).color(text_color),
+                egui::RichText::new(format!("{} {}", ph::FILE, file_name)).color(text_color),
             );
             if resp.clicked() {
                 selected = Some(path.to_path_buf());
