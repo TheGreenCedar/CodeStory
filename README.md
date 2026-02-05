@@ -1,8 +1,8 @@
 # CodeStory
 
-BIG NOTE: This project is at its infancy, I just got it to render graph nodes without dying on me. Contributions (bot or human) are welcome 😄
+CodeStory is a modern, Rust-based source code explorer inspired by [Sourcetrail](https://github.com/CoatiSoftware/Sourcetrail). It helps you understand unfamiliar codebases by combining an interactive dependency graph with code snippets and fast search. It will eventually incorporate coding agents of your choice to explain the codebase like a story book, using the generated graphs as grounding context + interactive visuals for the user.
 
-CodeStory is a modern, Rust-based source code explorer inspired by [Sourcetrail](https://github.com/CoatiSoftware/Sourcetrail). It helps you understand unfamiliar codebases by combining an interactive dependency graph with code snippets and fast search.
+BIG NOTE: This project is at its infancy, I just got it to render graph nodes without dying on me. Contributions (bot or human) are welcome 😄
 
 ## What You Get
 
@@ -72,5 +72,4 @@ CodeStory can listen for Sourcetrail-style IDE messages over TCP.
 
 ## License
 
-No license file is included yet. Add a `LICENSE` before distributing broadly (e.g., MIT/Apache-2.0/GPL).
-
+MIT. See `LICENSE`.
