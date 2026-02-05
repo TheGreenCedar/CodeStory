@@ -1,5 +1,6 @@
 use super::activation::ActivationController;
 use crate::components::code_view::enhanced::EnhancedCodeView;
+use crate::components::code_view::multi_file::MultiFileCodeView;
 use crate::components::commands::CommandHistory;
 use crate::components::detail_panel::DetailPanel;
 use crate::components::node_graph::NodeGraphView;
@@ -20,6 +21,7 @@ fn test_activation_updates_tab_title() {
     tab_manager.open_tab("Test".to_string(), None);
 
     let mut code_view = EnhancedCodeView::new();
+    let mut snippet_view = MultiFileCodeView::new();
     let mut node_graph_view = NodeGraphView::new(EventBus::new());
     let mut detail_panel = DetailPanel::new();
     let mut reference_list = ReferenceList::new();
@@ -41,6 +43,7 @@ fn test_activation_updates_tab_title() {
         &AppSettings::default(),
         &mut tab_manager,
         &mut code_view,
+        &mut snippet_view,
         &mut node_graph_view,
         &mut detail_panel,
         &mut reference_list,
