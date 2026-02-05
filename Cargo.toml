@@ -83,6 +83,10 @@ egui_code_editor = "0.2"
 sysinfo = "0.38"
 feature-probe = "0.1.1"
 tempfile = "3.10"
+egui-phosphor = "0.11.0"
+catppuccin-egui = { version = "5.7", default-features = false, features = ["egui33"] }
+image = "0.25"
+fontdue = "0.8"
 
 # Experimental Layout
 oak-visualize = "0.0.1"

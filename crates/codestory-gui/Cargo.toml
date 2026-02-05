@@ -20,7 +20,7 @@ egui-file-dialog = { workspace = true }
 egui_extras = { workspace = true }
 egui_plot = { workspace = true }
 egui_code_editor = { workspace = true }
-egui-phosphor = { version = "0.11.0", features = ["regular", "bold", "fill", "light", "thin"] }
+egui-phosphor = { workspace = true, features = ["regular", "bold", "fill", "light", "thin"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -38,11 +38,9 @@ tree-sitter-typescript = { workspace = true }
 rfd = { workspace = true }
 notify = { workspace = true }
 ignore = { workspace = true }
-image = "0.25"
-fontdue = "0.8"
-catppuccin-egui = { version = "5.7", default-features = false, features = [
-    "egui33",
-] }
+image = { workspace = true }
+fontdue = { workspace = true }
+catppuccin-egui = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
