@@ -2,7 +2,7 @@
 
 BIG NOTE: This project is at its infancy, I just got it to render graph nodes without dying on me. Contributions (bot or human) are welcome 😄
 
-CodeStory is a modern, Rust-based source code explorer inspired by Sourcetrail. It helps you understand unfamiliar codebases by combining an interactive dependency graph with code snippets and fast search.
+CodeStory is a modern, Rust-based source code explorer inspired by [Sourcetrail](https://github.com/CoatiSoftware/Sourcetrail). It helps you understand unfamiliar codebases by combining an interactive dependency graph with code snippets and fast search.
 
 ## What You Get
 
@@ -18,7 +18,7 @@ For a walkthrough of the UI, see `USER_GUIDE.md`. For architecture and contribut
 
 ### Prerequisites
 
-- Rust toolchain: this repo pins **nightly** via `rust-toolchain.toml`
+- Rust toolchain: this repo pins **nightly** via `rust-toolchain.toml`. I'll use stable releases once I'm happy enough with the feature set and can spend time stabilizing.
 - A C/C++ toolchain may be required on some platforms because dependencies can include native components
 
 ### Run the GUI
