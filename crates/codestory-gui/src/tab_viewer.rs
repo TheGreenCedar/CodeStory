@@ -3,8 +3,8 @@
 //! Implements `egui_dock::TabViewer` to connect the docking system
 //! with CodeStory's panel components.
 
-use crate::dock_state::TabId;
 use crate::components::code_view::{ClickAction, CodeViewMode};
+use crate::dock_state::TabId;
 use eframe::egui;
 use egui_dock::tab_viewer::{OnCloseResponse, TabViewer};
 use egui_phosphor::regular as ph;
@@ -93,14 +93,19 @@ impl<'a> TabViewer for CodeStoryTabViewer<'a> {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.selectable_value(self.code_view_mode, CodeViewMode::SingleFile, "File");
-                        ui.selectable_value(self.code_view_mode, CodeViewMode::Snippets, "Snippets");
+                        ui.selectable_value(
+                            self.code_view_mode,
+                            CodeViewMode::Snippets,
+                            "Snippets",
+                        );
                         ui.separator();
                         if ui
                             .button(ph::WARNING_CIRCLE)
                             .on_hover_text("Show Errors")
                             .clicked()
                         {
-                            self.event_bus.publish(codestory_events::Event::ErrorPanelToggle);
+                            self.event_bus
+                                .publish(codestory_events::Event::ErrorPanelToggle);
                         }
                         ui.separator();
                         let ref_label = self.reference_list.position_label();
@@ -120,16 +125,18 @@ impl<'a> TabViewer for CodeStoryTabViewer<'a> {
 
                         if prev_clicked {
                             if let Some(occ) = self.reference_list.prev_occurrence() {
-                                self.event_bus.publish(codestory_events::Event::ShowReference {
-                                    location: occ.location,
-                                });
+                                self.event_bus
+                                    .publish(codestory_events::Event::ShowReference {
+                                        location: occ.location,
+                                    });
                             }
                         }
                         if next_clicked {
                             if let Some(occ) = self.reference_list.next_occurrence() {
-                                self.event_bus.publish(codestory_events::Event::ShowReference {
-                                    location: occ.location,
-                                });
+                                self.event_bus
+                                    .publish(codestory_events::Event::ShowReference {
+                                        location: occ.location,
+                                    });
                             }
                         }
                     });
@@ -144,9 +151,7 @@ impl<'a> TabViewer for CodeStoryTabViewer<'a> {
                             });
                             ui.separator();
                             ui.group(|ui| {
-                                if let Some(occ) =
-                                    self.reference_list.ui(ui, self.node_names)
-                                {
+                                if let Some(occ) = self.reference_list.ui(ui, self.node_names) {
                                     self.event_bus.publish(
                                         codestory_events::Event::ShowReference {
                                             location: occ.location,
@@ -165,12 +170,18 @@ impl<'a> TabViewer for CodeStoryTabViewer<'a> {
                                     }
                                     ClickAction::NavigateToLine(path, line) => {
                                         self.event_bus.publish(
-                                            codestory_events::Event::ScrollToLine { file: path, line },
+                                            codestory_events::Event::ScrollToLine {
+                                                file: path,
+                                                line,
+                                            },
                                         );
                                     }
                                     ClickAction::OpenFile(path) => {
                                         self.event_bus.publish(
-                                            codestory_events::Event::ScrollToLine { file: path, line: 1 },
+                                            codestory_events::Event::ScrollToLine {
+                                                file: path,
+                                                line: 1,
+                                            },
                                         );
                                     }
                                 }
@@ -238,13 +249,17 @@ impl<'a> TabViewer for CodeStoryTabViewer<'a> {
                     if prev_clicked {
                         if let Some(occ) = self.reference_list.prev_occurrence() {
                             self.event_bus
-                                .publish(codestory_events::Event::ShowReference { location: occ.location });
+                                .publish(codestory_events::Event::ShowReference {
+                                    location: occ.location,
+                                });
                         }
                     }
                     if next_clicked {
                         if let Some(occ) = self.reference_list.next_occurrence() {
                             self.event_bus
-                                .publish(codestory_events::Event::ShowReference { location: occ.location });
+                                .publish(codestory_events::Event::ShowReference {
+                                    location: occ.location,
+                                });
                         }
                     }
                 });
@@ -256,16 +271,18 @@ impl<'a> TabViewer for CodeStoryTabViewer<'a> {
                                 .publish(codestory_events::Event::ShowReference { location });
                         }
                         ClickAction::NavigateToLine(path, line) => {
-                            self.event_bus.publish(codestory_events::Event::ScrollToLine {
-                                file: path,
-                                line,
-                            });
+                            self.event_bus
+                                .publish(codestory_events::Event::ScrollToLine {
+                                    file: path,
+                                    line,
+                                });
                         }
                         ClickAction::OpenFile(path) => {
-                            self.event_bus.publish(codestory_events::Event::ScrollToLine {
-                                file: path,
-                                line: 1,
-                            });
+                            self.event_bus
+                                .publish(codestory_events::Event::ScrollToLine {
+                                    file: path,
+                                    line: 1,
+                                });
                         }
                     }
                 }

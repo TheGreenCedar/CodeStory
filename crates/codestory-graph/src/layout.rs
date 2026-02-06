@@ -734,18 +734,10 @@ impl HierarchicalLayouter {
                     }
                     let neighbor = if use_predecessors {
                         // Looking at incoming edges to this node
-                        if target == node {
-                            Some(source)
-                        } else {
-                            None
-                        }
+                        if target == node { Some(source) } else { None }
                     } else {
                         // Looking at outgoing edges from this node
-                        if source == node {
-                            Some(target)
-                        } else {
-                            None
-                        }
+                        if source == node { Some(target) } else { None }
                     };
 
                     if let Some(n) = neighbor {
@@ -797,8 +789,7 @@ impl HierarchicalLayouter {
             let layer_pos = depth as f32 * self.layer_spacing;
 
             // Center the layer around y=0 (or x=0 for vertical)
-            let total_extent =
-                (layer.len().saturating_sub(1) as f32) * self.node_spacing;
+            let total_extent = (layer.len().saturating_sub(1) as f32) * self.node_spacing;
             let start_offset = -total_extent / 2.0;
 
             for (j, &node) in layer.iter().enumerate() {
@@ -1117,6 +1108,26 @@ impl EnhancedLayouter for NestingLayouter {
             );
         }
 
+        // Compress ranks to eliminate empty layers and to avoid pathological rank growth
+        // (e.g., cycles) pushing nodes very far apart. We only care about relative order
+        // between layers; gaps do not add useful information but do add a lot of panning.
+        if !ranks.is_empty() {
+            let mut unique_ranks: Vec<i32> = ranks.values().copied().collect();
+            unique_ranks.sort_unstable();
+            unique_ranks.dedup();
+
+            let mut remap: HashMap<i32, i32> = HashMap::new();
+            for (i, rank) in unique_ranks.iter().enumerate() {
+                remap.insert(*rank, i as i32);
+            }
+
+            for rank in ranks.values_mut() {
+                if let Some(new_rank) = remap.get(rank) {
+                    *rank = *new_rank;
+                }
+            }
+        }
+
         // Group root nodes by layer
         let mut layers: HashMap<i32, Vec<NodeIndex>> = HashMap::new();
         for (&node, &rank) in &ranks {
@@ -1132,13 +1143,42 @@ impl EnhancedLayouter for NestingLayouter {
         let mut sorted_ranks: Vec<_> = layers.keys().cloned().collect();
         sorted_ranks.sort();
 
+        // Spacing tuning:
+        // The nesting layouter is primarily used for small "trail"/neighborhood graphs.
+        // Using large constants makes even a 2-node graph require lots of panning,
+        // especially in Vertical (top-to-bottom) mode where screen height is limited.
+        let root_count = root_nodes.len();
+        let tiny_graph = root_count <= 4;
+        let small_graph = root_count <= 12;
+        let barycenter_spacing = if tiny_graph {
+            80.0
+        } else if small_graph {
+            100.0
+        } else {
+            150.0
+        };
+        let layer_spacing = if tiny_graph {
+            120.0
+        } else if small_graph {
+            160.0
+        } else {
+            300.0
+        };
+        let node_spacing = if tiny_graph {
+            60.0
+        } else if small_graph {
+            80.0
+        } else {
+            150.0
+        };
+
         // Assign initial layer coordinates for barycenter calculation
         // If Vertical, these are X. If Horizontal, these are Y.
         let mut layer_coords: HashMap<NodeIndex, f32> = HashMap::new();
         for rank in &sorted_ranks {
             if let Some(layer_nodes) = layers.get(rank) {
                 for (j, &node_idx) in layer_nodes.iter().enumerate() {
-                    layer_coords.insert(node_idx, j as f32 * 150.0);
+                    layer_coords.insert(node_idx, j as f32 * barycenter_spacing);
                 }
             }
         }
@@ -1151,7 +1191,7 @@ impl EnhancedLayouter for NestingLayouter {
                     Self::order_by_barycenter(layer_nodes, model, &layer_coords, true);
                     // Update layer_coords after reordering
                     for (j, &node_idx) in layer_nodes.iter().enumerate() {
-                        layer_coords.insert(node_idx, j as f32 * 150.0);
+                        layer_coords.insert(node_idx, j as f32 * barycenter_spacing);
                     }
                 }
             }
@@ -1161,16 +1201,13 @@ impl EnhancedLayouter for NestingLayouter {
                 if let Some(layer_nodes) = layers.get_mut(&rank) {
                     Self::order_by_barycenter(layer_nodes, model, &layer_coords, false);
                     for (j, &node_idx) in layer_nodes.iter().enumerate() {
-                        layer_coords.insert(node_idx, j as f32 * 150.0);
+                        layer_coords.insert(node_idx, j as f32 * barycenter_spacing);
                     }
                 }
             }
         }
 
         // --- Initial Position Assignment ---
-        let layer_spacing = 300.0;
-        let node_spacing = 150.0;
-
         for rank in &sorted_ranks {
             if let Some(layer_nodes) = layers.get(rank) {
                 // Calculate sizes first
@@ -1735,9 +1772,12 @@ mod tests {
 
         let y1 = pos_v[&node1_idx].1;
         let y2 = pos_v[&node2_idx].1;
+        let dy = (y2 - y1).abs();
+        assert!(dy >= 40.0, "Vertical layout should separate layers (dy={})", dy);
         assert!(
-            (y2 - y1).abs() >= 300.0,
-            "Vertical distance should be at least layer_spacing"
+            dy <= 600.0,
+            "Vertical layout should stay reasonably compact for small graphs (dy={})",
+            dy
         );
 
         // Test Horizontal
@@ -1750,9 +1790,76 @@ mod tests {
 
         let x1 = pos_h[&node1_idx].0;
         let x2 = pos_h[&node2_idx].0;
+        let dx = (x2 - x1).abs();
         assert!(
-            (x2 - x1).abs() >= 300.0,
-            "Horizontal distance should be at least layer_spacing"
+            dx >= 40.0,
+            "Horizontal layout should separate layers (dx={})",
+            dx
+        );
+        assert!(
+            dx <= 600.0,
+            "Horizontal layout should stay reasonably compact for small graphs (dx={})",
+            dx
+        );
+    }
+
+    #[test]
+    fn test_nesting_layouter_cycle_does_not_blow_apart() {
+        // Regression test: cycles shouldn't cause rank growth to explode node positions.
+        let mut model = GraphModel::new();
+        model.add_node(Node {
+            id: NodeId(1),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "A".to_string(),
+            ..Default::default()
+        });
+        model.add_node(Node {
+            id: NodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "B".to_string(),
+            ..Default::default()
+        });
+        model.add_edge(Edge {
+            id: codestory_core::EdgeId(1),
+            source: NodeId(1),
+            target: NodeId(2),
+            kind: EdgeKind::CALL,
+            ..Default::default()
+        });
+        model.add_edge(Edge {
+            id: codestory_core::EdgeId(2),
+            source: NodeId(2),
+            target: NodeId(1),
+            kind: EdgeKind::CALL,
+            ..Default::default()
+        });
+        model.rebuild_hierarchy();
+
+        let layouter = NestingLayouter {
+            inner_padding: 0.0,
+            child_spacing: 0.0,
+            direction: LayoutDirection::Vertical,
+        };
+        let (pos, _) = layouter.execute_enhanced(&model);
+
+        let node1_idx = *model.node_map.get(&NodeId(1)).unwrap();
+        let node2_idx = *model.node_map.get(&NodeId(2)).unwrap();
+
+        let dy = (pos[&node1_idx].1 - pos[&node2_idx].1).abs();
+        assert!(
+            dy <= 600.0,
+            "Cycle layout should remain bounded (dy={})",
+            dy
+        );
+
+        let max_abs = pos
+            .values()
+            .flat_map(|(x, y)| [x.abs(), y.abs()])
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs <= 2000.0,
+            "Cycle layout should not place nodes extremely far from origin (max_abs={})",
+            max_abs
         );
     }
 
@@ -1858,9 +1965,8 @@ mod property_tests {
         (2..20usize).prop_flat_map(|n| {
             let max_edges = n * (n - 1) / 2; // max forward edges
             let edge_count = 1..=max_edges.max(1);
-            (Just(n), proptest::collection::vec((0..n, 0..n), edge_count)).prop_map(
-                |(n, edges)| build_random_dag(n, edges),
-            )
+            (Just(n), proptest::collection::vec((0..n, 0..n), edge_count))
+                .prop_map(|(n, edges)| build_random_dag(n, edges))
         })
     }
 

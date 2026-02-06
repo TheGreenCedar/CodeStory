@@ -42,10 +42,7 @@ impl WelcomeScreen {
 
             let open_label = format!("{} Open Project Folder", ph::FOLDER_OPEN);
             if ui
-                .add(
-                    theme::primary_button(ui, &open_label)
-                        .min_size(egui::vec2(200.0, 40.0)),
-                )
+                .add(theme::primary_button(ui, &open_label).min_size(egui::vec2(200.0, 40.0)))
                 .clicked()
             {
                 FileDialogPresets::open_project(file_dialog);

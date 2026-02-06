@@ -26,7 +26,10 @@ fn index_single_file(filename: &str, contents: &str) -> anyhow::Result<Vec<codes
 }
 
 fn assert_imports_resolved(edges: &[codestory_core::Edge]) {
-    let imports: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::IMPORT).collect();
+    let imports: Vec<_> = edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::IMPORT)
+        .collect();
     assert!(!imports.is_empty(), "IMPORT edge not found");
     for edge in imports {
         assert!(

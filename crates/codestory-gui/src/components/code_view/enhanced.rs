@@ -184,8 +184,7 @@ impl EnhancedCodeView {
                 // Search Matches Highlight
                 if self.search_active && !self.search_query.is_empty() {
                     let query = &self.search_query.to_lowercase();
-                    let match_color =
-                        egui::Color32::from_rgba_premultiplied(255, 255, 0, 28); // Yellow tint
+                    let match_color = egui::Color32::from_rgba_premultiplied(255, 255, 0, 28); // Yellow tint
 
                     for (i, line) in self.content.lines().enumerate() {
                         let line_lower = line.to_lowercase();

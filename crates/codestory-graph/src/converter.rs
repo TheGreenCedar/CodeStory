@@ -207,8 +207,7 @@ impl NodeGraphConverter {
     ) {
         let mut uml_nodes: HashMap<NodeId, UmlNode> = HashMap::new();
         let mut graph_edges = Vec::new();
-        let mut pin_info: HashMap<NodeId, (Vec<NodeGraphPin>, Vec<NodeGraphPin>)> =
-            HashMap::new();
+        let mut pin_info: HashMap<NodeId, (Vec<NodeGraphPin>, Vec<NodeGraphPin>)> = HashMap::new();
         let mut node_map: HashMap<NodeId, &DummyNode> = HashMap::new();
         let mut member_to_host: HashMap<NodeId, NodeId> = HashMap::new();
 
@@ -302,11 +301,8 @@ impl NodeGraphConverter {
 
                         for &child_id in &node.children {
                             if let Some(child) = node_map.get(&child_id) {
-                                let mut member = MemberItem::new(
-                                    child.id,
-                                    child.node_kind,
-                                    child.name.clone(),
-                                );
+                                let mut member =
+                                    MemberItem::new(child.id, child.node_kind, child.name.clone());
 
                                 // Set whether this member has outgoing edges
                                 member.set_has_outgoing_edges(
@@ -335,22 +331,25 @@ impl NodeGraphConverter {
 
                         // Add non-empty sections to host
                         if !functions.is_empty() {
-                            host.visibility_sections.push(VisibilitySection::with_members(
-                                VisibilityKind::Functions,
-                                functions,
-                            ));
+                            host.visibility_sections
+                                .push(VisibilitySection::with_members(
+                                    VisibilityKind::Functions,
+                                    functions,
+                                ));
                         }
                         if !variables.is_empty() {
-                            host.visibility_sections.push(VisibilitySection::with_members(
-                                VisibilityKind::Variables,
-                                variables,
-                            ));
+                            host.visibility_sections
+                                .push(VisibilitySection::with_members(
+                                    VisibilityKind::Variables,
+                                    variables,
+                                ));
                         }
                         if !other.is_empty() {
-                            host.visibility_sections.push(VisibilitySection::with_members(
-                                VisibilityKind::Other,
-                                other,
-                            ));
+                            host.visibility_sections
+                                .push(VisibilitySection::with_members(
+                                    VisibilityKind::Other,
+                                    other,
+                                ));
                         }
                     }
                 } else if let Some(parent_id) = node.parent {
@@ -361,12 +360,12 @@ impl NodeGraphConverter {
                         .unwrap_or(false);
 
                     if !parent_is_bundle && let Some(host) = uml_nodes.get_mut(&parent_id) {
-                        let mut member = MemberItem::new(node.id, node.node_kind, node.name.clone());
+                        let mut member =
+                            MemberItem::new(node.id, node.node_kind, node.name.clone());
 
                         // Set whether this member has outgoing edges
-                        member.set_has_outgoing_edges(
-                            members_with_outgoing_edges.contains(&node.id),
-                        );
+                        member
+                            .set_has_outgoing_edges(members_with_outgoing_edges.contains(&node.id));
 
                         // Determine which section this member belongs to
                         let visibility = match node.node_kind {
@@ -389,10 +388,8 @@ impl NodeGraphConverter {
                         {
                             section.members.push(member);
                         } else {
-                            host.visibility_sections.push(VisibilitySection::with_members(
-                                visibility,
-                                vec![member],
-                            ));
+                            host.visibility_sections
+                                .push(VisibilitySection::with_members(visibility, vec![member]));
                         }
 
                         member_to_host.insert(node.id, parent_id);
@@ -446,11 +443,7 @@ impl NodeGraphConverter {
             });
         }
 
-        (
-            uml_nodes.into_values().collect(),
-            graph_edges,
-            pin_info,
-        )
+        (uml_nodes.into_values().collect(), graph_edges, pin_info)
     }
 }
 

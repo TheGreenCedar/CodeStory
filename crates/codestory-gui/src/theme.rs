@@ -104,12 +104,42 @@ impl Theme {
 
         // Load Sourcetrail fonts if available
         if let Some(font_dir) = find_sourcetrail_fonts_dir() {
-            load_font(&mut fonts, "SourceCodePro-Regular", &font_dir, "SourceCodePro-Regular.otf");
-            load_font(&mut fonts, "SourceCodePro-Medium", &font_dir, "SourceCodePro-Medium.otf");
-            load_font(&mut fonts, "SourceCodePro-Bold", &font_dir, "SourceCodePro-Bold.otf");
-            load_font(&mut fonts, "FiraSans-Regular", &font_dir, "FiraSans-Regular.otf");
-            load_font(&mut fonts, "FiraSans-SemiBold", &font_dir, "FiraSans-SemiBold.otf");
-            load_font(&mut fonts, "Roboto-Regular", &font_dir, "Roboto-Regular.ttf");
+            load_font(
+                &mut fonts,
+                "SourceCodePro-Regular",
+                &font_dir,
+                "SourceCodePro-Regular.otf",
+            );
+            load_font(
+                &mut fonts,
+                "SourceCodePro-Medium",
+                &font_dir,
+                "SourceCodePro-Medium.otf",
+            );
+            load_font(
+                &mut fonts,
+                "SourceCodePro-Bold",
+                &font_dir,
+                "SourceCodePro-Bold.otf",
+            );
+            load_font(
+                &mut fonts,
+                "FiraSans-Regular",
+                &font_dir,
+                "FiraSans-Regular.otf",
+            );
+            load_font(
+                &mut fonts,
+                "FiraSans-SemiBold",
+                &font_dir,
+                "FiraSans-SemiBold.otf",
+            );
+            load_font(
+                &mut fonts,
+                "Roboto-Regular",
+                &font_dir,
+                "Roboto-Regular.ttf",
+            );
             load_font(&mut fonts, "Roboto-Bold", &font_dir, "Roboto-Bold.ttf");
         }
 
@@ -130,10 +160,7 @@ impl Theme {
         };
 
         if fonts.font_data.contains_key(ui_font) {
-            if let Some(family) = fonts
-                .families
-                .get_mut(&egui::FontFamily::Proportional)
-            {
+            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
                 family.insert(0, ui_font.to_string());
             }
         }
@@ -267,7 +294,11 @@ fn find_sourcetrail_fonts_dir() -> Option<PathBuf> {
         }
     }
     if let Ok(dir) = std::env::var("CODESTORY_SOURCETRAIL_DIR") {
-        let path = PathBuf::from(dir).join("bin").join("app").join("data").join("fonts");
+        let path = PathBuf::from(dir)
+            .join("bin")
+            .join("app")
+            .join("data")
+            .join("fonts");
         if path.exists() {
             return Some(path);
         }

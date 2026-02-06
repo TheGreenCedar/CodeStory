@@ -125,6 +125,24 @@ impl PreferencesDialog {
                         &mut self.temp_settings.node_graph.show_graph_stats,
                         "Show graph stats overlay",
                     );
+                    ui.horizontal(|ui| {
+                        ui.label("Mouse wheel:");
+                        ui.selectable_value(
+                            &mut self.temp_settings.node_graph.graph_wheel_behavior,
+                            crate::settings::GraphWheelBehavior::ScrollPan,
+                            "Pan/Scroll",
+                        );
+                        ui.selectable_value(
+                            &mut self.temp_settings.node_graph.graph_wheel_behavior,
+                            crate::settings::GraphWheelBehavior::Zoom,
+                            "Zoom",
+                        );
+                    });
+                    ui.label(
+                        egui::RichText::new("Ctrl/Cmd + wheel always zooms.")
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    );
                     ui.add(
                         egui::Slider::new(
                             &mut self.temp_settings.node_graph.lod_points_zoom,
@@ -140,12 +158,10 @@ impl PreferencesDialog {
                         .text("LOD simplified zoom"),
                     );
                     ui.add(
-                        egui::DragValue::new(
-                            &mut self.temp_settings.node_graph.max_full_nodes,
-                        )
-                        .range(50..=20000)
-                        .speed(10)
-                        .prefix("Max full nodes: "),
+                        egui::DragValue::new(&mut self.temp_settings.node_graph.max_full_nodes)
+                            .range(50..=20000)
+                            .speed(10)
+                            .prefix("Max full nodes: "),
                     );
                 });
 

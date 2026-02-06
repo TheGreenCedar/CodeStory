@@ -12,17 +12,17 @@ pub use bundling::NodeBundler;
 pub use graph::{
     DummyEdge, DummyNode, EdgeIndex, GraphModel, GroupLayout, GroupType, NodeIndex, Vec2,
 };
+pub use hit_tester::{EdgeBundleRegion, HitResult, HitTester};
 pub use layout::{
     BucketLayouter, EdgeBundler, EnhancedLayouter, ForceDirectedLayouter, GridLayouter,
-    HierarchicalLayouter, Layouter, ListLayouter, NestingLayouter, RadialLayouter,
-    RankAlgorithm, TrailLayouter,
+    HierarchicalLayouter, Layouter, ListLayouter, NestingLayouter, RadialLayouter, RankAlgorithm,
+    TrailLayouter,
 };
 pub use style::{
     Color, EdgeStyle, GroupType as StyleGroupType, NodeColors, NodeStyle, get_bundle_style,
     get_edge_kind_label, get_edge_style, get_group_style, get_kind_label, get_node_colors,
     get_node_style,
 };
-pub use hit_tester::{EdgeBundleRegion, HitResult, HitTester};
 pub use uml_types::{
     AnchorSide, BundleInfo, EdgeAnchor, EdgeRoute, MemberItem, Rect, UmlNode, VisibilityKind,
     VisibilitySection,

@@ -84,7 +84,12 @@ impl BookmarkPanel {
 
         // Categories and bookmarks
         if self.categories.is_empty() {
-            empty_state(ui, ph::BOOKMARK, "No Bookmark Categories", "Click + to create one");
+            empty_state(
+                ui,
+                ph::BOOKMARK,
+                "No Bookmark Categories",
+                "Click + to create one",
+            );
             return;
         }
 

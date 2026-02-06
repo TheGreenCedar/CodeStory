@@ -1,6 +1,6 @@
+use crate::Vec2;
 use crate::edge_router::CubicBezier;
 use crate::uml_types::{EdgeRoute, Rect, UmlNode};
-use crate::Vec2;
 use codestory_core::{EdgeId, NodeId};
 use std::collections::HashMap;
 

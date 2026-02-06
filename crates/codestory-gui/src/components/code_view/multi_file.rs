@@ -266,13 +266,12 @@ impl MultiFileCodeView {
                         .unwrap_or(0);
 
                     if let Some(snippet) = self.files.get_mut(path)
-                        && let Some(click) =
-                            Self::render_file_section(
-                                ui,
-                                snippet,
-                                &self.focused_location,
-                                error_count,
-                            )
+                        && let Some(click) = Self::render_file_section(
+                            ui,
+                            snippet,
+                            &self.focused_location,
+                            error_count,
+                        )
                     {
                         action = Some(click);
                     }
@@ -292,110 +291,118 @@ impl MultiFileCodeView {
 
         // File header (collapsible)
         let header_id = ui.make_persistent_id(snippet.path.to_string_lossy().to_string());
-        let mut title = format!("{} ({} references)", snippet.file_name(), snippet.reference_count);
+        let mut title = format!(
+            "{} ({} references)",
+            snippet.file_name(),
+            snippet.reference_count
+        );
         if error_count > 0 {
             title = format!("{} {} ({})", ph::WARNING_CIRCLE, title, error_count);
         }
 
         let header_response = egui::CollapsingHeader::new(egui::RichText::new(title).strong())
-        .id_salt(header_id)
-        .default_open(snippet.expanded)
-        .show(ui, |ui| {
-            // File path subtitle
-            ui.label(
-                egui::RichText::new(snippet.path.to_string_lossy())
-                    .small()
-                    .color(egui::Color32::GRAY),
-            );
+            .id_salt(header_id)
+            .default_open(snippet.expanded)
+            .show(ui, |ui| {
+                // File path subtitle
+                ui.label(
+                    egui::RichText::new(snippet.path.to_string_lossy())
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
 
-            // Render visible ranges
-            let lines: Vec<&str> = snippet.content.lines().collect();
+                // Render visible ranges
+                let lines: Vec<&str> = snippet.content.lines().collect();
 
-            for (range_idx, range) in snippet.visible_ranges.iter().enumerate() {
-                if range_idx > 0 {
-                    // Separator between non-contiguous ranges
-                    ui.horizontal(|ui| {
-                        ui.add_space(20.0);
-                        ui.label(
-                            egui::RichText::new(ph::DOTS_THREE_VERTICAL)
-                                .color(egui::Color32::DARK_GRAY),
-                        );
-                    });
-                }
+                for (range_idx, range) in snippet.visible_ranges.iter().enumerate() {
+                    if range_idx > 0 {
+                        // Separator between non-contiguous ranges
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(
+                                egui::RichText::new(ph::DOTS_THREE_VERTICAL)
+                                    .color(egui::Color32::DARK_GRAY),
+                            );
+                        });
+                    }
 
-                for line_num in range.start..range.end.min(lines.len()) {
-                    let line = lines.get(line_num).unwrap_or(&"");
-                    // Note: line_num is 0-based (array index), but loc.start_line/end_line are 1-based
-                    let display_line_num = line_num + 1;
+                    for line_num in range.start..range.end.min(lines.len()) {
+                        let line = lines.get(line_num).unwrap_or(&"");
+                        // Note: line_num is 0-based (array index), but loc.start_line/end_line are 1-based
+                        let display_line_num = line_num + 1;
 
-                    // Determine if active and what color
-                    let mut bg_color = egui::Color32::TRANSPARENT;
+                        // Determine if active and what color
+                        let mut bg_color = egui::Color32::TRANSPARENT;
 
-                    // Check focus first
-                    let is_focused = focused.as_ref().is_some_and(|f| {
-                        (f.start_line as usize..=f.end_line as usize).contains(&display_line_num)
-                    });
-
-                    if is_focused {
-                        bg_color = egui::Color32::from_rgb(60, 80, 100);
-                    } else {
-                        // Check occurrences on this line
-                        for occ in &snippet.occurrences {
-                            let loc = &occ.location;
-                            if (loc.start_line as usize..=loc.end_line as usize)
+                        // Check focus first
+                        let is_focused = focused.as_ref().is_some_and(|f| {
+                            (f.start_line as usize..=f.end_line as usize)
                                 .contains(&display_line_num)
-                            {
-                                // Apply kind color
-                                let kind_color = match occ.kind {
-                                    codestory_core::OccurrenceKind::DEFINITION => {
-                                        egui::Color32::from_rgba_premultiplied(0, 100, 100, 60)
-                                    }
-                                    codestory_core::OccurrenceKind::REFERENCE
-                                    | codestory_core::OccurrenceKind::MACRO_REFERENCE => {
-                                        egui::Color32::from_rgba_premultiplied(100, 100, 0, 60)
-                                    }
-                                    _ => egui::Color32::from_rgba_premultiplied(60, 60, 60, 60),
-                                };
-                                // Mix or override? Override for now.
-                                bg_color = kind_color;
-                                break; // First match wins
+                        });
+
+                        if is_focused {
+                            bg_color = egui::Color32::from_rgb(60, 80, 100);
+                        } else {
+                            // Check occurrences on this line
+                            for occ in &snippet.occurrences {
+                                let loc = &occ.location;
+                                if (loc.start_line as usize..=loc.end_line as usize)
+                                    .contains(&display_line_num)
+                                {
+                                    // Apply kind color
+                                    let kind_color = match occ.kind {
+                                        codestory_core::OccurrenceKind::DEFINITION => {
+                                            egui::Color32::from_rgba_premultiplied(0, 100, 100, 60)
+                                        }
+                                        codestory_core::OccurrenceKind::REFERENCE
+                                        | codestory_core::OccurrenceKind::MACRO_REFERENCE => {
+                                            egui::Color32::from_rgba_premultiplied(100, 100, 0, 60)
+                                        }
+                                        _ => egui::Color32::from_rgba_premultiplied(60, 60, 60, 60),
+                                    };
+                                    // Mix or override? Override for now.
+                                    bg_color = kind_color;
+                                    break; // First match wins
+                                }
+                            }
+                        }
+
+                        let line_response = ui.horizontal(|ui| {
+                            // Line number
+                            let line_num_text = format!("{:4}", display_line_num);
+                            ui.label(
+                                egui::RichText::new(line_num_text)
+                                    .monospace()
+                                    .color(egui::Color32::GRAY),
+                            );
+
+                            // Line content with highlighting
+                            let frame = egui::Frame::NONE.fill(bg_color);
+                            frame.show(ui, |ui| {
+                                ui.label(egui::RichText::new(*line).monospace());
+                            });
+                        });
+
+                        // Check for click on line
+                        if line_response.response.clicked() {
+                            // Find the occurrence for this line
+                            if let Some(occ) = snippet.occurrences.iter().find(|occ| {
+                                let loc = &occ.location;
+                                (loc.start_line as usize..=loc.end_line as usize)
+                                    .contains(&display_line_num)
+                            }) {
+                                action =
+                                    Some(ClickAction::NavigateToLocation(occ.location.clone()));
+                            } else {
+                                action = Some(ClickAction::NavigateToLine(
+                                    snippet.path.clone(),
+                                    line_num,
+                                ));
                             }
                         }
                     }
-
-                    let line_response = ui.horizontal(|ui| {
-                        // Line number
-                        let line_num_text = format!("{:4}", display_line_num);
-                        ui.label(
-                            egui::RichText::new(line_num_text)
-                                .monospace()
-                                .color(egui::Color32::GRAY),
-                        );
-
-                        // Line content with highlighting
-                        let frame = egui::Frame::NONE.fill(bg_color);
-                        frame.show(ui, |ui| {
-                            ui.label(egui::RichText::new(*line).monospace());
-                        });
-                    });
-
-                    // Check for click on line
-                    if line_response.response.clicked() {
-                        // Find the occurrence for this line
-                        if let Some(occ) = snippet.occurrences.iter().find(|occ| {
-                            let loc = &occ.location;
-                            (loc.start_line as usize..=loc.end_line as usize)
-                                .contains(&display_line_num)
-                        }) {
-                            action = Some(ClickAction::NavigateToLocation(occ.location.clone()));
-                        } else {
-                            action =
-                                Some(ClickAction::NavigateToLine(snippet.path.clone(), line_num));
-                        }
-                    }
                 }
-            }
-        });
+            });
 
         // Track expanded state
         snippet.expanded = header_response.fully_open();

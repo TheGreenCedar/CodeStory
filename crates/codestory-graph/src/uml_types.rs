@@ -982,10 +982,7 @@ pub const VIEWPORT_CULL_THRESHOLD: usize = 50;
 /// A `HashSet` of `NodeId`s that are considered visible.
 ///
 /// **Validates: Requirements 10.1, 10.4, Property 25**
-pub fn viewport_cull(
-    node_rects: &HashMap<NodeId, Rect>,
-    viewport: Rect,
-) -> HashSet<NodeId> {
+pub fn viewport_cull(node_rects: &HashMap<NodeId, Rect>, viewport: Rect) -> HashSet<NodeId> {
     // Below threshold: all nodes visible
     if node_rects.len() < VIEWPORT_CULL_THRESHOLD {
         return node_rects.keys().copied().collect();

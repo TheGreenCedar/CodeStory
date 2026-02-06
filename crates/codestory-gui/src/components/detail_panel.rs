@@ -97,7 +97,12 @@ impl DetailPanel {
                         }
                     });
             } else {
-                empty_state(ui, ph::INFO, "No Selection", "Select a node to view details");
+                empty_state(
+                    ui,
+                    ph::INFO,
+                    "No Selection",
+                    "Select a node to view details",
+                );
             }
         });
     }

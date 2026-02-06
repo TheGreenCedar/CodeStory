@@ -535,9 +535,12 @@ impl CodeStoryApp {
             // Update Graph using trail with current depth
             let trail_config = codestory_core::TrailConfig {
                 root_id: id,
+                mode: codestory_core::TrailMode::Neighborhood,
+                target_id: None,
                 depth: self.settings.node_graph.trail_depth,
                 direction: self.settings.node_graph.trail_direction,
                 edge_filter: self.settings.node_graph.trail_edge_filter.clone(),
+                node_filter: Vec::new(),
                 max_nodes: 500,
             };
 
@@ -1110,7 +1113,12 @@ impl eframe::App for CodeStoryApp {
 
                 match self.search_bar.ui(ui) {
                     SearchAction::FullSearch(query) => {
-                        if let Some(engine) = &mut self.search_engine {
+                        let trimmed = query.trim();
+                        if trimmed.eq_ignore_ascii_case("legend") {
+                            // Sourcetrail parity: typing "legend" in the search field opens the graph legend.
+                            self.dock_state.focus_tab(crate::dock_state::TabId::Graph);
+                            self.event_bus.publish(Event::SetShowLegend(true));
+                        } else if let Some(engine) = &mut self.search_engine {
                             let results = engine.search_symbol(&query);
                             self.search_results = self.build_search_results(results);
                             // Update status message with search info
@@ -1473,57 +1481,38 @@ impl codestory_events::EventListener for CodeStoryApp {
             Event::TrailModeEnter { root_id } => {
                 self.show_trail_view = true;
                 self.trail_controls.activate_from_event(*root_id);
-                if let Some(storage) = &self.storage
-                    && let Some(config) = self.trail_controls.config.to_trail_config()
-                {
-                    match storage.get_trail(&config) {
-                        Ok(result) => {
-                            self.node_graph_view.load_from_data(
-                                *root_id,
-                                &result.nodes,
-                                &result.edges,
-                                &self.settings.node_graph,
-                            );
-                        }
-                        Err(e) => tracing::error!("Failed to get trail: {}", e),
-                    }
-                }
             }
             Event::TrailConfigChange {
                 depth,
                 direction,
                 edge_filter,
+                mode,
+                target_id,
+                node_filter,
             } => {
-                // Persist the trail configuration so graph controls remain consistent across
-                // subsequent activations and restarts.
-                self.settings.node_graph.trail_depth = *depth;
-                self.settings.node_graph.trail_direction = *direction;
-                self.settings.node_graph.trail_edge_filter = edge_filter.clone();
-                self.settings.save();
+                // Persist the "neighborhood" graph controls so they remain consistent across
+                // activations and restarts. Custom Trail settings are intentionally not persisted.
+                if *mode == codestory_core::TrailMode::Neighborhood {
+                    self.settings.node_graph.trail_depth = *depth;
+                    self.settings.node_graph.trail_direction = *direction;
+                    self.settings.node_graph.trail_edge_filter = edge_filter.clone();
+                    self.settings.save();
+                }
 
                 if self.show_trail_view
-                    && let Some(root_id) = self.tab_manager.active_tab().and_then(|t| t.active_node)
+                    && let Some(root_id) = self
+                        .trail_controls
+                        .config
+                        .root_id
+                        .or_else(|| self.tab_manager.active_tab().and_then(|t| t.active_node))
                 {
                     self.trail_controls.config.root_id = Some(root_id);
                     self.trail_controls.config.depth = *depth;
                     self.trail_controls.config.direction = *direction;
                     self.trail_controls.config.edge_filter = edge_filter.clone();
-
-                    if let Some(storage) = &self.storage
-                        && let Some(config) = self.trail_controls.config.to_trail_config()
-                    {
-                        match storage.get_trail(&config) {
-                            Ok(result) => {
-                                self.node_graph_view.load_from_data(
-                                    root_id,
-                                    &result.nodes,
-                                    &result.edges,
-                                    &self.settings.node_graph,
-                                );
-                            }
-                            Err(e) => tracing::error!("Failed to refresh trail: {}", e),
-                        }
-                    }
+                    self.trail_controls.config.mode = *mode;
+                    self.trail_controls.config.target_id = *target_id;
+                    self.trail_controls.config.node_filter = node_filter.clone();
                 }
             }
             Event::BookmarkRemove { id } => {
@@ -1708,58 +1697,50 @@ impl codestory_events::EventListener for CodeStoryApp {
             Event::SetTrailDepth(depth) => {
                 self.settings.node_graph.trail_depth = *depth;
                 self.settings.save();
-                if let Some(id) = self.tab_manager.active_tab().and_then(|t| t.active_node) {
+                // Only reload the neighborhood graph when not in Trail/Custom Trail mode; otherwise
+                // we'd clobber the current trail graph.
+                if !self.show_trail_view
+                    && let Some(id) = self.tab_manager.active_tab().and_then(|t| t.active_node)
+                {
                     self.select_node_graph_detail(id);
                 }
             }
             Event::SetGroupByFile(enabled) => {
                 self.settings.node_graph.group_by_file = *enabled;
                 self.settings.save();
-                if let Some(id) = self.tab_manager.active_tab().and_then(|t| t.active_node) {
-                    self.select_node_graph_detail(id);
-                }
+                // Grouping is a purely-visual overlay; no storage reload required.
             }
             Event::SetGroupByNamespace(enabled) => {
                 self.settings.node_graph.group_by_namespace = *enabled;
                 self.settings.save();
-                if let Some(id) = self.tab_manager.active_tab().and_then(|t| t.active_node) {
-                    self.select_node_graph_detail(id);
-                }
+                // Grouping is a purely-visual overlay; no storage reload required.
             }
             Event::SetLayoutMethod(algorithm) => {
                 self.settings.node_graph.layout_algorithm = *algorithm;
                 self.settings.save();
-                if let Some(id) = self.tab_manager.active_tab().and_then(|t| t.active_node) {
-                    self.select_node_graph_detail(id);
-                }
+                // Layout changes should re-layout the current cached graph (including trails)
+                // rather than re-querying storage.
             }
             Event::SetLayoutDirection(direction) => {
                 self.settings.node_graph.layout_direction = *direction;
                 self.settings.save();
-                if let Some(id) = self.tab_manager.active_tab().and_then(|t| t.active_node) {
-                    self.select_node_graph_detail(id);
-                }
+                // Layout changes should re-layout the current cached graph (including trails)
+                // rather than re-querying storage.
             }
             Event::SetShowClasses(visible) => {
                 self.settings.node_graph.show_classes = *visible;
                 self.settings.save();
-                if let Some(id) = self.tab_manager.active_tab().and_then(|t| t.active_node) {
-                    self.select_node_graph_detail(id);
-                }
+                // Filter changes are applied locally to the cached graph.
             }
             Event::SetShowFunctions(visible) => {
                 self.settings.node_graph.show_functions = *visible;
                 self.settings.save();
-                if let Some(id) = self.tab_manager.active_tab().and_then(|t| t.active_node) {
-                    self.select_node_graph_detail(id);
-                }
+                // Filter changes are applied locally to the cached graph.
             }
             Event::SetShowVariables(visible) => {
                 self.settings.node_graph.show_variables = *visible;
                 self.settings.save();
-                if let Some(id) = self.tab_manager.active_tab().and_then(|t| t.active_node) {
-                    self.select_node_graph_detail(id);
-                }
+                // Filter changes are applied locally to the cached graph.
             }
             Event::SetShowMinimap(visible) => {
                 self.settings.node_graph.show_minimap = *visible;

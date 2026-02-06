@@ -1,4 +1,4 @@
-use codestory_core::{EdgeId, EdgeKind, NodeId, SourceLocation};
+use codestory_core::{EdgeId, EdgeKind, NodeId, NodeKind, SourceLocation, TrailMode};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -231,6 +231,9 @@ pub enum Event {
         depth: u32,
         direction: codestory_core::TrailDirection,
         edge_filter: Vec<EdgeKind>,
+        mode: TrailMode,
+        target_id: Option<NodeId>,
+        node_filter: Vec<NodeKind>,
     },
 
     // ========================================================================

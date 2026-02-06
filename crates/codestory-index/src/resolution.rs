@@ -1,7 +1,7 @@
 use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind};
 use codestory_storage::Storage;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 
 #[derive(Default, Debug)]
 pub struct ResolutionStats {
@@ -56,6 +56,29 @@ impl ResolutionPass {
             params![EdgeKind::CALL as i32],
         )?;
 
+        // Repair/avoid incorrect call resolutions:
+        // - Previous versions used fuzzy matching for CALL edges, which can incorrectly resolve
+        //   common method calls (e.g. `dedup`, `sort`) to unrelated project functions.
+        // - Even with exact matching, some unqualified method names (e.g. `push`, `add`) are so
+        //   common in stdlib/3rd-party types that resolving them by name alone is often wrong.
+        //
+        // For CALL edges we prefer leaving the target unresolved over linking to the wrong node,
+        // since incorrect edges pollute the trail graph as depth increases.
+        conn.execute(
+            "UPDATE edge SET resolved_target_node_id = NULL, confidence = NULL
+             WHERE kind = ?1 AND confidence IS NOT NULL AND confidence <= ?2",
+            params![EdgeKind::CALL as i32, 0.4f32],
+        )?;
+        for common_name in common_unqualified_call_names() {
+            conn.execute(
+                "UPDATE edge SET resolved_target_node_id = NULL, confidence = NULL
+                 WHERE kind = ?1
+                 AND resolved_target_node_id IS NOT NULL
+                 AND target_node_id IN (SELECT id FROM node WHERE serialized_name = ?2)",
+                params![EdgeKind::CALL as i32, common_name],
+            )?;
+        }
+
         let mut resolved = 0usize;
         let mut stmt = conn.prepare(
             "SELECT e.id, caller.file_node_id, caller.qualified_name, target.serialized_name
@@ -82,13 +105,24 @@ impl ResolutionPass {
 
         for row in rows {
             let (edge_id, file_id, caller_qualified, target_name) = row?;
+            let is_common_unqualified = is_common_unqualified_call_name(&target_name);
             let (exact, suffix_dot, suffix_colon) = name_patterns(&target_name);
 
-            if let Some(candidate) =
-                find_same_file(conn, &function_kinds, file_id, &exact, &suffix_dot, &suffix_colon)?
-            {
-                resolved += update_edge_resolution(conn, edge_id, candidate, 0.95)?;
-                continue;
+            // For very common unqualified method names, resolving within the same file is too
+            // error-prone (e.g. `Vec::push` getting linked to an unrelated `SomeType::push`).
+            // Prefer module/type-local resolution instead (see `find_same_module` below).
+            if !is_common_unqualified {
+                if let Some(candidate) = find_same_file(
+                    conn,
+                    &function_kinds,
+                    file_id,
+                    &exact,
+                    &suffix_dot,
+                    &suffix_colon,
+                )? {
+                    resolved += update_edge_resolution(conn, edge_id, candidate, 0.95)?;
+                    continue;
+                }
             }
 
             if let Some(prefix) = caller_qualified.and_then(module_prefix) {
@@ -106,17 +140,18 @@ impl ResolutionPass {
                 }
             }
 
+            // For common unqualified method names (e.g. `push`, `add`), avoid global matching.
+            // These calls are often to stdlib/3rd-party types where we cannot infer the receiver
+            // type, and resolving by name alone produces incorrect edges.
+            if is_common_unqualified {
+                continue;
+            }
+
             if let Some(candidate) =
                 find_global_unique(conn, &function_kinds, &exact, &suffix_dot, &suffix_colon)?
             {
                 resolved += update_edge_resolution(conn, edge_id, candidate, 0.6)?;
                 continue;
-            }
-
-            if let Some(candidate) =
-                find_fuzzy(conn, &function_kinds, &exact, &suffix_dot, &suffix_colon)?
-            {
-                resolved += update_edge_resolution(conn, edge_id, candidate, 0.4)?;
             }
         }
 
@@ -159,9 +194,14 @@ impl ResolutionPass {
             let (edge_id, file_id, caller_qualified, target_name) = row?;
             let (exact, suffix_dot, suffix_colon) = name_patterns(&target_name);
 
-            if let Some(candidate) =
-                find_same_file(conn, &module_kinds, file_id, &exact, &suffix_dot, &suffix_colon)?
-            {
+            if let Some(candidate) = find_same_file(
+                conn,
+                &module_kinds,
+                file_id,
+                &exact,
+                &suffix_dot,
+                &suffix_colon,
+            )? {
                 resolved += update_edge_resolution(conn, edge_id, candidate, 0.9)?;
                 continue;
             }
@@ -248,9 +288,13 @@ fn find_same_file(
          ORDER BY start_line LIMIT 1",
         kind_clause(kinds)
     );
-    conn.query_row(&query, params![file_id, exact, suffix_dot, suffix_colon], |row| row.get(0))
-        .optional()
-        .map_err(Into::into)
+    conn.query_row(
+        &query,
+        params![file_id, exact, suffix_dot, suffix_colon],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn find_same_module(
@@ -271,9 +315,13 @@ fn find_same_module(
          ORDER BY start_line LIMIT 1",
         kind_clause(kinds)
     );
-    conn.query_row(&query, params![pattern, exact, suffix_dot, suffix_colon], |row| row.get(0))
-        .optional()
-        .map_err(Into::into)
+    conn.query_row(
+        &query,
+        params![pattern, exact, suffix_dot, suffix_colon],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn find_global_unique(
@@ -289,8 +337,11 @@ fn find_global_unique(
          AND (serialized_name = ?1 OR serialized_name LIKE ?2 OR serialized_name LIKE ?3)",
         kind_clause(kinds)
     );
-    let count: i64 =
-        conn.query_row(&count_query, params![exact, suffix_dot, suffix_colon], |row| row.get(0))?;
+    let count: i64 = conn.query_row(
+        &count_query,
+        params![exact, suffix_dot, suffix_colon],
+        |row| row.get(0),
+    )?;
     if count != 1 {
         return Ok(None);
     }
@@ -301,9 +352,11 @@ fn find_global_unique(
          LIMIT 1",
         kind_clause(kinds)
     );
-    conn.query_row(&query, params![exact, suffix_dot, suffix_colon], |row| row.get(0))
-        .optional()
-        .map_err(Into::into)
+    conn.query_row(&query, params![exact, suffix_dot, suffix_colon], |row| {
+        row.get(0)
+    })
+    .optional()
+    .map_err(Into::into)
 }
 
 fn find_fuzzy(
@@ -336,4 +389,32 @@ fn kind_clause(kinds: &[i32]) -> String {
         .map(|k| k.to_string())
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn common_unqualified_call_names() -> &'static [&'static str] {
+    // Keep this list intentionally small and focused on very common stdlib-like methods.
+    // These are frequently called on collections/types where we can't infer the receiver type,
+    // and resolving them by name alone is likely wrong.
+    &[
+        "add",
+        "clear",
+        "dedup",
+        "extend",
+        "insert",
+        "pop",
+        "push",
+        "remove",
+        "sort",
+        "sort_by",
+        "sort_by_key",
+        "truncate",
+    ]
+}
+
+fn is_common_unqualified_call_name(name: &str) -> bool {
+    // If the target already looks qualified, allow normal resolution.
+    if name.contains("::") || name.contains('.') {
+        return false;
+    }
+    common_unqualified_call_names().iter().any(|n| *n == name)
 }

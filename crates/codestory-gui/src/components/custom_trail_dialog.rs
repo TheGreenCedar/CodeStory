@@ -9,7 +9,9 @@
 
 use crate::components::search_bar::SearchMatch;
 use crate::theme::{badge, to_egui_color};
-use codestory_core::{EdgeKind, NodeId, NodeKind, TrailConfig, TrailDirection};
+use codestory_core::{
+    EdgeKind, LayoutDirection, NodeId, NodeKind, TrailConfig, TrailDirection, TrailMode,
+};
 use codestory_events::{Event, EventBus};
 use codestory_graph::{get_edge_kind_label, get_edge_style, get_kind_label, get_node_colors};
 use codestory_search::SearchEngine;
@@ -43,11 +45,14 @@ pub struct CustomTrailDialog {
     pub to_node: Option<NodeId>,
     pub to_node_name: String,
 
-    /// Trail depth (1-20)
+    /// Custom trail mode (Sourcetrail parity)
+    pub mode: TrailMode,
+
+    /// Trail depth (1-20), `0` means "infinite"
     pub depth: u32,
 
-    /// Layout direction
-    pub direction: TrailDirection,
+    /// Graph layout direction (Horizontal/Vertical)
+    pub layout_direction: LayoutDirection,
 
     /// Node types to include
     pub node_filters: NodeTypeFilters,
@@ -247,8 +252,9 @@ impl CustomTrailDialog {
             from_node_name: String::new(),
             to_node: None,
             to_node_name: String::new(),
+            mode: TrailMode::AllReferenced,
             depth: 3,
-            direction: TrailDirection::Outgoing,
+            layout_direction: LayoutDirection::Horizontal,
             node_filters: NodeTypeFilters::default(),
             edge_filters: EdgeTypeFilters::default(),
             from_search: String::new(),
@@ -291,6 +297,19 @@ impl CustomTrailDialog {
     /// Returns None if no starting node is set
     pub fn build_config(&self) -> Option<TrailConfig> {
         let root_id = self.from_node?;
+        let target_id = match self.mode {
+            TrailMode::ToTargetSymbol => self.to_node,
+            _ => None,
+        };
+        if self.mode == TrailMode::ToTargetSymbol && target_id.is_none() {
+            return None;
+        }
+
+        let direction = match self.mode {
+            TrailMode::AllReferencing => TrailDirection::Incoming,
+            TrailMode::AllReferenced | TrailMode::ToTargetSymbol => TrailDirection::Outgoing,
+            TrailMode::Neighborhood => TrailDirection::Both,
+        };
 
         // Log useful configuration info
         tracing::debug!(
@@ -300,9 +319,12 @@ impl CustomTrailDialog {
 
         Some(TrailConfig {
             root_id,
+            mode: self.mode,
+            target_id,
             depth: self.depth,
-            direction: self.direction,
+            direction,
             edge_filter: self.edge_filters.enabled_kinds(),
+            node_filter: self.node_filters.enabled_kinds(),
             max_nodes: 500,
         })
     }
@@ -378,10 +400,8 @@ impl CustomTrailDialog {
                                     self.from_suggestions.len(),
                                 );
                                 if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                    if let Some(match_) = self
-                                        .from_suggestions
-                                        .get(self.from_selected_index)
-                                        .cloned()
+                                    if let Some(match_) =
+                                        self.from_suggestions.get(self.from_selected_index).cloned()
                                     {
                                         self.select_from_match(match_);
                                     }
@@ -399,76 +419,115 @@ impl CustomTrailDialog {
                         });
                         ui.end_row();
 
-                        ui.label("To (optional):");
-                        ui.horizontal(|ui| {
-                            let response = ui.text_edit_singleline(&mut self.to_search);
-                            to_input_rect = Some(response.rect);
-                            if response.changed() {
-                                let query = self.to_search.clone();
-                                update_suggestions(
-                                    &query,
-                                    &mut self.last_to_query,
-                                    &mut self.to_suggestions,
-                                    &mut self.to_selected_index,
-                                    &mut self.show_to_search,
-                                    search_engine.as_deref_mut(),
-                                    storage,
-                                );
-                            }
-                            if response.has_focus() {
-                                handle_search_keys(
-                                    ui,
-                                    &mut self.to_selected_index,
-                                    &mut self.show_to_search,
-                                    self.to_suggestions.len(),
-                                );
-                                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                    if let Some(match_) = self
-                                        .to_suggestions
-                                        .get(self.to_selected_index)
-                                        .cloned()
-                                    {
-                                        self.select_to_match(match_);
+                        if self.mode == TrailMode::ToTargetSymbol {
+                            ui.label("To:");
+                            ui.horizontal(|ui| {
+                                let response = ui.text_edit_singleline(&mut self.to_search);
+                                to_input_rect = Some(response.rect);
+                                if response.changed() {
+                                    let query = self.to_search.clone();
+                                    update_suggestions(
+                                        &query,
+                                        &mut self.last_to_query,
+                                        &mut self.to_suggestions,
+                                        &mut self.to_selected_index,
+                                        &mut self.show_to_search,
+                                        search_engine.as_deref_mut(),
+                                        storage,
+                                    );
+                                }
+                                if response.has_focus() {
+                                    handle_search_keys(
+                                        ui,
+                                        &mut self.to_selected_index,
+                                        &mut self.show_to_search,
+                                        self.to_suggestions.len(),
+                                    );
+                                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                        if let Some(match_) =
+                                            self.to_suggestions.get(self.to_selected_index).cloned()
+                                        {
+                                            self.select_to_match(match_);
+                                        }
                                     }
                                 }
-                            }
-                            if self.to_node.is_some()
-                                && ui.button(ph::X).on_hover_text("Clear").clicked()
-                            {
-                                self.to_node = None;
-                                self.to_node_name.clear();
-                                self.to_search.clear();
-                                self.to_suggestions.clear();
-                                self.show_to_search = false;
-                            }
-                        });
-                        ui.end_row();
+                                if self.to_node.is_some()
+                                    && ui.button(ph::X).on_hover_text("Clear").clicked()
+                                {
+                                    self.to_node = None;
+                                    self.to_node_name.clear();
+                                    self.to_search.clear();
+                                    self.to_suggestions.clear();
+                                    self.show_to_search = false;
+                                }
+                            });
+                            ui.end_row();
+                        } else {
+                            ui.label("To:");
+                            ui.horizontal(|ui| {
+                                ui.add_enabled(
+                                    false,
+                                    egui::TextEdit::singleline(&mut self.to_search)
+                                        .hint_text("Only used in \"To Target Symbol\" mode"),
+                                );
+                            });
+                            ui.end_row();
+                        }
                     });
 
                 ui.separator();
 
-                // Depth and direction
+                // Mode
                 ui.horizontal(|ui| {
-                    ui.label("Depth:");
-                    ui.add(egui::Slider::new(&mut self.depth, 1..=20).integer());
+                    ui.label("Mode:");
+                    ui.selectable_value(&mut self.mode, TrailMode::AllReferenced, "All Referenced");
+                    ui.selectable_value(
+                        &mut self.mode,
+                        TrailMode::AllReferencing,
+                        "All Referencing",
+                    );
+                    ui.selectable_value(
+                        &mut self.mode,
+                        TrailMode::ToTargetSymbol,
+                        "To Target Symbol",
+                    );
                 });
 
+                // Depth: 1..=20 plus ∞ (stored as 0)
                 ui.horizontal(|ui| {
-                    ui.label("Direction:");
-                    let outgoing_label = format!("{} Outgoing", ph::ARROW_RIGHT);
-                    let incoming_label = format!("{} Incoming", ph::ARROW_LEFT);
-                    let both_label = format!("{} Both", ph::ARROWS_LEFT_RIGHT);
+                    ui.label("Max Depth:");
+                    let mut slider_pos: u32 = if self.depth == 0 {
+                        20
+                    } else {
+                        (self.depth.saturating_sub(1)).min(19)
+                    };
+                    let slider = egui::Slider::new(&mut slider_pos, 0..=20)
+                        .show_value(false)
+                        .step_by(1.0);
+                    if ui.add(slider).changed() {
+                        self.depth = if slider_pos == 20 { 0 } else { slider_pos + 1 };
+                    }
+                    let depth_label = if slider_pos == 20 {
+                        "∞".to_string()
+                    } else {
+                        (slider_pos + 1).to_string()
+                    };
+                    ui.label(depth_label);
+                });
+
+                // Graph layout direction (Horizontal/Vertical)
+                ui.horizontal(|ui| {
+                    ui.label("Layout:");
                     ui.selectable_value(
-                        &mut self.direction,
-                        TrailDirection::Outgoing,
-                        outgoing_label,
+                        &mut self.layout_direction,
+                        LayoutDirection::Horizontal,
+                        "Horizontal",
                     );
                     ui.selectable_value(
-                        &mut self.direction,
-                        TrailDirection::Incoming,
-                        incoming_label,
+                        &mut self.layout_direction,
+                        LayoutDirection::Vertical,
+                        "Vertical",
                     );
-                    ui.selectable_value(&mut self.direction, TrailDirection::Both, both_label);
                 });
 
                 ui.separator();
@@ -601,24 +660,30 @@ impl CustomTrailDialog {
 
                 // Action buttons
                 ui.horizontal(|ui| {
-                    let can_start = self.from_node.is_some();
+                    let needs_target = self.mode == TrailMode::ToTargetSymbol;
+                    let can_start =
+                        self.from_node.is_some() && (!needs_target || self.to_node.is_some());
 
                     if ui
                         .add_enabled(can_start, egui::Button::new("Start Trail"))
                         .on_hover_text(if can_start {
                             "Start the trail"
                         } else {
-                            "Select a From node first"
+                            "Select a From node (and a To node for \"To Target Symbol\")"
                         })
                         .clicked()
                         && let Some(from_id) = self.from_node
                         && let Some(config) = self.build_config()
                     {
                         event_bus.publish(Event::TrailModeEnter { root_id: from_id });
+                        event_bus.publish(Event::SetLayoutDirection(self.layout_direction));
                         event_bus.publish(Event::TrailConfigChange {
                             depth: config.depth,
                             direction: config.direction,
                             edge_filter: config.edge_filter,
+                            mode: config.mode,
+                            target_id: config.target_id,
+                            node_filter: config.node_filter,
                         });
                         start_trail = true;
                         should_close = true;
@@ -947,12 +1012,13 @@ mod tests {
 
         let mut dialog = CustomTrailDialog::new();
         dialog.from_node = Some(NodeId(42)); // Required for config to build
+        dialog.mode = TrailMode::Neighborhood;
         dialog.depth = 5;
-        dialog.direction = TrailDirection::Both;
 
         let config = dialog.build_config().unwrap();
         assert_eq!(config.depth, 5);
         assert_eq!(config.direction, TrailDirection::Both);
+        assert_eq!(config.mode, TrailMode::Neighborhood);
         assert_eq!(config.root_id, NodeId(42));
     }
 }

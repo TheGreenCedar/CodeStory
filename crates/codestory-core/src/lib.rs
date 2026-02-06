@@ -353,6 +353,25 @@ pub struct Bookmark {
 // Trail Types
 // ============================================================================
 
+/// High-level trail query mode (Sourcetrail parity).
+///
+/// This complements `TrailDirection`:
+/// - `Neighborhood` respects the chosen `TrailDirection` (incoming/outgoing/both).
+/// - `AllReferenced` / `AllReferencing` force an outgoing/incoming perspective.
+/// - `ToTargetSymbol` finds paths from `root_id` to `target_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TrailMode {
+    /// Default CodeStory behavior: explore a neighborhood subgraph around the root.
+    #[default]
+    Neighborhood,
+    /// Show nodes referenced by the root (outgoing).
+    AllReferenced,
+    /// Show nodes referencing the root (incoming).
+    AllReferencing,
+    /// Show paths from the root to a target symbol.
+    ToTargetSymbol,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrailDirection {
     Incoming,
@@ -363,9 +382,18 @@ pub enum TrailDirection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrailConfig {
     pub root_id: NodeId,
+    #[serde(default)]
+    pub mode: TrailMode,
+    /// Optional target for `TrailMode::ToTargetSymbol`.
+    #[serde(default)]
+    pub target_id: Option<NodeId>,
     pub depth: u32,
     pub direction: TrailDirection,
     pub edge_filter: Vec<EdgeKind>,
+    /// Optional node kind filter. When non-empty, the resulting trail will only include
+    /// nodes of the listed kinds (root/target are always included when present).
+    #[serde(default)]
+    pub node_filter: Vec<NodeKind>,
     pub max_nodes: usize,
 }
 
@@ -373,9 +401,12 @@ impl Default for TrailConfig {
     fn default() -> Self {
         Self {
             root_id: NodeId(0),
+            mode: TrailMode::Neighborhood,
+            target_id: None,
             depth: 2,
             direction: TrailDirection::Both,
             edge_filter: vec![],
+            node_filter: vec![],
             max_nodes: 500,
         }
     }

@@ -232,10 +232,9 @@ impl GraphModel {
 
     pub fn add_edge(&mut self, edge: Edge) {
         let (source_id, target_id) = edge.effective_endpoints();
-        if let (Some(&src), Some(&target)) = (
-            self.node_map.get(&source_id),
-            self.node_map.get(&target_id),
-        ) {
+        if let (Some(&src), Some(&target)) =
+            (self.node_map.get(&source_id), self.node_map.get(&target_id))
+        {
             let dummy = DummyEdge {
                 id: edge.id,
                 source: source_id,

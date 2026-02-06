@@ -3,7 +3,7 @@
 //! Displays a depth-limited subgraph for focused exploration.
 
 use crate::theme::{self, badge};
-use codestory_core::{EdgeKind, NodeId, TrailConfig, TrailDirection};
+use codestory_core::{EdgeKind, NodeId, NodeKind, TrailConfig, TrailDirection, TrailMode};
 use codestory_events::{Event, EventBus};
 use eframe::egui;
 
@@ -11,9 +11,12 @@ use eframe::egui;
 #[derive(Debug, Clone)]
 pub struct TrailViewConfig {
     pub root_id: Option<NodeId>,
+    pub mode: TrailMode,
+    pub target_id: Option<NodeId>,
     pub depth: u32,
     pub direction: TrailDirection,
     pub edge_filter: Vec<EdgeKind>,
+    pub node_filter: Vec<NodeKind>,
     pub max_nodes: usize,
     pub use_radial_layout: bool,
 }
@@ -22,9 +25,12 @@ impl Default for TrailViewConfig {
     fn default() -> Self {
         Self {
             root_id: None,
+            mode: TrailMode::Neighborhood,
+            target_id: None,
             depth: 2,
             direction: TrailDirection::Both,
             edge_filter: vec![],
+            node_filter: vec![],
             max_nodes: 500,
             use_radial_layout: false,
         }
@@ -35,9 +41,12 @@ impl TrailViewConfig {
     pub fn to_trail_config(&self) -> Option<TrailConfig> {
         self.root_id.map(|root_id| TrailConfig {
             root_id,
+            mode: self.mode,
+            target_id: self.target_id,
             depth: self.depth,
             direction: self.direction,
             edge_filter: self.edge_filter.clone(),
+            node_filter: self.node_filter.clone(),
             max_nodes: self.max_nodes,
         })
     }
@@ -190,6 +199,9 @@ impl TrailViewControls {
             depth: self.config.depth,
             direction: self.config.direction,
             edge_filter: self.config.edge_filter.clone(),
+            mode: self.config.mode,
+            target_id: self.config.target_id,
+            node_filter: self.config.node_filter.clone(),
         });
     }
 }

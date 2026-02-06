@@ -3,8 +3,8 @@ use codestory_graph::uml_types::{GraphViewState, MemberItem, UmlNode, Visibility
 use eframe::egui;
 use egui_phosphor::regular as ph;
 
-use crate::settings::NodeGraphSettings;
 use super::style_resolver::StyleResolver;
+use crate::settings::NodeGraphSettings;
 
 // Responsibility checklist for the custom canvas:
 // - Node cards (header, members, hatching) and collapse/expand interactions
@@ -130,6 +130,10 @@ impl GraphCanvas {
         self.zoom
     }
 
+    pub fn pan_by(&mut self, delta: egui::Vec2) {
+        self.pan += delta;
+    }
+
     pub fn zoom_by(&mut self, delta: f32, viewport_center: egui::Pos2) {
         if delta <= 0.0 {
             return;
@@ -183,17 +187,58 @@ impl GraphCanvas {
         let mut toggle_section = None;
         let mut action = None;
 
-        let zoom_delta = ui.input(|i| i.zoom_delta());
-        if response.hovered() && (zoom_delta - 1.0).abs() > f32::EPSILON {
-            let prev_zoom = self.zoom;
-            let new_zoom = (self.zoom * zoom_delta).clamp(0.1, 4.0);
-            if (new_zoom - prev_zoom).abs() > f32::EPSILON {
-                self.zoom = new_zoom;
-                if let Some(pointer) = response.hover_pos() {
-                    let graph_pos = self.screen_to_graph(pointer, viewport_center, prev_zoom);
-                    let new_screen = self.graph_to_screen(graph_pos, viewport_center);
-                    self.pan += pointer - new_screen;
+        fn apply_zoom(
+            canvas: &mut GraphCanvas,
+            zoom_delta: f32,
+            pointer: Option<egui::Pos2>,
+            viewport_center: egui::Pos2,
+        ) {
+            if zoom_delta <= 0.0 {
+                return;
+            }
+            let prev_zoom = canvas.zoom;
+            let new_zoom = (canvas.zoom * zoom_delta).clamp(0.1, 4.0);
+            if (new_zoom - prev_zoom).abs() <= f32::EPSILON {
+                return;
+            }
+            canvas.zoom = new_zoom;
+            if let Some(pointer) = pointer {
+                let graph_pos = canvas.screen_to_graph(pointer, viewport_center, prev_zoom);
+                let new_screen = canvas.graph_to_screen(graph_pos, viewport_center);
+                canvas.pan += pointer - new_screen;
+            }
+        }
+
+        if response.hovered() {
+            let pointer = response.hover_pos();
+            // Graph wheel behavior parity with Sourcetrail's "Graph Zoom" preference.
+            match settings.graph_wheel_behavior {
+                crate::settings::GraphWheelBehavior::ScrollPan => {
+                    let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+                    if scroll_delta != egui::Vec2::ZERO {
+                        self.pan += scroll_delta;
+                        // Consume scrolling so it doesn't leak to other panels.
+                        ui.ctx()
+                            .input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+                    }
                 }
+                crate::settings::GraphWheelBehavior::Zoom => {
+                    // Convert scroll into zoom (mirrors egui's default ctrl-scroll zoom math).
+                    let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+                    if scroll_delta != egui::Vec2::ZERO {
+                        ui.ctx()
+                            .input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+                        let scroll_for_zoom = scroll_delta.x + scroll_delta.y;
+                        let zoom_delta = (scroll_for_zoom * (1.0 / 200.0)).exp();
+                        apply_zoom(self, zoom_delta, pointer, viewport_center);
+                    }
+                }
+            }
+
+            // Ctrl/Cmd+wheel zoom (and pinch zoom) still apply via egui's zoom_delta.
+            let zoom_delta = ui.input(|i| i.zoom_delta());
+            if (zoom_delta - 1.0).abs() > f32::EPSILON {
+                apply_zoom(self, zoom_delta, pointer, viewport_center);
             }
         }
 
@@ -281,7 +326,10 @@ impl GraphCanvas {
             if let Some(node_id) = self.dragging_node {
                 if let Some(pointer) = response.interact_pointer_pos() {
                     let graph_pos = self.screen_to_graph(pointer, viewport_center, self.zoom);
-                    custom_positions.insert(node_id, codestory_graph::Vec2::new(graph_pos.x, graph_pos.y));
+                    custom_positions.insert(
+                        node_id,
+                        codestory_graph::Vec2::new(graph_pos.x, graph_pos.y),
+                    );
                 }
                 if ui.input(|i| !i.pointer.primary_down()) {
                     self.dragging_node = None;
@@ -304,8 +352,7 @@ impl GraphCanvas {
         }
 
         if response.dragged() && self.dragging_node.is_none() {
-            if let (Some(state), Some(pointer)) =
-                (self.drag_state, response.interact_pointer_pos())
+            if let (Some(state), Some(pointer)) = (self.drag_state, response.interact_pointer_pos())
             {
                 self.pan = state.start_pan + (pointer - state.start_pos);
             }
@@ -323,7 +370,15 @@ impl GraphCanvas {
                     continue;
                 }
                 let collapse_state = view_state.get_collapse_state(node.uml.id);
-                draw_node_card(ui, &painter, node, &collapse_state, layout, style, self.zoom);
+                draw_node_card(
+                    ui,
+                    &painter,
+                    node,
+                    &collapse_state,
+                    layout,
+                    style,
+                    self.zoom,
+                );
 
                 let header_id = ui.id().with(("graph_node_header", node.uml.id));
                 let header_response =
@@ -403,7 +458,8 @@ impl GraphCanvas {
 
                 for section in &layout.sections {
                     let section_id =
-                        ui.id().with(("graph_node_section", node.uml.id, section.kind));
+                        ui.id()
+                            .with(("graph_node_section", node.uml.id, section.kind));
                     let section_response =
                         ui.interact(section.header_rect, section_id, egui::Sense::click());
                     if section_response.clicked() {
@@ -503,17 +559,25 @@ impl GraphCanvas {
                     continue;
                 }
                 let collapse_state = codestory_graph::uml_types::CollapseState::collapsed();
-                draw_node_card(ui, &painter, node, &collapse_state, layout, style, self.zoom);
-        if hovered_node == Some(node.uml.id) {
-            let palette = style.palette();
-            painter.rect_stroke(
-                layout.rect,
-                6.0 * self.zoom,
-                egui::Stroke::new(1.5, palette.node_default_text),
-                egui::StrokeKind::Middle,
-            );
-        }
-    }
+                draw_node_card(
+                    ui,
+                    &painter,
+                    node,
+                    &collapse_state,
+                    layout,
+                    style,
+                    self.zoom,
+                );
+                if hovered_node == Some(node.uml.id) {
+                    let palette = style.palette();
+                    painter.rect_stroke(
+                        layout.rect,
+                        6.0 * self.zoom,
+                        egui::Stroke::new(1.5, palette.node_default_text),
+                        egui::StrokeKind::Middle,
+                    );
+                }
+            }
         } else {
             draw_point_cloud(
                 &painter,
@@ -577,7 +641,8 @@ impl GraphCanvas {
 
 impl GridIndex {
     fn build(nodes: &[GraphCanvasNode<'_>], cell_size: f32) -> Self {
-        let mut cells: std::collections::HashMap<(i32, i32), Vec<usize>> = std::collections::HashMap::new();
+        let mut cells: std::collections::HashMap<(i32, i32), Vec<usize>> =
+            std::collections::HashMap::new();
         for (idx, node) in nodes.iter().enumerate() {
             let key = cell_for(node.pos, cell_size);
             cells.entry(key).or_default().push(idx);
@@ -648,11 +713,7 @@ fn visible_nodes(
     }
 }
 
-fn select_lod_mode(
-    zoom: f32,
-    node_count: usize,
-    settings: &NodeGraphSettings,
-) -> GraphLodMode {
+fn select_lod_mode(zoom: f32, node_count: usize, settings: &NodeGraphSettings) -> GraphLodMode {
     if node_count > settings.max_full_nodes {
         if zoom >= settings.lod_simplified_zoom {
             GraphLodMode::Simplified
@@ -704,8 +765,11 @@ fn draw_lod_edges(
     style: &StyleResolver,
     lod_mode: GraphLodMode,
 ) {
-    let stroke_width =
-        if lod_mode == GraphLodMode::PointCloud { 0.6 } else { 1.0 } * style.edge_width_scale();
+    let stroke_width = if lod_mode == GraphLodMode::PointCloud {
+        0.6
+    } else {
+        1.0
+    } * style.edge_width_scale();
     for edge in edges {
         if !edge.visible {
             continue;
@@ -879,7 +943,10 @@ fn draw_node_card(
     let header_font = egui::FontId::proportional(13.0 * zoom);
     let header_label = format_header_label(node);
     painter.text(
-        egui::pos2(layout.header_rect.min.x + 10.0 * zoom, layout.header_rect.center().y),
+        egui::pos2(
+            layout.header_rect.min.x + 10.0 * zoom,
+            layout.header_rect.center().y,
+        ),
         egui::Align2::LEFT_CENTER,
         header_label,
         header_font,
@@ -900,7 +967,10 @@ fn draw_node_card(
         if total_members > 0 {
             let badge = format!("[{}]", total_members);
             painter.text(
-                egui::pos2(layout.header_rect.max.x - 10.0 * zoom, layout.header_rect.center().y),
+                egui::pos2(
+                    layout.header_rect.max.x - 10.0 * zoom,
+                    layout.header_rect.center().y,
+                ),
                 egui::Align2::RIGHT_CENTER,
                 badge,
                 egui::FontId::proportional(10.0 * zoom),
@@ -925,12 +995,22 @@ fn draw_node_card(
         let label = section.kind.label();
         let label_width = measure_text_width(ui, label, &section_font);
         let chip_padding = egui::vec2(6.0 * zoom, 2.0 * zoom);
-        let chip_size = egui::vec2(label_width + chip_padding.x * 2.0, section.header_rect.height() - 4.0 * zoom);
+        let chip_size = egui::vec2(
+            label_width + chip_padding.x * 2.0,
+            section.header_rect.height() - 4.0 * zoom,
+        );
         let chip_rect = egui::Rect::from_min_size(
-            egui::pos2(section.header_rect.min.x + 4.0 * zoom, section.header_rect.min.y + 2.0 * zoom),
+            egui::pos2(
+                section.header_rect.min.x + 4.0 * zoom,
+                section.header_rect.min.y + 2.0 * zoom,
+            ),
             chip_size,
         );
-        painter.rect_filled(chip_rect, chip_rect.height() / 2.0, palette.section_label_fill);
+        painter.rect_filled(
+            chip_rect,
+            chip_rect.height() / 2.0,
+            palette.section_label_fill,
+        );
 
         let mut text_offset_x = chip_padding.x;
         if let Some(icon_kind) = section_icon_kind(section.kind) {
@@ -1011,12 +1091,8 @@ fn draw_node_card(
 
 fn render_hatching_pattern(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let pattern = codestory_graph::style::hatching_pattern();
-    let hatch_color = egui::Color32::from_rgba_unmultiplied(
-        color.r(),
-        color.g(),
-        color.b(),
-        pattern.color.a,
-    );
+    let hatch_color =
+        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), pattern.color.a);
 
     let angle_rad = pattern.angle.to_radians();
     let cos_angle = angle_rad.cos();

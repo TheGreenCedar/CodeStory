@@ -1,6 +1,6 @@
 use codestory_core::{
     Bookmark, BookmarkCategory, Edge, EdgeKind, EnumConversionError, Node, NodeId, NodeKind,
-    Occurrence, OccurrenceKind, TrailConfig, TrailDirection, TrailResult,
+    Occurrence, OccurrenceKind, TrailConfig, TrailDirection, TrailMode, TrailResult,
 };
 use parking_lot::RwLock;
 use rusqlite::{Connection, Result, Row, params};
@@ -1003,6 +1003,13 @@ impl Storage {
 
     /// Get a trail (subgraph) starting from a root node up to a certain depth
     pub fn get_trail(&self, config: &TrailConfig) -> Result<TrailResult, StorageError> {
+        match config.mode {
+            TrailMode::ToTargetSymbol => self.get_trail_to_target(config),
+            _ => self.get_trail_bfs(config),
+        }
+    }
+
+    fn get_trail_bfs(&self, config: &TrailConfig) -> Result<TrailResult, StorageError> {
         let mut result = TrailResult::default();
         let mut visited: HashSet<NodeId> = HashSet::new();
         let mut queue: VecDeque<(NodeId, u32)> = VecDeque::new();
@@ -1011,6 +1018,13 @@ impl Storage {
             u32::MAX
         } else {
             config.depth
+        };
+
+        // Some modes force an effective direction regardless of the caller-provided direction.
+        let direction = match config.mode {
+            TrailMode::AllReferenced => TrailDirection::Outgoing,
+            TrailMode::AllReferencing => TrailDirection::Incoming,
+            _ => config.direction,
         };
 
         // Start with root
@@ -1032,8 +1046,7 @@ impl Storage {
 
             // If we haven't reached max depth, explore neighbors
             if depth < max_depth {
-                let edges =
-                    self.get_edges_for_node(current_id, &config.direction, &config.edge_filter)?;
+                let edges = self.get_edges_for_node(current_id, &direction, &config.edge_filter)?;
 
                 for edge in edges {
                     result.edges.push(edge.clone());
@@ -1058,7 +1071,276 @@ impl Storage {
             }
         }
 
+        apply_trail_node_filter(&mut result, config);
         Ok(result)
+    }
+
+    fn get_trail_to_target(&self, config: &TrailConfig) -> Result<TrailResult, StorageError> {
+        let target_id = config.target_id.ok_or_else(|| {
+            StorageError::Other(
+                "TrailMode::ToTargetSymbol requires TrailConfig.target_id".to_string(),
+            )
+        })?;
+
+        let max_depth = if config.depth == 0 {
+            // `0` means "infinite depth", bounded by node caps.
+            u32::MAX
+        } else {
+            config.depth
+        };
+
+        // Allow some slack for distance discovery (so we can still return a meaningful path)
+        // while keeping the query bounded.
+        let bfs_cap = config
+            .max_nodes
+            .saturating_mul(4)
+            .max(config.max_nodes)
+            .min(100_000);
+
+        let (dist_from_root, truncated_from_root) = self.bfs_distances(
+            config.root_id,
+            TrailDirection::Outgoing,
+            &config.edge_filter,
+            max_depth,
+            bfs_cap,
+        )?;
+        let (dist_to_target, truncated_to_target) = self.bfs_distances(
+            target_id,
+            TrailDirection::Incoming,
+            &config.edge_filter,
+            max_depth,
+            bfs_cap,
+        )?;
+
+        // If no path exists (within the discovered bounds), show the endpoints.
+        let target_reachable = dist_from_root.contains_key(&target_id);
+        if !target_reachable {
+            let mut result = TrailResult::default();
+            if let Some(node) = self.get_node(config.root_id)? {
+                result.nodes.push(node);
+                result.depth_map.insert(config.root_id, 0);
+            }
+            if target_id != config.root_id {
+                if let Some(node) = self.get_node(target_id)? {
+                    result.nodes.push(node);
+                }
+            }
+            result.truncated = truncated_from_root || truncated_to_target;
+            apply_trail_node_filter(&mut result, config);
+            return Ok(result);
+        }
+
+        let mut included: HashSet<NodeId> = HashSet::new();
+        for (id, d_root) in &dist_from_root {
+            if let Some(d_to) = dist_to_target.get(id) {
+                if max_depth == u32::MAX || (*d_root as u64 + *d_to as u64) <= max_depth as u64 {
+                    included.insert(*id);
+                }
+            }
+        }
+        included.insert(config.root_id);
+        included.insert(target_id);
+
+        // Extract one shortest (or near-shortest) path to prioritize in truncation.
+        let mut path_nodes: Vec<NodeId> = Vec::new();
+        path_nodes.push(config.root_id);
+        let mut current = config.root_id;
+        while current != target_id {
+            let Some(&d_cur) = dist_from_root.get(&current) else {
+                break;
+            };
+            let edges =
+                self.get_edges_for_node(current, &TrailDirection::Outgoing, &config.edge_filter)?;
+            let mut best_next: Option<NodeId> = None;
+            let mut best_key: Option<(u32, i64)> = None; // (dist_to_target, node_id)
+            for edge in edges {
+                let (src, dst) = edge.effective_endpoints();
+                if src != current {
+                    continue;
+                }
+                let next = dst;
+                let Some(&d_next) = dist_from_root.get(&next) else {
+                    continue;
+                };
+                if d_next != d_cur.saturating_add(1) {
+                    continue;
+                }
+                let Some(&d_to) = dist_to_target.get(&next) else {
+                    continue;
+                };
+                if max_depth != u32::MAX {
+                    let path_len = d_cur as u64 + 1 + d_to as u64;
+                    if path_len > max_depth as u64 {
+                        continue;
+                    }
+                }
+                if !included.contains(&next) {
+                    continue;
+                }
+                let key = (d_to, next.0);
+                if best_key.map_or(true, |k| key < k) {
+                    best_key = Some(key);
+                    best_next = Some(next);
+                }
+            }
+
+            let Some(next) = best_next else {
+                break;
+            };
+            path_nodes.push(next);
+            current = next;
+        }
+
+        // Final node selection (bounded by max_nodes), always keeping the extracted path.
+        fn push_unique(selected: &mut Vec<NodeId>, selected_set: &mut HashSet<NodeId>, id: NodeId) {
+            if selected_set.insert(id) {
+                selected.push(id);
+            }
+        }
+
+        let mut selected: Vec<NodeId> = Vec::new();
+        let mut selected_set: HashSet<NodeId> = HashSet::new();
+        for id in &path_nodes {
+            push_unique(&mut selected, &mut selected_set, *id);
+        }
+        push_unique(&mut selected, &mut selected_set, target_id);
+
+        let mut other: Vec<NodeId> = included.iter().copied().collect();
+        other.sort_by(|a, b| {
+            let da = dist_from_root.get(a).copied().unwrap_or(u32::MAX);
+            let db = dist_from_root.get(b).copied().unwrap_or(u32::MAX);
+            let ta = dist_to_target.get(a).copied().unwrap_or(u32::MAX);
+            let tb = dist_to_target.get(b).copied().unwrap_or(u32::MAX);
+            (da.saturating_add(ta), da, a.0).cmp(&(db.saturating_add(tb), db, b.0))
+        });
+        for id in other {
+            if selected.len() >= config.max_nodes {
+                break;
+            }
+            push_unique(&mut selected, &mut selected_set, id);
+        }
+
+        let mut result = TrailResult::default();
+        result.truncated = truncated_from_root
+            || truncated_to_target
+            || included.len() > config.max_nodes
+            || selected.len() < included.len();
+
+        // Populate nodes in stable order.
+        selected.sort_by(|a, b| {
+            let da = dist_from_root.get(a).copied().unwrap_or(u32::MAX);
+            let db = dist_from_root.get(b).copied().unwrap_or(u32::MAX);
+            (da, a.0).cmp(&(db, b.0))
+        });
+        for id in &selected {
+            if let Some(node) = self.get_node(*id)? {
+                result.nodes.push(node);
+            }
+            let depth = dist_from_root.get(id).copied().unwrap_or(0);
+            result.depth_map.insert(*id, depth);
+        }
+
+        // Populate edges that are on at least one root->target path within max_depth.
+        let selected_set: HashSet<NodeId> = selected.iter().copied().collect();
+        let mut edge_ids: HashSet<codestory_core::EdgeId> = HashSet::new();
+        for id in &selected {
+            let Some(&d_root) = dist_from_root.get(id) else {
+                continue;
+            };
+            let edges =
+                self.get_edges_for_node(*id, &TrailDirection::Outgoing, &config.edge_filter)?;
+            for edge in edges {
+                let (src, dst) = edge.effective_endpoints();
+                if src != *id {
+                    continue;
+                }
+                if !selected_set.contains(&dst) {
+                    continue;
+                }
+                let Some(&d_to) = dist_to_target.get(&dst) else {
+                    continue;
+                };
+                if max_depth != u32::MAX {
+                    let len = d_root as u64 + 1 + d_to as u64;
+                    if len > max_depth as u64 {
+                        continue;
+                    }
+                }
+                if edge_ids.insert(edge.id) {
+                    result.edges.push(edge);
+                }
+            }
+        }
+        result.edges.sort_by_key(|e| e.id.0);
+
+        apply_trail_node_filter(&mut result, config);
+        Ok(result)
+    }
+
+    fn bfs_distances(
+        &self,
+        start: NodeId,
+        direction: TrailDirection,
+        edge_filter: &[EdgeKind],
+        max_depth: u32,
+        max_nodes: usize,
+    ) -> Result<(HashMap<NodeId, u32>, bool), StorageError> {
+        let mut dist: HashMap<NodeId, u32> = HashMap::new();
+        let mut queue: VecDeque<(NodeId, u32)> = VecDeque::new();
+        let mut truncated = false;
+
+        dist.insert(start, 0);
+        queue.push_back((start, 0));
+
+        while let Some((current_id, depth)) = queue.pop_front() {
+            if dist.len() >= max_nodes {
+                truncated = true;
+                break;
+            }
+            if depth >= max_depth {
+                continue;
+            }
+
+            let edges = self.get_edges_for_node(current_id, &direction, edge_filter)?;
+            for edge in edges {
+                let (eff_source, eff_target) = edge.effective_endpoints();
+                let neighbor_id = match direction {
+                    TrailDirection::Outgoing => {
+                        if eff_source == current_id {
+                            eff_target
+                        } else {
+                            continue;
+                        }
+                    }
+                    TrailDirection::Incoming => {
+                        if eff_target == current_id {
+                            eff_source
+                        } else {
+                            continue;
+                        }
+                    }
+                    TrailDirection::Both => {
+                        // Not used by ToTargetSymbol distance discovery.
+                        let other = if eff_source == current_id {
+                            eff_target
+                        } else if eff_target == current_id {
+                            eff_source
+                        } else {
+                            continue;
+                        };
+                        other
+                    }
+                };
+
+                if !dist.contains_key(&neighbor_id) {
+                    let next_depth = depth.saturating_add(1);
+                    dist.insert(neighbor_id, next_depth);
+                    queue.push_back((neighbor_id, next_depth));
+                }
+            }
+        }
+
+        Ok((dist, truncated))
     }
 
     /// Helper: Get edges for a node in a specific direction
@@ -1070,13 +1352,22 @@ impl Storage {
     ) -> Result<Vec<Edge>, StorageError> {
         let query = match direction {
             TrailDirection::Outgoing => {
-                "SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence FROM edge WHERE source_node_id = ?1 OR resolved_source_node_id = ?1"
+                "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, t.serialized_name
+                 FROM edge e
+                 JOIN node t ON t.id = e.target_node_id
+                 WHERE e.source_node_id = ?1 OR e.resolved_source_node_id = ?1"
             }
             TrailDirection::Incoming => {
-                "SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence FROM edge WHERE target_node_id = ?1 OR resolved_target_node_id = ?1"
+                "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, t.serialized_name
+                 FROM edge e
+                 JOIN node t ON t.id = e.target_node_id
+                 WHERE e.target_node_id = ?1 OR e.resolved_target_node_id = ?1"
             }
             TrailDirection::Both => {
-                "SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence FROM edge WHERE source_node_id = ?1 OR target_node_id = ?1 OR resolved_source_node_id = ?1 OR resolved_target_node_id = ?1"
+                "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, t.serialized_name
+                 FROM edge e
+                 JOIN node t ON t.id = e.target_node_id
+                 WHERE e.source_node_id = ?1 OR e.target_node_id = ?1 OR e.resolved_source_node_id = ?1 OR e.resolved_target_node_id = ?1"
             }
         };
 
@@ -1085,7 +1376,17 @@ impl Storage {
         let mut rows = stmt.query(params![node_id.0])?;
 
         while let Some(row) = rows.next()? {
-            let edge = Self::edge_from_row(row)?;
+            let mut edge = Self::edge_from_row(row)?;
+            let target_symbol: String = row.get(9)?;
+
+            // Avoid polluting trail exploration with low-confidence or ambiguous CALL resolutions.
+            // It's better to show an unresolved symbol node than traverse to the wrong concrete node.
+            if edge.kind == EdgeKind::CALL && edge.resolved_target.is_some() {
+                if should_ignore_call_resolution(&target_symbol, edge.confidence) {
+                    edge.resolved_target = None;
+                    edge.confidence = None;
+                }
+            }
             let kind = edge.kind;
 
             // Apply edge filter if specified
@@ -1112,10 +1413,91 @@ impl Storage {
     }
 }
 
+fn apply_trail_node_filter(result: &mut TrailResult, config: &TrailConfig) {
+    if config.node_filter.is_empty() {
+        return;
+    }
+
+    let mut allowed: HashSet<NodeId> = result
+        .nodes
+        .iter()
+        .filter(|node| config.node_filter.contains(&node.kind))
+        .map(|node| node.id)
+        .collect();
+
+    // Always keep endpoints.
+    allowed.insert(config.root_id);
+    if let Some(target) = config.target_id {
+        allowed.insert(target);
+    }
+
+    result.nodes.retain(|node| allowed.contains(&node.id));
+    result.edges.retain(|edge| {
+        let (s, t) = edge.effective_endpoints();
+        allowed.contains(&s) && allowed.contains(&t)
+    });
+    result.depth_map.retain(|id, _| allowed.contains(id));
+}
+
+fn should_ignore_call_resolution(target_symbol: &str, confidence: Option<f32>) -> bool {
+    let conf = confidence.unwrap_or(0.0);
+
+    // Fuzzy matches from the resolution pass use a low confidence score; these have shown to
+    // create incorrect edges that seriously degrade trail graphs.
+    if conf <= 0.4 + f32::EPSILON {
+        return true;
+    }
+
+    // Even with exact matching, some unqualified method names are so common (often stdlib/3rd-party)
+    // that resolving them globally by name alone is frequently wrong. Treat low-confidence
+    // resolutions for these symbols as unresolved.
+    if is_common_unqualified_call_name(target_symbol) && conf <= 0.6 + f32::EPSILON {
+        return true;
+    }
+
+    false
+}
+
+fn is_common_unqualified_call_name(name: &str) -> bool {
+    if name.contains("::") || name.contains('.') {
+        return false;
+    }
+
+    matches!(
+        name,
+        "add"
+            | "all"
+            | "any"
+            | "append"
+            | "clear"
+            | "collect"
+            | "contains"
+            | "dedup"
+            | "extend"
+            | "filter"
+            | "insert"
+            | "into_iter"
+            | "iter"
+            | "iter_mut"
+            | "len"
+            | "map"
+            | "pop"
+            | "push"
+            | "remove"
+            | "retain"
+            | "sort"
+            | "sort_by"
+            | "sort_by_key"
+            | "truncate"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codestory_core::{NodeId, NodeKind, SourceLocation};
+    use codestory_core::{
+        Edge, EdgeId, EdgeKind, NodeId, NodeKind, SourceLocation, TrailConfig, TrailDirection,
+    };
 
     #[test]
     fn test_batch_inserts() -> Result<(), StorageError> {
@@ -1383,9 +1765,12 @@ mod tests {
         // Trail from A, depth 1, should get A and B
         let config = TrailConfig {
             root_id: NodeId(1),
+            mode: TrailMode::Neighborhood,
+            target_id: None,
             depth: 1,
             direction: TrailDirection::Outgoing,
             edge_filter: vec![],
+            node_filter: Vec::new(),
             max_nodes: 100,
         };
         let result = storage.get_trail(&config)?;
@@ -1395,9 +1780,12 @@ mod tests {
         // Trail from A, depth 2, should get A, B, and C
         let config = TrailConfig {
             root_id: NodeId(1),
+            mode: TrailMode::Neighborhood,
+            target_id: None,
             depth: 2,
             direction: TrailDirection::Outgoing,
             edge_filter: vec![],
+            node_filter: Vec::new(),
             max_nodes: 100,
         };
         let result = storage.get_trail(&config)?;
@@ -1406,13 +1794,132 @@ mod tests {
         // Trail from A, depth 0 (infinite), should also get A, B, and C (bounded by max_nodes)
         let config = TrailConfig {
             root_id: NodeId(1),
+            mode: TrailMode::Neighborhood,
+            target_id: None,
             depth: 0,
             direction: TrailDirection::Outgoing,
             edge_filter: vec![],
+            node_filter: Vec::new(),
             max_nodes: 100,
         };
         let result = storage.get_trail(&config)?;
         assert_eq!(result.nodes.len(), 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_trail_to_target_symbol_simple_path() -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+
+        let nodes = vec![
+            Node {
+                id: NodeId(1),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "A".to_string(),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(2),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "B".to_string(),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(3),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "C".to_string(),
+                ..Default::default()
+            },
+        ];
+        storage.insert_nodes_batch(&nodes)?;
+
+        storage.insert_edges_batch(&[
+            Edge {
+                id: EdgeId(1),
+                source: NodeId(1),
+                target: NodeId(2),
+                kind: EdgeKind::CALL,
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(2),
+                source: NodeId(2),
+                target: NodeId(3),
+                kind: EdgeKind::CALL,
+                ..Default::default()
+            },
+        ])?;
+
+        let result = storage.get_trail(&TrailConfig {
+            root_id: NodeId(1),
+            mode: TrailMode::ToTargetSymbol,
+            target_id: Some(NodeId(3)),
+            depth: 2,
+            direction: TrailDirection::Outgoing, // ignored/forced by mode, but set for clarity
+            edge_filter: vec![],
+            node_filter: Vec::new(),
+            max_nodes: 100,
+        })?;
+
+        assert_eq!(result.nodes.len(), 3);
+        assert_eq!(result.edges.len(), 2);
+        assert!(!result.truncated);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_trail_ignores_ambiguous_call_resolutions() -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+
+        let caller = Node {
+            id: NodeId(1),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "caller".to_string(),
+            qualified_name: Some("caller".to_string()),
+            ..Default::default()
+        };
+        let call_symbol = Node {
+            id: NodeId(10),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: "add".to_string(),
+            ..Default::default()
+        };
+        let resolved = Node {
+            id: NodeId(3),
+            kind: NodeKind::METHOD,
+            serialized_name: "SomeType::add".to_string(),
+            qualified_name: Some("SomeType::add".to_string()),
+            ..Default::default()
+        };
+
+        storage.insert_nodes_batch(&[caller.clone(), call_symbol.clone(), resolved.clone()])?;
+        storage.insert_edges_batch(&[Edge {
+            id: EdgeId(100),
+            source: caller.id,
+            target: call_symbol.id,
+            kind: EdgeKind::CALL,
+            resolved_target: Some(resolved.id),
+            confidence: Some(0.6),
+            ..Default::default()
+        }])?;
+
+        // Exploring from the resolved target should not traverse this edge.
+        let result = storage.get_trail(&TrailConfig {
+            root_id: resolved.id,
+            mode: TrailMode::Neighborhood,
+            target_id: None,
+            depth: 1,
+            direction: TrailDirection::Incoming,
+            edge_filter: vec![EdgeKind::CALL],
+            node_filter: Vec::new(),
+            max_nodes: 50,
+        })?;
+
+        assert!(result.edges.is_empty());
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].id, resolved.id);
 
         Ok(())
     }

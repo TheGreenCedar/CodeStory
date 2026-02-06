@@ -128,9 +128,12 @@ impl ActivationController {
             // Update Graph View
             let trail_config = codestory_core::TrailConfig {
                 root_id: id,
+                mode: codestory_core::TrailMode::Neighborhood,
+                target_id: None,
                 depth: settings.node_graph.trail_depth,
                 direction: settings.node_graph.trail_direction,
                 edge_filter: settings.node_graph.trail_edge_filter.clone(),
+                node_filter: Vec::new(),
                 max_nodes: 500,
             };
 

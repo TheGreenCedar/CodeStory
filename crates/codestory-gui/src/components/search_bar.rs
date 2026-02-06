@@ -81,7 +81,9 @@ impl SearchBar {
         let mut input_rect = egui::Rect::NOTHING;
 
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(ph::MAGNIFYING_GLASS).color(ui.visuals().selection.bg_fill));
+            ui.label(
+                egui::RichText::new(ph::MAGNIFYING_GLASS).color(ui.visuals().selection.bg_fill),
+            );
 
             // Text input
             let response = ui.add(

@@ -1,10 +1,10 @@
+use crate::components::node_graph::style_resolver::StyleResolver;
 use codestory_core::{EdgeKind, NodeId};
-use codestory_graph::edge_router::{CubicBezier, EdgeRouter, BUNDLE_THRESHOLD};
-use codestory_graph::style::{self, get_edge_kind_label};
 use codestory_graph::DummyEdge;
+use codestory_graph::edge_router::{BUNDLE_THRESHOLD, CubicBezier, EdgeRouter};
+use codestory_graph::style::{self, get_edge_kind_label};
 use eframe::egui::{self, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke, Vec2};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use crate::components::node_graph::style_resolver::StyleResolver;
 
 fn to_graph_rect(r: Rect) -> codestory_graph::uml_types::Rect {
     codestory_graph::uml_types::Rect {
@@ -275,7 +275,10 @@ impl EdgeOverlay {
                 .push(edge);
         }
 
-        let mouse_pos = ui.ctx().pointer_hover_pos().filter(|pos| visible_rect.contains(*pos));
+        let mouse_pos = ui
+            .ctx()
+            .pointer_hover_pos()
+            .filter(|pos| visible_rect.contains(*pos));
 
         for ((source, target), bundle) in &bundles {
             if let (Some(source_rect_graph), Some(target_rect_graph)) =
@@ -614,8 +617,7 @@ impl EdgeOverlay {
                     .route_edge(to_graph_rect(source_rect), to_graph_rect(target_rect));
 
                 let color = style_resolver.resolve_edge_color(edge.kind);
-                let width =
-                    style::edge_width(edge.kind, 1) * style_resolver.edge_width_scale();
+                let width = style::edge_width(edge.kind, 1) * style_resolver.edge_width_scale();
                 let stroke = Stroke::new(width, color);
 
                 let start = to_screen(curve.start);
@@ -860,22 +862,16 @@ fn mix_color(a: Color32, b: Color32, t: f32) -> Color32 {
     let (ar, ag, ab, aa) = a.to_tuple();
     let (br, bg, bb, ba) = b.to_tuple();
     let lerp = |x: u8, y: u8| -> u8 {
-        ((x as f32 * (1.0 - t) + y as f32 * t).round() as i32)
-            .clamp(0, 255) as u8
+        ((x as f32 * (1.0 - t) + y as f32 * t).round() as i32).clamp(0, 255) as u8
     };
-    Color32::from_rgba_unmultiplied(
-        lerp(ar, br),
-        lerp(ag, bg),
-        lerp(ab, bb),
-        lerp(aa, ba),
-    )
+    Color32::from_rgba_unmultiplied(lerp(ar, br), lerp(ag, bg), lerp(ab, bb), lerp(aa, ba))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codestory_graph::edge_router::CubicBezier;
     use codestory_graph::Vec2 as GVec2;
+    use codestory_graph::edge_router::CubicBezier;
 
     #[test]
     fn test_hit_test_near_edge() {

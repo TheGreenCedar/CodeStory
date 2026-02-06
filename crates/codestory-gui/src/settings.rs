@@ -135,6 +135,18 @@ fn default_phosphor_variant() -> PhosphorVariant {
     PhosphorVariant::Regular
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GraphWheelBehavior {
+    /// Mouse wheel pans/scrolls the graph; Ctrl/Cmd + wheel zooms.
+    ScrollPan,
+    /// Mouse wheel zooms the graph.
+    Zoom,
+}
+
+fn default_graph_wheel_behavior() -> GraphWheelBehavior {
+    GraphWheelBehavior::ScrollPan
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeGraphSettings {
     /// Trail depth when querying the graph subview from storage.
@@ -173,6 +185,8 @@ pub struct NodeGraphSettings {
     pub show_minimap: bool,
     #[serde(default)]
     pub show_legend: bool,
+    #[serde(default = "default_graph_wheel_behavior")]
+    pub graph_wheel_behavior: GraphWheelBehavior,
     #[serde(default = "default_view_state")]
     pub view_state: codestory_graph::uml_types::GraphViewState,
 }
@@ -228,6 +242,7 @@ impl Default for NodeGraphSettings {
             show_variables: true,
             show_minimap: true,
             show_legend: false,
+            graph_wheel_behavior: default_graph_wheel_behavior(),
             view_state: codestory_graph::uml_types::GraphViewState::new(),
         }
     }

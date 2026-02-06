@@ -1,5 +1,5 @@
-use crate::uml_types::{BundleData, Rect};
 use crate::Vec2;
+use crate::uml_types::{BundleData, Rect};
 use codestory_core::{EdgeId, EdgeKind, NodeId};
 use std::collections::HashMap;
 
@@ -145,26 +145,41 @@ impl EdgeRouter {
         source_rect: Rect,
         target_rect: Rect,
     ) -> CubicBezier {
+        // Prevent control points from scaling unbounded with edge length.
+        // If they do, edges can "swing" far outside the viewport and look comically long.
+        const MAX_CONTROL_LEN: f32 = 260.0;
+
         // Basic vector math helper since Vec2 might not implement ops
         let sub = |a: Vec2, b: Vec2| Vec2::new(a.x - b.x, a.y - b.y);
         let add = |a: Vec2, b: Vec2| Vec2::new(a.x + b.x, a.y + b.y);
         let mul = |v: Vec2, s: f32| Vec2::new(v.x * s, v.y * s);
-        let len = |v: Vec2| (v.x * v.x + v.y * v.y).sqrt();
 
         let delta = sub(end, start);
-        let dist = len(delta);
 
-        let control_dist = dist * self.curvature;
+        // Use a directionally-biased "distance" instead of full Euclidean distance.
+        // This keeps curves stable when nodes are far apart vertically but close horizontally,
+        // and also reduces the chance of overshooting control points.
+        let dx = delta.x.abs();
+        let dy = delta.y.abs();
+        let primary_dist = dx.max(dy * 0.5);
+
+        let control_dist = primary_dist * self.curvature;
 
         // Determine face directions based on anchor points relative to rect centers
         let start_dir = self.get_normal_direction(start, source_rect);
         let end_dir = self.get_normal_direction(end, target_rect);
 
-        let curve_len = if dist < self.node_margin * 2.0 {
+        let mut curve_len = if primary_dist < self.node_margin * 2.0 {
+            // For very close nodes, keep control points close so we don't create loops.
             control_dist
         } else {
             control_dist.max(self.node_margin)
         };
+        if curve_len.is_finite() {
+            curve_len = curve_len.min(MAX_CONTROL_LEN);
+        } else {
+            curve_len = self.node_margin.min(MAX_CONTROL_LEN);
+        }
 
         // control1 = start + start_dir * curve_len
         let control1 = add(start, mul(start_dir, curve_len));
@@ -301,27 +316,32 @@ impl EdgeRouter {
 
     /// Get approximate normal direction from rect center to point on its border
     fn get_normal_direction(&self, point: Vec2, rect: Rect) -> Vec2 {
-        let epsilon = 1.0;
-        if (point.x - rect.min.x).abs() < epsilon {
-            Vec2::new(-1.0, 0.0)
-        } else if (point.x - rect.max.x).abs() < epsilon {
-            Vec2::new(1.0, 0.0)
-        } else if (point.y - rect.min.y).abs() < epsilon {
-            Vec2::new(0.0, -1.0)
-        } else if (point.y - rect.max.y).abs() < epsilon {
-            Vec2::new(0.0, 1.0)
-        } else {
-            // Fallback for corners or internal
-            Vec2::new(1.0, 0.0)
+        // Avoid hard epsilons against border equality: we often get points that are
+        // microscopically inside/outside due to transform + float math, and a strict check
+        // can pick the wrong direction (which then produces very long curves).
+        let dl = (point.x - rect.min.x).abs();
+        let dr = (point.x - rect.max.x).abs();
+        let dt = (point.y - rect.min.y).abs();
+        let db = (point.y - rect.max.y).abs();
+
+        if dl <= dr && dl <= dt && dl <= db {
+            return Vec2::new(-1.0, 0.0);
         }
+        if dr <= dl && dr <= dt && dr <= db {
+            return Vec2::new(1.0, 0.0);
+        }
+        if dt <= dl && dt <= dr && dt <= db {
+            return Vec2::new(0.0, -1.0);
+        }
+        Vec2::new(0.0, 1.0)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::uml_types::Rect;
     use crate::Vec2;
+    use crate::uml_types::Rect;
     use proptest::prelude::*;
 
     // Helper to check if a point is approximately on a rect border
@@ -710,5 +730,22 @@ mod tests {
             data.set_expanded(false);
             prop_assert!(!data.is_expanded, "set_expanded(false) should collapse");
         }
+    }
+
+    #[test]
+    fn test_normal_direction_is_stable_near_borders() {
+        let router = EdgeRouter::new();
+        let r = Rect::from_pos_size(Vec2::new(10.0, 20.0), Vec2::new(100.0, 60.0));
+
+        // Points that are slightly off due to float error should still map to the expected side.
+        let leftish = Vec2::new(r.min.x + 0.0001, r.center().y);
+        let rightish = Vec2::new(r.max.x - 0.0001, r.center().y);
+        let topish = Vec2::new(r.center().x, r.min.y + 0.0001);
+        let bottomish = Vec2::new(r.center().x, r.max.y - 0.0001);
+
+        assert_eq!(router.get_normal_direction(leftish, r), Vec2::new(-1.0, 0.0));
+        assert_eq!(router.get_normal_direction(rightish, r), Vec2::new(1.0, 0.0));
+        assert_eq!(router.get_normal_direction(topish, r), Vec2::new(0.0, -1.0));
+        assert_eq!(router.get_normal_direction(bottomish, r), Vec2::new(0.0, 1.0));
     }
 }
