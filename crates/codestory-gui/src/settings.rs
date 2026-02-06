@@ -1,4 +1,4 @@
-use codestory_core::LayoutDirection;
+use codestory_core::{EdgeKind, LayoutDirection, TrailDirection};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,7 +137,15 @@ fn default_phosphor_variant() -> PhosphorVariant {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeGraphSettings {
-    pub max_depth: usize,
+    /// Trail depth when querying the graph subview from storage.
+    ///
+    /// `0` means "infinite" depth, bounded by `TrailConfig.max_nodes` and other safety limits.
+    #[serde(default = "default_trail_depth", alias = "max_depth")]
+    pub trail_depth: u32,
+    #[serde(default = "default_trail_direction")]
+    pub trail_direction: TrailDirection,
+    #[serde(default)]
+    pub trail_edge_filter: Vec<EdgeKind>,
     pub auto_layout: bool,
     pub show_connection_labels: bool,
     pub group_by_file: bool,
@@ -177,6 +185,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_trail_depth() -> u32 {
+    1
+}
+
+fn default_trail_direction() -> TrailDirection {
+    TrailDirection::Both
+}
+
 fn default_lod_points_zoom() -> f32 {
     0.4
 }
@@ -194,7 +210,9 @@ fn default_max_full_nodes() -> usize {
 impl Default for NodeGraphSettings {
     fn default() -> Self {
         Self {
-            max_depth: 1,
+            trail_depth: default_trail_depth(),
+            trail_direction: TrailDirection::Both,
+            trail_edge_filter: Vec::new(),
             auto_layout: true,
             show_connection_labels: true,
             group_by_file: true,
@@ -212,6 +230,40 @@ impl Default for NodeGraphSettings {
             show_legend: false,
             view_state: codestory_graph::uml_types::GraphViewState::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_trail_depth_alias_from_max_depth() {
+        let value = json!({
+            "max_depth": 3,
+            "auto_layout": true,
+            "show_connection_labels": true,
+            "group_by_file": true,
+            "group_by_namespace": true
+        });
+
+        let settings: NodeGraphSettings =
+            serde_json::from_value(value).expect("NodeGraphSettings should deserialize");
+
+        assert_eq!(settings.trail_depth, 3);
+    }
+
+    #[test]
+    fn test_infinite_trail_depth_roundtrip() {
+        let mut settings = NodeGraphSettings::default();
+        settings.trail_depth = 0;
+
+        let serialized = serde_json::to_string(&settings).expect("serialize settings");
+        let deserialized: NodeGraphSettings =
+            serde_json::from_str(&serialized).expect("deserialize settings");
+
+        assert_eq!(deserialized.trail_depth, 0);
     }
 }
 

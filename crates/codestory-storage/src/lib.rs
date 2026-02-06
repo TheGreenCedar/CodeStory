@@ -245,10 +245,8 @@ impl Storage {
             [],
         )?;
 
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_edge_line ON edge(line)",
-            [],
-        )?;
+        self.conn
+            .execute("CREATE INDEX IF NOT EXISTS idx_edge_line ON edge(line)", [])?;
 
         Ok(())
     }
@@ -1008,6 +1006,12 @@ impl Storage {
         let mut result = TrailResult::default();
         let mut visited: HashSet<NodeId> = HashSet::new();
         let mut queue: VecDeque<(NodeId, u32)> = VecDeque::new();
+        let max_depth = if config.depth == 0 {
+            // `0` means "infinite depth", bounded by `max_nodes` and the visited set.
+            u32::MAX
+        } else {
+            config.depth
+        };
 
         // Start with root
         queue.push_back((config.root_id, 0));
@@ -1027,7 +1031,7 @@ impl Storage {
             }
 
             // If we haven't reached max depth, explore neighbors
-            if depth < config.depth {
+            if depth < max_depth {
                 let edges =
                     self.get_edges_for_node(current_id, &config.direction, &config.edge_filter)?;
 
@@ -1392,6 +1396,17 @@ mod tests {
         let config = TrailConfig {
             root_id: NodeId(1),
             depth: 2,
+            direction: TrailDirection::Outgoing,
+            edge_filter: vec![],
+            max_nodes: 100,
+        };
+        let result = storage.get_trail(&config)?;
+        assert_eq!(result.nodes.len(), 3);
+
+        // Trail from A, depth 0 (infinite), should also get A, B, and C (bounded by max_nodes)
+        let config = TrailConfig {
+            root_id: NodeId(1),
+            depth: 0,
             direction: TrailDirection::Outgoing,
             edge_filter: vec![],
             max_nodes: 100,

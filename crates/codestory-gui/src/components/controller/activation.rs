@@ -1,9 +1,9 @@
 use crate::components::code_view::enhanced::EnhancedCodeView;
+use crate::components::code_view::multi_file::MultiFileCodeView;
 use crate::components::commands::{ActivateNodeCommand, AppState, CommandHistory};
 use crate::components::detail_panel::DetailPanel;
 use crate::components::node_graph::NodeGraphView;
 use crate::components::reference_list::ReferenceList;
-use crate::components::code_view::multi_file::MultiFileCodeView;
 use crate::components::sidebar::Sidebar;
 use crate::navigation::TabManager;
 use crate::settings::AppSettings;
@@ -128,9 +128,9 @@ impl ActivationController {
             // Update Graph View
             let trail_config = codestory_core::TrailConfig {
                 root_id: id,
-                depth: settings.node_graph.max_depth as u32,
-                direction: codestory_core::TrailDirection::Both,
-                edge_filter: Vec::new(),
+                depth: settings.node_graph.trail_depth,
+                direction: settings.node_graph.trail_direction,
+                edge_filter: settings.node_graph.trail_edge_filter.clone(),
                 max_nodes: 500,
             };
 
@@ -214,11 +214,7 @@ impl ActivationController {
                                     if path.exists()
                                         && let Ok(content) = std::fs::read_to_string(&path)
                                     {
-                                        snippet_view.add_file(
-                                            path.clone(),
-                                            content,
-                                            Some(file_id),
-                                        );
+                                        snippet_view.add_file(path.clone(), content, Some(file_id));
                                         file_paths.insert(file_id, path);
                                     }
                                 }

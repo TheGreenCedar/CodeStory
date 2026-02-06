@@ -5,7 +5,9 @@ use crate::settings::ThemeMode;
 use codestory_core::{Edge, EdgeKind, Node, NodeId, NodeKind, TrailConfig, TrailDirection};
 use codestory_events::Event;
 use codestory_graph::converter::NodeGraphConverter;
-use codestory_graph::uml_types::{CollapseState, GraphViewState, MemberItem, UmlNode, VisibilityKind};
+use codestory_graph::uml_types::{
+    CollapseState, GraphViewState, MemberItem, UmlNode, VisibilityKind,
+};
 use codestory_graph::{
     DummyEdge, ForceDirectedLayouter, GraphModel, GridLayouter, Layouter, NestingLayouter,
     RadialLayouter,
@@ -13,11 +15,11 @@ use codestory_graph::{
 use codestory_storage::Storage;
 use eframe::egui;
 use egui_phosphor::regular as ph;
-use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::{Duration, Instant};
-use std::thread;
 use fontdue::layout::{CoordinateSystem, Layout, LayoutSettings, TextStyle};
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread;
+use std::time::{Duration, Instant};
 
 type LayoutRequest = (
     Option<NodeId>,
@@ -84,6 +86,7 @@ pub struct NodeGraphView {
     node_to_navigate: Option<NodeId>,
     pending_zoom_to_fit: bool,
     pending_zoom_steps: i32,
+    pending_zoom_reset: bool,
     pending_expand_all: bool,
     pending_collapse_all: bool,
     show_toolbar_panel: bool,
@@ -212,6 +215,7 @@ impl NodeGraphView {
             node_to_navigate: None,
             pending_zoom_to_fit: false,
             pending_zoom_steps: 0,
+            pending_zoom_reset: false,
             pending_expand_all: false,
             pending_collapse_all: false,
             show_toolbar_panel: false,
@@ -267,6 +271,9 @@ impl NodeGraphView {
             Event::ZoomOut => {
                 self.pending_zoom_steps -= 1;
             }
+            Event::ZoomReset => {
+                self.pending_zoom_reset = true;
+            }
             _ => {}
         }
     }
@@ -279,9 +286,9 @@ impl NodeGraphView {
     ) {
         let trail_config = TrailConfig {
             root_id: center_node_id,
-            depth: settings.max_depth as u32,
-            direction: TrailDirection::Both,
-            edge_filter: Vec::new(),
+            depth: settings.trail_depth,
+            direction: settings.trail_direction,
+            edge_filter: settings.trail_edge_filter.clone(),
             max_nodes: 500,
         };
 
@@ -743,10 +750,8 @@ impl NodeGraphView {
         ui.allocate_rect(full_rect, egui::Sense::hover());
 
         let toolbar_width = 56.0;
-        let toolbar_rect = egui::Rect::from_min_size(
-            full_rect.min,
-            egui::vec2(toolbar_width, full_rect.height()),
-        );
+        let toolbar_rect =
+            egui::Rect::from_min_size(full_rect.min, egui::vec2(toolbar_width, full_rect.height()));
         let graph_rect = egui::Rect::from_min_max(
             egui::pos2(full_rect.min.x + toolbar_width, full_rect.min.y),
             full_rect.max,
@@ -799,6 +804,15 @@ impl NodeGraphView {
                 }
             }
 
+            if self.pending_zoom_reset {
+                self.pending_zoom_reset = false;
+                let current = self.graph_canvas.zoom();
+                if (current - 1.0).abs() > f32::EPSILON {
+                    self.graph_canvas
+                        .zoom_by(1.0 / current, snarl_rect.center());
+                }
+            }
+
             let view_state_snapshot = settings.view_state.clone();
             let graph_settings = settings.clone();
             let output = self.graph_canvas.show(
@@ -815,7 +829,10 @@ impl NodeGraphView {
             self.current_transform = output.transform;
             self.last_node_rects_graph = output.node_rects_graph.clone();
             self.last_view_state = view_state_snapshot.clone();
-            if self.graph_canvas.apply_to_view_state(&mut settings.view_state) {
+            if self
+                .graph_canvas
+                .apply_to_view_state(&mut settings.view_state)
+            {
                 view_state_dirty = true;
             }
             if let Some(node_id) = output.interaction.toggle_node {
@@ -839,7 +856,8 @@ impl NodeGraphView {
                     GraphCanvasAction::Navigate(id) => self.node_to_navigate = Some(id),
                     GraphCanvasAction::Hide(id) => self.node_to_hide = Some(id),
                     GraphCanvasAction::OpenInNewTab(id) => {
-                        self.event_bus.publish(Event::TabOpen { token_id: Some(id) });
+                        self.event_bus
+                            .publish(Event::TabOpen { token_id: Some(id) });
                     }
                     GraphCanvasAction::ShowDefinition(id) => {
                         self.event_bus.publish(Event::ActivateNode {
@@ -867,7 +885,8 @@ impl NodeGraphView {
                         }
                     }
                     GraphCanvasAction::Bookmark(id) => {
-                        self.event_bus.publish(Event::BookmarkAddDefault { node_id: id });
+                        self.event_bus
+                            .publish(Event::BookmarkAddDefault { node_id: id });
                     }
                     GraphCanvasAction::CopyName(id) => {
                         let name = self
@@ -947,8 +966,10 @@ impl NodeGraphView {
                 let mut close_menu = false;
                 let menu_key: EdgeKey = (menu.info.source, menu.info.target, menu.info.kind);
                 let label = codestory_graph::style::get_edge_kind_label(menu.info.kind);
-                let edge_label =
-                    format!("{} {} {}", menu.info.source_label, label, menu.info.target_label);
+                let edge_label = format!(
+                    "{} {} {}",
+                    menu.info.source_label, label, menu.info.target_label
+                );
 
                 egui::Area::new("edge_context_menu".into())
                     .fixed_pos(menu.pos)
@@ -974,14 +995,29 @@ impl NodeGraphView {
                 }
             }
 
-            self.ui_trail_cluster(ui, snarl_rect);
+            if !ui.ctx().wants_keyboard_input() {
+                let reset_zoom = ui.input(|i| i.key_pressed(egui::Key::Num0));
+                if reset_zoom {
+                    self.event_bus.publish(Event::ZoomReset);
+                }
+
+                if settings.show_legend && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.event_bus.publish(Event::SetShowLegend(false));
+                }
+            }
+
+            if self.ui_trail_toolbar(ui, snarl_rect, settings) {
+                view_state_dirty = true;
+            }
+            self.ui_zoom_cluster(ui, snarl_rect);
+            self.ui_legend_button(ui, snarl_rect, settings);
 
             if settings.show_minimap {
                 self.ui_minimap(ui, snarl_rect, settings);
             }
 
             if settings.show_legend {
-                self.ui_legend(ui, snarl_rect);
+                self.ui_legend(ui, snarl_rect, settings.show_minimap);
             }
         });
 
@@ -1128,9 +1164,16 @@ impl NodeGraphView {
         let palette = self.style_resolver.palette();
         let button_size = egui::vec2(36.0, 36.0);
         let is_light = is_light_color(palette.background);
-        let toolbar_fill = adjust_color(palette.background, is_light, if is_light { 0.08 } else { 0.24 });
-        let toolbar_stroke =
-            adjust_color(palette.node_section_border, is_light, if is_light { 0.30 } else { 0.45 });
+        let toolbar_fill = adjust_color(
+            palette.background,
+            is_light,
+            if is_light { 0.08 } else { 0.24 },
+        );
+        let toolbar_stroke = adjust_color(
+            palette.node_section_border,
+            is_light,
+            if is_light { 0.30 } else { 0.45 },
+        );
 
         ui.allocate_ui_with_layout(
             egui::vec2(toolbar_width, ui.available_height()),
@@ -1157,168 +1200,6 @@ impl NodeGraphView {
                     .clicked()
                     {
                         rebuild_needed = true;
-                    }
-
-                    if rail_button(
-                        ui,
-                        button_size,
-                        palette,
-                        RailButtonContent::Text(ph::ARROWS_OUT_SIMPLE),
-                        false,
-                    )
-                    .on_hover_text("Zoom to Fit")
-                    .clicked()
-                    {
-                        self.event_bus.publish(Event::ZoomToFit);
-                    }
-
-                    if rail_button(
-                        ui,
-                        button_size,
-                        palette,
-                        RailButtonContent::Text(ph::MAGNIFYING_GLASS_PLUS),
-                        false,
-                    )
-                    .on_hover_text("Zoom In")
-                    .clicked()
-                    {
-                        self.event_bus.publish(Event::ZoomIn);
-                    }
-                    if rail_button(
-                        ui,
-                        button_size,
-                        palette,
-                        RailButtonContent::Text(ph::MAGNIFYING_GLASS_MINUS),
-                        false,
-                    )
-                    .on_hover_text("Zoom Out")
-                    .clicked()
-                    {
-                        self.event_bus.publish(Event::ZoomOut);
-                    }
-
-                    ui.add_space(6.0);
-
-                    let depth = settings.max_depth as u32;
-                    let clamped_depth = depth.clamp(1, 10);
-                    ui.label(
-                        egui::RichText::new(clamped_depth.to_string())
-                            .size(12.0)
-                            .color(palette.node_default_text),
-                    );
-                    ui.scope(|ui| {
-                        let slider_rect =
-                            ui.allocate_exact_size(egui::vec2(button_size.x, 96.0), egui::Sense::hover()).0;
-                        let response = ui.interact(
-                            slider_rect,
-                            ui.id().with("trail_depth_slider"),
-                            egui::Sense::click_and_drag(),
-                        );
-                        let inner_rect = slider_rect.shrink(6.0);
-                        let knob_height = inner_rect.width().clamp(16.0, inner_rect.height());
-                        let travel = (inner_rect.height() - knob_height).max(1.0);
-                        let t = (clamped_depth.saturating_sub(1) as f32) / 9.0;
-                        let knob_y = inner_rect.top() + t * travel;
-                        let knob_rect = egui::Rect::from_min_size(
-                            egui::pos2(inner_rect.left(), knob_y),
-                            egui::vec2(inner_rect.width(), knob_height),
-                        );
-
-                        ui.painter().rect_filled(
-                            slider_rect,
-                            8.0,
-                            adjust_color(toolbar_fill, is_light, 0.12),
-                        );
-                        ui.painter().rect_stroke(
-                            slider_rect,
-                            8.0,
-                            egui::Stroke::new(1.0, toolbar_stroke),
-                            egui::StrokeKind::Middle,
-                        );
-
-                        let track_width = inner_rect.width() * 0.35;
-                        let track_rect = egui::Rect::from_min_max(
-                            egui::pos2(inner_rect.center().x - track_width * 0.5, inner_rect.top()),
-                            egui::pos2(inner_rect.center().x + track_width * 0.5, inner_rect.bottom()),
-                        );
-                        ui.painter().rect_filled(
-                            track_rect,
-                            track_width * 0.5,
-                            adjust_color(palette.node_default_fill, is_light, 0.18),
-                        );
-
-                        let knob_fill = if response.hovered() {
-                            adjust_color(palette.node_default_fill, is_light, 0.28)
-                        } else {
-                            adjust_color(palette.node_default_fill, is_light, 0.22)
-                        };
-                        ui.painter().rect_filled(knob_rect, 6.0, knob_fill);
-                        ui.painter().rect_stroke(
-                            knob_rect,
-                            6.0,
-                            egui::Stroke::new(1.2, toolbar_stroke),
-                            egui::StrokeKind::Middle,
-                        );
-
-                        if response.dragged() || response.clicked() {
-                            if let Some(pos) = response.interact_pointer_pos() {
-                                let target_y = (pos.y - knob_height * 0.5)
-                                    .clamp(inner_rect.top(), inner_rect.bottom() - knob_height);
-                                let t = (target_y - inner_rect.top()) / travel;
-                                let new_depth = (1.0 + t * 9.0).round() as u32;
-                                let new_depth = new_depth.clamp(1, 10);
-                                if new_depth != clamped_depth {
-                                    self.event_bus.publish(Event::SetTrailDepth(new_depth));
-                                }
-                            }
-                        }
-                    });
-
-                    ui.add_space(6.0);
-
-                    let mut group_ns = settings.group_by_namespace;
-                    if rail_button(
-                        ui,
-                        button_size,
-                        palette,
-                        RailButtonContent::Glyph(RailGlyph::Namespace),
-                        group_ns,
-                    )
-                    .on_hover_text("Group by namespace")
-                    .clicked()
-                    {
-                        group_ns = !group_ns;
-                        self.event_bus.publish(Event::SetGroupByNamespace(group_ns));
-                    }
-
-                    let mut group_file = settings.group_by_file;
-                    if rail_button(
-                        ui,
-                        button_size,
-                        palette,
-                        RailButtonContent::Glyph(RailGlyph::File),
-                        group_file,
-                    )
-                    .on_hover_text("Group by file")
-                    .clicked()
-                    {
-                        group_file = !group_file;
-                        self.event_bus.publish(Event::SetGroupByFile(group_file));
-                    }
-
-                    let mut show_legend = settings.show_legend;
-                    if rail_button(
-                        ui,
-                        button_size,
-                        palette,
-                        RailButtonContent::Text(ph::QUESTION),
-                        show_legend,
-                    )
-                    .on_hover_text("Toggle legend")
-                    .clicked()
-                    {
-                        show_legend = !show_legend;
-                        self.event_bus.publish(Event::SetShowLegend(show_legend));
                     }
 
                     let mut show_minimap = settings.show_minimap;
@@ -1368,10 +1249,16 @@ impl NodeGraphView {
                         .selected_text(format!("{:?}", settings.layout_algorithm))
                         .show_ui(ui, |ui| {
                             for (alg, label) in [
-                                (codestory_events::LayoutAlgorithm::ForceDirected, "Force Directed"),
+                                (
+                                    codestory_events::LayoutAlgorithm::ForceDirected,
+                                    "Force Directed",
+                                ),
                                 (codestory_events::LayoutAlgorithm::Radial, "Radial"),
                                 (codestory_events::LayoutAlgorithm::Grid, "Grid"),
-                                (codestory_events::LayoutAlgorithm::Hierarchical, "Hierarchical"),
+                                (
+                                    codestory_events::LayoutAlgorithm::Hierarchical,
+                                    "Hierarchical",
+                                ),
                             ] {
                                 if ui
                                     .selectable_label(settings.layout_algorithm == alg, label)
@@ -1382,8 +1269,7 @@ impl NodeGraphView {
                             }
                         });
 
-                    if settings.layout_algorithm
-                        == codestory_events::LayoutAlgorithm::Hierarchical
+                    if settings.layout_algorithm == codestory_events::LayoutAlgorithm::Hierarchical
                     {
                         ui.horizontal(|ui| {
                             if ui
@@ -1447,54 +1333,541 @@ impl NodeGraphView {
         rebuild_needed
     }
 
-    fn ui_trail_cluster(&mut self, ui: &mut egui::Ui, parent_rect: egui::Rect) {
+    fn ui_trail_toolbar(
+        &mut self,
+        ui: &mut egui::Ui,
+        parent_rect: egui::Rect,
+        settings: &mut crate::settings::NodeGraphSettings,
+    ) -> bool {
         let palette = self.style_resolver.palette();
         let button_size = egui::vec2(26.0, 26.0);
         let cluster_pos = parent_rect.min + egui::vec2(10.0, 10.0);
 
-        egui::Area::new("trail_cluster".into())
+        let is_light = is_light_color(palette.background);
+        let panel_fill = adjust_color(
+            palette.background,
+            is_light,
+            if is_light { 0.08 } else { 0.24 },
+        );
+        let panel_stroke = adjust_color(
+            palette.node_section_border,
+            is_light,
+            if is_light { 0.30 } else { 0.45 },
+        );
+
+        let mut settings_changed = false;
+
+        let publish_trail_config = |event_bus: &codestory_events::EventBus,
+                                    depth: u32,
+                                    direction: TrailDirection,
+                                    edge_filter: Vec<EdgeKind>| {
+            event_bus.publish(Event::TrailConfigChange {
+                depth,
+                direction,
+                edge_filter,
+            });
+        };
+
+        let matches_filter = |current: &[EdgeKind], preset: &[EdgeKind]| -> bool {
+            if current.len() != preset.len() {
+                return false;
+            }
+            let current_set: HashSet<EdgeKind> = current.iter().copied().collect();
+            let preset_set: HashSet<EdgeKind> = preset.iter().copied().collect();
+            current_set == preset_set
+        };
+
+        egui::Area::new("graph_trail_toolbar".into())
+            .order(egui::Order::Foreground)
+            .fixed_pos(cluster_pos)
+            .show(ui.ctx(), |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+
+                let frame = egui::Frame::NONE
+                    .fill(panel_fill)
+                    .inner_margin(6.0)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .stroke(egui::Stroke::new(1.0, panel_stroke));
+
+                frame.show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        // Navigation / trail entry
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Glyph(RailGlyph::TrailBack),
+                            false,
+                        )
+                        .on_hover_text("Back")
+                        .clicked()
+                        {
+                            self.event_bus.publish(Event::HistoryBack);
+                        }
+
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Glyph(RailGlyph::TrailForward),
+                            false,
+                        )
+                        .on_hover_text("Forward")
+                        .clicked()
+                        {
+                            self.event_bus.publish(Event::HistoryForward);
+                        }
+
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Glyph(RailGlyph::TrailCustom),
+                            false,
+                        )
+                        .on_hover_text("Custom trail")
+                        .clicked()
+                        {
+                            self.event_bus.publish(Event::OpenCustomTrailDialog);
+                        }
+
+                        ui.separator();
+
+                        // Predefined edge filter presets (Sourcetrail-style)
+                        let all_selected = settings.trail_edge_filter.is_empty();
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Text("All"),
+                            all_selected,
+                        )
+                        .on_hover_text("Show all edge kinds")
+                        .clicked()
+                        {
+                            settings.trail_edge_filter.clear();
+                            settings_changed = true;
+                            publish_trail_config(
+                                &self.event_bus,
+                                settings.trail_depth,
+                                settings.trail_direction,
+                                settings.trail_edge_filter.clone(),
+                            );
+                        }
+
+                        let call_filter = [EdgeKind::CALL];
+                        let call_selected =
+                            matches_filter(&settings.trail_edge_filter, &call_filter);
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Text("Call"),
+                            call_selected,
+                        )
+                        .on_hover_text("Call graph")
+                        .clicked()
+                        {
+                            settings.trail_edge_filter = call_filter.to_vec();
+                            settings_changed = true;
+                            publish_trail_config(
+                                &self.event_bus,
+                                settings.trail_depth,
+                                settings.trail_direction,
+                                settings.trail_edge_filter.clone(),
+                            );
+                        }
+
+                        let inheritance_filter = [EdgeKind::INHERITANCE, EdgeKind::OVERRIDE];
+                        let inheritance_selected =
+                            matches_filter(&settings.trail_edge_filter, &inheritance_filter);
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Text("Inh"),
+                            inheritance_selected,
+                        )
+                        .on_hover_text("Inheritance / override")
+                        .clicked()
+                        {
+                            settings.trail_edge_filter = inheritance_filter.to_vec();
+                            settings_changed = true;
+                            publish_trail_config(
+                                &self.event_bus,
+                                settings.trail_depth,
+                                settings.trail_direction,
+                                settings.trail_edge_filter.clone(),
+                            );
+                        }
+
+                        let include_filter = [EdgeKind::INCLUDE, EdgeKind::IMPORT];
+                        let include_selected =
+                            matches_filter(&settings.trail_edge_filter, &include_filter);
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Text("Inc"),
+                            include_selected,
+                        )
+                        .on_hover_text("Include / import tree")
+                        .clicked()
+                        {
+                            settings.trail_edge_filter = include_filter.to_vec();
+                            settings_changed = true;
+                            publish_trail_config(
+                                &self.event_bus,
+                                settings.trail_depth,
+                                settings.trail_direction,
+                                settings.trail_edge_filter.clone(),
+                            );
+                        }
+
+                        ui.separator();
+
+                        // Trail direction (Incoming / Outgoing / Both)
+                        let outgoing_selected =
+                            settings.trail_direction == TrailDirection::Outgoing;
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Text(ph::ARROW_RIGHT),
+                            outgoing_selected,
+                        )
+                        .on_hover_text("Outgoing")
+                        .clicked()
+                        {
+                            settings.trail_direction = TrailDirection::Outgoing;
+                            settings_changed = true;
+                            publish_trail_config(
+                                &self.event_bus,
+                                settings.trail_depth,
+                                settings.trail_direction,
+                                settings.trail_edge_filter.clone(),
+                            );
+                        }
+
+                        let both_selected = settings.trail_direction == TrailDirection::Both;
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Text(ph::ARROWS_LEFT_RIGHT),
+                            both_selected,
+                        )
+                        .on_hover_text("Both directions")
+                        .clicked()
+                        {
+                            settings.trail_direction = TrailDirection::Both;
+                            settings_changed = true;
+                            publish_trail_config(
+                                &self.event_bus,
+                                settings.trail_depth,
+                                settings.trail_direction,
+                                settings.trail_edge_filter.clone(),
+                            );
+                        }
+
+                        let incoming_selected =
+                            settings.trail_direction == TrailDirection::Incoming;
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Text(ph::ARROW_LEFT),
+                            incoming_selected,
+                        )
+                        .on_hover_text("Incoming")
+                        .clicked()
+                        {
+                            settings.trail_direction = TrailDirection::Incoming;
+                            settings_changed = true;
+                            publish_trail_config(
+                                &self.event_bus,
+                                settings.trail_depth,
+                                settings.trail_direction,
+                                settings.trail_edge_filter.clone(),
+                            );
+                        }
+
+                        ui.separator();
+
+                        // Depth: 1..=20 plus ∞ (stored as 0)
+                        ui.label(
+                            egui::RichText::new("Depth")
+                                .size(11.0)
+                                .color(palette.node_default_text),
+                        );
+                        let mut slider_pos: u32 = if settings.trail_depth == 0 {
+                            20
+                        } else {
+                            (settings.trail_depth.saturating_sub(1)).min(19)
+                        };
+                        let slider = egui::Slider::new(&mut slider_pos, 0..=20)
+                            .show_value(false)
+                            .step_by(1.0);
+                        let slider_response = ui.add_sized(egui::vec2(120.0, 18.0), slider);
+                        if slider_response.changed() {
+                            let new_depth = if slider_pos == 20 { 0 } else { slider_pos + 1 };
+                            if new_depth != settings.trail_depth {
+                                settings.trail_depth = new_depth;
+                                settings_changed = true;
+                                publish_trail_config(
+                                    &self.event_bus,
+                                    settings.trail_depth,
+                                    settings.trail_direction,
+                                    settings.trail_edge_filter.clone(),
+                                );
+                            }
+                        }
+                        let depth_label = if slider_pos == 20 {
+                            "∞".to_string()
+                        } else {
+                            (slider_pos + 1).to_string()
+                        };
+                        ui.label(
+                            egui::RichText::new(depth_label)
+                                .size(11.0)
+                                .color(palette.node_default_text),
+                        );
+
+                        ui.separator();
+
+                        // Layout direction (graph layout orientation)
+                        let horizontal_selected = settings.layout_direction
+                            == codestory_core::LayoutDirection::Horizontal;
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Text("H"),
+                            horizontal_selected,
+                        )
+                        .on_hover_text("Layout direction: Horizontal")
+                        .clicked()
+                        {
+                            settings.layout_direction = codestory_core::LayoutDirection::Horizontal;
+                            settings_changed = true;
+                            self.event_bus.publish(Event::SetLayoutDirection(
+                                codestory_core::LayoutDirection::Horizontal,
+                            ));
+                        }
+                        let vertical_selected =
+                            settings.layout_direction == codestory_core::LayoutDirection::Vertical;
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Text("V"),
+                            vertical_selected,
+                        )
+                        .on_hover_text("Layout direction: Vertical")
+                        .clicked()
+                        {
+                            settings.layout_direction = codestory_core::LayoutDirection::Vertical;
+                            settings_changed = true;
+                            self.event_bus.publish(Event::SetLayoutDirection(
+                                codestory_core::LayoutDirection::Vertical,
+                            ));
+                        }
+
+                        ui.separator();
+
+                        // Grouping toggles
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Glyph(RailGlyph::Namespace),
+                            settings.group_by_namespace,
+                        )
+                        .on_hover_text("Group by namespace")
+                        .clicked()
+                        {
+                            settings.group_by_namespace = !settings.group_by_namespace;
+                            settings_changed = true;
+                            self.event_bus
+                                .publish(Event::SetGroupByNamespace(settings.group_by_namespace));
+                        }
+
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Glyph(RailGlyph::File),
+                            settings.group_by_file,
+                        )
+                        .on_hover_text("Group by file")
+                        .clicked()
+                        {
+                            settings.group_by_file = !settings.group_by_file;
+                            settings_changed = true;
+                            self.event_bus
+                                .publish(Event::SetGroupByFile(settings.group_by_file));
+                        }
+                    });
+                });
+            });
+
+        settings_changed
+    }
+
+    fn ui_zoom_cluster(&mut self, ui: &mut egui::Ui, parent_rect: egui::Rect) {
+        let palette = self.style_resolver.palette();
+        let button_size = egui::vec2(26.0, 26.0);
+        let margin = 10.0;
+        let inner_margin = 6.0;
+        let cluster_pos = egui::pos2(
+            parent_rect.min.x + margin,
+            parent_rect.max.y - margin - (button_size.y + inner_margin * 2.0),
+        );
+
+        let is_light = is_light_color(palette.background);
+        let panel_fill = adjust_color(
+            palette.background,
+            is_light,
+            if is_light { 0.08 } else { 0.24 },
+        );
+        let panel_stroke = adjust_color(
+            palette.node_section_border,
+            is_light,
+            if is_light { 0.30 } else { 0.45 },
+        );
+
+        egui::Area::new("graph_zoom_cluster".into())
             .order(egui::Order::Foreground)
             .fixed_pos(cluster_pos)
             .show(ui.ctx(), |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-                ui.horizontal(|ui| {
-                    if rail_button(
-                        ui,
-                        button_size,
-                        palette,
-                        RailButtonContent::Glyph(RailGlyph::TrailBack),
-                        false,
-                    )
-                    .on_hover_text("Back")
-                    .clicked()
-                    {
-                        self.event_bus.publish(Event::HistoryBack);
-                    }
 
-                    if rail_button(
-                        ui,
-                        button_size,
-                        palette,
-                        RailButtonContent::Glyph(RailGlyph::TrailForward),
-                        false,
-                    )
-                    .on_hover_text("Forward")
-                    .clicked()
-                    {
-                        self.event_bus.publish(Event::HistoryForward);
-                    }
+                let frame = egui::Frame::NONE
+                    .fill(panel_fill)
+                    .inner_margin(inner_margin)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .stroke(egui::Stroke::new(1.0, panel_stroke));
 
+                frame.show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Text(ph::MAGNIFYING_GLASS_MINUS),
+                            false,
+                        )
+                        .on_hover_text("Zoom out")
+                        .clicked()
+                        {
+                            self.event_bus.publish(Event::ZoomOut);
+                        }
+
+                        ui.label(
+                            egui::RichText::new(format!("{:.0}%", self.current_zoom * 100.0))
+                                .size(11.0)
+                                .color(palette.node_default_text),
+                        );
+
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Text(ph::MAGNIFYING_GLASS_PLUS),
+                            false,
+                        )
+                        .on_hover_text("Zoom in")
+                        .clicked()
+                        {
+                            self.event_bus.publish(Event::ZoomIn);
+                        }
+
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Text("0"),
+                            false,
+                        )
+                        .on_hover_text("Reset zoom (0)")
+                        .clicked()
+                        {
+                            self.event_bus.publish(Event::ZoomReset);
+                        }
+
+                        if rail_button(
+                            ui,
+                            button_size,
+                            palette,
+                            RailButtonContent::Text(ph::ARROWS_OUT_SIMPLE),
+                            false,
+                        )
+                        .on_hover_text("Zoom to fit")
+                        .clicked()
+                        {
+                            self.event_bus.publish(Event::ZoomToFit);
+                        }
+                    });
+                });
+            });
+    }
+
+    fn ui_legend_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        parent_rect: egui::Rect,
+        settings: &crate::settings::NodeGraphSettings,
+    ) {
+        let palette = self.style_resolver.palette();
+        let button_size = egui::vec2(26.0, 26.0);
+        let margin = 10.0;
+        let inner_margin = 6.0;
+        let reserve_y = if settings.show_minimap {
+            // Minimap is 100px tall and already has a 10px bottom margin; reserve space above it.
+            100.0 + margin
+        } else {
+            0.0
+        };
+        let button_pos = egui::pos2(
+            parent_rect.max.x - margin - (button_size.x + inner_margin * 2.0),
+            parent_rect.max.y - margin - reserve_y - (button_size.y + inner_margin * 2.0),
+        );
+
+        let is_light = is_light_color(palette.background);
+        let panel_fill = adjust_color(
+            palette.background,
+            is_light,
+            if is_light { 0.08 } else { 0.24 },
+        );
+        let panel_stroke = adjust_color(
+            palette.node_section_border,
+            is_light,
+            if is_light { 0.30 } else { 0.45 },
+        );
+
+        egui::Area::new("graph_legend_button".into())
+            .order(egui::Order::Foreground)
+            .fixed_pos(button_pos)
+            .show(ui.ctx(), |ui| {
+                let frame = egui::Frame::NONE
+                    .fill(panel_fill)
+                    .inner_margin(inner_margin)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .stroke(egui::Stroke::new(1.0, panel_stroke));
+
+                frame.show(ui, |ui| {
                     if rail_button(
                         ui,
                         button_size,
                         palette,
-                        RailButtonContent::Glyph(RailGlyph::TrailCustom),
-                        false,
+                        RailButtonContent::Text(ph::QUESTION),
+                        settings.show_legend,
                     )
-                    .on_hover_text("Custom trail")
+                    .on_hover_text("Toggle legend")
                     .clicked()
                     {
-                        self.event_bus.publish(Event::OpenCustomTrailDialog);
+                        self.event_bus
+                            .publish(Event::SetShowLegend(!settings.show_legend));
                     }
                 });
             });
@@ -1583,12 +1956,8 @@ impl NodeGraphView {
             scale = scale.max(min_scale).min(max_scale);
         }
 
-        let img_width = ((width * scale) + padding * 2.0)
-            .ceil()
-            .max(1.0) as usize;
-        let img_height = ((height * scale) + padding * 2.0)
-            .ceil()
-            .max(1.0) as usize;
+        let img_width = ((width * scale) + padding * 2.0).ceil().max(1.0) as usize;
+        let img_height = ((height * scale) + padding * 2.0).ceil().max(1.0) as usize;
         let mut image = egui::ColorImage::filled([img_width, img_height], palette.background);
 
         let origin = bounds.min;
@@ -1619,11 +1988,8 @@ impl NodeGraphView {
         };
 
         let thickness = ((2.0 * scale).round() as i32).max(1);
-        let uml_lookup: std::collections::HashMap<NodeId, &UmlNode> = self
-            .uml_nodes
-            .iter()
-            .map(|uml| (uml.id, uml))
-            .collect();
+        let uml_lookup: std::collections::HashMap<NodeId, &UmlNode> =
+            self.uml_nodes.iter().map(|uml| (uml.id, uml)).collect();
 
         for edge in &self.current_edges {
             let (Some(src_rect), Some(dst_rect)) = (
@@ -1634,10 +2000,14 @@ impl NodeGraphView {
             };
             let source_rect = to_uml_rect(*src_rect);
             let target_rect = to_uml_rect(*dst_rect);
-            let curve = self.edge_overlay.router.route_edge(source_rect, target_rect);
+            let curve = self
+                .edge_overlay
+                .router
+                .route_edge(source_rect, target_rect);
             let color = self.style_resolver.resolve_edge_color(edge.kind);
-            let dist = ((curve.end.x - curve.start.x).powi(2) + (curve.end.y - curve.start.y).powi(2))
-                .sqrt();
+            let dist = ((curve.end.x - curve.start.x).powi(2)
+                + (curve.end.y - curve.start.y).powi(2))
+            .sqrt();
             let samples = ((dist / 40.0).ceil() as usize).clamp(12, 64);
             let mut prev: Option<(i32, i32)> = None;
             for i in 0..=samples {
@@ -1661,7 +2031,14 @@ impl NodeGraphView {
             let layout = export_layout_for_node(uml, *rect, &collapse_state, zoom);
 
             let (min_x, min_y, max_x, max_y) = map_rect(*rect);
-            draw_rect_filled(&mut image, min_x, min_y, max_x, max_y, palette.node_default_fill);
+            draw_rect_filled(
+                &mut image,
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+                palette.node_default_fill,
+            );
             draw_rect_stroke(
                 &mut image,
                 min_x,
@@ -1683,8 +2060,7 @@ impl NodeGraphView {
                 let header_x = layout.header_rect.min.x + 10.0 * zoom;
                 let header_y = layout.header_rect.center().y;
                 let (text_x, center_y_px) = map_pos_f(egui::pos2(header_x, header_y));
-                let max_header_width =
-                    (layout.header_rect.width() - 20.0 * zoom).max(10.0) * scale;
+                let max_header_width = (layout.header_rect.width() - 20.0 * zoom).max(10.0) * scale;
                 let header_font = fit_text_size(
                     &export_font,
                     &header_label,
@@ -1802,8 +2178,7 @@ impl NodeGraphView {
                     text_offset_x += icon_size + 4.0 * zoom;
                 }
 
-                let text_pos =
-                    egui::pos2(chip_rect.min.x + text_offset_x, chip_rect.center().y);
+                let text_pos = egui::pos2(chip_rect.min.x + text_offset_x, chip_rect.center().y);
                 let (tx, center_py) = map_pos_f(text_pos);
                 draw_text(
                     &mut image,
@@ -1818,8 +2193,7 @@ impl NodeGraphView {
                 for (member, member_rect) in &section.members {
                     let member_label = export_member_label(member);
                     let label_width =
-                        measure_text_width(&export_font, &member_label, member_font)
-                            .unwrap_or(0.0);
+                        measure_text_width(&export_font, &member_label, member_font).unwrap_or(0.0);
                     let pill_padding = egui::vec2(6.0 * zoom, 3.0 * zoom);
                     let pill_height = member_rect.height() - 6.0 * zoom;
                     let pill_width = label_width / scale + pill_padding.x * 2.0;
@@ -1871,12 +2245,21 @@ impl NodeGraphView {
         Some(image)
     }
 
-    fn ui_legend(&self, ui: &mut egui::Ui, parent_rect: egui::Rect) {
+    fn ui_legend(&self, ui: &mut egui::Ui, parent_rect: egui::Rect, minimap_enabled: bool) {
         let palette = self.style_resolver.palette();
         let legend_size = egui::vec2(150.0, 230.0);
+        let margin = 10.0;
+        let reserve_y = if minimap_enabled {
+            // Minimap is 100px tall and already has a 10px bottom margin; reserve space above it.
+            100.0 + margin
+        } else {
+            0.0
+        };
         let legend_rect = egui::Rect::from_min_size(
-            parent_rect.left_bottom() - egui::vec2(0.0, legend_size.y + 10.0)
-                + egui::vec2(10.0, 0.0),
+            egui::pos2(
+                parent_rect.max.x - margin - legend_size.x,
+                parent_rect.max.y - margin - reserve_y - legend_size.y,
+            ),
             legend_size,
         );
 
@@ -1912,18 +2295,27 @@ impl NodeGraphView {
                 ui.separator();
 
                 let edge_items = [
-                    ("Call", self.style_resolver.resolve_edge_color(EdgeKind::CALL)),
-                    ("Use", self.style_resolver.resolve_edge_color(EdgeKind::USAGE)),
-                    ("Override", self.style_resolver.resolve_edge_color(EdgeKind::OVERRIDE)),
+                    (
+                        "Call",
+                        self.style_resolver.resolve_edge_color(EdgeKind::CALL),
+                    ),
+                    (
+                        "Use",
+                        self.style_resolver.resolve_edge_color(EdgeKind::USAGE),
+                    ),
+                    (
+                        "Override",
+                        self.style_resolver.resolve_edge_color(EdgeKind::OVERRIDE),
+                    ),
                     (
                         "Type",
                         self.style_resolver.resolve_edge_color(EdgeKind::TYPE_USAGE),
                     ),
-                    ("Include", self.style_resolver.resolve_edge_color(EdgeKind::INCLUDE)),
                     (
-                        "Bundled",
-                        self.style_resolver.resolve_bundled_edge_color(),
+                        "Include",
+                        self.style_resolver.resolve_edge_color(EdgeKind::INCLUDE),
                     ),
+                    ("Bundled", self.style_resolver.resolve_bundled_edge_color()),
                 ];
 
                 for (name, color) in edge_items {
@@ -1932,10 +2324,7 @@ impl NodeGraphView {
                             ui.allocate_at_least(egui::vec2(18.0, 10.0), egui::Sense::hover());
                         let mid = rect.center().y;
                         ui.painter().line_segment(
-                            [
-                                egui::pos2(rect.left(), mid),
-                                egui::pos2(rect.right(), mid),
-                            ],
+                            [egui::pos2(rect.left(), mid), egui::pos2(rect.right(), mid)],
                             egui::Stroke::new(1.6, color),
                         );
                         ui.label(name);
@@ -2053,15 +2442,9 @@ fn mix_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     let (ar, ag, ab, aa) = a.to_tuple();
     let (br, bg, bb, ba) = b.to_tuple();
     let lerp = |x: u8, y: u8| -> u8 {
-        ((x as f32 * (1.0 - t) + y as f32 * t).round() as i32)
-            .clamp(0, 255) as u8
+        ((x as f32 * (1.0 - t) + y as f32 * t).round() as i32).clamp(0, 255) as u8
     };
-    egui::Color32::from_rgba_unmultiplied(
-        lerp(ar, br),
-        lerp(ag, bg),
-        lerp(ab, bb),
-        lerp(aa, ba),
-    )
+    egui::Color32::from_rgba_unmultiplied(lerp(ar, br), lerp(ag, bg), lerp(ab, bb), lerp(aa, ba))
 }
 
 fn to_uml_rect(rect: egui::Rect) -> codestory_graph::uml_types::Rect {
@@ -2208,11 +2591,7 @@ fn find_sourcetrail_fonts_dir() -> Option<std::path::PathBuf> {
     None
 }
 
-fn measure_text_width(
-    font: &Option<fontdue::Font>,
-    text: &str,
-    size: f32,
-) -> Option<f32> {
+fn measure_text_width(font: &Option<fontdue::Font>, text: &str, size: f32) -> Option<f32> {
     let font = font.as_ref()?;
     let mut layout = Layout::new(CoordinateSystem::PositiveYDown);
     let mut settings = LayoutSettings::default();
@@ -2439,13 +2818,7 @@ fn draw_arrow_right(
     );
 }
 
-fn blend_pixel(
-    image: &mut egui::ColorImage,
-    x: i32,
-    y: i32,
-    color: egui::Color32,
-    alpha: u8,
-) {
+fn blend_pixel(image: &mut egui::ColorImage, x: i32, y: i32, color: egui::Color32, alpha: u8) {
     let width = image.size[0] as i32;
     let height = image.size[1] as i32;
     if x < 0 || y < 0 || x >= width || y >= height {
@@ -2521,10 +2894,7 @@ fn open_in_default_app(path: &str) -> bool {
 
     #[cfg(target_os = "macos")]
     {
-        return std::process::Command::new("open")
-            .arg(path)
-            .spawn()
-            .is_ok();
+        return std::process::Command::new("open").arg(path).spawn().is_ok();
     }
 
     #[cfg(target_os = "linux")]
@@ -2550,10 +2920,7 @@ fn ensure_png_extension(path: std::path::PathBuf) -> std::path::PathBuf {
     }
 }
 
-fn write_color_image_png(
-    path: &std::path::Path,
-    image: &egui::ColorImage,
-) -> Result<(), String> {
+fn write_color_image_png(path: &std::path::Path, image: &egui::ColorImage) -> Result<(), String> {
     let mut bytes = Vec::with_capacity(image.pixels.len() * 4);
     for pixel in &image.pixels {
         let (r, g, b, a) = pixel.to_tuple();

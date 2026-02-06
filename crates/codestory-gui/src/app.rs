@@ -110,7 +110,6 @@ pub struct CodeStoryApp {
     // UI State
     show_project_wizard: bool,
     show_trail_view: bool,
-    show_graph_legend: bool,
     notification_manager: NotificationManager,
     file_dialog: FileDialogManager,
     recent_files: RecentFiles,
@@ -199,7 +198,6 @@ impl CodeStoryApp {
             theme,
             show_project_wizard: false,
             show_trail_view: false,
-            show_graph_legend: false,
             notification_manager: NotificationManager::new(),
             file_dialog: FileDialogManager::new(),
             recent_files: RecentFiles::load(),
@@ -537,9 +535,9 @@ impl CodeStoryApp {
             // Update Graph using trail with current depth
             let trail_config = codestory_core::TrailConfig {
                 root_id: id,
-                depth: self.settings.node_graph.max_depth as u32,
-                direction: codestory_core::TrailDirection::Both,
-                edge_filter: Vec::new(),
+                depth: self.settings.node_graph.trail_depth,
+                direction: self.settings.node_graph.trail_direction,
+                edge_filter: self.settings.node_graph.trail_edge_filter.clone(),
                 max_nodes: 500,
             };
 
@@ -640,9 +638,8 @@ impl CodeStoryApp {
                             let file_id = occ.location.file_node_id;
                             if !file_paths.contains_key(&file_id) {
                                 if let Ok(Some(file_node)) = storage.get_node(file_id) {
-                                    let path = std::path::PathBuf::from(
-                                        file_node.serialized_name.clone(),
-                                    );
+                                    let path =
+                                        std::path::PathBuf::from(file_node.serialized_name.clone());
                                     if path.exists()
                                         && let Ok(content) = std::fs::read_to_string(&path)
                                     {
@@ -1006,7 +1003,16 @@ impl eframe::App for CodeStoryApp {
                         self.dock_state.focus_tab(crate::dock_state::TabId::Graph);
                     }
                     ui.checkbox(&mut self.show_trail_view, "Trail View");
-                    ui.checkbox(&mut self.show_graph_legend, "Graph Legend");
+
+                    // Keep legend visibility in the persisted graph settings.
+                    let mut show_graph_legend = self.settings.node_graph.show_legend;
+                    if ui
+                        .checkbox(&mut show_graph_legend, "Graph Legend")
+                        .changed()
+                    {
+                        self.event_bus
+                            .publish(Event::SetShowLegend(show_graph_legend));
+                    }
                     ui.separator();
 
                     if ui.button("Reset Layout").clicked() {
@@ -1065,33 +1071,27 @@ impl eframe::App for CodeStoryApp {
 
                     let mut jump_to_index = None;
                     if let Some(tab) = self.tab_manager.active_tab_mut() {
-                        let history_response =
-                            ui.menu_button(ph::CLOCK_COUNTER_CLOCKWISE, |ui| {
-                                let entries = tab.history.entries();
-                                let current = tab.history.current_index();
-                                if entries.is_empty() {
-                                    ui.label("No history yet");
-                                    return;
+                        let history_response = ui.menu_button(ph::CLOCK_COUNTER_CLOCKWISE, |ui| {
+                            let entries = tab.history.entries();
+                            let current = tab.history.current_index();
+                            if entries.is_empty() {
+                                ui.label("No history yet");
+                                return;
+                            }
+                            for (idx, entry) in entries.iter().enumerate() {
+                                let label = entry
+                                    .node_ids
+                                    .first()
+                                    .and_then(|id| self.node_names.get(id))
+                                    .cloned()
+                                    .unwrap_or_else(|| "Unknown".to_string());
+                                if ui.selectable_label(current == Some(idx), label).clicked() {
+                                    jump_to_index = Some(idx);
+                                    ui.close();
                                 }
-                                for (idx, entry) in entries.iter().enumerate() {
-                                    let label = entry
-                                        .node_ids
-                                        .first()
-                                        .and_then(|id| self.node_names.get(id))
-                                        .cloned()
-                                        .unwrap_or_else(|| "Unknown".to_string());
-                                    if ui
-                                        .selectable_label(current == Some(idx), label)
-                                        .clicked()
-                                    {
-                                        jump_to_index = Some(idx);
-                                        ui.close();
-                                    }
-                                }
-                            });
-                        history_response
-                            .response
-                            .on_hover_text("History");
+                            }
+                        });
+                        history_response.response.on_hover_text("History");
 
                         if let Some(index) = jump_to_index {
                             if let Some(entry) = tab.history.jump_to(index)
@@ -1151,7 +1151,8 @@ impl eframe::App for CodeStoryApp {
                     self.start_indexing();
                 }
                 if ui.button(ph::EYE).on_hover_text("Overview").clicked() {
-                    self.dock_state.focus_tab(crate::dock_state::TabId::Overview);
+                    self.dock_state
+                        .focus_tab(crate::dock_state::TabId::Overview);
                 }
             });
 
@@ -1493,6 +1494,13 @@ impl codestory_events::EventListener for CodeStoryApp {
                 direction,
                 edge_filter,
             } => {
+                // Persist the trail configuration so graph controls remain consistent across
+                // subsequent activations and restarts.
+                self.settings.node_graph.trail_depth = *depth;
+                self.settings.node_graph.trail_direction = *direction;
+                self.settings.node_graph.trail_edge_filter = edge_filter.clone();
+                self.settings.save();
+
                 if self.show_trail_view
                     && let Some(root_id) = self.tab_manager.active_tab().and_then(|t| t.active_node)
                 {
@@ -1571,7 +1579,10 @@ impl codestory_events::EventListener for CodeStoryApp {
             Event::GraphNodeExpand { id, expand } => {
                 let mut state = self.settings.node_graph.view_state.get_collapse_state(*id);
                 state.is_collapsed = !expand;
-                self.settings.node_graph.view_state.set_collapse_state(*id, state);
+                self.settings
+                    .node_graph
+                    .view_state
+                    .set_collapse_state(*id, state);
                 self.settings.save();
             }
             Event::GraphSectionExpand {
@@ -1691,11 +1702,11 @@ impl codestory_events::EventListener for CodeStoryApp {
             Event::SearchFailed { error } => {
                 self.status_message = format!("Search failed: {}", error);
             }
-            Event::ZoomToFit | Event::ZoomIn | Event::ZoomOut => {
+            Event::ZoomToFit | Event::ZoomIn | Event::ZoomOut | Event::ZoomReset => {
                 // Handled via handle_event in NodeGraphView
             }
             Event::SetTrailDepth(depth) => {
-                self.settings.node_graph.max_depth = *depth as usize;
+                self.settings.node_graph.trail_depth = *depth;
                 self.settings.save();
                 if let Some(id) = self.tab_manager.active_tab().and_then(|t| t.active_node) {
                     self.select_node_graph_detail(id);

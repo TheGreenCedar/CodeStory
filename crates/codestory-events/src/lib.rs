@@ -271,7 +271,7 @@ pub enum Event {
     ExpandAll,
     /// Collapse all nodes in the graph
     CollapseAll,
-    /// Set the trail depth
+    /// Set the trail depth (`0` means "infinite", bounded by node caps).
     SetTrailDepth(u32),
     /// Set group by file mode
     SetGroupByFile(bool),
@@ -285,6 +285,8 @@ pub enum Event {
     ZoomIn,
     /// Zoom out the graph viewport
     ZoomOut,
+    /// Reset the graph viewport zoom to 100% (1.0)
+    ZoomReset,
     /// Set the graph layout method
     SetLayoutMethod(LayoutAlgorithm),
     /// Set the graph layout direction (Horizontal or Vertical)
