@@ -2,7 +2,7 @@
 
 CodeStory is a modern, Rust-based source code explorer inspired by [Sourcetrail](https://github.com/CoatiSoftware/Sourcetrail). It helps you understand unfamiliar codebases by combining an interactive dependency graph with code snippets and fast search. It will eventually incorporate coding agents of your choice to explain the codebase like a story book, using the generated graphs as grounding context + interactive visuals for the user.
 
-BIG NOTE: This project is at its infancy, I just got it to render graph nodes without dying on me. Contributions (bot or human) are welcome 😄
+BIG NOTE: This project is at its infancy, I just got it to render graph nodes without dying on me. Sometimes I wonder why I didn't do the frontend in plain HTML tbh... But the code indexing + search is solid, especially for rust. You can use the cli crate instead of the gui crate if you need that feature in isolation. Contributions (bot or human) are welcome 😄
 
 ## What You Get
 
