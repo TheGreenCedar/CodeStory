@@ -904,6 +904,33 @@ impl GraphViewState {
         self.pan = pan;
     }
 
+    /// Compute the pan offset that would place `node_pos` at the viewport center.
+    ///
+    /// `node_pos` is in graph coordinates (the same coordinate space as node positions).
+    /// Pan is in screen coordinates, so we apply zoom when converting.
+    pub fn expected_pan_for_center_on(&self, node_pos: Vec2) -> Vec2 {
+        Vec2::new(-node_pos.x * self.zoom, -node_pos.y * self.zoom)
+    }
+
+    /// Return true if the current pan would place `node_pos` within `tolerance_px` of the
+    /// viewport center.
+    pub fn is_centered_on(&self, node_pos: Vec2, tolerance_px: f32) -> bool {
+        let expected = self.expected_pan_for_center_on(node_pos);
+        (self.pan.x - expected.x).abs() <= tolerance_px
+            && (self.pan.y - expected.y).abs() <= tolerance_px
+    }
+
+    /// Recenter the view so that `node_pos` is at the viewport center.
+    ///
+    /// Returns true if the pan changed by more than `tolerance_px` in either axis.
+    pub fn recenter_on(&mut self, node_pos: Vec2, tolerance_px: f32) -> bool {
+        if self.is_centered_on(node_pos, tolerance_px) {
+            return false;
+        }
+        self.pan = self.expected_pan_for_center_on(node_pos);
+        true
+    }
+
     /// Set the layout algorithm
     pub fn set_layout_algorithm(&mut self, algorithm: LayoutAlgorithm) {
         self.layout_algorithm = algorithm;
@@ -1735,6 +1762,27 @@ mod tests {
 
         state.set_pan(pan);
         assert_eq!(state.pan, pan);
+    }
+
+    #[test]
+    fn test_graph_view_state_recenter_on() {
+        let mut state = GraphViewState::new();
+        state.set_zoom(2.0);
+
+        let node_pos = Vec2::new(10.0, -5.0);
+        let expected_pan = Vec2::new(-20.0, 10.0);
+        assert_eq!(state.expected_pan_for_center_on(node_pos), expected_pan);
+
+        // Not centered initially.
+        assert!(!state.is_centered_on(node_pos, 0.5));
+
+        // Recenters by setting pan to the expected value.
+        assert!(state.recenter_on(node_pos, 0.5));
+        assert_eq!(state.pan, expected_pan);
+        assert!(state.is_centered_on(node_pos, 0.5));
+
+        // Idempotent within tolerance.
+        assert!(!state.recenter_on(node_pos, 0.5));
     }
 
     #[test]

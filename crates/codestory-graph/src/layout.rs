@@ -1773,7 +1773,11 @@ mod tests {
         let y1 = pos_v[&node1_idx].1;
         let y2 = pos_v[&node2_idx].1;
         let dy = (y2 - y1).abs();
-        assert!(dy >= 40.0, "Vertical layout should separate layers (dy={})", dy);
+        assert!(
+            dy >= 40.0,
+            "Vertical layout should separate layers (dy={})",
+            dy
+        );
         assert!(
             dy <= 600.0,
             "Vertical layout should stay reasonably compact for small graphs (dy={})",

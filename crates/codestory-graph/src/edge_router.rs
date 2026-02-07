@@ -743,9 +743,18 @@ mod tests {
         let topish = Vec2::new(r.center().x, r.min.y + 0.0001);
         let bottomish = Vec2::new(r.center().x, r.max.y - 0.0001);
 
-        assert_eq!(router.get_normal_direction(leftish, r), Vec2::new(-1.0, 0.0));
-        assert_eq!(router.get_normal_direction(rightish, r), Vec2::new(1.0, 0.0));
+        assert_eq!(
+            router.get_normal_direction(leftish, r),
+            Vec2::new(-1.0, 0.0)
+        );
+        assert_eq!(
+            router.get_normal_direction(rightish, r),
+            Vec2::new(1.0, 0.0)
+        );
         assert_eq!(router.get_normal_direction(topish, r), Vec2::new(0.0, -1.0));
-        assert_eq!(router.get_normal_direction(bottomish, r), Vec2::new(0.0, 1.0));
+        assert_eq!(
+            router.get_normal_direction(bottomish, r),
+            Vec2::new(0.0, 1.0)
+        );
     }
 }

@@ -59,6 +59,7 @@ pub struct NodeGraphView {
     // Data Cache for rebuilding
     cached_data: Option<(NodeId, Vec<Node>, Vec<Edge>)>,
     cached_positions: Option<HashMap<NodeId, egui::Pos2>>,
+    center_visible_id: Option<NodeId>,
 
     // Async Layout
     layout_tx: Sender<LayoutRequest>,
@@ -83,6 +84,7 @@ pub struct NodeGraphView {
 
     // UI Features
     pub pending_pan_to_node: Option<NodeId>,
+    pending_recenter_on_selected: bool,
     view_version: u64,
     initial_layout_done: bool,
     current_transform: egui::emath::TSTransform,
@@ -146,23 +148,24 @@ impl NodeGraphView {
                     model.add_edge(edge.clone());
                 }
 
-                let to_node_positions = |positions: &HashMap<codestory_graph::NodeIndex, (f32, f32)>| {
-                    // Keep the requested root node stable at the origin (0,0) when possible.
-                    // This prevents tiny graphs from starting "far away" and needing lots of panning.
-                    let (shift_x, shift_y) = root
-                        .and_then(|root_id| model.node_map.get(&root_id))
-                        .and_then(|root_idx| positions.get(root_idx))
-                        .copied()
-                        .unwrap_or((0.0, 0.0));
+                let to_node_positions =
+                    |positions: &HashMap<codestory_graph::NodeIndex, (f32, f32)>| {
+                        // Keep the requested root node stable at the origin (0,0) when possible.
+                        // This prevents tiny graphs from starting "far away" and needing lots of panning.
+                        let (shift_x, shift_y) = root
+                            .and_then(|root_id| model.node_map.get(&root_id))
+                            .and_then(|root_idx| positions.get(root_idx))
+                            .copied()
+                            .unwrap_or((0.0, 0.0));
 
-                    let mut result = HashMap::new();
-                    for (idx, (x, y)) in positions {
-                        if let Some(node) = model.graph.node_weight(*idx) {
-                            result.insert(node.id, egui::pos2(*x - shift_x, *y - shift_y));
+                        let mut result = HashMap::new();
+                        for (idx, (x, y)) in positions {
+                            if let Some(node) = model.graph.node_weight(*idx) {
+                                result.insert(node.id, egui::pos2(*x - shift_x, *y - shift_y));
+                            }
                         }
-                    }
-                    result
-                };
+                        result
+                    };
 
                 let positions = match algorithm {
                     codestory_events::LayoutAlgorithm::ForceDirected => {
@@ -219,6 +222,7 @@ impl NodeGraphView {
             last_view_state: GraphViewState::default(),
             cached_data: None,
             cached_positions: None,
+            center_visible_id: None,
             layout_tx: req_tx,
             layout_rx: res_rx,
             is_calculating: false,
@@ -240,6 +244,7 @@ impl NodeGraphView {
             // show_minimap: true,
             // show_legend: false,
             pending_pan_to_node: None,
+            pending_recenter_on_selected: false,
             view_version: 0,
             initial_layout_done: false,
             current_transform: egui::emath::TSTransform::default(),
@@ -304,6 +309,9 @@ impl NodeGraphView {
 
                         if let Ok(result) = storage.get_trail(&trail_config) {
                             self.load_from_data(root_id, &result.nodes, &result.edges, settings);
+                            // If the user had panned away, keep the selected/root node in view
+                            // when depth/layout changes the graph content.
+                            self.pending_recenter_on_selected = true;
                         }
                     }
                 }
@@ -382,6 +390,7 @@ impl NodeGraphView {
             self.fallback_positions.clear();
             self.current_edges.clear();
             self.node_lookup.clear();
+            self.center_visible_id = None;
             return;
         };
 
@@ -547,6 +556,7 @@ impl NodeGraphView {
         };
 
         let center_visible_id = resolve_visible(center_node_id).unwrap_or(center_node_id);
+        self.center_visible_id = Some(center_visible_id);
 
         let mut overlay_edges = Vec::new();
         for edge in &bundled_edges {
@@ -592,18 +602,21 @@ impl NodeGraphView {
                 .uml_nodes
                 .iter()
                 .map(|uml| {
-                    self.node_lookup.get(&uml.id).cloned().unwrap_or_else(|| Node {
-                        id: uml.id,
-                        kind: uml.kind,
-                        serialized_name: uml.label.clone(),
-                        qualified_name: None,
-                        canonical_id: None,
-                        file_node_id: None,
-                        start_line: None,
-                        start_col: None,
-                        end_line: None,
-                        end_col: None,
-                    })
+                    self.node_lookup
+                        .get(&uml.id)
+                        .cloned()
+                        .unwrap_or_else(|| Node {
+                            id: uml.id,
+                            kind: uml.kind,
+                            serialized_name: uml.label.clone(),
+                            qualified_name: None,
+                            canonical_id: None,
+                            file_node_id: None,
+                            start_line: None,
+                            start_col: None,
+                            end_line: None,
+                            end_col: None,
+                        })
                 })
                 .collect();
 
@@ -669,6 +682,15 @@ impl NodeGraphView {
         animation_speed: f32,
     ) -> NodeGraphViewResponse {
         self.style_resolver.set_theme_mode(theme);
+
+        let mut view_state_dirty = false;
+        if self.pending_recenter_on_selected {
+            self.pending_recenter_on_selected = false;
+            if self.recenter_on_selected_node(settings) {
+                view_state_dirty = true;
+            }
+        }
+
         self.graph_canvas.sync_from_view_state(&settings.view_state);
 
         let node_inner_margin = egui::Margin {
@@ -679,7 +701,6 @@ impl NodeGraphView {
         };
 
         let mut node_to_navigate = None;
-        let mut view_state_dirty = false;
         let mut copy_text: Option<String> = None;
         let mut copy_image: Option<egui::ColorImage> = None;
         let mut export_image = false;
@@ -1218,6 +1239,9 @@ impl NodeGraphView {
             self.current_layout_algorithm = settings.layout_algorithm;
             self.current_layout_direction = settings.layout_direction;
             self.invalidate_layout();
+            // Layout changes can move nodes significantly; if the user had panned away,
+            // recenter the view around the selected/root node on the next frame.
+            self.pending_recenter_on_selected = true;
             rebuild_needed = true;
         }
 
@@ -1308,10 +1332,16 @@ impl NodeGraphView {
                         .selected_text(format!("{:?}", settings.layout_algorithm))
                         .show_ui(ui, |ui| {
                             for (alg, label) in [
-                                (codestory_events::LayoutAlgorithm::ForceDirected, "Force Directed"),
+                                (
+                                    codestory_events::LayoutAlgorithm::ForceDirected,
+                                    "Force Directed",
+                                ),
                                 (codestory_events::LayoutAlgorithm::Radial, "Radial"),
                                 (codestory_events::LayoutAlgorithm::Grid, "Grid"),
-                                (codestory_events::LayoutAlgorithm::Hierarchical, "Hierarchical"),
+                                (
+                                    codestory_events::LayoutAlgorithm::Hierarchical,
+                                    "Hierarchical",
+                                ),
                             ] {
                                 if ui
                                     .selectable_label(settings.layout_algorithm == alg, label)
@@ -1322,7 +1352,8 @@ impl NodeGraphView {
                             }
                         });
 
-                    if settings.layout_algorithm == codestory_events::LayoutAlgorithm::Hierarchical {
+                    if settings.layout_algorithm == codestory_events::LayoutAlgorithm::Hierarchical
+                    {
                         ui.horizontal(|ui| {
                             if ui
                                 .selectable_value(
@@ -1388,6 +1419,25 @@ impl NodeGraphView {
         }
 
         rebuild_needed
+    }
+
+    fn recenter_on_selected_node(&self, settings: &mut crate::settings::NodeGraphSettings) -> bool {
+        let Some(center_id) = self
+            .center_visible_id
+            .or_else(|| self.cached_data.as_ref().map(|(id, _, _)| *id))
+        else {
+            return false;
+        };
+
+        let positions = self.build_positions(settings);
+        let Some(pos) = positions.get(&center_id).copied() else {
+            return false;
+        };
+
+        // Tolerance in screen px: we only want to "snap back" when the user has actually panned
+        // away from the selected node.
+        let node_pos = codestory_graph::Vec2::new(pos.x, pos.y);
+        settings.view_state.recenter_on(node_pos, 0.75)
     }
 
     fn build_positions(
@@ -1519,56 +1569,48 @@ impl NodeGraphView {
             }
         };
 
-        let slider_to_depth = |slider: u32| -> u32 {
-            if slider == 20 {
-                0
-            } else {
-                slider + 1
-            }
-        };
+        let slider_to_depth = |slider: u32| -> u32 { if slider == 20 { 0 } else { slider + 1 } };
 
-        let paint_reference_icon = |painter: &egui::Painter,
-                                    rect: egui::Rect,
-                                    color: egui::Color32,
-                                    incoming: bool| {
-            let stroke = egui::Stroke::new(2.0, color);
-            let w = rect.width();
-            let h = rect.height();
-            let pad_x = w * 0.22;
-            let pad_y = h * 0.22;
-            let node_r = (w * 0.08).max(2.0);
-            let square = (w * 0.16).max(4.0);
+        let paint_reference_icon =
+            |painter: &egui::Painter, rect: egui::Rect, color: egui::Color32, incoming: bool| {
+                let stroke = egui::Stroke::new(2.0, color);
+                let w = rect.width();
+                let h = rect.height();
+                let pad_x = w * 0.22;
+                let pad_y = h * 0.22;
+                let node_r = (w * 0.08).max(2.0);
+                let square = (w * 0.16).max(4.0);
 
-            let left_x = rect.left() + pad_x;
-            let right_x = rect.right() - pad_x;
-            let y0 = rect.center().y;
-            let y_top = rect.top() + pad_y;
-            let y_bot = rect.bottom() - pad_y;
+                let left_x = rect.left() + pad_x;
+                let right_x = rect.right() - pad_x;
+                let y0 = rect.center().y;
+                let y_top = rect.top() + pad_y;
+                let y_bot = rect.bottom() - pad_y;
 
-            let source = if incoming {
-                egui::pos2(right_x, y0)
-            } else {
-                egui::pos2(left_x, y0)
+                let source = if incoming {
+                    egui::pos2(right_x, y0)
+                } else {
+                    egui::pos2(left_x, y0)
+                };
+                let t1 = if incoming {
+                    egui::pos2(left_x, y_top)
+                } else {
+                    egui::pos2(right_x, y_top)
+                };
+                let t2 = if incoming {
+                    egui::pos2(left_x, y_bot)
+                } else {
+                    egui::pos2(right_x, y_bot)
+                };
+
+                painter.line_segment([source, t1], stroke);
+                painter.line_segment([source, t2], stroke);
+                painter.circle_filled(source, node_r, color);
+                for target in [t1, t2] {
+                    let r = egui::Rect::from_center_size(target, egui::vec2(square, square));
+                    painter.rect_stroke(r, 1.0, stroke, egui::StrokeKind::Middle);
+                }
             };
-            let t1 = if incoming {
-                egui::pos2(left_x, y_top)
-            } else {
-                egui::pos2(right_x, y_top)
-            };
-            let t2 = if incoming {
-                egui::pos2(left_x, y_bot)
-            } else {
-                egui::pos2(right_x, y_bot)
-            };
-
-            painter.line_segment([source, t1], stroke);
-            painter.line_segment([source, t2], stroke);
-            painter.circle_filled(source, node_r, color);
-            for target in [t1, t2] {
-                let r = egui::Rect::from_center_size(target, egui::vec2(square, square));
-                painter.rect_stroke(r, 1.0, stroke, egui::StrokeKind::Middle);
-            }
-        };
 
         egui::Area::new("graph_trail_toolbar".into())
             .order(egui::Order::Foreground)
@@ -1581,8 +1623,7 @@ impl NodeGraphView {
                 } else {
                     (segment, false)
                 };
-                let rail_rect =
-                    egui::Rect::from_min_size(origin, egui::vec2(segment, rail_height));
+                let rail_rect = egui::Rect::from_min_size(origin, egui::vec2(segment, rail_height));
                 let grouping_rect = egui::Rect::from_min_size(
                     egui::pos2(rail_rect.max.x + gap, rail_rect.min.y),
                     egui::vec2(segment * 2.0, segment),
@@ -1734,11 +1775,8 @@ impl NodeGraphView {
                         rail_rect.max,
                     );
                     let slider_id = ui.id().with("graph_trail_depth");
-                    let slider_resp = ui.interact(
-                        slider_rect,
-                        slider_id,
-                        egui::Sense::click_and_drag(),
-                    );
+                    let slider_resp =
+                        ui.interact(slider_rect, slider_id, egui::Sense::click_and_drag());
                     let slider_rounding = egui::CornerRadius {
                         nw: 0,
                         ne: 0,
@@ -1754,11 +1792,7 @@ impl NodeGraphView {
                     // Separator lines between rail segments.
                     for idx in 1..=4 {
                         let y = rail_rect.min.y + segment * idx as f32;
-                        painter.hline(
-                            rail_rect.x_range(),
-                            y,
-                            egui::Stroke::new(1.0, divider),
-                        );
+                        painter.hline(rail_rect.x_range(), y, egui::Stroke::new(1.0, divider));
                     }
 
                     // Slider: value label + track + knob.
@@ -1796,8 +1830,8 @@ impl NodeGraphView {
                     if slider_resp.dragged() || slider_resp.clicked() {
                         if let Some(pointer) = ui.ctx().pointer_latest_pos() {
                             let y = pointer.y.clamp(track_top, track_bottom);
-                            let tt = ((track_bottom - y) / (track_bottom - track_top))
-                                .clamp(0.0, 1.0);
+                            let tt =
+                                ((track_bottom - y) / (track_bottom - track_top)).clamp(0.0, 1.0);
                             new_slider_pos = (tt * 20.0).round() as u32;
                         }
                     }
@@ -1819,11 +1853,7 @@ impl NodeGraphView {
                 }
 
                 // ---- Grouping pill (always visible) ----
-                painter.rect_filled(
-                    grouping_rect,
-                    egui::CornerRadius::same(rounding),
-                    base_fill,
-                );
+                painter.rect_filled(grouping_rect, egui::CornerRadius::same(rounding), base_fill);
                 painter.rect_stroke(
                     grouping_rect,
                     egui::CornerRadius::same(rounding),
@@ -1912,7 +1942,6 @@ impl NodeGraphView {
         settings_changed
     }
 
-
     fn ui_zoom_cluster(&mut self, ui: &mut egui::Ui, parent_rect: egui::Rect) {
         // Sourcetrail-style: only +/- zoom buttons in the bottom-left corner.
         let palette = self.style_resolver.palette();
@@ -1924,12 +1953,21 @@ impl NodeGraphView {
         );
 
         let is_light = is_light_color(palette.background);
-        let base_fill =
-            adjust_color(palette.node_default_fill, is_light, if is_light { 0.12 } else { 0.06 });
-        let border =
-            adjust_color(palette.node_section_border, is_light, if is_light { 0.25 } else { 0.10 });
-        let divider =
-            adjust_color(palette.node_section_border, is_light, if is_light { 0.18 } else { 0.06 });
+        let base_fill = adjust_color(
+            palette.node_default_fill,
+            is_light,
+            if is_light { 0.12 } else { 0.06 },
+        );
+        let border = adjust_color(
+            palette.node_section_border,
+            is_light,
+            if is_light { 0.25 } else { 0.10 },
+        );
+        let divider = adjust_color(
+            palette.node_section_border,
+            is_light,
+            if is_light { 0.18 } else { 0.06 },
+        );
         let icon_color = if is_light {
             egui::Color32::WHITE
         } else {
@@ -2050,10 +2088,16 @@ impl NodeGraphView {
         );
 
         let is_light = is_light_color(palette.background);
-        let base_fill =
-            adjust_color(palette.node_default_fill, is_light, if is_light { 0.12 } else { 0.06 });
-        let border =
-            adjust_color(palette.node_section_border, is_light, if is_light { 0.25 } else { 0.10 });
+        let base_fill = adjust_color(
+            palette.node_default_fill,
+            is_light,
+            if is_light { 0.12 } else { 0.06 },
+        );
+        let border = adjust_color(
+            palette.node_section_border,
+            is_light,
+            if is_light { 0.25 } else { 0.10 },
+        );
         let icon_color = if is_light {
             egui::Color32::WHITE
         } else {
