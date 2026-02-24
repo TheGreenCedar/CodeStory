@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -142,6 +142,11 @@ impl Project {
         &self,
         storage: &codestory_storage::Storage,
     ) -> Result<RefreshInfo> {
+        self.build_refresh_plan(storage)
+    }
+
+    /// Build a single-pass refresh plan with files to index and file projections to remove.
+    pub fn build_refresh_plan(&self, storage: &codestory_storage::Storage) -> Result<RefreshPlan> {
         let current_files = self.get_source_files()?;
         let stored_files = storage.get_files()?;
 
@@ -152,8 +157,10 @@ impl Project {
 
         let mut files_to_index = Vec::new();
         let mut files_to_remove = Vec::new();
+        let mut current_file_set = HashSet::with_capacity(current_files.len());
 
         for path in current_files {
+            current_file_set.insert(path.clone());
             let needs_index = match stored_map.get(&path) {
                 Some(info) => {
                     let metadata = fs::metadata(&path)?;
@@ -172,10 +179,8 @@ impl Project {
         }
 
         // Files in storage but not in project
-        let project_files_set: std::collections::HashSet<_> =
-            self.get_source_files()?.into_iter().collect();
         for (path, info) in stored_map {
-            if !project_files_set.contains(&path) {
+            if !current_file_set.contains(&path) {
                 files_to_remove.push(info.id);
             }
         }
@@ -231,10 +236,15 @@ impl Project {
     }
 }
 
-pub struct RefreshInfo {
+#[derive(Debug, Clone)]
+pub struct RefreshPlan {
     pub files_to_index: Vec<PathBuf>,
     pub files_to_remove: Vec<i64>, // List of IDs to remove from storage
 }
+
+/// Public alias retained for existing call sites while aligning naming with
+/// workspace refresh plans in the project architecture plan.
+pub type RefreshInfo = RefreshPlan;
 
 use std::path::Path;
 
@@ -350,6 +360,23 @@ mod tests {
 
         let info3 = project.generate_refresh_info(&storage)?;
         assert_eq!(info3.files_to_index.len(), 1);
+
+        // 6. Removed files in storage should be flagged for deletion
+        let missing = dir.path().join("old.rs");
+        storage
+            .insert_file(&FileInfo {
+                id: 9999,
+                path: missing,
+                language: "rust".to_string(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+            })
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let info4 = project.generate_refresh_info(&storage)?;
+        assert_eq!(info4.files_to_remove, vec![9999]);
 
         Ok(())
     }

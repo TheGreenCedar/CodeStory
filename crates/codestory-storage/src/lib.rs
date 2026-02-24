@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
+
+const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Error, Debug)]
 pub enum StorageError {
@@ -49,9 +52,28 @@ pub struct StorageStats {
     pub error_count: i64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileProjectionRemovalSummary {
+    pub canonical_file_node_id: i64,
+    pub removed_node_count: usize,
+    pub removed_edge_count: usize,
+    pub removed_occurrence_count: usize,
+    pub removed_error_count: usize,
+    pub removed_bookmark_node_count: usize,
+    pub removed_component_access_count: usize,
+    pub removed_local_symbol_count: usize,
+    pub removed_file_row_count: usize,
+}
+
 impl Storage {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         let conn = Connection::open(path)?;
+        // Allow concurrent reads while indexing writes, and avoid flaky "database is locked" errors
+        // in app shells when users query mid-index.
+        let _ = conn.busy_timeout(Duration::from_millis(2_500));
+        let _ = conn.pragma_update(None, "foreign_keys", "ON");
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
         let storage = Self {
             conn,
             cache: StorageCache::default(),
@@ -62,6 +84,7 @@ impl Storage {
 
     pub fn new_in_memory() -> Result<Self, StorageError> {
         let conn = Connection::open_in_memory()?;
+        let _ = conn.pragma_update(None, "foreign_keys", "ON");
         let storage = Self {
             conn,
             cache: StorageCache::default(),
@@ -248,6 +271,36 @@ impl Storage {
         self.conn
             .execute("CREATE INDEX IF NOT EXISTS idx_edge_line ON edge(line)", [])?;
 
+        self.apply_schema_migrations()
+    }
+
+    fn schema_version(&self) -> Result<u32, StorageError> {
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        Ok(version.max(0) as u32)
+    }
+
+    fn set_schema_version(&self, version: u32) -> Result<(), StorageError> {
+        self.conn
+            .pragma_update(None, "user_version", version.to_string())?;
+        Ok(())
+    }
+
+    fn apply_schema_migrations(&self) -> Result<(), StorageError> {
+        let stored_version = self.schema_version()?;
+
+        if stored_version > SCHEMA_VERSION {
+            return Err(StorageError::Other(format!(
+                "Unsupported database schema version: {stored_version} (max supported: {SCHEMA_VERSION})"
+            )));
+        }
+
+        if stored_version == SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        self.set_schema_version(SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -789,40 +842,111 @@ impl Storage {
         })
     }
 
-    /// Delete a file and all associated data (nodes, edges, occurrences, errors)
-    pub fn delete_file(&mut self, file_id: i64) -> Result<(), StorageError> {
+    /// Delete all graph/search projection data linked to one canonical file node.
+    pub fn delete_file_projection(
+        &mut self,
+        file_node_id: i64,
+    ) -> Result<FileProjectionRemovalSummary, StorageError> {
         let tx = self.conn.transaction()?;
 
-        // Delete occurrences for this file
-        tx.execute(
-            "DELETE FROM occurrence WHERE file_node_id = ?1",
-            params![file_id],
+        let node_ids_query = "
+            SELECT DISTINCT id FROM node
+            WHERE id = ?1 OR file_node_id = ?1
+        ";
+        let mut related_node_ids = Vec::new();
+        {
+            let mut node_ids_stmt = tx.prepare(node_ids_query)?;
+            let mut node_rows = node_ids_stmt.query(params![file_node_id])?;
+            while let Some(row) = node_rows.next()? {
+                related_node_ids.push(row.get::<_, i64>(0)?);
+            }
+        }
+
+        let removed_edges = tx.execute(
+            "DELETE FROM edge
+             WHERE source_node_id IN (
+                 SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1
+             )
+             OR target_node_id IN (
+                 SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1
+             )
+             OR resolved_source_node_id IN (
+                 SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1
+             )
+             OR resolved_target_node_id IN (
+                 SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1
+             )
+             OR file_node_id = ?1",
+            params![file_node_id],
         )?;
 
-        // Delete edges where source or target is a node from this file
-        // (This is approximate - ideally we'd track which nodes belong to which file)
-        tx.execute(
-            "DELETE FROM edge WHERE source_node_id = ?1 OR target_node_id = ?1",
-            params![file_id],
+        let removed_occurrences = tx.execute(
+            "DELETE FROM occurrence
+             WHERE file_node_id = ?1
+             OR element_id IN (
+                 SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1
+             )",
+            params![file_node_id],
         )?;
 
-        // Delete the file node itself
-        tx.execute("DELETE FROM node WHERE id = ?1", params![file_id])?;
+        let removed_bookmarks = tx.execute(
+            "DELETE FROM bookmark_node WHERE node_id IN (
+                SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1
+            )",
+            params![file_node_id],
+        )?;
 
-        // Delete errors for this file
-        tx.execute("DELETE FROM error WHERE file_id = ?1", params![file_id])?;
+        let removed_component_access = tx.execute(
+            "DELETE FROM component_access WHERE node_id IN (
+                SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1
+            )",
+            params![file_node_id],
+        )?;
 
-        // Delete file record
-        tx.execute("DELETE FROM file WHERE id = ?1", params![file_id])?;
+        let removed_local_symbols = tx.execute(
+            "DELETE FROM local_symbol WHERE file_id = ?1",
+            params![file_node_id],
+        )?;
+
+        // Remove any node references in other projection tables.
+        let removed_nodes = tx.execute(
+            "DELETE FROM node WHERE id = ?1 OR file_node_id = ?1",
+            params![file_node_id],
+        )?;
+
+        let removed_errors = tx.execute(
+            "DELETE FROM error WHERE file_id = ?1",
+            params![file_node_id],
+        )?;
+
+        let removed_file_rows =
+            tx.execute("DELETE FROM file WHERE id = ?1", params![file_node_id])?;
 
         tx.commit()?;
 
-        // Clear from cache
-        self.cache
-            .nodes
-            .write()
-            .remove(&codestory_core::NodeId(file_id));
+        {
+            let mut nodes = self.cache.nodes.write();
+            for node_id in related_node_ids {
+                nodes.remove(&NodeId(node_id));
+            }
+        }
 
+        Ok(FileProjectionRemovalSummary {
+            canonical_file_node_id: file_node_id,
+            removed_node_count: removed_nodes,
+            removed_edge_count: removed_edges,
+            removed_occurrence_count: removed_occurrences,
+            removed_error_count: removed_errors,
+            removed_bookmark_node_count: removed_bookmarks,
+            removed_component_access_count: removed_component_access,
+            removed_local_symbol_count: removed_local_symbols,
+            removed_file_row_count: removed_file_rows,
+        })
+    }
+
+    /// Delete a file and all associated projection data.
+    pub fn delete_file(&mut self, file_id: i64) -> Result<(), StorageError> {
+        self.delete_file_projection(file_id)?;
         Ok(())
     }
 
@@ -1120,10 +1244,10 @@ impl Storage {
                 result.nodes.push(node);
                 result.depth_map.insert(config.root_id, 0);
             }
-            if target_id != config.root_id {
-                if let Some(node) = self.get_node(target_id)? {
-                    result.nodes.push(node);
-                }
+            if target_id != config.root_id
+                && let Some(node) = self.get_node(target_id)?
+            {
+                result.nodes.push(node);
             }
             result.truncated = truncated_from_root || truncated_to_target;
             apply_trail_node_filter(&mut result, config);
@@ -1132,10 +1256,10 @@ impl Storage {
 
         let mut included: HashSet<NodeId> = HashSet::new();
         for (id, d_root) in &dist_from_root {
-            if let Some(d_to) = dist_to_target.get(id) {
-                if max_depth == u32::MAX || (*d_root as u64 + *d_to as u64) <= max_depth as u64 {
-                    included.insert(*id);
-                }
+            if let Some(d_to) = dist_to_target.get(id)
+                && (max_depth == u32::MAX || (*d_root as u64 + *d_to as u64) <= max_depth as u64)
+            {
+                included.insert(*id);
             }
         }
         included.insert(config.root_id);
@@ -1178,7 +1302,7 @@ impl Storage {
                     continue;
                 }
                 let key = (d_to, next.0);
-                if best_key.map_or(true, |k| key < k) {
+                if best_key.is_none_or(|k| key < k) {
                     best_key = Some(key);
                     best_next = Some(next);
                 }
@@ -1220,11 +1344,14 @@ impl Storage {
             push_unique(&mut selected, &mut selected_set, id);
         }
 
-        let mut result = TrailResult::default();
-        result.truncated = truncated_from_root
+        let truncated = truncated_from_root
             || truncated_to_target
             || included.len() > config.max_nodes
             || selected.len() < included.len();
+        let mut result = TrailResult {
+            truncated,
+            ..TrailResult::default()
+        };
 
         // Populate nodes in stable order.
         selected.sort_by(|a, b| {
@@ -1321,20 +1448,20 @@ impl Storage {
                     }
                     TrailDirection::Both => {
                         // Not used by ToTargetSymbol distance discovery.
-                        let other = if eff_source == current_id {
+
+                        if eff_source == current_id {
                             eff_target
                         } else if eff_target == current_id {
                             eff_source
                         } else {
                             continue;
-                        };
-                        other
+                        }
                     }
                 };
 
-                if !dist.contains_key(&neighbor_id) {
+                if let std::collections::hash_map::Entry::Vacant(e) = dist.entry(neighbor_id) {
                     let next_depth = depth.saturating_add(1);
-                    dist.insert(neighbor_id, next_depth);
+                    e.insert(next_depth);
                     queue.push_back((neighbor_id, next_depth));
                 }
             }
@@ -1381,11 +1508,12 @@ impl Storage {
 
             // Avoid polluting trail exploration with low-confidence or ambiguous CALL resolutions.
             // It's better to show an unresolved symbol node than traverse to the wrong concrete node.
-            if edge.kind == EdgeKind::CALL && edge.resolved_target.is_some() {
-                if should_ignore_call_resolution(&target_symbol, edge.confidence) {
-                    edge.resolved_target = None;
-                    edge.confidence = None;
-                }
+            if edge.kind == EdgeKind::CALL
+                && edge.resolved_target.is_some()
+                && should_ignore_call_resolution(&target_symbol, edge.confidence)
+            {
+                edge.resolved_target = None;
+                edge.confidence = None;
             }
             let kind = edge.kind;
 
@@ -1626,6 +1754,96 @@ mod tests {
         }
         let fetched = storage.get_node(NodeId(1))?.unwrap();
         assert_eq!(fetched.serialized_name, "test_node");
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_file_projection() -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        let file_node_id = 1_234_i64;
+        let file_node = Node {
+            id: NodeId(file_node_id),
+            kind: NodeKind::FILE,
+            serialized_name: "src/main.rs".to_string(),
+            start_line: Some(1),
+            start_col: Some(1),
+            end_line: Some(3),
+            end_col: Some(1),
+            ..Default::default()
+        };
+        let func_node = Node {
+            id: NodeId(2_001),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "foo".to_string(),
+            file_node_id: Some(NodeId(file_node_id)),
+            start_line: Some(1),
+            start_col: Some(1),
+            end_line: Some(1),
+            end_col: Some(20),
+            ..Default::default()
+        };
+        storage.insert_file(&FileInfo {
+            id: file_node_id,
+            path: PathBuf::from("src/main.rs"),
+            language: "rust".to_string(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 10,
+        })?;
+        storage.insert_nodes_batch(&[file_node.clone(), func_node.clone()])?;
+
+        storage.insert_edges_batch(&[Edge {
+            id: EdgeId(9_001),
+            source: file_node.id,
+            target: func_node.id,
+            kind: EdgeKind::MEMBER,
+            file_node_id: Some(file_node.id),
+            ..Default::default()
+        }])?;
+
+        storage.insert_occurrences_batch(&[Occurrence {
+            element_id: func_node.id.0,
+            kind: codestory_core::OccurrenceKind::DEFINITION,
+            location: SourceLocation {
+                file_node_id: file_node.id,
+                start_line: 1,
+                start_col: 1,
+                end_line: 1,
+                end_col: 3,
+            },
+        }])?;
+
+        storage.insert_error(&codestory_core::ErrorInfo {
+            message: "test".to_string(),
+            file_id: Some(file_node.id),
+            line: Some(1),
+            column: None,
+            is_fatal: false,
+            index_step: codestory_core::IndexStep::Indexing,
+        })?;
+
+        let category_id = storage.create_bookmark_category("Cat")?;
+        let _ = storage.add_bookmark(category_id, func_node.id, Some("test"))?;
+
+        let summary = storage.delete_file_projection(file_node_id)?;
+        assert_eq!(summary.canonical_file_node_id, file_node_id);
+        assert_eq!(summary.removed_node_count, 2);
+        assert_eq!(summary.removed_edge_count, 1);
+        assert_eq!(summary.removed_occurrence_count, 1);
+        assert_eq!(summary.removed_error_count, 1);
+        assert_eq!(summary.removed_file_row_count, 1);
+
+        assert!(storage.get_nodes()?.is_empty());
+        assert!(storage.get_edges()?.is_empty());
+        assert!(storage.get_occurrences()?.is_empty());
+        assert!(storage.get_errors(None)?.is_empty());
+        assert!(storage.get_bookmarks(Some(category_id))?.is_empty());
+
+        let cache = storage.cache.nodes.read();
+        assert!(!cache.contains_key(&NodeId(file_node_id)));
+        assert!(!cache.contains_key(&NodeId(2_001)));
+
         Ok(())
     }
 

@@ -6,6 +6,7 @@ edition = "2024"
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
+codestory-search = { workspace = true }
 
 [dependencies]
 codestory-core = { workspace = true }

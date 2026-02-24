@@ -2,11 +2,12 @@
 resolver = "2"
 members = [
     "crates/codestory-core",
+    "crates/codestory-api",
+    "crates/codestory-app",
     "crates/codestory-storage",
     "crates/codestory-index",
     "crates/codestory-search",
     "crates/codestory-graph",
-    "crates/codestory-gui",
     "crates/codestory-cli",
     "crates/codestory-events",
     "crates/codestory-project",
@@ -16,6 +17,8 @@ members = [
 [workspace.dependencies]
 # Internal crates
 codestory-core = { path = "crates/codestory-core" }
+codestory-api = { path = "crates/codestory-api" }
+codestory-app = { path = "crates/codestory-app" }
 codestory-storage = { path = "crates/codestory-storage" }
 codestory-index = { path = "crates/codestory-index" }
 codestory-search = { path = "crates/codestory-search" }
@@ -38,14 +41,6 @@ tree-sitter-go = "0.23.4"
 # Semantic Analysis
 tree-sitter-graph = "0.12"
 streaming-iterator = "0.1"
-
-# GUI
-eframe = "0.33"
-egui = "0.33"
-egui_extras = "0.33"
-
-# Graph
-
 
 # Storage
 rusqlite = { version = "0.38", features = ["bundled"] }
@@ -73,20 +68,10 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6.0.0"
 dirs = "6.0.0"
-rfd = "0.17.2"
 glob = "0.3"
-egui_dock = "0.18.0"
-egui-notify = "0.21"
-egui-file-dialog = "0.12.0"
-egui_plot = "0.34"
-egui_code_editor = "0.2"
 sysinfo = "0.38"
 feature-probe = "0.1.1"
 tempfile = "3.10"
-egui-phosphor = "0.11.0"
-catppuccin-egui = { version = "5.7", default-features = false, features = ["egui33"] }
-image = "0.25"
-fontdue = "0.8"
 
 # Experimental Layout
 oak-visualize = "0.0.1"
@@ -95,11 +80,10 @@ criterion = "0.5"
 proptest = "1.5"
 
 [profile.dev]
-opt-level = 0      # keep your code fast-to-compile
-debug = 1          # or 2 if you want full debug symbols
+opt-level = 0 # keep your own code fast-to-compile
+debug = 1 # or 2 if you want full debug symbols
 incremental = true
 
-# This is the key: optimize *all dependencies* in dev builds
 [profile.dev.package."*"]
-opt-level = 3
+opt-level = 3 # Optimize dependencies for faster execution
 debug = false # optional: reduces compile time + binary size for deps

@@ -1,0 +1,18 @@
+[package]
+name = "codestory-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+codestory-api = { workspace = true }
+codestory-core = { workspace = true }
+codestory-events = { workspace = true }
+codestory-index = { workspace = true }
+codestory-project = { workspace = true }
+codestory-search = { workspace = true }
+codestory-storage = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+

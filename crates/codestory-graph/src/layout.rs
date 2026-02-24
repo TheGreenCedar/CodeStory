@@ -25,8 +25,8 @@ pub fn compute_dag_ranks(model: &GraphModel) -> HashMap<NodeIndex, i32> {
                 // but for general flow, Call/Usage/Inheritance are good.
                 // For now, use all edges to define flow.
 
-                let source_rank = *ranks.get(&source).unwrap();
-                let target_rank = *ranks.get(&target).unwrap();
+                let source_rank = ranks.get(&source).copied().unwrap_or_default();
+                let target_rank = ranks.get(&target).copied().unwrap_or_default();
 
                 if target_rank <= source_rank {
                     ranks.insert(target, source_rank + 1);
@@ -52,21 +52,27 @@ fn canonicalize_positions(positions: &mut HashMap<NodeIndex, (f32, f32)>, model:
     // Identify two stable anchor nodes
     let indices: Vec<NodeIndex> = positions.keys().cloned().collect();
 
-    let min_node = indices
+    let min_node = match indices
         .iter()
         .min_by(|a, b| model.graph[**a].name.cmp(&model.graph[**b].name))
-        .unwrap();
-    let max_node = indices
+    {
+        Some(node) => *node,
+        None => return,
+    };
+    let max_node = match indices
         .iter()
         .max_by(|a, b| model.graph[**a].name.cmp(&model.graph[**b].name))
-        .unwrap();
+    {
+        Some(node) => *node,
+        None => return,
+    };
 
     if min_node == max_node {
         return;
     }
 
-    let p1 = positions[min_node];
-    let p2 = positions[max_node];
+    let p1 = positions[&min_node];
+    let p2 = positions[&max_node];
 
     // Horizontal check: Ensure min_node is to the left of max_node
     if p1.0 > p2.0 {
@@ -77,8 +83,8 @@ fn canonicalize_positions(positions: &mut HashMap<NodeIndex, (f32, f32)>, model:
 
     // Vertical check: Ensure min_node is above max_node
     // (We re-fetch positions because they might have been flipped horizontally)
-    let p1 = positions[min_node];
-    let p2 = positions[max_node];
+    let p1 = positions[&min_node];
+    let p2 = positions[&max_node];
 
     if p1.1 > p2.1 {
         for pos in positions.values_mut() {
@@ -277,8 +283,12 @@ impl Layouter for RadialLayouter {
         // Sort edges
         let mut sorted_edges: Vec<EdgeIndex> = model.graph.edge_indices().collect();
         sorted_edges.sort_by(|a, b| {
-            let (sa, ta) = model.graph.edge_endpoints(*a).unwrap();
-            let (sb, tb) = model.graph.edge_endpoints(*b).unwrap();
+            let Some((sa, ta)) = model.graph.edge_endpoints(*a) else {
+                return std::cmp::Ordering::Equal;
+            };
+            let Some((sb, tb)) = model.graph.edge_endpoints(*b) else {
+                return std::cmp::Ordering::Equal;
+            };
             let sa_name = &model.graph[sa].name;
             let ta_name = &model.graph[ta].name;
             let sb_name = &model.graph[sb].name;
@@ -385,8 +395,12 @@ impl Layouter for ForceDirectedLayouter {
         // Sort edges
         let mut sorted_edges: Vec<EdgeIndex> = model.graph.edge_indices().collect();
         sorted_edges.sort_by(|a, b| {
-            let (sa, ta) = model.graph.edge_endpoints(*a).unwrap();
-            let (sb, tb) = model.graph.edge_endpoints(*b).unwrap();
+            let Some((sa, ta)) = model.graph.edge_endpoints(*a) else {
+                return std::cmp::Ordering::Equal;
+            };
+            let Some((sb, tb)) = model.graph.edge_endpoints(*b) else {
+                return std::cmp::Ordering::Equal;
+            };
             let sa_name = &model.graph[sa].name;
             let ta_name = &model.graph[ta].name;
             let sb_name = &model.graph[sb].name;
@@ -480,8 +494,8 @@ impl Layouter for TrailLayouter {
                     if source == target {
                         continue;
                     } // Self-loop
-                    let source_rank = *ranks.get(&source).unwrap();
-                    let target_rank = *ranks.get(&target).unwrap();
+                    let source_rank = ranks.get(&source).copied().unwrap_or_default();
+                    let target_rank = ranks.get(&target).copied().unwrap_or_default();
 
                     if target_rank < source_rank + 1 {
                         ranks.insert(target, source_rank + 1);
@@ -622,8 +636,8 @@ impl HierarchicalLayouter {
                     if source == target {
                         continue; // skip self-loops
                     }
-                    let source_rank = *ranks.get(&source).unwrap();
-                    let target_rank = *ranks.get(&target).unwrap();
+                    let source_rank = ranks.get(&source).copied().unwrap_or_default();
+                    let target_rank = ranks.get(&target).copied().unwrap_or_default();
 
                     if target_rank < source_rank + 1 {
                         ranks.insert(target, source_rank + 1);
@@ -651,11 +665,11 @@ impl HierarchicalLayouter {
 
         sorted_ranks
             .into_iter()
-            .map(|r| {
-                let mut layer = layer_map.remove(&r).unwrap();
+            .filter_map(|r| {
+                let mut layer = layer_map.remove(&r)?;
                 // Sort by node index for deterministic initial ordering
                 layer.sort();
-                layer
+                Some(layer)
             })
             .collect()
     }
@@ -665,7 +679,7 @@ impl HierarchicalLayouter {
     /// Performs alternating down-sweeps and up-sweeps, reordering nodes
     /// in each layer based on the average position of their neighbors
     /// in the adjacent layer.
-    pub fn minimize_crossings(&self, layers: &mut Vec<Vec<NodeIndex>>, model: &GraphModel) {
+    pub fn minimize_crossings(&self, layers: &mut [Vec<NodeIndex>], model: &GraphModel) {
         if layers.len() <= 1 {
             return;
         }
@@ -685,15 +699,12 @@ impl HierarchicalLayouter {
 
         for _ in 0..Self::BARYCENTER_PASSES {
             // Down sweep: reorder layer[i] based on neighbors in layer[i-1]
-            for i in 1..layers.len() {
+            for layer in layers.iter_mut().skip(1) {
                 self.reorder_layer_by_barycenter(
-                    &mut layers[i],
-                    model,
-                    &positions,
-                    true, // use predecessors (upper layer neighbors)
+                    layer, model, &positions, true, // use predecessors (upper layer neighbors)
                 );
                 // Update positions after reorder
-                for (j, &node) in layers[i].iter().enumerate() {
+                for (j, &node) in layer.iter().enumerate() {
                     positions.insert(node, j as f32);
                 }
             }
@@ -740,11 +751,11 @@ impl HierarchicalLayouter {
                         if source == node { Some(target) } else { None }
                     };
 
-                    if let Some(n) = neighbor {
-                        if let Some(&pos) = positions.get(&n) {
-                            sum += pos;
-                            count += 1;
-                        }
+                    if let Some(n) = neighbor
+                        && let Some(&pos) = positions.get(&n)
+                    {
+                        sum += pos;
+                        count += 1;
                     }
                 }
             }
@@ -824,19 +835,23 @@ impl HierarchicalLayouter {
             // Sort by current offset in the stacking direction
             let mut ordered: Vec<NodeIndex> = layer.clone();
             ordered.sort_by(|a, b| {
-                let pa = positions.get(a).unwrap();
-                let pb = positions.get(b).unwrap();
+                let pa = positions.get(a).copied().unwrap_or((0.0, 0.0));
+                let pb = positions.get(b).copied().unwrap_or((0.0, 0.0));
                 match self.direction {
-                    LayoutDirection::Horizontal => pa.1.partial_cmp(&pb.1).unwrap(),
-                    LayoutDirection::Vertical => pa.0.partial_cmp(&pb.0).unwrap(),
+                    LayoutDirection::Horizontal => {
+                        pa.1.partial_cmp(&pb.1).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                    LayoutDirection::Vertical => {
+                        pa.0.partial_cmp(&pb.0).unwrap_or(std::cmp::Ordering::Equal)
+                    }
                 }
             });
 
             for i in 1..ordered.len() {
                 let prev = ordered[i - 1];
                 let curr = ordered[i];
-                let prev_pos = *positions.get(&prev).unwrap();
-                let curr_pos = *positions.get(&curr).unwrap();
+                let prev_pos = *positions.get(&prev).unwrap_or(&(0.0, 0.0));
+                let curr_pos = *positions.get(&curr).unwrap_or(&(0.0, 0.0));
 
                 let prev_size = model.graph[prev].size;
                 let _curr_size = model.graph[curr].size;
@@ -847,7 +862,11 @@ impl HierarchicalLayouter {
                         let prev_bottom = prev_pos.1 + prev_size.y;
                         let min_y = prev_bottom + self.node_spacing;
                         if curr_pos.1 < min_y {
-                            positions.get_mut(&curr).unwrap().1 = min_y;
+                            if let Some(curr_entry) = positions.get_mut(&curr) {
+                                curr_entry.1 = min_y;
+                            } else {
+                                positions.insert(curr, (0.0, min_y));
+                            }
                         }
                     }
                     LayoutDirection::Vertical => {
@@ -855,7 +874,11 @@ impl HierarchicalLayouter {
                         let prev_right = prev_pos.0 + prev_size.x;
                         let min_x = prev_right + self.node_spacing;
                         if curr_pos.0 < min_x {
-                            positions.get_mut(&curr).unwrap().0 = min_x;
+                            if let Some(curr_entry) = positions.get_mut(&curr) {
+                                curr_entry.0 = min_x;
+                            } else {
+                                positions.insert(curr, (min_x, 0.0));
+                            }
                         }
                     }
                 }
@@ -954,10 +977,22 @@ impl NestingLayouter {
                 Self::MAX_NESTING_DEPTH,
                 node_id
             );
-            let node_idx = *model.node_map.get(&node_id).unwrap();
+            let node_idx = match model.node_map.get(&node_id) {
+                Some(node_idx) => *node_idx,
+                None => {
+                    tracing::warn!("Missing node in node_map: {:?}", node_id);
+                    return Vec2::new(100.0, 30.0);
+                }
+            };
             return model.graph[node_idx].size;
         }
-        let node_idx = *model.node_map.get(&node_id).unwrap();
+        let node_idx = match model.node_map.get(&node_id) {
+            Some(node_idx) => *node_idx,
+            None => {
+                tracing::warn!("Missing node in node_map: {:?}", node_id);
+                return Vec2::new(100.0, 30.0);
+            }
+        };
         let node = &model.graph[node_idx];
 
         positions.insert(node_idx, (x, y));
@@ -1354,7 +1389,7 @@ impl NestingLayouter {
                 .get(a)
                 .unwrap_or(&0.0)
                 .partial_cmp(barycenters.get(b).unwrap_or(&0.0))
-                .unwrap()
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
 

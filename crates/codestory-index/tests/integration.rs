@@ -1,6 +1,7 @@
-use codestory_core::{EdgeKind, NodeKind, OccurrenceKind};
+use codestory_core::{EdgeKind, NodeId, NodeKind, OccurrenceKind};
 use codestory_events::EventBus;
 use codestory_index::WorkspaceIndexer;
+use codestory_search::SearchEngine;
 use codestory_storage::Storage;
 use std::fs;
 use tempfile::tempdir;
@@ -172,6 +173,83 @@ fn process(t: MyType) {
 
     // Should have edges (TYPE_USAGE or similar)
     assert!(edges.iter().any(|e| e.kind == EdgeKind::IMPORT));
+
+    Ok(())
+}
+
+#[test]
+fn test_indexing_and_search_projection_cleanup() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let root = dir.path();
+    let file_a = root.join("a.rs");
+    let file_b = root.join("b.rs");
+
+    fs::write(&file_a, "struct Alpha {}\n")?;
+    fs::write(&file_b, "struct Beta {}\n")?;
+
+    let mut storage = Storage::new_in_memory()?;
+    let indexer = WorkspaceIndexer::new(root.to_path_buf());
+    let event_bus = EventBus::new();
+
+    let refresh_info = codestory_project::RefreshInfo {
+        files_to_index: vec![file_a.clone(), file_b.clone()],
+        files_to_remove: vec![],
+    };
+    indexer.run_incremental(&mut storage, &refresh_info, &event_bus, None)?;
+
+    let mut engine = SearchEngine::new(None)?;
+    let nodes = storage.get_nodes()?;
+    let non_file_nodes: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.kind != NodeKind::FILE && node.file_node_id.is_some())
+        .map(|node| (node.id, node.serialized_name.clone()))
+        .collect();
+    assert!(!non_file_nodes.is_empty());
+
+    let alpha_node_id = non_file_nodes
+        .iter()
+        .find(|(_, name)| name == "Alpha")
+        .map(|(id, _)| *id)
+        .ok_or_else(|| anyhow::anyhow!("missing Alpha node"))?;
+
+    let _beta_node_id = non_file_nodes
+        .iter()
+        .find(|(_, name)| name == "Beta")
+        .map(|(id, _)| *id)
+        .ok_or_else(|| anyhow::anyhow!("missing Beta node"))?;
+
+    engine.index_nodes(
+        non_file_nodes
+            .iter()
+            .map(|(id, name)| (*id, name.clone()))
+            .collect(),
+    )?;
+
+    let alpha_search = engine.search_symbol("Alpha");
+    assert!(alpha_search.contains(&alpha_node_id));
+    assert!(!engine.search_symbol("Beta").is_empty());
+
+    let file_a_nodes = storage.get_nodes()?;
+    let file_node_id = file_a_nodes
+        .into_iter()
+        .find(|node| node.kind == NodeKind::FILE && node.serialized_name.ends_with("a.rs"))
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("missing file node for a.rs"))?;
+
+    let deleted_nodes: Vec<NodeId> = storage
+        .get_nodes()?
+        .into_iter()
+        .filter(|node| node.file_node_id == Some(file_node_id))
+        .map(|node| node.id)
+        .collect();
+
+    storage.delete_file_projection(file_node_id.0)?;
+    engine.remove_nodes(&deleted_nodes)?;
+
+    assert!(engine.search_symbol("Alpha").is_empty());
+    let beta_search = engine.search_symbol("Beta");
+    assert!(beta_search.len() > 0);
+    assert!(beta_search.iter().all(|id| *id != alpha_node_id));
 
     Ok(())
 }

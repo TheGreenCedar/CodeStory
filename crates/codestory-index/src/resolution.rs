@@ -111,22 +111,22 @@ impl ResolutionPass {
             // For very common unqualified method names, resolving within the same file is too
             // error-prone (e.g. `Vec::push` getting linked to an unrelated `SomeType::push`).
             // Prefer module/type-local resolution instead (see `find_same_module` below).
-            if !is_common_unqualified {
-                if let Some(candidate) = find_same_file(
+            if !is_common_unqualified
+                && let Some(candidate) = find_same_file(
                     conn,
                     &function_kinds,
                     file_id,
                     &exact,
                     &suffix_dot,
                     &suffix_colon,
-                )? {
-                    resolved += update_edge_resolution(conn, edge_id, candidate, 0.95)?;
-                    continue;
-                }
+                )?
+            {
+                resolved += update_edge_resolution(conn, edge_id, candidate, 0.95)?;
+                continue;
             }
 
-            if let Some(prefix) = caller_qualified.and_then(module_prefix) {
-                if let Some(candidate) = find_same_module(
+            if let Some(prefix) = caller_qualified.and_then(module_prefix)
+                && let Some(candidate) = find_same_module(
                     conn,
                     &function_kinds,
                     &prefix.0,
@@ -134,10 +134,10 @@ impl ResolutionPass {
                     &exact,
                     &suffix_dot,
                     &suffix_colon,
-                )? {
-                    resolved += update_edge_resolution(conn, edge_id, candidate, 0.8)?;
-                    continue;
-                }
+                )?
+            {
+                resolved += update_edge_resolution(conn, edge_id, candidate, 0.8)?;
+                continue;
             }
 
             // For common unqualified method names (e.g. `push`, `add`), avoid global matching.
@@ -206,8 +206,8 @@ impl ResolutionPass {
                 continue;
             }
 
-            if let Some(prefix) = caller_qualified.and_then(module_prefix) {
-                if let Some(candidate) = find_same_module(
+            if let Some(prefix) = caller_qualified.and_then(module_prefix)
+                && let Some(candidate) = find_same_module(
                     conn,
                     &module_kinds,
                     &prefix.0,
@@ -215,10 +215,10 @@ impl ResolutionPass {
                     &exact,
                     &suffix_dot,
                     &suffix_colon,
-                )? {
-                    resolved += update_edge_resolution(conn, edge_id, candidate, 0.7)?;
-                    continue;
-                }
+                )?
+            {
+                resolved += update_edge_resolution(conn, edge_id, candidate, 0.7)?;
+                continue;
             }
 
             if let Some(candidate) =
@@ -248,7 +248,7 @@ fn update_edge_resolution(
     Ok(conn.execute(
         "UPDATE edge SET resolved_target_node_id = ?1, confidence = ?2 WHERE id = ?3",
         params![resolved_target, confidence, edge_id],
-    )? as usize)
+    )?)
 }
 
 fn name_patterns(name: &str) -> (String, String, String) {
@@ -416,5 +416,5 @@ fn is_common_unqualified_call_name(name: &str) -> bool {
     if name.contains("::") || name.contains('.') {
         return false;
     }
-    common_unqualified_call_names().iter().any(|n| *n == name)
+    common_unqualified_call_names().contains(&name)
 }

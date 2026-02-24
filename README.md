@@ -2,7 +2,7 @@
 
 CodeStory is a modern, Rust-based source code explorer inspired by [Sourcetrail](https://github.com/CoatiSoftware/Sourcetrail). It helps you understand unfamiliar codebases by combining an interactive dependency graph with code snippets and fast search. It will eventually incorporate coding agents of your choice to explain the codebase like a story book, using the generated graphs as grounding context + interactive visuals for the user.
 
-BIG NOTE: This project is at its infancy, I just got it to render graph nodes without dying on me. Sometimes I wonder why I didn't do the frontend in plain HTML tbh... But the code indexing + search is solid, especially for rust. You can use the cli crate instead of the gui crate if you need that feature in isolation. Contributions (bot or human) are welcome 😄
+BIG NOTE: This project is at its infancy, but the code indexing + search is solid, especially for rust. Contributions (bot or human) are welcome.
 
 ## What You Get
 
@@ -21,21 +21,17 @@ For a walkthrough of the UI, see `USER_GUIDE.md`. For architecture and contribut
 - Rust toolchain: this repo pins **nightly** via `rust-toolchain.toml`. I'll use stable releases once I'm happy enough with the feature set and can spend time stabilizing.
 - A C/C++ toolchain may be required on some platforms because dependencies can include native components
 
-### Run the GUI
+### Run The CLI
 
-```bash
-cargo run -p codestory-gui
-```
+From the workspace root:
 
-Optional logging:
-
-```bash
-RUST_LOG=info cargo run -p codestory-gui
+```powershell
+cargo run -p codestory-cli -- --help
 ```
 
 ### Build and Test
 
-```bash
+```powershell
 cargo build
 cargo test
 cargo fmt
@@ -53,7 +49,9 @@ cargo clippy
   - `codestory-storage`: SQLite schema + batch writes
   - `codestory-search`: fuzzy + full-text search
   - `codestory-graph`: graph model/layout
-  - `codestory-gui`: egui/eframe application
+  - `codestory-api`: app-facing DTOs + string IDs
+  - `codestory-app`: headless app orchestrator
+  - `codestory-cli`: command line interface
 
 ## Generated Files (Not Committed)
 

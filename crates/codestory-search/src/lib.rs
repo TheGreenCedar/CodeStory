@@ -7,7 +7,7 @@ use tantivy::collector::TopDocs;
 use tantivy::doc;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
-use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument};
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 pub struct SearchEngine {
     // Nucleo matcher for fuzzy symbol search
@@ -29,9 +29,15 @@ impl SearchEngine {
 
         let index = if let Some(path) = storage_path {
             std::fs::create_dir_all(path)?;
-            Index::open_in_dir(path).unwrap_or_else(|_| {
-                Index::create_in_dir(path, schema.clone()).expect("Failed to create tantivy index")
-            })
+            match Index::open_in_dir(path) {
+                Ok(index) => index,
+                Err(open_err) => Index::create_in_dir(path, schema.clone()).with_context(|| {
+                    format!(
+                        "Failed to open existing tantivy index at {:?}: {}",
+                        path, open_err
+                    )
+                })?,
+            }
         } else {
             Index::create_in_ram(schema)
         };
@@ -51,7 +57,7 @@ impl SearchEngine {
 
     /// Index a batch of nodes for both fuzzy and full-text search
     pub fn index_nodes(&mut self, nodes: Vec<(NodeId, String)>) -> Result<()> {
-        let mut index_writer = self.index.writer(50_000_000)?;
+        let mut index_writer: IndexWriter<TantivyDocument> = self.index.writer(50_000_000)?;
         let schema = self.index.schema();
         let name_field = schema.get_field("name")?;
         let id_field = schema.get_field("node_id")?;
@@ -77,8 +83,17 @@ impl SearchEngine {
         if query.is_empty() {
             return Vec::new();
         }
+        self.search_symbol_with_scores(query)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
 
-        // Use Pattern API which properly handles edge cases
+    pub fn search_symbol_with_scores(&mut self, query: &str) -> Vec<(NodeId, f32)> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+
         let pattern = Pattern::new(
             query,
             CaseMatching::Ignore,
@@ -88,23 +103,45 @@ impl SearchEngine {
 
         let mut matches = Vec::new();
 
-        // Match against all symbols
         for (name, id) in &self.symbols {
             if let Some(score) = pattern.score(name.slice(..), &mut self.matcher) {
                 matches.push((*id, score));
             }
         }
 
-        // Sort by score descending
-        matches.sort_by(|a, b| b.1.cmp(&a.1));
+        matches.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         let mut seen = HashSet::new();
         matches
             .into_iter()
+            .map(|(id, score)| (id, score as f32))
             .filter(|(id, _)| seen.insert(*id))
-            .map(|(id, _)| id)
             .take(20)
             .collect()
+    }
+
+    /// Remove symbols from both fuzzy and full-text projections.
+    pub fn remove_nodes(&mut self, nodes: &[NodeId]) -> Result<()> {
+        if nodes.is_empty() {
+            return Ok(());
+        }
+
+        let mut remove_ids = HashSet::new();
+        for id in nodes {
+            remove_ids.insert(id.0);
+        }
+
+        self.symbols.retain(|(_, id)| !remove_ids.contains(&id.0));
+
+        let mut index_writer: IndexWriter<TantivyDocument> = self.index.writer(50_000_000)?;
+        let schema = self.index.schema();
+        let node_field = schema.get_field("node_id")?;
+        for id in &remove_ids {
+            index_writer.delete_term(Term::from_field_i64(node_field, *id));
+        }
+        index_writer.commit()?;
+        self.reader.reload()?;
+        Ok(())
     }
 
     /// Full-text search using tantivy
@@ -174,6 +211,32 @@ mod tests {
         let results = engine.search_full_text("another")?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], NodeId(3));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remove_nodes() -> Result<()> {
+        let mut engine = SearchEngine::new(None)?;
+
+        engine.index_nodes(vec![
+            (NodeId(1), "AlphaSymbol".to_string()),
+            (NodeId(2), "BetaSymbol".to_string()),
+            (NodeId(3), "GammaSymbol".to_string()),
+        ])?;
+
+        let before = engine.search_symbol("Beta");
+        assert!(before.contains(&NodeId(2)));
+        assert_eq!(engine.search_full_text("betasymbol")?, vec![NodeId(2)]);
+
+        engine.remove_nodes(&[NodeId(2)])?;
+
+        let after = engine.search_symbol("Beta");
+        assert!(!after.contains(&NodeId(2)));
+        assert!(engine.search_full_text("betasymbol")?.is_empty());
+
+        let remaining = engine.search_symbol("Gamma");
+        assert!(remaining.contains(&NodeId(3)));
 
         Ok(())
     }

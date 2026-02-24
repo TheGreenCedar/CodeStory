@@ -3,6 +3,19 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub mod boundary;
+pub mod telemetry;
+
+pub use boundary::{
+    ActivateNodeCmd, AppCommand, AppEvent, DeleteFileCmd, EventBusBoundary,
+    FileProjectionRemovedEvt, InMemoryBoundary, IndexBatchFlushedEvt, NodeUpsertedEvt,
+    OperationFailedEvt, RefreshWorkspaceCmd,
+};
+pub use telemetry::{
+    command_failure, command_start, command_success, new_correlation_id, CommandLifecycle,
+    CommandTelemetry,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ActivationOrigin {
     Graph,
@@ -130,6 +143,7 @@ pub enum Event {
     },
     ProjectClose,
     ProjectRefresh {
+        path: PathBuf,
         mode: RefreshMode,
     },
 
@@ -430,5 +444,28 @@ mod tests {
         } else {
             panic!("Expected IndexingComplete");
         }
+    }
+
+    #[test]
+    fn test_telemetry_helpers() {
+        let correlation_id = new_correlation_id();
+        assert!(!correlation_id.is_empty());
+
+        let start = CommandTelemetry::start("RefreshWorkspace", &correlation_id);
+        let success = CommandTelemetry::success("RefreshWorkspace", &correlation_id, Some(1234));
+        let failure = CommandTelemetry::failure(
+            "DeleteFile",
+            &correlation_id,
+            Some("failed to remove file".to_string()),
+        );
+
+        assert_eq!(start.command, "RefreshWorkspace");
+        assert_eq!(start.lifecycle, CommandLifecycle::Start);
+        assert_eq!(success.lifecycle, CommandLifecycle::Success);
+        assert_eq!(failure.lifecycle, CommandLifecycle::Failure);
+        assert_eq!(
+            failure.error_reason,
+            Some("failed to remove file".to_string())
+        );
     }
 }

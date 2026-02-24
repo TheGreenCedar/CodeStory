@@ -28,3 +28,10 @@ codestory_ui.json
 # Local scratch output
 check_output*.txt
 check_tests_output*.txt
+
+# Node tooling (if used locally)
+node_modules/
+pnpm-debug.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

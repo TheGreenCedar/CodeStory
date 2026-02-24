@@ -21,6 +21,27 @@ pub use cancellation::CancellationToken;
 use intermediate_storage::IntermediateStorage;
 use symbol_table::SymbolTable;
 
+#[derive(Debug, Clone, Copy)]
+pub struct IncrementalIndexingConfig {
+    pub file_batch_size: usize,
+    pub node_batch_size: usize,
+    pub edge_batch_size: usize,
+    pub occurrence_batch_size: usize,
+    pub error_batch_size: usize,
+}
+
+impl Default for IncrementalIndexingConfig {
+    fn default() -> Self {
+        Self {
+            file_batch_size: 16,
+            node_batch_size: 50_000,
+            edge_batch_size: 50_000,
+            occurrence_batch_size: 50_000,
+            error_batch_size: 1_000,
+        }
+    }
+}
+
 pub struct IndexResult {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
@@ -36,6 +57,7 @@ pub enum IndexingEvent {
 pub struct WorkspaceIndexer {
     root: PathBuf,
     compilation_db: Option<compilation_database::CompilationDatabase>,
+    batch_config: IncrementalIndexingConfig,
 }
 
 impl WorkspaceIndexer {
@@ -45,7 +67,13 @@ impl WorkspaceIndexer {
         Self {
             root,
             compilation_db,
+            batch_config: IncrementalIndexingConfig::default(),
         }
+    }
+
+    pub fn with_batch_config(mut self, batch_config: IncrementalIndexingConfig) -> Self {
+        self.batch_config = batch_config;
+        self
     }
 
     /// Returns the workspace root path
@@ -83,90 +111,161 @@ impl WorkspaceIndexer {
             return Ok(());
         }
 
-        // 1. Parallel Indexing
-        let results: Vec<IntermediateStorage> = refresh_info
-            .files_to_index
-            .par_iter()
-            .map(|path| {
-                // Check cancellation
-                if let Some(token) = cancel_token
-                    && token.is_cancelled()
-                {
-                    cancelled_clone.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return IntermediateStorage::default();
+        // 1. Parallel Indexing (chunked and flushed)
+        let mut batched_storage = IntermediateStorage::default();
+        let mut all_errors = Vec::new();
+        let mut had_edges = false;
+        let file_batch_size = self.batch_config.file_batch_size.max(1);
+        let batch_config = self.batch_config;
+        let flush_errors =
+            |errors: &mut Vec<codestory_core::ErrorInfo>, storage: &mut Storage| -> Result<()> {
+                if errors.is_empty() {
+                    return Ok(());
                 }
+                let take_count = errors.len().min(batch_config.error_batch_size);
+                let drain = errors.drain(..take_count).collect::<Vec<_>>();
+                for error in drain {
+                    storage
+                        .insert_error(&error)
+                        .map_err(|e| anyhow!("Storage error: {:?}", e))?;
+                }
+                Ok(())
+            };
 
-                // Resolve path relative to workspace root
-                let full_path = if path.is_absolute() {
-                    path.clone()
-                } else {
-                    root.join(path)
-                };
+        let flush_projection_batch = |storage: &mut Storage,
+                                      batched_storage: &mut IntermediateStorage,
+                                      had_edges: &mut bool|
+         -> Result<()> {
+            if !batched_storage.nodes.is_empty() {
+                storage
+                    .insert_nodes_batch(&batched_storage.nodes)
+                    .map_err(|e| anyhow!("Storage error: {:?}", e))?;
+            }
+            if !batched_storage.edges.is_empty() {
+                storage
+                    .insert_edges_batch(&batched_storage.edges)
+                    .map_err(|e| anyhow!("Storage error: {:?}", e))?;
+                *had_edges = true;
+            }
+            if !batched_storage.occurrences.is_empty() {
+                storage
+                    .insert_occurrences_batch(&batched_storage.occurrences)
+                    .map_err(|e| anyhow!("Storage error: {:?}", e))?;
+            }
 
-                let mut local_storage = IntermediateStorage::default();
-                if let Some((lang, lang_name, graph_query)) = get_language_for_ext(
-                    full_path.extension().and_then(|s| s.to_str()).unwrap_or(""),
-                ) {
-                    let compilation_info = self
-                        .compilation_db
-                        .as_ref()
-                        .and_then(|db| db.get_parsed_info(&full_path));
+            batched_storage.clear();
+            Ok(())
+        };
 
-                    match std::fs::read_to_string(&full_path) {
-                        Ok(source) => {
-                            match index_file(
-                                &full_path,
-                                &source,
-                                lang,
-                                lang_name,
-                                graph_query,
-                                compilation_info,
-                                Some(Arc::clone(&symbol_table)),
-                            ) {
-                                Ok(index_result) => {
-                                    local_storage.nodes = index_result.nodes;
-                                    local_storage.edges = index_result.edges;
-                                    local_storage.occurrences = index_result.occurrences;
-                                }
-                                Err(e) => {
-                                    local_storage.add_error(codestory_core::ErrorInfo {
-                                        message: format!(
-                                            "Failed to index {:?}: {}",
-                                            full_path.strip_prefix(&root).unwrap_or(&full_path),
-                                            e
-                                        ),
-                                        file_id: None,
-                                        line: None,
-                                        column: None,
-                                        is_fatal: false,
-                                        index_step: codestory_core::IndexStep::Indexing,
-                                    });
+        for file_chunk in refresh_info.files_to_index.chunks(file_batch_size) {
+            let chunk_results: Vec<IntermediateStorage> = file_chunk
+                .par_iter()
+                .map(|path| {
+                    // Check cancellation
+                    if let Some(token) = cancel_token
+                        && token.is_cancelled()
+                    {
+                        cancelled_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return IntermediateStorage::default();
+                    }
+
+                    // Resolve path relative to workspace root
+                    let full_path = if path.is_absolute() {
+                        path.clone()
+                    } else {
+                        root.join(path)
+                    };
+
+                    let mut local_storage = IntermediateStorage::default();
+                    if let Some((lang, lang_name, graph_query)) = get_language_for_ext(
+                        full_path.extension().and_then(|s| s.to_str()).unwrap_or(""),
+                    ) {
+                        let compilation_info = self
+                            .compilation_db
+                            .as_ref()
+                            .and_then(|db| db.get_parsed_info(&full_path));
+
+                        match std::fs::read_to_string(&full_path) {
+                            Ok(source) => {
+                                match index_file(
+                                    &full_path,
+                                    &source,
+                                    lang,
+                                    lang_name,
+                                    graph_query,
+                                    compilation_info,
+                                    Some(Arc::clone(&symbol_table)),
+                                ) {
+                                    Ok(index_result) => {
+                                        local_storage.nodes = index_result.nodes;
+                                        local_storage.edges = index_result.edges;
+                                        local_storage.occurrences = index_result.occurrences;
+                                    }
+                                    Err(e) => {
+                                        local_storage.add_error(codestory_core::ErrorInfo {
+                                            message: format!(
+                                                "Failed to index {:?}: {}",
+                                                full_path.strip_prefix(&root).unwrap_or(&full_path),
+                                                e
+                                            ),
+                                            file_id: None,
+                                            line: None,
+                                            column: None,
+                                            is_fatal: false,
+                                            index_step: codestory_core::IndexStep::Indexing,
+                                        });
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            local_storage.add_error(codestory_core::ErrorInfo {
-                                message: format!("Failed to read {:?}: {}", path, e),
-                                file_id: None,
-                                line: None,
-                                column: None,
-                                is_fatal: true,
-                                index_step: codestory_core::IndexStep::Collection,
-                            });
+                            Err(e) => {
+                                local_storage.add_error(codestory_core::ErrorInfo {
+                                    message: format!("Failed to read {:?}: {}", path, e),
+                                    file_id: None,
+                                    line: None,
+                                    column: None,
+                                    is_fatal: true,
+                                    index_step: codestory_core::IndexStep::Collection,
+                                });
+                            }
                         }
                     }
+
+                    let current =
+                        processed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    event_bus.publish(Event::IndexingProgress {
+                        current,
+                        total: total_files,
+                    });
+
+                    local_storage
+                })
+                .collect();
+
+            for mut local_storage in chunk_results {
+                all_errors.append(&mut local_storage.errors);
+                batched_storage.merge(local_storage);
+
+                let should_flush = !batched_storage.nodes.is_empty()
+                    || !batched_storage.edges.is_empty()
+                    || !batched_storage.occurrences.is_empty();
+                if should_flush
+                    && (batched_storage.nodes.len() >= batch_config.node_batch_size
+                        || batched_storage.edges.len() >= batch_config.edge_batch_size
+                        || batched_storage.occurrences.len() >= batch_config.occurrence_batch_size)
+                {
+                    flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
                 }
 
-                let current =
-                    processed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                event_bus.publish(Event::IndexingProgress {
-                    current,
-                    total: total_files,
-                });
+                if all_errors.len() >= batch_config.error_batch_size {
+                    flush_errors(&mut all_errors, storage)?;
+                }
+            }
 
-                local_storage
-            })
-            .collect();
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
+                return Ok(());
+            }
+        }
 
         // Check if cancelled during indexing
         if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -174,31 +273,10 @@ impl WorkspaceIndexer {
             return Ok(());
         }
 
-        // 2. Merge Results
-        let mut final_storage = IntermediateStorage::default();
-        for res in results {
-            final_storage.merge(res);
-        }
-
-        // 3. Write to Storage
-        if !final_storage.nodes.is_empty() {
-            storage
-                .insert_nodes_batch(&final_storage.nodes)
-                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
-        }
-        if !final_storage.edges.is_empty() {
-            storage
-                .insert_edges_batch(&final_storage.edges)
-                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
-        }
-        if !final_storage.occurrences.is_empty() {
-            storage
-                .insert_occurrences_batch(&final_storage.occurrences)
-                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
-        }
+        flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
 
         // 3.5 Resolve call/import edges post-pass
-        if !final_storage.edges.is_empty() {
+        if had_edges {
             let resolver = resolution::ResolutionPass::new();
             resolver
                 .run(storage)
@@ -206,10 +284,8 @@ impl WorkspaceIndexer {
         }
 
         // Write errors
-        for error in final_storage.errors {
-            storage
-                .insert_error(&error)
-                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
+        while !all_errors.is_empty() {
+            flush_errors(&mut all_errors, storage)?;
         }
 
         // 4. Cleanup removed files
@@ -303,16 +379,16 @@ pub fn index_file(
                 name_str = val.as_str().unwrap_or("").to_string();
             }
             if attr.as_str() == "start_row" {
-                start_row = val.as_integer().ok().map(|v| v as u32);
+                start_row = val.as_integer().ok();
             }
             if attr.as_str() == "start_col" {
-                start_col = val.as_integer().ok().map(|v| v as u32);
+                start_col = val.as_integer().ok();
             }
             if attr.as_str() == "end_row" {
-                end_row = val.as_integer().ok().map(|v| v as u32);
+                end_row = val.as_integer().ok();
             }
             if attr.as_str() == "end_col" {
-                end_col = val.as_integer().ok().map(|v| v as u32);
+                end_col = val.as_integer().ok();
             }
         }
 
@@ -521,11 +597,11 @@ pub fn index_file(
             format!("{}:{}:{}", file_name, qualified_name, start_line)
         };
 
-        if is_type_like(node.kind) {
-            if let Some(existing_id) = canonical_owner.get(&canonical_id) {
-                id_remap.insert(node.id, *existing_id);
-                continue;
-            }
+        if is_type_like(node.kind)
+            && let Some(existing_id) = canonical_owner.get(&canonical_id)
+        {
+            id_remap.insert(node.id, *existing_id);
+            continue;
         }
 
         let new_id = NodeId(generate_id(&canonical_id));
@@ -672,16 +748,14 @@ fn apply_line_range_call_attribution(nodes: &[Node], edges: &mut Vec<Edge>) {
 
     for edge in edges.iter_mut() {
         if edge.kind == EdgeKind::CALL {
-            if let (Some(file_id), Some(line)) = (edge.file_node_id, edge.line) {
-                if let Some(ranges) = functions_by_file.get(&file_id) {
-                    if let Some(best) = ranges
-                        .iter()
-                        .filter(|range| line >= range.start && line <= range.end)
-                        .min_by_key(|range| (range.end - range.start, range.start))
-                    {
-                        edge.source = best.id;
-                    }
-                }
+            if let (Some(file_id), Some(line)) = (edge.file_node_id, edge.line)
+                && let Some(ranges) = functions_by_file.get(&file_id)
+                && let Some(best) = ranges
+                    .iter()
+                    .filter(|range| line >= range.start && line <= range.end)
+                    .min_by_key(|range| (range.end - range.start, range.start))
+            {
+                edge.source = best.id;
             }
             edge.id = EdgeId(generate_edge_id(edge.source.0, edge.target.0, edge.kind));
         }
@@ -953,6 +1027,47 @@ function globalFunc() {}
                 .iter()
                 .any(|e| matches!(e, Event::IndexingComplete { .. }))
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_incremental_indexing_batch_flush() -> Result<()> {
+        use codestory_project::RefreshInfo;
+        use codestory_storage::Storage;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let mut files = Vec::new();
+        for index in 0..12 {
+            let path = dir.path().join(format!("module_{index}.rs"));
+            fs::write(&path, format!("struct File_{index} {{}}\n"))?;
+            files.push(path);
+        }
+
+        let mut storage = Storage::new_in_memory().unwrap();
+        let bus = EventBus::new();
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf()).with_batch_config(
+            IncrementalIndexingConfig {
+                file_batch_size: 3,
+                node_batch_size: 4,
+                edge_batch_size: 4,
+                occurrence_batch_size: 8,
+                error_batch_size: 128,
+            },
+        );
+
+        let refresh_info = RefreshInfo {
+            files_to_index: files,
+            files_to_remove: vec![],
+        };
+
+        indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
+
+        // Each file should contribute at least one file node and one symbol node.
+        let nodes = storage.get_nodes()?;
+        assert!(nodes.len() >= 24);
 
         Ok(())
     }

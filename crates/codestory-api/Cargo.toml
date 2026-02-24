@@ -1,0 +1,11 @@
+[package]
+name = "codestory-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+codestory-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+specta = { version = "2.0.0-rc.22", features = ["derive", "serde"] }
+

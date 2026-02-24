@@ -6,6 +6,9 @@ use crate::uml_types::{MemberItem, UmlNode, VisibilityKind, VisibilitySection};
 use codestory_core::{EdgeKind, NodeId, NodeKind};
 use std::collections::HashMap;
 
+type NodeGraphPinMap = HashMap<NodeId, (Vec<NodeGraphPin>, Vec<NodeGraphPin>)>;
+type UmlConversionResult = (Vec<UmlNode>, Vec<NodeGraphEdge>, NodeGraphPinMap);
+
 pub struct NodeGraphConverter;
 
 impl NodeGraphConverter {
@@ -193,21 +196,15 @@ impl NodeGraphConverter {
 
     /// Convert DummyNode/DummyEdge to UmlNode with pre-grouped visibility sections.
     /// Also returns pin information for the adapter to store separately.
-    ///
-    /// Returns: (UmlNodes, Edges, PinInfo)
-    /// where PinInfo is HashMap<NodeId, (inputs, outputs)>
+    /// Returns pin information for the adapter to store separately.
     pub fn convert_dummies_to_uml(
         &self,
         nodes: &[DummyNode],
         edges: &[DummyEdge],
-    ) -> (
-        Vec<UmlNode>,
-        Vec<NodeGraphEdge>,
-        HashMap<NodeId, (Vec<NodeGraphPin>, Vec<NodeGraphPin>)>,
-    ) {
+    ) -> UmlConversionResult {
         let mut uml_nodes: HashMap<NodeId, UmlNode> = HashMap::new();
         let mut graph_edges = Vec::new();
-        let mut pin_info: HashMap<NodeId, (Vec<NodeGraphPin>, Vec<NodeGraphPin>)> = HashMap::new();
+        let mut pin_info: NodeGraphPinMap = HashMap::new();
         let mut node_map: HashMap<NodeId, &DummyNode> = HashMap::new();
         let mut member_to_host: HashMap<NodeId, NodeId> = HashMap::new();
 
@@ -221,10 +218,10 @@ impl NodeGraphConverter {
         let mut members_with_outgoing_edges = std::collections::HashSet::new();
         for edge in edges {
             // Check if the edge source is a member (non-structural node)
-            if let Some(source_node) = node_map.get(&edge.source) {
-                if !Self::is_structural(source_node.node_kind) {
-                    members_with_outgoing_edges.insert(edge.source);
-                }
+            if let Some(source_node) = node_map.get(&edge.source)
+                && !Self::is_structural(source_node.node_kind)
+            {
+                members_with_outgoing_edges.insert(edge.source);
             }
         }
 
