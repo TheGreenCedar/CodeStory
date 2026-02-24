@@ -2442,7 +2442,7 @@ mod property_tests {
             mut state in collapse_state_strategy(),
             kind_idx in 0usize..7
         ) {
-             let kinds = vec![
+             let kinds = [
                 VisibilityKind::Public,
                 VisibilityKind::Private,
                 VisibilityKind::Protected,
@@ -2505,7 +2505,7 @@ mod property_tests {
             );
 
             // If input is within valid range, zoom should equal input
-            if zoom_input >= 0.1 && zoom_input <= 4.0 {
+            if (0.1..=4.0).contains(&zoom_input) {
                 prop_assert!(
                     (state.zoom - zoom_input).abs() < f32::EPSILON,
                     "Zoom {} should equal input {} when within valid range",
@@ -2605,7 +2605,7 @@ mod property_tests {
             // Calculate the zoom level needed to fit all content
             let zoom_x = viewport_width / content_width.max(1.0);
             let zoom_y = viewport_height / content_height.max(1.0);
-            let fit_zoom = zoom_x.min(zoom_y).min(4.0).max(0.1);
+            let fit_zoom = zoom_x.min(zoom_y).clamp(0.1, 4.0);
 
             // After fit, all content should be within the viewport
             // Allow small floating-point tolerance

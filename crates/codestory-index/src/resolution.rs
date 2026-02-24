@@ -3,6 +3,8 @@ use codestory_core::{EdgeKind, NodeKind};
 use codestory_storage::Storage;
 use rusqlite::{OptionalExtension, params};
 
+type UnresolvedEdgeRow = (i64, Option<i64>, Option<String>, String);
+
 #[derive(Default, Debug)]
 pub struct ResolutionStats {
     pub resolved_calls: usize,
@@ -80,22 +82,7 @@ impl ResolutionPass {
         }
 
         let mut resolved = 0usize;
-        let mut stmt = conn.prepare(
-            "SELECT e.id, caller.file_node_id, caller.qualified_name, target.serialized_name
-             FROM edge e
-             JOIN node caller ON caller.id = e.source_node_id
-             JOIN node target ON target.id = e.target_node_id
-             WHERE e.kind = ?1 AND e.resolved_target_node_id IS NULL",
-        )?;
-
-        let rows = stmt.query_map(params![EdgeKind::CALL as i32], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
+        let rows = unresolved_edges(conn, EdgeKind::CALL)?;
 
         let function_kinds = [
             NodeKind::FUNCTION as i32,
@@ -103,8 +90,7 @@ impl ResolutionPass {
             NodeKind::MACRO as i32,
         ];
 
-        for row in rows {
-            let (edge_id, file_id, caller_qualified, target_name) = row?;
+        for (edge_id, file_id, caller_qualified, target_name) in rows {
             let is_common_unqualified = is_common_unqualified_call_name(&target_name);
             let (exact, suffix_dot, suffix_colon) = name_patterns(&target_name);
 
@@ -167,22 +153,7 @@ impl ResolutionPass {
         )?;
 
         let mut resolved = 0usize;
-        let mut stmt = conn.prepare(
-            "SELECT e.id, caller.file_node_id, caller.qualified_name, target.serialized_name
-             FROM edge e
-             JOIN node caller ON caller.id = e.source_node_id
-             JOIN node target ON target.id = e.target_node_id
-             WHERE e.kind = ?1 AND e.resolved_target_node_id IS NULL",
-        )?;
-
-        let rows = stmt.query_map(params![EdgeKind::IMPORT as i32], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
+        let rows = unresolved_edges(conn, EdgeKind::IMPORT)?;
 
         let module_kinds = [
             NodeKind::MODULE as i32,
@@ -190,8 +161,7 @@ impl ResolutionPass {
             NodeKind::PACKAGE as i32,
         ];
 
-        for row in rows {
-            let (edge_id, file_id, caller_qualified, target_name) = row?;
+        for (edge_id, file_id, caller_qualified, target_name) in rows {
             let (exact, suffix_dot, suffix_colon) = name_patterns(&target_name);
 
             if let Some(candidate) = find_same_file(
@@ -249,6 +219,28 @@ fn update_edge_resolution(
         "UPDATE edge SET resolved_target_node_id = ?1, confidence = ?2 WHERE id = ?3",
         params![resolved_target, confidence, edge_id],
     )?)
+}
+
+fn unresolved_edges(conn: &rusqlite::Connection, kind: EdgeKind) -> Result<Vec<UnresolvedEdgeRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.id, caller.file_node_id, caller.qualified_name, target.serialized_name
+         FROM edge e
+         JOIN node caller ON caller.id = e.source_node_id
+         JOIN node target ON target.id = e.target_node_id
+         WHERE e.kind = ?1 AND e.resolved_target_node_id IS NULL",
+    )?;
+
+    let rows = stmt.query_map(params![kind as i32], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+
+    let collected = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(collected)
 }
 
 fn name_patterns(name: &str) -> (String, String, String) {

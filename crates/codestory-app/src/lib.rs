@@ -4,7 +4,7 @@ use codestory_api::{
     OpenProjectRequest, ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, SearchHit,
     SearchRequest, SetUiLayoutRequest, StartIndexingRequest, StorageStatsDto, TrailConfigDto,
 };
-use codestory_events::EventBus;
+use codestory_events::{Event, EventBus};
 use codestory_search::SearchEngine;
 use codestory_storage::Storage;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -13,6 +13,46 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+fn no_project_error() -> ApiError {
+    ApiError::invalid_argument("No project open. Call open_project first.")
+}
+
+fn node_display_name(node: &codestory_core::Node) -> String {
+    node.qualified_name
+        .clone()
+        .unwrap_or_else(|| node.serialized_name.clone())
+}
+
+fn clamp_i64_to_u32(v: i64) -> u32 {
+    if v <= 0 {
+        0
+    } else if v > u32::MAX as i64 {
+        u32::MAX
+    } else {
+        v as u32
+    }
+}
+
+fn build_search_state(
+    nodes: Vec<codestory_core::Node>,
+) -> Result<(HashMap<codestory_core::NodeId, String>, SearchEngine), ApiError> {
+    let mut node_names = HashMap::new();
+    let mut search_nodes = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let display_name = node_display_name(&node);
+        node_names.insert(node.id, display_name.clone());
+        search_nodes.push((node.id, display_name));
+    }
+
+    let mut engine = SearchEngine::new(None)
+        .map_err(|e| ApiError::internal(format!("Failed to init search engine: {e}")))?;
+    engine
+        .index_nodes(search_nodes)
+        .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
+
+    Ok((node_names, engine))
+}
 
 struct AppState {
     project_root: Option<PathBuf>,
@@ -61,6 +101,22 @@ impl AppController {
         self.events_rx.clone()
     }
 
+    fn require_project_root(&self) -> Result<PathBuf, ApiError> {
+        self.state
+            .lock()
+            .project_root
+            .clone()
+            .ok_or_else(no_project_error)
+    }
+
+    fn require_storage_path(&self) -> Result<PathBuf, ApiError> {
+        self.state
+            .lock()
+            .storage_path
+            .clone()
+            .ok_or_else(no_project_error)
+    }
+
     pub fn open_project(&self, req: OpenProjectRequest) -> Result<ProjectSummary, ApiError> {
         let root = PathBuf::from(req.path);
         if !root.exists() {
@@ -88,23 +144,7 @@ impl AppController {
         let nodes = storage
             .get_nodes()
             .map_err(|e| ApiError::internal(format!("Failed to load nodes: {e}")))?;
-
-        let mut node_names = HashMap::new();
-        let mut search_nodes = Vec::with_capacity(nodes.len());
-        for node in nodes {
-            let display_name = node
-                .qualified_name
-                .clone()
-                .unwrap_or_else(|| node.serialized_name.clone());
-            node_names.insert(node.id, display_name.clone());
-            search_nodes.push((node.id, display_name));
-        }
-
-        let mut engine = SearchEngine::new(None)
-            .map_err(|e| ApiError::internal(format!("Failed to init search engine: {e}")))?;
-        engine
-            .index_nodes(search_nodes)
-            .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
+        let (node_names, engine) = build_search_state(nodes)?;
 
         {
             let mut s = self.state.lock();
@@ -112,16 +152,6 @@ impl AppController {
             s.storage_path = Some(storage_path);
             s.node_names = node_names;
             s.search_engine = Some(engine);
-        }
-
-        fn clamp_i64_to_u32(v: i64) -> u32 {
-            if v <= 0 {
-                0
-            } else if v > u32::MAX as i64 {
-                u32::MAX
-            } else {
-                v as u32
-            }
         }
 
         let dto_stats = StorageStatsDto {
@@ -184,16 +214,15 @@ impl AppController {
     }
 
     pub fn search(&self, req: SearchRequest) -> Result<Vec<SearchHit>, ApiError> {
-        let (storage_path, matches) = {
+        let (storage_path, matches, node_names) = {
             let mut s = self.state.lock();
             let engine = s.search_engine.as_mut().ok_or_else(|| {
                 ApiError::invalid_argument("Search engine not initialized. Open a project first.")
             })?;
             let matches = engine.search_symbol_with_scores(&req.query);
-            let storage_path = s.storage_path.clone().ok_or_else(|| {
-                ApiError::invalid_argument("No project open. Call open_project first.")
-            })?;
-            (storage_path, matches)
+            let storage_path = s.storage_path.clone().ok_or_else(no_project_error)?;
+            let node_names = s.node_names.clone();
+            (storage_path, matches, node_names)
         };
 
         let storage = Storage::open(&storage_path)
@@ -201,10 +230,7 @@ impl AppController {
 
         let mut hits = Vec::new();
         for (id, score) in matches {
-            let display_name = self
-                .state
-                .lock()
-                .node_names
+            let display_name = node_names
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| id.0.to_string());
@@ -239,9 +265,7 @@ impl AppController {
     }
 
     pub fn graph_neighborhood(&self, req: GraphRequest) -> Result<GraphResponse, ApiError> {
-        let storage_path = self.state.lock().storage_path.clone().ok_or_else(|| {
-            ApiError::invalid_argument("No project open. Call open_project first.")
-        })?;
+        let storage_path = self.require_storage_path()?;
 
         let center = req.center_id.to_core()?;
 
@@ -324,9 +348,7 @@ impl AppController {
     }
 
     pub fn graph_trail(&self, req: TrailConfigDto) -> Result<GraphResponse, ApiError> {
-        let storage_path = self.state.lock().storage_path.clone().ok_or_else(|| {
-            ApiError::invalid_argument("No project open. Call open_project first.")
-        })?;
+        let storage_path = self.require_storage_path()?;
 
         let root_id = req.root_id.to_core()?;
         let target_id = match req.target_id {
@@ -408,9 +430,7 @@ impl AppController {
     }
 
     pub fn node_details(&self, req: NodeDetailsRequest) -> Result<NodeDetailsDto, ApiError> {
-        let storage_path = self.state.lock().storage_path.clone().ok_or_else(|| {
-            ApiError::invalid_argument("No project open. Call open_project first.")
-        })?;
+        let storage_path = self.require_storage_path()?;
 
         let id = req.id.to_core()?;
 
@@ -461,9 +481,7 @@ impl AppController {
         &self,
         req: ReadFileTextRequest,
     ) -> Result<ReadFileTextResponse, ApiError> {
-        let root = self.state.lock().project_root.clone().ok_or_else(|| {
-            ApiError::invalid_argument("No project open. Call open_project first.")
-        })?;
+        let root = self.require_project_root()?;
 
         let root = root
             .canonicalize()
@@ -501,9 +519,7 @@ impl AppController {
     }
 
     pub fn get_ui_layout(&self) -> Result<Option<String>, ApiError> {
-        let root = self.state.lock().project_root.clone().ok_or_else(|| {
-            ApiError::invalid_argument("No project open. Call open_project first.")
-        })?;
+        let root = self.require_project_root()?;
         let path = root.join("codestory_ui.json");
         match std::fs::read_to_string(&path) {
             Ok(contents) => Ok(Some(contents)),
@@ -516,9 +532,7 @@ impl AppController {
     }
 
     pub fn set_ui_layout(&self, req: SetUiLayoutRequest) -> Result<(), ApiError> {
-        let root = self.state.lock().project_root.clone().ok_or_else(|| {
-            ApiError::invalid_argument("No project open. Call open_project first.")
-        })?;
+        let root = self.require_project_root()?;
         let path = root.join("codestory_ui.json");
         std::fs::write(&path, req.json).map_err(|e| {
             ApiError::internal(format!("Failed to write UI layout {}: {e}", path.display()))
@@ -532,58 +546,11 @@ fn index_full(
     storage_path: &Path,
     events_tx: &Sender<AppEventPayload>,
 ) -> Result<(), ApiError> {
-    let start_time = std::time::Instant::now();
-
-    let mut storage = Storage::open(storage_path)
-        .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
-
-    storage
-        .clear()
-        .map_err(|e| ApiError::internal(format!("Failed to clear storage: {e}")))?;
-
-    let project = codestory_project::Project::open(root.to_path_buf())
-        .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
-
-    let refresh_info = project
-        .full_refresh()
-        .map_err(|e| ApiError::internal(format!("Failed to collect files: {e}")))?;
-
-    let total_files = refresh_info.files_to_index.len().min(u32::MAX as usize) as u32;
-    let _ = events_tx.send(AppEventPayload::IndexingStarted {
-        file_count: total_files,
-    });
-
-    let bus = EventBus::new();
-    let rx = bus.receiver();
-    let progress_tx = events_tx.clone();
-
-    // Forward progress events to the runtime event stream.
-    let forwarder = std::thread::spawn(move || {
-        while let Ok(ev) = rx.recv() {
-            if let codestory_events::Event::IndexingProgress { current, total } = ev {
-                let _ = progress_tx.send(AppEventPayload::IndexingProgress {
-                    current: current.min(u32::MAX as usize) as u32,
-                    total: total.min(u32::MAX as usize) as u32,
-                });
-            }
-        }
-    });
-
-    let indexer = codestory_index::WorkspaceIndexer::new(root.to_path_buf());
-    let result = indexer.run_incremental(&mut storage, &refresh_info, &bus, None);
-
-    // Drop bus so forwarder unblocks.
-    drop(bus);
-    let _ = forwarder.join();
-
-    if let Err(e) = result {
-        return Err(ApiError::internal(format!("Indexing failed: {e}")));
-    }
-
-    let _ = events_tx.send(AppEventPayload::IndexingComplete {
-        duration_ms: start_time.elapsed().as_millis().min(u32::MAX as u128) as u32,
-    });
-    Ok(())
+    run_indexing_common(root, storage_path, events_tx, true, |project, _storage| {
+        project
+            .full_refresh()
+            .map_err(|e| ApiError::internal(format!("Failed to collect files: {e}")))
+    })
 }
 
 fn index_incremental(
@@ -591,17 +558,54 @@ fn index_incremental(
     storage_path: &Path,
     events_tx: &Sender<AppEventPayload>,
 ) -> Result<(), ApiError> {
+    run_indexing_common(root, storage_path, events_tx, false, |project, storage| {
+        project
+            .generate_refresh_info(storage)
+            .map_err(|e| ApiError::internal(format!("Failed to generate refresh info: {e}")))
+    })
+}
+
+fn spawn_progress_forwarder(
+    rx: Receiver<Event>,
+    progress_tx: Sender<AppEventPayload>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while let Ok(ev) = rx.recv() {
+            if let Event::IndexingProgress { current, total } = ev {
+                let _ = progress_tx.send(AppEventPayload::IndexingProgress {
+                    current: current.min(u32::MAX as usize) as u32,
+                    total: total.min(u32::MAX as usize) as u32,
+                });
+            }
+        }
+    })
+}
+
+fn run_indexing_common<F>(
+    root: &Path,
+    storage_path: &Path,
+    events_tx: &Sender<AppEventPayload>,
+    clear_storage: bool,
+    refresh_builder: F,
+) -> Result<(), ApiError>
+where
+    F: FnOnce(&codestory_project::Project, &Storage) -> Result<codestory_project::RefreshInfo, ApiError>,
+{
     let start_time = std::time::Instant::now();
 
     let mut storage = Storage::open(storage_path)
         .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
 
+    if clear_storage {
+        storage
+            .clear()
+            .map_err(|e| ApiError::internal(format!("Failed to clear storage: {e}")))?;
+    }
+
     let project = codestory_project::Project::open(root.to_path_buf())
         .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
 
-    let refresh_info = project
-        .generate_refresh_info(&storage)
-        .map_err(|e| ApiError::internal(format!("Failed to generate refresh info: {e}")))?;
+    let refresh_info = refresh_builder(&project, &storage)?;
 
     let total_files = refresh_info.files_to_index.len().min(u32::MAX as usize) as u32;
     let _ = events_tx.send(AppEventPayload::IndexingStarted {
@@ -609,19 +613,7 @@ fn index_incremental(
     });
 
     let bus = EventBus::new();
-    let rx = bus.receiver();
-    let progress_tx = events_tx.clone();
-
-    let forwarder = std::thread::spawn(move || {
-        while let Ok(ev) = rx.recv() {
-            if let codestory_events::Event::IndexingProgress { current, total } = ev {
-                let _ = progress_tx.send(AppEventPayload::IndexingProgress {
-                    current: current.min(u32::MAX as usize) as u32,
-                    total: total.min(u32::MAX as usize) as u32,
-                });
-            }
-        }
-    });
+    let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
 
     let indexer = codestory_index::WorkspaceIndexer::new(root.to_path_buf());
     let result = indexer.run_incremental(&mut storage, &refresh_info, &bus, None);
@@ -641,30 +633,73 @@ fn index_incremental(
 }
 
 fn refresh_caches(controller: &AppController, storage: &Storage) {
-    if let Ok(nodes) = storage.get_nodes() {
-        let mut node_names = HashMap::new();
-        let mut search_nodes = Vec::with_capacity(nodes.len());
-        for node in nodes {
-            let display_name = node
-                .qualified_name
-                .clone()
-                .unwrap_or_else(|| node.serialized_name.clone());
-            node_names.insert(node.id, display_name.clone());
-            search_nodes.push((node.id, display_name));
-        }
+    let refreshed = storage
+        .get_nodes()
+        .ok()
+        .and_then(|nodes| build_search_state(nodes).ok());
 
-        if let Ok(mut engine) = SearchEngine::new(None) {
-            let _ = engine.index_nodes(search_nodes);
-            let mut s = controller.state.lock();
-            s.node_names = node_names;
-            s.search_engine = Some(engine);
-            s.is_indexing = false;
-        } else {
-            let mut s = controller.state.lock();
-            s.is_indexing = false;
-        }
-    } else {
-        let mut s = controller.state.lock();
-        s.is_indexing = false;
+    let mut s = controller.state.lock();
+    if let Some((node_names, engine)) = refreshed {
+        s.node_names = node_names;
+        s.search_engine = Some(engine);
+    }
+    s.is_indexing = false;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codestory_core::{Node, NodeId, NodeKind};
+    use crossbeam_channel::unbounded;
+
+    #[test]
+    fn build_search_state_prefers_qualified_name() {
+        let nodes = vec![Node {
+            id: NodeId(1),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "short_name".to_string(),
+            qualified_name: Some("pkg.mod.short_name".to_string()),
+            ..Default::default()
+        }];
+
+        let (node_names, mut engine) = build_search_state(nodes).expect("build search state");
+        assert_eq!(
+            node_names.get(&NodeId(1)).map(String::as_str),
+            Some("pkg.mod.short_name")
+        );
+
+        let hits = engine.search_symbol("pkg.mod");
+        assert_eq!(hits.first().copied(), Some(NodeId(1)));
+    }
+
+    #[test]
+    fn progress_forwarder_relay_only_progress_events() {
+        let (event_tx, event_rx) = unbounded::<Event>();
+        let (app_tx, app_rx) = unbounded::<AppEventPayload>();
+        let handle = spawn_progress_forwarder(event_rx, app_tx);
+
+        event_tx
+            .send(Event::IndexingProgress {
+                current: 3,
+                total: 5,
+            })
+            .expect("send progress event");
+        event_tx
+            .send(Event::StatusUpdate {
+                message: "ignore me".to_string(),
+            })
+            .expect("send status event");
+        drop(event_tx);
+
+        let forwarded = app_rx.recv().expect("receive forwarded event");
+        assert!(matches!(
+            forwarded,
+            AppEventPayload::IndexingProgress {
+                current: 3,
+                total: 5
+            }
+        ));
+        assert!(app_rx.try_recv().is_err());
+        handle.join().expect("join forwarder");
     }
 }

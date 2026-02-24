@@ -3,6 +3,7 @@ use codestory_core::NodeId;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crate::{ActivationOrigin, RefreshMode};
 
@@ -86,7 +87,7 @@ pub struct InMemoryBoundary {
     command_tx: Sender<AppCommand>,
     command_rx: Receiver<AppCommand>,
     event_tx: Sender<AppEvent>,
-    event_rx: Receiver<AppEvent>,
+    event_subscribers: Arc<Mutex<Vec<Sender<AppEvent>>>>,
 }
 
 impl Default for InMemoryBoundary {
@@ -98,13 +99,23 @@ impl Default for InMemoryBoundary {
 impl InMemoryBoundary {
     pub fn new() -> Self {
         let (command_tx, command_rx) = unbounded();
-        let (event_tx, event_rx) = unbounded();
+        let (event_tx, event_ingress_rx) = unbounded::<AppEvent>();
+        let event_subscribers: Arc<Mutex<Vec<Sender<AppEvent>>>> = Arc::new(Mutex::new(Vec::new()));
+        let subscribers_for_thread = Arc::clone(&event_subscribers);
+
+        std::thread::spawn(move || {
+            while let Ok(event) = event_ingress_rx.recv() {
+                if let Ok(mut sinks) = subscribers_for_thread.lock() {
+                    sinks.retain(|sink| sink.send(event.clone()).is_ok());
+                }
+            }
+        });
 
         Self {
             command_tx,
             command_rx,
             event_tx,
-            event_rx,
+            event_subscribers,
         }
     }
 
@@ -127,7 +138,11 @@ impl EventBusBoundary for InMemoryBoundary {
     }
 
     fn subscribe_events(&self) -> EventStream {
-        self.event_rx.clone()
+        let (tx, rx) = unbounded();
+        if let Ok(mut sinks) = self.event_subscribers.lock() {
+            sinks.push(tx);
+        }
+        rx
     }
 }
 
@@ -138,6 +153,7 @@ mod tests {
     #[test]
     fn command_bus_roundtrip() {
         let bus = InMemoryBoundary::new();
+        let events = bus.subscribe_events();
         let cmd = AppCommand::ActivateNode(ActivateNodeCmd {
             id: NodeId(123),
             origin: ActivationOrigin::Search,
@@ -160,13 +176,35 @@ mod tests {
             correlation_id: Some("corr-1".to_string()),
         });
         bus.publish_event(event.clone()).expect("publish event");
-        let received = bus.subscribe_events().recv().expect("receive event");
+        let received = events.recv().expect("receive event");
         assert!(matches!(
             received,
             AppEvent::IndexBatchFlushed(IndexBatchFlushedEvt {
                 flushed_nodes: 42,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn event_bus_boundary_fan_out() {
+        let bus = InMemoryBoundary::new();
+        let events_a = bus.subscribe_events();
+        let events_b = bus.subscribe_events();
+
+        let event = AppEvent::IndexBatchFlushed(IndexBatchFlushedEvt {
+            flushed_nodes: 7,
+            correlation_id: None,
+        });
+        bus.publish_event(event).expect("publish event");
+
+        assert!(matches!(
+            events_a.recv().expect("receive event a"),
+            AppEvent::IndexBatchFlushed(IndexBatchFlushedEvt { flushed_nodes: 7, .. })
+        ));
+        assert!(matches!(
+            events_b.recv().expect("receive event b"),
+            AppEvent::IndexBatchFlushed(IndexBatchFlushedEvt { flushed_nodes: 7, .. })
         ));
     }
 }

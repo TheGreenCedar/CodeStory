@@ -2,6 +2,7 @@ use codestory_core::{EdgeId, EdgeKind, NodeId, NodeKind, SourceLocation, TrailMo
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 pub mod boundary;
 pub mod telemetry;
@@ -345,7 +346,8 @@ pub enum Event {
 #[derive(Clone)]
 pub struct EventBus {
     tx: Sender<Event>,
-    rx: Receiver<Event>,
+    subscribers: Arc<Mutex<Vec<Sender<Event>>>>,
+    dispatch_rx: Receiver<Event>,
 }
 
 impl Default for EventBus {
@@ -356,8 +358,24 @@ impl Default for EventBus {
 
 impl EventBus {
     pub fn new() -> Self {
-        let (tx, rx) = unbounded();
-        Self { tx, rx }
+        let (tx, ingress_rx) = unbounded::<Event>();
+        let (dispatch_tx, dispatch_rx) = unbounded();
+        let subscribers = Arc::new(Mutex::new(vec![dispatch_tx]));
+        let subscribers_for_thread = Arc::clone(&subscribers);
+
+        std::thread::spawn(move || {
+            while let Ok(event) = ingress_rx.recv() {
+                if let Ok(mut sinks) = subscribers_for_thread.lock() {
+                    sinks.retain(|sink| sink.send(event.clone()).is_ok());
+                }
+            }
+        });
+
+        Self {
+            tx,
+            subscribers,
+            dispatch_rx,
+        }
     }
 
     pub fn sender(&self) -> Sender<Event> {
@@ -365,7 +383,11 @@ impl EventBus {
     }
 
     pub fn receiver(&self) -> Receiver<Event> {
-        self.rx.clone()
+        let (tx, rx) = unbounded();
+        if let Ok(mut sinks) = self.subscribers.lock() {
+            sinks.push(tx);
+        }
+        rx
     }
 
     pub fn publish(&self, event: Event) {
@@ -375,7 +397,7 @@ impl EventBus {
     /// Dispatch all pending events to a listener.
     /// This is useful for processing events in the UI loop.
     pub fn dispatch_to<L: EventListener>(&self, listener: &mut L) {
-        while let Ok(event) = self.rx.try_recv() {
+        while let Ok(event) = self.dispatch_rx.try_recv() {
             listener.handle_event(&event);
         }
     }
@@ -418,14 +440,14 @@ mod tests {
     #[test]
     fn test_indexing_events() {
         let bus = EventBus::new();
+        let rx = bus.receiver();
+
         bus.publish(Event::IndexingStarted { file_count: 10 });
         bus.publish(Event::IndexingProgress {
             current: 5,
             total: 10,
         });
         bus.publish(Event::IndexingComplete { duration_ms: 100 });
-
-        let rx = bus.receiver();
         if let Event::IndexingStarted { file_count } = rx.recv().unwrap() {
             assert_eq!(file_count, 10);
         } else {
@@ -444,6 +466,27 @@ mod tests {
         } else {
             panic!("Expected IndexingComplete");
         }
+    }
+
+    #[test]
+    fn test_event_bus_fan_out_to_multiple_receivers() {
+        let bus = EventBus::new();
+        let rx_a = bus.receiver();
+        let rx_b = bus.receiver();
+
+        let event = Event::StatusUpdate {
+            message: "fanout".to_string(),
+        };
+        bus.publish(event.clone());
+
+        assert!(matches!(
+            rx_a.recv().unwrap(),
+            Event::StatusUpdate { message } if message == "fanout"
+        ));
+        assert!(matches!(
+            rx_b.recv().unwrap(),
+            Event::StatusUpdate { message } if message == "fanout"
+        ));
     }
 
     #[test]

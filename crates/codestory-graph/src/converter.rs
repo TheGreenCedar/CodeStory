@@ -29,6 +29,60 @@ impl NodeGraphConverter {
         )
     }
 
+    fn is_bundle(node: &DummyNode) -> bool {
+        node.bundle_info
+            .as_ref()
+            .map(|b| b.is_bundle)
+            .unwrap_or(false)
+    }
+
+    fn default_pins(kind: NodeKind) -> (Vec<NodeGraphPin>, Vec<NodeGraphPin>) {
+        let inputs = vec![NodeGraphPin {
+            label: "References".to_string(),
+            pin_type: PinType::Standard,
+        }];
+
+        let mut outputs = vec![NodeGraphPin {
+            label: "Calls".to_string(),
+            pin_type: PinType::Standard,
+        }];
+
+        if Self::is_structural(kind) {
+            outputs.push(NodeGraphPin {
+                label: "Inherited By".to_string(),
+                pin_type: PinType::Inheritance,
+            });
+        }
+
+        (inputs, outputs)
+    }
+
+    fn parent_is_bundle(node_map: &HashMap<NodeId, &DummyNode>, parent_id: NodeId) -> bool {
+        node_map
+            .get(&parent_id)
+            .map(|n| Self::is_bundle(n))
+            .unwrap_or(false)
+    }
+
+    fn edge_pin(edge_kind: EdgeKind) -> (PinType, usize) {
+        match edge_kind {
+            EdgeKind::INHERITANCE | EdgeKind::OVERRIDE => (PinType::Inheritance, 1),
+            _ => (PinType::Standard, 0),
+        }
+    }
+
+    fn member_visibility(node_kind: NodeKind) -> VisibilityKind {
+        match node_kind {
+            NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO => VisibilityKind::Functions,
+            NodeKind::FIELD
+            | NodeKind::VARIABLE
+            | NodeKind::GLOBAL_VARIABLE
+            | NodeKind::CONSTANT
+            | NodeKind::ENUM_CONSTANT => VisibilityKind::Variables,
+            _ => VisibilityKind::Other,
+        }
+    }
+
     pub fn convert_dummies(&self, nodes: &[DummyNode], edges: &[DummyEdge]) -> NodeGraph {
         let mut graph_nodes: HashMap<NodeId, NodeGraphNode> = HashMap::new();
         let mut graph_edges = Vec::new();
@@ -41,11 +95,7 @@ impl NodeGraphConverter {
 
         // 1. Create Structural Nodes
         for node in nodes {
-            let is_bundle = node
-                .bundle_info
-                .as_ref()
-                .map(|b| b.is_bundle)
-                .unwrap_or(false);
+            let is_bundle = Self::is_bundle(node);
 
             // If it's a bundle of members (e.g. methods), skip creating a node for it.
             if is_bundle && !Self::is_structural(node.node_kind) {
@@ -57,22 +107,7 @@ impl NodeGraphConverter {
             }
 
             // Create the node
-            let inputs = vec![NodeGraphPin {
-                label: "References".to_string(),
-                pin_type: PinType::Standard,
-            }];
-
-            let mut outputs = vec![NodeGraphPin {
-                label: "Calls".to_string(),
-                pin_type: PinType::Standard,
-            }];
-
-            if Self::is_structural(node.node_kind) {
-                outputs.push(NodeGraphPin {
-                    label: "Inherited By".to_string(),
-                    pin_type: PinType::Inheritance,
-                });
-            }
+            let (inputs, outputs) = Self::default_pins(node.node_kind);
 
             graph_nodes.insert(
                 node.id,
@@ -99,11 +134,7 @@ impl NodeGraphConverter {
 
         // 2. Process Members (populate members list and member_to_host map)
         for node in nodes {
-            let is_bundle = node
-                .bundle_info
-                .as_ref()
-                .map(|b| b.is_bundle)
-                .unwrap_or(false);
+            let is_bundle = Self::is_bundle(node);
             let is_structural = Self::is_structural(node.node_kind);
 
             if !is_structural {
@@ -126,10 +157,7 @@ impl NodeGraphConverter {
                 } else if let Some(parent_id) = node.parent {
                     // It's an individual member node
                     // Check if parent is a bundle. If so, it was handled above (via bundle iteration).
-                    let parent_is_bundle = node_map
-                        .get(&parent_id)
-                        .map(|n| n.bundle_info.as_ref().map(|b| b.is_bundle).unwrap_or(false))
-                        .unwrap_or(false);
+                    let parent_is_bundle = Self::parent_is_bundle(&node_map, parent_id);
 
                     if !parent_is_bundle && let Some(host) = graph_nodes.get_mut(&parent_id) {
                         host.members.push(NodeMember {
@@ -163,13 +191,7 @@ impl NodeGraphConverter {
             // If Class A calls Class A (internal call), it's a self-loop.
             // Snarl can handle self-loops.
 
-            let (pin_type, source_output_index) = match edge.kind {
-                EdgeKind::INHERITANCE | EdgeKind::OVERRIDE => (PinType::Inheritance, 1),
-                EdgeKind::CALL => (PinType::Standard, 0),
-                EdgeKind::USAGE | EdgeKind::TYPE_USAGE => (PinType::Standard, 0),
-                EdgeKind::IMPORT | EdgeKind::INCLUDE => (PinType::Standard, 0),
-                _ => (PinType::Standard, 0),
-            };
+            let (pin_type, source_output_index) = Self::edge_pin(edge.kind);
 
             let source_node = graph_nodes.get(&source).unwrap();
             let valid_index = if source_output_index < source_node.outputs.len() {
@@ -227,11 +249,7 @@ impl NodeGraphConverter {
 
         // 1. Create Structural Nodes (classes, structs, etc.)
         for node in nodes {
-            let is_bundle = node
-                .bundle_info
-                .as_ref()
-                .map(|b| b.is_bundle)
-                .unwrap_or(false);
+            let is_bundle = Self::is_bundle(node);
 
             // Skip bundled non-structural nodes (they become members)
             if is_bundle && !Self::is_structural(node.node_kind) {
@@ -257,33 +275,14 @@ impl NodeGraphConverter {
             uml_nodes.insert(node.id, uml_node);
 
             // Compute pins for this node
-            let inputs = vec![NodeGraphPin {
-                label: "References".to_string(),
-                pin_type: PinType::Standard,
-            }];
-
-            let mut outputs = vec![NodeGraphPin {
-                label: "Calls".to_string(),
-                pin_type: PinType::Standard,
-            }];
-
-            if Self::is_structural(node.node_kind) {
-                outputs.push(NodeGraphPin {
-                    label: "Inherited By".to_string(),
-                    pin_type: PinType::Inheritance,
-                });
-            }
+            let (inputs, outputs) = Self::default_pins(node.node_kind);
 
             pin_info.insert(node.id, (inputs, outputs));
         }
 
         // 2. Group Members into Visibility Sections
         for node in nodes {
-            let is_bundle = node
-                .bundle_info
-                .as_ref()
-                .map(|b| b.is_bundle)
-                .unwrap_or(false);
+            let is_bundle = Self::is_bundle(node);
             let is_structural = Self::is_structural(node.node_kind);
 
             if !is_structural {
@@ -351,10 +350,7 @@ impl NodeGraphConverter {
                     }
                 } else if let Some(parent_id) = node.parent {
                     // It's an individual member node
-                    let parent_is_bundle = node_map
-                        .get(&parent_id)
-                        .map(|n| n.bundle_info.as_ref().map(|b| b.is_bundle).unwrap_or(false))
-                        .unwrap_or(false);
+                    let parent_is_bundle = Self::parent_is_bundle(&node_map, parent_id);
 
                     if !parent_is_bundle && let Some(host) = uml_nodes.get_mut(&parent_id) {
                         let mut member =
@@ -365,17 +361,7 @@ impl NodeGraphConverter {
                             .set_has_outgoing_edges(members_with_outgoing_edges.contains(&node.id));
 
                         // Determine which section this member belongs to
-                        let visibility = match node.node_kind {
-                            NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO => {
-                                VisibilityKind::Functions
-                            }
-                            NodeKind::FIELD
-                            | NodeKind::VARIABLE
-                            | NodeKind::GLOBAL_VARIABLE
-                            | NodeKind::CONSTANT
-                            | NodeKind::ENUM_CONSTANT => VisibilityKind::Variables,
-                            _ => VisibilityKind::Other,
-                        };
+                        let visibility = Self::member_visibility(node.node_kind);
 
                         // Find or create the appropriate section
                         if let Some(section) = host
@@ -411,13 +397,7 @@ impl NodeGraphConverter {
                 continue;
             }
 
-            let (pin_type, source_output_index) = match edge.kind {
-                EdgeKind::INHERITANCE | EdgeKind::OVERRIDE => (PinType::Inheritance, 1),
-                EdgeKind::CALL => (PinType::Standard, 0),
-                EdgeKind::USAGE | EdgeKind::TYPE_USAGE => (PinType::Standard, 0),
-                EdgeKind::IMPORT | EdgeKind::INCLUDE => (PinType::Standard, 0),
-                _ => (PinType::Standard, 0),
-            };
+            let (pin_type, source_output_index) = Self::edge_pin(edge.kind);
 
             // Validate pin index
             let valid_index = if let Some((_, outputs)) = pin_info.get(&source) {

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use codestory_events::{Event, EventBus};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tree_sitter::{Language, Parser};
 use tree_sitter_graph::ast::File as GraphFile;
@@ -92,22 +93,16 @@ impl WorkspaceIndexer {
             file_count: refresh_info.files_to_index.len(),
         });
         let total_files = refresh_info.files_to_index.len();
-        let processed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let processed_count = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
         let root = self.root.clone();
 
         let symbol_table = Arc::new(SymbolTable::new());
-        // Load existing symbols from storage to avoid re-creating UNKNOWN nodes
-        if let Ok(nodes) = storage.get_nodes() {
-            for node in nodes {
-                symbol_table.insert(node.id.0, node.kind);
-            }
-        }
+        Self::seed_symbol_table(storage, &symbol_table);
 
         // Clone for parallel closure
         let cancelled_clone = cancelled.clone();
-        let cancel_token_active = cancel_token.map(|t| t.is_cancelled()).unwrap_or(false);
-        if cancel_token_active {
+        if Self::is_cancelled(cancel_token) {
             return Ok(());
         }
 
@@ -117,45 +112,6 @@ impl WorkspaceIndexer {
         let mut had_edges = false;
         let file_batch_size = self.batch_config.file_batch_size.max(1);
         let batch_config = self.batch_config;
-        let flush_errors =
-            |errors: &mut Vec<codestory_core::ErrorInfo>, storage: &mut Storage| -> Result<()> {
-                if errors.is_empty() {
-                    return Ok(());
-                }
-                let take_count = errors.len().min(batch_config.error_batch_size);
-                let drain = errors.drain(..take_count).collect::<Vec<_>>();
-                for error in drain {
-                    storage
-                        .insert_error(&error)
-                        .map_err(|e| anyhow!("Storage error: {:?}", e))?;
-                }
-                Ok(())
-            };
-
-        let flush_projection_batch = |storage: &mut Storage,
-                                      batched_storage: &mut IntermediateStorage,
-                                      had_edges: &mut bool|
-         -> Result<()> {
-            if !batched_storage.nodes.is_empty() {
-                storage
-                    .insert_nodes_batch(&batched_storage.nodes)
-                    .map_err(|e| anyhow!("Storage error: {:?}", e))?;
-            }
-            if !batched_storage.edges.is_empty() {
-                storage
-                    .insert_edges_batch(&batched_storage.edges)
-                    .map_err(|e| anyhow!("Storage error: {:?}", e))?;
-                *had_edges = true;
-            }
-            if !batched_storage.occurrences.is_empty() {
-                storage
-                    .insert_occurrences_batch(&batched_storage.occurrences)
-                    .map_err(|e| anyhow!("Storage error: {:?}", e))?;
-            }
-
-            batched_storage.clear();
-            Ok(())
-        };
 
         for file_chunk in refresh_info.files_to_index.chunks(file_batch_size) {
             let chunk_results: Vec<IntermediateStorage> = file_chunk
@@ -165,73 +121,13 @@ impl WorkspaceIndexer {
                     if let Some(token) = cancel_token
                         && token.is_cancelled()
                     {
-                        cancelled_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                        cancelled_clone.store(true, Ordering::Relaxed);
                         return IntermediateStorage::default();
                     }
 
-                    // Resolve path relative to workspace root
-                    let full_path = if path.is_absolute() {
-                        path.clone()
-                    } else {
-                        root.join(path)
-                    };
+                    let local_storage = self.index_path(path, &root, &symbol_table);
 
-                    let mut local_storage = IntermediateStorage::default();
-                    if let Some((lang, lang_name, graph_query)) = get_language_for_ext(
-                        full_path.extension().and_then(|s| s.to_str()).unwrap_or(""),
-                    ) {
-                        let compilation_info = self
-                            .compilation_db
-                            .as_ref()
-                            .and_then(|db| db.get_parsed_info(&full_path));
-
-                        match std::fs::read_to_string(&full_path) {
-                            Ok(source) => {
-                                match index_file(
-                                    &full_path,
-                                    &source,
-                                    lang,
-                                    lang_name,
-                                    graph_query,
-                                    compilation_info,
-                                    Some(Arc::clone(&symbol_table)),
-                                ) {
-                                    Ok(index_result) => {
-                                        local_storage.nodes = index_result.nodes;
-                                        local_storage.edges = index_result.edges;
-                                        local_storage.occurrences = index_result.occurrences;
-                                    }
-                                    Err(e) => {
-                                        local_storage.add_error(codestory_core::ErrorInfo {
-                                            message: format!(
-                                                "Failed to index {:?}: {}",
-                                                full_path.strip_prefix(&root).unwrap_or(&full_path),
-                                                e
-                                            ),
-                                            file_id: None,
-                                            line: None,
-                                            column: None,
-                                            is_fatal: false,
-                                            index_step: codestory_core::IndexStep::Indexing,
-                                        });
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                local_storage.add_error(codestory_core::ErrorInfo {
-                                    message: format!("Failed to read {:?}: {}", path, e),
-                                    file_id: None,
-                                    line: None,
-                                    column: None,
-                                    is_fatal: true,
-                                    index_step: codestory_core::IndexStep::Collection,
-                                });
-                            }
-                        }
-                    }
-
-                    let current =
-                        processed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
                     event_bus.publish(Event::IndexingProgress {
                         current,
                         total: total_files,
@@ -253,27 +149,27 @@ impl WorkspaceIndexer {
                         || batched_storage.edges.len() >= batch_config.edge_batch_size
                         || batched_storage.occurrences.len() >= batch_config.occurrence_batch_size)
                 {
-                    flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
+                    Self::flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
                 }
 
                 if all_errors.len() >= batch_config.error_batch_size {
-                    flush_errors(&mut all_errors, storage)?;
+                    Self::flush_errors(storage, &mut all_errors, batch_config.error_batch_size)?;
                 }
             }
 
-            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            if cancelled.load(Ordering::Relaxed) {
                 event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
                 return Ok(());
             }
         }
 
         // Check if cancelled during indexing
-        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        if cancelled.load(Ordering::Relaxed) {
             event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
             return Ok(());
         }
 
-        flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
+        Self::flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
 
         // 3.5 Resolve call/import edges post-pass
         if had_edges {
@@ -285,7 +181,7 @@ impl WorkspaceIndexer {
 
         // Write errors
         while !all_errors.is_empty() {
-            flush_errors(&mut all_errors, storage)?;
+            Self::flush_errors(storage, &mut all_errors, batch_config.error_batch_size)?;
         }
 
         // 4. Cleanup removed files
@@ -297,6 +193,316 @@ impl WorkspaceIndexer {
 
         event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
         Ok(())
+    }
+
+    fn is_cancelled(cancel_token: Option<&CancellationToken>) -> bool {
+        cancel_token.map(CancellationToken::is_cancelled).unwrap_or(false)
+    }
+
+    fn seed_symbol_table(storage: &Storage, symbol_table: &SymbolTable) {
+        if let Ok(nodes) = storage.get_nodes() {
+            for node in nodes {
+                symbol_table.insert(node.id.0, node.kind);
+            }
+        }
+    }
+
+    fn flush_errors(
+        storage: &mut Storage,
+        errors: &mut Vec<codestory_core::ErrorInfo>,
+        error_batch_size: usize,
+    ) -> Result<()> {
+        if errors.is_empty() {
+            return Ok(());
+        }
+
+        let take_count = errors.len().min(error_batch_size.max(1));
+        let drain = errors.drain(..take_count).collect::<Vec<_>>();
+        for error in drain {
+            storage
+                .insert_error(&error)
+                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
+        }
+
+        Ok(())
+    }
+
+    fn flush_projection_batch(
+        storage: &mut Storage,
+        batched_storage: &mut IntermediateStorage,
+        had_edges: &mut bool,
+    ) -> Result<()> {
+        if !batched_storage.nodes.is_empty() {
+            storage
+                .insert_nodes_batch(&batched_storage.nodes)
+                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
+        }
+        if !batched_storage.edges.is_empty() {
+            storage
+                .insert_edges_batch(&batched_storage.edges)
+                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
+            *had_edges = true;
+        }
+        if !batched_storage.occurrences.is_empty() {
+            storage
+                .insert_occurrences_batch(&batched_storage.occurrences)
+                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
+        }
+
+        batched_storage.clear();
+        Ok(())
+    }
+
+    fn index_path(
+        &self,
+        path: &PathBuf,
+        root: &Path,
+        symbol_table: &Arc<SymbolTable>,
+    ) -> IntermediateStorage {
+        let full_path = if path.is_absolute() {
+            path.clone()
+        } else {
+            root.join(path)
+        };
+
+        let mut local_storage = IntermediateStorage::default();
+        let Some((lang, lang_name, graph_query)) =
+            get_language_for_ext(full_path.extension().and_then(|s| s.to_str()).unwrap_or(""))
+        else {
+            return local_storage;
+        };
+
+        let compilation_info = self
+            .compilation_db
+            .as_ref()
+            .and_then(|db| db.get_parsed_info(&full_path));
+
+        match std::fs::read_to_string(&full_path) {
+            Ok(source) => match index_file(
+                &full_path,
+                &source,
+                lang,
+                lang_name,
+                graph_query,
+                compilation_info,
+                Some(Arc::clone(symbol_table)),
+            ) {
+                Ok(index_result) => {
+                    local_storage.nodes = index_result.nodes;
+                    local_storage.edges = index_result.edges;
+                    local_storage.occurrences = index_result.occurrences;
+                }
+                Err(e) => {
+                    local_storage.add_error(codestory_core::ErrorInfo {
+                        message: format!(
+                            "Failed to index {:?}: {}",
+                            full_path.strip_prefix(root).unwrap_or(&full_path),
+                            e
+                        ),
+                        file_id: None,
+                        line: None,
+                        column: None,
+                        is_fatal: false,
+                        index_step: codestory_core::IndexStep::Indexing,
+                    });
+                }
+            },
+            Err(e) => {
+                local_storage.add_error(codestory_core::ErrorInfo {
+                    message: format!("Failed to read {:?}: {}", path, e),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: true,
+                    index_step: codestory_core::IndexStep::Collection,
+                });
+            }
+        }
+
+        local_storage
+    }
+}
+
+fn file_node_from_source(path: &Path, source: &str) -> (Node, String, NodeId) {
+    let file_name = path.to_string_lossy().to_string();
+    let file_id = NodeId(generate_id(&file_name));
+    let line_count = source.lines().count() as u32;
+    let file_end_line = if line_count == 0 { 1 } else { line_count };
+
+    let file_node = Node {
+        id: file_id,
+        kind: NodeKind::FILE,
+        serialized_name: file_name.clone(),
+        start_line: Some(1),
+        start_col: Some(1),
+        end_line: Some(file_end_line),
+        ..Default::default()
+    };
+
+    (file_node, file_name, file_id)
+}
+
+fn node_kind_from_graph_kind(kind_str: &str) -> NodeKind {
+    match kind_str {
+        "FUNCTION" | "METHOD" => NodeKind::FUNCTION,
+        "CLASS" | "STRUCT" => NodeKind::CLASS,
+        "MODULE" | "NAMESPACE" => NodeKind::MODULE,
+        "FILE" => NodeKind::FILE,
+        "VARIABLE" | "FIELD" => NodeKind::VARIABLE,
+        "CONSTANT" => NodeKind::CONSTANT,
+        _ => NodeKind::UNKNOWN,
+    }
+}
+
+fn definition_occurrences(unique_nodes: &HashMap<NodeId, Node>, file_id: NodeId) -> Vec<Occurrence> {
+    let mut occurrences = Vec::new();
+    for node in unique_nodes.values() {
+        if let (Some(start_line), Some(start_col), Some(end_line), Some(end_col)) =
+            (node.start_line, node.start_col, node.end_line, node.end_col)
+        {
+            occurrences.push(Occurrence {
+                element_id: node.id.0,
+                kind: codestory_core::OccurrenceKind::DEFINITION,
+                location: SourceLocation {
+                    file_node_id: file_id,
+                    start_line,
+                    start_col,
+                    end_line,
+                    end_col,
+                },
+            });
+        }
+    }
+
+    occurrences
+}
+
+fn apply_qualified_names(nodes: Vec<Node>, edges: &[Edge], language_name: &str) -> Vec<Node> {
+    let mut parent_map: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    let mut has_parent: HashMap<NodeId, bool> = HashMap::new();
+
+    for edge in edges {
+        if edge.kind == EdgeKind::MEMBER {
+            parent_map.entry(edge.source).or_default().push(edge.target);
+            has_parent.insert(edge.target, true);
+        }
+    }
+
+    let mut node_map: HashMap<NodeId, Node> = nodes.into_iter().map(|n| (n.id, n)).collect();
+    let mut queue: Vec<(NodeId, String)> = Vec::new();
+
+    for id in node_map.keys() {
+        if !has_parent.contains_key(id)
+            && let Some(node) = node_map.get(id)
+        {
+            queue.push((*id, node.serialized_name.clone()));
+        }
+    }
+
+    while let Some((parent_id, parent_qualified_name)) = queue.pop() {
+        if let Some(children) = parent_map.get(&parent_id) {
+            for child_id in children {
+                if let Some(child_node) = node_map.get_mut(child_id) {
+                    let delimiter = match language_name {
+                        "rust" | "cpp" | "c" => "::",
+                        _ => ".",
+                    };
+                    let new_name = format!(
+                        "{}{}{}",
+                        parent_qualified_name, delimiter, child_node.serialized_name
+                    );
+                    child_node.serialized_name = new_name.clone();
+                    queue.push((*child_id, new_name));
+                }
+            }
+        }
+    }
+
+    node_map.into_values().collect()
+}
+
+fn canonicalize_nodes(
+    file_name: &str,
+    final_nodes: Vec<Node>,
+) -> (Vec<Node>, HashMap<NodeId, NodeId>) {
+    let is_type_like = |kind: NodeKind| {
+        matches!(
+            kind,
+            NodeKind::CLASS
+                | NodeKind::STRUCT
+                | NodeKind::INTERFACE
+                | NodeKind::UNION
+                | NodeKind::ENUM
+                | NodeKind::TYPEDEF
+                | NodeKind::TYPE_PARAMETER
+                | NodeKind::BUILTIN_TYPE
+                | NodeKind::ANNOTATION
+        )
+    };
+
+    let mut id_remap: HashMap<NodeId, NodeId> = HashMap::new();
+    let mut canonical_owner: HashMap<String, NodeId> = HashMap::new();
+    let mut deduped_nodes = Vec::with_capacity(final_nodes.len());
+
+    for mut node in final_nodes {
+        let qualified_name = node.serialized_name.clone();
+        node.qualified_name = Some(qualified_name.clone());
+
+        let canonical_id = if is_type_like(node.kind) {
+            format!("{}:{}", file_name, qualified_name)
+        } else {
+            let start_line = node.start_line.unwrap_or(1);
+            format!("{}:{}:{}", file_name, qualified_name, start_line)
+        };
+
+        if is_type_like(node.kind)
+            && let Some(existing_id) = canonical_owner.get(&canonical_id)
+        {
+            id_remap.insert(node.id, *existing_id);
+            continue;
+        }
+
+        let new_id = NodeId(generate_id(&canonical_id));
+        node.canonical_id = Some(canonical_id.clone());
+        id_remap.insert(node.id, new_id);
+        node.id = new_id;
+        canonical_owner.insert(canonical_id, new_id);
+        deduped_nodes.push(node);
+    }
+
+    (deduped_nodes, id_remap)
+}
+
+fn remap_file_affinity(nodes: &mut [Node], new_file_id: NodeId) {
+    for node in nodes.iter_mut() {
+        node.file_node_id = Some(new_file_id);
+    }
+}
+
+fn remap_edges(edges: &mut [Edge], new_file_id: NodeId, id_remap: &HashMap<NodeId, NodeId>) {
+    for edge in edges.iter_mut() {
+        if let Some(new_id) = id_remap.get(&edge.source) {
+            edge.source = *new_id;
+        }
+        if let Some(new_id) = id_remap.get(&edge.target) {
+            edge.target = *new_id;
+        }
+        edge.file_node_id = Some(new_file_id);
+        edge.id = EdgeId(generate_edge_id(edge.source.0, edge.target.0, edge.kind));
+    }
+}
+
+fn remap_occurrences(
+    occurrences: &mut [Occurrence],
+    id_remap: &HashMap<NodeId, NodeId>,
+) {
+    for occ in occurrences.iter_mut() {
+        if let Some(new_id) = id_remap.get(&NodeId(occ.element_id)) {
+            occ.element_id = new_id.0;
+        }
+        if let Some(new_file_id) = id_remap.get(&occ.location.file_node_id) {
+            occ.location.file_node_id = *new_file_id;
+        }
     }
 }
 
@@ -342,20 +548,9 @@ pub fn index_file(
     let mut result_edges = Vec::new();
     let mut result_occurrences = Vec::new();
 
-    // 0. Create File Node
-    let file_name = path.to_string_lossy().to_string();
-    let file_id = NodeId(generate_id(&file_name));
-    let line_count = source.lines().count() as u32;
-    let file_end_line = if line_count == 0 { 1 } else { line_count };
-    result_nodes.push(Node {
-        id: file_id,
-        kind: NodeKind::FILE,
-        serialized_name: file_name.clone(),
-        start_line: Some(1),
-        start_col: Some(1),
-        end_line: Some(file_end_line),
-        ..Default::default()
-    });
+    // 0. Create file node.
+    let (file_node, file_name, file_id) = file_node_from_source(path, source);
+    result_nodes.push(file_node);
 
     // 1. First pass: Create nodes and a temporary mapping from GraphNodeId -> OurNodeId
     let mut graph_to_node_id = HashMap::new();
@@ -393,15 +588,7 @@ pub fn index_file(
         }
 
         if !kind_str.is_empty() && !name_str.is_empty() {
-            let kind = match kind_str.as_str() {
-                "FUNCTION" | "METHOD" => NodeKind::FUNCTION,
-                "CLASS" | "STRUCT" => NodeKind::CLASS,
-                "MODULE" | "NAMESPACE" => NodeKind::MODULE,
-                "FILE" => NodeKind::FILE,
-                "VARIABLE" | "FIELD" => NodeKind::VARIABLE,
-                "CONSTANT" => NodeKind::CONSTANT,
-                _ => NodeKind::UNKNOWN,
-            };
+            let kind = node_kind_from_graph_kind(kind_str.as_str());
 
             let start_line = start_row.map(|v| v + 1).unwrap_or(1);
             let canonical_seed = format!("{}:{}:{}", file_name, name_str, start_line);
@@ -485,159 +672,15 @@ pub fn index_file(
         }
     }
 
-    for node in unique_nodes.values() {
-        if let (Some(start_line), Some(start_col), Some(end_line), Some(end_col)) =
-            (node.start_line, node.start_col, node.end_line, node.end_col)
-        {
-            result_occurrences.push(Occurrence {
-                element_id: node.id.0,
-                kind: codestory_core::OccurrenceKind::DEFINITION,
-                location: SourceLocation {
-                    file_node_id: file_id,
-                    start_line,
-                    start_col,
-                    end_line,
-                    end_col,
-                },
-            });
-        }
-    }
+    result_occurrences.extend(definition_occurrences(&unique_nodes, file_id));
 
-    // 3. Third pass: Resolve Qualified Names
-    // Build hierarchy map (Parent -> Children) based on MEMBER edges
-    let mut parent_map: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
-    let mut has_parent: HashMap<NodeId, bool> = HashMap::new();
-
-    for edge in &result_edges {
-        if edge.kind == EdgeKind::MEMBER {
-            parent_map.entry(edge.source).or_default().push(edge.target);
-            has_parent.insert(edge.target, true);
-        }
-    }
-
-    // Identify roots (Nodes that are not targets of any MEMBER edge)
-    // We also treat the File node as a root for top-level items if we add MEMBER edges from File -> Items
-    // But typically tree-sitter-graph might not adding File -> Class MEMBER edges by default for all languages?
-    // Let's assume high-level nodes are roots or attached to File.
-
-    // We need to update result_nodes.
-    // Let's map NodeId -> Node for easy update
-    let mut node_map: HashMap<NodeId, Node> = result_nodes.into_iter().map(|n| (n.id, n)).collect();
-
-    let mut nodes_to_process: Vec<(NodeId, String)> = Vec::new();
-
-    // Initialize roots
-    for id in node_map.keys() {
-        if !has_parent.contains_key(id)
-            && let Some(node) = node_map.get(id)
-        {
-            // Root nodes (like File or global classes) keep their name or start the chain
-            nodes_to_process.push((*id, node.serialized_name.clone()));
-        }
-    }
-
-    // BFS/DFS to propagate names
-    let mut queue = nodes_to_process;
-    while let Some((parent_id, parent_qualified_name)) = queue.pop() {
-        if let Some(children) = parent_map.get(&parent_id) {
-            for child_id in children {
-                if let Some(child_node) = node_map.get_mut(child_id) {
-                    // Start with simple dot notation for now.
-                    // Ideally we'd use language specific delimiters (:: for Rust/C++, . for Java/Python)
-                    // We can check language_name or just match child kind.
-                    let delimiter = match language_name {
-                        "rust" | "cpp" | "c" => "::",
-                        _ => ".",
-                    };
-
-                    let new_name = format!(
-                        "{}{}{}",
-                        parent_qualified_name, delimiter, child_node.serialized_name
-                    );
-                    child_node.serialized_name = new_name.clone();
-                    queue.push((*child_id, new_name));
-                }
-            }
-        }
-    }
-
-    // Reconstruct result_nodes
-    let final_nodes: Vec<Node> = node_map.into_values().collect();
-
-    // 4. Canonicalize node IDs (file:qualified[:start_line]) and remap edges/occurrences.
-    // For type-like nodes, we intentionally de-duplicate by qualified name so Rust impls
-    // and declarations collapse into a single symbol.
-    let is_type_like = |kind: NodeKind| {
-        matches!(
-            kind,
-            NodeKind::CLASS
-                | NodeKind::STRUCT
-                | NodeKind::INTERFACE
-                | NodeKind::UNION
-                | NodeKind::ENUM
-                | NodeKind::TYPEDEF
-                | NodeKind::TYPE_PARAMETER
-                | NodeKind::BUILTIN_TYPE
-                | NodeKind::ANNOTATION
-        )
-    };
-
-    let mut id_remap: HashMap<NodeId, NodeId> = HashMap::new();
-    let mut canonical_owner: HashMap<String, NodeId> = HashMap::new();
-    let mut deduped_nodes = Vec::with_capacity(final_nodes.len());
-
-    for mut node in final_nodes {
-        let qualified_name = node.serialized_name.clone();
-        node.qualified_name = Some(qualified_name.clone());
-
-        let canonical_id = if is_type_like(node.kind) {
-            format!("{}:{}", file_name, qualified_name)
-        } else {
-            let start_line = node.start_line.unwrap_or(1);
-            format!("{}:{}:{}", file_name, qualified_name, start_line)
-        };
-
-        if is_type_like(node.kind)
-            && let Some(existing_id) = canonical_owner.get(&canonical_id)
-        {
-            id_remap.insert(node.id, *existing_id);
-            continue;
-        }
-
-        let new_id = NodeId(generate_id(&canonical_id));
-        node.canonical_id = Some(canonical_id.clone());
-        id_remap.insert(node.id, new_id);
-        node.id = new_id;
-        canonical_owner.insert(canonical_id, new_id);
-        deduped_nodes.push(node);
-    }
-
-    let mut final_nodes = deduped_nodes;
-
+    // 3. Resolve qualified names, canonicalize IDs, and remap projections.
+    let final_nodes = apply_qualified_names(result_nodes, &result_edges, language_name);
+    let (mut final_nodes, id_remap) = canonicalize_nodes(&file_name, final_nodes);
     let new_file_id = id_remap.get(&file_id).copied().unwrap_or(file_id);
-    for node in final_nodes.iter_mut() {
-        node.file_node_id = Some(new_file_id);
-    }
-
-    for edge in result_edges.iter_mut() {
-        if let Some(new_id) = id_remap.get(&edge.source) {
-            edge.source = *new_id;
-        }
-        if let Some(new_id) = id_remap.get(&edge.target) {
-            edge.target = *new_id;
-        }
-        edge.file_node_id = Some(new_file_id);
-        edge.id = EdgeId(generate_edge_id(edge.source.0, edge.target.0, edge.kind));
-    }
-
-    for occ in result_occurrences.iter_mut() {
-        if let Some(new_id) = id_remap.get(&NodeId(occ.element_id)) {
-            occ.element_id = new_id.0;
-        }
-        if let Some(new_file_id) = id_remap.get(&occ.location.file_node_id) {
-            occ.location.file_node_id = *new_file_id;
-        }
-    }
+    remap_file_affinity(&mut final_nodes, new_file_id);
+    remap_edges(&mut result_edges, new_file_id, &id_remap);
+    remap_occurrences(&mut result_occurrences, &id_remap);
 
     apply_line_range_call_attribution(&final_nodes, &mut result_edges);
 
@@ -991,6 +1034,7 @@ function globalFunc() {}
 
         let mut storage = Storage::new_in_memory().unwrap();
         let bus = EventBus::new();
+        let rx = bus.receiver();
         let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
 
         // Create RefreshInfo manually
@@ -1015,7 +1059,6 @@ function globalFunc() {}
         );
 
         // Check progress events
-        let rx = bus.receiver();
         let events: Vec<Event> = rx.try_iter().collect();
         assert!(
             events
@@ -1081,12 +1124,13 @@ class Derived : public Base {
     void foo() {}
 };
 "#;
+        let (lang, lang_name, graph_query) = get_language_for_ext("cpp").unwrap();
         let result = index_file(
             Path::new("test.cpp"),
             code,
-            get_language_for_ext("cpp").unwrap().0,
-            get_language_for_ext("cpp").unwrap().1,
-            get_language_for_ext("cpp").unwrap().2,
+            lang,
+            lang_name,
+            graph_query,
             None,
             None,
         )?;
@@ -1119,12 +1163,13 @@ from os import path
 class MyClass:
     x = 1
 "#;
+        let (lang, lang_name, graph_query) = get_language_for_ext("py").unwrap();
         let result = index_file(
             Path::new("test.py"),
             code,
-            get_language_for_ext("py").unwrap().0,
-            get_language_for_ext("py").unwrap().1,
-            get_language_for_ext("py").unwrap().2,
+            lang,
+            lang_name,
+            graph_query,
             None,
             None,
         )?;
@@ -1153,12 +1198,13 @@ fn main() {
     println!("Hello");
 }
 "#;
+        let (lang, lang_name, graph_query) = get_language_for_ext("rs").unwrap();
         let result = index_file(
             Path::new("main.rs"),
             code,
-            get_language_for_ext("rs").unwrap().0,
-            get_language_for_ext("rs").unwrap().1,
-            get_language_for_ext("rs").unwrap().2,
+            lang,
+            lang_name,
+            graph_query,
             None,
             None,
         )?;

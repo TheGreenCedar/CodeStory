@@ -346,16 +346,11 @@ mod tests {
 
     // Helper to check if a point is approximately on a rect border
     fn is_on_border(p: Vec2, r: Rect, epsilon: f32) -> bool {
-        (p.x - r.min.x).abs() < epsilon && p.y >= r.min.y - epsilon && p.y <= r.max.y + epsilon
-            || (p.x - r.max.x).abs() < epsilon
-                && p.y >= r.min.y - epsilon
-                && p.y <= r.max.y + epsilon
-            || (p.y - r.min.y).abs() < epsilon
-                && p.x >= r.min.x - epsilon
-                && p.x <= r.max.x + epsilon
-            || (p.y - r.max.y).abs() < epsilon
-                && p.x >= r.min.x - epsilon
-                && p.x <= r.max.x + epsilon
+        let within_vertical_span = p.y >= r.min.y - epsilon && p.y <= r.max.y + epsilon;
+        let within_horizontal_span = p.x >= r.min.x - epsilon && p.x <= r.max.x + epsilon;
+        ((p.x - r.min.x).abs() < epsilon || (p.x - r.max.x).abs() < epsilon) && within_vertical_span
+            || ((p.y - r.min.y).abs() < epsilon || (p.y - r.max.y).abs() < epsilon)
+                && within_horizontal_span
     }
 
     // Custom distance impl

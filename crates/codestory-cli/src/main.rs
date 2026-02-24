@@ -1,10 +1,11 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use codestory_index::{IndexResult, get_language_for_ext, index_file};
 use codestory_storage::Storage;
 use crossbeam_channel::bounded;
 use rayon::prelude::*;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 #[derive(Parser, Debug)]
@@ -77,37 +78,36 @@ fn main() -> Result<()> {
     });
 
     // 4. Parallel Indexing
-    let files_processed = files_to_index
-        .par_iter()
-        .filter_map(|path| {
-            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            if let Some((lang, lang_name, graph_query)) = get_language_for_ext(ext) {
-                if let Ok(source) = std::fs::read_to_string(path) {
-                    // println!("Indexing: {:?}", path); // Commented out to reduce noise in parallel output
-                    match index_file(path, &source, lang, lang_name, graph_query, None, None) {
-                        Ok(result) => Some(result),
-                        Err(e) => {
-                            eprintln!("Error indexing {:?}: {}", path, e);
-                            None
-                        }
-                    }
-                } else {
-                    None
+    let files_processed = AtomicUsize::new(0);
+    files_to_index.par_iter().for_each_with(tx.clone(), |sender, path| {
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        let Some((lang, lang_name, graph_query)) = get_language_for_ext(ext) else {
+            return;
+        };
+        let Ok(source) = std::fs::read_to_string(path) else {
+            return;
+        };
+
+        match index_file(path, &source, lang, lang_name, graph_query, None, None) {
+            Ok(result) => {
+                if sender.send(result).is_ok() {
+                    files_processed.fetch_add(1, Ordering::Relaxed);
                 }
-            } else {
-                None
             }
-        })
-        .map(|result| {
-            tx.send(result).unwrap(); // Send to writer
-        })
-        .count();
+            Err(e) => {
+                eprintln!("Error indexing {:?}: {}", path, e);
+            }
+        }
+    });
+    let files_processed = files_processed.load(Ordering::Relaxed);
 
     // Drop the sender to close the channel so the writer thread exits
     drop(tx);
 
     // 5. Wait for Writer
-    let files_stored = writer_handle.join().unwrap()?;
+    let files_stored = writer_handle
+        .join()
+        .map_err(|_| anyhow!("writer thread panicked"))??;
 
     println!("Processed {} files.", files_processed);
     println!("Stored {} files in database.", files_stored);

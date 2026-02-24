@@ -248,7 +248,7 @@ fn test_indexing_and_search_projection_cleanup() -> anyhow::Result<()> {
 
     assert!(engine.search_symbol("Alpha").is_empty());
     let beta_search = engine.search_symbol("Beta");
-    assert!(beta_search.len() > 0);
+    assert!(!beta_search.is_empty());
     assert!(beta_search.iter().all(|id| *id != alpha_node_id));
 
     Ok(())

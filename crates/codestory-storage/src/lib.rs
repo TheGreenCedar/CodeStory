@@ -12,6 +12,10 @@ use std::time::Duration;
 use thiserror::Error;
 
 const SCHEMA_VERSION: u32 = 1;
+const RELATED_NODE_SUBQUERY: &str = "SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1";
+const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, t.serialized_name
+                 FROM edge e
+                 JOIN node t ON t.id = e.target_node_id";
 
 #[derive(Error, Debug)]
 pub enum StorageError {
@@ -849,13 +853,10 @@ impl Storage {
     ) -> Result<FileProjectionRemovalSummary, StorageError> {
         let tx = self.conn.transaction()?;
 
-        let node_ids_query = "
-            SELECT DISTINCT id FROM node
-            WHERE id = ?1 OR file_node_id = ?1
-        ";
+        let node_ids_query = format!("SELECT DISTINCT id FROM ({RELATED_NODE_SUBQUERY})");
         let mut related_node_ids = Vec::new();
         {
-            let mut node_ids_stmt = tx.prepare(node_ids_query)?;
+            let mut node_ids_stmt = tx.prepare(&node_ids_query)?;
             let mut node_rows = node_ids_stmt.query(params![file_node_id])?;
             while let Some(row) = node_rows.next()? {
                 related_node_ids.push(row.get::<_, i64>(0)?);
@@ -863,43 +864,33 @@ impl Storage {
         }
 
         let removed_edges = tx.execute(
-            "DELETE FROM edge
-             WHERE source_node_id IN (
-                 SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1
-             )
-             OR target_node_id IN (
-                 SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1
-             )
-             OR resolved_source_node_id IN (
-                 SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1
-             )
-             OR resolved_target_node_id IN (
-                 SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1
-             )
-             OR file_node_id = ?1",
+            &format!(
+                "DELETE FROM edge
+                 WHERE source_node_id IN ({RELATED_NODE_SUBQUERY})
+                 OR target_node_id IN ({RELATED_NODE_SUBQUERY})
+                 OR resolved_source_node_id IN ({RELATED_NODE_SUBQUERY})
+                 OR resolved_target_node_id IN ({RELATED_NODE_SUBQUERY})
+                 OR file_node_id = ?1"
+            ),
             params![file_node_id],
         )?;
 
         let removed_occurrences = tx.execute(
-            "DELETE FROM occurrence
-             WHERE file_node_id = ?1
-             OR element_id IN (
-                 SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1
-             )",
+            &format!(
+                "DELETE FROM occurrence
+                 WHERE file_node_id = ?1
+                 OR element_id IN ({RELATED_NODE_SUBQUERY})"
+            ),
             params![file_node_id],
         )?;
 
         let removed_bookmarks = tx.execute(
-            "DELETE FROM bookmark_node WHERE node_id IN (
-                SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1
-            )",
+            &format!("DELETE FROM bookmark_node WHERE node_id IN ({RELATED_NODE_SUBQUERY})"),
             params![file_node_id],
         )?;
 
         let removed_component_access = tx.execute(
-            "DELETE FROM component_access WHERE node_id IN (
-                SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1
-            )",
+            &format!("DELETE FROM component_access WHERE node_id IN ({RELATED_NODE_SUBQUERY})"),
             params![file_node_id],
         )?;
 
@@ -1174,16 +1165,9 @@ impl Storage {
 
                 for edge in edges {
                     result.edges.push(edge.clone());
-
-                    let (eff_source, eff_target) = edge.effective_endpoints();
-                    let neighbor_id = if eff_source == current_id {
-                        eff_target
-                    } else if eff_target == current_id {
-                        eff_source
-                    } else if edge.source == current_id {
-                        edge.target
-                    } else {
-                        edge.source
+                    let Some(neighbor_id) = neighbor_for_direction(current_id, direction, &edge)
+                    else {
+                        continue;
                     };
 
                     if !visited.contains(&neighbor_id) {
@@ -1430,33 +1414,8 @@ impl Storage {
 
             let edges = self.get_edges_for_node(current_id, &direction, edge_filter)?;
             for edge in edges {
-                let (eff_source, eff_target) = edge.effective_endpoints();
-                let neighbor_id = match direction {
-                    TrailDirection::Outgoing => {
-                        if eff_source == current_id {
-                            eff_target
-                        } else {
-                            continue;
-                        }
-                    }
-                    TrailDirection::Incoming => {
-                        if eff_target == current_id {
-                            eff_source
-                        } else {
-                            continue;
-                        }
-                    }
-                    TrailDirection::Both => {
-                        // Not used by ToTargetSymbol distance discovery.
-
-                        if eff_source == current_id {
-                            eff_target
-                        } else if eff_target == current_id {
-                            eff_source
-                        } else {
-                            continue;
-                        }
-                    }
+                let Some(neighbor_id) = neighbor_for_direction(current_id, direction, &edge) else {
+                    continue;
                 };
 
                 if let std::collections::hash_map::Entry::Vacant(e) = dist.entry(neighbor_id) {
@@ -1477,28 +1436,16 @@ impl Storage {
         direction: &TrailDirection,
         edge_filter: &[EdgeKind],
     ) -> Result<Vec<Edge>, StorageError> {
-        let query = match direction {
-            TrailDirection::Outgoing => {
-                "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, t.serialized_name
-                 FROM edge e
-                 JOIN node t ON t.id = e.target_node_id
-                 WHERE e.source_node_id = ?1 OR e.resolved_source_node_id = ?1"
-            }
-            TrailDirection::Incoming => {
-                "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, t.serialized_name
-                 FROM edge e
-                 JOIN node t ON t.id = e.target_node_id
-                 WHERE e.target_node_id = ?1 OR e.resolved_target_node_id = ?1"
-            }
+        let where_clause = match direction {
+            TrailDirection::Outgoing => "e.source_node_id = ?1 OR e.resolved_source_node_id = ?1",
+            TrailDirection::Incoming => "e.target_node_id = ?1 OR e.resolved_target_node_id = ?1",
             TrailDirection::Both => {
-                "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, t.serialized_name
-                 FROM edge e
-                 JOIN node t ON t.id = e.target_node_id
-                 WHERE e.source_node_id = ?1 OR e.target_node_id = ?1 OR e.resolved_source_node_id = ?1 OR e.resolved_target_node_id = ?1"
+                "e.source_node_id = ?1 OR e.target_node_id = ?1 OR e.resolved_source_node_id = ?1 OR e.resolved_target_node_id = ?1"
             }
         };
+        let query = format!("{EDGE_SELECT_BASE} WHERE {where_clause}");
 
-        let mut stmt = self.conn.prepare(query)?;
+        let mut stmt = self.conn.prepare(&query)?;
         let mut edges = Vec::new();
         let mut rows = stmt.query(params![node_id.0])?;
 
@@ -1538,6 +1485,47 @@ impl Storage {
     /// Get all edges connected to a node (both directions)
     pub fn get_edges_for_node_id(&self, node_id: NodeId) -> Result<Vec<Edge>, StorageError> {
         self.get_edges_for_node(node_id, &TrailDirection::Both, &[])
+    }
+}
+
+fn neighbor_for_direction(
+    current_id: NodeId,
+    direction: TrailDirection,
+    edge: &Edge,
+) -> Option<NodeId> {
+    let (eff_source, eff_target) = edge.effective_endpoints();
+    match direction {
+        TrailDirection::Outgoing => {
+            if eff_source == current_id {
+                Some(eff_target)
+            } else if edge.source == current_id {
+                Some(edge.target)
+            } else {
+                None
+            }
+        }
+        TrailDirection::Incoming => {
+            if eff_target == current_id {
+                Some(eff_source)
+            } else if edge.target == current_id {
+                Some(edge.source)
+            } else {
+                None
+            }
+        }
+        TrailDirection::Both => {
+            if eff_source == current_id {
+                Some(eff_target)
+            } else if eff_target == current_id {
+                Some(eff_source)
+            } else if edge.source == current_id {
+                Some(edge.target)
+            } else if edge.target == current_id {
+                Some(edge.source)
+            } else {
+                None
+            }
+        }
     }
 }
 

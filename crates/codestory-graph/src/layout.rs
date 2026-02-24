@@ -6,12 +6,16 @@ use std::collections::HashMap;
 /// Returns a map of NodeIndex -> Rank (0-based level).
 /// Handles cycles by limiting iterations.
 pub fn compute_dag_ranks(model: &GraphModel) -> HashMap<NodeIndex, i32> {
+    compute_longest_path_ranks(model, 1000)
+}
+
+fn compute_longest_path_ranks(model: &GraphModel, max_iterations_cap: usize) -> HashMap<NodeIndex, i32> {
     let mut ranks: HashMap<NodeIndex, i32> = HashMap::new();
     for node in model.graph.node_indices() {
         ranks.insert(node, 0);
     }
 
-    let max_iterations = (model.node_count() + 2).min(1000);
+    let max_iterations = (model.node_count() + 2).min(max_iterations_cap);
 
     for _ in 0..max_iterations {
         let mut changed = false;
@@ -616,41 +620,11 @@ impl HierarchicalLayouter {
     /// For any directed edge (A -> B), rank(B) > rank(A).
     /// Nodes with zero incoming edges get rank 0 (leftmost layer).
     pub fn assign_ranks(&self, model: &GraphModel) -> HashMap<NodeIndex, i32> {
-        let mut ranks: HashMap<NodeIndex, i32> = HashMap::new();
-
-        // Initialize all nodes to rank 0
-        for node in model.graph.node_indices() {
-            ranks.insert(node, 0);
-        }
-
         if model.node_count() == 0 {
-            return ranks;
+            return HashMap::new();
         }
 
-        // Iterative longest-path: push targets to rank >= source_rank + 1
-        let max_iterations = (model.node_count() + 2).min(Self::MAX_RANKING_ITERATIONS);
-        for _ in 0..max_iterations {
-            let mut changed = false;
-            for edge_idx in model.graph.edge_indices() {
-                if let Some((source, target)) = model.graph.edge_endpoints(edge_idx) {
-                    if source == target {
-                        continue; // skip self-loops
-                    }
-                    let source_rank = ranks.get(&source).copied().unwrap_or_default();
-                    let target_rank = ranks.get(&target).copied().unwrap_or_default();
-
-                    if target_rank < source_rank + 1 {
-                        ranks.insert(target, source_rank + 1);
-                        changed = true;
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-
-        ranks
+        compute_longest_path_ranks(model, Self::MAX_RANKING_ITERATIONS)
     }
 
     /// Group nodes into layers based on their ranks.
@@ -2108,10 +2082,10 @@ mod property_tests {
             // Find nodes with zero incoming edges
             let mut has_incoming: std::collections::HashSet<NodeIndex> = std::collections::HashSet::new();
             for edge_idx in model.graph.edge_indices() {
-                if let Some((source, target)) = model.graph.edge_endpoints(edge_idx) {
-                    if source != target {
-                        has_incoming.insert(target);
-                    }
+                if let Some((source, target)) = model.graph.edge_endpoints(edge_idx)
+                    && source != target
+                {
+                    has_incoming.insert(target);
                 }
             }
 
