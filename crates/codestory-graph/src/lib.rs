@@ -13,11 +13,7 @@ pub use graph::{
     DummyEdge, DummyNode, EdgeIndex, GraphModel, GroupLayout, GroupType, NodeIndex, Vec2,
 };
 pub use hit_tester::{EdgeBundleRegion, HitResult, HitTester};
-pub use layout::{
-    BucketLayouter, EdgeBundler, EnhancedLayouter, ForceDirectedLayouter, GridLayouter,
-    HierarchicalLayouter, Layouter, ListLayouter, NestingLayouter, RadialLayouter, RankAlgorithm,
-    TrailLayouter,
-};
+pub use layout::{EdgeBundler, Layouter, NestingLayouter};
 pub use style::{
     Color, EdgeStyle, GroupType as StyleGroupType, NodeColors, NodeStyle, get_bundle_style,
     get_edge_kind_label, get_edge_style, get_group_style, get_kind_label, get_node_colors,

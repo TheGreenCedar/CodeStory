@@ -18,7 +18,6 @@ For a walkthrough of the UI, see `USER_GUIDE.md`. For architecture and contribut
 
 ### Prerequisites
 
-- Rust toolchain: this repo pins **nightly** via `rust-toolchain.toml`. I'll use stable releases once I'm happy enough with the feature set and can spend time stabilizing.
 - A C/C++ toolchain may be required on some platforms because dependencies can include native components
 
 ### Run The CLI

@@ -7,11 +7,11 @@ edition = "2024"
 codestory-core = { workspace = true }
 codestory-events = { workspace = true }
 
-oak-visualize = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

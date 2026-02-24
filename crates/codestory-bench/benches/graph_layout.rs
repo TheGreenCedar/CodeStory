@@ -1,9 +1,11 @@
+use std::hint::black_box;
+
 use codestory_core::{Node, NodeId, NodeKind};
 use codestory_graph::graph::GraphModel;
-use codestory_graph::layout::{GridLayouter, Layouter};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use codestory_graph::layout::{Layouter, NestingLayouter};
+use criterion::{Criterion, criterion_group, criterion_main};
 
-fn bench_grid_layout_1000_nodes(c: &mut Criterion) {
+fn bench_nesting_layout_1000_nodes(c: &mut Criterion) {
     let mut model = GraphModel::new();
     let node_count = 1000;
 
@@ -17,15 +19,19 @@ fn bench_grid_layout_1000_nodes(c: &mut Criterion) {
         });
     }
 
-    let layouter = GridLayouter { spacing: 100.0 };
+    let layouter = NestingLayouter {
+        inner_padding: NestingLayouter::DEFAULT_INNER_PADDING,
+        child_spacing: NestingLayouter::DEFAULT_CHILD_SPACING,
+        direction: codestory_core::LayoutDirection::Vertical,
+    };
 
-    c.bench_function("grid_layout_1000_nodes", |b| {
+    c.bench_function("nesting_layout_1000_nodes", |b| {
         b.iter(|| {
-            let positions = layouter.execute(black_box(&model));
-            black_box(positions);
+            let (positions, sizes) = layouter.execute(black_box(&model));
+            black_box((positions, sizes));
         })
     });
 }
 
-criterion_group!(benches, bench_grid_layout_1000_nodes);
+criterion_group!(benches, bench_nesting_layout_1000_nodes);
 criterion_main!(benches);

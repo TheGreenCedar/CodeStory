@@ -73,10 +73,7 @@ sysinfo = "0.38"
 feature-probe = "0.1.1"
 tempfile = "3.10"
 
-# Experimental Layout
-oak-visualize = "0.0.1"
-
-criterion = "0.5"
+criterion = "0.8.2"
 proptest = "1.5"
 
 [profile.dev]
