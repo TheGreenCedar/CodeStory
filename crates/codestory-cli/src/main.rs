@@ -79,26 +79,28 @@ fn main() -> Result<()> {
 
     // 4. Parallel Indexing
     let files_processed = AtomicUsize::new(0);
-    files_to_index.par_iter().for_each_with(tx.clone(), |sender, path| {
-        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-        let Some((lang, lang_name, graph_query)) = get_language_for_ext(ext) else {
-            return;
-        };
-        let Ok(source) = std::fs::read_to_string(path) else {
-            return;
-        };
+    files_to_index
+        .par_iter()
+        .for_each_with(tx.clone(), |sender, path| {
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            let Some((lang, lang_name, graph_query)) = get_language_for_ext(ext) else {
+                return;
+            };
+            let Ok(source) = std::fs::read_to_string(path) else {
+                return;
+            };
 
-        match index_file(path, &source, lang, lang_name, graph_query, None, None) {
-            Ok(result) => {
-                if sender.send(result).is_ok() {
-                    files_processed.fetch_add(1, Ordering::Relaxed);
+            match index_file(path, &source, lang, lang_name, graph_query, None, None) {
+                Ok(result) => {
+                    if sender.send(result).is_ok() {
+                        files_processed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error indexing {:?}: {}", path, e);
                 }
             }
-            Err(e) => {
-                eprintln!("Error indexing {:?}: {}", path, e);
-            }
-        }
-    });
+        });
     let files_processed = files_processed.load(Ordering::Relaxed);
 
     // Drop the sender to close the channel so the writer thread exits

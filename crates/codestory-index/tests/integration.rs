@@ -4,17 +4,46 @@ use codestory_index::WorkspaceIndexer;
 use codestory_search::SearchEngine;
 use codestory_storage::Storage;
 use std::fs;
+use std::path::{Path, PathBuf};
 use tempfile::tempdir;
+
+fn run_incremental_indexing(
+    root: &Path,
+    storage: &mut Storage,
+    files_to_index: Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    let indexer = WorkspaceIndexer::new(root.to_path_buf());
+    let event_bus = EventBus::new();
+    let refresh_info = codestory_project::RefreshInfo {
+        files_to_index,
+        files_to_remove: vec![],
+    };
+    indexer.run_incremental(storage, &refresh_info, &event_bus, None)?;
+    Ok(())
+}
+
+fn index_project(files: &[(&str, &str)]) -> anyhow::Result<Storage> {
+    let dir = tempdir()?;
+    let root = dir.path();
+    let mut indexed_files = Vec::with_capacity(files.len());
+    for (relative_path, contents) in files {
+        let path = root.join(relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, contents)?;
+        indexed_files.push(path);
+    }
+
+    let mut storage = Storage::new_in_memory()?;
+    run_incremental_indexing(root, &mut storage, indexed_files)?;
+    Ok(storage)
+}
 
 #[test]
 fn test_integration_full_loop() -> anyhow::Result<()> {
-    let dir = tempdir()?;
-    let root = dir.path();
-
-    // 1. Create a small project
-    let f1 = root.join("main.cpp");
-    fs::write(
-        &f1,
+    let storage = index_project(&[(
+        "main.cpp",
         r#"
 class MyClass {
 public:
@@ -27,19 +56,7 @@ int main() {
     return 0;
 }
 "#,
-    )?;
-
-    // 2. Index the project
-    let mut storage = Storage::new_in_memory()?;
-    let indexer = WorkspaceIndexer::new(root.to_path_buf());
-    let event_bus = EventBus::new();
-
-    let refresh_info = codestory_project::RefreshInfo {
-        files_to_index: vec![f1.clone()],
-        files_to_remove: vec![],
-    };
-
-    indexer.run_incremental(&mut storage, &refresh_info, &event_bus, None)?;
+    )])?;
 
     // 3. Verify Storage
     let nodes = storage.get_nodes()?;
@@ -98,16 +115,8 @@ fn test_incremental_indexing_modification() -> anyhow::Result<()> {
     fs::write(&f1, "struct Foo {}")?;
 
     let mut storage = Storage::new_in_memory()?;
-    let indexer = WorkspaceIndexer::new(root.to_path_buf());
-    let event_bus = EventBus::new();
-
     // 2. Index initial version
-    let refresh_info = codestory_project::RefreshInfo {
-        files_to_index: vec![f1.clone()],
-        files_to_remove: vec![],
-    };
-
-    indexer.run_incremental(&mut storage, &refresh_info, &event_bus, None)?;
+    run_incremental_indexing(root, &mut storage, vec![f1.clone()])?;
 
     let nodes = storage.get_nodes()?;
     assert!(nodes.iter().any(|n| n.serialized_name == "Foo"));
@@ -116,12 +125,7 @@ fn test_incremental_indexing_modification() -> anyhow::Result<()> {
     // 3. Modify file to add new symbol
     fs::write(&f1, "struct Foo {}\nstruct Bar {}")?;
 
-    let refresh_info = codestory_project::RefreshInfo {
-        files_to_index: vec![f1.clone()],
-        files_to_remove: vec![],
-    };
-
-    indexer.run_incremental(&mut storage, &refresh_info, &event_bus, None)?;
+    run_incremental_indexing(root, &mut storage, vec![f1.clone()])?;
 
     // 4. Verify both symbols exist
     let nodes = storage.get_nodes()?;
@@ -134,35 +138,19 @@ fn test_incremental_indexing_modification() -> anyhow::Result<()> {
 
 #[test]
 fn test_multi_file_cross_references() -> anyhow::Result<()> {
-    let dir = tempdir()?;
-    let root = dir.path();
-
-    // Create files with cross-references
-    let f1 = root.join("types.rs");
-    let f2 = root.join("main.rs");
-
-    fs::write(&f1, "pub struct MyType { pub value: i32 }")?;
-    fs::write(
-        &f2,
-        r#"
+    let storage = index_project(&[
+        ("types.rs", "pub struct MyType { pub value: i32 }"),
+        (
+            "main.rs",
+            r#"
 use types::MyType;
 
 fn process(t: MyType) {
     println!("{}", t.value);
 }
 "#,
-    )?;
-
-    let mut storage = Storage::new_in_memory()?;
-    let indexer = WorkspaceIndexer::new(root.to_path_buf());
-    let event_bus = EventBus::new();
-
-    let refresh_info = codestory_project::RefreshInfo {
-        files_to_index: vec![f1.clone(), f2.clone()],
-        files_to_remove: vec![],
-    };
-
-    indexer.run_incremental(&mut storage, &refresh_info, &event_bus, None)?;
+        ),
+    ])?;
 
     let nodes = storage.get_nodes()?;
     let edges = storage.get_edges()?;
@@ -179,23 +167,8 @@ fn process(t: MyType) {
 
 #[test]
 fn test_indexing_and_search_projection_cleanup() -> anyhow::Result<()> {
-    let dir = tempdir()?;
-    let root = dir.path();
-    let file_a = root.join("a.rs");
-    let file_b = root.join("b.rs");
-
-    fs::write(&file_a, "struct Alpha {}\n")?;
-    fs::write(&file_b, "struct Beta {}\n")?;
-
-    let mut storage = Storage::new_in_memory()?;
-    let indexer = WorkspaceIndexer::new(root.to_path_buf());
-    let event_bus = EventBus::new();
-
-    let refresh_info = codestory_project::RefreshInfo {
-        files_to_index: vec![file_a.clone(), file_b.clone()],
-        files_to_remove: vec![],
-    };
-    indexer.run_incremental(&mut storage, &refresh_info, &event_bus, None)?;
+    let mut storage =
+        index_project(&[("a.rs", "struct Alpha {}\n"), ("b.rs", "struct Beta {}\n")])?;
 
     let mut engine = SearchEngine::new(None)?;
     let nodes = storage.get_nodes()?;

@@ -148,13 +148,7 @@ impl EdgeRouter {
         // Prevent control points from scaling unbounded with edge length.
         // If they do, edges can "swing" far outside the viewport and look comically long.
         const MAX_CONTROL_LEN: f32 = 260.0;
-
-        // Basic vector math helper since Vec2 might not implement ops
-        let sub = |a: Vec2, b: Vec2| Vec2::new(a.x - b.x, a.y - b.y);
-        let add = |a: Vec2, b: Vec2| Vec2::new(a.x + b.x, a.y + b.y);
-        let mul = |v: Vec2, s: f32| Vec2::new(v.x * s, v.y * s);
-
-        let delta = sub(end, start);
+        let delta = end - start;
 
         // Use a directionally-biased "distance" instead of full Euclidean distance.
         // This keeps curves stable when nodes are far apart vertically but close horizontally,
@@ -182,9 +176,9 @@ impl EdgeRouter {
         }
 
         // control1 = start + start_dir * curve_len
-        let control1 = add(start, mul(start_dir, curve_len));
+        let control1 = start + (start_dir * curve_len);
         // control2 = end + end_dir * curve_len
-        let control2 = add(end, mul(end_dir, curve_len));
+        let control2 = end + (end_dir * curve_len);
 
         CubicBezier {
             start,
@@ -197,14 +191,9 @@ impl EdgeRouter {
     /// Calculate the best anchor point on the border of `rect` to connect to `target_center`.
     pub fn calculate_anchor(&self, rect: Rect, target_center: Vec2) -> Vec2 {
         let center = rect.center();
-
-        // Basic vector math helper
-        let sub = |a: Vec2, b: Vec2| Vec2::new(a.x - b.x, a.y - b.y);
-        let add = |a: Vec2, b: Vec2| Vec2::new(a.x + b.x, a.y + b.y);
-        let mul = |v: Vec2, s: f32| Vec2::new(v.x * s, v.y * s);
         let len_sq = |v: Vec2| v.x * v.x + v.y * v.y;
 
-        let vec = sub(target_center, center);
+        let vec = target_center - center;
 
         if len_sq(vec) < 1.0 {
             return center;
@@ -256,7 +245,7 @@ impl EdgeRouter {
             return center; // Should not happen ideally
         }
 
-        add(center, mul(vec, t_min))
+        center + (vec * t_min)
     }
 
     /// Bundle edges that share the same source and target nodes.
@@ -288,12 +277,18 @@ impl EdgeRouter {
         for ((source_node, target_node), group) in groups {
             if group.len() >= BUNDLE_THRESHOLD {
                 // Create a bundle
-                let edge_ids: Vec<EdgeId> = group.iter().map(|e| e.id).collect();
-                let edge_kinds: Vec<EdgeKind> = group.iter().map(|e| e.kind).collect();
-                let relationships: Vec<(String, String, EdgeKind)> = group
-                    .iter()
-                    .map(|e| (e.source_label.clone(), e.target_label.clone(), e.kind))
-                    .collect();
+                let mut edge_ids = Vec::with_capacity(group.len());
+                let mut edge_kinds = Vec::with_capacity(group.len());
+                let mut relationships = Vec::with_capacity(group.len());
+                for edge in group {
+                    edge_ids.push(edge.id);
+                    edge_kinds.push(edge.kind);
+                    relationships.push((
+                        edge.source_label.clone(),
+                        edge.target_label.clone(),
+                        edge.kind,
+                    ));
+                }
 
                 let bundle_data = BundleData::new(edge_ids.clone(), edge_kinds, relationships);
 

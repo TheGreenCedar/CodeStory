@@ -117,6 +117,22 @@ impl AppController {
             .ok_or_else(no_project_error)
     }
 
+    fn open_storage(&self) -> Result<Storage, ApiError> {
+        let storage_path = self.require_storage_path()?;
+        Storage::open(&storage_path)
+            .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))
+    }
+
+    fn cached_labels<I>(&self, ids: I) -> HashMap<codestory_core::NodeId, String>
+    where
+        I: IntoIterator<Item = codestory_core::NodeId>,
+    {
+        let s = self.state.lock();
+        ids.into_iter()
+            .filter_map(|id| s.node_names.get(&id).cloned().map(|name| (id, name)))
+            .collect()
+    }
+
     pub fn open_project(&self, req: OpenProjectRequest) -> Result<ProjectSummary, ApiError> {
         let root = PathBuf::from(req.path);
         if !root.exists() {
@@ -214,19 +230,17 @@ impl AppController {
     }
 
     pub fn search(&self, req: SearchRequest) -> Result<Vec<SearchHit>, ApiError> {
-        let (storage_path, matches, node_names) = {
+        let (matches, node_names) = {
             let mut s = self.state.lock();
             let engine = s.search_engine.as_mut().ok_or_else(|| {
                 ApiError::invalid_argument("Search engine not initialized. Open a project first.")
             })?;
             let matches = engine.search_symbol_with_scores(&req.query);
-            let storage_path = s.storage_path.clone().ok_or_else(no_project_error)?;
             let node_names = s.node_names.clone();
-            (storage_path, matches, node_names)
+            (matches, node_names)
         };
 
-        let storage = Storage::open(&storage_path)
-            .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
+        let storage = self.open_storage()?;
 
         let mut hits = Vec::new();
         for (id, score) in matches {
@@ -265,12 +279,9 @@ impl AppController {
     }
 
     pub fn graph_neighborhood(&self, req: GraphRequest) -> Result<GraphResponse, ApiError> {
-        let storage_path = self.require_storage_path()?;
-
         let center = req.center_id.to_core()?;
 
-        let storage = Storage::open(&storage_path)
-            .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
+        let storage = self.open_storage()?;
 
         let max_edges = req.max_edges.unwrap_or(400).min(2_000) as usize;
         let mut edges = storage
@@ -309,16 +320,7 @@ impl AppController {
         }
 
         // Pull labels from cached names for a small subset of nodes.
-        let labels_by_id = {
-            let s = self.state.lock();
-            let mut labels = HashMap::new();
-            for id in &ordered_node_ids {
-                if let Some(name) = s.node_names.get(id) {
-                    labels.insert(*id, name.clone());
-                }
-            }
-            labels
-        };
+        let labels_by_id = self.cached_labels(ordered_node_ids.iter().copied());
 
         let mut node_dtos = Vec::with_capacity(ordered_node_ids.len());
         for id in ordered_node_ids {
@@ -348,8 +350,6 @@ impl AppController {
     }
 
     pub fn graph_trail(&self, req: TrailConfigDto) -> Result<GraphResponse, ApiError> {
-        let storage_path = self.require_storage_path()?;
-
         let root_id = req.root_id.to_core()?;
         let target_id = match req.target_id {
             Some(id) => Some(id.to_core()?),
@@ -367,8 +367,7 @@ impl AppController {
             max_nodes: req.max_nodes.clamp(10, 100_000) as usize,
         };
 
-        let storage = Storage::open(&storage_path)
-            .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
+        let storage = self.open_storage()?;
 
         let result = storage
             .get_trail(&config)
@@ -382,16 +381,7 @@ impl AppController {
         } = result;
 
         // Pull labels from cached names for the returned node set.
-        let labels_by_id = {
-            let s = self.state.lock();
-            let mut labels = HashMap::new();
-            for node in &nodes {
-                if let Some(name) = s.node_names.get(&node.id) {
-                    labels.insert(node.id, name.clone());
-                }
-            }
-            labels
-        };
+        let labels_by_id = self.cached_labels(nodes.iter().map(|node| node.id));
 
         let mut node_dtos = Vec::with_capacity(nodes.len());
         for node in nodes {
@@ -430,12 +420,9 @@ impl AppController {
     }
 
     pub fn node_details(&self, req: NodeDetailsRequest) -> Result<NodeDetailsDto, ApiError> {
-        let storage_path = self.require_storage_path()?;
-
         let id = req.id.to_core()?;
 
-        let storage = Storage::open(&storage_path)
-            .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
+        let storage = self.open_storage()?;
 
         let node = storage
             .get_node(id)
@@ -589,7 +576,10 @@ fn run_indexing_common<F>(
     refresh_builder: F,
 ) -> Result<(), ApiError>
 where
-    F: FnOnce(&codestory_project::Project, &Storage) -> Result<codestory_project::RefreshInfo, ApiError>,
+    F: FnOnce(
+        &codestory_project::Project,
+        &Storage,
+    ) -> Result<codestory_project::RefreshInfo, ApiError>,
 {
     let start_time = std::time::Instant::now();
 

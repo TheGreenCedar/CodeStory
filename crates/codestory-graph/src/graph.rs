@@ -2,7 +2,7 @@ use codestory_core::{BundleInfo, Edge, EdgeId, Node, NodeId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
-use std::ops::{Index, IndexMut};
+use std::ops::{Add, Index, IndexMut, Mul, Sub};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeIndex(pub usize);
@@ -31,6 +31,30 @@ pub struct Vec2 {
 impl Vec2 {
     pub fn new(x: f32, y: f32) -> Self {
         Self { x, y }
+    }
+}
+
+impl Add for Vec2 {
+    type Output = Vec2;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Vec2::new(self.x + rhs.x, self.y + rhs.y)
+    }
+}
+
+impl Sub for Vec2 {
+    type Output = Vec2;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Vec2::new(self.x - rhs.x, self.y - rhs.y)
+    }
+}
+
+impl Mul<f32> for Vec2 {
+    type Output = Vec2;
+
+    fn mul(self, rhs: f32) -> Self::Output {
+        Vec2::new(self.x * rhs, self.y * rhs)
     }
 }
 
@@ -283,22 +307,25 @@ impl GraphModel {
 
     pub fn rebuild_hierarchy(&mut self) {
         // Clear existing hierarchy
-        let indices: Vec<_> = self.graph.node_indices().collect();
-        for node_idx in indices {
+        for index in 0..self.graph.nodes.len() {
+            let node_idx = NodeIndex(index);
             let node = &mut self.graph[node_idx];
             node.children.clear();
             node.parent = None;
         }
 
-        let mut parent_child_pairs = Vec::new();
-        for edge_idx in self.graph.edge_indices() {
-            let edge = &self.graph[edge_idx];
-            if edge.kind == codestory_core::EdgeKind::MEMBER {
-                parent_child_pairs.push((edge.source, edge.target));
+        for edge_index in 0..self.graph.edges.len() {
+            let (parent_id, child_id, is_member_edge) = {
+                let edge = &self.graph.edges[edge_index];
+                (
+                    edge.source,
+                    edge.target,
+                    edge.kind == codestory_core::EdgeKind::MEMBER,
+                )
+            };
+            if !is_member_edge {
+                continue;
             }
-        }
-
-        for (parent_id, child_id) in parent_child_pairs {
             if let (Some(&p_idx), Some(&c_idx)) =
                 (self.node_map.get(&parent_id), self.node_map.get(&child_id))
             {
@@ -312,16 +339,14 @@ impl GraphModel {
     }
 
     pub fn expand_all(&mut self) {
-        let indices: Vec<_> = self.graph.node_indices().collect();
-        for node_idx in indices {
-            self.graph[node_idx].expanded = true;
+        for node in &mut self.graph.nodes {
+            node.expanded = true;
         }
     }
 
     pub fn collapse_all(&mut self) {
-        let indices: Vec<_> = self.graph.node_indices().collect();
-        for node_idx in indices {
-            self.graph[node_idx].expanded = false;
+        for node in &mut self.graph.nodes {
+            node.expanded = false;
         }
     }
 

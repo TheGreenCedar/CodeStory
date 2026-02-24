@@ -3,10 +3,11 @@ use codestory_core::NodeId;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32String};
 use std::collections::HashSet;
+use std::path::Path;
 use tantivy::collector::TopDocs;
 use tantivy::doc;
 use tantivy::query::QueryParser;
-use tantivy::schema::*;
+use tantivy::schema::{FAST, INDEXED, STORED, Schema, TEXT, Value};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 pub struct SearchEngine {
@@ -21,7 +22,7 @@ pub struct SearchEngine {
 }
 
 impl SearchEngine {
-    pub fn new(storage_path: Option<&std::path::Path>) -> Result<Self> {
+    pub fn new(storage_path: Option<&Path>) -> Result<Self> {
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("name", TEXT | STORED);
         schema_builder.add_i64_field("node_id", INDEXED | STORED | FAST);
@@ -33,8 +34,8 @@ impl SearchEngine {
                 Ok(index) => index,
                 Err(open_err) => Index::create_in_dir(path, schema.clone()).with_context(|| {
                     format!(
-                        "Failed to open existing tantivy index at {:?}: {}",
-                        path, open_err
+                        "Failed to open existing tantivy index at {}: {open_err}",
+                        path.display()
                     )
                 })?,
             }

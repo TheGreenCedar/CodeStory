@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use codestory_events::{Event, EventBus};
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tree_sitter::{Language, Parser};
 use tree_sitter_graph::ast::File as GraphFile;
 use tree_sitter_graph::functions::Functions;
@@ -196,7 +196,9 @@ impl WorkspaceIndexer {
     }
 
     fn is_cancelled(cancel_token: Option<&CancellationToken>) -> bool {
-        cancel_token.map(CancellationToken::is_cancelled).unwrap_or(false)
+        cancel_token
+            .map(CancellationToken::is_cancelled)
+            .unwrap_or(false)
     }
 
     fn seed_symbol_table(storage: &Storage, symbol_table: &SymbolTable) {
@@ -354,7 +356,10 @@ fn node_kind_from_graph_kind(kind_str: &str) -> NodeKind {
     }
 }
 
-fn definition_occurrences(unique_nodes: &HashMap<NodeId, Node>, file_id: NodeId) -> Vec<Occurrence> {
+fn definition_occurrences(
+    unique_nodes: &HashMap<NodeId, Node>,
+    file_id: NodeId,
+) -> Vec<Occurrence> {
     let mut occurrences = Vec::new();
     for node in unique_nodes.values() {
         if let (Some(start_line), Some(start_col), Some(end_line), Some(end_col)) =
@@ -492,10 +497,7 @@ fn remap_edges(edges: &mut [Edge], new_file_id: NodeId, id_remap: &HashMap<NodeI
     }
 }
 
-fn remap_occurrences(
-    occurrences: &mut [Occurrence],
-    id_remap: &HashMap<NodeId, NodeId>,
-) {
+fn remap_occurrences(occurrences: &mut [Occurrence], id_remap: &HashMap<NodeId, NodeId>) {
     for occ in occurrences.iter_mut() {
         if let Some(new_id) = id_remap.get(&NodeId(occ.element_id)) {
             occ.element_id = new_id.0;
@@ -567,23 +569,14 @@ pub fn index_file(
         let mut end_col: Option<u32> = None;
 
         for (attr, val) in node_data.attributes.iter() {
-            if attr.as_str() == "kind" {
-                kind_str = val.as_str().unwrap_or("UNKNOWN").to_string();
-            }
-            if attr.as_str() == "name" {
-                name_str = val.as_str().unwrap_or("").to_string();
-            }
-            if attr.as_str() == "start_row" {
-                start_row = val.as_integer().ok();
-            }
-            if attr.as_str() == "start_col" {
-                start_col = val.as_integer().ok();
-            }
-            if attr.as_str() == "end_row" {
-                end_row = val.as_integer().ok();
-            }
-            if attr.as_str() == "end_col" {
-                end_col = val.as_integer().ok();
+            match attr.as_str() {
+                "kind" => kind_str = val.as_str().unwrap_or("UNKNOWN").to_string(),
+                "name" => name_str = val.as_str().unwrap_or("").to_string(),
+                "start_row" => start_row = val.as_integer().ok(),
+                "start_col" => start_col = val.as_integer().ok(),
+                "end_row" => end_row = val.as_integer().ok(),
+                "end_col" => end_col = val.as_integer().ok(),
+                _ => {}
             }
         }
 

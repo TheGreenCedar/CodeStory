@@ -89,6 +89,7 @@ impl ResolutionPass {
             NodeKind::METHOD as i32,
             NodeKind::MACRO as i32,
         ];
+        let function_kind_clause = kind_clause(&function_kinds);
 
         for (edge_id, file_id, caller_qualified, target_name) in rows {
             let is_common_unqualified = is_common_unqualified_call_name(&target_name);
@@ -100,7 +101,7 @@ impl ResolutionPass {
             if !is_common_unqualified
                 && let Some(candidate) = find_same_file(
                     conn,
-                    &function_kinds,
+                    &function_kind_clause,
                     file_id,
                     &exact,
                     &suffix_dot,
@@ -114,7 +115,7 @@ impl ResolutionPass {
             if let Some(prefix) = caller_qualified.and_then(module_prefix)
                 && let Some(candidate) = find_same_module(
                     conn,
-                    &function_kinds,
+                    &function_kind_clause,
                     &prefix.0,
                     prefix.1,
                     &exact,
@@ -133,9 +134,13 @@ impl ResolutionPass {
                 continue;
             }
 
-            if let Some(candidate) =
-                find_global_unique(conn, &function_kinds, &exact, &suffix_dot, &suffix_colon)?
-            {
+            if let Some(candidate) = find_global_unique(
+                conn,
+                &function_kind_clause,
+                &exact,
+                &suffix_dot,
+                &suffix_colon,
+            )? {
                 resolved += update_edge_resolution(conn, edge_id, candidate, 0.6)?;
                 continue;
             }
@@ -160,13 +165,14 @@ impl ResolutionPass {
             NodeKind::NAMESPACE as i32,
             NodeKind::PACKAGE as i32,
         ];
+        let module_kind_clause = kind_clause(&module_kinds);
 
         for (edge_id, file_id, caller_qualified, target_name) in rows {
             let (exact, suffix_dot, suffix_colon) = name_patterns(&target_name);
 
             if let Some(candidate) = find_same_file(
                 conn,
-                &module_kinds,
+                &module_kind_clause,
                 file_id,
                 &exact,
                 &suffix_dot,
@@ -179,7 +185,7 @@ impl ResolutionPass {
             if let Some(prefix) = caller_qualified.and_then(module_prefix)
                 && let Some(candidate) = find_same_module(
                     conn,
-                    &module_kinds,
+                    &module_kind_clause,
                     &prefix.0,
                     prefix.1,
                     &exact,
@@ -191,16 +197,24 @@ impl ResolutionPass {
                 continue;
             }
 
-            if let Some(candidate) =
-                find_global_unique(conn, &module_kinds, &exact, &suffix_dot, &suffix_colon)?
-            {
+            if let Some(candidate) = find_global_unique(
+                conn,
+                &module_kind_clause,
+                &exact,
+                &suffix_dot,
+                &suffix_colon,
+            )? {
                 resolved += update_edge_resolution(conn, edge_id, candidate, 0.5)?;
                 continue;
             }
 
-            if let Some(candidate) =
-                find_fuzzy(conn, &module_kinds, &exact, &suffix_dot, &suffix_colon)?
-            {
+            if let Some(candidate) = find_fuzzy(
+                conn,
+                &module_kind_clause,
+                &exact,
+                &suffix_dot,
+                &suffix_colon,
+            )? {
                 resolved += update_edge_resolution(conn, edge_id, candidate, 0.3)?;
             }
         }
@@ -263,7 +277,7 @@ fn module_prefix(qualified: String) -> Option<(String, &'static str)> {
 
 fn find_same_file(
     conn: &rusqlite::Connection,
-    kinds: &[i32],
+    kind_clause: &str,
     file_id: Option<i64>,
     exact: &str,
     suffix_dot: &str,
@@ -278,7 +292,7 @@ fn find_same_file(
          AND file_node_id = ?1
          AND (serialized_name = ?2 OR serialized_name LIKE ?3 OR serialized_name LIKE ?4)
          ORDER BY start_line LIMIT 1",
-        kind_clause(kinds)
+        kind_clause
     );
     conn.query_row(
         &query,
@@ -291,7 +305,7 @@ fn find_same_file(
 
 fn find_same_module(
     conn: &rusqlite::Connection,
-    kinds: &[i32],
+    kind_clause: &str,
     module_prefix: &str,
     delimiter: &str,
     exact: &str,
@@ -305,7 +319,7 @@ fn find_same_module(
          AND qualified_name LIKE ?1
          AND (serialized_name = ?2 OR serialized_name LIKE ?3 OR serialized_name LIKE ?4)
          ORDER BY start_line LIMIT 1",
-        kind_clause(kinds)
+        kind_clause
     );
     conn.query_row(
         &query,
@@ -318,7 +332,7 @@ fn find_same_module(
 
 fn find_global_unique(
     conn: &rusqlite::Connection,
-    kinds: &[i32],
+    kind_clause: &str,
     exact: &str,
     suffix_dot: &str,
     suffix_colon: &str,
@@ -327,7 +341,7 @@ fn find_global_unique(
         "SELECT COUNT(*) FROM node
          WHERE kind IN ({})
          AND (serialized_name = ?1 OR serialized_name LIKE ?2 OR serialized_name LIKE ?3)",
-        kind_clause(kinds)
+        kind_clause
     );
     let count: i64 = conn.query_row(
         &count_query,
@@ -342,7 +356,7 @@ fn find_global_unique(
          WHERE kind IN ({})
          AND (serialized_name = ?1 OR serialized_name LIKE ?2 OR serialized_name LIKE ?3)
          LIMIT 1",
-        kind_clause(kinds)
+        kind_clause
     );
     conn.query_row(&query, params![exact, suffix_dot, suffix_colon], |row| {
         row.get(0)
@@ -353,7 +367,7 @@ fn find_global_unique(
 
 fn find_fuzzy(
     conn: &rusqlite::Connection,
-    kinds: &[i32],
+    kind_clause: &str,
     exact: &str,
     suffix_dot: &str,
     suffix_colon: &str,
@@ -364,7 +378,7 @@ fn find_fuzzy(
          WHERE kind IN ({})
          AND (serialized_name = ?1 OR serialized_name LIKE ?2 OR serialized_name LIKE ?3 OR serialized_name LIKE ?4)
          ORDER BY start_line LIMIT 1",
-        kind_clause(kinds)
+        kind_clause
     );
     conn.query_row(
         &query,

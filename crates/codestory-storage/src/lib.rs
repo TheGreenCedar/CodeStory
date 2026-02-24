@@ -110,6 +110,12 @@ impl Storage {
     }
 
     fn init(&self) -> Result<(), StorageError> {
+        self.create_tables()?;
+        self.create_indexes()?;
+        self.apply_schema_migrations()
+    }
+
+    fn create_tables(&self) -> Result<(), StorageError> {
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS node (
                 id INTEGER PRIMARY KEY,
@@ -231,51 +237,45 @@ impl Storage {
             )",
             [],
         )?;
+        Ok(())
+    }
 
+    fn create_indexes(&self) -> Result<(), StorageError> {
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_occurrence_element ON occurrence(element_id)",
             [],
         )?;
-
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_occurrence_file ON occurrence(file_node_id)",
             [],
         )?;
-
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_edge_source ON edge(source_node_id)",
             [],
         )?;
-
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_edge_target ON edge(target_node_id)",
             [],
         )?;
-
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_node_file ON node(file_node_id)",
             [],
         )?;
-
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_node_qualified_name ON node(qualified_name)",
             [],
         )?;
-
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_edge_resolved_source ON edge(resolved_source_node_id)",
             [],
         )?;
-
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_edge_resolved_target ON edge(resolved_target_node_id)",
             [],
         )?;
-
         self.conn
             .execute("CREATE INDEX IF NOT EXISTS idx_edge_line ON edge(line)", [])?;
-
-        self.apply_schema_migrations()
+        Ok(())
     }
 
     fn schema_version(&self) -> Result<u32, StorageError> {
@@ -339,6 +339,39 @@ impl Storage {
         })
     }
 
+    fn occurrence_from_row(row: &Row) -> rusqlite::Result<Occurrence> {
+        let kind_int: i32 = row.get(1)?;
+        Ok(Occurrence {
+            element_id: row.get(0)?,
+            kind: OccurrenceKind::try_from(kind_int).unwrap_or(OccurrenceKind::UNKNOWN),
+            location: codestory_core::SourceLocation {
+                file_node_id: codestory_core::NodeId(row.get(2)?),
+                start_line: row.get(3)?,
+                start_col: row.get(4)?,
+                end_line: row.get(5)?,
+                end_col: row.get(6)?,
+            },
+        })
+    }
+
+    fn insert_node_with_stmt(
+        stmt: &mut rusqlite::Statement<'_>,
+        node: &Node,
+    ) -> rusqlite::Result<usize> {
+        stmt.execute(params![
+            node.id.0,
+            node.kind as i32,
+            node.serialized_name,
+            node.qualified_name,
+            node.canonical_id,
+            node.file_node_id.map(|id| id.0),
+            node.start_line,
+            node.start_col,
+            node.end_line,
+            node.end_col
+        ])
+    }
+
     pub fn insert_node(&self, node: &Node) -> Result<(), StorageError> {
         self.conn.execute(
             "INSERT INTO node (id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col)
@@ -389,33 +422,12 @@ impl Storage {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(id) DO NOTHING",
             )?;
             // Insert FILE nodes first so foreign keys to file_node_id are satisfied.
-            for node in nodes.iter().filter(|node| node.kind == NodeKind::FILE) {
-                stmt.execute(params![
-                    node.id.0,
-                    node.kind as i32,
-                    node.serialized_name,
-                    node.qualified_name,
-                    node.canonical_id,
-                    node.file_node_id.map(|id| id.0),
-                    node.start_line,
-                    node.start_col,
-                    node.end_line,
-                    node.end_col
-                ])?;
-            }
-            for node in nodes.iter().filter(|node| node.kind != NodeKind::FILE) {
-                stmt.execute(params![
-                    node.id.0,
-                    node.kind as i32,
-                    node.serialized_name,
-                    node.qualified_name,
-                    node.canonical_id,
-                    node.file_node_id.map(|id| id.0),
-                    node.start_line,
-                    node.start_col,
-                    node.end_line,
-                    node.end_col
-                ])?;
+            for node in nodes
+                .iter()
+                .filter(|node| node.kind == NodeKind::FILE)
+                .chain(nodes.iter().filter(|node| node.kind != NodeKind::FILE))
+            {
+                Self::insert_node_with_stmt(&mut stmt, node)?;
             }
         }
         tx.commit()?;
@@ -518,20 +530,7 @@ impl Storage {
         let mut stmt = self.conn.prepare(
             "SELECT element_id, kind, file_node_id, start_line, start_col, end_line, end_col FROM occurrence"
         )?;
-        let occ_iter = stmt.query_map([], |row| {
-            let kind_int: i32 = row.get(1)?;
-            Ok(Occurrence {
-                element_id: row.get(0)?,
-                kind: OccurrenceKind::try_from(kind_int).unwrap_or(OccurrenceKind::UNKNOWN),
-                location: codestory_core::SourceLocation {
-                    file_node_id: codestory_core::NodeId(row.get(2)?),
-                    start_line: row.get(3)?,
-                    start_col: row.get(4)?,
-                    end_line: row.get(5)?,
-                    end_col: row.get(6)?,
-                },
-            })
-        })?;
+        let occ_iter = stmt.query_map([], Self::occurrence_from_row)?;
 
         let mut occurrences = Vec::new();
         for occ in occ_iter {
@@ -547,20 +546,7 @@ impl Storage {
         let mut stmt = self.conn.prepare(
             "SELECT element_id, kind, file_node_id, start_line, start_col, end_line, end_col FROM occurrence WHERE element_id = ?1"
         )?;
-        let occ_iter = stmt.query_map([element_id], |row| {
-            let kind_int: i32 = row.get(1)?;
-            Ok(Occurrence {
-                element_id: row.get(0)?,
-                kind: OccurrenceKind::try_from(kind_int).unwrap_or(OccurrenceKind::UNKNOWN),
-                location: codestory_core::SourceLocation {
-                    file_node_id: codestory_core::NodeId(row.get(2)?),
-                    start_line: row.get(3)?,
-                    start_col: row.get(4)?,
-                    end_line: row.get(5)?,
-                    end_col: row.get(6)?,
-                },
-            })
-        })?;
+        let occ_iter = stmt.query_map([element_id], Self::occurrence_from_row)?;
 
         let mut occurrences = Vec::new();
         for occ in occ_iter {
@@ -638,20 +624,7 @@ impl Storage {
         let mut stmt = self.conn.prepare(
             "SELECT element_id, kind, file_node_id, start_line, start_col, end_line, end_col FROM occurrence WHERE element_id = ?1"
         )?;
-        let occ_iter = stmt.query_map(params![node_id.0], |row| {
-            let kind_int: i32 = row.get(1)?;
-            Ok(Occurrence {
-                element_id: row.get(0)?,
-                kind: OccurrenceKind::try_from(kind_int).unwrap_or(OccurrenceKind::UNKNOWN),
-                location: codestory_core::SourceLocation {
-                    file_node_id: codestory_core::NodeId(row.get(2)?),
-                    start_line: row.get(3)?,
-                    start_col: row.get(4)?,
-                    end_line: row.get(5)?,
-                    end_col: row.get(6)?,
-                },
-            })
-        })?;
+        let occ_iter = stmt.query_map(params![node_id.0], Self::occurrence_from_row)?;
 
         let mut occurrences = Vec::new();
         for occ in occ_iter {
@@ -667,20 +640,7 @@ impl Storage {
         let mut stmt = self.conn.prepare(
             "SELECT element_id, kind, file_node_id, start_line, start_col, end_line, end_col FROM occurrence WHERE file_node_id = ?1"
         )?;
-        let occ_iter = stmt.query_map(params![file_node_id.0], |row| {
-            let kind_int: i32 = row.get(1)?;
-            Ok(Occurrence {
-                element_id: row.get(0)?,
-                kind: OccurrenceKind::try_from(kind_int).unwrap_or(OccurrenceKind::UNKNOWN),
-                location: codestory_core::SourceLocation {
-                    file_node_id: codestory_core::NodeId(row.get(2)?),
-                    start_line: row.get(3)?,
-                    start_col: row.get(4)?,
-                    end_line: row.get(5)?,
-                    end_col: row.get(6)?,
-                },
-            })
-        })?;
+        let occ_iter = stmt.query_map(params![file_node_id.0], Self::occurrence_from_row)?;
 
         let mut occurrences = Vec::new();
         for occ in occ_iter {
@@ -703,8 +663,8 @@ impl Storage {
                 info.path.to_string_lossy(),
                 info.language,
                 info.modification_time,
-                info.indexed as i32,
-                info.complete as i32,
+                i32::from(info.indexed),
+                i32::from(info.complete),
                 info.line_count,
             ],
         )?;

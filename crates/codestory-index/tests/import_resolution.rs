@@ -46,45 +46,42 @@ fn assert_imports_resolved(edges: &[codestory_core::Edge]) {
 }
 
 #[test]
-fn test_import_resolution_javascript() -> anyhow::Result<()> {
-    let code = r#"
+fn test_import_resolution_across_languages() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "main.js",
+            r#"
 import foo from "foo";
 function main() {}
-"#;
-    let edges = index_single_file("main.js", code)?;
-    assert_imports_resolved(&edges);
-    Ok(())
-}
-
-#[test]
-fn test_import_resolution_typescript() -> anyhow::Result<()> {
-    let code = r#"
+"#,
+        ),
+        (
+            "main.ts",
+            r#"
 import { foo } from "foo";
 function main() {}
-"#;
-    let edges = index_single_file("main.ts", code)?;
-    assert_imports_resolved(&edges);
-    Ok(())
-}
-
-#[test]
-fn test_import_resolution_java() -> anyhow::Result<()> {
-    let code = r#"
+"#,
+        ),
+        (
+            "Test.java",
+            r#"
 import java.util.List;
 class Test {}
-"#;
-    let edges = index_single_file("Test.java", code)?;
-    assert_imports_resolved(&edges);
-    Ok(())
-}
-
-#[test]
-fn test_import_resolution_rust() -> anyhow::Result<()> {
-    let code = r#"
+"#,
+        ),
+        (
+            "main.rs",
+            r#"
 use std::collections::HashMap;
 fn main() {}
-"#;
-    let edges = index_single_file("main.rs", code)?;
-    assert_imports_resolved(&edges);
+"#,
+        ),
+    ];
+
+    for (filename, code) in cases {
+        let edges = index_single_file(filename, code)?;
+        assert_imports_resolved(&edges);
+    }
+
     Ok(())
 }

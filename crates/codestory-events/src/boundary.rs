@@ -200,11 +200,17 @@ mod tests {
 
         assert!(matches!(
             events_a.recv().expect("receive event a"),
-            AppEvent::IndexBatchFlushed(IndexBatchFlushedEvt { flushed_nodes: 7, .. })
+            AppEvent::IndexBatchFlushed(IndexBatchFlushedEvt {
+                flushed_nodes: 7,
+                ..
+            })
         ));
         assert!(matches!(
             events_b.recv().expect("receive event b"),
-            AppEvent::IndexBatchFlushed(IndexBatchFlushedEvt { flushed_nodes: 7, .. })
+            AppEvent::IndexBatchFlushed(IndexBatchFlushedEvt {
+                flushed_nodes: 7,
+                ..
+            })
         ));
     }
 }

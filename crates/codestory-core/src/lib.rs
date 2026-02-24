@@ -77,35 +77,43 @@ pub enum EnumConversionError {
     InvalidOccurrenceKind(i32),
 }
 
+fn enum_from_i32<T: Copy>(value: i32, variants: &[T]) -> Option<T> {
+    usize::try_from(value)
+        .ok()
+        .and_then(|index| variants.get(index).copied())
+}
+
+const NODE_KIND_BY_DISCRIMINANT: [NodeKind; 22] = [
+    NodeKind::MODULE,
+    NodeKind::NAMESPACE,
+    NodeKind::PACKAGE,
+    NodeKind::FILE,
+    NodeKind::STRUCT,
+    NodeKind::CLASS,
+    NodeKind::INTERFACE,
+    NodeKind::ANNOTATION,
+    NodeKind::UNION,
+    NodeKind::ENUM,
+    NodeKind::TYPEDEF,
+    NodeKind::TYPE_PARAMETER,
+    NodeKind::BUILTIN_TYPE,
+    NodeKind::FUNCTION,
+    NodeKind::METHOD,
+    NodeKind::MACRO,
+    NodeKind::GLOBAL_VARIABLE,
+    NodeKind::FIELD,
+    NodeKind::VARIABLE,
+    NodeKind::CONSTANT,
+    NodeKind::ENUM_CONSTANT,
+    NodeKind::UNKNOWN,
+];
+
 impl TryFrom<i32> for NodeKind {
     type Error = EnumConversionError;
 
     fn try_from(value: i32) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(NodeKind::MODULE),
-            1 => Ok(NodeKind::NAMESPACE),
-            2 => Ok(NodeKind::PACKAGE),
-            3 => Ok(NodeKind::FILE),
-            4 => Ok(NodeKind::STRUCT),
-            5 => Ok(NodeKind::CLASS),
-            6 => Ok(NodeKind::INTERFACE),
-            7 => Ok(NodeKind::ANNOTATION),
-            8 => Ok(NodeKind::UNION),
-            9 => Ok(NodeKind::ENUM),
-            10 => Ok(NodeKind::TYPEDEF),
-            11 => Ok(NodeKind::TYPE_PARAMETER),
-            12 => Ok(NodeKind::BUILTIN_TYPE),
-            13 => Ok(NodeKind::FUNCTION),
-            14 => Ok(NodeKind::METHOD),
-            15 => Ok(NodeKind::MACRO),
-            16 => Ok(NodeKind::GLOBAL_VARIABLE),
-            17 => Ok(NodeKind::FIELD),
-            18 => Ok(NodeKind::VARIABLE),
-            19 => Ok(NodeKind::CONSTANT),
-            20 => Ok(NodeKind::ENUM_CONSTANT),
-            21 => Ok(NodeKind::UNKNOWN),
-            _ => Err(EnumConversionError::InvalidNodeKind(value)),
-        }
+        enum_from_i32(value, &NODE_KIND_BY_DISCRIMINANT)
+            .ok_or(EnumConversionError::InvalidNodeKind(value))
     }
 }
 
@@ -140,26 +148,28 @@ pub enum EdgeKind {
     UNKNOWN,
 }
 
+const EDGE_KIND_BY_DISCRIMINANT: [EdgeKind; 13] = [
+    EdgeKind::MEMBER,
+    EdgeKind::TYPE_USAGE,
+    EdgeKind::USAGE,
+    EdgeKind::CALL,
+    EdgeKind::INHERITANCE,
+    EdgeKind::OVERRIDE,
+    EdgeKind::TYPE_ARGUMENT,
+    EdgeKind::TEMPLATE_SPECIALIZATION,
+    EdgeKind::INCLUDE,
+    EdgeKind::IMPORT,
+    EdgeKind::MACRO_USAGE,
+    EdgeKind::ANNOTATION_USAGE,
+    EdgeKind::UNKNOWN,
+];
+
 impl TryFrom<i32> for EdgeKind {
     type Error = EnumConversionError;
 
     fn try_from(value: i32) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(EdgeKind::MEMBER),
-            1 => Ok(EdgeKind::TYPE_USAGE),
-            2 => Ok(EdgeKind::USAGE),
-            3 => Ok(EdgeKind::CALL),
-            4 => Ok(EdgeKind::INHERITANCE),
-            5 => Ok(EdgeKind::OVERRIDE),
-            6 => Ok(EdgeKind::TYPE_ARGUMENT),
-            7 => Ok(EdgeKind::TEMPLATE_SPECIALIZATION),
-            8 => Ok(EdgeKind::INCLUDE),
-            9 => Ok(EdgeKind::IMPORT),
-            10 => Ok(EdgeKind::MACRO_USAGE),
-            11 => Ok(EdgeKind::ANNOTATION_USAGE),
-            12 => Ok(EdgeKind::UNKNOWN),
-            _ => Err(EnumConversionError::InvalidEdgeKind(value)),
-        }
+        enum_from_i32(value, &EDGE_KIND_BY_DISCRIMINANT)
+            .ok_or(EnumConversionError::InvalidEdgeKind(value))
     }
 }
 
@@ -298,19 +308,21 @@ pub enum OccurrenceKind {
     UNKNOWN,
 }
 
+const OCCURRENCE_KIND_BY_DISCRIMINANT: [OccurrenceKind; 6] = [
+    OccurrenceKind::DEFINITION,
+    OccurrenceKind::REFERENCE,
+    OccurrenceKind::DECLARATION,
+    OccurrenceKind::MACRO_DEFINITION,
+    OccurrenceKind::MACRO_REFERENCE,
+    OccurrenceKind::UNKNOWN,
+];
+
 impl TryFrom<i32> for OccurrenceKind {
     type Error = EnumConversionError;
 
     fn try_from(value: i32) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(OccurrenceKind::DEFINITION),
-            1 => Ok(OccurrenceKind::REFERENCE),
-            2 => Ok(OccurrenceKind::DECLARATION),
-            3 => Ok(OccurrenceKind::MACRO_DEFINITION),
-            4 => Ok(OccurrenceKind::MACRO_REFERENCE),
-            5 => Ok(OccurrenceKind::UNKNOWN),
-            _ => Err(EnumConversionError::InvalidOccurrenceKind(value)),
-        }
+        enum_from_i32(value, &OCCURRENCE_KIND_BY_DISCRIMINANT)
+            .ok_or(EnumConversionError::InvalidOccurrenceKind(value))
     }
 }
 

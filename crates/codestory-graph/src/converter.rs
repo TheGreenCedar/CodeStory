@@ -83,26 +83,58 @@ impl NodeGraphConverter {
         }
     }
 
+    fn build_node_map(nodes: &[DummyNode]) -> HashMap<NodeId, &DummyNode> {
+        nodes.iter().map(|node| (node.id, node)).collect()
+    }
+
+    fn should_emit_host_node(node: &DummyNode) -> bool {
+        let is_bundle = Self::is_bundle(node);
+        let is_structural = Self::is_structural(node.node_kind);
+        if is_bundle && !is_structural {
+            return false;
+        }
+        if !is_bundle && !is_structural && node.parent.is_some() {
+            return false;
+        }
+        true
+    }
+
+    fn for_each_member<F>(nodes: &[DummyNode], node_map: &HashMap<NodeId, &DummyNode>, mut f: F)
+    where
+        F: FnMut(NodeId, &DummyNode),
+    {
+        for node in nodes {
+            if Self::is_structural(node.node_kind) {
+                continue;
+            }
+            if Self::is_bundle(node) {
+                if let Some(parent_id) = node.parent {
+                    for &child_id in &node.children {
+                        if let Some(child) = node_map.get(&child_id) {
+                            f(parent_id, child);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if let Some(parent_id) = node.parent
+                && !Self::parent_is_bundle(node_map, parent_id)
+            {
+                f(parent_id, node);
+            }
+        }
+    }
+
     pub fn convert_dummies(&self, nodes: &[DummyNode], edges: &[DummyEdge]) -> NodeGraph {
         let mut graph_nodes: HashMap<NodeId, NodeGraphNode> = HashMap::new();
         let mut graph_edges = Vec::new();
-        let mut node_map: HashMap<NodeId, &DummyNode> = HashMap::new();
+        let node_map = Self::build_node_map(nodes);
         let mut member_to_host: HashMap<NodeId, NodeId> = HashMap::new();
-
-        for node in nodes {
-            node_map.insert(node.id, node);
-        }
 
         // 1. Create Structural Nodes
         for node in nodes {
-            let is_bundle = Self::is_bundle(node);
-
-            // If it's a bundle of members (e.g. methods), skip creating a node for it.
-            if is_bundle && !Self::is_structural(node.node_kind) {
-                continue;
-            }
-            // If it's a raw member node (unbundled), skip creating a node for it.
-            if !is_bundle && !Self::is_structural(node.node_kind) && node.parent.is_some() {
+            if !Self::should_emit_host_node(node) {
                 continue;
             }
 
@@ -133,43 +165,16 @@ impl NodeGraphConverter {
         }
 
         // 2. Process Members (populate members list and member_to_host map)
-        for node in nodes {
-            let is_bundle = Self::is_bundle(node);
-            let is_structural = Self::is_structural(node.node_kind);
-
-            if !is_structural {
-                if is_bundle {
-                    // It's a bundle of members. Children are members. Parent is host.
-                    if let Some(parent_id) = node.parent
-                        && let Some(host) = graph_nodes.get_mut(&parent_id)
-                    {
-                        for &child_id in &node.children {
-                            if let Some(child) = node_map.get(&child_id) {
-                                host.members.push(NodeMember {
-                                    id: child.id,
-                                    name: child.name.clone(),
-                                    kind: child.node_kind,
-                                });
-                                member_to_host.insert(child_id, parent_id);
-                            }
-                        }
-                    }
-                } else if let Some(parent_id) = node.parent {
-                    // It's an individual member node
-                    // Check if parent is a bundle. If so, it was handled above (via bundle iteration).
-                    let parent_is_bundle = Self::parent_is_bundle(&node_map, parent_id);
-
-                    if !parent_is_bundle && let Some(host) = graph_nodes.get_mut(&parent_id) {
-                        host.members.push(NodeMember {
-                            id: node.id,
-                            name: node.name.clone(),
-                            kind: node.node_kind,
-                        });
-                        member_to_host.insert(node.id, parent_id);
-                    }
-                }
+        Self::for_each_member(nodes, &node_map, |parent_id, member| {
+            if let Some(host) = graph_nodes.get_mut(&parent_id) {
+                host.members.push(NodeMember {
+                    id: member.id,
+                    name: member.name.clone(),
+                    kind: member.node_kind,
+                });
+                member_to_host.insert(member.id, parent_id);
             }
-        }
+        });
 
         // 3. Convert Edges
         for edge in edges {
@@ -227,13 +232,8 @@ impl NodeGraphConverter {
         let mut uml_nodes: HashMap<NodeId, UmlNode> = HashMap::new();
         let mut graph_edges = Vec::new();
         let mut pin_info: NodeGraphPinMap = HashMap::new();
-        let mut node_map: HashMap<NodeId, &DummyNode> = HashMap::new();
+        let node_map = Self::build_node_map(nodes);
         let mut member_to_host: HashMap<NodeId, NodeId> = HashMap::new();
-
-        // Build node map for quick lookup
-        for node in nodes {
-            node_map.insert(node.id, node);
-        }
 
         // Build set of member IDs that have outgoing edges
         // A member has outgoing edges if it appears as the source of any edge
@@ -249,14 +249,7 @@ impl NodeGraphConverter {
 
         // 1. Create Structural Nodes (classes, structs, etc.)
         for node in nodes {
-            let is_bundle = Self::is_bundle(node);
-
-            // Skip bundled non-structural nodes (they become members)
-            if is_bundle && !Self::is_structural(node.node_kind) {
-                continue;
-            }
-            // Skip unbundled member nodes with parents (they become members)
-            if !is_bundle && !Self::is_structural(node.node_kind) && node.parent.is_some() {
+            if !Self::should_emit_host_node(node) {
                 continue;
             }
 
@@ -281,105 +274,30 @@ impl NodeGraphConverter {
         }
 
         // 2. Group Members into Visibility Sections
-        for node in nodes {
-            let is_bundle = Self::is_bundle(node);
-            let is_structural = Self::is_structural(node.node_kind);
+        Self::for_each_member(nodes, &node_map, |parent_id, member_node| {
+            if let Some(host) = uml_nodes.get_mut(&parent_id) {
+                let mut member = MemberItem::new(
+                    member_node.id,
+                    member_node.node_kind,
+                    member_node.name.clone(),
+                );
+                member
+                    .set_has_outgoing_edges(members_with_outgoing_edges.contains(&member_node.id));
 
-            if !is_structural {
-                if is_bundle {
-                    // It's a bundle of members. Children are members. Parent is host.
-                    if let Some(parent_id) = node.parent
-                        && let Some(host) = uml_nodes.get_mut(&parent_id)
-                    {
-                        let mut functions = Vec::new();
-                        let mut variables = Vec::new();
-                        let mut other = Vec::new();
-
-                        for &child_id in &node.children {
-                            if let Some(child) = node_map.get(&child_id) {
-                                let mut member =
-                                    MemberItem::new(child.id, child.node_kind, child.name.clone());
-
-                                // Set whether this member has outgoing edges
-                                member.set_has_outgoing_edges(
-                                    members_with_outgoing_edges.contains(&child.id),
-                                );
-
-                                // Group by kind
-                                match child.node_kind {
-                                    NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO => {
-                                        functions.push(member);
-                                    }
-                                    NodeKind::FIELD
-                                    | NodeKind::VARIABLE
-                                    | NodeKind::GLOBAL_VARIABLE
-                                    | NodeKind::CONSTANT
-                                    | NodeKind::ENUM_CONSTANT => {
-                                        variables.push(member);
-                                    }
-                                    _ => {
-                                        other.push(member);
-                                    }
-                                }
-                                member_to_host.insert(child_id, parent_id);
-                            }
-                        }
-
-                        // Add non-empty sections to host
-                        if !functions.is_empty() {
-                            host.visibility_sections
-                                .push(VisibilitySection::with_members(
-                                    VisibilityKind::Functions,
-                                    functions,
-                                ));
-                        }
-                        if !variables.is_empty() {
-                            host.visibility_sections
-                                .push(VisibilitySection::with_members(
-                                    VisibilityKind::Variables,
-                                    variables,
-                                ));
-                        }
-                        if !other.is_empty() {
-                            host.visibility_sections
-                                .push(VisibilitySection::with_members(
-                                    VisibilityKind::Other,
-                                    other,
-                                ));
-                        }
-                    }
-                } else if let Some(parent_id) = node.parent {
-                    // It's an individual member node
-                    let parent_is_bundle = Self::parent_is_bundle(&node_map, parent_id);
-
-                    if !parent_is_bundle && let Some(host) = uml_nodes.get_mut(&parent_id) {
-                        let mut member =
-                            MemberItem::new(node.id, node.node_kind, node.name.clone());
-
-                        // Set whether this member has outgoing edges
-                        member
-                            .set_has_outgoing_edges(members_with_outgoing_edges.contains(&node.id));
-
-                        // Determine which section this member belongs to
-                        let visibility = Self::member_visibility(node.node_kind);
-
-                        // Find or create the appropriate section
-                        if let Some(section) = host
-                            .visibility_sections
-                            .iter_mut()
-                            .find(|s| s.kind == visibility)
-                        {
-                            section.members.push(member);
-                        } else {
-                            host.visibility_sections
-                                .push(VisibilitySection::with_members(visibility, vec![member]));
-                        }
-
-                        member_to_host.insert(node.id, parent_id);
-                    }
+                let visibility = Self::member_visibility(member_node.node_kind);
+                if let Some(section) = host
+                    .visibility_sections
+                    .iter_mut()
+                    .find(|s| s.kind == visibility)
+                {
+                    section.members.push(member);
+                } else {
+                    host.visibility_sections
+                        .push(VisibilitySection::with_members(visibility, vec![member]));
                 }
+                member_to_host.insert(member_node.id, parent_id);
             }
-        }
+        });
 
         // 3. Convert Edges (same logic as before)
         for edge in edges {

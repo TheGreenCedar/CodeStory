@@ -140,14 +140,16 @@ impl CompilationDatabase {
             match arg.as_str() {
                 "-I" => {
                     if let Some(path) = iter.next() {
-                        info.include_paths
-                            .push(Self::resolve_path(&cmd.directory, path));
+                        Self::push_resolved_path(&cmd.directory, path, &mut info.include_paths);
                     }
                 }
                 "-isystem" => {
                     if let Some(path) = iter.next() {
-                        info.system_include_paths
-                            .push(Self::resolve_path(&cmd.directory, path));
+                        Self::push_resolved_path(
+                            &cmd.directory,
+                            path,
+                            &mut info.system_include_paths,
+                        );
                     }
                 }
                 "-D" => {
@@ -156,15 +158,14 @@ impl CompilationDatabase {
                     }
                 }
                 arg if arg.starts_with("-I") => {
-                    let path = &arg[2..];
-                    if !path.is_empty() {
-                        info.include_paths
-                            .push(Self::resolve_path(&cmd.directory, path));
+                    if let Some(path) = arg.strip_prefix("-I") {
+                        Self::push_resolved_path(&cmd.directory, path, &mut info.include_paths);
                     }
                 }
                 arg if arg.starts_with("-D") => {
-                    let define = &arg[2..];
-                    if !define.is_empty() {
+                    if let Some(define) = arg.strip_prefix("-D")
+                        && !define.is_empty()
+                    {
                         Self::parse_define(&mut info.defines, define);
                     }
                 }
@@ -172,10 +173,12 @@ impl CompilationDatabase {
                     info.standard = CxxStandard::from_flag(arg);
                 }
                 arg if arg.starts_with("-isystem") => {
-                    let path = &arg[8..];
-                    if !path.is_empty() {
-                        info.system_include_paths
-                            .push(Self::resolve_path(&cmd.directory, path));
+                    if let Some(path) = arg.strip_prefix("-isystem") {
+                        Self::push_resolved_path(
+                            &cmd.directory,
+                            path,
+                            &mut info.system_include_paths,
+                        );
                     }
                 }
                 // Skip common flags we don't need
@@ -232,6 +235,12 @@ impl CompilationDatabase {
     fn resolve_path(base: &Path, path: &str) -> PathBuf {
         let p = PathBuf::from(path);
         if p.is_absolute() { p } else { base.join(p) }
+    }
+
+    fn push_resolved_path(base: &Path, path: &str, paths: &mut Vec<PathBuf>) {
+        if !path.is_empty() {
+            paths.push(Self::resolve_path(base, path));
+        }
     }
 
     /// Parse a define (-DFOO or -DFOO=bar)

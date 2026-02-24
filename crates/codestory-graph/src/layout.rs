@@ -9,7 +9,10 @@ pub fn compute_dag_ranks(model: &GraphModel) -> HashMap<NodeIndex, i32> {
     compute_longest_path_ranks(model, 1000)
 }
 
-fn compute_longest_path_ranks(model: &GraphModel, max_iterations_cap: usize) -> HashMap<NodeIndex, i32> {
+fn compute_longest_path_ranks(
+    model: &GraphModel,
+    max_iterations_cap: usize,
+) -> HashMap<NodeIndex, i32> {
     let mut ranks: HashMap<NodeIndex, i32> = HashMap::new();
     for node in model.graph.node_indices() {
         ranks.insert(node, 0);
