@@ -19,6 +19,16 @@ import type {
 } from "./generated/api";
 import { isTruncatedUmlGraph, languageForPath } from "./graph/GraphViewport";
 
+function toMonacoModelPath(path: string | null): string | null {
+  if (!path) {
+    return null;
+  }
+
+  // Monaco URIs are POSIX-like; normalize Windows paths to avoid parser quirks.
+  const forwardSlashPath = path.replace(/\\/g, "/");
+  return forwardSlashPath.replace(/^([A-Za-z]:)/, "/$1");
+}
+
 export default function App() {
   const [projectPath, setProjectPath] = useState<string>(".");
   const [status, setStatus] = useState<string>("Open a project to begin.");
@@ -59,6 +69,7 @@ export default function App() {
   const isDirty = draftText !== savedText;
   const activeGraph = activeGraphId ? (graphMap[activeGraphId] ?? null) : null;
   const codeLanguage = useMemo(() => languageForPath(activeFilePath), [activeFilePath]);
+  const monacoModelPath = useMemo(() => toMonacoModelPath(activeFilePath), [activeFilePath]);
 
   const loadRootSymbols = useCallback(async () => {
     const roots = await api.listRootSymbols(400);
@@ -494,6 +505,32 @@ export default function App() {
     editorRef.current = editor;
     monacoRef.current = monaco;
 
+    const tsDefaults = monaco.languages.typescript.typescriptDefaults;
+    const jsDefaults = monaco.languages.typescript.javascriptDefaults;
+    const sharedCompilerOptions = {
+      allowNonTsExtensions: true,
+      allowJs: true,
+      target: monaco.languages.typescript.ScriptTarget.ESNext,
+      module: monaco.languages.typescript.ModuleKind.ESNext,
+      moduleResolution: monaco.languages.typescript.ModuleResolutionKind.NodeJs,
+      jsx: monaco.languages.typescript.JsxEmit.ReactJSX,
+    };
+
+    tsDefaults.setEagerModelSync(true);
+    jsDefaults.setEagerModelSync(true);
+    tsDefaults.setCompilerOptions(sharedCompilerOptions);
+    jsDefaults.setCompilerOptions(sharedCompilerOptions);
+
+    const sharedDiagnostics = {
+      noSyntaxValidation: false,
+      noSemanticValidation: false,
+      // This Monaco instance only loads one file model at a time, so unresolved imports are noise.
+      diagnosticCodesToIgnore: [2307, 2792],
+    };
+
+    tsDefaults.setDiagnosticsOptions(sharedDiagnostics);
+    jsDefaults.setDiagnosticsOptions(sharedDiagnostics);
+
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
       void saveActionRef.current();
     });
@@ -588,6 +625,7 @@ export default function App() {
           expandedNodes={expandedNodes}
           onToggleNode={toggleNode}
           onFocusSymbol={focusSymbol}
+          activeSymbolId={activeNodeDetails?.id ?? null}
         />
 
         <GraphPane
@@ -623,6 +661,7 @@ export default function App() {
         <CodePane
           projectOpen={projectOpen}
           activeFilePath={activeFilePath}
+          monacoModelPath={monacoModelPath}
           isDirty={isDirty}
           isSaving={isSaving}
           onSave={saveCurrentFile}

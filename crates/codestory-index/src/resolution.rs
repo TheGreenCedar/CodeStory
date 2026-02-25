@@ -378,8 +378,8 @@ fn persist_resolution(
 ) -> Result<usize> {
     let candidate_payload = candidate_json(candidates)?;
     if let Some((resolved_target, confidence)) = selected {
-        let certainty = ResolutionCertainty::from_confidence(Some(confidence))
-            .map(ResolutionCertainty::as_str);
+        let certainty =
+            ResolutionCertainty::from_confidence(Some(confidence)).map(ResolutionCertainty::as_str);
         return Ok(conn.execute(
             "UPDATE edge
              SET resolved_target_node_id = ?1,
@@ -387,7 +387,13 @@ fn persist_resolution(
                  certainty = ?3,
                  candidate_target_node_ids = ?4
              WHERE id = ?5",
-            params![resolved_target, confidence, certainty, candidate_payload, edge_id],
+            params![
+                resolved_target,
+                confidence,
+                certainty,
+                candidate_payload,
+                edge_id
+            ],
         )?);
     }
 
@@ -772,7 +778,10 @@ fn is_common_unqualified_call_name(name: &str) -> bool {
 
 fn env_flag(name: &str, default: bool) -> bool {
     match std::env::var(name) {
-        Ok(value) => matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"),
+        Ok(value) => matches!(
+            value.trim(),
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+        ),
         Err(_) => default,
     }
 }

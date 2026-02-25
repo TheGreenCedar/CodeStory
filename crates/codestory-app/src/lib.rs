@@ -46,6 +46,19 @@ fn edge_certainty_label(
         .map(|value| value.as_str().to_string())
 }
 
+fn is_structural_kind(kind: codestory_core::NodeKind) -> bool {
+    matches!(
+        kind,
+        codestory_core::NodeKind::CLASS
+            | codestory_core::NodeKind::STRUCT
+            | codestory_core::NodeKind::INTERFACE
+            | codestory_core::NodeKind::UNION
+            | codestory_core::NodeKind::ENUM
+            | codestory_core::NodeKind::NAMESPACE
+            | codestory_core::NodeKind::MODULE
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AppGraphFeatureFlags {
     include_edge_certainty: bool,
@@ -70,7 +83,10 @@ fn app_graph_flags() -> AppGraphFeatureFlags {
 
 fn env_flag(name: &str, default: bool) -> bool {
     match std::env::var(name) {
-        Ok(value) => matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"),
+        Ok(value) => matches!(
+            value.trim(),
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+        ),
         Err(_) => default,
     }
 }
@@ -414,6 +430,27 @@ impl AppController {
         })
     }
 
+    fn dedupe_symbol_nodes(
+        nodes: Vec<codestory_core::Node>,
+        labels_by_id: &HashMap<codestory_core::NodeId, String>,
+    ) -> Vec<codestory_core::Node> {
+        let mut seen = HashSet::new();
+        let mut deduped = Vec::with_capacity(nodes.len());
+
+        for node in nodes {
+            let label = labels_by_id
+                .get(&node.id)
+                .cloned()
+                .unwrap_or_else(|| node_display_name(&node));
+            let key = (node.kind as i32, label, node.file_node_id);
+            if seen.insert(key) {
+                deduped.push(node);
+            }
+        }
+
+        deduped
+    }
+
     pub fn open_project(&self, req: OpenProjectRequest) -> Result<ProjectSummary, ApiError> {
         let root = PathBuf::from(req.path);
         if !root.exists() {
@@ -570,12 +607,14 @@ impl AppController {
             .map_err(|e| ApiError::internal(format!("Failed to load root symbols: {e}")))?;
         roots.sort_by_cached_key(node_display_name);
 
+        let labels_by_id = self.cached_labels(roots.iter().map(|node| node.id));
+        roots = Self::dedupe_symbol_nodes(roots, &labels_by_id);
+
         let limit = req.limit.unwrap_or(300).clamp(1, 2_000) as usize;
         if roots.len() > limit {
             roots.truncate(limit);
         }
 
-        let labels_by_id = self.cached_labels(roots.iter().map(|node| node.id));
         roots
             .into_iter()
             .map(|node| Self::symbol_summary_for_node(&storage, &labels_by_id, node))
@@ -595,6 +634,7 @@ impl AppController {
         children.sort_by_cached_key(node_display_name);
 
         let labels_by_id = self.cached_labels(children.iter().map(|node| node.id));
+        children = Self::dedupe_symbol_nodes(children, &labels_by_id);
         children
             .into_iter()
             .map(|node| Self::symbol_summary_for_node(&storage, &labels_by_id, node))
@@ -781,6 +821,40 @@ impl AppController {
         let mut edges = storage
             .get_edges_for_node_id(center)
             .map_err(|e| ApiError::internal(format!("Failed to load edges: {e}")))?;
+
+        // If the center is a member (for example, a trait method), pull
+        // implementation-style edges from its owner node too.
+        if let Ok(Some(center_node)) = storage.get_node(center)
+            && !is_structural_kind(center_node.kind)
+        {
+            let mut owner_ids = HashSet::new();
+            for edge in &edges {
+                if edge.kind != codestory_core::EdgeKind::MEMBER {
+                    continue;
+                }
+                let (source, target) = edge.effective_endpoints();
+                if target == center {
+                    owner_ids.insert(source);
+                }
+            }
+
+            for owner_id in owner_ids {
+                let owner_edges = storage
+                    .get_edges_for_node_id(owner_id)
+                    .map_err(|e| ApiError::internal(format!("Failed to load edges: {e}")))?;
+                for edge in owner_edges {
+                    if matches!(
+                        edge.kind,
+                        codestory_core::EdgeKind::INHERITANCE | codestory_core::EdgeKind::OVERRIDE
+                    ) {
+                        edges.push(edge);
+                    }
+                }
+            }
+        }
+
+        let mut seen_edge_ids = HashSet::new();
+        edges.retain(|edge| seen_edge_ids.insert(edge.id));
         edges.sort_by_key(|e| e.id.0);
         let mut truncated = false;
         if edges.len() > max_edges {
@@ -1113,14 +1187,14 @@ fn refresh_caches(controller: &AppController, storage: &Storage) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codestory_core::{Node, NodeId, NodeKind};
+    use codestory_core::{Edge, EdgeId, EdgeKind, Node, NodeId as CoreNodeId, NodeKind};
     use crossbeam_channel::unbounded;
     use tempfile::tempdir;
 
     #[test]
     fn build_search_state_prefers_qualified_name() {
         let nodes = vec![Node {
-            id: NodeId(1),
+            id: CoreNodeId(1),
             kind: NodeKind::FUNCTION,
             serialized_name: "short_name".to_string(),
             qualified_name: Some("pkg.mod.short_name".to_string()),
@@ -1129,12 +1203,12 @@ mod tests {
 
         let (node_names, mut engine) = build_search_state(nodes).expect("build search state");
         assert_eq!(
-            node_names.get(&NodeId(1)).map(String::as_str),
+            node_names.get(&CoreNodeId(1)).map(String::as_str),
             Some("pkg.mod.short_name")
         );
 
         let hits = engine.search_symbol("pkg.mod");
-        assert_eq!(hits.first().copied(), Some(NodeId(1)));
+        assert_eq!(hits.first().copied(), Some(CoreNodeId(1)));
     }
 
     #[test]
@@ -1208,5 +1282,127 @@ mod tests {
             .expect_err("write should fail");
 
         assert_eq!(err.code, "invalid_argument");
+    }
+
+    #[test]
+    fn list_root_symbols_deduplicates_repeated_entries() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("codestory.db");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(101),
+                        kind: NodeKind::MODULE,
+                        serialized_name: "\"react\"".to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(102),
+                        kind: NodeKind::MODULE,
+                        serialized_name: "\"react\"".to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(103),
+                        kind: NodeKind::MODULE,
+                        serialized_name: "\"./app/types\"".to_string(),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert root nodes");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: temp.path().to_string_lossy().to_string(),
+            })
+            .expect("open project");
+
+        let roots = controller
+            .list_root_symbols(ListRootSymbolsRequest { limit: None })
+            .expect("load roots");
+        let react_count = roots
+            .iter()
+            .filter(|symbol| symbol.label == "\"react\"")
+            .count();
+
+        assert_eq!(react_count, 1);
+        assert!(roots.iter().any(|symbol| symbol.label == "\"./app/types\""));
+    }
+
+    #[test]
+    fn graph_neighborhood_member_includes_owner_inheritance_edges() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("codestory.db");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(1),
+                        kind: NodeKind::INTERFACE,
+                        serialized_name: "EventListener".to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(2),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "EventListener::handle_event".to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(3),
+                        kind: NodeKind::CLASS,
+                        serialized_name: "UiListener".to_string(),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert nodes");
+            storage
+                .insert_edges_batch(&[
+                    Edge {
+                        id: EdgeId(11),
+                        source: CoreNodeId(1),
+                        target: CoreNodeId(2),
+                        kind: EdgeKind::MEMBER,
+                        ..Default::default()
+                    },
+                    Edge {
+                        id: EdgeId(12),
+                        source: CoreNodeId(3),
+                        target: CoreNodeId(1),
+                        kind: EdgeKind::INHERITANCE,
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert edges");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: temp.path().to_string_lossy().to_string(),
+            })
+            .expect("open project");
+
+        let graph = controller
+            .graph_neighborhood(GraphRequest {
+                center_id: codestory_api::NodeId("2".to_string()),
+                max_edges: None,
+            })
+            .expect("load graph neighborhood");
+
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.kind == codestory_api::EdgeKind::INHERITANCE),
+            "Expected INHERITANCE edge from owner trait context"
+        );
     }
 }

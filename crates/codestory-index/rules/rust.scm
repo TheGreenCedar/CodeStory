@@ -50,7 +50,7 @@
   name: (type_identifier) @name)
 {
   node @name.node
-  attr (@name.node) kind = "CLASS"
+  attr (@name.node) kind = "INTERFACE"
   attr (@name.node) name = (source-text @name)
   attr (@name.node) start_row = (start-row @name)
   attr (@name.node) start_col = (start-column @name)
@@ -185,7 +185,7 @@
   type: (type_identifier) @type_name)
 {
   node @trait_name.node
-  attr (@trait_name.node) kind = "CLASS"
+  attr (@trait_name.node) kind = "INTERFACE"
   attr (@trait_name.node) name = (source-text @trait_name)
   attr (@trait_name.node) start_row = (start-row @trait_name)
   attr (@trait_name.node) start_col = (start-column @trait_name)
@@ -367,11 +367,45 @@
 }
 
 (impl_item
+  trait: (type_identifier) @trait_name
+  type: (generic_type
+    type: (type_identifier) @type_name))
+{
+  node @trait_name.node
+  attr (@trait_name.node) kind = "INTERFACE"
+  attr (@trait_name.node) name = (source-text @trait_name)
+  attr (@trait_name.node) start_row = (start-row @trait_name)
+  attr (@trait_name.node) start_col = (start-column @trait_name)
+  attr (@trait_name.node) end_row = (end-row @trait_name)
+  attr (@trait_name.node) end_col = (end-column @trait_name)
+
+  edge @type_name.node -> @trait_name.node
+  attr (@type_name.node -> @trait_name.node) kind = "INHERITANCE"
+}
+
+(impl_item
   trait: (scoped_type_identifier) @trait_name
   type: (type_identifier) @type_name)
 {
   node @trait_name.node
-  attr (@trait_name.node) kind = "CLASS"
+  attr (@trait_name.node) kind = "INTERFACE"
+  attr (@trait_name.node) name = (source-text @trait_name)
+  attr (@trait_name.node) start_row = (start-row @trait_name)
+  attr (@trait_name.node) start_col = (start-column @trait_name)
+  attr (@trait_name.node) end_row = (end-row @trait_name)
+  attr (@trait_name.node) end_col = (end-column @trait_name)
+
+  edge @type_name.node -> @trait_name.node
+  attr (@type_name.node -> @trait_name.node) kind = "INHERITANCE"
+}
+
+(impl_item
+  trait: (scoped_type_identifier) @trait_name
+  type: (generic_type
+    type: (type_identifier) @type_name))
+{
+  node @trait_name.node
+  attr (@trait_name.node) kind = "INTERFACE"
   attr (@trait_name.node) name = (source-text @trait_name)
   attr (@trait_name.node) start_row = (start-row @trait_name)
   attr (@trait_name.node) start_col = (start-column @trait_name)
@@ -388,7 +422,25 @@
   type: (type_identifier) @type_name)
 {
   node @trait_name.node
-  attr (@trait_name.node) kind = "CLASS"
+  attr (@trait_name.node) kind = "INTERFACE"
+  attr (@trait_name.node) name = (source-text @trait_name)
+  attr (@trait_name.node) start_row = (start-row @trait_name)
+  attr (@trait_name.node) start_col = (start-column @trait_name)
+  attr (@trait_name.node) end_row = (end-row @trait_name)
+  attr (@trait_name.node) end_col = (end-column @trait_name)
+
+  edge @type_name.node -> @trait_name.node
+  attr (@type_name.node -> @trait_name.node) kind = "INHERITANCE"
+}
+
+(impl_item
+  trait: (generic_type
+    type: (type_identifier) @trait_name)
+  type: (generic_type
+    type: (type_identifier) @type_name))
+{
+  node @trait_name.node
+  attr (@trait_name.node) kind = "INTERFACE"
   attr (@trait_name.node) name = (source-text @trait_name)
   attr (@trait_name.node) start_row = (start-row @trait_name)
   attr (@trait_name.node) start_col = (start-column @trait_name)
@@ -404,7 +456,7 @@
   type: (scoped_type_identifier) @type_name)
 {
   node @trait_name.node
-  attr (@trait_name.node) kind = "CLASS"
+  attr (@trait_name.node) kind = "INTERFACE"
   attr (@trait_name.node) name = (source-text @trait_name)
   attr (@trait_name.node) start_row = (start-row @trait_name)
   attr (@trait_name.node) start_col = (start-column @trait_name)
@@ -421,7 +473,7 @@
   type: (scoped_type_identifier) @type_name)
 {
   node @trait_name.node
-  attr (@trait_name.node) kind = "CLASS"
+  attr (@trait_name.node) kind = "INTERFACE"
   attr (@trait_name.node) name = (source-text @trait_name)
   attr (@trait_name.node) start_row = (start-row @trait_name)
   attr (@trait_name.node) start_col = (start-column @trait_name)

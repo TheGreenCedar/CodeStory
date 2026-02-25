@@ -244,14 +244,90 @@ textarea {
 
 .explorer-card {
   min-height: 16rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
 }
 
 .explorer-card p {
-  margin-top: 0;
+  margin: 0;
   color: var(--muted);
 }
 
+.explorer-toolbar {
+  border: 1px solid var(--line);
+  border-radius: 0.68rem;
+  padding: 0.48rem 0.52rem;
+  display: grid;
+  gap: 0.44rem;
+  background: color-mix(in oklab, #fff 86%, oklch(0.91 0.035 95));
+}
+
+.explorer-search-input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 0.58rem;
+  padding: 0.36rem 0.52rem;
+  background: #fff;
+}
+
+.explorer-search-input:focus {
+  outline: 2px solid color-mix(in oklab, var(--focus) 48%, transparent);
+  outline-offset: 1px;
+}
+
+.explorer-toolbar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem;
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.explorer-toolbar-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+}
+
+.explorer-clear-button {
+  margin-left: auto;
+  border: 1px solid var(--line);
+  border-radius: 0.52rem;
+  background: #fff;
+  padding: 0.22rem 0.5rem;
+  cursor: pointer;
+}
+
+.explorer-clear-button:disabled {
+  opacity: 0.58;
+  cursor: default;
+}
+
+.explorer-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.34rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.explorer-summary span {
+  border: 1px solid color-mix(in oklab, var(--line) 80%, #0000);
+  border-radius: 999px;
+  padding: 0.12rem 0.42rem;
+  background: #fff;
+}
+
 .tree-root {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 0.7rem;
+  padding: 0.28rem;
+  background: color-mix(in oklab, #fff 92%, oklch(0.92 0.03 95));
+  scrollbar-width: thin;
   display: flex;
   flex-direction: column;
   gap: 0.14rem;
@@ -260,12 +336,17 @@ textarea {
 .tree-node {
   display: flex;
   gap: 0.24rem;
-  align-items: center;
+  align-items: stretch;
+}
+
+.tree-node-active .tree-label {
+  border-color: color-mix(in oklab, var(--focus) 35%, var(--line));
+  background: color-mix(in oklab, #fff 80%, oklch(0.88 0.04 219));
 }
 
 .tree-toggle {
   width: 1.42rem;
-  height: 1.42rem;
+  min-height: 2.15rem;
   border-radius: 0.4rem;
   border: 1px solid var(--line);
   background: #fff;
@@ -280,9 +361,34 @@ textarea {
   flex: 1;
   text-align: left;
   display: flex;
-  align-items: center;
-  gap: 0.45rem;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.15rem;
   overflow: hidden;
+}
+
+.tree-label-top {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.tree-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.tree-path {
+  font-family: var(--font-mono);
+  font-size: 0.67rem;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .kind-pill {
@@ -292,6 +398,28 @@ textarea {
   border: 1px solid color-mix(in oklab, var(--accent) 65%, var(--line));
   background: color-mix(in oklab, var(--accent) 44%, #fff);
   padding: 0.1rem 0.4rem;
+}
+
+.tree-duplicate-pill {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 0.64rem;
+  border-radius: 999px;
+  border: 1px solid color-mix(in oklab, var(--line) 90%, #697177);
+  background: color-mix(in oklab, #fff 92%, oklch(0.88 0.02 250));
+  color: color-mix(in oklab, var(--muted) 76%, var(--ink));
+  padding: 0.06rem 0.34rem;
+}
+
+.explorer-empty {
+  margin: 0.34rem;
+  border: 1px dashed var(--line);
+  border-radius: 0.56rem;
+  padding: 0.72rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+  text-align: center;
+  background: #fff;
 }
 
 .pane-graph {
@@ -811,6 +939,16 @@ textarea {
   border-color: color-mix(in oklab, var(--accent) 65%, #5e5d43);
   background: color-mix(in oklab, var(--accent) 45%, #fff);
   font-weight: 700;
+}
+
+@media (max-width: 700px) {
+  .explorer-toolbar-row {
+    font-size: 0.72rem;
+  }
+
+  .explorer-clear-button {
+    margin-left: 0;
+  }
 }
 
 @media (max-width: 1200px) {

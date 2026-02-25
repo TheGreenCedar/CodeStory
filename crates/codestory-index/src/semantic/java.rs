@@ -1,7 +1,7 @@
 use super::{SemanticResolutionCandidate, SemanticResolutionRequest, SemanticResolver};
 use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 pub struct JavaSemanticResolver;
 
@@ -116,9 +116,10 @@ impl JavaSemanticResolver {
         let suffix_colon = format!("%::{}", call_name);
         if let Some(file_id) = request.file_id {
             let mut stmt = conn.prepare(&query_same_file)?;
-            let rows = stmt.query_map(params![file_id, call_name, suffix_dot, suffix_colon], |row| {
-                row.get(0)
-            })?;
+            let rows = stmt.query_map(
+                params![file_id, call_name, suffix_dot, suffix_colon],
+                |row| row.get(0),
+            )?;
             for row in rows {
                 out.push(SemanticResolutionCandidate {
                     target_node_id: row?,
@@ -137,7 +138,9 @@ impl JavaSemanticResolver {
                 kind_clause
             );
             let mut stmt = conn.prepare(&query_global)?;
-            let rows = stmt.query_map(params![call_name, suffix_dot, suffix_colon], |row| row.get(0))?;
+            let rows = stmt.query_map(params![call_name, suffix_dot, suffix_colon], |row| {
+                row.get(0)
+            })?;
             for row in rows {
                 out.push(SemanticResolutionCandidate {
                     target_node_id: row?,

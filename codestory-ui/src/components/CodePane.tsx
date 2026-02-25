@@ -5,6 +5,7 @@ import type { NodeDetailsDto } from "../generated/api";
 type CodePaneProps = {
   projectOpen: boolean;
   activeFilePath: string | null;
+  monacoModelPath: string | null;
   isDirty: boolean;
   isSaving: boolean;
   onSave: () => Promise<boolean>;
@@ -18,6 +19,7 @@ type CodePaneProps = {
 export function CodePane({
   projectOpen,
   activeFilePath,
+  monacoModelPath,
   isDirty,
   isSaving,
   onSave,
@@ -59,8 +61,8 @@ export function CodePane({
       {activeFilePath ? (
         <div className="monaco-shell">
           <Editor
-            key={activeFilePath}
-            path={activeFilePath}
+            key={monacoModelPath ?? activeFilePath}
+            path={monacoModelPath ?? activeFilePath}
             language={codeLanguage}
             value={draftText}
             onChange={(next) => onDraftChange(next ?? "")}

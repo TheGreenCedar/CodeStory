@@ -45,7 +45,10 @@ fn index_feature_flags() -> IndexFeatureFlags {
 
 fn env_flag(name: &str, default: bool) -> bool {
     match std::env::var(name) {
-        Ok(value) => matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"),
+        Ok(value) => matches!(
+            value.trim(),
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+        ),
         Err(_) => default,
     }
 }
@@ -829,7 +832,8 @@ fn ensure_callsite_identity(edge: &mut Edge, col: Option<u32>) {
     if edge.kind != EdgeKind::CALL || edge.callsite_identity.is_some() {
         return;
     }
-    edge.callsite_identity = canonical_callsite_identity(edge.file_node_id, edge.line, col, edge.target);
+    edge.callsite_identity =
+        canonical_callsite_identity(edge.file_node_id, edge.line, col, edge.target);
 }
 
 fn edge_dedup_key(edge: &Edge, flags: IndexFeatureFlags) -> EdgeDedupKey {
@@ -1355,12 +1359,57 @@ fn main() {
             result
                 .nodes
                 .iter()
-                .any(|n| n.serialized_name == "MyTrait" && n.kind == NodeKind::CLASS)
+                .any(|n| n.serialized_name == "MyTrait" && n.kind == NodeKind::INTERFACE)
         );
         // Verify Impl Inheritance
         assert!(result.edges.iter().any(|e| e.kind == EdgeKind::INHERITANCE));
         // Verify Macro usage
         assert!(result.edges.iter().any(|e| e.kind == EdgeKind::USAGE));
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_rust_trait_impl_for_generic_type() -> Result<()> {
+        let code = r#"
+trait Listener {
+    fn on_event(&mut self);
+}
+
+struct Wrapper<T>(T);
+
+impl<T> Listener for Wrapper<T> {
+    fn on_event(&mut self) {}
+}
+"#;
+        let (lang, lang_name, graph_query) = get_language_for_ext("rs").unwrap();
+        let result = index_file(
+            Path::new("main.rs"),
+            code,
+            lang,
+            lang_name,
+            graph_query,
+            None,
+            None,
+        )?;
+
+        let listener = result
+            .nodes
+            .iter()
+            .find(|n| n.serialized_name == "Listener" && n.kind == NodeKind::INTERFACE)
+            .expect("Listener interface not found");
+        let wrapper = result
+            .nodes
+            .iter()
+            .find(|n| n.serialized_name == "Wrapper" && n.kind == NodeKind::CLASS)
+            .expect("Wrapper type not found");
+
+        assert!(
+            result.edges.iter().any(|e| e.kind == EdgeKind::INHERITANCE
+                && e.source == wrapper.id
+                && e.target == listener.id),
+            "INHERITANCE edge from Wrapper to Listener not found"
+        );
+
         Ok(())
     }
 

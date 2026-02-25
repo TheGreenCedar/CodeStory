@@ -136,7 +136,11 @@ impl Repository {
         .find(|node| {
             node.kind == codestory_core::NodeKind::FILE && node.serialized_name.contains("main.rs")
         })
-        .or_else(|| nodes.iter().find(|node| node.kind == codestory_core::NodeKind::FILE))
+        .or_else(|| {
+            nodes
+                .iter()
+                .find(|node| node.kind == codestory_core::NodeKind::FILE)
+        })
         .ok_or_else(|| anyhow::anyhow!("main.rs file node not found"))?;
     let node_by_id = nodes
         .iter()

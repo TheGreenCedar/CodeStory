@@ -15,23 +15,33 @@ struct FidelityFixture {
 const FIXTURES: &[FidelityFixture] = &[
     FidelityFixture {
         path: "python_fidelity_lab.py",
-        source: include_str!("../../codestory-index/tests/fixtures/fidelity_lab/python_fidelity_lab.py"),
+        source: include_str!(
+            "../../codestory-index/tests/fixtures/fidelity_lab/python_fidelity_lab.py"
+        ),
     },
     FidelityFixture {
         path: "typescript_fidelity_lab.ts",
-        source: include_str!("../../codestory-index/tests/fixtures/fidelity_lab/typescript_fidelity_lab.ts"),
+        source: include_str!(
+            "../../codestory-index/tests/fixtures/fidelity_lab/typescript_fidelity_lab.ts"
+        ),
     },
     FidelityFixture {
         path: "javascript_fidelity_lab.js",
-        source: include_str!("../../codestory-index/tests/fixtures/fidelity_lab/javascript_fidelity_lab.js"),
+        source: include_str!(
+            "../../codestory-index/tests/fixtures/fidelity_lab/javascript_fidelity_lab.js"
+        ),
     },
     FidelityFixture {
         path: "java_fidelity_lab.java",
-        source: include_str!("../../codestory-index/tests/fixtures/fidelity_lab/java_fidelity_lab.java"),
+        source: include_str!(
+            "../../codestory-index/tests/fixtures/fidelity_lab/java_fidelity_lab.java"
+        ),
     },
     FidelityFixture {
         path: "cpp_fidelity_lab.cpp",
-        source: include_str!("../../codestory-index/tests/fixtures/fidelity_lab/cpp_fidelity_lab.cpp"),
+        source: include_str!(
+            "../../codestory-index/tests/fixtures/fidelity_lab/cpp_fidelity_lab.cpp"
+        ),
     },
     FidelityFixture {
         path: "c_fidelity_lab.c",
@@ -39,7 +49,9 @@ const FIXTURES: &[FidelityFixture] = &[
     },
     FidelityFixture {
         path: "rust_fidelity_lab.rs",
-        source: include_str!("../../codestory-index/tests/fixtures/fidelity_lab/rust_fidelity_lab.rs"),
+        source: include_str!(
+            "../../codestory-index/tests/fixtures/fidelity_lab/rust_fidelity_lab.rs"
+        ),
     },
 ];
 
@@ -76,13 +88,18 @@ fn bench_graph_fidelity(c: &mut Criterion) {
                 .expect("indexing");
 
             let edges = storage.get_edges().expect("edges");
-            let call_edges = edges.iter().filter(|edge| edge.kind == EdgeKind::CALL).count();
+            let call_edges = edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::CALL)
+                .count();
             let uncertain_edges = edges
                 .iter()
                 .filter(|edge| {
                     edge.certainty
                         .or_else(|| ResolutionCertainty::from_confidence(edge.confidence))
-                        .is_some_and(|certainty| matches!(certainty, ResolutionCertainty::Uncertain))
+                        .is_some_and(|certainty| {
+                            matches!(certainty, ResolutionCertainty::Uncertain)
+                        })
                 })
                 .count();
 

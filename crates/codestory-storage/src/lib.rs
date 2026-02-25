@@ -1527,9 +1527,8 @@ fn deserialize_candidate_targets(payload: Option<&str>) -> Result<Vec<NodeId>, S
     if payload.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let parsed: Vec<i64> = serde_json::from_str(payload).map_err(|e| {
-        StorageError::Other(format!("failed to parse edge candidate payload: {e}"))
-    })?;
+    let parsed: Vec<i64> = serde_json::from_str(payload)
+        .map_err(|e| StorageError::Other(format!("failed to parse edge candidate payload: {e}")))?;
     Ok(parsed.into_iter().map(NodeId).collect())
 }
 
