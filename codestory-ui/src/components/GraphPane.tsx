@@ -22,7 +22,7 @@ type GraphPaneProps = {
   activeGraphId: string | null;
   graphMap: Record<string, GraphArtifactDto>;
   onActivateGraph: (graphId: string) => void;
-  onSelectNode: (nodeId: string) => void;
+  onSelectNode: (nodeId: string, label: string) => void;
 };
 
 export function GraphPane({
@@ -75,8 +75,8 @@ export function GraphPane({
                   onMouseEnter={() => onSearchHitHover(idx)}
                   onClick={() => onSearchHitActivate(hit)}
                 >
-                  <span>{hit.display_name}</span>
-                  <span>{hit.kind}</span>
+                  <span className="search-hit-name">{hit.display_name}</span>
+                  <span className="search-hit-kind">{hit.kind}</span>
                 </button>
               ))}
             </div>

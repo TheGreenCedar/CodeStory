@@ -300,7 +300,7 @@ textarea {
 
 .graph-header {
   display: grid;
-  grid-template-columns: auto minmax(180px, 1fr) auto;
+  grid-template-columns: auto minmax(200px, 360px) minmax(0, 1fr);
   align-items: center;
   gap: 0.6rem;
 }
@@ -322,6 +322,7 @@ textarea {
 
 .graph-search-wrap {
   position: relative;
+  min-width: 0;
 }
 
 .graph-search-input {
@@ -358,7 +359,8 @@ textarea {
   border-radius: 0.7rem;
   box-shadow: 0 12px 24px rgba(15, 23, 27, 0.16);
   max-height: 16rem;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   padding: 0.3rem;
 }
 
@@ -370,10 +372,45 @@ textarea {
   text-align: left;
   display: flex;
   justify-content: space-between;
+  align-items: center;
   gap: 0.5rem;
   padding: 0.34rem 0.5rem;
   cursor: pointer;
   font-size: 0.78rem;
+  min-width: 0;
+}
+
+.search-hit-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-hit-kind {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.graph-tabs {
+  min-width: 0;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  padding-bottom: 0.16rem;
+}
+
+.graph-tabs button {
+  flex: 0 0 auto;
+  max-width: 18rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .search-hit:hover,

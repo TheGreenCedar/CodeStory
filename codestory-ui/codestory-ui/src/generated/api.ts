@@ -18,7 +18,11 @@ export type EdgeKind = "MEMBER" | "TYPE_USAGE" | "USAGE" | "CALL" | "INHERITANCE
 
 export type GraphArtifactDto = { kind: "uml"; id: string; title: string; graph: GraphResponse } | { kind: "mermaid"; id: string; title: string; diagram: string; mermaid_syntax: string }
 
-export type GraphEdgeDto = { id: EdgeId; source: NodeId; target: NodeId; kind: EdgeKind }
+export type GraphEdgeDto = { id: EdgeId; source: NodeId; target: NodeId; kind: EdgeKind; confidence?: number | null; 
+/**
+ * `certain`, `probable`, or `uncertain`.
+ */
+certainty?: string | null; callsite_identity?: string | null; candidate_targets?: NodeId[] }
 
 export type GraphNodeDto = { id: NodeId; label: string; kind: NodeKind; depth: number }
 

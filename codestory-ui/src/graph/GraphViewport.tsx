@@ -141,6 +141,15 @@ function isCardNodeKind(kind: string): boolean {
   return CARD_NODE_KINDS.has(kind);
 }
 
+function nodeLabelFromData(data: unknown, fallback: string): string {
+  if (typeof data !== "object" || data === null) {
+    return fallback;
+  }
+
+  const candidate = (data as { label?: unknown }).label;
+  return typeof candidate === "string" ? candidate : fallback;
+}
+
 function inferMemberVisibility(kind: string, label: string): "public" | "private" {
   if (PRIVATE_MEMBER_KINDS.has(kind)) {
     return "private";
@@ -347,14 +356,56 @@ function toFlowElements(graph: GraphResponse): { nodes: Node<FlowNodeData>[]; ed
     }
   }
 
+  // Bias directly connected symbols to opposite sides of the focused node:
+  // incoming callers left, outgoing callees right.
+  const directionBiasByNode = new Map<string, number>();
+  for (const edge of graph.edges) {
+    if (edge.kind === "MEMBER") {
+      continue;
+    }
+
+    const source = memberHostById.get(edge.source) ?? edge.source;
+    const target = memberHostById.get(edge.target) ?? edge.target;
+    if (source === target) {
+      continue;
+    }
+
+    if (source === graph.center_id && target !== graph.center_id) {
+      directionBiasByNode.set(target, (directionBiasByNode.get(target) ?? 0) + 1);
+    }
+
+    if (target === graph.center_id && source !== graph.center_id) {
+      directionBiasByNode.set(source, (directionBiasByNode.get(source) ?? 0) - 1);
+    }
+  }
+
+  const effectiveDepthByNode = new Map<string, number>();
+  for (const node of graph.nodes) {
+    if (node.id === graph.center_id) {
+      effectiveDepthByNode.set(node.id, 0);
+      continue;
+    }
+
+    const baseDepth = Math.max(1, node.depth);
+    const bias = directionBiasByNode.get(node.id) ?? 0;
+    if (bias < 0) {
+      effectiveDepthByNode.set(node.id, -baseDepth);
+    } else if (bias > 0) {
+      effectiveDepthByNode.set(node.id, baseDepth);
+    } else {
+      effectiveDepthByNode.set(node.id, baseDepth);
+    }
+  }
+
   const byDepth = new Map<number, typeof graph.nodes>();
   for (const node of graph.nodes) {
     if (memberHostById.has(node.id)) {
       continue;
     }
-    const depthList = byDepth.get(node.depth) ?? [];
+    const depth = effectiveDepthByNode.get(node.id) ?? node.depth;
+    const depthList = byDepth.get(depth) ?? [];
     depthList.push(node);
-    byDepth.set(node.depth, depthList);
+    byDepth.set(depth, depthList);
   }
 
   const sortedDepths = [...byDepth.keys()].sort((a, b) => a - b);
@@ -419,12 +470,11 @@ function toFlowElements(graph: GraphResponse): { nodes: Node<FlowNodeData>[]; ed
     const sourceHandle = sourceHost ? `source-member-${edge.source}` : "source-node";
     const targetHandle = targetHost ? `target-member-${edge.target}` : "target-node";
 
-    if (source === target && sourceHandle === targetHandle) {
+    if (source === target) {
       continue;
     }
 
-    const callsiteKey =
-      edge.kind === "CALL" ? edge.callsite_identity ?? edge.id : "";
+    const callsiteKey = edge.kind === "CALL" ? (edge.callsite_identity ?? edge.id) : "";
     const key =
       edge.kind === "CALL"
         ? `${edge.kind}:${source}:${sourceHandle}:${target}:${targetHandle}:${callsiteKey}`
@@ -520,7 +570,7 @@ function MermaidGraph({ syntax }: { syntax: string }) {
 
 type GraphViewportProps = {
   graph: GraphArtifactDto | null;
-  onSelectNode: (nodeId: string) => void;
+  onSelectNode: (nodeId: string, label: string) => void;
 };
 
 export function GraphViewport({ graph, onSelectNode }: GraphViewportProps) {
@@ -584,7 +634,7 @@ export function GraphViewport({ graph, onSelectNode }: GraphViewportProps) {
       onInit={setFlow}
       nodes={flowElements.nodes}
       edges={flowElements.edges}
-      onNodeClick={(_, node) => onSelectNode(node.id)}
+      onNodeClick={(_, node) => onSelectNode(node.id, nodeLabelFromData(node.data, node.id))}
       nodeTypes={GRAPH_NODE_TYPES}
       minZoom={0.18}
       maxZoom={2.1}

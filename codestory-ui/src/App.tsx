@@ -615,8 +615,8 @@ export default function App() {
           activeGraphId={activeGraphId}
           graphMap={graphMap}
           onActivateGraph={setActiveGraphId}
-          onSelectNode={(nodeId) => {
-            focusSymbol(nodeId, nodeId);
+          onSelectNode={(nodeId, label) => {
+            focusSymbol(nodeId, label);
           }}
         />
 
