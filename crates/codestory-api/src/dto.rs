@@ -83,6 +83,15 @@ pub struct GraphEdgeDto {
     pub source: NodeId,
     pub target: NodeId,
     pub kind: EdgeKind,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    /// `certain`, `probable`, or `uncertain`.
+    #[serde(default)]
+    pub certainty: Option<String>,
+    #[serde(default)]
+    pub callsite_identity: Option<String>,
+    #[serde(default)]
+    pub candidate_targets: Vec<NodeId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

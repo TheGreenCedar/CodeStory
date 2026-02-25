@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 fn no_project_error() -> ApiError {
     ApiError::invalid_argument("No project open. Call open_project first.")
@@ -27,7 +27,6 @@ fn node_display_name(node: &codestory_core::Node) -> String {
         .unwrap_or_else(|| node.serialized_name.clone())
 }
 
-
 fn clamp_i64_to_u32(v: i64) -> u32 {
     if v <= 0 {
         0
@@ -35,6 +34,73 @@ fn clamp_i64_to_u32(v: i64) -> u32 {
         u32::MAX
     } else {
         v as u32
+    }
+}
+
+fn edge_certainty_label(
+    certainty: Option<codestory_core::ResolutionCertainty>,
+    confidence: Option<f32>,
+) -> Option<String> {
+    certainty
+        .or_else(|| codestory_core::ResolutionCertainty::from_confidence(confidence))
+        .map(|value| value.as_str().to_string())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AppGraphFeatureFlags {
+    include_edge_certainty: bool,
+    include_callsite_identity: bool,
+    include_candidate_targets: bool,
+}
+
+impl AppGraphFeatureFlags {
+    fn from_env() -> Self {
+        Self {
+            include_edge_certainty: env_flag("CODESTORY_GRAPH_INCLUDE_EDGE_CERTAINTY", true),
+            include_callsite_identity: env_flag("CODESTORY_GRAPH_INCLUDE_CALLSITE_IDENTITY", true),
+            include_candidate_targets: env_flag("CODESTORY_GRAPH_INCLUDE_CANDIDATE_TARGETS", true),
+        }
+    }
+}
+
+fn app_graph_flags() -> AppGraphFeatureFlags {
+    static FLAGS: OnceLock<AppGraphFeatureFlags> = OnceLock::new();
+    *FLAGS.get_or_init(AppGraphFeatureFlags::from_env)
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"),
+        Err(_) => default,
+    }
+}
+
+fn graph_edge_dto(edge: codestory_core::Edge, flags: AppGraphFeatureFlags) -> GraphEdgeDto {
+    GraphEdgeDto {
+        id: EdgeId::from(edge.id),
+        source: NodeId::from(edge.source),
+        target: NodeId::from(edge.target),
+        kind: EdgeKind::from(edge.kind),
+        confidence: edge.confidence,
+        certainty: if flags.include_edge_certainty {
+            edge_certainty_label(edge.certainty, edge.confidence)
+        } else {
+            None
+        },
+        callsite_identity: if flags.include_callsite_identity {
+            edge.callsite_identity.clone()
+        } else {
+            None
+        },
+        candidate_targets: if flags.include_candidate_targets {
+            edge.candidate_targets
+                .iter()
+                .copied()
+                .map(NodeId::from)
+                .collect()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -707,6 +773,7 @@ impl AppController {
 
     pub fn graph_neighborhood(&self, req: GraphRequest) -> Result<GraphResponse, ApiError> {
         let center = req.center_id.to_core()?;
+        let graph_flags = app_graph_flags();
 
         let storage = self.open_storage()?;
 
@@ -731,12 +798,7 @@ impl AppController {
             let edge = edge.with_effective_endpoints();
             let (source, target) = (edge.source, edge.target);
 
-            edge_dtos.push(GraphEdgeDto {
-                id: EdgeId::from(edge.id),
-                source: NodeId::from(source),
-                target: NodeId::from(target),
-                kind: EdgeKind::from(edge.kind),
-            });
+            edge_dtos.push(graph_edge_dto(edge, graph_flags));
 
             if seen.insert(source) {
                 ordered_node_ids.push(source);
@@ -778,6 +840,7 @@ impl AppController {
 
     pub fn graph_trail(&self, req: TrailConfigDto) -> Result<GraphResponse, ApiError> {
         let root_id = req.root_id.to_core()?;
+        let graph_flags = app_graph_flags();
         let target_id = match req.target_id {
             Some(id) => Some(id.to_core()?),
             None => None,
@@ -830,12 +893,7 @@ impl AppController {
         let mut edge_dtos = Vec::with_capacity(edges.len());
         for edge in edges {
             let edge = edge.with_effective_endpoints();
-            edge_dtos.push(GraphEdgeDto {
-                id: EdgeId::from(edge.id),
-                source: NodeId::from(edge.source),
-                target: NodeId::from(edge.target),
-                kind: EdgeKind::from(edge.kind),
-            });
+            edge_dtos.push(graph_edge_dto(edge, graph_flags));
         }
 
         Ok(GraphResponse {

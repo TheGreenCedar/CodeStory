@@ -380,9 +380,16 @@ fn is_matching_name(serialized_name: &str, wanted_name: &str) -> bool {
 }
 
 fn has_node(nodes: &[Node], kind: NodeKind, name: &str) -> bool {
-    nodes
-        .iter()
-        .any(|node| node.kind == kind && is_matching_name(&node.serialized_name, name))
+    nodes.iter().any(|node| {
+        let kind_matches = if kind == NodeKind::FUNCTION {
+            node.kind == NodeKind::FUNCTION || node.kind == NodeKind::METHOD
+        } else if kind == NodeKind::VARIABLE {
+            node.kind == NodeKind::VARIABLE || node.kind == NodeKind::FIELD
+        } else {
+            node.kind == kind
+        };
+        kind_matches && is_matching_name(&node.serialized_name, name)
+    })
 }
 
 fn has_edge_kind(edges: &[Edge], kind: EdgeKind) -> bool {
@@ -443,7 +450,10 @@ fn test_language_extension_coverage_and_names() {
     for (ext, expected_name) in expected {
         let (_, language_name, graph_query) =
             get_language_for_ext(ext).expect("Extension should resolve to a language");
-        assert_eq!(language_name, expected_name, "Wrong language name for extension {ext}");
+        assert_eq!(
+            language_name, expected_name,
+            "Wrong language name for extension {ext}"
+        );
         assert!(
             !graph_query.trim().is_empty(),
             "Expected non-empty graph query for extension {ext}"
@@ -563,7 +573,13 @@ fn test_tictactoe_member_relationships_are_extracted() -> Result<()> {
         let result = index_case(&case)?;
         for (owner, member) in case.required_member_pairs {
             assert!(
-                has_edge_between_names(&result.edges, &result.nodes, EdgeKind::MEMBER, owner, member),
+                has_edge_between_names(
+                    &result.edges,
+                    &result.nodes,
+                    EdgeKind::MEMBER,
+                    owner,
+                    member
+                ),
                 "Missing MEMBER edge '{} -> {}' for {}",
                 owner,
                 member,
@@ -584,7 +600,13 @@ fn test_tictactoe_inheritance_relationships_are_extracted() -> Result<()> {
         let result = index_case(&case)?;
         for (child, parent) in case.required_inheritance_pairs {
             assert!(
-                has_edge_between_names(&result.edges, &result.nodes, EdgeKind::INHERITANCE, child, parent),
+                has_edge_between_names(
+                    &result.edges,
+                    &result.nodes,
+                    EdgeKind::INHERITANCE,
+                    child,
+                    parent
+                ),
                 "Missing INHERITANCE edge '{} -> {}' for {}",
                 child,
                 parent,

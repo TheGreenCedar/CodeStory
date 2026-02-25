@@ -1,0 +1,47 @@
+name: graph-fidelity
+
+on:
+  pull_request:
+    paths:
+      - "crates/codestory-core/**"
+      - "crates/codestory-index/**"
+      - "crates/codestory-storage/**"
+      - "crates/codestory-api/**"
+      - "crates/codestory-app/**"
+      - "codestory-ui/**"
+      - "docs/graph-fidelity/**"
+      - "crates/codestory-bench/**"
+      - ".github/workflows/graph-fidelity.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/codestory-core/**"
+      - "crates/codestory-index/**"
+      - "crates/codestory-storage/**"
+      - "crates/codestory-api/**"
+      - "crates/codestory-app/**"
+      - "codestory-ui/**"
+      - "docs/graph-fidelity/**"
+      - "crates/codestory-bench/**"
+      - ".github/workflows/graph-fidelity.yml"
+
+jobs:
+  fidelity-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: cargo test index fidelity regressions
+        run: cargo test -p codestory-index --test fidelity_regression
+
+      - name: cargo test import and call fidelity
+        run: |
+          cargo test -p codestory-index --test import_resolution
+          cargo test -p codestory-index --test call_resolution_common_methods
+
+      - name: bench compile sanity
+        run: cargo bench -p codestory-bench --bench graph_fidelity --no-run

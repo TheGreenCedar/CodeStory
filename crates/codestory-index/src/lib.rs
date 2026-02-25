@@ -3,6 +3,7 @@ use codestory_core::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind, Occurrence,
 use codestory_storage::Storage;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use codestory_events::{Event, EventBus};
 use rayon::prelude::*;
@@ -17,10 +18,37 @@ pub mod cancellation;
 pub mod compilation_database;
 pub mod intermediate_storage;
 pub mod resolution;
+pub mod semantic;
 pub mod symbol_table;
 pub use cancellation::CancellationToken;
 use intermediate_storage::IntermediateStorage;
 use symbol_table::SymbolTable;
+
+#[derive(Debug, Clone, Copy)]
+struct IndexFeatureFlags {
+    legacy_edge_identity: bool,
+}
+
+impl IndexFeatureFlags {
+    fn from_env() -> Self {
+        Self {
+            legacy_edge_identity: env_flag("CODESTORY_INDEX_LEGACY_EDGE_IDENTITY", false)
+                || env_flag("CODESTORY_INDEX_LEGACY_DEDUP", false),
+        }
+    }
+}
+
+fn index_feature_flags() -> IndexFeatureFlags {
+    static FLAGS: OnceLock<IndexFeatureFlags> = OnceLock::new();
+    *FLAGS.get_or_init(IndexFeatureFlags::from_env)
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"),
+        Err(_) => default,
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct IncrementalIndexingConfig {
@@ -346,12 +374,27 @@ fn file_node_from_source(path: &Path, source: &str) -> (Node, String, NodeId) {
 
 fn node_kind_from_graph_kind(kind_str: &str) -> NodeKind {
     match kind_str {
-        "FUNCTION" | "METHOD" => NodeKind::FUNCTION,
-        "CLASS" | "STRUCT" => NodeKind::CLASS,
-        "MODULE" | "NAMESPACE" => NodeKind::MODULE,
+        "MODULE" => NodeKind::MODULE,
+        "NAMESPACE" => NodeKind::NAMESPACE,
+        "PACKAGE" => NodeKind::PACKAGE,
         "FILE" => NodeKind::FILE,
-        "VARIABLE" | "FIELD" => NodeKind::VARIABLE,
+        "STRUCT" => NodeKind::STRUCT,
+        "CLASS" => NodeKind::CLASS,
+        "INTERFACE" => NodeKind::INTERFACE,
+        "ANNOTATION" => NodeKind::ANNOTATION,
+        "UNION" => NodeKind::UNION,
+        "ENUM" => NodeKind::ENUM,
+        "TYPEDEF" => NodeKind::TYPEDEF,
+        "TYPE_PARAMETER" => NodeKind::TYPE_PARAMETER,
+        "BUILTIN_TYPE" => NodeKind::BUILTIN_TYPE,
+        "FUNCTION" => NodeKind::FUNCTION,
+        "METHOD" => NodeKind::METHOD,
+        "MACRO" => NodeKind::MACRO,
+        "GLOBAL_VARIABLE" => NodeKind::GLOBAL_VARIABLE,
+        "FIELD" => NodeKind::FIELD,
+        "VARIABLE" => NodeKind::VARIABLE,
         "CONSTANT" => NodeKind::CONSTANT,
+        "ENUM_CONSTANT" => NodeKind::ENUM_CONSTANT,
         _ => NodeKind::UNKNOWN,
     }
 }
@@ -484,7 +527,12 @@ fn remap_file_affinity(nodes: &mut [Node], new_file_id: NodeId) {
     }
 }
 
-fn remap_edges(edges: &mut [Edge], new_file_id: NodeId, id_remap: &HashMap<NodeId, NodeId>) {
+fn remap_edges(
+    edges: &mut [Edge],
+    new_file_id: NodeId,
+    id_remap: &HashMap<NodeId, NodeId>,
+    flags: IndexFeatureFlags,
+) {
     for edge in edges.iter_mut() {
         if let Some(new_id) = id_remap.get(&edge.source) {
             edge.source = *new_id;
@@ -493,7 +541,10 @@ fn remap_edges(edges: &mut [Edge], new_file_id: NodeId, id_remap: &HashMap<NodeI
             edge.target = *new_id;
         }
         edge.file_node_id = Some(new_file_id);
-        edge.id = EdgeId(generate_edge_id(edge.source.0, edge.target.0, edge.kind));
+        if !flags.legacy_edge_identity {
+            ensure_callsite_identity(edge, None);
+        }
+        edge.id = EdgeId(generate_edge_id_for_edge(edge, flags));
     }
 }
 
@@ -518,6 +569,8 @@ pub fn index_file(
     compilation_info: Option<compilation_database::CompilationInfo>,
     symbol_table: Option<Arc<SymbolTable>>,
 ) -> Result<IndexResult> {
+    let flags = index_feature_flags();
+
     let mut parser = Parser::new();
     parser
         .set_language(&language)
@@ -613,7 +666,7 @@ pub fn index_file(
     }
 
     // 2. Second pass: Create edges using tree-sitter-graph output
-    let mut edge_keys: HashSet<(NodeId, NodeId, EdgeKind)> = HashSet::new();
+    let mut edge_keys: HashSet<EdgeDedupKey> = HashSet::new();
 
     for source_ref in graph.iter_nodes() {
         let Some(source_id) = graph_to_node_id.get(&source_ref) else {
@@ -627,6 +680,7 @@ pub fn index_file(
 
             let mut kind: Option<EdgeKind> = None;
             let mut line: Option<u32> = None;
+            let mut callsite_identity: Option<String> = None;
 
             for (attr, val) in edge.attributes.iter() {
                 match attr.as_str() {
@@ -640,6 +694,14 @@ pub fn index_file(
                             line = Some(row + 1);
                         }
                     }
+                    "callsite_identity" | "callsite_id" | "callsite" => {
+                        if let Ok(raw) = val.as_str() {
+                            let raw = raw.trim();
+                            if !raw.is_empty() {
+                                callsite_identity = Some(raw.to_string());
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -648,20 +710,22 @@ pub fn index_file(
                 continue;
             };
 
-            if !edge_keys.insert((*source_id, *target_id, kind)) {
-                continue;
-            }
-
-            let edge_pk = generate_edge_id(source_id.0, target_id.0, kind);
-            result_edges.push(Edge {
-                id: EdgeId(edge_pk),
+            let mut edge = Edge {
+                id: EdgeId(0),
                 source: *source_id,
                 target: *target_id,
                 kind,
                 file_node_id: Some(file_id),
                 line,
+                callsite_identity,
                 ..Default::default()
-            });
+            };
+            if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
+                continue;
+            }
+
+            edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
+            result_edges.push(edge);
         }
     }
 
@@ -672,10 +736,10 @@ pub fn index_file(
     let (mut final_nodes, id_remap) = canonicalize_nodes(&file_name, final_nodes);
     let new_file_id = id_remap.get(&file_id).copied().unwrap_or(file_id);
     remap_file_affinity(&mut final_nodes, new_file_id);
-    remap_edges(&mut result_edges, new_file_id, &id_remap);
+    remap_edges(&mut result_edges, new_file_id, &id_remap, flags);
     remap_occurrences(&mut result_occurrences, &id_remap);
 
-    apply_line_range_call_attribution(&final_nodes, &mut result_edges);
+    apply_line_range_call_attribution(&final_nodes, &mut result_edges, flags);
 
     if let Some(st) = &symbol_table {
         for node in &final_nodes {
@@ -740,6 +804,54 @@ pub fn generate_id(name: &str) -> i64 {
     h as i64
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EdgeDedupKey {
+    source: NodeId,
+    target: NodeId,
+    kind: EdgeKind,
+    line: Option<u32>,
+    callsite_identity: Option<String>,
+}
+
+fn canonical_callsite_identity(
+    file_node_id: Option<NodeId>,
+    line: Option<u32>,
+    col: Option<u32>,
+    target: NodeId,
+) -> Option<String> {
+    let file = file_node_id?;
+    let line = line.unwrap_or(0);
+    let col = col.unwrap_or(0);
+    Some(format!("{}:{}:{}:{}", file.0, line, col, target.0))
+}
+
+fn ensure_callsite_identity(edge: &mut Edge, col: Option<u32>) {
+    if edge.kind != EdgeKind::CALL || edge.callsite_identity.is_some() {
+        return;
+    }
+    edge.callsite_identity = canonical_callsite_identity(edge.file_node_id, edge.line, col, edge.target);
+}
+
+fn edge_dedup_key(edge: &Edge, flags: IndexFeatureFlags) -> EdgeDedupKey {
+    if edge.kind == EdgeKind::CALL && !flags.legacy_edge_identity {
+        EdgeDedupKey {
+            source: edge.source,
+            target: edge.target,
+            kind: edge.kind,
+            line: edge.line,
+            callsite_identity: edge.callsite_identity.clone(),
+        }
+    } else {
+        EdgeDedupKey {
+            source: edge.source,
+            target: edge.target,
+            kind: edge.kind,
+            line: None,
+            callsite_identity: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FunctionRange {
     id: NodeId,
@@ -747,7 +859,11 @@ struct FunctionRange {
     end: u32,
 }
 
-fn apply_line_range_call_attribution(nodes: &[Node], edges: &mut Vec<Edge>) {
+fn apply_line_range_call_attribution(
+    nodes: &[Node],
+    edges: &mut Vec<Edge>,
+    flags: IndexFeatureFlags,
+) {
     let mut functions_by_file: HashMap<NodeId, Vec<FunctionRange>> = HashMap::new();
 
     for node in nodes {
@@ -779,7 +895,7 @@ fn apply_line_range_call_attribution(nodes: &[Node], edges: &mut Vec<Edge>) {
         ranges.sort_by_key(|range| (range.end - range.start, range.start));
     }
 
-    let mut dedup: HashSet<(NodeId, NodeId, EdgeKind)> = HashSet::new();
+    let mut dedup: HashSet<EdgeDedupKey> = HashSet::new();
     let mut updated_edges = Vec::with_capacity(edges.len());
 
     for edge in edges.iter_mut() {
@@ -793,11 +909,14 @@ fn apply_line_range_call_attribution(nodes: &[Node], edges: &mut Vec<Edge>) {
             {
                 edge.source = best.id;
             }
-            edge.id = EdgeId(generate_edge_id(edge.source.0, edge.target.0, edge.kind));
+            if !flags.legacy_edge_identity {
+                ensure_callsite_identity(edge, None);
+            }
         }
 
-        let key = (edge.source, edge.target, edge.kind);
-        if dedup.insert(key) {
+        edge.id = EdgeId(generate_edge_id_for_edge(edge, flags));
+
+        if dedup.insert(edge_dedup_key(edge, flags)) {
             updated_edges.push(edge.clone());
         }
     }
@@ -836,6 +955,35 @@ fn generate_edge_id(source: i64, target: i64, kind: codestory_core::EdgeKind) ->
     update(target);
     update(kind as i64);
     h as i64
+}
+
+fn generate_edge_id_with_identity(
+    source: i64,
+    target: i64,
+    kind: codestory_core::EdgeKind,
+    identity: &str,
+) -> i64 {
+    let mut h = generate_edge_id(source, target, kind) as u64;
+    for b in identity.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x01000193);
+    }
+    h as i64
+}
+
+fn generate_edge_id_for_edge(edge: &Edge, flags: IndexFeatureFlags) -> i64 {
+    if edge.kind == EdgeKind::CALL
+        && !flags.legacy_edge_identity
+        && let Some(callsite_identity) = edge.callsite_identity.as_deref()
+    {
+        return generate_edge_id_with_identity(
+            edge.source.0,
+            edge.target.0,
+            edge.kind,
+            callsite_identity,
+        );
+    }
+    generate_edge_id(edge.source.0, edge.target.0, edge.kind)
 }
 
 #[cfg(test)]
@@ -1241,14 +1389,14 @@ class Test {
             result
                 .nodes
                 .iter()
-                .any(|n| n.serialized_name.ends_with(".caller") && n.kind == NodeKind::FUNCTION),
+                .any(|n| n.serialized_name.ends_with(".caller") && n.kind == NodeKind::METHOD),
             "Caller node not found"
         );
         assert!(
             result
                 .nodes
                 .iter()
-                .any(|n| n.serialized_name.ends_with(".callee") && n.kind == NodeKind::FUNCTION),
+                .any(|n| n.serialized_name.ends_with(".callee") && n.kind == NodeKind::METHOD),
             "Callee node not found"
         );
         assert!(
@@ -1294,5 +1442,12 @@ class Test {
 
         assert_eq!(call_edge.source, caller.id);
         Ok(())
+    }
+
+    #[test]
+    fn test_node_kind_mapping_preserves_method_and_field() {
+        assert_eq!(node_kind_from_graph_kind("METHOD"), NodeKind::METHOD);
+        assert_eq!(node_kind_from_graph_kind("FIELD"), NodeKind::FIELD);
+        assert_eq!(node_kind_from_graph_kind("INTERFACE"), NodeKind::INTERFACE);
     }
 }

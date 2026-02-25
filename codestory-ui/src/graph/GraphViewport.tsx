@@ -423,7 +423,12 @@ function toFlowElements(graph: GraphResponse): { nodes: Node<FlowNodeData>[]; ed
       continue;
     }
 
-    const key = `${edge.kind}:${source}:${sourceHandle}:${target}:${targetHandle}`;
+    const callsiteKey =
+      edge.kind === "CALL" ? edge.callsite_identity ?? edge.id : "";
+    const key =
+      edge.kind === "CALL"
+        ? `${edge.kind}:${source}:${sourceHandle}:${target}:${targetHandle}:${callsiteKey}`
+        : `${edge.kind}:${source}:${sourceHandle}:${target}:${targetHandle}`;
     if (!foldedEdges.has(key)) {
       foldedEdges.set(key, {
         ...edge,
@@ -438,6 +443,9 @@ function toFlowElements(graph: GraphResponse): { nodes: Node<FlowNodeData>[]; ed
 
   const edges: Edge[] = [...foldedEdges.values()].map((edge) => {
     const palette = EDGE_STYLE[edge.kind] ?? { stroke: "#8b8f96", width: 2.1 };
+    const certainty = edge.certainty?.toLowerCase();
+    const isUncertain = certainty === "uncertain";
+    const isProbable = certainty === "probable";
 
     return {
       id: edge.id,
@@ -461,6 +469,8 @@ function toFlowElements(graph: GraphResponse): { nodes: Node<FlowNodeData>[]; ed
         stroke: palette.stroke,
         strokeWidth: palette.width,
         strokeLinecap: "round",
+        strokeDasharray: isUncertain ? "7 5" : undefined,
+        opacity: isUncertain ? 0.72 : isProbable ? 0.88 : 1,
       },
       interactionWidth: 18,
     };

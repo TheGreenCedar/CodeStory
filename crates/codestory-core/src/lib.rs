@@ -173,6 +173,47 @@ impl TryFrom<i32> for EdgeKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResolutionCertainty {
+    Certain,
+    Probable,
+    Uncertain,
+}
+
+impl ResolutionCertainty {
+    pub const CERTAIN_MIN: f32 = 0.85;
+    pub const PROBABLE_MIN: f32 = 0.55;
+
+    pub fn from_confidence(confidence: Option<f32>) -> Option<Self> {
+        let confidence = confidence?;
+        if confidence >= Self::CERTAIN_MIN {
+            Some(Self::Certain)
+        } else if confidence >= Self::PROBABLE_MIN {
+            Some(Self::Probable)
+        } else {
+            Some(Self::Uncertain)
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Certain => "certain",
+            Self::Probable => "probable",
+            Self::Uncertain => "uncertain",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "certain" => Some(Self::Certain),
+            "probable" => Some(Self::Probable),
+            "uncertain" => Some(Self::Uncertain),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Node {
     pub id: NodeId,
@@ -198,6 +239,12 @@ pub struct Edge {
     pub resolved_source: Option<NodeId>,
     pub resolved_target: Option<NodeId>,
     pub confidence: Option<f32>,
+    #[serde(default)]
+    pub certainty: Option<ResolutionCertainty>,
+    #[serde(default)]
+    pub callsite_identity: Option<String>,
+    #[serde(default)]
+    pub candidate_targets: Vec<NodeId>,
 }
 
 impl Edge {
@@ -250,6 +297,9 @@ impl Default for Edge {
             resolved_source: None,
             resolved_target: None,
             confidence: None,
+            certainty: None,
+            callsite_identity: None,
+            candidate_targets: Vec::new(),
         }
     }
 }

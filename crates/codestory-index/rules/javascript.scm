@@ -26,7 +26,7 @@
   name: (property_identifier) @name) @def
 {
   node @name.node
-  attr (@name.node) kind = "FUNCTION"
+  attr (@name.node) kind = "METHOD"
   attr (@name.node) name = (source-text @name)
   attr (@name.node) start_row = (start-row @def)
   attr (@name.node) start_col = (start-column @def)
@@ -252,4 +252,51 @@
 
   edge @module.node -> @module.node
   attr (@module.node -> @module.node) kind = "IMPORT"
+}
+
+;; Lambda assignment
+(variable_declarator
+  name: (identifier) @name
+  value: (arrow_function) @def)
+{
+  node @name.node
+  attr (@name.node) kind = "FUNCTION"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
+;; Import aliases
+(import_statement
+  (import_clause
+    (identifier) @alias_name))
+{
+  node @alias_name.node
+  attr (@alias_name.node) kind = "MODULE"
+  attr (@alias_name.node) name = (source-text @alias_name)
+  attr (@alias_name.node) start_row = (start-row @alias_name)
+  attr (@alias_name.node) start_col = (start-column @alias_name)
+  attr (@alias_name.node) end_row = (end-row @alias_name)
+  attr (@alias_name.node) end_col = (end-column @alias_name)
+
+  edge @alias_name.node -> @alias_name.node
+  attr (@alias_name.node -> @alias_name.node) kind = "IMPORT"
+}
+
+(import_statement
+  (import_clause
+    (namespace_import (identifier) @alias_name)))
+{
+  node @alias_name.node
+  attr (@alias_name.node) kind = "MODULE"
+  attr (@alias_name.node) name = (source-text @alias_name)
+  attr (@alias_name.node) start_row = (start-row @alias_name)
+  attr (@alias_name.node) start_col = (start-column @alias_name)
+  attr (@alias_name.node) end_row = (end-row @alias_name)
+  attr (@alias_name.node) end_col = (end-column @alias_name)
+
+  edge @alias_name.node -> @alias_name.node
+  attr (@alias_name.node -> @alias_name.node) kind = "IMPORT"
 }

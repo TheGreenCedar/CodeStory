@@ -2,7 +2,7 @@
   name: (identifier) @name) @def
 {
   node @name.node
-  attr (@name.node) kind = "FUNCTION"
+  attr (@name.node) kind = "METHOD"
   attr (@name.node) name = (source-text @name)
   attr (@name.node) start_row = (start-row @def)
   attr (@name.node) start_col = (start-column @def)
@@ -26,7 +26,7 @@
   name: (identifier) @name)
 {
   node @name.node
-  attr (@name.node) kind = "CLASS"
+  attr (@name.node) kind = "INTERFACE"
   attr (@name.node) name = (source-text @name)
   attr (@name.node) start_row = (start-row @name)
   attr (@name.node) start_col = (start-column @name)
@@ -38,7 +38,7 @@
   (variable_declarator name: (identifier) @name))
 {
   node @name.node
-  attr (@name.node) kind = "VARIABLE"
+  attr (@name.node) kind = "FIELD"
   attr (@name.node) name = (source-text @name)
   attr (@name.node) start_row = (start-row @name)
   attr (@name.node) start_col = (start-column @name)
@@ -102,6 +102,15 @@
 {
   edge @class_name.node -> @method_name.node
   attr (@class_name.node -> @method_name.node) kind = "MEMBER"
+}
+
+(interface_declaration
+  name: (identifier) @interface_name
+  body: (interface_body
+    (method_declaration name: (identifier) @method_name)))
+{
+  edge @interface_name.node -> @method_name.node
+  attr (@interface_name.node -> @method_name.node) kind = "MEMBER"
 }
 
 ;; Membership (fields)
@@ -230,4 +239,88 @@
 
   edge @module.node -> @module.node
   attr (@module.node -> @module.node) kind = "IMPORT"
+}
+
+;; Lambda assignment
+(variable_declarator
+  name: (identifier) @name
+  value: (lambda_expression) @def)
+{
+  node @name.node
+  attr (@name.node) kind = "FUNCTION"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
+;; Inheritance (superclass variants / implements / interface extends)
+(class_declaration
+  name: (identifier) @class_name
+  superclass: (superclass (scoped_type_identifier) @parent_name))
+{
+  node @parent_name.node
+  attr (@parent_name.node) kind = "CLASS"
+  attr (@parent_name.node) name = (source-text @parent_name)
+  attr (@parent_name.node) start_row = (start-row @parent_name)
+  attr (@parent_name.node) start_col = (start-column @parent_name)
+  attr (@parent_name.node) end_row = (end-row @parent_name)
+  attr (@parent_name.node) end_col = (end-column @parent_name)
+
+  edge @class_name.node -> @parent_name.node
+  attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
+}
+
+(class_declaration
+  name: (identifier) @class_name
+  superclass: (superclass (generic_type
+    (type_identifier) @parent_name)))
+{
+  node @parent_name.node
+  attr (@parent_name.node) kind = "CLASS"
+  attr (@parent_name.node) name = (source-text @parent_name)
+  attr (@parent_name.node) start_row = (start-row @parent_name)
+  attr (@parent_name.node) start_col = (start-column @parent_name)
+  attr (@parent_name.node) end_row = (end-row @parent_name)
+  attr (@parent_name.node) end_col = (end-column @parent_name)
+
+  edge @class_name.node -> @parent_name.node
+  attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
+}
+
+(class_declaration
+  name: (identifier) @class_name
+  interfaces: (super_interfaces
+    (type_list
+      (_) @parent_name)))
+{
+  node @parent_name.node
+  attr (@parent_name.node) kind = "CLASS"
+  attr (@parent_name.node) name = (source-text @parent_name)
+  attr (@parent_name.node) start_row = (start-row @parent_name)
+  attr (@parent_name.node) start_col = (start-column @parent_name)
+  attr (@parent_name.node) end_row = (end-row @parent_name)
+  attr (@parent_name.node) end_col = (end-column @parent_name)
+
+  edge @class_name.node -> @parent_name.node
+  attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
+}
+
+(interface_declaration
+  name: (identifier) @interface_name
+  (extends_interfaces
+    (type_list
+      (_) @parent_name)))
+{
+  node @parent_name.node
+  attr (@parent_name.node) kind = "CLASS"
+  attr (@parent_name.node) name = (source-text @parent_name)
+  attr (@parent_name.node) start_row = (start-row @parent_name)
+  attr (@parent_name.node) start_col = (start-column @parent_name)
+  attr (@parent_name.node) end_row = (end-row @parent_name)
+  attr (@parent_name.node) end_col = (end-column @parent_name)
+
+  edge @interface_name.node -> @parent_name.node
+  attr (@interface_name.node -> @parent_name.node) kind = "INHERITANCE"
 }

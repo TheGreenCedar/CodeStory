@@ -1,6 +1,7 @@
 use codestory_core::{
     Bookmark, BookmarkCategory, Edge, EdgeKind, EnumConversionError, Node, NodeId, NodeKind,
-    Occurrence, OccurrenceKind, TrailConfig, TrailDirection, TrailMode, TrailResult,
+    Occurrence, OccurrenceKind, ResolutionCertainty, TrailConfig, TrailDirection, TrailMode,
+    TrailResult,
 };
 use parking_lot::RwLock;
 use rusqlite::{Connection, Result, Row, params};
@@ -11,9 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const RELATED_NODE_SUBQUERY: &str = "SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1";
-const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, t.serialized_name
+const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, e.callsite_identity, e.certainty, e.candidate_target_node_ids, t.serialized_name
                  FROM edge e
                  JOIN node t ON t.id = e.target_node_id";
 
@@ -144,6 +145,9 @@ impl Storage {
                 resolved_source_node_id INTEGER,
                 resolved_target_node_id INTEGER,
                 confidence REAL,
+                callsite_identity TEXT,
+                certainty TEXT,
+                candidate_target_node_ids TEXT,
                 FOREIGN KEY(source_node_id) REFERENCES node(id),
                 FOREIGN KEY(target_node_id) REFERENCES node(id),
                 FOREIGN KEY(file_node_id) REFERENCES node(id),
@@ -275,6 +279,10 @@ impl Storage {
         )?;
         self.conn
             .execute("CREATE INDEX IF NOT EXISTS idx_edge_line ON edge(line)", [])?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_edge_callsite_identity ON edge(callsite_identity)",
+            [],
+        )?;
         Ok(())
     }
 
@@ -300,11 +308,45 @@ impl Storage {
             )));
         }
 
-        if stored_version == SCHEMA_VERSION {
-            return Ok(());
+        if stored_version < 2 {
+            self.migrate_v2_edge_metadata()?;
+            self.set_schema_version(2)?;
         }
 
-        self.set_schema_version(SCHEMA_VERSION)?;
+        if stored_version < SCHEMA_VERSION {
+            self.set_schema_version(SCHEMA_VERSION)?;
+        }
+        Ok(())
+    }
+
+    fn migrate_v2_edge_metadata(&self) -> Result<(), StorageError> {
+        self.try_add_column("edge", "callsite_identity TEXT")?;
+        self.try_add_column("edge", "certainty TEXT")?;
+        self.try_add_column("edge", "candidate_target_node_ids TEXT")?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_edge_callsite_identity ON edge(callsite_identity)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn try_add_column(&self, table: &str, column_sql: &str) -> Result<(), StorageError> {
+        let column_name = column_sql
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| StorageError::Other("missing column name in migration".to_string()))?;
+        let pragma = format!("PRAGMA table_info({table})");
+        let mut stmt = self.conn.prepare(&pragma)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let existing_name: String = row.get(1)?;
+            if existing_name == column_name {
+                return Ok(());
+            }
+        }
+
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {column_sql}");
+        self.conn.execute(&sql, [])?;
         Ok(())
     }
 
@@ -326,6 +368,12 @@ impl Storage {
 
     fn edge_from_row(row: &Row) -> Result<Edge, StorageError> {
         let kind_int: i32 = row.get(3)?;
+        let certainty = row
+            .get::<_, Option<String>>(10)?
+            .as_deref()
+            .and_then(ResolutionCertainty::from_str);
+        let candidate_targets =
+            deserialize_candidate_targets(row.get::<_, Option<String>>(11)?.as_deref())?;
         Ok(Edge {
             id: codestory_core::EdgeId(row.get(0)?),
             source: NodeId(row.get(1)?),
@@ -336,6 +384,9 @@ impl Storage {
             resolved_source: row.get::<_, Option<i64>>(6)?.map(NodeId),
             resolved_target: row.get::<_, Option<i64>>(7)?.map(NodeId),
             confidence: row.get(8)?,
+            callsite_identity: row.get(9)?,
+            certainty,
+            candidate_targets,
         })
     }
 
@@ -352,6 +403,10 @@ impl Storage {
                 end_col: row.get(6)?,
             },
         })
+    }
+
+    fn certainty_db_value(certainty: Option<ResolutionCertainty>) -> Option<&'static str> {
+        certainty.map(ResolutionCertainty::as_str)
     }
 
     fn insert_node_with_stmt(
@@ -396,8 +451,8 @@ impl Storage {
 
     pub fn insert_edge(&self, edge: &Edge) -> Result<(), StorageError> {
         self.conn.execute(
-            "INSERT INTO edge (id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO NOTHING",
+            "INSERT INTO edge (id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence, callsite_identity, certainty, candidate_target_node_ids)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT(id) DO NOTHING",
             params![
                 edge.id.0,
                 edge.source.0,
@@ -407,7 +462,10 @@ impl Storage {
                 edge.line,
                 edge.resolved_source.map(|id| id.0),
                 edge.resolved_target.map(|id| id.0),
-                edge.confidence
+                edge.confidence,
+                edge.callsite_identity.as_deref(),
+                Self::certainty_db_value(edge.certainty),
+                serialize_candidate_targets(&edge.candidate_targets)?
             ],
         )?;
         Ok(())
@@ -445,8 +503,8 @@ impl Storage {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO edge (id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO NOTHING"
+                "INSERT INTO edge (id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence, callsite_identity, certainty, candidate_target_node_ids)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT(id) DO NOTHING"
             )?;
             for edge in edges {
                 stmt.execute(params![
@@ -458,7 +516,10 @@ impl Storage {
                     edge.line,
                     edge.resolved_source.map(|id| id.0),
                     edge.resolved_target.map(|id| id.0),
-                    edge.confidence
+                    edge.confidence,
+                    edge.callsite_identity.as_deref(),
+                    Self::certainty_db_value(edge.certainty),
+                    serialize_candidate_targets(&edge.candidate_targets)?
                 ])?;
             }
         }
@@ -517,7 +578,7 @@ impl Storage {
     pub fn get_edges(&self) -> Result<Vec<Edge>, StorageError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence FROM edge")?;
+            .prepare("SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence, callsite_identity, certainty, candidate_target_node_ids FROM edge")?;
         let mut edges = Vec::new();
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
@@ -1411,16 +1472,17 @@ impl Storage {
 
         while let Some(row) = rows.next()? {
             let mut edge = Self::edge_from_row(row)?;
-            let target_symbol: String = row.get(9)?;
+            let target_symbol: String = row.get(12)?;
 
             // Avoid polluting trail exploration with low-confidence or ambiguous CALL resolutions.
             // It's better to show an unresolved symbol node than traverse to the wrong concrete node.
             if edge.kind == EdgeKind::CALL
                 && edge.resolved_target.is_some()
-                && should_ignore_call_resolution(&target_symbol, edge.confidence)
+                && should_ignore_call_resolution(&target_symbol, edge.certainty, edge.confidence)
             {
                 edge.resolved_target = None;
                 edge.confidence = None;
+                edge.certainty = None;
             }
             let kind = edge.kind;
 
@@ -1446,6 +1508,29 @@ impl Storage {
     pub fn get_edges_for_node_id(&self, node_id: NodeId) -> Result<Vec<Edge>, StorageError> {
         self.get_edges_for_node(node_id, &TrailDirection::Both, &[])
     }
+}
+
+fn serialize_candidate_targets(candidates: &[NodeId]) -> Result<Option<String>, StorageError> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let raw: Vec<i64> = candidates.iter().map(|id| id.0).collect();
+    Ok(Some(serde_json::to_string(&raw).map_err(|e| {
+        StorageError::Other(format!("failed to serialize edge candidates: {e}"))
+    })?))
+}
+
+fn deserialize_candidate_targets(payload: Option<&str>) -> Result<Vec<NodeId>, StorageError> {
+    let Some(payload) = payload else {
+        return Ok(Vec::new());
+    };
+    if payload.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed: Vec<i64> = serde_json::from_str(payload).map_err(|e| {
+        StorageError::Other(format!("failed to parse edge candidate payload: {e}"))
+    })?;
+    Ok(parsed.into_iter().map(NodeId).collect())
 }
 
 fn neighbor_for_direction(
@@ -1515,19 +1600,25 @@ fn apply_trail_node_filter(result: &mut TrailResult, config: &TrailConfig) {
     result.depth_map.retain(|id, _| allowed.contains(id));
 }
 
-fn should_ignore_call_resolution(target_symbol: &str, confidence: Option<f32>) -> bool {
-    let conf = confidence.unwrap_or(0.0);
+fn should_ignore_call_resolution(
+    target_symbol: &str,
+    certainty: Option<ResolutionCertainty>,
+    confidence: Option<f32>,
+) -> bool {
+    let certainty = certainty.or_else(|| ResolutionCertainty::from_confidence(confidence));
 
-    // Fuzzy matches from the resolution pass use a low confidence score; these have shown to
-    // create incorrect edges that seriously degrade trail graphs.
-    if conf <= 0.4 + f32::EPSILON {
+    let Some(certainty) = certainty else {
+        return false;
+    };
+
+    if matches!(certainty, ResolutionCertainty::Uncertain) {
         return true;
     }
 
-    // Even with exact matching, some unqualified method names are so common (often stdlib/3rd-party)
-    // that resolving them globally by name alone is frequently wrong. Treat low-confidence
-    // resolutions for these symbols as unresolved.
-    if is_common_unqualified_call_name(target_symbol) && conf <= 0.6 + f32::EPSILON {
+    // For very common unqualified methods, only keep high-certainty resolutions.
+    if is_common_unqualified_call_name(target_symbol)
+        && !matches!(certainty, ResolutionCertainty::Certain)
+    {
         return true;
     }
 
