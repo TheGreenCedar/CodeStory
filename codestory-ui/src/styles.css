@@ -988,6 +988,16 @@ textarea {
   line-height: 1.1;
 }
 
+.graph-pill-duplicate-count {
+  margin-left: 0.38rem;
+  border-radius: 999px;
+  border: 1px solid #b39a55;
+  background: color-mix(in oklab, #f2cf72 62%, #fff);
+  padding: 0.08rem 0.34rem;
+  font-size: 0.64rem;
+  font-weight: 700;
+}
+
 .graph-floating-pill-center {
   border-color: #31353c;
   box-shadow: 0 0 0 2px rgba(49, 53, 60, 0.45);

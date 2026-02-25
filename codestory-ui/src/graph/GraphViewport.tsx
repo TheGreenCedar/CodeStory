@@ -26,6 +26,7 @@ type FlowNodeData = {
   label: string;
   center: boolean;
   nodeStyle: "card" | "pill";
+  duplicateCount: number;
   memberCount: number;
   members: Array<{
     id: string;
@@ -203,6 +204,20 @@ function inferMemberVisibility(kind: string, label: string): "public" | "private
   return "public";
 }
 
+function dedupeKeyForNode(
+  kind: string,
+  label: string,
+  depth: number,
+  isCenter: boolean,
+): string | null {
+  if (isCenter || isCardNodeKind(kind)) {
+    return null;
+  }
+
+  // Keep dedupe constrained within one depth lane to preserve overall flow direction.
+  return `${kind}:${label.toLowerCase()}:${depth}`;
+}
+
 function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
   if (data.nodeStyle === "pill") {
     const pillClassName = [
@@ -222,6 +237,9 @@ function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
           position={Position.Left}
         />
         <span>{data.label}</span>
+        {data.duplicateCount > 1 ? (
+          <span className="graph-pill-duplicate-count">x{data.duplicateCount}</span>
+        ) : null}
         <Handle
           id="source-node"
           className="graph-handle graph-handle-source"
@@ -434,12 +452,43 @@ function toFlowElements(graph: GraphResponse): { nodes: Node<FlowNodeData>[]; ed
     }
   }
 
+  const canonicalNodeById = new Map<string, string>();
+  const canonicalNodeByKey = new Map<string, string>();
+  const duplicateCountByCanonical = new Map<string, number>();
+
+  for (const node of graph.nodes) {
+    if (memberHostById.has(node.id)) {
+      continue;
+    }
+
+    const depth = effectiveDepthByNode.get(node.id) ?? node.depth;
+    const dedupeKey = dedupeKeyForNode(node.kind, node.label, depth, node.id === graph.center_id);
+    const canonicalId =
+      dedupeKey === null ? node.id : (canonicalNodeByKey.get(dedupeKey) ?? node.id);
+
+    if (dedupeKey !== null && !canonicalNodeByKey.has(dedupeKey)) {
+      canonicalNodeByKey.set(dedupeKey, canonicalId);
+    }
+
+    canonicalNodeById.set(node.id, canonicalId);
+    duplicateCountByCanonical.set(
+      canonicalId,
+      (duplicateCountByCanonical.get(canonicalId) ?? 0) + 1,
+    );
+  }
+
   const byDepth = new Map<number, typeof graph.nodes>();
   for (const node of graph.nodes) {
     if (memberHostById.has(node.id)) {
       continue;
     }
-    const depth = effectiveDepthByNode.get(node.id) ?? node.depth;
+
+    const canonicalId = canonicalNodeById.get(node.id) ?? node.id;
+    if (canonicalId !== node.id) {
+      continue;
+    }
+
+    const depth = effectiveDepthByNode.get(canonicalId) ?? node.depth;
     const depthList = byDepth.get(depth) ?? [];
     depthList.push(node);
     byDepth.set(depth, depthList);
@@ -471,6 +520,7 @@ function toFlowElements(graph: GraphResponse): { nodes: Node<FlowNodeData>[]; ed
           label: node.label,
           center: node.id === graph.center_id,
           nodeStyle: isCardNodeKind(node.kind) ? "card" : "pill",
+          duplicateCount: duplicateCountByCanonical.get(node.id) ?? 1,
           memberCount: membersByHost.get(node.id)?.length ?? 0,
           members: [...(membersByHost.get(node.id) ?? [])].sort((a, b) =>
             a.label.localeCompare(b.label),
@@ -502,8 +552,10 @@ function toFlowElements(graph: GraphResponse): { nodes: Node<FlowNodeData>[]; ed
 
     const sourceHost = memberHostById.get(edge.source);
     const targetHost = memberHostById.get(edge.target);
-    const source = sourceHost ?? edge.source;
-    const target = targetHost ?? edge.target;
+    const sourceNodeId = sourceHost ?? edge.source;
+    const targetNodeId = targetHost ?? edge.target;
+    const source = canonicalNodeById.get(sourceNodeId) ?? sourceNodeId;
+    const target = canonicalNodeById.get(targetNodeId) ?? targetNodeId;
     const sourceHandle = sourceHost ? `source-member-${edge.source}` : "source-node";
     const targetHandle = targetHost ? `target-member-${edge.target}` : "target-node";
 
