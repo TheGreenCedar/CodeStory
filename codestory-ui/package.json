@@ -1,0 +1,40 @@
+{
+  "name": "codestory-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "predev": "npm run generate:types",
+    "dev:server": "cargo run -p codestory-server --manifest-path ../Cargo.toml -- --project ..",
+    "dev:all": "npm-run-all --parallel dev:server dev",
+    "build": "vite build",
+    "prebuild": "npm run generate:types",
+    "preview": "vite preview",
+    "generate:types": "cargo run -p codestory-server --manifest-path ../Cargo.toml -- --types-only --types-out src/generated/api.ts",
+    "typecheck": "tsgo --project tsconfig.app.json && tsgo --project tsconfig.node.json",
+    "lint": "oxlint . --deny-warnings",
+    "format": "oxfmt .",
+    "format:check": "oxfmt --check .",
+    "check": "npm-run-all --parallel typecheck lint format:check"
+  },
+  "dependencies": {
+    "@monaco-editor/react": "4.7.0",
+    "@xyflow/react": "12.9.0",
+    "mermaid": "11.12.1",
+    "monaco-editor": "0.52.2",
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.2",
+    "@typescript/native-preview": "7.0.0-dev.20260224.1",
+    "@vitejs/plugin-react": "5.1.1",
+    "npm-run-all2": "8.0.4",
+    "oxfmt": "0.35.0",
+    "oxlint": "1.50.0",
+    "typescript": "5.9.3",
+    "vite": "7.1.12"
+  }
+}

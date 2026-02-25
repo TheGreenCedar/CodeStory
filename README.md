@@ -28,6 +28,31 @@ From the workspace root:
 cargo run -p codestory-cli -- --help
 ```
 
+### Run The Agentic UI
+
+From the workspace root, start the API server:
+
+```powershell
+cargo run -p codestory-server -- --project .
+```
+
+In another terminal, run the frontend:
+
+```powershell
+cd codestory-ui
+npm install
+npm run dev
+```
+
+For a production build:
+
+```powershell
+cd codestory-ui
+npm run build
+cd ..
+cargo run -p codestory-server -- --project . --frontend-dist codestory-ui/dist
+```
+
 ### Build and Test
 
 ```powershell
