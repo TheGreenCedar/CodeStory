@@ -14,7 +14,7 @@ use codestory_api::{
     GraphResponse, IndexMode, ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto,
     NodeDetailsRequest, NodeId, NodeKind, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
     ReadFileTextResponse, SearchHit, SearchRequest, SetUiLayoutRequest, StartIndexingRequest,
-    StorageStatsDto, SymbolSummaryDto, TrailConfigDto, TrailDirection, TrailMode,
+    StorageStatsDto, SymbolSummaryDto, TrailCallerScope, TrailConfigDto, TrailDirection, TrailMode,
     WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_app::AppController;
@@ -188,6 +188,7 @@ fn collect_types() -> TypeCollection {
         .register::<EdgeKind>()
         .register::<TrailMode>()
         .register::<TrailDirection>()
+        .register::<TrailCallerScope>()
         .register::<OpenProjectRequest>()
         .register::<StorageStatsDto>()
         .register::<ProjectSummary>()

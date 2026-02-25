@@ -1,50 +1,66 @@
 # CodeStory
 
-CodeStory is a modern, Rust-based source code explorer inspired by [Sourcetrail](https://github.com/CoatiSoftware/Sourcetrail). It helps you understand unfamiliar codebases by combining an interactive dependency graph with code snippets and fast search. It will eventually incorporate coding agents of your choice to explain the codebase like a story book, using the generated graphs as grounding context + interactive visuals for the user.
+CodeStory is a Rust-first code understanding system with a web UI. It indexes a repository into a local SQLite graph, then uses symbol search, graph exploration, and agent responses to help you inspect unfamiliar code quickly.
 
-BIG NOTE: This project is at its infancy, but the code indexing + search is solid, especially for rust. Contributions (bot or human) are welcome.
+The project is actively evolving. Current architecture is centered on a headless app core (`codestory-app`), an HTTP server (`codestory-server`), and a React frontend (`codestory-ui`).
 
-## What You Get
+## Highlights
 
-- Interactive graph visualization centered on the selected symbol
-- Code view with snippet/full-file modes and clickable highlighted tokens
-- Tabbed navigation with back/forward history
-- High-performance, parallel indexing powered by tree-sitter
-- Local persistence for UI state and an on-disk SQLite index
+- Graph-grounded exploration around symbols
+- Trail controls (mode, direction, depth, edge/node filters, target symbol pathing)
+- Full-text and fuzzy search over indexed symbols
+- Editable code pane with incremental re-index flow
+- Event-streamed status updates from backend to UI
 
-For a walkthrough of the UI, see `USER_GUIDE.md`. For architecture and contribution notes, see `DEVELOPER_GUIDE.md`.
+## Supported Languages (Indexer)
+
+- Python
+- Java
+- Rust
+- JavaScript
+- TypeScript/TSX
+- C
+- C++
 
 ## Quickstart
 
 ### Prerequisites
 
-- A C/C++ toolchain may be required on some platforms because dependencies can include native components
+- Rust toolchain (edition 2024 crates in this workspace)
+- Node.js + npm (for `codestory-ui`)
+- A C/C++ build toolchain may be required on some platforms for native dependencies
 
-### Run The CLI
+### Run Full Stack In Dev Mode
 
 From the workspace root:
 
 ```powershell
-cargo run -p codestory-cli -- --help
+cd codestory-ui
+npm install
+npm run dev:all
 ```
 
-### Run The Agentic UI
+This starts:
 
-From the workspace root, start the API server:
+- Vite UI at `http://127.0.0.1:5173`
+- API server at `http://127.0.0.1:7878`
+
+### Run Backend And Frontend Separately
+
+Terminal 1 (from repo root):
 
 ```powershell
 cargo run -p codestory-server -- --project .
 ```
 
-In another terminal, run the frontend:
+Terminal 2 (from repo root):
 
 ```powershell
 cd codestory-ui
-npm install
 npm run dev
 ```
 
-For a production build:
+### Build For Local Production-Style Serving
 
 ```powershell
 cd codestory-ui
@@ -53,44 +69,67 @@ cd ..
 cargo run -p codestory-server -- --project . --frontend-dist codestory-ui/dist
 ```
 
-### Build and Test
+## CLI Indexer
+
+For direct indexing workflows:
+
+```powershell
+cargo run -p codestory-cli -- --path .
+```
+
+Use `--db <path>` to write to a custom SQLite file.
+
+## Common Development Commands
+
+Backend (repo root):
 
 ```powershell
 cargo build
 cargo test
+cargo check
 cargo fmt
 cargo clippy
+```
+
+Frontend (`codestory-ui`):
+
+```powershell
+npm run check
+```
+
+Regenerate shared TypeScript API bindings (repo root):
+
+```powershell
+cargo run -p codestory-server -- --types-only --types-out codestory-ui/src/generated/api.ts
 ```
 
 ## Repository Layout
 
 - Workspace manifest: `Cargo.toml`
-- Crates: `crates/`
-  - `codestory-core`: shared types (nodes/edges/locations)
-  - `codestory-events`: event bus for decoupled communication
-  - `codestory-project`: workspace discovery and file watching
-  - `codestory-index`: tree-sitter based extraction pipeline
-  - `codestory-storage`: SQLite schema + batch writes
-  - `codestory-search`: fuzzy + full-text search
-  - `codestory-graph`: graph model/layout
-  - `codestory-api`: app-facing DTOs + string IDs
-  - `codestory-app`: headless app orchestrator
-  - `codestory-cli`: command line interface
+- Rust crates: `crates/`
+  - `codestory-core`: shared graph/index domain types
+  - `codestory-events`: event types and event bus
+  - `codestory-project`: workspace discovery/refresh metadata
+  - `codestory-index`: tree-sitter + semantic resolution indexing pipeline
+  - `codestory-storage`: SQLite schema and query layer
+  - `codestory-search`: search primitives over indexed data
+  - `codestory-graph`: graph shaping/layout helpers
+  - `codestory-api`: API DTOs and identifiers shared with frontend
+  - `codestory-app`: headless orchestrator
+  - `codestory-server`: Axum API + SSE + optional static file serving
+  - `codestory-cli`: standalone indexing CLI
+  - `codestory-bench`: Criterion benchmark suite
+- Web UI: `codestory-ui/` (Vite + React + TypeScript)
+- Specs: `docs/specs/graph-ui-controls/`
 
-## Generated Files (Not Committed)
+## Generated Runtime Files
 
-Running CodeStory will generate local artifacts like:
+Running CodeStory locally creates artifacts such as:
 
 - `codestory.db` (SQLite index)
-- `codestory_ui.json` (UI state)
+- `codestory_ui.json` (persisted UI layout/state)
 
-These are intentionally ignored via `.gitignore`.
-
-## IDE Integration
-
-CodeStory can listen for Sourcetrail-style IDE messages over TCP.
-
-- Default port: `6667`
+These files are local runtime state and are ignored via `.gitignore`.
 
 ## License
 

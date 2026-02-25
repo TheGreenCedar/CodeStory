@@ -17,10 +17,14 @@ export type FlowNodeData = {
   center: boolean;
   nodeStyle: FlowNodeStyle;
   duplicateCount: number;
+  mergedSymbolIds?: string[];
   memberCount: number;
+  badgeVisibleMembers?: number;
+  badgeTotalMembers?: number;
   members: FlowMemberData[];
   isVirtualBundle?: boolean;
   isSelected?: boolean;
+  focusedMemberId?: string | null;
   onSelectMember?: (memberId: string, label: string) => void;
 };
 
@@ -35,7 +39,10 @@ export type SemanticNodePlacement = {
   center: boolean;
   nodeStyle: FlowNodeStyle;
   duplicateCount: number;
+  mergedSymbolIds: string[];
   memberCount: number;
+  badgeVisibleMembers?: number;
+  badgeTotalMembers?: number;
   members: FlowMemberData[];
   xRank: number;
   yRank: number;

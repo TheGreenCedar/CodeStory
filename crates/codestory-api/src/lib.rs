@@ -15,4 +15,4 @@ pub use dto::{
 pub use errors::ApiError;
 pub use events::AppEventPayload;
 pub use ids::{EdgeId, NodeId};
-pub use types::{EdgeKind, IndexMode, NodeKind, TrailDirection, TrailMode};
+pub use types::{EdgeKind, IndexMode, NodeKind, TrailCallerScope, TrailDirection, TrailMode};

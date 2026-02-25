@@ -1,6 +1,7 @@
 import type {
   EdgeKind,
   NodeKind,
+  TrailCallerScope,
   TrailConfigDto,
   TrailDirection,
   TrailMode,
@@ -53,8 +54,13 @@ export type TrailUiConfig = {
   targetLabel: string;
   depth: number;
   direction: TrailDirection;
+  callerScope: TrailCallerScope;
   edgeFilter: EdgeKind[];
+  showUtilityCalls: boolean;
   nodeFilter: NodeKind[];
+  bundlingMode: "off" | "overview" | "trace";
+  showLegend: boolean;
+  showMiniMap: boolean;
   maxNodes: number;
 };
 
@@ -65,17 +71,22 @@ export function defaultTrailUiConfig(): TrailUiConfig {
     mode: "Neighborhood",
     targetId: null,
     targetLabel: "",
-    depth: 2,
+    depth: 1,
     direction: "Both",
+    callerScope: "ProductionOnly",
     edgeFilter: [...EDGE_KIND_OPTIONS],
+    showUtilityCalls: false,
     nodeFilter: [],
+    bundlingMode: "overview",
+    showLegend: true,
+    showMiniMap: true,
     maxNodes: 500,
   };
 }
 
 function clampDepth(value: number): number {
   if (!Number.isFinite(value)) {
-    return 2;
+    return 1;
   }
   if (value < 0) {
     return 0;
@@ -111,6 +122,11 @@ export function normalizeTrailUiConfig(
       ? raw.direction
       : defaults.direction;
 
+  const callerScope =
+    raw.callerScope === "ProductionOnly" || raw.callerScope === "IncludeTestsAndBenches"
+      ? raw.callerScope
+      : defaults.callerScope;
+
   const edgeFilter = Array.isArray(raw.edgeFilter)
     ? raw.edgeFilter.filter((kind): kind is EdgeKind =>
         EDGE_KIND_OPTIONS.includes(kind as EdgeKind),
@@ -129,8 +145,17 @@ export function normalizeTrailUiConfig(
     targetLabel: typeof raw.targetLabel === "string" ? raw.targetLabel : "",
     depth: clampDepth(typeof raw.depth === "number" ? raw.depth : defaults.depth),
     direction,
+    callerScope,
     edgeFilter: edgeFilter.length > 0 ? edgeFilter : defaults.edgeFilter,
+    showUtilityCalls:
+      typeof raw.showUtilityCalls === "boolean" ? raw.showUtilityCalls : defaults.showUtilityCalls,
     nodeFilter,
+    bundlingMode:
+      raw.bundlingMode === "off" || raw.bundlingMode === "overview" || raw.bundlingMode === "trace"
+        ? raw.bundlingMode
+        : defaults.bundlingMode,
+    showLegend: typeof raw.showLegend === "boolean" ? raw.showLegend : defaults.showLegend,
+    showMiniMap: typeof raw.showMiniMap === "boolean" ? raw.showMiniMap : defaults.showMiniMap,
     maxNodes: clampMaxNodes(typeof raw.maxNodes === "number" ? raw.maxNodes : defaults.maxNodes),
   };
 }
@@ -142,7 +167,9 @@ export function toTrailConfigDto(rootId: string, config: TrailUiConfig): TrailCo
     target_id: config.mode === "ToTargetSymbol" ? config.targetId : null,
     depth: clampDepth(config.depth),
     direction: config.direction,
+    caller_scope: config.callerScope,
     edge_filter: config.edgeFilter,
+    show_utility_calls: config.showUtilityCalls,
     node_filter: config.nodeFilter,
     max_nodes: clampMaxNodes(config.maxNodes),
   };

@@ -11,17 +11,22 @@ import {
   type SemanticEdgeFamily,
 } from "./types";
 
-export const FLOW_COL_SPACING = 332;
-export const HIER_ROW_SPACING = 112;
+export const FLOW_COL_SPACING = 380;
+export const HIER_ROW_SPACING = 100;
 export const LANE_JITTER_SPACING = 58;
 
-const ROOT_TARGET_Y = 320;
+const ROOT_TARGET_Y = 200;
 const DENSE_LAYER_ROW_TARGET = 9;
 const DENSE_LAYER_MAX_COLUMNS = 4;
-const DENSE_LAYER_COL_SPACING_MIN = 220;
-const RANK_ONE_CENTER_CLEARANCE_X = 104;
-const DENSE_LAYER_COL_GAP = 64;
-const DENSE_LAYER_STAGGER_Y = 40;
+const DENSE_LAYER_COL_SPACING_MIN = 300;
+const RANK_ONE_CENTER_CLEARANCE_X = 80;
+const DEPTH_TWO_ROW_TARGET = 7;
+const DEPTH_TWO_MIN_COLUMNS = 2;
+const DEPTH_TWO_OUTWARD_OFFSET_X = 32;
+const OUTER_LAYER_OUTWARD_STEP_X = 16;
+const DEPTH_TWO_ROW_SPACING_BOOST = 8;
+const DENSE_LAYER_COL_GAP = 48;
+const DENSE_LAYER_STAGGER_Y = 28;
 const MIN_ROW_SPACING = 56;
 const CARD_WIDTH_MIN = 228;
 const CARD_WIDTH_MAX = 432;
@@ -189,8 +194,18 @@ function columnCountForLayer(layerSize: number, rank: number): number {
     return 1;
   }
 
-  if (Math.abs(rank) === 1) {
+  const absRank = Math.abs(rank);
+  if (absRank === 1) {
     return 1;
+  }
+
+  if (absRank === 2) {
+    if (layerSize <= DEPTH_TWO_ROW_TARGET + 1) {
+      return 1;
+    }
+
+    const preferred = Math.ceil(layerSize / DEPTH_TWO_ROW_TARGET);
+    return Math.min(DENSE_LAYER_MAX_COLUMNS, Math.max(DEPTH_TWO_MIN_COLUMNS, preferred));
   }
 
   if (layerSize <= DENSE_LAYER_ROW_TARGET) {
@@ -200,8 +215,36 @@ function columnCountForLayer(layerSize: number, rank: number): number {
   return Math.min(DENSE_LAYER_MAX_COLUMNS, Math.ceil(layerSize / DENSE_LAYER_ROW_TARGET));
 }
 
-function bucketLayerNodes(layerNodeIds: string[], columnCount: number): string[][] {
+function centerOutColumnOrder(columnCount: number): number[] {
+  const center = (columnCount - 1) / 2;
+  return Array.from({ length: columnCount }, (_, idx) => idx).sort((left, right) => {
+    const leftDist = Math.abs(left - center);
+    const rightDist = Math.abs(right - center);
+    if (leftDist !== rightDist) {
+      return leftDist - rightDist;
+    }
+    return left - right;
+  });
+}
+
+function bucketLayerNodes(layerNodeIds: string[], columnCount: number, rank: number): string[][] {
+  if (columnCount <= 1) {
+    return [layerNodeIds];
+  }
+
   const columns = Array.from({ length: columnCount }, () => [] as string[]);
+  if (Math.abs(rank) === 2) {
+    const visitOrder = centerOutColumnOrder(columnCount);
+    for (let idx = 0; idx < layerNodeIds.length; idx += 1) {
+      const nodeId = layerNodeIds[idx];
+      if (!nodeId) {
+        continue;
+      }
+      const columnIdx = visitOrder[idx % visitOrder.length] ?? 0;
+      columns[columnIdx]?.push(nodeId);
+    }
+    return columns.filter((columnNodes) => columnNodes.length > 0);
+  }
 
   for (let idx = 0; idx < layerNodeIds.length; idx += 1) {
     const nodeId = layerNodeIds[idx];
@@ -285,6 +328,41 @@ function extractMembers(graph: GraphResponse): MemberExtraction {
     }
   }
 
+  // Fallback grouping: attach detached `Type::member` symbols to visible structural hosts.
+  const hostIdsByLabel = new Map<string, string>();
+  for (const node of graph.nodes) {
+    if (STRUCTURAL_KINDS.has(node.kind)) {
+      hostIdsByLabel.set(node.label, node.id);
+    }
+  }
+
+  for (const node of graph.nodes) {
+    if (STRUCTURAL_KINDS.has(node.kind) || memberHostById.has(node.id)) {
+      continue;
+    }
+    const separatorIdx = node.label.indexOf("::");
+    if (separatorIdx <= 0) {
+      continue;
+    }
+    const hostLabel = node.label.slice(0, separatorIdx);
+    const hostId = hostIdsByLabel.get(hostLabel);
+    if (!hostId) {
+      continue;
+    }
+
+    memberHostById.set(node.id, hostId);
+    const hostMembers = membersByHost.get(hostId) ?? [];
+    if (!hostMembers.some((member) => member.id === node.id)) {
+      hostMembers.push({
+        id: node.id,
+        label: node.label,
+        kind: node.kind,
+        visibility: inferMemberVisibility(node.kind, node.label),
+      });
+      membersByHost.set(hostId, hostMembers);
+    }
+  }
+
   return { memberHostById, membersByHost };
 }
 
@@ -297,10 +375,12 @@ function foldEdges(
   foldedEdges: FoldedEdge[];
   canonicalNodeById: Map<string, string>;
   duplicateCountByCanonical: Map<string, number>;
+  mergedIdsByCanonical: Map<string, string[]>;
 } {
   const canonicalNodeById = new Map<string, string>();
   const canonicalNodeByKey = new Map<string, string>();
   const duplicateCountByCanonical = new Map<string, number>();
+  const mergedIdsByCanonical = new Map<string, string[]>();
 
   for (const node of graph.nodes) {
     if (memberHostById.has(node.id)) {
@@ -319,6 +399,9 @@ function foldEdges(
       canonicalId,
       (duplicateCountByCanonical.get(canonicalId) ?? 0) + 1,
     );
+    const mergedIds = mergedIdsByCanonical.get(canonicalId) ?? [];
+    mergedIds.push(node.id);
+    mergedIdsByCanonical.set(canonicalId, mergedIds);
   }
 
   const folded = new Map<string, FoldedEdge>();
@@ -375,6 +458,7 @@ function foldEdges(
     foldedEdges: [...folded.values()],
     canonicalNodeById,
     duplicateCountByCanonical,
+    mergedIdsByCanonical,
   };
 }
 
@@ -440,12 +524,8 @@ export function buildSemanticLayout(graph: GraphResponse): LayoutElements {
   const centerHostNodeId = memberHostById.get(graph.center_id) ?? graph.center_id;
   const signedDepthByNode = computeSignedDepthByNode(graph, centerHostNodeId);
 
-  const { foldedEdges, canonicalNodeById, duplicateCountByCanonical } = foldEdges(
-    graph,
-    centerHostNodeId,
-    memberHostById,
-    signedDepthByNode,
-  );
+  const { foldedEdges, canonicalNodeById, duplicateCountByCanonical, mergedIdsByCanonical } =
+    foldEdges(graph, centerHostNodeId, memberHostById, signedDepthByNode);
 
   const canonicalNodeIds = [...new Set(canonicalNodeById.values())];
   const centerNodeId = canonicalNodeById.get(centerHostNodeId) ?? centerHostNodeId;
@@ -607,12 +687,10 @@ export function buildSemanticLayout(graph: GraphResponse): LayoutElements {
     }
   }
 
-  const positionsByNode = new Map<string, { x: number; y: number }>();
-  layers.forEach((layerNodeIds, xIdx) => {
+  const layerRelativeBounds = layers.map((layerNodeIds, xIdx) => {
     const rank = sortedXRanks[xIdx] ?? 0;
     const columnCount = columnCountForLayer(layerNodeIds.length, rank);
-    const columns = bucketLayerNodes(layerNodeIds, columnCount);
-    const columnCenter = (columns.length - 1) / 2;
+    const columns = bucketLayerNodes(layerNodeIds, columnCount, rank);
     const maxColumnWidth = layerNodeIds.reduce(
       (maxWidth, nodeId) => Math.max(maxWidth, estimatedWidthByNode.get(nodeId) ?? PILL_WIDTH_MIN),
       PILL_WIDTH_MIN,
@@ -621,9 +699,57 @@ export function buildSemanticLayout(graph: GraphResponse): LayoutElements {
       DENSE_LAYER_COL_SPACING_MIN,
       maxColumnWidth + DENSE_LAYER_COL_GAP,
     );
-    const columnSpacing = baseColumnSpacing;
-    const rowSpacing = Math.max(MIN_ROW_SPACING, LANE_JITTER_SPACING + (columns.length - 1) * 10);
+
+    let minX = 0;
+    let maxX = 0;
     const side = rank < 0 ? -1 : 1;
+    const absRank = Math.abs(rank);
+    const outwardDepthOffset =
+      absRank >= 2
+        ? side * (DEPTH_TWO_OUTWARD_OFFSET_X + (absRank - 2) * OUTER_LAYER_OUTWARD_STEP_X)
+        : 0;
+
+    for (let columnIdx = 0; columnIdx < columns.length; columnIdx += 1) {
+      const columnOffset = side * columnIdx * baseColumnSpacing;
+      const rankOneOffset = Math.abs(rank) === 1 ? side * RANK_ONE_CENTER_CLEARANCE_X : 0;
+      const nodeX = columnOffset + rankOneOffset + outwardDepthOffset;
+      minX = Math.min(minX, nodeX);
+      maxX = Math.max(maxX, nodeX + maxColumnWidth);
+    }
+
+    return { minX, maxX, baseColumnSpacing, columns, rank };
+  });
+
+  const layerBaseX = Array.from<number>({ length: layers.length }).fill(0);
+  if (layers.length > 0) {
+    layerBaseX[0] = 150;
+    for (let i = 1; i < layers.length; i++) {
+      const prevLayer = layerRelativeBounds[i - 1]!;
+      const thisLayer = layerRelativeBounds[i]!;
+      const prevRightEdge = layerBaseX[i - 1]! + prevLayer.maxX;
+      // GAP of 160 ensures trunk paths have ample horizontal room for routing branches
+      layerBaseX[i] = prevRightEdge + 160 - thisLayer.minX;
+    }
+  }
+
+  const positionsByNode = new Map<string, { x: number; y: number }>();
+  layers.forEach((_, xIdx) => {
+    const rank = sortedXRanks[xIdx] ?? 0;
+    const layerBounds = layerRelativeBounds[xIdx]!;
+    const columns = layerBounds.columns;
+    const columnCenter = (columns.length - 1) / 2;
+    const columnSpacing = layerBounds.baseColumnSpacing;
+    const depthTwoSpacingBoost = Math.abs(rank) === 2 ? DEPTH_TWO_ROW_SPACING_BOOST : 0;
+    const rowSpacing = Math.max(
+      MIN_ROW_SPACING,
+      LANE_JITTER_SPACING + (columns.length - 1) * 10 + depthTwoSpacingBoost,
+    );
+    const side = rank < 0 ? -1 : 1;
+    const absRank = Math.abs(rank);
+    const outwardDepthOffset =
+      absRank >= 2
+        ? side * (DEPTH_TWO_OUTWARD_OFFSET_X + (absRank - 2) * OUTER_LAYER_OUTWARD_STEP_X)
+        : 0;
 
     for (let columnIdx = 0; columnIdx < columns.length; columnIdx += 1) {
       const columnNodes = columns[columnIdx];
@@ -642,24 +768,88 @@ export function buildSemanticLayout(graph: GraphResponse): LayoutElements {
           continue;
         }
 
+        let anchorOffset = 17;
+        const node = nodeById.get(nodeId);
+        if (node && CARD_NODE_KINDS.has(node.kind)) {
+          if (nodeId === centerNodeId) {
+            const members = membersByHost.get(nodeId) ?? [];
+            const publicMembers = members.filter((m) => m.visibility === "public");
+            const privateMembers = members.filter((m) => m.visibility === "private");
+            const memberId = graph.center_id;
+
+            const pIdx = publicMembers.findIndex((m) => m.id === memberId);
+            if (pIdx >= 0) {
+              anchorOffset = 74 + 28 + pIdx * 21 + 10;
+            } else {
+              const prIdx = privateMembers.findIndex((m) => m.id === memberId);
+              if (prIdx >= 0) {
+                anchorOffset =
+                  74 +
+                  (publicMembers.length > 0 ? 28 + publicMembers.length * 21 : 0) +
+                  28 +
+                  prIdx * 21 +
+                  10;
+              } else {
+                anchorOffset = 42;
+              }
+            }
+          } else {
+            anchorOffset = 42;
+          }
+        }
+
         const hierarchyOffset = (yRank.get(nodeId) ?? 0) * HIER_ROW_SPACING;
         const compactOffset = (rowIdx - rowCenter) * rowSpacing;
+        const anchorLineY = ROOT_TARGET_Y + hierarchyOffset + compactOffset + columnStagger;
+
         positionsByNode.set(nodeId, {
-          x: 150 + xIdx * FLOW_COL_SPACING + columnOffset + rankOneOffset,
-          y: ROOT_TARGET_Y + hierarchyOffset + compactOffset + columnStagger,
+          x: layerBaseX[xIdx]! + columnOffset + rankOneOffset + outwardDepthOffset,
+          y: anchorLineY - anchorOffset,
         });
       }
     }
   });
 
-  const centerPos = positionsByNode.get(centerNodeId);
-  if (centerPos) {
-    const deltaY = ROOT_TARGET_Y - centerPos.y;
-    for (const [nodeId, position] of positionsByNode) {
-      positionsByNode.set(nodeId, {
-        x: position.x,
-        y: position.y + deltaY,
-      });
+  // Final collision guard by rank to avoid stacked container overlap in dense views.
+  const byRank = new Map<number, Array<{ id: string; y: number }>>();
+  for (const [nodeId, position] of positionsByNode) {
+    const rank = xRank.get(nodeId) ?? 0;
+    const bucket = byRank.get(rank) ?? [];
+    bucket.push({ id: nodeId, y: position.y });
+    byRank.set(rank, bucket);
+  }
+  for (const [rank, entries] of byRank) {
+    if (entries.length === 0) continue;
+    const minGap = Math.abs(rank) >= 2 ? 52 : 48;
+    entries.sort((left, right) => left.y - right.y);
+
+    const originalYs = entries.map((entry) => positionsByNode.get(entry.id)!.y);
+    const originalCenterY = (originalYs[0]! + originalYs[originalYs.length - 1]!) / 2;
+
+    let lastY = Number.NEGATIVE_INFINITY;
+    for (const entry of entries) {
+      const position = positionsByNode.get(entry.id);
+      if (!position) {
+        continue;
+      }
+      const minAllowedY = lastY + minGap;
+      if (position.y < minAllowedY) {
+        position.y = minAllowedY;
+        positionsByNode.set(entry.id, position);
+      }
+      lastY = position.y;
+    }
+
+    const newYs = entries.map((entry) => positionsByNode.get(entry.id)!.y);
+    const newCenterY = (newYs[0]! + newYs[newYs.length - 1]!) / 2;
+    const correction = originalCenterY - newCenterY;
+
+    for (const entry of entries) {
+      const position = positionsByNode.get(entry.id);
+      if (position) {
+        position.y += correction;
+        positionsByNode.set(entry.id, position);
+      }
     }
   }
 
@@ -681,7 +871,10 @@ export function buildSemanticLayout(graph: GraphResponse): LayoutElements {
         center: nodeId === centerNodeId,
         nodeStyle,
         duplicateCount: duplicateCountByCanonical.get(nodeId) ?? 1,
-        memberCount: membersByHost.get(nodeId)?.length ?? 0,
+        mergedSymbolIds: (mergedIdsByCanonical.get(nodeId) ?? [nodeId]).slice(0, 6),
+        memberCount: node.badge_visible_members ?? membersByHost.get(nodeId)?.length ?? 0,
+        badgeVisibleMembers: node.badge_visible_members ?? undefined,
+        badgeTotalMembers: node.badge_total_members ?? undefined,
         members: [...(membersByHost.get(nodeId) ?? [])].sort((left, right) =>
           left.label.localeCompare(right.label),
         ),
@@ -719,7 +912,10 @@ export function buildFallbackLayout(graph: GraphResponse): LayoutElements {
         center: node.id === centerNodeId,
         nodeStyle,
         duplicateCount: 1,
-        memberCount: membersByHost.get(node.id)?.length ?? 0,
+        mergedSymbolIds: [node.id],
+        memberCount: node.badge_visible_members ?? membersByHost.get(node.id)?.length ?? 0,
+        badgeVisibleMembers: node.badge_visible_members ?? undefined,
+        badgeTotalMembers: node.badge_total_members ?? undefined,
         members: [...(membersByHost.get(node.id) ?? [])].sort((leftEntry, rightEntry) =>
           leftEntry.label.localeCompare(rightEntry.label),
         ),

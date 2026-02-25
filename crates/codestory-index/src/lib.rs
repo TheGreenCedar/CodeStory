@@ -1261,6 +1261,90 @@ function globalFunc() {}
     }
 
     #[test]
+    fn test_run_incremental_helper_calls_are_indexed() -> Result<()> {
+        use codestory_project::RefreshInfo;
+        use codestory_storage::Storage;
+        use std::collections::HashSet;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let f1 = dir.path().join("indexer.rs");
+        fs::write(
+            &f1,
+            r#"
+            struct WorkspaceIndexer;
+            impl WorkspaceIndexer {
+                fn run_incremental(&self) {
+                    Self::seed_symbol_table();
+                    Self::flush_projection_batch();
+                    Self::flush_errors();
+                }
+                fn seed_symbol_table() {}
+                fn flush_projection_batch() {}
+                fn flush_errors() {}
+            }
+        "#,
+        )?;
+
+        let mut storage = Storage::new_in_memory().unwrap();
+        let bus = EventBus::new();
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+        let refresh_info = RefreshInfo {
+            files_to_index: vec![f1.clone()],
+            files_to_remove: vec![],
+        };
+
+        indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
+
+        let run_node_ids: HashSet<_> = storage
+            .get_nodes()?
+            .into_iter()
+            .filter(|node| node.serialized_name.ends_with("run_incremental"))
+            .map(|node| node.id)
+            .collect();
+        assert!(!run_node_ids.is_empty(), "run_incremental node not found");
+
+        let edges = storage.get_edges()?;
+        let mut callees = HashSet::new();
+        for edge in edges {
+            if edge.kind != EdgeKind::CALL || !run_node_ids.contains(&edge.source) {
+                continue;
+            }
+            if let Some(callsite_identity) = edge.callsite_identity.as_ref() {
+                if !callsite_identity.is_empty() {
+                    callees.insert(callsite_identity.clone());
+                }
+            }
+            if let Some(target) = storage.get_node(edge.target)? {
+                callees.insert(target.serialized_name);
+            }
+        }
+
+        assert!(
+            callees
+                .iter()
+                .any(|name| name.contains("seed_symbol_table")),
+            "missing seed_symbol_table call edge; found: {:?}",
+            callees
+        );
+        assert!(
+            callees
+                .iter()
+                .any(|name| name.contains("flush_projection_batch")),
+            "missing flush_projection_batch call edge; found: {:?}",
+            callees
+        );
+        assert!(
+            callees.iter().any(|name| name.contains("flush_errors")),
+            "missing flush_errors call edge; found: {:?}",
+            callees
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_index_cpp_advanced() -> Result<()> {
         let code = r#"
 class Base {};

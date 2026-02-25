@@ -63,7 +63,7 @@ const RUST_SYMBOLS: &[(NodeKind, &str)] = &[
     (NodeKind::CLASS, "Token"),
     (NodeKind::CLASS, "Move"),
     (NodeKind::CLASS, "Field"),
-    (NodeKind::CLASS, "Player"),
+    (NodeKind::INTERFACE, "Player"),
     (NodeKind::CLASS, "HumanPlayer"),
     (NodeKind::CLASS, "ArtificialPlayer"),
     (NodeKind::CLASS, "Node"),

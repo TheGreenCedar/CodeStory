@@ -4,7 +4,14 @@ use codestory_core::{EdgeKind, NodeKind, ResolutionCertainty};
 use codestory_storage::Storage;
 use rusqlite::{OptionalExtension, params};
 
-type UnresolvedEdgeRow = (i64, Option<i64>, Option<String>, String, Option<String>);
+type UnresolvedEdgeRow = (
+    i64,
+    Option<i64>,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+);
 
 #[derive(Default, Debug)]
 pub struct ResolutionStats {
@@ -139,7 +146,15 @@ impl ResolutionPass {
         ];
         let function_kind_clause = kind_clause(&function_kinds);
 
-        for (edge_id, file_id, caller_qualified, target_name, caller_file_path) in rows {
+        for (
+            edge_id,
+            file_id,
+            caller_qualified,
+            target_name,
+            caller_file_path,
+            callsite_identity,
+        ) in rows
+        {
             let mut selected: Option<(i64, f32)> = None;
             let mut semantic_fallback: Option<(i64, f32)> = None;
             let mut candidate_ids: Vec<i64> = Vec::new();
@@ -219,6 +234,16 @@ impl ResolutionPass {
                 selected = semantic_fallback;
             }
 
+            if let Some((_, confidence)) = selected
+                && !should_keep_common_call_resolution(
+                    &target_name,
+                    confidence,
+                    callsite_identity.as_deref(),
+                )
+            {
+                selected = None;
+            }
+
             persist_resolution(conn, edge_id, selected, &candidate_ids)?;
             if selected.is_some() {
                 resolved += 1;
@@ -246,7 +271,7 @@ impl ResolutionPass {
         ];
         let module_kind_clause = kind_clause(&module_kinds);
 
-        for (edge_id, file_id, caller_qualified, target_name, caller_file_path) in rows {
+        for (edge_id, file_id, caller_qualified, target_name, caller_file_path, _) in rows {
             let mut selected: Option<(i64, f32)> = None;
             let mut semantic_fallback: Option<(i64, f32)> = None;
             let mut candidate_ids: Vec<i64> = Vec::new();
@@ -450,7 +475,7 @@ fn cleanup_stale_call_resolutions(
 
 fn unresolved_edges(conn: &rusqlite::Connection, kind: EdgeKind) -> Result<Vec<UnresolvedEdgeRow>> {
     let mut stmt = conn.prepare(
-        "SELECT e.id, caller.file_node_id, caller.qualified_name, target.serialized_name, file_node.serialized_name
+        "SELECT e.id, caller.file_node_id, caller.qualified_name, target.serialized_name, file_node.serialized_name, e.callsite_identity
          FROM edge e
          JOIN node caller ON caller.id = e.source_node_id
          JOIN node target ON target.id = e.target_node_id
@@ -465,6 +490,7 @@ fn unresolved_edges(conn: &rusqlite::Connection, kind: EdgeKind) -> Result<Vec<U
             row.get::<_, Option<String>>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
         ))
     })?;
 
@@ -755,10 +781,18 @@ fn kind_clause(kinds: &[i32]) -> String {
 fn common_unqualified_call_names() -> &'static [&'static str] {
     &[
         "add",
+        "any",
         "clear",
+        "clone",
+        "collect",
         "dedup",
         "extend",
+        "is_empty",
         "insert",
+        "len",
+        "map",
+        "map_err",
+        "ok",
         "pop",
         "push",
         "remove",
@@ -776,6 +810,19 @@ fn is_common_unqualified_call_name(name: &str) -> bool {
     common_unqualified_call_names().contains(&name)
 }
 
+fn should_keep_common_call_resolution(
+    target_name: &str,
+    confidence: f32,
+    callsite_identity: Option<&str>,
+) -> bool {
+    if !is_common_unqualified_call_name(target_name) {
+        return true;
+    }
+
+    let certainty = ResolutionCertainty::from_confidence(Some(confidence));
+    matches!(certainty, Some(ResolutionCertainty::Certain)) && callsite_identity.is_some()
+}
+
 fn env_flag(name: &str, default: bool) -> bool {
     match std::env::var(name) {
         Ok(value) => matches!(
@@ -783,5 +830,34 @@ fn env_flag(name: &str, default: bool) -> bool {
             "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
         ),
         Err(_) => default,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_common_unqualified_call_names_include_clone_like_noise() {
+        assert!(is_common_unqualified_call_name("clone"));
+        assert!(is_common_unqualified_call_name("len"));
+        assert!(!is_common_unqualified_call_name(
+            "WorkspaceIndexer::run_incremental"
+        ));
+    }
+
+    #[test]
+    fn test_common_call_resolution_requires_certain_confidence_and_callsite() {
+        assert!(!should_keep_common_call_resolution(
+            "clone",
+            0.80,
+            Some("1:2:3:4")
+        ));
+        assert!(!should_keep_common_call_resolution("clone", 0.95, None));
+        assert!(should_keep_common_call_resolution(
+            "clone",
+            ResolutionCertainty::CERTAIN_MIN,
+            Some("1:2:3:4")
+        ));
     }
 }

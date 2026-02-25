@@ -431,6 +431,80 @@ fn main() {
 }
 
 #[test]
+fn test_run_incremental_clone_does_not_resolve_to_unrelated_field_clone() -> anyhow::Result<()> {
+    // Regression guard for graph trail fidelity: `run_incremental` should not resolve generic
+    // `.clone()` calls to unrelated project methods like `Field::clone`.
+    let source = r#"
+use std::sync::Arc;
+
+struct Field;
+impl Field {
+    fn clone(&self) -> Self { Field }
+}
+
+struct WorkspaceIndexer {
+    root: Arc<String>,
+}
+
+impl WorkspaceIndexer {
+    fn run_incremental(&self) {
+        let _root = self.root.clone();
+        let _tmp = Arc::new(String::from("x")).clone();
+    }
+}
+"#;
+
+    let (nodes, edges) = index_single_file("main.rs", source)?;
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+
+    let run_node_ids: Vec<_> = nodes
+        .iter()
+        .filter(|node| is_matching_name(&node.serialized_name, "run_incremental"))
+        .map(|node| node.id)
+        .collect();
+    assert!(
+        !run_node_ids.is_empty(),
+        "expected run_incremental symbol to be indexed"
+    );
+
+    let field_clone_id = nodes
+        .iter()
+        .find(|node| is_matching_owned_method(&node.serialized_name, "Field", "clone"))
+        .map(|node| node.id);
+    assert!(
+        field_clone_id.is_some(),
+        "expected Field::clone symbol to be indexed"
+    );
+    let field_clone_id = field_clone_id.expect("field clone id should be present");
+
+    let mut clone_edges_from_run = 0usize;
+    for edge in edges.iter().filter(|edge| edge.kind == EdgeKind::CALL) {
+        if !run_node_ids.contains(&edge.source) {
+            continue;
+        }
+        let Some(target_node) = node_by_id.get(&edge.target) else {
+            continue;
+        };
+        if !is_matching_name(&target_node.serialized_name, "clone") {
+            continue;
+        }
+
+        clone_edges_from_run += 1;
+        assert_ne!(
+            edge.resolved_target,
+            Some(field_clone_id),
+            "clone call from run_incremental must not resolve to Field::clone"
+        );
+    }
+
+    assert!(
+        clone_edges_from_run >= 1,
+        "expected at least one clone call edge from run_incremental"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_comprehensive_polymorphic_call_resolution_fixtures() -> anyhow::Result<()> {
     for case in rich_fixture_cases() {
         let (nodes, edges) = index_single_file(case.filename, case.source)?;

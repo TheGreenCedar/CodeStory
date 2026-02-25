@@ -24,7 +24,7 @@ export type GraphEdgeDto = { id: EdgeId; source: NodeId; target: NodeId; kind: E
  */
 certainty?: string | null; callsite_identity?: string | null; candidate_targets?: NodeId[] }
 
-export type GraphNodeDto = { id: NodeId; label: string; kind: NodeKind; depth: number }
+export type GraphNodeDto = { id: NodeId; label: string; kind: NodeKind; depth: number; label_policy?: string | null; badge_visible_members?: number | null; badge_total_members?: number | null; merged_symbol_examples?: string[] }
 
 export type GraphRequest = { center_id: NodeId; 
 /**
@@ -68,11 +68,13 @@ export type StorageStatsDto = { node_count: number; edge_count: number; file_cou
 
 export type SymbolSummaryDto = { id: NodeId; label: string; kind: NodeKind; file_path: string | null; has_children: boolean }
 
+export type TrailCallerScope = "ProductionOnly" | "IncludeTestsAndBenches"
+
 export type TrailConfigDto = { root_id: NodeId; mode?: TrailMode; target_id?: NodeId | null; 
 /**
  * Use `0` to mean "infinite" (bounded by `max_nodes`).
  */
-depth: number; direction: TrailDirection; edge_filter: EdgeKind[]; node_filter?: NodeKind[]; max_nodes: number }
+depth: number; direction: TrailDirection; caller_scope?: TrailCallerScope; edge_filter: EdgeKind[]; show_utility_calls?: boolean; node_filter?: NodeKind[]; max_nodes: number }
 
 export type TrailDirection = "Incoming" | "Outgoing" | "Both"
 

@@ -16,7 +16,8 @@
     "lint": "oxlint . --deny-warnings",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
-    "check": "npm-run-all --parallel typecheck lint format:check"
+    "check": "npm-run-all --parallel typecheck lint format:check",
+    "test": "vitest run"
   },
   "dependencies": {
     "@monaco-editor/react": "4.7.0",
@@ -27,14 +28,18 @@
     "react-dom": "19.2.4"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
     "@types/react": "19.2.2",
     "@types/react-dom": "19.2.2",
     "@typescript/native-preview": "7.0.0-dev.20260224.1",
     "@vitejs/plugin-react": "5.1.1",
+    "jsdom": "^28.1.0",
     "npm-run-all2": "8.0.4",
     "oxfmt": "0.35.0",
     "oxlint": "1.50.0",
     "typescript": "5.9.3",
-    "vite": "7.1.12"
+    "vite": "7.1.12",
+    "vitest": "^4.0.18"
   }
 }

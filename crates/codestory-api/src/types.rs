@@ -207,6 +207,33 @@ impl From<codestory_core::TrailDirection> for TrailDirection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type, Default)]
+pub enum TrailCallerScope {
+    #[default]
+    ProductionOnly,
+    IncludeTestsAndBenches,
+}
+
+impl From<codestory_core::TrailCallerScope> for TrailCallerScope {
+    fn from(value: codestory_core::TrailCallerScope) -> Self {
+        match value {
+            codestory_core::TrailCallerScope::ProductionOnly => Self::ProductionOnly,
+            codestory_core::TrailCallerScope::IncludeTestsAndBenches => {
+                Self::IncludeTestsAndBenches
+            }
+        }
+    }
+}
+
+impl From<TrailCallerScope> for codestory_core::TrailCallerScope {
+    fn from(value: TrailCallerScope) -> Self {
+        match value {
+            TrailCallerScope::ProductionOnly => Self::ProductionOnly,
+            TrailCallerScope::IncludeTestsAndBenches => Self::IncludeTestsAndBenches,
+        }
+    }
+}
+
 impl From<TrailDirection> for codestory_core::TrailDirection {
     fn from(value: TrailDirection) -> Self {
         match value {

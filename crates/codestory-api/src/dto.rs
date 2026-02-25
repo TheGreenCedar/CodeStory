@@ -1,5 +1,5 @@
 use crate::ids::{EdgeId, NodeId};
-use crate::types::{EdgeKind, IndexMode, NodeKind, TrailDirection, TrailMode};
+use crate::types::{EdgeKind, IndexMode, NodeKind, TrailCallerScope, TrailDirection, TrailMode};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
@@ -75,6 +75,14 @@ pub struct GraphNodeDto {
     pub label: String,
     pub kind: NodeKind,
     pub depth: u32,
+    #[serde(default)]
+    pub label_policy: Option<String>,
+    #[serde(default)]
+    pub badge_visible_members: Option<u32>,
+    #[serde(default)]
+    pub badge_total_members: Option<u32>,
+    #[serde(default)]
+    pub merged_symbol_examples: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -112,10 +120,18 @@ pub struct TrailConfigDto {
     /// Use `0` to mean "infinite" (bounded by `max_nodes`).
     pub depth: u32,
     pub direction: TrailDirection,
+    #[serde(default)]
+    pub caller_scope: TrailCallerScope,
     pub edge_filter: Vec<EdgeKind>,
+    #[serde(default = "default_show_utility_calls")]
+    pub show_utility_calls: bool,
     #[serde(default)]
     pub node_filter: Vec<NodeKind>,
     pub max_nodes: u32,
+}
+
+const fn default_show_utility_calls() -> bool {
+    false
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

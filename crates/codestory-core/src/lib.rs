@@ -441,6 +441,13 @@ pub enum TrailDirection {
     Both,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TrailCallerScope {
+    #[default]
+    ProductionOnly,
+    IncludeTestsAndBenches,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrailConfig {
     pub root_id: NodeId,
@@ -451,12 +458,20 @@ pub struct TrailConfig {
     pub target_id: Option<NodeId>,
     pub depth: u32,
     pub direction: TrailDirection,
+    #[serde(default)]
+    pub caller_scope: TrailCallerScope,
     pub edge_filter: Vec<EdgeKind>,
+    #[serde(default = "default_show_utility_calls")]
+    pub show_utility_calls: bool,
     /// Optional node kind filter. When non-empty, the resulting trail will only include
     /// nodes of the listed kinds (root/target are always included when present).
     #[serde(default)]
     pub node_filter: Vec<NodeKind>,
     pub max_nodes: usize,
+}
+
+const fn default_show_utility_calls() -> bool {
+    false
 }
 
 impl Default for TrailConfig {
@@ -467,7 +482,9 @@ impl Default for TrailConfig {
             target_id: None,
             depth: 2,
             direction: TrailDirection::Both,
+            caller_scope: TrailCallerScope::ProductionOnly,
             edge_filter: vec![],
+            show_utility_calls: false,
             node_filter: vec![],
             max_nodes: 500,
         }

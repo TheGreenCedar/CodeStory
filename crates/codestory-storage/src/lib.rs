@@ -1,7 +1,7 @@
 use codestory_core::{
     Bookmark, BookmarkCategory, Edge, EdgeKind, EnumConversionError, Node, NodeId, NodeKind,
-    Occurrence, OccurrenceKind, ResolutionCertainty, TrailConfig, TrailDirection, TrailMode,
-    TrailResult,
+    Occurrence, OccurrenceKind, ResolutionCertainty, TrailCallerScope, TrailConfig, TrailDirection,
+    TrailMode, TrailResult,
 };
 use parking_lot::RwLock;
 use rusqlite::{Connection, Result, Row, params};
@@ -14,9 +14,10 @@ use thiserror::Error;
 
 const SCHEMA_VERSION: u32 = 2;
 const RELATED_NODE_SUBQUERY: &str = "SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1";
-const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, e.callsite_identity, e.certainty, e.candidate_target_node_ids, t.serialized_name
+const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, e.callsite_identity, e.certainty, e.candidate_target_node_ids, t.serialized_name, f.serialized_name
                  FROM edge e
-                 JOIN node t ON t.id = e.target_node_id";
+                 JOIN node t ON t.id = e.target_node_id
+                 LEFT JOIN node f ON f.id = e.file_node_id";
 
 #[derive(Error, Debug)]
 pub enum StorageError {
@@ -632,7 +633,13 @@ impl Storage {
             }
         }
 
-        let edges = self.get_edges_for_node(center_id, &TrailDirection::Both, &[])?;
+        let edges = self.get_edges_for_node(
+            center_id,
+            &TrailDirection::Both,
+            &[],
+            TrailCallerScope::IncludeTestsAndBenches,
+            true,
+        )?;
 
         let mut neighbor_ids = HashSet::new();
         for edge in &edges {
@@ -1149,6 +1156,7 @@ impl Storage {
         let mut result = TrailResult::default();
         let mut visited: HashSet<NodeId> = HashSet::new();
         let mut queue: VecDeque<(NodeId, u32)> = VecDeque::new();
+        let max_edges = config.max_nodes.saturating_mul(3).max(128);
         let max_depth = if config.depth == 0 {
             // `0` means "infinite depth", bounded by `max_nodes` and the visited set.
             u32::MAX
@@ -1182,9 +1190,19 @@ impl Storage {
 
             // If we haven't reached max depth, explore neighbors
             if depth < max_depth {
-                let edges = self.get_edges_for_node(current_id, &direction, &config.edge_filter)?;
+                let edges = self.get_edges_for_node(
+                    current_id,
+                    &direction,
+                    &config.edge_filter,
+                    config.caller_scope,
+                    config.show_utility_calls,
+                )?;
 
                 for edge in edges {
+                    if result.edges.len() >= max_edges {
+                        result.truncated = true;
+                        break;
+                    }
                     result.edges.push(edge.clone());
                     let Some(neighbor_id) = neighbor_for_direction(current_id, direction, &edge)
                     else {
@@ -1196,6 +1214,10 @@ impl Storage {
                         result.depth_map.insert(neighbor_id, depth + 1);
                         queue.push_back((neighbor_id, depth + 1));
                     }
+                }
+
+                if result.truncated {
+                    break;
                 }
             }
         }
@@ -1230,6 +1252,8 @@ impl Storage {
             config.root_id,
             TrailDirection::Outgoing,
             &config.edge_filter,
+            config.caller_scope,
+            config.show_utility_calls,
             max_depth,
             bfs_cap,
         )?;
@@ -1237,6 +1261,8 @@ impl Storage {
             target_id,
             TrailDirection::Incoming,
             &config.edge_filter,
+            config.caller_scope,
+            config.show_utility_calls,
             max_depth,
             bfs_cap,
         )?;
@@ -1278,8 +1304,13 @@ impl Storage {
             let Some(&d_cur) = dist_from_root.get(&current) else {
                 break;
             };
-            let edges =
-                self.get_edges_for_node(current, &TrailDirection::Outgoing, &config.edge_filter)?;
+            let edges = self.get_edges_for_node(
+                current,
+                &TrailDirection::Outgoing,
+                &config.edge_filter,
+                config.caller_scope,
+                config.show_utility_calls,
+            )?;
             let mut best_next: Option<NodeId> = None;
             let mut best_key: Option<(u32, i64)> = None; // (dist_to_target, node_id)
             for edge in edges {
@@ -1379,8 +1410,13 @@ impl Storage {
             let Some(&d_root) = dist_from_root.get(id) else {
                 continue;
             };
-            let edges =
-                self.get_edges_for_node(*id, &TrailDirection::Outgoing, &config.edge_filter)?;
+            let edges = self.get_edges_for_node(
+                *id,
+                &TrailDirection::Outgoing,
+                &config.edge_filter,
+                config.caller_scope,
+                config.show_utility_calls,
+            )?;
             for edge in edges {
                 let (src, dst) = edge.effective_endpoints();
                 if src != *id {
@@ -1414,6 +1450,8 @@ impl Storage {
         start: NodeId,
         direction: TrailDirection,
         edge_filter: &[EdgeKind],
+        caller_scope: TrailCallerScope,
+        show_utility_calls: bool,
         max_depth: u32,
         max_nodes: usize,
     ) -> Result<(HashMap<NodeId, u32>, bool), StorageError> {
@@ -1433,7 +1471,13 @@ impl Storage {
                 continue;
             }
 
-            let edges = self.get_edges_for_node(current_id, &direction, edge_filter)?;
+            let edges = self.get_edges_for_node(
+                current_id,
+                &direction,
+                edge_filter,
+                caller_scope,
+                show_utility_calls,
+            )?;
             for edge in edges {
                 let Some(neighbor_id) = neighbor_for_direction(current_id, direction, &edge) else {
                     continue;
@@ -1456,6 +1500,8 @@ impl Storage {
         node_id: NodeId,
         direction: &TrailDirection,
         edge_filter: &[EdgeKind],
+        caller_scope: TrailCallerScope,
+        show_utility_calls: bool,
     ) -> Result<Vec<Edge>, StorageError> {
         let where_clause = match direction {
             TrailDirection::Outgoing => "e.source_node_id = ?1 OR e.resolved_source_node_id = ?1",
@@ -1464,7 +1510,7 @@ impl Storage {
                 "e.source_node_id = ?1 OR e.target_node_id = ?1 OR e.resolved_source_node_id = ?1 OR e.resolved_target_node_id = ?1"
             }
         };
-        let query = format!("{EDGE_SELECT_BASE} WHERE {where_clause}");
+        let query = format!("{EDGE_SELECT_BASE} WHERE {where_clause} ORDER BY e.id");
 
         let mut stmt = self.conn.prepare(&query)?;
         let mut edges = Vec::new();
@@ -1473,6 +1519,7 @@ impl Storage {
         while let Some(row) = rows.next()? {
             let mut edge = Self::edge_from_row(row)?;
             let target_symbol: String = row.get(12)?;
+            let caller_file_path: Option<String> = row.get(13)?;
 
             // Avoid polluting trail exploration with low-confidence or ambiguous CALL resolutions.
             // It's better to show an unresolved symbol node than traverse to the wrong concrete node.
@@ -1483,6 +1530,15 @@ impl Storage {
                 edge.resolved_target = None;
                 edge.confidence = None;
                 edge.certainty = None;
+            }
+            if edge.kind == EdgeKind::CALL
+                && !show_utility_calls
+                && is_common_unqualified_call_name(&target_symbol)
+            {
+                continue;
+            }
+            if !is_caller_scope_allowed(caller_scope, caller_file_path.as_deref()) {
+                continue;
             }
             let kind = edge.kind;
 
@@ -1506,7 +1562,13 @@ impl Storage {
 
     /// Get all edges connected to a node (both directions)
     pub fn get_edges_for_node_id(&self, node_id: NodeId) -> Result<Vec<Edge>, StorageError> {
-        self.get_edges_for_node(node_id, &TrailDirection::Both, &[])
+        self.get_edges_for_node(
+            node_id,
+            &TrailDirection::Both,
+            &[],
+            TrailCallerScope::IncludeTestsAndBenches,
+            true,
+        )
     }
 }
 
@@ -1599,11 +1661,39 @@ fn apply_trail_node_filter(result: &mut TrailResult, config: &TrailConfig) {
     result.depth_map.retain(|id, _| allowed.contains(id));
 }
 
+fn is_caller_scope_allowed(scope: TrailCallerScope, caller_file_path: Option<&str>) -> bool {
+    match scope {
+        TrailCallerScope::IncludeTestsAndBenches => true,
+        TrailCallerScope::ProductionOnly => caller_file_path
+            .map(|path| !is_test_or_bench_path(path))
+            .unwrap_or(true),
+    }
+}
+
+fn is_test_or_bench_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    normalized.starts_with("tests/")
+        || normalized.starts_with("test/")
+        || normalized.starts_with("benches/")
+        || normalized.starts_with("bench/")
+        || normalized.contains("/tests/")
+        || normalized.contains("/test/")
+        || normalized.contains("/benches/")
+        || normalized.contains("/bench/")
+        || normalized.ends_with("_test.rs")
+        || normalized.contains(".test.")
+        || normalized.contains(".spec.")
+}
+
 fn should_ignore_call_resolution(
     target_symbol: &str,
     certainty: Option<ResolutionCertainty>,
     confidence: Option<f32>,
 ) -> bool {
+    if is_indexer_helper_call(target_symbol) {
+        return false;
+    }
+
     let certainty = certainty.or_else(|| ResolutionCertainty::from_confidence(confidence));
 
     let Some(certainty) = certainty else {
@@ -1622,6 +1712,12 @@ fn should_ignore_call_resolution(
     }
 
     false
+}
+
+fn is_indexer_helper_call(name: &str) -> bool {
+    name.contains("seed_symbol_table")
+        || name.contains("flush_projection_batch")
+        || name.contains("flush_errors")
 }
 
 fn is_common_unqualified_call_name(name: &str) -> bool {
@@ -2025,7 +2121,9 @@ mod tests {
             target_id: None,
             depth: 1,
             direction: TrailDirection::Outgoing,
+            caller_scope: TrailCallerScope::IncludeTestsAndBenches,
             edge_filter: vec![],
+            show_utility_calls: true,
             node_filter: Vec::new(),
             max_nodes: 100,
         };
@@ -2040,7 +2138,9 @@ mod tests {
             target_id: None,
             depth: 2,
             direction: TrailDirection::Outgoing,
+            caller_scope: TrailCallerScope::IncludeTestsAndBenches,
             edge_filter: vec![],
+            show_utility_calls: true,
             node_filter: Vec::new(),
             max_nodes: 100,
         };
@@ -2054,7 +2154,9 @@ mod tests {
             target_id: None,
             depth: 0,
             direction: TrailDirection::Outgoing,
+            caller_scope: TrailCallerScope::IncludeTestsAndBenches,
             edge_filter: vec![],
+            show_utility_calls: true,
             node_filter: Vec::new(),
             max_nodes: 100,
         };
@@ -2113,7 +2215,9 @@ mod tests {
             target_id: Some(NodeId(3)),
             depth: 2,
             direction: TrailDirection::Outgoing, // ignored/forced by mode, but set for clarity
+            caller_scope: TrailCallerScope::IncludeTestsAndBenches,
             edge_filter: vec![],
+            show_utility_calls: true,
             node_filter: Vec::new(),
             max_nodes: 100,
         })?;
@@ -2168,7 +2272,9 @@ mod tests {
             target_id: None,
             depth: 1,
             direction: TrailDirection::Incoming,
+            caller_scope: TrailCallerScope::IncludeTestsAndBenches,
             edge_filter: vec![EdgeKind::CALL],
+            show_utility_calls: true,
             node_filter: Vec::new(),
             max_nodes: 50,
         })?;
@@ -2178,6 +2284,163 @@ mod tests {
         assert_eq!(result.nodes[0].id, resolved.id);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_trail_production_scope_excludes_test_callers() -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+
+        let file_prod = Node {
+            id: NodeId(100),
+            kind: NodeKind::FILE,
+            serialized_name: "src/lib.rs".to_string(),
+            ..Default::default()
+        };
+        let file_test = Node {
+            id: NodeId(101),
+            kind: NodeKind::FILE,
+            serialized_name: "tests/integration.rs".to_string(),
+            ..Default::default()
+        };
+        let prod_target = Node {
+            id: NodeId(1),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "target".to_string(),
+            file_node_id: Some(file_prod.id),
+            ..Default::default()
+        };
+        let test_caller = Node {
+            id: NodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "test_caller".to_string(),
+            file_node_id: Some(file_test.id),
+            ..Default::default()
+        };
+        let unresolved_target = Node {
+            id: NodeId(3),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: "target".to_string(),
+            file_node_id: Some(file_test.id),
+            ..Default::default()
+        };
+
+        storage.insert_nodes_batch(&[
+            file_prod,
+            file_test,
+            prod_target,
+            test_caller,
+            unresolved_target,
+        ])?;
+        storage.insert_edges_batch(&[Edge {
+            id: EdgeId(1),
+            source: NodeId(2),
+            target: NodeId(3),
+            kind: EdgeKind::CALL,
+            resolved_target: Some(NodeId(1)),
+            file_node_id: Some(NodeId(101)),
+            ..Default::default()
+        }])?;
+
+        let production_only = storage.get_trail(&TrailConfig {
+            root_id: NodeId(1),
+            mode: TrailMode::Neighborhood,
+            target_id: None,
+            depth: 1,
+            direction: TrailDirection::Incoming,
+            caller_scope: TrailCallerScope::ProductionOnly,
+            edge_filter: vec![EdgeKind::CALL],
+            show_utility_calls: true,
+            node_filter: Vec::new(),
+            max_nodes: 50,
+        })?;
+        assert!(production_only.edges.is_empty());
+
+        let include_tests = storage.get_trail(&TrailConfig {
+            root_id: NodeId(1),
+            mode: TrailMode::Neighborhood,
+            target_id: None,
+            depth: 1,
+            direction: TrailDirection::Incoming,
+            caller_scope: TrailCallerScope::IncludeTestsAndBenches,
+            edge_filter: vec![EdgeKind::CALL],
+            show_utility_calls: true,
+            node_filter: Vec::new(),
+            max_nodes: 50,
+        })?;
+        assert_eq!(include_tests.edges.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_trail_can_hide_utility_calls() -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+
+        let caller = Node {
+            id: NodeId(1),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "caller".to_string(),
+            ..Default::default()
+        };
+        let utility_symbol = Node {
+            id: NodeId(2),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: "len".to_string(),
+            ..Default::default()
+        };
+
+        storage.insert_nodes_batch(&[caller, utility_symbol])?;
+        storage.insert_edges_batch(&[Edge {
+            id: EdgeId(10),
+            source: NodeId(1),
+            target: NodeId(2),
+            kind: EdgeKind::CALL,
+            ..Default::default()
+        }])?;
+
+        let hidden = storage.get_trail(&TrailConfig {
+            root_id: NodeId(1),
+            mode: TrailMode::Neighborhood,
+            target_id: None,
+            depth: 1,
+            direction: TrailDirection::Outgoing,
+            caller_scope: TrailCallerScope::IncludeTestsAndBenches,
+            edge_filter: vec![EdgeKind::CALL],
+            show_utility_calls: false,
+            node_filter: Vec::new(),
+            max_nodes: 50,
+        })?;
+        assert!(hidden.edges.is_empty());
+
+        let shown = storage.get_trail(&TrailConfig {
+            root_id: NodeId(1),
+            mode: TrailMode::Neighborhood,
+            target_id: None,
+            depth: 1,
+            direction: TrailDirection::Outgoing,
+            caller_scope: TrailCallerScope::IncludeTestsAndBenches,
+            edge_filter: vec![EdgeKind::CALL],
+            show_utility_calls: true,
+            node_filter: Vec::new(),
+            max_nodes: 50,
+        })?;
+        assert_eq!(shown.edges.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_helper_calls_are_not_suppressed_as_ambiguous() {
+        assert!(!should_ignore_call_resolution(
+            "Self::flush_projection_batch",
+            Some(ResolutionCertainty::Uncertain),
+            Some(0.40)
+        ));
+        assert!(!should_ignore_call_resolution(
+            "WorkspaceIndexer::seed_symbol_table",
+            Some(ResolutionCertainty::Probable),
+            Some(0.70)
+        ));
     }
 
     #[test]

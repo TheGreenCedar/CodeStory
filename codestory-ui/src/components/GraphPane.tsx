@@ -121,7 +121,7 @@ export function GraphPane({
         onResetDefaults={onResetTrailDefaults}
       />
       <div className="graph-canvas">
-        <GraphViewport graph={activeGraph} onSelectNode={onSelectNode} />
+        <GraphViewport graph={activeGraph} onSelectNode={onSelectNode} trailConfig={trailConfig} />
       </div>
     </section>
   );

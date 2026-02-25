@@ -882,18 +882,11 @@ impl AppController {
             }
         }
 
-        // Pull labels from cached names for a small subset of nodes.
-        let labels_by_id = self.cached_labels(ordered_node_ids.iter().copied());
-
         let mut node_dtos = Vec::with_capacity(ordered_node_ids.len());
         for id in ordered_node_ids {
-            let label = labels_by_id
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| id.0.to_string());
-            let kind = match storage.get_node(id) {
-                Ok(Some(node)) => NodeKind::from(node.kind),
-                _ => NodeKind::UNKNOWN,
+            let (label, kind) = match storage.get_node(id) {
+                Ok(Some(node)) => (node_display_name(&node), NodeKind::from(node.kind)),
+                _ => (id.0.to_string(), NodeKind::UNKNOWN),
             };
 
             node_dtos.push(GraphNodeDto {
@@ -901,6 +894,10 @@ impl AppController {
                 label,
                 kind,
                 depth: if id == center { 0 } else { 1 },
+                label_policy: Some("qualified_or_serialized".to_string()),
+                badge_visible_members: None,
+                badge_total_members: None,
+                merged_symbol_examples: Vec::new(),
             });
         }
 
@@ -926,7 +923,9 @@ impl AppController {
             target_id,
             depth: req.depth,
             direction: req.direction.into(),
+            caller_scope: req.caller_scope.into(),
             edge_filter: req.edge_filter.into_iter().map(Into::into).collect(),
+            show_utility_calls: req.show_utility_calls,
             node_filter: req.node_filter.into_iter().map(Into::into).collect(),
             max_nodes: req.max_nodes.clamp(10, 100_000) as usize,
         };
@@ -944,23 +943,58 @@ impl AppController {
             truncated,
         } = result;
 
-        // Pull labels from cached names for the returned node set.
-        let labels_by_id = self.cached_labels(nodes.iter().map(|node| node.id));
+        let node_kind_by_id: HashMap<codestory_core::NodeId, codestory_core::NodeKind> =
+            nodes.iter().map(|node| (node.id, node.kind)).collect();
+        let mut visible_member_counts: HashMap<codestory_core::NodeId, u32> = HashMap::new();
+        for edge in &edges {
+            if edge.kind != codestory_core::EdgeKind::MEMBER {
+                continue;
+            }
+            let (source, target) = edge.effective_endpoints();
+            let source_kind = node_kind_by_id.get(&source).copied();
+            let target_kind = node_kind_by_id.get(&target).copied();
+            let source_is_structural = source_kind.is_some_and(is_structural_kind);
+            let target_is_structural = target_kind.is_some_and(is_structural_kind);
+            let host_id = if source_is_structural && !target_is_structural {
+                Some(source)
+            } else if target_is_structural && !source_is_structural {
+                Some(target)
+            } else {
+                None
+            };
+            if let Some(host_id) = host_id {
+                *visible_member_counts.entry(host_id).or_insert(0) += 1;
+            }
+        }
 
         let mut node_dtos = Vec::with_capacity(nodes.len());
         for node in nodes {
-            let label = labels_by_id.get(&node.id).cloned().unwrap_or_else(|| {
-                node.qualified_name
-                    .clone()
-                    .unwrap_or_else(|| node.serialized_name.clone())
-            });
+            let label = node_display_name(&node);
             let depth = depth_map.get(&node.id).copied().unwrap_or(0);
+            let is_structural = is_structural_kind(node.kind);
+            let badge_visible_members = if is_structural {
+                Some(*visible_member_counts.get(&node.id).unwrap_or(&0))
+            } else {
+                None
+            };
+            let badge_total_members = if is_structural {
+                storage
+                    .get_children_symbols(node.id)
+                    .ok()
+                    .map(|children| children.len() as u32)
+            } else {
+                None
+            };
 
             node_dtos.push(GraphNodeDto {
                 id: NodeId::from(node.id),
                 label,
                 kind: NodeKind::from(node.kind),
                 depth,
+                label_policy: Some("qualified_or_serialized".to_string()),
+                badge_visible_members,
+                badge_total_members,
+                merged_symbol_examples: Vec::new(),
             });
         }
 

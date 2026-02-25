@@ -398,52 +398,55 @@ export default function App() {
     [focusSymbolInternal, pendingFocus, saveCurrentFile, savedText],
   );
 
-  const handleOpenProject = useCallback(async (pathOverride?: string, restored = false) => {
-    const path = (pathOverride ?? projectPath).trim() || ".";
-    setIsBusy(true);
-    try {
-      const summary = await api.openProject({ path });
-      setProjectPath(path);
-      if (typeof window !== "undefined") {
-        window.localStorage.setItem(LAST_OPENED_PROJECT_KEY, path);
-      }
-      setStatus(restored ? `Restored project: ${summary.root}` : `Project open: ${summary.root}`);
-      setProjectOpen(true);
-      setTrailConfig(defaultTrailUiConfig());
-      await loadRootSymbols();
-
-      const saved = await api.getUiLayout();
-      if (saved) {
-        try {
-          const parsed = JSON.parse(saved) as Partial<PersistedLayout>;
-          if (typeof parsed.activeGraphId === "string" || parsed.activeGraphId === null) {
-            setActiveGraphId(parsed.activeGraphId ?? null);
-          }
-          if (parsed.expandedNodes && typeof parsed.expandedNodes === "object") {
-            setExpandedNodes(parsed.expandedNodes);
-          }
-          if (parsed.selectedTab === "agent" || parsed.selectedTab === "explorer") {
-            setSelectedTab(parsed.selectedTab);
-          }
-          setTrailConfig(normalizeTrailUiConfig(parsed.trailConfig));
-        } catch {
-          // Ignore malformed saved layouts.
+  const handleOpenProject = useCallback(
+    async (pathOverride?: string, restored = false) => {
+      const path = (pathOverride ?? projectPath).trim() || ".";
+      setIsBusy(true);
+      try {
+        const summary = await api.openProject({ path });
+        setProjectPath(path);
+        if (typeof window !== "undefined") {
+          window.localStorage.setItem(LAST_OPENED_PROJECT_KEY, path);
         }
+        setStatus(restored ? `Restored project: ${summary.root}` : `Project open: ${summary.root}`);
+        setProjectOpen(true);
+        setTrailConfig(defaultTrailUiConfig());
+        await loadRootSymbols();
+
+        const saved = await api.getUiLayout();
+        if (saved) {
+          try {
+            const parsed = JSON.parse(saved) as Partial<PersistedLayout>;
+            if (typeof parsed.activeGraphId === "string" || parsed.activeGraphId === null) {
+              setActiveGraphId(parsed.activeGraphId ?? null);
+            }
+            if (parsed.expandedNodes && typeof parsed.expandedNodes === "object") {
+              setExpandedNodes(parsed.expandedNodes);
+            }
+            if (parsed.selectedTab === "agent" || parsed.selectedTab === "explorer") {
+              setSelectedTab(parsed.selectedTab);
+            }
+            setTrailConfig(normalizeTrailUiConfig(parsed.trailConfig));
+          } catch {
+            // Ignore malformed saved layouts.
+          }
+        }
+      } catch (error) {
+        if (restored) {
+          setStatus(
+            error instanceof Error
+              ? `Failed to restore ${path}: ${error.message}`
+              : `Failed to restore ${path}.`,
+          );
+        } else {
+          setStatus(error instanceof Error ? error.message : "Failed to open project.");
+        }
+      } finally {
+        setIsBusy(false);
       }
-    } catch (error) {
-      if (restored) {
-        setStatus(
-          error instanceof Error
-            ? `Failed to restore ${path}: ${error.message}`
-            : `Failed to restore ${path}.`,
-        );
-      } else {
-        setStatus(error instanceof Error ? error.message : "Failed to open project.");
-      }
-    } finally {
-      setIsBusy(false);
-    }
-  }, [loadRootSymbols, projectPath]);
+    },
+    [loadRootSymbols, projectPath],
+  );
 
   useEffect(() => {
     if (attemptedProjectRestoreRef.current || projectOpen || isBusy) {

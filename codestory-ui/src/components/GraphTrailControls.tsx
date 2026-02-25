@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 
 import { api } from "../api/client";
-import type { EdgeKind, NodeKind, SearchHit, TrailDirection, TrailMode } from "../generated/api";
+import type {
+  EdgeKind,
+  NodeKind,
+  SearchHit,
+  TrailCallerScope,
+  TrailDirection,
+  TrailMode,
+} from "../generated/api";
 import { EDGE_KIND_OPTIONS, NODE_KIND_OPTIONS, type TrailUiConfig } from "../graph/trailConfig";
 
 type GraphTrailControlsProps = {
@@ -44,6 +51,15 @@ function directionLabel(direction: TrailDirection): string {
       return "Outgoing";
     case "Both":
       return "Both";
+  }
+}
+
+function callerScopeLabel(scope: TrailCallerScope): string {
+  switch (scope) {
+    case "ProductionOnly":
+      return "Production Only";
+    case "IncludeTestsAndBenches":
+      return "Include Tests/Benches";
   }
 }
 
@@ -249,6 +265,38 @@ export function GraphTrailControls({
         </label>
 
         <label className="graph-control-field">
+          <span>Caller Scope</span>
+          <select
+            value={config.callerScope}
+            onChange={(event) =>
+              onConfigChange({ callerScope: event.target.value as TrailCallerScope })
+            }
+          >
+            {(["ProductionOnly", "IncludeTestsAndBenches"] as TrailCallerScope[]).map((scope) => (
+              <option key={scope} value={scope}>
+                {callerScopeLabel(scope)}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="graph-control-field">
+          <span>Bundling</span>
+          <select
+            value={config.bundlingMode}
+            onChange={(event) =>
+              onConfigChange({ bundlingMode: event.target.value as TrailUiConfig["bundlingMode"] })
+            }
+          >
+            {(["overview", "trace", "off"] as const).map((mode) => (
+              <option key={mode} value={mode}>
+                {mode}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="graph-control-field">
           <span>Max Nodes</span>
           <input
             type="number"
@@ -263,6 +311,33 @@ export function GraphTrailControls({
             }}
           />
         </label>
+      </div>
+
+      <div className="graph-filter-row">
+        <span className="graph-filter-label">View Options</span>
+        <div className="graph-chip-row">
+          <button
+            type="button"
+            className={config.showUtilityCalls ? "graph-chip graph-chip-active" : "graph-chip"}
+            onClick={() => onConfigChange({ showUtilityCalls: !config.showUtilityCalls })}
+          >
+            Utility Calls
+          </button>
+          <button
+            type="button"
+            className={config.showLegend ? "graph-chip graph-chip-active" : "graph-chip"}
+            onClick={() => onConfigChange({ showLegend: !config.showLegend })}
+          >
+            Legend
+          </button>
+          <button
+            type="button"
+            className={config.showMiniMap ? "graph-chip graph-chip-active" : "graph-chip"}
+            onClick={() => onConfigChange({ showMiniMap: !config.showMiniMap })}
+          >
+            MiniMap
+          </button>
+        </div>
       </div>
 
       {config.mode === "ToTargetSymbol" ? (
