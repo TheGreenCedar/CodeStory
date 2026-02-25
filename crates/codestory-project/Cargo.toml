@@ -12,6 +12,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
 walkdir = { workspace = true }
+ignore = { workspace = true }
 glob = { workspace = true }
 
 [dev-dependencies]

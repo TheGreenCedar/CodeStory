@@ -112,13 +112,12 @@ impl Project {
                 if full_path.is_file() {
                     group_files.push(full_path);
                 } else if full_path.is_dir() {
-                    for entry in walkdir::WalkDir::new(&full_path)
-                        .follow_links(true)
-                        .into_iter()
-                        .filter_map(|e| e.ok())
-                    {
-                        if entry.file_type().is_file() {
-                            group_files.push(entry.path().to_path_buf());
+                    let mut builder = ignore::WalkBuilder::new(&full_path);
+                    builder.follow_links(true);
+                    builder.require_git(false);
+                    for entry in builder.build().filter_map(|e| e.ok()) {
+                        if entry.file_type().is_some_and(|kind| kind.is_file()) {
+                            group_files.push(entry.into_path());
                         }
                     }
                 }
@@ -302,6 +301,38 @@ mod tests {
         assert!(files.iter().any(|f| f.ends_with("lib.rs")));
         assert!(!files.iter().any(|f| f.ends_with("ignore.txt")));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_discovery_respects_gitignore() -> Result<()> {
+        let dir = tempdir()?;
+        let src_dir = dir.path().join("src");
+        fs::create_dir(&src_dir)?;
+
+        let tracked = src_dir.join("main.rs");
+        let ignored = src_dir.join("generated.ts");
+        fs::write(dir.path().join(".gitignore"), "src/generated.ts\n")?;
+        fs::write(&tracked, "fn main() {}\n")?;
+        fs::write(&ignored, "export const generated = true;\n")?;
+
+        let project_path = dir.path().join("proj.json");
+        let mut project = Project::new("Test".to_string(), project_path);
+
+        project.settings.source_groups.push(SourceGroupSettings {
+            id: Uuid::new_v4(),
+            language: Language::Rust,
+            standard: LanguageStandard::Default,
+            source_paths: vec![PathBuf::from("src")],
+            exclude_patterns: vec![],
+            include_paths: vec![],
+            defines: HashMap::new(),
+            language_specific: LanguageSpecificSettings::Other,
+        });
+
+        let files = project.get_source_files()?;
+        assert!(files.iter().any(|f| f.ends_with("main.rs")));
+        assert!(!files.iter().any(|f| f.ends_with("generated.ts")));
         Ok(())
     }
 

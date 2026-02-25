@@ -56,6 +56,23 @@
   attr (@class_name.node -> @method_name.node) kind = "MEMBER"
 }
 
+;; Inheritance (extends)
+(class_declaration
+  name: (type_identifier) @class_name
+  (class_heritage (_) @parent_name))
+{
+  node @parent_name.node
+  attr (@parent_name.node) kind = "CLASS"
+  attr (@parent_name.node) name = (source-text @parent_name)
+  attr (@parent_name.node) start_row = (start-row @parent_name)
+  attr (@parent_name.node) start_col = (start-column @parent_name)
+  attr (@parent_name.node) end_row = (end-row @parent_name)
+  attr (@parent_name.node) end_col = (end-column @parent_name)
+
+  edge @class_name.node -> @parent_name.node
+  attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
+}
+
 ;; Calls (function -> identifier)
 (function_declaration
   name: (identifier) @caller
@@ -134,6 +151,41 @@
   edge @caller.node -> @callee.node
   attr (@caller.node -> @callee.node) kind = "CALL"
   attr (@caller.node -> @callee.node) line = (start-row @call)
+}
+
+;; Calls (global fallback identifier)
+(call_expression
+  function: (identifier) @callee_any) @call_any
+{
+  node @call_any.node
+  attr (@call_any.node) kind = "UNKNOWN"
+  attr (@call_any.node) name = (source-text @callee_any)
+  attr (@call_any.node) start_row = (start-row @callee_any)
+  attr (@call_any.node) start_col = (start-column @callee_any)
+  attr (@call_any.node) end_row = (end-row @callee_any)
+  attr (@call_any.node) end_col = (end-column @callee_any)
+
+  edge @call_any.node -> @call_any.node
+  attr (@call_any.node -> @call_any.node) kind = "CALL"
+  attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
+}
+
+;; Calls (global fallback member)
+(call_expression
+  function: (member_expression
+    property: (_) @callee_any) @call_any)
+{
+  node @call_any.node
+  attr (@call_any.node) kind = "UNKNOWN"
+  attr (@call_any.node) name = (source-text @callee_any)
+  attr (@call_any.node) start_row = (start-row @callee_any)
+  attr (@call_any.node) start_col = (start-column @callee_any)
+  attr (@call_any.node) end_row = (end-row @callee_any)
+  attr (@call_any.node) end_col = (end-column @callee_any)
+
+  edge @call_any.node -> @call_any.node
+  attr (@call_any.node -> @call_any.node) kind = "CALL"
+  attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
 }
 
 ;; Imports

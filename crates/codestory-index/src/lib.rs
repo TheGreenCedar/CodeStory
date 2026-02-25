@@ -724,7 +724,7 @@ pub fn get_language_for_ext(ext: &str) -> Option<(Language, &'static str, &'stat
         )),
         "c" => Some((
             tree_sitter_c::LANGUAGE.into(),
-            "cpp",
+            "c",
             include_str!("../rules/c.scm"),
         )),
         _ => None,

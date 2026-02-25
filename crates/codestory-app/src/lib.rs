@@ -1,8 +1,10 @@
 use codestory_api::{
-    ApiError, AppEventPayload, EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphRequest,
-    GraphResponse, IndexMode, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
-    OpenProjectRequest, ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, SearchHit,
-    SearchRequest, SetUiLayoutRequest, StartIndexingRequest, StorageStatsDto, TrailConfigDto,
+    AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentResponseSectionDto, ApiError,
+    AppEventPayload, EdgeId, EdgeKind, GraphArtifactDto, GraphEdgeDto, GraphNodeDto, GraphRequest,
+    GraphResponse, IndexMode, ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto,
+    NodeDetailsRequest, NodeId, NodeKind, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
+    ReadFileTextResponse, SearchHit, SearchRequest, SetUiLayoutRequest, StartIndexingRequest,
+    StorageStatsDto, SymbolSummaryDto, TrailConfigDto, WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_events::{Event, EventBus};
 use codestory_search::SearchEngine;
@@ -10,6 +12,7 @@ use codestory_storage::Storage;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,6 +27,7 @@ fn node_display_name(node: &codestory_core::Node) -> String {
         .unwrap_or_else(|| node.serialized_name.clone())
 }
 
+
 fn clamp_i64_to_u32(v: i64) -> u32 {
     if v <= 0 {
         0
@@ -32,6 +36,115 @@ fn clamp_i64_to_u32(v: i64) -> u32 {
     } else {
         v as u32
     }
+}
+
+fn sanitize_mermaid_label(input: &str) -> String {
+    input.replace('"', "'").replace('\n', " ")
+}
+
+fn markdown_snippet(text: &str, focus_line: Option<u32>, context: usize) -> String {
+    let all_lines: Vec<&str> = text.lines().collect();
+    if all_lines.is_empty() {
+        return String::new();
+    }
+
+    let line_index = focus_line
+        .and_then(|line| line.checked_sub(1))
+        .map(|line| line as usize)
+        .unwrap_or(0)
+        .min(all_lines.len().saturating_sub(1));
+
+    let start = line_index.saturating_sub(context);
+    let end = (line_index + context + 1).min(all_lines.len());
+
+    let mut out = String::new();
+    out.push_str("```text\n");
+    for (idx, line) in all_lines[start..end].iter().enumerate() {
+        let source_line = start + idx + 1;
+        let marker = if source_line == line_index + 1 {
+            ">"
+        } else {
+            " "
+        };
+        let _ = writeln!(out, "{marker}{source_line:>5} | {line}");
+    }
+    out.push_str("```");
+    out
+}
+
+fn mermaid_flowchart(graph: &GraphResponse) -> String {
+    let mut out = String::from("flowchart LR\n");
+    for node in graph.nodes.iter().take(14) {
+        let _ = writeln!(
+            out,
+            "    N{}[\"{}\"]",
+            node.id.0,
+            sanitize_mermaid_label(&node.label)
+        );
+    }
+
+    for edge in graph.edges.iter().take(20) {
+        let _ = writeln!(
+            out,
+            "    N{} -->|\"{:?}\"| N{}",
+            edge.source.0, edge.kind, edge.target.0
+        );
+    }
+
+    out
+}
+
+fn mermaid_sequence(graph: &GraphResponse) -> String {
+    let mut out = String::from("sequenceDiagram\n");
+    let mut labels: HashMap<String, String> = HashMap::new();
+    for node in graph.nodes.iter().take(10) {
+        labels.insert(node.id.0.clone(), node.label.clone());
+    }
+
+    let mut emitted = 0usize;
+    for edge in graph.edges.iter().take(14) {
+        let Some(source) = labels.get(&edge.source.0) else {
+            continue;
+        };
+        let Some(target) = labels.get(&edge.target.0) else {
+            continue;
+        };
+
+        emitted += 1;
+        let _ = writeln!(
+            out,
+            "    {}->>{}: {:?}",
+            sanitize_mermaid_label(source),
+            sanitize_mermaid_label(target),
+            edge.kind
+        );
+    }
+
+    if emitted == 0 {
+        out.push_str("    User->>System: No sequencing data available\n");
+    }
+    out
+}
+
+fn mermaid_gantt(citations: &[SearchHit]) -> String {
+    let mut out = String::from("gantt\n    title Investigation Plan\n    dateFormat X\n");
+    let mut current = 0u32;
+    for (idx, hit) in citations.iter().take(5).enumerate() {
+        let duration = 1 + (idx as u32 % 2);
+        let _ = writeln!(
+            out,
+            "    {} :{}, {}, {}",
+            sanitize_mermaid_label(&hit.display_name),
+            idx + 1,
+            current,
+            duration
+        );
+        current += duration;
+    }
+    if citations.is_empty() {
+        out.push_str("    Baseline scan :1, 0, 1\n");
+    }
+    out
 }
 
 fn build_search_state(
@@ -123,6 +236,69 @@ impl AppController {
             .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))
     }
 
+    fn resolve_project_file_path(
+        &self,
+        path: &str,
+        allow_missing_leaf: bool,
+    ) -> Result<PathBuf, ApiError> {
+        let root = self.require_project_root()?;
+        let root = root
+            .canonicalize()
+            .map_err(|e| ApiError::internal(format!("Failed to resolve project root: {e}")))?;
+
+        let raw = PathBuf::from(path);
+        let candidate = if raw.is_absolute() {
+            raw
+        } else {
+            root.join(raw)
+        };
+
+        let resolved = match candidate.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(err) if allow_missing_leaf && err.kind() == io::ErrorKind::NotFound => {
+                let Some(parent) = candidate.parent() else {
+                    return Err(ApiError::invalid_argument(format!(
+                        "Invalid file path: {}",
+                        candidate.display()
+                    )));
+                };
+                let Some(file_name) = candidate.file_name() else {
+                    return Err(ApiError::invalid_argument(format!(
+                        "Invalid file path: {}",
+                        candidate.display()
+                    )));
+                };
+
+                let parent = parent.canonicalize().map_err(|e| {
+                    if e.kind() == io::ErrorKind::NotFound {
+                        ApiError::not_found(format!(
+                            "Parent directory not found: {}",
+                            parent.display()
+                        ))
+                    } else {
+                        ApiError::internal(format!("Failed to resolve parent path: {e}"))
+                    }
+                })?;
+                parent.join(file_name)
+            }
+            Err(err) => {
+                return Err(if err.kind() == io::ErrorKind::NotFound {
+                    ApiError::not_found(format!("File not found: {}", candidate.display()))
+                } else {
+                    ApiError::internal(format!("Failed to resolve file path: {err}"))
+                });
+            }
+        };
+
+        if !resolved.starts_with(&root) {
+            return Err(ApiError::invalid_argument(
+                "Refusing to access file outside project root.",
+            ));
+        }
+
+        Ok(resolved)
+    }
+
     fn cached_labels<I>(&self, ids: I) -> HashMap<codestory_core::NodeId, String>
     where
         I: IntoIterator<Item = codestory_core::NodeId>,
@@ -131,6 +307,45 @@ impl AppController {
         ids.into_iter()
             .filter_map(|id| s.node_names.get(&id).cloned().map(|name| (id, name)))
             .collect()
+    }
+
+    fn file_path_for_node(
+        storage: &Storage,
+        node: &codestory_core::Node,
+    ) -> Result<Option<String>, ApiError> {
+        let Some(file_id) = node.file_node_id else {
+            return Ok(None);
+        };
+
+        let file_node = storage
+            .get_node(file_id)
+            .map_err(|e| ApiError::internal(format!("Failed to load file node: {e}")))?;
+
+        Ok(file_node.map(|file| file.serialized_name))
+    }
+
+    fn symbol_summary_for_node(
+        storage: &Storage,
+        labels_by_id: &HashMap<codestory_core::NodeId, String>,
+        node: codestory_core::Node,
+    ) -> Result<SymbolSummaryDto, ApiError> {
+        let has_children = !storage
+            .get_children_symbols(node.id)
+            .map_err(|e| ApiError::internal(format!("Failed to load child symbols: {e}")))?
+            .is_empty();
+
+        let label = labels_by_id
+            .get(&node.id)
+            .cloned()
+            .unwrap_or_else(|| node_display_name(&node));
+
+        Ok(SymbolSummaryDto {
+            id: NodeId::from(node.id),
+            label,
+            kind: NodeKind::from(node.kind),
+            file_path: Self::file_path_for_node(storage, &node)?,
+            has_children,
+        })
     }
 
     pub fn open_project(&self, req: OpenProjectRequest) -> Result<ProjectSummary, ApiError> {
@@ -276,6 +491,218 @@ impl AppController {
         }
 
         Ok(hits)
+    }
+
+    pub fn list_root_symbols(
+        &self,
+        req: ListRootSymbolsRequest,
+    ) -> Result<Vec<SymbolSummaryDto>, ApiError> {
+        let storage = self.open_storage()?;
+
+        let mut roots = storage
+            .get_root_symbols()
+            .map_err(|e| ApiError::internal(format!("Failed to load root symbols: {e}")))?;
+        roots.sort_by_cached_key(node_display_name);
+
+        let limit = req.limit.unwrap_or(300).clamp(1, 2_000) as usize;
+        if roots.len() > limit {
+            roots.truncate(limit);
+        }
+
+        let labels_by_id = self.cached_labels(roots.iter().map(|node| node.id));
+        roots
+            .into_iter()
+            .map(|node| Self::symbol_summary_for_node(&storage, &labels_by_id, node))
+            .collect()
+    }
+
+    pub fn list_children_symbols(
+        &self,
+        req: ListChildrenSymbolsRequest,
+    ) -> Result<Vec<SymbolSummaryDto>, ApiError> {
+        let parent_id = req.parent_id.to_core()?;
+        let storage = self.open_storage()?;
+
+        let mut children = storage
+            .get_children_symbols(parent_id)
+            .map_err(|e| ApiError::internal(format!("Failed to load child symbols: {e}")))?;
+        children.sort_by_cached_key(node_display_name);
+
+        let labels_by_id = self.cached_labels(children.iter().map(|node| node.id));
+        children
+            .into_iter()
+            .map(|node| Self::symbol_summary_for_node(&storage, &labels_by_id, node))
+            .collect()
+    }
+
+    pub fn agent_ask(&self, req: AgentAskRequest) -> Result<AgentAnswerDto, ApiError> {
+        let prompt = req.prompt.trim().to_string();
+        if prompt.is_empty() {
+            return Err(ApiError::invalid_argument("Prompt cannot be empty."));
+        }
+
+        let mut hits = self.search(SearchRequest {
+            query: prompt.clone(),
+        })?;
+        let max_results = req.max_results.unwrap_or(8).clamp(1, 25) as usize;
+        if hits.len() > max_results {
+            hits.truncate(max_results);
+        }
+
+        let mut chosen_node = req.focus_node_id.clone();
+        if chosen_node.is_none() {
+            chosen_node = hits.first().map(|hit| hit.node_id.clone());
+        }
+
+        let mut graphs = Vec::new();
+        let mut primary_graph_id = None::<String>;
+
+        if let Some(center_id) = chosen_node.clone() {
+            let neighborhood = self.graph_neighborhood(GraphRequest {
+                center_id: center_id.clone(),
+                max_edges: Some(240),
+            })?;
+
+            primary_graph_id = Some("uml-primary".to_string());
+            graphs.push(GraphArtifactDto::Uml {
+                id: "uml-primary".to_string(),
+                title: "Primary Dependency Graph".to_string(),
+                graph: neighborhood.clone(),
+            });
+
+            if req.include_mermaid {
+                graphs.push(GraphArtifactDto::Mermaid {
+                    id: "mermaid-flow".to_string(),
+                    title: "Flow Overview".to_string(),
+                    diagram: "flowchart".to_string(),
+                    mermaid_syntax: mermaid_flowchart(&neighborhood),
+                });
+
+                let prompt_lower = prompt.to_ascii_lowercase();
+                if prompt_lower.contains("sequence") {
+                    graphs.push(GraphArtifactDto::Mermaid {
+                        id: "mermaid-sequence".to_string(),
+                        title: "Sequence Narrative".to_string(),
+                        diagram: "sequenceDiagram".to_string(),
+                        mermaid_syntax: mermaid_sequence(&neighborhood),
+                    });
+                }
+
+                if prompt_lower.contains("timeline") || prompt_lower.contains("gantt") {
+                    graphs.push(GraphArtifactDto::Mermaid {
+                        id: "mermaid-gantt".to_string(),
+                        title: "Execution Timeline".to_string(),
+                        diagram: "gantt".to_string(),
+                        mermaid_syntax: mermaid_gantt(&hits),
+                    });
+                }
+            }
+        }
+
+        let citations: Vec<AgentCitationDto> = hits
+            .iter()
+            .map(|hit| AgentCitationDto {
+                node_id: hit.node_id.clone(),
+                display_name: hit.display_name.clone(),
+                kind: hit.kind,
+                file_path: hit.file_path.clone(),
+                line: hit.line,
+                score: hit.score,
+            })
+            .collect();
+
+        let mut sections = Vec::new();
+        if !hits.is_empty() {
+            let mut markdown = String::from("Top symbol matches from indexed search:\n");
+            for hit in hits.iter().take(6) {
+                let location = match (&hit.file_path, hit.line) {
+                    (Some(path), Some(line)) => format!(" ({path}:{line})"),
+                    (Some(path), None) => format!(" ({path})"),
+                    _ => String::new(),
+                };
+                let _ = writeln!(
+                    markdown,
+                    "- **{}** [{:?}] score `{:.3}`{}",
+                    hit.display_name, hit.kind, hit.score, location
+                );
+            }
+            sections.push(AgentResponseSectionDto {
+                id: "search-results".to_string(),
+                title: "Indexed Search".to_string(),
+                markdown,
+                graph_ids: Vec::new(),
+            });
+        } else {
+            sections.push(AgentResponseSectionDto {
+                id: "search-results".to_string(),
+                title: "Indexed Search".to_string(),
+                markdown: "No direct indexed matches were found. Try a symbol name, file stem, or a narrower phrase.".to_string(),
+                graph_ids: Vec::new(),
+            });
+        }
+
+        if let Some(center_id) = chosen_node {
+            let node = self.node_details(NodeDetailsRequest {
+                id: center_id.clone(),
+            })?;
+
+            let mut markdown = format!(
+                "Focused symbol: **{}** (`{:?}`)\n",
+                node.display_name, node.kind
+            );
+
+            if let (Some(path), Some(line)) = (node.file_path.clone(), node.start_line)
+                && let Ok(file) = self.read_file_text(ReadFileTextRequest { path: path.clone() })
+            {
+                let _ = writeln!(markdown, "\nSource context from `{path}:{line}`:\n");
+                markdown.push_str(&markdown_snippet(&file.text, Some(line), 6));
+            }
+
+            let graph_ids = primary_graph_id.clone().into_iter().collect();
+            sections.push(AgentResponseSectionDto {
+                id: "deep-inspection".to_string(),
+                title: "Deep Inspection".to_string(),
+                markdown,
+                graph_ids,
+            });
+        }
+
+        if req.include_mermaid {
+            let graph_ids = graphs
+                .iter()
+                .filter_map(|graph| match graph {
+                    GraphArtifactDto::Mermaid { id, .. } => Some(id.clone()),
+                    GraphArtifactDto::Uml { .. } => None,
+                })
+                .collect::<Vec<_>>();
+
+            if !graph_ids.is_empty() {
+                sections.push(AgentResponseSectionDto {
+                    id: "agent-diagrams".to_string(),
+                    title: "Agent Diagrams".to_string(),
+                    markdown: "Generated Mermaid diagrams for storytelling views (flow, sequence, or timeline when requested).".to_string(),
+                    graph_ids,
+                });
+            }
+        }
+
+        let summary = if hits.is_empty() {
+            "No indexed symbols matched the prompt yet.".to_string()
+        } else {
+            format!(
+                "Investigated {} symbol matches and generated {} graph artifact(s).",
+                hits.len(),
+                graphs.len()
+            )
+        };
+
+        Ok(AgentAnswerDto {
+            prompt,
+            summary,
+            sections,
+            citations,
+            graphs,
+        })
     }
 
     pub fn graph_neighborhood(&self, req: GraphRequest) -> Result<GraphResponse, ApiError> {
@@ -468,32 +895,7 @@ impl AppController {
         &self,
         req: ReadFileTextRequest,
     ) -> Result<ReadFileTextResponse, ApiError> {
-        let root = self.require_project_root()?;
-
-        let root = root
-            .canonicalize()
-            .map_err(|e| ApiError::internal(format!("Failed to resolve project root: {e}")))?;
-
-        let raw = PathBuf::from(req.path);
-        let candidate = if raw.is_absolute() {
-            raw
-        } else {
-            root.join(raw)
-        };
-
-        let candidate = candidate.canonicalize().map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                ApiError::not_found(format!("File not found: {}", candidate.display()))
-            } else {
-                ApiError::internal(format!("Failed to resolve file path: {e}"))
-            }
-        })?;
-
-        if !candidate.starts_with(&root) {
-            return Err(ApiError::invalid_argument(
-                "Refusing to read file outside project root.",
-            ));
-        }
+        let candidate = self.resolve_project_file_path(&req.path, false)?;
 
         let text = std::fs::read_to_string(&candidate).map_err(|e| {
             ApiError::internal(format!("Failed to read file {}: {e}", candidate.display()))
@@ -502,6 +904,20 @@ impl AppController {
         Ok(ReadFileTextResponse {
             path: candidate.to_string_lossy().to_string(),
             text,
+        })
+    }
+
+    pub fn write_file_text(
+        &self,
+        req: WriteFileTextRequest,
+    ) -> Result<WriteFileResponse, ApiError> {
+        let candidate = self.resolve_project_file_path(&req.path, true)?;
+        std::fs::write(&candidate, &req.text).map_err(|e| {
+            ApiError::internal(format!("Failed to write file {}: {e}", candidate.display()))
+        })?;
+
+        Ok(WriteFileResponse {
+            bytes_written: clamp_i64_to_u32(req.text.len() as i64),
         })
     }
 
@@ -641,6 +1057,7 @@ mod tests {
     use super::*;
     use codestory_core::{Node, NodeId, NodeKind};
     use crossbeam_channel::unbounded;
+    use tempfile::tempdir;
 
     #[test]
     fn build_search_state_prefers_qualified_name() {
@@ -691,5 +1108,47 @@ mod tests {
         ));
         assert!(app_rx.try_recv().is_err());
         handle.join().expect("join forwarder");
+    }
+
+    #[test]
+    fn write_file_text_writes_inside_project_root() {
+        let temp = tempdir().expect("create temp dir");
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: temp.path().to_string_lossy().to_string(),
+            })
+            .expect("open project");
+
+        let result = controller
+            .write_file_text(WriteFileTextRequest {
+                path: "notes.txt".to_string(),
+                text: "hello world".to_string(),
+            })
+            .expect("write text file");
+
+        assert_eq!(result.bytes_written, 11);
+        let saved = std::fs::read_to_string(temp.path().join("notes.txt")).expect("read file");
+        assert_eq!(saved, "hello world");
+    }
+
+    #[test]
+    fn write_file_text_rejects_paths_outside_project_root() {
+        let temp = tempdir().expect("create temp dir");
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: temp.path().to_string_lossy().to_string(),
+            })
+            .expect("open project");
+
+        let err = controller
+            .write_file_text(WriteFileTextRequest {
+                path: "../escape.txt".to_string(),
+                text: "nope".to_string(),
+            })
+            .expect_err("write should fail");
+
+        assert_eq!(err.code, "invalid_argument");
     }
 }

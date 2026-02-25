@@ -44,6 +44,25 @@ pub struct SearchHit {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct ListRootSymbolsRequest {
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct ListChildrenSymbolsRequest {
+    pub parent_id: NodeId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SymbolSummaryDto {
+    pub id: NodeId,
+    pub label: String,
+    pub kind: NodeKind,
+    pub file_path: Option<String>,
+    pub has_children: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct GraphRequest {
     pub center_id: NodeId,
     /// Optional cap to avoid pulling extremely dense neighborhoods into the UI.
@@ -122,8 +141,68 @@ pub struct ReadFileTextResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct WriteFileTextRequest {
+    pub path: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SetUiLayoutRequest {
     pub json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AgentAskRequest {
+    pub prompt: String,
+    #[serde(default)]
+    pub include_mermaid: bool,
+    #[serde(default)]
+    pub focus_node_id: Option<NodeId>,
+    #[serde(default)]
+    pub max_results: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AgentCitationDto {
+    pub node_id: NodeId,
+    pub display_name: String,
+    pub kind: NodeKind,
+    pub file_path: Option<String>,
+    pub line: Option<u32>,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AgentResponseSectionDto {
+    pub id: String,
+    pub title: String,
+    pub markdown: String,
+    pub graph_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GraphArtifactDto {
+    Uml {
+        id: String,
+        title: String,
+        graph: GraphResponse,
+    },
+    Mermaid {
+        id: String,
+        title: String,
+        diagram: String,
+        mermaid_syntax: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AgentAnswerDto {
+    pub prompt: String,
+    pub summary: String,
+    pub sections: Vec<AgentResponseSectionDto>,
+    pub citations: Vec<AgentCitationDto>,
+    pub graphs: Vec<GraphArtifactDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
