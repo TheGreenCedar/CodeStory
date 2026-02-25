@@ -1,7 +1,9 @@
 import type { KeyboardEvent } from "react";
 
+import { GraphTrailControls } from "./GraphTrailControls";
 import { GraphViewport } from "../graph/GraphViewport";
 import type { GraphArtifactDto, SearchHit } from "../generated/api";
+import type { TrailUiConfig } from "../graph/trailConfig";
 
 type GraphPaneProps = {
   activeGraph: GraphArtifactDto | null;
@@ -23,6 +25,13 @@ type GraphPaneProps = {
   graphMap: Record<string, GraphArtifactDto>;
   onActivateGraph: (graphId: string) => void;
   onSelectNode: (nodeId: string, label: string) => void;
+  trailConfig: TrailUiConfig;
+  trailRunning: boolean;
+  trailDisabledReason: string | null;
+  hasActiveRoot: boolean;
+  onTrailConfigChange: (patch: Partial<TrailUiConfig>) => void;
+  onRunTrail: () => void;
+  onResetTrailDefaults: () => void;
 };
 
 export function GraphPane({
@@ -45,6 +54,13 @@ export function GraphPane({
   graphMap,
   onActivateGraph,
   onSelectNode,
+  trailConfig,
+  trailRunning,
+  trailDisabledReason,
+  hasActiveRoot,
+  onTrailConfigChange,
+  onRunTrail,
+  onResetTrailDefaults,
 }: GraphPaneProps) {
   return (
     <section className="pane pane-graph">
@@ -94,6 +110,16 @@ export function GraphPane({
           ))}
         </div>
       </div>
+      <GraphTrailControls
+        config={trailConfig}
+        projectOpen={projectOpen}
+        hasRootSymbol={hasActiveRoot}
+        disabledReason={trailDisabledReason}
+        isRunning={trailRunning}
+        onConfigChange={onTrailConfigChange}
+        onRunTrail={onRunTrail}
+        onResetDefaults={onResetTrailDefaults}
+      />
       <div className="graph-canvas">
         <GraphViewport graph={activeGraph} onSelectNode={onSelectNode} />
       </div>

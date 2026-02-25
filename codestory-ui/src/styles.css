@@ -14,15 +14,23 @@
   box-sizing: border-box;
 }
 
+html,
+body,
+#root {
+  height: 100%;
+}
+
 body {
   margin: 0;
   min-height: 100vh;
+  min-height: 100dvh;
   font-family: var(--font-ui);
   color: var(--ink);
   background:
     radial-gradient(circle at 10% 10%, oklch(0.9 0.018 101 / 0.75), transparent 38%),
     radial-gradient(circle at 88% 24%, oklch(0.9 0.015 234 / 0.5), transparent 41%),
     linear-gradient(180deg, oklch(0.94 0.004 95), oklch(0.925 0.004 94));
+  overflow: hidden;
 }
 
 button,
@@ -32,9 +40,12 @@ textarea {
 }
 
 .app-shell {
-  min-height: 100vh;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 0;
   display: grid;
-  grid-template-rows: auto auto 1fr;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  overflow: hidden;
 }
 
 .topbar {
@@ -115,10 +126,12 @@ textarea {
   gap: 0.74rem;
   padding: 0.74rem;
   min-height: 0;
+  overflow: hidden;
 }
 
 .pane {
   min-height: 0;
+  max-height: 100%;
   border: 1px solid var(--line);
   border-radius: 0.95rem;
   background: color-mix(in oklab, var(--bg-elevated) 95%, #fff);
@@ -439,6 +452,152 @@ textarea {
   gap: 0.4rem;
 }
 
+.graph-trail-controls {
+  border-bottom: 1px solid var(--line);
+  padding: 0.56rem 0.75rem 0.62rem;
+  display: grid;
+  gap: 0.48rem;
+  background: color-mix(in oklab, #fff 86%, oklch(0.9 0.03 95));
+}
+
+.graph-trail-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.44rem;
+}
+
+.graph-control-field {
+  min-width: 0;
+  display: grid;
+  gap: 0.22rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.graph-control-field span {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.graph-control-field select,
+.graph-control-field input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: #fff;
+  min-height: 2rem;
+  padding: 0.26rem 0.44rem;
+}
+
+.graph-target-wrap {
+  position: relative;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.graph-control-field-target {
+  max-width: 24rem;
+}
+
+.trail-target-state {
+  position: absolute;
+  right: 0.52rem;
+  top: 1.75rem;
+  transform: translateY(-50%);
+  font-size: 0.66rem;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.graph-target-clear {
+  width: fit-content;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #fff;
+  font-size: 0.68rem;
+  padding: 0.14rem 0.48rem;
+  cursor: pointer;
+}
+
+.graph-filter-row {
+  display: grid;
+  gap: 0.28rem;
+}
+
+.graph-filter-label {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.graph-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.24rem;
+}
+
+.graph-chip {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #fff;
+  font-size: 0.67rem;
+  padding: 0.14rem 0.44rem;
+  cursor: pointer;
+}
+
+.graph-chip-active {
+  border-color: color-mix(in oklab, var(--focus) 50%, var(--line));
+  background: color-mix(in oklab, #fff 80%, oklch(0.88 0.05 219));
+  color: color-mix(in oklab, var(--ink) 85%, #0a2238);
+}
+
+.graph-filter-details {
+  border: 1px solid color-mix(in oklab, var(--line) 84%, #f0f0f0);
+  border-radius: 0.5rem;
+  background: color-mix(in oklab, #fff 92%, oklch(0.92 0.03 95));
+  padding: 0.28rem 0.36rem 0.38rem;
+}
+
+.graph-filter-details summary {
+  cursor: pointer;
+  font-size: 0.7rem;
+  color: var(--muted);
+  margin-bottom: 0.3rem;
+}
+
+.graph-chip-row-node {
+  margin-top: 0.2rem;
+}
+
+.graph-trail-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.38rem;
+  flex-wrap: wrap;
+}
+
+.graph-trail-actions button {
+  border: 1px solid var(--line);
+  border-radius: 0.56rem;
+  background: #fff;
+  padding: 0.3rem 0.56rem;
+  cursor: pointer;
+}
+
+.graph-trail-actions button:disabled {
+  opacity: 0.58;
+  cursor: default;
+}
+
+.graph-trail-reason,
+.graph-trail-hint {
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+
 .truncation-pill {
   border: 1px solid color-mix(in oklab, var(--accent) 65%, #5e5d43);
   background: color-mix(in oklab, var(--accent) 38%, #fff);
@@ -589,6 +748,59 @@ textarea {
 
 .sourcetrail-flow .react-flow__controls button:hover {
   background: #b8b8b8;
+}
+
+.graph-legend-panel {
+  min-width: 10rem;
+  border: 1px solid color-mix(in oklab, var(--line) 92%, #a1a1a1);
+  border-radius: 0.66rem;
+  background: color-mix(in oklab, #fff 88%, #e9eaeb);
+  box-shadow: 0 8px 18px rgba(14, 20, 26, 0.16);
+  padding: 0.42rem 0.46rem;
+}
+
+.graph-legend-title {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  margin-bottom: 0.3rem;
+}
+
+.graph-legend-rows {
+  display: grid;
+  gap: 0.18rem;
+}
+
+.graph-legend-row {
+  display: grid;
+  grid-template-columns: 1.2rem 1fr auto;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.graph-legend-line {
+  display: inline-block;
+  height: 0.18rem;
+  border-radius: 999px;
+}
+
+.graph-legend-kind {
+  font-size: 0.7rem;
+  color: var(--ink);
+}
+
+.graph-legend-count {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--muted);
+}
+
+.graph-legend-note {
+  margin-top: 0.36rem;
+  font-size: 0.64rem;
+  color: var(--muted);
 }
 
 .graph-node {
@@ -964,5 +1176,9 @@ textarea {
   .graph-header {
     grid-template-columns: 1fr;
     align-items: stretch;
+  }
+
+  .graph-trail-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

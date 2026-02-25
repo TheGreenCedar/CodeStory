@@ -3,6 +3,7 @@ import {
   Controls,
   Handle,
   MarkerType,
+  Panel,
   Position,
   ReactFlow,
   type Edge,
@@ -37,6 +38,14 @@ type FlowNodeData = {
 type EdgePalette = {
   stroke: string;
   width: number;
+};
+
+export type LegendRow = {
+  kind: string;
+  stroke: string;
+  count: number;
+  hasUncertain: boolean;
+  hasProbable: boolean;
 };
 
 const MAX_ROWS_PER_COLUMN = 7;
@@ -79,6 +88,34 @@ const EDGE_STYLE: Record<string, EdgePalette> = {
   INCLUDE: { stroke: "#a4b88c", width: 2.1 },
   MACRO_USAGE: { stroke: "#c88758", width: 2.1 },
 };
+
+export function buildLegendRows(graph: GraphResponse): LegendRow[] {
+  const byKind = new Map<string, LegendRow>();
+  for (const edge of graph.edges) {
+    if (edge.kind === "MEMBER") {
+      continue;
+    }
+
+    const certainty = edge.certainty?.toLowerCase();
+    const existing = byKind.get(edge.kind) ?? {
+      kind: edge.kind,
+      stroke: EDGE_STYLE[edge.kind]?.stroke ?? "#8b8f96",
+      count: 0,
+      hasUncertain: false,
+      hasProbable: false,
+    };
+
+    existing.count += 1;
+    if (certainty === "uncertain") {
+      existing.hasUncertain = true;
+    } else if (certainty === "probable") {
+      existing.hasProbable = true;
+    }
+    byKind.set(edge.kind, existing);
+  }
+
+  return [...byKind.values()].sort((a, b) => b.count - a.count || a.kind.localeCompare(b.kind));
+}
 
 const CODE_LANGUAGE_BY_EXT: Record<string, string> = {
   c: "c",
@@ -629,6 +666,10 @@ export function GraphViewport({ graph, onSelectNode }: GraphViewportProps) {
     return <div className="graph-empty">No UML nodes were returned for this symbol yet.</div>;
   }
 
+  const legendRows = buildLegendRows(graph.graph);
+  const hasUncertainEdges = legendRows.some((row) => row.hasUncertain);
+  const hasProbableEdges = legendRows.some((row) => row.hasProbable);
+
   return (
     <ReactFlow
       onInit={setFlow}
@@ -646,6 +687,27 @@ export function GraphViewport({ graph, onSelectNode }: GraphViewportProps) {
       className="sourcetrail-flow"
     >
       <Controls position="top-left" showInteractive={false} />
+      {legendRows.length > 0 ? (
+        <Panel position="top-right" className="graph-legend-panel">
+          <div className="graph-legend-title">Legend</div>
+          <div className="graph-legend-rows">
+            {legendRows.map((row) => (
+              <div key={row.kind} className="graph-legend-row">
+                <span className="graph-legend-line" style={{ background: row.stroke }} />
+                <span className="graph-legend-kind">{formatKindLabel(row.kind)}</span>
+                <span className="graph-legend-count">{row.count}</span>
+              </div>
+            ))}
+          </div>
+          {hasUncertainEdges || hasProbableEdges ? (
+            <div className="graph-legend-note">
+              {hasUncertainEdges ? "Dashed edges = uncertain." : ""}
+              {hasUncertainEdges && hasProbableEdges ? " " : ""}
+              {hasProbableEdges ? "Lower opacity = probable." : ""}
+            </div>
+          ) : null}
+        </Panel>
+      ) : null}
     </ReactFlow>
   );
 }

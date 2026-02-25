@@ -18,6 +18,12 @@ import type {
   SymbolSummaryDto,
 } from "./generated/api";
 import { isTruncatedUmlGraph, languageForPath } from "./graph/GraphViewport";
+import {
+  defaultTrailUiConfig,
+  normalizeTrailUiConfig,
+  toTrailConfigDto,
+  type TrailUiConfig,
+} from "./graph/trailConfig";
 
 function toMonacoModelPath(path: string | null): string | null {
   if (!path) {
@@ -47,6 +53,8 @@ export default function App() {
   const [graphMap, setGraphMap] = useState<Record<string, GraphArtifactDto>>({});
   const [graphOrder, setGraphOrder] = useState<string[]>([]);
   const [activeGraphId, setActiveGraphId] = useState<string | null>(null);
+  const [trailConfig, setTrailConfig] = useState<TrailUiConfig>(defaultTrailUiConfig);
+  const [isTrailRunning, setIsTrailRunning] = useState<boolean>(false);
   const [activeNodeDetails, setActiveNodeDetails] = useState<NodeDetailsDto | null>(null);
   const [activeFilePath, setActiveFilePath] = useState<string | null>(null);
   const [savedText, setSavedText] = useState<string>("");
@@ -70,6 +78,27 @@ export default function App() {
   const activeGraph = activeGraphId ? (graphMap[activeGraphId] ?? null) : null;
   const codeLanguage = useMemo(() => languageForPath(activeFilePath), [activeFilePath]);
   const monacoModelPath = useMemo(() => toMonacoModelPath(activeFilePath), [activeFilePath]);
+  const trailDisabledReason = useMemo(() => {
+    if (!projectOpen) {
+      return "Open a project first.";
+    }
+    if (!activeNodeDetails?.id) {
+      return "Select a symbol to use as trail root.";
+    }
+    if (trailConfig.edgeFilter.length === 0) {
+      return "Select at least one edge kind.";
+    }
+    if (trailConfig.mode === "ToTargetSymbol" && !trailConfig.targetId) {
+      return "Pick a target symbol for path search.";
+    }
+    return null;
+  }, [
+    activeNodeDetails?.id,
+    projectOpen,
+    trailConfig.edgeFilter.length,
+    trailConfig.mode,
+    trailConfig.targetId,
+  ]);
 
   const loadRootSymbols = useCallback(async () => {
     const roots = await api.listRootSymbols(400);
@@ -169,11 +198,12 @@ export default function App() {
         activeGraphId,
         expandedNodes,
         selectedTab,
+        trailConfig,
       });
     }, 350);
 
     return () => clearTimeout(timer);
-  }, [activeGraphId, expandedNodes, projectOpen, saveLayout, selectedTab]);
+  }, [activeGraphId, expandedNodes, projectOpen, saveLayout, selectedTab, trailConfig]);
 
   useEffect(() => {
     return api.subscribeEvents((event: AppEventPayload) => {
@@ -249,6 +279,58 @@ export default function App() {
     [upsertGraph],
   );
 
+  const updateTrailConfig = useCallback((patch: Partial<TrailUiConfig>) => {
+    setTrailConfig((prev) => ({
+      ...prev,
+      ...patch,
+    }));
+  }, []);
+
+  const resetTrailConfig = useCallback(() => {
+    setTrailConfig(defaultTrailUiConfig());
+  }, []);
+
+  const runTrail = useCallback(async () => {
+    if (!activeNodeDetails?.id) {
+      setStatus("Select a symbol to use as trail root.");
+      return;
+    }
+
+    if (trailDisabledReason) {
+      setStatus(trailDisabledReason);
+      return;
+    }
+
+    setIsTrailRunning(true);
+    try {
+      const graph = await api.graphTrail(toTrailConfigDto(activeNodeDetails.id, trailConfig));
+      const trailGraphId = `trail-${activeNodeDetails.id}-${Date.now()}`;
+      const modeLabel =
+        trailConfig.mode === "Neighborhood"
+          ? "Neighborhood"
+          : trailConfig.mode === "AllReferenced"
+            ? "All Referenced"
+            : trailConfig.mode === "AllReferencing"
+              ? "All Referencing"
+              : "To Target";
+
+      upsertGraph(
+        {
+          kind: "uml",
+          id: trailGraphId,
+          title: `Trail: ${activeNodeDetails.display_name} (${modeLabel})`,
+          graph,
+        },
+        true,
+      );
+      setStatus(`Trail loaded (${graph.nodes.length} nodes, ${graph.edges.length} edges).`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Failed to run trail graph query.");
+    } finally {
+      setIsTrailRunning(false);
+    }
+  }, [activeNodeDetails, trailConfig, trailDisabledReason, upsertGraph]);
+
   const focusSymbolInternal = useCallback(
     async (symbolId: string, label: string) => {
       const [contextResult, graphResult] = await Promise.allSettled([
@@ -313,6 +395,7 @@ export default function App() {
       const summary = await api.openProject({ path: projectPath });
       setStatus(`Project open: ${summary.root}`);
       setProjectOpen(true);
+      setTrailConfig(defaultTrailUiConfig());
       await loadRootSymbols();
 
       const saved = await api.getUiLayout();
@@ -328,6 +411,7 @@ export default function App() {
           if (parsed.selectedTab === "agent" || parsed.selectedTab === "explorer") {
             setSelectedTab(parsed.selectedTab);
           }
+          setTrailConfig(normalizeTrailUiConfig(parsed.trailConfig));
         } catch {
           // Ignore malformed saved layouts.
         }
@@ -656,6 +740,15 @@ export default function App() {
           onSelectNode={(nodeId, label) => {
             focusSymbol(nodeId, label);
           }}
+          trailConfig={trailConfig}
+          trailRunning={isTrailRunning}
+          trailDisabledReason={trailDisabledReason}
+          hasActiveRoot={Boolean(activeNodeDetails?.id)}
+          onTrailConfigChange={updateTrailConfig}
+          onRunTrail={() => {
+            void runTrail();
+          }}
+          onResetTrailDefaults={resetTrailConfig}
         />
 
         <CodePane
