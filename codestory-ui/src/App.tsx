@@ -35,8 +35,16 @@ function toMonacoModelPath(path: string | null): string | null {
   return forwardSlashPath.replace(/^([A-Za-z]:)/, "/$1");
 }
 
+const LAST_OPENED_PROJECT_KEY = "codestory:last-opened-project";
+
 export default function App() {
-  const [projectPath, setProjectPath] = useState<string>(".");
+  const [projectPath, setProjectPath] = useState<string>(() => {
+    if (typeof window === "undefined") {
+      return ".";
+    }
+    const saved = window.localStorage.getItem(LAST_OPENED_PROJECT_KEY)?.trim();
+    return saved && saved.length > 0 ? saved : ".";
+  });
   const [status, setStatus] = useState<string>("Open a project to begin.");
   const [prompt, setPrompt] = useState<string>("Trace how this feature works end-to-end.");
   const [searchQuery, setSearchQuery] = useState<string>("");
@@ -73,6 +81,7 @@ export default function App() {
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const monacoRef = useRef<Monaco | null>(null);
   const decorationIdsRef = useRef<string[]>([]);
+  const attemptedProjectRestoreRef = useRef<boolean>(false);
 
   const isDirty = draftText !== savedText;
   const activeGraph = activeGraphId ? (graphMap[activeGraphId] ?? null) : null;
@@ -389,11 +398,16 @@ export default function App() {
     [focusSymbolInternal, pendingFocus, saveCurrentFile, savedText],
   );
 
-  const handleOpenProject = useCallback(async () => {
+  const handleOpenProject = useCallback(async (pathOverride?: string, restored = false) => {
+    const path = (pathOverride ?? projectPath).trim() || ".";
     setIsBusy(true);
     try {
-      const summary = await api.openProject({ path: projectPath });
-      setStatus(`Project open: ${summary.root}`);
+      const summary = await api.openProject({ path });
+      setProjectPath(path);
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(LAST_OPENED_PROJECT_KEY, path);
+      }
+      setStatus(restored ? `Restored project: ${summary.root}` : `Project open: ${summary.root}`);
       setProjectOpen(true);
       setTrailConfig(defaultTrailUiConfig());
       await loadRootSymbols();
@@ -417,11 +431,35 @@ export default function App() {
         }
       }
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Failed to open project.");
+      if (restored) {
+        setStatus(
+          error instanceof Error
+            ? `Failed to restore ${path}: ${error.message}`
+            : `Failed to restore ${path}.`,
+        );
+      } else {
+        setStatus(error instanceof Error ? error.message : "Failed to open project.");
+      }
     } finally {
       setIsBusy(false);
     }
   }, [loadRootSymbols, projectPath]);
+
+  useEffect(() => {
+    if (attemptedProjectRestoreRef.current || projectOpen || isBusy) {
+      return;
+    }
+    attemptedProjectRestoreRef.current = true;
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const saved = window.localStorage.getItem(LAST_OPENED_PROJECT_KEY)?.trim();
+    if (!saved || saved.length === 0) {
+      return;
+    }
+    void handleOpenProject(saved, true);
+  }, [handleOpenProject, isBusy, projectOpen]);
 
   const handleIndex = useCallback(async (mode: "Full" | "Incremental") => {
     setIsBusy(true);

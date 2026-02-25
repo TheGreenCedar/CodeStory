@@ -12,6 +12,10 @@
 ## Build, Test, and Development Commands
 - Build/run: `cargo build`, `cargo run -p codestory-cli -- --help` (add `RUST_LOG=info` for logs).
 - Quality: `cargo test` or `cargo test -p <crate>`, `cargo check`, `cargo fmt`, `cargo clippy`.
+- Playwright skill wrapper (`~/.codex/skills/playwright/scripts/playwright_cli.sh`) is Bash-based; on this Windows setup use `C:\Program Files\Git\bin\bash.exe -lc ...` rather than WSL `bash` when WSL has no distro configured.
+- When iterating over a specific component with playwright, crop only the parts of the page that you need to save context.
+- For tight Playwright crops on this Windows setup, prefer element screenshots then crop with PowerShell (`System.Drawing`) instead of `run-code` snippets with nested shell quoting.
+- With playwright, make sure you start the browser maximized
 
 ## Coding Style & Naming Conventions
 - Toolchain is nightly (`rust-toolchain.toml`).

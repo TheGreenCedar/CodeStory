@@ -1,0 +1,122 @@
+import type { EdgeKind } from "../../generated/api";
+
+export type MemberVisibility = "public" | "private";
+
+export type FlowMemberData = {
+  id: string;
+  label: string;
+  kind: string;
+  visibility: MemberVisibility;
+};
+
+export type FlowNodeStyle = "card" | "pill" | "bundle";
+
+export type FlowNodeData = {
+  kind: string;
+  label: string;
+  center: boolean;
+  nodeStyle: FlowNodeStyle;
+  duplicateCount: number;
+  memberCount: number;
+  members: FlowMemberData[];
+  isVirtualBundle?: boolean;
+  isSelected?: boolean;
+  onSelectMember?: (memberId: string, label: string) => void;
+};
+
+export type SemanticEdgeFamily = "flow" | "hierarchy";
+
+export type RouteKind = "direct" | "flow-trunk" | "flow-branch" | "hierarchy";
+
+export type SemanticNodePlacement = {
+  id: string;
+  kind: string;
+  label: string;
+  center: boolean;
+  nodeStyle: FlowNodeStyle;
+  duplicateCount: number;
+  memberCount: number;
+  members: FlowMemberData[];
+  xRank: number;
+  yRank: number;
+  x: number;
+  y: number;
+  isVirtualBundle: boolean;
+};
+
+export type RoutedEdgeSpec = {
+  id: string;
+  source: string;
+  target: string;
+  sourceHandle: string;
+  targetHandle: string;
+  kind: EdgeKind;
+  certainty: string | null | undefined;
+  multiplicity: number;
+  family: SemanticEdgeFamily;
+  routeKind: RouteKind;
+  bundleCount: number;
+  trunkCoord?: number;
+};
+
+export type LayoutElements = {
+  nodes: SemanticNodePlacement[];
+  edges: RoutedEdgeSpec[];
+  centerNodeId: string;
+};
+
+export type LegendRow = {
+  kind: string;
+  stroke: string;
+  count: number;
+  hasUncertain: boolean;
+  hasProbable: boolean;
+};
+
+export const STRUCTURAL_KINDS = new Set([
+  "CLASS",
+  "STRUCT",
+  "INTERFACE",
+  "UNION",
+  "ENUM",
+  "NAMESPACE",
+  "MODULE",
+  "PACKAGE",
+]);
+
+export const CARD_NODE_KINDS = new Set([...STRUCTURAL_KINDS, "FILE"]);
+
+export const PRIVATE_MEMBER_KINDS = new Set([
+  "FIELD",
+  "VARIABLE",
+  "GLOBAL_VARIABLE",
+  "CONSTANT",
+  "ENUM_CONSTANT",
+]);
+
+export const PUBLIC_MEMBER_KINDS = new Set(["FUNCTION", "METHOD", "MACRO"]);
+
+export const FLOW_EDGE_KINDS = new Set<EdgeKind>([
+  "CALL",
+  "USAGE",
+  "TYPE_USAGE",
+  "IMPORT",
+  "INCLUDE",
+  "MACRO_USAGE",
+  "ANNOTATION_USAGE",
+  "UNKNOWN",
+]);
+
+export const HIERARCHY_EDGE_KINDS = new Set<EdgeKind>([
+  "INHERITANCE",
+  "OVERRIDE",
+  "TYPE_ARGUMENT",
+  "TEMPLATE_SPECIALIZATION",
+]);
+
+export function edgeFamilyForKind(kind: EdgeKind): SemanticEdgeFamily {
+  if (HIERARCHY_EDGE_KINDS.has(kind)) {
+    return "hierarchy";
+  }
+  return "flow";
+}

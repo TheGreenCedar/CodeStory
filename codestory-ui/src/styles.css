@@ -8,6 +8,19 @@
   --line: oklch(0.84 0.006 95);
   --accent: oklch(0.79 0.14 89);
   --focus: oklch(0.73 0.12 220);
+  --graph-canvas-top: oklch(0.94 0.003 95);
+  --graph-canvas-bottom: oklch(0.91 0.004 95);
+  --graph-chrome-bg: oklch(0.93 0.003 95 / 0.9);
+  --graph-chrome-border: oklch(0.79 0.005 95);
+  --graph-node-shell: oklch(0.84 0.002 95);
+  --graph-node-shell-border: oklch(0.75 0.003 95);
+  --graph-node-core: oklch(0.95 0.002 95);
+  --graph-node-core-border: oklch(0.82 0.003 95);
+  --graph-file-accent: oklch(0.83 0.06 135);
+  --graph-public-chip: oklch(0.84 0.11 86);
+  --graph-public-chip-border: oklch(0.74 0.08 86);
+  --graph-private-chip: oklch(0.82 0.06 235);
+  --graph-private-chip-border: oklch(0.68 0.06 235);
 }
 
 * {
@@ -710,8 +723,9 @@ textarea {
   min-height: 0;
   flex: 1;
   background:
-    radial-gradient(circle at 8% 10%, rgba(255, 255, 255, 0.62), transparent 30%),
-    linear-gradient(180deg, #ececec, #e7e7e7);
+    radial-gradient(circle at 7% 12%, rgb(255 255 255 / 0.7), transparent 30%),
+    radial-gradient(circle at 86% 16%, rgb(255 255 255 / 0.38), transparent 34%),
+    linear-gradient(180deg, var(--graph-canvas-top), var(--graph-canvas-bottom));
 }
 
 .sourcetrail-flow .react-flow__renderer {
@@ -732,31 +746,33 @@ textarea {
 }
 
 .sourcetrail-flow .react-flow__controls {
-  border: none;
-  box-shadow: none;
-  background: transparent;
+  border: 1px solid var(--graph-chrome-border);
+  border-radius: 0.72rem;
+  box-shadow: 0 8px 18px rgb(15 19 23 / 0.14);
+  background: var(--graph-chrome-bg);
   gap: 0.14rem;
+  padding: 0.1rem;
 }
 
 .sourcetrail-flow .react-flow__controls button {
-  border: 1px solid #bebebe;
+  border: 1px solid var(--graph-chrome-border);
   border-radius: 0.52rem;
-  background: #c8c8c8;
-  color: #f4f4f4;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.24);
+  background: color-mix(in oklab, #fff 84%, var(--graph-chrome-bg));
+  color: #5f6670;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.45);
 }
 
 .sourcetrail-flow .react-flow__controls button:hover {
-  background: #b8b8b8;
+  background: color-mix(in oklab, #fff 72%, var(--graph-chrome-bg));
 }
 
 .graph-legend-panel {
   min-width: 10rem;
-  border: 1px solid color-mix(in oklab, var(--line) 92%, #a1a1a1);
-  border-radius: 0.66rem;
-  background: color-mix(in oklab, #fff 88%, #e9eaeb);
-  box-shadow: 0 8px 18px rgba(14, 20, 26, 0.16);
-  padding: 0.42rem 0.46rem;
+  border: 1px solid var(--graph-chrome-border);
+  border-radius: 0.74rem;
+  background: color-mix(in oklab, #fff 84%, var(--graph-chrome-bg));
+  box-shadow: 0 10px 22px rgb(14 20 26 / 0.16);
+  padding: 0.45rem 0.5rem;
 }
 
 .graph-legend-title {
@@ -782,7 +798,7 @@ textarea {
 
 .graph-legend-line {
   display: inline-block;
-  height: 0.18rem;
+  height: 0.2rem;
   border-radius: 999px;
 }
 
@@ -798,43 +814,48 @@ textarea {
 }
 
 .graph-legend-note {
-  margin-top: 0.36rem;
+  margin-top: 0.42rem;
   font-size: 0.64rem;
   color: var(--muted);
+  line-height: 1.35;
 }
 
 .graph-node {
   position: relative;
-  min-width: 198px;
-  border-radius: 25px;
-  border: 1px solid #bfc1c4;
-  background: #d4d4d4;
-  padding: 0.54rem 0.58rem 0.62rem;
-  box-shadow: inset 0 1px 0 #e7e7e7;
+  min-width: 210px;
+  border-radius: 23px;
+  border: 1px solid var(--graph-node-shell-border);
+  background: var(--graph-node-shell);
+  padding: 0.58rem 0.6rem 0.64rem;
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.45),
+    0 2px 10px rgb(41 47 55 / 0.08);
   color: #1c1f23;
+  transition: box-shadow 180ms ease;
 }
 
 .graph-node-file {
-  border-color: #9fc68f;
+  border-color: color-mix(in oklab, var(--graph-file-accent) 52%, var(--graph-node-shell-border));
   box-shadow:
-    inset 0 1px 0 #e7e7e7,
-    0 0 0 2px rgba(159, 198, 143, 0.2);
+    inset 0 1px 0 rgb(255 255 255 / 0.45),
+    0 0 0 2px color-mix(in oklab, var(--graph-file-accent) 35%, transparent);
 }
 
 .graph-node-file-tab {
   position: absolute;
-  left: -0.55rem;
-  top: -1.72rem;
-  border: 1px solid #9fc68f;
+  left: -0.5rem;
+  top: -1.66rem;
+  border: 1px solid
+    color-mix(in oklab, var(--graph-file-accent) 56%, var(--graph-node-shell-border));
   border-bottom: none;
-  border-radius: 0.75rem 0.75rem 0 0;
-  background: #a8cf93;
-  padding: 0.2rem 0.85rem 0.26rem;
+  border-radius: 0.8rem 0.8rem 0 0;
+  background: color-mix(in oklab, var(--graph-file-accent) 76%, #fff);
+  padding: 0.22rem 0.88rem 0.26rem;
   font-family: var(--font-mono);
   font-size: 0.76rem;
   letter-spacing: 0.01em;
   font-weight: 700;
-  color: #42524a;
+  color: color-mix(in oklab, #354046 72%, #000);
 }
 
 .graph-node-title-row {
@@ -854,8 +875,8 @@ textarea {
 .graph-node-count {
   min-width: 1.9rem;
   border-radius: 999px;
-  border: 1px solid #c8c9cc;
-  background: #ececed;
+  border: 1px solid color-mix(in oklab, var(--graph-node-core-border) 70%, #9da3ab);
+  background: color-mix(in oklab, var(--graph-node-core) 74%, #ebedf0);
   padding: 0.12rem 0.46rem;
   text-align: center;
   font-family: var(--font-mono);
@@ -864,10 +885,31 @@ textarea {
   color: #1d2125;
 }
 
+.graph-node-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+  border: none;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+}
+
+.graph-node-toggle:disabled {
+  cursor: default;
+}
+
+.graph-node-chevron {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: #4d545c;
+  line-height: 1;
+}
+
 .graph-node-body {
-  border-radius: 15px;
-  border: 1px solid #c9cacd;
-  background: #f2f2f2;
+  border-radius: 14px;
+  border: 1px solid var(--graph-node-core-border);
+  background: var(--graph-node-core);
   min-height: 2.7rem;
   padding: 0.52rem;
   display: flex;
@@ -877,9 +919,9 @@ textarea {
 
 .graph-node-section {
   width: 100%;
-  border-radius: 0.72rem;
-  border: 1px solid #d3d5d8;
-  background: #f6f6f6;
+  border-radius: 0.68rem;
+  border: 1px solid color-mix(in oklab, var(--graph-node-core-border) 88%, #efefef);
+  background: color-mix(in oklab, #fff 94%, var(--graph-node-core));
   padding: 0.38rem 0.38rem 0.35rem;
 }
 
@@ -913,8 +955,8 @@ textarea {
 }
 
 .graph-section-dot-private {
-  border-color: #6d9ab2;
-  background: #9fc4da;
+  border-color: color-mix(in oklab, var(--graph-private-chip-border) 88%, #6f8aa4);
+  background: color-mix(in oklab, var(--graph-private-chip) 66%, #fff);
 }
 
 .graph-node-members {
@@ -931,20 +973,27 @@ textarea {
   align-items: center;
   min-height: 1.44rem;
   border-radius: 999px;
-  border: 1px solid #cfb971;
-  background: #f2ce62;
+  border: 1px solid var(--graph-public-chip-border);
+  background: var(--graph-public-chip);
   padding: 0.18rem 0.58rem;
   max-width: 100%;
 }
 
+.graph-member-chip-button {
+  width: 100%;
+  appearance: none;
+  text-align: left;
+  cursor: pointer;
+}
+
 .graph-member-chip-public {
-  border-color: #cfa73c;
-  background: #f2ca57;
+  border-color: var(--graph-public-chip-border);
+  background: var(--graph-public-chip);
 }
 
 .graph-member-chip-private {
-  border-color: #6ba4c5;
-  background: #84c4e6;
+  border-color: var(--graph-private-chip-border);
+  background: var(--graph-private-chip);
 }
 
 .graph-member-name {
@@ -964,35 +1013,40 @@ textarea {
 }
 
 .graph-node-center {
-  border: 2px solid #2f333a;
+  border: 2px solid color-mix(in oklab, #30343a 86%, #fff);
 }
 
 .graph-node-selected {
   box-shadow:
-    0 0 0 2px rgba(47, 58, 65, 0.36),
-    inset 0 1px 0 #e8e8e8;
+    0 0 0 2px rgb(47 58 65 / 0.28),
+    inset 0 1px 0 rgb(255 255 255 / 0.42);
 }
 
 .graph-floating-pill {
   position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
   min-width: 3.7rem;
-  max-width: 14rem;
+  width: fit-content;
+  max-width: none;
   border-radius: 999px;
-  border: 1px solid #cea845;
-  background: #efc54f;
+  border: 1px solid var(--graph-public-chip-border);
+  background: var(--graph-public-chip);
   padding: 0.24rem 0.66rem;
   font-family: var(--font-mono);
   font-size: 0.74rem;
   font-weight: 700;
   color: #101215;
   line-height: 1.1;
+  white-space: nowrap;
 }
 
 .graph-pill-duplicate-count {
   margin-left: 0.38rem;
   border-radius: 999px;
-  border: 1px solid #b39a55;
-  background: color-mix(in oklab, #f2cf72 62%, #fff);
+  border: 1px solid color-mix(in oklab, var(--graph-public-chip-border) 70%, #9f8b57);
+  background: color-mix(in oklab, var(--graph-public-chip) 62%, #fff);
   padding: 0.08rem 0.34rem;
   font-size: 0.64rem;
   font-weight: 700;
@@ -1007,12 +1061,39 @@ textarea {
   box-shadow: 0 0 0 2px rgba(49, 53, 60, 0.35);
 }
 
+.graph-bundle-node {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: transparent;
+  border: none;
+  pointer-events: none;
+}
+
+.graph-bundle-count {
+  position: absolute;
+  pointer-events: none;
+  border: 1px solid var(--graph-chrome-border);
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--graph-chrome-bg) 85%, #fff);
+  color: #434a56;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  font-weight: 700;
+  padding: 0.03rem 0.34rem;
+  box-shadow: 0 2px 8px rgb(20 24 28 / 0.14);
+}
+
 .graph-handle {
   width: 6px;
   height: 6px;
   opacity: 0;
   border: none;
   background: transparent;
+}
+
+.graph-bundle-handle {
+  pointer-events: none;
 }
 
 .graph-member-handle {
@@ -1031,8 +1112,33 @@ textarea {
   right: -6px;
 }
 
+.graph-handle-top {
+  top: -6px;
+}
+
+.graph-handle-bottom {
+  bottom: -6px;
+}
+
 .graph-member-handle-source {
   right: -5px;
+}
+
+.graph-hidden-member-handles {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.graph-hidden-member-handle-pair {
+  position: relative;
+  width: 100%;
+  height: 0;
+}
+
+.graph-hidden-member-handle {
+  opacity: 0;
+  pointer-events: none;
 }
 
 .graph-empty {
