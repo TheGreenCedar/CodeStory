@@ -12,6 +12,7 @@ import { StatusStrip } from "./components/StatusStrip";
 import { TopBar } from "./components/TopBar";
 import type {
   AgentAnswerDto,
+  AgentConnectionSettingsDto,
   AppEventPayload,
   GraphArtifactDto,
   NodeDetailsDto,
@@ -56,6 +57,48 @@ function isLikelyTestOrBenchPath(path: string | null): boolean {
   );
 }
 
+type FocusGraphMode = "neighborhood" | "trailDepthOne";
+
+function trailModeLabel(mode: TrailUiConfig["mode"]): string {
+  if (mode === "Neighborhood") {
+    return "Neighborhood";
+  }
+  if (mode === "AllReferenced") {
+    return "All Referenced";
+  }
+  if (mode === "AllReferencing") {
+    return "All Referencing";
+  }
+  return "To Target";
+}
+
+type AgentConnectionState = {
+  backend: NonNullable<AgentConnectionSettingsDto["backend"]>;
+  command: string | null;
+};
+
+const DEFAULT_AGENT_CONNECTION: AgentConnectionState = {
+  backend: "codex",
+  command: null,
+};
+
+function normalizeAgentConnection(raw: unknown): AgentConnectionState {
+  if (!raw || typeof raw !== "object") {
+    return DEFAULT_AGENT_CONNECTION;
+  }
+
+  const candidate = raw as Partial<AgentConnectionSettingsDto>;
+  const backend = candidate.backend === "claude_code" ? "claude_code" : "codex";
+  const command =
+    typeof candidate.command === "string" && candidate.command.trim().length > 0
+      ? candidate.command.trim()
+      : null;
+  return {
+    backend,
+    command,
+  };
+}
+
 export default function App() {
   const [projectPath, setProjectPath] = useState<string>(() => {
     if (typeof window === "undefined") {
@@ -68,6 +111,8 @@ export default function App() {
   const [prompt, setPrompt] = useState<string>("Trace how this feature works end-to-end.");
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [includeMermaid, setIncludeMermaid] = useState<boolean>(true);
+  const [agentConnection, setAgentConnection] =
+    useState<AgentConnectionState>(DEFAULT_AGENT_CONNECTION);
   const [selectedTab, setSelectedTab] = useState<"agent" | "explorer">("agent");
   const [agentAnswer, setAgentAnswer] = useState<AgentAnswerDto | null>(null);
   const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
@@ -233,11 +278,20 @@ export default function App() {
         expandedNodes,
         selectedTab,
         trailConfig,
+        agentConnection,
       });
     }, 350);
 
     return () => clearTimeout(timer);
-  }, [activeGraphId, expandedNodes, projectOpen, saveLayout, selectedTab, trailConfig]);
+  }, [
+    activeGraphId,
+    agentConnection,
+    expandedNodes,
+    projectOpen,
+    saveLayout,
+    selectedTab,
+    trailConfig,
+  ]);
 
   useEffect(() => {
     return api.subscribeEvents((event: AppEventPayload) => {
@@ -336,7 +390,7 @@ export default function App() {
         if (nextOccurrence) {
           const opened = await openOccurrenceFile(nextOccurrence, { allowDirtyCrossFile: true });
           if (opened) {
-            return;
+            return details;
           }
         }
       } else {
@@ -353,6 +407,8 @@ export default function App() {
         setSavedText("");
         setDraftText("");
       }
+
+      return details;
     },
     [openOccurrenceFile],
   );
@@ -450,6 +506,70 @@ export default function App() {
     setTrailConfig(defaultTrailUiConfig());
   }, []);
 
+  const queryTrailGraph = useCallback(
+    async (rootId: string, rootFilePath: string | null, config: TrailUiConfig) => {
+      const rootInTestPath = isLikelyTestOrBenchPath(rootFilePath);
+      const initialConfig =
+        config.callerScope === "ProductionOnly" && rootInTestPath
+          ? { ...config, callerScope: "IncludeTestsAndBenches" as const }
+          : config;
+
+      let graph = await api.graphTrail(toTrailConfigDto(rootId, initialConfig));
+      let usedExpandedCallerScope = initialConfig.callerScope !== config.callerScope;
+
+      // Keep the "Production Only" default, but recover automatically when it would hide all context.
+      if (
+        !usedExpandedCallerScope &&
+        config.callerScope === "ProductionOnly" &&
+        graph.nodes.length <= 1 &&
+        graph.edges.length === 0
+      ) {
+        const fallbackConfig = { ...config, callerScope: "IncludeTestsAndBenches" as const };
+        const fallbackGraph = await api.graphTrail(toTrailConfigDto(rootId, fallbackConfig));
+        if (
+          fallbackGraph.edges.length > graph.edges.length ||
+          fallbackGraph.nodes.length > graph.nodes.length
+        ) {
+          graph = fallbackGraph;
+          usedExpandedCallerScope = true;
+        }
+      }
+
+      return { graph, usedExpandedCallerScope };
+    },
+    [],
+  );
+
+  const openTrailGraph = useCallback(
+    async (
+      rootId: string,
+      rootLabel: string,
+      rootFilePath: string | null,
+      config: TrailUiConfig,
+    ) => {
+      const { graph, usedExpandedCallerScope } = await queryTrailGraph(
+        rootId,
+        rootFilePath,
+        config,
+      );
+      const trailGraphId = `trail-${rootId}-${Date.now()}`;
+      upsertGraph(
+        {
+          kind: "uml",
+          id: trailGraphId,
+          title: `Trail: ${rootLabel} (${trailModeLabel(config.mode)})`,
+          graph,
+        },
+        true,
+      );
+      const scopeSuffix = usedExpandedCallerScope ? " using expanded caller scope." : ".";
+      setStatus(
+        `Trail loaded (${graph.nodes.length} nodes, ${graph.edges.length} edges)${scopeSuffix}`,
+      );
+    },
+    [queryTrailGraph, upsertGraph],
+  );
+
   const runTrail = useCallback(async () => {
     if (!activeNodeDetails?.id) {
       setStatus("Select a symbol to use as trail root.");
@@ -463,64 +583,18 @@ export default function App() {
 
     setIsTrailRunning(true);
     try {
-      const rootInTestPath = isLikelyTestOrBenchPath(activeNodeDetails.file_path);
-      const initialConfig =
-        trailConfig.callerScope === "ProductionOnly" && rootInTestPath
-          ? { ...trailConfig, callerScope: "IncludeTestsAndBenches" as const }
-          : trailConfig;
-
-      let graph = await api.graphTrail(toTrailConfigDto(activeNodeDetails.id, initialConfig));
-      let usedExpandedCallerScope = initialConfig.callerScope !== trailConfig.callerScope;
-
-      // Keep the "Production Only" default, but recover automatically when it would hide all context.
-      if (
-        !usedExpandedCallerScope &&
-        trailConfig.callerScope === "ProductionOnly" &&
-        graph.nodes.length <= 1 &&
-        graph.edges.length === 0
-      ) {
-        const fallbackConfig = { ...trailConfig, callerScope: "IncludeTestsAndBenches" as const };
-        const fallbackGraph = await api.graphTrail(
-          toTrailConfigDto(activeNodeDetails.id, fallbackConfig),
-        );
-        if (
-          fallbackGraph.edges.length > graph.edges.length ||
-          fallbackGraph.nodes.length > graph.nodes.length
-        ) {
-          graph = fallbackGraph;
-          usedExpandedCallerScope = true;
-        }
-      }
-
-      const trailGraphId = `trail-${activeNodeDetails.id}-${Date.now()}`;
-      const modeLabel =
-        trailConfig.mode === "Neighborhood"
-          ? "Neighborhood"
-          : trailConfig.mode === "AllReferenced"
-            ? "All Referenced"
-            : trailConfig.mode === "AllReferencing"
-              ? "All Referencing"
-              : "To Target";
-
-      upsertGraph(
-        {
-          kind: "uml",
-          id: trailGraphId,
-          title: `Trail: ${activeNodeDetails.display_name} (${modeLabel})`,
-          graph,
-        },
-        true,
-      );
-      const scopeSuffix = usedExpandedCallerScope ? " using expanded caller scope." : ".";
-      setStatus(
-        `Trail loaded (${graph.nodes.length} nodes, ${graph.edges.length} edges)${scopeSuffix}`,
+      await openTrailGraph(
+        activeNodeDetails.id,
+        activeNodeDetails.display_name,
+        activeNodeDetails.file_path,
+        trailConfig,
       );
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Failed to run trail graph query.");
     } finally {
       setIsTrailRunning(false);
     }
-  }, [activeNodeDetails, trailConfig, trailDisabledReason, upsertGraph]);
+  }, [activeNodeDetails, openTrailGraph, trailConfig, trailDisabledReason]);
 
   const selectOccurrenceByIndex = useCallback(
     async (index: number) => {
@@ -635,7 +709,33 @@ export default function App() {
   );
 
   const focusSymbolInternal = useCallback(
-    async (symbolId: string, label: string) => {
+    async (symbolId: string, label: string, graphMode: FocusGraphMode = "neighborhood") => {
+      if (graphMode === "trailDepthOne") {
+        const depthOneTrailConfig: TrailUiConfig = { ...trailConfig, depth: 1 };
+        setIsTrailRunning(true);
+        try {
+          const contextPromise = loadNodeContext(symbolId);
+          const graphPromise = contextPromise.then((details) =>
+            openTrailGraph(symbolId, details.display_name, details.file_path, depthOneTrailConfig),
+          );
+          const [contextResult, graphResult] = await Promise.allSettled([
+            contextPromise,
+            graphPromise,
+          ]);
+
+          if (contextResult.status === "rejected" && graphResult.status === "rejected") {
+            setStatus("Failed to load code context and trail graph for that symbol.");
+          } else if (graphResult.status === "rejected") {
+            setStatus("Loaded code context, but trail graph failed to load for that symbol.");
+          } else if (contextResult.status === "rejected") {
+            setStatus("Loaded trail graph, but code context failed to load for that symbol.");
+          }
+        } finally {
+          setIsTrailRunning(false);
+        }
+        return;
+      }
+
       const [contextResult, graphResult] = await Promise.allSettled([
         loadNodeContext(symbolId),
         openNeighborhood(symbolId, label),
@@ -649,7 +749,7 @@ export default function App() {
         setStatus("Loaded UML graph, but code context failed to load for that symbol.");
       }
     },
-    [loadNodeContext, openNeighborhood],
+    [loadNodeContext, openNeighborhood, openTrailGraph, trailConfig],
   );
 
   const focusSymbol = useCallback(
@@ -687,7 +787,11 @@ export default function App() {
       }
 
       setPendingFocus(null);
-      void focusSymbolInternal(pending.symbolId, pending.label);
+      void focusSymbolInternal(
+        pending.symbolId,
+        pending.label,
+        pending.graphMode ?? "neighborhood",
+      );
     },
     [focusSymbolInternal, pendingFocus, saveCurrentFile, savedText],
   );
@@ -706,6 +810,7 @@ export default function App() {
         setProjectOpen(true);
         setProjectRevision((previous) => previous + 1);
         setTrailConfig(defaultTrailUiConfig());
+        setAgentConnection(DEFAULT_AGENT_CONNECTION);
         await loadRootSymbols();
 
         const saved = await api.getUiLayout();
@@ -722,6 +827,7 @@ export default function App() {
               setSelectedTab(parsed.selectedTab);
             }
             setTrailConfig(normalizeTrailUiConfig(parsed.trailConfig));
+            setAgentConnection(normalizeAgentConnection(parsed.agentConnection));
           } catch {
             // Ignore malformed saved layouts.
           }
@@ -775,6 +881,12 @@ export default function App() {
       return;
     }
 
+    const command = agentConnection.command?.trim();
+    const connection: AgentConnectionSettingsDto = {
+      backend: agentConnection.backend,
+      command: command && command.length > 0 ? command : null,
+    };
+
     setIsBusy(true);
     try {
       const answer = await api.ask({
@@ -782,6 +894,7 @@ export default function App() {
         include_mermaid: includeMermaid,
         focus_node_id: activeNodeDetails?.id,
         max_results: 10,
+        connection,
       });
       setAgentAnswer(answer);
       setStatus(answer.summary);
@@ -806,7 +919,7 @@ export default function App() {
     } finally {
       setIsBusy(false);
     }
-  }, [activeNodeDetails?.id, focusSymbol, includeMermaid, prompt]);
+  }, [activeNodeDetails?.id, agentConnection, focusSymbol, includeMermaid, prompt]);
 
   const toggleNode = useCallback(
     async (node: SymbolSummaryDto) => {
@@ -877,9 +990,17 @@ export default function App() {
     (hit: SearchHit) => {
       setSearchOpen(false);
       setSearchQuery(hit.display_name);
-      focusSymbol(hit.node_id, hit.display_name);
+      if (isDirty && activeFilePath && activeNodeDetails?.id !== hit.node_id) {
+        setPendingFocus({
+          symbolId: hit.node_id,
+          label: hit.display_name,
+          graphMode: "trailDepthOne",
+        });
+        return;
+      }
+      void focusSymbolInternal(hit.node_id, hit.display_name, "trailDepthOne");
     },
-    [focusSymbol],
+    [activeFilePath, activeNodeDetails?.id, focusSymbolInternal, isDirty],
   );
 
   const handleSearchKeyDown = useCallback(
@@ -1064,6 +1185,20 @@ export default function App() {
           onPromptChange={setPrompt}
           includeMermaid={includeMermaid}
           onIncludeMermaidChange={setIncludeMermaid}
+          agentBackend={agentConnection.backend}
+          onAgentBackendChange={(backend) => {
+            setAgentConnection((prev) => ({
+              ...prev,
+              backend,
+            }));
+          }}
+          agentCommand={agentConnection.command ?? ""}
+          onAgentCommandChange={(command) => {
+            setAgentConnection((prev) => ({
+              ...prev,
+              command,
+            }));
+          }}
           onAskAgent={() => {
             void handlePrompt();
           }}

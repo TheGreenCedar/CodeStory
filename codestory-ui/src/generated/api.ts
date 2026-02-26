@@ -2,9 +2,13 @@
 
 export type AgentAnswerDto = { prompt: string; summary: string; sections: AgentResponseSectionDto[]; citations: AgentCitationDto[]; graphs: GraphArtifactDto[] }
 
-export type AgentAskRequest = { prompt: string; include_mermaid?: boolean; focus_node_id?: NodeId | null; max_results?: number | null }
+export type AgentAskRequest = { prompt: string; include_mermaid?: boolean; focus_node_id?: NodeId | null; max_results?: number | null; connection?: AgentConnectionSettingsDto }
+
+export type AgentBackend = "codex" | "claude_code"
 
 export type AgentCitationDto = { node_id: NodeId; display_name: string; kind: NodeKind; file_path: string | null; line: number | null; score: number }
+
+export type AgentConnectionSettingsDto = { backend?: AgentBackend; command?: string | null }
 
 export type AgentResponseSectionDto = { id: string; title: string; markdown: string; graph_ids: string[] }
 

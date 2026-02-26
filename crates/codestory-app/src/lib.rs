@@ -1,15 +1,15 @@
 use codestory_api::{
-    AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentResponseSectionDto, ApiError,
-    AppEventPayload, BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest,
-    CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest, GraphArtifactDto,
-    GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse, IndexMode, IndexingPhaseTimings,
-    ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess, NodeDetailsDto,
-    NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest, OpenContainingFolderRequest,
-    OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
-    ReadFileTextResponse, SearchHit, SearchRequest, SetUiLayoutRequest, SourceOccurrenceDto,
-    StartIndexingRequest, StorageStatsDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
-    TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WriteFileResponse,
-    WriteFileTextRequest,
+    AgentAnswerDto, AgentAskRequest, AgentBackend, AgentCitationDto, AgentConnectionSettingsDto,
+    AgentResponseSectionDto, ApiError, AppEventPayload, BookmarkCategoryDto, BookmarkDto,
+    CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind,
+    EdgeOccurrencesRequest, GraphArtifactDto, GraphEdgeDto, GraphNodeDto, GraphRequest,
+    GraphResponse, IndexMode, IndexingPhaseTimings, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
+    NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
+    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, SearchHit, SearchRequest,
+    SetUiLayoutRequest, SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto,
+    SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailFilterOptionsDto,
+    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_events::{Event, EventBus};
 use codestory_search::SearchEngine;
@@ -18,10 +18,12 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn no_project_error() -> ApiError {
     ApiError::invalid_argument("No project open. Call open_project first.")
@@ -53,6 +55,110 @@ fn clamp_u128_to_u32(v: u128) -> u32 {
 
 fn clamp_usize_to_u32(v: usize) -> u32 {
     v.min(u32::MAX as usize) as u32
+}
+
+#[derive(Debug, Clone)]
+struct FocusedSourceContext {
+    path: String,
+    line: u32,
+    snippet: String,
+}
+
+#[derive(Debug, Clone)]
+struct LocalAgentResponse {
+    backend_label: &'static str,
+    command: String,
+    markdown: String,
+}
+
+fn agent_backend_label(backend: AgentBackend) -> &'static str {
+    match backend {
+        AgentBackend::Codex => "Codex",
+        AgentBackend::ClaudeCode => "Claude Code",
+    }
+}
+
+fn default_agent_command(backend: AgentBackend) -> &'static str {
+    match backend {
+        AgentBackend::Codex => "codex",
+        AgentBackend::ClaudeCode => "claude",
+    }
+}
+
+fn configured_agent_command(connection: &AgentConnectionSettingsDto) -> String {
+    connection
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| default_agent_command(connection.backend).to_string())
+}
+
+fn truncate_for_diagnostic(raw: &str, max_chars: usize) -> String {
+    let mut compact = raw.trim().replace('\r', "");
+    if compact.len() > max_chars {
+        compact.truncate(max_chars);
+        compact.push_str("...");
+    }
+    compact
+}
+
+fn build_local_agent_prompt(
+    user_prompt: &str,
+    hits: &[SearchHit],
+    focused_node: Option<&NodeDetailsDto>,
+    focused_source: Option<&FocusedSourceContext>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("You are a codebase assistant. Use only the provided indexed context.\n");
+    out.push_str("Do not run tools or execute commands. If context is insufficient, say so.\n\n");
+    let _ = writeln!(out, "User request:\n{}\n", user_prompt.trim());
+
+    out.push_str("Indexed symbol hits:\n");
+    if hits.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        for hit in hits.iter().take(8) {
+            let location = match (&hit.file_path, hit.line) {
+                (Some(path), Some(line)) => format!(" ({path}:{line})"),
+                (Some(path), None) => format!(" ({path})"),
+                _ => String::new(),
+            };
+            let _ = writeln!(
+                out,
+                "- {} [{:?}] score {:.3}{}",
+                hit.display_name, hit.kind, hit.score, location
+            );
+        }
+    }
+
+    if let Some(node) = focused_node {
+        let _ = writeln!(
+            out,
+            "\nFocused symbol:\n- {} [{:?}]",
+            node.display_name, node.kind
+        );
+        if let Some(path) = node.file_path.as_deref() {
+            let _ = writeln!(out, "- file: {}", path);
+        }
+        if let Some(line) = node.start_line {
+            let _ = writeln!(out, "- start line: {}", line);
+        }
+    }
+
+    if let Some(source) = focused_source {
+        let _ = writeln!(
+            out,
+            "\nSource snippet from {}:{}:\n{}",
+            source.path, source.line, source.snippet
+        );
+    }
+
+    out.push_str(
+        "\nRespond in markdown with:\n1. Summary\n2. Key findings\n3. Recommended next steps\n",
+    );
+    out
 }
 
 #[derive(Debug, Clone, Default)]
@@ -532,6 +638,152 @@ impl AppController {
         Ok(())
     }
 
+    fn run_codex_agent(
+        command: &str,
+        cwd: &Path,
+        prompt: &str,
+    ) -> Result<LocalAgentResponse, ApiError> {
+        let backend_label = agent_backend_label(AgentBackend::Codex);
+        let temp_nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let output_path =
+            std::env::temp_dir().join(format!("codestory-codex-response-{temp_nonce}.txt"));
+
+        let output = Command::new(command)
+            .arg("exec")
+            .arg("--sandbox")
+            .arg("read-only")
+            .arg("--skip-git-repo-check")
+            .arg("--cd")
+            .arg(cwd)
+            .arg("--output-last-message")
+            .arg(&output_path)
+            .arg(prompt)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to run {backend_label} command `{command}`: {e}"
+                ))
+            })?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        let response_text = fs::read_to_string(&output_path)
+            .ok()
+            .or_else(|| {
+                let fallback = stdout.trim().to_string();
+                if fallback.is_empty() {
+                    None
+                } else {
+                    Some(fallback)
+                }
+            })
+            .unwrap_or_default();
+        let _ = fs::remove_file(&output_path);
+
+        if !output.status.success() {
+            let diagnostic = if stderr.trim().is_empty() {
+                truncate_for_diagnostic(&stdout, 280)
+            } else {
+                truncate_for_diagnostic(&stderr, 280)
+            };
+            return Err(ApiError::invalid_argument(format!(
+                "{backend_label} command failed: {}",
+                if diagnostic.is_empty() {
+                    "no diagnostics available".to_string()
+                } else {
+                    diagnostic
+                }
+            )));
+        }
+
+        let markdown = response_text.trim().to_string();
+        if markdown.is_empty() {
+            return Err(ApiError::invalid_argument(format!(
+                "{backend_label} returned an empty response."
+            )));
+        }
+
+        Ok(LocalAgentResponse {
+            backend_label,
+            command: command.to_string(),
+            markdown,
+        })
+    }
+
+    fn run_claude_agent(
+        command: &str,
+        cwd: &Path,
+        prompt: &str,
+    ) -> Result<LocalAgentResponse, ApiError> {
+        let backend_label = agent_backend_label(AgentBackend::ClaudeCode);
+        let output = Command::new(command)
+            .arg("-p")
+            .arg("--output-format")
+            .arg("text")
+            .arg("--permission-mode")
+            .arg("dontAsk")
+            .arg(prompt)
+            .current_dir(cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to run {backend_label} command `{command}`: {e}"
+                ))
+            })?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if !output.status.success() {
+            let diagnostic = if stderr.trim().is_empty() {
+                truncate_for_diagnostic(&stdout, 280)
+            } else {
+                truncate_for_diagnostic(&stderr, 280)
+            };
+            return Err(ApiError::invalid_argument(format!(
+                "{backend_label} command failed: {}",
+                if diagnostic.is_empty() {
+                    "no diagnostics available".to_string()
+                } else {
+                    diagnostic
+                }
+            )));
+        }
+
+        let markdown = stdout.trim().to_string();
+        if markdown.is_empty() {
+            return Err(ApiError::invalid_argument(format!(
+                "{backend_label} returned an empty response."
+            )));
+        }
+
+        Ok(LocalAgentResponse {
+            backend_label,
+            command: command.to_string(),
+            markdown,
+        })
+    }
+
+    fn run_local_agent(
+        &self,
+        connection: &AgentConnectionSettingsDto,
+        prompt: &str,
+    ) -> Result<LocalAgentResponse, ApiError> {
+        let command = configured_agent_command(connection);
+        let cwd = self.require_project_root()?;
+        match connection.backend {
+            AgentBackend::Codex => Self::run_codex_agent(&command, &cwd, prompt),
+            AgentBackend::ClaudeCode => Self::run_claude_agent(&command, &cwd, prompt),
+        }
+    }
+
     fn launch_definition_in_ide(
         &self,
         path: &Path,
@@ -958,6 +1210,40 @@ impl AppController {
             }
         }
 
+        let focused_node = if let Some(center_id) = chosen_node.clone() {
+            Some(self.node_details(NodeDetailsRequest { id: center_id })?)
+        } else {
+            None
+        };
+
+        let focused_source = if let Some(node) = focused_node.as_ref() {
+            if let (Some(path), Some(line)) = (node.file_path.clone(), node.start_line) {
+                if let Ok(file) = self.read_file_text(ReadFileTextRequest { path: path.clone() }) {
+                    Some(FocusedSourceContext {
+                        path,
+                        line,
+                        snippet: markdown_snippet(&file.text, Some(line), 6),
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let backend_label = agent_backend_label(req.connection.backend);
+        let configured_command = configured_agent_command(&req.connection);
+        let local_agent_prompt = build_local_agent_prompt(
+            &prompt,
+            &hits,
+            focused_node.as_ref(),
+            focused_source.as_ref(),
+        );
+        let local_agent_result = self.run_local_agent(&req.connection, &local_agent_prompt);
+
         let citations: Vec<AgentCitationDto> = hits
             .iter()
             .map(|hit| AgentCitationDto {
@@ -971,6 +1257,31 @@ impl AppController {
             .collect();
 
         let mut sections = Vec::new();
+        match &local_agent_result {
+            Ok(local_agent) => {
+                sections.push(AgentResponseSectionDto {
+                    id: "agent-response".to_string(),
+                    title: format!("{} Response", local_agent.backend_label),
+                    markdown: format!(
+                        "{}\n\n_Executed via `{}`._",
+                        local_agent.markdown, local_agent.command
+                    ),
+                    graph_ids: Vec::new(),
+                });
+            }
+            Err(error) => {
+                sections.push(AgentResponseSectionDto {
+                    id: "agent-connection".to_string(),
+                    title: "Local Agent Connection".to_string(),
+                    markdown: format!(
+                        "Could not run local {} command `{}`.\n\nReason: {}\n\nShowing indexed fallback response below.",
+                        backend_label, configured_command, error.message
+                    ),
+                    graph_ids: Vec::new(),
+                });
+            }
+        }
+
         if !hits.is_empty() {
             let mut markdown = String::from("Top symbol matches from indexed search:\n");
             for hit in hits.iter().take(6) {
@@ -1000,21 +1311,19 @@ impl AppController {
             });
         }
 
-        if let Some(center_id) = chosen_node {
-            let node = self.node_details(NodeDetailsRequest {
-                id: center_id.clone(),
-            })?;
-
+        if let Some(node) = focused_node {
             let mut markdown = format!(
                 "Focused symbol: **{}** (`{:?}`)\n",
                 node.display_name, node.kind
             );
 
-            if let (Some(path), Some(line)) = (node.file_path.clone(), node.start_line)
-                && let Ok(file) = self.read_file_text(ReadFileTextRequest { path: path.clone() })
-            {
-                let _ = writeln!(markdown, "\nSource context from `{path}:{line}`:\n");
-                markdown.push_str(&markdown_snippet(&file.text, Some(line), 6));
+            if let Some(source) = focused_source.as_ref() {
+                let _ = writeln!(
+                    markdown,
+                    "\nSource context from `{}:{}`:\n",
+                    source.path, source.line
+                );
+                markdown.push_str(&source.snippet);
             }
 
             let graph_ids = primary_graph_id.clone().into_iter().collect();
@@ -1045,14 +1354,22 @@ impl AppController {
             }
         }
 
-        let summary = if hits.is_empty() {
-            "No indexed symbols matched the prompt yet.".to_string()
-        } else {
-            format!(
-                "Investigated {} symbol matches and generated {} graph artifact(s).",
+        let summary = match &local_agent_result {
+            Ok(local_agent) => format!(
+                "{} analyzed {} indexed symbol match(es) and generated {} graph artifact(s).",
+                local_agent.backend_label,
                 hits.len(),
                 graphs.len()
-            )
+            ),
+            Err(_) if hits.is_empty() => {
+                "No indexed symbols matched the prompt yet, and local agent execution failed."
+                    .to_string()
+            }
+            Err(_) => format!(
+                "Local agent execution failed; fallback investigated {} indexed symbol match(es) and generated {} graph artifact(s).",
+                hits.len(),
+                graphs.len()
+            ),
         };
 
         Ok(AgentAnswerDto {

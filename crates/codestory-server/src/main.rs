@@ -9,17 +9,18 @@ use axum::{
 };
 use clap::Parser;
 use codestory_api::{
-    AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentResponseSectionDto, ApiError,
-    AppEventPayload, BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest,
-    CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest, GraphArtifactDto,
-    GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse, IndexMode, LayoutDirection,
-    ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess, NodeDetailsDto,
-    NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest, OpenContainingFolderRequest,
-    OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
-    ReadFileTextResponse, SearchHit, SearchRequest, SetUiLayoutRequest, SourceOccurrenceDto,
-    StartIndexingRequest, StorageStatsDto, SymbolSummaryDto, SystemActionResponse,
-    TrailCallerScope, TrailConfigDto, TrailDirection, TrailFilterOptionsDto, TrailMode,
-    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WriteFileResponse, WriteFileTextRequest,
+    AgentAnswerDto, AgentAskRequest, AgentBackend, AgentCitationDto, AgentConnectionSettingsDto,
+    AgentResponseSectionDto, ApiError, AppEventPayload, BookmarkCategoryDto, BookmarkDto,
+    CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind,
+    EdgeOccurrencesRequest, GraphArtifactDto, GraphEdgeDto, GraphNodeDto, GraphRequest,
+    GraphResponse, IndexMode, LayoutDirection, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
+    NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
+    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, SearchHit, SearchRequest,
+    SetUiLayoutRequest, SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto,
+    SymbolSummaryDto, SystemActionResponse, TrailCallerScope, TrailConfigDto, TrailDirection,
+    TrailFilterOptionsDto, TrailMode, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
+    WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_app::AppController;
 use serde::{Deserialize, Serialize};
@@ -258,6 +259,8 @@ fn collect_types() -> TypeCollection {
         .register::<WriteFileTextRequest>()
         .register::<WriteFileResponse>()
         .register::<SetUiLayoutRequest>()
+        .register::<AgentBackend>()
+        .register::<AgentConnectionSettingsDto>()
         .register::<AgentAskRequest>()
         .register::<AgentCitationDto>()
         .register::<AgentResponseSectionDto>()

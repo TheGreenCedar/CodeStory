@@ -1,7 +1,12 @@
 import { useMemo, useState, type ChangeEvent, type ReactNode } from "react";
 
 import type { LeftTab } from "../app/types";
-import type { AgentAnswerDto, GraphArtifactDto, SymbolSummaryDto } from "../generated/api";
+import type {
+  AgentAnswerDto,
+  AgentConnectionSettingsDto,
+  GraphArtifactDto,
+  SymbolSummaryDto,
+} from "../generated/api";
 
 type ResponsePaneProps = {
   selectedTab: LeftTab;
@@ -10,6 +15,10 @@ type ResponsePaneProps = {
   onPromptChange: (prompt: string) => void;
   includeMermaid: boolean;
   onIncludeMermaidChange: (next: boolean) => void;
+  agentBackend: NonNullable<AgentConnectionSettingsDto["backend"]>;
+  onAgentBackendChange: (backend: NonNullable<AgentConnectionSettingsDto["backend"]>) => void;
+  agentCommand: string;
+  onAgentCommandChange: (command: string) => void;
   onAskAgent: () => void;
   isBusy: boolean;
   projectOpen: boolean;
@@ -117,6 +126,10 @@ export function ResponsePane({
   onPromptChange,
   includeMermaid,
   onIncludeMermaidChange,
+  agentBackend,
+  onAgentBackendChange,
+  agentCommand,
+  onAgentCommandChange,
   onAskAgent,
   isBusy,
   projectOpen,
@@ -132,6 +145,17 @@ export function ResponsePane({
 }: ResponsePaneProps) {
   const handlePromptChange = (event: ChangeEvent<HTMLTextAreaElement>) => {
     onPromptChange(event.target.value);
+  };
+
+  const handleBackendChange = (event: ChangeEvent<HTMLSelectElement>) => {
+    const nextBackend = event.target.value;
+    if (nextBackend === "codex" || nextBackend === "claude_code") {
+      onAgentBackendChange(nextBackend);
+    }
+  };
+
+  const handleCommandChange = (event: ChangeEvent<HTMLInputElement>) => {
+    onAgentCommandChange(event.target.value);
   };
 
   const [explorerQuery, setExplorerQuery] = useState<string>("");
@@ -265,6 +289,23 @@ export function ResponsePane({
               onChange={handlePromptChange}
               placeholder="Ask Codestory to explain architecture, trace behavior, or summarize relationships"
             />
+            <div className="agent-connection-settings">
+              <label className="agent-connection-field">
+                <span>Local agent</span>
+                <select value={agentBackend} onChange={handleBackendChange}>
+                  <option value="codex">Codex</option>
+                  <option value="claude_code">Claude Code</option>
+                </select>
+              </label>
+              <label className="agent-connection-field">
+                <span>Command override (optional)</span>
+                <input
+                  value={agentCommand}
+                  onChange={handleCommandChange}
+                  placeholder="Executable path or command name"
+                />
+              </label>
+            </div>
             <div className="prompt-actions">
               <label>
                 <input

@@ -220,6 +220,22 @@ pub struct SetUiLayoutRequest {
     pub json: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentBackend {
+    #[default]
+    Codex,
+    ClaudeCode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Default)]
+pub struct AgentConnectionSettingsDto {
+    #[serde(default)]
+    pub backend: AgentBackend,
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentAskRequest {
     pub prompt: String,
@@ -229,6 +245,8 @@ pub struct AgentAskRequest {
     pub focus_node_id: Option<NodeId>,
     #[serde(default)]
     pub max_results: Option<u32>,
+    #[serde(default)]
+    pub connection: AgentConnectionSettingsDto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

@@ -214,6 +214,39 @@ textarea {
   background: #fff;
 }
 
+.agent-connection-settings {
+  display: grid;
+  grid-template-columns: minmax(7rem, 11rem) minmax(0, 1fr);
+  gap: 0.5rem;
+  padding: 0.52rem 0.7rem;
+  border-top: 1px solid var(--line);
+  background: color-mix(in oklab, #fff 88%, oklch(0.91 0.03 95));
+}
+
+.agent-connection-field {
+  min-width: 0;
+  display: grid;
+  gap: 0.2rem;
+}
+
+.agent-connection-field span {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.agent-connection-field select,
+.agent-connection-field input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: #fff;
+  min-height: 1.85rem;
+  padding: 0.24rem 0.46rem;
+}
+
 .prompt-actions {
   display: flex;
   justify-content: space-between;
@@ -1941,6 +1974,10 @@ textarea {
 }
 
 @media (max-width: 700px) {
+  .agent-connection-settings {
+    grid-template-columns: 1fr;
+  }
+
   .explorer-toolbar-row {
     font-size: 0.72rem;
   }
