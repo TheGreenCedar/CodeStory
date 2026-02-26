@@ -64,6 +64,7 @@ export type TrailUiConfig = {
   nodeFilter: NodeKind[];
   showLegend: boolean;
   showMiniMap: boolean;
+  bundleEdges: boolean;
   groupingMode: GroupingMode;
   maxNodes: number;
 };
@@ -84,6 +85,7 @@ export function defaultTrailUiConfig(): TrailUiConfig {
     nodeFilter: [],
     showLegend: true,
     showMiniMap: true,
+    bundleEdges: true,
     groupingMode: "none",
     maxNodes: 500,
   };
@@ -148,7 +150,7 @@ export function normalizeTrailUiConfig(
       )
     : defaults.nodeFilter;
 
-  // Legacy persisted layouts may include bundlingMode; ignore it.
+  // Legacy persisted layouts may include bundlingMode; keep ignoring that shape.
   const _legacyBundlingMode = (raw as { bundlingMode?: unknown }).bundlingMode;
   void _legacyBundlingMode;
   const _legacyDebugParityChannels = (raw as { debugParityChannels?: unknown }).debugParityChannels;
@@ -175,6 +177,7 @@ export function normalizeTrailUiConfig(
     nodeFilter,
     showLegend: typeof raw.showLegend === "boolean" ? raw.showLegend : defaults.showLegend,
     showMiniMap: typeof raw.showMiniMap === "boolean" ? raw.showMiniMap : defaults.showMiniMap,
+    bundleEdges: typeof raw.bundleEdges === "boolean" ? raw.bundleEdges : defaults.bundleEdges,
     groupingMode,
     maxNodes: clampMaxNodes(typeof raw.maxNodes === "number" ? raw.maxNodes : defaults.maxNodes),
   };

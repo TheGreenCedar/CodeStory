@@ -22,6 +22,7 @@ export type SemanticEdgeData = {
   family: SemanticEdgeFamily;
   multiplicity: number;
   routePoints: RoutePoint[];
+  bundleTrunkX?: number;
   layoutDirection?: LayoutDirection;
   tooltipLabel?: string;
   isFocused?: boolean;

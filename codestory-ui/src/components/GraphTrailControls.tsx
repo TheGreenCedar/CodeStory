@@ -481,6 +481,19 @@ export function GraphTrailControls({
               </label>
 
               <label className="graph-control-field">
+                <span>Edge Bundling</span>
+                <select
+                  value={config.bundleEdges ? "bundled" : "separate"}
+                  onChange={(event) =>
+                    onConfigChange({ bundleEdges: event.target.value === "bundled" })
+                  }
+                >
+                  <option value="bundled">Bundled</option>
+                  <option value="separate">Separate</option>
+                </select>
+              </label>
+
+              <label className="graph-control-field">
                 <span>Max Nodes</span>
                 <input
                   type="number"

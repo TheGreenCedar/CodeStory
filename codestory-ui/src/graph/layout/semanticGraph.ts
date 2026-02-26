@@ -8,6 +8,7 @@ import {
   type FlowMemberData,
   type LayoutElements,
   type RoutedEdgeSpec,
+  type SemanticNodePlacement,
   type SemanticEdgeFamily,
 } from "./types";
 
@@ -21,6 +22,10 @@ const PILL_WIDTH_MAX = 560;
 const PILL_CHROME_WIDTH = 72;
 const PILL_HEIGHT = 34;
 const APPROX_CHAR_WIDTH = 7.25;
+const EDGE_BUNDLE_NODE_SIZE = 6;
+const EDGE_BUNDLE_MIN_BRANCHES = 3;
+const EDGE_BUNDLE_DEPTH_STEP = 0.42;
+const EDGE_BUNDLE_ROW_STEP = 0.26;
 
 type FoldedEdge = {
   id: string;
@@ -42,6 +47,10 @@ type MemberExtraction = {
   memberHostById: Map<string, string>;
   membersByHost: Map<string, FlowMemberData[]>;
   syntheticHosts: GraphNodeLike[];
+};
+
+export type CanonicalLayoutOptions = {
+  bundleFanOutEdges?: boolean;
 };
 
 function inferMemberVisibility(
@@ -415,7 +424,328 @@ function toRoutedEdgeSpecs(edges: FoldedEdge[]): RoutedEdgeSpec[] {
   }));
 }
 
-export function buildCanonicalLayout(graph: GraphResponse): LayoutElements {
+function dedupeStringList(items: string[]): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const item of items) {
+    if (!seen.has(item)) {
+      deduped.push(item);
+      seen.add(item);
+    }
+  }
+  return deduped;
+}
+
+function collectSourceEdgeIds(edges: RoutedEdgeSpec[]): string[] {
+  return dedupeStringList(
+    edges.flatMap((edge) => (edge.sourceEdgeIds.length > 0 ? edge.sourceEdgeIds : [edge.id])),
+  );
+}
+
+function mergeEdgeCertainty(edges: RoutedEdgeSpec[]): string | null | undefined {
+  return edges.reduce(
+    (certainty, edge) => mergeCertainty(certainty, edge.certainty),
+    null as string | null | undefined,
+  );
+}
+
+function totalEdgeMultiplicity(edges: RoutedEdgeSpec[]): number {
+  return edges.reduce((sum, edge) => sum + edge.multiplicity, 0);
+}
+
+function applyFanOutBundling(
+  nodes: SemanticNodePlacement[],
+  edges: RoutedEdgeSpec[],
+  depthByNode: Map<string, number>,
+): { nodes: SemanticNodePlacement[]; edges: RoutedEdgeSpec[] } {
+  if (edges.length < EDGE_BUNDLE_MIN_BRANCHES) {
+    return { nodes, edges };
+  }
+
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const groupsByKey = new Map<
+    string,
+    {
+      key: string;
+      kind: EdgeKind;
+      source: string;
+      sourceHandle: string;
+      edges: RoutedEdgeSpec[];
+    }
+  >();
+
+  for (const edge of edges) {
+    if (edge.family !== "flow") {
+      continue;
+    }
+
+    const sourceNode = nodeById.get(edge.source);
+    const targetNode = nodeById.get(edge.target);
+    if (!sourceNode || !targetNode || sourceNode.isVirtualBundle || targetNode.isVirtualBundle) {
+      continue;
+    }
+
+    const key = `${edge.kind}:${edge.source}:${edge.sourceHandle}`;
+    const group = groupsByKey.get(key) ?? {
+      key,
+      kind: edge.kind,
+      source: edge.source,
+      sourceHandle: edge.sourceHandle,
+      edges: [],
+    };
+    group.edges.push(edge);
+    groupsByKey.set(key, group);
+  }
+
+  const groups = [...groupsByKey.values()]
+    .filter((group) => {
+      if (group.edges.length < EDGE_BUNDLE_MIN_BRANCHES) {
+        return false;
+      }
+      const distinctTargets = new Set(group.edges.map((edge) => edge.target));
+      return distinctTargets.size > 1;
+    })
+    .sort((left, right) => left.key.localeCompare(right.key));
+
+  if (groups.length === 0) {
+    return { nodes, edges };
+  }
+
+  const groupsBySource = new Map<string, typeof groups>();
+  for (const group of groups) {
+    const sourceGroups = groupsBySource.get(group.source) ?? [];
+    sourceGroups.push(group);
+    groupsBySource.set(group.source, sourceGroups);
+  }
+  for (const sourceGroups of groupsBySource.values()) {
+    sourceGroups.sort((left, right) => left.key.localeCompare(right.key));
+  }
+
+  const reroutedEdgesById = new Map<string, RoutedEdgeSpec>();
+  const bundleTrunkEdges: RoutedEdgeSpec[] = [];
+  const bundleNodes: SemanticNodePlacement[] = [];
+
+  let bundleCounter = 0;
+  for (const group of groups) {
+    const sourceNode = nodeById.get(group.source);
+    if (!sourceNode) {
+      continue;
+    }
+
+    const edgeTargetRow = (edge: RoutedEdgeSpec): number =>
+      nodeById.get(edge.target)?.yRank ?? sourceNode.yRank;
+    const edgeTargetDepth = (edge: RoutedEdgeSpec): number =>
+      depthByNode.get(edge.target) ?? nodeById.get(edge.target)?.xRank ?? sourceNode.xRank;
+    const rowSortedEdges = [...group.edges].sort((left, right) => {
+      const rowDiff = edgeTargetRow(left) - edgeTargetRow(right);
+      if (rowDiff !== 0) {
+        return rowDiff;
+      }
+      const depthDiff = edgeTargetDepth(left) - edgeTargetDepth(right);
+      if (depthDiff !== 0) {
+        return depthDiff;
+      }
+      return left.id.localeCompare(right.id);
+    });
+
+    if (rowSortedEdges.length < EDGE_BUNDLE_MIN_BRANCHES) {
+      continue;
+    }
+
+    const sourceDepth = depthByNode.get(group.source) ?? sourceNode.xRank;
+
+    const sourceGroups = groupsBySource.get(group.source) ?? [group];
+    const sourceGroupIndex = sourceGroups.findIndex((candidate) => candidate.key === group.key);
+    const rowOffset =
+      sourceGroups.length <= 1
+        ? 0
+        : (sourceGroupIndex - (sourceGroups.length - 1) / 2) * EDGE_BUNDLE_ROW_STEP;
+
+    const groupToken = `${bundleCounter}`;
+    bundleCounter += 1;
+    const upperLaneEdges = rowSortedEdges
+      .filter((edge) => edgeTargetRow(edge) < sourceNode.yRank)
+      .sort(
+        (left, right) =>
+          edgeTargetRow(right) - edgeTargetRow(left) || left.id.localeCompare(right.id),
+      );
+    const lowerLaneEdges = rowSortedEdges
+      .filter((edge) => edgeTargetRow(edge) >= sourceNode.yRank)
+      .sort(
+        (left, right) =>
+          edgeTargetRow(left) - edgeTargetRow(right) || left.id.localeCompare(right.id),
+      );
+
+    const lanes = [
+      { laneId: "up", edges: upperLaneEdges, laneRowOffset: -0.24 },
+      { laneId: "down", edges: lowerLaneEdges, laneRowOffset: 0.24 },
+    ].filter((lane) => lane.edges.length > 0);
+
+    if (lanes.length === 1) {
+      lanes[0]!.laneRowOffset = 0;
+    }
+
+    for (const lane of lanes) {
+      const laneEdges = lane.edges;
+      if (laneEdges.length < 2) {
+        continue;
+      }
+
+      const avgTargetDepth =
+        laneEdges.reduce((sum, edge) => sum + edgeTargetDepth(edge), 0) / laneEdges.length;
+      const depthDirection = avgTargetDepth >= sourceDepth ? 1 : -1;
+      const directedDepthSpan = Math.max(
+        EDGE_BUNDLE_DEPTH_STEP * 2.2,
+        Math.abs(avgTargetDepth - sourceDepth),
+      );
+      const splitDepthStart =
+        sourceDepth +
+        depthDirection * Math.max(EDGE_BUNDLE_DEPTH_STEP * 2.8, directedDepthSpan * 0.72);
+      const splitDepthEnd =
+        sourceDepth +
+        depthDirection * Math.max(EDGE_BUNDLE_DEPTH_STEP * 3.4, directedDepthSpan * 0.94);
+      const maxSplitLevel = Math.max(1, Math.ceil(Math.log2(laneEdges.length)));
+
+      const laneToken = `${groupToken}__${lane.laneId}`;
+      const splitDepthFor = (level: number, subsetAvgDepth: number): number => {
+        const levelRatio =
+          maxSplitLevel <= 1 ? 1 : Math.min(1, level / Math.max(1, maxSplitLevel - 1));
+        const plannedDepth = splitDepthStart + (splitDepthEnd - splitDepthStart) * levelRatio;
+        const maxOffsetTowardSubset = Math.max(
+          EDGE_BUNDLE_DEPTH_STEP * 2,
+          Math.abs(subsetAvgDepth - sourceDepth) - EDGE_BUNDLE_DEPTH_STEP * 0.25,
+        );
+        const plannedOffset = Math.min(Math.abs(plannedDepth - sourceDepth), maxOffsetTowardSubset);
+        return sourceDepth + depthDirection * plannedOffset;
+      };
+
+      const rerouteLeaf = (edge: RoutedEdgeSpec, bundleId: string) => {
+        reroutedEdgesById.set(edge.id, {
+          ...edge,
+          source: bundleId,
+          sourceHandle: "source-node-right",
+        });
+      };
+
+      const buildBundleTree = (
+        subset: RoutedEdgeSpec[],
+        level: number,
+        pathToken: string,
+      ): string | null => {
+        if (subset.length < 2) {
+          return null;
+        }
+
+        const subsetAvgRow =
+          subset.reduce((sum, edge) => sum + edgeTargetRow(edge), 0) / subset.length;
+        const subsetAvgDepth =
+          subset.reduce((sum, edge) => sum + edgeTargetDepth(edge), 0) / subset.length;
+        const bundleId = `__fanout_bundle__${laneToken}__${pathToken}`;
+
+        bundleNodes.push({
+          id: bundleId,
+          kind: "BUNDLE",
+          label: "",
+          center: false,
+          nodeStyle: "bundle",
+          isNonIndexed: false,
+          duplicateCount: 1,
+          mergedSymbolIds: [],
+          memberCount: 0,
+          members: [],
+          xRank: splitDepthFor(level, subsetAvgDepth),
+          yRank: subsetAvgRow + rowOffset + lane.laneRowOffset,
+          x: 0,
+          y: 0,
+          width: EDGE_BUNDLE_NODE_SIZE,
+          height: EDGE_BUNDLE_NODE_SIZE,
+          isVirtualBundle: true,
+        });
+
+        if (subset.length === 2) {
+          rerouteLeaf(subset[0]!, bundleId);
+          rerouteLeaf(subset[1]!, bundleId);
+          return bundleId;
+        }
+
+        const splitAt = Math.floor(subset.length / 2);
+        const leftSubset = subset.slice(0, splitAt);
+        const rightSubset = subset.slice(splitAt);
+        const childSubsets = [leftSubset, rightSubset];
+
+        for (const [childIndex, childSubset] of childSubsets.entries()) {
+          if (childSubset.length === 0) {
+            continue;
+          }
+          if (childSubset.length === 1) {
+            rerouteLeaf(childSubset[0]!, bundleId);
+            continue;
+          }
+
+          const childToken = `${pathToken}_${childIndex}`;
+          const childBundleId = buildBundleTree(childSubset, level + 1, childToken);
+          if (!childBundleId) {
+            continue;
+          }
+          bundleTrunkEdges.push({
+            id: `__fanout_trunk__${laneToken}__${pathToken}_${childIndex}`,
+            sourceEdgeIds: collectSourceEdgeIds(childSubset),
+            source: bundleId,
+            target: childBundleId,
+            sourceHandle: "source-node-right",
+            targetHandle: "target-node-left",
+            kind: group.kind,
+            certainty: mergeEdgeCertainty(childSubset),
+            multiplicity: totalEdgeMultiplicity(childSubset),
+            family: "flow",
+            routeKind: "direct",
+            routePoints: [],
+          });
+        }
+
+        return bundleId;
+      };
+
+      const rootBundleId = buildBundleTree(laneEdges, 0, "root");
+      if (!rootBundleId) {
+        continue;
+      }
+      bundleTrunkEdges.push({
+        id: `__fanout_trunk__${laneToken}__source`,
+        sourceEdgeIds: collectSourceEdgeIds(laneEdges),
+        source: group.source,
+        target: rootBundleId,
+        sourceHandle: group.sourceHandle,
+        targetHandle: "target-node-left",
+        kind: group.kind,
+        certainty: mergeEdgeCertainty(laneEdges),
+        multiplicity: totalEdgeMultiplicity(laneEdges),
+        family: "flow",
+        routeKind: "direct",
+        routePoints: [],
+      });
+    }
+  }
+
+  if (bundleNodes.length === 0) {
+    return { nodes, edges };
+  }
+
+  const reroutedEdges = edges.map((edge) => reroutedEdgesById.get(edge.id) ?? edge);
+  const bundledEdges = [...reroutedEdges, ...bundleTrunkEdges].sort((left, right) =>
+    left.id.localeCompare(right.id),
+  );
+
+  return {
+    nodes: [...nodes, ...bundleNodes],
+    edges: bundledEdges,
+  };
+}
+
+export function buildCanonicalLayout(
+  graph: GraphResponse,
+  options?: CanonicalLayoutOptions,
+): LayoutElements {
   const { memberHostById, membersByHost, syntheticHosts } = extractMembers(graph);
   const allNodes = [...graph.nodes, ...syntheticHosts];
   const nodeById = new Map(allNodes.map((node) => [node.id, node]));
@@ -506,9 +836,14 @@ export function buildCanonicalLayout(graph: GraphResponse): LayoutElements {
     })
     .filter((node): node is NonNullable<typeof node> => node !== null);
 
+  const routedEdges = toRoutedEdgeSpecs(foldedEdges);
+  const bundledLayout = options?.bundleFanOutEdges
+    ? applyFanOutBundling(nodes, routedEdges, depthByCanonical)
+    : { nodes, edges: routedEdges };
+
   return {
-    nodes,
-    edges: toRoutedEdgeSpecs(foldedEdges),
+    nodes: bundledLayout.nodes,
+    edges: bundledLayout.edges,
     centerNodeId,
   };
 }
