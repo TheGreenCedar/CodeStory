@@ -5,21 +5,24 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response, Sse, sse::Event},
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use clap::Parser;
 use codestory_api::{
     AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentResponseSectionDto, ApiError,
-    AppEventPayload, EdgeId, EdgeKind, EdgeOccurrencesRequest, GraphArtifactDto, GraphEdgeDto,
-    GraphNodeDto, GraphRequest, GraphResponse, IndexMode, ListChildrenSymbolsRequest,
-    ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
-    NodeOccurrencesRequest, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
+    AppEventPayload, BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest,
+    CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest, GraphArtifactDto,
+    GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse, IndexMode, LayoutDirection,
+    ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess, NodeDetailsDto,
+    NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest, OpenContainingFolderRequest,
+    OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
     ReadFileTextResponse, SearchHit, SearchRequest, SetUiLayoutRequest, SourceOccurrenceDto,
-    StartIndexingRequest, StorageStatsDto, SymbolSummaryDto, TrailCallerScope, TrailConfigDto,
-    TrailDirection, TrailMode, WriteFileResponse, WriteFileTextRequest,
+    StartIndexingRequest, StorageStatsDto, SymbolSummaryDto, SystemActionResponse,
+    TrailCallerScope, TrailConfigDto, TrailDirection, TrailFilterOptionsDto, TrailMode,
+    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_app::AppController;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use specta::TypeCollection;
 use specta_typescript::Typescript;
 use std::convert::Infallible;
@@ -92,6 +95,11 @@ struct HealthResponse {
     status: &'static str,
 }
 
+#[derive(Debug, Deserialize)]
+struct BookmarksQuery {
+    category_id: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -142,9 +150,31 @@ async fn main() -> Result<()> {
         .route("/agent/ask", post(agent_ask))
         .route("/graph/neighborhood", post(graph_neighborhood))
         .route("/graph/trail", post(graph_trail))
+        .route(
+            "/graph/trail/filter-options",
+            get(graph_trail_filter_options),
+        )
         .route("/node/details", post(node_details))
         .route("/node/occurrences", post(node_occurrences))
         .route("/edge/occurrences", post(edge_occurrences))
+        .route(
+            "/bookmarks/categories",
+            get(get_bookmark_categories).post(create_bookmark_category),
+        )
+        .route(
+            "/bookmarks/categories/{id}",
+            patch(update_bookmark_category).delete(delete_bookmark_category),
+        )
+        .route("/bookmarks", get(get_bookmarks).post(create_bookmark))
+        .route(
+            "/bookmarks/{id}",
+            patch(update_bookmark).delete(delete_bookmark),
+        )
+        .route("/system/open-definition", post(open_definition))
+        .route(
+            "/system/open-containing-folder",
+            post(open_containing_folder),
+        )
         .route("/file/read", post(read_file_text))
         .route("/file/write-text", post(write_file_text))
         .route("/ui-layout", get(get_ui_layout).post(set_ui_layout))
@@ -192,6 +222,8 @@ fn collect_types() -> TypeCollection {
         .register::<TrailMode>()
         .register::<TrailDirection>()
         .register::<TrailCallerScope>()
+        .register::<LayoutDirection>()
+        .register::<MemberAccess>()
         .register::<OpenProjectRequest>()
         .register::<StorageStatsDto>()
         .register::<ProjectSummary>()
@@ -206,11 +238,21 @@ fn collect_types() -> TypeCollection {
         .register::<GraphEdgeDto>()
         .register::<GraphResponse>()
         .register::<TrailConfigDto>()
+        .register::<TrailFilterOptionsDto>()
         .register::<NodeDetailsRequest>()
         .register::<NodeDetailsDto>()
         .register::<NodeOccurrencesRequest>()
         .register::<EdgeOccurrencesRequest>()
         .register::<SourceOccurrenceDto>()
+        .register::<BookmarkCategoryDto>()
+        .register::<CreateBookmarkCategoryRequest>()
+        .register::<UpdateBookmarkCategoryRequest>()
+        .register::<BookmarkDto>()
+        .register::<CreateBookmarkRequest>()
+        .register::<UpdateBookmarkRequest>()
+        .register::<OpenDefinitionRequest>()
+        .register::<OpenContainingFolderRequest>()
+        .register::<SystemActionResponse>()
         .register::<ReadFileTextRequest>()
         .register::<ReadFileTextResponse>()
         .register::<WriteFileTextRequest>()
@@ -332,6 +374,16 @@ async fn graph_trail(
         .map_err(Into::into)
 }
 
+async fn graph_trail_filter_options(
+    State(state): State<Arc<ServerState>>,
+) -> ApiResult<TrailFilterOptionsDto> {
+    state
+        .controller
+        .graph_trail_filter_options()
+        .map(Json)
+        .map_err(Into::into)
+}
+
 async fn node_details(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<NodeDetailsRequest>,
@@ -361,6 +413,142 @@ async fn edge_occurrences(
     state
         .controller
         .edge_occurrences(req)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn get_bookmark_categories(
+    State(state): State<Arc<ServerState>>,
+) -> ApiResult<Vec<BookmarkCategoryDto>> {
+    state
+        .controller
+        .list_bookmark_categories()
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn create_bookmark_category(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<CreateBookmarkCategoryRequest>,
+) -> ApiResult<BookmarkCategoryDto> {
+    state
+        .controller
+        .create_bookmark_category(req)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn update_bookmark_category(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateBookmarkCategoryRequest>,
+) -> ApiResult<BookmarkCategoryDto> {
+    let parsed_id = id.trim().parse::<i64>().map_err(|_| {
+        HttpError(ApiError::invalid_argument(format!(
+            "Invalid category id: {id}"
+        )))
+    })?;
+    state
+        .controller
+        .update_bookmark_category(parsed_id, req)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn delete_bookmark_category(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+) -> ApiEmptyResult {
+    let parsed_id = id.trim().parse::<i64>().map_err(|_| {
+        HttpError(ApiError::invalid_argument(format!(
+            "Invalid category id: {id}"
+        )))
+    })?;
+    state.controller.delete_bookmark_category(parsed_id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_bookmarks(
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<BookmarksQuery>,
+) -> ApiResult<Vec<BookmarkDto>> {
+    let category_id = query
+        .category_id
+        .as_deref()
+        .map(|raw| {
+            raw.trim().parse::<i64>().map_err(|_| {
+                HttpError(ApiError::invalid_argument(format!(
+                    "Invalid category id: {raw}"
+                )))
+            })
+        })
+        .transpose()?;
+    state
+        .controller
+        .list_bookmarks(category_id)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn create_bookmark(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<CreateBookmarkRequest>,
+) -> ApiResult<BookmarkDto> {
+    state
+        .controller
+        .create_bookmark(req)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn update_bookmark(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateBookmarkRequest>,
+) -> ApiResult<BookmarkDto> {
+    let parsed_id = id.trim().parse::<i64>().map_err(|_| {
+        HttpError(ApiError::invalid_argument(format!(
+            "Invalid bookmark id: {id}"
+        )))
+    })?;
+    state
+        .controller
+        .update_bookmark(parsed_id, req)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn delete_bookmark(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+) -> ApiEmptyResult {
+    let parsed_id = id.trim().parse::<i64>().map_err(|_| {
+        HttpError(ApiError::invalid_argument(format!(
+            "Invalid bookmark id: {id}"
+        )))
+    })?;
+    state.controller.delete_bookmark(parsed_id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn open_definition(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<OpenDefinitionRequest>,
+) -> ApiResult<SystemActionResponse> {
+    state
+        .controller
+        .open_definition(req)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn open_containing_folder(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<OpenContainingFolderRequest>,
+) -> ApiResult<SystemActionResponse> {
+    state
+        .controller
+        .open_containing_folder(req)
         .map(Json)
         .map_err(Into::into)
 }

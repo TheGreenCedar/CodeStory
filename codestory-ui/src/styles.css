@@ -467,16 +467,31 @@ textarea {
 
 .graph-trail-controls {
   border-bottom: 1px solid var(--line);
-  padding: 0.56rem 0.75rem 0.62rem;
+  padding: 0.46rem 0.62rem 0.5rem;
   display: grid;
-  gap: 0.48rem;
-  background: color-mix(in oklab, #fff 86%, oklch(0.9 0.03 95));
+  gap: 0.38rem;
+  background: color-mix(in oklab, #fff 90%, oklch(0.9 0.02 95));
 }
 
-.graph-trail-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 0.44rem;
+.graph-trail-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.32rem;
+}
+
+.graph-trail-toolbar button {
+  border: 1px solid var(--line);
+  border-radius: 0.56rem;
+  background: #fff;
+  padding: 0.22rem 0.52rem;
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+
+.graph-trail-toolbar button:disabled {
+  opacity: 0.58;
+  cursor: default;
 }
 
 .graph-control-field {
@@ -499,28 +514,176 @@ textarea {
   border: 1px solid var(--line);
   border-radius: 0.5rem;
   background: #fff;
-  min-height: 2rem;
+  min-height: 1.9rem;
   padding: 0.26rem 0.44rem;
 }
 
-.graph-target-wrap {
-  position: relative;
+.trail-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgb(17 19 22 / 0.42);
   display: grid;
-  gap: 0.35rem;
+  place-items: center;
+  z-index: 60;
 }
 
-.graph-control-field-target {
-  max-width: 24rem;
+.trail-dialog {
+  width: min(58rem, calc(100vw - 1.6rem));
+  max-height: calc(100vh - 2rem);
+  border: 1px solid var(--line);
+  border-radius: 0.86rem;
+  background: #fff;
+  box-shadow: 0 22px 42px rgb(12 18 24 / 0.24);
+  padding: 0.9rem;
+  overflow: auto;
+  display: grid;
+  gap: 0.62rem;
 }
 
-.trail-target-state {
-  position: absolute;
-  right: 0.52rem;
-  top: 1.75rem;
-  transform: translateY(-50%);
-  font-size: 0.66rem;
+.trail-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.trail-dialog-header h3 {
+  margin: 0;
+}
+
+.trail-dialog-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.52rem;
+}
+
+.trail-dialog-grid-secondary {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.trail-target-field {
+  position: relative;
+}
+
+.trail-target-placeholder {
+  display: grid;
+  gap: 0.22rem;
+  font-size: 0.72rem;
   color: var(--muted);
-  pointer-events: none;
+}
+
+.trail-target-placeholder span {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.trail-target-placeholder-value {
+  min-height: 1.9rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: color-mix(in oklab, #fff 92%, #f3f4f6);
+  display: flex;
+  align-items: center;
+  padding: 0.26rem 0.44rem;
+}
+
+.trail-mode-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.64rem;
+  border: 1px solid var(--line);
+  border-radius: 0.66rem;
+  padding: 0.5rem;
+  background: color-mix(in oklab, #fff 92%, oklch(0.9 0.02 95));
+}
+
+.trail-mode-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.32rem;
+  font-size: 0.78rem;
+}
+
+.trail-range-value {
+  font-size: 0.7rem;
+  color: var(--muted);
+  font-family: var(--font-mono);
+}
+
+.trail-inline-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.64rem;
+}
+
+.trail-filter-columns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.62rem;
+}
+
+.trail-filter-column {
+  border: 1px solid var(--line);
+  border-radius: 0.66rem;
+  background: color-mix(in oklab, #fff 95%, oklch(0.9 0.02 95));
+  padding: 0.48rem;
+  display: grid;
+  gap: 0.42rem;
+}
+
+.trail-filter-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.trail-filter-actions {
+  display: inline-flex;
+  gap: 0.25rem;
+}
+
+.trail-filter-actions button {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #fff;
+  font-size: 0.64rem;
+  padding: 0.08rem 0.44rem;
+  cursor: pointer;
+}
+
+.trail-filter-list {
+  max-height: 12rem;
+  overflow: auto;
+  display: grid;
+  gap: 0.24rem;
+  padding-right: 0.22rem;
+}
+
+.trail-filter-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.34rem;
+  font-size: 0.74rem;
+}
+
+.trail-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.4rem;
+}
+
+.trail-dialog-actions button {
+  border: 1px solid var(--line);
+  border-radius: 0.56rem;
+  background: #fff;
+  padding: 0.26rem 0.62rem;
+  cursor: pointer;
+}
+
+.trail-dialog-actions button:disabled {
+  opacity: 0.58;
+  cursor: default;
 }
 
 .graph-target-clear {
@@ -611,8 +774,26 @@ textarea {
 
 .graph-trail-reason,
 .graph-trail-hint {
-  font-size: 0.7rem;
+  font-size: 0.72rem;
   color: var(--muted);
+}
+
+.graph-trail-reason {
+  padding-left: 0.1rem;
+}
+
+.graph-trail-hint {
+  padding-left: 0.1rem;
+}
+
+.trail-target-state {
+  position: absolute;
+  right: 0.52rem;
+  top: 1.9rem;
+  transform: translateY(-50%);
+  font-size: 0.66rem;
+  color: var(--muted);
+  pointer-events: none;
 }
 
 .truncation-pill {
@@ -730,6 +911,42 @@ textarea {
     radial-gradient(circle at 7% 12%, rgb(255 255 255 / 0.7), transparent 30%),
     radial-gradient(circle at 86% 16%, rgb(255 255 255 / 0.38), transparent 34%),
     linear-gradient(180deg, var(--graph-canvas-top), var(--graph-canvas-bottom));
+}
+
+.graph-flow-shell {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.graph-context-menu {
+  position: absolute;
+  z-index: 45;
+  min-width: 12rem;
+  border: 1px solid var(--graph-chrome-border);
+  border-radius: 0.66rem;
+  background: color-mix(in oklab, #fff 90%, var(--graph-chrome-bg));
+  box-shadow: 0 14px 24px rgb(14 20 26 / 0.2);
+  padding: 0.3rem;
+  display: grid;
+  gap: 0.2rem;
+}
+
+.graph-context-menu button {
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 0.5rem;
+  background: transparent;
+  text-align: left;
+  font-size: 0.74rem;
+  padding: 0.24rem 0.42rem;
+  cursor: pointer;
+  color: var(--ink);
+}
+
+.graph-context-menu button:hover {
+  border-color: color-mix(in oklab, var(--graph-chrome-border) 72%, #fff);
+  background: color-mix(in oklab, #fff 68%, var(--graph-chrome-bg));
 }
 
 .sourcetrail-flow .react-flow__renderer {
@@ -1283,18 +1500,21 @@ textarea {
   opacity: 0 !important;
 }
 
-.graph-bundle-count {
+.graph-edge-tooltip {
   position: absolute;
   pointer-events: none;
-  border: 1px solid var(--graph-chrome-border);
-  border-radius: 999px;
-  background: color-mix(in oklab, var(--graph-chrome-bg) 85%, #fff);
-  color: #434a56;
+  border: 1px solid color-mix(in oklab, var(--graph-chrome-border) 88%, #fff);
+  border-radius: 0.42rem;
+  background: color-mix(in oklab, #fff 90%, var(--graph-chrome-bg));
+  color: #3d4650;
   font-family: var(--font-mono);
-  font-size: 0.62rem;
+  font-size: 0.61rem;
   font-weight: 700;
-  padding: 0.03rem 0.34rem;
-  box-shadow: 0 2px 8px rgb(20 24 28 / 0.14);
+  letter-spacing: 0.01em;
+  text-transform: lowercase;
+  white-space: nowrap;
+  padding: 0.08rem 0.42rem;
+  box-shadow: 0 6px 12px rgb(20 24 28 / 0.16);
 }
 
 .graph-handle {
@@ -1539,6 +1759,187 @@ textarea {
   font-weight: 700;
 }
 
+.bookmark-manager-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgb(17 19 22 / 0.42);
+  display: grid;
+  place-items: center;
+  z-index: 65;
+}
+
+.bookmark-manager {
+  width: min(70rem, calc(100vw - 1.6rem));
+  max-height: calc(100vh - 1.6rem);
+  border: 1px solid var(--line);
+  border-radius: 0.86rem;
+  background: #fff;
+  box-shadow: 0 22px 42px rgb(12 18 24 / 0.24);
+  padding: 0.9rem;
+  display: grid;
+  gap: 0.62rem;
+  overflow: auto;
+}
+
+.bookmark-manager-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.bookmark-manager-header h3 {
+  margin: 0;
+}
+
+.bookmark-manager-header button {
+  border: 1px solid var(--line);
+  border-radius: 0.56rem;
+  background: #fff;
+  padding: 0.22rem 0.58rem;
+  cursor: pointer;
+}
+
+.bookmark-manager-columns {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(380px, 1.4fr);
+  gap: 0.62rem;
+  min-height: 0;
+}
+
+.bookmark-section {
+  border: 1px solid var(--line);
+  border-radius: 0.72rem;
+  background: color-mix(in oklab, #fff 94%, oklch(0.9 0.02 95));
+  padding: 0.56rem;
+  display: grid;
+  gap: 0.46rem;
+  min-height: 0;
+}
+
+.bookmark-section h4 {
+  margin: 0;
+  font-size: 0.84rem;
+}
+
+.bookmark-inline-row {
+  display: flex;
+  gap: 0.3rem;
+  align-items: center;
+}
+
+.bookmark-inline-row input,
+.bookmark-inline-row select,
+.bookmark-seed-card textarea,
+.bookmark-item textarea,
+.bookmark-category-row input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: #fff;
+  min-height: 1.85rem;
+  padding: 0.22rem 0.44rem;
+}
+
+.bookmark-inline-row button,
+.bookmark-item button,
+.bookmark-category-row button,
+.bookmark-seed-card button {
+  border: 1px solid var(--line);
+  border-radius: 0.48rem;
+  background: #fff;
+  padding: 0.18rem 0.52rem;
+  cursor: pointer;
+  font-size: 0.72rem;
+}
+
+.bookmark-category-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.26rem;
+}
+
+.bookmark-category-filter button {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #fff;
+  padding: 0.12rem 0.5rem;
+  font-size: 0.68rem;
+  cursor: pointer;
+}
+
+.bookmark-category-filter .bookmark-active {
+  border-color: color-mix(in oklab, var(--focus) 45%, var(--line));
+  background: color-mix(in oklab, #fff 80%, oklch(0.88 0.05 219));
+}
+
+.bookmark-list {
+  display: grid;
+  gap: 0.34rem;
+  overflow: auto;
+  min-height: 0;
+}
+
+.bookmark-category-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 0.24rem;
+}
+
+.bookmark-seed-card {
+  border: 1px solid var(--line);
+  border-radius: 0.62rem;
+  background: #fff;
+  padding: 0.5rem;
+  display: grid;
+  gap: 0.34rem;
+}
+
+.bookmark-seed-title {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-family: var(--font-mono);
+}
+
+.bookmark-seed-label {
+  font-weight: 700;
+  font-size: 0.84rem;
+}
+
+.bookmark-item {
+  border: 1px solid var(--line);
+  border-radius: 0.62rem;
+  background: #fff;
+  padding: 0.46rem;
+  display: grid;
+  gap: 0.3rem;
+}
+
+.bookmark-node-link {
+  border: none;
+  background: transparent;
+  text-align: left;
+  padding: 0;
+  color: color-mix(in oklab, var(--ink) 90%, #08203b);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.bookmark-node-link:hover {
+  text-decoration: underline;
+}
+
+.bookmark-empty {
+  border: 1px dashed var(--line);
+  border-radius: 0.56rem;
+  background: #fff;
+  color: var(--muted);
+  padding: 0.7rem;
+  text-align: center;
+  font-size: 0.76rem;
+}
+
 @media (max-width: 700px) {
   .explorer-toolbar-row {
     font-size: 0.72rem;
@@ -1566,5 +1967,15 @@ textarea {
 
   .graph-trail-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .trail-dialog-grid,
+  .trail-dialog-grid-secondary,
+  .trail-filter-columns {
+    grid-template-columns: 1fr;
+  }
+
+  .bookmark-manager-columns {
+    grid-template-columns: 1fr;
   }
 }

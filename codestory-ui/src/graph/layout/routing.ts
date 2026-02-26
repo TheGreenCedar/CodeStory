@@ -1,12 +1,14 @@
 import { MarkerType, Position, type Edge, type Node } from "@xyflow/react";
 
-import type { EdgeKind, GraphResponse } from "../../generated/api";
+import type { EdgeKind, GraphResponse, LayoutDirection } from "../../generated/api";
+import { PARITY_CONSTANTS } from "./parityConstants";
 import type {
   FlowNodeData,
   LayoutElements,
   LegendRow,
   RoutePoint,
   RouteKind,
+  RoutedEdgeSpec,
   SemanticEdgeFamily,
 } from "./types";
 
@@ -18,13 +20,23 @@ type EdgePalette = {
 export type SemanticEdgeData = {
   edgeKind: EdgeKind;
   sourceEdgeIds: string[];
+  certainty: string | null | undefined;
   routeKind: RouteKind;
   family: SemanticEdgeFamily;
   bundleCount: number;
   routePoints: RoutePoint[];
   trunkCoord?: number;
   channelId?: string;
+  channelPairId?: string;
   channelWeight?: number;
+  sharedTrunkPoints?: RoutePoint[];
+  sourceMemberOrder?: number;
+  targetMemberOrder?: number;
+  layoutDirection?: LayoutDirection;
+  channelSourceEdgeIds?: string[];
+  tooltipLabel?: string;
+  isFocused?: boolean;
+  isHovered?: boolean;
 };
 
 export const EDGE_STYLE: Record<EdgeKind, EdgePalette> = {
@@ -43,15 +55,27 @@ export const EDGE_STYLE: Record<EdgeKind, EdgePalette> = {
   UNKNOWN: { stroke: "#8b8f96", width: 2.4 },
 };
 
-const OPEN_ARROW_KINDS = new Set<EdgeKind>([
+const CLOSED_TRIANGLE_KINDS = new Set<EdgeKind>([
   "INHERITANCE",
-  "OVERRIDE",
   "TYPE_ARGUMENT",
   "TEMPLATE_SPECIALIZATION",
 ]);
 
 function markerTypeFor(kind: EdgeKind): MarkerType {
-  return OPEN_ARROW_KINDS.has(kind) ? MarkerType.Arrow : MarkerType.ArrowClosed;
+  return CLOSED_TRIANGLE_KINDS.has(kind) ? MarkerType.ArrowClosed : MarkerType.Arrow;
+}
+
+function markerSizeFor(edge: RoutedEdgeSpec): { width: number; height: number } {
+  if (edge.kind === "INHERITANCE") {
+    return PARITY_CONSTANTS.markers.inheritance;
+  }
+  if (edge.kind === "TEMPLATE_SPECIALIZATION") {
+    return PARITY_CONSTANTS.markers.templateSpecialization;
+  }
+  if (edge.routeKind === "flow-trunk" || edge.bundleCount > 1) {
+    return PARITY_CONSTANTS.markers.bundled;
+  }
+  return PARITY_CONSTANTS.markers.default;
 }
 
 function certaintyStroke(
@@ -61,21 +85,43 @@ function certaintyStroke(
   dash?: string;
   opacity: number;
 } {
-  const hierarchyOpacityBias = family === "hierarchy" ? 0.14 : 0;
+  const certaintyProfile = PARITY_CONSTANTS.rendering.certainty;
+  const hierarchyOpacityBias = family === "hierarchy" ? certaintyProfile.hierarchyOpacityBias : 0;
   const normalized = certainty?.toLowerCase();
   if (normalized === "uncertain") {
-    return { dash: "6 5", opacity: Math.min(1, 0.85 + hierarchyOpacityBias) };
+    return {
+      dash: certaintyProfile.uncertainDash,
+      opacity: Math.min(1, certaintyProfile.uncertainOpacity + hierarchyOpacityBias),
+    };
   }
   if (normalized === "probable") {
-    return { opacity: Math.min(1, 0.95 + hierarchyOpacityBias) };
+    return { opacity: Math.min(1, certaintyProfile.probableOpacity + hierarchyOpacityBias) };
   }
   return { opacity: 1 };
 }
 
-function edgeWidth(baseWidth: number, multiplicity: number, family: SemanticEdgeFamily): number {
-  const multiplicityBoost = Math.min(0.72, Math.max(0, multiplicity - 1) * 0.15);
-  const hierarchyBoost = family === "hierarchy" ? 0.2 : 0;
-  return baseWidth + multiplicityBoost + hierarchyBoost;
+function edgeWidth(
+  baseWidth: number,
+  multiplicity: number,
+  family: SemanticEdgeFamily,
+  routeKind: RouteKind,
+  bundleCount: number,
+): number {
+  const strokeAmplification = PARITY_CONSTANTS.rendering.strokeAmplification;
+  const multiplicityBoost = Math.min(
+    strokeAmplification.multiplicityMaxBoost,
+    Math.max(0, multiplicity - 1) * strokeAmplification.multiplicityStep,
+  );
+  const hierarchyBoost = family === "hierarchy" ? strokeAmplification.hierarchyBoost : 0;
+  const bundledWeight = Math.max(1, bundleCount);
+  const bundledBoost =
+    routeKind === "flow-trunk" && bundledWeight > 1
+      ? Math.min(
+          strokeAmplification.bundledMaxBoost,
+          Math.log2(bundledWeight) * strokeAmplification.bundledLogMultiplier,
+        )
+      : 0;
+  return baseWidth + multiplicityBoost + hierarchyBoost + bundledBoost;
 }
 
 export function buildLegendRows(graph: GraphResponse): LegendRow[] {
@@ -108,19 +154,23 @@ export function buildLegendRows(graph: GraphResponse): LegendRow[] {
   );
 }
 
-export function toReactFlowElements(layout: LayoutElements): {
+export function toReactFlowElements(
+  layout: LayoutElements,
+  layoutDirection: LayoutDirection = "Horizontal",
+): {
   nodes: Node<FlowNodeData>[];
   edges: Edge<SemanticEdgeData>[];
   centerNodeId: string;
 } {
+  const horizontal = layoutDirection !== "Vertical";
   const nodes: Node<FlowNodeData>[] = layout.nodes.map((node) => ({
     width: node.width,
     height: node.height,
     id: node.id,
     type: "sourcetrail",
     position: { x: node.x, y: node.y },
-    sourcePosition: Position.Right,
-    targetPosition: Position.Left,
+    sourcePosition: horizontal ? Position.Right : Position.Bottom,
+    targetPosition: horizontal ? Position.Left : Position.Top,
     draggable: false,
     selectable: !node.isVirtualBundle,
     focusable: !node.isVirtualBundle,
@@ -129,6 +179,7 @@ export function toReactFlowElements(layout: LayoutElements): {
       label: node.label,
       center: node.center,
       nodeStyle: node.nodeStyle,
+      layoutDirection,
       isNonIndexed: node.isNonIndexed,
       duplicateCount: node.duplicateCount,
       mergedSymbolIds: node.mergedSymbolIds,
@@ -143,12 +194,11 @@ export function toReactFlowElements(layout: LayoutElements): {
   const edges: Edge<SemanticEdgeData>[] = layout.edges.map((edge) => {
     const palette = EDGE_STYLE[edge.kind] ?? EDGE_STYLE.UNKNOWN;
     const certainty = certaintyStroke(edge.certainty, edge.family);
-    const hierarchyEdge = edge.family === "hierarchy";
-    const markerSize = hierarchyEdge ? 14 : 13;
+    const markerSize = markerSizeFor(edge);
     const markerEnd = {
       type: markerTypeFor(edge.kind),
-      width: markerSize,
-      height: markerSize,
+      width: markerSize.width,
+      height: markerSize.height,
       color: palette.stroke,
     };
     return {
@@ -162,22 +212,43 @@ export function toReactFlowElements(layout: LayoutElements): {
       markerEnd,
       style: {
         stroke: palette.stroke,
-        strokeWidth: edgeWidth(palette.width, edge.multiplicity, edge.family),
-        strokeLinecap: "butt",
+        strokeWidth: edgeWidth(
+          palette.width,
+          edge.multiplicity,
+          edge.family,
+          edge.routeKind,
+          edge.bundleCount,
+        ),
         strokeDasharray: certainty.dash,
         opacity: certainty.opacity,
       },
-      interactionWidth: edge.routeKind === "flow-trunk" ? 24 : hierarchyEdge ? 20 : 18,
+      interactionWidth:
+        edge.routeKind === "flow-trunk"
+          ? PARITY_CONSTANTS.rendering.interactionWidth.bundledBase +
+            Math.min(
+              PARITY_CONSTANTS.rendering.interactionWidth.bundledMaxExtra,
+              Math.log2(Math.max(1, edge.bundleCount)) *
+                PARITY_CONSTANTS.rendering.interactionWidth.bundledScale,
+            )
+          : edge.family === "hierarchy"
+            ? PARITY_CONSTANTS.rendering.interactionWidth.hierarchy
+            : PARITY_CONSTANTS.rendering.interactionWidth.default,
       data: {
         edgeKind: edge.kind,
         sourceEdgeIds: edge.sourceEdgeIds,
+        certainty: edge.certainty,
         routeKind: edge.routeKind,
         family: edge.family,
         bundleCount: edge.bundleCount,
         routePoints: edge.routePoints,
         trunkCoord: edge.trunkCoord,
         channelId: edge.channelId,
+        channelPairId: edge.channelPairId,
         channelWeight: edge.channelWeight,
+        sharedTrunkPoints: edge.sharedTrunkPoints,
+        sourceMemberOrder: edge.sourceMemberOrder,
+        targetMemberOrder: edge.targetMemberOrder,
+        layoutDirection,
       },
     };
   });

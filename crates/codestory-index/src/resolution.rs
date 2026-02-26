@@ -461,14 +461,13 @@ impl ResolutionPass {
                 if selected.is_some() {
                     break;
                 }
-                if let Some(prefix) = caller_prefix.as_ref() {
-                    if let Some(candidate) =
+                if let Some(prefix) = caller_prefix.as_ref()
+                    && let Some(candidate) =
                         candidate_index.find_same_module(&prefix.0, prefix.1, name)
-                    {
-                        record_candidate(&mut candidate_ids, candidate);
-                        if !candidate_index.is_same_file_candidate(candidate, file_id) {
-                            selected = Some((candidate, self.policy.import_same_module));
-                        }
+                {
+                    record_candidate(&mut candidate_ids, candidate);
+                    if !candidate_index.is_same_file_candidate(candidate, file_id) {
+                        selected = Some((candidate, self.policy.import_same_module));
                     }
                 }
             }
@@ -523,7 +522,7 @@ impl ResolutionPass {
         apply_resolution_updates(conn, &updates)?;
         Ok(resolved)
     }
-
+    #[warn(clippy::too_many_arguments)]
     fn semantic_candidates_for_edge(
         &self,
         conn: &rusqlite::Connection,

@@ -3,6 +3,7 @@ import { type Monaco, type OnMount } from "@monaco-editor/react";
 
 import { api } from "./api/client";
 import type { PendingSymbolFocus, PersistedLayout } from "./app/types";
+import { BookmarkManager } from "./components/BookmarkManager";
 import { CodePane, type CodeEdgeContext } from "./components/CodePane";
 import { GraphPane } from "./components/GraphPane";
 import { PendingFocusDialog } from "./components/PendingFocusDialog";
@@ -95,6 +96,9 @@ export default function App() {
   );
   const [isBusy, setIsBusy] = useState<boolean>(false);
   const [projectOpen, setProjectOpen] = useState<boolean>(false);
+  const [projectRevision, setProjectRevision] = useState<number>(0);
+  const [bookmarkManagerOpen, setBookmarkManagerOpen] = useState<boolean>(false);
+  const [bookmarkSeed, setBookmarkSeed] = useState<{ nodeId: string; label: string } | null>(null);
 
   const searchSeqRef = useRef<number>(0);
   const queuedAutoIndexRef = useRef<boolean>(false);
@@ -369,6 +373,72 @@ export default function App() {
     [upsertGraph],
   );
 
+  const openNeighborhoodInNewTab = useCallback(
+    async (nodeId: string, title: string) => {
+      try {
+        const graph = await api.graphNeighborhood({ center_id: nodeId, max_edges: 260 });
+        upsertGraph(
+          {
+            kind: "uml",
+            id: `explore-${nodeId}-${Date.now()}`,
+            title: `Neighborhood: ${title}`,
+            graph,
+          },
+          true,
+        );
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : "Failed to open graph in new tab.");
+      }
+    },
+    [upsertGraph],
+  );
+
+  const navigateGraphBack = useCallback(() => {
+    if (!activeGraphId) {
+      return;
+    }
+    const index = graphOrder.indexOf(activeGraphId);
+    if (index < 0) {
+      return;
+    }
+    const next = graphOrder[index + 1];
+    if (next) {
+      setActiveGraphId(next);
+    }
+  }, [activeGraphId, graphOrder]);
+
+  const navigateGraphForward = useCallback(() => {
+    if (!activeGraphId) {
+      return;
+    }
+    const index = graphOrder.indexOf(activeGraphId);
+    if (index <= 0) {
+      return;
+    }
+    const next = graphOrder[index - 1];
+    if (next) {
+      setActiveGraphId(next);
+    }
+  }, [activeGraphId, graphOrder]);
+
+  const showDefinitionInIde = useCallback(async (nodeId: string) => {
+    try {
+      const response = await api.openDefinition({ node_id: nodeId });
+      setStatus(response.message);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Failed to open definition in IDE.");
+    }
+  }, []);
+
+  const openContainingFolder = useCallback(async (path: string) => {
+    try {
+      const response = await api.openContainingFolder({ path });
+      setStatus(response.message);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Failed to open containing folder.");
+    }
+  }, []);
+
   const updateTrailConfig = useCallback((patch: Partial<TrailUiConfig>) => {
     setTrailConfig((prev) => ({
       ...prev,
@@ -634,6 +704,7 @@ export default function App() {
         }
         setStatus(restored ? `Restored project: ${summary.root}` : `Project open: ${summary.root}`);
         setProjectOpen(true);
+        setProjectRevision((previous) => previous + 1);
         setTrailConfig(defaultTrailUiConfig());
         await loadRootSymbols();
 
@@ -813,6 +884,14 @@ export default function App() {
 
   const handleSearchKeyDown = useCallback(
     (event: KeyboardEvent<HTMLInputElement>) => {
+      if (event.key === "Enter" && searchQuery.trim().toLowerCase() === "legend") {
+        event.preventDefault();
+        updateTrailConfig({ showLegend: true });
+        setSearchOpen(false);
+        setStatus("Legend opened.");
+        return;
+      }
+
       if (event.key === "ArrowDown") {
         event.preventDefault();
         if (searchHits.length > 0) {
@@ -847,7 +926,7 @@ export default function App() {
         setSearchOpen(false);
       }
     },
-    [activateSearchHit, searchHits, searchIndex],
+    [activateSearchHit, searchHits, searchIndex, searchQuery, updateTrailConfig],
   );
 
   const handleEditorMount = useCallback<OnMount>((editor, monaco) => {
@@ -1022,6 +1101,7 @@ export default function App() {
           onSearchHitHover={setSearchIndex}
           onSearchHitActivate={activateSearchHit}
           projectOpen={projectOpen}
+          projectRevision={projectRevision}
           graphOrder={graphOrder}
           activeGraphId={activeGraphId}
           graphMap={graphMap}
@@ -1036,6 +1116,32 @@ export default function App() {
           trailRunning={isTrailRunning}
           trailDisabledReason={trailDisabledReason}
           hasActiveRoot={Boolean(activeNodeDetails?.id)}
+          activeRootLabel={activeNodeDetails?.display_name ?? null}
+          onOpenNodeInNewTab={(nodeId, label) => {
+            void openNeighborhoodInNewTab(nodeId, label);
+          }}
+          onNavigateBack={navigateGraphBack}
+          onNavigateForward={navigateGraphForward}
+          onShowDefinitionInIde={(nodeId) => {
+            void showDefinitionInIde(nodeId);
+          }}
+          onBookmarkNode={(nodeId, label) => {
+            setBookmarkSeed({ nodeId, label });
+            setBookmarkManagerOpen(true);
+          }}
+          onOpenContainingFolder={(path) => {
+            void openContainingFolder(path);
+          }}
+          onOpenBookmarkManager={() => {
+            if (activeNodeDetails?.id) {
+              setBookmarkSeed({
+                nodeId: activeNodeDetails.id,
+                label: activeNodeDetails.display_name,
+              });
+            }
+            setBookmarkManagerOpen(true);
+          }}
+          onGraphStatusMessage={setStatus}
           onTrailConfigChange={updateTrailConfig}
           onRunTrail={() => {
             void runTrail();
@@ -1069,6 +1175,17 @@ export default function App() {
           onEditorMount={handleEditorMount}
         />
       </main>
+
+      <BookmarkManager
+        open={bookmarkManagerOpen}
+        seed={bookmarkSeed}
+        onClose={() => setBookmarkManagerOpen(false)}
+        onFocusSymbol={(nodeId, label) => {
+          setBookmarkManagerOpen(false);
+          focusSymbol(nodeId, label);
+        }}
+        onStatus={setStatus}
+      />
 
       <PendingFocusDialog pendingFocus={pendingFocus} onResolve={resolvePendingFocus} />
     </div>

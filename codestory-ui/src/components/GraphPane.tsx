@@ -1,4 +1,4 @@
-import type { KeyboardEvent } from "react";
+import { useState, type KeyboardEvent } from "react";
 
 import { GraphTrailControls } from "./GraphTrailControls";
 import { GraphViewport, type GraphEdgeSelection } from "../graph/GraphViewport";
@@ -20,6 +20,7 @@ type GraphPaneProps = {
   onSearchHitHover: (index: number) => void;
   onSearchHitActivate: (hit: SearchHit) => void;
   projectOpen: boolean;
+  projectRevision: number;
   graphOrder: string[];
   activeGraphId: string | null;
   graphMap: Record<string, GraphArtifactDto>;
@@ -30,6 +31,15 @@ type GraphPaneProps = {
   trailRunning: boolean;
   trailDisabledReason: string | null;
   hasActiveRoot: boolean;
+  activeRootLabel: string | null;
+  onOpenNodeInNewTab?: (nodeId: string, label: string) => void;
+  onNavigateBack?: () => void;
+  onNavigateForward?: () => void;
+  onShowDefinitionInIde?: (nodeId: string) => void;
+  onBookmarkNode?: (nodeId: string, label: string) => void;
+  onOpenContainingFolder?: (path: string) => void;
+  onOpenBookmarkManager?: () => void;
+  onGraphStatusMessage?: (message: string) => void;
   onTrailConfigChange: (patch: Partial<TrailUiConfig>) => void;
   onRunTrail: () => void;
   onResetTrailDefaults: () => void;
@@ -50,6 +60,7 @@ export function GraphPane({
   onSearchHitHover,
   onSearchHitActivate,
   projectOpen,
+  projectRevision,
   graphOrder,
   activeGraphId,
   graphMap,
@@ -60,10 +71,21 @@ export function GraphPane({
   trailRunning,
   trailDisabledReason,
   hasActiveRoot,
+  activeRootLabel,
+  onOpenNodeInNewTab,
+  onNavigateBack,
+  onNavigateForward,
+  onShowDefinitionInIde,
+  onBookmarkNode,
+  onOpenContainingFolder,
+  onOpenBookmarkManager,
+  onGraphStatusMessage,
   onTrailConfigChange,
   onRunTrail,
   onResetTrailDefaults,
 }: GraphPaneProps) {
+  const [trailDialogOpen, setTrailDialogOpen] = useState<boolean>(false);
+
   return (
     <section className="pane pane-graph">
       <div className="pane-header graph-header">
@@ -115,9 +137,14 @@ export function GraphPane({
       <GraphTrailControls
         config={trailConfig}
         projectOpen={projectOpen}
+        projectRevision={projectRevision}
         hasRootSymbol={hasActiveRoot}
+        rootSymbolLabel={activeRootLabel}
         disabledReason={trailDisabledReason}
         isRunning={trailRunning}
+        dialogOpen={trailDialogOpen}
+        onDialogOpenChange={setTrailDialogOpen}
+        onOpenBookmarkManager={onOpenBookmarkManager}
         onConfigChange={onTrailConfigChange}
         onRunTrail={onRunTrail}
         onResetDefaults={onResetTrailDefaults}
@@ -129,6 +156,14 @@ export function GraphPane({
           onSelectEdge={onSelectEdge}
           trailConfig={trailConfig}
           onToggleLegend={() => onTrailConfigChange({ showLegend: !trailConfig.showLegend })}
+          onOpenNodeInNewTab={onOpenNodeInNewTab}
+          onNavigateBack={onNavigateBack}
+          onNavigateForward={onNavigateForward}
+          onShowDefinitionInIde={onShowDefinitionInIde}
+          onBookmarkNode={onBookmarkNode}
+          onOpenContainingFolder={onOpenContainingFolder}
+          onRequestOpenTrailDialog={() => setTrailDialogOpen(true)}
+          onStatusMessage={onGraphStatusMessage}
         />
       </div>
     </section>

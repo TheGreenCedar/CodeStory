@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "predev": "npm run generate:types",
-    "dev:server": "cargo run -p codestory-server --manifest-path ../Cargo.toml -- --project ..",
+    "dev:server": "cargo run -p codestory-server --manifest-path ../Cargo.toml -- --project C:\\Users\\alber\\source\\repos\\codestory",
     "dev:all": "npm-run-all --parallel dev:server dev",
     "build": "vite build",
     "prebuild": "npm run generate:types",
@@ -17,17 +17,22 @@
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "check": "npm-run-all --parallel typecheck lint format:check",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:parity": "npm-run-all test:parity:geometry test:parity:visual",
+    "test:parity:geometry": "vitest run tests/graph/parityProfile.test.ts tests/graph/parityPipeline.test.ts tests/graph/parityRouting.test.ts tests/graph/edgePath.test.ts",
+    "test:parity:visual": "playwright test -c playwright.config.ts tests/graph/parity-trail.spec.ts"
   },
   "dependencies": {
     "@monaco-editor/react": "4.7.0",
-    "@xyflow/react": "12.9.0",
-    "mermaid": "11.12.1",
-    "monaco-editor": "0.52.2",
+    "@xyflow/react": "12.10.1",
+    "html-to-image": "^1.11.13",
+    "mermaid": "11.12.3",
+    "monaco-editor": "0.55.1",
     "react": "19.2.4",
     "react-dom": "19.2.4"
   },
   "devDependencies": {
+    "@playwright/test": "^1.56.1",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@types/react": "19.2.2",

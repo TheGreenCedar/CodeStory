@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   BaseEdge,
   Controls,
@@ -14,15 +14,16 @@ import {
   type NodeProps,
   type ReactFlowInstance,
 } from "@xyflow/react";
+import { toBlob, toJpeg, toPng, toSvg } from "html-to-image";
 import mermaid from "mermaid";
 
 import type { EdgeKind, GraphArtifactDto } from "../generated/api";
-import { applyAdaptiveBundling } from "./layout/bundling";
-import { routeEdgesWithObstacles } from "./layout/obstacleRouting";
+import { buildEdgePath } from "./render/edgePath";
+import { runDeterministicParityPipeline } from "./layout/parityPipeline";
 import { buildFallbackLayout, buildSemanticLayout } from "./layout/semanticLayout";
 import { buildLegendRows, toReactFlowElements, type SemanticEdgeData } from "./layout/routing";
 import type { GroupingMode, TrailUiConfig } from "./trailConfig";
-import type { FlowNodeData } from "./layout/types";
+import { STRUCTURAL_KINDS, type FlowNodeData, type LayoutElements } from "./layout/types";
 
 mermaid.initialize({
   startOnLoad: false,
@@ -77,6 +78,27 @@ function formatKindLabel(kind: string): string {
     .split("_")
     .map((segment) => `${segment.slice(0, 1).toUpperCase()}${segment.slice(1)}`)
     .join(" ");
+}
+
+function isUncertainEdge(certainty: string | null | undefined): boolean {
+  return certainty?.toLowerCase() === "uncertain";
+}
+
+function edgeTooltipLabel(
+  data: SemanticEdgeData | undefined,
+  bundledCount: number,
+): string | undefined {
+  if (!data?.edgeKind) {
+    return undefined;
+  }
+  let label = formatKindLabel(data.edgeKind);
+  if (bundledCount > 1) {
+    label = `${label} (${bundledCount} edges)`;
+  }
+  if (isUncertainEdge(data.certainty)) {
+    label = `ambiguous ${label}`;
+  }
+  return label;
 }
 
 const SIMPLE_TYPE_PILL_LABELS = new Set([
@@ -319,6 +341,12 @@ function applyGrouping(
     const groupId = `group:${key}`;
     const groupWidth = maxX - minX + GROUP_PADDING_X * 2;
     const groupHeight = maxY - minY + GROUP_PADDING_Y * 2 + GROUP_HEADER_HEIGHT;
+    const layoutDirection = bucket.nodes[0]?.data.layoutDirection ?? "Horizontal";
+    const preferredAnchor =
+      bucket.nodes.find((node) => node.data.kind === "FILE") ??
+      bucket.nodes.find((node) => STRUCTURAL_KINDS.has(node.data.kind)) ??
+      bucket.nodes[0];
+    const groupAnchorId = preferredAnchor?.id;
 
     groupedNodes.push({
       id: groupId,
@@ -329,12 +357,14 @@ function applyGrouping(
         label: bucket.label,
         center: false,
         nodeStyle: "card",
+        layoutDirection,
         duplicateCount: 1,
         memberCount: 0,
         members: [],
         isVirtualBundle: true,
         groupMode: groupingMode,
         groupLabel: bucket.label,
+        groupAnchorId,
       },
       style: {
         width: groupWidth,
@@ -362,135 +392,29 @@ function applyGrouping(
   return [...groupedNodes, ...childNodes, ...passthrough];
 }
 
-function orthogonalPath(points: Array<{ x: number; y: number }>): string {
-  if (points.length === 0) {
-    return "";
-  }
-  const [first, ...rest] = points;
-  if (!first) {
-    return "";
-  }
-
-  let path = `M ${first.x} ${first.y}`;
-  for (const point of rest) {
-    path += ` L ${point.x} ${point.y}`;
-  }
-  return path;
-}
-
-function hash32(value: string): number {
-  let hash = 2166136261;
-  for (let idx = 0; idx < value.length; idx += 1) {
-    hash ^= value.charCodeAt(idx);
-    hash = Math.imul(hash, 16777619);
-  }
-  return hash >>> 0;
-}
-
-function laneOffsetFromEdgeId(edgeId: string, step: number, radius: number): number {
-  const slots = radius * 2 + 1;
-  const slot = hash32(edgeId) % slots;
-  return (slot - radius) * step;
-}
-
-function clampedElbowX(sourceX: number, targetX: number, desiredX: number, gutter = 10): number {
-  if (targetX >= sourceX) {
-    const min = sourceX + gutter;
-    const max = Math.max(min, targetX - gutter);
-    return Math.min(max, Math.max(min, desiredX));
-  }
-
-  const max = sourceX - gutter;
-  const min = Math.min(max, targetX + gutter);
-  return Math.max(min, Math.min(max, desiredX));
-}
-
-function buildEdgePath(
-  edgeId: string,
-  sourceX: number,
-  sourceY: number,
-  targetX: number,
-  targetY: number,
-  data: SemanticEdgeData | undefined,
-): { path: string; labelX: number; labelY: number } {
-  const r = 14;
-
-  const makeRoundedOrthogonal = (points: Array<{ x: number; y: number }>) => {
-    if (points.length < 3) return orthogonalPath(points);
-    const firstPoint = points[0]!;
-    let path = `M ${firstPoint.x} ${firstPoint.y}`;
-    for (let i = 1; i < points.length - 1; i++) {
-      const prev = points[i - 1]!;
-      const curr = points[i]!;
-      const next = points[i + 1]!;
-
-      // Calculate the distances to check if we have enough room for the radius
-      const dist1 = Math.sqrt((curr.x - prev.x) ** 2 + (curr.y - prev.y) ** 2);
-      const dist2 = Math.sqrt((next.x - curr.x) ** 2 + (next.y - curr.y) ** 2);
-      const radius = Math.min(r, dist1 / 2, dist2 / 2);
-
-      // Directions
-      const dir1X = Math.sign(curr.x - prev.x);
-      const dir1Y = Math.sign(curr.y - prev.y);
-      const dir2X = Math.sign(next.x - curr.x);
-      const dir2Y = Math.sign(next.y - curr.y);
-
-      // Arc start and end points
-      const arcStartX = curr.x - dir1X * radius;
-      const arcStartY = curr.y - dir1Y * radius;
-      const arcEndX = curr.x + dir2X * radius;
-      const arcEndY = curr.y + dir2Y * radius;
-
-      // Determine sweep flag based on cross product
-      const crossProduct = dir1X * dir2Y - dir1Y * dir2X;
-      const sweepFlag = crossProduct > 0 ? 1 : 0;
-
-      path += ` L ${arcStartX} ${arcStartY} A ${radius} ${radius} 0 0 ${sweepFlag} ${arcEndX} ${arcEndY}`;
+function buildChannelSourceEdgeIds(edges: Edge<SemanticEdgeData>[]): Map<string, string[]> {
+  const byChannel = new Map<string, Set<string>>();
+  for (const edge of edges) {
+    const channelId = edge.data?.channelId;
+    if (!channelId) {
+      continue;
     }
-    const last = points[points.length - 1]!;
-    path += ` L ${last.x} ${last.y}`;
-    return path;
-  };
-  const routedPoints = data?.routePoints ?? [];
-  if (routedPoints.length >= 2) {
-    const points = routedPoints.map((point) => ({ ...point }));
-    points[0] = { x: sourceX, y: sourceY };
-    points[points.length - 1] = { x: targetX, y: targetY };
-    const path = makeRoundedOrthogonal(points);
-    const mid = points[Math.floor(points.length / 2)] ?? {
-      x: (sourceX + targetX) / 2,
-      y: (sourceY + targetY) / 2,
-    };
-    return { path, labelX: mid.x, labelY: mid.y };
+    const sourceEdgeIds =
+      edge.data?.sourceEdgeIds && edge.data.sourceEdgeIds.length > 0
+        ? edge.data.sourceEdgeIds
+        : [edge.id];
+    const existing = byChannel.get(channelId) ?? new Set<string>();
+    for (const sourceEdgeId of sourceEdgeIds) {
+      existing.add(sourceEdgeId);
+    }
+    byChannel.set(channelId, existing);
   }
 
-  const routeKind = data?.routeKind ?? "direct";
-  const laneSpanY = Math.abs(targetY - sourceY);
-  const laneOffset = laneSpanY > 20 ? laneOffsetFromEdgeId(edgeId, 8, 5) : 0;
-  if (routeKind === "flow-trunk" || routeKind === "flow-branch") {
-    const trunkCoord = data?.trunkCoord ?? (sourceX + targetX) / 2;
-    const elbowX = clampedElbowX(sourceX, targetX, trunkCoord, 42);
-    const path = makeRoundedOrthogonal([
-      { x: sourceX, y: sourceY },
-      { x: elbowX, y: sourceY },
-      { x: elbowX, y: targetY },
-      { x: targetX, y: targetY },
-    ]);
-    return { path, labelX: elbowX, labelY: (sourceY + targetY) / 2 };
-  }
-
-  const midX = (sourceX + targetX) / 2 + laneOffset;
-  const path = makeRoundedOrthogonal([
-    { x: sourceX, y: sourceY },
-    { x: midX, y: sourceY },
-    { x: midX, y: targetY },
-    { x: targetX, y: targetY },
-  ]);
-  return { path, labelX: midX, labelY: (sourceY + targetY) / 2 };
+  return new Map([...byChannel.entries()].map(([channelId, ids]) => [channelId, [...ids]]));
 }
 
 function SemanticEdge({
-  id,
+  id: _id,
   sourceX,
   sourceY,
   targetX,
@@ -499,21 +423,21 @@ function SemanticEdge({
   style,
   data,
 }: EdgeProps<Edge<SemanticEdgeData>>) {
-  const { path, labelX, labelY } = buildEdgePath(id, sourceX, sourceY, targetX, targetY, data);
-  const bundleCount = data?.bundleCount ?? 1;
+  const { path, labelX, labelY } = buildEdgePath(sourceX, sourceY, targetX, targetY, data);
+  const showTooltip = Boolean(data?.tooltipLabel) && (data?.isHovered || data?.isFocused);
 
   return (
     <>
-      <BaseEdge id={id} path={path} markerEnd={markerEnd} style={style} />
-      {bundleCount > 1 ? (
+      <BaseEdge id={_id} path={path} markerEnd={markerEnd} style={style} />
+      {showTooltip ? (
         <EdgeLabelRenderer>
           <div
-            className="graph-bundle-count"
+            className="graph-edge-tooltip"
             style={{
               transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
             }}
           >
-            {bundleCount}
+            {data?.tooltipLabel}
           </div>
         </EdgeLabelRenderer>
       ) : null}
@@ -522,8 +446,14 @@ function SemanticEdge({
 }
 
 function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
-  const [manuallyExpanded, setManuallyExpanded] = useState(false);
   const isSelected = selected || data.isSelected === true;
+  const horizontal = data.layoutDirection !== "Vertical";
+  const targetNodePosition = horizontal ? Position.Left : Position.Top;
+  const sourceNodePosition = horizontal ? Position.Right : Position.Bottom;
+  const sourceSecondaryPosition = horizontal ? Position.Top : Position.Right;
+  const targetSecondaryPosition = horizontal ? Position.Bottom : Position.Left;
+  const targetMemberPosition = horizontal ? Position.Left : Position.Top;
+  const sourceMemberPosition = horizontal ? Position.Right : Position.Bottom;
 
   if (data.nodeStyle === "bundle") {
     return (
@@ -532,25 +462,25 @@ function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
           id="target-node-left"
           className="graph-handle graph-bundle-handle"
           type="target"
-          position={Position.Left}
+          position={targetNodePosition}
         />
         <Handle
           id="source-node-right"
           className="graph-handle graph-bundle-handle"
           type="source"
-          position={Position.Right}
+          position={sourceNodePosition}
         />
         <Handle
           id="source-node-top"
           className="graph-handle graph-bundle-handle"
           type="source"
-          position={Position.Top}
+          position={sourceSecondaryPosition}
         />
         <Handle
           id="target-node-bottom"
           className="graph-handle graph-bundle-handle"
           type="target"
-          position={Position.Bottom}
+          position={targetSecondaryPosition}
         />
       </div>
     );
@@ -574,25 +504,25 @@ function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
           id="target-node"
           className="graph-handle graph-handle-target"
           type="target"
-          position={Position.Left}
+          position={targetNodePosition}
         />
         <Handle
           id="source-node"
           className="graph-handle graph-handle-source"
           type="source"
-          position={Position.Right}
+          position={sourceNodePosition}
         />
         <Handle
           id="source-node-top"
           className="graph-handle graph-handle-top"
           type="source"
-          position={Position.Top}
+          position={sourceSecondaryPosition}
         />
         <Handle
           id="target-node-bottom"
           className="graph-handle graph-handle-bottom"
           type="target"
-          position={Position.Bottom}
+          position={targetSecondaryPosition}
         />
         <span>{data.label}</span>
         {data.duplicateCount > 1 ? (
@@ -608,7 +538,7 @@ function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
   }
 
   const canToggleMembers = data.members.length > MAX_VISIBLE_MEMBERS_PER_NODE;
-  const showAllMembers = data.center || isSelected || manuallyExpanded || !canToggleMembers;
+  const showAllMembers = data.center || isSelected || data.isExpanded === true || !canToggleMembers;
   const visibleMembers = showAllMembers
     ? data.members
     : data.members.slice(0, MAX_VISIBLE_MEMBERS_PER_NODE);
@@ -617,7 +547,9 @@ function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
     : data.members.slice(MAX_VISIBLE_MEMBERS_PER_NODE);
   const hiddenMembers = data.members.length - visibleMembers.length;
   const publicMembers = visibleMembers.filter((member) => member.visibility === "public");
+  const protectedMembers = visibleMembers.filter((member) => member.visibility === "protected");
   const privateMembers = visibleMembers.filter((member) => member.visibility === "private");
+  const defaultMembers = visibleMembers.filter((member) => member.visibility === "default");
   const countTitle =
     typeof data.badgeVisibleMembers === "number" && typeof data.badgeTotalMembers === "number"
       ? `Visible members: ${data.badgeVisibleMembers} / total members: ${data.badgeTotalMembers}`
@@ -633,7 +565,7 @@ function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
     .join(" ");
 
   const renderSection = (
-    visibility: "public" | "private",
+    visibility: "public" | "protected" | "private" | "default",
     sectionLabel: string,
     members: FlowNodeData["members"],
   ): ReactNode => {
@@ -644,7 +576,15 @@ function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
     return (
       <div className="graph-node-section">
         <div className="graph-node-section-header">
-          <span className="graph-section-dot">{visibility === "public" ? "🌐" : "🏠"}</span>
+          <span className="graph-section-dot" aria-hidden>
+            {visibility === "public"
+              ? "○"
+              : visibility === "protected"
+                ? "◑"
+                : visibility === "private"
+                  ? "●"
+                  : "◇"}
+          </span>
           <span className="graph-node-section-title">{sectionLabel}</span>
           <span
             className={`graph-node-section-count graph-node-section-count-${visibility}`}
@@ -682,7 +622,7 @@ function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
                   id={`target-member-${member.id}`}
                   className="graph-handle graph-member-handle graph-member-handle-target"
                   type="target"
-                  position={Position.Left}
+                  position={targetMemberPosition}
                 />
                 <span className="graph-member-name" title={member.label}>
                   {memberLabel}
@@ -691,7 +631,7 @@ function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
                   id={`source-member-${member.id}`}
                   className="graph-handle graph-member-handle graph-member-handle-source"
                   type="source"
-                  position={Position.Right}
+                  position={sourceMemberPosition}
                 />
               </button>
             );
@@ -707,25 +647,25 @@ function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
         id="target-node"
         className="graph-handle graph-handle-target"
         type="target"
-        position={Position.Left}
+        position={targetNodePosition}
       />
       <Handle
         id="source-node"
         className="graph-handle graph-handle-source"
         type="source"
-        position={Position.Right}
+        position={sourceNodePosition}
       />
       <Handle
         id="source-node-top"
         className="graph-handle graph-handle-top"
         type="source"
-        position={Position.Top}
+        position={sourceSecondaryPosition}
       />
       <Handle
         id="target-node-bottom"
         className="graph-handle graph-handle-bottom"
         type="target"
-        position={Position.Bottom}
+        position={targetSecondaryPosition}
       />
       {hiddenMemberHandleMembers.length > 0 ? (
         <div className="graph-hidden-member-handles" aria-hidden>
@@ -738,13 +678,13 @@ function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
                 id={`target-member-${member.id}`}
                 className="graph-handle graph-member-handle graph-member-handle-target graph-hidden-member-handle"
                 type="target"
-                position={Position.Left}
+                position={targetMemberPosition}
               />
               <Handle
                 id={`source-member-${member.id}`}
                 className="graph-handle graph-member-handle graph-member-handle-source graph-hidden-member-handle"
                 type="source"
-                position={Position.Right}
+                position={sourceMemberPosition}
               />
             </div>
           ))}
@@ -767,17 +707,13 @@ function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
           <button
             type="button"
             className="graph-node-toggle"
-            disabled={isSelected}
             aria-label={
               showAllMembers ? "Collapse members" : `Expand members (${hiddenMembers} hidden)`
             }
             onClick={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              if (isSelected) {
-                return;
-              }
-              setManuallyExpanded((prev) => !prev);
+              data.onToggleExpand?.();
             }}
           >
             <span className="graph-node-count" title={countTitle}>
@@ -793,7 +729,9 @@ function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
       </div>
       <div className="graph-node-body">
         {renderSection("public", "PUBLIC", publicMembers)}
+        {renderSection("protected", "PROTECTED", protectedMembers)}
         {renderSection("private", "PRIVATE", privateMembers)}
+        {renderSection("default", "DEFAULT", defaultMembers)}
         {visibleMembers.length === 0 ? (
           <div className="graph-node-section graph-node-section-empty">
             <div className="graph-node-section-header">
@@ -806,14 +744,14 @@ function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
                   id="target-node-chip"
                   className="graph-handle graph-member-handle graph-member-handle-target"
                   type="target"
-                  position={Position.Left}
+                  position={targetMemberPosition}
                 />
                 <span className="graph-member-name">{data.label}</span>
                 <Handle
                   id="source-node-chip"
                   className="graph-handle graph-member-handle graph-member-handle-source"
                   type="source"
-                  position={Position.Right}
+                  position={sourceMemberPosition}
                 />
               </div>
             </div>
@@ -830,17 +768,24 @@ function GraphGroupNode({ data }: NodeProps<Node<FlowNodeData>>) {
     return null;
   }
   return (
-    <div
+    <button
+      type="button"
       className={[
         "graph-group-node",
         data.groupMode === "file" ? "graph-group-node-file" : "graph-group-node-namespace",
       ]
         .filter(Boolean)
         .join(" ")}
-      aria-hidden
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        data.onSelectGroup?.();
+      }}
+      title={`Open ${data.groupLabel}`}
+      aria-label={`Open ${data.groupLabel}`}
     >
       <div className="graph-group-label">{data.groupLabel}</div>
-    </div>
+    </button>
   );
 }
 
@@ -896,6 +841,14 @@ type GraphViewportProps = {
   onSelectEdge?: (selection: GraphEdgeSelection) => void;
   trailConfig: TrailUiConfig;
   onToggleLegend?: () => void;
+  onOpenNodeInNewTab?: (nodeId: string, label: string) => void;
+  onNavigateBack?: () => void;
+  onNavigateForward?: () => void;
+  onShowDefinitionInIde?: (nodeId: string) => void;
+  onBookmarkNode?: (nodeId: string, label: string) => void;
+  onOpenContainingFolder?: (path: string) => void;
+  onRequestOpenTrailDialog?: () => void;
+  onStatusMessage?: (message: string) => void;
 };
 
 export type GraphEdgeSelection = {
@@ -907,6 +860,131 @@ export type GraphEdgeSelection = {
   sourceLabel: string;
   targetLabel: string;
 };
+
+type NavDirection = "left" | "right" | "up" | "down";
+
+type ContextMenuState =
+  | {
+      x: number;
+      y: number;
+      kind: "pane";
+    }
+  | {
+      x: number;
+      y: number;
+      kind: "node";
+      nodeId: string;
+      label: string;
+      filePath: string | null;
+      isFile: boolean;
+      isGroup: boolean;
+      groupAnchorId: string | null;
+    }
+  | {
+      x: number;
+      y: number;
+      kind: "edge";
+      edgeId: string;
+    };
+
+type ContextMenuPayload =
+  | {
+      kind: "pane";
+    }
+  | {
+      kind: "node";
+      nodeId: string;
+      label: string;
+      filePath: string | null;
+      isFile: boolean;
+      isGroup: boolean;
+      groupAnchorId: string | null;
+    }
+  | {
+      kind: "edge";
+      edgeId: string;
+    };
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLSelectElement ||
+    (target instanceof HTMLElement && target.isContentEditable)
+  );
+}
+
+function nodeCenter(node: Node<FlowNodeData>): { x: number; y: number } {
+  const width = typeof node.width === "number" ? node.width : 140;
+  const height = typeof node.height === "number" ? node.height : 40;
+  return {
+    x: node.position.x + width / 2,
+    y: node.position.y + height / 2,
+  };
+}
+
+function edgeMidpoint(
+  edge: Edge<SemanticEdgeData>,
+  nodeById: Map<string, Node<FlowNodeData>>,
+): { x: number; y: number } {
+  const route = edge.data?.routePoints ?? [];
+  if (route.length > 0) {
+    const mid = route[Math.floor(route.length / 2)];
+    if (mid) {
+      return { x: mid.x, y: mid.y };
+    }
+  }
+  const source = nodeById.get(edge.source);
+  const target = nodeById.get(edge.target);
+  if (source && target) {
+    const sourceCenter = nodeCenter(source);
+    const targetCenter = nodeCenter(target);
+    return {
+      x: (sourceCenter.x + targetCenter.x) / 2,
+      y: (sourceCenter.y + targetCenter.y) / 2,
+    };
+  }
+  return { x: 0, y: 0 };
+}
+
+function directionalScore(
+  direction: NavDirection,
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+): number | null {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  if (direction === "left" && dx >= -0.5) {
+    return null;
+  }
+  if (direction === "right" && dx <= 0.5) {
+    return null;
+  }
+  if (direction === "up" && dy >= -0.5) {
+    return null;
+  }
+  if (direction === "down" && dy <= 0.5) {
+    return null;
+  }
+
+  const primary = direction === "left" || direction === "right" ? Math.abs(dx) : Math.abs(dy);
+  const orthogonal = direction === "left" || direction === "right" ? Math.abs(dy) : Math.abs(dx);
+  return primary + orthogonal * 0.6;
+}
+
+function orientSeedLayoutForDirection(layout: LayoutElements, vertical: boolean): LayoutElements {
+  if (!vertical) {
+    return layout;
+  }
+  return {
+    ...layout,
+    nodes: layout.nodes.map((node) => ({
+      ...node,
+      x: node.y,
+      y: node.x,
+    })),
+  };
+}
 
 function isDenseGraph(depth: number, nodeCount: number, edgeCount: number): boolean {
   if (nodeCount <= 48) {
@@ -921,21 +999,73 @@ function isDenseGraph(depth: number, nodeCount: number, edgeCount: number): bool
   return nodeCount > 180 || edgeCount > 360;
 }
 
+function graphExportBaseName(graphTitle: string): string {
+  const raw = graphTitle
+    .trim()
+    .replace(/\s+/g, "_")
+    .replace(/[^a-zA-Z0-9_.-]/g, "");
+  return raw.length > 0 ? raw : "graph";
+}
+
+function directionFromKey(key: string): NavDirection | null {
+  const normalized = key.toLowerCase();
+  if (normalized === "arrowleft" || normalized === "h") {
+    return "left";
+  }
+  if (normalized === "arrowright" || normalized === "l") {
+    return "right";
+  }
+  if (normalized === "arrowup" || normalized === "k") {
+    return "up";
+  }
+  if (normalized === "arrowdown" || normalized === "j") {
+    return "down";
+  }
+  if (normalized === "w") {
+    return "up";
+  }
+  if (normalized === "a") {
+    return "left";
+  }
+  if (normalized === "s") {
+    return "down";
+  }
+  if (normalized === "d") {
+    return "right";
+  }
+  return null;
+}
+
 export function GraphViewport({
   graph,
   onSelectNode,
   onSelectEdge,
   trailConfig,
   onToggleLegend,
+  onOpenNodeInNewTab,
+  onNavigateBack,
+  onNavigateForward,
+  onShowDefinitionInIde,
+  onBookmarkNode,
+  onOpenContainingFolder,
+  onRequestOpenTrailDialog,
+  onStatusMessage,
 }: GraphViewportProps) {
   const [flow, setFlow] = useState<ReactFlowInstance | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [hoveredEdgeId, setHoveredEdgeId] = useState<string | null>(null);
   const [legendFilterKinds, setLegendFilterKinds] = useState<Set<EdgeKind> | null>(null);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [expandedNodeIdsByGraph, setExpandedNodeIdsByGraph] = useState<Record<string, string[]>>(
+    {},
+  );
+  const [hiddenNodeIdsByGraph, setHiddenNodeIdsByGraph] = useState<Record<string, string[]>>({});
+  const [hiddenEdgeIdsByGraph, setHiddenEdgeIdsByGraph] = useState<Record<string, string[]>>({});
   const [manualNodePositionsByGraph, setManualNodePositionsByGraph] = useState<
     Record<string, Record<string, { x: number; y: number }>>
   >({});
+  const flowShellRef = useRef<HTMLDivElement | null>(null);
   const lastFittedGraphId = useRef<string | null>(null);
   const activeGraphNodePositions = useMemo(() => {
     if (!graph || isMermaidGraph(graph)) {
@@ -943,13 +1073,29 @@ export function GraphViewport({
     }
     return manualNodePositionsByGraph[graph.id] ?? {};
   }, [graph, manualNodePositionsByGraph]);
-
-  const flowElements = useMemo(() => {
-    if (graph === null || isMermaidGraph(graph)) {
-      return null;
+  const expandedNodeIds = useMemo(() => {
+    if (!graph || isMermaidGraph(graph)) {
+      return new Set<string>();
     }
-
-    const nodeMetaById = new Map(
+    return new Set(expandedNodeIdsByGraph[graph.id] ?? []);
+  }, [expandedNodeIdsByGraph, graph]);
+  const hiddenNodeIds = useMemo(() => {
+    if (!graph || isMermaidGraph(graph)) {
+      return new Set<string>();
+    }
+    return new Set(hiddenNodeIdsByGraph[graph.id] ?? []);
+  }, [graph, hiddenNodeIdsByGraph]);
+  const hiddenEdgeIds = useMemo(() => {
+    if (!graph || isMermaidGraph(graph)) {
+      return new Set<string>();
+    }
+    return new Set(hiddenEdgeIdsByGraph[graph.id] ?? []);
+  }, [graph, hiddenEdgeIdsByGraph]);
+  const nodeMetaById = useMemo(() => {
+    if (graph === null || isMermaidGraph(graph)) {
+      return new Map<string, { filePath: string | null; qualifiedName: string | null }>();
+    }
+    return new Map(
       graph.graph.nodes.map((node) => [
         node.id,
         {
@@ -958,7 +1104,42 @@ export function GraphViewport({
         },
       ]),
     );
+  }, [graph]);
+  const nodeKindById = useMemo(() => {
+    if (graph === null || isMermaidGraph(graph)) {
+      return new Map<string, string>();
+    }
+    return new Map(graph.graph.nodes.map((node) => [node.id, node.kind]));
+  }, [graph]);
+  const toggleExpandedNode = useCallback(
+    (nodeId: string) => {
+      if (!graph || isMermaidGraph(graph)) {
+        return;
+      }
+      setExpandedNodeIdsByGraph((previous) => {
+        const current = new Set(previous[graph.id] ?? []);
+        if (current.has(nodeId)) {
+          current.delete(nodeId);
+        } else {
+          current.add(nodeId);
+        }
+        return {
+          ...previous,
+          [graph.id]: [...current],
+        };
+      });
+    },
+    [graph],
+  );
+
+  const flowElements = useMemo(() => {
+    if (graph === null || isMermaidGraph(graph)) {
+      return null;
+    }
+
     const centerMemberId = graph.graph.center_id;
+    const verticalLayout = trailConfig.layoutDirection === "Vertical";
+
     const withInteractiveNodeData = (node: Node<FlowNodeData>): Node<FlowNodeData> => {
       const focusedMemberId =
         node.data.center && node.data.members.some((member) => member.id === centerMemberId)
@@ -968,144 +1149,595 @@ export function GraphViewport({
         ...node,
         data: {
           ...node.data,
+          layoutDirection: trailConfig.layoutDirection,
           isSelected: node.id === selectedNodeId,
+          isExpanded: expandedNodeIds.has(node.id),
           focusedMemberId,
           onSelectMember: (memberId: string, label: string) => {
             setSelectedNodeId(node.id);
             setSelectedEdgeId(null);
             onSelectNode(memberId, label);
           },
+          onToggleExpand: () => toggleExpandedNode(node.id),
         },
       };
     };
 
+    const applyManualPosition = (node: Node<FlowNodeData>): Node<FlowNodeData> => {
+      const manualPosition = activeGraphNodePositions[node.id];
+      if (!manualPosition) {
+        return node;
+      }
+      return {
+        ...node,
+        position: manualPosition,
+      };
+    };
+
+    const edgeStyling = (
+      edges: Edge<SemanticEdgeData>[],
+      centerNodeId: string,
+      nodeCount: number,
+      channelSourceEdgeIdsByChannelId: Map<string, string[]>,
+    ): Edge<SemanticEdgeData>[] => {
+      const denseFocusActive = isDenseGraph(trailConfig.depth, nodeCount, edges.length);
+      return edges.map((edge) => {
+        const edgeData = edge.data;
+        if (!edgeData) {
+          return edge;
+        }
+        const touchesCenter = edge.source === centerNodeId || edge.target === centerNodeId;
+        const isTrunk = edgeData.routeKind === "flow-trunk";
+        const hasSelectedEdge = selectedEdgeId !== null;
+        const isSelectedEdge = selectedEdgeId === edge.id;
+        const isHoveredEdge = hoveredEdgeId === edge.id;
+        const isFilteredOut =
+          legendFilterKinds !== null && !legendFilterKinds.has(edgeData.edgeKind);
+        const certaintyOpacity = Number(edge.style?.opacity ?? 1);
+        const baseStroke = Number(edge.style?.strokeWidth ?? 2);
+        const hasHoveredEdge = hoveredEdgeId !== null;
+        const deemphasized = denseFocusActive && !touchesCenter && !isTrunk;
+        let interactionOpacity: number;
+        let strokeWidth: number;
+        if (isFilteredOut) {
+          interactionOpacity = hasHoveredEdge ? 0.08 : 0.09;
+          strokeWidth = Math.max(1, baseStroke - 0.8);
+        } else if (hasHoveredEdge) {
+          const dimmed = !isHoveredEdge;
+          interactionOpacity = dimmed ? 0.18 : 1;
+          strokeWidth = dimmed ? Math.max(1, baseStroke - 0.6) : baseStroke + 0.45;
+        } else if (hasSelectedEdge) {
+          interactionOpacity = isSelectedEdge ? 1 : 0.2;
+          strokeWidth = isSelectedEdge ? baseStroke + 0.45 : Math.max(1, baseStroke - 0.55);
+        } else {
+          interactionOpacity = deemphasized ? 0.42 : 0.94;
+          strokeWidth = deemphasized ? Math.max(1, baseStroke - 0.3) : baseStroke + 0.1;
+        }
+
+        const finalOpacity = Math.max(0.04, Math.min(1, interactionOpacity * certaintyOpacity));
+        const isFocusHighlighted =
+          !isFilteredOut && (hasHoveredEdge ? isHoveredEdge : isSelectedEdge);
+        const baseStrokeColor = String(edge.style?.stroke ?? "currentColor");
+        const strokeColor = isFocusHighlighted ? "var(--focus)" : baseStrokeColor;
+        const baseMarkerEnd = edge.markerEnd;
+        const markerEnd =
+          baseMarkerEnd && typeof baseMarkerEnd === "object"
+            ? {
+                ...baseMarkerEnd,
+                color: strokeColor,
+              }
+            : baseMarkerEnd;
+        const channelSourceEdgeIds = edgeData.channelId
+          ? channelSourceEdgeIdsByChannelId.get(edgeData.channelId)
+          : undefined;
+        const bundledCount = channelSourceEdgeIds?.length ?? edgeData.bundleCount;
+        return {
+          ...edge,
+          markerEnd,
+          style: {
+            ...edge.style,
+            stroke: strokeColor,
+            opacity: finalOpacity,
+            strokeWidth,
+          },
+          data: {
+            ...edgeData,
+            channelSourceEdgeIds,
+            tooltipLabel: edgeTooltipLabel(edgeData, bundledCount),
+            isFocused: isSelectedEdge,
+            isHovered: isHoveredEdge,
+          },
+        };
+      });
+    };
+
     try {
-      const semantic = buildSemanticLayout(graph.graph);
-      const bundled = applyAdaptiveBundling(
-        semantic,
-        trailConfig.depth,
-        graph.graph.nodes.length,
-        graph.graph.edges.length,
+      const semantic = orientSeedLayoutForDirection(
+        buildSemanticLayout(graph.graph),
+        verticalLayout,
       );
-      const routed = routeEdgesWithObstacles(bundled);
-      const flowLayout = toReactFlowElements(routed);
+      const parityPipeline = runDeterministicParityPipeline({
+        layout: semantic,
+        depth: trailConfig.depth,
+        nodeCount: graph.graph.nodes.length,
+        edgeCount: graph.graph.edges.length,
+        layoutDirection: trailConfig.layoutDirection,
+        debugChannels: trailConfig.debugParityChannels,
+        debugRoutes: trailConfig.debugParityRoutes,
+      });
+      const routed = parityPipeline.routed;
+      const flowLayout = toReactFlowElements(routed, trailConfig.layoutDirection);
       const centerNodeId = flowLayout.centerNodeId;
-      const denseFocusActive = isDenseGraph(
-        trailConfig.depth,
-        flowLayout.nodes.length,
-        flowLayout.edges.length,
-      );
-      const withManualNodePosition = (node: Node<FlowNodeData>): Node<FlowNodeData> => {
-        const manualPosition = activeGraphNodePositions[node.id];
-        if (!manualPosition) {
+      const groupedNodes = applyGrouping(
+        flowLayout.nodes.map(withInteractiveNodeData).map(applyManualPosition),
+        trailConfig.groupingMode,
+        nodeMetaById,
+      ).map((node) => {
+        if (!node.data.groupMode || !node.data.groupAnchorId) {
           return node;
         }
         return {
           ...node,
-          position: manualPosition,
+          data: {
+            ...node.data,
+            layoutDirection: trailConfig.layoutDirection,
+            onSelectGroup: () => {
+              const anchorId = node.data.groupAnchorId;
+              if (!anchorId) {
+                return;
+              }
+              const anchorMeta = nodeMetaById.get(anchorId);
+              onSelectNode(anchorId, anchorMeta?.qualifiedName ?? anchorId);
+            },
+          },
         };
-      };
+      });
+      const visibleNodes = groupedNodes.filter((node) => !hiddenNodeIds.has(node.id));
+      const visibleNodeIds = new Set(visibleNodes.map((node) => node.id));
+      const visibleEdges = flowLayout.edges.filter(
+        (edge) =>
+          !hiddenEdgeIds.has(edge.id) &&
+          visibleNodeIds.has(edge.source) &&
+          visibleNodeIds.has(edge.target),
+      );
+      const channelSourceEdgeIdsByChannelId = buildChannelSourceEdgeIds(visibleEdges);
       return {
         ...flowLayout,
-        nodes: applyGrouping(
-          flowLayout.nodes.map(withInteractiveNodeData).map(withManualNodePosition),
-          trailConfig.groupingMode,
-          nodeMetaById,
+        nodes: visibleNodes,
+        edges: edgeStyling(
+          visibleEdges,
+          centerNodeId,
+          visibleNodes.length,
+          channelSourceEdgeIdsByChannelId,
         ),
-        edges: flowLayout.edges.map((edge) => {
-          const touchesCenter = edge.source === centerNodeId || edge.target === centerNodeId;
-          const isTrunk = edge.data?.routeKind === "flow-trunk";
-          const hasSelectedEdge = selectedEdgeId !== null;
-          const isSelectedEdge = selectedEdgeId === edge.id;
-          const isFilteredOut =
-            legendFilterKinds !== null &&
-            edge.data?.edgeKind !== undefined &&
-            !legendFilterKinds.has(edge.data.edgeKind);
-          const baseOpacity = Number(edge.style?.opacity ?? 1);
-          const baseStroke = Number(edge.style?.strokeWidth ?? 2);
-
-          if (!hoveredEdgeId) {
-            const deemphasized = denseFocusActive && !touchesCenter && !isTrunk;
-            return {
-              ...edge,
-              style: {
-                ...edge.style,
-                opacity: isFilteredOut
-                  ? 0.09
-                  : hasSelectedEdge
-                    ? isSelectedEdge
-                      ? 1
-                      : 0.2
-                    : deemphasized
-                      ? Math.max(0.12, baseOpacity * 0.42)
-                      : Math.max(0.82, baseOpacity),
-                strokeWidth: isFilteredOut
-                  ? Math.max(1, baseStroke - 0.8)
-                  : hasSelectedEdge
-                    ? isSelectedEdge
-                      ? baseStroke + 0.45
-                      : Math.max(1, baseStroke - 0.55)
-                    : deemphasized
-                      ? Math.max(1, baseStroke - 0.3)
-                      : baseStroke + 0.1,
-              },
-            };
-          }
-
-          const dimmed = edge.id !== hoveredEdgeId;
-          return {
-            ...edge,
-            style: {
-              ...edge.style,
-              opacity: isFilteredOut ? 0.08 : dimmed ? 0.18 : 1,
-              strokeWidth: isFilteredOut
-                ? Math.max(1, Number(edge.style?.strokeWidth ?? 1) - 0.8)
-                : dimmed
-                  ? Math.max(1, Number(edge.style?.strokeWidth ?? 1) - 0.6)
-                  : Number(edge.style?.strokeWidth ?? 2) + 0.35,
-            },
-          };
-        }),
       };
     } catch {
-      const fallback = routeEdgesWithObstacles(buildFallbackLayout(graph.graph));
-      const elements = toReactFlowElements(fallback);
-      const withManualNodePosition = (node: Node<FlowNodeData>): Node<FlowNodeData> => {
-        const manualPosition = activeGraphNodePositions[node.id];
-        if (!manualPosition) {
+      const fallbackSeed = orientSeedLayoutForDirection(
+        buildFallbackLayout(graph.graph),
+        verticalLayout,
+      );
+      const fallbackPipeline = runDeterministicParityPipeline({
+        layout: fallbackSeed,
+        depth: trailConfig.depth,
+        nodeCount: graph.graph.nodes.length,
+        edgeCount: graph.graph.edges.length,
+        layoutDirection: trailConfig.layoutDirection,
+        debugChannels: trailConfig.debugParityChannels,
+        debugRoutes: trailConfig.debugParityRoutes,
+      });
+      const elements = toReactFlowElements(fallbackPipeline.routed, trailConfig.layoutDirection);
+      const groupedNodes = applyGrouping(
+        elements.nodes.map(withInteractiveNodeData).map(applyManualPosition),
+        trailConfig.groupingMode,
+        nodeMetaById,
+      ).map((node) => {
+        if (!node.data.groupMode || !node.data.groupAnchorId) {
           return node;
         }
         return {
           ...node,
-          position: manualPosition,
+          data: {
+            ...node.data,
+            layoutDirection: trailConfig.layoutDirection,
+            onSelectGroup: () => {
+              const anchorId = node.data.groupAnchorId;
+              if (!anchorId) {
+                return;
+              }
+              const anchorMeta = nodeMetaById.get(anchorId);
+              onSelectNode(anchorId, anchorMeta?.qualifiedName ?? anchorId);
+            },
+          },
         };
-      };
+      });
+      const visibleNodes = groupedNodes.filter((node) => !hiddenNodeIds.has(node.id));
+      const visibleNodeIds = new Set(visibleNodes.map((node) => node.id));
+      const visibleEdges = elements.edges.filter(
+        (edge) =>
+          !hiddenEdgeIds.has(edge.id) &&
+          visibleNodeIds.has(edge.source) &&
+          visibleNodeIds.has(edge.target),
+      );
+      const channelSourceEdgeIdsByChannelId = buildChannelSourceEdgeIds(visibleEdges);
       return {
         ...elements,
-        nodes: applyGrouping(
-          elements.nodes.map(withInteractiveNodeData).map(withManualNodePosition),
-          trailConfig.groupingMode,
-          nodeMetaById,
+        nodes: visibleNodes,
+        edges: edgeStyling(
+          visibleEdges,
+          elements.centerNodeId,
+          visibleNodes.length,
+          channelSourceEdgeIdsByChannelId,
         ),
       };
     }
   }, [
     activeGraphNodePositions,
+    expandedNodeIds,
     graph,
+    hiddenEdgeIds,
+    hiddenNodeIds,
     hoveredEdgeId,
     legendFilterKinds,
     onSelectNode,
     selectedEdgeId,
     selectedNodeId,
     trailConfig.depth,
+    trailConfig.debugParityChannels,
+    trailConfig.debugParityRoutes,
+    trailConfig.layoutDirection,
     trailConfig.groupingMode,
+    toggleExpandedNode,
   ]);
+  const flowNodesById = useMemo(() => {
+    return new Map(flowElements?.nodes.map((node) => [node.id, node]) ?? []);
+  }, [flowElements?.nodes]);
+  const flowEdgesById = useMemo(() => {
+    return new Map(flowElements?.edges.map((edge) => [edge.id, edge]) ?? []);
+  }, [flowElements?.edges]);
+  const channelSourceEdgeIdsByChannelId = useMemo(() => {
+    if (!flowElements?.edges) {
+      return new Map<string, string[]>();
+    }
+    return buildChannelSourceEdgeIds(flowElements.edges);
+  }, [flowElements?.edges]);
+  const selectNodeById = useCallback(
+    (nodeId: string) => {
+      const node = flowNodesById.get(nodeId);
+      if (!node) {
+        return;
+      }
+      setSelectedNodeId(nodeId);
+      setSelectedEdgeId(null);
+      onSelectNode(nodeId, nodeLabelFromData(node.data, nodeId));
+    },
+    [flowNodesById, onSelectNode],
+  );
+  const activateEdge = useCallback(
+    (edge: Edge<SemanticEdgeData>) => {
+      setSelectedEdgeId(edge.id);
+      const sourceNode = flowNodesById.get(edge.source);
+      const targetNode = flowNodesById.get(edge.target);
+      const semanticEdgeData = edge.data;
+
+      if (onSelectEdge && semanticEdgeData?.edgeKind) {
+        const baseSourceEdgeIds =
+          semanticEdgeData.sourceEdgeIds.length > 0 ? semanticEdgeData.sourceEdgeIds : [edge.id];
+        const channelSourceEdgeIds = semanticEdgeData.channelId
+          ? channelSourceEdgeIdsByChannelId.get(semanticEdgeData.channelId)
+          : undefined;
+        const sourceEdgeIds =
+          channelSourceEdgeIds && channelSourceEdgeIds.length > 0
+            ? channelSourceEdgeIds
+            : semanticEdgeData.channelSourceEdgeIds &&
+                semanticEdgeData.channelSourceEdgeIds.length > 0
+              ? semanticEdgeData.channelSourceEdgeIds
+              : baseSourceEdgeIds;
+        const primaryEdgeId = sourceEdgeIds[0] ?? baseSourceEdgeIds[0] ?? edge.id;
+        onSelectEdge({
+          id: primaryEdgeId,
+          edgeIds: sourceEdgeIds,
+          kind: semanticEdgeData.edgeKind,
+          sourceNodeId: edge.source,
+          targetNodeId: edge.target,
+          sourceLabel: sourceNode ? nodeLabelFromData(sourceNode.data, edge.source) : edge.source,
+          targetLabel: targetNode ? nodeLabelFromData(targetNode.data, edge.target) : edge.target,
+        });
+        return;
+      }
+
+      const centerNodeId = flowElements?.centerNodeId;
+      const preferredNodeId =
+        edge.source === centerNodeId
+          ? edge.target
+          : edge.target === centerNodeId
+            ? edge.source
+            : edge.target;
+      const fallbackNode =
+        flowNodesById.get(preferredNodeId) ??
+        flowNodesById.get(edge.target) ??
+        flowNodesById.get(edge.source);
+      if (!fallbackNode) {
+        return;
+      }
+      setSelectedNodeId(fallbackNode.id);
+      onSelectNode(fallbackNode.id, nodeLabelFromData(fallbackNode.data, fallbackNode.id));
+    },
+    [
+      channelSourceEdgeIdsByChannelId,
+      flowElements?.centerNodeId,
+      flowNodesById,
+      onSelectEdge,
+      onSelectNode,
+    ],
+  );
+  const closeContextMenu = useCallback(() => {
+    setContextMenu(null);
+  }, []);
+  const openContextMenu = useCallback(
+    (
+      event: {
+        clientX: number;
+        clientY: number;
+        preventDefault: () => void;
+        stopPropagation: () => void;
+      },
+      state: ContextMenuPayload,
+    ) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const shellRect = flowShellRef.current?.getBoundingClientRect();
+      const x = shellRect ? event.clientX - shellRect.left : event.clientX;
+      const y = shellRect ? event.clientY - shellRect.top : event.clientY;
+      setContextMenu({
+        ...state,
+        x,
+        y,
+      } as ContextMenuState);
+    },
+    [],
+  );
+  const hideNode = useCallback(
+    (nodeId: string) => {
+      if (!graph || isMermaidGraph(graph)) {
+        return;
+      }
+      setHiddenNodeIdsByGraph((previous) => {
+        const current = new Set(previous[graph.id] ?? []);
+        current.add(nodeId);
+        return {
+          ...previous,
+          [graph.id]: [...current],
+        };
+      });
+      setSelectedNodeId((current) => (current === nodeId ? null : current));
+      onStatusMessage?.("Node hidden. Use Reset Hidden in the context menu to restore.");
+    },
+    [graph, onStatusMessage],
+  );
+  const hideEdge = useCallback(
+    (edgeId: string) => {
+      if (!graph || isMermaidGraph(graph)) {
+        return;
+      }
+      setHiddenEdgeIdsByGraph((previous) => {
+        const current = new Set(previous[graph.id] ?? []);
+        current.add(edgeId);
+        return {
+          ...previous,
+          [graph.id]: [...current],
+        };
+      });
+      setSelectedEdgeId((current) => (current === edgeId ? null : current));
+      onStatusMessage?.("Edge hidden. Use Reset Hidden in the context menu to restore.");
+    },
+    [graph, onStatusMessage],
+  );
+  const resetHidden = useCallback(() => {
+    if (!graph || isMermaidGraph(graph)) {
+      return;
+    }
+    setHiddenNodeIdsByGraph((previous) => {
+      if (!previous[graph.id]) {
+        return previous;
+      }
+      const next = { ...previous };
+      delete next[graph.id];
+      return next;
+    });
+    setHiddenEdgeIdsByGraph((previous) => {
+      if (!previous[graph.id]) {
+        return previous;
+      }
+      const next = { ...previous };
+      delete next[graph.id];
+      return next;
+    });
+    onStatusMessage?.("Hidden graph elements restored.");
+  }, [graph, onStatusMessage]);
+  const exportRootElement = useCallback((): HTMLElement | null => {
+    const shell = flowShellRef.current;
+    if (!shell) {
+      return null;
+    }
+    const viewport = shell.querySelector<HTMLElement>(".react-flow__viewport");
+    if (viewport) {
+      return viewport;
+    }
+    return shell.querySelector<HTMLElement>(".react-flow");
+  }, []);
+  const triggerDownload = useCallback((fileName: string, dataUrl: string) => {
+    const anchor = document.createElement("a");
+    anchor.href = dataUrl;
+    anchor.download = fileName;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+  }, []);
+  const exportImage = useCallback(
+    async (format: "png" | "jpeg" | "svg") => {
+      const element = exportRootElement();
+      if (!element) {
+        onStatusMessage?.("Unable to capture graph image right now.");
+        return;
+      }
+      const baseName = graphExportBaseName(graph?.title ?? "graph");
+      const options = {
+        cacheBust: true,
+        backgroundColor: "#f1f1ef",
+        pixelRatio: 2,
+      };
+      try {
+        if (format === "png") {
+          const dataUrl = await toPng(element, options);
+          triggerDownload(`${baseName}.png`, dataUrl);
+          onStatusMessage?.("PNG export saved.");
+          return;
+        }
+        if (format === "jpeg") {
+          const dataUrl = await toJpeg(element, { ...options, quality: 0.96 });
+          triggerDownload(`${baseName}.jpg`, dataUrl);
+          onStatusMessage?.("JPEG export saved.");
+          return;
+        }
+        const dataUrl = await toSvg(element, options);
+        triggerDownload(`${baseName}.svg`, dataUrl);
+        onStatusMessage?.("SVG export saved.");
+      } catch (error) {
+        onStatusMessage?.(
+          error instanceof Error ? `Image export failed: ${error.message}` : "Image export failed.",
+        );
+      }
+    },
+    [exportRootElement, graph?.title, onStatusMessage, triggerDownload],
+  );
+  const exportToClipboard = useCallback(async () => {
+    const element = exportRootElement();
+    if (!element) {
+      onStatusMessage?.("Unable to copy graph image right now.");
+      return;
+    }
+    if (
+      typeof navigator === "undefined" ||
+      !navigator.clipboard ||
+      typeof ClipboardItem === "undefined"
+    ) {
+      onStatusMessage?.("Clipboard image export is not supported in this browser context.");
+      return;
+    }
+    try {
+      const blob = await toBlob(element, {
+        cacheBust: true,
+        backgroundColor: "#f1f1ef",
+        pixelRatio: 2,
+      });
+      if (!blob) {
+        onStatusMessage?.("Clipboard export failed: empty image payload.");
+        return;
+      }
+      await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+      onStatusMessage?.("Graph copied to clipboard as PNG.");
+    } catch (error) {
+      onStatusMessage?.(
+        error instanceof Error
+          ? `Clipboard export failed: ${error.message}`
+          : "Clipboard export failed.",
+      );
+    }
+  }, [exportRootElement, onStatusMessage]);
+  const copyText = useCallback(
+    async (text: string, successMessage: string) => {
+      if (!navigator.clipboard) {
+        onStatusMessage?.("Clipboard is unavailable in this context.");
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(text);
+        onStatusMessage?.(successMessage);
+      } catch (error) {
+        onStatusMessage?.(
+          error instanceof Error ? `Copy failed: ${error.message}` : "Copy failed.",
+        );
+      }
+    },
+    [onStatusMessage],
+  );
+  const moveNodeSelection = useCallback(
+    (direction: NavDirection) => {
+      const graphNodes = flowElements?.nodes.filter((node) => !node.data.groupMode) ?? [];
+      if (graphNodes.length === 0) {
+        return;
+      }
+      const current = selectedNodeId ? flowNodesById.get(selectedNodeId) : null;
+      const fromPoint = current ? nodeCenter(current) : nodeCenter(graphNodes[0]!);
+      let best: Node<FlowNodeData> | null = null;
+      let bestScore = Number.POSITIVE_INFINITY;
+      for (const candidate of graphNodes) {
+        if (candidate.id === current?.id) {
+          continue;
+        }
+        const score = directionalScore(direction, fromPoint, nodeCenter(candidate));
+        if (score === null || score >= bestScore) {
+          continue;
+        }
+        best = candidate;
+        bestScore = score;
+      }
+      if (!best) {
+        return;
+      }
+      setSelectedNodeId(best.id);
+      setSelectedEdgeId(null);
+    },
+    [flowElements?.nodes, flowNodesById, selectedNodeId],
+  );
+  const moveEdgeSelection = useCallback(
+    (direction: NavDirection) => {
+      const edges = flowElements?.edges ?? [];
+      if (edges.length === 0) {
+        return;
+      }
+      const nodeById = flowNodesById;
+      const currentEdge = selectedEdgeId ? flowEdgesById.get(selectedEdgeId) : null;
+      const fromPoint = currentEdge
+        ? edgeMidpoint(currentEdge, nodeById)
+        : selectedNodeId
+          ? nodeCenter(flowNodesById.get(selectedNodeId) ?? flowElements?.nodes[0]!)
+          : edgeMidpoint(edges[0]!, nodeById);
+      let best: Edge<SemanticEdgeData> | null = null;
+      let bestScore = Number.POSITIVE_INFINITY;
+      for (const candidate of edges) {
+        if (candidate.id === currentEdge?.id) {
+          continue;
+        }
+        const score = directionalScore(direction, fromPoint, edgeMidpoint(candidate, nodeById));
+        if (score === null || score >= bestScore) {
+          continue;
+        }
+        best = candidate;
+        bestScore = score;
+      }
+      if (!best) {
+        return;
+      }
+      setSelectedNodeId(null);
+      setSelectedEdgeId(best.id);
+    },
+    [
+      flowEdgesById,
+      flowElements?.edges,
+      flowElements?.nodes,
+      flowNodesById,
+      selectedEdgeId,
+      selectedNodeId,
+    ],
+  );
 
   useEffect(() => {
     setSelectedNodeId(flowElements?.centerNodeId ?? null);
     setSelectedEdgeId(null);
     setHoveredEdgeId(null);
     setLegendFilterKinds(null);
+    setContextMenu(null);
   }, [graph?.id, flowElements?.centerNodeId]);
 
   useEffect(() => {
@@ -1168,31 +1800,87 @@ export function GraphViewport({
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      const target = event.target;
-      if (
-        target instanceof HTMLInputElement ||
-        target instanceof HTMLTextAreaElement ||
-        target instanceof HTMLSelectElement ||
-        (target instanceof HTMLElement && target.isContentEditable)
-      ) {
+      if (isEditableTarget(event.target)) {
+        return;
+      }
+      const key = event.key;
+      const normalized = key.toLowerCase();
+
+      if ((event.ctrlKey || event.metaKey) && normalized === "u") {
+        event.preventDefault();
+        onRequestOpenTrailDialog?.();
         return;
       }
 
-      if (event.key === "0") {
+      if (key === "?" || (event.shiftKey && key === "/")) {
+        event.preventDefault();
+        setLegendFilterKinds(null);
+        onToggleLegend?.();
+        return;
+      }
+
+      if (key === "0") {
         event.preventDefault();
         resetZoom();
         return;
       }
 
-      if (event.key === "+" || event.key === "=") {
+      if (key === "+" || key === "=") {
         event.preventDefault();
         zoomIn();
         return;
       }
 
-      if (event.key === "-" || event.key === "_") {
+      if (key === "-" || key === "_") {
         event.preventDefault();
         zoomOut();
+        return;
+      }
+
+      const direction = directionFromKey(key);
+      if (direction) {
+        event.preventDefault();
+        if (event.shiftKey) {
+          moveEdgeSelection(direction);
+        } else {
+          moveNodeSelection(direction);
+        }
+        return;
+      }
+
+      if (key === "Enter" || normalized === "e") {
+        event.preventDefault();
+        if ((event.ctrlKey || event.metaKey) && event.shiftKey && selectedNodeId) {
+          const node = flowNodesById.get(selectedNodeId);
+          onOpenNodeInNewTab?.(
+            selectedNodeId,
+            node ? nodeLabelFromData(node.data, selectedNodeId) : selectedNodeId,
+          );
+          return;
+        }
+
+        if (event.shiftKey) {
+          if (selectedNodeId) {
+            toggleExpandedNode(selectedNodeId);
+          }
+          return;
+        }
+
+        if (selectedEdgeId) {
+          const edge = flowEdgesById.get(selectedEdgeId);
+          if (edge) {
+            activateEdge(edge);
+          }
+          return;
+        }
+        if (selectedNodeId) {
+          selectNodeById(selectedNodeId);
+        }
+        return;
+      }
+
+      if (key === "Escape") {
+        closeContextMenu();
       }
     };
 
@@ -1200,7 +1888,24 @@ export function GraphViewport({
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [flow]);
+  }, [
+    activateEdge,
+    closeContextMenu,
+    flowEdgesById,
+    flowNodesById,
+    moveEdgeSelection,
+    moveNodeSelection,
+    onOpenNodeInNewTab,
+    onRequestOpenTrailDialog,
+    onToggleLegend,
+    resetZoom,
+    selectNodeById,
+    selectedEdgeId,
+    selectedNodeId,
+    toggleExpandedNode,
+    zoomIn,
+    zoomOut,
+  ]);
 
   const toggleLegendKind = (kind: EdgeKind) => {
     setLegendFilterKinds((previous) => {
@@ -1233,182 +1938,320 @@ export function GraphViewport({
   const hasUncertainEdges = legendRows.some((row) => row.hasUncertain);
   const hasProbableEdges = legendRows.some((row) => row.hasProbable);
   const denseGraph = flowElements.nodes.length > 64;
+  const hasHiddenElements = hiddenNodeIds.size > 0 || hiddenEdgeIds.size > 0;
+  const contextNode =
+    contextMenu?.kind === "node" ? (flowNodesById.get(contextMenu.nodeId) ?? null) : null;
+  const contextNodeIsExpandable =
+    contextNode?.data.nodeStyle === "card" &&
+    contextNode.data.members.length > MAX_VISIBLE_MEMBERS_PER_NODE;
 
   return (
-    <ReactFlow
-      key={graph.id}
-      onInit={setFlow}
-      nodes={flowElements.nodes}
-      edges={flowElements.edges}
-      onNodeClick={(_, node) => {
-        const data = node.data as FlowNodeData | undefined;
-        if (data?.isVirtualBundle) {
-          return;
+    <div
+      ref={flowShellRef}
+      className="graph-flow-shell"
+      onClick={() => {
+        if (contextMenu) {
+          closeContextMenu();
         }
-        setSelectedNodeId(node.id);
-        setSelectedEdgeId(null);
-        onSelectNode(node.id, nodeLabelFromData(node.data, node.id));
       }}
-      onNodeDragStop={(_, node) => {
-        const data = node.data as FlowNodeData | undefined;
-        if (data?.isVirtualBundle) {
-          return;
-        }
-        const absolutePosition = (
-          node as Node<FlowNodeData> & { positionAbsolute?: { x: number; y: number } }
-        ).positionAbsolute;
-        const persistedPosition = absolutePosition ?? node.position;
-        setManualNodePositionsByGraph((previous) => ({
-          ...previous,
-          [graph.id]: {
-            ...previous[graph.id],
-            [node.id]: {
-              x: persistedPosition.x,
-              y: persistedPosition.y,
-            },
-          },
-        }));
-      }}
-      onPaneClick={() => {
-        setSelectedNodeId(null);
-        setSelectedEdgeId(null);
-      }}
-      onEdgeClick={(_, edge) => {
-        setSelectedEdgeId(edge.id);
-        const sourceNode = flowElements.nodes.find((node) => node.id === edge.source);
-        const targetNode = flowElements.nodes.find((node) => node.id === edge.target);
-        const semanticEdgeData = edge.data as SemanticEdgeData | undefined;
-
-        if (onSelectEdge && semanticEdgeData?.edgeKind) {
-          const sourceEdgeIds =
-            semanticEdgeData.sourceEdgeIds.length > 0 ? semanticEdgeData.sourceEdgeIds : [edge.id];
-          const primaryEdgeId = sourceEdgeIds[0] ?? edge.id;
-          onSelectEdge({
-            id: primaryEdgeId,
-            edgeIds: sourceEdgeIds,
-            kind: semanticEdgeData.edgeKind,
-            sourceNodeId: edge.source,
-            targetNodeId: edge.target,
-            sourceLabel: sourceNode ? nodeLabelFromData(sourceNode.data, edge.source) : edge.source,
-            targetLabel: targetNode ? nodeLabelFromData(targetNode.data, edge.target) : edge.target,
-          });
-          return;
-        }
-
-        const centerNodeId = flowElements.centerNodeId;
-        const preferredNodeId =
-          edge.source === centerNodeId
-            ? edge.target
-            : edge.target === centerNodeId
-              ? edge.source
-              : edge.target;
-        const fallbackNode =
-          flowElements.nodes.find((node) => node.id === preferredNodeId) ??
-          flowElements.nodes.find((node) => node.id === edge.target) ??
-          flowElements.nodes.find((node) => node.id === edge.source);
-        if (!fallbackNode) {
-          return;
-        }
-        setSelectedNodeId(fallbackNode.id);
-        onSelectNode(fallbackNode.id, nodeLabelFromData(fallbackNode.data, fallbackNode.id));
-      }}
-      onEdgeMouseEnter={(_, edge) => {
-        setHoveredEdgeId(edge.id);
-      }}
-      onEdgeMouseLeave={() => {
-        setHoveredEdgeId(null);
-      }}
-      nodeTypes={GRAPH_NODE_TYPES}
-      edgeTypes={GRAPH_EDGE_TYPES}
-      minZoom={0.18}
-      maxZoom={2.1}
-      proOptions={{ hideAttribution: true }}
-      nodesDraggable
-      nodesConnectable={false}
-      elementsSelectable
-      onlyRenderVisibleElements={denseGraph}
-      fitView={false}
-      className="sourcetrail-flow"
     >
-      <Controls position="top-left" showInteractive={false} />
-      <Panel position="bottom-left" className="graph-zoom-panel">
-        <button type="button" aria-label="Zoom in" onClick={zoomIn}>
-          +
-        </button>
-        <button type="button" aria-label="Zoom out" onClick={zoomOut}>
-          -
-        </button>
-        <button type="button" aria-label="Reset zoom to 100%" onClick={resetZoom}>
-          0
-        </button>
-      </Panel>
-      {trailConfig.showMiniMap ? (
-        <MiniMap
-          className="graph-minimap"
-          pannable
-          zoomable
-          position="bottom-left"
-          bgColor="rgb(251 251 249 / 0.92)"
-          maskColor="rgb(39 44 52 / 0.16)"
-          nodeColor={minimapNodeColor}
-          nodeStrokeColor={minimapNodeStrokeColor}
-          nodeBorderRadius={2}
-        />
-      ) : null}
-      <Panel position="bottom-right" className="graph-legend-toggle-panel">
-        <button
-          type="button"
-          aria-label={trailConfig.showLegend ? "Hide legend" : "Show legend"}
-          onClick={() => {
-            setLegendFilterKinds(null);
-            onToggleLegend?.();
-          }}
-        >
-          {trailConfig.showLegend ? "×" : "?"}
-        </button>
-      </Panel>
-      {trailConfig.showLegend && legendRows.length > 0 ? (
-        <Panel position="bottom-right" className="graph-legend-panel">
-          <div className="graph-legend-title">Legend</div>
-          <div className="graph-legend-rows">
-            {legendRows.map((row) => (
-              <button
-                key={row.kind}
-                type="button"
-                className={[
-                  "graph-legend-row",
-                  legendFilterKinds !== null && !legendFilterKinds.has(row.kind)
-                    ? "graph-legend-row-muted"
-                    : "graph-legend-row-active",
-                ]
-                  .filter(Boolean)
-                  .join(" ")}
-                onClick={() => toggleLegendKind(row.kind)}
-              >
-                <span className="graph-legend-line" style={{ background: row.stroke }} />
-                <span className="graph-legend-kind">{formatKindLabel(row.kind)}</span>
-                <span className="graph-legend-count">{row.count}</span>
-              </button>
-            ))}
-          </div>
-          <div className="graph-legend-note">
-            Trunk lines indicate bundled flow edges.
-            {(hasUncertainEdges || hasProbableEdges) && " "}
-            {hasUncertainEdges ? "Dashed edges = uncertain." : ""}
-            {hasUncertainEdges && hasProbableEdges ? " " : ""}
-            {hasProbableEdges ? "Lower opacity = probable." : ""}
-            {legendFilterKinds !== null ? (
-              <button
-                type="button"
-                className="graph-legend-reset"
-                onClick={() => setLegendFilterKinds(null)}
-              >
-                Show all
-              </button>
-            ) : null}
-          </div>
+      <ReactFlow
+        key={graph.id}
+        onInit={setFlow}
+        nodes={flowElements.nodes}
+        edges={flowElements.edges}
+        onNodeClick={(_, node) => {
+          const data = node.data as FlowNodeData | undefined;
+          if (data?.isVirtualBundle || data?.groupMode) {
+            return;
+          }
+          setSelectedNodeId(node.id);
+          setSelectedEdgeId(null);
+          onSelectNode(node.id, nodeLabelFromData(node.data, node.id));
+        }}
+        onNodeContextMenu={(event, node) => {
+          const data = node.data as FlowNodeData | undefined;
+          const isGroup = Boolean(data?.groupMode);
+          const anchorId = data?.groupAnchorId ?? null;
+          const resolvedNodeId = isGroup && anchorId ? anchorId : node.id;
+          const resolvedKind = isGroup ? nodeKindById.get(resolvedNodeId) : data?.kind;
+          const resolvedLabel = isGroup
+            ? (nodeMetaById.get(resolvedNodeId)?.qualifiedName ??
+              nodeMetaById.get(resolvedNodeId)?.filePath ??
+              nodeLabelFromData(node.data, node.id))
+            : nodeLabelFromData(node.data, node.id);
+          const resolvedPath = nodeMetaById.get(resolvedNodeId)?.filePath ?? null;
+          if (!isGroup) {
+            setSelectedNodeId(node.id);
+            setSelectedEdgeId(null);
+          }
+          openContextMenu(event, {
+            kind: "node",
+            nodeId: resolvedNodeId,
+            label: resolvedLabel,
+            filePath: resolvedPath,
+            isFile: resolvedKind === "FILE",
+            isGroup,
+            groupAnchorId: anchorId,
+          });
+        }}
+        onNodeDragStop={(_, node) => {
+          const data = node.data as FlowNodeData | undefined;
+          if (data?.isVirtualBundle) {
+            return;
+          }
+          const absolutePosition = (
+            node as Node<FlowNodeData> & { positionAbsolute?: { x: number; y: number } }
+          ).positionAbsolute;
+          const persistedPosition = absolutePosition ?? node.position;
+          setManualNodePositionsByGraph((previous) => ({
+            ...previous,
+            [graph.id]: {
+              ...previous[graph.id],
+              [node.id]: {
+                x: persistedPosition.x,
+                y: persistedPosition.y,
+              },
+            },
+          }));
+        }}
+        onPaneClick={() => {
+          setSelectedNodeId(null);
+          setSelectedEdgeId(null);
+          closeContextMenu();
+        }}
+        onPaneContextMenu={(event) => {
+          openContextMenu(event, { kind: "pane" });
+        }}
+        onEdgeClick={(event, edge) => {
+          const mouseEvent = event as { button?: number; altKey?: boolean };
+          if (mouseEvent.button === 2) {
+            return;
+          }
+          if (mouseEvent.altKey) {
+            setSelectedNodeId(null);
+            hideEdge(edge.id);
+            closeContextMenu();
+            return;
+          }
+          activateEdge(edge as Edge<SemanticEdgeData>);
+        }}
+        onEdgeContextMenu={(event, edge) => {
+          setSelectedNodeId(null);
+          setSelectedEdgeId(edge.id);
+          openContextMenu(event, { kind: "edge", edgeId: edge.id });
+        }}
+        onEdgeMouseEnter={(_, edge) => {
+          setHoveredEdgeId(edge.id);
+        }}
+        onEdgeMouseLeave={() => {
+          setHoveredEdgeId(null);
+        }}
+        nodeTypes={GRAPH_NODE_TYPES}
+        edgeTypes={GRAPH_EDGE_TYPES}
+        minZoom={0.18}
+        maxZoom={2.1}
+        proOptions={{ hideAttribution: true }}
+        nodesDraggable
+        nodesConnectable={false}
+        elementsSelectable
+        onlyRenderVisibleElements={denseGraph}
+        fitView={false}
+        className="sourcetrail-flow"
+      >
+        <Controls position="top-left" showInteractive={false} />
+        <Panel position="bottom-left" className="graph-zoom-panel">
+          <button type="button" aria-label="Zoom in" onClick={zoomIn}>
+            +
+          </button>
+          <button type="button" aria-label="Zoom out" onClick={zoomOut}>
+            -
+          </button>
+          <button type="button" aria-label="Reset zoom to 100%" onClick={resetZoom}>
+            0
+          </button>
         </Panel>
+        {trailConfig.showMiniMap ? (
+          <MiniMap
+            className="graph-minimap"
+            pannable
+            zoomable
+            position="bottom-left"
+            bgColor="rgb(251 251 249 / 0.92)"
+            maskColor="rgb(39 44 52 / 0.16)"
+            nodeColor={minimapNodeColor}
+            nodeStrokeColor={minimapNodeStrokeColor}
+            nodeBorderRadius={2}
+          />
+        ) : null}
+        <Panel position="bottom-right" className="graph-legend-toggle-panel">
+          <button
+            type="button"
+            aria-label={trailConfig.showLegend ? "Hide legend" : "Show legend"}
+            onClick={() => {
+              setLegendFilterKinds(null);
+              onToggleLegend?.();
+            }}
+          >
+            {trailConfig.showLegend ? "×" : "?"}
+          </button>
+        </Panel>
+        {trailConfig.showLegend && legendRows.length > 0 ? (
+          <Panel position="bottom-right" className="graph-legend-panel">
+            <div className="graph-legend-title">Legend</div>
+            <div className="graph-legend-rows">
+              {legendRows.map((row) => (
+                <button
+                  key={row.kind}
+                  type="button"
+                  className={[
+                    "graph-legend-row",
+                    legendFilterKinds !== null && !legendFilterKinds.has(row.kind)
+                      ? "graph-legend-row-muted"
+                      : "graph-legend-row-active",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")}
+                  onClick={() => toggleLegendKind(row.kind)}
+                >
+                  <span className="graph-legend-line" style={{ background: row.stroke }} />
+                  <span className="graph-legend-kind">{formatKindLabel(row.kind)}</span>
+                  <span className="graph-legend-count">{row.count}</span>
+                </button>
+              ))}
+            </div>
+            <div className="graph-legend-note">
+              Trunk lines indicate bundled flow edges.
+              {(hasUncertainEdges || hasProbableEdges) && " "}
+              {hasUncertainEdges ? "Dashed edges = uncertain." : ""}
+              {hasUncertainEdges && hasProbableEdges ? " " : ""}
+              {hasProbableEdges ? "Lower opacity = probable." : ""}
+              {legendFilterKinds !== null ? (
+                <button
+                  type="button"
+                  className="graph-legend-reset"
+                  onClick={() => setLegendFilterKinds(null)}
+                >
+                  Show all
+                </button>
+              ) : null}
+            </div>
+          </Panel>
+        ) : null}
+      </ReactFlow>
+      {contextMenu ? (
+        <div
+          className="graph-context-menu"
+          style={{ left: Math.max(8, contextMenu.x), top: Math.max(8, contextMenu.y) }}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          {contextMenu.kind === "pane" ? (
+            <>
+              <button type="button" onClick={() => onNavigateBack?.()}>
+                Back
+              </button>
+              <button type="button" onClick={() => onNavigateForward?.()}>
+                Forward
+              </button>
+              <button type="button" onClick={() => void exportImage("png")}>
+                Save Image (PNG)
+              </button>
+              <button type="button" onClick={() => void exportImage("jpeg")}>
+                Save Image (JPEG)
+              </button>
+              <button type="button" onClick={() => void exportImage("svg")}>
+                Save Image (SVG)
+              </button>
+              <button type="button" onClick={() => void exportToClipboard()}>
+                Save To Clipboard (PNG)
+              </button>
+              {hasHiddenElements ? (
+                <button type="button" onClick={resetHidden}>
+                  Reset Hidden
+                </button>
+              ) : null}
+            </>
+          ) : null}
+          {contextMenu.kind === "edge" ? (
+            <>
+              <button
+                type="button"
+                onClick={() => {
+                  const edge = flowEdgesById.get(contextMenu.edgeId);
+                  if (edge) {
+                    activateEdge(edge);
+                  }
+                }}
+              >
+                Show Definition
+              </button>
+              <button type="button" onClick={() => hideEdge(contextMenu.edgeId)}>
+                Hide Edge
+              </button>
+              <button type="button" onClick={() => void exportImage("png")}>
+                Save Image (PNG)
+              </button>
+              <button type="button" onClick={() => void exportToClipboard()}>
+                Save To Clipboard (PNG)
+              </button>
+            </>
+          ) : null}
+          {contextMenu.kind === "node" ? (
+            <>
+              <button type="button" onClick={() => selectNodeById(contextMenu.nodeId)}>
+                Show Definition
+              </button>
+              <button
+                type="button"
+                onClick={() => onOpenNodeInNewTab?.(contextMenu.nodeId, contextMenu.label)}
+              >
+                Open In New Tab
+              </button>
+              <button type="button" onClick={() => onShowDefinitionInIde?.(contextMenu.nodeId)}>
+                Show Definition In IDE
+              </button>
+              {contextNodeIsExpandable ? (
+                <button type="button" onClick={() => toggleExpandedNode(contextMenu.nodeId)}>
+                  {contextNode?.data.isExpanded ? "Collapse Node" : "Expand Node"}
+                </button>
+              ) : null}
+              <button type="button" onClick={() => hideNode(contextMenu.nodeId)}>
+                Hide Node
+              </button>
+              <button
+                type="button"
+                onClick={() => onBookmarkNode?.(contextMenu.nodeId, contextMenu.label)}
+              >
+                Bookmark Node
+              </button>
+              <button
+                type="button"
+                onClick={() => void copyText(contextMenu.label, "Name copied to clipboard.")}
+              >
+                Copy Name
+              </button>
+              {contextMenu.isFile && contextMenu.filePath ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void copyText(contextMenu.filePath ?? "", "Full path copied to clipboard.")
+                    }
+                  >
+                    Copy Full Path
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onOpenContainingFolder?.(contextMenu.filePath ?? "")}
+                  >
+                    Open Containing Folder
+                  </button>
+                </>
+              ) : null}
+            </>
+          ) : null}
+        </div>
       ) : null}
-    </ReactFlow>
+    </div>
   );
 }

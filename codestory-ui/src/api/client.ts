@@ -2,12 +2,18 @@ import type {
   AgentAnswerDto,
   AgentAskRequest,
   AppEventPayload,
+  BookmarkCategoryDto,
+  BookmarkDto,
+  CreateBookmarkCategoryRequest,
+  CreateBookmarkRequest,
   EdgeOccurrencesRequest,
   GraphRequest,
   GraphResponse,
   NodeDetailsDto,
   NodeDetailsRequest,
   NodeOccurrencesRequest,
+  OpenContainingFolderRequest,
+  OpenDefinitionRequest,
   OpenProjectRequest,
   ProjectSummary,
   ReadFileTextRequest,
@@ -19,6 +25,10 @@ import type {
   StartIndexingRequest,
   SymbolSummaryDto,
   TrailConfigDto,
+  TrailFilterOptionsDto,
+  SystemActionResponse,
+  UpdateBookmarkCategoryRequest,
+  UpdateBookmarkRequest,
   WriteFileResponse,
   WriteFileTextRequest,
 } from "../generated/api";
@@ -112,6 +122,10 @@ class ApiClient {
     });
   }
 
+  graphTrailFilterOptions(): Promise<TrailFilterOptionsDto> {
+    return this.request<TrailFilterOptionsDto>("/api/graph/trail/filter-options");
+  }
+
   nodeDetails(req: NodeDetailsRequest): Promise<NodeDetailsDto> {
     return this.request<NodeDetailsDto>("/api/node/details", {
       method: "POST",
@@ -167,6 +181,73 @@ class ApiClient {
     return this.request<SymbolSummaryDto[]>(
       `/api/explorer/children/${encodeURIComponent(parentId)}`,
     );
+  }
+
+  getBookmarkCategories(): Promise<BookmarkCategoryDto[]> {
+    return this.request<BookmarkCategoryDto[]>("/api/bookmarks/categories");
+  }
+
+  createBookmarkCategory(req: CreateBookmarkCategoryRequest): Promise<BookmarkCategoryDto> {
+    return this.request<BookmarkCategoryDto>("/api/bookmarks/categories", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
+  }
+
+  updateBookmarkCategory(
+    id: string,
+    req: UpdateBookmarkCategoryRequest,
+  ): Promise<BookmarkCategoryDto> {
+    return this.request<BookmarkCategoryDto>(`/api/bookmarks/categories/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(req),
+    });
+  }
+
+  deleteBookmarkCategory(id: string): Promise<void> {
+    return this.request<void>(`/api/bookmarks/categories/${id}`, {
+      method: "DELETE",
+    });
+  }
+
+  getBookmarks(categoryId?: string | null): Promise<BookmarkDto[]> {
+    const query =
+      typeof categoryId === "string" ? `?category_id=${encodeURIComponent(categoryId)}` : "";
+    return this.request<BookmarkDto[]>(`/api/bookmarks${query}`);
+  }
+
+  createBookmark(req: CreateBookmarkRequest): Promise<BookmarkDto> {
+    return this.request<BookmarkDto>("/api/bookmarks", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
+  }
+
+  updateBookmark(id: string, req: UpdateBookmarkRequest): Promise<BookmarkDto> {
+    return this.request<BookmarkDto>(`/api/bookmarks/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(req),
+    });
+  }
+
+  deleteBookmark(id: string): Promise<void> {
+    return this.request<void>(`/api/bookmarks/${id}`, {
+      method: "DELETE",
+    });
+  }
+
+  openDefinition(req: OpenDefinitionRequest): Promise<SystemActionResponse> {
+    return this.request<SystemActionResponse>("/api/system/open-definition", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
+  }
+
+  openContainingFolder(req: OpenContainingFolderRequest): Promise<SystemActionResponse> {
+    return this.request<SystemActionResponse>("/api/system/open-containing-folder", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
   }
 
   subscribeEvents(onEvent: (event: AppEventPayload) => void): () => void {

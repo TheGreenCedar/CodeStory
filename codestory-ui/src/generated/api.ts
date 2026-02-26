@@ -12,6 +12,14 @@ export type ApiError = { code: string; message: string }
 
 export type AppEventPayload = { type: "IndexingStarted"; data: { file_count: number } } | { type: "IndexingProgress"; data: { current: number; total: number } } | { type: "IndexingComplete"; data: { duration_ms: number; phase_timings: IndexingPhaseTimings } } | { type: "IndexingFailed"; data: { error: string } } | { type: "StatusUpdate"; data: { message: string } }
 
+export type BookmarkCategoryDto = { id: string; name: string }
+
+export type BookmarkDto = { id: string; category_id: string; node_id: NodeId; comment: string | null; node_label: string; node_kind: NodeKind; file_path: string | null }
+
+export type CreateBookmarkCategoryRequest = { name: string }
+
+export type CreateBookmarkRequest = { category_id: string; node_id: NodeId; comment?: string | null }
+
 export type EdgeId = string
 
 export type EdgeKind = "MEMBER" | "TYPE_USAGE" | "USAGE" | "CALL" | "INHERITANCE" | "OVERRIDE" | "TYPE_ARGUMENT" | "TEMPLATE_SPECIALIZATION" | "INCLUDE" | "IMPORT" | "MACRO_USAGE" | "ANNOTATION_USAGE" | "UNKNOWN"
@@ -26,7 +34,7 @@ export type GraphEdgeDto = { id: EdgeId; source: NodeId; target: NodeId; kind: E
  */
 certainty?: string | null; callsite_identity?: string | null; candidate_targets?: NodeId[] }
 
-export type GraphNodeDto = { id: NodeId; label: string; kind: NodeKind; depth: number; label_policy?: string | null; badge_visible_members?: number | null; badge_total_members?: number | null; merged_symbol_examples?: string[]; file_path?: string | null; qualified_name?: string | null }
+export type GraphNodeDto = { id: NodeId; label: string; kind: NodeKind; depth: number; label_policy?: string | null; badge_visible_members?: number | null; badge_total_members?: number | null; merged_symbol_examples?: string[]; file_path?: string | null; qualified_name?: string | null; member_access?: MemberAccess | null }
 
 export type GraphRequest = { center_id: NodeId; 
 /**
@@ -40,11 +48,15 @@ export type IndexMode = "Full" | "Incremental"
 
 export type IndexingPhaseTimings = { parse_index_ms: number; projection_flush_ms: number; edge_resolution_ms: number; error_flush_ms: number; cleanup_ms: number; cache_refresh_ms: number | null; unresolved_calls_start: number; unresolved_imports_start: number; resolved_calls: number; resolved_imports: number; unresolved_calls_end: number; unresolved_imports_end: number }
 
+export type LayoutDirection = "Horizontal" | "Vertical"
+
 export type ListChildrenSymbolsRequest = { parent_id: NodeId }
 
 export type ListRootSymbolsRequest = { limit: number | null }
 
-export type NodeDetailsDto = { id: NodeId; kind: NodeKind; display_name: string; serialized_name: string; qualified_name: string | null; canonical_id: string | null; file_path: string | null; start_line: number | null; start_col: number | null; end_line: number | null; end_col: number | null }
+export type MemberAccess = "Public" | "Protected" | "Private" | "Default"
+
+export type NodeDetailsDto = { id: NodeId; kind: NodeKind; display_name: string; serialized_name: string; qualified_name: string | null; canonical_id: string | null; file_path: string | null; start_line: number | null; start_col: number | null; end_line: number | null; end_col: number | null; member_access?: MemberAccess | null }
 
 export type NodeDetailsRequest = { id: NodeId }
 
@@ -53,6 +65,10 @@ export type NodeId = string
 export type NodeKind = "MODULE" | "NAMESPACE" | "PACKAGE" | "FILE" | "STRUCT" | "CLASS" | "INTERFACE" | "ANNOTATION" | "UNION" | "ENUM" | "TYPEDEF" | "TYPE_PARAMETER" | "BUILTIN_TYPE" | "FUNCTION" | "METHOD" | "MACRO" | "GLOBAL_VARIABLE" | "FIELD" | "VARIABLE" | "CONSTANT" | "ENUM_CONSTANT" | "UNKNOWN"
 
 export type NodeOccurrencesRequest = { id: NodeId }
+
+export type OpenContainingFolderRequest = { path: string }
+
+export type OpenDefinitionRequest = { node_id: NodeId }
 
 export type OpenProjectRequest = { path: string }
 
@@ -76,17 +92,25 @@ export type StorageStatsDto = { node_count: number; edge_count: number; file_cou
 
 export type SymbolSummaryDto = { id: NodeId; label: string; kind: NodeKind; file_path: string | null; has_children: boolean }
 
+export type SystemActionResponse = { ok: boolean; message: string }
+
 export type TrailCallerScope = "ProductionOnly" | "IncludeTestsAndBenches"
 
 export type TrailConfigDto = { root_id: NodeId; mode?: TrailMode; target_id?: NodeId | null; 
 /**
  * Use `0` to mean "infinite" (bounded by `max_nodes`).
  */
-depth: number; direction: TrailDirection; caller_scope?: TrailCallerScope; edge_filter: EdgeKind[]; show_utility_calls?: boolean; node_filter?: NodeKind[]; max_nodes: number }
+depth: number; direction: TrailDirection; caller_scope?: TrailCallerScope; edge_filter: EdgeKind[]; show_utility_calls?: boolean; node_filter?: NodeKind[]; max_nodes: number; layout_direction?: LayoutDirection }
 
 export type TrailDirection = "Incoming" | "Outgoing" | "Both"
 
+export type TrailFilterOptionsDto = { node_kinds: NodeKind[]; edge_kinds: EdgeKind[] }
+
 export type TrailMode = "Neighborhood" | "AllReferenced" | "AllReferencing" | "ToTargetSymbol"
+
+export type UpdateBookmarkCategoryRequest = { name: string }
+
+export type UpdateBookmarkRequest = { category_id?: string | null; comment?: string | null }
 
 export type WriteFileResponse = { bytes_written: number }
 

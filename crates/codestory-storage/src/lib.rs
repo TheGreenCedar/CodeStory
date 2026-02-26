@@ -1,7 +1,7 @@
 use codestory_core::{
-    Bookmark, BookmarkCategory, Edge, EdgeKind, EnumConversionError, Node, NodeId, NodeKind,
-    Occurrence, OccurrenceKind, ResolutionCertainty, TrailCallerScope, TrailConfig, TrailDirection,
-    TrailMode, TrailResult,
+    AccessKind, Bookmark, BookmarkCategory, Edge, EdgeKind, EnumConversionError, Node, NodeId,
+    NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty, TrailCallerScope, TrailConfig,
+    TrailDirection, TrailMode, TrailResult,
 };
 use parking_lot::RwLock;
 use rusqlite::{Connection, Result, Row, params};
@@ -105,9 +105,18 @@ impl Storage {
     }
 
     pub fn clear(&self) -> Result<(), StorageError> {
-        self.conn.execute("DELETE FROM occurrence", [])?;
-        self.conn.execute("DELETE FROM edge", [])?;
-        self.conn.execute("DELETE FROM node", [])?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM occurrence", [])?;
+        tx.execute("DELETE FROM edge", [])?;
+        tx.execute("DELETE FROM component_access", [])?;
+        tx.execute("DELETE FROM bookmark_node", [])?;
+        tx.execute("DELETE FROM local_symbol", [])?;
+        tx.execute("DELETE FROM error", [])?;
+        tx.execute("DELETE FROM node", [])?;
+        tx.execute("DELETE FROM file", [])?;
+        tx.commit()?;
+
+        self.cache.nodes.write().clear();
         Ok(())
     }
 
@@ -271,6 +280,18 @@ impl Storage {
             [],
         )?;
         self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_component_access_node ON component_access(node_id)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bookmark_node_category ON bookmark_node(category_id)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bookmark_node_node ON bookmark_node(node_id)",
+            [],
+        )?;
+        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_node_kind_serialized_name ON node(kind, serialized_name)",
             [],
         )?;
@@ -416,6 +437,24 @@ impl Storage {
 
     fn certainty_db_value(certainty: Option<ResolutionCertainty>) -> Option<&'static str> {
         certainty.map(ResolutionCertainty::as_str)
+    }
+
+    fn access_kind_db_value(access: AccessKind) -> i32 {
+        match access {
+            AccessKind::Public => 0,
+            AccessKind::Protected => 1,
+            AccessKind::Private => 2,
+            AccessKind::Default => 3,
+        }
+    }
+
+    fn access_kind_from_db(value: i32) -> AccessKind {
+        match value {
+            1 => AccessKind::Protected,
+            2 => AccessKind::Private,
+            3 => AccessKind::Default,
+            _ => AccessKind::Public,
+        }
     }
 
     fn insert_node_with_stmt(
@@ -594,6 +633,98 @@ impl Storage {
             edges.push(Self::edge_from_row(row)?);
         }
         Ok(edges)
+    }
+
+    pub fn get_present_node_kinds(&self) -> Result<Vec<NodeKind>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT kind FROM node ORDER BY kind ASC")?;
+        let mut kinds = Vec::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let raw: i32 = row.get(0)?;
+            if let Ok(kind) = NodeKind::try_from(raw) {
+                kinds.push(kind);
+            }
+        }
+        Ok(kinds)
+    }
+
+    pub fn get_present_edge_kinds(&self) -> Result<Vec<EdgeKind>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT kind FROM edge ORDER BY kind ASC")?;
+        let mut kinds = Vec::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let raw: i32 = row.get(0)?;
+            if let Ok(kind) = EdgeKind::try_from(raw) {
+                kinds.push(kind);
+            }
+        }
+        Ok(kinds)
+    }
+
+    pub fn insert_component_access_batch(
+        &mut self,
+        entries: &[(NodeId, AccessKind)],
+    ) -> Result<(), StorageError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO component_access (node_id, type)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(node_id) DO UPDATE SET type = excluded.type",
+            )?;
+            for (node_id, access) in entries {
+                stmt.execute(params![node_id.0, Self::access_kind_db_value(*access)])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_component_access(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<AccessKind>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT type FROM component_access WHERE node_id = ?1")?;
+        let mut rows = stmt.query(params![node_id.0])?;
+        if let Some(row) = rows.next()? {
+            let raw: i32 = row.get(0)?;
+            return Ok(Some(Self::access_kind_from_db(raw)));
+        }
+        Ok(None)
+    }
+
+    pub fn get_component_access_map_for_nodes(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<HashMap<NodeId, AccessKind>, StorageError> {
+        if node_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let placeholders = std::iter::repeat_n("?", node_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql =
+            format!("SELECT node_id, type FROM component_access WHERE node_id IN ({placeholders})");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(node_ids.iter().map(|id| id.0)))?;
+        let mut map = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let node_id: i64 = row.get(0)?;
+            let raw: i32 = row.get(1)?;
+            map.insert(NodeId(node_id), Self::access_kind_from_db(raw));
+        }
+        Ok(map)
     }
 
     pub fn get_occurrences(&self) -> Result<Vec<Occurrence>, StorageError> {
@@ -1082,12 +1213,12 @@ impl Storage {
     }
 
     /// Rename a bookmark category
-    pub fn rename_bookmark_category(&self, id: i64, new_name: &str) -> Result<(), StorageError> {
-        self.conn.execute(
+    pub fn rename_bookmark_category(&self, id: i64, new_name: &str) -> Result<bool, StorageError> {
+        let updated = self.conn.execute(
             "UPDATE bookmark_category SET name = ?1 WHERE id = ?2",
             params![new_name, id],
         )?;
-        Ok(())
+        Ok(updated > 0)
     }
 
     /// Add a bookmark to a category
@@ -1137,6 +1268,36 @@ impl Storage {
         self.conn.execute(
             "UPDATE bookmark_node SET comment = ?1 WHERE id = ?2",
             params![comment, id],
+        )?;
+        Ok(())
+    }
+
+    /// Update bookmark fields.
+    pub fn update_bookmark(
+        &self,
+        id: i64,
+        category_id: Option<i64>,
+        comment: Option<Option<&str>>,
+    ) -> Result<(), StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT category_id, comment FROM bookmark_node WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(());
+        };
+        let current_category_id: i64 = row.get(0)?;
+        let current_comment: Option<String> = row.get(1)?;
+        let next_category_id = category_id.unwrap_or(current_category_id);
+        let next_comment = match comment {
+            Some(Some(value)) => Some(value.to_string()),
+            Some(None) => None,
+            None => current_comment,
+        };
+
+        self.conn.execute(
+            "UPDATE bookmark_node SET category_id = ?1, comment = ?2 WHERE id = ?3",
+            params![next_category_id, next_comment, id],
         )?;
         Ok(())
     }
@@ -1766,7 +1927,8 @@ fn is_common_unqualified_call_name(name: &str) -> bool {
 mod tests {
     use super::*;
     use codestory_core::{
-        Edge, EdgeId, EdgeKind, NodeId, NodeKind, SourceLocation, TrailConfig, TrailDirection,
+        AccessKind, Edge, EdgeId, EdgeKind, NodeId, NodeKind, SourceLocation, TrailConfig,
+        TrailDirection,
     };
 
     #[test]
@@ -1821,6 +1983,173 @@ mod tests {
                 .any(|name| name == "idx_edge_kind_resolved_target")
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_present_kind_queries() -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        storage.insert_nodes_batch(&[
+            Node {
+                id: NodeId(1),
+                kind: NodeKind::CLASS,
+                serialized_name: "A".to_string(),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(2),
+                kind: NodeKind::METHOD,
+                serialized_name: "A::run".to_string(),
+                ..Default::default()
+            },
+        ])?;
+        storage.insert_edges_batch(&[
+            Edge {
+                id: EdgeId(1),
+                source: NodeId(1),
+                target: NodeId(2),
+                kind: EdgeKind::MEMBER,
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(2),
+                source: NodeId(2),
+                target: NodeId(2),
+                kind: EdgeKind::CALL,
+                ..Default::default()
+            },
+        ])?;
+
+        let node_kinds = storage.get_present_node_kinds()?;
+        let edge_kinds = storage.get_present_edge_kinds()?;
+        assert!(node_kinds.contains(&NodeKind::CLASS));
+        assert!(node_kinds.contains(&NodeKind::METHOD));
+        assert!(edge_kinds.contains(&EdgeKind::MEMBER));
+        assert!(edge_kinds.contains(&EdgeKind::CALL));
+        Ok(())
+    }
+
+    #[test]
+    fn test_component_access_round_trip() -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        storage.insert_nodes_batch(&[
+            Node {
+                id: NodeId(41),
+                kind: NodeKind::METHOD,
+                serialized_name: "run".to_string(),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(42),
+                kind: NodeKind::FIELD,
+                serialized_name: "state".to_string(),
+                ..Default::default()
+            },
+        ])?;
+        storage.insert_component_access_batch(&[
+            (NodeId(41), AccessKind::Protected),
+            (NodeId(42), AccessKind::Private),
+        ])?;
+
+        assert_eq!(
+            storage.get_component_access(NodeId(41))?,
+            Some(AccessKind::Protected)
+        );
+        let map = storage.get_component_access_map_for_nodes(&[NodeId(41), NodeId(42)])?;
+        assert_eq!(map.get(&NodeId(42)).copied(), Some(AccessKind::Private));
+        Ok(())
+    }
+
+    #[test]
+    fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        let file_node = Node {
+            id: NodeId(500),
+            kind: NodeKind::FILE,
+            serialized_name: "src/main.rs".to_string(),
+            ..Default::default()
+        };
+        let function_node = Node {
+            id: NodeId(501),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "main".to_string(),
+            file_node_id: Some(file_node.id),
+            ..Default::default()
+        };
+
+        storage.insert_file(&FileInfo {
+            id: file_node.id.0,
+            path: PathBuf::from("src/main.rs"),
+            language: "rust".to_string(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 10,
+        })?;
+        storage.insert_nodes_batch(&[file_node.clone(), function_node.clone()])?;
+        storage.insert_edges_batch(&[Edge {
+            id: EdgeId(700),
+            source: function_node.id,
+            target: function_node.id,
+            kind: EdgeKind::CALL,
+            file_node_id: Some(file_node.id),
+            ..Default::default()
+        }])?;
+        storage.insert_occurrences_batch(&[Occurrence {
+            element_id: function_node.id.0,
+            kind: codestory_core::OccurrenceKind::DEFINITION,
+            location: SourceLocation {
+                file_node_id: file_node.id,
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: 4,
+            },
+        }])?;
+        storage.insert_component_access_batch(&[(function_node.id, AccessKind::Public)])?;
+        storage.insert_error(&codestory_core::ErrorInfo {
+            message: "test".to_string(),
+            file_id: Some(file_node.id),
+            line: Some(1),
+            column: Some(1),
+            is_fatal: false,
+            index_step: codestory_core::IndexStep::Indexing,
+        })?;
+        storage.conn.execute(
+            "INSERT INTO local_symbol (id, name, file_id) VALUES (?1, ?2, ?3)",
+            params![1_i64, "main", file_node.id.0],
+        )?;
+
+        let category_id = storage.create_bookmark_category("Favorites")?;
+        let _ = storage.add_bookmark(category_id, function_node.id, Some("keep"))?;
+
+        // Ensure cache is warm before clear.
+        assert!(storage.get_node(function_node.id)?.is_some());
+
+        storage.clear()?;
+
+        for table in [
+            "occurrence",
+            "edge",
+            "component_access",
+            "bookmark_node",
+            "local_symbol",
+            "error",
+            "node",
+            "file",
+        ] {
+            let count: i64 =
+                storage
+                    .conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?;
+            assert_eq!(count, 0, "expected {table} to be empty after clear");
+        }
+
+        // Categories are user-managed metadata; clear only removes node-linked data.
+        assert_eq!(storage.get_bookmark_categories()?.len(), 1);
+        assert!(storage.get_node(function_node.id)?.is_none());
         Ok(())
     }
 
@@ -2093,6 +2422,37 @@ mod tests {
         storage.delete_bookmark_category(cat_id)?;
         let categories = storage.get_bookmark_categories()?;
         assert_eq!(categories.len(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_bookmark_tri_state_comment_patch() -> Result<(), StorageError> {
+        let storage = Storage::new_in_memory()?;
+
+        let category_id = storage.create_bookmark_category("General")?;
+        storage.insert_node(&Node {
+            id: NodeId(300),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "tri_state_target".to_string(),
+            ..Default::default()
+        })?;
+        let bookmark_id = storage.add_bookmark(category_id, NodeId(300), Some("initial"))?;
+
+        // Omitted comment keeps existing value.
+        storage.update_bookmark(bookmark_id, None, None)?;
+        let mut bookmarks = storage.get_bookmarks(Some(category_id))?;
+        assert_eq!(bookmarks.remove(0).comment.as_deref(), Some("initial"));
+
+        // Explicit null clears the comment.
+        storage.update_bookmark(bookmark_id, None, Some(None))?;
+        let mut bookmarks = storage.get_bookmarks(Some(category_id))?;
+        assert_eq!(bookmarks.remove(0).comment, None);
+
+        // Explicit value sets the comment.
+        storage.update_bookmark(bookmark_id, None, Some(Some("updated")))?;
+        let mut bookmarks = storage.get_bookmarks(Some(category_id))?;
+        assert_eq!(bookmarks.remove(0).comment.as_deref(), Some("updated"));
 
         Ok(())
     }

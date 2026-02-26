@@ -1,5 +1,6 @@
 import type {
   EdgeKind,
+  LayoutDirection,
   NodeKind,
   TrailCallerScope,
   TrailConfigDto,
@@ -55,6 +56,7 @@ export type TrailUiConfig = {
   targetId: string | null;
   targetLabel: string;
   depth: number;
+  layoutDirection: LayoutDirection;
   direction: TrailDirection;
   callerScope: TrailCallerScope;
   edgeFilter: EdgeKind[];
@@ -62,6 +64,8 @@ export type TrailUiConfig = {
   nodeFilter: NodeKind[];
   showLegend: boolean;
   showMiniMap: boolean;
+  debugParityChannels: boolean;
+  debugParityRoutes: boolean;
   groupingMode: GroupingMode;
   maxNodes: number;
 };
@@ -74,6 +78,7 @@ export function defaultTrailUiConfig(): TrailUiConfig {
     targetId: null,
     targetLabel: "",
     depth: 1,
+    layoutDirection: "Horizontal",
     direction: "Both",
     callerScope: "ProductionOnly",
     edgeFilter: [...EDGE_KIND_OPTIONS],
@@ -81,6 +86,8 @@ export function defaultTrailUiConfig(): TrailUiConfig {
     nodeFilter: [],
     showLegend: true,
     showMiniMap: true,
+    debugParityChannels: false,
+    debugParityRoutes: false,
     groupingMode: "none",
     maxNodes: 500,
   };
@@ -123,6 +130,10 @@ export function normalizeTrailUiConfig(
     raw.direction === "Incoming" || raw.direction === "Outgoing" || raw.direction === "Both"
       ? raw.direction
       : defaults.direction;
+  const layoutDirection =
+    raw.layoutDirection === "Horizontal" || raw.layoutDirection === "Vertical"
+      ? raw.layoutDirection
+      : defaults.layoutDirection;
 
   const callerScope =
     raw.callerScope === "ProductionOnly" || raw.callerScope === "IncludeTestsAndBenches"
@@ -155,6 +166,7 @@ export function normalizeTrailUiConfig(
     targetId: typeof raw.targetId === "string" ? raw.targetId : null,
     targetLabel: typeof raw.targetLabel === "string" ? raw.targetLabel : "",
     depth: clampDepth(typeof raw.depth === "number" ? raw.depth : defaults.depth),
+    layoutDirection,
     direction,
     callerScope,
     edgeFilter: edgeFilter.length > 0 ? edgeFilter : defaults.edgeFilter,
@@ -163,6 +175,14 @@ export function normalizeTrailUiConfig(
     nodeFilter,
     showLegend: typeof raw.showLegend === "boolean" ? raw.showLegend : defaults.showLegend,
     showMiniMap: typeof raw.showMiniMap === "boolean" ? raw.showMiniMap : defaults.showMiniMap,
+    debugParityChannels:
+      typeof raw.debugParityChannels === "boolean"
+        ? raw.debugParityChannels
+        : defaults.debugParityChannels,
+    debugParityRoutes:
+      typeof raw.debugParityRoutes === "boolean"
+        ? raw.debugParityRoutes
+        : defaults.debugParityRoutes,
     groupingMode,
     maxNodes: clampMaxNodes(typeof raw.maxNodes === "number" ? raw.maxNodes : defaults.maxNodes),
   };
@@ -174,6 +194,7 @@ export function toTrailConfigDto(rootId: string, config: TrailUiConfig): TrailCo
     mode: config.mode,
     target_id: config.mode === "ToTargetSymbol" ? config.targetId : null,
     depth: clampDepth(config.depth),
+    layout_direction: config.layoutDirection,
     direction: config.direction,
     caller_scope: config.callerScope,
     edge_filter: config.edgeFilter,

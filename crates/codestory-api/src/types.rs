@@ -243,3 +243,59 @@ impl From<TrailDirection> for codestory_core::TrailDirection {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type, Default)]
+pub enum LayoutDirection {
+    #[default]
+    Horizontal,
+    Vertical,
+}
+
+impl From<codestory_core::LayoutDirection> for LayoutDirection {
+    fn from(value: codestory_core::LayoutDirection) -> Self {
+        match value {
+            codestory_core::LayoutDirection::Horizontal => Self::Horizontal,
+            codestory_core::LayoutDirection::Vertical => Self::Vertical,
+        }
+    }
+}
+
+impl From<LayoutDirection> for codestory_core::LayoutDirection {
+    fn from(value: LayoutDirection) -> Self {
+        match value {
+            LayoutDirection::Horizontal => Self::Horizontal,
+            LayoutDirection::Vertical => Self::Vertical,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type, Default)]
+pub enum MemberAccess {
+    #[default]
+    Public,
+    Protected,
+    Private,
+    Default,
+}
+
+impl From<codestory_core::AccessKind> for MemberAccess {
+    fn from(value: codestory_core::AccessKind) -> Self {
+        match value {
+            codestory_core::AccessKind::Public => Self::Public,
+            codestory_core::AccessKind::Protected => Self::Protected,
+            codestory_core::AccessKind::Private => Self::Private,
+            codestory_core::AccessKind::Default => Self::Default,
+        }
+    }
+}
+
+impl From<MemberAccess> for codestory_core::AccessKind {
+    fn from(value: MemberAccess) -> Self {
+        match value {
+            MemberAccess::Public => Self::Public,
+            MemberAccess::Protected => Self::Protected,
+            MemberAccess::Private => Self::Private,
+            MemberAccess::Default => Self::Default,
+        }
+    }
+}

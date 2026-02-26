@@ -1,5 +1,8 @@
 use crate::ids::{EdgeId, NodeId};
-use crate::types::{EdgeKind, IndexMode, NodeKind, TrailCallerScope, TrailDirection, TrailMode};
+use crate::types::{
+    EdgeKind, IndexMode, LayoutDirection, MemberAccess, NodeKind, TrailCallerScope, TrailDirection,
+    TrailMode,
+};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
@@ -87,6 +90,8 @@ pub struct GraphNodeDto {
     pub file_path: Option<String>,
     #[serde(default)]
     pub qualified_name: Option<String>,
+    #[serde(default)]
+    pub member_access: Option<MemberAccess>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -132,10 +137,22 @@ pub struct TrailConfigDto {
     #[serde(default)]
     pub node_filter: Vec<NodeKind>,
     pub max_nodes: u32,
+    #[serde(default = "default_layout_direction")]
+    pub layout_direction: LayoutDirection,
 }
 
 const fn default_show_utility_calls() -> bool {
     false
+}
+
+const fn default_layout_direction() -> LayoutDirection {
+    LayoutDirection::Horizontal
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct TrailFilterOptionsDto {
+    pub node_kinds: Vec<NodeKind>,
+    pub edge_kinds: Vec<EdgeKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -177,6 +194,8 @@ pub struct NodeDetailsDto {
     pub start_col: Option<u32>,
     pub end_line: Option<u32>,
     pub end_col: Option<u32>,
+    #[serde(default)]
+    pub member_access: Option<MemberAccess>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -253,6 +272,65 @@ pub struct AgentAnswerDto {
     pub sections: Vec<AgentResponseSectionDto>,
     pub citations: Vec<AgentCitationDto>,
     pub graphs: Vec<GraphArtifactDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct BookmarkCategoryDto {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct CreateBookmarkCategoryRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct UpdateBookmarkCategoryRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct BookmarkDto {
+    pub id: String,
+    pub category_id: String,
+    pub node_id: NodeId,
+    pub comment: Option<String>,
+    pub node_label: String,
+    pub node_kind: NodeKind,
+    pub file_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct CreateBookmarkRequest {
+    pub category_id: String,
+    pub node_id: NodeId,
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct UpdateBookmarkRequest {
+    #[serde(default)]
+    pub category_id: Option<String>,
+    #[serde(default, with = "::serde_with::rust::double_option")]
+    pub comment: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct OpenDefinitionRequest {
+    pub node_id: NodeId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct OpenContainingFolderRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SystemActionResponse {
+    pub ok: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

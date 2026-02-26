@@ -1,0 +1,248 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`graph parity geometry harness > keeps route points and channel metadata deterministic by snapshot 1`] = `
+{
+  "horizontal": [
+    {
+      "channelId": undefined,
+      "id": "call-1",
+      "routeKind": "direct",
+      "routePoints": [
+        {
+          "x": 304,
+          "y": 208,
+        },
+        {
+          "x": 344,
+          "y": 208,
+        },
+        {
+          "x": 344,
+          "y": 64,
+        },
+        {
+          "x": 680,
+          "y": 64,
+        },
+        {
+          "x": 680,
+          "y": 104,
+        },
+        {
+          "x": 720,
+          "y": 104,
+        },
+      ],
+      "sourceMemberOrder": undefined,
+      "targetMemberOrder": undefined,
+      "trunkCoord": undefined,
+    },
+    {
+      "channelId": undefined,
+      "id": "call-2",
+      "routeKind": "direct",
+      "routePoints": [
+        {
+          "x": 304,
+          "y": 208,
+        },
+        {
+          "x": 344,
+          "y": 208,
+        },
+        {
+          "x": 344,
+          "y": 120,
+        },
+        {
+          "x": 680,
+          "y": 120,
+        },
+        {
+          "x": 680,
+          "y": 216,
+        },
+        {
+          "x": 720,
+          "y": 216,
+        },
+      ],
+      "sourceMemberOrder": undefined,
+      "targetMemberOrder": undefined,
+      "trunkCoord": undefined,
+    },
+    {
+      "channelId": undefined,
+      "id": "call-3",
+      "routeKind": "direct",
+      "routePoints": [
+        {
+          "x": 304,
+          "y": 208,
+        },
+        {
+          "x": 344,
+          "y": 208,
+        },
+        {
+          "x": 344,
+          "y": 264,
+        },
+        {
+          "x": 680,
+          "y": 264,
+        },
+        {
+          "x": 680,
+          "y": 320,
+        },
+        {
+          "x": 720,
+          "y": 320,
+        },
+      ],
+      "sourceMemberOrder": undefined,
+      "targetMemberOrder": undefined,
+      "trunkCoord": undefined,
+    },
+    {
+      "channelId": undefined,
+      "id": "call-4",
+      "routeKind": "direct",
+      "routePoints": [
+        {
+          "x": 304,
+          "y": 208,
+        },
+        {
+          "x": 344,
+          "y": 208,
+        },
+        {
+          "x": 344,
+          "y": 416,
+        },
+        {
+          "x": 680,
+          "y": 416,
+        },
+        {
+          "x": 680,
+          "y": 432,
+        },
+        {
+          "x": 720,
+          "y": 432,
+        },
+      ],
+      "sourceMemberOrder": undefined,
+      "targetMemberOrder": undefined,
+      "trunkCoord": undefined,
+    },
+  ],
+  "vertical": [
+    {
+      "channelId": "channel:CALL:top<->bottom:0",
+      "id": "v-1",
+      "routeKind": "flow-trunk",
+      "routePoints": [
+        {
+          "x": 328,
+          "y": 120,
+        },
+        {
+          "x": 328,
+          "y": 160,
+        },
+        {
+          "x": 144,
+          "y": 160,
+        },
+        {
+          "x": 144,
+          "y": 520,
+        },
+        {
+          "x": 152,
+          "y": 520,
+        },
+        {
+          "x": 152,
+          "y": 560,
+        },
+      ],
+      "sourceMemberOrder": undefined,
+      "targetMemberOrder": undefined,
+      "trunkCoord": 344,
+    },
+    {
+      "channelId": "channel:CALL:top<->bottom:0",
+      "id": "v-2",
+      "routeKind": "flow-trunk",
+      "routePoints": [
+        {
+          "x": 328,
+          "y": 120,
+        },
+        {
+          "x": 328,
+          "y": 160,
+        },
+        {
+          "x": 416,
+          "y": 160,
+        },
+        {
+          "x": 416,
+          "y": 520,
+        },
+        {
+          "x": 312,
+          "y": 520,
+        },
+        {
+          "x": 312,
+          "y": 560,
+        },
+      ],
+      "sourceMemberOrder": undefined,
+      "targetMemberOrder": undefined,
+      "trunkCoord": 344,
+    },
+    {
+      "channelId": "channel:CALL:top<->bottom:0",
+      "id": "v-3",
+      "routeKind": "flow-trunk",
+      "routePoints": [
+        {
+          "x": 328,
+          "y": 120,
+        },
+        {
+          "x": 328,
+          "y": 160,
+        },
+        {
+          "x": 496,
+          "y": 160,
+        },
+        {
+          "x": 496,
+          "y": 520,
+        },
+        {
+          "x": 472,
+          "y": 520,
+        },
+        {
+          "x": 472,
+          "y": 560,
+        },
+      ],
+      "sourceMemberOrder": undefined,
+      "targetMemberOrder": undefined,
+      "trunkCoord": 344,
+    },
+  ],
+}
+`;

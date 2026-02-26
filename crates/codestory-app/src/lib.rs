@@ -1,11 +1,14 @@
 use codestory_api::{
     AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentResponseSectionDto, ApiError,
-    AppEventPayload, EdgeId, EdgeKind, EdgeOccurrencesRequest, GraphArtifactDto, GraphEdgeDto,
-    GraphNodeDto, GraphRequest, GraphResponse, IndexMode, IndexingPhaseTimings,
-    ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId,
-    NodeKind, NodeOccurrencesRequest, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
+    AppEventPayload, BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest,
+    CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest, GraphArtifactDto,
+    GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse, IndexMode, IndexingPhaseTimings,
+    ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess, NodeDetailsDto,
+    NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest, OpenContainingFolderRequest,
+    OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
     ReadFileTextResponse, SearchHit, SearchRequest, SetUiLayoutRequest, SourceOccurrenceDto,
-    StartIndexingRequest, StorageStatsDto, SymbolSummaryDto, TrailConfigDto, WriteFileResponse,
+    StartIndexingRequest, StorageStatsDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
+    TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WriteFileResponse,
     WriteFileTextRequest,
 };
 use codestory_events::{Event, EventBus};
@@ -17,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
 fn no_project_error() -> ApiError {
@@ -51,6 +55,12 @@ fn clamp_usize_to_u32(v: usize) -> u32 {
     v.min(u32::MAX as usize) as u32
 }
 
+fn parse_db_id(raw: &str, field_name: &str) -> Result<i64, ApiError> {
+    raw.trim()
+        .parse::<i64>()
+        .map_err(|_| ApiError::invalid_argument(format!("Invalid {field_name}: {raw}")))
+}
+
 fn edge_certainty_label(
     certainty: Option<codestory_core::ResolutionCertainty>,
     confidence: Option<f32>,
@@ -71,6 +81,17 @@ fn is_structural_kind(kind: codestory_core::NodeKind) -> bool {
             | codestory_core::NodeKind::NAMESPACE
             | codestory_core::NodeKind::MODULE
     )
+}
+
+fn member_access_dto(access: Option<codestory_core::AccessKind>) -> Option<MemberAccess> {
+    access.map(MemberAccess::from)
+}
+
+fn status_response(message: impl Into<String>) -> SystemActionResponse {
+    SystemActionResponse {
+        ok: true,
+        message: message.into(),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -393,6 +414,116 @@ impl AppController {
         }
 
         Ok(resolved)
+    }
+
+    fn expand_ide_template(
+        template: &str,
+        file_path: &Path,
+        line: Option<u32>,
+        col: Option<u32>,
+    ) -> String {
+        let file = file_path.to_string_lossy();
+        let line = line.unwrap_or(1).to_string();
+        let col = col.unwrap_or(1).to_string();
+        template
+            .replace("{file}", &file)
+            .replace("{line}", &line)
+            .replace("{col}", &col)
+    }
+
+    fn run_shell_command(command: &str) -> io::Result<()> {
+        if cfg!(target_os = "windows") {
+            Command::new("cmd").args(["/C", command]).spawn()?;
+            return Ok(());
+        }
+        Command::new("sh").args(["-lc", command]).spawn()?;
+        Ok(())
+    }
+
+    fn open_with_os_default(path: &Path) -> io::Result<()> {
+        if cfg!(target_os = "windows") {
+            Command::new("cmd")
+                .args(["/C", "start", ""])
+                .arg(path)
+                .spawn()?;
+            return Ok(());
+        }
+        if cfg!(target_os = "macos") {
+            Command::new("open").arg(path).spawn()?;
+            return Ok(());
+        }
+        Command::new("xdg-open").arg(path).spawn()?;
+        Ok(())
+    }
+
+    fn open_folder_in_os(path: &Path) -> io::Result<()> {
+        if cfg!(target_os = "windows") {
+            Command::new("explorer")
+                .arg(format!("/select,{}", path.display()))
+                .spawn()?;
+            return Ok(());
+        }
+        let folder = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| path.to_path_buf())
+        };
+        if cfg!(target_os = "macos") {
+            Command::new("open").arg(folder).spawn()?;
+            return Ok(());
+        }
+        Command::new("xdg-open").arg(folder).spawn()?;
+        Ok(())
+    }
+
+    fn launch_definition_in_ide(
+        &self,
+        path: &Path,
+        line: Option<u32>,
+        col: Option<u32>,
+    ) -> Result<SystemActionResponse, ApiError> {
+        if let Ok(template) = std::env::var("CODESTORY_IDE_COMMAND") {
+            let trimmed = template.trim();
+            if !trimmed.is_empty() {
+                let expanded = Self::expand_ide_template(trimmed, path, line, col);
+                if Self::run_shell_command(&expanded).is_ok() {
+                    return Ok(status_response(format!(
+                        "Opened definition in IDE via CODESTORY_IDE_COMMAND: {}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+
+        let goto = format!(
+            "{}:{}:{}",
+            path.display(),
+            line.unwrap_or(1),
+            col.unwrap_or(1)
+        );
+        if Command::new("code")
+            .args(["--goto", goto.as_str()])
+            .spawn()
+            .is_ok()
+        {
+            return Ok(status_response(format!(
+                "Opened definition in IDE via `code --goto`: {}",
+                path.display()
+            )));
+        }
+
+        Self::open_with_os_default(path).map_err(|e| {
+            ApiError::internal(format!(
+                "Failed to open definition using OS default handler for {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(status_response(format!(
+            "Opened definition with OS default handler: {}",
+            path.display()
+        )))
     }
 
     fn cached_labels<I>(&self, ids: I) -> HashMap<codestory_core::NodeId, String>
@@ -952,14 +1083,19 @@ impl AppController {
 
         let mut node_dtos = Vec::with_capacity(ordered_node_ids.len());
         for id in ordered_node_ids {
-            let (label, kind, file_path, qualified_name) = match storage.get_node(id) {
-                Ok(Some(node)) => (
-                    node_display_name(&node),
-                    NodeKind::from(node.kind),
-                    Self::file_path_for_node(&storage, &node).ok().flatten(),
-                    node.qualified_name,
-                ),
-                _ => (id.0.to_string(), NodeKind::UNKNOWN, None, None),
+            let (label, kind, file_path, qualified_name, member_access) = match storage.get_node(id)
+            {
+                Ok(Some(node)) => {
+                    let access = storage.get_component_access(node.id).ok().flatten();
+                    (
+                        node_display_name(&node),
+                        NodeKind::from(node.kind),
+                        Self::file_path_for_node(&storage, &node).ok().flatten(),
+                        node.qualified_name,
+                        member_access_dto(access),
+                    )
+                }
+                _ => (id.0.to_string(), NodeKind::UNKNOWN, None, None, None),
             };
 
             node_dtos.push(GraphNodeDto {
@@ -973,6 +1109,7 @@ impl AppController {
                 merged_symbol_examples: Vec::new(),
                 file_path,
                 qualified_name,
+                member_access,
             });
         }
 
@@ -1060,6 +1197,7 @@ impl AppController {
             } else {
                 None
             };
+            let member_access = storage.get_component_access(node.id).ok().flatten();
 
             node_dtos.push(GraphNodeDto {
                 id: NodeId::from(node.id),
@@ -1072,6 +1210,7 @@ impl AppController {
                 merged_symbol_examples: Vec::new(),
                 file_path: Self::file_path_for_node(&storage, &node)?,
                 qualified_name: node.qualified_name.clone(),
+                member_access: member_access_dto(member_access),
             });
         }
 
@@ -1087,6 +1226,242 @@ impl AppController {
             edges: edge_dtos,
             truncated,
         })
+    }
+
+    pub fn graph_trail_filter_options(&self) -> Result<TrailFilterOptionsDto, ApiError> {
+        let storage = self.open_storage()?;
+        let node_kinds = storage
+            .get_present_node_kinds()
+            .map_err(|e| ApiError::internal(format!("Failed to load node kinds: {e}")))?
+            .into_iter()
+            .map(NodeKind::from)
+            .collect::<Vec<_>>();
+        let edge_kinds = storage
+            .get_present_edge_kinds()
+            .map_err(|e| ApiError::internal(format!("Failed to load edge kinds: {e}")))?
+            .into_iter()
+            .map(EdgeKind::from)
+            .collect::<Vec<_>>();
+        Ok(TrailFilterOptionsDto {
+            node_kinds,
+            edge_kinds,
+        })
+    }
+
+    pub fn list_bookmark_categories(&self) -> Result<Vec<BookmarkCategoryDto>, ApiError> {
+        let storage = self.open_storage()?;
+        let categories = storage
+            .get_bookmark_categories()
+            .map_err(|e| ApiError::internal(format!("Failed to load bookmark categories: {e}")))?;
+        Ok(categories
+            .into_iter()
+            .map(|category| BookmarkCategoryDto {
+                id: category.id.to_string(),
+                name: category.name,
+            })
+            .collect())
+    }
+
+    pub fn create_bookmark_category(
+        &self,
+        req: CreateBookmarkCategoryRequest,
+    ) -> Result<BookmarkCategoryDto, ApiError> {
+        let name = req.name.trim();
+        if name.is_empty() {
+            return Err(ApiError::invalid_argument(
+                "Bookmark category name cannot be empty.",
+            ));
+        }
+
+        let storage = self.open_storage()?;
+        let id = storage
+            .create_bookmark_category(name)
+            .map_err(|e| ApiError::internal(format!("Failed to create bookmark category: {e}")))?;
+        Ok(BookmarkCategoryDto {
+            id: id.to_string(),
+            name: name.to_string(),
+        })
+    }
+
+    pub fn update_bookmark_category(
+        &self,
+        id: i64,
+        req: UpdateBookmarkCategoryRequest,
+    ) -> Result<BookmarkCategoryDto, ApiError> {
+        let name = req.name.trim();
+        if name.is_empty() {
+            return Err(ApiError::invalid_argument(
+                "Bookmark category name cannot be empty.",
+            ));
+        }
+        let storage = self.open_storage()?;
+        let updated = storage
+            .rename_bookmark_category(id, name)
+            .map_err(|e| ApiError::internal(format!("Failed to update bookmark category: {e}")))?;
+        if !updated {
+            return Err(ApiError::not_found(format!(
+                "Bookmark category not found: {id}"
+            )));
+        }
+        Ok(BookmarkCategoryDto {
+            id: id.to_string(),
+            name: name.to_string(),
+        })
+    }
+
+    pub fn delete_bookmark_category(&self, id: i64) -> Result<(), ApiError> {
+        let storage = self.open_storage()?;
+        storage
+            .delete_bookmark_category(id)
+            .map_err(|e| ApiError::internal(format!("Failed to delete bookmark category: {e}")))?;
+        Ok(())
+    }
+
+    pub fn list_bookmarks(&self, category_id: Option<i64>) -> Result<Vec<BookmarkDto>, ApiError> {
+        let storage = self.open_storage()?;
+        let bookmarks = storage
+            .get_bookmarks(category_id)
+            .map_err(|e| ApiError::internal(format!("Failed to load bookmarks: {e}")))?;
+
+        let mut response = Vec::with_capacity(bookmarks.len());
+        for bookmark in bookmarks {
+            let node = storage
+                .get_node(bookmark.node_id)
+                .map_err(|e| ApiError::internal(format!("Failed to load bookmark node: {e}")))?;
+            let (node_label, node_kind, file_path) = match node {
+                Some(node) => (
+                    node_display_name(&node),
+                    NodeKind::from(node.kind),
+                    Self::file_path_for_node(&storage, &node)?,
+                ),
+                None => (bookmark.node_id.0.to_string(), NodeKind::UNKNOWN, None),
+            };
+            response.push(BookmarkDto {
+                id: bookmark.id.to_string(),
+                category_id: bookmark.category_id.to_string(),
+                node_id: NodeId::from(bookmark.node_id),
+                comment: bookmark.comment,
+                node_label,
+                node_kind,
+                file_path,
+            });
+        }
+        Ok(response)
+    }
+
+    pub fn create_bookmark(&self, req: CreateBookmarkRequest) -> Result<BookmarkDto, ApiError> {
+        let node_id = req.node_id.to_core()?;
+        let category_id = parse_db_id(&req.category_id, "category_id")?;
+        let storage = self.open_storage()?;
+        let node = storage
+            .get_node(node_id)
+            .map_err(|e| ApiError::internal(format!("Failed to load bookmark node: {e}")))?
+            .ok_or_else(|| ApiError::not_found(format!("Node not found: {}", req.node_id.0)))?;
+        let bookmark_id = storage
+            .add_bookmark(category_id, node_id, req.comment.as_deref())
+            .map_err(|e| ApiError::internal(format!("Failed to create bookmark: {e}")))?;
+
+        Ok(BookmarkDto {
+            id: bookmark_id.to_string(),
+            category_id: category_id.to_string(),
+            node_id: NodeId::from(node_id),
+            comment: req.comment,
+            node_label: node_display_name(&node),
+            node_kind: NodeKind::from(node.kind),
+            file_path: Self::file_path_for_node(&storage, &node)?,
+        })
+    }
+
+    pub fn update_bookmark(
+        &self,
+        id: i64,
+        req: UpdateBookmarkRequest,
+    ) -> Result<BookmarkDto, ApiError> {
+        let storage = self.open_storage()?;
+        let category_id = req
+            .category_id
+            .as_deref()
+            .map(|raw| parse_db_id(raw, "category_id"))
+            .transpose()?;
+        let comment_patch = req.comment.as_ref().map(|value| value.as_deref());
+        storage
+            .update_bookmark(id, category_id, comment_patch)
+            .map_err(|e| ApiError::internal(format!("Failed to update bookmark: {e}")))?;
+        let bookmark = storage
+            .get_bookmarks(None)
+            .map_err(|e| ApiError::internal(format!("Failed to reload bookmarks: {e}")))?
+            .into_iter()
+            .find(|bookmark| bookmark.id == id)
+            .ok_or_else(|| ApiError::not_found(format!("Bookmark not found: {id}")))?;
+        let node = storage
+            .get_node(bookmark.node_id)
+            .map_err(|e| ApiError::internal(format!("Failed to load bookmark node: {e}")))?;
+
+        let (node_label, node_kind, file_path) = match node {
+            Some(node) => (
+                node_display_name(&node),
+                NodeKind::from(node.kind),
+                Self::file_path_for_node(&storage, &node)?,
+            ),
+            None => (bookmark.node_id.0.to_string(), NodeKind::UNKNOWN, None),
+        };
+
+        Ok(BookmarkDto {
+            id: bookmark.id.to_string(),
+            category_id: bookmark.category_id.to_string(),
+            node_id: NodeId::from(bookmark.node_id),
+            comment: bookmark.comment,
+            node_label,
+            node_kind,
+            file_path,
+        })
+    }
+
+    pub fn delete_bookmark(&self, id: i64) -> Result<(), ApiError> {
+        let storage = self.open_storage()?;
+        storage
+            .delete_bookmark(id)
+            .map_err(|e| ApiError::internal(format!("Failed to delete bookmark: {e}")))?;
+        Ok(())
+    }
+
+    pub fn open_definition(
+        &self,
+        req: OpenDefinitionRequest,
+    ) -> Result<SystemActionResponse, ApiError> {
+        let node_id = req.node_id.to_core()?;
+        let storage = self.open_storage()?;
+        let node = storage
+            .get_node(node_id)
+            .map_err(|e| ApiError::internal(format!("Failed to load node: {e}")))?
+            .ok_or_else(|| ApiError::not_found(format!("Node not found: {}", req.node_id.0)))?;
+
+        let raw_path = if node.kind == codestory_core::NodeKind::FILE {
+            Some(node.serialized_name.clone())
+        } else {
+            Self::file_path_for_node(&storage, &node)?
+        }
+        .ok_or_else(|| ApiError::invalid_argument("Node has no file path for definition open."))?;
+
+        let resolved = self.resolve_project_file_path(&raw_path, false)?;
+        self.launch_definition_in_ide(&resolved, node.start_line, node.start_col)
+    }
+
+    pub fn open_containing_folder(
+        &self,
+        req: OpenContainingFolderRequest,
+    ) -> Result<SystemActionResponse, ApiError> {
+        let resolved = self.resolve_project_file_path(&req.path, false)?;
+        Self::open_folder_in_os(&resolved).map_err(|e| {
+            ApiError::internal(format!(
+                "Failed to open containing folder for {}: {e}",
+                resolved.display()
+            ))
+        })?;
+        Ok(status_response(format!(
+            "Opened containing folder for {}",
+            resolved.display()
+        )))
     }
 
     pub fn node_details(&self, req: NodeDetailsRequest) -> Result<NodeDetailsDto, ApiError> {
@@ -1131,6 +1506,7 @@ impl AppController {
             start_col: node.start_col,
             end_line: node.end_line,
             end_col: node.end_col,
+            member_access: member_access_dto(storage.get_component_access(node.id).ok().flatten()),
         })
     }
 
@@ -1593,5 +1969,27 @@ mod tests {
                 .any(|edge| edge.kind == codestory_api::EdgeKind::INHERITANCE),
             "Expected INHERITANCE edge from owner trait context"
         );
+    }
+
+    #[test]
+    fn update_bookmark_category_returns_not_found_when_missing() {
+        let temp = tempdir().expect("create temp dir");
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: temp.path().to_string_lossy().to_string(),
+            })
+            .expect("open project");
+
+        let err = controller
+            .update_bookmark_category(
+                9_999,
+                UpdateBookmarkCategoryRequest {
+                    name: "Renamed".to_string(),
+                },
+            )
+            .expect_err("missing category should return not_found");
+
+        assert_eq!(err.code, "not_found");
     }
 }

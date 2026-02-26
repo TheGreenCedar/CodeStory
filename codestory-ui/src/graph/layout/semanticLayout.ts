@@ -57,7 +57,23 @@ type FoldedEdge = {
 type GraphNodeLike = GraphResponse["nodes"][number];
 type GraphEdgeLike = GraphResponse["edges"][number];
 
-function inferMemberVisibility(kind: string, label: string): "public" | "private" {
+function inferMemberVisibility(
+  kind: string,
+  label: string,
+  explicitAccess?: GraphNodeLike["member_access"] | null,
+): "public" | "protected" | "private" | "default" {
+  if (explicitAccess === "Public") {
+    return "public";
+  }
+  if (explicitAccess === "Protected") {
+    return "protected";
+  }
+  if (explicitAccess === "Private") {
+    return "private";
+  }
+  if (explicitAccess === "Default") {
+    return "default";
+  }
   if (PRIVATE_MEMBER_KINDS.has(kind)) {
     return "private";
   }
@@ -293,8 +309,12 @@ function estimatedNodeHeight(kind: string, members: FlowMemberData[]): number {
   }
 
   const publicCount = members.filter((member) => member.visibility === "public").length;
-  const privateCount = members.length - publicCount;
-  const sectionCount = (publicCount > 0 ? 1 : 0) + (privateCount > 0 ? 1 : 0);
+  const protectedCount = members.filter((member) => member.visibility === "protected").length;
+  const privateCount = members.filter((member) => member.visibility === "private").length;
+  const defaultCount = members.filter((member) => member.visibility === "default").length;
+  const sectionCount = [publicCount, protectedCount, privateCount, defaultCount].filter(
+    (count) => count > 0,
+  ).length;
   const effectiveSections = sectionCount === 0 ? 1 : sectionCount;
   return clamp(
     74 + effectiveSections * 28 + Math.max(1, members.length) * 21,
@@ -359,13 +379,14 @@ function extractMembers(graph: GraphResponse): MemberExtraction {
     memberHostById.set(memberId, hostId);
     const hostMembers = membersByHost.get(hostId) ?? [];
     if (!hostMembers.some((member) => member.id === memberId)) {
-      const memberLabel = nodeById.get(memberId)?.label ?? memberId;
-      const memberKind = nodeById.get(memberId)?.kind ?? "UNKNOWN";
+      const memberNode = nodeById.get(memberId);
+      const memberLabel = memberNode?.label ?? memberId;
+      const memberKind = memberNode?.kind ?? "UNKNOWN";
       hostMembers.push({
         id: memberId,
         label: memberLabel,
         kind: memberKind,
-        visibility: inferMemberVisibility(memberKind, memberLabel),
+        visibility: inferMemberVisibility(memberKind, memberLabel, memberNode?.member_access),
       });
       membersByHost.set(hostId, hostMembers);
     }
@@ -412,7 +433,7 @@ function extractMembers(graph: GraphResponse): MemberExtraction {
         id: node.id,
         label: node.label,
         kind: node.kind,
-        visibility: inferMemberVisibility(node.kind, node.label),
+        visibility: inferMemberVisibility(node.kind, node.label, node.member_access),
       });
       membersByHost.set(hostId, hostMembers);
     }
@@ -1001,23 +1022,48 @@ export function buildSemanticLayout(graph: GraphResponse): LayoutElements {
             const members = membersByHost.get(nodeId) ?? [];
             const mergedMembers = membersByCanonical.get(nodeId) ?? members;
             const publicMembers = mergedMembers.filter((m) => m.visibility === "public");
+            const protectedMembers = mergedMembers.filter((m) => m.visibility === "protected");
             const privateMembers = mergedMembers.filter((m) => m.visibility === "private");
+            const defaultMembers = mergedMembers.filter((m) => m.visibility === "default");
             const memberId = graph.center_id;
 
             const pIdx = publicMembers.findIndex((m) => m.id === memberId);
             if (pIdx >= 0) {
               anchorOffset = 74 + 28 + pIdx * 21 + 10;
             } else {
-              const prIdx = privateMembers.findIndex((m) => m.id === memberId);
-              if (prIdx >= 0) {
+              const protIdx = protectedMembers.findIndex((m) => m.id === memberId);
+              if (protIdx >= 0) {
                 anchorOffset =
                   74 +
                   (publicMembers.length > 0 ? 28 + publicMembers.length * 21 : 0) +
                   28 +
-                  prIdx * 21 +
+                  protIdx * 21 +
                   10;
               } else {
-                anchorOffset = 42;
+                const prIdx = privateMembers.findIndex((m) => m.id === memberId);
+                if (prIdx >= 0) {
+                  anchorOffset =
+                    74 +
+                    (publicMembers.length > 0 ? 28 + publicMembers.length * 21 : 0) +
+                    (protectedMembers.length > 0 ? 28 + protectedMembers.length * 21 : 0) +
+                    28 +
+                    prIdx * 21 +
+                    10;
+                } else {
+                  const defaultIdx = defaultMembers.findIndex((m) => m.id === memberId);
+                  if (defaultIdx >= 0) {
+                    anchorOffset =
+                      74 +
+                      (publicMembers.length > 0 ? 28 + publicMembers.length * 21 : 0) +
+                      (protectedMembers.length > 0 ? 28 + protectedMembers.length * 21 : 0) +
+                      (privateMembers.length > 0 ? 28 + privateMembers.length * 21 : 0) +
+                      28 +
+                      defaultIdx * 21 +
+                      10;
+                  } else {
+                    anchorOffset = 42;
+                  }
+                }
               }
             }
           } else {

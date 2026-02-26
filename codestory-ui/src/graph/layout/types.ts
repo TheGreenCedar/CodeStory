@@ -1,6 +1,6 @@
-import type { EdgeKind } from "../../generated/api";
+import type { EdgeKind, LayoutDirection } from "../../generated/api";
 
-export type MemberVisibility = "public" | "private";
+export type MemberVisibility = "public" | "protected" | "private" | "default";
 
 export type FlowMemberData = {
   id: string;
@@ -16,8 +16,10 @@ export type FlowNodeData = {
   label: string;
   center: boolean;
   nodeStyle: FlowNodeStyle;
+  layoutDirection: LayoutDirection;
   groupMode?: "namespace" | "file";
   groupLabel?: string;
+  groupAnchorId?: string;
   isNonIndexed?: boolean;
   duplicateCount: number;
   mergedSymbolIds?: string[];
@@ -27,8 +29,11 @@ export type FlowNodeData = {
   members: FlowMemberData[];
   isVirtualBundle?: boolean;
   isSelected?: boolean;
+  isExpanded?: boolean;
   focusedMemberId?: string | null;
   onSelectMember?: (memberId: string, label: string) => void;
+  onToggleExpand?: () => void;
+  onSelectGroup?: () => void;
 };
 
 export type SemanticEdgeFamily = "flow" | "hierarchy";
@@ -78,7 +83,11 @@ export type RoutedEdgeSpec = {
   routePoints: RoutePoint[];
   trunkCoord?: number;
   channelId?: string;
+  channelPairId?: string;
   channelWeight?: number;
+  sharedTrunkPoints?: RoutePoint[];
+  sourceMemberOrder?: number;
+  targetMemberOrder?: number;
 };
 
 export type LayoutElements = {
