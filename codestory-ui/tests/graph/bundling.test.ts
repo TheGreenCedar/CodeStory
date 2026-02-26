@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { applySharedTrunkBundling } from "../../src/graph/layout/bundling";
+import { applyAdaptiveBundling } from "../../src/graph/layout/bundling";
 import type { LayoutElements, SemanticNodePlacement } from "../../src/graph/layout/types";
 
 function makeNode(id: string, x: number, y: number, xRank: number): SemanticNodePlacement {
@@ -18,103 +18,57 @@ function makeNode(id: string, x: number, y: number, xRank: number): SemanticNode
     yRank: 0,
     x,
     y,
+    width: 172,
+    height: 34,
     isVirtualBundle: false,
   };
 }
 
-describe("applySharedTrunkBundling", () => {
-  it("preserves pairwise edges in trace/off modes and bundles in overview mode", () => {
-    const center = makeNode("center", 480, 320, 0);
-    const rightNodes = Array.from({ length: 18 }, (_, idx) =>
-      makeNode(`target-${idx}`, 860, 120 + idx * 28, 1),
-    );
+function baseLayout(edgeCount: number): LayoutElements {
+  const center = makeNode("center", 520, 300, 0);
+  const rightNodes = Array.from({ length: edgeCount }, (_, idx) =>
+    makeNode(`target-${idx}`, 960, 90 + idx * 20, 2),
+  );
+  return {
+    nodes: [center, ...rightNodes],
+    edges: rightNodes.map((node, idx) => ({
+      id: `call-${idx}`,
+      source: "center",
+      target: node.id,
+      sourceHandle: `source-member-center-${idx % 4}`,
+      targetHandle: "target-node",
+      kind: "CALL",
+      certainty: null,
+      multiplicity: 1,
+      family: "flow",
+      routeKind: "direct",
+      bundleCount: 1,
+      routePoints: [],
+    })),
+    centerNodeId: "center",
+  };
+}
 
-    const layout: LayoutElements = {
-      nodes: [center, ...rightNodes],
-      edges: rightNodes.map((node, idx) => ({
-        id: `call-${idx}`,
-        source: "center",
-        target: node.id,
-        sourceHandle: "source-node",
-        targetHandle: "target-node",
-        kind: "CALL",
-        certainty: null,
-        multiplicity: 1,
-        family: "flow",
-        routeKind: "direct",
-        bundleCount: 1,
-      })),
-      centerNodeId: "center",
-    };
+describe("applyAdaptiveBundling", () => {
+  it("increases bundling compression as depth grows on fixed fixtures", () => {
+    const layout = baseLayout(22);
+    const shallow = applyAdaptiveBundling(layout, 1, 40, 70);
+    const deep = applyAdaptiveBundling(layout, 5, 220, 520);
 
-    const trace = applySharedTrunkBundling(layout, "trace");
-    const off = applySharedTrunkBundling(layout, "off");
-    const overview = applySharedTrunkBundling(layout, "overview");
-
-    expect(trace).toBe(layout);
-    expect(off).toBe(layout);
-    expect(overview.nodes.length).toBeGreaterThan(layout.nodes.length);
-    expect(overview.nodes.some((node) => node.isVirtualBundle)).toBe(true);
-    expect(overview.edges.some((edge) => edge.routeKind === "flow-trunk")).toBe(true);
+    const shallowBundled = shallow.edges.filter((edge) => edge.routeKind === "flow-trunk").length;
+    const deepBundled = deep.edges.filter((edge) => edge.routeKind === "flow-trunk").length;
+    expect(deepBundled).toBeGreaterThanOrEqual(shallowBundled);
+    expect(deepBundled).toBeGreaterThan(0);
   });
 
-  it("keeps center-member handles on bundled trunk edges", () => {
-    const center = makeNode("center", 480, 320, 0);
-    const rightNodes = Array.from({ length: 12 }, (_, idx) =>
-      makeNode(`target-${idx}`, 860, 120 + idx * 28, 1),
-    );
-    const leftNodes = Array.from({ length: 12 }, (_, idx) =>
-      makeNode(`source-${idx}`, 120, 120 + idx * 28, -1),
-    );
+  it("assigns stable channel metadata for trunked edges", () => {
+    const layout = baseLayout(16);
+    const bundled = applyAdaptiveBundling(layout, 4, 180, 420);
+    const trunk = bundled.edges.find((edge) => edge.routeKind === "flow-trunk");
 
-    const layout: LayoutElements = {
-      nodes: [center, ...rightNodes, ...leftNodes],
-      edges: [
-        ...rightNodes.map((node, idx) => ({
-          id: `call-out-${idx}`,
-          source: "center",
-          target: node.id,
-          sourceHandle: "source-member-run_incremental",
-          targetHandle: "target-node",
-          kind: "CALL",
-          certainty: null,
-          multiplicity: 1,
-          family: "flow",
-          routeKind: "direct",
-          bundleCount: 1,
-        })),
-        ...leftNodes.map((node, idx) => ({
-          id: `call-in-${idx}`,
-          source: node.id,
-          target: "center",
-          sourceHandle: "source-node",
-          targetHandle: "target-member-run_incremental",
-          kind: "CALL",
-          certainty: null,
-          multiplicity: 1,
-          family: "flow",
-          routeKind: "direct",
-          bundleCount: 1,
-        })),
-      ],
-      centerNodeId: "center",
-    };
-
-    const overview = applySharedTrunkBundling(layout, "overview");
-    const centerOutgoingTrunk = overview.edges.find(
-      (edge) =>
-        edge.routeKind === "flow-trunk" &&
-        edge.source === "center" &&
-        edge.sourceHandle === "source-member-run_incremental",
-    );
-    const centerIncomingTrunk = overview.edges.find(
-      (edge) =>
-        edge.routeKind === "flow-trunk" &&
-        edge.target === "center" &&
-        edge.targetHandle === "target-member-run_incremental",
-    );
-
-    expect(centerOutgoingTrunk).toBeDefined();
-    expect(centerIncomingTrunk).toBeDefined();
+    expect(trunk).toBeDefined();
+    expect(trunk?.channelId?.startsWith("channel:CALL:center:right")).toBe(true);
+    expect((trunk?.channelWeight ?? 0) > 1).toBe(true);
+    expect(typeof trunk?.trunkCoord).toBe("number");
   });
 });

@@ -13,6 +13,7 @@ target/
 
 # Local agent/tooling state (not meant for publishing)
 .agent/
+.agents/
 .kiro/
 **/.playwright-cli/
 

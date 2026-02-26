@@ -9,6 +9,7 @@ use codestory_events::{Event, EventBus};
 use rayon::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Instant;
 use tree_sitter::{Language, Parser};
 use tree_sitter_graph::ast::File as GraphFile;
 use tree_sitter_graph::functions::Functions;
@@ -86,6 +87,21 @@ pub enum IndexingEvent {
     Finished,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IncrementalIndexingStats {
+    pub parse_index_ms: u64,
+    pub projection_flush_ms: u64,
+    pub edge_resolution_ms: u64,
+    pub error_flush_ms: u64,
+    pub cleanup_ms: u64,
+    pub unresolved_calls_start: usize,
+    pub unresolved_imports_start: usize,
+    pub resolved_calls: usize,
+    pub resolved_imports: usize,
+    pub unresolved_calls_end: usize,
+    pub unresolved_imports_end: usize,
+}
+
 pub struct WorkspaceIndexer {
     root: PathBuf,
     compilation_db: Option<compilation_database::CompilationDatabase>,
@@ -119,10 +135,11 @@ impl WorkspaceIndexer {
         refresh_info: &codestory_project::RefreshInfo,
         event_bus: &EventBus,
         cancel_token: Option<&CancellationToken>,
-    ) -> Result<()> {
+    ) -> Result<IncrementalIndexingStats> {
         event_bus.publish(Event::IndexingStarted {
             file_count: refresh_info.files_to_index.len(),
         });
+        let mut stats = IncrementalIndexingStats::default();
         let total_files = refresh_info.files_to_index.len();
         let processed_count = Arc::new(AtomicUsize::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -134,7 +151,7 @@ impl WorkspaceIndexer {
         // Clone for parallel closure
         let cancelled_clone = cancelled.clone();
         if Self::is_cancelled(cancel_token) {
-            return Ok(());
+            return Ok(stats);
         }
 
         // 1. Parallel Indexing (chunked and flushed)
@@ -145,6 +162,7 @@ impl WorkspaceIndexer {
         let batch_config = self.batch_config;
 
         for file_chunk in refresh_info.files_to_index.chunks(file_batch_size) {
+            let chunk_started = Instant::now();
             let chunk_results: Vec<IntermediateStorage> = file_chunk
                 .par_iter()
                 .map(|path| {
@@ -167,6 +185,9 @@ impl WorkspaceIndexer {
                     local_storage
                 })
                 .collect();
+            stats.parse_index_ms = stats
+                .parse_index_ms
+                .saturating_add(duration_ms_u64(chunk_started.elapsed()));
 
             for mut local_storage in chunk_results {
                 all_errors.append(&mut local_storage.errors);
@@ -180,50 +201,94 @@ impl WorkspaceIndexer {
                         || batched_storage.edges.len() >= batch_config.edge_batch_size
                         || batched_storage.occurrences.len() >= batch_config.occurrence_batch_size)
                 {
+                    let flush_started = Instant::now();
                     Self::flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
+                    stats.projection_flush_ms = stats
+                        .projection_flush_ms
+                        .saturating_add(duration_ms_u64(flush_started.elapsed()));
                 }
 
                 if all_errors.len() >= batch_config.error_batch_size {
+                    let error_flush_started = Instant::now();
                     Self::flush_errors(storage, &mut all_errors, batch_config.error_batch_size)?;
+                    stats.error_flush_ms = stats
+                        .error_flush_ms
+                        .saturating_add(duration_ms_u64(error_flush_started.elapsed()));
                 }
             }
 
             if cancelled.load(Ordering::Relaxed) {
                 event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
-                return Ok(());
+                return Ok(stats);
             }
         }
 
         // Check if cancelled during indexing
         if cancelled.load(Ordering::Relaxed) {
             event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
-            return Ok(());
+            return Ok(stats);
         }
 
+        let flush_started = Instant::now();
         Self::flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
+        stats.projection_flush_ms = stats
+            .projection_flush_ms
+            .saturating_add(duration_ms_u64(flush_started.elapsed()));
 
         // 3.5 Resolve call/import edges post-pass
         if had_edges {
             let resolver = resolution::ResolutionPass::new();
-            resolver
-                .run(storage)
+            let resolution_scope_file_ids =
+                Self::collect_touched_file_ids(&root, &refresh_info.files_to_index);
+            let resolution_scope =
+                (!resolution_scope_file_ids.is_empty()).then_some(&resolution_scope_file_ids);
+            let (unresolved_calls_start, unresolved_imports_start) =
+                resolver.unresolved_counts_with_scope(storage, resolution_scope)?;
+            stats.unresolved_calls_start = unresolved_calls_start;
+            stats.unresolved_imports_start = unresolved_imports_start;
+            let scope_suffix = resolution_scope
+                .map(|scope| format!(" (scoped to {} touched files)", scope.len()))
+                .unwrap_or_default();
+            event_bus.publish(Event::StatusUpdate {
+                message: format!(
+                    "Resolution pass starting with {unresolved_calls_start} unresolved CALL edges and {unresolved_imports_start} unresolved IMPORT edges{scope_suffix}."
+                ),
+            });
+            let resolution_started = Instant::now();
+            let resolution_stats = resolver
+                .run_with_scope(storage, resolution_scope)
                 .map_err(|e| anyhow!("Resolution error: {:?}", e))?;
+            stats.edge_resolution_ms = stats
+                .edge_resolution_ms
+                .saturating_add(duration_ms_u64(resolution_started.elapsed()));
+            stats.resolved_calls = resolution_stats.resolved_calls;
+            stats.resolved_imports = resolution_stats.resolved_imports;
+            stats.unresolved_calls_end = resolution_stats.unresolved_calls;
+            stats.unresolved_imports_end = resolution_stats.unresolved_imports;
         }
 
         // Write errors
         while !all_errors.is_empty() {
+            let error_flush_started = Instant::now();
             Self::flush_errors(storage, &mut all_errors, batch_config.error_batch_size)?;
+            stats.error_flush_ms = stats
+                .error_flush_ms
+                .saturating_add(duration_ms_u64(error_flush_started.elapsed()));
         }
 
         // 4. Cleanup removed files
         if !refresh_info.files_to_remove.is_empty() {
+            let cleanup_started = Instant::now();
             storage
                 .delete_files_batch(&refresh_info.files_to_remove)
                 .map_err(|e| anyhow!("Storage cleanup error: {:?}", e))?;
+            stats.cleanup_ms = stats
+                .cleanup_ms
+                .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
         }
 
         event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
-        Ok(())
+        Ok(stats)
     }
 
     fn is_cancelled(cancel_token: Option<&CancellationToken>) -> bool {
@@ -238,6 +303,32 @@ impl WorkspaceIndexer {
                 symbol_table.insert(node.id.0, node.kind);
             }
         }
+    }
+
+    fn collect_touched_file_ids(root: &Path, files_to_index: &[PathBuf]) -> HashSet<i64> {
+        let mut file_ids = HashSet::new();
+        for path in files_to_index {
+            let full_path = Self::normalize_index_path(root, path);
+            file_ids.insert(Self::canonical_file_node_id_for_path(&full_path));
+            if let Ok(canonical) = full_path.canonicalize() {
+                file_ids.insert(Self::canonical_file_node_id_for_path(&canonical));
+            }
+        }
+        file_ids
+    }
+
+    fn normalize_index_path(root: &Path, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        }
+    }
+
+    fn canonical_file_node_id_for_path(path: &Path) -> i64 {
+        let file_name = path.to_string_lossy();
+        let canonical_id = format!("{file_name}:{file_name}:1");
+        generate_id(&canonical_id)
     }
 
     fn flush_errors(
@@ -292,11 +383,7 @@ impl WorkspaceIndexer {
         root: &Path,
         symbol_table: &Arc<SymbolTable>,
     ) -> IntermediateStorage {
-        let full_path = if path.is_absolute() {
-            path.clone()
-        } else {
-            root.join(path)
-        };
+        let full_path = Self::normalize_index_path(root, path);
 
         let mut local_storage = IntermediateStorage::default();
         let Some((lang, lang_name, graph_query)) =
@@ -354,6 +441,10 @@ impl WorkspaceIndexer {
 
         local_storage
     }
+}
+
+fn duration_ms_u64(duration: std::time::Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
 }
 
 fn file_node_from_source(path: &Path, source: &str) -> (Node, String, NodeId) {

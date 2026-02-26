@@ -10,11 +10,13 @@ export type AgentResponseSectionDto = { id: string; title: string; markdown: str
 
 export type ApiError = { code: string; message: string }
 
-export type AppEventPayload = { type: "IndexingStarted"; data: { file_count: number } } | { type: "IndexingProgress"; data: { current: number; total: number } } | { type: "IndexingComplete"; data: { duration_ms: number } } | { type: "IndexingFailed"; data: { error: string } } | { type: "StatusUpdate"; data: { message: string } }
+export type AppEventPayload = { type: "IndexingStarted"; data: { file_count: number } } | { type: "IndexingProgress"; data: { current: number; total: number } } | { type: "IndexingComplete"; data: { duration_ms: number; phase_timings: IndexingPhaseTimings } } | { type: "IndexingFailed"; data: { error: string } } | { type: "StatusUpdate"; data: { message: string } }
 
 export type EdgeId = string
 
 export type EdgeKind = "MEMBER" | "TYPE_USAGE" | "USAGE" | "CALL" | "INHERITANCE" | "OVERRIDE" | "TYPE_ARGUMENT" | "TEMPLATE_SPECIALIZATION" | "INCLUDE" | "IMPORT" | "MACRO_USAGE" | "ANNOTATION_USAGE" | "UNKNOWN"
+
+export type EdgeOccurrencesRequest = { id: EdgeId }
 
 export type GraphArtifactDto = { kind: "uml"; id: string; title: string; graph: GraphResponse } | { kind: "mermaid"; id: string; title: string; diagram: string; mermaid_syntax: string }
 
@@ -24,7 +26,7 @@ export type GraphEdgeDto = { id: EdgeId; source: NodeId; target: NodeId; kind: E
  */
 certainty?: string | null; callsite_identity?: string | null; candidate_targets?: NodeId[] }
 
-export type GraphNodeDto = { id: NodeId; label: string; kind: NodeKind; depth: number; label_policy?: string | null; badge_visible_members?: number | null; badge_total_members?: number | null; merged_symbol_examples?: string[] }
+export type GraphNodeDto = { id: NodeId; label: string; kind: NodeKind; depth: number; label_policy?: string | null; badge_visible_members?: number | null; badge_total_members?: number | null; merged_symbol_examples?: string[]; file_path?: string | null; qualified_name?: string | null }
 
 export type GraphRequest = { center_id: NodeId; 
 /**
@@ -35,6 +37,8 @@ max_edges: number | null }
 export type GraphResponse = { center_id: NodeId; nodes: GraphNodeDto[]; edges: GraphEdgeDto[]; truncated: boolean }
 
 export type IndexMode = "Full" | "Incremental"
+
+export type IndexingPhaseTimings = { parse_index_ms: number; projection_flush_ms: number; edge_resolution_ms: number; error_flush_ms: number; cleanup_ms: number; cache_refresh_ms: number | null; unresolved_calls_start: number; unresolved_imports_start: number; resolved_calls: number; resolved_imports: number; unresolved_calls_end: number; unresolved_imports_end: number }
 
 export type ListChildrenSymbolsRequest = { parent_id: NodeId }
 
@@ -47,6 +51,8 @@ export type NodeDetailsRequest = { id: NodeId }
 export type NodeId = string
 
 export type NodeKind = "MODULE" | "NAMESPACE" | "PACKAGE" | "FILE" | "STRUCT" | "CLASS" | "INTERFACE" | "ANNOTATION" | "UNION" | "ENUM" | "TYPEDEF" | "TYPE_PARAMETER" | "BUILTIN_TYPE" | "FUNCTION" | "METHOD" | "MACRO" | "GLOBAL_VARIABLE" | "FIELD" | "VARIABLE" | "CONSTANT" | "ENUM_CONSTANT" | "UNKNOWN"
+
+export type NodeOccurrencesRequest = { id: NodeId }
 
 export type OpenProjectRequest = { path: string }
 
@@ -61,6 +67,8 @@ export type SearchHit = { node_id: NodeId; display_name: string; kind: NodeKind;
 export type SearchRequest = { query: string }
 
 export type SetUiLayoutRequest = { json: string }
+
+export type SourceOccurrenceDto = { element_id: string; kind: string; file_path: string; start_line: number; start_col: number; end_line: number; end_col: number }
 
 export type StartIndexingRequest = { mode: IndexMode }
 

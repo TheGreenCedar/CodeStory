@@ -1,10 +1,12 @@
 use codestory_api::{
     AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentResponseSectionDto, ApiError,
-    AppEventPayload, EdgeId, EdgeKind, GraphArtifactDto, GraphEdgeDto, GraphNodeDto, GraphRequest,
-    GraphResponse, IndexMode, ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto,
-    NodeDetailsRequest, NodeId, NodeKind, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
-    ReadFileTextResponse, SearchHit, SearchRequest, SetUiLayoutRequest, StartIndexingRequest,
-    StorageStatsDto, SymbolSummaryDto, TrailConfigDto, WriteFileResponse, WriteFileTextRequest,
+    AppEventPayload, EdgeId, EdgeKind, EdgeOccurrencesRequest, GraphArtifactDto, GraphEdgeDto,
+    GraphNodeDto, GraphRequest, GraphResponse, IndexMode, IndexingPhaseTimings,
+    ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId,
+    NodeKind, NodeOccurrencesRequest, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
+    ReadFileTextResponse, SearchHit, SearchRequest, SetUiLayoutRequest, SourceOccurrenceDto,
+    StartIndexingRequest, StorageStatsDto, SymbolSummaryDto, TrailConfigDto, WriteFileResponse,
+    WriteFileTextRequest,
 };
 use codestory_events::{Event, EventBus};
 use codestory_search::SearchEngine;
@@ -35,6 +37,18 @@ fn clamp_i64_to_u32(v: i64) -> u32 {
     } else {
         v as u32
     }
+}
+
+fn clamp_u64_to_u32(v: u64) -> u32 {
+    v.min(u32::MAX as u64) as u32
+}
+
+fn clamp_u128_to_u32(v: u128) -> u32 {
+    v.min(u32::MAX as u128) as u32
+}
+
+fn clamp_usize_to_u32(v: usize) -> u32 {
+    v.min(u32::MAX as usize) as u32
 }
 
 fn edge_certainty_label(
@@ -406,6 +420,41 @@ impl AppController {
         Ok(file_node.map(|file| file.serialized_name))
     }
 
+    fn occurrence_kind_label(kind: codestory_core::OccurrenceKind) -> &'static str {
+        match kind {
+            codestory_core::OccurrenceKind::DEFINITION => "definition",
+            codestory_core::OccurrenceKind::REFERENCE => "reference",
+            codestory_core::OccurrenceKind::DECLARATION => "declaration",
+            codestory_core::OccurrenceKind::MACRO_DEFINITION => "macro_definition",
+            codestory_core::OccurrenceKind::MACRO_REFERENCE => "macro_reference",
+            codestory_core::OccurrenceKind::UNKNOWN => "unknown",
+        }
+    }
+
+    fn to_source_occurrence_dto(
+        storage: &Storage,
+        occurrence: codestory_core::Occurrence,
+    ) -> Result<Option<SourceOccurrenceDto>, ApiError> {
+        let file_node = storage
+            .get_node(occurrence.location.file_node_id)
+            .map_err(|e| {
+                ApiError::internal(format!("Failed to resolve occurrence file node: {e}"))
+            })?;
+        let Some(file_node) = file_node else {
+            return Ok(None);
+        };
+
+        Ok(Some(SourceOccurrenceDto {
+            element_id: occurrence.element_id.to_string(),
+            kind: Self::occurrence_kind_label(occurrence.kind).to_string(),
+            file_path: file_node.serialized_name,
+            start_line: occurrence.location.start_line,
+            start_col: occurrence.location.start_col,
+            end_line: occurrence.location.end_line,
+            end_col: occurrence.location.end_col,
+        }))
+    }
+
     fn symbol_summary_for_node(
         storage: &Storage,
         labels_by_id: &HashMap<codestory_core::NodeId, String>,
@@ -527,20 +576,39 @@ impl AppController {
 
         // Use a dedicated thread so callers can keep their runtime responsive.
         std::thread::spawn(move || {
+            let indexing_started = std::time::Instant::now();
             let result = match req.mode {
                 IndexMode::Full => index_full(&root, &storage_path, &events_tx),
                 IndexMode::Incremental => index_incremental(&root, &storage_path, &events_tx),
             };
 
-            if let Err(err) = result {
-                let _ = events_tx.send(AppEventPayload::IndexingFailed { error: err.message });
-            }
+            match result {
+                Ok(mut summary) => {
+                    let _ = events_tx.send(AppEventPayload::StatusUpdate {
+                        message: "Indexing finished. Refreshing caches...".to_string(),
+                    });
+                    let cache_started = std::time::Instant::now();
+                    if let Ok(storage) = Storage::open(&storage_path) {
+                        refresh_caches(&controller, &storage);
+                        summary.phase_timings.cache_refresh_ms =
+                            Some(clamp_u128_to_u32(cache_started.elapsed().as_millis()));
+                    } else {
+                        controller.state.lock().is_indexing = false;
+                    }
 
-            // Mark indexing as complete and refresh caches if possible.
-            if let Ok(storage) = Storage::open(&storage_path) {
-                refresh_caches(&controller, &storage);
-            } else {
-                controller.state.lock().is_indexing = false;
+                    let _ = events_tx.send(AppEventPayload::IndexingComplete {
+                        duration_ms: clamp_u128_to_u32(indexing_started.elapsed().as_millis()),
+                        phase_timings: summary.phase_timings,
+                    });
+                }
+                Err(err) => {
+                    let _ = events_tx.send(AppEventPayload::IndexingFailed { error: err.message });
+                    if let Ok(storage) = Storage::open(&storage_path) {
+                        refresh_caches(&controller, &storage);
+                    } else {
+                        controller.state.lock().is_indexing = false;
+                    }
+                }
             }
         });
 
@@ -884,9 +952,14 @@ impl AppController {
 
         let mut node_dtos = Vec::with_capacity(ordered_node_ids.len());
         for id in ordered_node_ids {
-            let (label, kind) = match storage.get_node(id) {
-                Ok(Some(node)) => (node_display_name(&node), NodeKind::from(node.kind)),
-                _ => (id.0.to_string(), NodeKind::UNKNOWN),
+            let (label, kind, file_path, qualified_name) = match storage.get_node(id) {
+                Ok(Some(node)) => (
+                    node_display_name(&node),
+                    NodeKind::from(node.kind),
+                    Self::file_path_for_node(&storage, &node).ok().flatten(),
+                    node.qualified_name,
+                ),
+                _ => (id.0.to_string(), NodeKind::UNKNOWN, None, None),
             };
 
             node_dtos.push(GraphNodeDto {
@@ -898,6 +971,8 @@ impl AppController {
                 badge_visible_members: None,
                 badge_total_members: None,
                 merged_symbol_examples: Vec::new(),
+                file_path,
+                qualified_name,
             });
         }
 
@@ -995,6 +1070,8 @@ impl AppController {
                 badge_visible_members,
                 badge_total_members,
                 merged_symbol_examples: Vec::new(),
+                file_path: Self::file_path_for_node(&storage, &node)?,
+                qualified_name: node.qualified_name.clone(),
             });
         }
 
@@ -1057,6 +1134,58 @@ impl AppController {
         })
     }
 
+    pub fn node_occurrences(
+        &self,
+        req: NodeOccurrencesRequest,
+    ) -> Result<Vec<SourceOccurrenceDto>, ApiError> {
+        let id = req.id.to_core()?;
+        let storage = self.open_storage()?;
+        let mut occurrences = storage
+            .get_occurrences_for_node(id)
+            .map_err(|e| ApiError::internal(format!("Failed to load node occurrences: {e}")))?
+            .into_iter()
+            .filter_map(|occurrence| {
+                Self::to_source_occurrence_dto(&storage, occurrence).transpose()
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+
+        occurrences.sort_by(|left, right| {
+            left.file_path
+                .cmp(&right.file_path)
+                .then(left.start_line.cmp(&right.start_line))
+                .then(left.start_col.cmp(&right.start_col))
+                .then(left.end_line.cmp(&right.end_line))
+                .then(left.end_col.cmp(&right.end_col))
+        });
+        Ok(occurrences)
+    }
+
+    pub fn edge_occurrences(
+        &self,
+        req: EdgeOccurrencesRequest,
+    ) -> Result<Vec<SourceOccurrenceDto>, ApiError> {
+        let id = req.id.to_core()?;
+        let storage = self.open_storage()?;
+        let mut occurrences = storage
+            .get_occurrences_for_element(id.0)
+            .map_err(|e| ApiError::internal(format!("Failed to load edge occurrences: {e}")))?
+            .into_iter()
+            .filter_map(|occurrence| {
+                Self::to_source_occurrence_dto(&storage, occurrence).transpose()
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+
+        occurrences.sort_by(|left, right| {
+            left.file_path
+                .cmp(&right.file_path)
+                .then(left.start_line.cmp(&right.start_line))
+                .then(left.start_col.cmp(&right.start_col))
+                .then(left.end_line.cmp(&right.end_line))
+                .then(left.end_col.cmp(&right.end_col))
+        });
+        Ok(occurrences)
+    }
+
     pub fn read_file_text(
         &self,
         req: ReadFileTextRequest,
@@ -1110,11 +1239,16 @@ impl AppController {
     }
 }
 
+#[derive(Debug, Clone)]
+struct IndexingRunSummary {
+    phase_timings: IndexingPhaseTimings,
+}
+
 fn index_full(
     root: &Path,
     storage_path: &Path,
     events_tx: &Sender<AppEventPayload>,
-) -> Result<(), ApiError> {
+) -> Result<IndexingRunSummary, ApiError> {
     run_indexing_common(root, storage_path, events_tx, true, |project, _storage| {
         project
             .full_refresh()
@@ -1126,7 +1260,7 @@ fn index_incremental(
     root: &Path,
     storage_path: &Path,
     events_tx: &Sender<AppEventPayload>,
-) -> Result<(), ApiError> {
+) -> Result<IndexingRunSummary, ApiError> {
     run_indexing_common(root, storage_path, events_tx, false, |project, storage| {
         project
             .generate_refresh_info(storage)
@@ -1140,11 +1274,17 @@ fn spawn_progress_forwarder(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         while let Ok(ev) = rx.recv() {
-            if let Event::IndexingProgress { current, total } = ev {
-                let _ = progress_tx.send(AppEventPayload::IndexingProgress {
-                    current: current.min(u32::MAX as usize) as u32,
-                    total: total.min(u32::MAX as usize) as u32,
-                });
+            match ev {
+                Event::IndexingProgress { current, total } => {
+                    let _ = progress_tx.send(AppEventPayload::IndexingProgress {
+                        current: current.min(u32::MAX as usize) as u32,
+                        total: total.min(u32::MAX as usize) as u32,
+                    });
+                }
+                Event::StatusUpdate { message } => {
+                    let _ = progress_tx.send(AppEventPayload::StatusUpdate { message });
+                }
+                _ => {}
             }
         }
     })
@@ -1156,15 +1296,13 @@ fn run_indexing_common<F>(
     events_tx: &Sender<AppEventPayload>,
     clear_storage: bool,
     refresh_builder: F,
-) -> Result<(), ApiError>
+) -> Result<IndexingRunSummary, ApiError>
 where
     F: FnOnce(
         &codestory_project::Project,
         &Storage,
     ) -> Result<codestory_project::RefreshInfo, ApiError>,
 {
-    let start_time = std::time::Instant::now();
-
     let mut storage = Storage::open(storage_path)
         .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
 
@@ -1194,14 +1332,23 @@ where
     drop(bus);
     let _ = forwarder.join();
 
-    if let Err(e) = result {
-        return Err(ApiError::internal(format!("Indexing failed: {e}")));
-    }
-
-    let _ = events_tx.send(AppEventPayload::IndexingComplete {
-        duration_ms: start_time.elapsed().as_millis().min(u32::MAX as u128) as u32,
-    });
-    Ok(())
+    let index_stats = result.map_err(|e| ApiError::internal(format!("Indexing failed: {e}")))?;
+    Ok(IndexingRunSummary {
+        phase_timings: IndexingPhaseTimings {
+            parse_index_ms: clamp_u64_to_u32(index_stats.parse_index_ms),
+            projection_flush_ms: clamp_u64_to_u32(index_stats.projection_flush_ms),
+            edge_resolution_ms: clamp_u64_to_u32(index_stats.edge_resolution_ms),
+            error_flush_ms: clamp_u64_to_u32(index_stats.error_flush_ms),
+            cleanup_ms: clamp_u64_to_u32(index_stats.cleanup_ms),
+            cache_refresh_ms: None,
+            unresolved_calls_start: clamp_usize_to_u32(index_stats.unresolved_calls_start),
+            unresolved_imports_start: clamp_usize_to_u32(index_stats.unresolved_imports_start),
+            resolved_calls: clamp_usize_to_u32(index_stats.resolved_calls),
+            resolved_imports: clamp_usize_to_u32(index_stats.resolved_imports),
+            unresolved_calls_end: clamp_usize_to_u32(index_stats.unresolved_calls_end),
+            unresolved_imports_end: clamp_usize_to_u32(index_stats.unresolved_imports_end),
+        },
+    })
 }
 
 fn refresh_caches(controller: &AppController, storage: &Storage) {
@@ -1246,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_forwarder_relay_only_progress_events() {
+    fn progress_forwarder_relays_progress_and_status_events() {
         let (event_tx, event_rx) = unbounded::<Event>();
         let (app_tx, app_rx) = unbounded::<AppEventPayload>();
         let handle = spawn_progress_forwarder(event_rx, app_tx);
@@ -1272,7 +1419,15 @@ mod tests {
                 total: 5
             }
         ));
-        assert!(app_rx.try_recv().is_err());
+        let status = app_rx.recv().expect("receive status update");
+        assert!(matches!(
+            status,
+            AppEventPayload::StatusUpdate { message } if message == "ignore me"
+        ));
+        assert!(
+            app_rx.try_recv().is_err(),
+            "unexpected extra forwarded events"
+        );
         handle.join().expect("join forwarder");
     }
 

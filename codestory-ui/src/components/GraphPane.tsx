@@ -1,7 +1,7 @@
 import type { KeyboardEvent } from "react";
 
 import { GraphTrailControls } from "./GraphTrailControls";
-import { GraphViewport } from "../graph/GraphViewport";
+import { GraphViewport, type GraphEdgeSelection } from "../graph/GraphViewport";
 import type { GraphArtifactDto, SearchHit } from "../generated/api";
 import type { TrailUiConfig } from "../graph/trailConfig";
 
@@ -25,6 +25,7 @@ type GraphPaneProps = {
   graphMap: Record<string, GraphArtifactDto>;
   onActivateGraph: (graphId: string) => void;
   onSelectNode: (nodeId: string, label: string) => void;
+  onSelectEdge: (selection: GraphEdgeSelection) => void;
   trailConfig: TrailUiConfig;
   trailRunning: boolean;
   trailDisabledReason: string | null;
@@ -54,6 +55,7 @@ export function GraphPane({
   graphMap,
   onActivateGraph,
   onSelectNode,
+  onSelectEdge,
   trailConfig,
   trailRunning,
   trailDisabledReason,
@@ -121,7 +123,13 @@ export function GraphPane({
         onResetDefaults={onResetTrailDefaults}
       />
       <div className="graph-canvas">
-        <GraphViewport graph={activeGraph} onSelectNode={onSelectNode} trailConfig={trailConfig} />
+        <GraphViewport
+          graph={activeGraph}
+          onSelectNode={onSelectNode}
+          onSelectEdge={onSelectEdge}
+          trailConfig={trailConfig}
+          onToggleLegend={() => onTrailConfigChange({ showLegend: !trailConfig.showLegend })}
+        />
       </div>
     </section>
   );

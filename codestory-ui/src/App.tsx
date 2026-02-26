@@ -3,7 +3,7 @@ import { type Monaco, type OnMount } from "@monaco-editor/react";
 
 import { api } from "./api/client";
 import type { PendingSymbolFocus, PersistedLayout } from "./app/types";
-import { CodePane } from "./components/CodePane";
+import { CodePane, type CodeEdgeContext } from "./components/CodePane";
 import { GraphPane } from "./components/GraphPane";
 import { PendingFocusDialog } from "./components/PendingFocusDialog";
 import { ResponsePane } from "./components/ResponsePane";
@@ -15,6 +15,7 @@ import type {
   GraphArtifactDto,
   NodeDetailsDto,
   SearchHit,
+  SourceOccurrenceDto,
   SymbolSummaryDto,
 } from "./generated/api";
 import { isTruncatedUmlGraph, languageForPath } from "./graph/GraphViewport";
@@ -36,6 +37,23 @@ function toMonacoModelPath(path: string | null): string | null {
 }
 
 const LAST_OPENED_PROJECT_KEY = "codestory:last-opened-project";
+
+function isLikelyTestOrBenchPath(path: string | null): boolean {
+  if (!path) {
+    return false;
+  }
+  const normalized = path.replace(/\\/g, "/").toLowerCase();
+  const segments = normalized.split("/").filter((segment) => segment.length > 0);
+  return (
+    segments.includes("tests") ||
+    segments.includes("test") ||
+    segments.includes("benches") ||
+    segments.includes("bench") ||
+    normalized.endsWith("_test.rs") ||
+    normalized.includes(".test.") ||
+    normalized.includes(".spec.")
+  );
+}
 
 export default function App() {
   const [projectPath, setProjectPath] = useState<string>(() => {
@@ -64,6 +82,9 @@ export default function App() {
   const [trailConfig, setTrailConfig] = useState<TrailUiConfig>(defaultTrailUiConfig);
   const [isTrailRunning, setIsTrailRunning] = useState<boolean>(false);
   const [activeNodeDetails, setActiveNodeDetails] = useState<NodeDetailsDto | null>(null);
+  const [activeEdgeContext, setActiveEdgeContext] = useState<CodeEdgeContext | null>(null);
+  const [activeOccurrences, setActiveOccurrences] = useState<SourceOccurrenceDto[]>([]);
+  const [activeOccurrenceIndex, setActiveOccurrenceIndex] = useState<number>(0);
   const [activeFilePath, setActiveFilePath] = useState<string | null>(null);
   const [savedText, setSavedText] = useState<string>("");
   const [draftText, setDraftText] = useState<string>("");
@@ -224,11 +245,15 @@ export default function App() {
         case "IndexingProgress":
           setIndexProgress({ current: event.data.current, total: event.data.total });
           break;
-        case "IndexingComplete":
+        case "IndexingComplete": {
+          const phases = event.data.phase_timings;
           setIndexProgress(null);
-          setStatus(`Indexing complete in ${event.data.duration_ms} ms.`);
+          setStatus(
+            `Indexing complete in ${event.data.duration_ms} ms (parse ${phases.parse_index_ms} ms, flush ${phases.projection_flush_ms} ms, resolve ${phases.edge_resolution_ms} ms, cache ${phases.cache_refresh_ms ?? 0} ms).`,
+          );
           void loadRootSymbols();
           break;
+        }
         case "IndexingFailed":
           setIndexProgress(null);
           setStatus(`Indexing failed: ${event.data.error}`);
@@ -256,21 +281,77 @@ export default function App() {
     }
   }, []);
 
-  const loadNodeContext = useCallback(async (nodeId: string) => {
-    const details = await api.nodeDetails({ id: nodeId });
-    setActiveNodeDetails(details);
+  const openOccurrenceFile = useCallback(
+    async (
+      occurrence: SourceOccurrenceDto,
+      options?: {
+        allowDirtyCrossFile?: boolean;
+      },
+    ): Promise<boolean> => {
+      if (
+        !options?.allowDirtyCrossFile &&
+        isDirty &&
+        activeFilePath &&
+        activeFilePath !== occurrence.file_path
+      ) {
+        setStatus("Save or discard changes before jumping to a different source file.");
+        return false;
+      }
 
-    if (details.file_path) {
-      const file = await api.readFileText({ path: details.file_path });
+      const file = await api.readFileText({ path: occurrence.file_path });
       setActiveFilePath(file.path);
       setSavedText(file.text);
       setDraftText(file.text);
-    } else {
-      setActiveFilePath(null);
-      setSavedText("");
-      setDraftText("");
-    }
-  }, []);
+      return true;
+    },
+    [activeFilePath, isDirty],
+  );
+
+  const loadNodeContext = useCallback(
+    async (nodeId: string) => {
+      const details = await api.nodeDetails({ id: nodeId });
+      setActiveNodeDetails(details);
+      setActiveEdgeContext(null);
+
+      const occurrences = await api.nodeOccurrences({ id: nodeId });
+      setActiveOccurrences(occurrences);
+
+      if (occurrences.length > 0) {
+        const preferredIndex = occurrences.findIndex((occurrence) => {
+          if (!details.file_path || !details.start_line) {
+            return false;
+          }
+          return (
+            occurrence.file_path === details.file_path &&
+            occurrence.start_line === details.start_line
+          );
+        });
+        const nextIndex = preferredIndex >= 0 ? preferredIndex : 0;
+        setActiveOccurrenceIndex(nextIndex);
+        const nextOccurrence = occurrences[nextIndex];
+        if (nextOccurrence) {
+          const opened = await openOccurrenceFile(nextOccurrence, { allowDirtyCrossFile: true });
+          if (opened) {
+            return;
+          }
+        }
+      } else {
+        setActiveOccurrenceIndex(0);
+      }
+
+      if (details.file_path) {
+        const file = await api.readFileText({ path: details.file_path });
+        setActiveFilePath(file.path);
+        setSavedText(file.text);
+        setDraftText(file.text);
+      } else {
+        setActiveFilePath(null);
+        setSavedText("");
+        setDraftText("");
+      }
+    },
+    [openOccurrenceFile],
+  );
 
   const openNeighborhood = useCallback(
     async (nodeId: string, title: string) => {
@@ -312,7 +393,35 @@ export default function App() {
 
     setIsTrailRunning(true);
     try {
-      const graph = await api.graphTrail(toTrailConfigDto(activeNodeDetails.id, trailConfig));
+      const rootInTestPath = isLikelyTestOrBenchPath(activeNodeDetails.file_path);
+      const initialConfig =
+        trailConfig.callerScope === "ProductionOnly" && rootInTestPath
+          ? { ...trailConfig, callerScope: "IncludeTestsAndBenches" as const }
+          : trailConfig;
+
+      let graph = await api.graphTrail(toTrailConfigDto(activeNodeDetails.id, initialConfig));
+      let usedExpandedCallerScope = initialConfig.callerScope !== trailConfig.callerScope;
+
+      // Keep the "Production Only" default, but recover automatically when it would hide all context.
+      if (
+        !usedExpandedCallerScope &&
+        trailConfig.callerScope === "ProductionOnly" &&
+        graph.nodes.length <= 1 &&
+        graph.edges.length === 0
+      ) {
+        const fallbackConfig = { ...trailConfig, callerScope: "IncludeTestsAndBenches" as const };
+        const fallbackGraph = await api.graphTrail(
+          toTrailConfigDto(activeNodeDetails.id, fallbackConfig),
+        );
+        if (
+          fallbackGraph.edges.length > graph.edges.length ||
+          fallbackGraph.nodes.length > graph.nodes.length
+        ) {
+          graph = fallbackGraph;
+          usedExpandedCallerScope = true;
+        }
+      }
+
       const trailGraphId = `trail-${activeNodeDetails.id}-${Date.now()}`;
       const modeLabel =
         trailConfig.mode === "Neighborhood"
@@ -332,13 +441,128 @@ export default function App() {
         },
         true,
       );
-      setStatus(`Trail loaded (${graph.nodes.length} nodes, ${graph.edges.length} edges).`);
+      const scopeSuffix = usedExpandedCallerScope ? " using expanded caller scope." : ".";
+      setStatus(
+        `Trail loaded (${graph.nodes.length} nodes, ${graph.edges.length} edges)${scopeSuffix}`,
+      );
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Failed to run trail graph query.");
     } finally {
       setIsTrailRunning(false);
     }
   }, [activeNodeDetails, trailConfig, trailDisabledReason, upsertGraph]);
+
+  const selectOccurrenceByIndex = useCallback(
+    async (index: number) => {
+      if (activeOccurrences.length === 0) {
+        return;
+      }
+      const boundedIndex =
+        ((index % activeOccurrences.length) + activeOccurrences.length) % activeOccurrences.length;
+      const occurrence = activeOccurrences[boundedIndex];
+      if (!occurrence) {
+        return;
+      }
+      const opened = await openOccurrenceFile(occurrence);
+      if (!opened) {
+        return;
+      }
+      setActiveOccurrenceIndex(boundedIndex);
+    },
+    [activeOccurrences, openOccurrenceFile],
+  );
+
+  const selectNextOccurrence = useCallback(async () => {
+    await selectOccurrenceByIndex(activeOccurrenceIndex + 1);
+  }, [activeOccurrenceIndex, selectOccurrenceByIndex]);
+
+  const selectPreviousOccurrence = useCallback(async () => {
+    await selectOccurrenceByIndex(activeOccurrenceIndex - 1);
+  }, [activeOccurrenceIndex, selectOccurrenceByIndex]);
+
+  const selectEdge = useCallback(
+    async (selection: {
+      id: string;
+      edgeIds: string[];
+      kind: string;
+      sourceNodeId: string;
+      targetNodeId: string;
+      sourceLabel: string;
+      targetLabel: string;
+    }) => {
+      if (!projectOpen) {
+        return;
+      }
+
+      setActiveEdgeContext({
+        id: selection.id,
+        kind: selection.kind,
+        sourceLabel: selection.sourceLabel,
+        targetLabel: selection.targetLabel,
+      });
+
+      try {
+        const sourceEdgeIds = selection.edgeIds.length > 0 ? selection.edgeIds : [selection.id];
+        const uniqueEdgeIds = [...new Set(sourceEdgeIds)];
+        const occurrenceResults = await Promise.allSettled(
+          uniqueEdgeIds.map((edgeId) => api.edgeOccurrences({ id: edgeId })),
+        );
+        const occurrences = occurrenceResults
+          .filter(
+            (result): result is PromiseFulfilledResult<SourceOccurrenceDto[]> =>
+              result.status === "fulfilled",
+          )
+          .flatMap((result) => result.value);
+        const dedupedOccurrences = [
+          ...new Map(
+            occurrences.map((occurrence) => [
+              `${occurrence.element_id}|${occurrence.kind}|${occurrence.file_path}|${occurrence.start_line}|${occurrence.start_col}|${occurrence.end_line}|${occurrence.end_col}`,
+              occurrence,
+            ]),
+          ).values(),
+        ].sort(
+          (left, right) =>
+            left.file_path.localeCompare(right.file_path) ||
+            left.start_line - right.start_line ||
+            left.start_col - right.start_col ||
+            left.end_line - right.end_line ||
+            left.end_col - right.end_col,
+        );
+        const failedLookups = occurrenceResults.filter(
+          (result) => result.status === "rejected",
+        ).length;
+        if (failedLookups > 0) {
+          setStatus(
+            `Loaded edge locations with ${failedLookups} lookup failure${failedLookups === 1 ? "" : "s"}.`,
+          );
+        }
+
+        setActiveOccurrences(dedupedOccurrences);
+        if (dedupedOccurrences.length === 0) {
+          setActiveOccurrenceIndex(0);
+          setStatus(`No source locations recorded for ${selection.kind} edge.`);
+          return;
+        }
+
+        const firstOccurrence = dedupedOccurrences[0];
+        if (!firstOccurrence) {
+          setActiveOccurrenceIndex(0);
+          return;
+        }
+        const opened = await openOccurrenceFile(firstOccurrence);
+        if (!opened) {
+          return;
+        }
+        setActiveOccurrenceIndex(0);
+        setStatus(
+          `Selected ${selection.kind} edge (${selection.sourceLabel} -> ${selection.targetLabel}).`,
+        );
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : "Failed to load edge source locations.");
+      }
+    },
+    [openOccurrenceFile, projectOpen],
+  );
 
   const focusSymbolInternal = useCallback(
     async (symbolId: string, label: string) => {
@@ -668,18 +892,39 @@ export default function App() {
       return;
     }
 
-    if (!activeFilePath || !activeNodeDetails?.start_line) {
+    if (!activeFilePath) {
       decorationIdsRef.current = editor.deltaDecorations(decorationIdsRef.current, []);
       return;
     }
 
-    const startLine = Math.max(1, activeNodeDetails.start_line ?? 1);
-    const startColumn = Math.max(1, activeNodeDetails.start_col ?? 1);
-    const endLine = Math.max(startLine, activeNodeDetails.end_line ?? startLine);
-    const endColumn =
-      endLine === startLine
-        ? Math.max(startColumn + 1, activeNodeDetails.end_col ?? startColumn + 1)
-        : Math.max(1, activeNodeDetails.end_col ?? 1);
+    const activeOccurrence =
+      activeOccurrences.length > 0
+        ? (activeOccurrences[Math.min(activeOccurrenceIndex, activeOccurrences.length - 1)] ?? null)
+        : null;
+
+    const hasEdgeRange = Boolean(activeEdgeContext && activeOccurrence);
+    const nodeStartLine = activeNodeDetails?.start_line ?? null;
+    if (!hasEdgeRange && !nodeStartLine) {
+      decorationIdsRef.current = editor.deltaDecorations(decorationIdsRef.current, []);
+      return;
+    }
+    const startLine = hasEdgeRange
+      ? Math.max(1, activeOccurrence?.start_line ?? 1)
+      : Math.max(1, nodeStartLine ?? 1);
+
+    const startColumn = hasEdgeRange
+      ? Math.max(1, activeOccurrence?.start_col ?? 1)
+      : Math.max(1, activeNodeDetails?.start_col ?? 1);
+    const endLine = hasEdgeRange
+      ? Math.max(startLine, activeOccurrence?.end_line ?? startLine)
+      : Math.max(startLine, activeNodeDetails?.end_line ?? startLine);
+    const endColumn = hasEdgeRange
+      ? endLine === startLine
+        ? Math.max(startColumn + 1, activeOccurrence?.end_col ?? startColumn + 1)
+        : Math.max(1, activeOccurrence?.end_col ?? 1)
+      : endLine === startLine
+        ? Math.max(startColumn + 1, activeNodeDetails?.end_col ?? startColumn + 1)
+        : Math.max(1, activeNodeDetails?.end_col ?? 1);
 
     decorationIdsRef.current = editor.deltaDecorations(decorationIdsRef.current, [
       {
@@ -704,7 +949,10 @@ export default function App() {
 
     editor.revealLineInCenter(startLine);
   }, [
+    activeEdgeContext,
     activeFilePath,
+    activeOccurrenceIndex,
+    activeOccurrences,
     activeNodeDetails?.end_col,
     activeNodeDetails?.end_line,
     activeNodeDetails?.start_col,
@@ -781,6 +1029,9 @@ export default function App() {
           onSelectNode={(nodeId, label) => {
             focusSymbol(nodeId, label);
           }}
+          onSelectEdge={(selection) => {
+            void selectEdge(selection);
+          }}
           trailConfig={trailConfig}
           trailRunning={isTrailRunning}
           trailDisabledReason={trailDisabledReason}
@@ -800,6 +1051,18 @@ export default function App() {
           isSaving={isSaving}
           onSave={saveCurrentFile}
           activeNodeDetails={activeNodeDetails}
+          activeEdgeContext={activeEdgeContext}
+          occurrences={activeOccurrences}
+          activeOccurrenceIndex={activeOccurrenceIndex}
+          onSelectOccurrence={(index) => {
+            void selectOccurrenceByIndex(index);
+          }}
+          onNextOccurrence={() => {
+            void selectNextOccurrence();
+          }}
+          onPreviousOccurrence={() => {
+            void selectPreviousOccurrence();
+          }}
           codeLanguage={codeLanguage}
           draftText={draftText}
           onDraftChange={setDraftText}

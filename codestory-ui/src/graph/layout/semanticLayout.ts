@@ -31,13 +31,19 @@ const MIN_ROW_SPACING = 56;
 const CARD_WIDTH_MIN = 228;
 const CARD_WIDTH_MAX = 432;
 const CARD_CHROME_WIDTH = 112;
+const CARD_HEIGHT_MIN = 110;
+const CARD_HEIGHT_MAX = 560;
 const PILL_WIDTH_MIN = 96;
 const PILL_WIDTH_MAX = 560;
 const PILL_CHROME_WIDTH = 72;
+const PILL_HEIGHT = 34;
 const APPROX_CHAR_WIDTH = 7.25;
+const RANK_MIN_VERTICAL_GAP = 26;
+const RASTER_STEP = 8;
 
 type FoldedEdge = {
   id: string;
+  sourceEdgeIds: string[];
   source: string;
   target: string;
   kind: EdgeKind;
@@ -47,6 +53,9 @@ type FoldedEdge = {
   targetHandle: string;
   family: SemanticEdgeFamily;
 };
+
+type GraphNodeLike = GraphResponse["nodes"][number];
+type GraphEdgeLike = GraphResponse["edges"][number];
 
 function inferMemberVisibility(kind: string, label: string): "public" | "private" {
   if (PRIVATE_MEMBER_KINDS.has(kind)) {
@@ -85,8 +94,11 @@ function dedupeKeyForNode(
   depth: number,
   isCenter: boolean,
 ): string | null {
-  if (isCenter || CARD_NODE_KINDS.has(kind)) {
+  if (isCenter) {
     return null;
+  }
+  if (CARD_NODE_KINDS.has(kind)) {
+    return `${kind}:${label.toLowerCase()}`;
   }
   return `${kind}:${label.toLowerCase()}:${depth}`;
 }
@@ -275,15 +287,46 @@ function estimatedNodeWidth(kind: string, label: string, members: FlowMemberData
   return clamp(pillWidth, PILL_WIDTH_MIN, PILL_WIDTH_MAX);
 }
 
+function estimatedNodeHeight(kind: string, members: FlowMemberData[]): number {
+  if (!CARD_NODE_KINDS.has(kind)) {
+    return PILL_HEIGHT;
+  }
+
+  const publicCount = members.filter((member) => member.visibility === "public").length;
+  const privateCount = members.length - publicCount;
+  const sectionCount = (publicCount > 0 ? 1 : 0) + (privateCount > 0 ? 1 : 0);
+  const effectiveSections = sectionCount === 0 ? 1 : sectionCount;
+  return clamp(
+    74 + effectiveSections * 28 + Math.max(1, members.length) * 21,
+    CARD_HEIGHT_MIN,
+    CARD_HEIGHT_MAX,
+  );
+}
+
+function snapToRaster(value: number, step = RASTER_STEP): number {
+  return Math.round(value / step) * step;
+}
+
 type MemberExtraction = {
   memberHostById: Map<string, string>;
   membersByHost: Map<string, FlowMemberData[]>;
+  syntheticHosts: GraphNodeLike[];
 };
+
+function syntheticHostId(hostLabel: string): string {
+  const slug = hostLabel
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `__synthetic_host__${slug.length > 0 ? slug : "anonymous"}`;
+}
 
 function extractMembers(graph: GraphResponse): MemberExtraction {
   const nodeById = new Map(graph.nodes.map((node) => [node.id, node]));
   const memberHostById = new Map<string, string>();
   const membersByHost = new Map<string, FlowMemberData[]>();
+  const syntheticHostsById = new Map<string, GraphNodeLike>();
 
   for (const edge of graph.edges) {
     if (edge.kind !== "MEMBER") {
@@ -345,9 +388,21 @@ function extractMembers(graph: GraphResponse): MemberExtraction {
       continue;
     }
     const hostLabel = node.label.slice(0, separatorIdx);
-    const hostId = hostIdsByLabel.get(hostLabel);
+    let hostId = hostIdsByLabel.get(hostLabel);
     if (!hostId) {
-      continue;
+      hostId = syntheticHostId(hostLabel);
+      hostIdsByLabel.set(hostLabel, hostId);
+      if (!syntheticHostsById.has(hostId)) {
+        syntheticHostsById.set(hostId, {
+          id: hostId,
+          label: hostLabel,
+          kind: "CLASS",
+          depth: Math.max(1, node.depth - 1),
+          badge_visible_members: null,
+          badge_total_members: null,
+          merged_symbol_examples: [],
+        });
+      }
     }
 
     memberHostById.set(node.id, hostId);
@@ -363,11 +418,16 @@ function extractMembers(graph: GraphResponse): MemberExtraction {
     }
   }
 
-  return { memberHostById, membersByHost };
+  return {
+    memberHostById,
+    membersByHost,
+    syntheticHosts: [...syntheticHostsById.values()],
+  };
 }
 
 function foldEdges(
-  graph: GraphResponse,
+  nodes: GraphNodeLike[],
+  edges: GraphEdgeLike[],
   centerHostNodeId: string,
   memberHostById: Map<string, string>,
   signedDepthByNode: Map<string, number>,
@@ -382,7 +442,7 @@ function foldEdges(
   const duplicateCountByCanonical = new Map<string, number>();
   const mergedIdsByCanonical = new Map<string, string[]>();
 
-  for (const node of graph.nodes) {
+  for (const node of nodes) {
     if (memberHostById.has(node.id)) {
       continue;
     }
@@ -405,7 +465,7 @@ function foldEdges(
   }
 
   const folded = new Map<string, FoldedEdge>();
-  for (const edge of graph.edges) {
+  for (const edge of edges) {
     if (edge.kind === "MEMBER") {
       continue;
     }
@@ -438,6 +498,7 @@ function foldEdges(
     if (!existing) {
       folded.set(key, {
         id: key,
+        sourceEdgeIds: [edge.id],
         source,
         target,
         kind: edge.kind,
@@ -451,6 +512,7 @@ function foldEdges(
     }
 
     existing.multiplicity += 1;
+    existing.sourceEdgeIds.push(edge.id);
     existing.certainty = mergeCertainty(existing.certainty, edge.certainty);
   }
 
@@ -463,11 +525,12 @@ function foldEdges(
 }
 
 function computeSignedDepthByNode(
-  graph: GraphResponse,
+  nodes: GraphNodeLike[],
+  edges: GraphEdgeLike[],
   centerHostNodeId: string,
 ): Map<string, number> {
   const directionBiasByNode = new Map<string, number>();
-  for (const edge of graph.edges) {
+  for (const edge of edges) {
     if (edge.kind === "MEMBER") {
       continue;
     }
@@ -481,7 +544,7 @@ function computeSignedDepthByNode(
   }
 
   const signedDepthByNode = new Map<string, number>();
-  for (const node of graph.nodes) {
+  for (const node of nodes) {
     if (node.id === centerHostNodeId) {
       signedDepthByNode.set(node.id, 0);
       continue;
@@ -494,6 +557,149 @@ function computeSignedDepthByNode(
   return signedDepthByNode;
 }
 
+function applyVirtualRankHints(
+  yRank: Map<string, number>,
+  xRank: Map<string, number>,
+  edges: FoldedEdge[],
+): void {
+  const longEdges = edges.filter((edge) => {
+    if (edge.family !== "flow") {
+      return false;
+    }
+    return Math.abs((xRank.get(edge.target) ?? 0) - (xRank.get(edge.source) ?? 0)) > 1;
+  });
+  if (longEdges.length === 0) {
+    return;
+  }
+
+  for (let pass = 0; pass < 3; pass += 1) {
+    for (const edge of longEdges) {
+      const sourceY = yRank.get(edge.source) ?? 0;
+      const targetY = yRank.get(edge.target) ?? 0;
+      const blended = targetY * 0.65 + sourceY * 0.35;
+      yRank.set(edge.target, blended);
+    }
+  }
+}
+
+function compactRankPositions(
+  positionsByNode: Map<string, { x: number; y: number }>,
+  xRank: Map<string, number>,
+  heightByNode: Map<string, number>,
+): void {
+  const byRank = new Map<number, string[]>();
+  for (const nodeId of positionsByNode.keys()) {
+    const rank = xRank.get(nodeId) ?? 0;
+    const bucket = byRank.get(rank) ?? [];
+    bucket.push(nodeId);
+    byRank.set(rank, bucket);
+  }
+
+  for (const [rank, nodeIds] of byRank) {
+    nodeIds.sort((left, right) => {
+      const leftY = positionsByNode.get(left)?.y ?? 0;
+      const rightY = positionsByNode.get(right)?.y ?? 0;
+      return leftY - rightY;
+    });
+
+    const minGap = Math.abs(rank) >= 2 ? RANK_MIN_VERTICAL_GAP + 4 : RANK_MIN_VERTICAL_GAP;
+    const originalTops = nodeIds.map((nodeId) => positionsByNode.get(nodeId)?.y ?? 0);
+    const originalTop = originalTops[0] ?? 0;
+    const originalBottom = originalTops.at(-1) ?? originalTop;
+    const originalCenter = originalTops.length > 0 ? (originalTop + originalBottom) / 2 : 0;
+
+    let lastBottom = Number.NEGATIVE_INFINITY;
+    for (const nodeId of nodeIds) {
+      const position = positionsByNode.get(nodeId);
+      if (!position) {
+        continue;
+      }
+      const height = heightByNode.get(nodeId) ?? PILL_HEIGHT;
+      const minTop = lastBottom + minGap;
+      if (position.y < minTop) {
+        position.y = minTop;
+        positionsByNode.set(nodeId, position);
+      }
+      lastBottom = position.y + height;
+    }
+
+    const newTops = nodeIds.map((nodeId) => positionsByNode.get(nodeId)?.y ?? 0);
+    const newTop = newTops[0] ?? 0;
+    const newBottom = newTops.at(-1) ?? newTop;
+    const newCenter = newTops.length > 0 ? (newTop + newBottom) / 2 : 0;
+    const correction = originalCenter - newCenter;
+    for (const nodeId of nodeIds) {
+      const position = positionsByNode.get(nodeId);
+      if (!position) {
+        continue;
+      }
+      position.y += correction;
+      positionsByNode.set(nodeId, position);
+    }
+  }
+}
+
+function smoothRankPositions(
+  layers: string[][],
+  sortedXRanks: number[],
+  positionsByNode: Map<string, { x: number; y: number }>,
+  xRank: Map<string, number>,
+  neighborsByNode: Map<string, Set<string>>,
+  heightByNode: Map<string, number>,
+): void {
+  const layerByRank = new Map<number, string[]>();
+  for (let idx = 0; idx < sortedXRanks.length; idx += 1) {
+    const rank = sortedXRanks[idx];
+    const layer = layers[idx];
+    if (typeof rank !== "number" || !layer) {
+      continue;
+    }
+    layerByRank.set(rank, layer);
+  }
+
+  const smoothDirection = (direction: "forward" | "backward") => {
+    const rankList = [...sortedXRanks];
+    if (direction === "backward") {
+      rankList.reverse();
+    }
+
+    for (const rank of rankList) {
+      const layer = layerByRank.get(rank);
+      if (!layer || layer.length <= 1) {
+        continue;
+      }
+
+      const refRank = direction === "forward" ? rank - 1 : rank + 1;
+      const refLayer = layerByRank.get(refRank);
+      if (!refLayer || refLayer.length === 0) {
+        continue;
+      }
+      const refSet = new Set(refLayer);
+
+      for (const nodeId of layer) {
+        const position = positionsByNode.get(nodeId);
+        if (!position) {
+          continue;
+        }
+        const neighborYs = [...(neighborsByNode.get(nodeId) ?? [])]
+          .filter((neighborId) => refSet.has(neighborId))
+          .map((neighborId) => positionsByNode.get(neighborId)?.y ?? 0);
+        if (neighborYs.length === 0) {
+          continue;
+        }
+        const desiredY = median(neighborYs);
+        position.y = position.y * 0.68 + desiredY * 0.32;
+        positionsByNode.set(nodeId, position);
+      }
+    }
+
+    compactRankPositions(positionsByNode, xRank, heightByNode);
+  };
+
+  smoothDirection("forward");
+  smoothDirection("backward");
+}
+
 function toRoutedEdgeSpecs(edges: FoldedEdge[]): RoutedEdgeSpec[] {
   return edges
     .map((edge) => {
@@ -502,6 +708,7 @@ function toRoutedEdgeSpecs(edges: FoldedEdge[]): RoutedEdgeSpec[] {
 
       return {
         id: edge.id,
+        sourceEdgeIds: [...edge.sourceEdgeIds],
         source: edge.source,
         target: edge.target,
         sourceHandle: edge.sourceHandle,
@@ -512,33 +719,51 @@ function toRoutedEdgeSpecs(edges: FoldedEdge[]): RoutedEdgeSpec[] {
         family: edge.family,
         routeKind,
         bundleCount: edge.multiplicity,
+        routePoints: [],
       };
     })
     .sort((left, right) => left.id.localeCompare(right.id));
 }
 
 export function buildSemanticLayout(graph: GraphResponse): LayoutElements {
-  const nodeById = new Map(graph.nodes.map((node) => [node.id, node]));
-  const labelsByNode = new Map(graph.nodes.map((node) => [node.id, node.label]));
-  const { memberHostById, membersByHost } = extractMembers(graph);
+  const { memberHostById, membersByHost, syntheticHosts } = extractMembers(graph);
+  const allNodes = [...graph.nodes, ...syntheticHosts];
+  const nodeById = new Map(allNodes.map((node) => [node.id, node]));
+  const labelsByNode = new Map(allNodes.map((node) => [node.id, node.label]));
   const centerHostNodeId = memberHostById.get(graph.center_id) ?? graph.center_id;
-  const signedDepthByNode = computeSignedDepthByNode(graph, centerHostNodeId);
+  const signedDepthByNode = computeSignedDepthByNode(allNodes, graph.edges, centerHostNodeId);
 
   const { foldedEdges, canonicalNodeById, duplicateCountByCanonical, mergedIdsByCanonical } =
-    foldEdges(graph, centerHostNodeId, memberHostById, signedDepthByNode);
+    foldEdges(allNodes, graph.edges, centerHostNodeId, memberHostById, signedDepthByNode);
+  const membersByCanonical = new Map<string, FlowMemberData[]>();
+  for (const [nodeId, canonicalId] of canonicalNodeById) {
+    const members = membersByHost.get(nodeId);
+    if (!members || members.length === 0) {
+      continue;
+    }
+    const merged = membersByCanonical.get(canonicalId) ?? [];
+    const seen = new Set(merged.map((member) => member.id));
+    for (const member of members) {
+      if (!seen.has(member.id)) {
+        merged.push(member);
+        seen.add(member.id);
+      }
+    }
+    membersByCanonical.set(canonicalId, merged);
+  }
 
   const canonicalNodeIds = [...new Set(canonicalNodeById.values())];
   const centerNodeId = canonicalNodeById.get(centerHostNodeId) ?? centerHostNodeId;
   const estimatedWidthByNode = new Map<string, number>();
+  const estimatedHeightByNode = new Map<string, number>();
   for (const nodeId of canonicalNodeIds) {
     const node = nodeById.get(nodeId);
     if (!node) {
       continue;
     }
-    estimatedWidthByNode.set(
-      nodeId,
-      estimatedNodeWidth(node.kind, node.label, membersByHost.get(nodeId) ?? []),
-    );
+    const members = membersByCanonical.get(nodeId) ?? [];
+    estimatedWidthByNode.set(nodeId, estimatedNodeWidth(node.kind, node.label, members));
+    estimatedHeightByNode.set(nodeId, estimatedNodeHeight(node.kind, members));
   }
 
   const outgoingAdj = new Map<string, Set<string>>();
@@ -625,6 +850,7 @@ export function buildSemanticLayout(graph: GraphResponse): LayoutElements {
   for (const nodeId of canonicalNodeIds) {
     yRank.set(nodeId, (yRank.get(nodeId) ?? 0) - centerYRank);
   }
+  applyVirtualRankHints(yRank, xRank, foldedEdges);
 
   const byXRank = new Map<number, string[]>();
   for (const nodeId of canonicalNodeIds) {
@@ -773,8 +999,9 @@ export function buildSemanticLayout(graph: GraphResponse): LayoutElements {
         if (node && CARD_NODE_KINDS.has(node.kind)) {
           if (nodeId === centerNodeId) {
             const members = membersByHost.get(nodeId) ?? [];
-            const publicMembers = members.filter((m) => m.visibility === "public");
-            const privateMembers = members.filter((m) => m.visibility === "private");
+            const mergedMembers = membersByCanonical.get(nodeId) ?? members;
+            const publicMembers = mergedMembers.filter((m) => m.visibility === "public");
+            const privateMembers = mergedMembers.filter((m) => m.visibility === "private");
             const memberId = graph.center_id;
 
             const pIdx = publicMembers.findIndex((m) => m.id === memberId);
@@ -810,47 +1037,22 @@ export function buildSemanticLayout(graph: GraphResponse): LayoutElements {
     }
   });
 
-  // Final collision guard by rank to avoid stacked container overlap in dense views.
-  const byRank = new Map<number, Array<{ id: string; y: number }>>();
+  compactRankPositions(positionsByNode, xRank, estimatedHeightByNode);
+  smoothRankPositions(
+    layers,
+    sortedXRanks,
+    positionsByNode,
+    xRank,
+    neighborsByNode,
+    estimatedHeightByNode,
+  );
+  compactRankPositions(positionsByNode, xRank, estimatedHeightByNode);
+
   for (const [nodeId, position] of positionsByNode) {
-    const rank = xRank.get(nodeId) ?? 0;
-    const bucket = byRank.get(rank) ?? [];
-    bucket.push({ id: nodeId, y: position.y });
-    byRank.set(rank, bucket);
-  }
-  for (const [rank, entries] of byRank) {
-    if (entries.length === 0) continue;
-    const minGap = Math.abs(rank) >= 2 ? 52 : 48;
-    entries.sort((left, right) => left.y - right.y);
-
-    const originalYs = entries.map((entry) => positionsByNode.get(entry.id)!.y);
-    const originalCenterY = (originalYs[0]! + originalYs[originalYs.length - 1]!) / 2;
-
-    let lastY = Number.NEGATIVE_INFINITY;
-    for (const entry of entries) {
-      const position = positionsByNode.get(entry.id);
-      if (!position) {
-        continue;
-      }
-      const minAllowedY = lastY + minGap;
-      if (position.y < minAllowedY) {
-        position.y = minAllowedY;
-        positionsByNode.set(entry.id, position);
-      }
-      lastY = position.y;
-    }
-
-    const newYs = entries.map((entry) => positionsByNode.get(entry.id)!.y);
-    const newCenterY = (newYs[0]! + newYs[newYs.length - 1]!) / 2;
-    const correction = originalCenterY - newCenterY;
-
-    for (const entry of entries) {
-      const position = positionsByNode.get(entry.id);
-      if (position) {
-        position.y += correction;
-        positionsByNode.set(entry.id, position);
-      }
-    }
+    positionsByNode.set(nodeId, {
+      x: snapToRaster(position.x),
+      y: snapToRaster(position.y),
+    });
   }
 
   const nodeOrder = layers.flat();
@@ -870,18 +1072,21 @@ export function buildSemanticLayout(graph: GraphResponse): LayoutElements {
         label: node.label,
         center: nodeId === centerNodeId,
         nodeStyle,
+        isNonIndexed: node.kind === "UNKNOWN" || node.kind === "BUILTIN_TYPE",
         duplicateCount: duplicateCountByCanonical.get(nodeId) ?? 1,
         mergedSymbolIds: (mergedIdsByCanonical.get(nodeId) ?? [nodeId]).slice(0, 6),
-        memberCount: node.badge_visible_members ?? membersByHost.get(nodeId)?.length ?? 0,
+        memberCount: node.badge_visible_members ?? membersByCanonical.get(nodeId)?.length ?? 0,
         badgeVisibleMembers: node.badge_visible_members ?? undefined,
         badgeTotalMembers: node.badge_total_members ?? undefined,
-        members: [...(membersByHost.get(nodeId) ?? [])].sort((left, right) =>
+        members: [...(membersByCanonical.get(nodeId) ?? [])].sort((left, right) =>
           left.label.localeCompare(right.label),
         ),
         xRank: xRank.get(nodeId) ?? 0,
         yRank: yRank.get(nodeId) ?? 0,
         x: pos.x,
         y: pos.y,
+        width: estimatedWidthByNode.get(nodeId) ?? PILL_WIDTH_MIN,
+        height: estimatedHeightByNode.get(nodeId) ?? PILL_HEIGHT,
         isVirtualBundle: false,
       };
     })
@@ -895,34 +1100,41 @@ export function buildSemanticLayout(graph: GraphResponse): LayoutElements {
 }
 
 export function buildFallbackLayout(graph: GraphResponse): LayoutElements {
-  const { memberHostById, membersByHost } = extractMembers(graph);
+  const { memberHostById, membersByHost, syntheticHosts } = extractMembers(graph);
+  const allNodes = [...graph.nodes, ...syntheticHosts];
   const centerNodeId = memberHostById.get(graph.center_id) ?? graph.center_id;
 
-  const nodes = graph.nodes
+  const nodes = allNodes
     .filter((node) => !memberHostById.has(node.id))
     .sort((left, right) => left.depth - right.depth || left.label.localeCompare(right.label))
     .map((node, index) => {
       const column = Math.max(0, node.depth);
       const row = index % 10;
       const nodeStyle: "card" | "pill" = CARD_NODE_KINDS.has(node.kind) ? "card" : "pill";
+      const members = membersByHost.get(node.id) ?? [];
+      const width = estimatedNodeWidth(node.kind, node.label, members);
+      const height = estimatedNodeHeight(node.kind, members);
       return {
         id: node.id,
         kind: node.kind,
         label: node.label,
         center: node.id === centerNodeId,
         nodeStyle,
+        isNonIndexed: node.kind === "UNKNOWN" || node.kind === "BUILTIN_TYPE",
         duplicateCount: 1,
         mergedSymbolIds: [node.id],
         memberCount: node.badge_visible_members ?? membersByHost.get(node.id)?.length ?? 0,
         badgeVisibleMembers: node.badge_visible_members ?? undefined,
         badgeTotalMembers: node.badge_total_members ?? undefined,
-        members: [...(membersByHost.get(node.id) ?? [])].sort((leftEntry, rightEntry) =>
+        members: [...members].sort((leftEntry, rightEntry) =>
           leftEntry.label.localeCompare(rightEntry.label),
         ),
         xRank: column,
         yRank: row,
-        x: 120 + column * FLOW_COL_SPACING,
-        y: 120 + row * LANE_JITTER_SPACING,
+        x: snapToRaster(120 + column * FLOW_COL_SPACING),
+        y: snapToRaster(120 + row * LANE_JITTER_SPACING),
+        width,
+        height,
         isVirtualBundle: false,
       };
     });
@@ -938,6 +1150,7 @@ export function buildFallbackLayout(graph: GraphResponse): LayoutElements {
         family === "hierarchy" ? "hierarchy" : "direct";
       return {
         id: `${edge.kind}:${source}:${target}:${edge.id}`,
+        sourceEdgeIds: [edge.id],
         source,
         target,
         sourceHandle: family === "hierarchy" ? "source-node-top" : "source-node",
@@ -948,6 +1161,7 @@ export function buildFallbackLayout(graph: GraphResponse): LayoutElements {
         family,
         routeKind,
         bundleCount: 1,
+        routePoints: [],
       };
     })
     .filter((edge) => canonicalIds.has(edge.source) && canonicalIds.has(edge.target));

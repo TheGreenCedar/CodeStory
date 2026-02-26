@@ -83,6 +83,10 @@ pub struct GraphNodeDto {
     pub badge_total_members: Option<u32>,
     #[serde(default)]
     pub merged_symbol_examples: Vec<String>,
+    #[serde(default)]
+    pub file_path: Option<String>,
+    #[serde(default)]
+    pub qualified_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -137,6 +141,27 @@ const fn default_show_utility_calls() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct NodeDetailsRequest {
     pub id: NodeId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct NodeOccurrencesRequest {
+    pub id: NodeId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct EdgeOccurrencesRequest {
+    pub id: EdgeId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SourceOccurrenceDto {
+    pub element_id: String,
+    pub kind: String,
+    pub file_path: String,
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

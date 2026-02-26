@@ -552,6 +552,10 @@ textarea {
   gap: 0.24rem;
 }
 
+.graph-chip-row-grouping {
+  margin-top: 0.18rem;
+}
+
 .graph-chip {
   border: 1px solid var(--line);
   border-radius: 999px;
@@ -782,6 +786,38 @@ textarea {
   stroke-width: 0.95;
 }
 
+.graph-zoom-panel {
+  display: grid;
+  gap: 0.2rem;
+  margin-bottom: 0.4rem;
+}
+
+.graph-zoom-panel button,
+.graph-legend-toggle-panel button {
+  min-width: 1.9rem;
+  min-height: 1.9rem;
+  border: 1px solid var(--graph-chrome-border);
+  border-radius: 0.56rem;
+  background: color-mix(in oklab, #fff 84%, var(--graph-chrome-bg));
+  color: #4d545d;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  font-weight: 700;
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.45),
+    0 6px 14px rgb(15 19 23 / 0.12);
+  cursor: pointer;
+}
+
+.graph-zoom-panel button:hover,
+.graph-legend-toggle-panel button:hover {
+  background: color-mix(in oklab, #fff 72%, var(--graph-chrome-bg));
+}
+
+.graph-legend-toggle-panel {
+  margin-bottom: 0.2rem;
+}
+
 .graph-legend-panel {
   min-width: 10rem;
   border: 1px solid var(--graph-chrome-border);
@@ -789,6 +825,7 @@ textarea {
   background: color-mix(in oklab, #fff 84%, var(--graph-chrome-bg));
   box-shadow: 0 10px 22px rgb(14 20 26 / 0.16);
   padding: 0.45rem 0.5rem;
+  margin-bottom: 2.4rem;
 }
 
 .graph-legend-title {
@@ -806,10 +843,30 @@ textarea {
 }
 
 .graph-legend-row {
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 0.5rem;
+  background: transparent;
+  padding: 0.18rem 0.2rem;
   display: grid;
   grid-template-columns: 1.2rem 1fr auto;
   align-items: center;
   gap: 0.3rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.graph-legend-row:hover {
+  border-color: color-mix(in oklab, var(--graph-chrome-border) 72%, #fff);
+  background: color-mix(in oklab, #fff 62%, var(--graph-chrome-bg));
+}
+
+.graph-legend-row-muted {
+  opacity: 0.45;
+}
+
+.graph-legend-row-active {
+  opacity: 1;
 }
 
 .graph-legend-line {
@@ -830,10 +887,25 @@ textarea {
 }
 
 .graph-legend-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
   margin-top: 0.42rem;
   font-size: 0.64rem;
   color: var(--muted);
   line-height: 1.35;
+}
+
+.graph-legend-reset {
+  border: 1px solid var(--graph-chrome-border);
+  border-radius: 999px;
+  background: #fff;
+  color: #4f5660;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  padding: 0.08rem 0.44rem;
+  cursor: pointer;
 }
 
 .graph-node {
@@ -1125,6 +1197,14 @@ textarea {
   box-shadow: none;
 }
 
+.graph-node-unresolved {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    rgb(227 232 238 / 0.82) 0 9px,
+    rgb(245 247 250 / 0.95) 9px 18px
+  );
+}
+
 .graph-bundle-node {
   width: 6px;
   height: 6px;
@@ -1134,6 +1214,59 @@ textarea {
   box-shadow: none;
   opacity: 0;
   pointer-events: none;
+}
+
+.react-flow__node-sourcetrailGroup {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+}
+
+.graph-group-node {
+  width: 100%;
+  height: 100%;
+  border: 2px solid #d7dade;
+  border-radius: 1rem;
+  background: color-mix(in oklab, #fff 64%, var(--graph-node-shell));
+  pointer-events: none;
+  position: relative;
+}
+
+.graph-group-node-file {
+  border-color: #aacd95;
+  background: color-mix(in oklab, #f4fbef 88%, #fff);
+}
+
+.graph-group-node-namespace {
+  border-color: #e2bcc1;
+  background: color-mix(in oklab, #fdf4f5 88%, #fff);
+}
+
+.graph-group-label {
+  position: absolute;
+  top: 0.52rem;
+  left: 0.78rem;
+  border-radius: 0.65rem 0.65rem 0.85rem 0.85rem;
+  border: 1px solid color-mix(in oklab, #c9ced5 72%, #fff);
+  background: color-mix(in oklab, #f0f2f5 88%, #fff);
+  padding: 0.12rem 0.55rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #4d5966;
+}
+
+.graph-group-node-file .graph-group-label {
+  border-color: #98bf84;
+  background: #d8ebc9;
+  color: #455b49;
+}
+
+.graph-group-node-namespace .graph-group-label {
+  border-color: #deafb5;
+  background: #f0d0d3;
+  color: #6c4b54;
 }
 
 /* Strip the React Flow wrapper node of all visual styling for bundle nodes */
@@ -1239,6 +1372,63 @@ textarea {
 
 .pane-code {
   min-height: 0;
+}
+
+.code-occurrence-toolbar {
+  margin: 0 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 0.74rem;
+  background: color-mix(in oklab, #fff 90%, oklch(0.9 0.03 95));
+  padding: 0.35rem 0.48rem;
+  display: grid;
+  grid-template-columns: auto auto auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0.38rem;
+}
+
+.code-occurrence-toolbar button {
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: #fff;
+  padding: 0.2rem 0.5rem;
+  cursor: pointer;
+}
+
+.code-occurrence-toolbar button:disabled {
+  opacity: 0.58;
+  cursor: default;
+}
+
+.code-occurrence-summary {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+
+.code-occurrence-list {
+  min-width: 0;
+  display: flex;
+  gap: 0.22rem;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 0.08rem;
+  scrollbar-width: thin;
+}
+
+.code-occurrence-chip {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 0.64rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #fff;
+  padding: 0.1rem 0.44rem;
+  cursor: pointer;
+}
+
+.code-occurrence-chip.active {
+  border-color: color-mix(in oklab, var(--focus) 45%, var(--line));
+  background: color-mix(in oklab, #fff 78%, oklch(0.88 0.05 219));
 }
 
 .pane-code-header button {

@@ -271,11 +271,19 @@ impl Storage {
             [],
         )?;
         self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_node_kind_serialized_name ON node(kind, serialized_name)",
+            [],
+        )?;
+        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_edge_resolved_source ON edge(resolved_source_node_id)",
             [],
         )?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_edge_resolved_target ON edge(resolved_target_node_id)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_edge_kind_resolved_target ON edge(kind, resolved_target_node_id)",
             [],
         )?;
         self.conn
@@ -1785,6 +1793,64 @@ mod tests {
         let mut stmt = storage.conn.prepare("SELECT count(*) FROM node")?;
         let count: i64 = stmt.query_row([], |row| row.get(0))?;
         assert_eq!(count, 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolution_indexes_are_created() -> Result<(), StorageError> {
+        let storage = Storage::new_in_memory()?;
+
+        let mut node_stmt = storage.conn.prepare("PRAGMA index_list('node')")?;
+        let node_indexes = node_stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            node_indexes
+                .iter()
+                .any(|name| name == "idx_node_kind_serialized_name")
+        );
+
+        let mut edge_stmt = storage.conn.prepare("PRAGMA index_list('edge')")?;
+        let edge_indexes = edge_stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            edge_indexes
+                .iter()
+                .any(|name| name == "idx_edge_kind_resolved_target")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolution_query_plan_prefers_new_indexes() -> Result<(), StorageError> {
+        let storage = Storage::new_in_memory()?;
+
+        let mut node_plan_stmt = storage.conn.prepare(
+            "EXPLAIN QUERY PLAN SELECT id FROM node WHERE kind IN (3, 11, 12) AND serialized_name = 'foo' LIMIT 1",
+        )?;
+        let node_plan = node_plan_stmt
+            .query_map([], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            node_plan
+                .iter()
+                .any(|line| line.contains("idx_node_kind_serialized_name"))
+        );
+
+        let mut edge_plan_stmt = storage.conn.prepare(
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM edge WHERE kind = 3 AND resolved_target_node_id IS NULL",
+        )?;
+        let edge_plan = edge_plan_stmt
+            .query_map([], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            edge_plan
+                .iter()
+                .any(|line| line.contains("idx_edge_kind_resolved_target"))
+        );
 
         Ok(())
     }

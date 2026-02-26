@@ -120,7 +120,6 @@ cargo run -p codestory-server -- --types-only --types-out codestory-ui/src/gener
   - `codestory-cli`: standalone indexing CLI
   - `codestory-bench`: Criterion benchmark suite
 - Web UI: `codestory-ui/` (Vite + React + TypeScript)
-- Specs: `docs/specs/graph-ui-controls/`
 
 ## Generated Runtime Files
 

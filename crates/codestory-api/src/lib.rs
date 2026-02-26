@@ -5,14 +5,15 @@ mod ids;
 mod types;
 
 pub use dto::{
-    AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentResponseSectionDto, GraphArtifactDto,
-    GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse, ListChildrenSymbolsRequest,
-    ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, OpenProjectRequest, ProjectSummary,
+    AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentResponseSectionDto,
+    EdgeOccurrencesRequest, GraphArtifactDto, GraphEdgeDto, GraphNodeDto, GraphRequest,
+    GraphResponse, ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto,
+    NodeDetailsRequest, NodeOccurrencesRequest, OpenProjectRequest, ProjectSummary,
     ReadFileTextRequest, ReadFileTextResponse, SearchHit, SearchRequest, SetUiLayoutRequest,
-    StartIndexingRequest, StorageStatsDto, SymbolSummaryDto, TrailConfigDto,
+    SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto, SymbolSummaryDto, TrailConfigDto,
     WriteFileDataUrlRequest, WriteFileResponse, WriteFileTextRequest,
 };
 pub use errors::ApiError;
-pub use events::AppEventPayload;
+pub use events::{AppEventPayload, IndexingPhaseTimings};
 pub use ids::{EdgeId, NodeId};
 pub use types::{EdgeKind, IndexMode, NodeKind, TrailCallerScope, TrailDirection, TrailMode};

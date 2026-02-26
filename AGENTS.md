@@ -20,7 +20,9 @@
 - Frontend quality (from `codestory-ui`): `npm run check` (`tsgo`, `oxlint`, `oxfmt --check`).
 - Type generation: `cargo run -p codestory-server -- --types-only --types-out codestory-ui/src/generated/api.ts`.
 - Playwright skill wrapper (`~/.codex/skills/playwright/scripts/playwright_cli.sh`) is Bash-based; on this Windows setup use `C:\Program Files\Git\bin\bash.exe -lc ...` rather than WSL `bash` when WSL has no distro configured.
+- This Playwright CLI build has no `wait-for` command; use `snapshot` polling (or `eval` checks) between async UI steps.
 - When iterating over a specific component with Playwright, capture only the relevant crop and start the browser maximized.
+- Always open the project `C:\Users\alber\source\repos\codestory` when in the UI with playwright.
 
 ## Coding Style & Naming Conventions
 - Rust edition is `2024` across workspace crates.

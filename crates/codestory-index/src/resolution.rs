@@ -2,7 +2,8 @@ use crate::semantic::{SemanticResolutionRequest, SemanticResolverRegistry};
 use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind, ResolutionCertainty};
 use codestory_storage::Storage;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, params, params_from_iter, types::Value};
+use std::collections::{HashMap, HashSet};
 
 type UnresolvedEdgeRow = (
     i64,
@@ -13,10 +14,26 @@ type UnresolvedEdgeRow = (
     Option<String>,
 );
 
+#[derive(Clone, Copy, Debug)]
+enum GlobalExactMatch {
+    Missing,
+    Multiple,
+    Unique(i64),
+}
+
+#[derive(Default)]
+struct ResolutionLookupCache {
+    same_file_exact: HashMap<(String, i64, String), Option<i64>>,
+    same_module_exact: HashMap<(String, String, String), Option<i64>>,
+    global_unique_exact: HashMap<(String, String), GlobalExactMatch>,
+}
+
 #[derive(Default, Debug)]
 pub struct ResolutionStats {
+    pub unresolved_calls_before: usize,
     pub resolved_calls: usize,
     pub unresolved_calls: usize,
+    pub unresolved_imports_before: usize,
     pub resolved_imports: usize,
     pub unresolved_imports: usize,
 }
@@ -104,47 +121,124 @@ impl ResolutionPass {
     }
 
     pub fn run(&self, storage: &mut Storage) -> Result<ResolutionStats> {
-        let resolved_calls = self.resolve_calls(storage)?;
-        let resolved_imports = self.resolve_imports(storage)?;
-        let unresolved_calls = self.count_unresolved(storage, EdgeKind::CALL)?;
-        let unresolved_imports = self.count_unresolved(storage, EdgeKind::IMPORT)?;
+        self.run_with_scope(storage, None)
+    }
 
-        Ok(ResolutionStats {
-            resolved_calls,
-            unresolved_calls,
-            resolved_imports,
-            unresolved_imports,
+    pub fn run_with_scope(
+        &self,
+        storage: &mut Storage,
+        caller_scope_file_ids: Option<&HashSet<i64>>,
+    ) -> Result<ResolutionStats> {
+        let conn = storage.get_connection();
+        run_in_immediate_transaction(conn, |conn| {
+            let unresolved_calls_before =
+                Self::count_unresolved_on_conn(conn, EdgeKind::CALL, caller_scope_file_ids)?;
+            let unresolved_imports_before =
+                Self::count_unresolved_on_conn(conn, EdgeKind::IMPORT, caller_scope_file_ids)?;
+            let resolved_calls = self.resolve_calls_on_conn(conn, caller_scope_file_ids)?;
+            let resolved_imports = self.resolve_imports_on_conn(conn, caller_scope_file_ids)?;
+            let unresolved_calls =
+                Self::count_unresolved_on_conn(conn, EdgeKind::CALL, caller_scope_file_ids)?;
+            let unresolved_imports =
+                Self::count_unresolved_on_conn(conn, EdgeKind::IMPORT, caller_scope_file_ids)?;
+
+            Ok(ResolutionStats {
+                unresolved_calls_before,
+                resolved_calls,
+                unresolved_calls,
+                unresolved_imports_before,
+                resolved_imports,
+                unresolved_imports,
+            })
         })
     }
 
-    fn count_unresolved(&self, storage: &Storage, kind: EdgeKind) -> Result<usize> {
-        let conn = storage.get_connection();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM edge WHERE kind = ?1 AND resolved_target_node_id IS NULL",
-            params![kind as i32],
-            |row| row.get(0),
-        )?;
+    pub fn unresolved_counts(&self, storage: &Storage) -> Result<(usize, usize)> {
+        self.unresolved_counts_with_scope(storage, None)
+    }
+
+    pub fn unresolved_counts_with_scope(
+        &self,
+        storage: &Storage,
+        caller_scope_file_ids: Option<&HashSet<i64>>,
+    ) -> Result<(usize, usize)> {
+        Ok((
+            self.count_unresolved(storage, EdgeKind::CALL, caller_scope_file_ids)?,
+            self.count_unresolved(storage, EdgeKind::IMPORT, caller_scope_file_ids)?,
+        ))
+    }
+
+    fn count_unresolved(
+        &self,
+        storage: &Storage,
+        kind: EdgeKind,
+        caller_scope_file_ids: Option<&HashSet<i64>>,
+    ) -> Result<usize> {
+        Self::count_unresolved_on_conn(storage.get_connection(), kind, caller_scope_file_ids)
+    }
+
+    fn count_unresolved_on_conn(
+        conn: &rusqlite::Connection,
+        kind: EdgeKind,
+        caller_scope_file_ids: Option<&HashSet<i64>>,
+    ) -> Result<usize> {
+        let scope_file_ids = sorted_scope_file_ids(caller_scope_file_ids);
+        if matches!(scope_file_ids.as_ref(), Some(ids) if ids.is_empty()) {
+            return Ok(0);
+        }
+
+        let mut query = String::from("SELECT COUNT(*) FROM edge e");
+        if scope_file_ids.is_some() {
+            query.push_str(" JOIN node caller ON caller.id = e.source_node_id");
+        }
+        query.push_str(" WHERE e.kind = ?1 AND e.resolved_target_node_id IS NULL");
+
+        let count: i64 = if let Some(scope_ids) = scope_file_ids.as_ref() {
+            query.push_str(" AND caller.file_node_id IN (");
+            query.push_str(&numbered_placeholders(2, scope_ids.len()));
+            query.push(')');
+            let params = kind_scope_params(kind, scope_ids);
+            conn.query_row(&query, params_from_iter(params.iter()), |row| row.get(0))?
+        } else {
+            conn.query_row(&query, params![kind as i32], |row| row.get(0))?
+        };
         Ok(count as usize)
     }
 
     pub fn resolve_calls(&self, storage: &mut Storage) -> Result<usize> {
-        let conn = storage.get_connection();
+        self.resolve_calls_with_scope(storage, None)
+    }
+
+    pub fn resolve_calls_with_scope(
+        &self,
+        storage: &mut Storage,
+        caller_scope_file_ids: Option<&HashSet<i64>>,
+    ) -> Result<usize> {
+        self.resolve_calls_on_conn(storage.get_connection(), caller_scope_file_ids)
+    }
+
+    fn resolve_calls_on_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        caller_scope_file_ids: Option<&HashSet<i64>>,
+    ) -> Result<usize> {
         conn.execute(
             "UPDATE edge SET resolved_source_node_id = source_node_id
              WHERE kind = ?1 AND resolved_source_node_id IS NULL",
             params![EdgeKind::CALL as i32],
         )?;
 
-        cleanup_stale_call_resolutions(conn, self.flags, self.policy)?;
+        cleanup_stale_call_resolutions(conn, self.flags, self.policy, caller_scope_file_ids)?;
 
         let mut resolved = 0usize;
-        let rows = unresolved_edges(conn, EdgeKind::CALL)?;
+        let rows = unresolved_edges(conn, EdgeKind::CALL, caller_scope_file_ids)?;
         let function_kinds = [
             NodeKind::FUNCTION as i32,
             NodeKind::METHOD as i32,
             NodeKind::MACRO as i32,
         ];
         let function_kind_clause = kind_clause(&function_kinds);
+        let mut lookup_cache = ResolutionLookupCache::default();
 
         for (
             edge_id,
@@ -189,6 +283,7 @@ impl ResolutionPass {
                     &exact,
                     &suffix_dot,
                     &suffix_colon,
+                    &mut lookup_cache,
                 )?
             {
                 record_candidate(&mut candidate_ids, candidate);
@@ -205,6 +300,7 @@ impl ResolutionPass {
                     &exact,
                     &suffix_dot,
                     &suffix_colon,
+                    &mut lookup_cache,
                 )?
             {
                 record_candidate(&mut candidate_ids, candidate);
@@ -219,6 +315,7 @@ impl ResolutionPass {
                     &exact,
                     &suffix_dot,
                     &suffix_colon,
+                    &mut lookup_cache,
                 )?
             {
                 record_candidate(&mut candidate_ids, candidate);
@@ -254,7 +351,22 @@ impl ResolutionPass {
     }
 
     pub fn resolve_imports(&self, storage: &mut Storage) -> Result<usize> {
-        let conn = storage.get_connection();
+        self.resolve_imports_with_scope(storage, None)
+    }
+
+    pub fn resolve_imports_with_scope(
+        &self,
+        storage: &mut Storage,
+        caller_scope_file_ids: Option<&HashSet<i64>>,
+    ) -> Result<usize> {
+        self.resolve_imports_on_conn(storage.get_connection(), caller_scope_file_ids)
+    }
+
+    fn resolve_imports_on_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        caller_scope_file_ids: Option<&HashSet<i64>>,
+    ) -> Result<usize> {
         conn.execute(
             "UPDATE edge SET resolved_source_node_id = source_node_id
              WHERE kind = ?1 AND resolved_source_node_id IS NULL",
@@ -262,7 +374,8 @@ impl ResolutionPass {
         )?;
 
         let mut resolved = 0usize;
-        let rows = unresolved_edges(conn, EdgeKind::IMPORT)?;
+        let rows = unresolved_edges(conn, EdgeKind::IMPORT, caller_scope_file_ids)?;
+        let mut lookup_cache = ResolutionLookupCache::default();
 
         let module_kinds = [
             NodeKind::MODULE as i32,
@@ -309,6 +422,7 @@ impl ResolutionPass {
                         &exact,
                         &suffix_dot,
                         &suffix_colon,
+                        &mut lookup_cache,
                     )? {
                         record_candidate(&mut candidate_ids, candidate);
                         selected = Some((candidate, self.policy.import_same_file));
@@ -330,6 +444,7 @@ impl ResolutionPass {
                         &exact,
                         &suffix_dot,
                         &suffix_colon,
+                        &mut lookup_cache,
                     )? {
                         record_candidate(&mut candidate_ids, candidate);
                         if !is_same_file_candidate(conn, candidate, file_id)? {
@@ -350,6 +465,7 @@ impl ResolutionPass {
                     &exact,
                     &suffix_dot,
                     &suffix_colon,
+                    &mut lookup_cache,
                 )? {
                     record_candidate(&mut candidate_ids, candidate);
                     if !is_same_file_candidate(conn, candidate, file_id)? {
@@ -395,6 +511,23 @@ impl ResolutionPass {
     }
 }
 
+fn run_in_immediate_transaction<T, F>(conn: &rusqlite::Connection, work: F) -> Result<T>
+where
+    F: FnOnce(&rusqlite::Connection) -> Result<T>,
+{
+    conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+    match work(conn) {
+        Ok(value) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(value)
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
+    }
+}
+
 fn persist_resolution(
     conn: &rusqlite::Connection,
     edge_id: i64,
@@ -437,65 +570,152 @@ fn cleanup_stale_call_resolutions(
     conn: &rusqlite::Connection,
     flags: ResolutionFlags,
     policy: ResolutionPolicy,
+    caller_scope_file_ids: Option<&HashSet<i64>>,
 ) -> Result<()> {
     let cutoff = policy.min_call_confidence;
-    conn.execute(
+    let scope_file_ids = sorted_scope_file_ids(caller_scope_file_ids);
+    let mut low_confidence_query = String::from(
         "UPDATE edge SET resolved_target_node_id = NULL, confidence = NULL, certainty = NULL
          WHERE kind = ?1 AND confidence IS NOT NULL AND confidence < ?2",
-        params![EdgeKind::CALL as i32, cutoff],
+    );
+    if let Some(scope_ids) = scope_file_ids.as_ref() {
+        low_confidence_query
+            .push_str(" AND source_node_id IN (SELECT id FROM node WHERE file_node_id IN (");
+        low_confidence_query.push_str(&numbered_placeholders(3, scope_ids.len()));
+        low_confidence_query.push_str("))");
+    }
+    let mut low_confidence_params = vec![
+        Value::Integer(EdgeKind::CALL as i64),
+        Value::Real(cutoff as f64),
+    ];
+    if let Some(scope_ids) = scope_file_ids.as_ref() {
+        low_confidence_params.extend(scope_ids.iter().copied().map(Value::Integer));
+    }
+    conn.execute(
+        &low_confidence_query,
+        params_from_iter(low_confidence_params.iter()),
     )?;
 
     for common_name in common_unqualified_call_names() {
         if flags.legacy_mode {
-            conn.execute(
+            let mut legacy_query = String::from(
                 "UPDATE edge SET resolved_target_node_id = NULL, confidence = NULL, certainty = NULL
                  WHERE kind = ?1
                  AND resolved_target_node_id IS NOT NULL
                  AND target_node_id IN (SELECT id FROM node WHERE serialized_name = ?2)",
-                params![EdgeKind::CALL as i32, common_name],
-            )?;
+            );
+            if let Some(scope_ids) = scope_file_ids.as_ref() {
+                legacy_query.push_str(
+                    " AND source_node_id IN (SELECT id FROM node WHERE file_node_id IN (",
+                );
+                legacy_query.push_str(&numbered_placeholders(3, scope_ids.len()));
+                legacy_query.push_str("))");
+            }
+            let mut legacy_params = vec![
+                Value::Integer(EdgeKind::CALL as i64),
+                Value::Text((*common_name).to_string()),
+            ];
+            if let Some(scope_ids) = scope_file_ids.as_ref() {
+                legacy_params.extend(scope_ids.iter().copied().map(Value::Integer));
+            }
+            conn.execute(&legacy_query, params_from_iter(legacy_params.iter()))?;
         } else {
-            conn.execute(
+            let mut strict_query = String::from(
                 "UPDATE edge SET resolved_target_node_id = NULL, confidence = NULL, certainty = NULL
                  WHERE kind = ?1
                  AND resolved_target_node_id IS NOT NULL
                  AND target_node_id IN (SELECT id FROM node WHERE serialized_name = ?2)
                  AND (certainty IS NULL OR certainty != ?3)",
-                params![
-                    EdgeKind::CALL as i32,
-                    common_name,
-                    ResolutionCertainty::Certain.as_str()
-                ],
-            )?;
+            );
+            if let Some(scope_ids) = scope_file_ids.as_ref() {
+                strict_query.push_str(
+                    " AND source_node_id IN (SELECT id FROM node WHERE file_node_id IN (",
+                );
+                strict_query.push_str(&numbered_placeholders(4, scope_ids.len()));
+                strict_query.push_str("))");
+            }
+            let mut strict_params = vec![
+                Value::Integer(EdgeKind::CALL as i64),
+                Value::Text((*common_name).to_string()),
+                Value::Text(ResolutionCertainty::Certain.as_str().to_string()),
+            ];
+            if let Some(scope_ids) = scope_file_ids.as_ref() {
+                strict_params.extend(scope_ids.iter().copied().map(Value::Integer));
+            }
+            conn.execute(&strict_query, params_from_iter(strict_params.iter()))?;
         }
     }
 
     Ok(())
 }
 
-fn unresolved_edges(conn: &rusqlite::Connection, kind: EdgeKind) -> Result<Vec<UnresolvedEdgeRow>> {
-    let mut stmt = conn.prepare(
+fn unresolved_edges(
+    conn: &rusqlite::Connection,
+    kind: EdgeKind,
+    caller_scope_file_ids: Option<&HashSet<i64>>,
+) -> Result<Vec<UnresolvedEdgeRow>> {
+    let scope_file_ids = sorted_scope_file_ids(caller_scope_file_ids);
+    if matches!(scope_file_ids.as_ref(), Some(ids) if ids.is_empty()) {
+        return Ok(Vec::new());
+    }
+
+    let mut query = String::from(
         "SELECT e.id, caller.file_node_id, caller.qualified_name, target.serialized_name, file_node.serialized_name, e.callsite_identity
          FROM edge e
          JOIN node caller ON caller.id = e.source_node_id
          JOIN node target ON target.id = e.target_node_id
          LEFT JOIN node file_node ON file_node.id = caller.file_node_id
          WHERE e.kind = ?1 AND e.resolved_target_node_id IS NULL",
-    )?;
+    );
+    if let Some(scope_ids) = scope_file_ids.as_ref() {
+        query.push_str(" AND caller.file_node_id IN (");
+        query.push_str(&numbered_placeholders(2, scope_ids.len()));
+        query.push(')');
+    }
+    let mut stmt = conn.prepare(&query)?;
 
-    let rows = stmt.query_map(params![kind as i32], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, Option<i64>>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, Option<String>>(4)?,
-            row.get::<_, Option<String>>(5)?,
-        ))
-    })?;
-
-    let collected = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let collected = if let Some(scope_ids) = scope_file_ids.as_ref() {
+        let params = kind_scope_params(kind, scope_ids);
+        let rows = stmt.query_map(params_from_iter(params.iter()), map_unresolved_edge_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let rows = stmt.query_map(params![kind as i32], map_unresolved_edge_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
     Ok(collected)
+}
+
+fn map_unresolved_edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UnresolvedEdgeRow> {
+    Ok((
+        row.get::<_, i64>(0)?,
+        row.get::<_, Option<i64>>(1)?,
+        row.get::<_, Option<String>>(2)?,
+        row.get::<_, String>(3)?,
+        row.get::<_, Option<String>>(4)?,
+        row.get::<_, Option<String>>(5)?,
+    ))
+}
+
+fn sorted_scope_file_ids(caller_scope_file_ids: Option<&HashSet<i64>>) -> Option<Vec<i64>> {
+    caller_scope_file_ids.map(|scope| {
+        let mut ids = scope.iter().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    })
+}
+
+fn numbered_placeholders(start: usize, count: usize) -> String {
+    (0..count)
+        .map(|offset| format!("?{}", start + offset))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn kind_scope_params(kind: EdgeKind, scope_file_ids: &[i64]) -> Vec<Value> {
+    let mut values = Vec::with_capacity(1 + scope_file_ids.len());
+    values.push(Value::Integer(kind as i64));
+    values.extend(scope_file_ids.iter().copied().map(Value::Integer));
+    values
 }
 
 fn is_same_file_candidate(
@@ -586,21 +806,45 @@ fn find_same_file(
     exact: &str,
     suffix_dot: &str,
     suffix_colon: &str,
+    lookup_cache: &mut ResolutionLookupCache,
 ) -> Result<Option<i64>> {
     let Some(file_id) = file_id else {
         return Ok(None);
     };
-    let query = format!(
+    let exact_cache_key = (kind_clause.to_string(), file_id, exact.to_string());
+    let exact_match = if let Some(cached) = lookup_cache.same_file_exact.get(&exact_cache_key) {
+        *cached
+    } else {
+        let exact_query = format!(
+            "SELECT id FROM node
+             WHERE kind IN ({})
+             AND file_node_id = ?1
+             AND serialized_name = ?2
+             ORDER BY start_line LIMIT 1",
+            kind_clause
+        );
+        let found = conn
+            .query_row(&exact_query, params![file_id, exact], |row| row.get(0))
+            .optional()?;
+        lookup_cache.same_file_exact.insert(exact_cache_key, found);
+        found
+    };
+
+    if let Some(id) = exact_match {
+        return Ok(Some(id));
+    }
+
+    let suffix_query = format!(
         "SELECT id FROM node
          WHERE kind IN ({})
          AND file_node_id = ?1
-         AND (serialized_name = ?2 OR serialized_name LIKE ?3 OR serialized_name LIKE ?4)
+         AND (serialized_name LIKE ?2 OR serialized_name LIKE ?3)
          ORDER BY start_line LIMIT 1",
         kind_clause
     );
     conn.query_row(
-        &query,
-        params![file_id, exact, suffix_dot, suffix_colon],
+        &suffix_query,
+        params![file_id, suffix_dot, suffix_colon],
         |row| row.get(0),
     )
     .optional()
@@ -615,19 +859,45 @@ fn find_same_module(
     exact: &str,
     suffix_dot: &str,
     suffix_colon: &str,
+    lookup_cache: &mut ResolutionLookupCache,
 ) -> Result<Option<i64>> {
     let pattern = format!("{}{}%", module_prefix, delimiter);
-    let query = format!(
+    let exact_cache_key = (kind_clause.to_string(), pattern.clone(), exact.to_string());
+    let exact_match = if let Some(cached) = lookup_cache.same_module_exact.get(&exact_cache_key) {
+        *cached
+    } else {
+        let exact_query = format!(
+            "SELECT id FROM node
+             WHERE kind IN ({})
+             AND qualified_name LIKE ?1
+             AND serialized_name = ?2
+             ORDER BY start_line LIMIT 1",
+            kind_clause
+        );
+        let found = conn
+            .query_row(&exact_query, params![pattern, exact], |row| row.get(0))
+            .optional()?;
+        lookup_cache
+            .same_module_exact
+            .insert(exact_cache_key, found);
+        found
+    };
+
+    if let Some(id) = exact_match {
+        return Ok(Some(id));
+    }
+
+    let suffix_query = format!(
         "SELECT id FROM node
          WHERE kind IN ({})
          AND qualified_name LIKE ?1
-         AND (serialized_name = ?2 OR serialized_name LIKE ?3 OR serialized_name LIKE ?4)
+         AND (serialized_name LIKE ?2 OR serialized_name LIKE ?3)
          ORDER BY start_line LIMIT 1",
         kind_clause
     );
     conn.query_row(
-        &query,
-        params![pattern, exact, suffix_dot, suffix_colon],
+        &suffix_query,
+        params![pattern, suffix_dot, suffix_colon],
         |row| row.get(0),
     )
     .optional()
@@ -640,29 +910,75 @@ fn find_global_unique(
     exact: &str,
     suffix_dot: &str,
     suffix_colon: &str,
+    lookup_cache: &mut ResolutionLookupCache,
 ) -> Result<Option<i64>> {
-    let count_query = format!(
+    let exact_cache_key = (kind_clause.to_string(), exact.to_string());
+    let exact_match = if let Some(cached) = lookup_cache.global_unique_exact.get(&exact_cache_key) {
+        *cached
+    } else {
+        let exact_count_query = format!(
+            "SELECT COUNT(*) FROM node
+             WHERE kind IN ({})
+             AND serialized_name = ?1",
+            kind_clause
+        );
+        let exact_count: i64 =
+            conn.query_row(&exact_count_query, params![exact], |row| row.get(0))?;
+        let computed = if exact_count == 1 {
+            let exact_query = format!(
+                "SELECT id FROM node
+                 WHERE kind IN ({})
+                 AND serialized_name = ?1
+                 LIMIT 1",
+                kind_clause
+            );
+            match conn
+                .query_row(&exact_query, params![exact], |row| row.get(0))
+                .optional()?
+            {
+                Some(id) => GlobalExactMatch::Unique(id),
+                None => GlobalExactMatch::Missing,
+            }
+        } else if exact_count > 1 {
+            GlobalExactMatch::Multiple
+        } else {
+            GlobalExactMatch::Missing
+        };
+        lookup_cache
+            .global_unique_exact
+            .insert(exact_cache_key, computed);
+        computed
+    };
+
+    match exact_match {
+        GlobalExactMatch::Unique(id) => return Ok(Some(id)),
+        GlobalExactMatch::Multiple => return Ok(None),
+        GlobalExactMatch::Missing => {}
+    }
+
+    let suffix_count_query = format!(
         "SELECT COUNT(*) FROM node
          WHERE kind IN ({})
-         AND (serialized_name = ?1 OR serialized_name LIKE ?2 OR serialized_name LIKE ?3)",
+         AND (serialized_name LIKE ?1 OR serialized_name LIKE ?2)",
         kind_clause
     );
-    let count: i64 = conn.query_row(
-        &count_query,
-        params![exact, suffix_dot, suffix_colon],
+    let suffix_count: i64 = conn.query_row(
+        &suffix_count_query,
+        params![suffix_dot, suffix_colon],
         |row| row.get(0),
     )?;
-    if count != 1 {
+    if suffix_count != 1 {
         return Ok(None);
     }
-    let query = format!(
+
+    let suffix_query = format!(
         "SELECT id FROM node
          WHERE kind IN ({})
-         AND (serialized_name = ?1 OR serialized_name LIKE ?2 OR serialized_name LIKE ?3)
+         AND (serialized_name LIKE ?1 OR serialized_name LIKE ?2)
          LIMIT 1",
         kind_clause
     );
-    conn.query_row(&query, params![exact, suffix_dot, suffix_colon], |row| {
+    conn.query_row(&suffix_query, params![suffix_dot, suffix_colon], |row| {
         row.get(0)
     })
     .optional()
@@ -676,21 +992,47 @@ fn find_fuzzy(
     suffix_dot: &str,
     suffix_colon: &str,
 ) -> Result<Option<i64>> {
+    let exact_query = format!(
+        "SELECT id FROM node
+         WHERE kind IN ({})
+         AND serialized_name = ?1
+         ORDER BY start_line LIMIT 1",
+        kind_clause
+    );
+    if let Some(id) = conn
+        .query_row(&exact_query, params![exact], |row| row.get(0))
+        .optional()?
+    {
+        return Ok(Some(id));
+    }
+
+    let suffix_query = format!(
+        "SELECT id FROM node
+         WHERE kind IN ({})
+         AND (serialized_name LIKE ?1 OR serialized_name LIKE ?2)
+         ORDER BY start_line LIMIT 1",
+        kind_clause
+    );
+    if let Some(id) = conn
+        .query_row(&suffix_query, params![suffix_dot, suffix_colon], |row| {
+            row.get(0)
+        })
+        .optional()?
+    {
+        return Ok(Some(id));
+    }
+
     let fuzzy = format!("%{}%", exact);
     let query = format!(
         "SELECT id FROM node
          WHERE kind IN ({})
-         AND (serialized_name = ?1 OR serialized_name LIKE ?2 OR serialized_name LIKE ?3 OR serialized_name LIKE ?4)
+         AND serialized_name LIKE ?1
          ORDER BY start_line LIMIT 1",
         kind_clause
     );
-    conn.query_row(
-        &query,
-        params![exact, suffix_dot, suffix_colon, fuzzy],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(Into::into)
+    conn.query_row(&query, params![fuzzy], |row| row.get(0))
+        .optional()
+        .map_err(Into::into)
 }
 
 fn collect_candidate_pool(
@@ -724,17 +1066,44 @@ fn find_top_matches(
     suffix_colon: &str,
     limit: usize,
 ) -> Result<Vec<i64>> {
-    let query = format!(
+    let exact_query = format!(
         "SELECT id FROM node
          WHERE kind IN ({})
-         AND (serialized_name = ?1 OR serialized_name LIKE ?2 OR serialized_name LIKE ?3)
+         AND serialized_name = ?1
          ORDER BY start_line
          LIMIT {}",
         kind_clause, limit
     );
-    let mut stmt = conn.prepare(&query)?;
-    let rows = stmt.query_map(params![exact, suffix_dot, suffix_colon], |row| row.get(0))?;
-    Ok(rows.collect::<rusqlite::Result<Vec<i64>>>()?)
+    let mut out = Vec::with_capacity(limit);
+    {
+        let mut stmt = conn.prepare(&exact_query)?;
+        let rows = stmt.query_map(params![exact], |row| row.get(0))?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    if out.len() >= limit {
+        return Ok(out);
+    }
+
+    let remaining = limit - out.len();
+    let suffix_query = format!(
+        "SELECT id FROM node
+         WHERE kind IN ({})
+         AND (serialized_name LIKE ?1 OR serialized_name LIKE ?2)
+         ORDER BY start_line
+         LIMIT {}",
+        kind_clause, remaining
+    );
+    let mut stmt = conn.prepare(&suffix_query)?;
+    let rows = stmt.query_map(params![suffix_dot, suffix_colon], |row| row.get(0))?;
+    for row in rows {
+        let candidate = row?;
+        if !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    Ok(out)
 }
 
 fn candidate_json(candidates: &[i64]) -> Result<Option<String>> {
@@ -836,6 +1205,10 @@ fn env_flag(name: &str, default: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::{Connection, params};
+    use std::collections::HashSet;
+    use std::time::Instant;
+    use tempfile::tempdir;
 
     #[test]
     fn test_common_unqualified_call_names_include_clone_like_noise() {
@@ -859,5 +1232,290 @@ mod tests {
             ResolutionCertainty::CERTAIN_MIN,
             Some("1:2:3:4")
         ));
+    }
+
+    #[test]
+    fn test_scope_filters_unresolved_edges_and_counts() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE node (
+                id INTEGER PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                serialized_name TEXT NOT NULL,
+                qualified_name TEXT,
+                file_node_id INTEGER,
+                start_line INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE edge (
+                id INTEGER PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                source_node_id INTEGER NOT NULL,
+                target_node_id INTEGER NOT NULL,
+                resolved_target_node_id INTEGER,
+                callsite_identity TEXT
+            );",
+        )?;
+
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, NULL, NULL, 1)",
+            params![100_i64, NodeKind::FILE as i32, "/repo/a.rs"],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, NULL, NULL, 1)",
+            params![200_i64, NodeKind::FILE as i32, "/repo/b.rs"],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![
+                1_i64,
+                NodeKind::FUNCTION as i32,
+                "caller_a",
+                "mod_a::caller",
+                100_i64
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![
+                2_i64,
+                NodeKind::FUNCTION as i32,
+                "caller_b",
+                "mod_b::caller",
+                200_i64
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![
+                10_i64,
+                NodeKind::FUNCTION as i32,
+                "target_fn",
+                "mod::target_fn",
+                100_i64
+            ],
+        )?;
+
+        conn.execute(
+            "INSERT INTO edge (id, kind, source_node_id, target_node_id, resolved_target_node_id, callsite_identity)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
+            params![1000_i64, EdgeKind::CALL as i32, 1_i64, 10_i64],
+        )?;
+        conn.execute(
+            "INSERT INTO edge (id, kind, source_node_id, target_node_id, resolved_target_node_id, callsite_identity)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
+            params![1001_i64, EdgeKind::CALL as i32, 2_i64, 10_i64],
+        )?;
+
+        let scope = HashSet::from([100_i64]);
+        let scoped_rows = unresolved_edges(&conn, EdgeKind::CALL, Some(&scope))?;
+        assert_eq!(scoped_rows.len(), 1);
+        assert_eq!(scoped_rows[0].0, 1000_i64);
+        assert_eq!(scoped_rows[0].1, Some(100_i64));
+
+        let all_rows = unresolved_edges(&conn, EdgeKind::CALL, None)?;
+        assert_eq!(all_rows.len(), 2);
+
+        let scoped_count =
+            ResolutionPass::count_unresolved_on_conn(&conn, EdgeKind::CALL, Some(&scope))?;
+        let all_count = ResolutionPass::count_unresolved_on_conn(&conn, EdgeKind::CALL, None)?;
+        assert_eq!(scoped_count, 1);
+        assert_eq!(all_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_exact_lookup_cache_reuses_same_file_key() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE node (
+                id INTEGER PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                serialized_name TEXT NOT NULL,
+                file_node_id INTEGER,
+                start_line INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![77_i64, NodeKind::FUNCTION as i32, "foo", 555_i64, 1_i64],
+        )?;
+
+        let kind_clause = kind_clause(&[NodeKind::FUNCTION as i32]);
+        let (exact, suffix_dot, suffix_colon) = name_patterns("foo");
+        let mut lookup_cache = ResolutionLookupCache::default();
+
+        let first = find_same_file(
+            &conn,
+            &kind_clause,
+            Some(555_i64),
+            &exact,
+            &suffix_dot,
+            &suffix_colon,
+            &mut lookup_cache,
+        )?;
+        assert_eq!(first, Some(77_i64));
+        assert_eq!(lookup_cache.same_file_exact.len(), 1);
+
+        let second = find_same_file(
+            &conn,
+            &kind_clause,
+            Some(555_i64),
+            &exact,
+            &suffix_dot,
+            &suffix_colon,
+            &mut lookup_cache,
+        )?;
+        assert_eq!(second, Some(77_i64));
+        assert_eq!(lookup_cache.same_file_exact.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scoped_cleanup_only_mutates_scoped_callers() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE node (
+                id INTEGER PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                serialized_name TEXT NOT NULL,
+                qualified_name TEXT,
+                file_node_id INTEGER,
+                start_line INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE edge (
+                id INTEGER PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                source_node_id INTEGER NOT NULL,
+                target_node_id INTEGER NOT NULL,
+                resolved_target_node_id INTEGER,
+                confidence REAL,
+                certainty TEXT
+            );",
+        )?;
+
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![
+                1_i64,
+                NodeKind::FUNCTION as i32,
+                "caller_one",
+                "pkg::one",
+                100_i64
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![
+                2_i64,
+                NodeKind::FUNCTION as i32,
+                "caller_two",
+                "pkg::two",
+                200_i64
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![
+                50_i64,
+                NodeKind::FUNCTION as i32,
+                "helper_target",
+                "pkg::helper_target",
+                100_i64
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO edge (id, kind, source_node_id, target_node_id, resolved_target_node_id, confidence, certainty)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![900_i64, EdgeKind::CALL as i32, 1_i64, 50_i64, 50_i64, 0.10_f64],
+        )?;
+        conn.execute(
+            "INSERT INTO edge (id, kind, source_node_id, target_node_id, resolved_target_node_id, confidence, certainty)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![901_i64, EdgeKind::CALL as i32, 2_i64, 50_i64, 50_i64, 0.10_f64],
+        )?;
+
+        let flags = ResolutionFlags {
+            legacy_mode: false,
+            enable_semantic: false,
+            store_candidates: false,
+        };
+        let policy = ResolutionPolicy::for_flags(flags);
+        let scope = HashSet::from([100_i64]);
+        cleanup_stale_call_resolutions(&conn, flags, policy, Some(&scope))?;
+
+        let scoped_target: Option<i64> = conn.query_row(
+            "SELECT resolved_target_node_id FROM edge WHERE id = ?1",
+            params![900_i64],
+            |row| row.get(0),
+        )?;
+        let unscoped_target: Option<i64> = conn.query_row(
+            "SELECT resolved_target_node_id FROM edge WHERE id = ?1",
+            params![901_i64],
+            |row| row.get(0),
+        )?;
+        assert_eq!(scoped_target, None);
+        assert_eq!(unscoped_target, Some(50_i64));
+        Ok(())
+    }
+
+    #[test]
+    fn test_transaction_smoke_is_faster_than_autocommit() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("resolution_perf_smoke.db");
+        let conn = Connection::open(db_path)?;
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+        conn.execute(
+            "CREATE TABLE perf (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)",
+            [],
+        )?;
+
+        run_in_immediate_transaction(&conn, |tx_conn| {
+            let mut stmt = tx_conn.prepare("INSERT INTO perf (id, value) VALUES (?1, 0)")?;
+            for id in 1..=600_i64 {
+                stmt.execute(params![id])?;
+            }
+            Ok(())
+        })?;
+
+        let ids: Vec<i64> = (1..=600_i64).collect();
+
+        let no_tx_start = Instant::now();
+        for id in &ids {
+            conn.execute(
+                "UPDATE perf SET value = value + 1 WHERE id = ?1",
+                params![id],
+            )?;
+        }
+        let no_tx_elapsed = no_tx_start.elapsed();
+
+        conn.execute("UPDATE perf SET value = 0", [])?;
+
+        let tx_start = Instant::now();
+        run_in_immediate_transaction(&conn, |tx_conn| {
+            let mut stmt = tx_conn.prepare("UPDATE perf SET value = value + 1 WHERE id = ?1")?;
+            for id in &ids {
+                stmt.execute(params![id])?;
+            }
+            Ok(())
+        })?;
+        let tx_elapsed = tx_start.elapsed();
+
+        assert!(
+            tx_elapsed < no_tx_elapsed,
+            "expected transaction updates to beat autocommit; no_tx={:?}, tx={:?}",
+            no_tx_elapsed,
+            tx_elapsed
+        );
+        Ok(())
     }
 }

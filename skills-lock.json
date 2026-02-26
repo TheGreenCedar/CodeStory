@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "skills": {
+    "react-flow": {
+      "source": "existential-birds/beagle",
+      "sourceType": "github",
+      "computedHash": "2e0b696ee5d7d3407263fb8330c1ed455837eb86f52464688e3bc7c60304b7b7"
+    },
+    "react-flow-advanced": {
+      "source": "existential-birds/beagle",
+      "sourceType": "github",
+      "computedHash": "8584b77e9491af20225a185bebdb3823bbc3e66e1da74d2e5e9dc5114559ef19"
+    },
+    "react-flow-architecture": {
+      "source": "existential-birds/beagle",
+      "sourceType": "github",
+      "computedHash": "5cd5f71fb064348da0e8fe00e162c71e4d03e36cfdbf72e45dcb5b1dac238427"
+    },
+    "react-flow-implementation": {
+      "source": "existential-birds/beagle",
+      "sourceType": "github",
+      "computedHash": "e9c445033968ed667d8cf211fdd7d695c64c3328d8d26792b3e6d165271aa6d2"
+    },
+    "reactflow-custom-nodes": {
+      "source": "thebushidocollective/han",
+      "sourceType": "github",
+      "computedHash": "55b66c857c972b70fc168b3fa2f0a805745832746b1fe32ca4e9c75424683b82"
+    }
+  }
+}

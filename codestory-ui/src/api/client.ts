@@ -2,10 +2,12 @@ import type {
   AgentAnswerDto,
   AgentAskRequest,
   AppEventPayload,
+  EdgeOccurrencesRequest,
   GraphRequest,
   GraphResponse,
   NodeDetailsDto,
   NodeDetailsRequest,
+  NodeOccurrencesRequest,
   OpenProjectRequest,
   ProjectSummary,
   ReadFileTextRequest,
@@ -13,6 +15,7 @@ import type {
   SearchHit,
   SearchRequest,
   SetUiLayoutRequest,
+  SourceOccurrenceDto,
   StartIndexingRequest,
   SymbolSummaryDto,
   TrailConfigDto,
@@ -111,6 +114,20 @@ class ApiClient {
 
   nodeDetails(req: NodeDetailsRequest): Promise<NodeDetailsDto> {
     return this.request<NodeDetailsDto>("/api/node/details", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
+  }
+
+  nodeOccurrences(req: NodeOccurrencesRequest): Promise<SourceOccurrenceDto[]> {
+    return this.request<SourceOccurrenceDto[]>("/api/node/occurrences", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
+  }
+
+  edgeOccurrences(req: EdgeOccurrencesRequest): Promise<SourceOccurrenceDto[]> {
+    return this.request<SourceOccurrenceDto[]>("/api/edge/occurrences", {
       method: "POST",
       body: JSON.stringify(req),
     });

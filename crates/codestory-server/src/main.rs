@@ -10,12 +10,13 @@ use axum::{
 use clap::Parser;
 use codestory_api::{
     AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentResponseSectionDto, ApiError,
-    AppEventPayload, EdgeId, EdgeKind, GraphArtifactDto, GraphEdgeDto, GraphNodeDto, GraphRequest,
-    GraphResponse, IndexMode, ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto,
-    NodeDetailsRequest, NodeId, NodeKind, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
-    ReadFileTextResponse, SearchHit, SearchRequest, SetUiLayoutRequest, StartIndexingRequest,
-    StorageStatsDto, SymbolSummaryDto, TrailCallerScope, TrailConfigDto, TrailDirection, TrailMode,
-    WriteFileResponse, WriteFileTextRequest,
+    AppEventPayload, EdgeId, EdgeKind, EdgeOccurrencesRequest, GraphArtifactDto, GraphEdgeDto,
+    GraphNodeDto, GraphRequest, GraphResponse, IndexMode, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
+    NodeOccurrencesRequest, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
+    ReadFileTextResponse, SearchHit, SearchRequest, SetUiLayoutRequest, SourceOccurrenceDto,
+    StartIndexingRequest, StorageStatsDto, SymbolSummaryDto, TrailCallerScope, TrailConfigDto,
+    TrailDirection, TrailMode, WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_app::AppController;
 use serde::Serialize;
@@ -142,6 +143,8 @@ async fn main() -> Result<()> {
         .route("/graph/neighborhood", post(graph_neighborhood))
         .route("/graph/trail", post(graph_trail))
         .route("/node/details", post(node_details))
+        .route("/node/occurrences", post(node_occurrences))
+        .route("/edge/occurrences", post(edge_occurrences))
         .route("/file/read", post(read_file_text))
         .route("/file/write-text", post(write_file_text))
         .route("/ui-layout", get(get_ui_layout).post(set_ui_layout))
@@ -205,6 +208,9 @@ fn collect_types() -> TypeCollection {
         .register::<TrailConfigDto>()
         .register::<NodeDetailsRequest>()
         .register::<NodeDetailsDto>()
+        .register::<NodeOccurrencesRequest>()
+        .register::<EdgeOccurrencesRequest>()
+        .register::<SourceOccurrenceDto>()
         .register::<ReadFileTextRequest>()
         .register::<ReadFileTextResponse>()
         .register::<WriteFileTextRequest>()
@@ -333,6 +339,28 @@ async fn node_details(
     state
         .controller
         .node_details(req)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn node_occurrences(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<NodeOccurrencesRequest>,
+) -> ApiResult<Vec<SourceOccurrenceDto>> {
+    state
+        .controller
+        .node_occurrences(req)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn edge_occurrences(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<EdgeOccurrencesRequest>,
+) -> ApiResult<Vec<SourceOccurrenceDto>> {
+    state
+        .controller
+        .edge_occurrences(req)
         .map(Json)
         .map_err(Into::into)
 }

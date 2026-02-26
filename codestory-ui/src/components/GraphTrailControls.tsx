@@ -9,7 +9,12 @@ import type {
   TrailDirection,
   TrailMode,
 } from "../generated/api";
-import { EDGE_KIND_OPTIONS, NODE_KIND_OPTIONS, type TrailUiConfig } from "../graph/trailConfig";
+import {
+  EDGE_KIND_OPTIONS,
+  NODE_KIND_OPTIONS,
+  type GroupingMode,
+  type TrailUiConfig,
+} from "../graph/trailConfig";
 
 type GraphTrailControlsProps = {
   config: TrailUiConfig;
@@ -60,6 +65,17 @@ function callerScopeLabel(scope: TrailCallerScope): string {
       return "Production Only";
     case "IncludeTestsAndBenches":
       return "Include Tests/Benches";
+  }
+}
+
+function groupingModeLabel(mode: GroupingMode): string {
+  switch (mode) {
+    case "none":
+      return "No Group";
+    case "namespace":
+      return "Namespace";
+    case "file":
+      return "File";
   }
 }
 
@@ -281,22 +297,6 @@ export function GraphTrailControls({
         </label>
 
         <label className="graph-control-field">
-          <span>Bundling</span>
-          <select
-            value={config.bundlingMode}
-            onChange={(event) =>
-              onConfigChange({ bundlingMode: event.target.value as TrailUiConfig["bundlingMode"] })
-            }
-          >
-            {(["overview", "trace", "off"] as const).map((mode) => (
-              <option key={mode} value={mode}>
-                {mode}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <label className="graph-control-field">
           <span>Max Nodes</span>
           <input
             type="number"
@@ -337,6 +337,26 @@ export function GraphTrailControls({
           >
             MiniMap
           </button>
+        </div>
+        <div
+          className="graph-chip-row graph-chip-row-grouping"
+          role="group"
+          aria-label="Node grouping"
+        >
+          {(["none", "namespace", "file"] as GroupingMode[]).map((mode) => {
+            const active = config.groupingMode === mode;
+            return (
+              <button
+                key={mode}
+                type="button"
+                className={active ? "graph-chip graph-chip-active" : "graph-chip"}
+                aria-pressed={active}
+                onClick={() => onConfigChange({ groupingMode: mode })}
+              >
+                {groupingModeLabel(mode)}
+              </button>
+            );
+          })}
         </div>
       </div>
 

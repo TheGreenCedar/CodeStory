@@ -16,6 +16,9 @@ export type FlowNodeData = {
   label: string;
   center: boolean;
   nodeStyle: FlowNodeStyle;
+  groupMode?: "namespace" | "file";
+  groupLabel?: string;
+  isNonIndexed?: boolean;
   duplicateCount: number;
   mergedSymbolIds?: string[];
   memberCount: number;
@@ -38,6 +41,7 @@ export type SemanticNodePlacement = {
   label: string;
   center: boolean;
   nodeStyle: FlowNodeStyle;
+  isNonIndexed: boolean;
   duplicateCount: number;
   mergedSymbolIds: string[];
   memberCount: number;
@@ -48,11 +52,19 @@ export type SemanticNodePlacement = {
   yRank: number;
   x: number;
   y: number;
+  width: number;
+  height: number;
   isVirtualBundle: boolean;
+};
+
+export type RoutePoint = {
+  x: number;
+  y: number;
 };
 
 export type RoutedEdgeSpec = {
   id: string;
+  sourceEdgeIds: string[];
   source: string;
   target: string;
   sourceHandle: string;
@@ -63,7 +75,10 @@ export type RoutedEdgeSpec = {
   family: SemanticEdgeFamily;
   routeKind: RouteKind;
   bundleCount: number;
+  routePoints: RoutePoint[];
   trunkCoord?: number;
+  channelId?: string;
+  channelWeight?: number;
 };
 
 export type LayoutElements = {
@@ -73,7 +88,7 @@ export type LayoutElements = {
 };
 
 export type LegendRow = {
-  kind: string;
+  kind: EdgeKind;
   stroke: string;
   count: number;
   hasUncertain: boolean;

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   BaseEdge,
   Controls,
+  EdgeLabelRenderer,
   Handle,
   MiniMap,
   Panel,
@@ -15,11 +16,12 @@ import {
 } from "@xyflow/react";
 import mermaid from "mermaid";
 
-import type { GraphArtifactDto } from "../generated/api";
-import { applySharedTrunkBundling } from "./layout/bundling";
+import type { EdgeKind, GraphArtifactDto } from "../generated/api";
+import { applyAdaptiveBundling } from "./layout/bundling";
+import { routeEdgesWithObstacles } from "./layout/obstacleRouting";
 import { buildFallbackLayout, buildSemanticLayout } from "./layout/semanticLayout";
 import { buildLegendRows, toReactFlowElements, type SemanticEdgeData } from "./layout/routing";
-import type { TrailUiConfig } from "./trailConfig";
+import type { GroupingMode, TrailUiConfig } from "./trailConfig";
 import type { FlowNodeData } from "./layout/types";
 
 mermaid.initialize({
@@ -29,6 +31,9 @@ mermaid.initialize({
 });
 
 const MAX_VISIBLE_MEMBERS_PER_NODE = 6;
+const GROUP_PADDING_X = 20;
+const GROUP_PADDING_Y = 16;
+const GROUP_HEADER_HEIGHT = 34;
 
 const CODE_LANGUAGE_BY_EXT: Record<string, string> = {
   c: "c",
@@ -139,6 +144,12 @@ function isSimpleTypePillLabel(label: string): boolean {
 
 function minimapNodeColor(node: Node<FlowNodeData>): string {
   const data = node.data;
+  if (data?.groupMode === "file") {
+    return "#c6dfb4";
+  }
+  if (data?.groupMode === "namespace") {
+    return "#efc7cb";
+  }
   if (data?.isVirtualBundle) {
     return "#d4a63a";
   }
@@ -155,6 +166,12 @@ function minimapNodeColor(node: Node<FlowNodeData>): string {
 }
 
 function minimapNodeStrokeColor(node: Node<FlowNodeData>): string {
+  if (node.data?.groupMode === "file") {
+    return "#96bb7e";
+  }
+  if (node.data?.groupMode === "namespace") {
+    return "#dfb3b8";
+  }
   return node.data?.center ? "#1f252c" : "#8f98a3";
 }
 
@@ -176,6 +193,173 @@ function nodeLabelFromData(data: unknown, fallback: string): string {
   }
   const candidate = (data as { label?: unknown }).label;
   return typeof candidate === "string" ? candidate : fallback;
+}
+
+function basename(path: string): string {
+  const normalized = path.replaceAll("\\", "/");
+  const segments = normalized.split("/").filter((segment) => segment.length > 0);
+  return segments.at(-1) ?? normalized;
+}
+
+function namespaceLabelFromQualifiedName(qualifiedName: string | null | undefined): string | null {
+  if (!qualifiedName) {
+    return null;
+  }
+  const trimmed = qualifiedName.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+  const idxCpp = trimmed.lastIndexOf("::");
+  const idxDot = trimmed.lastIndexOf(".");
+  const idx = Math.max(idxCpp, idxDot);
+  if (idx <= 0) {
+    return null;
+  }
+  return trimmed.slice(0, idx);
+}
+
+function measuredWidth(node: Node<FlowNodeData>): number {
+  if (typeof node.width === "number") {
+    return node.width;
+  }
+  if (node.data.nodeStyle === "card") {
+    return 240;
+  }
+  return 132;
+}
+
+function measuredHeight(node: Node<FlowNodeData>): number {
+  if (typeof node.height === "number") {
+    return node.height;
+  }
+  if (node.data.nodeStyle === "card") {
+    return 160;
+  }
+  return 42;
+}
+
+function groupLabelForNode(
+  mode: GroupingMode,
+  nodeMeta: Map<string, { filePath: string | null; qualifiedName: string | null }>,
+  nodeId: string,
+): string | null {
+  const meta = nodeMeta.get(nodeId);
+  if (!meta) {
+    return null;
+  }
+
+  if (mode === "file") {
+    const filePath = meta.filePath?.trim();
+    if (!filePath) {
+      return null;
+    }
+    return basename(filePath);
+  }
+
+  if (mode === "namespace") {
+    return namespaceLabelFromQualifiedName(meta.qualifiedName);
+  }
+
+  return null;
+}
+
+function applyGrouping(
+  nodes: Node<FlowNodeData>[],
+  groupingMode: GroupingMode,
+  nodeMeta: Map<string, { filePath: string | null; qualifiedName: string | null }>,
+): Node<FlowNodeData>[] {
+  if (groupingMode === "none") {
+    return nodes;
+  }
+
+  const passthrough: Node<FlowNodeData>[] = [];
+  const grouped = new Map<string, { label: string; nodes: Node<FlowNodeData>[] }>();
+  for (const node of nodes) {
+    if (node.data.isVirtualBundle || node.data.groupMode) {
+      passthrough.push(node);
+      continue;
+    }
+
+    const label = groupLabelForNode(groupingMode, nodeMeta, node.id);
+    if (!label) {
+      passthrough.push(node);
+      continue;
+    }
+
+    const key = `${groupingMode}:${label}`;
+    const bucket = grouped.get(key) ?? { label, nodes: [] };
+    bucket.nodes.push(node);
+    grouped.set(key, bucket);
+  }
+
+  if (grouped.size === 0) {
+    return nodes;
+  }
+
+  const groupedNodes: Node<FlowNodeData>[] = [];
+  const childNodes: Node<FlowNodeData>[] = [];
+
+  for (const [key, bucket] of grouped) {
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+
+    for (const node of bucket.nodes) {
+      const width = measuredWidth(node);
+      const height = measuredHeight(node);
+      minX = Math.min(minX, node.position.x);
+      minY = Math.min(minY, node.position.y);
+      maxX = Math.max(maxX, node.position.x + width);
+      maxY = Math.max(maxY, node.position.y + height);
+    }
+
+    const groupX = minX - GROUP_PADDING_X;
+    const groupY = minY - GROUP_HEADER_HEIGHT - GROUP_PADDING_Y;
+    const groupId = `group:${key}`;
+    const groupWidth = maxX - minX + GROUP_PADDING_X * 2;
+    const groupHeight = maxY - minY + GROUP_PADDING_Y * 2 + GROUP_HEADER_HEIGHT;
+
+    groupedNodes.push({
+      id: groupId,
+      type: "sourcetrailGroup",
+      position: { x: groupX, y: groupY },
+      data: {
+        kind: "GROUP",
+        label: bucket.label,
+        center: false,
+        nodeStyle: "card",
+        duplicateCount: 1,
+        memberCount: 0,
+        members: [],
+        isVirtualBundle: true,
+        groupMode: groupingMode,
+        groupLabel: bucket.label,
+      },
+      style: {
+        width: groupWidth,
+        height: groupHeight,
+      },
+      draggable: false,
+      selectable: false,
+      focusable: false,
+      zIndex: -1,
+    });
+
+    for (const node of bucket.nodes) {
+      childNodes.push({
+        ...node,
+        parentId: groupId,
+        extent: "parent",
+        position: {
+          x: node.position.x - groupX,
+          y: node.position.y - groupY,
+        },
+      });
+    }
+  }
+
+  return [...groupedNodes, ...childNodes, ...passthrough];
 }
 
 function orthogonalPath(points: Array<{ x: number; y: number }>): string {
@@ -229,9 +413,6 @@ function buildEdgePath(
   targetY: number,
   data: SemanticEdgeData | undefined,
 ): { path: string; labelX: number; labelY: number } {
-  const routeKind = data?.routeKind ?? "direct";
-
-  // Base 14px rounding radius for elbows
   const r = 14;
 
   const makeRoundedOrthogonal = (points: Array<{ x: number; y: number }>) => {
@@ -270,37 +451,34 @@ function buildEdgePath(
     path += ` L ${last.x} ${last.y}`;
     return path;
   };
+  const routedPoints = data?.routePoints ?? [];
+  if (routedPoints.length >= 2) {
+    const points = routedPoints.map((point) => ({ ...point }));
+    points[0] = { x: sourceX, y: sourceY };
+    points[points.length - 1] = { x: targetX, y: targetY };
+    const path = makeRoundedOrthogonal(points);
+    const mid = points[Math.floor(points.length / 2)] ?? {
+      x: (sourceX + targetX) / 2,
+      y: (sourceY + targetY) / 2,
+    };
+    return { path, labelX: mid.x, labelY: mid.y };
+  }
+
+  const routeKind = data?.routeKind ?? "direct";
   const laneSpanY = Math.abs(targetY - sourceY);
   const laneOffset = laneSpanY > 20 ? laneOffsetFromEdgeId(edgeId, 8, 5) : 0;
-
   if (routeKind === "flow-trunk" || routeKind === "flow-branch") {
-    // Disable laneOffset jitter for trunks so they perfectly merge into a single solid line
     const trunkCoord = data?.trunkCoord ?? (sourceX + targetX) / 2;
-    // Gutter set to 42 to ensure: 14px for curve + ~16px for visible straight line + ~12px for arrowhead
     const elbowX = clampedElbowX(sourceX, targetX, trunkCoord, 42);
-
     const path = makeRoundedOrthogonal([
       { x: sourceX, y: sourceY },
       { x: elbowX, y: sourceY },
       { x: elbowX, y: targetY },
       { x: targetX, y: targetY },
     ]);
-
     return { path, labelX: elbowX, labelY: (sourceY + targetY) / 2 };
   }
 
-  if (routeKind === "hierarchy") {
-    const liftY = (sourceY + targetY) / 2 + laneOffset;
-    const path = makeRoundedOrthogonal([
-      { x: sourceX, y: sourceY },
-      { x: sourceX, y: liftY },
-      { x: targetX, y: liftY },
-      { x: targetX, y: targetY },
-    ]);
-    return { path, labelX: (sourceX + targetX) / 2, labelY: liftY };
-  }
-
-  // Default to a simple routed path instead of bezier to match the flowchart vibe
   const midX = (sourceX + targetX) / 2 + laneOffset;
   const path = makeRoundedOrthogonal([
     { x: sourceX, y: sourceY },
@@ -308,7 +486,6 @@ function buildEdgePath(
     { x: midX, y: targetY },
     { x: targetX, y: targetY },
   ]);
-
   return { path, labelX: midX, labelY: (sourceY + targetY) / 2 };
 }
 
@@ -322,9 +499,26 @@ function SemanticEdge({
   style,
   data,
 }: EdgeProps<Edge<SemanticEdgeData>>) {
-  const { path } = buildEdgePath(id, sourceX, sourceY, targetX, targetY, data);
+  const { path, labelX, labelY } = buildEdgePath(id, sourceX, sourceY, targetX, targetY, data);
+  const bundleCount = data?.bundleCount ?? 1;
 
-  return <BaseEdge id={id} path={path} markerEnd={markerEnd} style={style} />;
+  return (
+    <>
+      <BaseEdge id={id} path={path} markerEnd={markerEnd} style={style} />
+      {bundleCount > 1 ? (
+        <EdgeLabelRenderer>
+          <div
+            className="graph-bundle-count"
+            style={{
+              transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
+            }}
+          >
+            {bundleCount}
+          </div>
+        </EdgeLabelRenderer>
+      ) : null}
+    </>
+  );
 }
 
 function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
@@ -368,6 +562,7 @@ function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
       "graph-floating-pill",
       data.center ? "graph-floating-pill-center" : "",
       isSimpleTypePill ? "graph-floating-pill-simple" : "",
+      data.isNonIndexed ? "graph-node-unresolved" : "",
       isSelected ? "graph-floating-pill-selected" : "",
     ]
       .filter(Boolean)
@@ -432,6 +627,7 @@ function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
     isSelected ? "graph-node-selected" : "",
     data.center ? "graph-node-center" : "",
     data.kind === "FILE" ? "graph-node-file" : "",
+    data.isNonIndexed ? "graph-node-unresolved" : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -629,8 +825,28 @@ function GraphCardNode({ data, selected }: NodeProps<Node<FlowNodeData>>) {
   );
 }
 
+function GraphGroupNode({ data }: NodeProps<Node<FlowNodeData>>) {
+  if (!data.groupMode || !data.groupLabel) {
+    return null;
+  }
+  return (
+    <div
+      className={[
+        "graph-group-node",
+        data.groupMode === "file" ? "graph-group-node-file" : "graph-group-node-namespace",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+      aria-hidden
+    >
+      <div className="graph-group-label">{data.groupLabel}</div>
+    </div>
+  );
+}
+
 const GRAPH_NODE_TYPES = {
   sourcetrail: GraphCardNode,
+  sourcetrailGroup: GraphGroupNode,
 };
 
 const GRAPH_EDGE_TYPES = {
@@ -677,196 +893,71 @@ function MermaidGraph({ syntax }: { syntax: string }) {
 type GraphViewportProps = {
   graph: GraphArtifactDto | null;
   onSelectNode: (nodeId: string, label: string) => void;
+  onSelectEdge?: (selection: GraphEdgeSelection) => void;
   trailConfig: TrailUiConfig;
+  onToggleLegend?: () => void;
 };
 
-type FlowElements = {
-  nodes: Node<FlowNodeData>[];
-  edges: Edge<SemanticEdgeData>[];
-  centerNodeId: string;
+export type GraphEdgeSelection = {
+  id: string;
+  edgeIds: string[];
+  kind: EdgeKind;
+  sourceNodeId: string;
+  targetNodeId: string;
+  sourceLabel: string;
+  targetLabel: string;
 };
 
-function isLowSignalTraceLabel(label: string): boolean {
-  const normalized = label.toLowerCase();
-  return (
-    normalized.includes("test") ||
-    normalized.includes("bench") ||
-    normalized.startsWith("run_") ||
-    normalized.startsWith("index_")
-  );
+function isDenseGraph(depth: number, nodeCount: number, edgeCount: number): boolean {
+  if (nodeCount <= 48) {
+    return false;
+  }
+  if (depth >= 4) {
+    return nodeCount > 90 || edgeCount > 180;
+  }
+  if (depth >= 3) {
+    return nodeCount > 120 || edgeCount > 240;
+  }
+  return nodeCount > 180 || edgeCount > 360;
 }
 
-function traceNodeBudget(depth: number): number {
-  if (depth <= 1) {
-    return 16;
-  }
-  if (depth === 2) {
-    return 20;
-  }
-  return 28;
-}
-
-function pruneTraceElements(elements: FlowElements, depth: number): FlowElements {
-  if (elements.nodes.length <= 1) {
-    return elements;
-  }
-
-  const bundleIds = new Set(
-    elements.nodes.filter((node) => node.data.isVirtualBundle).map((node) => node.id),
-  );
-  const neighbors = new Map<string, Set<string>>();
-  const weightedDegree = new Map<string, number>();
-  for (const edge of elements.edges) {
-    if (!neighbors.has(edge.source)) {
-      neighbors.set(edge.source, new Set());
-    }
-    if (!neighbors.has(edge.target)) {
-      neighbors.set(edge.target, new Set());
-    }
-    neighbors.get(edge.source)?.add(edge.target);
-    neighbors.get(edge.target)?.add(edge.source);
-    const weight = Math.max(1, Number(edge.data?.bundleCount ?? 1));
-    weightedDegree.set(edge.source, (weightedDegree.get(edge.source) ?? 0) + weight);
-    weightedDegree.set(edge.target, (weightedDegree.get(edge.target) ?? 0) + weight);
-  }
-
-  const dist = new Map<string, number>();
-  const queue: Array<{ id: string; cost: number }> = [{ id: elements.centerNodeId, cost: 0 }];
-  dist.set(elements.centerNodeId, 0);
-
-  while (queue.length > 0) {
-    queue.sort((left, right) => left.cost - right.cost);
-    const current = queue.shift();
-    if (!current) {
-      continue;
-    }
-    const knownCost = dist.get(current.id);
-    if (typeof knownCost === "number" && current.cost > knownCost) {
-      continue;
-    }
-    for (const next of neighbors.get(current.id) ?? []) {
-      const step = bundleIds.has(next) ? 0 : 1;
-      const nextCost = current.cost + step;
-      const prev = dist.get(next);
-      if (typeof prev === "number" && prev <= nextCost) {
-        continue;
-      }
-      dist.set(next, nextCost);
-      queue.push({ id: next, cost: nextCost });
-    }
-  }
-
-  const candidateNodes = elements.nodes
-    .filter((node) => node.id !== elements.centerNodeId && !bundleIds.has(node.id))
-    .map((node) => ({
-      node,
-      dist: dist.get(node.id) ?? Number.POSITIVE_INFINITY,
-      score: weightedDegree.get(node.id) ?? 0,
-      isCard: node.data.nodeStyle === "card",
-      lowSignal: isLowSignalTraceLabel(node.data.label),
-    }))
-    .filter((entry) => Number.isFinite(entry.dist))
-    .sort((left, right) => {
-      if (left.dist !== right.dist) {
-        return left.dist - right.dist;
-      }
-      if (left.isCard !== right.isCard) {
-        return left.isCard ? -1 : 1;
-      }
-      if (left.lowSignal !== right.lowSignal) {
-        return left.lowSignal ? 1 : -1;
-      }
-      if (left.score !== right.score) {
-        return right.score - left.score;
-      }
-      return left.node.data.label.localeCompare(right.node.data.label);
-    });
-
-  const budget = traceNodeBudget(depth);
-  const keptNodeIds = new Set<string>([elements.centerNodeId]);
-  for (const entry of candidateNodes) {
-    if (keptNodeIds.size - 1 >= budget) {
-      break;
-    }
-    keptNodeIds.add(entry.node.id);
-  }
-
-  // Keep only bundle nodes that bridge at least two kept non-bundle nodes.
-  const bundleSupport = new Map<string, Set<string>>();
-  for (const edge of elements.edges) {
-    const sourceBundle = bundleIds.has(edge.source);
-    const targetBundle = bundleIds.has(edge.target);
-    if (!sourceBundle && !targetBundle) {
-      continue;
-    }
-    if (sourceBundle && keptNodeIds.has(edge.target)) {
-      const support = bundleSupport.get(edge.source) ?? new Set<string>();
-      support.add(edge.target);
-      bundleSupport.set(edge.source, support);
-    }
-    if (targetBundle && keptNodeIds.has(edge.source)) {
-      const support = bundleSupport.get(edge.target) ?? new Set<string>();
-      support.add(edge.source);
-      bundleSupport.set(edge.target, support);
-    }
-  }
-  for (const [bundleId, support] of bundleSupport) {
-    if (support.size >= 2 || support.has(elements.centerNodeId)) {
-      keptNodeIds.add(bundleId);
-    }
-  }
-
-  const nodeById = new Map(elements.nodes.map((node) => [node.id, node]));
-  const keptEdges = elements.edges.filter((edge) => {
-    if (!keptNodeIds.has(edge.source) || !keptNodeIds.has(edge.target)) {
-      return false;
-    }
-
-    if (depth < 2) {
-      return true;
-    }
-
-    const source = nodeById.get(edge.source);
-    const target = nodeById.get(edge.target);
-    const sourceCard = source?.data.nodeStyle === "card";
-    const targetCard = target?.data.nodeStyle === "card";
-    const touchesCenter =
-      edge.source === elements.centerNodeId || edge.target === elements.centerNodeId;
-    const isTrunk = edge.data?.routeKind === "flow-trunk";
-
-    return touchesCenter || sourceCard || targetCard || isTrunk;
-  });
-
-  // Drop isolated virtual nodes after edge filtering.
-  const usedNodeIds = new Set<string>([elements.centerNodeId]);
-  for (const edge of keptEdges) {
-    usedNodeIds.add(edge.source);
-    usedNodeIds.add(edge.target);
-  }
-
-  const keptNodes = elements.nodes.filter((node) => usedNodeIds.has(node.id));
-  if (keptNodes.length === elements.nodes.length && keptEdges.length === elements.edges.length) {
-    return elements;
-  }
-
-  return {
-    ...elements,
-    nodes: keptNodes,
-    edges: keptEdges,
-  };
-}
-
-export function GraphViewport({ graph, onSelectNode, trailConfig }: GraphViewportProps) {
+export function GraphViewport({
+  graph,
+  onSelectNode,
+  onSelectEdge,
+  trailConfig,
+  onToggleLegend,
+}: GraphViewportProps) {
   const [flow, setFlow] = useState<ReactFlowInstance | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [hoveredEdgeId, setHoveredEdgeId] = useState<string | null>(null);
+  const [legendFilterKinds, setLegendFilterKinds] = useState<Set<EdgeKind> | null>(null);
+  const [manualNodePositionsByGraph, setManualNodePositionsByGraph] = useState<
+    Record<string, Record<string, { x: number; y: number }>>
+  >({});
   const lastFittedGraphId = useRef<string | null>(null);
+  const activeGraphNodePositions = useMemo(() => {
+    if (!graph || isMermaidGraph(graph)) {
+      return {};
+    }
+    return manualNodePositionsByGraph[graph.id] ?? {};
+  }, [graph, manualNodePositionsByGraph]);
 
   const flowElements = useMemo(() => {
     if (graph === null || isMermaidGraph(graph)) {
       return null;
     }
 
+    const nodeMetaById = new Map(
+      graph.graph.nodes.map((node) => [
+        node.id,
+        {
+          filePath: node.file_path ?? null,
+          qualifiedName: node.qualified_name ?? null,
+        },
+      ]),
+    );
     const centerMemberId = graph.graph.center_id;
     const withInteractiveNodeData = (node: Node<FlowNodeData>): Node<FlowNodeData> => {
       const focusedMemberId =
@@ -881,6 +972,7 @@ export function GraphViewport({ graph, onSelectNode, trailConfig }: GraphViewpor
           focusedMemberId,
           onSelectMember: (memberId: string, label: string) => {
             setSelectedNodeId(node.id);
+            setSelectedEdgeId(null);
             onSelectNode(memberId, label);
           },
         },
@@ -889,40 +981,73 @@ export function GraphViewport({ graph, onSelectNode, trailConfig }: GraphViewpor
 
     try {
       const semantic = buildSemanticLayout(graph.graph);
-      // Skip bundling — route edges directly from source to target
-      // Run the semantic edge-grouping pass which now applies flow-trunk coords without
-      // generating synthetic layout nodes
-      const routed = applySharedTrunkBundling(semantic, trailConfig.bundlingMode);
+      const bundled = applyAdaptiveBundling(
+        semantic,
+        trailConfig.depth,
+        graph.graph.nodes.length,
+        graph.graph.edges.length,
+      );
+      const routed = routeEdgesWithObstacles(bundled);
       const flowLayout = toReactFlowElements(routed);
-      const traceActive = trailConfig.bundlingMode === "trace";
-      const scopedElements =
-        traceActive && flowLayout.nodes.length > 36
-          ? pruneTraceElements(flowLayout, trailConfig.depth)
-          : flowLayout;
-      const centerNodeId = scopedElements.centerNodeId;
+      const centerNodeId = flowLayout.centerNodeId;
+      const denseFocusActive = isDenseGraph(
+        trailConfig.depth,
+        flowLayout.nodes.length,
+        flowLayout.edges.length,
+      );
+      const withManualNodePosition = (node: Node<FlowNodeData>): Node<FlowNodeData> => {
+        const manualPosition = activeGraphNodePositions[node.id];
+        if (!manualPosition) {
+          return node;
+        }
+        return {
+          ...node,
+          position: manualPosition,
+        };
+      };
       return {
-        ...scopedElements,
-        nodes: scopedElements.nodes.map(withInteractiveNodeData),
-        edges: scopedElements.edges.map((edge) => {
-          if (!traceActive) {
-            return edge;
-          }
-
+        ...flowLayout,
+        nodes: applyGrouping(
+          flowLayout.nodes.map(withInteractiveNodeData).map(withManualNodePosition),
+          trailConfig.groupingMode,
+          nodeMetaById,
+        ),
+        edges: flowLayout.edges.map((edge) => {
           const touchesCenter = edge.source === centerNodeId || edge.target === centerNodeId;
           const isTrunk = edge.data?.routeKind === "flow-trunk";
+          const hasSelectedEdge = selectedEdgeId !== null;
+          const isSelectedEdge = selectedEdgeId === edge.id;
+          const isFilteredOut =
+            legendFilterKinds !== null &&
+            edge.data?.edgeKind !== undefined &&
+            !legendFilterKinds.has(edge.data.edgeKind);
           const baseOpacity = Number(edge.style?.opacity ?? 1);
           const baseStroke = Number(edge.style?.strokeWidth ?? 2);
 
           if (!hoveredEdgeId) {
-            const deemphasized = !touchesCenter && !isTrunk;
+            const deemphasized = denseFocusActive && !touchesCenter && !isTrunk;
             return {
               ...edge,
               style: {
                 ...edge.style,
-                opacity: deemphasized
-                  ? Math.max(0.12, baseOpacity * 0.42)
-                  : Math.max(0.82, baseOpacity),
-                strokeWidth: deemphasized ? Math.max(1, baseStroke - 0.3) : baseStroke + 0.1,
+                opacity: isFilteredOut
+                  ? 0.09
+                  : hasSelectedEdge
+                    ? isSelectedEdge
+                      ? 1
+                      : 0.2
+                    : deemphasized
+                      ? Math.max(0.12, baseOpacity * 0.42)
+                      : Math.max(0.82, baseOpacity),
+                strokeWidth: isFilteredOut
+                  ? Math.max(1, baseStroke - 0.8)
+                  : hasSelectedEdge
+                    ? isSelectedEdge
+                      ? baseStroke + 0.45
+                      : Math.max(1, baseStroke - 0.55)
+                    : deemphasized
+                      ? Math.max(1, baseStroke - 0.3)
+                      : baseStroke + 0.1,
               },
             };
           }
@@ -932,26 +1057,55 @@ export function GraphViewport({ graph, onSelectNode, trailConfig }: GraphViewpor
             ...edge,
             style: {
               ...edge.style,
-              opacity: dimmed ? 0.18 : 1,
-              strokeWidth: dimmed
-                ? Math.max(1, Number(edge.style?.strokeWidth ?? 1) - 0.6)
-                : Number(edge.style?.strokeWidth ?? 2) + 0.35,
+              opacity: isFilteredOut ? 0.08 : dimmed ? 0.18 : 1,
+              strokeWidth: isFilteredOut
+                ? Math.max(1, Number(edge.style?.strokeWidth ?? 1) - 0.8)
+                : dimmed
+                  ? Math.max(1, Number(edge.style?.strokeWidth ?? 1) - 0.6)
+                  : Number(edge.style?.strokeWidth ?? 2) + 0.35,
             },
           };
         }),
       };
     } catch {
-      const elements = toReactFlowElements(buildFallbackLayout(graph.graph));
+      const fallback = routeEdgesWithObstacles(buildFallbackLayout(graph.graph));
+      const elements = toReactFlowElements(fallback);
+      const withManualNodePosition = (node: Node<FlowNodeData>): Node<FlowNodeData> => {
+        const manualPosition = activeGraphNodePositions[node.id];
+        if (!manualPosition) {
+          return node;
+        }
+        return {
+          ...node,
+          position: manualPosition,
+        };
+      };
       return {
         ...elements,
-        nodes: elements.nodes.map(withInteractiveNodeData),
+        nodes: applyGrouping(
+          elements.nodes.map(withInteractiveNodeData).map(withManualNodePosition),
+          trailConfig.groupingMode,
+          nodeMetaById,
+        ),
       };
     }
-  }, [graph, hoveredEdgeId, onSelectNode, selectedNodeId, trailConfig.bundlingMode]);
+  }, [
+    activeGraphNodePositions,
+    graph,
+    hoveredEdgeId,
+    legendFilterKinds,
+    onSelectNode,
+    selectedEdgeId,
+    selectedNodeId,
+    trailConfig.depth,
+    trailConfig.groupingMode,
+  ]);
 
   useEffect(() => {
     setSelectedNodeId(flowElements?.centerNodeId ?? null);
+    setSelectedEdgeId(null);
     setHoveredEdgeId(null);
+    setLegendFilterKinds(null);
   }, [graph?.id, flowElements?.centerNodeId]);
 
   useEffect(() => {
@@ -990,6 +1144,81 @@ export function GraphViewport({ graph, onSelectNode, trailConfig }: GraphViewpor
     lastFittedGraphId.current = graph.id;
   }, [flow, flowElements, graph]);
 
+  const zoomIn = () => {
+    if (!flow) {
+      return;
+    }
+    void flow.zoomIn({ duration: 140 });
+  };
+
+  const zoomOut = () => {
+    if (!flow) {
+      return;
+    }
+    void flow.zoomOut({ duration: 140 });
+  };
+
+  const resetZoom = () => {
+    if (!flow) {
+      return;
+    }
+    const viewport = flow.getViewport();
+    void flow.setViewport({ ...viewport, zoom: 1 }, { duration: 180 });
+  };
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        (target instanceof HTMLElement && target.isContentEditable)
+      ) {
+        return;
+      }
+
+      if (event.key === "0") {
+        event.preventDefault();
+        resetZoom();
+        return;
+      }
+
+      if (event.key === "+" || event.key === "=") {
+        event.preventDefault();
+        zoomIn();
+        return;
+      }
+
+      if (event.key === "-" || event.key === "_") {
+        event.preventDefault();
+        zoomOut();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [flow]);
+
+  const toggleLegendKind = (kind: EdgeKind) => {
+    setLegendFilterKinds((previous) => {
+      if (previous === null) {
+        return new Set([kind]);
+      }
+
+      const next = new Set(previous);
+      if (next.has(kind)) {
+        next.delete(kind);
+      } else {
+        next.add(kind);
+      }
+
+      return next.size > 0 ? next : null;
+    });
+  };
+
   if (graph === null) {
     return <div className="graph-empty">Pick a symbol or submit a prompt to render a graph.</div>;
   }
@@ -1017,21 +1246,76 @@ export function GraphViewport({ graph, onSelectNode, trailConfig }: GraphViewpor
           return;
         }
         setSelectedNodeId(node.id);
+        setSelectedEdgeId(null);
         onSelectNode(node.id, nodeLabelFromData(node.data, node.id));
+      }}
+      onNodeDragStop={(_, node) => {
+        const data = node.data as FlowNodeData | undefined;
+        if (data?.isVirtualBundle) {
+          return;
+        }
+        const absolutePosition = (
+          node as Node<FlowNodeData> & { positionAbsolute?: { x: number; y: number } }
+        ).positionAbsolute;
+        const persistedPosition = absolutePosition ?? node.position;
+        setManualNodePositionsByGraph((previous) => ({
+          ...previous,
+          [graph.id]: {
+            ...previous[graph.id],
+            [node.id]: {
+              x: persistedPosition.x,
+              y: persistedPosition.y,
+            },
+          },
+        }));
       }}
       onPaneClick={() => {
         setSelectedNodeId(null);
+        setSelectedEdgeId(null);
       }}
-      onEdgeMouseEnter={(_, edge) => {
-        if (trailConfig.bundlingMode !== "trace") {
+      onEdgeClick={(_, edge) => {
+        setSelectedEdgeId(edge.id);
+        const sourceNode = flowElements.nodes.find((node) => node.id === edge.source);
+        const targetNode = flowElements.nodes.find((node) => node.id === edge.target);
+        const semanticEdgeData = edge.data as SemanticEdgeData | undefined;
+
+        if (onSelectEdge && semanticEdgeData?.edgeKind) {
+          const sourceEdgeIds =
+            semanticEdgeData.sourceEdgeIds.length > 0 ? semanticEdgeData.sourceEdgeIds : [edge.id];
+          const primaryEdgeId = sourceEdgeIds[0] ?? edge.id;
+          onSelectEdge({
+            id: primaryEdgeId,
+            edgeIds: sourceEdgeIds,
+            kind: semanticEdgeData.edgeKind,
+            sourceNodeId: edge.source,
+            targetNodeId: edge.target,
+            sourceLabel: sourceNode ? nodeLabelFromData(sourceNode.data, edge.source) : edge.source,
+            targetLabel: targetNode ? nodeLabelFromData(targetNode.data, edge.target) : edge.target,
+          });
           return;
         }
+
+        const centerNodeId = flowElements.centerNodeId;
+        const preferredNodeId =
+          edge.source === centerNodeId
+            ? edge.target
+            : edge.target === centerNodeId
+              ? edge.source
+              : edge.target;
+        const fallbackNode =
+          flowElements.nodes.find((node) => node.id === preferredNodeId) ??
+          flowElements.nodes.find((node) => node.id === edge.target) ??
+          flowElements.nodes.find((node) => node.id === edge.source);
+        if (!fallbackNode) {
+          return;
+        }
+        setSelectedNodeId(fallbackNode.id);
+        onSelectNode(fallbackNode.id, nodeLabelFromData(fallbackNode.data, fallbackNode.id));
+      }}
+      onEdgeMouseEnter={(_, edge) => {
         setHoveredEdgeId(edge.id);
       }}
       onEdgeMouseLeave={() => {
-        if (trailConfig.bundlingMode !== "trace") {
-          return;
-        }
         setHoveredEdgeId(null);
       }}
       nodeTypes={GRAPH_NODE_TYPES}
@@ -1039,7 +1323,7 @@ export function GraphViewport({ graph, onSelectNode, trailConfig }: GraphViewpor
       minZoom={0.18}
       maxZoom={2.1}
       proOptions={{ hideAttribution: true }}
-      nodesDraggable={false}
+      nodesDraggable
       nodesConnectable={false}
       elementsSelectable
       onlyRenderVisibleElements={denseGraph}
@@ -1047,6 +1331,17 @@ export function GraphViewport({ graph, onSelectNode, trailConfig }: GraphViewpor
       className="sourcetrail-flow"
     >
       <Controls position="top-left" showInteractive={false} />
+      <Panel position="bottom-left" className="graph-zoom-panel">
+        <button type="button" aria-label="Zoom in" onClick={zoomIn}>
+          +
+        </button>
+        <button type="button" aria-label="Zoom out" onClick={zoomOut}>
+          -
+        </button>
+        <button type="button" aria-label="Reset zoom to 100%" onClick={resetZoom}>
+          0
+        </button>
+      </Panel>
       {trailConfig.showMiniMap ? (
         <MiniMap
           className="graph-minimap"
@@ -1060,16 +1355,40 @@ export function GraphViewport({ graph, onSelectNode, trailConfig }: GraphViewpor
           nodeBorderRadius={2}
         />
       ) : null}
+      <Panel position="bottom-right" className="graph-legend-toggle-panel">
+        <button
+          type="button"
+          aria-label={trailConfig.showLegend ? "Hide legend" : "Show legend"}
+          onClick={() => {
+            setLegendFilterKinds(null);
+            onToggleLegend?.();
+          }}
+        >
+          {trailConfig.showLegend ? "×" : "?"}
+        </button>
+      </Panel>
       {trailConfig.showLegend && legendRows.length > 0 ? (
         <Panel position="bottom-right" className="graph-legend-panel">
           <div className="graph-legend-title">Legend</div>
           <div className="graph-legend-rows">
             {legendRows.map((row) => (
-              <div key={row.kind} className="graph-legend-row">
+              <button
+                key={row.kind}
+                type="button"
+                className={[
+                  "graph-legend-row",
+                  legendFilterKinds !== null && !legendFilterKinds.has(row.kind)
+                    ? "graph-legend-row-muted"
+                    : "graph-legend-row-active",
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
+                onClick={() => toggleLegendKind(row.kind)}
+              >
                 <span className="graph-legend-line" style={{ background: row.stroke }} />
                 <span className="graph-legend-kind">{formatKindLabel(row.kind)}</span>
                 <span className="graph-legend-count">{row.count}</span>
-              </div>
+              </button>
             ))}
           </div>
           <div className="graph-legend-note">
@@ -1078,6 +1397,15 @@ export function GraphViewport({ graph, onSelectNode, trailConfig }: GraphViewpor
             {hasUncertainEdges ? "Dashed edges = uncertain." : ""}
             {hasUncertainEdges && hasProbableEdges ? " " : ""}
             {hasProbableEdges ? "Lower opacity = probable." : ""}
+            {legendFilterKinds !== null ? (
+              <button
+                type="button"
+                className="graph-legend-reset"
+                onClick={() => setLegendFilterKinds(null)}
+              >
+                Show all
+              </button>
+            ) : null}
           </div>
         </Panel>
       ) : null}

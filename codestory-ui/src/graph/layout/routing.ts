@@ -5,6 +5,7 @@ import type {
   FlowNodeData,
   LayoutElements,
   LegendRow,
+  RoutePoint,
   RouteKind,
   SemanticEdgeFamily,
 } from "./types";
@@ -15,61 +16,16 @@ type EdgePalette = {
 };
 
 export type SemanticEdgeData = {
+  edgeKind: EdgeKind;
+  sourceEdgeIds: string[];
   routeKind: RouteKind;
   family: SemanticEdgeFamily;
   bundleCount: number;
+  routePoints: RoutePoint[];
   trunkCoord?: number;
+  channelId?: string;
+  channelWeight?: number;
 };
-
-const CARD_WIDTH_MIN = 228;
-const CARD_WIDTH_MAX = 432;
-const CARD_CHROME_WIDTH = 112;
-const PILL_WIDTH_MIN = 96;
-const PILL_WIDTH_MAX = 272;
-const PILL_CHROME_WIDTH = 58;
-const APPROX_CHAR_WIDTH = 7.25;
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
-
-function estimateNodeDimensions(node: LayoutElements["nodes"][number]): {
-  width: number;
-  height: number;
-} {
-  if (node.nodeStyle === "bundle") {
-    return { width: 6, height: 6 };
-  }
-
-  if (node.nodeStyle === "pill") {
-    const width = clamp(
-      PILL_CHROME_WIDTH + node.label.length * APPROX_CHAR_WIDTH,
-      PILL_WIDTH_MIN,
-      PILL_WIDTH_MAX,
-    );
-    return { width, height: 34 };
-  }
-
-  const longestLabel = Math.max(
-    node.label.length,
-    ...node.members.map((member) => member.label.length),
-  );
-  const width = clamp(
-    CARD_CHROME_WIDTH + longestLabel * APPROX_CHAR_WIDTH,
-    CARD_WIDTH_MIN,
-    CARD_WIDTH_MAX,
-  );
-  const publicCount = node.members.filter((member) => member.visibility === "public").length;
-  const privateCount = node.members.length - publicCount;
-  const sectionCount = (publicCount > 0 ? 1 : 0) + (privateCount > 0 ? 1 : 0);
-  const effectiveSections = sectionCount === 0 ? 1 : sectionCount;
-  const height = clamp(
-    74 + effectiveSections * 28 + Math.max(1, node.members.length) * 21,
-    110,
-    560,
-  );
-  return { width, height };
-}
 
 export const EDGE_STYLE: Record<EdgeKind, EdgePalette> = {
   MEMBER: { stroke: "#adb1b8", width: 2.0 },
@@ -123,7 +79,7 @@ function edgeWidth(baseWidth: number, multiplicity: number, family: SemanticEdge
 }
 
 export function buildLegendRows(graph: GraphResponse): LegendRow[] {
-  const byKind = new Map<string, LegendRow>();
+  const byKind = new Map<EdgeKind, LegendRow>();
   for (const edge of graph.edges) {
     if (edge.kind === "MEMBER") {
       continue;
@@ -158,7 +114,8 @@ export function toReactFlowElements(layout: LayoutElements): {
   centerNodeId: string;
 } {
   const nodes: Node<FlowNodeData>[] = layout.nodes.map((node) => ({
-    ...estimateNodeDimensions(node),
+    width: node.width,
+    height: node.height,
     id: node.id,
     type: "sourcetrail",
     position: { x: node.x, y: node.y },
@@ -172,6 +129,7 @@ export function toReactFlowElements(layout: LayoutElements): {
       label: node.label,
       center: node.center,
       nodeStyle: node.nodeStyle,
+      isNonIndexed: node.isNonIndexed,
       duplicateCount: node.duplicateCount,
       mergedSymbolIds: node.mergedSymbolIds,
       memberCount: node.memberCount,
@@ -185,17 +143,14 @@ export function toReactFlowElements(layout: LayoutElements): {
   const edges: Edge<SemanticEdgeData>[] = layout.edges.map((edge) => {
     const palette = EDGE_STYLE[edge.kind] ?? EDGE_STYLE.UNKNOWN;
     const certainty = certaintyStroke(edge.certainty, edge.family);
-    const targetIsBundleNode = edge.target.startsWith("bundle:");
     const hierarchyEdge = edge.family === "hierarchy";
     const markerSize = hierarchyEdge ? 14 : 13;
-    const markerEnd = targetIsBundleNode
-      ? undefined
-      : {
-          type: markerTypeFor(edge.kind),
-          width: markerSize,
-          height: markerSize,
-          color: palette.stroke,
-        };
+    const markerEnd = {
+      type: markerTypeFor(edge.kind),
+      width: markerSize,
+      height: markerSize,
+      color: palette.stroke,
+    };
     return {
       id: edge.id,
       source: edge.source,
@@ -214,10 +169,15 @@ export function toReactFlowElements(layout: LayoutElements): {
       },
       interactionWidth: edge.routeKind === "flow-trunk" ? 24 : hierarchyEdge ? 20 : 18,
       data: {
+        edgeKind: edge.kind,
+        sourceEdgeIds: edge.sourceEdgeIds,
         routeKind: edge.routeKind,
         family: edge.family,
         bundleCount: edge.bundleCount,
+        routePoints: edge.routePoints,
         trunkCoord: edge.trunkCoord,
+        channelId: edge.channelId,
+        channelWeight: edge.channelWeight,
       },
     };
   });

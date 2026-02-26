@@ -7,6 +7,8 @@ import type {
   TrailMode,
 } from "../generated/api";
 
+export type GroupingMode = "none" | "namespace" | "file";
+
 export const EDGE_KIND_OPTIONS: EdgeKind[] = [
   "MEMBER",
   "TYPE_USAGE",
@@ -58,9 +60,9 @@ export type TrailUiConfig = {
   edgeFilter: EdgeKind[];
   showUtilityCalls: boolean;
   nodeFilter: NodeKind[];
-  bundlingMode: "off" | "overview" | "trace";
   showLegend: boolean;
   showMiniMap: boolean;
+  groupingMode: GroupingMode;
   maxNodes: number;
 };
 
@@ -77,9 +79,9 @@ export function defaultTrailUiConfig(): TrailUiConfig {
     edgeFilter: [...EDGE_KIND_OPTIONS],
     showUtilityCalls: false,
     nodeFilter: [],
-    bundlingMode: "overview",
     showLegend: true,
     showMiniMap: true,
+    groupingMode: "none",
     maxNodes: 500,
   };
 }
@@ -139,6 +141,15 @@ export function normalizeTrailUiConfig(
       )
     : defaults.nodeFilter;
 
+  // Legacy persisted layouts may include bundlingMode; ignore it.
+  const _legacyBundlingMode = (raw as { bundlingMode?: unknown }).bundlingMode;
+  void _legacyBundlingMode;
+
+  const groupingMode =
+    raw.groupingMode === "namespace" || raw.groupingMode === "file" || raw.groupingMode === "none"
+      ? raw.groupingMode
+      : defaults.groupingMode;
+
   return {
     mode,
     targetId: typeof raw.targetId === "string" ? raw.targetId : null,
@@ -150,12 +161,9 @@ export function normalizeTrailUiConfig(
     showUtilityCalls:
       typeof raw.showUtilityCalls === "boolean" ? raw.showUtilityCalls : defaults.showUtilityCalls,
     nodeFilter,
-    bundlingMode:
-      raw.bundlingMode === "off" || raw.bundlingMode === "overview" || raw.bundlingMode === "trace"
-        ? raw.bundlingMode
-        : defaults.bundlingMode,
     showLegend: typeof raw.showLegend === "boolean" ? raw.showLegend : defaults.showLegend,
     showMiniMap: typeof raw.showMiniMap === "boolean" ? raw.showMiniMap : defaults.showMiniMap,
+    groupingMode,
     maxNodes: clampMaxNodes(typeof raw.maxNodes === "number" ? raw.maxNodes : defaults.maxNodes),
   };
 }
