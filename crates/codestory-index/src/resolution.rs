@@ -4,10 +4,12 @@ use crate::semantic::{
 use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind, ResolutionCertainty};
 use codestory_storage::Storage;
+use rayon::prelude::*;
 #[cfg(test)]
 use rusqlite::OptionalExtension;
 use rusqlite::{params, params_from_iter, types::Value};
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 type UnresolvedEdgeRow = (
     i64,
@@ -17,6 +19,8 @@ type UnresolvedEdgeRow = (
     Option<String>,
     Option<String>,
 );
+
+const SCOPED_CALLER_TABLE: &str = "resolution_scoped_caller_ids";
 
 #[cfg(test)]
 #[allow(dead_code)]
@@ -34,7 +38,6 @@ struct CandidateNode {
     serialized_name: String,
     serialized_name_ascii_lower: String,
     qualified_name: Option<String>,
-    start_line: Option<i64>,
 }
 
 #[derive(Default, Debug)]
@@ -43,11 +46,14 @@ struct CandidateIndex {
     node_offset_by_id: HashMap<i64, usize>,
     exact_map: HashMap<String, Vec<usize>>,
     suffix_map_ascii_lower: HashMap<String, Vec<usize>>,
+    #[cfg(test)]
     same_file_cache: HashMap<(i64, String), Option<i64>>,
+    #[cfg(test)]
     same_module_cache: HashMap<(String, String), Option<i64>>,
+    #[cfg(test)]
     global_unique_cache: HashMap<String, Option<i64>>,
+    #[cfg(test)]
     fuzzy_cache_ascii_lower: HashMap<String, Option<i64>>,
-    top_match_cache: HashMap<String, Vec<i64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +82,196 @@ pub struct ResolutionStats {
     pub unresolved_imports_before: usize,
     pub resolved_imports: usize,
     pub unresolved_imports: usize,
+    pub telemetry: ResolutionPhaseTelemetry,
+    pub strategy_counters: ResolutionStrategyCounters,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+pub struct ResolutionPhaseTelemetry {
+    pub scope_prepare_ms: u64,
+    pub unresolved_count_start_ms: u64,
+    pub call_prepare_ms: u64,
+    pub call_cleanup_ms: u64,
+    pub call_unresolved_load_ms: u64,
+    pub call_candidate_index_ms: u64,
+    pub call_compute_ms: u64,
+    pub call_apply_ms: u64,
+    pub import_prepare_ms: u64,
+    pub import_unresolved_load_ms: u64,
+    pub import_candidate_index_ms: u64,
+    pub import_compute_ms: u64,
+    pub import_apply_ms: u64,
+    pub unresolved_count_end_ms: u64,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+pub struct ResolutionStrategyCounters {
+    pub call_same_file: usize,
+    pub call_same_module: usize,
+    pub call_global_unique: usize,
+    pub call_semantic_fallback: usize,
+    pub import_same_file: usize,
+    pub import_same_module: usize,
+    pub import_global_unique: usize,
+    pub import_fuzzy: usize,
+    pub import_semantic_fallback: usize,
+}
+
+impl ResolutionStrategyCounters {
+    fn record(&mut self, strategy: Option<ResolutionStrategy>) {
+        match strategy {
+            Some(ResolutionStrategy::CallSameFile) => self.call_same_file += 1,
+            Some(ResolutionStrategy::CallSameModule) => self.call_same_module += 1,
+            Some(ResolutionStrategy::CallGlobalUnique) => self.call_global_unique += 1,
+            Some(ResolutionStrategy::CallSemanticFallback) => self.call_semantic_fallback += 1,
+            Some(ResolutionStrategy::ImportSameFile) => self.import_same_file += 1,
+            Some(ResolutionStrategy::ImportSameModule) => self.import_same_module += 1,
+            Some(ResolutionStrategy::ImportGlobalUnique) => self.import_global_unique += 1,
+            Some(ResolutionStrategy::ImportFuzzy) => self.import_fuzzy += 1,
+            Some(ResolutionStrategy::ImportSemanticFallback) => self.import_semantic_fallback += 1,
+            None => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolutionStrategy {
+    CallSameFile,
+    CallSameModule,
+    CallGlobalUnique,
+    CallSemanticFallback,
+    ImportSameFile,
+    ImportSameModule,
+    ImportGlobalUnique,
+    ImportFuzzy,
+    ImportSemanticFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeCallerMode {
+    Unscoped,
+    ScopedCallers,
+    Empty,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScopeCallerContext {
+    mode: ScopeCallerMode,
+}
+
+impl ScopeCallerContext {
+    fn unscoped() -> Self {
+        Self {
+            mode: ScopeCallerMode::Unscoped,
+        }
+    }
+
+    fn prepare(
+        conn: &rusqlite::Connection,
+        caller_scope_file_ids: Option<&HashSet<i64>>,
+    ) -> Result<Self> {
+        let Some(scope_ids) = sorted_scope_file_ids(caller_scope_file_ids) else {
+            return Ok(Self::unscoped());
+        };
+        if scope_ids.is_empty() {
+            return Ok(Self {
+                mode: ScopeCallerMode::Empty,
+            });
+        }
+
+        conn.execute_batch(&format!(
+            "CREATE TEMP TABLE IF NOT EXISTS {SCOPED_CALLER_TABLE} (
+                caller_id INTEGER PRIMARY KEY
+             );
+             DELETE FROM {SCOPED_CALLER_TABLE};"
+        ))?;
+        let mut query = format!(
+            "INSERT INTO {SCOPED_CALLER_TABLE} (caller_id)
+             SELECT id FROM node WHERE file_node_id IN ("
+        );
+        query.push_str(&numbered_placeholders(1, scope_ids.len()));
+        query.push(')');
+        conn.execute(&query, params_from_iter(scope_ids.iter()))?;
+
+        Ok(Self {
+            mode: ScopeCallerMode::ScopedCallers,
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(self.mode, ScopeCallerMode::Empty)
+    }
+
+    fn is_scoped(&self) -> bool {
+        matches!(self.mode, ScopeCallerMode::ScopedCallers)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PreparedName {
+    original: String,
+    ascii_lower: String,
+}
+
+impl PreparedName {
+    fn new(value: String) -> Self {
+        let ascii_lower = value.to_ascii_lowercase();
+        Self {
+            original: value,
+            ascii_lower,
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+struct OrderedCandidateIds {
+    ordered: Vec<i64>,
+    seen: HashSet<i64>,
+}
+
+impl OrderedCandidateIds {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            ordered: Vec::with_capacity(capacity),
+            seen: HashSet::with_capacity(capacity.saturating_mul(2)),
+        }
+    }
+
+    fn push(&mut self, candidate: i64) {
+        if self.seen.insert(candidate) {
+            self.ordered.push(candidate);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.ordered.len()
+    }
+
+    fn as_slice(&self) -> &[i64] {
+        &self.ordered
+    }
+
+    fn into_vec(self) -> Vec<i64> {
+        self.ordered
+    }
+
+    fn extend_stage(&mut self, stage_candidates: &[i64], limit: usize) {
+        if self.len() >= limit {
+            return;
+        }
+        for candidate in stage_candidates {
+            self.push(*candidate);
+            if self.len() >= limit {
+                return;
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ComputedResolution {
+    update: ResolvedEdgeUpdate,
+    strategy: Option<ResolutionStrategy>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,6 +279,7 @@ struct ResolutionFlags {
     legacy_mode: bool,
     enable_semantic: bool,
     store_candidates: bool,
+    parallel_compute: bool,
 }
 
 impl ResolutionFlags {
@@ -93,6 +290,7 @@ impl ResolutionFlags {
             legacy_mode,
             enable_semantic: env_flag("CODESTORY_RESOLUTION_ENABLE_SEMANTIC", !legacy_mode),
             store_candidates: env_flag("CODESTORY_RESOLUTION_STORE_CANDIDATES", !legacy_mode),
+            parallel_compute: env_flag("CODESTORY_RESOLUTION_PARALLEL_COMPUTE", false),
         }
     }
 }
@@ -171,16 +369,51 @@ impl ResolutionPass {
     ) -> Result<ResolutionStats> {
         let conn = storage.get_connection();
         run_in_immediate_transaction(conn, |conn| {
+            let mut telemetry = ResolutionPhaseTelemetry::default();
+            let scope_started = Instant::now();
+            let scope_context = ScopeCallerContext::prepare(conn, caller_scope_file_ids)?;
+            telemetry.scope_prepare_ms = duration_ms_u64(scope_started.elapsed());
+
+            let counts_started = Instant::now();
             let unresolved_calls_before =
-                Self::count_unresolved_on_conn(conn, EdgeKind::CALL, caller_scope_file_ids)?;
+                Self::count_unresolved_on_conn(conn, EdgeKind::CALL, &scope_context)?;
             let unresolved_imports_before =
-                Self::count_unresolved_on_conn(conn, EdgeKind::IMPORT, caller_scope_file_ids)?;
-            let resolved_calls = self.resolve_calls_on_conn(conn, caller_scope_file_ids)?;
-            let resolved_imports = self.resolve_imports_on_conn(conn, caller_scope_file_ids)?;
+                Self::count_unresolved_on_conn(conn, EdgeKind::IMPORT, &scope_context)?;
+            telemetry.unresolved_count_start_ms = duration_ms_u64(counts_started.elapsed());
+
+            if unresolved_calls_before == 0 && unresolved_imports_before == 0 {
+                return Ok(ResolutionStats {
+                    unresolved_calls_before,
+                    resolved_calls: 0,
+                    unresolved_calls: unresolved_calls_before,
+                    unresolved_imports_before,
+                    resolved_imports: 0,
+                    unresolved_imports: unresolved_imports_before,
+                    telemetry,
+                    strategy_counters: ResolutionStrategyCounters::default(),
+                });
+            }
+
+            let mut strategy_counters = ResolutionStrategyCounters::default();
+            let resolved_calls = self.resolve_calls_on_conn(
+                conn,
+                &scope_context,
+                &mut telemetry,
+                &mut strategy_counters,
+            )?;
+            let resolved_imports = self.resolve_imports_on_conn(
+                conn,
+                &scope_context,
+                &mut telemetry,
+                &mut strategy_counters,
+            )?;
+
+            let counts_finished = Instant::now();
             let unresolved_calls =
-                Self::count_unresolved_on_conn(conn, EdgeKind::CALL, caller_scope_file_ids)?;
+                Self::count_unresolved_on_conn(conn, EdgeKind::CALL, &scope_context)?;
             let unresolved_imports =
-                Self::count_unresolved_on_conn(conn, EdgeKind::IMPORT, caller_scope_file_ids)?;
+                Self::count_unresolved_on_conn(conn, EdgeKind::IMPORT, &scope_context)?;
+            telemetry.unresolved_count_end_ms = duration_ms_u64(counts_finished.elapsed());
 
             Ok(ResolutionStats {
                 unresolved_calls_before,
@@ -189,6 +422,8 @@ impl ResolutionPass {
                 unresolved_imports_before,
                 resolved_imports,
                 unresolved_imports,
+                telemetry,
+                strategy_counters,
             })
         })
     }
@@ -202,46 +437,32 @@ impl ResolutionPass {
         storage: &Storage,
         caller_scope_file_ids: Option<&HashSet<i64>>,
     ) -> Result<(usize, usize)> {
+        let conn = storage.get_connection();
+        let scope_context = ScopeCallerContext::prepare(conn, caller_scope_file_ids)?;
         Ok((
-            self.count_unresolved(storage, EdgeKind::CALL, caller_scope_file_ids)?,
-            self.count_unresolved(storage, EdgeKind::IMPORT, caller_scope_file_ids)?,
+            Self::count_unresolved_on_conn(conn, EdgeKind::CALL, &scope_context)?,
+            Self::count_unresolved_on_conn(conn, EdgeKind::IMPORT, &scope_context)?,
         ))
-    }
-
-    fn count_unresolved(
-        &self,
-        storage: &Storage,
-        kind: EdgeKind,
-        caller_scope_file_ids: Option<&HashSet<i64>>,
-    ) -> Result<usize> {
-        Self::count_unresolved_on_conn(storage.get_connection(), kind, caller_scope_file_ids)
     }
 
     fn count_unresolved_on_conn(
         conn: &rusqlite::Connection,
         kind: EdgeKind,
-        caller_scope_file_ids: Option<&HashSet<i64>>,
+        scope_context: &ScopeCallerContext,
     ) -> Result<usize> {
-        let scope_file_ids = sorted_scope_file_ids(caller_scope_file_ids);
-        if matches!(scope_file_ids.as_ref(), Some(ids) if ids.is_empty()) {
+        if scope_context.is_empty() {
             return Ok(0);
         }
 
         let mut query = String::from("SELECT COUNT(*) FROM edge e");
-        if scope_file_ids.is_some() {
-            query.push_str(" JOIN node caller ON caller.id = e.source_node_id");
+        if scope_context.is_scoped() {
+            query.push_str(&format!(
+                " JOIN {SCOPED_CALLER_TABLE} scoped ON scoped.caller_id = e.source_node_id"
+            ));
         }
         query.push_str(" WHERE e.kind = ?1 AND e.resolved_target_node_id IS NULL");
 
-        let count: i64 = if let Some(scope_ids) = scope_file_ids.as_ref() {
-            query.push_str(" AND caller.file_node_id IN (");
-            query.push_str(&numbered_placeholders(2, scope_ids.len()));
-            query.push(')');
-            let params = kind_scope_params(kind, scope_ids);
-            conn.query_row(&query, params_from_iter(params.iter()), |row| row.get(0))?
-        } else {
-            conn.query_row(&query, params![kind as i32], |row| row.get(0))?
-        };
+        let count: i64 = conn.query_row(&query, params![kind as i32], |row| row.get(0))?;
         Ok(count as usize)
     }
 
@@ -254,25 +475,51 @@ impl ResolutionPass {
         storage: &mut Storage,
         caller_scope_file_ids: Option<&HashSet<i64>>,
     ) -> Result<usize> {
-        self.resolve_calls_on_conn(storage.get_connection(), caller_scope_file_ids)
+        let conn = storage.get_connection();
+        let scope_context = ScopeCallerContext::prepare(conn, caller_scope_file_ids)?;
+        let mut telemetry = ResolutionPhaseTelemetry::default();
+        let mut strategy_counters = ResolutionStrategyCounters::default();
+        self.resolve_calls_on_conn(conn, &scope_context, &mut telemetry, &mut strategy_counters)
     }
 
     fn resolve_calls_on_conn(
         &self,
         conn: &rusqlite::Connection,
-        caller_scope_file_ids: Option<&HashSet<i64>>,
+        scope_context: &ScopeCallerContext,
+        telemetry: &mut ResolutionPhaseTelemetry,
+        strategy_counters: &mut ResolutionStrategyCounters,
     ) -> Result<usize> {
+        if scope_context.is_empty() {
+            return Ok(0);
+        }
+
+        let prepare_started = Instant::now();
         conn.execute(
             "UPDATE edge SET resolved_source_node_id = source_node_id
              WHERE kind = ?1 AND resolved_source_node_id IS NULL",
             params![EdgeKind::CALL as i32],
         )?;
+        telemetry.call_prepare_ms = telemetry
+            .call_prepare_ms
+            .saturating_add(duration_ms_u64(prepare_started.elapsed()));
 
-        cleanup_stale_call_resolutions(conn, self.flags, self.policy, caller_scope_file_ids)?;
+        let cleanup_started = Instant::now();
+        cleanup_stale_call_resolutions(conn, self.flags, self.policy, scope_context)?;
+        telemetry.call_cleanup_ms = telemetry
+            .call_cleanup_ms
+            .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
 
-        let rows = unresolved_edges(conn, EdgeKind::CALL, caller_scope_file_ids)?;
-        let mut resolved = 0usize;
-        let mut candidate_index = CandidateIndex::load(
+        let rows_started = Instant::now();
+        let rows = unresolved_edges(conn, EdgeKind::CALL, scope_context)?;
+        telemetry.call_unresolved_load_ms = telemetry
+            .call_unresolved_load_ms
+            .saturating_add(duration_ms_u64(rows_started.elapsed()));
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let candidate_started = Instant::now();
+        let candidate_index = CandidateIndex::load(
             conn,
             &[
                 NodeKind::FUNCTION as i32,
@@ -280,104 +527,50 @@ impl ResolutionPass {
                 NodeKind::MACRO as i32,
             ],
         )?;
-        let mut semantic_cache: HashMap<SemanticCacheKey, Vec<SemanticResolutionCandidate>> =
-            HashMap::new();
+        telemetry.call_candidate_index_ms = telemetry
+            .call_candidate_index_ms
+            .saturating_add(duration_ms_u64(candidate_started.elapsed()));
+
+        let semantic_candidates_by_row =
+            self.semantic_candidates_for_rows(conn, &rows, EdgeKind::CALL)?;
+
+        let compute_started = Instant::now();
+        let computed_results: Vec<Result<ComputedResolution>> =
+            if self.flags.parallel_compute && rows.len() > 1 {
+                rows.par_iter()
+                    .zip(semantic_candidates_by_row.par_iter())
+                    .map(|(row, semantic_candidates)| {
+                        self.compute_call_resolution(&candidate_index, row, semantic_candidates)
+                    })
+                    .collect()
+            } else {
+                rows.iter()
+                    .zip(semantic_candidates_by_row.iter())
+                    .map(|(row, semantic_candidates)| {
+                        self.compute_call_resolution(&candidate_index, row, semantic_candidates)
+                    })
+                    .collect()
+            };
+        telemetry.call_compute_ms = telemetry
+            .call_compute_ms
+            .saturating_add(duration_ms_u64(compute_started.elapsed()));
+
+        let mut resolved = 0usize;
         let mut updates = Vec::with_capacity(rows.len());
-
-        for (
-            edge_id,
-            file_id,
-            caller_qualified,
-            target_name,
-            caller_file_path,
-            callsite_identity,
-        ) in rows
-        {
-            let mut selected: Option<(i64, f32)> = None;
-            let mut semantic_fallback: Option<(i64, f32)> = None;
-            let mut candidate_ids: Vec<i64> = Vec::new();
-            let is_common_unqualified = is_common_unqualified_call_name(&target_name);
-
-            if self.flags.enable_semantic {
-                let semantic_candidates = self.semantic_candidates_for_edge(
-                    conn,
-                    &mut semantic_cache,
-                    EdgeKind::CALL,
-                    file_id,
-                    caller_file_path.as_deref(),
-                    caller_qualified.as_deref(),
-                    &target_name,
-                )?;
-                for candidate in semantic_candidates {
-                    record_candidate(&mut candidate_ids, candidate.target_node_id);
-                    consider_selected(
-                        &mut semantic_fallback,
-                        candidate.target_node_id,
-                        candidate.confidence,
-                    );
-                }
-            }
-
-            if selected.is_none()
-                && !is_common_unqualified
-                && let Some(candidate) = candidate_index.find_same_file(file_id, &target_name)
-            {
-                record_candidate(&mut candidate_ids, candidate);
-                selected = Some((candidate, self.policy.call_same_file));
-            }
-
-            if selected.is_none()
-                && let Some(prefix) = caller_qualified.as_deref().and_then(module_prefix)
-                && let Some(candidate) =
-                    candidate_index.find_same_module(&prefix.0, prefix.1, &target_name)
-            {
-                record_candidate(&mut candidate_ids, candidate);
-                selected = Some((candidate, self.policy.call_same_module));
-            }
-
-            if selected.is_none()
-                && !is_common_unqualified
-                && let Some(candidate) = candidate_index.find_global_unique(&target_name)
-            {
-                record_candidate(&mut candidate_ids, candidate);
-                selected = Some((candidate, self.policy.call_global_unique));
-            }
-
-            if self.flags.store_candidates && selected.is_none() {
-                let names = vec![target_name.clone()];
-                collect_candidate_pool_from_index(
-                    &mut candidate_index,
-                    &names,
-                    &mut candidate_ids,
-                    6,
-                );
-            }
-
-            if selected.is_none() {
-                selected = semantic_fallback;
-            }
-
-            if let Some((_, confidence)) = selected
-                && !should_keep_common_call_resolution(
-                    &target_name,
-                    confidence,
-                    callsite_identity.as_deref(),
-                )
-            {
-                selected = None;
-            }
-
-            updates.push(build_resolved_edge_update(
-                edge_id,
-                selected,
-                &candidate_ids,
-            )?);
-            if selected.is_some() {
+        for computed in computed_results {
+            let computed = computed?;
+            if computed.strategy.is_some() {
                 resolved += 1;
             }
+            strategy_counters.record(computed.strategy);
+            updates.push(computed.update);
         }
 
+        let apply_started = Instant::now();
         apply_resolution_updates(conn, &updates)?;
+        telemetry.call_apply_ms = telemetry
+            .call_apply_ms
+            .saturating_add(duration_ms_u64(apply_started.elapsed()));
         Ok(resolved)
     }
 
@@ -390,23 +583,45 @@ impl ResolutionPass {
         storage: &mut Storage,
         caller_scope_file_ids: Option<&HashSet<i64>>,
     ) -> Result<usize> {
-        self.resolve_imports_on_conn(storage.get_connection(), caller_scope_file_ids)
+        let conn = storage.get_connection();
+        let scope_context = ScopeCallerContext::prepare(conn, caller_scope_file_ids)?;
+        let mut telemetry = ResolutionPhaseTelemetry::default();
+        let mut strategy_counters = ResolutionStrategyCounters::default();
+        self.resolve_imports_on_conn(conn, &scope_context, &mut telemetry, &mut strategy_counters)
     }
 
     fn resolve_imports_on_conn(
         &self,
         conn: &rusqlite::Connection,
-        caller_scope_file_ids: Option<&HashSet<i64>>,
+        scope_context: &ScopeCallerContext,
+        telemetry: &mut ResolutionPhaseTelemetry,
+        strategy_counters: &mut ResolutionStrategyCounters,
     ) -> Result<usize> {
+        if scope_context.is_empty() {
+            return Ok(0);
+        }
+
+        let prepare_started = Instant::now();
         conn.execute(
             "UPDATE edge SET resolved_source_node_id = source_node_id
              WHERE kind = ?1 AND resolved_source_node_id IS NULL",
             params![EdgeKind::IMPORT as i32],
         )?;
+        telemetry.import_prepare_ms = telemetry
+            .import_prepare_ms
+            .saturating_add(duration_ms_u64(prepare_started.elapsed()));
 
-        let rows = unresolved_edges(conn, EdgeKind::IMPORT, caller_scope_file_ids)?;
-        let mut resolved = 0usize;
-        let mut candidate_index = CandidateIndex::load(
+        let rows_started = Instant::now();
+        let rows = unresolved_edges(conn, EdgeKind::IMPORT, scope_context)?;
+        telemetry.import_unresolved_load_ms = telemetry
+            .import_unresolved_load_ms
+            .saturating_add(duration_ms_u64(rows_started.elapsed()));
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let candidate_started = Instant::now();
+        let candidate_index = CandidateIndex::load(
             conn,
             &[
                 NodeKind::MODULE as i32,
@@ -414,113 +629,325 @@ impl ResolutionPass {
                 NodeKind::PACKAGE as i32,
             ],
         )?;
-        let mut semantic_cache: HashMap<SemanticCacheKey, Vec<SemanticResolutionCandidate>> =
-            HashMap::new();
+        telemetry.import_candidate_index_ms = telemetry
+            .import_candidate_index_ms
+            .saturating_add(duration_ms_u64(candidate_started.elapsed()));
+
+        let semantic_candidates_by_row =
+            self.semantic_candidates_for_rows(conn, &rows, EdgeKind::IMPORT)?;
+
+        let compute_started = Instant::now();
+        let computed_results: Vec<Result<ComputedResolution>> =
+            if self.flags.parallel_compute && rows.len() > 1 {
+                rows.par_iter()
+                    .zip(semantic_candidates_by_row.par_iter())
+                    .map(|(row, semantic_candidates)| {
+                        self.compute_import_resolution(&candidate_index, row, semantic_candidates)
+                    })
+                    .collect()
+            } else {
+                rows.iter()
+                    .zip(semantic_candidates_by_row.iter())
+                    .map(|(row, semantic_candidates)| {
+                        self.compute_import_resolution(&candidate_index, row, semantic_candidates)
+                    })
+                    .collect()
+            };
+        telemetry.import_compute_ms = telemetry
+            .import_compute_ms
+            .saturating_add(duration_ms_u64(compute_started.elapsed()));
+
+        let mut resolved = 0usize;
         let mut updates = Vec::with_capacity(rows.len());
-
-        for (edge_id, file_id, caller_qualified, target_name, caller_file_path, _) in rows {
-            let mut selected: Option<(i64, f32)> = None;
-            let mut semantic_fallback: Option<(i64, f32)> = None;
-            let mut candidate_ids: Vec<i64> = Vec::new();
-            let names = import_name_candidates(&target_name, self.flags.legacy_mode);
-            let caller_prefix = caller_qualified.as_deref().and_then(module_prefix);
-
-            if self.flags.enable_semantic {
-                let semantic_candidates = self.semantic_candidates_for_edge(
-                    conn,
-                    &mut semantic_cache,
-                    EdgeKind::IMPORT,
-                    file_id,
-                    caller_file_path.as_deref(),
-                    caller_qualified.as_deref(),
-                    &target_name,
-                )?;
-                for candidate in semantic_candidates {
-                    record_candidate(&mut candidate_ids, candidate.target_node_id);
-                    consider_selected(
-                        &mut semantic_fallback,
-                        candidate.target_node_id,
-                        candidate.confidence,
-                    );
-                }
-            }
-
-            if self.flags.legacy_mode {
-                for name in &names {
-                    if selected.is_some() {
-                        break;
-                    }
-                    if let Some(candidate) = candidate_index.find_same_file(file_id, name) {
-                        record_candidate(&mut candidate_ids, candidate);
-                        selected = Some((candidate, self.policy.import_same_file));
-                    }
-                }
-            }
-
-            for name in &names {
-                if selected.is_some() {
-                    break;
-                }
-                if let Some(prefix) = caller_prefix.as_ref()
-                    && let Some(candidate) =
-                        candidate_index.find_same_module(&prefix.0, prefix.1, name)
-                {
-                    record_candidate(&mut candidate_ids, candidate);
-                    if !candidate_index.is_same_file_candidate(candidate, file_id) {
-                        selected = Some((candidate, self.policy.import_same_module));
-                    }
-                }
-            }
-
-            for name in &names {
-                if selected.is_some() {
-                    break;
-                }
-                if let Some(candidate) = candidate_index.find_global_unique(name) {
-                    record_candidate(&mut candidate_ids, candidate);
-                    if !candidate_index.is_same_file_candidate(candidate, file_id) {
-                        selected = Some((candidate, self.policy.import_global_unique));
-                    }
-                }
-            }
-
-            if selected.is_none() && !self.flags.legacy_mode {
-                for name in &names {
-                    if let Some(candidate) = candidate_index.find_fuzzy(name) {
-                        record_candidate(&mut candidate_ids, candidate);
-                        if !candidate_index.is_same_file_candidate(candidate, file_id) {
-                            selected = Some((candidate, self.policy.import_fuzzy));
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if self.flags.store_candidates {
-                collect_candidate_pool_from_index(
-                    &mut candidate_index,
-                    &names,
-                    &mut candidate_ids,
-                    8,
-                );
-            }
-
-            if selected.is_none() {
-                selected = semantic_fallback;
-            }
-
-            updates.push(build_resolved_edge_update(
-                edge_id,
-                selected,
-                &candidate_ids,
-            )?);
-            if selected.is_some() {
+        for computed in computed_results {
+            let computed = computed?;
+            if computed.strategy.is_some() {
                 resolved += 1;
+            }
+            strategy_counters.record(computed.strategy);
+            updates.push(computed.update);
+        }
+
+        let apply_started = Instant::now();
+        apply_resolution_updates(conn, &updates)?;
+        telemetry.import_apply_ms = telemetry
+            .import_apply_ms
+            .saturating_add(duration_ms_u64(apply_started.elapsed()));
+        Ok(resolved)
+    }
+
+    fn semantic_candidates_for_rows(
+        &self,
+        conn: &rusqlite::Connection,
+        rows: &[UnresolvedEdgeRow],
+        edge_kind: EdgeKind,
+    ) -> Result<Vec<Vec<SemanticResolutionCandidate>>> {
+        if !self.flags.enable_semantic {
+            return Ok(vec![Vec::new(); rows.len()]);
+        }
+
+        let mut cache: HashMap<SemanticCacheKey, Vec<SemanticResolutionCandidate>> =
+            HashMap::new();
+        let mut out = Vec::with_capacity(rows.len());
+        for (_, file_id, caller_qualified, target_name, caller_file_path, _) in rows {
+            out.push(self.semantic_candidates_for_edge(
+                conn,
+                &mut cache,
+                edge_kind,
+                *file_id,
+                caller_file_path.as_deref(),
+                caller_qualified.as_deref(),
+                target_name,
+            )?);
+        }
+        Ok(out)
+    }
+
+    fn compute_call_resolution(
+        &self,
+        candidate_index: &CandidateIndex,
+        row: &UnresolvedEdgeRow,
+        semantic_candidates: &[SemanticResolutionCandidate],
+    ) -> Result<ComputedResolution> {
+        let (edge_id, file_id, caller_qualified, target_name, _, callsite_identity) = row;
+        let prepared_name = PreparedName::new(target_name.clone());
+        let is_common_unqualified = is_common_unqualified_call_name(&prepared_name.original);
+        let mut selected: Option<(i64, f32, ResolutionStrategy)> = None;
+        let mut semantic_fallback: Option<(i64, f32)> = None;
+        let mut candidate_ids = OrderedCandidateIds::with_capacity(8);
+
+        for candidate in semantic_candidates {
+            candidate_ids.push(candidate.target_node_id);
+            consider_selected(
+                &mut semantic_fallback,
+                candidate.target_node_id,
+                candidate.confidence,
+            );
+        }
+
+        if selected.is_none()
+            && !is_common_unqualified
+            && let Some(candidate) = candidate_index.find_same_file_readonly(
+                *file_id,
+                &prepared_name.original,
+                &prepared_name.ascii_lower,
+            )
+        {
+            candidate_ids.push(candidate);
+            selected = Some((
+                candidate,
+                self.policy.call_same_file,
+                ResolutionStrategy::CallSameFile,
+            ));
+        }
+
+        if selected.is_none()
+            && let Some(prefix) = caller_qualified.as_deref().and_then(module_prefix)
+            && let Some(candidate) = candidate_index.find_same_module_readonly(
+                &prefix.0,
+                prefix.1,
+                &prepared_name.original,
+                &prepared_name.ascii_lower,
+            )
+        {
+            candidate_ids.push(candidate);
+            selected = Some((
+                candidate,
+                self.policy.call_same_module,
+                ResolutionStrategy::CallSameModule,
+            ));
+        }
+
+        if selected.is_none()
+            && !is_common_unqualified
+            && let Some(candidate) = candidate_index.find_global_unique_readonly(
+                &prepared_name.original,
+                &prepared_name.ascii_lower,
+            )
+        {
+            candidate_ids.push(candidate);
+            selected = Some((
+                candidate,
+                self.policy.call_global_unique,
+                ResolutionStrategy::CallGlobalUnique,
+            ));
+        }
+
+        if self.flags.store_candidates && selected.is_none() {
+            collect_candidate_pool_from_index(
+                candidate_index,
+                std::slice::from_ref(&prepared_name),
+                &mut candidate_ids,
+                6,
+            );
+        }
+
+        if selected.is_none()
+            && let Some((candidate, confidence)) = semantic_fallback
+        {
+            selected = Some((
+                candidate,
+                confidence,
+                ResolutionStrategy::CallSemanticFallback,
+            ));
+        }
+
+        if let Some((_, confidence, _)) = selected
+            && !should_keep_common_call_resolution(
+                &prepared_name.original,
+                confidence,
+                callsite_identity.as_deref(),
+            )
+        {
+            selected = None;
+        }
+
+        let strategy = selected.map(|(_, _, strategy)| strategy);
+        let selected_pair = selected.map(|(candidate, confidence, _)| (candidate, confidence));
+        let update = build_resolved_edge_update(*edge_id, selected_pair, candidate_ids.as_slice())?;
+        Ok(ComputedResolution { update, strategy })
+    }
+
+    fn compute_import_resolution(
+        &self,
+        candidate_index: &CandidateIndex,
+        row: &UnresolvedEdgeRow,
+        semantic_candidates: &[SemanticResolutionCandidate],
+    ) -> Result<ComputedResolution> {
+        let (edge_id, file_id, caller_qualified, target_name, _, _) = row;
+        let caller_prefix = caller_qualified.as_deref().and_then(module_prefix);
+        let name_candidates = import_name_candidates(target_name, self.flags.legacy_mode)
+            .into_iter()
+            .map(PreparedName::new)
+            .collect::<Vec<_>>();
+
+        let mut semantic_fallback: Option<(i64, f32)> = None;
+        let mut candidate_ids = OrderedCandidateIds::with_capacity(10);
+        for candidate in semantic_candidates {
+            candidate_ids.push(candidate.target_node_id);
+            consider_selected(
+                &mut semantic_fallback,
+                candidate.target_node_id,
+                candidate.confidence,
+            );
+        }
+
+        let mut same_file_stage = OrderedCandidateIds::default();
+        let mut same_module_stage = OrderedCandidateIds::default();
+        let mut global_stage = OrderedCandidateIds::default();
+        let mut fuzzy_stage = OrderedCandidateIds::default();
+
+        let mut same_file_selected: Option<i64> = None;
+        let mut same_module_selected: Option<i64> = None;
+        let mut global_selected: Option<i64> = None;
+        let mut fuzzy_selected: Option<i64> = None;
+
+        for name in &name_candidates {
+            if self.flags.legacy_mode && same_file_selected.is_none() {
+                if let Some(candidate) = candidate_index.find_same_file_readonly(
+                    *file_id,
+                    &name.original,
+                    &name.ascii_lower,
+                ) {
+                    same_file_stage.push(candidate);
+                    same_file_selected = Some(candidate);
+                    break;
+                }
+            }
+
+            if same_module_selected.is_none()
+                && let Some(prefix) = caller_prefix.as_ref()
+                && let Some(candidate) = candidate_index.find_same_module_readonly(
+                    &prefix.0,
+                    prefix.1,
+                    &name.original,
+                    &name.ascii_lower,
+                )
+            {
+                same_module_stage.push(candidate);
+                if !candidate_index.is_same_file_candidate(candidate, *file_id) {
+                    same_module_selected = Some(candidate);
+                }
+            }
+
+            if global_selected.is_none()
+                && let Some(candidate) = candidate_index
+                    .find_global_unique_readonly(&name.original, &name.ascii_lower)
+            {
+                global_stage.push(candidate);
+                if !candidate_index.is_same_file_candidate(candidate, *file_id) {
+                    global_selected = Some(candidate);
+                }
+            }
+
+            if !self.flags.legacy_mode
+                && fuzzy_selected.is_none()
+                && let Some(candidate) =
+                    candidate_index.find_fuzzy_readonly(&name.original, &name.ascii_lower)
+            {
+                fuzzy_stage.push(candidate);
+                if !candidate_index.is_same_file_candidate(candidate, *file_id) {
+                    fuzzy_selected = Some(candidate);
+                }
             }
         }
 
-        apply_resolution_updates(conn, &updates)?;
-        Ok(resolved)
+        if self.flags.legacy_mode && same_file_selected.is_some() {
+            candidate_ids.extend_stage(&same_file_stage.into_vec(), usize::MAX);
+        } else {
+            candidate_ids.extend_stage(&same_module_stage.into_vec(), usize::MAX);
+            if same_module_selected.is_none() {
+                candidate_ids.extend_stage(&global_stage.into_vec(), usize::MAX);
+                if global_selected.is_none() && !self.flags.legacy_mode {
+                    candidate_ids.extend_stage(&fuzzy_stage.into_vec(), usize::MAX);
+                }
+            }
+        }
+
+        if self.flags.store_candidates {
+            collect_candidate_pool_from_index(candidate_index, &name_candidates, &mut candidate_ids, 8);
+        }
+
+        let mut selected: Option<(i64, f32, ResolutionStrategy)> = if let Some(candidate) =
+            same_file_selected
+        {
+            Some((
+                candidate,
+                self.policy.import_same_file,
+                ResolutionStrategy::ImportSameFile,
+            ))
+        } else if let Some(candidate) = same_module_selected {
+            Some((
+                candidate,
+                self.policy.import_same_module,
+                ResolutionStrategy::ImportSameModule,
+            ))
+        } else if let Some(candidate) = global_selected {
+            Some((
+                candidate,
+                self.policy.import_global_unique,
+                ResolutionStrategy::ImportGlobalUnique,
+            ))
+        } else if let Some(candidate) = fuzzy_selected {
+            Some((candidate, self.policy.import_fuzzy, ResolutionStrategy::ImportFuzzy))
+        } else {
+            None
+        };
+
+        if selected.is_none()
+            && let Some((candidate, confidence)) = semantic_fallback
+        {
+            selected = Some((
+                candidate,
+                confidence,
+                ResolutionStrategy::ImportSemanticFallback,
+            ));
+        }
+
+        let strategy = selected.map(|(_, _, strategy)| strategy);
+        let selected_pair = selected.map(|(candidate, confidence, _)| (candidate, confidence));
+        let update = build_resolved_edge_update(*edge_id, selected_pair, candidate_ids.as_slice())?;
+        Ok(ComputedResolution { update, strategy })
     }
     #[warn(clippy::too_many_arguments)]
     fn semantic_candidates_for_edge(
@@ -634,17 +1061,17 @@ fn apply_resolution_updates(
 }
 
 fn collect_candidate_pool_from_index(
-    index: &mut CandidateIndex,
-    names: &[String],
-    out: &mut Vec<i64>,
+    index: &CandidateIndex,
+    names: &[PreparedName],
+    out: &mut OrderedCandidateIds,
     limit: usize,
 ) {
     if out.len() >= limit {
         return;
     }
     for name in names {
-        for id in index.top_matches(name, 3) {
-            record_candidate(out, id);
+        for id in index.top_matches_readonly(&name.original, &name.ascii_lower, 3) {
+            out.push(id);
             if out.len() >= limit {
                 return;
             }
@@ -666,9 +1093,10 @@ impl CandidateIndex {
     fn load(conn: &rusqlite::Connection, kinds: &[i32]) -> Result<Self> {
         let kind_clause = kind_clause(kinds);
         let query = format!(
-            "SELECT id, file_node_id, serialized_name, qualified_name, start_line
+            "SELECT id, file_node_id, serialized_name, qualified_name
              FROM node
-             WHERE kind IN ({})",
+             WHERE kind IN ({})
+             ORDER BY COALESCE(start_line, -9223372036854775808), id",
             kind_clause
         );
         let mut stmt = conn.prepare(&query)?;
@@ -680,7 +1108,6 @@ impl CandidateIndex {
                 serialized_name_ascii_lower: serialized_name.to_ascii_lowercase(),
                 serialized_name,
                 qualified_name: row.get(3)?,
-                start_line: row.get(4)?,
             })
         })?;
 
@@ -688,9 +1115,6 @@ impl CandidateIndex {
         for row in rows {
             index.nodes.push(row?);
         }
-        index
-            .nodes
-            .sort_by_key(|node| (node.start_line.unwrap_or(i64::MIN), node.id));
 
         for (offset, node) in index.nodes.iter().enumerate() {
             index.node_offset_by_id.insert(node.id, offset);
@@ -710,111 +1134,169 @@ impl CandidateIndex {
         Ok(index)
     }
 
+    #[cfg(test)]
     fn find_same_file(&mut self, file_id: Option<i64>, name: &str) -> Option<i64> {
+        let name_ascii_lower = name.to_ascii_lowercase();
+        self.find_same_file_prepared(file_id, name, &name_ascii_lower)
+    }
+
+    #[cfg(test)]
+    fn find_same_file_prepared(
+        &mut self,
+        file_id: Option<i64>,
+        name: &str,
+        name_ascii_lower: &str,
+    ) -> Option<i64> {
         let file_id = file_id?;
         let key = (file_id, name.to_string());
         if let Some(cached) = self.same_file_cache.get(&key) {
             return *cached;
         }
-        let suffix_key = name.to_ascii_lowercase();
-        let resolved = self
-            .first_in_file(self.exact_map.get(name), file_id)
-            .or_else(|| self.first_in_file(self.suffix_map_ascii_lower.get(&suffix_key), file_id));
+        let resolved = self.find_same_file_readonly(Some(file_id), name, name_ascii_lower);
         self.same_file_cache.insert(key, resolved);
         resolved
     }
 
+    fn find_same_file_readonly(
+        &self,
+        file_id: Option<i64>,
+        name: &str,
+        name_ascii_lower: &str,
+    ) -> Option<i64> {
+        let file_id = file_id?;
+        self.first_in_file(self.exact_map.get(name), file_id)
+            .or_else(|| self.first_in_file(self.suffix_map_ascii_lower.get(name_ascii_lower), file_id))
+    }
+
+    #[cfg(test)]
     fn find_same_module(
         &mut self,
         module_prefix: &str,
         delimiter: &str,
         name: &str,
     ) -> Option<i64> {
+        let name_ascii_lower = name.to_ascii_lowercase();
+        self.find_same_module_prepared(module_prefix, delimiter, name, &name_ascii_lower)
+    }
+
+    #[cfg(test)]
+    fn find_same_module_prepared(
+        &mut self,
+        module_prefix: &str,
+        delimiter: &str,
+        name: &str,
+        name_ascii_lower: &str,
+    ) -> Option<i64> {
         let qualified_prefix = format!("{module_prefix}{delimiter}");
         let key = (qualified_prefix.clone(), name.to_string());
         if let Some(cached) = self.same_module_cache.get(&key) {
             return *cached;
         }
-        let suffix_key = name.to_ascii_lowercase();
-        let resolved = self
-            .first_in_module(self.exact_map.get(name), &qualified_prefix)
-            .or_else(|| {
-                self.first_in_module(
-                    self.suffix_map_ascii_lower.get(&suffix_key),
-                    &qualified_prefix,
-                )
-            });
+        let resolved = self.find_same_module_readonly(
+            module_prefix,
+            delimiter,
+            name,
+            name_ascii_lower,
+        );
         self.same_module_cache.insert(key, resolved);
         resolved
     }
 
+    fn find_same_module_readonly(
+        &self,
+        module_prefix: &str,
+        delimiter: &str,
+        name: &str,
+        name_ascii_lower: &str,
+    ) -> Option<i64> {
+        let qualified_prefix = format!("{module_prefix}{delimiter}");
+        self.first_in_module(self.exact_map.get(name), &qualified_prefix)
+            .or_else(|| {
+                self.first_in_module(
+                    self.suffix_map_ascii_lower.get(name_ascii_lower),
+                    &qualified_prefix,
+                )
+            })
+    }
+
+    #[cfg(test)]
     fn find_global_unique(&mut self, name: &str) -> Option<i64> {
+        let name_ascii_lower = name.to_ascii_lowercase();
+        self.find_global_unique_prepared(name, &name_ascii_lower)
+    }
+
+    #[cfg(test)]
+    fn find_global_unique_prepared(&mut self, name: &str, name_ascii_lower: &str) -> Option<i64> {
         if let Some(cached) = self.global_unique_cache.get(name) {
             return *cached;
         }
-        let suffix_key = name.to_ascii_lowercase();
-        let resolved = if let Some(exact) = self.exact_map.get(name) {
-            if exact.len() == 1 {
-                Some(self.nodes[exact[0]].id)
-            } else {
-                None
-            }
-        } else if let Some(suffix) = self.suffix_map_ascii_lower.get(&suffix_key) {
-            if suffix.len() == 1 {
-                Some(self.nodes[suffix[0]].id)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let resolved = self.find_global_unique_readonly(name, name_ascii_lower);
         self.global_unique_cache.insert(name.to_string(), resolved);
         resolved
     }
 
+    fn find_global_unique_readonly(&self, name: &str, name_ascii_lower: &str) -> Option<i64> {
+        if let Some(exact) = self.exact_map.get(name) {
+            if exact.len() == 1 {
+                return Some(self.nodes[exact[0]].id);
+            }
+            return None;
+        }
+        if let Some(suffix) = self.suffix_map_ascii_lower.get(name_ascii_lower) {
+            if suffix.len() == 1 {
+                return Some(self.nodes[suffix[0]].id);
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
     fn find_fuzzy(&mut self, name: &str) -> Option<i64> {
+        let name_ascii_lower = name.to_ascii_lowercase();
+        if let Some(cached) = self.fuzzy_cache_ascii_lower.get(&name_ascii_lower) {
+            return *cached;
+        }
+        let resolved = self.find_fuzzy_readonly(name, &name_ascii_lower);
+        self.fuzzy_cache_ascii_lower
+            .insert(name_ascii_lower, resolved);
+        resolved
+    }
+
+    fn find_fuzzy_readonly(&self, name: &str, name_ascii_lower: &str) -> Option<i64> {
         if let Some(exact) = self.exact_map.get(name)
             && let Some(&idx) = exact.first()
         {
             return Some(self.nodes[idx].id);
         }
 
-        let suffix_key = name.to_ascii_lowercase();
-        if let Some(suffix) = self.suffix_map_ascii_lower.get(&suffix_key)
+        if let Some(suffix) = self.suffix_map_ascii_lower.get(name_ascii_lower)
             && let Some(&idx) = suffix.first()
         {
             return Some(self.nodes[idx].id);
         }
 
-        if let Some(cached) = self.fuzzy_cache_ascii_lower.get(&suffix_key) {
-            return *cached;
-        }
-
-        let resolved = self
-            .nodes
+        self.nodes
             .iter()
-            .find(|node| node.serialized_name_ascii_lower.contains(&suffix_key))
-            .map(|node| node.id);
-        self.fuzzy_cache_ascii_lower.insert(suffix_key, resolved);
-        resolved
+            .find(|node| node.serialized_name_ascii_lower.contains(name_ascii_lower))
+            .map(|node| node.id)
     }
 
-    fn top_matches(&mut self, name: &str, limit: usize) -> Vec<i64> {
-        if let Some(cached) = self.top_match_cache.get(name) {
-            return cached.iter().take(limit).copied().collect();
-        }
+    fn top_matches_readonly(&self, name: &str, name_ascii_lower: &str, limit: usize) -> Vec<i64> {
         let mut out = Vec::with_capacity(limit);
+        let mut seen = HashSet::with_capacity(limit.saturating_mul(2));
         if let Some(exact) = self.exact_map.get(name) {
             for &idx in exact.iter().take(limit) {
-                out.push(self.nodes[idx].id);
+                let candidate = self.nodes[idx].id;
+                if seen.insert(candidate) {
+                    out.push(candidate);
+                }
             }
         }
         if out.len() < limit {
-            let suffix_key = name.to_ascii_lowercase();
-            if let Some(suffix) = self.suffix_map_ascii_lower.get(&suffix_key) {
+            if let Some(suffix) = self.suffix_map_ascii_lower.get(name_ascii_lower) {
                 for &idx in suffix {
                     let candidate = self.nodes[idx].id;
-                    if !out.contains(&candidate) {
+                    if seen.insert(candidate) {
                         out.push(candidate);
                     }
                     if out.len() >= limit {
@@ -823,7 +1305,6 @@ impl CandidateIndex {
                 }
             }
         }
-        self.top_match_cache.insert(name.to_string(), out.clone());
         out
     }
 
@@ -882,30 +1363,25 @@ fn cleanup_stale_call_resolutions(
     conn: &rusqlite::Connection,
     flags: ResolutionFlags,
     policy: ResolutionPolicy,
-    caller_scope_file_ids: Option<&HashSet<i64>>,
+    scope_context: &ScopeCallerContext,
 ) -> Result<()> {
+    if scope_context.is_empty() {
+        return Ok(());
+    }
+
     let cutoff = policy.min_call_confidence;
-    let scope_file_ids = sorted_scope_file_ids(caller_scope_file_ids);
     let mut low_confidence_query = String::from(
         "UPDATE edge SET resolved_target_node_id = NULL, confidence = NULL, certainty = NULL
          WHERE kind = ?1 AND confidence IS NOT NULL AND confidence < ?2",
     );
-    if let Some(scope_ids) = scope_file_ids.as_ref() {
-        low_confidence_query
-            .push_str(" AND source_node_id IN (SELECT id FROM node WHERE file_node_id IN (");
-        low_confidence_query.push_str(&numbered_placeholders(3, scope_ids.len()));
-        low_confidence_query.push_str("))");
-    }
-    let mut low_confidence_params = vec![
-        Value::Integer(EdgeKind::CALL as i64),
-        Value::Real(cutoff as f64),
-    ];
-    if let Some(scope_ids) = scope_file_ids.as_ref() {
-        low_confidence_params.extend(scope_ids.iter().copied().map(Value::Integer));
+    if scope_context.is_scoped() {
+        low_confidence_query.push_str(&format!(
+            " AND source_node_id IN (SELECT caller_id FROM {SCOPED_CALLER_TABLE})"
+        ));
     }
     conn.execute(
         &low_confidence_query,
-        params_from_iter(low_confidence_params.iter()),
+        params![EdgeKind::CALL as i64, cutoff as f64],
     )?;
 
     let common_names = common_unqualified_call_names();
@@ -922,11 +1398,10 @@ fn cleanup_stale_call_resolutions(
              AND target_node_id IN (SELECT id FROM node WHERE serialized_name IN ({}))",
             names_placeholders
         );
-        if let Some(scope_ids) = scope_file_ids.as_ref() {
-            legacy_query
-                .push_str(" AND source_node_id IN (SELECT id FROM node WHERE file_node_id IN (");
-            legacy_query.push_str(&question_placeholders(scope_ids.len()));
-            legacy_query.push_str("))");
+        if scope_context.is_scoped() {
+            legacy_query.push_str(&format!(
+                " AND source_node_id IN (SELECT caller_id FROM {SCOPED_CALLER_TABLE})"
+            ));
         }
         let mut legacy_params = vec![Value::Integer(EdgeKind::CALL as i64)];
         legacy_params.extend(
@@ -934,9 +1409,6 @@ fn cleanup_stale_call_resolutions(
                 .iter()
                 .map(|name| Value::Text((*name).to_string())),
         );
-        if let Some(scope_ids) = scope_file_ids.as_ref() {
-            legacy_params.extend(scope_ids.iter().copied().map(Value::Integer));
-        }
         conn.execute(&legacy_query, params_from_iter(legacy_params.iter()))?;
     } else {
         let mut strict_query = format!(
@@ -947,11 +1419,10 @@ fn cleanup_stale_call_resolutions(
              AND (certainty IS NULL OR certainty != ?)",
             names_placeholders
         );
-        if let Some(scope_ids) = scope_file_ids.as_ref() {
-            strict_query
-                .push_str(" AND source_node_id IN (SELECT id FROM node WHERE file_node_id IN (");
-            strict_query.push_str(&question_placeholders(scope_ids.len()));
-            strict_query.push_str("))");
+        if scope_context.is_scoped() {
+            strict_query.push_str(&format!(
+                " AND source_node_id IN (SELECT caller_id FROM {SCOPED_CALLER_TABLE})"
+            ));
         }
         let mut strict_params = vec![Value::Integer(EdgeKind::CALL as i64)];
         strict_params.extend(
@@ -962,9 +1433,6 @@ fn cleanup_stale_call_resolutions(
         strict_params.push(Value::Text(
             ResolutionCertainty::Certain.as_str().to_string(),
         ));
-        if let Some(scope_ids) = scope_file_ids.as_ref() {
-            strict_params.extend(scope_ids.iter().copied().map(Value::Integer));
-        }
         conn.execute(&strict_query, params_from_iter(strict_params.iter()))?;
     }
 
@@ -974,10 +1442,9 @@ fn cleanup_stale_call_resolutions(
 fn unresolved_edges(
     conn: &rusqlite::Connection,
     kind: EdgeKind,
-    caller_scope_file_ids: Option<&HashSet<i64>>,
+    scope_context: &ScopeCallerContext,
 ) -> Result<Vec<UnresolvedEdgeRow>> {
-    let scope_file_ids = sorted_scope_file_ids(caller_scope_file_ids);
-    if matches!(scope_file_ids.as_ref(), Some(ids) if ids.is_empty()) {
+    if scope_context.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -989,21 +1456,16 @@ fn unresolved_edges(
          LEFT JOIN node file_node ON file_node.id = caller.file_node_id
          WHERE e.kind = ?1 AND e.resolved_target_node_id IS NULL",
     );
-    if let Some(scope_ids) = scope_file_ids.as_ref() {
-        query.push_str(" AND caller.file_node_id IN (");
-        query.push_str(&numbered_placeholders(2, scope_ids.len()));
-        query.push(')');
+    if scope_context.is_scoped() {
+        query.push_str(&format!(
+            " AND e.source_node_id IN (SELECT caller_id FROM {SCOPED_CALLER_TABLE})"
+        ));
     }
+    query.push_str(" ORDER BY e.id");
     let mut stmt = conn.prepare(&query)?;
 
-    let collected = if let Some(scope_ids) = scope_file_ids.as_ref() {
-        let params = kind_scope_params(kind, scope_ids);
-        let rows = stmt.query_map(params_from_iter(params.iter()), map_unresolved_edge_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    } else {
-        let rows = stmt.query_map(params![kind as i32], map_unresolved_edge_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
+    let rows = stmt.query_map(params![kind as i32], map_unresolved_edge_row)?;
+    let collected = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(collected)
 }
 
@@ -1037,13 +1499,6 @@ fn question_placeholders(count: usize) -> String {
     std::iter::repeat_n("?", count)
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn kind_scope_params(kind: EdgeKind, scope_file_ids: &[i64]) -> Vec<Value> {
-    let mut values = Vec::with_capacity(1 + scope_file_ids.len());
-    values.push(Value::Integer(kind as i64));
-    values.extend(scope_file_ids.iter().copied().map(Value::Integer));
-    values
 }
 
 #[cfg(test)]
@@ -1436,6 +1891,7 @@ fn candidate_json(candidates: &[i64]) -> Result<Option<String>> {
     Ok(Some(serde_json::to_string(candidates)?))
 }
 
+#[cfg(test)]
 fn record_candidate(candidates: &mut Vec<i64>, candidate: i64) {
     if !candidates.contains(&candidate) {
         candidates.push(candidate);
@@ -1523,6 +1979,10 @@ fn env_flag(name: &str, default: bool) -> bool {
         ),
         Err(_) => default,
     }
+}
+
+fn duration_ms_u64(duration: std::time::Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
 }
 
 #[cfg(test)]
@@ -1649,17 +2109,20 @@ mod tests {
         )?;
 
         let scope = HashSet::from([100_i64]);
-        let scoped_rows = unresolved_edges(&conn, EdgeKind::CALL, Some(&scope))?;
+        let scoped_context = ScopeCallerContext::prepare(&conn, Some(&scope))?;
+        let unscoped_context = ScopeCallerContext::prepare(&conn, None)?;
+        let scoped_rows = unresolved_edges(&conn, EdgeKind::CALL, &scoped_context)?;
         assert_eq!(scoped_rows.len(), 1);
         assert_eq!(scoped_rows[0].0, 1000_i64);
         assert_eq!(scoped_rows[0].1, Some(100_i64));
 
-        let all_rows = unresolved_edges(&conn, EdgeKind::CALL, None)?;
+        let all_rows = unresolved_edges(&conn, EdgeKind::CALL, &unscoped_context)?;
         assert_eq!(all_rows.len(), 2);
 
         let scoped_count =
-            ResolutionPass::count_unresolved_on_conn(&conn, EdgeKind::CALL, Some(&scope))?;
-        let all_count = ResolutionPass::count_unresolved_on_conn(&conn, EdgeKind::CALL, None)?;
+            ResolutionPass::count_unresolved_on_conn(&conn, EdgeKind::CALL, &scoped_context)?;
+        let all_count =
+            ResolutionPass::count_unresolved_on_conn(&conn, EdgeKind::CALL, &unscoped_context)?;
         assert_eq!(scoped_count, 1);
         assert_eq!(all_count, 2);
         Ok(())
@@ -1955,10 +2418,12 @@ mod tests {
             legacy_mode: false,
             enable_semantic: false,
             store_candidates: false,
+            parallel_compute: false,
         };
         let policy = ResolutionPolicy::for_flags(flags);
         let scope = HashSet::from([100_i64]);
-        cleanup_stale_call_resolutions(&conn, flags, policy, Some(&scope))?;
+        let scope_context = ScopeCallerContext::prepare(&conn, Some(&scope))?;
+        cleanup_stale_call_resolutions(&conn, flags, policy, &scope_context)?;
 
         let scoped_target: Option<i64> = conn.query_row(
             "SELECT resolved_target_node_id FROM edge WHERE id = ?1",

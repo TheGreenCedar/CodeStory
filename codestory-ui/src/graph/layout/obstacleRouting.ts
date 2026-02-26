@@ -21,6 +21,11 @@ type EdgeRouteStyle = {
   verticalOffset: number;
 };
 
+type ChannelRouteContext = {
+  slotByEdgeId: Map<string, number>;
+  slotCount: number;
+};
+
 export type RouteIntersection = {
   obstacleId: string;
   segmentIndex: number;
@@ -39,8 +44,19 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+function compareDeterministicString(left: string, right: string): number {
+  if (left === right) {
+    return 0;
+  }
+  return left < right ? -1 : 1;
+}
+
 function snap(value: number): number {
   return Math.round(value / PARITY_CONSTANTS.rasterStep) * PARITY_CONSTANTS.rasterStep;
+}
+
+function orderValue(value: number | undefined): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : Number.POSITIVE_INFINITY;
 }
 
 function toVirtualPoint(point: RoutePoint, vertical: boolean): RoutePoint {
@@ -314,6 +330,150 @@ function simplify(points: RoutePoint[]): RoutePoint[] {
     simplified.push(point);
   }
   return simplified;
+}
+
+function buildChannelRouteContexts(edges: RoutedEdgeSpec[]): Map<string, ChannelRouteContext> {
+  const edgesByChannel = new Map<string, RoutedEdgeSpec[]>();
+  for (const edge of edges) {
+    if (!edge.channelId || edge.family !== "flow") {
+      continue;
+    }
+    const bucket = edgesByChannel.get(edge.channelId) ?? [];
+    bucket.push(edge);
+    edgesByChannel.set(edge.channelId, bucket);
+  }
+
+  const contexts = new Map<string, ChannelRouteContext>();
+  for (const [channelId, channelEdges] of edgesByChannel) {
+    if (channelEdges.length <= 1) {
+      contexts.set(channelId, {
+        slotByEdgeId: new Map(channelEdges.map((edge) => [edge.id, 0])),
+        slotCount: channelEdges.length,
+      });
+      continue;
+    }
+
+    const sorted = [...channelEdges].sort((left, right) => {
+      const bySourceOrder =
+        orderValue(left.sourceMemberOrder) - orderValue(right.sourceMemberOrder);
+      if (bySourceOrder !== 0) {
+        return bySourceOrder;
+      }
+      const byTargetOrder =
+        orderValue(left.targetMemberOrder) - orderValue(right.targetMemberOrder);
+      if (byTargetOrder !== 0) {
+        return byTargetOrder;
+      }
+      const bySource = compareDeterministicString(left.source, right.source);
+      if (bySource !== 0) {
+        return bySource;
+      }
+      const byTarget = compareDeterministicString(left.target, right.target);
+      if (byTarget !== 0) {
+        return byTarget;
+      }
+      const bySourceHandle = compareDeterministicString(left.sourceHandle, right.sourceHandle);
+      if (bySourceHandle !== 0) {
+        return bySourceHandle;
+      }
+      const byTargetHandle = compareDeterministicString(left.targetHandle, right.targetHandle);
+      if (byTargetHandle !== 0) {
+        return byTargetHandle;
+      }
+      return compareDeterministicString(left.id, right.id);
+    });
+
+    contexts.set(channelId, {
+      slotByEdgeId: new Map(sorted.map((edge, idx) => [edge.id, idx])),
+      slotCount: sorted.length,
+    });
+  }
+
+  return contexts;
+}
+
+function laneOffset(slot: number, slotCount: number): number {
+  if (slotCount <= 1) {
+    return 0;
+  }
+  const centeredSlot = slot - (slotCount - 1) / 2;
+  return clamp(
+    centeredSlot * PARITY_CONSTANTS.routing.channelLaneStep,
+    -PARITY_CONSTANTS.routing.channelLaneMaxOffset,
+    PARITY_CONSTANTS.routing.channelLaneMaxOffset,
+  );
+}
+
+function channelLaneCoord(
+  sourceY: number,
+  targetY: number,
+  slot: number,
+  slotCount: number,
+  sharedTrunkPoints: RoutePoint[] | undefined,
+  vertical: boolean,
+): number {
+  let laneY = snap((sourceY + targetY) / 2 + laneOffset(slot, slotCount));
+  if (!sharedTrunkPoints || sharedTrunkPoints.length < 2) {
+    return laneY;
+  }
+
+  const virtualPoints = sharedTrunkPoints.map((point) => toVirtualPoint(point, vertical));
+  const yValues = virtualPoints.map((point) => point.y);
+  const minY = Math.min(...yValues) + PARITY_CONSTANTS.routing.channelTrunkInset;
+  const maxY = Math.max(...yValues) - PARITY_CONSTANTS.routing.channelTrunkInset;
+  if (minY > maxY) {
+    return laneY;
+  }
+  laneY = snap(clamp(laneY, minY, maxY));
+  return laneY;
+}
+
+function flowChannelCandidates(
+  edge: RoutedEdgeSpec,
+  source: RoutePoint,
+  target: RoutePoint,
+  preferredX: number,
+  context: ChannelRouteContext | undefined,
+  vertical: boolean,
+): { candidates: RoutePoint[][]; laneY?: number } {
+  if (!context || context.slotCount <= 0) {
+    return { candidates: [] };
+  }
+
+  const slot = context.slotByEdgeId.get(edge.id);
+  if (typeof slot !== "number") {
+    return { candidates: [] };
+  }
+
+  const routing = PARITY_CONSTANTS.routing;
+  const direction = target.x >= source.x ? 1 : -1;
+  const sourceStubX = snap(source.x + direction * routing.branchStub);
+  const targetStubX = snap(target.x - direction * routing.branchStub);
+  const laneY = channelLaneCoord(
+    source.y,
+    target.y,
+    slot,
+    context.slotCount,
+    edge.sharedTrunkPoints,
+    vertical,
+  );
+  const laneNudge = Math.max(PARITY_CONSTANTS.rasterStep, Math.round(routing.channelLaneStep / 2));
+  const laneVariants = [...new Set([laneY, snap(laneY - laneNudge), snap(laneY + laneNudge)])];
+
+  const candidates = laneVariants.map((candidateLaneY) => [
+    source,
+    { x: sourceStubX, y: source.y },
+    { x: sourceStubX, y: candidateLaneY },
+    { x: preferredX, y: candidateLaneY },
+    { x: targetStubX, y: candidateLaneY },
+    { x: targetStubX, y: target.y },
+    target,
+  ]);
+
+  return {
+    candidates,
+    laneY,
+  };
 }
 
 function edgeRouteStyle(edge: RoutedEdgeSpec): EdgeRouteStyle {
@@ -630,6 +790,18 @@ function trunkPenalty(points: RoutePoint[], trunkCoord: number | undefined): num
   return Math.min(...distances) * PARITY_CONSTANTS.routing.trunkPenaltyWeight;
 }
 
+function channelLanePenalty(points: RoutePoint[], laneY: number | undefined): number {
+  if (typeof laneY !== "number") {
+    return 0;
+  }
+  const interior = points.slice(1, -1);
+  if (interior.length === 0) {
+    return 0;
+  }
+  const minDistance = Math.min(...interior.map((point) => Math.abs(point.y - laneY)));
+  return minDistance * PARITY_CONSTANTS.routing.channelLanePenaltyWeight;
+}
+
 function flowCandidates(
   source: RoutePoint,
   target: RoutePoint,
@@ -698,6 +870,7 @@ function selectBestPath(
   candidates: RoutePoint[][],
   obstacles: Rect[],
   trunkCoord: number | undefined,
+  laneY: number | undefined,
 ): RoutePoint[] {
   const scoreWeights = PARITY_CONSTANTS.routing.scoreWeights;
   let bestPath = simplify(candidates[0] ?? []);
@@ -723,6 +896,7 @@ function selectBestPath(
           Math.min(scoreWeights.turnBundleCap, weightBias * scoreWeights.turnBundleScale)) +
       length * scoreWeights.length +
       trunkPenalty(path, trunkCoord) +
+      channelLanePenalty(path, laneY) +
       idx * scoreWeights.candidateOrder;
     if (score < bestScore) {
       bestScore = score;
@@ -748,6 +922,7 @@ export function routeEdgesWithObstacles(
   const nodeById = new Map(layout.nodes.map((node) => [node.id, node]));
   const obstacles = layout.nodes.map((node) => nodeRect(node, routing.obstaclePadding));
   const virtualObstacles = obstacles.map((obstacle) => toVirtualRect(obstacle, vertical));
+  const channelContexts = buildChannelRouteContexts(layout.edges);
 
   const edges = layout.edges.map((edge) => {
     const sourceNode = nodeById.get(edge.source);
@@ -786,16 +961,32 @@ export function routeEdgesWithObstacles(
       sideIndex(targetVirtualSide),
       edge.routeKind === "flow-trunk" ? preferredX : undefined,
     );
+    const channelContext = edge.channelId ? channelContexts.get(edge.channelId) : undefined;
+    const { candidates: channelCandidates, laneY } =
+      edge.family === "flow" && edge.routeKind === "flow-trunk"
+        ? flowChannelCandidates(
+            edge,
+            sourceVirtual,
+            targetVirtual,
+            preferredX,
+            channelContext,
+            vertical,
+          )
+        : { candidates: [] as RoutePoint[][], laneY: undefined as number | undefined };
     const fallbackCandidates =
       edge.family === "hierarchy"
         ? hierarchyCandidates(sourceVirtual, targetVirtual, preferredY)
         : flowCandidates(sourceVirtual, targetVirtual, preferredX);
-    const candidates = [styledCandidate, ...fallbackCandidates];
+    const candidates =
+      channelCandidates.length > 0
+        ? [...channelCandidates, styledCandidate, ...fallbackCandidates]
+        : [styledCandidate, ...fallbackCandidates];
     const bestPath = selectBestPath(
       edge,
       candidates,
       edgeObstacles(virtualObstacles, edge),
       edge.routeKind === "flow-trunk" || edge.bundleCount > 1 ? preferredX : undefined,
+      laneY,
     );
     if (bestPath.length >= 2) {
       bestPath[0] = sourceVirtual;

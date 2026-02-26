@@ -220,19 +220,19 @@ exports[`graph parity geometry harness > keeps route points and channel metadata
         },
         {
           "x": 328,
-          "y": 160,
+          "y": 144,
         },
         {
-          "x": 496,
-          "y": 160,
+          "x": 416,
+          "y": 144,
         },
         {
-          "x": 496,
-          "y": 520,
+          "x": 416,
+          "y": 536,
         },
         {
           "x": 472,
-          "y": 520,
+          "y": 536,
         },
         {
           "x": 472,

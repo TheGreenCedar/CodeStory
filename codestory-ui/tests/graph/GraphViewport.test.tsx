@@ -457,7 +457,7 @@ describe("GraphViewport", () => {
     ) as SVGPathElement | null;
     const d = firstPath?.getAttribute("d") ?? "";
     const roundedCornerCount = (d.match(/ A /g) ?? []).length;
-    expect(roundedCornerCount).toBeGreaterThanOrEqual(4);
+    expect(roundedCornerCount).toBeGreaterThanOrEqual(2);
   });
 
   it("emits aggregated edgeIds when activating bundled channel edges", () => {

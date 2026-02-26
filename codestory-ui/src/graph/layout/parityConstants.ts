@@ -32,6 +32,10 @@ export type ParityStyleProfile = {
     targetEntry: number;
     branchStub: number;
     trunkPenaltyWeight: number;
+    channelLaneStep: number;
+    channelLaneMaxOffset: number;
+    channelLanePenaltyWeight: number;
+    channelTrunkInset: number;
     yDetourStep: number;
     xDetourStep: number;
     scoreWeights: {
@@ -125,6 +129,14 @@ export const PARITY_CONSTANTS: ParityStyleProfile = {
     branchStub: 24,
     // Keep routed interior points close to configured trunk coordinates.
     trunkPenaltyWeight: 0.08,
+    // Per-channel branch spacing in pixels for fan-in/fan-out separation.
+    channelLaneStep: 14,
+    // Prevent lane offsets from drifting too far from source/target anchors.
+    channelLaneMaxOffset: 56,
+    // Bias path selection toward the assigned channel lane when bundled.
+    channelLanePenaltyWeight: 0.09,
+    // Keep assigned lanes slightly inside shared trunk span boundaries.
+    channelTrunkInset: 10,
     // Vertical detour search spacing for dense routing fallback.
     yDetourStep: 96,
     // Horizontal detour search spacing for dense routing fallback.
@@ -242,6 +254,10 @@ type RequiredRoutingFields = Pick<
   | "targetEntry"
   | "branchStub"
   | "trunkPenaltyWeight"
+  | "channelLaneStep"
+  | "channelLaneMaxOffset"
+  | "channelLanePenaltyWeight"
+  | "channelTrunkInset"
   | "yDetourStep"
   | "xDetourStep"
   | "scoreWeights"

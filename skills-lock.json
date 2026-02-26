@@ -1,6 +1,11 @@
 {
   "version": 1,
   "skills": {
+    "dagre-react-flow": {
+      "source": "existential-birds/beagle",
+      "sourceType": "github",
+      "computedHash": "1db5c73080d7f0a95838a80584b741246c44c0a272e9527984bbff278f6b3df6"
+    },
     "react-flow": {
       "source": "existential-birds/beagle",
       "sourceType": "github",

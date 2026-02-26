@@ -55,6 +55,60 @@ fn clamp_usize_to_u32(v: usize) -> u32 {
     v.min(u32::MAX as usize) as u32
 }
 
+#[derive(Debug, Clone, Default)]
+struct OptionalResolutionTelemetry {
+    resolution_unresolved_counts_ms: Option<u32>,
+    resolution_calls_ms: Option<u32>,
+    resolution_imports_ms: Option<u32>,
+    resolution_cleanup_ms: Option<u32>,
+    resolved_calls_same_file: Option<u32>,
+    resolved_calls_same_module: Option<u32>,
+    resolved_calls_global_unique: Option<u32>,
+    resolved_calls_semantic: Option<u32>,
+    resolved_imports_same_file: Option<u32>,
+    resolved_imports_same_module: Option<u32>,
+    resolved_imports_global_unique: Option<u32>,
+    resolved_imports_fuzzy: Option<u32>,
+    resolved_imports_semantic: Option<u32>,
+}
+
+impl OptionalResolutionTelemetry {
+    fn from_incremental_stats(index_stats: &codestory_index::IncrementalIndexingStats) -> Self {
+        if !index_stats.resolution_ran {
+            return Self::default();
+        }
+        Self {
+            resolution_unresolved_counts_ms: Some(clamp_u64_to_u32(
+                index_stats.resolution_unresolved_counts_ms,
+            )),
+            resolution_calls_ms: Some(clamp_u64_to_u32(index_stats.resolution_calls_ms)),
+            resolution_imports_ms: Some(clamp_u64_to_u32(index_stats.resolution_imports_ms)),
+            resolution_cleanup_ms: Some(clamp_u64_to_u32(index_stats.resolution_cleanup_ms)),
+            resolved_calls_same_file: Some(clamp_usize_to_u32(index_stats.resolved_calls_same_file)),
+            resolved_calls_same_module: Some(clamp_usize_to_u32(
+                index_stats.resolved_calls_same_module,
+            )),
+            resolved_calls_global_unique: Some(clamp_usize_to_u32(
+                index_stats.resolved_calls_global_unique,
+            )),
+            resolved_calls_semantic: Some(clamp_usize_to_u32(index_stats.resolved_calls_semantic)),
+            resolved_imports_same_file: Some(clamp_usize_to_u32(
+                index_stats.resolved_imports_same_file,
+            )),
+            resolved_imports_same_module: Some(clamp_usize_to_u32(
+                index_stats.resolved_imports_same_module,
+            )),
+            resolved_imports_global_unique: Some(clamp_usize_to_u32(
+                index_stats.resolved_imports_global_unique,
+            )),
+            resolved_imports_fuzzy: Some(clamp_usize_to_u32(index_stats.resolved_imports_fuzzy)),
+            resolved_imports_semantic: Some(clamp_usize_to_u32(
+                index_stats.resolved_imports_semantic,
+            )),
+        }
+    }
+}
+
 fn parse_db_id(raw: &str, field_name: &str) -> Result<i64, ApiError> {
     raw.trim()
         .parse::<i64>()
@@ -1709,6 +1763,7 @@ where
     let _ = forwarder.join();
 
     let index_stats = result.map_err(|e| ApiError::internal(format!("Indexing failed: {e}")))?;
+    let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
     Ok(IndexingRunSummary {
         phase_timings: IndexingPhaseTimings {
             parse_index_ms: clamp_u64_to_u32(index_stats.parse_index_ms),
@@ -1723,6 +1778,19 @@ where
             resolved_imports: clamp_usize_to_u32(index_stats.resolved_imports),
             unresolved_calls_end: clamp_usize_to_u32(index_stats.unresolved_calls_end),
             unresolved_imports_end: clamp_usize_to_u32(index_stats.unresolved_imports_end),
+            resolution_unresolved_counts_ms: resolution_telemetry.resolution_unresolved_counts_ms,
+            resolution_calls_ms: resolution_telemetry.resolution_calls_ms,
+            resolution_imports_ms: resolution_telemetry.resolution_imports_ms,
+            resolution_cleanup_ms: resolution_telemetry.resolution_cleanup_ms,
+            resolved_calls_same_file: resolution_telemetry.resolved_calls_same_file,
+            resolved_calls_same_module: resolution_telemetry.resolved_calls_same_module,
+            resolved_calls_global_unique: resolution_telemetry.resolved_calls_global_unique,
+            resolved_calls_semantic: resolution_telemetry.resolved_calls_semantic,
+            resolved_imports_same_file: resolution_telemetry.resolved_imports_same_file,
+            resolved_imports_same_module: resolution_telemetry.resolved_imports_same_module,
+            resolved_imports_global_unique: resolution_telemetry.resolved_imports_global_unique,
+            resolved_imports_fuzzy: resolution_telemetry.resolved_imports_fuzzy,
+            resolved_imports_semantic: resolution_telemetry.resolved_imports_semantic,
         },
     })
 }

@@ -5,6 +5,7 @@ import {
   routeIntersectionDiagnostics,
   routeIntersectsNonEndpointNode,
 } from "../../src/graph/layout/obstacleRouting";
+import { PARITY_CONSTANTS } from "../../src/graph/layout/parityConstants";
 import type { LayoutElements, SemanticNodePlacement } from "../../src/graph/layout/types";
 
 function makeNode(
@@ -130,6 +131,69 @@ describe("routeEdgesWithObstacles", () => {
           (point) => point.y >= sharedTrunkPoints[0]!.y && point.y <= sharedTrunkPoints[1]!.y,
         ),
       ).toBe(true);
+    }
+  });
+
+  it("keeps bundled branch lanes ordered by source member order", () => {
+    const nodes = [
+      makeNode("center", 120, 220, 180, 56, 0),
+      makeNode("t1", 620, 110, 140, 44, 2),
+      makeNode("t2", 620, 220, 140, 44, 2),
+      makeNode("t3", 620, 330, 140, 44, 2),
+    ];
+    const trunkCoord = 392;
+    const layout: LayoutElements = {
+      nodes,
+      edges: ["t1", "t2", "t3"].map((target, idx) => ({
+        id: `ordered-${idx}`,
+        source: "center",
+        target,
+        sourceHandle: `source-member-center-${idx}`,
+        targetHandle: `target-member-${target}`,
+        kind: "CALL" as const,
+        certainty: null,
+        multiplicity: 1,
+        family: "flow" as const,
+        routeKind: "flow-trunk" as const,
+        bundleCount: 3,
+        trunkCoord,
+        channelId: "channel:CALL:center<->ordered:0",
+        channelWeight: 3,
+        sourceMemberOrder: idx,
+        targetMemberOrder: idx,
+        sharedTrunkPoints: [
+          { x: trunkCoord, y: 120 },
+          { x: trunkCoord, y: 360 },
+        ],
+        routePoints: [],
+      })),
+      centerNodeId: "center",
+    };
+
+    const routed = routeEdgesWithObstacles(layout);
+    const laneYs = [...routed.edges]
+      .sort(
+        (left, right) =>
+          (left.sourceMemberOrder ?? Number.POSITIVE_INFINITY) -
+            (right.sourceMemberOrder ?? Number.POSITIVE_INFINITY) ||
+          left.id.localeCompare(right.id),
+      )
+      .map((edge) => {
+        const interior = edge.routePoints.slice(1, -1);
+        const nearest = interior.reduce(
+          (best, point) => {
+            const distance = Math.abs(point.x - trunkCoord);
+            return distance < best.distance ? { distance, y: point.y } : best;
+          },
+          { distance: Number.POSITIVE_INFINITY, y: edge.routePoints[0]?.y ?? 0 },
+        );
+        return nearest.y;
+      });
+
+    for (let idx = 1; idx < laneYs.length; idx += 1) {
+      expect((laneYs[idx] ?? 0) + PARITY_CONSTANTS.rasterStep).toBeGreaterThanOrEqual(
+        laneYs[idx - 1] ?? 0,
+      );
     }
   });
 

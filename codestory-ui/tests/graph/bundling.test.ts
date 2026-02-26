@@ -134,6 +134,9 @@ describe("applyAdaptiveBundling", () => {
     const layout = pairLayout(16);
     const bundled = applyAdaptiveBundling(layout, 4, 180, 420);
     const trunk = bundled.edges.find((edge) => edge.routeKind === "flow-trunk");
+    const trunkEdges = bundled.edges
+      .filter((edge) => edge.routeKind === "flow-trunk")
+      .sort((left, right) => left.id.localeCompare(right.id));
 
     expect(trunk).toBeDefined();
     expect(trunk?.channelId?.startsWith("channel:CALL:center<->")).toBe(true);
@@ -142,6 +145,19 @@ describe("applyAdaptiveBundling", () => {
     expect(typeof trunk?.trunkCoord).toBe("number");
     expect((trunk?.sharedTrunkPoints?.length ?? 0) >= 2).toBe(true);
     expect(typeof trunk?.sourceMemberOrder).toBe("number");
+    expect(trunkEdges.every((edge) => typeof edge.sourceMemberOrder === "number")).toBe(true);
+    expect(trunkEdges.every((edge) => typeof edge.targetMemberOrder === "number")).toBe(true);
+
+    const bySourceHandle = new Map<string, number>();
+    for (const edge of trunkEdges) {
+      const order = edge.sourceMemberOrder ?? -1;
+      const existing = bySourceHandle.get(edge.sourceHandle);
+      if (typeof existing === "number") {
+        expect(order).toBe(existing);
+      } else {
+        bySourceHandle.set(edge.sourceHandle, order);
+      }
+    }
   });
 
   it("uses deterministic code-point ordering for locale-sensitive ids and handles", () => {

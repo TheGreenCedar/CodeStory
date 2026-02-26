@@ -103,6 +103,20 @@ pub struct IncrementalIndexingStats {
     pub resolved_imports: usize,
     pub unresolved_calls_end: usize,
     pub unresolved_imports_end: usize,
+    pub resolution_ran: bool,
+    pub resolution_unresolved_counts_ms: u64,
+    pub resolution_calls_ms: u64,
+    pub resolution_imports_ms: u64,
+    pub resolution_cleanup_ms: u64,
+    pub resolved_calls_same_file: usize,
+    pub resolved_calls_same_module: usize,
+    pub resolved_calls_global_unique: usize,
+    pub resolved_calls_semantic: usize,
+    pub resolved_imports_same_file: usize,
+    pub resolved_imports_same_module: usize,
+    pub resolved_imports_global_unique: usize,
+    pub resolved_imports_fuzzy: usize,
+    pub resolved_imports_semantic: usize,
 }
 
 pub struct WorkspaceIndexer {
@@ -252,22 +266,71 @@ impl WorkspaceIndexer {
             let scope_suffix = resolution_scope
                 .map(|scope| format!(" (scoped to {} touched files)", scope.len()))
                 .unwrap_or_default();
-            event_bus.publish(Event::StatusUpdate {
-                message: format!(
-                    "Resolution pass starting with {unresolved_calls_start} unresolved CALL edges and {unresolved_imports_start} unresolved IMPORT edges{scope_suffix}."
-                ),
-            });
-            let resolution_started = Instant::now();
-            let resolution_stats = resolver
-                .run_with_scope(storage, resolution_scope)
-                .map_err(|e| anyhow!("Resolution error: {:?}", e))?;
-            stats.edge_resolution_ms = stats
-                .edge_resolution_ms
-                .saturating_add(duration_ms_u64(resolution_started.elapsed()));
-            stats.resolved_calls = resolution_stats.resolved_calls;
-            stats.resolved_imports = resolution_stats.resolved_imports;
-            stats.unresolved_calls_end = resolution_stats.unresolved_calls;
-            stats.unresolved_imports_end = resolution_stats.unresolved_imports;
+            if unresolved_calls_start == 0 && unresolved_imports_start == 0 {
+                stats.unresolved_calls_end = unresolved_calls_start;
+                stats.unresolved_imports_end = unresolved_imports_start;
+                event_bus.publish(Event::StatusUpdate {
+                    message: format!(
+                        "Resolution pass skipped because there are no unresolved CALL/IMPORT edges{scope_suffix}."
+                    ),
+                });
+            } else {
+                event_bus.publish(Event::StatusUpdate {
+                    message: format!(
+                        "Resolution pass starting with {unresolved_calls_start} unresolved CALL edges and {unresolved_imports_start} unresolved IMPORT edges{scope_suffix}."
+                    ),
+                });
+                let resolution_started = Instant::now();
+                let resolution_stats = resolver
+                    .run_with_scope(storage, resolution_scope)
+                    .map_err(|e| anyhow!("Resolution error: {:?}", e))?;
+                stats.edge_resolution_ms = stats
+                    .edge_resolution_ms
+                    .saturating_add(duration_ms_u64(resolution_started.elapsed()));
+                stats.resolution_ran = true;
+                stats.resolved_calls = resolution_stats.resolved_calls;
+                stats.resolved_imports = resolution_stats.resolved_imports;
+                stats.unresolved_calls_end = resolution_stats.unresolved_calls;
+                stats.unresolved_imports_end = resolution_stats.unresolved_imports;
+                stats.resolution_unresolved_counts_ms = resolution_stats
+                    .telemetry
+                    .unresolved_count_start_ms
+                    .saturating_add(resolution_stats.telemetry.unresolved_count_end_ms);
+                stats.resolution_calls_ms = resolution_stats
+                    .telemetry
+                    .call_prepare_ms
+                    .saturating_add(resolution_stats.telemetry.call_unresolved_load_ms)
+                    .saturating_add(resolution_stats.telemetry.call_candidate_index_ms)
+                    .saturating_add(resolution_stats.telemetry.call_compute_ms)
+                    .saturating_add(resolution_stats.telemetry.call_apply_ms);
+                stats.resolution_imports_ms = resolution_stats
+                    .telemetry
+                    .import_prepare_ms
+                    .saturating_add(resolution_stats.telemetry.import_unresolved_load_ms)
+                    .saturating_add(resolution_stats.telemetry.import_candidate_index_ms)
+                    .saturating_add(resolution_stats.telemetry.import_compute_ms)
+                    .saturating_add(resolution_stats.telemetry.import_apply_ms);
+                stats.resolution_cleanup_ms = resolution_stats
+                    .telemetry
+                    .scope_prepare_ms
+                    .saturating_add(resolution_stats.telemetry.call_cleanup_ms);
+                stats.resolved_calls_same_file = resolution_stats.strategy_counters.call_same_file;
+                stats.resolved_calls_same_module =
+                    resolution_stats.strategy_counters.call_same_module;
+                stats.resolved_calls_global_unique =
+                    resolution_stats.strategy_counters.call_global_unique;
+                stats.resolved_calls_semantic =
+                    resolution_stats.strategy_counters.call_semantic_fallback;
+                stats.resolved_imports_same_file =
+                    resolution_stats.strategy_counters.import_same_file;
+                stats.resolved_imports_same_module =
+                    resolution_stats.strategy_counters.import_same_module;
+                stats.resolved_imports_global_unique =
+                    resolution_stats.strategy_counters.import_global_unique;
+                stats.resolved_imports_fuzzy = resolution_stats.strategy_counters.import_fuzzy;
+                stats.resolved_imports_semantic =
+                    resolution_stats.strategy_counters.import_semantic_fallback;
+            }
         }
 
         // Write errors

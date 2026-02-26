@@ -24,6 +24,7 @@
 - For hover-driven UI (for example edge tooltips), prefer real pointer input (`mousemove`/`hover`) over synthetic `eval`-dispatched DOM events before taking screenshots.
 - When iterating over a specific component with Playwright, capture only the relevant crop and start the browser maximized.
 - Always open the project `C:\Users\alber\source\repos\codestory` when in the UI with playwright.
+- In this PowerShell environment, large parallel file reads can truncate output; when investigating a single large file, prefer one direct read command (for example `Get-Content` or `cmd /c type`) before parallelizing.
 
 ## Coding Style & Naming Conventions
 - Rust edition is `2024` across workspace crates.
