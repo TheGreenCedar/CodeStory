@@ -14,18 +14,11 @@ type UnresolvedEdgeRow = (
     Option<String>,
 );
 
-#[derive(Clone, Copy, Debug)]
-enum GlobalExactMatch {
-    Missing,
-    Multiple,
-    Unique(i64),
-}
-
 #[derive(Default)]
 struct ResolutionLookupCache {
-    same_file_exact: HashMap<(String, i64, String), Option<i64>>,
-    same_module_exact: HashMap<(String, String, String), Option<i64>>,
-    global_unique_exact: HashMap<(String, String), GlobalExactMatch>,
+    same_file_lookup: HashMap<(String, i64, String), Option<i64>>,
+    same_module_lookup: HashMap<(String, String, String), Option<i64>>,
+    global_unique_lookup: HashMap<(String, String), Option<i64>>,
 }
 
 #[derive(Default, Debug)]
@@ -811,44 +804,42 @@ fn find_same_file(
     let Some(file_id) = file_id else {
         return Ok(None);
     };
-    let exact_cache_key = (kind_clause.to_string(), file_id, exact.to_string());
-    let exact_match = if let Some(cached) = lookup_cache.same_file_exact.get(&exact_cache_key) {
-        *cached
-    } else {
-        let exact_query = format!(
-            "SELECT id FROM node
-             WHERE kind IN ({})
-             AND file_node_id = ?1
-             AND serialized_name = ?2
-             ORDER BY start_line LIMIT 1",
-            kind_clause
-        );
-        let found = conn
-            .query_row(&exact_query, params![file_id, exact], |row| row.get(0))
-            .optional()?;
-        lookup_cache.same_file_exact.insert(exact_cache_key, found);
-        found
-    };
-
-    if let Some(id) = exact_match {
-        return Ok(Some(id));
+    let cache_key = (kind_clause.to_string(), file_id, exact.to_string());
+    if let Some(cached) = lookup_cache.same_file_lookup.get(&cache_key) {
+        return Ok(*cached);
     }
 
-    let suffix_query = format!(
+    let exact_query = format!(
         "SELECT id FROM node
          WHERE kind IN ({})
          AND file_node_id = ?1
-         AND (serialized_name LIKE ?2 OR serialized_name LIKE ?3)
+         AND serialized_name = ?2
          ORDER BY start_line LIMIT 1",
         kind_clause
     );
-    conn.query_row(
-        &suffix_query,
-        params![file_id, suffix_dot, suffix_colon],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(Into::into)
+    let resolved = if let Some(id) = conn
+        .query_row(&exact_query, params![file_id, exact], |row| row.get(0))
+        .optional()?
+    {
+        Some(id)
+    } else {
+        let suffix_query = format!(
+            "SELECT id FROM node
+             WHERE kind IN ({})
+             AND file_node_id = ?1
+             AND (serialized_name LIKE ?2 OR serialized_name LIKE ?3)
+             ORDER BY start_line LIMIT 1",
+            kind_clause
+        );
+        conn.query_row(
+            &suffix_query,
+            params![file_id, suffix_dot, suffix_colon],
+            |row| row.get(0),
+        )
+        .optional()?
+    };
+    lookup_cache.same_file_lookup.insert(cache_key, resolved);
+    Ok(resolved)
 }
 
 fn find_same_module(
@@ -862,46 +853,42 @@ fn find_same_module(
     lookup_cache: &mut ResolutionLookupCache,
 ) -> Result<Option<i64>> {
     let pattern = format!("{}{}%", module_prefix, delimiter);
-    let exact_cache_key = (kind_clause.to_string(), pattern.clone(), exact.to_string());
-    let exact_match = if let Some(cached) = lookup_cache.same_module_exact.get(&exact_cache_key) {
-        *cached
-    } else {
-        let exact_query = format!(
-            "SELECT id FROM node
-             WHERE kind IN ({})
-             AND qualified_name LIKE ?1
-             AND serialized_name = ?2
-             ORDER BY start_line LIMIT 1",
-            kind_clause
-        );
-        let found = conn
-            .query_row(&exact_query, params![pattern, exact], |row| row.get(0))
-            .optional()?;
-        lookup_cache
-            .same_module_exact
-            .insert(exact_cache_key, found);
-        found
-    };
-
-    if let Some(id) = exact_match {
-        return Ok(Some(id));
+    let cache_key = (kind_clause.to_string(), pattern.clone(), exact.to_string());
+    if let Some(cached) = lookup_cache.same_module_lookup.get(&cache_key) {
+        return Ok(*cached);
     }
 
-    let suffix_query = format!(
+    let exact_query = format!(
         "SELECT id FROM node
          WHERE kind IN ({})
          AND qualified_name LIKE ?1
-         AND (serialized_name LIKE ?2 OR serialized_name LIKE ?3)
+         AND serialized_name = ?2
          ORDER BY start_line LIMIT 1",
         kind_clause
     );
-    conn.query_row(
-        &suffix_query,
-        params![pattern, suffix_dot, suffix_colon],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(Into::into)
+    let resolved = if let Some(id) = conn
+        .query_row(&exact_query, params![pattern, exact], |row| row.get(0))
+        .optional()?
+    {
+        Some(id)
+    } else {
+        let suffix_query = format!(
+            "SELECT id FROM node
+             WHERE kind IN ({})
+             AND qualified_name LIKE ?1
+             AND (serialized_name LIKE ?2 OR serialized_name LIKE ?3)
+             ORDER BY start_line LIMIT 1",
+            kind_clause
+        );
+        conn.query_row(
+            &suffix_query,
+            params![pattern, suffix_dot, suffix_colon],
+            |row| row.get(0),
+        )
+        .optional()?
+    };
+    lookup_cache.same_module_lookup.insert(cache_key, resolved);
+    Ok(resolved)
 }
 
 fn find_global_unique(
@@ -912,77 +899,62 @@ fn find_global_unique(
     suffix_colon: &str,
     lookup_cache: &mut ResolutionLookupCache,
 ) -> Result<Option<i64>> {
-    let exact_cache_key = (kind_clause.to_string(), exact.to_string());
-    let exact_match = if let Some(cached) = lookup_cache.global_unique_exact.get(&exact_cache_key) {
-        *cached
-    } else {
-        let exact_count_query = format!(
-            "SELECT COUNT(*) FROM node
+    let cache_key = (kind_clause.to_string(), exact.to_string());
+    if let Some(cached) = lookup_cache.global_unique_lookup.get(&cache_key) {
+        return Ok(*cached);
+    }
+
+    let exact_count_query = format!(
+        "SELECT COUNT(*) FROM node
+         WHERE kind IN ({})
+         AND serialized_name = ?1",
+        kind_clause
+    );
+    let exact_count: i64 = conn.query_row(&exact_count_query, params![exact], |row| row.get(0))?;
+    let resolved = if exact_count == 1 {
+        let exact_query = format!(
+            "SELECT id FROM node
              WHERE kind IN ({})
-             AND serialized_name = ?1",
+             AND serialized_name = ?1
+             LIMIT 1",
             kind_clause
         );
-        let exact_count: i64 =
-            conn.query_row(&exact_count_query, params![exact], |row| row.get(0))?;
-        let computed = if exact_count == 1 {
-            let exact_query = format!(
+        conn.query_row(&exact_query, params![exact], |row| row.get(0))
+            .optional()?
+    } else if exact_count > 1 {
+        None
+    } else {
+        let suffix_count_query = format!(
+            "SELECT COUNT(*) FROM node
+             WHERE kind IN ({})
+             AND (serialized_name LIKE ?1 OR serialized_name LIKE ?2)",
+            kind_clause
+        );
+        let suffix_count: i64 = conn.query_row(
+            &suffix_count_query,
+            params![suffix_dot, suffix_colon],
+            |row| row.get(0),
+        )?;
+        if suffix_count != 1 {
+            None
+        } else {
+            let suffix_query = format!(
                 "SELECT id FROM node
                  WHERE kind IN ({})
-                 AND serialized_name = ?1
+                 AND (serialized_name LIKE ?1 OR serialized_name LIKE ?2)
                  LIMIT 1",
                 kind_clause
             );
-            match conn
-                .query_row(&exact_query, params![exact], |row| row.get(0))
-                .optional()?
-            {
-                Some(id) => GlobalExactMatch::Unique(id),
-                None => GlobalExactMatch::Missing,
-            }
-        } else if exact_count > 1 {
-            GlobalExactMatch::Multiple
-        } else {
-            GlobalExactMatch::Missing
-        };
-        lookup_cache
-            .global_unique_exact
-            .insert(exact_cache_key, computed);
-        computed
+            conn.query_row(&suffix_query, params![suffix_dot, suffix_colon], |row| {
+                row.get(0)
+            })
+            .optional()?
+        }
     };
-
-    match exact_match {
-        GlobalExactMatch::Unique(id) => return Ok(Some(id)),
-        GlobalExactMatch::Multiple => return Ok(None),
-        GlobalExactMatch::Missing => {}
-    }
-
-    let suffix_count_query = format!(
-        "SELECT COUNT(*) FROM node
-         WHERE kind IN ({})
-         AND (serialized_name LIKE ?1 OR serialized_name LIKE ?2)",
-        kind_clause
-    );
-    let suffix_count: i64 = conn.query_row(
-        &suffix_count_query,
-        params![suffix_dot, suffix_colon],
-        |row| row.get(0),
-    )?;
-    if suffix_count != 1 {
-        return Ok(None);
-    }
-
-    let suffix_query = format!(
-        "SELECT id FROM node
-         WHERE kind IN ({})
-         AND (serialized_name LIKE ?1 OR serialized_name LIKE ?2)
-         LIMIT 1",
-        kind_clause
-    );
-    conn.query_row(&suffix_query, params![suffix_dot, suffix_colon], |row| {
-        row.get(0)
-    })
-    .optional()
-    .map_err(Into::into)
+    lookup_cache
+        .global_unique_lookup
+        .insert(cache_key, resolved);
+    Ok(resolved)
 }
 
 fn find_fuzzy(
@@ -1360,7 +1332,7 @@ mod tests {
             &mut lookup_cache,
         )?;
         assert_eq!(first, Some(77_i64));
-        assert_eq!(lookup_cache.same_file_exact.len(), 1);
+        assert_eq!(lookup_cache.same_file_lookup.len(), 1);
 
         let second = find_same_file(
             &conn,
@@ -1372,7 +1344,7 @@ mod tests {
             &mut lookup_cache,
         )?;
         assert_eq!(second, Some(77_i64));
-        assert_eq!(lookup_cache.same_file_exact.len(), 1);
+        assert_eq!(lookup_cache.same_file_lookup.len(), 1);
         Ok(())
     }
 
