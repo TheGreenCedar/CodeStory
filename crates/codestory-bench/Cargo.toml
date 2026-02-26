@@ -27,3 +27,7 @@ harness = false
 [[bench]]
 name = "graph_fidelity"
 harness = false
+
+[[bench]]
+name = "resolution_full_scope"
+harness = false

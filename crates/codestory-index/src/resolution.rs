@@ -1,8 +1,12 @@
-use crate::semantic::{SemanticResolutionRequest, SemanticResolverRegistry};
+use crate::semantic::{
+    SemanticResolutionCandidate, SemanticResolutionRequest, SemanticResolverRegistry,
+};
 use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind, ResolutionCertainty};
 use codestory_storage::Storage;
-use rusqlite::{OptionalExtension, params, params_from_iter, types::Value};
+#[cfg(test)]
+use rusqlite::OptionalExtension;
+use rusqlite::{params, params_from_iter, types::Value};
 use std::collections::{HashMap, HashSet};
 
 type UnresolvedEdgeRow = (
@@ -14,11 +18,54 @@ type UnresolvedEdgeRow = (
     Option<String>,
 );
 
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Default)]
 struct ResolutionLookupCache {
     same_file_lookup: HashMap<(String, i64, String), Option<i64>>,
     same_module_lookup: HashMap<(String, String, String), Option<i64>>,
     global_unique_lookup: HashMap<(String, String), Option<i64>>,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateNode {
+    id: i64,
+    file_node_id: Option<i64>,
+    serialized_name: String,
+    serialized_name_ascii_lower: String,
+    qualified_name: Option<String>,
+    start_line: Option<i64>,
+}
+
+#[derive(Default, Debug)]
+struct CandidateIndex {
+    nodes: Vec<CandidateNode>,
+    node_offset_by_id: HashMap<i64, usize>,
+    exact_map: HashMap<String, Vec<usize>>,
+    suffix_map_ascii_lower: HashMap<String, Vec<usize>>,
+    same_file_cache: HashMap<(i64, String), Option<i64>>,
+    same_module_cache: HashMap<(String, String), Option<i64>>,
+    global_unique_cache: HashMap<String, Option<i64>>,
+    fuzzy_cache_ascii_lower: HashMap<String, Option<i64>>,
+    top_match_cache: HashMap<String, Vec<i64>>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedEdgeUpdate {
+    edge_id: i64,
+    resolved_target_node_id: Option<i64>,
+    confidence: Option<f32>,
+    certainty: Option<&'static str>,
+    candidate_payload: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SemanticCacheKey {
+    edge_kind: EdgeKind,
+    file_id: Option<i64>,
+    caller_qualified: Option<String>,
+    target_name: String,
+    language_bucket: Option<String>,
 }
 
 #[derive(Default, Debug)]
@@ -223,15 +270,19 @@ impl ResolutionPass {
 
         cleanup_stale_call_resolutions(conn, self.flags, self.policy, caller_scope_file_ids)?;
 
-        let mut resolved = 0usize;
         let rows = unresolved_edges(conn, EdgeKind::CALL, caller_scope_file_ids)?;
-        let function_kinds = [
-            NodeKind::FUNCTION as i32,
-            NodeKind::METHOD as i32,
-            NodeKind::MACRO as i32,
-        ];
-        let function_kind_clause = kind_clause(&function_kinds);
-        let mut lookup_cache = ResolutionLookupCache::default();
+        let mut resolved = 0usize;
+        let mut candidate_index = CandidateIndex::load(
+            conn,
+            &[
+                NodeKind::FUNCTION as i32,
+                NodeKind::METHOD as i32,
+                NodeKind::MACRO as i32,
+            ],
+        )?;
+        let mut semantic_cache: HashMap<SemanticCacheKey, Vec<SemanticResolutionCandidate>> =
+            HashMap::new();
+        let mut updates = Vec::with_capacity(rows.len());
 
         for (
             edge_id,
@@ -246,17 +297,17 @@ impl ResolutionPass {
             let mut semantic_fallback: Option<(i64, f32)> = None;
             let mut candidate_ids: Vec<i64> = Vec::new();
             let is_common_unqualified = is_common_unqualified_call_name(&target_name);
-            let (exact, suffix_dot, suffix_colon) = name_patterns(&target_name);
 
             if self.flags.enable_semantic {
-                let request = SemanticResolutionRequest {
-                    edge_kind: EdgeKind::CALL,
+                let semantic_candidates = self.semantic_candidates_for_edge(
+                    conn,
+                    &mut semantic_cache,
+                    EdgeKind::CALL,
                     file_id,
-                    file_path: caller_file_path.clone(),
-                    caller_qualified: caller_qualified.clone(),
-                    target_name: target_name.clone(),
-                };
-                let semantic_candidates = self.semantic_resolvers.resolve(conn, &request)?;
+                    caller_file_path.as_deref(),
+                    caller_qualified.as_deref(),
+                    &target_name,
+                )?;
                 for candidate in semantic_candidates {
                     record_candidate(&mut candidate_ids, candidate.target_node_id);
                     consider_selected(
@@ -269,32 +320,16 @@ impl ResolutionPass {
 
             if selected.is_none()
                 && !is_common_unqualified
-                && let Some(candidate) = find_same_file(
-                    conn,
-                    &function_kind_clause,
-                    file_id,
-                    &exact,
-                    &suffix_dot,
-                    &suffix_colon,
-                    &mut lookup_cache,
-                )?
+                && let Some(candidate) = candidate_index.find_same_file(file_id, &target_name)
             {
                 record_candidate(&mut candidate_ids, candidate);
                 selected = Some((candidate, self.policy.call_same_file));
             }
 
             if selected.is_none()
-                && let Some(prefix) = caller_qualified.and_then(module_prefix)
-                && let Some(candidate) = find_same_module(
-                    conn,
-                    &function_kind_clause,
-                    &prefix.0,
-                    prefix.1,
-                    &exact,
-                    &suffix_dot,
-                    &suffix_colon,
-                    &mut lookup_cache,
-                )?
+                && let Some(prefix) = caller_qualified.as_deref().and_then(module_prefix)
+                && let Some(candidate) =
+                    candidate_index.find_same_module(&prefix.0, prefix.1, &target_name)
             {
                 record_candidate(&mut candidate_ids, candidate);
                 selected = Some((candidate, self.policy.call_same_module));
@@ -302,14 +337,7 @@ impl ResolutionPass {
 
             if selected.is_none()
                 && !is_common_unqualified
-                && let Some(candidate) = find_global_unique(
-                    conn,
-                    &function_kind_clause,
-                    &exact,
-                    &suffix_dot,
-                    &suffix_colon,
-                    &mut lookup_cache,
-                )?
+                && let Some(candidate) = candidate_index.find_global_unique(&target_name)
             {
                 record_candidate(&mut candidate_ids, candidate);
                 selected = Some((candidate, self.policy.call_global_unique));
@@ -317,7 +345,12 @@ impl ResolutionPass {
 
             if self.flags.store_candidates && selected.is_none() {
                 let names = vec![target_name.clone()];
-                collect_candidate_pool(conn, &function_kind_clause, &names, &mut candidate_ids, 6)?;
+                collect_candidate_pool_from_index(
+                    &mut candidate_index,
+                    &names,
+                    &mut candidate_ids,
+                    6,
+                );
             }
 
             if selected.is_none() {
@@ -334,12 +367,17 @@ impl ResolutionPass {
                 selected = None;
             }
 
-            persist_resolution(conn, edge_id, selected, &candidate_ids)?;
+            updates.push(build_resolved_edge_update(
+                edge_id,
+                selected,
+                &candidate_ids,
+            )?);
             if selected.is_some() {
                 resolved += 1;
             }
         }
 
+        apply_resolution_updates(conn, &updates)?;
         Ok(resolved)
     }
 
@@ -366,32 +404,37 @@ impl ResolutionPass {
             params![EdgeKind::IMPORT as i32],
         )?;
 
-        let mut resolved = 0usize;
         let rows = unresolved_edges(conn, EdgeKind::IMPORT, caller_scope_file_ids)?;
-        let mut lookup_cache = ResolutionLookupCache::default();
-
-        let module_kinds = [
-            NodeKind::MODULE as i32,
-            NodeKind::NAMESPACE as i32,
-            NodeKind::PACKAGE as i32,
-        ];
-        let module_kind_clause = kind_clause(&module_kinds);
+        let mut resolved = 0usize;
+        let mut candidate_index = CandidateIndex::load(
+            conn,
+            &[
+                NodeKind::MODULE as i32,
+                NodeKind::NAMESPACE as i32,
+                NodeKind::PACKAGE as i32,
+            ],
+        )?;
+        let mut semantic_cache: HashMap<SemanticCacheKey, Vec<SemanticResolutionCandidate>> =
+            HashMap::new();
+        let mut updates = Vec::with_capacity(rows.len());
 
         for (edge_id, file_id, caller_qualified, target_name, caller_file_path, _) in rows {
             let mut selected: Option<(i64, f32)> = None;
             let mut semantic_fallback: Option<(i64, f32)> = None;
             let mut candidate_ids: Vec<i64> = Vec::new();
             let names = import_name_candidates(&target_name, self.flags.legacy_mode);
+            let caller_prefix = caller_qualified.as_deref().and_then(module_prefix);
 
             if self.flags.enable_semantic {
-                let request = SemanticResolutionRequest {
-                    edge_kind: EdgeKind::IMPORT,
+                let semantic_candidates = self.semantic_candidates_for_edge(
+                    conn,
+                    &mut semantic_cache,
+                    EdgeKind::IMPORT,
                     file_id,
-                    file_path: caller_file_path.clone(),
-                    caller_qualified: caller_qualified.clone(),
-                    target_name: target_name.clone(),
-                };
-                let semantic_candidates = self.semantic_resolvers.resolve(conn, &request)?;
+                    caller_file_path.as_deref(),
+                    caller_qualified.as_deref(),
+                    &target_name,
+                )?;
                 for candidate in semantic_candidates {
                     record_candidate(&mut candidate_ids, candidate.target_node_id);
                     consider_selected(
@@ -407,16 +450,7 @@ impl ResolutionPass {
                     if selected.is_some() {
                         break;
                     }
-                    let (exact, suffix_dot, suffix_colon) = name_patterns(name);
-                    if let Some(candidate) = find_same_file(
-                        conn,
-                        &module_kind_clause,
-                        file_id,
-                        &exact,
-                        &suffix_dot,
-                        &suffix_colon,
-                        &mut lookup_cache,
-                    )? {
+                    if let Some(candidate) = candidate_index.find_same_file(file_id, name) {
                         record_candidate(&mut candidate_ids, candidate);
                         selected = Some((candidate, self.policy.import_same_file));
                     }
@@ -427,20 +461,12 @@ impl ResolutionPass {
                 if selected.is_some() {
                     break;
                 }
-                if let Some(prefix) = caller_qualified.clone().and_then(module_prefix) {
-                    let (exact, suffix_dot, suffix_colon) = name_patterns(name);
-                    if let Some(candidate) = find_same_module(
-                        conn,
-                        &module_kind_clause,
-                        &prefix.0,
-                        prefix.1,
-                        &exact,
-                        &suffix_dot,
-                        &suffix_colon,
-                        &mut lookup_cache,
-                    )? {
+                if let Some(prefix) = caller_prefix.as_ref() {
+                    if let Some(candidate) =
+                        candidate_index.find_same_module(&prefix.0, prefix.1, name)
+                    {
                         record_candidate(&mut candidate_ids, candidate);
-                        if !is_same_file_candidate(conn, candidate, file_id)? {
+                        if !candidate_index.is_same_file_candidate(candidate, file_id) {
                             selected = Some((candidate, self.policy.import_same_module));
                         }
                     }
@@ -451,17 +477,9 @@ impl ResolutionPass {
                 if selected.is_some() {
                     break;
                 }
-                let (exact, suffix_dot, suffix_colon) = name_patterns(name);
-                if let Some(candidate) = find_global_unique(
-                    conn,
-                    &module_kind_clause,
-                    &exact,
-                    &suffix_dot,
-                    &suffix_colon,
-                    &mut lookup_cache,
-                )? {
+                if let Some(candidate) = candidate_index.find_global_unique(name) {
                     record_candidate(&mut candidate_ids, candidate);
-                    if !is_same_file_candidate(conn, candidate, file_id)? {
+                    if !candidate_index.is_same_file_candidate(candidate, file_id) {
                         selected = Some((candidate, self.policy.import_global_unique));
                     }
                 }
@@ -469,16 +487,9 @@ impl ResolutionPass {
 
             if selected.is_none() && !self.flags.legacy_mode {
                 for name in &names {
-                    let (exact, suffix_dot, suffix_colon) = name_patterns(name);
-                    if let Some(candidate) = find_fuzzy(
-                        conn,
-                        &module_kind_clause,
-                        &exact,
-                        &suffix_dot,
-                        &suffix_colon,
-                    )? {
+                    if let Some(candidate) = candidate_index.find_fuzzy(name) {
                         record_candidate(&mut candidate_ids, candidate);
-                        if !is_same_file_candidate(conn, candidate, file_id)? {
+                        if !candidate_index.is_same_file_candidate(candidate, file_id) {
                             selected = Some((candidate, self.policy.import_fuzzy));
                             break;
                         }
@@ -487,19 +498,68 @@ impl ResolutionPass {
             }
 
             if self.flags.store_candidates {
-                collect_candidate_pool(conn, &module_kind_clause, &names, &mut candidate_ids, 8)?;
+                collect_candidate_pool_from_index(
+                    &mut candidate_index,
+                    &names,
+                    &mut candidate_ids,
+                    8,
+                );
             }
 
             if selected.is_none() {
                 selected = semantic_fallback;
             }
 
-            persist_resolution(conn, edge_id, selected, &candidate_ids)?;
+            updates.push(build_resolved_edge_update(
+                edge_id,
+                selected,
+                &candidate_ids,
+            )?);
             if selected.is_some() {
                 resolved += 1;
             }
         }
 
+        apply_resolution_updates(conn, &updates)?;
+        Ok(resolved)
+    }
+
+    fn semantic_candidates_for_edge(
+        &self,
+        conn: &rusqlite::Connection,
+        cache: &mut HashMap<SemanticCacheKey, Vec<SemanticResolutionCandidate>>,
+        edge_kind: EdgeKind,
+        file_id: Option<i64>,
+        file_path: Option<&str>,
+        caller_qualified: Option<&str>,
+        target_name: &str,
+    ) -> Result<Vec<SemanticResolutionCandidate>> {
+        let language_bucket = semantic_language_bucket(file_path).map(str::to_string);
+        if language_bucket.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let key = SemanticCacheKey {
+            edge_kind,
+            file_id,
+            caller_qualified: caller_qualified.map(str::to_string),
+            target_name: target_name.to_string(),
+            language_bucket,
+        };
+
+        if let Some(cached) = cache.get(&key) {
+            return Ok(cached.clone());
+        }
+
+        let request = SemanticResolutionRequest {
+            edge_kind,
+            file_id,
+            file_path: file_path.map(str::to_string),
+            caller_qualified: caller_qualified.map(str::to_string),
+            target_name: target_name.to_string(),
+        };
+        let resolved = self.semantic_resolvers.resolve(conn, &request)?;
+        cache.insert(key, resolved.clone());
         Ok(resolved)
     }
 }
@@ -521,42 +581,302 @@ where
     }
 }
 
-fn persist_resolution(
-    conn: &rusqlite::Connection,
+fn build_resolved_edge_update(
     edge_id: i64,
     selected: Option<(i64, f32)>,
     candidates: &[i64],
-) -> Result<usize> {
+) -> Result<ResolvedEdgeUpdate> {
     let candidate_payload = candidate_json(candidates)?;
-    if let Some((resolved_target, confidence)) = selected {
-        let certainty =
-            ResolutionCertainty::from_confidence(Some(confidence)).map(ResolutionCertainty::as_str);
-        return Ok(conn.execute(
-            "UPDATE edge
-             SET resolved_target_node_id = ?1,
-                 confidence = ?2,
-                 certainty = ?3,
-                 candidate_target_node_ids = ?4
-             WHERE id = ?5",
-            params![
-                resolved_target,
-                confidence,
-                certainty,
-                candidate_payload,
-                edge_id
-            ],
-        )?);
+    let (resolved_target_node_id, confidence, certainty) = if let Some((target_id, confidence)) =
+        selected
+    {
+        (
+            Some(target_id),
+            Some(confidence),
+            ResolutionCertainty::from_confidence(Some(confidence)).map(ResolutionCertainty::as_str),
+        )
+    } else {
+        (None, None, None)
+    };
+    Ok(ResolvedEdgeUpdate {
+        edge_id,
+        resolved_target_node_id,
+        confidence,
+        certainty,
+        candidate_payload,
+    })
+}
+
+fn apply_resolution_updates(
+    conn: &rusqlite::Connection,
+    updates: &[ResolvedEdgeUpdate],
+) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare(
+        "UPDATE edge
+         SET resolved_target_node_id = ?1,
+             confidence = ?2,
+             certainty = ?3,
+             candidate_target_node_ids = ?4
+         WHERE id = ?5",
+    )?;
+    for update in updates {
+        stmt.execute(params![
+            update.resolved_target_node_id,
+            update.confidence,
+            update.certainty,
+            update.candidate_payload.as_deref(),
+            update.edge_id
+        ])?;
+    }
+    Ok(())
+}
+
+fn collect_candidate_pool_from_index(
+    index: &mut CandidateIndex,
+    names: &[String],
+    out: &mut Vec<i64>,
+    limit: usize,
+) {
+    if out.len() >= limit {
+        return;
+    }
+    for name in names {
+        for id in index.top_matches(name, 3) {
+            record_candidate(out, id);
+            if out.len() >= limit {
+                return;
+            }
+        }
+    }
+}
+
+fn semantic_language_bucket(file_path: Option<&str>) -> Option<&'static str> {
+    let file_path = file_path?;
+    let ext = file_path.rsplit('.').next()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "ts" | "tsx" => Some("typescript"),
+        "java" => Some("java"),
+        _ => None,
+    }
+}
+
+impl CandidateIndex {
+    fn load(conn: &rusqlite::Connection, kinds: &[i32]) -> Result<Self> {
+        let kind_clause = kind_clause(kinds);
+        let query = format!(
+            "SELECT id, file_node_id, serialized_name, qualified_name, start_line
+             FROM node
+             WHERE kind IN ({})",
+            kind_clause
+        );
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map([], |row| {
+            let serialized_name: String = row.get(2)?;
+            Ok(CandidateNode {
+                id: row.get(0)?,
+                file_node_id: row.get(1)?,
+                serialized_name_ascii_lower: serialized_name.to_ascii_lowercase(),
+                serialized_name,
+                qualified_name: row.get(3)?,
+                start_line: row.get(4)?,
+            })
+        })?;
+
+        let mut index = CandidateIndex::default();
+        for row in rows {
+            index.nodes.push(row?);
+        }
+        index
+            .nodes
+            .sort_by_key(|node| (node.start_line.unwrap_or(i64::MIN), node.id));
+
+        for (offset, node) in index.nodes.iter().enumerate() {
+            index.node_offset_by_id.insert(node.id, offset);
+            index
+                .exact_map
+                .entry(node.serialized_name.clone())
+                .or_default()
+                .push(offset);
+            if let Some(tail) = tail_component(&node.serialized_name) {
+                index
+                    .suffix_map_ascii_lower
+                    .entry(tail.to_ascii_lowercase())
+                    .or_default()
+                    .push(offset);
+            }
+        }
+        Ok(index)
     }
 
-    Ok(conn.execute(
-        "UPDATE edge
-         SET resolved_target_node_id = NULL,
-             confidence = NULL,
-             certainty = NULL,
-             candidate_target_node_ids = ?1
-         WHERE id = ?2",
-        params![candidate_payload, edge_id],
-    )?)
+    fn find_same_file(&mut self, file_id: Option<i64>, name: &str) -> Option<i64> {
+        let file_id = file_id?;
+        let key = (file_id, name.to_string());
+        if let Some(cached) = self.same_file_cache.get(&key) {
+            return *cached;
+        }
+        let suffix_key = name.to_ascii_lowercase();
+        let resolved = self
+            .first_in_file(self.exact_map.get(name), file_id)
+            .or_else(|| self.first_in_file(self.suffix_map_ascii_lower.get(&suffix_key), file_id));
+        self.same_file_cache.insert(key, resolved);
+        resolved
+    }
+
+    fn find_same_module(
+        &mut self,
+        module_prefix: &str,
+        delimiter: &str,
+        name: &str,
+    ) -> Option<i64> {
+        let qualified_prefix = format!("{module_prefix}{delimiter}");
+        let key = (qualified_prefix.clone(), name.to_string());
+        if let Some(cached) = self.same_module_cache.get(&key) {
+            return *cached;
+        }
+        let suffix_key = name.to_ascii_lowercase();
+        let resolved = self
+            .first_in_module(self.exact_map.get(name), &qualified_prefix)
+            .or_else(|| {
+                self.first_in_module(
+                    self.suffix_map_ascii_lower.get(&suffix_key),
+                    &qualified_prefix,
+                )
+            });
+        self.same_module_cache.insert(key, resolved);
+        resolved
+    }
+
+    fn find_global_unique(&mut self, name: &str) -> Option<i64> {
+        if let Some(cached) = self.global_unique_cache.get(name) {
+            return *cached;
+        }
+        let suffix_key = name.to_ascii_lowercase();
+        let resolved = if let Some(exact) = self.exact_map.get(name) {
+            if exact.len() == 1 {
+                Some(self.nodes[exact[0]].id)
+            } else {
+                None
+            }
+        } else if let Some(suffix) = self.suffix_map_ascii_lower.get(&suffix_key) {
+            if suffix.len() == 1 {
+                Some(self.nodes[suffix[0]].id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.global_unique_cache.insert(name.to_string(), resolved);
+        resolved
+    }
+
+    fn find_fuzzy(&mut self, name: &str) -> Option<i64> {
+        if let Some(exact) = self.exact_map.get(name)
+            && let Some(&idx) = exact.first()
+        {
+            return Some(self.nodes[idx].id);
+        }
+
+        let suffix_key = name.to_ascii_lowercase();
+        if let Some(suffix) = self.suffix_map_ascii_lower.get(&suffix_key)
+            && let Some(&idx) = suffix.first()
+        {
+            return Some(self.nodes[idx].id);
+        }
+
+        if let Some(cached) = self.fuzzy_cache_ascii_lower.get(&suffix_key) {
+            return *cached;
+        }
+
+        let resolved = self
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name_ascii_lower.contains(&suffix_key))
+            .map(|node| node.id);
+        self.fuzzy_cache_ascii_lower.insert(suffix_key, resolved);
+        resolved
+    }
+
+    fn top_matches(&mut self, name: &str, limit: usize) -> Vec<i64> {
+        if let Some(cached) = self.top_match_cache.get(name) {
+            return cached.iter().take(limit).copied().collect();
+        }
+        let mut out = Vec::with_capacity(limit);
+        if let Some(exact) = self.exact_map.get(name) {
+            for &idx in exact.iter().take(limit) {
+                out.push(self.nodes[idx].id);
+            }
+        }
+        if out.len() < limit {
+            let suffix_key = name.to_ascii_lowercase();
+            if let Some(suffix) = self.suffix_map_ascii_lower.get(&suffix_key) {
+                for &idx in suffix {
+                    let candidate = self.nodes[idx].id;
+                    if !out.contains(&candidate) {
+                        out.push(candidate);
+                    }
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        self.top_match_cache.insert(name.to_string(), out.clone());
+        out
+    }
+
+    fn is_same_file_candidate(&self, candidate_id: i64, caller_file_id: Option<i64>) -> bool {
+        let Some(caller_file_id) = caller_file_id else {
+            return false;
+        };
+        self.node_offset_by_id
+            .get(&candidate_id)
+            .and_then(|offset| self.nodes.get(*offset))
+            .is_some_and(|node| node.file_node_id == Some(caller_file_id))
+    }
+
+    fn first_in_file(&self, candidates: Option<&Vec<usize>>, file_id: i64) -> Option<i64> {
+        candidates.and_then(|candidates| {
+            candidates.iter().find_map(|idx| {
+                let node = &self.nodes[*idx];
+                (node.file_node_id == Some(file_id)).then_some(node.id)
+            })
+        })
+    }
+
+    fn first_in_module(&self, candidates: Option<&Vec<usize>>, prefix: &str) -> Option<i64> {
+        candidates.and_then(|candidates| {
+            candidates.iter().find_map(|idx| {
+                let node = &self.nodes[*idx];
+                node.qualified_name
+                    .as_deref()
+                    .is_some_and(|qualified| qualified.starts_with(prefix))
+                    .then_some(node.id)
+            })
+        })
+    }
+}
+
+fn tail_component(serialized_name: &str) -> Option<&str> {
+    let dot_idx = serialized_name.rfind('.');
+    let colon_idx = serialized_name.rfind("::");
+    let start = match (dot_idx, colon_idx) {
+        (Some(dot), Some(colon)) => {
+            if dot > colon {
+                dot + 1
+            } else {
+                colon + 2
+            }
+        }
+        (Some(dot), None) => dot + 1,
+        (None, Some(colon)) => colon + 2,
+        (None, None) => return None,
+    };
+    let tail = &serialized_name[start..];
+    if tail.is_empty() { None } else { Some(tail) }
 }
 
 fn cleanup_stale_call_resolutions(
@@ -589,54 +909,64 @@ fn cleanup_stale_call_resolutions(
         params_from_iter(low_confidence_params.iter()),
     )?;
 
-    for common_name in common_unqualified_call_names() {
-        if flags.legacy_mode {
-            let mut legacy_query = String::from(
-                "UPDATE edge SET resolved_target_node_id = NULL, confidence = NULL, certainty = NULL
-                 WHERE kind = ?1
-                 AND resolved_target_node_id IS NOT NULL
-                 AND target_node_id IN (SELECT id FROM node WHERE serialized_name = ?2)",
-            );
-            if let Some(scope_ids) = scope_file_ids.as_ref() {
-                legacy_query.push_str(
-                    " AND source_node_id IN (SELECT id FROM node WHERE file_node_id IN (",
-                );
-                legacy_query.push_str(&numbered_placeholders(3, scope_ids.len()));
-                legacy_query.push_str("))");
-            }
-            let mut legacy_params = vec![
-                Value::Integer(EdgeKind::CALL as i64),
-                Value::Text((*common_name).to_string()),
-            ];
-            if let Some(scope_ids) = scope_file_ids.as_ref() {
-                legacy_params.extend(scope_ids.iter().copied().map(Value::Integer));
-            }
-            conn.execute(&legacy_query, params_from_iter(legacy_params.iter()))?;
-        } else {
-            let mut strict_query = String::from(
-                "UPDATE edge SET resolved_target_node_id = NULL, confidence = NULL, certainty = NULL
-                 WHERE kind = ?1
-                 AND resolved_target_node_id IS NOT NULL
-                 AND target_node_id IN (SELECT id FROM node WHERE serialized_name = ?2)
-                 AND (certainty IS NULL OR certainty != ?3)",
-            );
-            if let Some(scope_ids) = scope_file_ids.as_ref() {
-                strict_query.push_str(
-                    " AND source_node_id IN (SELECT id FROM node WHERE file_node_id IN (",
-                );
-                strict_query.push_str(&numbered_placeholders(4, scope_ids.len()));
-                strict_query.push_str("))");
-            }
-            let mut strict_params = vec![
-                Value::Integer(EdgeKind::CALL as i64),
-                Value::Text((*common_name).to_string()),
-                Value::Text(ResolutionCertainty::Certain.as_str().to_string()),
-            ];
-            if let Some(scope_ids) = scope_file_ids.as_ref() {
-                strict_params.extend(scope_ids.iter().copied().map(Value::Integer));
-            }
-            conn.execute(&strict_query, params_from_iter(strict_params.iter()))?;
+    let common_names = common_unqualified_call_names();
+    if common_names.is_empty() {
+        return Ok(());
+    }
+    let names_placeholders = question_placeholders(common_names.len());
+
+    if flags.legacy_mode {
+        let mut legacy_query = format!(
+            "UPDATE edge SET resolved_target_node_id = NULL, confidence = NULL, certainty = NULL
+             WHERE kind = ?
+             AND resolved_target_node_id IS NOT NULL
+             AND target_node_id IN (SELECT id FROM node WHERE serialized_name IN ({}))",
+            names_placeholders
+        );
+        if let Some(scope_ids) = scope_file_ids.as_ref() {
+            legacy_query
+                .push_str(" AND source_node_id IN (SELECT id FROM node WHERE file_node_id IN (");
+            legacy_query.push_str(&question_placeholders(scope_ids.len()));
+            legacy_query.push_str("))");
         }
+        let mut legacy_params = vec![Value::Integer(EdgeKind::CALL as i64)];
+        legacy_params.extend(
+            common_names
+                .iter()
+                .map(|name| Value::Text((*name).to_string())),
+        );
+        if let Some(scope_ids) = scope_file_ids.as_ref() {
+            legacy_params.extend(scope_ids.iter().copied().map(Value::Integer));
+        }
+        conn.execute(&legacy_query, params_from_iter(legacy_params.iter()))?;
+    } else {
+        let mut strict_query = format!(
+            "UPDATE edge SET resolved_target_node_id = NULL, confidence = NULL, certainty = NULL
+             WHERE kind = ?
+             AND resolved_target_node_id IS NOT NULL
+             AND target_node_id IN (SELECT id FROM node WHERE serialized_name IN ({}))
+             AND (certainty IS NULL OR certainty != ?)",
+            names_placeholders
+        );
+        if let Some(scope_ids) = scope_file_ids.as_ref() {
+            strict_query
+                .push_str(" AND source_node_id IN (SELECT id FROM node WHERE file_node_id IN (");
+            strict_query.push_str(&question_placeholders(scope_ids.len()));
+            strict_query.push_str("))");
+        }
+        let mut strict_params = vec![Value::Integer(EdgeKind::CALL as i64)];
+        strict_params.extend(
+            common_names
+                .iter()
+                .map(|name| Value::Text((*name).to_string())),
+        );
+        strict_params.push(Value::Text(
+            ResolutionCertainty::Certain.as_str().to_string(),
+        ));
+        if let Some(scope_ids) = scope_file_ids.as_ref() {
+            strict_params.extend(scope_ids.iter().copied().map(Value::Integer));
+        }
+        conn.execute(&strict_query, params_from_iter(strict_params.iter()))?;
     }
 
     Ok(())
@@ -704,6 +1034,12 @@ fn numbered_placeholders(start: usize, count: usize) -> String {
         .join(", ")
 }
 
+fn question_placeholders(count: usize) -> String {
+    std::iter::repeat_n("?", count)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn kind_scope_params(kind: EdgeKind, scope_file_ids: &[i64]) -> Vec<Value> {
     let mut values = Vec::with_capacity(1 + scope_file_ids.len());
     values.push(Value::Integer(kind as i64));
@@ -711,6 +1047,8 @@ fn kind_scope_params(kind: EdgeKind, scope_file_ids: &[i64]) -> Vec<Value> {
     values
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn is_same_file_candidate(
     conn: &rusqlite::Connection,
     candidate_id: i64,
@@ -730,6 +1068,8 @@ fn is_same_file_candidate(
     Ok(candidate_file_id.is_some() && candidate_file_id == Some(caller_file_id))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn name_patterns(name: &str) -> (String, String, String) {
     (
         name.to_string(),
@@ -782,7 +1122,7 @@ fn import_name_candidates(target_name: &str, legacy_mode: bool) -> Vec<String> {
     candidates
 }
 
-fn module_prefix(qualified: String) -> Option<(String, &'static str)> {
+fn module_prefix(qualified: &str) -> Option<(String, &'static str)> {
     if let Some(idx) = qualified.rfind("::") {
         return Some((qualified[..idx].to_string(), "::"));
     }
@@ -792,6 +1132,8 @@ fn module_prefix(qualified: String) -> Option<(String, &'static str)> {
     None
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn find_same_file(
     conn: &rusqlite::Connection,
     kind_clause: &str,
@@ -842,6 +1184,8 @@ fn find_same_file(
     Ok(resolved)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn find_same_module(
     conn: &rusqlite::Connection,
     kind_clause: &str,
@@ -891,6 +1235,8 @@ fn find_same_module(
     Ok(resolved)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn find_global_unique(
     conn: &rusqlite::Connection,
     kind_clause: &str,
@@ -957,6 +1303,8 @@ fn find_global_unique(
     Ok(resolved)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn find_fuzzy(
     conn: &rusqlite::Connection,
     kind_clause: &str,
@@ -1007,6 +1355,8 @@ fn find_fuzzy(
         .map_err(Into::into)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn collect_candidate_pool(
     conn: &rusqlite::Connection,
     kind_clause: &str,
@@ -1030,6 +1380,8 @@ fn collect_candidate_pool(
     Ok(())
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn find_top_matches(
     conn: &rusqlite::Connection,
     kind_clause: &str,
@@ -1181,6 +1533,20 @@ mod tests {
     use std::collections::HashSet;
     use std::time::Instant;
     use tempfile::tempdir;
+
+    fn create_node_table(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE node (
+                id INTEGER PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                serialized_name TEXT NOT NULL,
+                qualified_name TEXT,
+                file_node_id INTEGER,
+                start_line INTEGER
+            );",
+        )?;
+        Ok(())
+    }
 
     #[test]
     fn test_common_unqualified_call_names_include_clone_like_noise() {
@@ -1345,6 +1711,177 @@ mod tests {
         )?;
         assert_eq!(second, Some(77_i64));
         assert_eq!(lookup_cache.same_file_lookup.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_candidate_index_same_file_exact_beats_suffix() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                10_i64,
+                NodeKind::FUNCTION as i32,
+                "target",
+                "pkg::target",
+                101_i64,
+                10_i64
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                11_i64,
+                NodeKind::FUNCTION as i32,
+                "pkg::target",
+                "pkg::nested::target",
+                101_i64,
+                5_i64
+            ],
+        )?;
+
+        let mut index = CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
+        assert_eq!(index.find_same_file(Some(101_i64), "target"), Some(10_i64));
+        Ok(())
+    }
+
+    #[test]
+    fn test_candidate_index_same_module_and_suffix_resolution() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                20_i64,
+                NodeKind::FUNCTION as i32,
+                "build",
+                "pkg::core::build",
+                201_i64,
+                40_i64
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                21_i64,
+                NodeKind::FUNCTION as i32,
+                "pkg::helper",
+                "pkg::core::helper",
+                201_i64,
+                20_i64
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                22_i64,
+                NodeKind::FUNCTION as i32,
+                "build_dot",
+                "pkg.core.build_dot",
+                201_i64,
+                30_i64
+            ],
+        )?;
+
+        let mut index = CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
+        assert_eq!(
+            index.find_same_module("pkg::core", "::", "build"),
+            Some(20_i64)
+        );
+        assert_eq!(
+            index.find_same_module("pkg::core", "::", "helper"),
+            Some(21_i64)
+        );
+        assert_eq!(
+            index.find_same_module("pkg.core", ".", "build_dot"),
+            Some(22_i64)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_candidate_index_global_unique_and_fuzzy_order() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+            params![
+                30_i64,
+                NodeKind::MODULE as i32,
+                "UniqueThing",
+                "pkg::UniqueThing",
+                1_i64
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+            params![
+                31_i64,
+                NodeKind::MODULE as i32,
+                "pkg::AliasThing",
+                "pkg::AliasThing",
+                2_i64
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+            params![
+                32_i64,
+                NodeKind::MODULE as i32,
+                "other::AliasThing",
+                "other::AliasThing",
+                3_i64
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+            params![
+                33_i64,
+                NodeKind::MODULE as i32,
+                "pkg::ContainsOnlyTarget",
+                "pkg::ContainsOnlyTarget",
+                4_i64
+            ],
+        )?;
+
+        let mut index = CandidateIndex::load(&conn, &[NodeKind::MODULE as i32])?;
+        assert_eq!(index.find_global_unique("UniqueThing"), Some(30_i64));
+        assert_eq!(index.find_global_unique("AliasThing"), None);
+        assert_eq!(index.find_fuzzy("ContainsOnlyTarget"), Some(33_i64));
+        assert_eq!(index.find_fuzzy("containsonly"), Some(33_i64));
+        Ok(())
+    }
+
+    #[test]
+    fn test_candidate_index_same_file_candidate_detection() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                41_i64,
+                NodeKind::MODULE as i32,
+                "pkg::same",
+                "pkg::same",
+                900_i64,
+                1_i64
+            ],
+        )?;
+        let index = CandidateIndex::load(&conn, &[NodeKind::MODULE as i32])?;
+        assert!(index.is_same_file_candidate(41_i64, Some(900_i64)));
+        assert!(!index.is_same_file_candidate(41_i64, Some(901_i64)));
+        assert!(!index.is_same_file_candidate(41_i64, None));
         Ok(())
     }
 

@@ -1,10 +1,11 @@
-use codestory_core::{Edge, ErrorInfo, Node, Occurrence};
+use codestory_core::{AccessKind, Edge, ErrorInfo, Node, NodeId, Occurrence};
 
 #[derive(Default)]
 pub struct IntermediateStorage {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub occurrences: Vec<Occurrence>,
+    pub component_access: Vec<(NodeId, AccessKind)>,
     pub errors: Vec<ErrorInfo>,
 }
 
@@ -29,10 +30,15 @@ impl IntermediateStorage {
         self.errors.push(error);
     }
 
+    pub fn add_component_access(&mut self, node_id: NodeId, access: AccessKind) {
+        self.component_access.push((node_id, access));
+    }
+
     pub fn merge(&mut self, other: IntermediateStorage) {
         self.nodes.extend(other.nodes);
         self.edges.extend(other.edges);
         self.occurrences.extend(other.occurrences);
+        self.component_access.extend(other.component_access);
         self.errors.extend(other.errors);
     }
 
@@ -40,6 +46,7 @@ impl IntermediateStorage {
         self.nodes.clear();
         self.edges.clear();
         self.occurrences.clear();
+        self.component_access.clear();
         self.errors.clear();
     }
 }

@@ -1,5 +1,7 @@
 use anyhow::{Result, anyhow};
-use codestory_core::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind, Occurrence, SourceLocation};
+use codestory_core::{
+    AccessKind, Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind, Occurrence, SourceLocation,
+};
 use codestory_storage::Storage;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -79,6 +81,7 @@ pub struct IndexResult {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub occurrences: Vec<Occurrence>,
+    pub component_access: Vec<(NodeId, AccessKind)>,
 }
 
 pub enum IndexingEvent {
@@ -372,6 +375,11 @@ impl WorkspaceIndexer {
                 .insert_occurrences_batch(&batched_storage.occurrences)
                 .map_err(|e| anyhow!("Storage error: {:?}", e))?;
         }
+        if !batched_storage.component_access.is_empty() {
+            storage
+                .insert_component_access_batch(&batched_storage.component_access)
+                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
+        }
 
         batched_storage.clear();
         Ok(())
@@ -411,6 +419,7 @@ impl WorkspaceIndexer {
                     local_storage.nodes = index_result.nodes;
                     local_storage.edges = index_result.edges;
                     local_storage.occurrences = index_result.occurrences;
+                    local_storage.component_access = index_result.component_access;
                 }
                 Err(e) => {
                     local_storage.add_error(codestory_core::ErrorInfo {
@@ -490,6 +499,100 @@ fn node_kind_from_graph_kind(kind_str: &str) -> NodeKind {
         "CONSTANT" => NodeKind::CONSTANT,
         "ENUM_CONSTANT" => NodeKind::ENUM_CONSTANT,
         _ => NodeKind::UNKNOWN,
+    }
+}
+
+fn access_kind_from_graph_access(value: &str) -> Option<AccessKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "public" => Some(AccessKind::Public),
+        "protected" => Some(AccessKind::Protected),
+        "private" => Some(AccessKind::Private),
+        "default" | "package" | "package_private" => Some(AccessKind::Default),
+        _ => None,
+    }
+}
+
+fn source_line(source: &str, line: u32) -> Option<&str> {
+    if line == 0 {
+        return None;
+    }
+    source.lines().nth((line - 1) as usize)
+}
+
+fn classify_access_from_text(text: &str) -> Option<AccessKind> {
+    let normalized = text.to_ascii_lowercase();
+    if normalized.contains("private") {
+        return Some(AccessKind::Private);
+    }
+    if normalized.contains("protected") {
+        return Some(AccessKind::Protected);
+    }
+    if normalized.contains("public") {
+        return Some(AccessKind::Public);
+    }
+    None
+}
+
+fn infer_access_from_source(
+    language_name: &str,
+    source: &str,
+    start_line: u32,
+    kind: NodeKind,
+) -> Option<AccessKind> {
+    if !matches!(
+        kind,
+        NodeKind::METHOD
+            | NodeKind::FIELD
+            | NodeKind::VARIABLE
+            | NodeKind::GLOBAL_VARIABLE
+            | NodeKind::CONSTANT
+    ) {
+        return None;
+    }
+
+    if let Some(line_text) = source_line(source, start_line)
+        && let Some(access) = classify_access_from_text(line_text)
+    {
+        return Some(access);
+    }
+    if let Some(prev_line) = start_line
+        .checked_sub(1)
+        .and_then(|line| source_line(source, line))
+        && let Some(access) = classify_access_from_text(prev_line)
+    {
+        return Some(access);
+    }
+
+    match language_name {
+        "java" => Some(AccessKind::Default),
+        "typescript" | "javascript" => Some(AccessKind::Public),
+        "cpp" | "c" => {
+            let lines: Vec<&str> = source.lines().collect();
+            let mut idx = start_line.saturating_sub(1) as i32;
+            let mut remaining = 40;
+            while idx >= 0 && remaining > 0 {
+                let line = lines[idx as usize].trim().to_ascii_lowercase();
+                if line.starts_with("public:") {
+                    return Some(AccessKind::Public);
+                }
+                if line.starts_with("protected:") {
+                    return Some(AccessKind::Protected);
+                }
+                if line.starts_with("private:") {
+                    return Some(AccessKind::Private);
+                }
+                if line.contains("struct ") {
+                    return Some(AccessKind::Public);
+                }
+                if line.contains("class ") {
+                    return Some(AccessKind::Private);
+                }
+                idx -= 1;
+                remaining -= 1;
+            }
+            Some(AccessKind::Private)
+        }
+        _ => Some(AccessKind::Public),
     }
 }
 
@@ -704,6 +807,7 @@ pub fn index_file(
     // 1. First pass: Create nodes and a temporary mapping from GraphNodeId -> OurNodeId
     let mut graph_to_node_id = HashMap::new();
     let mut unique_nodes: HashMap<NodeId, Node> = HashMap::new();
+    let mut component_access_by_node_id: HashMap<NodeId, AccessKind> = HashMap::new();
 
     for node_id in graph.iter_nodes() {
         let node_data = &graph[node_id];
@@ -714,6 +818,7 @@ pub fn index_file(
         let mut start_col: Option<u32> = None;
         let mut end_row: Option<u32> = None;
         let mut end_col: Option<u32> = None;
+        let mut access_kind: Option<AccessKind> = None;
 
         for (attr, val) in node_data.attributes.iter() {
             match attr.as_str() {
@@ -723,6 +828,11 @@ pub fn index_file(
                 "start_col" => start_col = val.as_integer().ok(),
                 "end_row" => end_row = val.as_integer().ok(),
                 "end_col" => end_col = val.as_integer().ok(),
+                "access" => {
+                    if let Ok(value) = val.as_str() {
+                        access_kind = access_kind_from_graph_access(value);
+                    }
+                }
                 _ => {}
             }
         }
@@ -734,6 +844,8 @@ pub fn index_file(
             let canonical_seed = format!("{}:{}:{}", file_name, name_str, start_line);
             let nid = NodeId(generate_id(&canonical_seed));
             graph_to_node_id.insert(node_id, nid);
+            let effective_access = access_kind
+                .or_else(|| infer_access_from_source(language_name, source, start_line, kind));
 
             unique_nodes.insert(
                 nid,
@@ -748,6 +860,9 @@ pub fn index_file(
                     ..Default::default()
                 },
             );
+            if let Some(access) = effective_access {
+                component_access_by_node_id.insert(nid, access);
+            }
 
             if let Some(st) = &symbol_table {
                 st.insert(nid.0, kind);
@@ -832,6 +947,12 @@ pub fn index_file(
     remap_file_affinity(&mut final_nodes, new_file_id);
     remap_edges(&mut result_edges, new_file_id, &id_remap, flags);
     remap_occurrences(&mut result_occurrences, &id_remap);
+    let mut remapped_component_access: HashMap<NodeId, AccessKind> = HashMap::new();
+    for (original_id, access) in component_access_by_node_id {
+        let remapped_id = id_remap.get(&original_id).copied().unwrap_or(original_id);
+        remapped_component_access.insert(remapped_id, access);
+    }
+    let component_access = remapped_component_access.into_iter().collect::<Vec<_>>();
 
     apply_line_range_call_attribution(&final_nodes, &mut result_edges, flags);
 
@@ -845,6 +966,7 @@ pub fn index_file(
         nodes: final_nodes,
         edges: result_edges,
         occurrences: result_occurrences,
+        component_access,
     })
 }
 
