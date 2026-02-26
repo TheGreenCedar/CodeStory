@@ -18,11 +18,11 @@
     "format:check": "oxfmt --check .",
     "check": "npm-run-all --parallel typecheck lint format:check",
     "test": "vitest run",
-    "test:parity": "npm-run-all test:parity:geometry test:parity:visual",
-    "test:parity:geometry": "vitest run tests/graph/parityProfile.test.ts tests/graph/parityPipeline.test.ts tests/graph/parityRouting.test.ts tests/graph/edgePath.test.ts",
-    "test:parity:visual": "playwright test -c playwright.config.ts tests/graph/parity-trail.spec.ts"
+    "test:graph": "vitest run tests/graph/dagreLayout.test.ts tests/graph/routing.test.ts tests/graph/GraphViewport.test.tsx tests/graph/trailConfig.test.ts",
+    "test:parity": "npm run test:graph"
   },
   "dependencies": {
+    "@dagrejs/dagre": "^2.0.0",
     "@monaco-editor/react": "4.7.0",
     "@xyflow/react": "12.10.1",
     "html-to-image": "^1.11.13",

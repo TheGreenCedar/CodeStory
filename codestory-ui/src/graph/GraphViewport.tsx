@@ -8,6 +8,7 @@ import {
   Panel,
   Position,
   ReactFlow,
+  getSmoothStepPath,
   type Edge,
   type EdgeProps,
   type Node,
@@ -18,12 +19,11 @@ import { toBlob, toJpeg, toPng, toSvg } from "html-to-image";
 import mermaid from "mermaid";
 
 import type { EdgeKind, GraphArtifactDto } from "../generated/api";
-import { buildEdgePath } from "./render/edgePath";
-import { runDeterministicParityPipeline } from "./layout/parityPipeline";
-import { buildFallbackLayout, buildSemanticLayout } from "./layout/semanticLayout";
+import { buildDagreLayout } from "./layout/dagreLayout";
 import { buildLegendRows, toReactFlowElements, type SemanticEdgeData } from "./layout/routing";
+import { buildCanonicalLayout } from "./layout/semanticGraph";
 import type { GroupingMode, TrailUiConfig } from "./trailConfig";
-import { STRUCTURAL_KINDS, type FlowNodeData, type LayoutElements } from "./layout/types";
+import { STRUCTURAL_KINDS, type FlowNodeData } from "./layout/types";
 
 mermaid.initialize({
   startOnLoad: false,
@@ -392,38 +392,28 @@ function applyGrouping(
   return [...groupedNodes, ...childNodes, ...passthrough];
 }
 
-function buildChannelSourceEdgeIds(edges: Edge<SemanticEdgeData>[]): Map<string, string[]> {
-  const byChannel = new Map<string, Set<string>>();
-  for (const edge of edges) {
-    const channelId = edge.data?.channelId;
-    if (!channelId) {
-      continue;
-    }
-    const sourceEdgeIds =
-      edge.data?.sourceEdgeIds && edge.data.sourceEdgeIds.length > 0
-        ? edge.data.sourceEdgeIds
-        : [edge.id];
-    const existing = byChannel.get(channelId) ?? new Set<string>();
-    for (const sourceEdgeId of sourceEdgeIds) {
-      existing.add(sourceEdgeId);
-    }
-    byChannel.set(channelId, existing);
-  }
-
-  return new Map([...byChannel.entries()].map(([channelId, ids]) => [channelId, [...ids]]));
-}
-
 function SemanticEdge({
   id: _id,
   sourceX,
   sourceY,
   targetX,
   targetY,
+  sourcePosition,
+  targetPosition,
   markerEnd,
   style,
   data,
 }: EdgeProps<Edge<SemanticEdgeData>>) {
-  const { path, labelX, labelY } = buildEdgePath(sourceX, sourceY, targetX, targetY, data);
+  const [path, labelX, labelY] = getSmoothStepPath({
+    sourceX,
+    sourceY,
+    targetX,
+    targetY,
+    sourcePosition,
+    targetPosition,
+    borderRadius: 18,
+    offset: 24,
+  });
   const showTooltip = Boolean(data?.tooltipLabel) && (data?.isHovered || data?.isFocused);
 
   return (
@@ -972,20 +962,6 @@ function directionalScore(
   return primary + orthogonal * 0.6;
 }
 
-function orientSeedLayoutForDirection(layout: LayoutElements, vertical: boolean): LayoutElements {
-  if (!vertical) {
-    return layout;
-  }
-  return {
-    ...layout,
-    nodes: layout.nodes.map((node) => ({
-      ...node,
-      x: node.y,
-      y: node.x,
-    })),
-  };
-}
-
 function isDenseGraph(depth: number, nodeCount: number, edgeCount: number): boolean {
   if (nodeCount <= 48) {
     return false;
@@ -1138,7 +1114,6 @@ export function GraphViewport({
     }
 
     const centerMemberId = graph.graph.center_id;
-    const verticalLayout = trailConfig.layoutDirection === "Vertical";
 
     const withInteractiveNodeData = (node: Node<FlowNodeData>): Node<FlowNodeData> => {
       const focusedMemberId =
@@ -1178,7 +1153,6 @@ export function GraphViewport({
       edges: Edge<SemanticEdgeData>[],
       centerNodeId: string,
       nodeCount: number,
-      channelSourceEdgeIdsByChannelId: Map<string, string[]>,
     ): Edge<SemanticEdgeData>[] => {
       const denseFocusActive = isDenseGraph(trailConfig.depth, nodeCount, edges.length);
       return edges.map((edge) => {
@@ -1187,7 +1161,6 @@ export function GraphViewport({
           return edge;
         }
         const touchesCenter = edge.source === centerNodeId || edge.target === centerNodeId;
-        const isTrunk = edgeData.routeKind === "flow-trunk";
         const hasSelectedEdge = selectedEdgeId !== null;
         const isSelectedEdge = selectedEdgeId === edge.id;
         const isHoveredEdge = hoveredEdgeId === edge.id;
@@ -1196,7 +1169,7 @@ export function GraphViewport({
         const certaintyOpacity = Number(edge.style?.opacity ?? 1);
         const baseStroke = Number(edge.style?.strokeWidth ?? 2);
         const hasHoveredEdge = hoveredEdgeId !== null;
-        const deemphasized = denseFocusActive && !touchesCenter && !isTrunk;
+        const deemphasized = denseFocusActive && !touchesCenter;
         let interactionOpacity: number;
         let strokeWidth: number;
         if (isFilteredOut) {
@@ -1227,10 +1200,9 @@ export function GraphViewport({
                 color: strokeColor,
               }
             : baseMarkerEnd;
-        const channelSourceEdgeIds = edgeData.channelId
-          ? channelSourceEdgeIdsByChannelId.get(edgeData.channelId)
-          : undefined;
-        const bundledCount = channelSourceEdgeIds?.length ?? edgeData.bundleCount;
+        const sourceEdgeIds =
+          edgeData.sourceEdgeIds.length > 0 ? edgeData.sourceEdgeIds : [edge.id];
+        const groupedCount = sourceEdgeIds.length;
         return {
           ...edge,
           markerEnd,
@@ -1242,8 +1214,7 @@ export function GraphViewport({
           },
           data: {
             ...edgeData,
-            channelSourceEdgeIds,
-            tooltipLabel: edgeTooltipLabel(edgeData, bundledCount),
+            tooltipLabel: edgeTooltipLabel(edgeData, groupedCount),
             isFocused: isSelectedEdge,
             isHovered: isHoveredEdge,
           },
@@ -1251,125 +1222,47 @@ export function GraphViewport({
       });
     };
 
-    try {
-      const semantic = orientSeedLayoutForDirection(
-        buildSemanticLayout(graph.graph),
-        verticalLayout,
-      );
-      const parityPipeline = runDeterministicParityPipeline({
-        layout: semantic,
-        depth: trailConfig.depth,
-        nodeCount: graph.graph.nodes.length,
-        edgeCount: graph.graph.edges.length,
-        layoutDirection: trailConfig.layoutDirection,
-        debugChannels: trailConfig.debugParityChannels,
-        debugRoutes: trailConfig.debugParityRoutes,
-      });
-      const routed = parityPipeline.routed;
-      const flowLayout = toReactFlowElements(routed, trailConfig.layoutDirection);
-      const centerNodeId = flowLayout.centerNodeId;
-      const groupedNodes = applyGrouping(
-        flowLayout.nodes.map(withInteractiveNodeData).map(applyManualPosition),
-        trailConfig.groupingMode,
-        nodeMetaById,
-      ).map((node) => {
-        if (!node.data.groupMode || !node.data.groupAnchorId) {
-          return node;
-        }
-        return {
-          ...node,
-          data: {
-            ...node.data,
-            layoutDirection: trailConfig.layoutDirection,
-            onSelectGroup: () => {
-              const anchorId = node.data.groupAnchorId;
-              if (!anchorId) {
-                return;
-              }
-              const anchorMeta = nodeMetaById.get(anchorId);
-              onSelectNode(anchorId, anchorMeta?.qualifiedName ?? anchorId);
-            },
-          },
-        };
-      });
-      const visibleNodes = groupedNodes.filter((node) => !hiddenNodeIds.has(node.id));
-      const visibleNodeIds = new Set(visibleNodes.map((node) => node.id));
-      const visibleEdges = flowLayout.edges.filter(
-        (edge) =>
-          !hiddenEdgeIds.has(edge.id) &&
-          visibleNodeIds.has(edge.source) &&
-          visibleNodeIds.has(edge.target),
-      );
-      const channelSourceEdgeIdsByChannelId = buildChannelSourceEdgeIds(visibleEdges);
+    const seed = buildCanonicalLayout(graph.graph);
+    const layouted = buildDagreLayout(seed, trailConfig.layoutDirection);
+    const flowLayout = toReactFlowElements(layouted, trailConfig.layoutDirection);
+
+    const groupedNodes = applyGrouping(
+      flowLayout.nodes.map(withInteractiveNodeData).map(applyManualPosition),
+      trailConfig.groupingMode,
+      nodeMetaById,
+    ).map((node) => {
+      if (!node.data.groupMode || !node.data.groupAnchorId) {
+        return node;
+      }
       return {
-        ...flowLayout,
-        nodes: visibleNodes,
-        edges: edgeStyling(
-          visibleEdges,
-          centerNodeId,
-          visibleNodes.length,
-          channelSourceEdgeIdsByChannelId,
-        ),
-      };
-    } catch {
-      const fallbackSeed = orientSeedLayoutForDirection(
-        buildFallbackLayout(graph.graph),
-        verticalLayout,
-      );
-      const fallbackPipeline = runDeterministicParityPipeline({
-        layout: fallbackSeed,
-        depth: trailConfig.depth,
-        nodeCount: graph.graph.nodes.length,
-        edgeCount: graph.graph.edges.length,
-        layoutDirection: trailConfig.layoutDirection,
-        debugChannels: trailConfig.debugParityChannels,
-        debugRoutes: trailConfig.debugParityRoutes,
-      });
-      const elements = toReactFlowElements(fallbackPipeline.routed, trailConfig.layoutDirection);
-      const groupedNodes = applyGrouping(
-        elements.nodes.map(withInteractiveNodeData).map(applyManualPosition),
-        trailConfig.groupingMode,
-        nodeMetaById,
-      ).map((node) => {
-        if (!node.data.groupMode || !node.data.groupAnchorId) {
-          return node;
-        }
-        return {
-          ...node,
-          data: {
-            ...node.data,
-            layoutDirection: trailConfig.layoutDirection,
-            onSelectGroup: () => {
-              const anchorId = node.data.groupAnchorId;
-              if (!anchorId) {
-                return;
-              }
-              const anchorMeta = nodeMetaById.get(anchorId);
-              onSelectNode(anchorId, anchorMeta?.qualifiedName ?? anchorId);
-            },
+        ...node,
+        data: {
+          ...node.data,
+          layoutDirection: trailConfig.layoutDirection,
+          onSelectGroup: () => {
+            const anchorId = node.data.groupAnchorId;
+            if (!anchorId) {
+              return;
+            }
+            const anchorMeta = nodeMetaById.get(anchorId);
+            onSelectNode(anchorId, anchorMeta?.qualifiedName ?? anchorId);
           },
-        };
-      });
-      const visibleNodes = groupedNodes.filter((node) => !hiddenNodeIds.has(node.id));
-      const visibleNodeIds = new Set(visibleNodes.map((node) => node.id));
-      const visibleEdges = elements.edges.filter(
-        (edge) =>
-          !hiddenEdgeIds.has(edge.id) &&
-          visibleNodeIds.has(edge.source) &&
-          visibleNodeIds.has(edge.target),
-      );
-      const channelSourceEdgeIdsByChannelId = buildChannelSourceEdgeIds(visibleEdges);
-      return {
-        ...elements,
-        nodes: visibleNodes,
-        edges: edgeStyling(
-          visibleEdges,
-          elements.centerNodeId,
-          visibleNodes.length,
-          channelSourceEdgeIdsByChannelId,
-        ),
+        },
       };
-    }
+    });
+    const visibleNodes = groupedNodes.filter((node) => !hiddenNodeIds.has(node.id));
+    const visibleNodeIds = new Set(visibleNodes.map((node) => node.id));
+    const visibleEdges = flowLayout.edges.filter(
+      (edge) =>
+        !hiddenEdgeIds.has(edge.id) &&
+        visibleNodeIds.has(edge.source) &&
+        visibleNodeIds.has(edge.target),
+    );
+    return {
+      ...flowLayout,
+      nodes: visibleNodes,
+      edges: edgeStyling(visibleEdges, flowLayout.centerNodeId, visibleNodes.length),
+    };
   }, [
     activeGraphNodePositions,
     expandedNodeIds,
@@ -1382,8 +1275,6 @@ export function GraphViewport({
     selectedEdgeId,
     selectedNodeId,
     trailConfig.depth,
-    trailConfig.debugParityChannels,
-    trailConfig.debugParityRoutes,
     trailConfig.layoutDirection,
     trailConfig.groupingMode,
     toggleExpandedNode,
@@ -1393,12 +1284,6 @@ export function GraphViewport({
   }, [flowElements?.nodes]);
   const flowEdgesById = useMemo(() => {
     return new Map(flowElements?.edges.map((edge) => [edge.id, edge]) ?? []);
-  }, [flowElements?.edges]);
-  const channelSourceEdgeIdsByChannelId = useMemo(() => {
-    if (!flowElements?.edges) {
-      return new Map<string, string[]>();
-    }
-    return buildChannelSourceEdgeIds(flowElements.edges);
   }, [flowElements?.edges]);
   const selectNodeById = useCallback(
     (nodeId: string) => {
@@ -1420,19 +1305,9 @@ export function GraphViewport({
       const semanticEdgeData = edge.data;
 
       if (onSelectEdge && semanticEdgeData?.edgeKind) {
-        const baseSourceEdgeIds =
-          semanticEdgeData.sourceEdgeIds.length > 0 ? semanticEdgeData.sourceEdgeIds : [edge.id];
-        const channelSourceEdgeIds = semanticEdgeData.channelId
-          ? channelSourceEdgeIdsByChannelId.get(semanticEdgeData.channelId)
-          : undefined;
         const sourceEdgeIds =
-          channelSourceEdgeIds && channelSourceEdgeIds.length > 0
-            ? channelSourceEdgeIds
-            : semanticEdgeData.channelSourceEdgeIds &&
-                semanticEdgeData.channelSourceEdgeIds.length > 0
-              ? semanticEdgeData.channelSourceEdgeIds
-              : baseSourceEdgeIds;
-        const primaryEdgeId = sourceEdgeIds[0] ?? baseSourceEdgeIds[0] ?? edge.id;
+          semanticEdgeData.sourceEdgeIds.length > 0 ? semanticEdgeData.sourceEdgeIds : [edge.id];
+        const primaryEdgeId = sourceEdgeIds[0] ?? edge.id;
         onSelectEdge({
           id: primaryEdgeId,
           edgeIds: sourceEdgeIds,
@@ -1462,13 +1337,7 @@ export function GraphViewport({
       setSelectedNodeId(fallbackNode.id);
       onSelectNode(fallbackNode.id, nodeLabelFromData(fallbackNode.data, fallbackNode.id));
     },
-    [
-      channelSourceEdgeIdsByChannelId,
-      flowElements?.centerNodeId,
-      flowNodesById,
-      onSelectEdge,
-      onSelectNode,
-    ],
+    [flowElements?.centerNodeId, flowNodesById, onSelectEdge, onSelectNode],
   );
   const closeContextMenu = useCallback(() => {
     setContextMenu(null);
@@ -2121,8 +1990,8 @@ export function GraphViewport({
               ))}
             </div>
             <div className="graph-legend-note">
-              Trunk lines indicate bundled flow edges.
-              {(hasUncertainEdges || hasProbableEdges) && " "}
+              Edge thickness may indicate merged parallel relationships.
+              {hasUncertainEdges || hasProbableEdges ? " " : ""}
               {hasUncertainEdges ? "Dashed edges = uncertain." : ""}
               {hasUncertainEdges && hasProbableEdges ? " " : ""}
               {hasProbableEdges ? "Lower opacity = probable." : ""}

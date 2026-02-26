@@ -38,7 +38,7 @@ export type FlowNodeData = {
 
 export type SemanticEdgeFamily = "flow" | "hierarchy";
 
-export type RouteKind = "direct" | "flow-trunk" | "flow-branch" | "hierarchy";
+export type RouteKind = "direct" | "hierarchy";
 
 export type SemanticNodePlacement = {
   id: string;
@@ -79,15 +79,7 @@ export type RoutedEdgeSpec = {
   multiplicity: number;
   family: SemanticEdgeFamily;
   routeKind: RouteKind;
-  bundleCount: number;
   routePoints: RoutePoint[];
-  trunkCoord?: number;
-  channelId?: string;
-  channelPairId?: string;
-  channelWeight?: number;
-  sharedTrunkPoints?: RoutePoint[];
-  sourceMemberOrder?: number;
-  targetMemberOrder?: number;
 };
 
 export type LayoutElements = {

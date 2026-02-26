@@ -46,7 +46,7 @@ export type GraphResponse = { center_id: NodeId; nodes: GraphNodeDto[]; edges: G
 
 export type IndexMode = "Full" | "Incremental"
 
-export type IndexingPhaseTimings = { parse_index_ms: number; projection_flush_ms: number; edge_resolution_ms: number; error_flush_ms: number; cleanup_ms: number; cache_refresh_ms: number | null; unresolved_calls_start: number; unresolved_imports_start: number; resolved_calls: number; resolved_imports: number; unresolved_calls_end: number; unresolved_imports_end: number }
+export type IndexingPhaseTimings = { parse_index_ms: number; projection_flush_ms: number; edge_resolution_ms: number; error_flush_ms: number; cleanup_ms: number; cache_refresh_ms: number | null; unresolved_calls_start: number; unresolved_imports_start: number; resolved_calls: number; resolved_imports: number; unresolved_calls_end: number; unresolved_imports_end: number; resolution_unresolved_counts_ms?: number | null; resolution_calls_ms?: number | null; resolution_imports_ms?: number | null; resolution_cleanup_ms?: number | null; resolved_calls_same_file?: number | null; resolved_calls_same_module?: number | null; resolved_calls_global_unique?: number | null; resolved_calls_semantic?: number | null; resolved_imports_same_file?: number | null; resolved_imports_same_module?: number | null; resolved_imports_global_unique?: number | null; resolved_imports_fuzzy?: number | null; resolved_imports_semantic?: number | null }
 
 export type LayoutDirection = "Horizontal" | "Vertical"
 

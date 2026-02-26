@@ -7,8 +7,6 @@ import type {
   LayoutElements,
   LegendRow,
   RoutePoint,
-  RouteKind,
-  RoutedEdgeSpec,
   SemanticEdgeFamily,
 } from "./types";
 
@@ -21,19 +19,10 @@ export type SemanticEdgeData = {
   edgeKind: EdgeKind;
   sourceEdgeIds: string[];
   certainty: string | null | undefined;
-  routeKind: RouteKind;
   family: SemanticEdgeFamily;
-  bundleCount: number;
+  multiplicity: number;
   routePoints: RoutePoint[];
-  trunkCoord?: number;
-  channelId?: string;
-  channelPairId?: string;
-  channelWeight?: number;
-  sharedTrunkPoints?: RoutePoint[];
-  sourceMemberOrder?: number;
-  targetMemberOrder?: number;
   layoutDirection?: LayoutDirection;
-  channelSourceEdgeIds?: string[];
   tooltipLabel?: string;
   isFocused?: boolean;
   isHovered?: boolean;
@@ -65,14 +54,17 @@ function markerTypeFor(kind: EdgeKind): MarkerType {
   return CLOSED_TRIANGLE_KINDS.has(kind) ? MarkerType.ArrowClosed : MarkerType.Arrow;
 }
 
-function markerSizeFor(edge: RoutedEdgeSpec): { width: number; height: number } {
+function markerSizeFor(edge: { kind: EdgeKind; multiplicity: number }): {
+  width: number;
+  height: number;
+} {
   if (edge.kind === "INHERITANCE") {
     return PARITY_CONSTANTS.markers.inheritance;
   }
   if (edge.kind === "TEMPLATE_SPECIALIZATION") {
     return PARITY_CONSTANTS.markers.templateSpecialization;
   }
-  if (edge.routeKind === "flow-trunk" || edge.bundleCount > 1) {
+  if (edge.multiplicity > 1) {
     return PARITY_CONSTANTS.markers.bundled;
   }
   return PARITY_CONSTANTS.markers.default;
@@ -100,28 +92,14 @@ function certaintyStroke(
   return { opacity: 1 };
 }
 
-function edgeWidth(
-  baseWidth: number,
-  multiplicity: number,
-  family: SemanticEdgeFamily,
-  routeKind: RouteKind,
-  bundleCount: number,
-): number {
+function edgeWidth(baseWidth: number, multiplicity: number, family: SemanticEdgeFamily): number {
   const strokeAmplification = PARITY_CONSTANTS.rendering.strokeAmplification;
   const multiplicityBoost = Math.min(
     strokeAmplification.multiplicityMaxBoost,
     Math.max(0, multiplicity - 1) * strokeAmplification.multiplicityStep,
   );
   const hierarchyBoost = family === "hierarchy" ? strokeAmplification.hierarchyBoost : 0;
-  const bundledWeight = Math.max(1, bundleCount);
-  const bundledBoost =
-    routeKind === "flow-trunk" && bundledWeight > 1
-      ? Math.min(
-          strokeAmplification.bundledMaxBoost,
-          Math.log2(bundledWeight) * strokeAmplification.bundledLogMultiplier,
-        )
-      : 0;
-  return baseWidth + multiplicityBoost + hierarchyBoost + bundledBoost;
+  return baseWidth + multiplicityBoost + hierarchyBoost;
 }
 
 export function buildLegendRows(graph: GraphResponse): LegendRow[] {
@@ -212,42 +190,22 @@ export function toReactFlowElements(
       markerEnd,
       style: {
         stroke: palette.stroke,
-        strokeWidth: edgeWidth(
-          palette.width,
-          edge.multiplicity,
-          edge.family,
-          edge.routeKind,
-          edge.bundleCount,
-        ),
+        strokeWidth: edgeWidth(palette.width, edge.multiplicity, edge.family),
         strokeDasharray: certainty.dash,
         opacity: certainty.opacity,
       },
       interactionWidth:
-        edge.routeKind === "flow-trunk"
-          ? PARITY_CONSTANTS.rendering.interactionWidth.bundledBase +
-            Math.min(
-              PARITY_CONSTANTS.rendering.interactionWidth.bundledMaxExtra,
-              Math.log2(Math.max(1, edge.bundleCount)) *
-                PARITY_CONSTANTS.rendering.interactionWidth.bundledScale,
-            )
-          : edge.family === "hierarchy"
-            ? PARITY_CONSTANTS.rendering.interactionWidth.hierarchy
-            : PARITY_CONSTANTS.rendering.interactionWidth.default,
+        edge.family === "hierarchy"
+          ? PARITY_CONSTANTS.rendering.interactionWidth.hierarchy
+          : PARITY_CONSTANTS.rendering.interactionWidth.default +
+            Math.min(6, Math.max(0, edge.multiplicity - 1) * 1.1),
       data: {
         edgeKind: edge.kind,
         sourceEdgeIds: edge.sourceEdgeIds,
         certainty: edge.certainty,
-        routeKind: edge.routeKind,
         family: edge.family,
-        bundleCount: edge.bundleCount,
+        multiplicity: edge.multiplicity,
         routePoints: edge.routePoints,
-        trunkCoord: edge.trunkCoord,
-        channelId: edge.channelId,
-        channelPairId: edge.channelPairId,
-        channelWeight: edge.channelWeight,
-        sharedTrunkPoints: edge.sharedTrunkPoints,
-        sourceMemberOrder: edge.sourceMemberOrder,
-        targetMemberOrder: edge.targetMemberOrder,
         layoutDirection,
       },
     };

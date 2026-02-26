@@ -64,8 +64,6 @@ export type TrailUiConfig = {
   nodeFilter: NodeKind[];
   showLegend: boolean;
   showMiniMap: boolean;
-  debugParityChannels: boolean;
-  debugParityRoutes: boolean;
   groupingMode: GroupingMode;
   maxNodes: number;
 };
@@ -86,8 +84,6 @@ export function defaultTrailUiConfig(): TrailUiConfig {
     nodeFilter: [],
     showLegend: true,
     showMiniMap: true,
-    debugParityChannels: false,
-    debugParityRoutes: false,
     groupingMode: "none",
     maxNodes: 500,
   };
@@ -155,6 +151,10 @@ export function normalizeTrailUiConfig(
   // Legacy persisted layouts may include bundlingMode; ignore it.
   const _legacyBundlingMode = (raw as { bundlingMode?: unknown }).bundlingMode;
   void _legacyBundlingMode;
+  const _legacyDebugParityChannels = (raw as { debugParityChannels?: unknown }).debugParityChannels;
+  const _legacyDebugParityRoutes = (raw as { debugParityRoutes?: unknown }).debugParityRoutes;
+  void _legacyDebugParityChannels;
+  void _legacyDebugParityRoutes;
 
   const groupingMode =
     raw.groupingMode === "namespace" || raw.groupingMode === "file" || raw.groupingMode === "none"
@@ -175,14 +175,6 @@ export function normalizeTrailUiConfig(
     nodeFilter,
     showLegend: typeof raw.showLegend === "boolean" ? raw.showLegend : defaults.showLegend,
     showMiniMap: typeof raw.showMiniMap === "boolean" ? raw.showMiniMap : defaults.showMiniMap,
-    debugParityChannels:
-      typeof raw.debugParityChannels === "boolean"
-        ? raw.debugParityChannels
-        : defaults.debugParityChannels,
-    debugParityRoutes:
-      typeof raw.debugParityRoutes === "boolean"
-        ? raw.debugParityRoutes
-        : defaults.debugParityRoutes,
     groupingMode,
     maxNodes: clampMaxNodes(typeof raw.maxNodes === "number" ? raw.maxNodes : defaults.maxNodes),
   };

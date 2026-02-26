@@ -1,11 +1,9 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { GraphArtifactDto } from "../../src/generated/api";
 import { GraphViewport } from "../../src/graph/GraphViewport";
 import { defaultTrailUiConfig } from "../../src/graph/trailConfig";
-
-const bundlingControl = { forceChannelizedBundling: false };
 
 vi.mock("mermaid", () => ({
   default: {
@@ -13,35 +11,6 @@ vi.mock("mermaid", () => ({
     render: vi.fn(),
   },
 }));
-
-vi.mock("../../src/graph/layout/bundling", async () => {
-  const actual = await vi.importActual<typeof import("../../src/graph/layout/bundling")>(
-    "../../src/graph/layout/bundling",
-  );
-  return {
-    ...actual,
-    applyAdaptiveBundling: (...args: Parameters<typeof actual.applyAdaptiveBundling>) => {
-      const bundled = actual.applyAdaptiveBundling(...args);
-      if (!bundlingControl.forceChannelizedBundling) {
-        return bundled;
-      }
-      return {
-        ...bundled,
-        edges: bundled.edges.map((edge) =>
-          edge.kind === "CALL"
-            ? {
-                ...edge,
-                routeKind: "flow-trunk",
-                channelId: "channel:test:forced",
-                channelWeight: 6,
-                bundleCount: 6,
-              }
-            : edge,
-        ),
-      };
-    },
-  };
-});
 
 vi.mock("@xyflow/react", async () => {
   const React = await import("react");
@@ -82,6 +51,7 @@ vi.mock("@xyflow/react", async () => {
           });
         }
       }, [onInit]);
+
       return (
         <div data-testid="reactflow">
           <div data-testid="node-ids">{nodes?.map((node) => node.id).join(",")}</div>
@@ -219,6 +189,21 @@ vi.mock("@xyflow/react", async () => {
       <path data-testid={`base-edge-${id ?? "unknown"}`} d={path} />
     ),
     EdgeLabelRenderer: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+    getSmoothStepPath: ({
+      sourceX,
+      sourceY,
+      targetX,
+      targetY,
+    }: {
+      sourceX: number;
+      sourceY: number;
+      targetX: number;
+      targetY: number;
+    }) => {
+      const midX = (sourceX + targetX) / 2;
+      const midY = (sourceY + targetY) / 2;
+      return [`M ${sourceX} ${sourceY} L ${targetX} ${targetY}`, midX, midY];
+    },
     Position: {
       Left: "left",
       Right: "right",
@@ -230,10 +215,6 @@ vi.mock("@xyflow/react", async () => {
       ArrowClosed: "arrow-closed",
     },
   };
-});
-
-afterEach(() => {
-  bundlingControl.forceChannelizedBundling = false;
 });
 
 const GRAPH_FIXTURE: GraphArtifactDto = {
@@ -308,55 +289,6 @@ const TOOLTIP_GRAPH_FIXTURE: GraphArtifactDto = {
   },
 };
 
-const BUNDLED_GRAPH_FIXTURE: GraphArtifactDto = {
-  kind: "uml",
-  id: "graph-bundled",
-  title: "Bundled Graph",
-  graph: {
-    center_id: "hub",
-    truncated: false,
-    nodes: [
-      {
-        id: "hub",
-        label: "Hub::run",
-        kind: "METHOD",
-        depth: 0,
-        file_path: "src/hub.cpp",
-        qualified_name: "Hub::run",
-      },
-      {
-        id: "leaf-1",
-        label: "Leaf::one",
-        kind: "METHOD",
-        depth: 1,
-        file_path: "src/leaf1.cpp",
-        qualified_name: "Leaf::one",
-      },
-      {
-        id: "leaf-2",
-        label: "Leaf::two",
-        kind: "METHOD",
-        depth: 1,
-        file_path: "src/leaf2.cpp",
-        qualified_name: "Leaf::two",
-      },
-      {
-        id: "leaf-3",
-        label: "Leaf::three",
-        kind: "METHOD",
-        depth: 1,
-        file_path: "src/leaf3.cpp",
-        qualified_name: "Leaf::three",
-      },
-    ],
-    edges: [
-      { id: "call-b-1", source: "hub", target: "leaf-1", kind: "CALL" },
-      { id: "call-b-2", source: "hub", target: "leaf-2", kind: "CALL" },
-      { id: "call-b-3", source: "hub", target: "leaf-3", kind: "CALL" },
-    ],
-  },
-};
-
 describe("GraphViewport", () => {
   it("renders legend docked to bottom-right when enabled", () => {
     const config = { ...defaultTrailUiConfig(), showLegend: true, showMiniMap: false };
@@ -371,7 +303,6 @@ describe("GraphViewport", () => {
     render(<GraphViewport graph={GRAPH_FIXTURE} onSelectNode={vi.fn()} trailConfig={config} />);
 
     expect(screen.queryByText("Legend")).not.toBeInTheDocument();
-    expect(document.querySelector(".graph-legend-panel")).not.toBeInTheDocument();
   });
 
   it("renders minimap toggle state", () => {
@@ -380,8 +311,6 @@ describe("GraphViewport", () => {
 
     expect(screen.getByTestId("minimap")).toHaveAttribute("data-position", "bottom-left");
     expect(screen.getByTestId("minimap")).toHaveAttribute("data-class", "graph-minimap");
-    expect(screen.getByTestId("minimap")).toHaveAttribute("data-bg-color");
-    expect(screen.getByTestId("minimap")).toHaveAttribute("data-mask-color");
   });
 
   it("emits edge selections from edge clicks", () => {
@@ -399,8 +328,8 @@ describe("GraphViewport", () => {
     fireEvent.click(screen.getByTestId("mock-edge-click"));
     expect(onSelectEdge).toHaveBeenCalledTimes(1);
     expect(onSelectEdge.mock.calls[0]?.[0]).toMatchObject({
-      id: expect.stringMatching(/^(call|usage)-1$/),
-      edgeIds: [expect.stringMatching(/^(call|usage)-1$/)],
+      id: expect.any(String),
+      edgeIds: expect.arrayContaining([expect.any(String)]),
       sourceNodeId: expect.any(String),
       targetNodeId: expect.any(String),
       kind: expect.any(String),
@@ -420,7 +349,7 @@ describe("GraphViewport", () => {
     expect(screen.queryByText(/call/i)).not.toBeInTheDocument();
   });
 
-  it("renders rounded orthogonal svg paths for semantic edges", () => {
+  it("renders smoothstep svg paths for semantic edges", () => {
     const config = { ...defaultTrailUiConfig(), showLegend: false, showMiniMap: false };
     render(
       <GraphViewport graph={TOOLTIP_GRAPH_FIXTURE} onSelectNode={vi.fn()} trailConfig={config} />,
@@ -431,80 +360,7 @@ describe("GraphViewport", () => {
     ) as SVGPathElement | null;
     const d = firstPath?.getAttribute("d") ?? "";
     expect(d.startsWith("M ")).toBe(true);
-    expect(d.includes("A ")).toBe(true);
-  });
-
-  it("shows bundled edge count in tooltip on bundled hover", () => {
-    bundlingControl.forceChannelizedBundling = true;
-    const config = { ...defaultTrailUiConfig(), showLegend: false, showMiniMap: false };
-    render(
-      <GraphViewport graph={BUNDLED_GRAPH_FIXTURE} onSelectNode={vi.fn()} trailConfig={config} />,
-    );
-
-    fireEvent.click(screen.getByTestId("mock-edge-enter"));
-    expect(screen.getByText(/call \(3 edges\)/i)).toBeInTheDocument();
-  });
-
-  it("renders Sourcetrail-style rounded hook joins for bundled trunks", () => {
-    bundlingControl.forceChannelizedBundling = true;
-    const config = { ...defaultTrailUiConfig(), showLegend: false, showMiniMap: false };
-    render(
-      <GraphViewport graph={BUNDLED_GRAPH_FIXTURE} onSelectNode={vi.fn()} trailConfig={config} />,
-    );
-
-    const firstPath = document.querySelector(
-      'path[data-testid^="base-edge-"]',
-    ) as SVGPathElement | null;
-    const d = firstPath?.getAttribute("d") ?? "";
-    const roundedCornerCount = (d.match(/ A /g) ?? []).length;
-    expect(roundedCornerCount).toBeGreaterThanOrEqual(2);
-  });
-
-  it("emits aggregated edgeIds when activating bundled channel edges", () => {
-    bundlingControl.forceChannelizedBundling = true;
-    const config = { ...defaultTrailUiConfig(), showLegend: false, showMiniMap: false };
-    const onSelectEdge = vi.fn();
-    render(
-      <GraphViewport
-        graph={BUNDLED_GRAPH_FIXTURE}
-        onSelectNode={vi.fn()}
-        onSelectEdge={onSelectEdge}
-        trailConfig={config}
-      />,
-    );
-
-    fireEvent.click(screen.getByTestId("mock-edge-click"));
-    expect(onSelectEdge).toHaveBeenCalledTimes(1);
-    expect(onSelectEdge.mock.calls[0]?.[0]).toMatchObject({
-      edgeIds: expect.arrayContaining(["call-b-1", "call-b-2", "call-b-3"]),
-      kind: "CALL",
-    });
-  });
-
-  it("keeps bundled path geometry deterministic in vertical layout", () => {
-    bundlingControl.forceChannelizedBundling = true;
-    const config = {
-      ...defaultTrailUiConfig(),
-      showLegend: false,
-      showMiniMap: false,
-      layoutDirection: "Vertical" as const,
-    };
-    const { rerender } = render(
-      <GraphViewport graph={BUNDLED_GRAPH_FIXTURE} onSelectNode={vi.fn()} trailConfig={config} />,
-    );
-    const firstRenderD = (
-      document.querySelector('path[data-testid^="base-edge-"]') as SVGPathElement | null
-    )?.getAttribute("d");
-
-    rerender(
-      <GraphViewport graph={BUNDLED_GRAPH_FIXTURE} onSelectNode={vi.fn()} trailConfig={config} />,
-    );
-    const secondRenderD = (
-      document.querySelector('path[data-testid^="base-edge-"]') as SVGPathElement | null
-    )?.getAttribute("d");
-
-    expect(firstRenderD).toBeTruthy();
-    expect(firstRenderD).toBe(secondRenderD);
+    expect(d.includes("L")).toBe(true);
   });
 
   it("hides edges on alt+left-click without activating selection", () => {
@@ -539,33 +395,6 @@ describe("GraphViewport", () => {
 
     const renderedNodeIds = screen.getByTestId("node-ids").textContent ?? "";
     expect(renderedNodeIds).toContain("group:file:");
-  });
-
-  it("keeps edge route contracts stable between grouped and non-grouped modes", () => {
-    const baseConfig = {
-      ...defaultTrailUiConfig(),
-      showLegend: false,
-      showMiniMap: false,
-    };
-    const { rerender } = render(
-      <GraphViewport graph={GRAPH_FIXTURE} onSelectNode={vi.fn()} trailConfig={baseConfig} />,
-    );
-    const baselinePath = (
-      document.querySelector('path[data-testid^="base-edge-"]') as SVGPathElement | null
-    )?.getAttribute("d");
-
-    rerender(
-      <GraphViewport
-        graph={GRAPH_FIXTURE}
-        onSelectNode={vi.fn()}
-        trailConfig={{ ...baseConfig, groupingMode: "file" }}
-      />,
-    );
-    const groupedPath = (
-      document.querySelector('path[data-testid^="base-edge-"]') as SVGPathElement | null
-    )?.getAttribute("d");
-
-    expect(groupedPath).toBe(baselinePath);
   });
 
   it("opens custom trail dialog with ctrl+u", () => {

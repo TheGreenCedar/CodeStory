@@ -50,8 +50,7 @@ function makeEdge(
       kind === "INHERITANCE" || kind === "TYPE_ARGUMENT" || kind === "TEMPLATE_SPECIALIZATION"
         ? "hierarchy"
         : "flow",
-    routeKind: "direct",
-    bundleCount: 1,
+    routeKind: kind === "INHERITANCE" ? "hierarchy" : "direct",
     routePoints: [],
     ...overrides,
   };
@@ -84,10 +83,10 @@ describe("toReactFlowElements edge styling", () => {
     expect(byId.get("template-spec")?.markerEnd).toMatchObject({ type: MarkerType.ArrowClosed });
   });
 
-  it("applies marker size tiers for default, bundled, inheritance, and template specialization", () => {
+  it("uses bundled marker tier when multiplicity is greater than one", () => {
     const layout = baseLayout([
       makeEdge("default", "CALL"),
-      makeEdge("bundled", "CALL", { routeKind: "flow-trunk", bundleCount: 9 }),
+      makeEdge("multi", "CALL", { multiplicity: 6 }),
       makeEdge("inheritance", "INHERITANCE"),
       makeEdge("template-spec", "TEMPLATE_SPECIALIZATION"),
     ]);
@@ -95,40 +94,33 @@ describe("toReactFlowElements edge styling", () => {
     const byId = new Map(edges.map((edge) => [edge.id, edge]));
 
     expect(byId.get("default")?.markerEnd).toMatchObject({ width: 10, height: 10 });
-    expect(byId.get("bundled")?.markerEnd).toMatchObject({ width: 12, height: 12 });
+    expect(byId.get("multi")?.markerEnd).toMatchObject({ width: 12, height: 12 });
     expect(byId.get("inheritance")?.markerEnd).toMatchObject({ width: 18, height: 16 });
     expect(byId.get("template-spec")?.markerEnd).toMatchObject({ width: 14, height: 13 });
   });
 
-  it("applies interaction width semantics for default, hierarchy, and bundled routes", () => {
-    const bundledCount = 16;
+  it("applies interaction width semantics for default and hierarchy edges", () => {
     const layout = baseLayout([
       makeEdge("default", "CALL"),
       makeEdge("hierarchy", "INHERITANCE"),
-      makeEdge("bundled", "CALL", { routeKind: "flow-trunk", bundleCount: bundledCount }),
+      makeEdge("multi", "CALL", { multiplicity: 5 }),
     ]);
     const { edges } = toReactFlowElements(layout);
     const byId = new Map(edges.map((edge) => [edge.id, edge]));
     const interactionWidth = PARITY_CONSTANTS.rendering.interactionWidth;
 
-    const expectedBundled =
-      interactionWidth.bundledBase +
-      Math.min(
-        interactionWidth.bundledMaxExtra,
-        Math.log2(bundledCount) * interactionWidth.bundledScale,
-      );
-
     expect(byId.get("default")?.interactionWidth).toBe(interactionWidth.default);
     expect(byId.get("hierarchy")?.interactionWidth).toBe(interactionWidth.hierarchy);
-    expect(byId.get("bundled")?.interactionWidth).toBeCloseTo(expectedBundled, 4);
+    expect(Number(byId.get("multi")?.interactionWidth ?? 0)).toBeGreaterThan(
+      interactionWidth.default,
+    );
   });
 
-  it("applies stroke width semantics for default, hierarchy, and bundled routes", () => {
-    const bundledCount = 16;
+  it("applies stroke width semantics for default, hierarchy, and multiplicity", () => {
     const layout = baseLayout([
       makeEdge("default", "CALL"),
       makeEdge("hierarchy", "INHERITANCE"),
-      makeEdge("bundled", "CALL", { routeKind: "flow-trunk", bundleCount: bundledCount }),
+      makeEdge("multi", "CALL", { multiplicity: 7 }),
     ]);
     const { edges } = toReactFlowElements(layout);
     const byId = new Map(edges.map((edge) => [edge.id, edge]));
@@ -136,46 +128,22 @@ describe("toReactFlowElements edge styling", () => {
 
     const expectedDefault = EDGE_STYLE.CALL.width;
     const expectedHierarchy = EDGE_STYLE.INHERITANCE.width + strokeAmplification.hierarchyBoost;
-    const expectedBundled =
-      EDGE_STYLE.CALL.width +
-      Math.min(
-        strokeAmplification.bundledMaxBoost,
-        Math.log2(bundledCount) * strokeAmplification.bundledLogMultiplier,
-      );
 
     expect(Number(byId.get("default")?.style?.strokeWidth ?? 0)).toBeCloseTo(expectedDefault, 4);
     expect(Number(byId.get("hierarchy")?.style?.strokeWidth ?? 0)).toBeCloseTo(
       expectedHierarchy,
       4,
     );
-    expect(Number(byId.get("bundled")?.style?.strokeWidth ?? 0)).toBeCloseTo(expectedBundled, 4);
+    expect(Number(byId.get("multi")?.style?.strokeWidth ?? 0)).toBeGreaterThan(expectedDefault);
   });
 
-  it("thickens bundled trunk edges logarithmically with bundle count", () => {
+  it("preserves orientation-aware metadata for vertical layouts", () => {
     const layout = baseLayout([
-      makeEdge("bundle-small", "CALL", { routeKind: "flow-trunk", bundleCount: 2 }),
-      makeEdge("bundle-large", "CALL", { routeKind: "flow-trunk", bundleCount: 32 }),
-    ]);
-    const { edges } = toReactFlowElements(layout);
-    const byId = new Map(edges.map((edge) => [edge.id, edge]));
-    const smallWidth = Number(byId.get("bundle-small")?.style?.strokeWidth ?? 0);
-    const largeWidth = Number(byId.get("bundle-large")?.style?.strokeWidth ?? 0);
-
-    expect(largeWidth).toBeGreaterThan(smallWidth);
-  });
-
-  it("preserves orientation-aware edge metadata for vertical layouts", () => {
-    const layout = baseLayout([
-      makeEdge("vertical-trunk", "CALL", {
-        routeKind: "flow-trunk",
-        bundleCount: 4,
-        trunkCoord: 360,
-        channelId: "channel:CALL:center<->target:0",
-        channelPairId: "center<->target",
-        channelWeight: 4,
-        sharedTrunkPoints: [
-          { x: 220, y: 360 },
-          { x: 420, y: 360 },
+      makeEdge("vertical", "CALL", {
+        multiplicity: 3,
+        routePoints: [
+          { x: 160, y: 210 },
+          { x: 300, y: 280 },
         ],
       }),
     ]);
@@ -186,14 +154,13 @@ describe("toReactFlowElements edge styling", () => {
     expect(firstNode?.sourcePosition).toBe(Position.Bottom);
     expect(firstNode?.targetPosition).toBe(Position.Top);
     expect(edge?.data?.layoutDirection).toBe("Vertical");
-    expect(edge?.data?.channelPairId).toBe("center<->target");
-    expect(edge?.data?.sharedTrunkPoints).toEqual([
-      { x: 220, y: 360 },
-      { x: 420, y: 360 },
+    expect(edge?.data?.routePoints).toEqual([
+      { x: 160, y: 210 },
+      { x: 300, y: 280 },
     ]);
   });
 
-  it("keeps certainty dash and opacity semantics after styling refactors", () => {
+  it("keeps certainty dash and opacity semantics after routing simplification", () => {
     const layout = baseLayout([
       makeEdge("uncertain-flow", "CALL", { certainty: "uncertain", family: "flow" }),
       makeEdge("probable-flow", "CALL", { certainty: "probable", family: "flow" }),
