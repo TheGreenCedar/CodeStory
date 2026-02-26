@@ -1,15 +1,15 @@
 use codestory_api::{
     AgentAnswerDto, AgentAskRequest, AgentBackend, AgentCitationDto, AgentConnectionSettingsDto,
     AgentResponseSectionDto, ApiError, AppEventPayload, BookmarkCategoryDto, BookmarkDto,
-    CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind,
-    EdgeOccurrencesRequest, GraphArtifactDto, GraphEdgeDto, GraphNodeDto, GraphRequest,
-    GraphResponse, IndexMode, IndexingPhaseTimings, ListChildrenSymbolsRequest,
-    ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
-    NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
-    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, SearchHit, SearchRequest,
-    SetUiLayoutRequest, SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto,
-    SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailFilterOptionsDto,
-    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WriteFileResponse, WriteFileTextRequest,
+    CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest,
+    GraphArtifactDto, GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse, IndexMode,
+    IndexingPhaseTimings, ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess,
+    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest,
+    OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest, ProjectSummary,
+    ReadFileTextRequest, ReadFileTextResponse, SearchHit, SearchRequest, SetUiLayoutRequest,
+    SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto, SymbolSummaryDto,
+    SystemActionResponse, TrailConfigDto, TrailFilterOptionsDto, UpdateBookmarkCategoryRequest,
+    UpdateBookmarkRequest, WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_events::{Event, EventBus};
 use codestory_search::SearchEngine;
@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
@@ -80,7 +80,13 @@ fn agent_backend_label(backend: AgentBackend) -> &'static str {
 
 fn default_agent_command(backend: AgentBackend) -> &'static str {
     match backend {
-        AgentBackend::Codex => "codex",
+        AgentBackend::Codex => {
+            if cfg!(target_os = "windows") {
+                "codex.cmd"
+            } else {
+                "codex"
+            }
+        }
         AgentBackend::ClaudeCode => "claude",
     }
 }
@@ -93,6 +99,45 @@ fn configured_agent_command(connection: &AgentConnectionSettingsDto) -> String {
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| default_agent_command(connection.backend).to_string())
+}
+
+fn resolve_agent_command(command: &str) -> String {
+    if !cfg!(target_os = "windows") {
+        return command.to_string();
+    }
+
+    if command.contains('\\') || command.contains('/') {
+        return command.to_string();
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(app_data) = std::env::var("APPDATA") {
+        let npm_bin = PathBuf::from(app_data).join("npm");
+        candidates.push(npm_bin.join(format!("{command}.cmd")));
+        candidates.push(npm_bin.join(format!("{command}.exe")));
+        candidates.push(npm_bin.join(command));
+    }
+    if let Ok(user_profile) = std::env::var("USERPROFILE") {
+        let local_bin = PathBuf::from(user_profile).join(".local").join("bin");
+        candidates.push(local_bin.join(format!("{command}.exe")));
+        candidates.push(local_bin.join(format!("{command}.cmd")));
+        candidates.push(local_bin.join(command));
+    }
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        let windows_apps = PathBuf::from(local_app_data)
+            .join("Microsoft")
+            .join("WindowsApps");
+        candidates.push(windows_apps.join(format!("{command}.exe")));
+        candidates.push(windows_apps.join(command));
+    }
+
+    for candidate in candidates {
+        if candidate.is_file() {
+            return candidate.to_string_lossy().to_string();
+        }
+    }
+
+    command.to_string()
 }
 
 fn truncate_for_diagnostic(raw: &str, max_chars: usize) -> String {
@@ -190,7 +235,9 @@ impl OptionalResolutionTelemetry {
             resolution_calls_ms: Some(clamp_u64_to_u32(index_stats.resolution_calls_ms)),
             resolution_imports_ms: Some(clamp_u64_to_u32(index_stats.resolution_imports_ms)),
             resolution_cleanup_ms: Some(clamp_u64_to_u32(index_stats.resolution_cleanup_ms)),
-            resolved_calls_same_file: Some(clamp_usize_to_u32(index_stats.resolved_calls_same_file)),
+            resolved_calls_same_file: Some(clamp_usize_to_u32(
+                index_stats.resolved_calls_same_file,
+            )),
             resolved_calls_same_module: Some(clamp_usize_to_u32(
                 index_stats.resolved_calls_same_module,
             )),
@@ -638,6 +685,20 @@ impl AppController {
         Ok(())
     }
 
+    fn is_windows_batch_command(command: &str) -> bool {
+        if !cfg!(target_os = "windows") {
+            return false;
+        }
+        Path::new(command)
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| {
+                let ext = value.to_ascii_lowercase();
+                ext == "cmd" || ext == "bat"
+            })
+            .unwrap_or(false)
+    }
+
     fn run_codex_agent(
         command: &str,
         cwd: &Path,
@@ -651,7 +712,15 @@ impl AppController {
         let output_path =
             std::env::temp_dir().join(format!("codestory-codex-response-{temp_nonce}.txt"));
 
-        let output = Command::new(command)
+        let mut command_builder = if Self::is_windows_batch_command(command) {
+            let mut cmd = Command::new("cmd");
+            cmd.arg("/C").arg(command);
+            cmd
+        } else {
+            Command::new(command)
+        };
+
+        let mut child = command_builder
             .arg("exec")
             .arg("--sandbox")
             .arg("read-only")
@@ -660,15 +729,38 @@ impl AppController {
             .arg(cwd)
             .arg("--output-last-message")
             .arg(&output_path)
-            .arg(prompt)
+            .arg("-")
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .spawn()
             .map_err(|e| {
                 ApiError::internal(format!(
                     "Failed to run {backend_label} command `{command}`: {e}"
                 ))
             })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(prompt.as_bytes()).map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to write prompt to {backend_label} command `{command}`: {e}"
+                ))
+            })?;
+            if !prompt.ends_with('\n') {
+                stdin.write_all(b"\n").map_err(|e| {
+                    ApiError::internal(format!(
+                        "Failed to finalize prompt for {backend_label} command `{command}`: {e}"
+                    ))
+                })?;
+            }
+        }
+
+        let output = child.wait_with_output().map_err(|e| {
+            ApiError::internal(format!(
+                "Failed to wait for {backend_label} command `{command}`: {e}"
+            ))
+        })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -777,6 +869,7 @@ impl AppController {
         prompt: &str,
     ) -> Result<LocalAgentResponse, ApiError> {
         let command = configured_agent_command(connection);
+        let command = resolve_agent_command(&command);
         let cwd = self.require_project_root()?;
         match connection.backend {
             AgentBackend::Codex => Self::run_codex_agent(&command, &cwd, prompt),
@@ -1274,7 +1367,7 @@ impl AppController {
                     id: "agent-connection".to_string(),
                     title: "Local Agent Connection".to_string(),
                     markdown: format!(
-                        "Could not run local {} command `{}`.\n\nReason: {}\n\nShowing indexed fallback response below.",
+                        "Could not run local {} command `{}`.\n\nReason: {}\n\nSet the command override in Agent settings to the full executable path if needed, then retry.\n\nShowing indexed fallback response below.",
                         backend_label, configured_command, error.message
                     ),
                     graph_ids: Vec::new(),

@@ -19,6 +19,7 @@
 - Frontend dev (from `codestory-ui`): `npm install`, `npm run dev` (UI only), `npm run dev:all` (UI + server).
 - Frontend quality (from `codestory-ui`): `npm run check` (`tsgo`, `oxlint`, `oxfmt --check`).
 - Type generation: `cargo run -p codestory-server -- --types-only --types-out codestory-ui/src/generated/api.ts`.
+- On Windows, the Codex npm shim should be invoked as `codex.cmd` (typically under `%APPDATA%\\npm`); using the extensionless `codex` shim can fail with `os error 193`.
 - Playwright skill wrapper (`~/.codex/skills/playwright/scripts/playwright_cli.sh`) is Bash-based; on this Windows setup use `C:\Program Files\Git\bin\bash.exe -lc ...` rather than WSL `bash` when WSL has no distro configured.
 - This Playwright CLI build has no `wait-for` command; use `snapshot` polling (or `eval` checks) between async UI steps.
 - For hover-driven UI (for example edge tooltips), prefer real pointer input (`mousemove`/`hover`) over synthetic `eval`-dispatched DOM events before taking screenshots.

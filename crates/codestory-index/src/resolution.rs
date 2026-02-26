@@ -686,8 +686,7 @@ impl ResolutionPass {
             return Ok(vec![Vec::new(); rows.len()]);
         }
 
-        let mut cache: HashMap<SemanticCacheKey, Vec<SemanticResolutionCandidate>> =
-            HashMap::new();
+        let mut cache: HashMap<SemanticCacheKey, Vec<SemanticResolutionCandidate>> = HashMap::new();
         let mut out = Vec::with_capacity(rows.len());
         for (_, file_id, caller_qualified, target_name, caller_file_path, _) in rows {
             out.push(self.semantic_candidates_for_edge(
@@ -760,10 +759,8 @@ impl ResolutionPass {
 
         if selected.is_none()
             && !is_common_unqualified
-            && let Some(candidate) = candidate_index.find_global_unique_readonly(
-                &prepared_name.original,
-                &prepared_name.ascii_lower,
-            )
+            && let Some(candidate) = candidate_index
+                .find_global_unique_readonly(&prepared_name.original, &prepared_name.ascii_lower)
         {
             candidate_ids.push(candidate);
             selected = Some((
@@ -871,8 +868,8 @@ impl ResolutionPass {
             }
 
             if global_selected.is_none()
-                && let Some(candidate) = candidate_index
-                    .find_global_unique_readonly(&name.original, &name.ascii_lower)
+                && let Some(candidate) =
+                    candidate_index.find_global_unique_readonly(&name.original, &name.ascii_lower)
             {
                 global_stage.push(candidate);
                 if !candidate_index.is_same_file_candidate(candidate, *file_id) {
@@ -905,34 +902,42 @@ impl ResolutionPass {
         }
 
         if self.flags.store_candidates {
-            collect_candidate_pool_from_index(candidate_index, &name_candidates, &mut candidate_ids, 8);
+            collect_candidate_pool_from_index(
+                candidate_index,
+                &name_candidates,
+                &mut candidate_ids,
+                8,
+            );
         }
 
-        let mut selected: Option<(i64, f32, ResolutionStrategy)> = if let Some(candidate) =
-            same_file_selected
-        {
-            Some((
-                candidate,
-                self.policy.import_same_file,
-                ResolutionStrategy::ImportSameFile,
-            ))
-        } else if let Some(candidate) = same_module_selected {
-            Some((
-                candidate,
-                self.policy.import_same_module,
-                ResolutionStrategy::ImportSameModule,
-            ))
-        } else if let Some(candidate) = global_selected {
-            Some((
-                candidate,
-                self.policy.import_global_unique,
-                ResolutionStrategy::ImportGlobalUnique,
-            ))
-        } else if let Some(candidate) = fuzzy_selected {
-            Some((candidate, self.policy.import_fuzzy, ResolutionStrategy::ImportFuzzy))
-        } else {
-            None
-        };
+        let mut selected: Option<(i64, f32, ResolutionStrategy)> =
+            if let Some(candidate) = same_file_selected {
+                Some((
+                    candidate,
+                    self.policy.import_same_file,
+                    ResolutionStrategy::ImportSameFile,
+                ))
+            } else if let Some(candidate) = same_module_selected {
+                Some((
+                    candidate,
+                    self.policy.import_same_module,
+                    ResolutionStrategy::ImportSameModule,
+                ))
+            } else if let Some(candidate) = global_selected {
+                Some((
+                    candidate,
+                    self.policy.import_global_unique,
+                    ResolutionStrategy::ImportGlobalUnique,
+                ))
+            } else if let Some(candidate) = fuzzy_selected {
+                Some((
+                    candidate,
+                    self.policy.import_fuzzy,
+                    ResolutionStrategy::ImportFuzzy,
+                ))
+            } else {
+                None
+            };
 
         if selected.is_none()
             && let Some((candidate, confidence)) = semantic_fallback
@@ -1165,7 +1170,9 @@ impl CandidateIndex {
     ) -> Option<i64> {
         let file_id = file_id?;
         self.first_in_file(self.exact_map.get(name), file_id)
-            .or_else(|| self.first_in_file(self.suffix_map_ascii_lower.get(name_ascii_lower), file_id))
+            .or_else(|| {
+                self.first_in_file(self.suffix_map_ascii_lower.get(name_ascii_lower), file_id)
+            })
     }
 
     #[cfg(test)]
@@ -1192,12 +1199,8 @@ impl CandidateIndex {
         if let Some(cached) = self.same_module_cache.get(&key) {
             return *cached;
         }
-        let resolved = self.find_same_module_readonly(
-            module_prefix,
-            delimiter,
-            name,
-            name_ascii_lower,
-        );
+        let resolved =
+            self.find_same_module_readonly(module_prefix, delimiter, name, name_ascii_lower);
         self.same_module_cache.insert(key, resolved);
         resolved
     }
