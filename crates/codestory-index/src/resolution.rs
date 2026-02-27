@@ -1,5 +1,6 @@
 use crate::semantic::{
     SemanticResolutionCandidate, SemanticResolutionRequest, SemanticResolverRegistry,
+    detect_language as semantic_detect_language,
 };
 use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind, ResolutionCertainty};
@@ -1085,13 +1086,7 @@ fn collect_candidate_pool_from_index(
 }
 
 fn semantic_language_bucket(file_path: Option<&str>) -> Option<&'static str> {
-    let file_path = file_path?;
-    let ext = file_path.rsplit('.').next()?.to_ascii_lowercase();
-    match ext.as_str() {
-        "ts" | "tsx" => Some("typescript"),
-        "java" => Some("java"),
-        _ => None,
-    }
+    semantic_detect_language(file_path)
 }
 
 impl CandidateIndex {
@@ -2032,6 +2027,32 @@ mod tests {
             ResolutionCertainty::CERTAIN_MIN,
             Some("1:2:3:4")
         ));
+    }
+
+    #[test]
+    fn test_semantic_language_bucket_matrix() {
+        let expected = [
+            ("a.c", Some("c")),
+            ("a.cpp", Some("cpp")),
+            ("a.h", Some("cpp")),
+            ("a.hh", Some("cpp")),
+            ("a.java", Some("java")),
+            ("a.js", Some("javascript")),
+            ("a.jsx", Some("javascript")),
+            ("a.pyi", Some("python")),
+            ("a.rs", Some("rust")),
+            ("a.ts", Some("typescript")),
+            ("a.tsx", Some("typescript")),
+            ("a.mts", Some("typescript")),
+            ("a.unknown", None),
+        ];
+        for (path, language) in expected {
+            assert_eq!(
+                semantic_language_bucket(Some(path)),
+                language,
+                "path={path}"
+            );
+        }
     }
 
     #[test]

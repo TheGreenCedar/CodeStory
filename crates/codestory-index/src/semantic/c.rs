@@ -6,11 +6,11 @@ use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind};
 use rusqlite::Connection;
 
-pub struct TypeScriptSemanticResolver;
+pub struct CSemanticResolver;
 
-impl SemanticResolver for TypeScriptSemanticResolver {
+impl SemanticResolver for CSemanticResolver {
     fn language(&self) -> &'static str {
-        "typescript"
+        "c"
     }
 
     fn resolve(
@@ -26,39 +26,33 @@ impl SemanticResolver for TypeScriptSemanticResolver {
     }
 }
 
-impl TypeScriptSemanticResolver {
+impl CSemanticResolver {
     fn resolve_import(
         &self,
         conn: &Connection,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
-        let normalized = request.target_name.trim();
-        if normalized.is_empty() {
+        let target = request.target_name.trim();
+        if target.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Phase 1: derive likely exported symbol from import path/alias and suggest package/module nodes.
-        let symbol = normalized
-            .split_once(" as ")
-            .map(|(_, rhs)| rhs.trim())
-            .unwrap_or(normalized)
-            .rsplit(['/', '.', ':'])
-            .next()
-            .unwrap_or(normalized)
-            .trim();
+        let symbol = normalize_include_symbol(target);
         if symbol.is_empty() {
             return Ok(Vec::new());
         }
 
         let kinds = [
             NodeKind::MODULE as i32,
-            NodeKind::NAMESPACE as i32,
-            NodeKind::PACKAGE as i32,
-            NodeKind::CLASS as i32,
-            NodeKind::INTERFACE as i32,
+            NodeKind::STRUCT as i32,
+            NodeKind::UNION as i32,
+            NodeKind::ENUM as i32,
+            NodeKind::TYPEDEF as i32,
+            NodeKind::FUNCTION as i32,
         ];
         let kind_clause = kind_clause(&kinds);
-        resolve_import_candidates(conn, &kind_clause, symbol, request.file_id, 0.58)
+
+        resolve_import_candidates(conn, &kind_clause, &symbol, request.file_id, 0.54)
     }
 
     fn resolve_call(
@@ -72,23 +66,34 @@ impl TypeScriptSemanticResolver {
         }
 
         let call_name = target
-            .rsplit_once('.')
+            .rsplit_once("::")
             .map(|(_, tail)| tail.trim())
+            .or_else(|| target.rsplit_once('.').map(|(_, tail)| tail.trim()))
             .unwrap_or(target);
         if call_name.is_empty() {
             return Ok(Vec::new());
         }
 
-        let kinds = [NodeKind::METHOD as i32, NodeKind::FUNCTION as i32];
+        let kinds = [NodeKind::FUNCTION as i32, NodeKind::METHOD as i32];
         let kind_clause = kind_clause(&kinds);
-        resolve_call_candidates(conn, &kind_clause, call_name, request.file_id, 0.88, 0.70)
+        resolve_call_candidates(conn, &kind_clause, call_name, request.file_id, 0.82, 0.66)
     }
+}
+
+fn normalize_include_symbol(target: &str) -> String {
+    let trimmed = target
+        .trim()
+        .trim_matches('"')
+        .trim_matches('<')
+        .trim_matches('>');
+    let base = trimmed.rsplit('/').next().unwrap_or(trimmed).trim();
+    let no_ext = base.strip_suffix(".h").unwrap_or(base);
+    no_ext.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codestory_core::ResolutionCertainty;
     use rusqlite::{Connection, params};
 
     fn create_node_table(conn: &Connection) -> Result<()> {
@@ -106,34 +111,34 @@ mod tests {
     }
 
     #[test]
-    fn test_typescript_resolver_same_file_common_call_is_certain() -> Result<()> {
+    fn test_c_resolver_returns_import_candidate() -> Result<()> {
         let conn = Connection::open_in_memory()?;
         create_node_table(&conn)?;
         conn.execute(
             "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                31_i64,
-                NodeKind::METHOD as i32,
-                "clone",
-                "pkg.foo.clone",
-                7_i64,
+                21_i64,
+                NodeKind::MODULE as i32,
+                "stdio",
+                "stdio",
+                4_i64,
                 1_i64
             ],
         )?;
 
-        let resolver = TypeScriptSemanticResolver;
+        let resolver = CSemanticResolver;
         let request = SemanticResolutionRequest {
-            edge_kind: EdgeKind::CALL,
-            file_id: Some(7),
-            file_path: Some("foo.ts".to_string()),
-            caller_qualified: Some("pkg.foo.call".to_string()),
-            target_name: "clone".to_string(),
+            edge_kind: EdgeKind::IMPORT,
+            file_id: Some(3),
+            file_path: Some("main.c".to_string()),
+            caller_qualified: None,
+            target_name: "<stdio.h>".to_string(),
         };
 
         let out = resolver.resolve(&conn, &request)?;
         assert!(!out.is_empty());
-        assert!(out[0].confidence >= ResolutionCertainty::CERTAIN_MIN);
+        assert_eq!(out[0].target_node_id, 21_i64);
         Ok(())
     }
 }

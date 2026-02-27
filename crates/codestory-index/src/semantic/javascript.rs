@@ -6,11 +6,11 @@ use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind};
 use rusqlite::Connection;
 
-pub struct TypeScriptSemanticResolver;
+pub struct JavaScriptSemanticResolver;
 
-impl SemanticResolver for TypeScriptSemanticResolver {
+impl SemanticResolver for JavaScriptSemanticResolver {
     fn language(&self) -> &'static str {
-        "typescript"
+        "javascript"
     }
 
     fn resolve(
@@ -26,26 +26,18 @@ impl SemanticResolver for TypeScriptSemanticResolver {
     }
 }
 
-impl TypeScriptSemanticResolver {
+impl JavaScriptSemanticResolver {
     fn resolve_import(
         &self,
         conn: &Connection,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
-        let normalized = request.target_name.trim();
-        if normalized.is_empty() {
+        let target = request.target_name.trim();
+        if target.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Phase 1: derive likely exported symbol from import path/alias and suggest package/module nodes.
-        let symbol = normalized
-            .split_once(" as ")
-            .map(|(_, rhs)| rhs.trim())
-            .unwrap_or(normalized)
-            .rsplit(['/', '.', ':'])
-            .next()
-            .unwrap_or(normalized)
-            .trim();
+        let symbol = normalize_import_symbol(target);
         if symbol.is_empty() {
             return Ok(Vec::new());
         }
@@ -55,10 +47,11 @@ impl TypeScriptSemanticResolver {
             NodeKind::NAMESPACE as i32,
             NodeKind::PACKAGE as i32,
             NodeKind::CLASS as i32,
-            NodeKind::INTERFACE as i32,
+            NodeKind::FUNCTION as i32,
         ];
         let kind_clause = kind_clause(&kinds);
-        resolve_import_candidates(conn, &kind_clause, symbol, request.file_id, 0.58)
+
+        resolve_import_candidates(conn, &kind_clause, &symbol, request.file_id, 0.57)
     }
 
     fn resolve_call(
@@ -81,14 +74,37 @@ impl TypeScriptSemanticResolver {
 
         let kinds = [NodeKind::METHOD as i32, NodeKind::FUNCTION as i32];
         let kind_clause = kind_clause(&kinds);
-        resolve_call_candidates(conn, &kind_clause, call_name, request.file_id, 0.88, 0.70)
+        resolve_call_candidates(conn, &kind_clause, call_name, request.file_id, 0.82, 0.69)
     }
+}
+
+fn normalize_import_symbol(target: &str) -> String {
+    let target = target
+        .split_once(" as ")
+        .map(|(_, rhs)| rhs.trim())
+        .unwrap_or(target)
+        .trim();
+    let unquoted = target.trim_matches(|c| matches!(c, '"' | '\'' | '`'));
+    let tail = unquoted
+        .rsplit(['/', '\\', ':'])
+        .next()
+        .unwrap_or(unquoted)
+        .trim();
+    strip_known_script_extension(tail).to_string()
+}
+
+fn strip_known_script_extension(symbol: &str) -> &str {
+    [
+        ".d.ts", ".tsx", ".cts", ".mts", ".jsx", ".cjs", ".mjs", ".js", ".ts",
+    ]
+    .iter()
+    .find_map(|ext| symbol.strip_suffix(ext))
+    .unwrap_or(symbol)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codestory_core::ResolutionCertainty;
     use rusqlite::{Connection, params};
 
     fn create_node_table(conn: &Connection) -> Result<()> {
@@ -106,34 +122,66 @@ mod tests {
     }
 
     #[test]
-    fn test_typescript_resolver_same_file_common_call_is_certain() -> Result<()> {
+    fn test_javascript_resolver_returns_call_candidate() -> Result<()> {
         let conn = Connection::open_in_memory()?;
         create_node_table(&conn)?;
         conn.execute(
             "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                31_i64,
-                NodeKind::METHOD as i32,
-                "clone",
-                "pkg.foo.clone",
-                7_i64,
+                10_i64,
+                NodeKind::FUNCTION as i32,
+                "logValue",
+                "utils.logValue",
+                1_i64,
                 1_i64
             ],
         )?;
 
-        let resolver = TypeScriptSemanticResolver;
+        let resolver = JavaScriptSemanticResolver;
         let request = SemanticResolutionRequest {
             edge_kind: EdgeKind::CALL,
-            file_id: Some(7),
-            file_path: Some("foo.ts".to_string()),
-            caller_qualified: Some("pkg.foo.call".to_string()),
-            target_name: "clone".to_string(),
+            file_id: Some(1),
+            file_path: Some("app.js".to_string()),
+            caller_qualified: Some("app.main".to_string()),
+            target_name: "logValue".to_string(),
         };
 
         let out = resolver.resolve(&conn, &request)?;
         assert!(!out.is_empty());
-        assert!(out[0].confidence >= ResolutionCertainty::CERTAIN_MIN);
+        assert_eq!(out[0].target_node_id, 10_i64);
+        Ok(())
+    }
+
+    #[test]
+    fn test_javascript_resolver_normalizes_quoted_import_path() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                13_i64,
+                NodeKind::MODULE as i32,
+                "utils",
+                "lib.utils",
+                2_i64,
+                1_i64
+            ],
+        )?;
+
+        let resolver = JavaScriptSemanticResolver;
+        let request = SemanticResolutionRequest {
+            edge_kind: EdgeKind::IMPORT,
+            file_id: Some(1),
+            file_path: Some("app.js".to_string()),
+            caller_qualified: None,
+            target_name: "\"./lib/utils.js\"".to_string(),
+        };
+
+        let out = resolver.resolve(&conn, &request)?;
+        assert!(!out.is_empty());
+        assert_eq!(out[0].target_node_id, 13_i64);
         Ok(())
     }
 }

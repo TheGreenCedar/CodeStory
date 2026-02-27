@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -162,11 +162,7 @@ impl Project {
             current_file_set.insert(path.clone());
             let needs_index = match stored_map.get(&path) {
                 Some(info) => {
-                    let metadata = fs::metadata(&path)?;
-                    let mtime = metadata
-                        .modified()?
-                        .duration_since(std::time::UNIX_EPOCH)?
-                        .as_secs() as i64;
+                    let mtime = modification_time_nanos(&path)?;
                     mtime > info.modification_time || !info.indexed
                 }
                 None => true,
@@ -235,6 +231,14 @@ impl Project {
     }
 }
 
+fn modification_time_nanos(path: &Path) -> Result<i64> {
+    let nanos = fs::metadata(path)?
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    Ok(nanos.min(i64::MAX as u128) as i64)
+}
+
 #[derive(Debug, Clone)]
 pub struct RefreshPlan {
     pub files_to_index: Vec<PathBuf>,
@@ -244,8 +248,6 @@ pub struct RefreshPlan {
 /// Public alias retained for existing call sites while aligning naming with
 /// workspace refresh plans in the project architecture plan.
 pub type RefreshInfo = RefreshPlan;
-
-use std::path::Path;
 
 #[cfg(test)]
 mod tests {
@@ -363,10 +365,7 @@ mod tests {
         assert_eq!(info.files_to_index[0], f1);
 
         // 3. Mark file as indexed in storage
-        let mtime = fs::metadata(&f1)?
-            .modified()?
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs() as i64;
+        let mtime = modification_time_nanos(&f1)?;
         storage
             .insert_file(&FileInfo {
                 id: 1,
@@ -383,10 +382,8 @@ mod tests {
         let info2 = project.generate_refresh_info(&storage)?;
         assert_eq!(info2.files_to_index.len(), 0);
 
-        // 5. Modify file (update mtime)
-        // Wait a bit to ensure mtime changes if filesystem resolution is low?
-        // Or just set it manually using filetime? For simplicity in test we just re-write.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // 5. Modify file (update mtime). Short sleep keeps this stable on coarse clocks.
+        std::thread::sleep(std::time::Duration::from_millis(20));
         fs::write(&f1, "content modified")?;
 
         let info3 = project.generate_refresh_info(&storage)?;

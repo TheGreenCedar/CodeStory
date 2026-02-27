@@ -122,16 +122,33 @@ pub struct IncrementalIndexingStats {
 pub struct WorkspaceIndexer {
     root: PathBuf,
     compilation_db: Option<compilation_database::CompilationDatabase>,
+    compilation_db_warning: Option<String>,
     batch_config: IncrementalIndexingConfig,
 }
 
 impl WorkspaceIndexer {
     pub fn new(root: PathBuf) -> Self {
-        let compilation_db = compilation_database::CompilationDatabase::find_in_directory(&root)
-            .and_then(|path| compilation_database::CompilationDatabase::load(path).ok());
+        let (compilation_db, compilation_db_warning) = if let Some(path) =
+            compilation_database::CompilationDatabase::find_in_directory(&root)
+        {
+            match compilation_database::CompilationDatabase::load(&path) {
+                Ok(db) => (Some(db), None),
+                Err(err) => (
+                    None,
+                    Some(format!(
+                        "Failed to load compile_commands.json at {}: {}. Continuing without compilation metadata.",
+                        path.display(),
+                        err
+                    )),
+                ),
+            }
+        } else {
+            (None, None)
+        };
         Self {
             root,
             compilation_db,
+            compilation_db_warning,
             batch_config: IncrementalIndexingConfig::default(),
         }
     }
@@ -156,6 +173,11 @@ impl WorkspaceIndexer {
         event_bus.publish(Event::IndexingStarted {
             file_count: refresh_info.files_to_index.len(),
         });
+        if let Some(message) = &self.compilation_db_warning {
+            event_bus.publish(Event::ShowWarning {
+                message: message.clone(),
+            });
+        }
         let mut stats = IncrementalIndexingStats::default();
         let total_files = refresh_info.files_to_index.len();
         let processed_count = Arc::new(AtomicUsize::new(0));
@@ -939,6 +961,7 @@ pub fn index_file(
 
     // 2. Second pass: Create edges using tree-sitter-graph output
     let mut edge_keys: HashSet<EdgeDedupKey> = HashSet::new();
+    let mut callsite_ordinals: HashMap<(NodeId, Option<u32>), u32> = HashMap::new();
 
     for source_ref in graph.iter_nodes() {
         let Some(source_id) = graph_to_node_id.get(&source_ref) else {
@@ -952,6 +975,7 @@ pub fn index_file(
 
             let mut kind: Option<EdgeKind> = None;
             let mut line: Option<u32> = None;
+            let mut col: Option<u32> = None;
             let mut callsite_identity: Option<String> = None;
 
             for (attr, val) in edge.attributes.iter() {
@@ -964,6 +988,11 @@ pub fn index_file(
                     "line" | "start_row" => {
                         if let Ok(row) = val.as_integer() {
                             line = Some(row + 1);
+                        }
+                    }
+                    "col" | "start_col" | "column" => {
+                        if let Ok(raw_col) = val.as_integer() {
+                            col = Some(raw_col + 1);
                         }
                     }
                     "callsite_identity" | "callsite_id" | "callsite" => {
@@ -992,6 +1021,18 @@ pub fn index_file(
                 callsite_identity,
                 ..Default::default()
             };
+            if edge.kind == EdgeKind::CALL
+                && !flags.legacy_edge_identity
+                && edge.callsite_identity.is_none()
+            {
+                let resolved_col = col.or_else(|| {
+                    let key = (edge.target, edge.line);
+                    let next = callsite_ordinals.entry(key).or_insert(0);
+                    *next = next.saturating_add(1);
+                    Some(*next)
+                });
+                ensure_callsite_identity(&mut edge, resolved_col);
+            }
             if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
                 continue;
             }
@@ -1034,8 +1075,9 @@ pub fn index_file(
 }
 
 pub fn get_language_for_ext(ext: &str) -> Option<(Language, &'static str, &'static str)> {
-    match ext {
-        "py" => Some((
+    let ext = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    match ext.as_str() {
+        "py" | "pyi" => Some((
             tree_sitter_python::LANGUAGE.into(),
             "python",
             include_str!("../rules/python.scm"),
@@ -1050,17 +1092,22 @@ pub fn get_language_for_ext(ext: &str) -> Option<(Language, &'static str, &'stat
             "rust",
             include_str!("../rules/rust.scm"),
         )),
-        "js" => Some((
+        "js" | "jsx" | "mjs" | "cjs" => Some((
             tree_sitter_javascript::LANGUAGE.into(),
             "javascript",
             include_str!("../rules/javascript.scm"),
         )),
-        "ts" | "tsx" => Some((
+        "ts" | "mts" | "cts" => Some((
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             "typescript",
             include_str!("../rules/typescript.scm"),
         )),
-        "cpp" | "cc" | "cxx" | "h" | "hpp" => Some((
+        "tsx" => Some((
+            tree_sitter_typescript::LANGUAGE_TSX.into(),
+            "typescript",
+            include_str!("../rules/typescript.scm"),
+        )),
+        "cpp" | "cc" | "cxx" | "h" | "hpp" | "hh" | "hxx" => Some((
             tree_sitter_cpp::LANGUAGE.into(),
             "cpp",
             include_str!("../rules/cpp.scm"),
@@ -1850,6 +1897,151 @@ class Test {
             .expect("CALL edge not found");
 
         assert_eq!(call_edge.source, caller.id);
+        Ok(())
+    }
+
+    #[test]
+    fn test_call_edges_same_line_preserve_distinct_callsites() {
+        use std::collections::{HashMap, HashSet};
+
+        let flags = IndexFeatureFlags {
+            legacy_edge_identity: false,
+        };
+        let file_id = NodeId(1);
+        let mut edges = vec![
+            Edge {
+                id: EdgeId(0),
+                source: NodeId(10),
+                target: NodeId(20),
+                kind: EdgeKind::CALL,
+                file_node_id: Some(file_id),
+                line: Some(42),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(0),
+                source: NodeId(10),
+                target: NodeId(20),
+                kind: EdgeKind::CALL,
+                file_node_id: Some(file_id),
+                line: Some(42),
+                ..Default::default()
+            },
+        ];
+
+        let mut callsite_ordinals: HashMap<(NodeId, Option<u32>), u32> = HashMap::new();
+        for edge in &mut edges {
+            let key = (edge.target, edge.line);
+            let next = callsite_ordinals.entry(key).or_insert(0);
+            *next = next.saturating_add(1);
+            ensure_callsite_identity(edge, Some(*next));
+            edge.id = EdgeId(generate_edge_id_for_edge(edge, flags));
+        }
+
+        let mut dedup = HashSet::new();
+        let deduped = edges
+            .into_iter()
+            .filter(|edge| dedup.insert(edge_dedup_key(edge, flags)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(deduped.len(), 2, "expected one edge per callsite");
+        let identities = deduped
+            .iter()
+            .map(|edge| edge.callsite_identity.clone().unwrap_or_default())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            identities.len(),
+            2,
+            "callsites should have unique identities"
+        );
+        let edge_ids = deduped.iter().map(|edge| edge.id).collect::<HashSet<_>>();
+        assert_eq!(edge_ids.len(), 2, "callsites should have unique edge ids");
+    }
+
+    #[test]
+    fn test_legacy_edge_identity_dedup_ignores_callsite_identity() {
+        let edge_a = Edge {
+            id: EdgeId(1),
+            source: NodeId(10),
+            target: NodeId(20),
+            kind: EdgeKind::CALL,
+            line: Some(42),
+            callsite_identity: Some("10:42:1:20".to_string()),
+            ..Default::default()
+        };
+        let edge_b = Edge {
+            id: EdgeId(2),
+            source: NodeId(10),
+            target: NodeId(20),
+            kind: EdgeKind::CALL,
+            line: Some(42),
+            callsite_identity: Some("10:42:2:20".to_string()),
+            ..Default::default()
+        };
+
+        let modern_flags = IndexFeatureFlags {
+            legacy_edge_identity: false,
+        };
+        let legacy_flags = IndexFeatureFlags {
+            legacy_edge_identity: true,
+        };
+        assert_ne!(
+            edge_dedup_key(&edge_a, modern_flags),
+            edge_dedup_key(&edge_b, modern_flags),
+            "modern identity should differentiate callsites"
+        );
+        assert_eq!(
+            edge_dedup_key(&edge_a, legacy_flags),
+            edge_dedup_key(&edge_b, legacy_flags),
+            "legacy identity should collapse callsites"
+        );
+    }
+
+    #[test]
+    fn test_run_incremental_emits_compile_db_warning_on_load_failure() -> Result<()> {
+        use codestory_project::RefreshInfo;
+        use codestory_storage::Storage;
+        use std::fs;
+        use std::time::Duration;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join("compile_commands.json"),
+            "{ this is not valid json ",
+        )?;
+        let file = dir.path().join("main.rs");
+        fs::write(&file, "fn main() {}")?;
+
+        let mut storage = Storage::new_in_memory().unwrap();
+        let bus = EventBus::new();
+        let rx = bus.receiver();
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+        let refresh_info = RefreshInfo {
+            files_to_index: vec![file],
+            files_to_remove: vec![],
+        };
+
+        indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
+
+        let mut saw_warning = false;
+        for _ in 0..32 {
+            match rx.recv_timeout(Duration::from_millis(25)) {
+                Ok(Event::ShowWarning { message }) => {
+                    if message.contains("compile_commands.json") {
+                        saw_warning = true;
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            saw_warning,
+            "expected compile_commands warning event when loading fails"
+        );
         Ok(())
     }
 

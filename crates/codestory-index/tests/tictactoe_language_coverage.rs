@@ -434,16 +434,24 @@ fn has_edge_between_names(
 fn test_language_extension_coverage_and_names() {
     let expected = [
         ("py", "python"),
+        ("pyi", "python"),
         ("java", "java"),
         ("rs", "rust"),
         ("js", "javascript"),
+        ("jsx", "javascript"),
+        ("mjs", "javascript"),
+        ("cjs", "javascript"),
         ("ts", "typescript"),
         ("tsx", "typescript"),
+        ("mts", "typescript"),
+        ("cts", "typescript"),
         ("cpp", "cpp"),
         ("cc", "cpp"),
         ("cxx", "cpp"),
         ("h", "cpp"),
+        ("hh", "cpp"),
         ("hpp", "cpp"),
+        ("hxx", "cpp"),
         ("c", "c"),
     ];
 
@@ -459,6 +467,68 @@ fn test_language_extension_coverage_and_names() {
             "Expected non-empty graph query for extension {ext}"
         );
     }
+}
+
+#[test]
+fn test_language_extension_coverage_is_case_insensitive() {
+    let expected = [
+        ("PY", "python"),
+        ("PYI", "python"),
+        ("RS", "rust"),
+        ("JSX", "javascript"),
+        ("TSX", "typescript"),
+        ("CPP", "cpp"),
+    ];
+    for (ext, expected_name) in expected {
+        let (_, language_name, graph_query) =
+            get_language_for_ext(ext).expect("Uppercase extension should resolve");
+        assert_eq!(language_name, expected_name, "Wrong language for ext={ext}");
+        assert!(
+            !graph_query.trim().is_empty(),
+            "Missing graph query for ext={ext}"
+        );
+    }
+}
+
+#[test]
+fn test_tsx_file_with_jsx_parses() -> Result<()> {
+    let source = r#"
+const helper = (name: string) => name.toUpperCase();
+
+export function App() {
+    const title = helper("hello");
+    return <div className="title">{title}</div>;
+}
+"#;
+
+    let (lang, lang_name, graph_query) =
+        get_language_for_ext("tsx").expect("tsx extension should be supported");
+    let result = index_file(
+        Path::new("App.tsx"),
+        source,
+        lang,
+        lang_name,
+        graph_query,
+        None,
+        None,
+    )?;
+
+    assert!(
+        !result.nodes.is_empty(),
+        "Expected TSX parse to yield at least one node"
+    );
+    assert!(
+        result
+            .nodes
+            .iter()
+            .any(|node| node.kind == NodeKind::FUNCTION || node.kind == NodeKind::METHOD),
+        "Expected TSX parse to yield callable symbols"
+    );
+    assert!(
+        result.edges.iter().any(|edge| edge.kind == EdgeKind::CALL),
+        "Expected TSX parse to yield CALL edges"
+    );
+    Ok(())
 }
 
 #[test]

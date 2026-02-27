@@ -6,11 +6,11 @@ use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind};
 use rusqlite::Connection;
 
-pub struct TypeScriptSemanticResolver;
+pub struct PythonSemanticResolver;
 
-impl SemanticResolver for TypeScriptSemanticResolver {
+impl SemanticResolver for PythonSemanticResolver {
     fn language(&self) -> &'static str {
-        "typescript"
+        "python"
     }
 
     fn resolve(
@@ -26,25 +26,24 @@ impl SemanticResolver for TypeScriptSemanticResolver {
     }
 }
 
-impl TypeScriptSemanticResolver {
+impl PythonSemanticResolver {
     fn resolve_import(
         &self,
         conn: &Connection,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
-        let normalized = request.target_name.trim();
-        if normalized.is_empty() {
+        let target = request.target_name.trim();
+        if target.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Phase 1: derive likely exported symbol from import path/alias and suggest package/module nodes.
-        let symbol = normalized
+        let symbol = target
             .split_once(" as ")
             .map(|(_, rhs)| rhs.trim())
-            .unwrap_or(normalized)
-            .rsplit(['/', '.', ':'])
+            .unwrap_or(target)
+            .rsplit(['.', '/', ':'])
             .next()
-            .unwrap_or(normalized)
+            .unwrap_or(target)
             .trim();
         if symbol.is_empty() {
             return Ok(Vec::new());
@@ -52,13 +51,14 @@ impl TypeScriptSemanticResolver {
 
         let kinds = [
             NodeKind::MODULE as i32,
-            NodeKind::NAMESPACE as i32,
             NodeKind::PACKAGE as i32,
             NodeKind::CLASS as i32,
-            NodeKind::INTERFACE as i32,
+            NodeKind::FUNCTION as i32,
+            NodeKind::METHOD as i32,
         ];
         let kind_clause = kind_clause(&kinds);
-        resolve_import_candidates(conn, &kind_clause, symbol, request.file_id, 0.58)
+
+        resolve_import_candidates(conn, &kind_clause, symbol, request.file_id, 0.59)
     }
 
     fn resolve_call(
@@ -81,14 +81,13 @@ impl TypeScriptSemanticResolver {
 
         let kinds = [NodeKind::METHOD as i32, NodeKind::FUNCTION as i32];
         let kind_clause = kind_clause(&kinds);
-        resolve_call_candidates(conn, &kind_clause, call_name, request.file_id, 0.88, 0.70)
+        resolve_call_candidates(conn, &kind_clause, call_name, request.file_id, 0.82, 0.72)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codestory_core::ResolutionCertainty;
     use rusqlite::{Connection, params};
 
     fn create_node_table(conn: &Connection) -> Result<()> {
@@ -106,34 +105,34 @@ mod tests {
     }
 
     #[test]
-    fn test_typescript_resolver_same_file_common_call_is_certain() -> Result<()> {
+    fn test_python_resolver_returns_import_candidate() -> Result<()> {
         let conn = Connection::open_in_memory()?;
         create_node_table(&conn)?;
         conn.execute(
             "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                31_i64,
-                NodeKind::METHOD as i32,
-                "clone",
-                "pkg.foo.clone",
-                7_i64,
+                11_i64,
+                NodeKind::MODULE as i32,
+                "collections",
+                "collections",
+                3_i64,
                 1_i64
             ],
         )?;
 
-        let resolver = TypeScriptSemanticResolver;
+        let resolver = PythonSemanticResolver;
         let request = SemanticResolutionRequest {
-            edge_kind: EdgeKind::CALL,
-            file_id: Some(7),
-            file_path: Some("foo.ts".to_string()),
-            caller_qualified: Some("pkg.foo.call".to_string()),
-            target_name: "clone".to_string(),
+            edge_kind: EdgeKind::IMPORT,
+            file_id: Some(2),
+            file_path: Some("app.py".to_string()),
+            caller_qualified: None,
+            target_name: "collections".to_string(),
         };
 
         let out = resolver.resolve(&conn, &request)?;
         assert!(!out.is_empty());
-        assert!(out[0].confidence >= ResolutionCertainty::CERTAIN_MIN);
+        assert_eq!(out[0].target_node_id, 11_i64);
         Ok(())
     }
 }

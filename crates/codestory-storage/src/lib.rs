@@ -1030,13 +1030,38 @@ impl Storage {
             }
         }
 
+        tx.execute(
+            &format!(
+                "UPDATE edge
+                 SET resolved_source_node_id = NULL
+                 WHERE resolved_source_node_id IN ({RELATED_NODE_SUBQUERY})
+                 AND source_node_id NOT IN ({RELATED_NODE_SUBQUERY})
+                 AND target_node_id NOT IN ({RELATED_NODE_SUBQUERY})
+                 AND (file_node_id IS NULL OR file_node_id != ?1)"
+            ),
+            params![file_node_id],
+        )?;
+
+        tx.execute(
+            &format!(
+                "UPDATE edge
+                 SET resolved_target_node_id = NULL,
+                     confidence = NULL,
+                     certainty = NULL,
+                     candidate_target_node_ids = NULL
+                 WHERE resolved_target_node_id IN ({RELATED_NODE_SUBQUERY})
+                 AND source_node_id NOT IN ({RELATED_NODE_SUBQUERY})
+                 AND target_node_id NOT IN ({RELATED_NODE_SUBQUERY})
+                 AND (file_node_id IS NULL OR file_node_id != ?1)"
+            ),
+            params![file_node_id],
+        )?;
+
         let removed_edges = tx.execute(
             &format!(
                 "DELETE FROM edge
                  WHERE source_node_id IN ({RELATED_NODE_SUBQUERY})
                  OR target_node_id IN ({RELATED_NODE_SUBQUERY})
-                 OR resolved_source_node_id IN ({RELATED_NODE_SUBQUERY})
-                 OR resolved_target_node_id IN ({RELATED_NODE_SUBQUERY})
                  OR file_node_id = ?1"
             ),
             params![file_node_id],
@@ -2372,6 +2397,109 @@ mod tests {
         let cache = storage.cache.nodes.read();
         assert!(!cache.contains_key(&NodeId(file_node_id)));
         assert!(!cache.contains_key(&NodeId(2_001)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_file_projection_preserves_cross_file_edges_and_clears_resolution()
+    -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        let file_a_id = 1_001_i64;
+        let file_b_id = 2_001_i64;
+
+        storage.insert_file(&FileInfo {
+            id: file_a_id,
+            path: PathBuf::from("src/a.rs"),
+            language: "rust".to_string(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 10,
+        })?;
+        storage.insert_file(&FileInfo {
+            id: file_b_id,
+            path: PathBuf::from("src/b.rs"),
+            language: "rust".to_string(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 10,
+        })?;
+
+        let file_a = Node {
+            id: NodeId(file_a_id),
+            kind: NodeKind::FILE,
+            serialized_name: "src/a.rs".to_string(),
+            ..Default::default()
+        };
+        let file_b = Node {
+            id: NodeId(file_b_id),
+            kind: NodeKind::FILE,
+            serialized_name: "src/b.rs".to_string(),
+            ..Default::default()
+        };
+        let caller_in_a = Node {
+            id: NodeId(10_001),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "caller".to_string(),
+            file_node_id: Some(file_a.id),
+            ..Default::default()
+        };
+        let unresolved_in_a = Node {
+            id: NodeId(10_002),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "callee".to_string(),
+            file_node_id: Some(file_a.id),
+            ..Default::default()
+        };
+        let callee_in_b = Node {
+            id: NodeId(20_001),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "callee".to_string(),
+            file_node_id: Some(file_b.id),
+            ..Default::default()
+        };
+        storage.insert_nodes_batch(&[
+            file_a.clone(),
+            file_b.clone(),
+            caller_in_a.clone(),
+            unresolved_in_a.clone(),
+            callee_in_b.clone(),
+        ])?;
+
+        storage.insert_edges_batch(&[Edge {
+            id: EdgeId(30_001),
+            source: caller_in_a.id,
+            target: unresolved_in_a.id,
+            kind: EdgeKind::CALL,
+            file_node_id: Some(file_a.id),
+            resolved_target: Some(callee_in_b.id),
+            confidence: Some(0.91),
+            certainty: Some(codestory_core::ResolutionCertainty::Certain),
+            candidate_targets: vec![callee_in_b.id],
+            ..Default::default()
+        }])?;
+
+        let summary = storage.delete_file_projection(file_b_id)?;
+        assert_eq!(summary.canonical_file_node_id, file_b_id);
+        assert_eq!(summary.removed_node_count, 2);
+        assert_eq!(summary.removed_edge_count, 0);
+
+        let edges = storage.get_edges()?;
+        assert_eq!(edges.len(), 1);
+        let edge = &edges[0];
+        assert_eq!(edge.source, caller_in_a.id);
+        assert_eq!(edge.target, unresolved_in_a.id);
+        assert_eq!(edge.file_node_id, Some(file_a.id));
+        assert_eq!(edge.resolved_target, None);
+        assert_eq!(edge.confidence, None);
+        assert_eq!(edge.certainty, None);
+        assert!(edge.candidate_targets.is_empty());
+
+        assert!(storage.get_node(file_b.id)?.is_none());
+        assert!(storage.get_node(callee_in_b.id)?.is_none());
+        assert!(storage.get_node(caller_in_a.id)?.is_some());
 
         Ok(())
     }
