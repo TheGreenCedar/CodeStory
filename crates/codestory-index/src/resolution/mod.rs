@@ -12,6 +12,10 @@ use rusqlite::{params, params_from_iter, types::Value};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+mod candidate_selection;
+mod pipeline;
+mod sql;
+
 type UnresolvedEdgeRow = (
     i64,
     Option<i64>,
@@ -490,89 +494,7 @@ impl ResolutionPass {
         telemetry: &mut ResolutionPhaseTelemetry,
         strategy_counters: &mut ResolutionStrategyCounters,
     ) -> Result<usize> {
-        if scope_context.is_empty() {
-            return Ok(0);
-        }
-
-        let prepare_started = Instant::now();
-        conn.execute(
-            "UPDATE edge SET resolved_source_node_id = source_node_id
-             WHERE kind = ?1 AND resolved_source_node_id IS NULL",
-            params![EdgeKind::CALL as i32],
-        )?;
-        telemetry.call_prepare_ms = telemetry
-            .call_prepare_ms
-            .saturating_add(duration_ms_u64(prepare_started.elapsed()));
-
-        let cleanup_started = Instant::now();
-        cleanup_stale_call_resolutions(conn, self.flags, self.policy, scope_context)?;
-        telemetry.call_cleanup_ms = telemetry
-            .call_cleanup_ms
-            .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
-
-        let rows_started = Instant::now();
-        let rows = unresolved_edges(conn, EdgeKind::CALL, scope_context)?;
-        telemetry.call_unresolved_load_ms = telemetry
-            .call_unresolved_load_ms
-            .saturating_add(duration_ms_u64(rows_started.elapsed()));
-        if rows.is_empty() {
-            return Ok(0);
-        }
-
-        let candidate_started = Instant::now();
-        let candidate_index = CandidateIndex::load(
-            conn,
-            &[
-                NodeKind::FUNCTION as i32,
-                NodeKind::METHOD as i32,
-                NodeKind::MACRO as i32,
-            ],
-        )?;
-        telemetry.call_candidate_index_ms = telemetry
-            .call_candidate_index_ms
-            .saturating_add(duration_ms_u64(candidate_started.elapsed()));
-
-        let semantic_candidates_by_row =
-            self.semantic_candidates_for_rows(conn, &rows, EdgeKind::CALL)?;
-
-        let compute_started = Instant::now();
-        let computed_results: Vec<Result<ComputedResolution>> =
-            if self.flags.parallel_compute && rows.len() > 1 {
-                rows.par_iter()
-                    .zip(semantic_candidates_by_row.par_iter())
-                    .map(|(row, semantic_candidates)| {
-                        self.compute_call_resolution(&candidate_index, row, semantic_candidates)
-                    })
-                    .collect()
-            } else {
-                rows.iter()
-                    .zip(semantic_candidates_by_row.iter())
-                    .map(|(row, semantic_candidates)| {
-                        self.compute_call_resolution(&candidate_index, row, semantic_candidates)
-                    })
-                    .collect()
-            };
-        telemetry.call_compute_ms = telemetry
-            .call_compute_ms
-            .saturating_add(duration_ms_u64(compute_started.elapsed()));
-
-        let mut resolved = 0usize;
-        let mut updates = Vec::with_capacity(rows.len());
-        for computed in computed_results {
-            let computed = computed?;
-            if computed.strategy.is_some() {
-                resolved += 1;
-            }
-            strategy_counters.record(computed.strategy);
-            updates.push(computed.update);
-        }
-
-        let apply_started = Instant::now();
-        apply_resolution_updates(conn, &updates)?;
-        telemetry.call_apply_ms = telemetry
-            .call_apply_ms
-            .saturating_add(duration_ms_u64(apply_started.elapsed()));
-        Ok(resolved)
+        pipeline::resolve_calls_on_conn(self, conn, scope_context, telemetry, strategy_counters)
     }
 
     pub fn resolve_imports(&self, storage: &mut Storage) -> Result<usize> {
@@ -598,83 +520,7 @@ impl ResolutionPass {
         telemetry: &mut ResolutionPhaseTelemetry,
         strategy_counters: &mut ResolutionStrategyCounters,
     ) -> Result<usize> {
-        if scope_context.is_empty() {
-            return Ok(0);
-        }
-
-        let prepare_started = Instant::now();
-        conn.execute(
-            "UPDATE edge SET resolved_source_node_id = source_node_id
-             WHERE kind = ?1 AND resolved_source_node_id IS NULL",
-            params![EdgeKind::IMPORT as i32],
-        )?;
-        telemetry.import_prepare_ms = telemetry
-            .import_prepare_ms
-            .saturating_add(duration_ms_u64(prepare_started.elapsed()));
-
-        let rows_started = Instant::now();
-        let rows = unresolved_edges(conn, EdgeKind::IMPORT, scope_context)?;
-        telemetry.import_unresolved_load_ms = telemetry
-            .import_unresolved_load_ms
-            .saturating_add(duration_ms_u64(rows_started.elapsed()));
-        if rows.is_empty() {
-            return Ok(0);
-        }
-
-        let candidate_started = Instant::now();
-        let candidate_index = CandidateIndex::load(
-            conn,
-            &[
-                NodeKind::MODULE as i32,
-                NodeKind::NAMESPACE as i32,
-                NodeKind::PACKAGE as i32,
-            ],
-        )?;
-        telemetry.import_candidate_index_ms = telemetry
-            .import_candidate_index_ms
-            .saturating_add(duration_ms_u64(candidate_started.elapsed()));
-
-        let semantic_candidates_by_row =
-            self.semantic_candidates_for_rows(conn, &rows, EdgeKind::IMPORT)?;
-
-        let compute_started = Instant::now();
-        let computed_results: Vec<Result<ComputedResolution>> =
-            if self.flags.parallel_compute && rows.len() > 1 {
-                rows.par_iter()
-                    .zip(semantic_candidates_by_row.par_iter())
-                    .map(|(row, semantic_candidates)| {
-                        self.compute_import_resolution(&candidate_index, row, semantic_candidates)
-                    })
-                    .collect()
-            } else {
-                rows.iter()
-                    .zip(semantic_candidates_by_row.iter())
-                    .map(|(row, semantic_candidates)| {
-                        self.compute_import_resolution(&candidate_index, row, semantic_candidates)
-                    })
-                    .collect()
-            };
-        telemetry.import_compute_ms = telemetry
-            .import_compute_ms
-            .saturating_add(duration_ms_u64(compute_started.elapsed()));
-
-        let mut resolved = 0usize;
-        let mut updates = Vec::with_capacity(rows.len());
-        for computed in computed_results {
-            let computed = computed?;
-            if computed.strategy.is_some() {
-                resolved += 1;
-            }
-            strategy_counters.record(computed.strategy);
-            updates.push(computed.update);
-        }
-
-        let apply_started = Instant::now();
-        apply_resolution_updates(conn, &updates)?;
-        telemetry.import_apply_ms = telemetry
-            .import_apply_ms
-            .saturating_add(duration_ms_u64(apply_started.elapsed()));
-        Ok(resolved)
+        pipeline::resolve_imports_on_conn(self, conn, scope_context, telemetry, strategy_counters)
     }
 
     fn semantic_candidates_for_rows(
@@ -709,101 +555,7 @@ impl ResolutionPass {
         row: &UnresolvedEdgeRow,
         semantic_candidates: &[SemanticResolutionCandidate],
     ) -> Result<ComputedResolution> {
-        let (edge_id, file_id, caller_qualified, target_name, _, callsite_identity) = row;
-        let prepared_name = PreparedName::new(target_name.clone());
-        let is_common_unqualified = is_common_unqualified_call_name(&prepared_name.original);
-        let mut selected: Option<(i64, f32, ResolutionStrategy)> = None;
-        let mut semantic_fallback: Option<(i64, f32)> = None;
-        let mut candidate_ids = OrderedCandidateIds::with_capacity(8);
-
-        for candidate in semantic_candidates {
-            candidate_ids.push(candidate.target_node_id);
-            consider_selected(
-                &mut semantic_fallback,
-                candidate.target_node_id,
-                candidate.confidence,
-            );
-        }
-
-        if selected.is_none()
-            && !is_common_unqualified
-            && let Some(candidate) = candidate_index.find_same_file_readonly(
-                *file_id,
-                &prepared_name.original,
-                &prepared_name.ascii_lower,
-            )
-        {
-            candidate_ids.push(candidate);
-            selected = Some((
-                candidate,
-                self.policy.call_same_file,
-                ResolutionStrategy::CallSameFile,
-            ));
-        }
-
-        if selected.is_none()
-            && let Some(prefix) = caller_qualified.as_deref().and_then(module_prefix)
-            && let Some(candidate) = candidate_index.find_same_module_readonly(
-                &prefix.0,
-                prefix.1,
-                &prepared_name.original,
-                &prepared_name.ascii_lower,
-            )
-        {
-            candidate_ids.push(candidate);
-            selected = Some((
-                candidate,
-                self.policy.call_same_module,
-                ResolutionStrategy::CallSameModule,
-            ));
-        }
-
-        if selected.is_none()
-            && !is_common_unqualified
-            && let Some(candidate) = candidate_index
-                .find_global_unique_readonly(&prepared_name.original, &prepared_name.ascii_lower)
-        {
-            candidate_ids.push(candidate);
-            selected = Some((
-                candidate,
-                self.policy.call_global_unique,
-                ResolutionStrategy::CallGlobalUnique,
-            ));
-        }
-
-        if self.flags.store_candidates && selected.is_none() {
-            collect_candidate_pool_from_index(
-                candidate_index,
-                std::slice::from_ref(&prepared_name),
-                &mut candidate_ids,
-                6,
-            );
-        }
-
-        if selected.is_none()
-            && let Some((candidate, confidence)) = semantic_fallback
-        {
-            selected = Some((
-                candidate,
-                confidence,
-                ResolutionStrategy::CallSemanticFallback,
-            ));
-        }
-
-        if let Some((_, confidence, _)) = selected
-            && !should_keep_common_call_resolution(
-                &prepared_name.original,
-                confidence,
-                callsite_identity.as_deref(),
-            )
-        {
-            selected = None;
-        }
-
-        let strategy = selected.map(|(_, _, strategy)| strategy);
-        let selected_pair = selected.map(|(candidate, confidence, _)| (candidate, confidence));
-        let update = build_resolved_edge_update(*edge_id, selected_pair, candidate_ids.as_slice())?;
-        Ok(ComputedResolution { update, strategy })
+        candidate_selection::compute_call_resolution(self, candidate_index, row, semantic_candidates)
     }
 
     fn compute_import_resolution(
@@ -812,148 +564,12 @@ impl ResolutionPass {
         row: &UnresolvedEdgeRow,
         semantic_candidates: &[SemanticResolutionCandidate],
     ) -> Result<ComputedResolution> {
-        let (edge_id, file_id, caller_qualified, target_name, _, _) = row;
-        let caller_prefix = caller_qualified.as_deref().and_then(module_prefix);
-        let name_candidates = import_name_candidates(target_name, self.flags.legacy_mode)
-            .into_iter()
-            .map(PreparedName::new)
-            .collect::<Vec<_>>();
-
-        let mut semantic_fallback: Option<(i64, f32)> = None;
-        let mut candidate_ids = OrderedCandidateIds::with_capacity(10);
-        for candidate in semantic_candidates {
-            candidate_ids.push(candidate.target_node_id);
-            consider_selected(
-                &mut semantic_fallback,
-                candidate.target_node_id,
-                candidate.confidence,
-            );
-        }
-
-        let mut same_file_stage = OrderedCandidateIds::default();
-        let mut same_module_stage = OrderedCandidateIds::default();
-        let mut global_stage = OrderedCandidateIds::default();
-        let mut fuzzy_stage = OrderedCandidateIds::default();
-
-        let mut same_file_selected: Option<i64> = None;
-        let mut same_module_selected: Option<i64> = None;
-        let mut global_selected: Option<i64> = None;
-        let mut fuzzy_selected: Option<i64> = None;
-
-        for name in &name_candidates {
-            if self.flags.legacy_mode && same_file_selected.is_none() {
-                if let Some(candidate) = candidate_index.find_same_file_readonly(
-                    *file_id,
-                    &name.original,
-                    &name.ascii_lower,
-                ) {
-                    same_file_stage.push(candidate);
-                    same_file_selected = Some(candidate);
-                    break;
-                }
-            }
-
-            if same_module_selected.is_none()
-                && let Some(prefix) = caller_prefix.as_ref()
-                && let Some(candidate) = candidate_index.find_same_module_readonly(
-                    &prefix.0,
-                    prefix.1,
-                    &name.original,
-                    &name.ascii_lower,
-                )
-            {
-                same_module_stage.push(candidate);
-                if !candidate_index.is_same_file_candidate(candidate, *file_id) {
-                    same_module_selected = Some(candidate);
-                }
-            }
-
-            if global_selected.is_none()
-                && let Some(candidate) =
-                    candidate_index.find_global_unique_readonly(&name.original, &name.ascii_lower)
-            {
-                global_stage.push(candidate);
-                if !candidate_index.is_same_file_candidate(candidate, *file_id) {
-                    global_selected = Some(candidate);
-                }
-            }
-
-            if !self.flags.legacy_mode
-                && fuzzy_selected.is_none()
-                && let Some(candidate) =
-                    candidate_index.find_fuzzy_readonly(&name.original, &name.ascii_lower)
-            {
-                fuzzy_stage.push(candidate);
-                if !candidate_index.is_same_file_candidate(candidate, *file_id) {
-                    fuzzy_selected = Some(candidate);
-                }
-            }
-        }
-
-        if self.flags.legacy_mode && same_file_selected.is_some() {
-            candidate_ids.extend_stage(&same_file_stage.into_vec(), usize::MAX);
-        } else {
-            candidate_ids.extend_stage(&same_module_stage.into_vec(), usize::MAX);
-            if same_module_selected.is_none() {
-                candidate_ids.extend_stage(&global_stage.into_vec(), usize::MAX);
-                if global_selected.is_none() && !self.flags.legacy_mode {
-                    candidate_ids.extend_stage(&fuzzy_stage.into_vec(), usize::MAX);
-                }
-            }
-        }
-
-        if self.flags.store_candidates {
-            collect_candidate_pool_from_index(
-                candidate_index,
-                &name_candidates,
-                &mut candidate_ids,
-                8,
-            );
-        }
-
-        let mut selected: Option<(i64, f32, ResolutionStrategy)> =
-            if let Some(candidate) = same_file_selected {
-                Some((
-                    candidate,
-                    self.policy.import_same_file,
-                    ResolutionStrategy::ImportSameFile,
-                ))
-            } else if let Some(candidate) = same_module_selected {
-                Some((
-                    candidate,
-                    self.policy.import_same_module,
-                    ResolutionStrategy::ImportSameModule,
-                ))
-            } else if let Some(candidate) = global_selected {
-                Some((
-                    candidate,
-                    self.policy.import_global_unique,
-                    ResolutionStrategy::ImportGlobalUnique,
-                ))
-            } else if let Some(candidate) = fuzzy_selected {
-                Some((
-                    candidate,
-                    self.policy.import_fuzzy,
-                    ResolutionStrategy::ImportFuzzy,
-                ))
-            } else {
-                None
-            };
-
-        if selected.is_none()
-            && let Some((candidate, confidence)) = semantic_fallback
-        {
-            selected = Some((
-                candidate,
-                confidence,
-                ResolutionStrategy::ImportSemanticFallback,
-            ));
-        }
-
-        let strategy = selected.map(|(_, _, strategy)| strategy);
-        let selected_pair = selected.map(|(candidate, confidence, _)| (candidate, confidence));
-        let update = build_resolved_edge_update(*edge_id, selected_pair, candidate_ids.as_slice())?;
-        Ok(ComputedResolution { update, strategy })
+        candidate_selection::compute_import_resolution(
+            self,
+            candidate_index,
+            row,
+            semantic_candidates,
+        )
     }
     #[warn(clippy::too_many_arguments)]
     fn semantic_candidates_for_edge(
