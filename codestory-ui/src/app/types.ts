@@ -1,4 +1,7 @@
-import type { AgentConnectionSettingsDto } from "../generated/api";
+import type {
+  AgentConnectionSettingsDto,
+  AgentRetrievalProfileSelectionDto,
+} from "../generated/api";
 import type { PersistedTrailUiConfig } from "../graph/trailConfig";
 
 export type LeftTab = "agent" | "explorer";
@@ -9,6 +12,7 @@ export type PersistedLayout = {
   selectedTab: LeftTab;
   trailConfig?: PersistedTrailUiConfig;
   agentConnection?: AgentConnectionSettingsDto;
+  retrievalProfile?: AgentRetrievalProfileSelectionDto;
 };
 
 export type PendingSymbolFocus = {

@@ -1,10 +1,15 @@
 import { useMemo, useState, type ChangeEvent, type ReactNode } from "react";
 
 import type { LeftTab } from "../app/types";
+import { MermaidDiagram } from "./MermaidDiagram";
 import type {
   AgentAnswerDto,
   AgentConnectionSettingsDto,
+  AgentResponseBlockDto,
+  AgentRetrievalProfileSelectionDto,
+  EdgeKind,
   GraphArtifactDto,
+  NodeKind,
   SymbolSummaryDto,
 } from "../generated/api";
 
@@ -13,8 +18,8 @@ type ResponsePaneProps = {
   onSelectTab: (tab: LeftTab) => void;
   prompt: string;
   onPromptChange: (prompt: string) => void;
-  includeMermaid: boolean;
-  onIncludeMermaidChange: (next: boolean) => void;
+  retrievalProfile: AgentRetrievalProfileSelectionDto;
+  onRetrievalProfileChange: (next: AgentRetrievalProfileSelectionDto) => void;
   agentBackend: NonNullable<AgentConnectionSettingsDto["backend"]>;
   onAgentBackendChange: (backend: NonNullable<AgentConnectionSettingsDto["backend"]>) => void;
   agentCommand: string;
@@ -40,7 +45,34 @@ type ExplorerEntry = {
   isDependency: boolean;
 };
 
+type ResolvedCustomConfig = {
+  depth: number;
+  direction: "Incoming" | "Outgoing" | "Both";
+  edge_filter: EdgeKind[];
+  node_filter: NodeKind[];
+  max_nodes: number;
+  include_edge_occurrences: boolean;
+  enable_source_reads: boolean;
+};
+
 const WRAPPING_QUOTES = new Set(["'", '"', "`", "“", "”", "‘", "’"]);
+
+const DEFAULT_CUSTOM_PROFILE_CONFIG: ResolvedCustomConfig = {
+  depth: 3,
+  direction: "Both",
+  edge_filter: [],
+  node_filter: [],
+  max_nodes: 800,
+  include_edge_occurrences: false,
+  enable_source_reads: true,
+};
+
+const PRESET_LABELS: Record<"architecture" | "callflow" | "inheritance" | "impact", string> = {
+  architecture: "Architecture",
+  callflow: "Call Flow",
+  inheritance: "Inheritance",
+  impact: "Impact",
+};
 
 function normalizeSymbolLabel(label: string): string {
   const trimmed = label.trim();
@@ -119,13 +151,91 @@ function buildExplorerEntries(
   return [...grouped.values()];
 }
 
+function parseCsvList(value: string): string[] {
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
+function formatCsvList(values: string[]): string {
+  return values.join(", ");
+}
+
+function asCustomConfig(profile: AgentRetrievalProfileSelectionDto): ResolvedCustomConfig {
+  if (profile.kind === "custom") {
+    return {
+      depth:
+        typeof profile.config.depth === "number"
+          ? Math.max(0, Math.trunc(profile.config.depth))
+          : 3,
+      direction:
+        profile.config.direction === "Incoming" || profile.config.direction === "Outgoing"
+          ? profile.config.direction
+          : "Both",
+      edge_filter: Array.isArray(profile.config.edge_filter) ? profile.config.edge_filter : [],
+      node_filter: Array.isArray(profile.config.node_filter) ? profile.config.node_filter : [],
+      max_nodes:
+        typeof profile.config.max_nodes === "number"
+          ? Math.max(10, Math.trunc(profile.config.max_nodes))
+          : 800,
+      include_edge_occurrences: Boolean(profile.config.include_edge_occurrences),
+      enable_source_reads:
+        typeof profile.config.enable_source_reads === "boolean"
+          ? profile.config.enable_source_reads
+          : true,
+    };
+  }
+  return DEFAULT_CUSTOM_PROFILE_CONFIG;
+}
+
+function renderResponseBlock(
+  block: AgentResponseBlockDto,
+  graphMap: Record<string, GraphArtifactDto>,
+  onActivateGraph: (graphId: string) => void,
+): ReactNode {
+  if (block.kind === "markdown") {
+    return <pre className="section-markdown">{block.markdown}</pre>;
+  }
+
+  if (block.kind === "mermaid") {
+    const graph = graphMap[block.graph_id];
+    if (!graph) {
+      return (
+        <div className="graph-empty">
+          Mermaid artifact `{block.graph_id}` was not found in this response payload.
+        </div>
+      );
+    }
+
+    if (graph.kind !== "mermaid") {
+      return (
+        <div className="graph-links">
+          <button onClick={() => onActivateGraph(graph.id)}>Open {graph.title}</button>
+        </div>
+      );
+    }
+
+    return (
+      <div className="inline-mermaid-block">
+        <div className="graph-links">
+          <button onClick={() => onActivateGraph(graph.id)}>Open in Graph Pane</button>
+        </div>
+        <MermaidDiagram syntax={graph.mermaid_syntax} className="mermaid-shell inline-mermaid" />
+      </div>
+    );
+  }
+
+  return null;
+}
+
 export function ResponsePane({
   selectedTab,
   onSelectTab,
   prompt,
   onPromptChange,
-  includeMermaid,
-  onIncludeMermaidChange,
+  retrievalProfile,
+  onRetrievalProfileChange,
   agentBackend,
   onAgentBackendChange,
   agentCommand,
@@ -156,6 +266,36 @@ export function ResponsePane({
 
   const handleCommandChange = (event: ChangeEvent<HTMLInputElement>) => {
     onAgentCommandChange(event.target.value);
+  };
+
+  const handleProfileModeChange = (event: ChangeEvent<HTMLSelectElement>) => {
+    const nextMode = event.target.value;
+    if (nextMode === "auto") {
+      onRetrievalProfileChange({ kind: "auto" });
+      return;
+    }
+    if (nextMode === "preset") {
+      const preset = retrievalProfile.kind === "preset" ? retrievalProfile.preset : "architecture";
+      onRetrievalProfileChange({ kind: "preset", preset });
+      return;
+    }
+    if (nextMode === "custom") {
+      onRetrievalProfileChange({
+        kind: "custom",
+        config: asCustomConfig(retrievalProfile),
+      });
+    }
+  };
+
+  const updateCustomConfig = (patch: Partial<ResolvedCustomConfig>) => {
+    const current = asCustomConfig(retrievalProfile);
+    onRetrievalProfileChange({
+      kind: "custom",
+      config: {
+        ...current,
+        ...patch,
+      },
+    });
   };
 
   const [explorerQuery, setExplorerQuery] = useState<string>("");
@@ -261,6 +401,7 @@ export function ResponsePane({
   };
 
   const treeRows = renderTree(rootSymbols);
+  const activeCustomConfig = asCustomConfig(retrievalProfile);
 
   return (
     <section className="pane pane-response">
@@ -306,15 +447,151 @@ export function ResponsePane({
                 />
               </label>
             </div>
-            <div className="prompt-actions">
-              <label>
-                <input
-                  type="checkbox"
-                  checked={includeMermaid}
-                  onChange={(event) => onIncludeMermaidChange(event.target.checked)}
-                />
-                Add Mermaid diagrams
+
+            <div className="retrieval-profile-settings">
+              <label className="agent-connection-field">
+                <span>Retrieval profile</span>
+                <select value={retrievalProfile.kind} onChange={handleProfileModeChange}>
+                  <option value="auto">Auto (latency-first)</option>
+                  <option value="preset">Preset (latency-first)</option>
+                  <option value="custom">Custom (completeness-first)</option>
+                </select>
               </label>
+
+              {retrievalProfile.kind === "preset" ? (
+                <label className="agent-connection-field">
+                  <span>Preset</span>
+                  <select
+                    value={retrievalProfile.preset}
+                    onChange={(event) => {
+                      const nextPreset = event.target.value as
+                        | "architecture"
+                        | "callflow"
+                        | "inheritance"
+                        | "impact";
+                      onRetrievalProfileChange({ kind: "preset", preset: nextPreset });
+                    }}
+                  >
+                    {(Object.keys(PRESET_LABELS) as Array<keyof typeof PRESET_LABELS>).map(
+                      (preset) => (
+                        <option key={preset} value={preset}>
+                          {PRESET_LABELS[preset]}
+                        </option>
+                      ),
+                    )}
+                  </select>
+                </label>
+              ) : null}
+
+              {retrievalProfile.kind === "custom" ? (
+                <div className="custom-profile-grid">
+                  <label className="agent-connection-field">
+                    <span>Depth (0 = infinite)</span>
+                    <input
+                      type="number"
+                      min={0}
+                      value={activeCustomConfig.depth}
+                      onChange={(event) => {
+                        const nextDepth = Number.parseInt(event.target.value, 10);
+                        updateCustomConfig({
+                          depth: Number.isFinite(nextDepth) ? Math.max(0, nextDepth) : 0,
+                        });
+                      }}
+                    />
+                  </label>
+
+                  <label className="agent-connection-field">
+                    <span>Direction</span>
+                    <select
+                      value={activeCustomConfig.direction}
+                      onChange={(event) => {
+                        const nextDirection = event.target.value;
+                        updateCustomConfig({
+                          direction:
+                            nextDirection === "Incoming" || nextDirection === "Outgoing"
+                              ? nextDirection
+                              : "Both",
+                        });
+                      }}
+                    >
+                      <option value="Both">Both</option>
+                      <option value="Outgoing">Outgoing</option>
+                      <option value="Incoming">Incoming</option>
+                    </select>
+                  </label>
+
+                  <label className="agent-connection-field">
+                    <span>Max nodes</span>
+                    <input
+                      type="number"
+                      min={10}
+                      value={activeCustomConfig.max_nodes}
+                      onChange={(event) => {
+                        const nextMaxNodes = Number.parseInt(event.target.value, 10);
+                        updateCustomConfig({
+                          max_nodes: Number.isFinite(nextMaxNodes)
+                            ? Math.max(10, nextMaxNodes)
+                            : activeCustomConfig.max_nodes,
+                        });
+                      }}
+                    />
+                  </label>
+
+                  <label className="agent-connection-field agent-connection-field-wide">
+                    <span>Edge filter (comma-separated)</span>
+                    <input
+                      value={formatCsvList(activeCustomConfig.edge_filter)}
+                      onChange={(event) => {
+                        updateCustomConfig({
+                          edge_filter: parseCsvList(event.target.value) as EdgeKind[],
+                        });
+                      }}
+                      placeholder="CALL, INHERITANCE, OVERRIDE"
+                    />
+                  </label>
+
+                  <label className="agent-connection-field agent-connection-field-wide">
+                    <span>Node filter (comma-separated)</span>
+                    <input
+                      value={formatCsvList(activeCustomConfig.node_filter)}
+                      onChange={(event) => {
+                        updateCustomConfig({
+                          node_filter: parseCsvList(event.target.value) as NodeKind[],
+                        });
+                      }}
+                      placeholder="CLASS, METHOD, INTERFACE"
+                    />
+                  </label>
+
+                  <label className="profile-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={activeCustomConfig.enable_source_reads}
+                      onChange={(event) => {
+                        updateCustomConfig({ enable_source_reads: event.target.checked });
+                      }}
+                    />
+                    Enable optional source reads after retrieval
+                  </label>
+
+                  <label className="profile-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={activeCustomConfig.include_edge_occurrences}
+                      onChange={(event) => {
+                        updateCustomConfig({ include_edge_occurrences: event.target.checked });
+                      }}
+                    />
+                    Include edge occurrence lookups
+                  </label>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="prompt-actions">
+              <div className="prompt-actions-meta">
+                Mermaid diagrams are always included and rendered inline.
+              </div>
               <button onClick={onAskAgent} disabled={isBusy || !projectOpen}>
                 Ask Agent
               </button>
@@ -327,16 +604,20 @@ export function ResponsePane({
               {agentAnswer.sections.map((section) => (
                 <article key={section.id} className="section-block">
                   <h4>{section.title}</h4>
-                  <pre>{section.markdown}</pre>
-                  <div className="graph-links">
-                    {section.graph_ids.map((graphId) => (
-                      <button key={graphId} onClick={() => onActivateGraph(graphId)}>
-                        {graphMap[graphId]?.title ?? graphId}
-                      </button>
+                  <div className="section-block-content">
+                    {section.blocks.map((block, index) => (
+                      <div key={`${section.id}-${index}`} className="response-block">
+                        {renderResponseBlock(block, graphMap, onActivateGraph)}
+                      </div>
                     ))}
                   </div>
                 </article>
               ))}
+
+              <details className="trace-panel">
+                <summary>Retrieval Trace</summary>
+                <pre>{JSON.stringify(agentAnswer.retrieval_trace, null, 2)}</pre>
+              </details>
             </div>
           )}
         </>

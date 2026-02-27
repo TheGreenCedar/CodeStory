@@ -12,9 +12,11 @@ import { StatusStrip } from "./components/StatusStrip";
 import { TopBar } from "./components/TopBar";
 import type {
   AgentAnswerDto,
+  AgentCustomRetrievalConfigDto,
   AgentConnectionSettingsDto,
   AppEventPayload,
   GraphArtifactDto,
+  AgentRetrievalProfileSelectionDto,
   NodeDetailsDto,
   SearchHit,
   SourceOccurrenceDto,
@@ -82,6 +84,12 @@ const DEFAULT_AGENT_CONNECTION: AgentConnectionState = {
   command: null,
 };
 
+const DEFAULT_RETRIEVAL_PROFILE: AgentRetrievalProfileSelectionDto = {
+  kind: "auto",
+};
+
+const ALLOWED_PRESETS = new Set(["architecture", "callflow", "inheritance", "impact"]);
+
 function normalizeAgentConnection(raw: unknown): AgentConnectionState {
   if (!raw || typeof raw !== "object") {
     return DEFAULT_AGENT_CONNECTION;
@@ -99,6 +107,73 @@ function normalizeAgentConnection(raw: unknown): AgentConnectionState {
   };
 }
 
+function normalizeCustomConfig(raw: unknown): AgentCustomRetrievalConfigDto {
+  if (!raw || typeof raw !== "object") {
+    return {
+      depth: 3,
+      direction: "Both",
+      edge_filter: [],
+      node_filter: [],
+      max_nodes: 800,
+      include_edge_occurrences: false,
+      enable_source_reads: true,
+    };
+  }
+
+  const candidate = raw as Partial<AgentCustomRetrievalConfigDto>;
+  const depth = typeof candidate.depth === "number" ? Math.max(0, Math.trunc(candidate.depth)) : 3;
+  const maxNodes =
+    typeof candidate.max_nodes === "number" ? Math.max(10, Math.trunc(candidate.max_nodes)) : 800;
+  const direction =
+    candidate.direction === "Incoming" || candidate.direction === "Outgoing"
+      ? candidate.direction
+      : "Both";
+  return {
+    depth,
+    direction,
+    edge_filter: Array.isArray(candidate.edge_filter) ? candidate.edge_filter : [],
+    node_filter: Array.isArray(candidate.node_filter) ? candidate.node_filter : [],
+    max_nodes: maxNodes,
+    include_edge_occurrences: Boolean(candidate.include_edge_occurrences),
+    enable_source_reads:
+      typeof candidate.enable_source_reads === "boolean" ? candidate.enable_source_reads : true,
+  };
+}
+
+function normalizeRetrievalProfile(raw: unknown): AgentRetrievalProfileSelectionDto {
+  if (!raw || typeof raw !== "object") {
+    return DEFAULT_RETRIEVAL_PROFILE;
+  }
+
+  const candidate = raw as Partial<AgentRetrievalProfileSelectionDto> & {
+    preset?: unknown;
+    config?: unknown;
+  };
+
+  if (candidate.kind === "preset") {
+    const preset = typeof candidate.preset === "string" ? candidate.preset : "";
+    if (ALLOWED_PRESETS.has(preset)) {
+      return {
+        kind: "preset",
+        preset: preset as "architecture" | "callflow" | "inheritance" | "impact",
+      };
+    }
+    return {
+      kind: "preset",
+      preset: "architecture",
+    };
+  }
+
+  if (candidate.kind === "custom") {
+    return {
+      kind: "custom",
+      config: normalizeCustomConfig(candidate.config),
+    };
+  }
+
+  return DEFAULT_RETRIEVAL_PROFILE;
+}
+
 export default function App() {
   const [projectPath, setProjectPath] = useState<string>(() => {
     if (typeof window === "undefined") {
@@ -110,7 +185,8 @@ export default function App() {
   const [status, setStatus] = useState<string>("Open a project to begin.");
   const [prompt, setPrompt] = useState<string>("Trace how this feature works end-to-end.");
   const [searchQuery, setSearchQuery] = useState<string>("");
-  const [includeMermaid, setIncludeMermaid] = useState<boolean>(true);
+  const [retrievalProfile, setRetrievalProfile] =
+    useState<AgentRetrievalProfileSelectionDto>(DEFAULT_RETRIEVAL_PROFILE);
   const [agentConnection, setAgentConnection] =
     useState<AgentConnectionState>(DEFAULT_AGENT_CONNECTION);
   const [selectedTab, setSelectedTab] = useState<"agent" | "explorer">("agent");
@@ -279,6 +355,7 @@ export default function App() {
         selectedTab,
         trailConfig,
         agentConnection,
+        retrievalProfile,
       });
     }, 350);
 
@@ -288,6 +365,7 @@ export default function App() {
     agentConnection,
     expandedNodes,
     projectOpen,
+    retrievalProfile,
     saveLayout,
     selectedTab,
     trailConfig,
@@ -811,6 +889,7 @@ export default function App() {
         setProjectRevision((previous) => previous + 1);
         setTrailConfig(defaultTrailUiConfig());
         setAgentConnection(DEFAULT_AGENT_CONNECTION);
+        setRetrievalProfile(DEFAULT_RETRIEVAL_PROFILE);
         await loadRootSymbols();
 
         const saved = await api.getUiLayout();
@@ -828,6 +907,7 @@ export default function App() {
             }
             setTrailConfig(normalizeTrailUiConfig(parsed.trailConfig));
             setAgentConnection(normalizeAgentConnection(parsed.agentConnection));
+            setRetrievalProfile(normalizeRetrievalProfile(parsed.retrievalProfile));
           } catch {
             // Ignore malformed saved layouts.
           }
@@ -891,7 +971,7 @@ export default function App() {
     try {
       const answer = await api.ask({
         prompt,
-        include_mermaid: includeMermaid,
+        retrieval_profile: retrievalProfile,
         focus_node_id: activeNodeDetails?.id,
         max_results: 10,
         connection,
@@ -919,7 +999,7 @@ export default function App() {
     } finally {
       setIsBusy(false);
     }
-  }, [activeNodeDetails?.id, agentConnection, focusSymbol, includeMermaid, prompt]);
+  }, [activeNodeDetails?.id, agentConnection, focusSymbol, prompt, retrievalProfile]);
 
   const toggleNode = useCallback(
     async (node: SymbolSummaryDto) => {
@@ -1183,8 +1263,8 @@ export default function App() {
           onSelectTab={setSelectedTab}
           prompt={prompt}
           onPromptChange={setPrompt}
-          includeMermaid={includeMermaid}
-          onIncludeMermaidChange={setIncludeMermaid}
+          retrievalProfile={retrievalProfile}
+          onRetrievalProfileChange={setRetrievalProfile}
           agentBackend={agentConnection.backend}
           onAgentBackendChange={(backend) => {
             setAgentConnection((prev) => ({

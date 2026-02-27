@@ -1,15 +1,14 @@
 use codestory_api::{
-    AgentAnswerDto, AgentAskRequest, AgentBackend, AgentCitationDto, AgentConnectionSettingsDto,
-    AgentResponseSectionDto, ApiError, AppEventPayload, BookmarkCategoryDto, BookmarkDto,
-    CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest,
-    GraphArtifactDto, GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse, IndexMode,
-    IndexingPhaseTimings, ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess,
-    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest,
-    OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest, ProjectSummary,
-    ReadFileTextRequest, ReadFileTextResponse, SearchHit, SearchRequest, SetUiLayoutRequest,
-    SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto, SymbolSummaryDto,
-    SystemActionResponse, TrailConfigDto, TrailFilterOptionsDto, UpdateBookmarkCategoryRequest,
-    UpdateBookmarkRequest, WriteFileResponse, WriteFileTextRequest,
+    AgentAnswerDto, AgentAskRequest, AgentBackend, AgentConnectionSettingsDto, ApiError,
+    AppEventPayload, BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest,
+    CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest, GraphEdgeDto, GraphNodeDto,
+    GraphRequest, GraphResponse, IndexMode, IndexingPhaseTimings, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
+    NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
+    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, SearchHit, SearchRequest,
+    SetUiLayoutRequest, SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto,
+    SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailFilterOptionsDto,
+    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_events::{Event, EventBus};
 use codestory_search::SearchEngine;
@@ -24,6 +23,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod agent;
 
 fn no_project_error() -> ApiError {
     ApiError::invalid_argument("No project open. Call open_project first.")
@@ -1240,238 +1241,7 @@ impl AppController {
     }
 
     pub fn agent_ask(&self, req: AgentAskRequest) -> Result<AgentAnswerDto, ApiError> {
-        let prompt = req.prompt.trim().to_string();
-        if prompt.is_empty() {
-            return Err(ApiError::invalid_argument("Prompt cannot be empty."));
-        }
-
-        let mut hits = self.search(SearchRequest {
-            query: prompt.clone(),
-        })?;
-        let max_results = req.max_results.unwrap_or(8).clamp(1, 25) as usize;
-        if hits.len() > max_results {
-            hits.truncate(max_results);
-        }
-
-        let mut chosen_node = req.focus_node_id.clone();
-        if chosen_node.is_none() {
-            chosen_node = hits.first().map(|hit| hit.node_id.clone());
-        }
-
-        let mut graphs = Vec::new();
-        let mut primary_graph_id = None::<String>;
-
-        if let Some(center_id) = chosen_node.clone() {
-            let neighborhood = self.graph_neighborhood(GraphRequest {
-                center_id: center_id.clone(),
-                max_edges: Some(240),
-            })?;
-
-            primary_graph_id = Some("uml-primary".to_string());
-            graphs.push(GraphArtifactDto::Uml {
-                id: "uml-primary".to_string(),
-                title: "Primary Dependency Graph".to_string(),
-                graph: neighborhood.clone(),
-            });
-
-            if req.include_mermaid {
-                graphs.push(GraphArtifactDto::Mermaid {
-                    id: "mermaid-flow".to_string(),
-                    title: "Flow Overview".to_string(),
-                    diagram: "flowchart".to_string(),
-                    mermaid_syntax: mermaid_flowchart(&neighborhood),
-                });
-
-                let prompt_lower = prompt.to_ascii_lowercase();
-                if prompt_lower.contains("sequence") {
-                    graphs.push(GraphArtifactDto::Mermaid {
-                        id: "mermaid-sequence".to_string(),
-                        title: "Sequence Narrative".to_string(),
-                        diagram: "sequenceDiagram".to_string(),
-                        mermaid_syntax: mermaid_sequence(&neighborhood),
-                    });
-                }
-
-                if prompt_lower.contains("timeline") || prompt_lower.contains("gantt") {
-                    graphs.push(GraphArtifactDto::Mermaid {
-                        id: "mermaid-gantt".to_string(),
-                        title: "Execution Timeline".to_string(),
-                        diagram: "gantt".to_string(),
-                        mermaid_syntax: mermaid_gantt(&hits),
-                    });
-                }
-            }
-        }
-
-        let focused_node = if let Some(center_id) = chosen_node.clone() {
-            Some(self.node_details(NodeDetailsRequest { id: center_id })?)
-        } else {
-            None
-        };
-
-        let focused_source = if let Some(node) = focused_node.as_ref() {
-            if let (Some(path), Some(line)) = (node.file_path.clone(), node.start_line) {
-                if let Ok(file) = self.read_file_text(ReadFileTextRequest { path: path.clone() }) {
-                    Some(FocusedSourceContext {
-                        path,
-                        line,
-                        snippet: markdown_snippet(&file.text, Some(line), 6),
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let backend_label = agent_backend_label(req.connection.backend);
-        let configured_command = configured_agent_command(&req.connection);
-        let local_agent_prompt = build_local_agent_prompt(
-            &prompt,
-            &hits,
-            focused_node.as_ref(),
-            focused_source.as_ref(),
-        );
-        let local_agent_result = self.run_local_agent(&req.connection, &local_agent_prompt);
-
-        let citations: Vec<AgentCitationDto> = hits
-            .iter()
-            .map(|hit| AgentCitationDto {
-                node_id: hit.node_id.clone(),
-                display_name: hit.display_name.clone(),
-                kind: hit.kind,
-                file_path: hit.file_path.clone(),
-                line: hit.line,
-                score: hit.score,
-            })
-            .collect();
-
-        let mut sections = Vec::new();
-        match &local_agent_result {
-            Ok(local_agent) => {
-                sections.push(AgentResponseSectionDto {
-                    id: "agent-response".to_string(),
-                    title: format!("{} Response", local_agent.backend_label),
-                    markdown: format!(
-                        "{}\n\n_Executed via `{}`._",
-                        local_agent.markdown, local_agent.command
-                    ),
-                    graph_ids: Vec::new(),
-                });
-            }
-            Err(error) => {
-                sections.push(AgentResponseSectionDto {
-                    id: "agent-connection".to_string(),
-                    title: "Local Agent Connection".to_string(),
-                    markdown: format!(
-                        "Could not run local {} command `{}`.\n\nReason: {}\n\nSet the command override in Agent settings to the full executable path if needed, then retry.\n\nShowing indexed fallback response below.",
-                        backend_label, configured_command, error.message
-                    ),
-                    graph_ids: Vec::new(),
-                });
-            }
-        }
-
-        if !hits.is_empty() {
-            let mut markdown = String::from("Top symbol matches from indexed search:\n");
-            for hit in hits.iter().take(6) {
-                let location = match (&hit.file_path, hit.line) {
-                    (Some(path), Some(line)) => format!(" ({path}:{line})"),
-                    (Some(path), None) => format!(" ({path})"),
-                    _ => String::new(),
-                };
-                let _ = writeln!(
-                    markdown,
-                    "- **{}** [{:?}] score `{:.3}`{}",
-                    hit.display_name, hit.kind, hit.score, location
-                );
-            }
-            sections.push(AgentResponseSectionDto {
-                id: "search-results".to_string(),
-                title: "Indexed Search".to_string(),
-                markdown,
-                graph_ids: Vec::new(),
-            });
-        } else {
-            sections.push(AgentResponseSectionDto {
-                id: "search-results".to_string(),
-                title: "Indexed Search".to_string(),
-                markdown: "No direct indexed matches were found. Try a symbol name, file stem, or a narrower phrase.".to_string(),
-                graph_ids: Vec::new(),
-            });
-        }
-
-        if let Some(node) = focused_node {
-            let mut markdown = format!(
-                "Focused symbol: **{}** (`{:?}`)\n",
-                node.display_name, node.kind
-            );
-
-            if let Some(source) = focused_source.as_ref() {
-                let _ = writeln!(
-                    markdown,
-                    "\nSource context from `{}:{}`:\n",
-                    source.path, source.line
-                );
-                markdown.push_str(&source.snippet);
-            }
-
-            let graph_ids = primary_graph_id.clone().into_iter().collect();
-            sections.push(AgentResponseSectionDto {
-                id: "deep-inspection".to_string(),
-                title: "Deep Inspection".to_string(),
-                markdown,
-                graph_ids,
-            });
-        }
-
-        if req.include_mermaid {
-            let graph_ids = graphs
-                .iter()
-                .filter_map(|graph| match graph {
-                    GraphArtifactDto::Mermaid { id, .. } => Some(id.clone()),
-                    GraphArtifactDto::Uml { .. } => None,
-                })
-                .collect::<Vec<_>>();
-
-            if !graph_ids.is_empty() {
-                sections.push(AgentResponseSectionDto {
-                    id: "agent-diagrams".to_string(),
-                    title: "Agent Diagrams".to_string(),
-                    markdown: "Generated Mermaid diagrams for storytelling views (flow, sequence, or timeline when requested).".to_string(),
-                    graph_ids,
-                });
-            }
-        }
-
-        let summary = match &local_agent_result {
-            Ok(local_agent) => format!(
-                "{} analyzed {} indexed symbol match(es) and generated {} graph artifact(s).",
-                local_agent.backend_label,
-                hits.len(),
-                graphs.len()
-            ),
-            Err(_) if hits.is_empty() => {
-                "No indexed symbols matched the prompt yet, and local agent execution failed."
-                    .to_string()
-            }
-            Err(_) => format!(
-                "Local agent execution failed; fallback investigated {} indexed symbol match(es) and generated {} graph artifact(s).",
-                hits.len(),
-                graphs.len()
-            ),
-        };
-
-        Ok(AgentAnswerDto {
-            prompt,
-            summary,
-            sections,
-            citations,
-            graphs,
-        })
+        agent::agent_ask(self, req)
     }
 
     pub fn graph_neighborhood(&self, req: GraphRequest) -> Result<GraphResponse, ApiError> {

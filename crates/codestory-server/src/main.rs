@@ -10,11 +10,14 @@ use axum::{
 use clap::Parser;
 use codestory_api::{
     AgentAnswerDto, AgentAskRequest, AgentBackend, AgentCitationDto, AgentConnectionSettingsDto,
-    AgentResponseSectionDto, ApiError, AppEventPayload, BookmarkCategoryDto, BookmarkDto,
-    CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest,
-    GraphArtifactDto, GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse, IndexMode,
-    LayoutDirection, ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess,
-    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest,
+    AgentCustomRetrievalConfigDto, AgentResponseBlockDto, AgentResponseSectionDto,
+    AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto,
+    AgentRetrievalStepDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
+    AgentRetrievalSummaryFieldDto, AgentRetrievalTraceDto, ApiError, AppEventPayload,
+    BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId,
+    EdgeKind, EdgeOccurrencesRequest, GraphArtifactDto, GraphEdgeDto, GraphNodeDto, GraphRequest,
+    GraphResponse, IndexMode, LayoutDirection, ListChildrenSymbolsRequest, ListRootSymbolsRequest,
+    MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest,
     OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest, ProjectSummary,
     ReadFileTextRequest, ReadFileTextResponse, SearchHit, SearchRequest, SetUiLayoutRequest,
     SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto, SymbolSummaryDto,
@@ -261,9 +264,19 @@ fn collect_types() -> TypeCollection {
         .register::<SetUiLayoutRequest>()
         .register::<AgentBackend>()
         .register::<AgentConnectionSettingsDto>()
+        .register::<AgentRetrievalPresetDto>()
+        .register::<AgentRetrievalPolicyModeDto>()
+        .register::<AgentCustomRetrievalConfigDto>()
+        .register::<AgentRetrievalProfileSelectionDto>()
         .register::<AgentAskRequest>()
         .register::<AgentCitationDto>()
+        .register::<AgentResponseBlockDto>()
         .register::<AgentResponseSectionDto>()
+        .register::<AgentRetrievalSummaryFieldDto>()
+        .register::<AgentRetrievalStepKindDto>()
+        .register::<AgentRetrievalStepStatusDto>()
+        .register::<AgentRetrievalStepDto>()
+        .register::<AgentRetrievalTraceDto>()
         .register::<GraphArtifactDto>()
         .register::<AgentAnswerDto>();
 

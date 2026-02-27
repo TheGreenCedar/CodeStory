@@ -247,6 +247,32 @@ textarea {
   padding: 0.24rem 0.46rem;
 }
 
+.retrieval-profile-settings {
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.52rem 0.7rem;
+  border-top: 1px solid var(--line);
+  background: color-mix(in oklab, #fff 90%, oklch(0.9 0.04 95));
+}
+
+.custom-profile-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: 0.48rem;
+}
+
+.agent-connection-field-wide {
+  grid-column: 1 / -1;
+}
+
+.profile-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
 .prompt-actions {
   display: flex;
   justify-content: space-between;
@@ -255,6 +281,11 @@ textarea {
   border-top: 1px solid var(--line);
   padding: 0.54rem 0.72rem;
   background: color-mix(in oklab, #fff 85%, oklch(0.89 0.05 95));
+}
+
+.prompt-actions-meta {
+  color: var(--muted);
+  font-size: 0.74rem;
 }
 
 .prompt-actions button,
@@ -282,7 +313,16 @@ textarea {
   margin-top: 0.58rem;
 }
 
-.section-block pre {
+.section-block-content {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.response-block {
+  min-width: 0;
+}
+
+.section-markdown {
   margin: 0;
   white-space: pre-wrap;
   font-family: var(--font-mono);
@@ -294,11 +334,48 @@ textarea {
   padding: 0.58rem;
 }
 
+.inline-mermaid-block {
+  border: 1px solid var(--line);
+  border-radius: 0.68rem;
+  background: color-mix(in oklab, #fff 88%, #e8eaeb);
+  overflow: hidden;
+}
+
+.inline-mermaid {
+  max-height: 22rem;
+  padding: 0.75rem;
+}
+
 .graph-links {
   display: flex;
   gap: 0.35rem;
   flex-wrap: wrap;
   margin-top: 0.52rem;
+}
+
+.trace-panel {
+  margin-top: 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 0.68rem;
+  padding: 0.52rem;
+  background: color-mix(in oklab, #fff 90%, oklch(0.9 0.04 95));
+}
+
+.trace-panel summary {
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.trace-panel pre {
+  margin: 0.5rem 0 0;
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: color-mix(in oklab, var(--ink) 90%, #000 9%);
 }
 
 .explorer-card {

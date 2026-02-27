@@ -16,20 +16,14 @@ import {
   type ReactFlowInstance,
 } from "@xyflow/react";
 import { toBlob, toJpeg, toPng, toSvg } from "html-to-image";
-import mermaid from "mermaid";
 
+import { MermaidDiagram } from "../components/MermaidDiagram";
 import type { EdgeKind, GraphArtifactDto } from "../generated/api";
 import { buildDagreLayout } from "./layout/dagreLayout";
 import { buildLegendRows, toReactFlowElements, type SemanticEdgeData } from "./layout/routing";
 import { buildCanonicalLayout } from "./layout/semanticGraph";
 import type { GroupingMode, TrailUiConfig } from "./trailConfig";
 import { STRUCTURAL_KINDS, type FlowNodeData } from "./layout/types";
-
-mermaid.initialize({
-  startOnLoad: false,
-  theme: "neutral",
-  securityLevel: "loose",
-});
 
 const MAX_VISIBLE_MEMBERS_PER_NODE = 6;
 const GROUP_PADDING_X = 20;
@@ -1158,43 +1152,6 @@ const GRAPH_EDGE_TYPES = {
   semantic: SemanticEdge,
 };
 
-function MermaidGraph({ syntax }: { syntax: string }) {
-  const [svg, setSvg] = useState<string>("");
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let disposed = false;
-    const renderId = `mermaid-${Math.random().toString(36).slice(2)}`;
-
-    mermaid
-      .render(renderId, syntax)
-      .then(({ svg: renderedSvg }) => {
-        if (!disposed) {
-          setSvg(renderedSvg);
-          setError(null);
-        }
-      })
-      .catch((err: unknown) => {
-        if (!disposed) {
-          setError(err instanceof Error ? err.message : "Failed to render Mermaid diagram.");
-          setSvg("");
-        }
-      });
-
-    return () => {
-      disposed = true;
-    };
-  }, [syntax]);
-
-  if (error) {
-    return <div className="graph-empty">{error}</div>;
-  }
-  if (svg.length === 0) {
-    return <div className="graph-empty">Rendering diagram...</div>;
-  }
-  return <div className="mermaid-shell" dangerouslySetInnerHTML={{ __html: svg }} />;
-}
-
 type GraphViewportProps = {
   graph: GraphArtifactDto | null;
   onSelectNode: (nodeId: string, label: string) => void;
@@ -2224,7 +2181,7 @@ export function GraphViewport({
     return <div className="graph-empty">Pick a symbol or submit a prompt to render a graph.</div>;
   }
   if (isMermaidGraph(graph)) {
-    return <MermaidGraph syntax={graph.mermaid_syntax} />;
+    return <MermaidDiagram syntax={graph.mermaid_syntax} />;
   }
   if (graph.graph.nodes.length === 0 || flowElements === null) {
     return <div className="graph-empty">No UML nodes were returned for this symbol yet.</div>;

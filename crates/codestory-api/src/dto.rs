@@ -236,11 +236,90 @@ pub struct AgentConnectionSettingsDto {
     pub command: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRetrievalPresetDto {
+    #[default]
+    Architecture,
+    Callflow,
+    Inheritance,
+    Impact,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRetrievalPolicyModeDto {
+    LatencyFirst,
+    CompletenessFirst,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AgentCustomRetrievalConfigDto {
+    /// Use `0` to mean "infinite" (bounded by `max_nodes`).
+    #[serde(default = "default_custom_depth")]
+    pub depth: u32,
+    #[serde(default = "default_custom_direction")]
+    pub direction: TrailDirection,
+    #[serde(default)]
+    pub edge_filter: Vec<EdgeKind>,
+    #[serde(default)]
+    pub node_filter: Vec<NodeKind>,
+    #[serde(default = "default_custom_max_nodes")]
+    pub max_nodes: u32,
+    #[serde(default)]
+    pub include_edge_occurrences: bool,
+    #[serde(default = "default_custom_enable_source_reads")]
+    pub enable_source_reads: bool,
+}
+
+const fn default_custom_depth() -> u32 {
+    3
+}
+
+const fn default_custom_direction() -> TrailDirection {
+    TrailDirection::Both
+}
+
+const fn default_custom_max_nodes() -> u32 {
+    800
+}
+
+const fn default_custom_enable_source_reads() -> bool {
+    true
+}
+
+impl Default for AgentCustomRetrievalConfigDto {
+    fn default() -> Self {
+        Self {
+            depth: default_custom_depth(),
+            direction: default_custom_direction(),
+            edge_filter: Vec::new(),
+            node_filter: Vec::new(),
+            max_nodes: default_custom_max_nodes(),
+            include_edge_occurrences: false,
+            enable_source_reads: default_custom_enable_source_reads(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentRetrievalProfileSelectionDto {
+    #[default]
+    Auto,
+    Preset {
+        preset: AgentRetrievalPresetDto,
+    },
+    Custom {
+        config: AgentCustomRetrievalConfigDto,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentAskRequest {
     pub prompt: String,
     #[serde(default)]
-    pub include_mermaid: bool,
+    pub retrieval_profile: AgentRetrievalProfileSelectionDto,
     #[serde(default)]
     pub focus_node_id: Option<NodeId>,
     #[serde(default)]
@@ -260,11 +339,17 @@ pub struct AgentCitationDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentResponseBlockDto {
+    Markdown { markdown: String },
+    Mermaid { graph_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentResponseSectionDto {
     pub id: String,
     pub title: String,
-    pub markdown: String,
-    pub graph_ids: Vec<String>,
+    pub blocks: Vec<AgentResponseBlockDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -284,12 +369,73 @@ pub enum GraphArtifactDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AgentRetrievalSummaryFieldDto {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRetrievalStepKindDto {
+    Search,
+    TrailFilterOptions,
+    Neighborhood,
+    Trail,
+    NodeDetails,
+    NodeOccurrences,
+    EdgeOccurrences,
+    SourceRead,
+    MermaidSynthesis,
+    AnswerSynthesis,
+    LocalAgent,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRetrievalStepStatusDto {
+    Ok,
+    Error,
+    Skipped,
+    Truncated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AgentRetrievalStepDto {
+    pub kind: AgentRetrievalStepKindDto,
+    pub status: AgentRetrievalStepStatusDto,
+    pub duration_ms: u32,
+    #[serde(default)]
+    pub input: Vec<AgentRetrievalSummaryFieldDto>,
+    #[serde(default)]
+    pub output: Vec<AgentRetrievalSummaryFieldDto>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AgentRetrievalTraceDto {
+    pub request_id: String,
+    pub resolved_profile: AgentRetrievalPresetDto,
+    pub policy_mode: AgentRetrievalPolicyModeDto,
+    pub total_latency_ms: u32,
+    #[serde(default)]
+    pub sla_target_ms: Option<u32>,
+    #[serde(default)]
+    pub sla_missed: bool,
+    #[serde(default)]
+    pub annotations: Vec<String>,
+    pub steps: Vec<AgentRetrievalStepDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentAnswerDto {
+    pub answer_id: String,
     pub prompt: String,
     pub summary: String,
     pub sections: Vec<AgentResponseSectionDto>,
     pub citations: Vec<AgentCitationDto>,
     pub graphs: Vec<GraphArtifactDto>,
+    pub retrieval_trace: AgentRetrievalTraceDto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
