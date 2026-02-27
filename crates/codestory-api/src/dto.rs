@@ -117,6 +117,97 @@ pub struct GraphResponse {
     pub nodes: Vec<GraphNodeDto>,
     pub edges: Vec<GraphEdgeDto>,
     pub truncated: bool,
+    #[serde(default)]
+    pub canonical_layout: Option<CanonicalLayoutDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct CanonicalLayoutDto {
+    pub schema_version: u32,
+    pub center_node_id: NodeId,
+    pub nodes: Vec<CanonicalNodeDto>,
+    pub edges: Vec<CanonicalEdgeDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct CanonicalNodeDto {
+    pub id: NodeId,
+    pub kind: NodeKind,
+    pub label: String,
+    pub center: bool,
+    pub node_style: CanonicalNodeStyle,
+    pub is_non_indexed: bool,
+    pub duplicate_count: u32,
+    #[serde(default)]
+    pub merged_symbol_ids: Vec<NodeId>,
+    pub member_count: u32,
+    #[serde(default)]
+    pub badge_visible_members: Option<u32>,
+    #[serde(default)]
+    pub badge_total_members: Option<u32>,
+    #[serde(default)]
+    pub members: Vec<CanonicalMemberDto>,
+    pub x_rank: i32,
+    pub y_rank: u32,
+    pub width: f32,
+    pub height: f32,
+    pub is_virtual_bundle: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct CanonicalEdgeDto {
+    pub id: String,
+    #[serde(default)]
+    pub source_edge_ids: Vec<EdgeId>,
+    pub source: NodeId,
+    pub target: NodeId,
+    pub source_handle: String,
+    pub target_handle: String,
+    pub kind: EdgeKind,
+    #[serde(default)]
+    pub certainty: Option<String>,
+    pub multiplicity: u32,
+    pub family: CanonicalEdgeFamily,
+    pub route_kind: CanonicalRouteKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct CanonicalMemberDto {
+    pub id: NodeId,
+    pub label: String,
+    pub kind: NodeKind,
+    pub visibility: CanonicalMemberVisibility,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalNodeStyle {
+    Card,
+    Pill,
+    Bundle,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalEdgeFamily {
+    Flow,
+    Hierarchy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalRouteKind {
+    Direct,
+    Hierarchy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalMemberVisibility {
+    Public,
+    Protected,
+    Private,
+    Default,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

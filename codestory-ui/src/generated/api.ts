@@ -44,6 +44,22 @@ export type BookmarkCategoryDto = { id: string; name: string }
 
 export type BookmarkDto = { id: string; category_id: string; node_id: NodeId; comment: string | null; node_label: string; node_kind: NodeKind; file_path: string | null }
 
+export type CanonicalEdgeDto = { id: string; source_edge_ids?: EdgeId[]; source: NodeId; target: NodeId; source_handle: string; target_handle: string; kind: EdgeKind; certainty?: string | null; multiplicity: number; family: CanonicalEdgeFamily; route_kind: CanonicalRouteKind }
+
+export type CanonicalEdgeFamily = "flow" | "hierarchy"
+
+export type CanonicalLayoutDto = { schema_version: number; center_node_id: NodeId; nodes: CanonicalNodeDto[]; edges: CanonicalEdgeDto[] }
+
+export type CanonicalMemberDto = { id: NodeId; label: string; kind: NodeKind; visibility: CanonicalMemberVisibility }
+
+export type CanonicalMemberVisibility = "public" | "protected" | "private" | "default"
+
+export type CanonicalNodeDto = { id: NodeId; kind: NodeKind; label: string; center: boolean; node_style: CanonicalNodeStyle; is_non_indexed: boolean; duplicate_count: number; merged_symbol_ids?: NodeId[]; member_count: number; badge_visible_members?: number | null; badge_total_members?: number | null; members?: CanonicalMemberDto[]; x_rank: number; y_rank: number; width: number; height: number; is_virtual_bundle: boolean }
+
+export type CanonicalNodeStyle = "card" | "pill" | "bundle"
+
+export type CanonicalRouteKind = "direct" | "hierarchy"
+
 export type CreateBookmarkCategoryRequest = { name: string }
 
 export type CreateBookmarkRequest = { category_id: string; node_id: NodeId; comment?: string | null }
@@ -70,7 +86,7 @@ export type GraphRequest = { center_id: NodeId;
  */
 max_edges: number | null }
 
-export type GraphResponse = { center_id: NodeId; nodes: GraphNodeDto[]; edges: GraphEdgeDto[]; truncated: boolean }
+export type GraphResponse = { center_id: NodeId; nodes: GraphNodeDto[]; edges: GraphEdgeDto[]; truncated: boolean; canonical_layout?: CanonicalLayoutDto | null }
 
 export type IndexMode = "Full" | "Incremental"
 

@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { GraphArtifactDto } from "../../src/generated/api";
 import { GraphViewport } from "../../src/graph/GraphViewport";
+import * as dagreLayout from "../../src/graph/layout/dagreLayout";
 import { defaultTrailUiConfig } from "../../src/graph/trailConfig";
 
 vi.mock("mermaid", () => ({
@@ -217,7 +218,102 @@ vi.mock("@xyflow/react", async () => {
   };
 });
 
-const GRAPH_FIXTURE: GraphArtifactDto = {
+const STRUCTURAL_NODE_KINDS = new Set([
+  "CLASS",
+  "STRUCT",
+  "INTERFACE",
+  "UNION",
+  "ENUM",
+  "NAMESPACE",
+  "MODULE",
+  "PACKAGE",
+  "FILE",
+]);
+
+const HIERARCHY_EDGE_KINDS = new Set([
+  "INHERITANCE",
+  "OVERRIDE",
+  "TYPE_ARGUMENT",
+  "TEMPLATE_SPECIALIZATION",
+]);
+
+function withCanonicalLayout(graph: GraphArtifactDto): GraphArtifactDto {
+  if (graph.kind !== "uml") {
+    return graph;
+  }
+
+  const orderedNodes = [...graph.graph.nodes].sort((left, right) => {
+    const depthDiff = left.depth - right.depth;
+    if (depthDiff !== 0) {
+      return depthDiff;
+    }
+    const labelDiff = left.label.localeCompare(right.label);
+    if (labelDiff !== 0) {
+      return labelDiff;
+    }
+    return left.id.localeCompare(right.id);
+  });
+
+  const rowByDepth = new Map<number, number>();
+  const canonicalNodes = orderedNodes.map((node) => {
+    const yRank = rowByDepth.get(node.depth) ?? 0;
+    rowByDepth.set(node.depth, yRank + 1);
+    const nodeStyle = STRUCTURAL_NODE_KINDS.has(node.kind) ? "card" : "pill";
+    return {
+      id: node.id,
+      kind: node.kind,
+      label: node.label,
+      center: node.id === graph.graph.center_id,
+      node_style: nodeStyle,
+      is_non_indexed: node.kind === "UNKNOWN" || node.kind === "BUILTIN_TYPE",
+      duplicate_count: 1,
+      merged_symbol_ids: [node.id],
+      member_count: node.badge_visible_members ?? 0,
+      badge_visible_members: node.badge_visible_members ?? null,
+      badge_total_members: node.badge_total_members ?? null,
+      members: [],
+      x_rank: node.depth,
+      y_rank: yRank,
+      width: nodeStyle === "card" ? 260 : 220,
+      height: nodeStyle === "card" ? 140 : 34,
+      is_virtual_bundle: false,
+    };
+  });
+
+  const canonicalEdges = graph.graph.edges
+    .filter((edge) => edge.kind !== "MEMBER")
+    .map((edge) => {
+      const isHierarchy = HIERARCHY_EDGE_KINDS.has(edge.kind);
+      return {
+        id: edge.id,
+        source_edge_ids: [edge.id],
+        source: edge.source,
+        target: edge.target,
+        source_handle: "source-node",
+        target_handle: "target-node",
+        kind: edge.kind,
+        certainty: edge.certainty ?? null,
+        multiplicity: 1,
+        family: isHierarchy ? ("hierarchy" as const) : ("flow" as const),
+        route_kind: isHierarchy ? ("hierarchy" as const) : ("direct" as const),
+      };
+    });
+
+  return {
+    ...graph,
+    graph: {
+      ...graph.graph,
+      canonical_layout: {
+        schema_version: 1,
+        center_node_id: graph.graph.center_id,
+        nodes: canonicalNodes,
+        edges: canonicalEdges,
+      },
+    },
+  };
+}
+
+const GRAPH_FIXTURE: GraphArtifactDto = withCanonicalLayout({
   kind: "uml",
   id: "graph-1",
   title: "Graph",
@@ -258,9 +354,9 @@ const GRAPH_FIXTURE: GraphArtifactDto = {
       { id: "usage-1", source: "workspace", target: "merge", kind: "USAGE" },
     ],
   },
-};
+});
 
-const TOOLTIP_GRAPH_FIXTURE: GraphArtifactDto = {
+const TOOLTIP_GRAPH_FIXTURE: GraphArtifactDto = withCanonicalLayout({
   kind: "uml",
   id: "graph-tooltip",
   title: "Tooltip Graph",
@@ -287,7 +383,7 @@ const TOOLTIP_GRAPH_FIXTURE: GraphArtifactDto = {
     ],
     edges: [{ id: "tooltip-call", source: "runner", target: "worker", kind: "CALL" }],
   },
-};
+});
 
 describe("GraphViewport", () => {
   it("renders legend docked to bottom-right when enabled", () => {
@@ -427,5 +523,48 @@ describe("GraphViewport", () => {
 
     fireEvent.keyDown(window, { key: "?", shiftKey: true });
     expect(onToggleLegend).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not recompute dagre for hover/selection-only interactions", () => {
+    const config = { ...defaultTrailUiConfig(), showLegend: false, showMiniMap: false };
+    const dagreSpy = vi.spyOn(dagreLayout, "buildDagreLayout");
+    const onSelectEdge = vi.fn();
+    render(
+      <GraphViewport
+        graph={TOOLTIP_GRAPH_FIXTURE}
+        onSelectNode={vi.fn()}
+        onSelectEdge={onSelectEdge}
+        trailConfig={config}
+      />,
+    );
+
+    const baseline = dagreSpy.mock.calls.length;
+    fireEvent.click(screen.getByTestId("mock-edge-enter"));
+    fireEvent.click(screen.getByTestId("mock-edge-click"));
+    fireEvent.click(screen.getByTestId("mock-edge-leave"));
+
+    expect(dagreSpy.mock.calls.length).toBe(baseline);
+    dagreSpy.mockRestore();
+  });
+
+  it("hard-fails rendering when canonical payload is missing", () => {
+    const config = { ...defaultTrailUiConfig(), showLegend: false, showMiniMap: false };
+    render(
+      <GraphViewport
+        graph={{
+          ...GRAPH_FIXTURE,
+          id: "graph-missing-canonical",
+          graph: {
+            ...GRAPH_FIXTURE.graph,
+            canonical_layout: null,
+          },
+        }}
+        onSelectNode={vi.fn()}
+        trailConfig={config}
+      />,
+    );
+
+    expect(screen.getByText(/Unable to render UML graph:/i)).toBeInTheDocument();
+    expect(screen.queryByTestId("reactflow")).not.toBeInTheDocument();
   });
 });

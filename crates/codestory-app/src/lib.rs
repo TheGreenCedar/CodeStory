@@ -25,6 +25,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod agent;
+mod graph_canonical;
 
 fn no_project_error() -> ApiError {
     ApiError::invalid_argument("No project open. Call open_project first.")
@@ -1347,11 +1348,16 @@ impl AppController {
             });
         }
 
+        let center_id = NodeId::from(center);
+        let canonical_layout =
+            graph_canonical::build_canonical_layout(&center_id, &node_dtos, &edge_dtos);
+
         Ok(GraphResponse {
-            center_id: NodeId::from(center),
+            center_id,
             nodes: node_dtos,
             edges: edge_dtos,
             truncated,
+            canonical_layout: Some(canonical_layout),
         })
     }
 
@@ -1454,11 +1460,16 @@ impl AppController {
             edge_dtos.push(graph_edge_dto(edge, graph_flags));
         }
 
+        let center_id = NodeId::from(config.root_id);
+        let canonical_layout =
+            graph_canonical::build_canonical_layout(&center_id, &node_dtos, &edge_dtos);
+
         Ok(GraphResponse {
-            center_id: NodeId::from(config.root_id),
+            center_id,
             nodes: node_dtos,
             edges: edge_dtos,
             truncated,
+            canonical_layout: Some(canonical_layout),
         })
     }
 
@@ -2216,6 +2227,88 @@ mod tests {
                 .iter()
                 .any(|edge| edge.kind == codestory_api::EdgeKind::INHERITANCE),
             "Expected INHERITANCE edge from owner trait context"
+        );
+        assert!(
+            graph.canonical_layout.is_some(),
+            "Expected canonical_layout on neighborhood response"
+        );
+    }
+
+    #[test]
+    fn graph_trail_includes_canonical_layout() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("codestory.db");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(1),
+                        kind: NodeKind::CLASS,
+                        serialized_name: "Runner".to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(2),
+                        kind: NodeKind::METHOD,
+                        serialized_name: "Runner::run".to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(3),
+                        kind: NodeKind::METHOD,
+                        serialized_name: "Worker::execute".to_string(),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert nodes");
+            storage
+                .insert_edges_batch(&[
+                    Edge {
+                        id: EdgeId(11),
+                        source: CoreNodeId(1),
+                        target: CoreNodeId(2),
+                        kind: EdgeKind::MEMBER,
+                        ..Default::default()
+                    },
+                    Edge {
+                        id: EdgeId(12),
+                        source: CoreNodeId(2),
+                        target: CoreNodeId(3),
+                        kind: EdgeKind::CALL,
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert edges");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: temp.path().to_string_lossy().to_string(),
+            })
+            .expect("open project");
+
+        let graph = controller
+            .graph_trail(TrailConfigDto {
+                root_id: codestory_api::NodeId("2".to_string()),
+                mode: codestory_api::TrailMode::Neighborhood,
+                target_id: None,
+                depth: 2,
+                direction: codestory_api::TrailDirection::Both,
+                caller_scope: codestory_api::TrailCallerScope::ProductionOnly,
+                edge_filter: vec![],
+                show_utility_calls: false,
+                node_filter: vec![],
+                max_nodes: 128,
+                layout_direction: codestory_api::LayoutDirection::Horizontal,
+            })
+            .expect("load graph trail");
+
+        assert!(
+            graph.canonical_layout.is_some(),
+            "Expected canonical_layout on trail response"
         );
     }
 

@@ -20,8 +20,8 @@ import { toBlob, toJpeg, toPng, toSvg } from "html-to-image";
 import { MermaidDiagram } from "../components/MermaidDiagram";
 import type { EdgeKind, GraphArtifactDto } from "../generated/api";
 import { buildDagreLayout } from "./layout/dagreLayout";
+import { canonicalSeedFromGraphResponse } from "./layout/backendCanonical";
 import { buildLegendRows, toReactFlowElements, type SemanticEdgeData } from "./layout/routing";
-import { buildCanonicalLayout } from "./layout/semanticGraph";
 import type { GroupingMode, TrailUiConfig } from "./trailConfig";
 import { STRUCTURAL_KINDS, type FlowNodeData } from "./layout/types";
 
@@ -1435,8 +1435,29 @@ export function GraphViewport({
     [graph],
   );
 
-  const flowElements = useMemo(() => {
+  const canonicalSeedResult = useMemo(() => {
     if (graph === null || isMermaidGraph(graph)) {
+      return { seed: null, error: null };
+    }
+    return canonicalSeedFromGraphResponse(graph.graph);
+  }, [graph]);
+  const dagreSeedMemo = canonicalSeedResult.seed;
+  const canonicalLayoutError = canonicalSeedResult.error;
+  const dagreLayoutMemo = useMemo(() => {
+    if (!dagreSeedMemo) {
+      return null;
+    }
+    return buildDagreLayout(dagreSeedMemo, trailConfig.layoutDirection);
+  }, [dagreSeedMemo, trailConfig.layoutDirection]);
+  const baseFlowLayoutMemo = useMemo(() => {
+    if (!dagreLayoutMemo) {
+      return null;
+    }
+    return toReactFlowElements(dagreLayoutMemo, trailConfig.layoutDirection);
+  }, [dagreLayoutMemo, trailConfig.layoutDirection]);
+
+  const flowElements = useMemo(() => {
+    if (graph === null || isMermaidGraph(graph) || baseFlowLayoutMemo === null) {
       return null;
     }
 
@@ -1550,19 +1571,16 @@ export function GraphViewport({
       });
     };
 
-    const seed = buildCanonicalLayout(graph.graph);
-    const layouted = buildDagreLayout(seed, trailConfig.layoutDirection);
-    const flowLayout = toReactFlowElements(layouted, trailConfig.layoutDirection);
     const hideUnknownByDefault =
       graph.id.startsWith("explore-") && !trailConfig.nodeFilter.includes("UNKNOWN");
 
     const groupedNodes = applyGrouping(
-      flowLayout.nodes
+      baseFlowLayoutMemo.nodes
         .filter(
           (node) =>
             !(
               hideUnknownByDefault &&
-              node.id !== flowLayout.centerNodeId &&
+              node.id !== baseFlowLayoutMemo.centerNodeId &&
               node.data.kind === "UNKNOWN"
             ),
         )
@@ -1592,7 +1610,7 @@ export function GraphViewport({
     });
     const visibleNodes = groupedNodes.filter((node) => !hiddenNodeIds.has(node.id));
     const visibleNodeIds = new Set(visibleNodes.map((node) => node.id));
-    const visibleEdges = flowLayout.edges.filter(
+    const visibleEdges = baseFlowLayoutMemo.edges.filter(
       (edge) =>
         !hiddenEdgeIds.has(edge.id) &&
         visibleNodeIds.has(edge.source) &&
@@ -1602,25 +1620,27 @@ export function GraphViewport({
       ? applyEdgeBusRouting(visibleEdges, visibleNodes, trailConfig.layoutDirection)
       : visibleEdges;
     return {
-      ...flowLayout,
+      ...baseFlowLayoutMemo,
       nodes: visibleNodes,
-      edges: edgeStyling(routedEdges, flowLayout.centerNodeId, visibleNodes.length),
+      edges: edgeStyling(routedEdges, baseFlowLayoutMemo.centerNodeId, visibleNodes.length),
     };
   }, [
     activeGraphNodePositions,
+    baseFlowLayoutMemo,
     expandedNodeIds,
     graph,
     hiddenEdgeIds,
     hiddenNodeIds,
     hoveredEdgeId,
     legendFilterKinds,
+    nodeMetaById,
     onSelectNode,
     selectedEdgeId,
     selectedNodeId,
-    trailConfig.depth,
     trailConfig.bundleEdges,
-    trailConfig.layoutDirection,
+    trailConfig.depth,
     trailConfig.groupingMode,
+    trailConfig.layoutDirection,
     trailConfig.nodeFilter,
     toggleExpandedNode,
   ]);
@@ -2183,8 +2203,14 @@ export function GraphViewport({
   if (isMermaidGraph(graph)) {
     return <MermaidDiagram syntax={graph.mermaid_syntax} />;
   }
-  if (graph.graph.nodes.length === 0 || flowElements === null) {
+  if (canonicalLayoutError !== null) {
+    return <div className="graph-empty">Unable to render UML graph: {canonicalLayoutError}</div>;
+  }
+  if (graph.graph.nodes.length === 0) {
     return <div className="graph-empty">No UML nodes were returned for this symbol yet.</div>;
+  }
+  if (flowElements === null) {
+    return <div className="graph-empty">Unable to render UML graph layout.</div>;
   }
 
   const legendRows = buildLegendRows(graph.graph);

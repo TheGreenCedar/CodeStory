@@ -10,6 +10,8 @@ pub use dto::{
     AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto,
     AgentRetrievalStepDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
     AgentRetrievalSummaryFieldDto, AgentRetrievalTraceDto, BookmarkCategoryDto, BookmarkDto,
+    CanonicalEdgeDto, CanonicalEdgeFamily, CanonicalLayoutDto, CanonicalMemberDto,
+    CanonicalMemberVisibility, CanonicalNodeDto, CanonicalNodeStyle, CanonicalRouteKind,
     CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeOccurrencesRequest, GraphArtifactDto,
     GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse, ListChildrenSymbolsRequest,
     ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeOccurrencesRequest,

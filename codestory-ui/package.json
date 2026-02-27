@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "predev": "npm run generate:types",
-    "dev:server": "cargo run -p codestory-server --manifest-path ../Cargo.toml -- --project C:\\Users\\alber\\source\\repos\\codestory",
+    "dev:server": "cargo run -p codestory-server --manifest-path ../Cargo.toml -- --project C:\\Users\\alber\\source\\repos\\codestory --types-out src/generated/api.ts",
     "dev:all": "npm-run-all --parallel dev:server dev",
     "build": "vite build",
     "prebuild": "npm run generate:types",
