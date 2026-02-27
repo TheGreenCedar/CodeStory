@@ -7,7 +7,6 @@ members = [
     "crates/codestory-storage",
     "crates/codestory-index",
     "crates/codestory-search",
-    "crates/codestory-graph",
     "crates/codestory-server",
     "crates/codestory-cli",
     "crates/codestory-events",
@@ -23,7 +22,6 @@ codestory-app = { path = "crates/codestory-app" }
 codestory-storage = { path = "crates/codestory-storage" }
 codestory-index = { path = "crates/codestory-index" }
 codestory-search = { path = "crates/codestory-search" }
-codestory-graph = { path = "crates/codestory-graph" }
 codestory-events = { path = "crates/codestory-events" }
 codestory-project = { path = "crates/codestory-project" }
 codestory-bench = { path = "crates/codestory-bench" }

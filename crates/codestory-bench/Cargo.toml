@@ -8,7 +8,6 @@ publish = false
 codestory-core = { workspace = true }
 codestory-index = { workspace = true }
 codestory-storage = { workspace = true }
-codestory-graph = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 anyhow = { workspace = true }
@@ -18,10 +17,6 @@ codestory-project = { workspace = true }
 
 [[bench]]
 name = "indexing"
-harness = false
-
-[[bench]]
-name = "graph_layout"
 harness = false
 
 [[bench]]

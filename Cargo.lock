@@ -442,11 +442,10 @@ dependencies = [
 name = "codestory-bench"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "codestory-core",
- "codestory-events",
- "codestory-graph",
- "codestory-index",
+  "anyhow",
+  "codestory-core",
+  "codestory-events",
+  "codestory-index",
  "codestory-project",
  "codestory-storage",
  "criterion",
@@ -499,20 +498,6 @@ dependencies = [
  "serde_json",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "codestory-graph"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "codestory-core",
- "codestory-events",
- "proptest",
- "rayon",
- "serde",
- "serde_json",
- "tracing",
 ]
 
 [[package]]

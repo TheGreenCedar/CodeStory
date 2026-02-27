@@ -3,7 +3,7 @@
 ## Project Structure & Module Organization
 - Rust workspace is defined in `Cargo.toml`; crates live under `crates/`.
 - Runtime stack: `crates/codestory-server` (Axum API + SSE + static SPA hosting) and `codestory-ui` (Vite + React + TypeScript).
-- Core crates: `codestory-core`, `codestory-events`, `codestory-storage`, `codestory-index`, `codestory-search`, `codestory-graph`, `codestory-app`, `codestory-api`, `codestory-project`, `codestory-cli`.
+- Core crates: `codestory-core`, `codestory-events`, `codestory-storage`, `codestory-index`, `codestory-search`, `codestory-app`, `codestory-api`, `codestory-project`, `codestory-cli`.
 - Runtime artifacts: `codestory.db`, `codestory_ui.json`; build outputs in `target/` and `codestory-ui/dist/`.
 
 ## Architecture Overview
