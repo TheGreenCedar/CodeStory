@@ -1,4 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
+import { Sparkles } from "lucide-react";
+
+import { Badge, Button, Card } from "../../ui/primitives";
 
 type StarterCardProps = {
   projectPath: string;
@@ -112,27 +115,28 @@ export function StarterCard({
 
   if (dismissed) {
     return (
-      <section className={className}>
+      <Card className={className}>
         <p>Starter card dismissed.</p>
-        <button
-          type="button"
+        <Button
           onClick={() => {
             setDismissed(false);
             writeDismissedState(key, false);
           }}
         >
           Show starter
-        </button>
-      </section>
+        </Button>
+      </Card>
     );
   }
 
   return (
-    <section className={className} aria-label="First-run starter">
+    <Card className={className} aria-label="First-run starter">
       <div className="starter-header">
-        <h2>Start Here</h2>
-        <button
-          type="button"
+        <h2>
+          <Sparkles size={16} strokeWidth={2.5} aria-hidden /> Start Here
+        </h2>
+        <Button
+          variant="ghost"
           className="starter-dismiss"
           onClick={() => {
             setDismissed(true);
@@ -140,17 +144,17 @@ export function StarterCard({
           }}
         >
           Dismiss
-        </button>
+        </Button>
       </div>
 
       <div className="starter-status-chips" aria-label="Readiness status">
-        <span className={projectOpen ? "starter-chip starter-chip-ready" : "starter-chip"}>
+        <Badge className={projectOpen ? "starter-chip starter-chip-ready" : "starter-chip"}>
           Project
-        </span>
-        <span className={indexComplete ? "starter-chip starter-chip-ready" : "starter-chip"}>
+        </Badge>
+        <Badge className={indexComplete ? "starter-chip starter-chip-ready" : "starter-chip"}>
           Index
-        </span>
-        <span
+        </Badge>
+        <Badge
           className={
             projectOpen && indexComplete && askedFirstQuestion && inspectedSource
               ? "starter-chip starter-chip-ready"
@@ -158,7 +162,7 @@ export function StarterCard({
           }
         >
           Ready
-        </span>
+        </Badge>
       </div>
 
       <div className="starter-next-step">
@@ -167,8 +171,8 @@ export function StarterCard({
       </div>
 
       {nextStep.run ? (
-        <button
-          type="button"
+        <Button
+          variant="primary"
           className="starter-primary"
           onClick={() => {
             onPrimaryAction?.(nextStep.action);
@@ -176,23 +180,23 @@ export function StarterCard({
           }}
         >
           {nextStep.title}
-        </button>
+        </Button>
       ) : null}
 
-      <button
-        type="button"
+      <Button
+        variant="ghost"
         className="starter-help-toggle"
         onClick={() => setHelpOpen((prev) => !prev)}
         aria-expanded={helpOpen}
       >
         Need help?
-      </button>
+      </Button>
 
       {helpOpen ? (
         <div className="starter-help">
           <p>Use `Ctrl+K` for quick actions and switch focus modes to keep context clear.</p>
         </div>
       ) : null}
-    </section>
+    </Card>
   );
 }

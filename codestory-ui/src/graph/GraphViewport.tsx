@@ -17,6 +17,7 @@ import {
 
 import { MermaidDiagram } from "../components/MermaidDiagram";
 import type { EdgeKind, GraphArtifactDto } from "../generated/api";
+import { GRAPH_THEME } from "../theme/tokens";
 import { buildDagreLayout } from "./layout/dagreLayout";
 import { canonicalSeedFromGraphResponse } from "./layout/backendCanonical";
 import { buildLegendRows, toReactFlowElements, type SemanticEdgeData } from "./layout/routing";
@@ -148,34 +149,34 @@ function isSimpleTypePillLabel(label: string): boolean {
 function minimapNodeColor(node: Node<FlowNodeData>): string {
   const data = node.data;
   if (data?.groupMode === "file") {
-    return "#c6dfb4";
+    return GRAPH_THEME.minimap.nodeGroupFile;
   }
   if (data?.groupMode === "namespace") {
-    return "#efc7cb";
+    return GRAPH_THEME.minimap.nodeGroupNamespace;
   }
   if (data?.isVirtualBundle) {
-    return "#d4a63a";
+    return GRAPH_THEME.minimap.nodeVirtualBundle;
   }
   if (data?.center) {
-    return "#3d434b";
+    return GRAPH_THEME.minimap.nodeCenter;
   }
   if (data?.kind === "FILE") {
-    return "#9fc88e";
+    return GRAPH_THEME.minimap.nodeFile;
   }
   if (data?.nodeStyle === "card") {
-    return "#c5cad2";
+    return GRAPH_THEME.minimap.nodeDefault;
   }
-  return "#d8dce3";
+  return GRAPH_THEME.minimap.nodeDefault;
 }
 
 function minimapNodeStrokeColor(node: Node<FlowNodeData>): string {
   if (node.data?.groupMode === "file") {
-    return "#96bb7e";
+    return GRAPH_THEME.minimap.strokeGroupFile;
   }
   if (node.data?.groupMode === "namespace") {
-    return "#dfb3b8";
+    return GRAPH_THEME.minimap.strokeGroupNamespace;
   }
-  return node.data?.center ? "#1f252c" : "#8f98a3";
+  return GRAPH_THEME.minimap.strokeDefault;
 }
 
 export function languageForPath(path: string | null): string {
@@ -1590,8 +1591,8 @@ export function GraphViewport({
             pannable
             zoomable
             position="bottom-left"
-            bgColor="rgb(251 251 249 / 0.92)"
-            maskColor="rgb(39 44 52 / 0.16)"
+            bgColor={GRAPH_THEME.minimap.background}
+            maskColor={GRAPH_THEME.minimap.mask}
             nodeColor={minimapNodeColor}
             nodeStrokeColor={minimapNodeStrokeColor}
             nodeBorderRadius={2}

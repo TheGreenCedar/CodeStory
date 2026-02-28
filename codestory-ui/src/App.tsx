@@ -8,7 +8,6 @@ import {
   toMonacoModelPath,
   type AgentConnectionState,
 } from "./app/layoutPersistence";
-import { loadFeatureFlags, saveFeatureFlags, type FeatureFlagState } from "./app/featureFlags";
 import { trackAnalyticsEvent } from "./app/analytics";
 import { UI_CONTRACT, UI_LAYOUT_SCHEMA_STORAGE_KEY } from "./app/uiContract";
 import type { PendingSymbolFocus } from "./app/types";
@@ -107,7 +106,6 @@ export default function App() {
   const [bookmarkSeed, setBookmarkSeed] = useState<{ nodeId: string; label: string } | null>(null);
   const [activeSection, setActiveSection] = useState<AppShellSection>("investigate");
   const [commandPaletteOpen, setCommandPaletteOpen] = useState<boolean>(false);
-  const [featureFlags, setFeatureFlags] = useState<FeatureFlagState>(() => loadFeatureFlags());
   const [investigateMode, setInvestigateMode] = useState<InvestigateFocusMode>(() => {
     if (typeof window === "undefined") {
       return "graph";
@@ -163,10 +161,6 @@ export default function App() {
     window.localStorage.setItem(INVESTIGATE_FOCUS_MODE_KEY, investigateMode);
     window.localStorage.setItem(UI_LAYOUT_SCHEMA_STORAGE_KEY, String(UI_CONTRACT.schemaVersion));
   }, [investigateMode]);
-
-  useEffect(() => {
-    saveFeatureFlags(featureFlags);
-  }, [featureFlags]);
 
   useEffect(() => {
     const previous = previousIndexProgressRef.current;
@@ -591,13 +585,6 @@ export default function App() {
     }));
   }, []);
 
-  const updateFeatureFlag = useCallback((flag: keyof FeatureFlagState, value: boolean) => {
-    setFeatureFlags((previous) => ({
-      ...previous,
-      [flag]: value,
-    }));
-  }, []);
-
   const refreshSpaces = useCallback(() => {
     setSpaces(listSpaces());
   }, []);
@@ -848,29 +835,16 @@ export default function App() {
         label: "Save Investigation Space",
         detail: "Store current prompt and focus for reuse",
         keywords: ["space", "save", "library"],
-        disabled: !featureFlags.spacesLibrary,
         run: () =>
           invokeCommand("save-space", () => {
             createSpaceFromCurrentContext("", "");
             setActiveSection("library");
           }),
       },
-      {
-        id: "toggle-ux-reset",
-        label: featureFlags.uxResetV2 ? "Disable UX Reset" : "Enable UX Reset",
-        detail: "Rollback switch for staged rollout",
-        keywords: ["feature flag", "rollback", "shell"],
-        run: () =>
-          invokeCommand("toggle-ux-reset", () => {
-            updateFeatureFlag("uxResetV2", !featureFlags.uxResetV2);
-          }),
-      },
     ],
     [
       activeSection,
       createSpaceFromCurrentContext,
-      featureFlags.spacesLibrary,
-      featureFlags.uxResetV2,
       focusGraphSearchInput,
       handleInvestigateModeChange,
       handlePrompt,
@@ -883,7 +857,6 @@ export default function App() {
       prompt,
       runIndexFromUi,
       trailDisabledReason,
-      updateFeatureFlag,
     ],
   );
 
@@ -1034,14 +1007,6 @@ export default function App() {
     />
   );
 
-  const legacyWorkspaceView = (
-    <div className="workspace">
-      {responsePaneView}
-      {graphPaneView}
-      {codePaneView}
-    </div>
-  );
-
   const focusedPane =
     investigateMode === "graph"
       ? graphPaneView
@@ -1051,31 +1016,29 @@ export default function App() {
 
   const focusedWorkspaceView = (
     <div className="investigate-layout">
-      {featureFlags.onboardingStarter ? (
-        <StarterCard
-          className="starter-card"
-          projectPath={projectPath}
-          projectOpen={projectOpen}
-          indexComplete={hasCompletedIndex || rootSymbols.length > 0}
-          askedFirstQuestion={askedFirstQuestion}
-          inspectedSource={inspectedSource}
-          onOpenProject={openProjectFromUi}
-          onRunIndex={runRecommendedIndex}
-          onSeedQuestion={seedFirstQuestion}
-          onInspectSource={jumpToSourceInspection}
-          onPrimaryAction={(action) => {
-            trackAnalyticsEvent(
-              "starter_card_cta_clicked",
-              {
-                action,
-              },
-              {
-                projectPath,
-              },
-            );
-          }}
-        />
-      ) : null}
+      <StarterCard
+        className="starter-card"
+        projectPath={projectPath}
+        projectOpen={projectOpen}
+        indexComplete={hasCompletedIndex || rootSymbols.length > 0}
+        askedFirstQuestion={askedFirstQuestion}
+        inspectedSource={inspectedSource}
+        onOpenProject={openProjectFromUi}
+        onRunIndex={runRecommendedIndex}
+        onSeedQuestion={seedFirstQuestion}
+        onInspectSource={jumpToSourceInspection}
+        onPrimaryAction={(action) => {
+          trackAnalyticsEvent(
+            "starter_card_cta_clicked",
+            {
+              action,
+            },
+            {
+              projectPath,
+            },
+          );
+        }}
+      />
 
       <div className="investigate-toolbar">
         <InvestigateFocusSwitcher
@@ -1089,7 +1052,6 @@ export default function App() {
               createSpaceFromCurrentContext("", "");
               setActiveSection("library");
             }}
-            disabled={!featureFlags.spacesLibrary}
           >
             Save Space
           </button>
@@ -1108,12 +1070,8 @@ export default function App() {
     </div>
   );
 
-  const workspaceView = featureFlags.singlePaneInvestigate
-    ? focusedWorkspaceView
-    : legacyWorkspaceView;
-
   const sectionContent: Partial<Record<AppShellSection, ReactNode>> = {
-    library: featureFlags.spacesLibrary ? (
+    library: (
       <SpacesPanel
         spaces={spaces}
         activeSpaceId={activeSpaceId}
@@ -1121,13 +1079,8 @@ export default function App() {
         onLoadSpace={loadSpaceIntoWorkspace}
         onDeleteSpace={removeSpaceById}
       />
-    ) : (
-      <section className="shell-card">
-        <h3>Spaces Disabled</h3>
-        <p>Enable spaces in Settings to save and reopen investigations.</p>
-      </section>
     ),
-    settings: <SettingsPage featureFlags={featureFlags} onUpdateFlag={updateFeatureFlag} />,
+    settings: <SettingsPage />,
   };
 
   return (
@@ -1147,16 +1100,12 @@ export default function App() {
 
       <StatusStrip status={status} indexProgress={indexProgress} />
 
-      {featureFlags.uxResetV2 ? (
-        <AppShell
-          activeSection={activeSection}
-          onSelectSection={setActiveSection}
-          workspace={workspaceView}
-          sectionContent={sectionContent}
-        />
-      ) : (
-        legacyWorkspaceView
-      )}
+      <AppShell
+        activeSection={activeSection}
+        onSelectSection={setActiveSection}
+        workspace={focusedWorkspaceView}
+        sectionContent={sectionContent}
+      />
 
       <BookmarkManager
         open={bookmarkManagerOpen}

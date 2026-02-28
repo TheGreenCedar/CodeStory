@@ -1,6 +1,7 @@
 import { MarkerType, Position, type Edge, type Node } from "@xyflow/react";
 
 import type { EdgeKind, GraphResponse, LayoutDirection } from "../../generated/api";
+import { EDGE_KIND_COLORS } from "../../theme/tokens";
 import { PARITY_CONSTANTS } from "./parityConstants";
 import type {
   FlowNodeData,
@@ -30,19 +31,19 @@ export type SemanticEdgeData = {
 };
 
 export const EDGE_STYLE: Record<EdgeKind, EdgePalette> = {
-  MEMBER: { stroke: "#adb1b8", width: 2.0 },
-  TYPE_USAGE: { stroke: "#7d8a99", width: 2.4 },
-  USAGE: { stroke: "#1f84d6", width: 2.8 },
-  CALL: { stroke: "#dfa72e", width: 2.8 },
-  INHERITANCE: { stroke: "#7f7f86", width: 2.4 },
-  OVERRIDE: { stroke: "#ad86c8", width: 2.4 },
-  TYPE_ARGUMENT: { stroke: "#d37b93", width: 2.4 },
-  TEMPLATE_SPECIALIZATION: { stroke: "#bc8fa3", width: 2.4 },
-  INCLUDE: { stroke: "#87a988", width: 2.4 },
-  IMPORT: { stroke: "#87a988", width: 2.4 },
-  MACRO_USAGE: { stroke: "#b88b66", width: 2.4 },
-  ANNOTATION_USAGE: { stroke: "#8f96b2", width: 2.4 },
-  UNKNOWN: { stroke: "#8b8f96", width: 2.4 },
+  MEMBER: { stroke: EDGE_KIND_COLORS.MEMBER, width: 2.0 },
+  TYPE_USAGE: { stroke: EDGE_KIND_COLORS.TYPE_USAGE, width: 2.4 },
+  USAGE: { stroke: EDGE_KIND_COLORS.USAGE, width: 2.8 },
+  CALL: { stroke: EDGE_KIND_COLORS.CALL, width: 2.8 },
+  INHERITANCE: { stroke: EDGE_KIND_COLORS.INHERITANCE, width: 2.4 },
+  OVERRIDE: { stroke: EDGE_KIND_COLORS.OVERRIDE, width: 2.4 },
+  TYPE_ARGUMENT: { stroke: EDGE_KIND_COLORS.TYPE_ARGUMENT, width: 2.4 },
+  TEMPLATE_SPECIALIZATION: { stroke: EDGE_KIND_COLORS.TEMPLATE_SPECIALIZATION, width: 2.4 },
+  INCLUDE: { stroke: EDGE_KIND_COLORS.INCLUDE, width: 2.4 },
+  IMPORT: { stroke: EDGE_KIND_COLORS.IMPORT, width: 2.4 },
+  MACRO_USAGE: { stroke: EDGE_KIND_COLORS.MACRO_USAGE, width: 2.4 },
+  ANNOTATION_USAGE: { stroke: EDGE_KIND_COLORS.ANNOTATION_USAGE, width: 2.4 },
+  UNKNOWN: { stroke: EDGE_KIND_COLORS.UNKNOWN, width: 2.4 },
 };
 
 const CLOSED_TRIANGLE_KINDS = new Set<EdgeKind>([

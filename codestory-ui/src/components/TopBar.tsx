@@ -1,4 +1,7 @@
 import type { ChangeEvent } from "react";
+import { FolderOpen, RefreshCcw, ScanSearch } from "lucide-react";
+
+import { Button } from "../ui/primitives";
 
 type IndexMode = "Full" | "Incremental";
 
@@ -37,15 +40,28 @@ export function TopBar({
           placeholder="Project path"
           aria-label="Project path"
         />
-        <button onClick={onOpenProject} disabled={isBusy}>
+        <Button
+          variant="primary"
+          onClick={onOpenProject}
+          disabled={isBusy}
+          leadingIcon={<FolderOpen size={16} strokeWidth={2.5} aria-hidden />}
+        >
           Open Project
-        </button>
-        <button onClick={() => onIndex("Incremental")} disabled={isBusy || !projectOpen}>
+        </Button>
+        <Button
+          onClick={() => onIndex("Incremental")}
+          disabled={isBusy || !projectOpen}
+          leadingIcon={<RefreshCcw size={16} strokeWidth={2.5} aria-hidden />}
+        >
           Incremental Index
-        </button>
-        <button onClick={() => onIndex("Full")} disabled={isBusy || !projectOpen}>
+        </Button>
+        <Button
+          onClick={() => onIndex("Full")}
+          disabled={isBusy || !projectOpen}
+          leadingIcon={<ScanSearch size={16} strokeWidth={2.5} aria-hidden />}
+        >
           Full Index
-        </button>
+        </Button>
       </div>
     </header>
   );

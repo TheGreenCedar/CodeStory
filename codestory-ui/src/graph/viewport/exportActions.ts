@@ -1,6 +1,8 @@
 import { useCallback, type RefObject } from "react";
 import { toBlob, toJpeg, toPng, toSvg } from "html-to-image";
 
+import { GRAPH_THEME } from "../../theme/tokens";
+
 function graphExportBaseName(graphTitle: string): string {
   const raw = graphTitle
     .trim()
@@ -57,7 +59,7 @@ export function useGraphExportActions({
       const baseName = graphExportBaseName(graphTitle);
       const options = {
         cacheBust: true,
-        backgroundColor: "#f1f1ef",
+        backgroundColor: GRAPH_THEME.exportBackground,
         pixelRatio: 2,
       };
       try {
@@ -102,7 +104,7 @@ export function useGraphExportActions({
     try {
       const blob = await toBlob(element, {
         cacheBust: true,
-        backgroundColor: "#f1f1ef",
+        backgroundColor: GRAPH_THEME.exportBackground,
         pixelRatio: 2,
       });
       if (!blob) {

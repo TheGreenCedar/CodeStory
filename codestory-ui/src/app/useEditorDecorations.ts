@@ -3,6 +3,7 @@ import { type Monaco, type OnMount } from "@monaco-editor/react";
 
 import type { CodeEdgeContext } from "../components/CodePane";
 import type { NodeDetailsDto, SourceOccurrenceDto } from "../generated/api";
+import { GRAPH_THEME } from "../theme/tokens";
 
 type UseEditorDecorationsArgs = {
   saveCurrentFile: () => Promise<boolean>;
@@ -120,7 +121,7 @@ export function useEditorDecorations({
           isWholeLine: true,
           className: "monaco-focus-line",
           overviewRuler: {
-            color: "#f0b42988",
+            color: GRAPH_THEME.editorOverview,
             position: monaco.editor.OverviewRulerLane.Center,
           },
         },
