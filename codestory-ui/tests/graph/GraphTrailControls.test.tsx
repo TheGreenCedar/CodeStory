@@ -1,16 +1,19 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "../../src/api/client";
 import { GraphTrailControls } from "../../src/components/GraphTrailControls";
-import { defaultTrailUiConfig } from "../../src/graph/trailConfig";
+import {
+  defaultTrailUiConfig,
+  trailConfigFromPerspectivePreset,
+} from "../../src/graph/trailConfig";
 
 describe("GraphTrailControls", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  it("does not render a bundling selector", () => {
+  it("keeps inline toolbar focused on high-frequency controls", () => {
     render(
       <GraphTrailControls
         config={defaultTrailUiConfig()}
@@ -28,7 +31,39 @@ describe("GraphTrailControls", () => {
       />,
     );
 
-    expect(screen.queryByText("Bundling")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run Trail" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Architecture" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Call Flow" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Impact" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Ownership" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Legend" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Help" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Advanced Settings" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "MiniMap" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Utility Calls" })).not.toBeInTheDocument();
+  });
+
+  it("applies perspective defaults from preset mapping", () => {
+    const onConfigChange = vi.fn();
+    render(
+      <GraphTrailControls
+        config={defaultTrailUiConfig()}
+        projectOpen
+        projectRevision={0}
+        hasRootSymbol
+        rootSymbolLabel="WorkspaceIndexer::run_incremental"
+        disabledReason={null}
+        isRunning={false}
+        dialogOpen={false}
+        onDialogOpenChange={vi.fn()}
+        onConfigChange={onConfigChange}
+        onRunTrail={vi.fn()}
+        onResetDefaults={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Call Flow" }));
+    expect(onConfigChange).toHaveBeenCalledWith(trailConfigFromPerspectivePreset("CallFlow"));
   });
 
   it("renders node grouping controls", () => {
@@ -74,10 +109,38 @@ describe("GraphTrailControls", () => {
     );
 
     expect(screen.getByRole("dialog", { name: "Custom trail" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Find advanced option" })).toBeInTheDocument();
     expect(screen.getByRole("radio", { name: "Horizontal" })).toBeInTheDocument();
     expect(screen.getByRole("radio", { name: "Vertical" })).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: "Check All" })).toHaveLength(2);
     expect(screen.getAllByRole("button", { name: "Uncheck All" })).toHaveLength(2);
+  });
+
+  it("filters advanced controls using the search box", () => {
+    render(
+      <GraphTrailControls
+        config={defaultTrailUiConfig()}
+        projectOpen
+        projectRevision={0}
+        hasRootSymbol
+        rootSymbolLabel="WorkspaceIndexer::run_incremental"
+        disabledReason={null}
+        isRunning={false}
+        dialogOpen
+        onDialogOpenChange={vi.fn()}
+        onConfigChange={vi.fn()}
+        onRunTrail={vi.fn()}
+        onResetDefaults={vi.fn()}
+      />,
+    );
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Find advanced option" }), {
+      target: { value: "utility" },
+    });
+
+    expect(screen.getByRole("combobox", { name: "Utility Calls" })).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Grouping" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Check All" })).not.toBeInTheDocument();
   });
 
   it("refetches trail filter options when project revision changes", async () => {

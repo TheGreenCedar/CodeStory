@@ -80,7 +80,9 @@ pub(super) fn graph_neighborhood(
                 (
                     node_display_name(&node),
                     NodeKind::from(node.kind),
-                    AppController::file_path_for_node(&storage, &node).ok().flatten(),
+                    AppController::file_path_for_node(&storage, &node)
+                        .ok()
+                        .flatten(),
                     node.qualified_name,
                     member_access_dto(access),
                 )
@@ -104,7 +106,8 @@ pub(super) fn graph_neighborhood(
     }
 
     let center_id = NodeId::from(center);
-    let canonical_layout = graph_canonical::build_canonical_layout(&center_id, &node_dtos, &edge_dtos);
+    let canonical_layout =
+        graph_canonical::build_canonical_layout(&center_id, &node_dtos, &edge_dtos);
 
     Ok(GraphResponse {
         center_id,
@@ -217,7 +220,8 @@ pub(super) fn graph_trail(
     }
 
     let center_id = NodeId::from(config.root_id);
-    let canonical_layout = graph_canonical::build_canonical_layout(&center_id, &node_dtos, &edge_dtos);
+    let canonical_layout =
+        graph_canonical::build_canonical_layout(&center_id, &node_dtos, &edge_dtos);
 
     Ok(GraphResponse {
         center_id,

@@ -1,7 +1,16 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 
 import { api } from "../api/client";
 import type { BookmarkCategoryDto, BookmarkDto } from "../generated/api";
+import {
+  bookmarkTagsToDraft,
+  filterBookmarksByQuery,
+  loadBookmarkMetadataMap,
+  removeBookmarkMetadata,
+  saveBookmarkMetadataMap,
+  type BookmarkLocalMetadataMap,
+  upsertBookmarkMetadata,
+} from "./bookmarkManagerUtils";
 
 type BookmarkSeed = {
   nodeId: string;
@@ -14,6 +23,7 @@ type BookmarkManagerProps = {
   onClose: () => void;
   onFocusSymbol: (nodeId: string, label: string) => void;
   onStatus: (message: string) => void;
+  onPromoteBookmarkToSpace?: (bookmark: BookmarkDto) => void;
 };
 
 const DEFAULT_CATEGORY_NAME = "General";
@@ -24,10 +34,12 @@ export function BookmarkManager({
   onClose,
   onFocusSymbol,
   onStatus,
+  onPromoteBookmarkToSpace,
 }: BookmarkManagerProps) {
   const [categories, setCategories] = useState<BookmarkCategoryDto[]>([]);
   const [bookmarks, setBookmarks] = useState<BookmarkDto[]>([]);
   const [selectedCategoryId, setSelectedCategoryId] = useState<string | null>(null);
+  const [bookmarkSearchQuery, setBookmarkSearchQuery] = useState<string>("");
   const [newCategoryName, setNewCategoryName] = useState<string>("");
   const [newBookmarkComment, setNewBookmarkComment] = useState<string>("");
   const [bookmarkCategoryId, setBookmarkCategoryId] = useState<string>("");
@@ -35,14 +47,48 @@ export function BookmarkManager({
   const [categoryDrafts, setCategoryDrafts] = useState<Record<string, string>>({});
   const [bookmarkCommentDrafts, setBookmarkCommentDrafts] = useState<Record<string, string>>({});
   const [bookmarkCategoryDrafts, setBookmarkCategoryDrafts] = useState<Record<string, string>>({});
+  const [bookmarkTagDrafts, setBookmarkTagDrafts] = useState<Record<string, string>>({});
+  const [bookmarkNotesTemplateDrafts, setBookmarkNotesTemplateDrafts] = useState<
+    Record<string, string>
+  >({});
+  const [bookmarkMetadataMap, setBookmarkMetadataMap] = useState<BookmarkLocalMetadataMap>(() =>
+    loadBookmarkMetadataMap(),
+  );
   const [loading, setLoading] = useState<boolean>(false);
+  const deferredBookmarkSearchQuery = useDeferredValue(bookmarkSearchQuery);
 
-  const visibleBookmarks = useMemo(() => {
+  const categoryFilteredBookmarks = useMemo(() => {
     if (!selectedCategoryId) {
       return bookmarks;
     }
     return bookmarks.filter((bookmark) => bookmark.category_id === selectedCategoryId);
   }, [bookmarks, selectedCategoryId]);
+
+  const visibleBookmarks = useMemo(
+    () =>
+      filterBookmarksByQuery(
+        categoryFilteredBookmarks,
+        deferredBookmarkSearchQuery,
+        bookmarkMetadataMap,
+      ),
+    [bookmarkMetadataMap, categoryFilteredBookmarks, deferredBookmarkSearchQuery],
+  );
+
+  const persistBookmarkMetadataDraft = useCallback(
+    (bookmarkId: string) => {
+      setBookmarkMetadataMap((previous) => {
+        const next = upsertBookmarkMetadata(
+          previous,
+          bookmarkId,
+          bookmarkTagDrafts[bookmarkId] ?? "",
+          bookmarkNotesTemplateDrafts[bookmarkId] ?? "",
+        );
+        saveBookmarkMetadataMap(next);
+        return next;
+      });
+    },
+    [bookmarkNotesTemplateDrafts, bookmarkTagDrafts],
+  );
 
   const refreshData = useCallback(
     async (categoryFilter: string | null = selectedCategoryId): Promise<void> => {
@@ -52,8 +98,10 @@ export function BookmarkManager({
           api.getBookmarkCategories(),
           api.getBookmarks(categoryFilter),
         ]);
+        const loadedMetadata = loadBookmarkMetadataMap();
         setCategories(loadedCategories);
         setBookmarks(loadedBookmarks);
+        setBookmarkMetadataMap(loadedMetadata);
         setCategoryDrafts(
           Object.fromEntries(loadedCategories.map((category) => [category.id, category.name])),
         );
@@ -65,6 +113,22 @@ export function BookmarkManager({
         setBookmarkCategoryDrafts(
           Object.fromEntries(
             loadedBookmarks.map((bookmark) => [bookmark.id, bookmark.category_id]),
+          ),
+        );
+        setBookmarkTagDrafts(
+          Object.fromEntries(
+            loadedBookmarks.map((bookmark) => [
+              bookmark.id,
+              bookmarkTagsToDraft(loadedMetadata[bookmark.id]?.tags ?? []),
+            ]),
+          ),
+        );
+        setBookmarkNotesTemplateDrafts(
+          Object.fromEntries(
+            loadedBookmarks.map((bookmark) => [
+              bookmark.id,
+              loadedMetadata[bookmark.id]?.notesTemplate ?? "",
+            ]),
           ),
         );
 
@@ -194,6 +258,7 @@ export function BookmarkManager({
   };
 
   const saveBookmark = async (bookmark: BookmarkDto) => {
+    persistBookmarkMetadataDraft(bookmark.id);
     const nextComment = (bookmarkCommentDrafts[bookmark.id] ?? "").trim();
     const nextCategory = bookmarkCategoryDrafts[bookmark.id] ?? bookmark.category_id;
     try {
@@ -214,6 +279,21 @@ export function BookmarkManager({
     try {
       await api.deleteBookmark(bookmarkId);
       setBookmarks((previous) => previous.filter((bookmark) => bookmark.id !== bookmarkId));
+      setBookmarkTagDrafts((previous) => {
+        const next = { ...previous };
+        delete next[bookmarkId];
+        return next;
+      });
+      setBookmarkNotesTemplateDrafts((previous) => {
+        const next = { ...previous };
+        delete next[bookmarkId];
+        return next;
+      });
+      setBookmarkMetadataMap((previous) => {
+        const next = removeBookmarkMetadata(previous, bookmarkId);
+        saveBookmarkMetadataMap(next);
+        return next;
+      });
       onStatus("Bookmark deleted.");
     } catch (error) {
       onStatus(error instanceof Error ? error.message : "Failed to delete bookmark.");
@@ -241,7 +321,7 @@ export function BookmarkManager({
               <input
                 value={newCategoryName}
                 onChange={(event) => setNewCategoryName(event.target.value)}
-                placeholder="New category name"
+                placeholder="Category name"
               />
               <button type="button" onClick={() => void createCategory()}>
                 Add
@@ -268,7 +348,8 @@ export function BookmarkManager({
               ))}
             </div>
 
-            <div className="bookmark-list">
+            <details className="bookmark-list">
+              <summary>Manage categories</summary>
               {categories.map((category) => (
                 <div key={category.id} className="bookmark-category-row">
                   <input
@@ -288,14 +369,14 @@ export function BookmarkManager({
                   </button>
                 </div>
               ))}
-            </div>
+            </details>
           </section>
 
           <section className="bookmark-section">
             <h4>Bookmarks</h4>
             {seedNode ? (
               <div className="bookmark-seed-card">
-                <div className="bookmark-seed-title">Bookmark Node</div>
+                <div className="bookmark-seed-title">New bookmark</div>
                 <div className="bookmark-seed-label">{seedNode.label}</div>
                 <div className="bookmark-inline-row">
                   <select
@@ -313,18 +394,28 @@ export function BookmarkManager({
                 <textarea
                   value={newBookmarkComment}
                   onChange={(event) => setNewBookmarkComment(event.target.value)}
-                  placeholder="Bookmark comment"
+                  placeholder="Comment (optional)"
                 />
                 <button type="button" onClick={() => void createBookmark()}>
-                  Save Bookmark
+                  Save
                 </button>
               </div>
             ) : null}
 
             <div className="bookmark-list">
+              <div className="bookmark-inline-row">
+                <input
+                  aria-label="Search bookmarks"
+                  value={bookmarkSearchQuery}
+                  onChange={(event) => setBookmarkSearchQuery(event.target.value)}
+                  placeholder="Search bookmarks"
+                />
+              </div>
               {loading ? <div className="bookmark-empty">Loading...</div> : null}
               {!loading && visibleBookmarks.length === 0 ? (
-                <div className="bookmark-empty">No bookmarks in this category.</div>
+                <div className="bookmark-empty">
+                  No bookmarks yet. Save one from a selected node.
+                </div>
               ) : null}
               {visibleBookmarks.map((bookmark) => (
                 <div key={bookmark.id} className="bookmark-item">
@@ -360,11 +451,42 @@ export function BookmarkManager({
                         [bookmark.id]: event.target.value,
                       }))
                     }
+                    placeholder="Comment"
                   />
+                  <details>
+                    <summary>Local notes and tags</summary>
+                    <input
+                      value={bookmarkTagDrafts[bookmark.id] ?? ""}
+                      onBlur={() => persistBookmarkMetadataDraft(bookmark.id)}
+                      onChange={(event) =>
+                        setBookmarkTagDrafts((previous) => ({
+                          ...previous,
+                          [bookmark.id]: event.target.value,
+                        }))
+                      }
+                      placeholder="Tags (comma-separated)"
+                    />
+                    <textarea
+                      value={bookmarkNotesTemplateDrafts[bookmark.id] ?? ""}
+                      onBlur={() => persistBookmarkMetadataDraft(bookmark.id)}
+                      onChange={(event) =>
+                        setBookmarkNotesTemplateDrafts((previous) => ({
+                          ...previous,
+                          [bookmark.id]: event.target.value,
+                        }))
+                      }
+                      placeholder="Notes template"
+                    />
+                  </details>
                   <div className="bookmark-inline-row">
                     <button type="button" onClick={() => void saveBookmark(bookmark)}>
                       Save
                     </button>
+                    {onPromoteBookmarkToSpace ? (
+                      <button type="button" onClick={() => onPromoteBookmarkToSpace(bookmark)}>
+                        Promote to Space
+                      </button>
+                    ) : null}
                     <button type="button" onClick={() => void removeBookmark(bookmark.id)}>
                       Delete
                     </button>

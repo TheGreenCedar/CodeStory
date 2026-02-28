@@ -9,6 +9,14 @@ import type {
 } from "../generated/api";
 
 export type GroupingMode = "none" | "namespace" | "file";
+export type TrailPerspectivePreset = "Architecture" | "CallFlow" | "Impact" | "Ownership";
+
+export const TRAIL_PERSPECTIVE_PRESETS: TrailPerspectivePreset[] = [
+  "Architecture",
+  "CallFlow",
+  "Impact",
+  "Ownership",
+];
 
 export const EDGE_KIND_OPTIONS: EdgeKind[] = [
   "MEMBER",
@@ -89,6 +97,135 @@ export function defaultTrailUiConfig(): TrailUiConfig {
     groupingMode: "none",
     maxNodes: 500,
   };
+}
+
+const TRAIL_PERSPECTIVE_PRESET_OVERRIDES: Record<TrailPerspectivePreset, Partial<TrailUiConfig>> = {
+  Architecture: {
+    mode: "Neighborhood",
+    depth: 2,
+    layoutDirection: "Horizontal",
+    direction: "Both",
+    callerScope: "ProductionOnly",
+    edgeFilter: [
+      "MEMBER",
+      "CALL",
+      "INHERITANCE",
+      "OVERRIDE",
+      "TYPE_USAGE",
+      "TYPE_ARGUMENT",
+      "TEMPLATE_SPECIALIZATION",
+      "IMPORT",
+      "INCLUDE",
+    ],
+    nodeFilter: [],
+    showUtilityCalls: false,
+    bundleEdges: true,
+    groupingMode: "namespace",
+    maxNodes: 600,
+  },
+  CallFlow: {
+    mode: "Neighborhood",
+    depth: 4,
+    layoutDirection: "Vertical",
+    direction: "Outgoing",
+    callerScope: "ProductionOnly",
+    edgeFilter: ["CALL", "OVERRIDE", "MACRO_USAGE"],
+    nodeFilter: ["CLASS", "STRUCT", "INTERFACE", "FUNCTION", "METHOD", "MACRO"],
+    showUtilityCalls: true,
+    bundleEdges: false,
+    groupingMode: "none",
+    maxNodes: 900,
+  },
+  Impact: {
+    mode: "AllReferencing",
+    depth: 3,
+    layoutDirection: "Horizontal",
+    direction: "Incoming",
+    callerScope: "IncludeTestsAndBenches",
+    edgeFilter: ["CALL", "USAGE", "TYPE_USAGE", "IMPORT", "INCLUDE", "ANNOTATION_USAGE"],
+    nodeFilter: [],
+    showUtilityCalls: true,
+    bundleEdges: true,
+    groupingMode: "none",
+    maxNodes: 1_500,
+  },
+  Ownership: {
+    mode: "Neighborhood",
+    depth: 2,
+    layoutDirection: "Horizontal",
+    direction: "Both",
+    callerScope: "IncludeTestsAndBenches",
+    edgeFilter: ["MEMBER", "CALL", "USAGE", "IMPORT", "INCLUDE"],
+    nodeFilter: [
+      "PACKAGE",
+      "MODULE",
+      "NAMESPACE",
+      "FILE",
+      "CLASS",
+      "STRUCT",
+      "INTERFACE",
+      "FUNCTION",
+      "METHOD",
+    ],
+    showUtilityCalls: false,
+    bundleEdges: true,
+    groupingMode: "file",
+    maxNodes: 800,
+  },
+};
+
+export function trailConfigFromPerspectivePreset(preset: TrailPerspectivePreset): TrailUiConfig {
+  const defaults = defaultTrailUiConfig();
+  const merged = normalizeTrailUiConfig({
+    ...defaults,
+    ...TRAIL_PERSPECTIVE_PRESET_OVERRIDES[preset],
+  });
+  if (merged.mode !== "ToTargetSymbol") {
+    return {
+      ...merged,
+      targetId: null,
+      targetLabel: "",
+      edgeFilter: [...merged.edgeFilter],
+      nodeFilter: [...merged.nodeFilter],
+    };
+  }
+  return {
+    ...merged,
+    edgeFilter: [...merged.edgeFilter],
+    nodeFilter: [...merged.nodeFilter],
+  };
+}
+
+function sameFilterSet(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  const rightSet = new Set(right);
+  return left.every((entry) => rightSet.has(entry));
+}
+
+export function trailPerspectivePresetForConfig(
+  config: TrailUiConfig,
+): TrailPerspectivePreset | null {
+  for (const preset of TRAIL_PERSPECTIVE_PRESETS) {
+    const presetConfig = trailConfigFromPerspectivePreset(preset);
+    if (
+      config.mode === presetConfig.mode &&
+      config.depth === presetConfig.depth &&
+      config.layoutDirection === presetConfig.layoutDirection &&
+      config.direction === presetConfig.direction &&
+      config.callerScope === presetConfig.callerScope &&
+      config.showUtilityCalls === presetConfig.showUtilityCalls &&
+      config.bundleEdges === presetConfig.bundleEdges &&
+      config.groupingMode === presetConfig.groupingMode &&
+      config.maxNodes === presetConfig.maxNodes &&
+      sameFilterSet(config.edgeFilter, presetConfig.edgeFilter) &&
+      sameFilterSet(config.nodeFilter, presetConfig.nodeFilter)
+    ) {
+      return preset;
+    }
+  }
+  return null;
 }
 
 function clampDepth(value: number): number {

@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { GraphArtifactDto } from "../../src/generated/api";
 import { GraphViewport } from "../../src/graph/GraphViewport";
@@ -386,6 +386,10 @@ const TOOLTIP_GRAPH_FIXTURE: GraphArtifactDto = withCanonicalLayout({
 });
 
 describe("GraphViewport", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("renders legend docked to bottom-right when enabled", () => {
     const config = { ...defaultTrailUiConfig(), showLegend: true, showMiniMap: false };
     render(<GraphViewport graph={GRAPH_FIXTURE} onSelectNode={vi.fn()} trailConfig={config} />);
@@ -463,6 +467,7 @@ describe("GraphViewport", () => {
     const config = { ...defaultTrailUiConfig(), showLegend: false, showMiniMap: false };
     const onStatusMessage = vi.fn();
     const onSelectEdge = vi.fn();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     render(
       <GraphViewport
         graph={TOOLTIP_GRAPH_FIXTURE}
@@ -475,9 +480,42 @@ describe("GraphViewport", () => {
 
     fireEvent.click(screen.getByTestId("mock-edge-alt-click"));
     expect(onSelectEdge).not.toHaveBeenCalled();
-    expect(onStatusMessage).toHaveBeenCalledWith(
-      "Edge hidden. Use Reset Hidden in the context menu to restore.",
+    expect(confirmSpy).toHaveBeenCalledWith(
+      "Hide this edge from the graph? You can restore hidden elements from the context menu.",
     );
+    expect(onStatusMessage).toHaveBeenCalledWith(
+      "Edge hidden. Undo with Restore Hidden Elements from the context menu.",
+    );
+  });
+
+  it("cancels destructive hide when confirmation is declined", () => {
+    const config = { ...defaultTrailUiConfig(), showLegend: false, showMiniMap: false };
+    const onStatusMessage = vi.fn();
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    render(
+      <GraphViewport
+        graph={TOOLTIP_GRAPH_FIXTURE}
+        onSelectNode={vi.fn()}
+        onStatusMessage={onStatusMessage}
+        trailConfig={config}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("mock-edge-alt-click"));
+    expect(onStatusMessage).toHaveBeenCalledWith("Hide canceled. Edge remains visible.");
+  });
+
+  it("keeps top edge outcomes visible in context menu", () => {
+    const config = { ...defaultTrailUiConfig(), showLegend: false, showMiniMap: false };
+    render(
+      <GraphViewport graph={TOOLTIP_GRAPH_FIXTURE} onSelectNode={vi.fn()} trailConfig={config} />,
+    );
+
+    fireEvent.click(screen.getByTestId("mock-edge-context-menu"));
+    expect(screen.getByRole("button", { name: "Open Related Definition" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Hide This Edge" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export Graph (PNG)" })).toBeInTheDocument();
   });
 
   it("adds grouping container nodes for file grouping mode", () => {

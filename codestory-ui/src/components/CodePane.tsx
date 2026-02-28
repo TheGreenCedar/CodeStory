@@ -56,7 +56,7 @@ export function CodePane({
   return (
     <section className="pane pane-code">
       <div className="pane-header pane-code-header">
-        <h2>Code Context</h2>
+        <h2>Code</h2>
         <button
           onClick={() => void onSave()}
           disabled={!projectOpen || !activeFilePath || !isDirty || isSaving}
@@ -77,7 +77,7 @@ export function CodePane({
           <div>
             {activeOccurrence
               ? `${activeOccurrence.file_path}:${activeOccurrence.start_line}`
-              : "No source locations for this edge"}
+              : "No source locations"}
           </div>
         </div>
       ) : activeNodeDetails ? (
@@ -94,7 +94,7 @@ export function CodePane({
           </div>
         </div>
       ) : (
-        <div className="graph-empty">Select a graph node to load source context.</div>
+        <div className="graph-empty">Select a symbol in Graph or Explorer to load code.</div>
       )}
 
       {occurrences.length > 0 ? (
@@ -161,7 +161,7 @@ export function CodePane({
         </div>
       ) : (
         activeNodeDetails && (
-          <div className="graph-empty">This symbol does not have readable source text.</div>
+          <div className="graph-empty">No readable source here. Try another occurrence.</div>
         )
       )}
     </section>

@@ -57,8 +57,8 @@ pub(super) fn compute_call_resolution(
 
     if selected.is_none()
         && !is_common_unqualified
-        && let Some(candidate) =
-            candidate_index.find_global_unique_readonly(&prepared_name.original, &prepared_name.ascii_lower)
+        && let Some(candidate) = candidate_index
+            .find_global_unique_readonly(&prepared_name.original, &prepared_name.ascii_lower)
     {
         candidate_ids.push(candidate);
         selected = Some((
@@ -139,11 +139,9 @@ pub(super) fn compute_import_resolution(
 
     for name in &name_candidates {
         if pass.flags.legacy_mode && same_file_selected.is_none() {
-            if let Some(candidate) = candidate_index.find_same_file_readonly(
-                *file_id,
-                &name.original,
-                &name.ascii_lower,
-            ) {
+            if let Some(candidate) =
+                candidate_index.find_same_file_readonly(*file_id, &name.original, &name.ascii_lower)
+            {
                 same_file_stage.push(candidate);
                 same_file_selected = Some(candidate);
                 break;
@@ -203,31 +201,34 @@ pub(super) fn compute_import_resolution(
         collect_candidate_pool_from_index(candidate_index, &name_candidates, &mut candidate_ids, 8);
     }
 
-    let mut selected: Option<(i64, f32, ResolutionStrategy)> = if let Some(candidate) =
-        same_file_selected
-    {
-        Some((
-            candidate,
-            pass.policy.import_same_file,
-            ResolutionStrategy::ImportSameFile,
-        ))
-    } else if let Some(candidate) = same_module_selected {
-        Some((
-            candidate,
-            pass.policy.import_same_module,
-            ResolutionStrategy::ImportSameModule,
-        ))
-    } else if let Some(candidate) = global_selected {
-        Some((
-            candidate,
-            pass.policy.import_global_unique,
-            ResolutionStrategy::ImportGlobalUnique,
-        ))
-    } else if let Some(candidate) = fuzzy_selected {
-        Some((candidate, pass.policy.import_fuzzy, ResolutionStrategy::ImportFuzzy))
-    } else {
-        None
-    };
+    let mut selected: Option<(i64, f32, ResolutionStrategy)> =
+        if let Some(candidate) = same_file_selected {
+            Some((
+                candidate,
+                pass.policy.import_same_file,
+                ResolutionStrategy::ImportSameFile,
+            ))
+        } else if let Some(candidate) = same_module_selected {
+            Some((
+                candidate,
+                pass.policy.import_same_module,
+                ResolutionStrategy::ImportSameModule,
+            ))
+        } else if let Some(candidate) = global_selected {
+            Some((
+                candidate,
+                pass.policy.import_global_unique,
+                ResolutionStrategy::ImportGlobalUnique,
+            ))
+        } else if let Some(candidate) = fuzzy_selected {
+            Some((
+                candidate,
+                pass.policy.import_fuzzy,
+                ResolutionStrategy::ImportFuzzy,
+            ))
+        } else {
+            None
+        };
 
     if selected.is_none()
         && let Some((candidate, confidence)) = semantic_fallback

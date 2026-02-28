@@ -555,7 +555,12 @@ impl ResolutionPass {
         row: &UnresolvedEdgeRow,
         semantic_candidates: &[SemanticResolutionCandidate],
     ) -> Result<ComputedResolution> {
-        candidate_selection::compute_call_resolution(self, candidate_index, row, semantic_candidates)
+        candidate_selection::compute_call_resolution(
+            self,
+            candidate_index,
+            row,
+            semantic_candidates,
+        )
     }
 
     fn compute_import_resolution(

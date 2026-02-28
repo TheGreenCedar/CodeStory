@@ -1,6 +1,9 @@
 use super::*;
 
-pub(super) fn get_trail(storage: &Storage, config: &TrailConfig) -> Result<TrailResult, StorageError> {
+pub(super) fn get_trail(
+    storage: &Storage,
+    config: &TrailConfig,
+) -> Result<TrailResult, StorageError> {
     match config.mode {
         TrailMode::ToTargetSymbol => get_trail_to_target(storage, config),
         _ => get_trail_bfs(storage, config),
@@ -15,7 +18,11 @@ pub(super) fn get_trail_bfs(
     let mut visited: HashSet<NodeId> = HashSet::new();
     let mut queue: VecDeque<(NodeId, u32)> = VecDeque::new();
     let max_edges = config.max_nodes.saturating_mul(3).max(128);
-    let max_depth = if config.depth == 0 { u32::MAX } else { config.depth };
+    let max_depth = if config.depth == 0 {
+        u32::MAX
+    } else {
+        config.depth
+    };
 
     let direction = match config.mode {
         TrailMode::AllReferenced => TrailDirection::Outgoing,
@@ -53,7 +60,8 @@ pub(super) fn get_trail_bfs(
                     break;
                 }
                 result.edges.push(edge.clone());
-                let Some(neighbor_id) = super::neighbor_for_direction(current_id, direction, &edge) else {
+                let Some(neighbor_id) = super::neighbor_for_direction(current_id, direction, &edge)
+                else {
                     continue;
                 };
 
@@ -82,7 +90,11 @@ pub(super) fn get_trail_to_target(
         StorageError::Other("TrailMode::ToTargetSymbol requires TrailConfig.target_id".to_string())
     })?;
 
-    let max_depth = if config.depth == 0 { u32::MAX } else { config.depth };
+    let max_depth = if config.depth == 0 {
+        u32::MAX
+    } else {
+        config.depth
+    };
     let bfs_cap = config
         .max_nodes
         .saturating_mul(4)
@@ -309,7 +321,8 @@ pub(super) fn bfs_distances(
             show_utility_calls,
         )?;
         for edge in edges {
-            let Some(neighbor_id) = super::neighbor_for_direction(current_id, direction, &edge) else {
+            let Some(neighbor_id) = super::neighbor_for_direction(current_id, direction, &edge)
+            else {
                 continue;
             };
             if let std::collections::hash_map::Entry::Vacant(entry) = dist.entry(neighbor_id) {
@@ -338,7 +351,10 @@ pub(super) fn get_edges_for_node(
             "e.source_node_id = ?1 OR e.target_node_id = ?1 OR e.resolved_source_node_id = ?1 OR e.resolved_target_node_id = ?1"
         }
     };
-    let query = format!("{} WHERE {where_clause} ORDER BY e.id", super::EDGE_SELECT_BASE);
+    let query = format!(
+        "{} WHERE {where_clause} ORDER BY e.id",
+        super::EDGE_SELECT_BASE
+    );
 
     let mut stmt = storage.conn.prepare(&query)?;
     let mut edges = Vec::new();
@@ -386,7 +402,10 @@ pub(super) fn get_edges_for_node(
     Ok(edges)
 }
 
-pub(super) fn get_edges_for_node_id(storage: &Storage, node_id: NodeId) -> Result<Vec<Edge>, StorageError> {
+pub(super) fn get_edges_for_node_id(
+    storage: &Storage,
+    node_id: NodeId,
+) -> Result<Vec<Edge>, StorageError> {
     get_edges_for_node(
         storage,
         node_id,
