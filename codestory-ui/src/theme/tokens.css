@@ -1,0 +1,66 @@
+:root {
+  --font-heading: "Outfit", system-ui, sans-serif;
+  --font-body: "Plus Jakarta Sans", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Consolas", monospace;
+
+  --color-background: #fffdf5;
+  --color-foreground: #1e293b;
+  --color-muted: #f1f5f9;
+  --color-muted-foreground: #64748b;
+  --color-accent: #8b5cf6;
+  --color-accent-foreground: #ffffff;
+  --color-secondary: #f472b6;
+  --color-tertiary: #fbbf24;
+  --color-quaternary: #34d399;
+  --color-border: #e2e8f0;
+  --color-card: #ffffff;
+  --color-input: #ffffff;
+  --color-ring: #8b5cf6;
+  --color-shadow: #1e293b;
+
+  --radius-sm: 8px;
+  --radius-md: 16px;
+  --radius-lg: 24px;
+  --radius-full: 9999px;
+  --border-width: 2px;
+
+  --shadow-pop: 4px 4px 0 0 var(--color-shadow);
+  --shadow-pop-hover: 6px 6px 0 0 var(--color-shadow);
+  --shadow-pop-active: 2px 2px 0 0 var(--color-shadow);
+
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+
+  --duration-fast: 140ms;
+  --duration-medium: 220ms;
+  --duration-playful: 300ms;
+  --ease-playful: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  --graph-canvas-top: #fffdf5;
+  --graph-canvas-bottom: #fff6d8;
+  --graph-chrome-bg: #fffdf5e6;
+  --graph-chrome-border: #d5def3;
+  --graph-node-shell: #ffffff;
+  --graph-node-shell-border: #c9d5f3;
+  --graph-node-core: #ffffff;
+  --graph-node-core-border: #bfd0f2;
+  --graph-file-accent: #34d399;
+  --graph-public-chip: #dcfce7;
+  --graph-public-chip-border: #22c55e;
+  --graph-private-chip: #fbcfe8;
+  --graph-private-chip-border: #ec4899;
+
+  --surface-1: color-mix(in oklab, var(--color-card) 90%, var(--color-background));
+  --surface-2: color-mix(in oklab, var(--color-muted) 70%, var(--color-background));
+
+  --bg: var(--color-background);
+  --bg-elevated: color-mix(in oklab, var(--color-background) 72%, white);
+  --ink: var(--color-foreground);
+  --muted: var(--color-muted-foreground);
+  --line: var(--color-border);
+  --accent: var(--color-accent);
+  --focus: var(--color-ring);
+  --font-ui: var(--font-body);
+}

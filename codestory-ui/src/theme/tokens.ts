@@ -1,0 +1,70 @@
+export const PLAYFUL_TOKENS = {
+  colors: {
+    background: "#FFFDF5",
+    foreground: "#1E293B",
+    muted: "#F1F5F9",
+    mutedForeground: "#64748B",
+    accent: "#8B5CF6",
+    accentForeground: "#FFFFFF",
+    secondary: "#F472B6",
+    tertiary: "#FBBF24",
+    quaternary: "#34D399",
+    border: "#E2E8F0",
+    input: "#FFFFFF",
+    card: "#FFFFFF",
+    ring: "#8B5CF6",
+    shadow: "#1E293B",
+  },
+  radius: {
+    sm: "8px",
+    md: "16px",
+    lg: "24px",
+    full: "9999px",
+  },
+  spacing: {
+    2: "0.5rem",
+    3: "0.75rem",
+    4: "1rem",
+    5: "1.25rem",
+  },
+  motion: {
+    fast: "140ms",
+    medium: "220ms",
+    playful: "300ms",
+    bounce: "cubic-bezier(0.34, 1.56, 0.64, 1)",
+  },
+} as const;
+
+export const EDGE_KIND_COLORS = {
+  MEMBER: "#94A3B8",
+  TYPE_USAGE: "#0EA5E9",
+  USAGE: "#8B5CF6",
+  CALL: "#F59E0B",
+  INHERITANCE: "#475569",
+  OVERRIDE: "#EC4899",
+  TYPE_ARGUMENT: "#22C55E",
+  TEMPLATE_SPECIALIZATION: "#14B8A6",
+  INCLUDE: "#FB7185",
+  IMPORT: "#F97316",
+  MACRO_USAGE: "#A78BFA",
+  ANNOTATION_USAGE: "#06B6D4",
+  UNKNOWN: "#64748B",
+} as const;
+
+export const GRAPH_THEME = {
+  minimap: {
+    nodeDefault: "#C4B5FD",
+    nodeCenter: "#8B5CF6",
+    nodeFile: "#34D399",
+    nodeGroupFile: "#FBBF24",
+    nodeGroupNamespace: "#F472B6",
+    nodeVirtualBundle: "#94A3B8",
+    strokeDefault: "#334155",
+    strokeGroupFile: "#CA8A04",
+    strokeGroupNamespace: "#DB2777",
+    background: "rgb(255 253 245 / 0.94)",
+    mask: "rgb(30 41 59 / 0.15)",
+  },
+  exportBackground: "#FFFDF5",
+  editorOverview: "#8B5CF688",
+} as const;

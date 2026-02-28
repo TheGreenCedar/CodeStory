@@ -1,4 +1,7 @@
 import type { ReactNode } from "react";
+import { BookMarked, Compass, Settings2 } from "lucide-react";
+
+import { Button, Panel } from "../ui/primitives";
 
 export const APP_SHELL_SECTIONS = [
   {
@@ -33,6 +36,11 @@ export function AppShell({
   workspace,
   sectionContent,
 }: AppShellProps) {
+  const sectionIcons: Record<AppShellSection, ReactNode> = {
+    investigate: <Compass size={16} strokeWidth={2.5} aria-hidden />,
+    library: <BookMarked size={16} strokeWidth={2.5} aria-hidden />,
+    settings: <Settings2 size={16} strokeWidth={2.5} aria-hidden />,
+  };
   const customContent = sectionContent?.[activeSection] ?? null;
   const activeLabel = APP_SHELL_SECTIONS.find((section) => section.id === activeSection)?.label;
   return (
@@ -44,16 +52,18 @@ export function AppShell({
           {APP_SHELL_SECTIONS.map((section) => {
             const isActive = section.id === activeSection;
             return (
-              <button
+              <Button
                 key={section.id}
-                type="button"
                 className={isActive ? "app-nav-link app-nav-link-active" : "app-nav-link"}
                 aria-current={isActive ? "page" : undefined}
                 onClick={() => onSelectSection(section.id)}
               >
-                <span>{section.label}</span>
+                <span>
+                  {sectionIcons[section.id]}
+                  {section.label}
+                </span>
                 <small>{section.blurb}</small>
-              </button>
+              </Button>
             );
           })}
         </div>
@@ -64,13 +74,13 @@ export function AppShell({
         ) : customContent ? (
           customContent
         ) : (
-          <div className="app-placeholder-card">
+          <Panel className="app-placeholder-card">
             <h3>{activeLabel}</h3>
             <p>This section is not available right now. Return to Investigate to continue.</p>
-            <button type="button" onClick={() => onSelectSection("investigate")}>
+            <Button type="button" onClick={() => onSelectSection("investigate")}>
               Open Investigate
-            </button>
-          </div>
+            </Button>
+          </Panel>
         )}
       </section>
     </div>

@@ -1,6 +1,8 @@
 import { useMemo, useState } from "react";
+import { LibraryBig, Search, Trash2 } from "lucide-react";
 
 import type { InvestigationSpace } from "./types";
+import { Button, Card } from "../../ui/primitives";
 
 type SpacesPanelProps = {
   spaces: InvestigationSpace[];
@@ -36,11 +38,13 @@ export function SpacesPanel({
   return (
     <section className="spaces-panel">
       <header className="spaces-panel-header">
-        <h3>Spaces</h3>
+        <h3>
+          <LibraryBig size={16} strokeWidth={2.5} aria-hidden /> Spaces
+        </h3>
         <p>Save current context so you can reopen it fast.</p>
       </header>
 
-      <div className="spaces-create">
+      <Card className="spaces-create">
         <input
           value={nameDraft}
           onChange={(event) => setNameDraft(event.target.value)}
@@ -53,8 +57,8 @@ export function SpacesPanel({
           placeholder="Notes (optional)"
           aria-label="Space notes"
         />
-        <button
-          type="button"
+        <Button
+          variant="primary"
           onClick={() => {
             onCreateSpace(nameDraft, notesDraft);
             setNameDraft("");
@@ -62,24 +66,26 @@ export function SpacesPanel({
           }}
         >
           Save Space
-        </button>
-      </div>
+        </Button>
+      </Card>
 
-      <div className="spaces-filter-row">
+      <Card className="spaces-filter-row">
         <input
           value={query}
           onChange={(event) => setQuery(event.target.value)}
           placeholder="Search spaces"
           aria-label="Filter spaces"
         />
-      </div>
+        <Search size={16} strokeWidth={2.5} aria-hidden />
+      </Card>
 
       <div className="spaces-list">
         {visibleSpaces.length === 0 ? (
           <div className="spaces-empty">No spaces yet. Save the current investigation.</div>
         ) : (
           visibleSpaces.map((space) => (
-            <article
+            <Card
+              as={"article"}
               key={space.id}
               className={
                 activeSpaceId === space.id ? "spaces-item spaces-item-active" : "spaces-item"
@@ -93,14 +99,19 @@ export function SpacesPanel({
                 <span>{space.owner}</span>
               </div>
               <div className="spaces-item-actions">
-                <button type="button" onClick={() => onLoadSpace(space.id)}>
+                <Button type="button" onClick={() => onLoadSpace(space.id)}>
                   Open
-                </button>
-                <button type="button" onClick={() => onDeleteSpace(space.id)}>
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  trailingIcon={<Trash2 size={14} strokeWidth={2.5} aria-hidden />}
+                  onClick={() => onDeleteSpace(space.id)}
+                >
                   Delete
-                </button>
+                </Button>
               </div>
-            </article>
+            </Card>
           ))
         )}
       </div>

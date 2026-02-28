@@ -1,0 +1,442 @@
+.ui-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  padding: 0.5rem 0.95rem;
+  border: var(--border-width) solid var(--color-shadow);
+  border-radius: var(--radius-full);
+  font-family: var(--font-heading);
+  font-weight: 700;
+  text-decoration: none;
+  cursor: pointer;
+  transition:
+    transform var(--duration-medium) var(--ease-playful),
+    box-shadow var(--duration-medium) var(--ease-playful),
+    background-color var(--duration-fast) ease,
+    color var(--duration-fast) ease;
+}
+
+.ui-button svg {
+  flex-shrink: 0;
+}
+
+.ui-button:focus-visible,
+.ui-input:focus-visible,
+.ui-select:focus-visible,
+.ui-textarea:focus-visible,
+.path-input:focus-visible,
+.graph-search-input:focus-visible,
+.command-palette input:focus-visible {
+  outline: 3px solid color-mix(in oklab, var(--color-ring) 60%, transparent);
+  outline-offset: 2px;
+}
+
+.ui-button-primary {
+  background: var(--color-accent);
+  color: var(--color-accent-foreground);
+  box-shadow: var(--shadow-pop);
+}
+
+.ui-button-secondary {
+  background: white;
+  color: var(--color-foreground);
+  box-shadow: none;
+}
+
+.ui-button-ghost {
+  background: color-mix(in oklab, var(--color-muted) 60%, white);
+  color: var(--color-foreground);
+  box-shadow: none;
+}
+
+.ui-button:hover:not(:disabled),
+.topbar-actions button:hover:not(:disabled),
+.investigate-toolbar-actions button:hover:not(:disabled),
+.graph-trail-toolbar button:hover:not(:disabled),
+.graph-zoom-panel button:hover,
+.graph-legend-toggle-panel button:hover,
+.command-palette-item:hover:not(:disabled),
+.bookmark-inline-row button:hover,
+.bookmark-item button:hover,
+.bookmark-category-row button:hover,
+.bookmark-seed-card button:hover,
+.spaces-item-actions button:hover {
+  transform: translate(-2px, -2px);
+  box-shadow: var(--shadow-pop-hover);
+}
+
+.ui-button:active:not(:disabled),
+.topbar-actions button:active:not(:disabled),
+.investigate-toolbar-actions button:active:not(:disabled),
+.graph-trail-toolbar button:active:not(:disabled),
+.command-palette-item:active:not(:disabled),
+.spaces-item-actions button:active {
+  transform: translate(2px, 2px);
+  box-shadow: var(--shadow-pop-active);
+}
+
+.ui-button:disabled,
+.topbar-actions button:disabled,
+.investigate-toolbar-actions button:disabled,
+.graph-trail-toolbar button:disabled,
+.spaces-item-actions button:disabled,
+.command-palette-item:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.ui-card,
+.pane,
+.card,
+.app-nav,
+.graph-trail-controls,
+.command-palette,
+.bookmark-manager,
+.spaces-item,
+.starter-card,
+.settings-help-card,
+.settings-toggle,
+.spaces-create,
+.spaces-filter-row,
+.graph-context-menu,
+.app-placeholder-card {
+  border: var(--border-width) solid var(--color-shadow);
+  border-radius: var(--radius-md);
+  background: var(--color-card);
+  box-shadow: var(--shadow-pop);
+}
+
+.ui-card-accent {
+  background: color-mix(in oklab, white 82%, var(--color-accent));
+}
+
+.ui-card-secondary {
+  background: color-mix(in oklab, white 82%, var(--color-secondary));
+}
+
+.ui-card-tertiary {
+  background: color-mix(in oklab, white 80%, var(--color-tertiary));
+}
+
+.ui-panel,
+.pane {
+  border-radius: var(--radius-lg);
+}
+
+.ui-input-field {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.ui-input-label {
+  font-family: var(--font-heading);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 700;
+}
+
+.ui-input-hint {
+  color: var(--color-muted-foreground);
+  font-size: 0.7rem;
+}
+
+.ui-badge,
+.starter-chip,
+.kind-pill,
+.graph-chip,
+.focus-switcher,
+.focus-switcher-item,
+.tabs button,
+.graph-tabs button,
+.tree-duplicate-pill,
+.graph-pill-duplicate-count,
+.command-palette-empty,
+.bookmark-category-filter button,
+.bookmark-active {
+  border: var(--border-width) solid var(--color-shadow);
+  border-radius: var(--radius-full);
+  background: white;
+  box-shadow: 2px 2px 0 0 color-mix(in oklab, var(--color-shadow) 50%, transparent);
+}
+
+.ui-input,
+.ui-select,
+.ui-textarea,
+.path-input,
+.graph-search-input,
+.command-palette input,
+.topbar-actions input,
+.spaces-create input,
+.spaces-create textarea,
+.spaces-filter-row input,
+.graph-control-field select,
+.graph-control-field input,
+.bookmark-inline-row input,
+.bookmark-inline-row select,
+.bookmark-seed-card textarea,
+.bookmark-item textarea,
+.bookmark-category-row input {
+  border: var(--border-width) solid
+    color-mix(in oklab, var(--color-border) 30%, var(--color-shadow));
+  border-radius: var(--radius-sm);
+  background: var(--color-input);
+  color: var(--color-foreground);
+}
+
+.topbar,
+.status-strip,
+.investigate-toolbar,
+.pane-header,
+.bookmark-manager-header,
+.spaces-panel-header,
+.settings-page-header {
+  background: linear-gradient(
+    140deg,
+    color-mix(in oklab, white 70%, var(--color-tertiary)),
+    color-mix(in oklab, white 78%, var(--color-secondary))
+  );
+}
+
+.brand h1,
+.app-nav h2,
+.pane-header h2,
+.starter-header h2,
+.settings-page-header h3 {
+  font-weight: 800;
+}
+
+.brand h1 {
+  font-size: 1.72rem;
+}
+
+.brand p {
+  font-size: 0.92rem;
+}
+
+.app-nav-link span,
+.starter-header h2,
+.settings-page-header h3 {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.topbar-actions button,
+.investigate-toolbar-actions button,
+.graph-trail-toolbar button,
+.spaces-item-actions button,
+.command-palette-item,
+.bookmark-inline-row button,
+.bookmark-item button,
+.bookmark-category-row button,
+.bookmark-seed-card button,
+.app-placeholder-card button,
+.trail-dialog-actions button {
+  border: var(--border-width) solid var(--color-shadow);
+  border-radius: var(--radius-full);
+  background: white;
+  box-shadow: var(--shadow-pop);
+  font-family: var(--font-heading);
+  font-weight: 700;
+}
+
+.topbar-actions button:first-of-type,
+.graph-trail-toolbar button:first-of-type,
+.starter-primary,
+.confirm-actions .confirm-primary,
+.command-palette-item-active,
+.bookmark-category-filter .bookmark-active,
+.spaces-item-active,
+.focus-switcher-item-active,
+.graph-chip-active,
+.tab-active {
+  background: var(--color-accent) !important;
+  border-color: var(--color-shadow) !important;
+  color: white !important;
+}
+
+.status-strip,
+.brand p,
+.app-nav p,
+.starter-help p,
+.tree-path,
+.graph-empty,
+.bookmark-empty,
+.command-palette label,
+.command-palette-item small,
+.settings-page-header p,
+.settings-help-card p,
+.spaces-item-meta,
+.spaces-empty {
+  color: var(--color-muted-foreground);
+}
+
+.settings-toggle {
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.85rem 1rem;
+  border-radius: var(--radius-md);
+  box-shadow: 3px 3px 0 0 var(--color-shadow);
+}
+
+.settings-toggle p,
+.settings-help-card p {
+  margin: 0;
+}
+
+.settings-toggle .ui-badge {
+  justify-self: start;
+  width: auto;
+}
+
+.settings-toggle h4,
+.settings-help-card h4 {
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.spaces-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.spaces-filter-row svg {
+  color: var(--color-muted-foreground);
+}
+
+.status-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  font-weight: 500;
+}
+
+.status-strip > span:first-child {
+  font-family: var(--font-heading);
+  font-size: 0.95rem;
+  color: color-mix(in oklab, var(--color-foreground) 80%, var(--color-ring));
+}
+
+.status-strip > span:last-child {
+  border: var(--border-width) solid var(--color-shadow);
+  border-radius: var(--radius-full);
+  padding: 0.25rem 0.6rem;
+  background: color-mix(in oklab, white 64%, var(--color-quaternary));
+  box-shadow: 2px 2px 0 0 color-mix(in oklab, var(--color-shadow) 55%, transparent);
+  font-family: var(--font-heading);
+  font-size: 0.8rem;
+}
+
+.app-nav-link.ui-button {
+  justify-content: flex-start;
+  border-radius: var(--radius-md);
+  font-family: var(--font-body);
+  font-weight: 600;
+  padding: 0.5rem 0.65rem;
+  box-shadow: 2px 2px 0 0 color-mix(in oklab, var(--color-shadow) 50%, transparent);
+  min-height: 0;
+}
+
+.app-nav-link span {
+  font-size: 0.92rem;
+  font-weight: 800;
+}
+
+.app-nav-link small {
+  font-size: 0.74rem;
+}
+
+.focus-switcher {
+  padding: 0.3rem;
+  box-shadow: var(--shadow-pop);
+}
+
+.focus-switcher .focus-switcher-item.ui-button {
+  min-height: 2.2rem;
+  padding: 0.34rem 0.8rem;
+  font-family: var(--font-heading);
+}
+
+.pane-header h2 {
+  font-size: 1rem;
+}
+
+.settings-groups {
+  display: grid;
+  gap: 0.7rem;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+}
+
+.settings-help-card {
+  margin-top: 0.75rem;
+  padding: 0.8rem 0.95rem;
+}
+
+.settings-page {
+  width: 100%;
+}
+
+.tree-node-active .tree-label,
+.graph-node-selected,
+.graph-floating-pill-selected,
+.graph-member-chip-focused,
+.graph-context-menu button:focus-visible,
+.command-palette-item-active {
+  border-color: var(--color-ring) !important;
+}
+
+.app-nav-link-active,
+.starter-chip-ready,
+.graph-node-file,
+.graph-node-center {
+  background: color-mix(in oklab, white 72%, var(--color-quaternary));
+}
+
+.investigate-toolbar-actions button:first-child,
+.spaces-create button,
+.spaces-item-actions button:first-child,
+.section-card-actions button,
+.graph-links button {
+  background: var(--color-tertiary);
+}
+
+.investigate-toolbar-actions button:last-child,
+.spaces-item-actions button:last-child,
+.confirm-actions button,
+.starter-dismiss,
+.starter-help-toggle {
+  background: var(--color-secondary);
+  color: white;
+}
+
+.starter-dismiss,
+.starter-help-toggle {
+  border: var(--border-width) solid var(--color-shadow);
+  border-radius: var(--radius-full);
+  box-shadow: var(--shadow-pop);
+  padding: 0.25rem 0.55rem;
+}
+
+@media (max-width: 1200px) {
+  .pane,
+  .card,
+  .app-nav,
+  .graph-trail-controls,
+  .bookmark-manager,
+  .command-palette,
+  .spaces-item,
+  .settings-help-card,
+  .settings-toggle,
+  .spaces-create,
+  .spaces-filter-row {
+    box-shadow: 2px 2px 0 0 var(--color-shadow);
+  }
+}

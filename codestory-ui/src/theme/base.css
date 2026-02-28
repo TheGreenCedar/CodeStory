@@ -1,0 +1,94 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
+  font-family: var(--font-body);
+  color: var(--color-foreground);
+  background:
+    radial-gradient(
+      circle at 8% 10%,
+      color-mix(in oklab, var(--color-tertiary) 34%, transparent),
+      transparent 28%
+    ),
+    radial-gradient(
+      circle at 86% 16%,
+      color-mix(in oklab, var(--color-secondary) 25%, transparent),
+      transparent 35%
+    ),
+    radial-gradient(
+      circle at 96% 92%,
+      color-mix(in oklab, var(--color-quaternary) 26%, transparent),
+      transparent 34%
+    ),
+    radial-gradient(var(--color-border) 1px, transparent 1px),
+    linear-gradient(180deg, #fffdf5 0%, #fff8e7 100%);
+  background-size:
+    auto,
+    auto,
+    auto,
+    22px 22px,
+    auto;
+  background-position:
+    center,
+    center,
+    center,
+    0 0,
+    center;
+  overflow: auto;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-family: var(--font-heading);
+  letter-spacing: -0.02em;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button,
+input,
+textarea,
+select,
+[role="button"] {
+  min-height: 2.75rem;
+}
+
+@media (max-width: 700px) {
+  button,
+  input,
+  textarea,
+  select,
+  [role="button"] {
+    min-height: 3rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+}

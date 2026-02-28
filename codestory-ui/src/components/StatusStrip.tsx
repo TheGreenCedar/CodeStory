@@ -7,11 +7,11 @@ export function StatusStrip({ status, indexProgress }: StatusStripProps) {
   return (
     <div className="status-strip">
       <span>{status}</span>
-      {indexProgress && (
+      {indexProgress ? (
         <span>
           Indexing {indexProgress.current}/{indexProgress.total}
         </span>
-      )}
+      ) : null}
     </div>
   );
 }

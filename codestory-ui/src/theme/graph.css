@@ -1,0 +1,141 @@
+.graph-canvas {
+  background:
+    radial-gradient(
+      circle at 10% 12%,
+      color-mix(in oklab, var(--color-tertiary) 30%, transparent),
+      transparent 30%
+    ),
+    radial-gradient(
+      circle at 92% 16%,
+      color-mix(in oklab, var(--color-secondary) 30%, transparent),
+      transparent 34%
+    ),
+    linear-gradient(180deg, var(--graph-canvas-top), var(--graph-canvas-bottom));
+}
+
+.graph-flow-shell,
+.react-flow,
+.react-flow__renderer,
+.react-flow__pane {
+  background: transparent;
+}
+
+.graph-node,
+.graph-floating-pill,
+.graph-group-node,
+.graph-trail-controls,
+.graph-context-menu,
+.graph-legend-panel,
+.graph-minimap,
+.graph-zoom-panel,
+.graph-legend-toggle-panel,
+.trail-dialog,
+.trail-target-placeholder,
+.search-dropdown {
+  border: var(--border-width) solid var(--color-shadow);
+  box-shadow: var(--shadow-pop);
+}
+
+.graph-node,
+.graph-floating-pill,
+.graph-group-node,
+.graph-target-clear,
+.graph-control-field select,
+.graph-control-field input,
+.graph-chip,
+.graph-trail-toolbar button,
+.graph-tabs button,
+.search-hit,
+.trail-filter-item,
+.trail-filter-actions button,
+.trail-dialog-actions button {
+  transition:
+    transform var(--duration-medium) var(--ease-playful),
+    box-shadow var(--duration-medium) var(--ease-playful),
+    border-color var(--duration-fast) ease,
+    background-color var(--duration-fast) ease;
+}
+
+.graph-node:hover,
+.graph-floating-pill:hover,
+.graph-group-node:hover,
+.search-hit:hover,
+.graph-chip:hover,
+.trail-filter-actions button:hover,
+.trail-dialog-actions button:hover,
+.graph-tabs button:hover {
+  transform: translate(-1px, -1px) rotate(-0.3deg);
+  box-shadow: var(--shadow-pop-hover);
+}
+
+.graph-node-file-tab {
+  background: color-mix(in oklab, white 30%, var(--color-tertiary));
+}
+
+.graph-member-chip-public {
+  background: color-mix(in oklab, white 50%, var(--color-quaternary));
+}
+
+.graph-member-chip-private {
+  background: color-mix(in oklab, white 62%, var(--color-secondary));
+}
+
+.graph-member-chip-focused,
+.graph-floating-pill-selected,
+.graph-node-selected,
+.search-hit-active,
+.graph-legend-row-active {
+  border-color: var(--color-ring) !important;
+  box-shadow:
+    0 0 0 2px color-mix(in oklab, var(--color-ring) 45%, transparent),
+    var(--shadow-pop);
+}
+
+.graph-edge-tooltip {
+  border: var(--border-width) solid var(--color-shadow);
+  border-radius: var(--radius-full);
+  background: var(--color-accent);
+  color: white;
+  box-shadow: 3px 3px 0 0 var(--color-shadow);
+}
+
+.truncation-pill,
+.graph-node-count,
+.graph-node-section-count,
+.graph-legend-count,
+.trail-range-value {
+  border: var(--border-width) solid var(--color-shadow);
+  border-radius: var(--radius-full);
+  background: var(--color-tertiary);
+  color: var(--color-foreground);
+  box-shadow: 2px 2px 0 0 var(--color-shadow);
+}
+
+.trail-dialog-backdrop,
+.command-palette-overlay,
+.bookmark-manager-overlay {
+  background: rgb(30 41 59 / 0.42);
+}
+
+.graph-legend-line {
+  border-radius: var(--radius-full);
+}
+
+.graph-empty {
+  border: var(--border-width) dashed var(--color-shadow);
+  border-radius: var(--radius-md);
+  background: color-mix(in oklab, white 80%, var(--color-muted));
+}
+
+@media (max-width: 1200px) {
+  .graph-node,
+  .graph-floating-pill,
+  .graph-group-node,
+  .graph-context-menu,
+  .graph-legend-panel,
+  .graph-minimap,
+  .trail-dialog,
+  .search-dropdown {
+    box-shadow: 2px 2px 0 0 var(--color-shadow);
+  }
+}
