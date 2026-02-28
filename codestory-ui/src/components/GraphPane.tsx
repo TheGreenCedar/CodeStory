@@ -90,7 +90,7 @@ export function GraphPane({
     <section className="pane pane-graph">
       <div className="pane-header graph-header">
         <div className="graph-header-title">
-          <h2>Graph Workspace</h2>
+          <h2>Graph</h2>
           {isTruncated && <span className="truncation-pill">Truncated</span>}
         </div>
         <div className="graph-search-wrap">
@@ -101,7 +101,7 @@ export function GraphPane({
             onKeyDown={onSearchKeyDown}
             onFocus={onSearchFocus}
             onBlur={onSearchBlur}
-            placeholder="Search symbols"
+            placeholder="Find symbol"
             disabled={!projectOpen}
             aria-label="Search symbols"
           />
@@ -150,21 +150,27 @@ export function GraphPane({
         onResetDefaults={onResetTrailDefaults}
       />
       <div className="graph-canvas">
-        <GraphViewport
-          graph={activeGraph}
-          onSelectNode={onSelectNode}
-          onSelectEdge={onSelectEdge}
-          trailConfig={trailConfig}
-          onToggleLegend={() => onTrailConfigChange({ showLegend: !trailConfig.showLegend })}
-          onOpenNodeInNewTab={onOpenNodeInNewTab}
-          onNavigateBack={onNavigateBack}
-          onNavigateForward={onNavigateForward}
-          onShowDefinitionInIde={onShowDefinitionInIde}
-          onBookmarkNode={onBookmarkNode}
-          onOpenContainingFolder={onOpenContainingFolder}
-          onRequestOpenTrailDialog={() => setTrailDialogOpen(true)}
-          onStatusMessage={onGraphStatusMessage}
-        />
+        {!projectOpen ? (
+          <div className="graph-empty">Open a project, then run index to explore graphs.</div>
+        ) : !activeGraph ? (
+          <div className="graph-empty">Run Trail to load a graph.</div>
+        ) : (
+          <GraphViewport
+            graph={activeGraph}
+            onSelectNode={onSelectNode}
+            onSelectEdge={onSelectEdge}
+            trailConfig={trailConfig}
+            onToggleLegend={() => onTrailConfigChange({ showLegend: !trailConfig.showLegend })}
+            onOpenNodeInNewTab={onOpenNodeInNewTab}
+            onNavigateBack={onNavigateBack}
+            onNavigateForward={onNavigateForward}
+            onShowDefinitionInIde={onShowDefinitionInIde}
+            onBookmarkNode={onBookmarkNode}
+            onOpenContainingFolder={onOpenContainingFolder}
+            onRequestOpenTrailDialog={() => setTrailDialogOpen(true)}
+            onStatusMessage={onGraphStatusMessage}
+          />
+        )}
       </div>
     </section>
   );

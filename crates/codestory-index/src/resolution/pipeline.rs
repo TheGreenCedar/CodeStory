@@ -110,7 +110,8 @@ where
 {
     let rows_started = Instant::now();
     let rows = sql::unresolved_edges(conn, edge_kind, scope_context)?;
-    *unresolved_load_ms = unresolved_load_ms.saturating_add(duration_ms_u64(rows_started.elapsed()));
+    *unresolved_load_ms =
+        unresolved_load_ms.saturating_add(duration_ms_u64(rows_started.elapsed()));
     if rows.is_empty() {
         return Ok(0);
     }
@@ -127,12 +128,16 @@ where
         if pass.flags.parallel_compute && rows.len() > 1 {
             rows.par_iter()
                 .zip(semantic_candidates_by_row.par_iter())
-                .map(|(row, semantic_candidates)| compute(pass, &candidate_index, row, semantic_candidates))
+                .map(|(row, semantic_candidates)| {
+                    compute(pass, &candidate_index, row, semantic_candidates)
+                })
                 .collect()
         } else {
             rows.iter()
                 .zip(semantic_candidates_by_row.iter())
-                .map(|(row, semantic_candidates)| compute(pass, &candidate_index, row, semantic_candidates))
+                .map(|(row, semantic_candidates)| {
+                    compute(pass, &candidate_index, row, semantic_candidates)
+                })
                 .collect()
         };
     *compute_ms = compute_ms.saturating_add(duration_ms_u64(compute_started.elapsed()));

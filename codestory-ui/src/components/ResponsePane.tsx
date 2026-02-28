@@ -2,14 +2,15 @@ import { useMemo, useState, type ChangeEvent, type ReactNode } from "react";
 
 import type { LeftTab } from "../app/types";
 import { MermaidDiagram } from "./MermaidDiagram";
+import { AdvancedSettingsDrawer, type ResolvedCustomConfig } from "./AdvancedSettingsDrawer";
 import type {
   AgentAnswerDto,
+  AgentCitationDto,
   AgentConnectionSettingsDto,
   AgentResponseBlockDto,
   AgentRetrievalProfileSelectionDto,
-  EdgeKind,
+  AgentRetrievalPresetDto,
   GraphArtifactDto,
-  NodeKind,
   SymbolSummaryDto,
 } from "../generated/api";
 
@@ -45,16 +46,6 @@ type ExplorerEntry = {
   isDependency: boolean;
 };
 
-type ResolvedCustomConfig = {
-  depth: number;
-  direction: "Incoming" | "Outgoing" | "Both";
-  edge_filter: EdgeKind[];
-  node_filter: NodeKind[];
-  max_nodes: number;
-  include_edge_occurrences: boolean;
-  enable_source_reads: boolean;
-};
-
 const WRAPPING_QUOTES = new Set(["'", '"', "`", "“", "”", "‘", "’"]);
 
 const DEFAULT_CUSTOM_PROFILE_CONFIG: ResolvedCustomConfig = {
@@ -67,7 +58,7 @@ const DEFAULT_CUSTOM_PROFILE_CONFIG: ResolvedCustomConfig = {
   enable_source_reads: true,
 };
 
-const PRESET_LABELS: Record<"architecture" | "callflow" | "inheritance" | "impact", string> = {
+const PRESET_LABELS: Record<AgentRetrievalPresetDto, string> = {
   architecture: "Architecture",
   callflow: "Call Flow",
   inheritance: "Inheritance",
@@ -151,17 +142,6 @@ function buildExplorerEntries(
   return [...grouped.values()];
 }
 
-function parseCsvList(value: string): string[] {
-  return value
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
-}
-
-function formatCsvList(values: string[]): string {
-  return values.join(", ");
-}
-
 function asCustomConfig(profile: AgentRetrievalProfileSelectionDto): ResolvedCustomConfig {
   if (profile.kind === "custom") {
     return {
@@ -189,10 +169,147 @@ function asCustomConfig(profile: AgentRetrievalProfileSelectionDto): ResolvedCus
   return DEFAULT_CUSTOM_PROFILE_CONFIG;
 }
 
+function sectionGraphs(
+  section: AgentAnswerDto["sections"][number],
+  graphMap: Record<string, GraphArtifactDto>,
+): GraphArtifactDto[] {
+  const uniqueGraphIds = new Set(
+    section.blocks.filter((block) => block.kind === "mermaid").map((block) => block.graph_id),
+  );
+  return [...uniqueGraphIds]
+    .map((graphId) => graphMap[graphId])
+    .filter((graph): graph is GraphArtifactDto => Boolean(graph));
+}
+
+function citationLocationLabel(citation: AgentCitationDto): string {
+  if (!citation.file_path) {
+    return "Unknown location";
+  }
+  if (citation.line === null) {
+    return citation.file_path;
+  }
+  return `${citation.file_path}:${citation.line}`;
+}
+
+function responseBlockToMarkdown(
+  block: AgentResponseBlockDto,
+  graphMap: Record<string, GraphArtifactDto>,
+): string {
+  if (block.kind === "markdown") {
+    return block.markdown;
+  }
+
+  const graph = graphMap[block.graph_id];
+  if (!graph) {
+    return `Mermaid graph \`${block.graph_id}\` is unavailable in this payload.`;
+  }
+
+  if (graph.kind !== "mermaid") {
+    return `Graph \`${graph.title}\` is available in the graph pane.`;
+  }
+
+  return `\`\`\`mermaid\n${graph.mermaid_syntax}\n\`\`\``;
+}
+
+function sanitizeFileName(baseName: string): string {
+  const normalized = baseName
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9_.-]/g, "");
+  return normalized.length > 0 ? normalized : "agent-summary";
+}
+
+function buildMarkdownSummary(
+  answer: AgentAnswerDto,
+  graphMap: Record<string, GraphArtifactDto>,
+): string {
+  const lines: string[] = [];
+  lines.push("# Codestory Answer Summary");
+  lines.push("");
+  lines.push(`- Prompt: ${answer.prompt}`);
+  lines.push(`- Answer ID: ${answer.answer_id}`);
+  lines.push("");
+  lines.push("## Summary");
+  lines.push(answer.summary);
+  lines.push("");
+  lines.push("## Evidence");
+  if (answer.citations.length === 0) {
+    lines.push("- No citations were returned.");
+  } else {
+    for (const citation of answer.citations) {
+      lines.push(
+        `- ${citation.display_name} (${citation.kind}) - ${citationLocationLabel(citation)} - score ${citation.score.toFixed(3)}`,
+      );
+    }
+  }
+  lines.push("");
+  lines.push("## Sections");
+  for (const section of answer.sections) {
+    lines.push(`### ${section.title}`);
+    lines.push("");
+    for (const block of section.blocks) {
+      lines.push(responseBlockToMarkdown(block, graphMap));
+      lines.push("");
+    }
+  }
+  return lines.join("\n").trimEnd();
+}
+
+function buildJsonSummary(
+  answer: AgentAnswerDto,
+  graphMap: Record<string, GraphArtifactDto>,
+): string {
+  return JSON.stringify(
+    {
+      answer_id: answer.answer_id,
+      prompt: answer.prompt,
+      summary: answer.summary,
+      sections: answer.sections.map((section) => ({
+        id: section.id,
+        title: section.title,
+        blocks: section.blocks.map((block) => {
+          if (block.kind === "markdown") {
+            return { kind: "markdown", markdown: block.markdown };
+          }
+          const graph = graphMap[block.graph_id];
+          return {
+            kind: "mermaid",
+            graph_id: block.graph_id,
+            graph_title: graph?.title ?? null,
+            mermaid_syntax: graph?.kind === "mermaid" ? graph.mermaid_syntax : null,
+          };
+        }),
+      })),
+      citations: answer.citations.map((citation) => ({
+        node_id: citation.node_id,
+        display_name: citation.display_name,
+        kind: citation.kind,
+        file_path: citation.file_path,
+        line: citation.line,
+        score: citation.score,
+      })),
+    },
+    null,
+    2,
+  );
+}
+
+function triggerTextDownload(fileName: string, content: string, mimeType: string): void {
+  const blob = new Blob([content], { type: `${mimeType};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
 function renderResponseBlock(
   block: AgentResponseBlockDto,
   graphMap: Record<string, GraphArtifactDto>,
-  onActivateGraph: (graphId: string) => void,
 ): ReactNode {
   if (block.kind === "markdown") {
     return <pre className="section-markdown">{block.markdown}</pre>;
@@ -201,28 +318,15 @@ function renderResponseBlock(
   if (block.kind === "mermaid") {
     const graph = graphMap[block.graph_id];
     if (!graph) {
-      return (
-        <div className="graph-empty">
-          Mermaid artifact `{block.graph_id}` was not found in this response payload.
-        </div>
-      );
+      return <div className="graph-empty">Graph artifact `{block.graph_id}` was not found.</div>;
     }
 
     if (graph.kind !== "mermaid") {
-      return (
-        <div className="graph-links">
-          <button onClick={() => onActivateGraph(graph.id)}>Open {graph.title}</button>
-        </div>
-      );
+      return <div className="graph-empty">Graph `{graph.title}` is in the graph pane.</div>;
     }
 
     return (
-      <div className="inline-mermaid-block">
-        <div className="graph-links">
-          <button onClick={() => onActivateGraph(graph.id)}>Open in Graph Pane</button>
-        </div>
-        <MermaidDiagram syntax={graph.mermaid_syntax} className="mermaid-shell inline-mermaid" />
-      </div>
+      <MermaidDiagram syntax={graph.mermaid_syntax} className="mermaid-shell inline-mermaid" />
     );
   }
 
@@ -257,36 +361,6 @@ export function ResponsePane({
     onPromptChange(event.target.value);
   };
 
-  const handleBackendChange = (event: ChangeEvent<HTMLSelectElement>) => {
-    const nextBackend = event.target.value;
-    if (nextBackend === "codex" || nextBackend === "claude_code") {
-      onAgentBackendChange(nextBackend);
-    }
-  };
-
-  const handleCommandChange = (event: ChangeEvent<HTMLInputElement>) => {
-    onAgentCommandChange(event.target.value);
-  };
-
-  const handleProfileModeChange = (event: ChangeEvent<HTMLSelectElement>) => {
-    const nextMode = event.target.value;
-    if (nextMode === "auto") {
-      onRetrievalProfileChange({ kind: "auto" });
-      return;
-    }
-    if (nextMode === "preset") {
-      const preset = retrievalProfile.kind === "preset" ? retrievalProfile.preset : "architecture";
-      onRetrievalProfileChange({ kind: "preset", preset });
-      return;
-    }
-    if (nextMode === "custom") {
-      onRetrievalProfileChange({
-        kind: "custom",
-        config: asCustomConfig(retrievalProfile),
-      });
-    }
-  };
-
   const updateCustomConfig = (patch: Partial<ResolvedCustomConfig>) => {
     const current = asCustomConfig(retrievalProfile);
     onRetrievalProfileChange({
@@ -298,10 +372,34 @@ export function ResponsePane({
     });
   };
 
+  const [showAdvancedSettings, setShowAdvancedSettings] = useState<boolean>(false);
   const [explorerQuery, setExplorerQuery] = useState<string>("");
   const [hideDependencies, setHideDependencies] = useState<boolean>(true);
   const [collapseDuplicates, setCollapseDuplicates] = useState<boolean>(true);
   const query = explorerQuery.trim().toLowerCase();
+  const quickPickValue =
+    retrievalProfile.kind === "preset"
+      ? `preset:${retrievalProfile.preset}`
+      : retrievalProfile.kind;
+
+  const handleQuickPickChange = (event: ChangeEvent<HTMLSelectElement>) => {
+    const nextValue = event.target.value;
+    if (nextValue === "auto") {
+      onRetrievalProfileChange({ kind: "auto" });
+      return;
+    }
+    if (nextValue === "custom") {
+      onRetrievalProfileChange({
+        kind: "custom",
+        config: asCustomConfig(retrievalProfile),
+      });
+      return;
+    }
+    if (nextValue.startsWith("preset:")) {
+      const preset = nextValue.slice("preset:".length) as AgentRetrievalPresetDto;
+      onRetrievalProfileChange({ kind: "preset", preset });
+    }
+  };
 
   const matchesQuery = (entry: ExplorerEntry): boolean => {
     if (query.length === 0) {
@@ -428,203 +526,165 @@ export function ResponsePane({
             <textarea
               value={prompt}
               onChange={handlePromptChange}
-              placeholder="Ask Codestory to explain architecture, trace behavior, or summarize relationships"
+              placeholder="Ask about architecture, behavior, or impact."
             />
-            <div className="agent-connection-settings">
-              <label className="agent-connection-field">
-                <span>Local agent</span>
-                <select value={agentBackend} onChange={handleBackendChange}>
-                  <option value="codex">Codex</option>
-                  <option value="claude_code">Claude Code</option>
-                </select>
-              </label>
-              <label className="agent-connection-field">
-                <span>Command override (optional)</span>
-                <input
-                  value={agentCommand}
-                  onChange={handleCommandChange}
-                  placeholder="Executable path or command name"
-                />
-              </label>
-            </div>
-
             <div className="retrieval-profile-settings">
               <label className="agent-connection-field">
-                <span>Retrieval profile</span>
-                <select value={retrievalProfile.kind} onChange={handleProfileModeChange}>
+                <span>Profile quick pick</span>
+                <select value={quickPickValue} onChange={handleQuickPickChange}>
                   <option value="auto">Auto (latency-first)</option>
-                  <option value="preset">Preset (latency-first)</option>
-                  <option value="custom">Custom (completeness-first)</option>
+                  {(Object.keys(PRESET_LABELS) as AgentRetrievalPresetDto[]).map((preset) => (
+                    <option key={preset} value={`preset:${preset}`}>
+                      {PRESET_LABELS[preset]}
+                    </option>
+                  ))}
+                  <option value="custom">Custom (advanced)</option>
                 </select>
               </label>
-
-              {retrievalProfile.kind === "preset" ? (
-                <label className="agent-connection-field">
-                  <span>Preset</span>
-                  <select
-                    value={retrievalProfile.preset}
-                    onChange={(event) => {
-                      const nextPreset = event.target.value as
-                        | "architecture"
-                        | "callflow"
-                        | "inheritance"
-                        | "impact";
-                      onRetrievalProfileChange({ kind: "preset", preset: nextPreset });
-                    }}
-                  >
-                    {(Object.keys(PRESET_LABELS) as Array<keyof typeof PRESET_LABELS>).map(
-                      (preset) => (
-                        <option key={preset} value={preset}>
-                          {PRESET_LABELS[preset]}
-                        </option>
-                      ),
-                    )}
-                  </select>
-                </label>
-              ) : null}
-
-              {retrievalProfile.kind === "custom" ? (
-                <div className="custom-profile-grid">
-                  <label className="agent-connection-field">
-                    <span>Depth (0 = infinite)</span>
-                    <input
-                      type="number"
-                      min={0}
-                      value={activeCustomConfig.depth}
-                      onChange={(event) => {
-                        const nextDepth = Number.parseInt(event.target.value, 10);
-                        updateCustomConfig({
-                          depth: Number.isFinite(nextDepth) ? Math.max(0, nextDepth) : 0,
-                        });
-                      }}
-                    />
-                  </label>
-
-                  <label className="agent-connection-field">
-                    <span>Direction</span>
-                    <select
-                      value={activeCustomConfig.direction}
-                      onChange={(event) => {
-                        const nextDirection = event.target.value;
-                        updateCustomConfig({
-                          direction:
-                            nextDirection === "Incoming" || nextDirection === "Outgoing"
-                              ? nextDirection
-                              : "Both",
-                        });
-                      }}
-                    >
-                      <option value="Both">Both</option>
-                      <option value="Outgoing">Outgoing</option>
-                      <option value="Incoming">Incoming</option>
-                    </select>
-                  </label>
-
-                  <label className="agent-connection-field">
-                    <span>Max nodes</span>
-                    <input
-                      type="number"
-                      min={10}
-                      value={activeCustomConfig.max_nodes}
-                      onChange={(event) => {
-                        const nextMaxNodes = Number.parseInt(event.target.value, 10);
-                        updateCustomConfig({
-                          max_nodes: Number.isFinite(nextMaxNodes)
-                            ? Math.max(10, nextMaxNodes)
-                            : activeCustomConfig.max_nodes,
-                        });
-                      }}
-                    />
-                  </label>
-
-                  <label className="agent-connection-field agent-connection-field-wide">
-                    <span>Edge filter (comma-separated)</span>
-                    <input
-                      value={formatCsvList(activeCustomConfig.edge_filter)}
-                      onChange={(event) => {
-                        updateCustomConfig({
-                          edge_filter: parseCsvList(event.target.value) as EdgeKind[],
-                        });
-                      }}
-                      placeholder="CALL, INHERITANCE, OVERRIDE"
-                    />
-                  </label>
-
-                  <label className="agent-connection-field agent-connection-field-wide">
-                    <span>Node filter (comma-separated)</span>
-                    <input
-                      value={formatCsvList(activeCustomConfig.node_filter)}
-                      onChange={(event) => {
-                        updateCustomConfig({
-                          node_filter: parseCsvList(event.target.value) as NodeKind[],
-                        });
-                      }}
-                      placeholder="CLASS, METHOD, INTERFACE"
-                    />
-                  </label>
-
-                  <label className="profile-checkbox">
-                    <input
-                      type="checkbox"
-                      checked={activeCustomConfig.enable_source_reads}
-                      onChange={(event) => {
-                        updateCustomConfig({ enable_source_reads: event.target.checked });
-                      }}
-                    />
-                    Enable optional source reads after retrieval
-                  </label>
-
-                  <label className="profile-checkbox">
-                    <input
-                      type="checkbox"
-                      checked={activeCustomConfig.include_edge_occurrences}
-                      onChange={(event) => {
-                        updateCustomConfig({ include_edge_occurrences: event.target.checked });
-                      }}
-                    />
-                    Include edge occurrence lookups
-                  </label>
-                </div>
-              ) : null}
             </div>
 
             <div className="prompt-actions">
-              <div className="prompt-actions-meta">
-                Mermaid diagrams are always included and rendered inline.
-              </div>
+              <div className="prompt-actions-meta">Add context, then ask.</div>
               <button onClick={onAskAgent} disabled={isBusy || !projectOpen}>
                 Ask Agent
               </button>
             </div>
+
+            <AdvancedSettingsDrawer
+              isOpen={showAdvancedSettings}
+              onToggle={() => {
+                setShowAdvancedSettings((previous) => !previous);
+              }}
+              retrievalProfile={retrievalProfile}
+              onRetrievalProfileChange={onRetrievalProfileChange}
+              activeCustomConfig={activeCustomConfig}
+              onCustomConfigChange={updateCustomConfig}
+              agentBackend={agentBackend}
+              onAgentBackendChange={onAgentBackendChange}
+              agentCommand={agentCommand}
+              onAgentCommandChange={onAgentCommandChange}
+              retrievalTrace={agentAnswer?.retrieval_trace ?? null}
+            />
           </div>
 
-          {agentAnswer && (
-            <div className="card">
-              <h3>{agentAnswer.summary}</h3>
+          {agentAnswer ? (
+            <div className="response-answer-cards">
+              <article className="card response-summary-card">
+                <div className="section-card-header">
+                  <h3>{agentAnswer.summary}</h3>
+                  <div className="section-card-actions">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const baseName = sanitizeFileName(
+                          `${agentAnswer.answer_id}-${agentAnswer.summary}`,
+                        );
+                        triggerTextDownload(
+                          `${baseName}.md`,
+                          buildMarkdownSummary(agentAnswer, graphMap),
+                          "text/markdown",
+                        );
+                      }}
+                    >
+                      Export Markdown
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const baseName = sanitizeFileName(
+                          `${agentAnswer.answer_id}-${agentAnswer.summary}`,
+                        );
+                        triggerTextDownload(
+                          `${baseName}.json`,
+                          buildJsonSummary(agentAnswer, graphMap),
+                          "application/json",
+                        );
+                      }}
+                    >
+                      Export JSON
+                    </button>
+                  </div>
+                </div>
+                <p>{agentAnswer.prompt}</p>
+              </article>
+
+              <article className="card response-evidence-card">
+                <div className="section-card-header">
+                  <h4>Evidence</h4>
+                </div>
+                {agentAnswer.citations.length > 0 ? (
+                  <ul className="response-citation-list">
+                    {agentAnswer.citations.map((citation) => (
+                      <li
+                        key={`${citation.node_id}:${citation.line ?? "unknown"}:${citation.display_name}`}
+                        className="response-citation-item"
+                      >
+                        <div className="response-citation-meta">
+                          <strong>{citation.display_name}</strong>
+                          <span>{citation.kind}</span>
+                          <span>{citationLocationLabel(citation)}</span>
+                          <span>Score {citation.score.toFixed(3)}</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            onFocusSymbol(citation.node_id, citation.display_name);
+                          }}
+                        >
+                          Jump to Cited Node
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <div className="graph-empty">No citations yet. Ask a narrower question.</div>
+                )}
+              </article>
+
               {agentAnswer.sections.map((section) => (
-                <article key={section.id} className="section-block">
-                  <h4>{section.title}</h4>
+                <article key={section.id} className="card section-block">
+                  <div className="section-card-header">
+                    <h4>{section.title}</h4>
+                    <div className="section-card-actions">
+                      {sectionGraphs(section, graphMap).map((graph) => (
+                        <button
+                          key={`${section.id}-${graph.id}`}
+                          type="button"
+                          onClick={() => {
+                            onActivateGraph(graph.id);
+                          }}
+                        >
+                          Open Related Graph: {graph.title}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                   <div className="section-block-content">
                     {section.blocks.map((block, index) => (
                       <div key={`${section.id}-${index}`} className="response-block">
-                        {renderResponseBlock(block, graphMap, onActivateGraph)}
+                        {renderResponseBlock(block, graphMap)}
                       </div>
                     ))}
                   </div>
                 </article>
               ))}
-
-              <details className="trace-panel">
-                <summary>Retrieval Trace</summary>
-                <pre>{JSON.stringify(agentAnswer.retrieval_trace, null, 2)}</pre>
-              </details>
+            </div>
+          ) : (
+            <div className="card response-empty-state">
+              <h3>Ask your first question</h3>
+              <p>Run the current prompt, then inspect evidence and graphs.</p>
+              <div className="graph-links">
+                <button type="button" onClick={onAskAgent} disabled={isBusy || !projectOpen}>
+                  Ask With Current Prompt
+                </button>
+              </div>
             </div>
           )}
         </>
       ) : (
         <div className="card explorer-card">
           <h3>Symbol Explorer</h3>
-          <p>Browse the indexed symbol tree without asking a prompt.</p>
+          <p>Search symbols, then focus one to inspect code.</p>
           <div className="explorer-toolbar">
             <input
               className="explorer-search-input"
@@ -633,40 +693,43 @@ export function ResponsePane({
               placeholder="Filter symbols, kinds, or files"
               aria-label="Filter explorer symbols"
             />
-            <div className="explorer-toolbar-row">
-              <label>
-                <input
-                  type="checkbox"
-                  checked={hideDependencies}
-                  onChange={(event) => setHideDependencies(event.target.checked)}
-                />
-                Hide dependencies
-              </label>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={collapseDuplicates}
-                  onChange={(event) => setCollapseDuplicates(event.target.checked)}
-                />
-                Collapse duplicates
-              </label>
-              <button
-                type="button"
-                className="explorer-clear-button"
-                onClick={() => setExplorerQuery("")}
-                disabled={explorerQuery.length === 0}
-              >
-                Clear
-              </button>
-            </div>
+            <details>
+              <summary>Explorer options</summary>
+              <div className="explorer-toolbar-row">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={hideDependencies}
+                    onChange={(event) => setHideDependencies(event.target.checked)}
+                  />
+                  Hide dependencies
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={collapseDuplicates}
+                    onChange={(event) => setCollapseDuplicates(event.target.checked)}
+                  />
+                  Collapse duplicates
+                </label>
+                <button
+                  type="button"
+                  className="explorer-clear-button"
+                  onClick={() => setExplorerQuery("")}
+                  disabled={explorerQuery.length === 0}
+                >
+                  Clear
+                </button>
+              </div>
+            </details>
             <div className="explorer-summary">
-              <span>{visibleRootStats.visible} visible roots</span>
-              <span>{visibleRootStats.totalRaw} total roots</span>
+              <span>{visibleRootStats.visible} shown</span>
+              <span>{visibleRootStats.totalRaw} total</span>
               {visibleRootStats.hiddenDependencies > 0 ? (
-                <span>{visibleRootStats.hiddenDependencies} dependency roots hidden</span>
+                <span>{visibleRootStats.hiddenDependencies} dependencies hidden</span>
               ) : null}
               {visibleRootStats.hiddenDuplicates > 0 ? (
-                <span>{visibleRootStats.hiddenDuplicates} duplicate roots collapsed</span>
+                <span>{visibleRootStats.hiddenDuplicates} duplicates collapsed</span>
               ) : null}
             </div>
           </div>
@@ -674,7 +737,7 @@ export function ResponsePane({
             {treeRows.length > 0 ? (
               treeRows
             ) : (
-              <div className="explorer-empty">No symbols match the current filters.</div>
+              <div className="explorer-empty">No matches. Clear filters or try another term.</div>
             )}
           </div>
         </div>

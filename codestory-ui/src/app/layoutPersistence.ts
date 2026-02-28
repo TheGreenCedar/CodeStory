@@ -51,6 +51,7 @@ export type AgentConnectionState = {
   command: string | null;
 };
 
+export const UI_LAYOUT_SCHEMA_VERSION = 2;
 export const LAST_OPENED_PROJECT_KEY = "codestory:last-opened-project";
 
 export const DEFAULT_AGENT_CONNECTION: AgentConnectionState = {

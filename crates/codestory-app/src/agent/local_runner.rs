@@ -32,7 +32,8 @@ pub(crate) fn run_codex_agent(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let output_path = std::env::temp_dir().join(format!("codestory-codex-response-{temp_nonce}.txt"));
+    let output_path =
+        std::env::temp_dir().join(format!("codestory-codex-response-{temp_nonce}.txt"));
 
     let mut command_builder = if is_windows_batch_command(command) {
         let mut cmd = Command::new("cmd");

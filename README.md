@@ -113,7 +113,6 @@ cargo run -p codestory-server -- --types-only --types-out codestory-ui/src/gener
   - `codestory-index`: tree-sitter + semantic resolution indexing pipeline
   - `codestory-storage`: SQLite schema and query layer
   - `codestory-search`: search primitives over indexed data
-  - `codestory-graph`: graph shaping/layout helpers
   - `codestory-api`: API DTOs and identifiers shared with frontend
   - `codestory-app`: headless orchestrator
   - `codestory-server`: Axum API + SSE + optional static file serving

@@ -13,8 +13,12 @@ import type {
 import {
   EDGE_KIND_OPTIONS,
   NODE_KIND_OPTIONS,
+  TRAIL_PERSPECTIVE_PRESETS,
   type GroupingMode,
+  type TrailPerspectivePreset,
   type TrailUiConfig,
+  trailConfigFromPerspectivePreset,
+  trailPerspectivePresetForConfig,
 } from "../graph/trailConfig";
 
 type GraphTrailControlsProps = {
@@ -85,6 +89,19 @@ function groupingModeLabel(mode: GroupingMode): string {
   }
 }
 
+function perspectivePresetLabel(preset: TrailPerspectivePreset): string {
+  switch (preset) {
+    case "Architecture":
+      return "Architecture";
+    case "CallFlow":
+      return "Call Flow";
+    case "Impact":
+      return "Impact";
+    case "Ownership":
+      return "Ownership";
+  }
+}
+
 export function GraphTrailControls({
   config,
   projectOpen,
@@ -107,6 +124,8 @@ export function GraphTrailControls({
   const [searching, setSearching] = useState<boolean>(false);
   const [nodeOptions, setNodeOptions] = useState<NodeKind[]>(NODE_KIND_OPTIONS);
   const [edgeOptions, setEdgeOptions] = useState<EdgeKind[]>(EDGE_KIND_OPTIONS);
+  const [showQuickHelp, setShowQuickHelp] = useState<boolean>(false);
+  const [advancedFilterQuery, setAdvancedFilterQuery] = useState<string>("");
   const searchSeqRef = useRef<number>(0);
   const isSubmitDisabled = disabledReason !== null || isRunning;
 
@@ -135,6 +154,12 @@ export function GraphTrailControls({
   useEffect(() => {
     setTargetQuery(config.targetLabel);
   }, [config.targetLabel]);
+
+  useEffect(() => {
+    if (!dialogOpen) {
+      setAdvancedFilterQuery("");
+    }
+  }, [dialogOpen]);
 
   useEffect(() => {
     if (config.mode !== "ToTargetSymbol") {
@@ -191,6 +216,42 @@ export function GraphTrailControls({
 
   const activeEdgeKinds = useMemo(() => new Set(config.edgeFilter), [config.edgeFilter]);
   const activeNodeKinds = useMemo(() => new Set(config.nodeFilter), [config.nodeFilter]);
+  const activePerspectivePreset = useMemo(() => trailPerspectivePresetForConfig(config), [config]);
+  const normalizedAdvancedFilter = advancedFilterQuery.trim().toLowerCase();
+  const matchesAdvancedFilter = (label: string): boolean =>
+    normalizedAdvancedFilter.length === 0 || label.toLowerCase().includes(normalizedAdvancedFilter);
+
+  const filteredNodeOptions = nodeOptions.filter((kind) =>
+    matchesAdvancedFilter(`node ${titleCase(kind)}`),
+  );
+  const filteredEdgeOptions = edgeOptions.filter((kind) =>
+    matchesAdvancedFilter(`edge ${titleCase(kind)}`),
+  );
+  const showTrailMode = matchesAdvancedFilter("trail mode neighborhood target all referenced");
+  const showDepth = matchesAdvancedFilter("max depth");
+  const showLayoutDirection = matchesAdvancedFilter("layout direction horizontal vertical");
+  const showDirection = matchesAdvancedFilter("direction incoming outgoing both");
+  const showCallerScope = matchesAdvancedFilter("caller scope tests benches");
+  const showGrouping = matchesAdvancedFilter("grouping namespace file");
+  const showEdgeBundling = matchesAdvancedFilter("edge bundling bundled separate");
+  const showMaxNodes = matchesAdvancedFilter("max nodes limit");
+  const showMiniMap = matchesAdvancedFilter("minimap map");
+  const showUtilityCalls = matchesAdvancedFilter("utility calls");
+  const showNodeFilters = matchesAdvancedFilter("node filters") || filteredNodeOptions.length > 0;
+  const showEdgeFilters = matchesAdvancedFilter("edge filters") || filteredEdgeOptions.length > 0;
+  const hasAdvancedMatches =
+    showTrailMode ||
+    showDepth ||
+    showLayoutDirection ||
+    showDirection ||
+    showCallerScope ||
+    showGrouping ||
+    showEdgeBundling ||
+    showMaxNodes ||
+    showMiniMap ||
+    showUtilityCalls ||
+    showNodeFilters ||
+    showEdgeFilters;
 
   const toggleEdgeKind = (kind: EdgeKind) => {
     if (activeEdgeKinds.has(kind)) {
@@ -261,12 +322,23 @@ export function GraphTrailControls({
   return (
     <div className="graph-trail-controls" aria-label="Trail controls">
       <div className="graph-trail-toolbar">
-        <button type="button" onClick={() => onDialogOpenChange(true)} disabled={!projectOpen}>
-          Custom Trail
-        </button>
         <button type="button" onClick={onRunTrail} disabled={isSubmitDisabled}>
           {isRunning ? "Running..." : "Run Trail"}
         </button>
+        <div className="trail-mode-row" role="radiogroup" aria-label="Perspective preset">
+          {TRAIL_PERSPECTIVE_PRESETS.map((preset) => (
+            <button
+              key={preset}
+              type="button"
+              className={
+                activePerspectivePreset === preset ? "graph-chip graph-chip-active" : "graph-chip"
+              }
+              onClick={() => onConfigChange(trailConfigFromPerspectivePreset(preset))}
+            >
+              {perspectivePresetLabel(preset)}
+            </button>
+          ))}
+        </div>
         <button
           type="button"
           className={config.showLegend ? "graph-chip graph-chip-active" : "graph-chip"}
@@ -276,35 +348,32 @@ export function GraphTrailControls({
         </button>
         <button
           type="button"
-          className={config.showMiniMap ? "graph-chip graph-chip-active" : "graph-chip"}
-          onClick={() => onConfigChange({ showMiniMap: !config.showMiniMap })}
+          className={showQuickHelp ? "graph-chip graph-chip-active" : "graph-chip"}
+          onClick={() => setShowQuickHelp((previous) => !previous)}
         >
-          MiniMap
+          Help
         </button>
-        <button
-          type="button"
-          className={config.showUtilityCalls ? "graph-chip graph-chip-active" : "graph-chip"}
-          onClick={() => onConfigChange({ showUtilityCalls: !config.showUtilityCalls })}
-        >
-          Utility Calls
-        </button>
-        {onOpenBookmarkManager ? (
-          <button type="button" onClick={onOpenBookmarkManager}>
-            Bookmarks
-          </button>
-        ) : null}
       </div>
+
+      {showQuickHelp ? (
+        <div className="graph-trail-hint" role="status">
+          Pick a preset, then run trail. Press `Ctrl+U` for advanced settings.
+        </div>
+      ) : null}
+      <button type="button" onClick={() => onDialogOpenChange(true)} disabled={!projectOpen}>
+        Advanced Settings
+      </button>
 
       {disabledReason ? <div className="graph-trail-reason">{disabledReason}</div> : null}
       {!projectOpen || !hasRootSymbol ? (
-        <div className="graph-trail-hint">Select a symbol to use as the trail root.</div>
+        <div className="graph-trail-hint">Select a symbol, then run trail.</div>
       ) : null}
 
       {dialogOpen ? (
         <div className="trail-dialog-backdrop" role="presentation">
           <div className="trail-dialog" role="dialog" aria-modal="true" aria-label="Custom trail">
             <div className="trail-dialog-header">
-              <h3>Custom Trail</h3>
+              <h3>Trail Settings</h3>
             </div>
 
             <div className="trail-dialog-grid">
@@ -313,7 +382,7 @@ export function GraphTrailControls({
                 <input
                   value={rootSymbolLabel ?? ""}
                   readOnly
-                  placeholder="Start Symbol"
+                  placeholder="Start symbol"
                   aria-label="Start symbol"
                 />
               </label>
@@ -326,7 +395,7 @@ export function GraphTrailControls({
                     aria-expanded={searchOpen}
                     aria-controls="trail-target-results"
                     value={targetQuery}
-                    placeholder="Target Symbol"
+                    placeholder="Target symbol"
                     onChange={(event) => {
                       const nextValue = event.target.value;
                       setTargetQuery(nextValue);
@@ -372,207 +441,285 @@ export function GraphTrailControls({
               )}
             </div>
 
-            <div className="trail-mode-row" role="radiogroup" aria-label="Trail mode">
-              {(
-                ["Neighborhood", "ToTargetSymbol", "AllReferenced", "AllReferencing"] as TrailMode[]
-              ).map((mode) => (
-                <label key={mode} className="trail-mode-option">
-                  <input
-                    type="radio"
-                    checked={config.mode === mode}
-                    onChange={() =>
-                      onConfigChange({
-                        mode,
-                        ...(mode !== "ToTargetSymbol" ? { targetId: null, targetLabel: "" } : {}),
-                      })
-                    }
-                  />
-                  <span>{modeLabel(mode)}</span>
-                </label>
-              ))}
-            </div>
+            <label className="graph-control-field">
+              <span>Find advanced option</span>
+              <input
+                value={advancedFilterQuery}
+                onChange={(event) => setAdvancedFilterQuery(event.target.value)}
+                placeholder="Search settings"
+                aria-label="Find advanced option"
+              />
+            </label>
+
+            {showTrailMode ? (
+              <div className="trail-mode-row" role="radiogroup" aria-label="Trail mode">
+                {(
+                  [
+                    "Neighborhood",
+                    "ToTargetSymbol",
+                    "AllReferenced",
+                    "AllReferencing",
+                  ] as TrailMode[]
+                ).map((mode) => (
+                  <label key={mode} className="trail-mode-option">
+                    <input
+                      type="radio"
+                      checked={config.mode === mode}
+                      onChange={() =>
+                        onConfigChange({
+                          mode,
+                          ...(mode !== "ToTargetSymbol" ? { targetId: null, targetLabel: "" } : {}),
+                        })
+                      }
+                    />
+                    <span>{modeLabel(mode)}</span>
+                  </label>
+                ))}
+              </div>
+            ) : null}
 
             <div className="trail-dialog-grid trail-dialog-grid-secondary">
-              <label className="graph-control-field">
-                <span>Max Depth</span>
-                <input
-                  type="range"
-                  min={0}
-                  max={12}
-                  value={Math.max(0, Math.min(12, config.depth))}
-                  onChange={(event) => {
-                    const depth = Number(event.target.value);
-                    onConfigChange({ depth: Number.isFinite(depth) ? depth : 1 });
-                  }}
-                />
-                <span className="trail-range-value">
-                  {config.depth === 0 ? "0 (infinite)" : String(config.depth)}
-                </span>
-              </label>
+              {showDepth ? (
+                <label className="graph-control-field">
+                  <span>Max Depth</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={12}
+                    value={Math.max(0, Math.min(12, config.depth))}
+                    onChange={(event) => {
+                      const depth = Number(event.target.value);
+                      onConfigChange({ depth: Number.isFinite(depth) ? depth : 1 });
+                    }}
+                  />
+                  <span className="trail-range-value">
+                    {config.depth === 0 ? "0 (infinite)" : String(config.depth)}
+                  </span>
+                </label>
+              ) : null}
 
-              <div className="graph-control-field">
-                <span>Layout Direction</span>
-                <div
-                  className="trail-inline-options"
-                  role="radiogroup"
-                  aria-label="Layout direction"
-                >
-                  {(["Horizontal", "Vertical"] as LayoutDirection[]).map((direction) => (
-                    <label key={direction} className="trail-mode-option">
-                      <input
-                        type="radio"
-                        checked={config.layoutDirection === direction}
-                        onChange={() => onConfigChange({ layoutDirection: direction })}
-                      />
-                      <span>{direction}</span>
-                    </label>
-                  ))}
+              {showLayoutDirection ? (
+                <div className="graph-control-field">
+                  <span>Layout Direction</span>
+                  <div
+                    className="trail-inline-options"
+                    role="radiogroup"
+                    aria-label="Layout direction"
+                  >
+                    {(["Horizontal", "Vertical"] as LayoutDirection[]).map((direction) => (
+                      <label key={direction} className="trail-mode-option">
+                        <input
+                          type="radio"
+                          checked={config.layoutDirection === direction}
+                          onChange={() => onConfigChange({ layoutDirection: direction })}
+                        />
+                        <span>{direction}</span>
+                      </label>
+                    ))}
+                  </div>
                 </div>
-              </div>
+              ) : null}
 
-              <label className="graph-control-field">
-                <span>Direction</span>
-                <select
-                  value={config.direction}
-                  onChange={(event) =>
-                    onConfigChange({ direction: event.target.value as TrailDirection })
-                  }
-                >
-                  {(["Incoming", "Outgoing", "Both"] as TrailDirection[]).map((direction) => (
-                    <option key={direction} value={direction}>
-                      {directionLabel(direction)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="graph-control-field">
-                <span>Caller Scope</span>
-                <select
-                  value={config.callerScope}
-                  onChange={(event) =>
-                    onConfigChange({ callerScope: event.target.value as TrailCallerScope })
-                  }
-                >
-                  {(["ProductionOnly", "IncludeTestsAndBenches"] as TrailCallerScope[]).map(
-                    (scope) => (
-                      <option key={scope} value={scope}>
-                        {callerScopeLabel(scope)}
+              {showDirection ? (
+                <label className="graph-control-field">
+                  <span>Direction</span>
+                  <select
+                    value={config.direction}
+                    onChange={(event) =>
+                      onConfigChange({ direction: event.target.value as TrailDirection })
+                    }
+                  >
+                    {(["Incoming", "Outgoing", "Both"] as TrailDirection[]).map((direction) => (
+                      <option key={direction} value={direction}>
+                        {directionLabel(direction)}
                       </option>
-                    ),
-                  )}
-                </select>
-              </label>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
 
-              <label className="graph-control-field">
-                <span>Grouping</span>
-                <select
-                  value={config.groupingMode}
-                  onChange={(event) =>
-                    onConfigChange({ groupingMode: event.target.value as GroupingMode })
-                  }
-                >
-                  {(["none", "namespace", "file"] as GroupingMode[]).map((mode) => (
-                    <option key={mode} value={mode}>
-                      {groupingModeLabel(mode)}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              {showCallerScope ? (
+                <label className="graph-control-field">
+                  <span>Caller Scope</span>
+                  <select
+                    value={config.callerScope}
+                    onChange={(event) =>
+                      onConfigChange({ callerScope: event.target.value as TrailCallerScope })
+                    }
+                  >
+                    {(["ProductionOnly", "IncludeTestsAndBenches"] as TrailCallerScope[]).map(
+                      (scope) => (
+                        <option key={scope} value={scope}>
+                          {callerScopeLabel(scope)}
+                        </option>
+                      ),
+                    )}
+                  </select>
+                </label>
+              ) : null}
 
-              <label className="graph-control-field">
-                <span>Edge Bundling</span>
-                <select
-                  value={config.bundleEdges ? "bundled" : "separate"}
-                  onChange={(event) =>
-                    onConfigChange({ bundleEdges: event.target.value === "bundled" })
-                  }
-                >
-                  <option value="bundled">Bundled</option>
-                  <option value="separate">Separate</option>
-                </select>
-              </label>
+              {showGrouping ? (
+                <label className="graph-control-field">
+                  <span>Grouping</span>
+                  <select
+                    value={config.groupingMode}
+                    onChange={(event) =>
+                      onConfigChange({ groupingMode: event.target.value as GroupingMode })
+                    }
+                  >
+                    {(["none", "namespace", "file"] as GroupingMode[]).map((mode) => (
+                      <option key={mode} value={mode}>
+                        {groupingModeLabel(mode)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
 
-              <label className="graph-control-field">
-                <span>Max Nodes</span>
-                <input
-                  type="number"
-                  min={10}
-                  max={100000}
-                  value={config.maxNodes}
-                  onChange={(event) => {
-                    const parsed = Number(event.target.value);
-                    onConfigChange({
-                      maxNodes: Number.isFinite(parsed)
-                        ? Math.max(10, Math.min(100000, parsed))
-                        : 500,
-                    });
-                  }}
-                />
-              </label>
+              {showEdgeBundling ? (
+                <label className="graph-control-field">
+                  <span>Edge Bundling</span>
+                  <select
+                    value={config.bundleEdges ? "bundled" : "separate"}
+                    onChange={(event) =>
+                      onConfigChange({ bundleEdges: event.target.value === "bundled" })
+                    }
+                  >
+                    <option value="bundled">Bundled</option>
+                    <option value="separate">Separate</option>
+                  </select>
+                </label>
+              ) : null}
+
+              {showMaxNodes ? (
+                <label className="graph-control-field">
+                  <span>Max Nodes</span>
+                  <input
+                    type="number"
+                    min={10}
+                    max={100000}
+                    value={config.maxNodes}
+                    onChange={(event) => {
+                      const parsed = Number(event.target.value);
+                      onConfigChange({
+                        maxNodes: Number.isFinite(parsed)
+                          ? Math.max(10, Math.min(100000, parsed))
+                          : 500,
+                      });
+                    }}
+                  />
+                </label>
+              ) : null}
+
+              {showMiniMap ? (
+                <label className="graph-control-field">
+                  <span>MiniMap</span>
+                  <select
+                    value={config.showMiniMap ? "show" : "hide"}
+                    onChange={(event) =>
+                      onConfigChange({ showMiniMap: event.target.value === "show" })
+                    }
+                  >
+                    <option value="show">Show</option>
+                    <option value="hide">Hide</option>
+                  </select>
+                </label>
+              ) : null}
+
+              {showUtilityCalls ? (
+                <label className="graph-control-field">
+                  <span>Utility Calls</span>
+                  <select
+                    value={config.showUtilityCalls ? "show" : "hide"}
+                    onChange={(event) =>
+                      onConfigChange({ showUtilityCalls: event.target.value === "show" })
+                    }
+                  >
+                    <option value="show">Show</option>
+                    <option value="hide">Hide</option>
+                  </select>
+                </label>
+              ) : null}
             </div>
 
-            <div className="trail-filter-columns">
-              <div className="trail-filter-column">
-                <div className="trail-filter-header">
-                  <strong>Nodes</strong>
-                  <div className="trail-filter-actions">
-                    <button
-                      type="button"
-                      onClick={() => onConfigChange({ nodeFilter: [...nodeOptions] })}
-                    >
-                      Check All
-                    </button>
-                    <button type="button" onClick={() => onConfigChange({ nodeFilter: [] })}>
-                      Uncheck All
-                    </button>
+            {showNodeFilters || showEdgeFilters ? (
+              <div className="trail-filter-columns">
+                {showNodeFilters ? (
+                  <div className="trail-filter-column">
+                    <div className="trail-filter-header">
+                      <strong>Nodes</strong>
+                      <div className="trail-filter-actions">
+                        <button
+                          type="button"
+                          onClick={() => onConfigChange({ nodeFilter: [...nodeOptions] })}
+                        >
+                          Check All
+                        </button>
+                        <button type="button" onClick={() => onConfigChange({ nodeFilter: [] })}>
+                          Uncheck All
+                        </button>
+                      </div>
+                    </div>
+                    <div className="trail-filter-list">
+                      {filteredNodeOptions.map((kind) => (
+                        <label key={kind} className="trail-filter-item">
+                          <input
+                            type="checkbox"
+                            checked={activeNodeKinds.has(kind)}
+                            onChange={() => toggleNodeKind(kind)}
+                          />
+                          <span>{titleCase(kind)}</span>
+                        </label>
+                      ))}
+                    </div>
                   </div>
-                </div>
-                <div className="trail-filter-list">
-                  {nodeOptions.map((kind) => (
-                    <label key={kind} className="trail-filter-item">
-                      <input
-                        type="checkbox"
-                        checked={activeNodeKinds.has(kind)}
-                        onChange={() => toggleNodeKind(kind)}
-                      />
-                      <span>{titleCase(kind)}</span>
-                    </label>
-                  ))}
-                </div>
-              </div>
+                ) : null}
 
-              <div className="trail-filter-column">
-                <div className="trail-filter-header">
-                  <strong>Edges</strong>
-                  <div className="trail-filter-actions">
-                    <button
-                      type="button"
-                      onClick={() => onConfigChange({ edgeFilter: [...edgeOptions] })}
-                    >
-                      Check All
-                    </button>
-                    <button type="button" onClick={() => onConfigChange({ edgeFilter: [] })}>
-                      Uncheck All
-                    </button>
+                {showEdgeFilters ? (
+                  <div className="trail-filter-column">
+                    <div className="trail-filter-header">
+                      <strong>Edges</strong>
+                      <div className="trail-filter-actions">
+                        <button
+                          type="button"
+                          onClick={() => onConfigChange({ edgeFilter: [...edgeOptions] })}
+                        >
+                          Check All
+                        </button>
+                        <button type="button" onClick={() => onConfigChange({ edgeFilter: [] })}>
+                          Uncheck All
+                        </button>
+                      </div>
+                    </div>
+                    <div className="trail-filter-list">
+                      {filteredEdgeOptions.map((kind) => (
+                        <label key={kind} className="trail-filter-item">
+                          <input
+                            type="checkbox"
+                            checked={activeEdgeKinds.has(kind)}
+                            onChange={() => toggleEdgeKind(kind)}
+                          />
+                          <span>{titleCase(kind)}</span>
+                        </label>
+                      ))}
+                    </div>
                   </div>
-                </div>
-                <div className="trail-filter-list">
-                  {edgeOptions.map((kind) => (
-                    <label key={kind} className="trail-filter-item">
-                      <input
-                        type="checkbox"
-                        checked={activeEdgeKinds.has(kind)}
-                        onChange={() => toggleEdgeKind(kind)}
-                      />
-                      <span>{titleCase(kind)}</span>
-                    </label>
-                  ))}
-                </div>
+                ) : null}
               </div>
-            </div>
+            ) : null}
+
+            {!hasAdvancedMatches ? (
+              <div className="graph-trail-hint" role="status">
+                No match for "{advancedFilterQuery.trim()}".
+              </div>
+            ) : null}
 
             <div className="trail-dialog-actions">
+              {onOpenBookmarkManager ? (
+                <button type="button" onClick={onOpenBookmarkManager}>
+                  Bookmarks
+                </button>
+              ) : null}
               <button type="button" onClick={() => onDialogOpenChange(false)}>
                 Cancel
               </button>
@@ -580,7 +727,7 @@ export function GraphTrailControls({
                 Reset
               </button>
               <button type="button" disabled={isSubmitDisabled} onClick={runAndCloseDialog}>
-                Search
+                Run Trail
               </button>
             </div>
           </div>

@@ -20,6 +20,7 @@ import {
   normalizeRetrievalProfile,
   type AgentConnectionState,
 } from "./layoutPersistence";
+import { trackAnalyticsEvent } from "./analytics";
 
 type IndexProgressState = { current: number; total: number } | null;
 
@@ -181,6 +182,15 @@ export function useProjectLifecycle({
           setStatus(
             `Indexing complete in ${event.data.duration_ms} ms (parse ${phases.parse_index_ms} ms, flush ${phases.projection_flush_ms} ms, resolve ${phases.edge_resolution_ms} ms, cache ${phases.cache_refresh_ms ?? 0} ms).`,
           );
+          trackAnalyticsEvent(
+            "index_completed",
+            {
+              duration_ms: event.data.duration_ms,
+            },
+            {
+              projectPath,
+            },
+          );
           void loadRootSymbols();
           break;
         }
@@ -193,7 +203,7 @@ export function useProjectLifecycle({
           break;
       }
     });
-  }, [loadRootSymbols, setIndexProgress, setStatus]);
+  }, [loadRootSymbols, projectPath, setIndexProgress, setStatus]);
 
   const handleOpenProject = useCallback(
     async (pathOverride?: string, restored = false) => {
@@ -211,6 +221,15 @@ export function useProjectLifecycle({
         setTrailConfig(defaultTrailUiConfig());
         setAgentConnection(DEFAULT_AGENT_CONNECTION);
         setRetrievalProfile(DEFAULT_RETRIEVAL_PROFILE);
+        trackAnalyticsEvent(
+          "project_opened",
+          {
+            source: restored ? "restore" : "manual",
+          },
+          {
+            projectPath: path,
+          },
+        );
         await loadRootSymbols();
 
         const saved = await api.getUiLayout();
@@ -285,13 +304,22 @@ export function useProjectLifecycle({
       setIsBusy(true);
       try {
         await api.startIndexing({ mode });
+        trackAnalyticsEvent(
+          "index_started",
+          {
+            mode,
+          },
+          {
+            projectPath,
+          },
+        );
       } catch (error) {
         setStatus(error instanceof Error ? error.message : "Failed to start indexing.");
       } finally {
         setIsBusy(false);
       }
     },
-    [setIsBusy, setStatus],
+    [projectPath, setIsBusy, setStatus],
   );
 
   return {

@@ -12,6 +12,8 @@ use codestory_api::{
     NodeOccurrencesRequest, ReadFileTextRequest, SearchHit, SearchRequest, TrailConfigDto,
     TrailFilterOptionsDto,
 };
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +21,9 @@ const DEFAULT_MAX_RESULTS: u32 = 8;
 const DEFAULT_MAX_EDGES: u32 = 260;
 const LATENCY_PHASE_DEADLINE_MS: u128 = 7_000;
 const DEFAULT_SLA_TARGET_MS: u32 = 18_000;
+const SEARCH_LOOP_MAX_TERMS_LATENCY: usize = 3;
+const SEARCH_LOOP_MAX_TERMS_COMPLETENESS: usize = 6;
+const AGENT_TERM_PLANNER_MAX_TERMS: usize = 6;
 
 #[derive(Debug, Clone, Default)]
 struct RetrievalBundle {
@@ -161,6 +166,70 @@ fn execute_retrieval(
     })?;
 
     let max_results = req.max_results.unwrap_or(DEFAULT_MAX_RESULTS).clamp(1, 25) as usize;
+    if hits.len() < max_results {
+        let loop_budget = if matches!(
+            resolved_profile.policy_mode,
+            AgentRetrievalPolicyModeDto::CompletenessFirst
+        ) {
+            SEARCH_LOOP_MAX_TERMS_COMPLETENESS
+        } else {
+            SEARCH_LOOP_MAX_TERMS_LATENCY
+        };
+
+        let agent_terms = if should_use_agent_term_planner(prompt, hits.len()) {
+            request_agent_search_terms(
+                controller,
+                req,
+                prompt,
+                &hits,
+                trace,
+                AGENT_TERM_PLANNER_MAX_TERMS,
+            )
+        } else {
+            Vec::new()
+        };
+        let heuristic_terms = prompt_search_terms(prompt);
+        let mut combined_terms = Vec::<String>::new();
+        let mut seen_terms = HashSet::<String>::new();
+        for term in agent_terms.into_iter().chain(heuristic_terms.into_iter()) {
+            let key = term.to_ascii_lowercase();
+            if seen_terms.insert(key) {
+                combined_terms.push(term);
+            }
+        }
+
+        let mut loop_runs = 0usize;
+        for term in combined_terms.into_iter().take(loop_budget) {
+            if hits.len() >= max_results {
+                break;
+            }
+
+            match controller.search(SearchRequest {
+                query: term.to_string(),
+            }) {
+                Ok(extra_hits) => {
+                    loop_runs += 1;
+                    merge_search_hits(&mut hits, extra_hits, max_results * 3);
+                }
+                Err(error) => {
+                    trace.annotate(format!(
+                        "Search loop term '{}' failed: {}",
+                        term, error.message
+                    ));
+                }
+            }
+        }
+
+        if loop_runs > 0 {
+            trace.annotate(format!(
+                "Search loop executed {} term query(ies).",
+                loop_runs
+            ));
+        } else {
+            trace.annotate("Search loop did not run additional term queries.");
+        }
+    }
+
     if hits.len() > max_results {
         hits.truncate(max_results);
     }
@@ -818,6 +887,218 @@ fn next_request_id() -> String {
     format!("ask-{}", nanos)
 }
 
+fn should_use_agent_term_planner(prompt: &str, hit_count: usize) -> bool {
+    if hit_count >= 3 {
+        return false;
+    }
+    prompt.split_whitespace().count() >= 4
+}
+
+fn build_term_planner_prompt(
+    prompt: &str,
+    existing_hits: &[SearchHit],
+    max_terms: usize,
+) -> String {
+    let seed = existing_hits
+        .iter()
+        .take(5)
+        .map(|hit| hit.display_name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "You are selecting code-symbol search terms.\n\
+User question: {prompt}\n\
+Current symbol hits: {}\n\
+Return ONLY a comma-separated list of up to {max_terms} concise code search terms (identifiers, modules, or API names). \
+No explanation, no markdown, no numbering.",
+        if seed.is_empty() {
+            "(none)"
+        } else {
+            seed.as_str()
+        }
+    )
+}
+
+fn parse_agent_terms(markdown: &str, max_terms: usize) -> Vec<String> {
+    let normalized = markdown
+        .replace('\r', "\n")
+        .replace('\n', ",")
+        .replace(';', ",");
+
+    let mut terms = Vec::new();
+    let mut seen = HashSet::<String>::new();
+
+    for raw in normalized.split(',') {
+        let trimmed = raw
+            .trim()
+            .trim_matches(['`', '"', '\'', '“', '”', '‘', '’'])
+            .trim_start_matches([
+                '-', '*', '•', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', ')',
+            ])
+            .trim();
+
+        if trimmed.len() < 3 || trimmed.len() > 80 {
+            continue;
+        }
+
+        let has_signal = trimmed
+            .chars()
+            .any(|ch| ch.is_ascii_alphabetic() || ch == '_' || ch == ':');
+        if !has_signal {
+            continue;
+        }
+
+        let key = trimmed.to_ascii_lowercase();
+        if seen.insert(key) {
+            terms.push(trimmed.to_string());
+        }
+
+        if terms.len() >= max_terms {
+            break;
+        }
+    }
+
+    terms
+}
+
+fn request_agent_search_terms(
+    controller: &AppController,
+    req: &AgentAskRequest,
+    prompt: &str,
+    existing_hits: &[SearchHit],
+    trace: &mut TraceRecorder,
+    max_terms: usize,
+) -> Vec<String> {
+    let planner_step = trace.start_step(
+        AgentRetrievalStepKindDto::LocalAgent,
+        vec![
+            field("purpose", "term_planning"),
+            field("existing_hits", existing_hits.len().to_string()),
+            field("max_terms", max_terms.to_string()),
+        ],
+    );
+
+    let planner_prompt = build_term_planner_prompt(prompt, existing_hits, max_terms);
+    match controller.run_local_agent(&req.connection, &planner_prompt) {
+        Ok(response) => {
+            let terms = parse_agent_terms(&response.markdown, max_terms);
+            trace.finish_ok(
+                planner_step,
+                vec![
+                    field("backend_label", response.backend_label),
+                    field("terms_count", terms.len().to_string()),
+                ],
+            );
+            if terms.is_empty() {
+                trace.annotate("Agent term planner returned no usable terms.");
+            } else {
+                trace.annotate(format!(
+                    "Agent term planner proposed terms: {}",
+                    terms.join(", ")
+                ));
+            }
+            terms
+        }
+        Err(error) => {
+            trace.finish_err(planner_step, error.message.clone());
+            trace.annotate("Agent term planner failed; falling back to heuristic terms.");
+            Vec::new()
+        }
+    }
+}
+
+fn prompt_search_terms(prompt: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "can",
+        "does",
+        "for",
+        "from",
+        "how",
+        "in",
+        "is",
+        "it",
+        "of",
+        "on",
+        "or",
+        "repo",
+        "repository",
+        "the",
+        "this",
+        "to",
+        "what",
+        "where",
+        "which",
+        "why",
+        "with",
+        "work",
+        "works",
+    ];
+
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut seen = HashSet::new();
+
+    for ch in prompt.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current.push(ch.to_ascii_lowercase());
+            continue;
+        }
+
+        if current.len() >= 3
+            && !STOPWORDS.contains(&current.as_str())
+            && seen.insert(current.clone())
+        {
+            terms.push(current.clone());
+        }
+        current.clear();
+    }
+
+    if current.len() >= 3 && !STOPWORDS.contains(&current.as_str()) && seen.insert(current.clone())
+    {
+        terms.push(current);
+    }
+
+    terms
+}
+
+fn merge_search_hits(into: &mut Vec<SearchHit>, additional: Vec<SearchHit>, max_candidates: usize) {
+    let mut by_id = HashMap::<codestory_api::NodeId, SearchHit>::new();
+
+    for hit in into.drain(..) {
+        by_id.insert(hit.node_id.clone(), hit);
+    }
+
+    for hit in additional {
+        by_id
+            .entry(hit.node_id.clone())
+            .and_modify(|existing| {
+                if hit.score > existing.score {
+                    *existing = hit.clone();
+                }
+            })
+            .or_insert(hit);
+    }
+
+    let mut merged = by_id.into_values().collect::<Vec<_>>();
+    merged.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(Ordering::Equal)
+    });
+    merged.truncate(max_candidates);
+    *into = merged;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,5 +1133,80 @@ mod tests {
         assert!(!needs_source_context(
             "summarize architecture at a high level"
         ));
+    }
+
+    #[test]
+    fn prompt_search_terms_extracts_core_keywords() {
+        let terms = prompt_search_terms("How does the language parsing work in this repo?");
+        assert_eq!(terms, vec!["language".to_string(), "parsing".to_string()]);
+    }
+
+    #[test]
+    fn should_use_agent_term_planner_for_sentence_queries_with_few_hits() {
+        assert!(should_use_agent_term_planner(
+            "How does the language parsing work in this repo?",
+            0
+        ));
+        assert!(!should_use_agent_term_planner("parser", 0));
+        assert!(!should_use_agent_term_planner(
+            "How does the language parsing work in this repo?",
+            4
+        ));
+    }
+
+    #[test]
+    fn parse_agent_terms_handles_bullets_and_commas() {
+        let parsed = parse_agent_terms(
+            "- parser_pipeline\n- tree_sitter::Parser, language_parsing, ast_builder",
+            6,
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                "parser_pipeline".to_string(),
+                "tree_sitter::Parser".to_string(),
+                "language_parsing".to_string(),
+                "ast_builder".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_search_hits_deduplicates_and_keeps_best_score() {
+        let mut into = vec![SearchHit {
+            node_id: codestory_api::NodeId("1".to_string()),
+            display_name: "Parser".to_string(),
+            kind: codestory_api::NodeKind::FUNCTION,
+            file_path: None,
+            line: None,
+            score: 10.0,
+        }];
+
+        merge_search_hits(
+            &mut into,
+            vec![
+                SearchHit {
+                    node_id: codestory_api::NodeId("1".to_string()),
+                    display_name: "Parser".to_string(),
+                    kind: codestory_api::NodeKind::FUNCTION,
+                    file_path: None,
+                    line: None,
+                    score: 42.0,
+                },
+                SearchHit {
+                    node_id: codestory_api::NodeId("2".to_string()),
+                    display_name: "LanguageParser".to_string(),
+                    kind: codestory_api::NodeKind::MODULE,
+                    file_path: None,
+                    line: None,
+                    score: 18.0,
+                },
+            ],
+            10,
+        );
+
+        assert_eq!(into.len(), 2);
+        assert_eq!(into[0].node_id.0, "1");
+        assert_eq!(into[0].score, 42.0);
     }
 }

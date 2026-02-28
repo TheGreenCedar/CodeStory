@@ -15,6 +15,7 @@ use codestory_search::SearchEngine;
 use codestory_storage::Storage;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io;
@@ -57,6 +58,109 @@ fn clamp_u128_to_u32(v: u128) -> u32 {
 
 fn clamp_usize_to_u32(v: usize) -> u32 {
     v.min(u32::MAX as usize) as u32
+}
+
+const NL_STOPWORDS: &[&str] = &[
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "can",
+    "do",
+    "does",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "repo",
+    "repository",
+    "show",
+    "tell",
+    "that",
+    "the",
+    "this",
+    "to",
+    "what",
+    "where",
+    "which",
+    "why",
+    "with",
+    "work",
+    "works",
+];
+
+fn extract_symbol_search_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut seen = HashSet::new();
+
+    for ch in query.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current.push(ch.to_ascii_lowercase());
+            continue;
+        }
+
+        if current.len() >= 3
+            && !NL_STOPWORDS.contains(&current.as_str())
+            && seen.insert(current.clone())
+        {
+            terms.push(current.clone());
+        }
+        current.clear();
+    }
+
+    if current.len() >= 3
+        && !NL_STOPWORDS.contains(&current.as_str())
+        && seen.insert(current.clone())
+    {
+        terms.push(current);
+    }
+
+    terms.truncate(8);
+    terms
+}
+
+fn should_expand_symbol_query(query: &str, direct_hit_count: usize) -> bool {
+    if direct_hit_count >= 3 {
+        return false;
+    }
+
+    let has_sentence_shape = query.split_whitespace().count() > 2 || query.len() > 28;
+    has_sentence_shape
+}
+
+fn aggregate_symbol_matches(
+    primary: Vec<(codestory_core::NodeId, f32)>,
+    expanded: Vec<(codestory_core::NodeId, f32)>,
+) -> Vec<(codestory_core::NodeId, f32)> {
+    let mut scores = HashMap::<codestory_core::NodeId, f32>::new();
+
+    for (id, score) in expanded {
+        scores.insert(id, score);
+    }
+
+    // Prefer direct query matches when available.
+    for (id, score) in primary {
+        let preferred = score + 100.0;
+        scores
+            .entry(id)
+            .and_modify(|existing| *existing = existing.max(preferred))
+            .or_insert(preferred);
+    }
+
+    let mut merged = scores.into_iter().collect::<Vec<_>>();
+    merged.sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(Ordering::Equal));
+    merged.truncate(20);
+    merged
 }
 
 #[derive(Debug, Clone)]
@@ -817,7 +921,32 @@ impl AppController {
             let engine = s.search_engine.as_mut().ok_or_else(|| {
                 ApiError::invalid_argument("Search engine not initialized. Open a project first.")
             })?;
-            let matches = engine.search_symbol_with_scores(&req.query);
+            let direct_matches = engine.search_symbol_with_scores(&req.query);
+            let matches = if should_expand_symbol_query(&req.query, direct_matches.len()) {
+                let terms = extract_symbol_search_terms(&req.query);
+                if terms.is_empty() {
+                    direct_matches
+                } else {
+                    let mut expanded = Vec::<(codestory_core::NodeId, f32)>::new();
+
+                    for term in terms {
+                        for (id, score) in engine.search_symbol_with_scores(&term) {
+                            expanded.push((id, score));
+                        }
+
+                        if let Ok(ids) = engine.search_full_text(&term) {
+                            for (rank, id) in ids.into_iter().enumerate() {
+                                let text_score = 40.0_f32 - (rank as f32 * 1.5);
+                                expanded.push((id, text_score));
+                            }
+                        }
+                    }
+
+                    aggregate_symbol_matches(direct_matches, expanded)
+                }
+            } else {
+                direct_matches
+            };
             let node_names = s.node_names.clone();
             (matches, node_names)
         };
@@ -1450,6 +1579,77 @@ mod tests {
     use codestory_core::{Edge, EdgeId, EdgeKind, Node, NodeId as CoreNodeId, NodeKind};
     use crossbeam_channel::unbounded;
     use tempfile::tempdir;
+
+    #[test]
+    fn extract_symbol_search_terms_removes_stopwords_and_short_tokens() {
+        let terms = extract_symbol_search_terms("How does the language parsing work in this repo?");
+        assert_eq!(terms, vec!["language".to_string(), "parsing".to_string()]);
+    }
+
+    #[test]
+    fn should_expand_symbol_query_for_sentence_prompts() {
+        assert!(should_expand_symbol_query(
+            "How does the language parsing work in this repo?",
+            0
+        ));
+        assert!(!should_expand_symbol_query("parser", 0));
+        assert!(!should_expand_symbol_query(
+            "How does the language parsing work in this repo?",
+            5
+        ));
+    }
+
+    #[test]
+    fn aggregate_symbol_matches_prioritizes_direct_matches() {
+        let direct = vec![(CoreNodeId(7), 2.0)];
+        let expanded = vec![(CoreNodeId(7), 99.0), (CoreNodeId(8), 95.0)];
+        let merged = aggregate_symbol_matches(direct, expanded);
+        assert_eq!(merged.first().map(|(id, _)| *id), Some(CoreNodeId(7)));
+    }
+
+    #[test]
+    fn search_expands_natural_language_queries() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("codestory.db");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(201),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "language_parsing_pipeline".to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(202),
+                        kind: NodeKind::MODULE,
+                        serialized_name: "parser_core".to_string(),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert nodes");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: temp.path().to_string_lossy().to_string(),
+            })
+            .expect("open project");
+
+        let hits = controller
+            .search(SearchRequest {
+                query: "How does the language parsing work in this repo?".to_string(),
+            })
+            .expect("search with natural language");
+
+        assert!(
+            !hits.is_empty(),
+            "Expected term extraction fallback to find symbol matches"
+        );
+    }
 
     #[test]
     fn build_search_state_prefers_qualified_name() {

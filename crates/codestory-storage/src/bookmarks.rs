@@ -8,7 +8,9 @@ pub(super) fn create_bookmark_category(conn: &Connection, name: &str) -> Result<
     Ok(conn.last_insert_rowid())
 }
 
-pub(super) fn get_bookmark_categories(conn: &Connection) -> Result<Vec<BookmarkCategory>, StorageError> {
+pub(super) fn get_bookmark_categories(
+    conn: &Connection,
+) -> Result<Vec<BookmarkCategory>, StorageError> {
     let mut stmt = conn.prepare("SELECT id, name FROM bookmark_category")?;
     let mut categories = Vec::new();
     let mut rows = stmt.query([])?;
@@ -22,7 +24,10 @@ pub(super) fn get_bookmark_categories(conn: &Connection) -> Result<Vec<BookmarkC
 }
 
 pub(super) fn delete_bookmark_category(conn: &Connection, id: i64) -> Result<(), StorageError> {
-    conn.execute("DELETE FROM bookmark_node WHERE category_id = ?1", params![id])?;
+    conn.execute(
+        "DELETE FROM bookmark_node WHERE category_id = ?1",
+        params![id],
+    )?;
     conn.execute("DELETE FROM bookmark_category WHERE id = ?1", params![id])?;
     Ok(())
 }
@@ -57,7 +62,9 @@ pub(super) fn get_bookmarks(
     category_id: Option<i64>,
 ) -> Result<Vec<Bookmark>, StorageError> {
     let query = match category_id {
-        Some(_) => "SELECT id, category_id, node_id, comment FROM bookmark_node WHERE category_id = ?1",
+        Some(_) => {
+            "SELECT id, category_id, node_id, comment FROM bookmark_node WHERE category_id = ?1"
+        }
         None => "SELECT id, category_id, node_id, comment FROM bookmark_node",
     };
     let mut stmt = conn.prepare(query)?;

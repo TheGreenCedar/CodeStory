@@ -1099,6 +1099,22 @@ export function GraphViewport({
     },
     [],
   );
+  const confirmDestructiveAction = useCallback(
+    (message: string, canceledStatusMessage: string): boolean => {
+      if (typeof window !== "undefined" && typeof window.confirm === "function") {
+        try {
+          if (!window.confirm(message)) {
+            onStatusMessage?.(canceledStatusMessage);
+            return false;
+          }
+        } catch {
+          // Keep flow interactive in environments where confirm dialogs are unavailable.
+        }
+      }
+      return true;
+    },
+    [onStatusMessage],
+  );
   const hideNode = useCallback(
     (nodeId: string) => {
       if (!graph || isMermaidGraph(graph)) {
@@ -1113,7 +1129,7 @@ export function GraphViewport({
         };
       });
       setSelectedNodeId((current) => (current === nodeId ? null : current));
-      onStatusMessage?.("Node hidden. Use Reset Hidden in the context menu to restore.");
+      onStatusMessage?.("Node hidden. Undo with Restore Hidden Elements from the context menu.");
     },
     [graph, onStatusMessage],
   );
@@ -1131,7 +1147,7 @@ export function GraphViewport({
         };
       });
       setSelectedEdgeId((current) => (current === edgeId ? null : current));
-      onStatusMessage?.("Edge hidden. Use Reset Hidden in the context menu to restore.");
+      onStatusMessage?.("Edge hidden. Undo with Restore Hidden Elements from the context menu.");
     },
     [graph, onStatusMessage],
   );
@@ -1157,6 +1173,48 @@ export function GraphViewport({
     });
     onStatusMessage?.("Hidden graph elements restored.");
   }, [graph, onStatusMessage]);
+  const requestHideNode = useCallback(
+    (nodeId: string, label: string) => {
+      if (
+        !confirmDestructiveAction(
+          `Hide "${label}" from this graph? You can restore hidden elements from the context menu.`,
+          "Hide canceled. Node remains visible.",
+        )
+      ) {
+        return;
+      }
+      hideNode(nodeId);
+      closeContextMenu();
+    },
+    [closeContextMenu, confirmDestructiveAction, hideNode],
+  );
+  const requestHideEdge = useCallback(
+    (edgeId: string) => {
+      if (
+        !confirmDestructiveAction(
+          "Hide this edge from the graph? You can restore hidden elements from the context menu.",
+          "Hide canceled. Edge remains visible.",
+        )
+      ) {
+        return;
+      }
+      hideEdge(edgeId);
+      closeContextMenu();
+    },
+    [closeContextMenu, confirmDestructiveAction, hideEdge],
+  );
+  const requestResetHidden = useCallback(() => {
+    if (
+      !confirmDestructiveAction(
+        "Restore all hidden nodes and edges in this graph?",
+        "Restore canceled. Hidden elements remain hidden.",
+      )
+    ) {
+      return;
+    }
+    resetHidden();
+    closeContextMenu();
+  }, [closeContextMenu, confirmDestructiveAction, resetHidden]);
   const { exportImage, exportToClipboard, copyText } = useGraphExportActions({
     graphTitle: graph?.title ?? "graph",
     flowShellRef,
@@ -1486,8 +1544,7 @@ export function GraphViewport({
           }
           if (mouseEvent.altKey) {
             setSelectedNodeId(null);
-            hideEdge(edge.id);
-            closeContextMenu();
+            requestHideEdge(edge.id);
             return;
           }
           activateEdge(edge as Edge<SemanticEdgeData>);
@@ -1603,27 +1660,31 @@ export function GraphViewport({
         >
           {contextMenu.kind === "pane" ? (
             <>
-              <button type="button" onClick={() => onNavigateBack?.()}>
-                Back
+              <button type="button" disabled={!onNavigateBack} onClick={() => onNavigateBack?.()}>
+                Navigate Back
               </button>
-              <button type="button" onClick={() => onNavigateForward?.()}>
-                Forward
+              <button
+                type="button"
+                disabled={!onNavigateForward}
+                onClick={() => onNavigateForward?.()}
+              >
+                Navigate Forward
               </button>
               <button type="button" onClick={() => void exportImage("png")}>
-                Save Image (PNG)
+                Export Graph (PNG)
               </button>
               <button type="button" onClick={() => void exportImage("jpeg")}>
-                Save Image (JPEG)
+                Export Graph (JPEG)
               </button>
               <button type="button" onClick={() => void exportImage("svg")}>
-                Save Image (SVG)
+                Export Graph (SVG)
               </button>
               <button type="button" onClick={() => void exportToClipboard()}>
-                Save To Clipboard (PNG)
+                Copy Graph Image (PNG)
               </button>
               {hasHiddenElements ? (
-                <button type="button" onClick={resetHidden}>
-                  Reset Hidden
+                <button type="button" onClick={requestResetHidden}>
+                  Restore Hidden Elements
                 </button>
               ) : null}
             </>
@@ -1639,40 +1700,48 @@ export function GraphViewport({
                   }
                 }}
               >
-                Show Definition
+                Open Related Definition
               </button>
-              <button type="button" onClick={() => hideEdge(contextMenu.edgeId)}>
-                Hide Edge
+              <button type="button" onClick={() => requestHideEdge(contextMenu.edgeId)}>
+                Hide This Edge
               </button>
               <button type="button" onClick={() => void exportImage("png")}>
-                Save Image (PNG)
+                Export Graph (PNG)
               </button>
               <button type="button" onClick={() => void exportToClipboard()}>
-                Save To Clipboard (PNG)
+                Copy Graph Image (PNG)
               </button>
             </>
           ) : null}
           {contextMenu.kind === "node" ? (
             <>
               <button type="button" onClick={() => selectNodeById(contextMenu.nodeId)}>
-                Show Definition
+                Open Definition
               </button>
               <button
                 type="button"
+                disabled={!onOpenNodeInNewTab}
                 onClick={() => onOpenNodeInNewTab?.(contextMenu.nodeId, contextMenu.label)}
               >
-                Open In New Tab
+                Open Definition In New Tab
               </button>
-              <button type="button" onClick={() => onShowDefinitionInIde?.(contextMenu.nodeId)}>
-                Show Definition In IDE
+              <button
+                type="button"
+                disabled={!onShowDefinitionInIde}
+                onClick={() => onShowDefinitionInIde?.(contextMenu.nodeId)}
+              >
+                Reveal Definition In IDE
               </button>
               {contextNodeIsExpandable ? (
                 <button type="button" onClick={() => toggleExpandedNode(contextMenu.nodeId)}>
-                  {contextNode?.data.isExpanded ? "Collapse Node" : "Expand Node"}
+                  {contextNode?.data.isExpanded ? "Collapse Members" : "Expand Members"}
                 </button>
               ) : null}
-              <button type="button" onClick={() => hideNode(contextMenu.nodeId)}>
-                Hide Node
+              <button
+                type="button"
+                onClick={() => requestHideNode(contextMenu.nodeId, contextMenu.label)}
+              >
+                Hide This Node
               </button>
               <button
                 type="button"
@@ -1698,6 +1767,7 @@ export function GraphViewport({
                   </button>
                   <button
                     type="button"
+                    disabled={!onOpenContainingFolder}
                     onClick={() => onOpenContainingFolder?.(contextMenu.filePath ?? "")}
                   >
                     Open Containing Folder
