@@ -406,6 +406,24 @@ pub enum AgentRetrievalProfileSelectionDto {
     },
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentResponseModeDto {
+    #[default]
+    Markdown,
+    Structured,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Default)]
+pub struct AgentHybridWeightsDto {
+    #[serde(default)]
+    pub lexical: Option<f32>,
+    #[serde(default)]
+    pub semantic: Option<f32>,
+    #[serde(default)]
+    pub graph: Option<f32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentAskRequest {
     pub prompt: String,
@@ -416,7 +434,27 @@ pub struct AgentAskRequest {
     #[serde(default)]
     pub max_results: Option<u32>,
     #[serde(default)]
+    pub response_mode: AgentResponseModeDto,
+    #[serde(default)]
+    pub latency_budget_ms: Option<u32>,
+    #[serde(default = "default_include_evidence")]
+    pub include_evidence: bool,
+    #[serde(default)]
+    pub hybrid_weights: Option<AgentHybridWeightsDto>,
+    #[serde(default)]
     pub connection: AgentConnectionSettingsDto,
+}
+
+const fn default_include_evidence() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct RetrievalScoreBreakdownDto {
+    pub lexical: f32,
+    pub semantic: f32,
+    pub graph: f32,
+    pub total: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -427,6 +465,12 @@ pub struct AgentCitationDto {
     pub file_path: Option<String>,
     pub line: Option<u32>,
     pub score: f32,
+    #[serde(default)]
+    pub subgraph_id: Option<String>,
+    #[serde(default)]
+    pub evidence_edge_ids: Vec<EdgeId>,
+    #[serde(default)]
+    pub retrieval_score_breakdown: Option<RetrievalScoreBreakdownDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -469,6 +513,9 @@ pub struct AgentRetrievalSummaryFieldDto {
 #[serde(rename_all = "snake_case")]
 pub enum AgentRetrievalStepKindDto {
     Search,
+    SemanticQueryEmbedding,
+    SemanticCandidateRetrieval,
+    HybridRerank,
     TrailFilterOptions,
     Neighborhood,
     Trail,
@@ -525,6 +572,8 @@ pub struct AgentAnswerDto {
     pub summary: String,
     pub sections: Vec<AgentResponseSectionDto>,
     pub citations: Vec<AgentCitationDto>,
+    pub subgraph_ids: Vec<String>,
+    pub retrieval_version: String,
     pub graphs: Vec<GraphArtifactDto>,
     pub retrieval_trace: AgentRetrievalTraceDto,
 }

@@ -1488,6 +1488,7 @@ function globalFunc() {}
         use codestory_project::RefreshInfo;
         use codestory_storage::Storage;
         use std::fs;
+        use std::time::{Duration, Instant};
         use tempfile::tempdir;
 
         let dir = tempdir()?;
@@ -1526,18 +1527,21 @@ function globalFunc() {}
                 .any(|n| n.serialized_name == "bar" && n.kind == NodeKind::FUNCTION)
         );
 
-        // Check progress events
-        let events: Vec<Event> = rx.try_iter().collect();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, Event::IndexingStarted { .. }))
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, Event::IndexingComplete { .. }))
-        );
+        // Check progress events with a short timeout to avoid race with async fan-out thread.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_started = false;
+        let mut saw_complete = false;
+        while Instant::now() < deadline && (!saw_started || !saw_complete) {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Event::IndexingStarted { .. }) => saw_started = true,
+                Ok(Event::IndexingComplete { .. }) => saw_complete = true,
+                Ok(_) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(saw_started, "expected IndexingStarted event");
+        assert!(saw_complete, "expected IndexingComplete event");
 
         Ok(())
     }

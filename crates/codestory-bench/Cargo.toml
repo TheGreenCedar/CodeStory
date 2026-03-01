@@ -8,6 +8,8 @@ publish = false
 codestory-core = { workspace = true }
 codestory-index = { workspace = true }
 codestory-storage = { workspace = true }
+codestory-app = { workspace = true }
+codestory-api = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 anyhow = { workspace = true }
@@ -25,4 +27,8 @@ harness = false
 
 [[bench]]
 name = "resolution_full_scope"
+harness = false
+
+[[bench]]
+name = "ask_latency"
 harness = false

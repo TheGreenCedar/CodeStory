@@ -17,7 +17,7 @@ mod row_mapping;
 mod schema;
 mod trail;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const RELATED_NODE_SUBQUERY: &str = "SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1";
 const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, e.callsite_identity, e.certainty, e.candidate_target_node_ids, t.serialized_name, f.serialized_name
                  FROM edge e
@@ -76,6 +76,22 @@ pub struct FileProjectionRemovalSummary {
     pub removed_file_row_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LlmSymbolDoc {
+    pub node_id: NodeId,
+    pub file_node_id: Option<NodeId>,
+    pub kind: NodeKind,
+    pub display_name: String,
+    pub qualified_name: Option<String>,
+    pub file_path: Option<String>,
+    pub start_line: Option<u32>,
+    pub doc_text: String,
+    pub embedding_model: String,
+    pub embedding_dim: u32,
+    pub embedding: Vec<f32>,
+    pub updated_at_epoch_ms: i64,
+}
+
 impl Storage {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         let conn = Connection::open(path)?;
@@ -113,6 +129,7 @@ impl Storage {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM occurrence", [])?;
         tx.execute("DELETE FROM edge", [])?;
+        tx.execute("DELETE FROM llm_symbol_doc", [])?;
         tx.execute("DELETE FROM component_access", [])?;
         tx.execute("DELETE FROM bookmark_node", [])?;
         tx.execute("DELETE FROM local_symbol", [])?;
@@ -448,6 +465,177 @@ impl Storage {
             map.insert(NodeId(node_id), Self::access_kind_from_db(raw));
         }
         Ok(map)
+    }
+
+    pub fn upsert_llm_symbol_docs_batch(
+        &mut self,
+        docs: &[LlmSymbolDoc],
+    ) -> Result<(), StorageError> {
+        if docs.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO llm_symbol_doc (
+                    node_id,
+                    file_node_id,
+                    kind,
+                    display_name,
+                    qualified_name,
+                    file_path,
+                    start_line,
+                    doc_text,
+                    embedding_model,
+                    embedding_dim,
+                    embedding_blob,
+                    updated_at_epoch_ms
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+                 )
+                 ON CONFLICT(node_id) DO UPDATE SET
+                    file_node_id = excluded.file_node_id,
+                    kind = excluded.kind,
+                    display_name = excluded.display_name,
+                    qualified_name = excluded.qualified_name,
+                    file_path = excluded.file_path,
+                    start_line = excluded.start_line,
+                    doc_text = excluded.doc_text,
+                    embedding_model = excluded.embedding_model,
+                    embedding_dim = excluded.embedding_dim,
+                    embedding_blob = excluded.embedding_blob,
+                    updated_at_epoch_ms = excluded.updated_at_epoch_ms",
+            )?;
+
+            for doc in docs {
+                stmt.execute(params![
+                    doc.node_id.0,
+                    doc.file_node_id.map(|id| id.0),
+                    doc.kind as i32,
+                    doc.display_name,
+                    doc.qualified_name,
+                    doc.file_path,
+                    doc.start_line,
+                    doc.doc_text,
+                    doc.embedding_model,
+                    doc.embedding_dim as i64,
+                    encode_embedding_blob(&doc.embedding),
+                    doc.updated_at_epoch_ms,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_llm_symbol_docs_by_node_ids(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<Vec<LlmSymbolDoc>, StorageError> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", node_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT
+                node_id,
+                file_node_id,
+                kind,
+                display_name,
+                qualified_name,
+                file_path,
+                start_line,
+                doc_text,
+                embedding_model,
+                embedding_dim,
+                embedding_blob,
+                updated_at_epoch_ms
+             FROM llm_symbol_doc
+             WHERE node_id IN ({placeholders})
+             ORDER BY node_id ASC"
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(node_ids.iter().map(|id| id.0)))?;
+        let mut docs = Vec::new();
+
+        while let Some(row) = rows.next()? {
+            let kind: i32 = row.get(2)?;
+            let embedding_dim: i64 = row.get(9)?;
+            let embedding_blob: Vec<u8> = row.get(10)?;
+            docs.push(LlmSymbolDoc {
+                node_id: NodeId(row.get(0)?),
+                file_node_id: row.get::<_, Option<i64>>(1)?.map(NodeId),
+                kind: NodeKind::try_from(kind)?,
+                display_name: row.get(3)?,
+                qualified_name: row.get(4)?,
+                file_path: row.get(5)?,
+                start_line: row.get(6)?,
+                doc_text: row.get(7)?,
+                embedding_model: row.get(8)?,
+                embedding_dim: embedding_dim.max(0) as u32,
+                embedding: decode_embedding_blob(&embedding_blob)?,
+                updated_at_epoch_ms: row.get(11)?,
+            });
+        }
+
+        Ok(docs)
+    }
+
+    pub fn get_all_llm_symbol_docs(&self) -> Result<Vec<LlmSymbolDoc>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                node_id,
+                file_node_id,
+                kind,
+                display_name,
+                qualified_name,
+                file_path,
+                start_line,
+                doc_text,
+                embedding_model,
+                embedding_dim,
+                embedding_blob,
+                updated_at_epoch_ms
+             FROM llm_symbol_doc
+             ORDER BY node_id ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut docs = Vec::new();
+        while let Some(row) = rows.next()? {
+            let kind: i32 = row.get(2)?;
+            let embedding_dim: i64 = row.get(9)?;
+            let embedding_blob: Vec<u8> = row.get(10)?;
+            docs.push(LlmSymbolDoc {
+                node_id: NodeId(row.get(0)?),
+                file_node_id: row.get::<_, Option<i64>>(1)?.map(NodeId),
+                kind: NodeKind::try_from(kind)?,
+                display_name: row.get(3)?,
+                qualified_name: row.get(4)?,
+                file_path: row.get(5)?,
+                start_line: row.get(6)?,
+                doc_text: row.get(7)?,
+                embedding_model: row.get(8)?,
+                embedding_dim: embedding_dim.max(0) as u32,
+                embedding: decode_embedding_blob(&embedding_blob)?,
+                updated_at_epoch_ms: row.get(11)?,
+            });
+        }
+        Ok(docs)
+    }
+
+    pub fn delete_llm_symbol_docs_for_file(
+        &mut self,
+        file_node_id: NodeId,
+    ) -> Result<usize, StorageError> {
+        let removed = self.conn.execute(
+            "DELETE FROM llm_symbol_doc WHERE file_node_id = ?1",
+            params![file_node_id.0],
+        )?;
+        Ok(removed)
     }
 
     pub fn get_occurrences(&self) -> Result<Vec<Occurrence>, StorageError> {
@@ -814,6 +1002,15 @@ impl Storage {
             params![file_node_id],
         )?;
 
+        tx.execute(
+            &format!(
+                "DELETE FROM llm_symbol_doc
+                 WHERE node_id IN ({RELATED_NODE_SUBQUERY})
+                 OR file_node_id = ?1"
+            ),
+            params![file_node_id],
+        )?;
+
         // Remove any node references in other projection tables.
         let removed_nodes = tx.execute(
             "DELETE FROM node WHERE id = ?1 OR file_node_id = ?1",
@@ -1033,6 +1230,29 @@ fn deserialize_candidate_targets(payload: Option<&str>) -> Result<Vec<NodeId>, S
     let parsed: Vec<i64> = serde_json::from_str(payload)
         .map_err(|e| StorageError::Other(format!("failed to parse edge candidate payload: {e}")))?;
     Ok(parsed.into_iter().map(NodeId).collect())
+}
+
+fn encode_embedding_blob(values: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * std::mem::size_of::<f32>());
+    for value in values {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+fn decode_embedding_blob(blob: &[u8]) -> Result<Vec<f32>, StorageError> {
+    if blob.len() % std::mem::size_of::<f32>() != 0 {
+        return Err(StorageError::Other(
+            "invalid embedding blob length: expected multiple of 4 bytes".to_string(),
+        ));
+    }
+
+    let mut out = Vec::with_capacity(blob.len() / std::mem::size_of::<f32>());
+    for chunk in blob.chunks_exact(std::mem::size_of::<f32>()) {
+        let bytes: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        out.push(f32::from_le_bytes(bytes));
+    }
+    Ok(out)
 }
 
 fn neighbor_for_direction(

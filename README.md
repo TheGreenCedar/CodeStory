@@ -103,6 +103,40 @@ Regenerate shared TypeScript API bindings (repo root):
 cargo run -p codestory-server -- --types-only --types-out codestory-ui/src/generated/api.ts
 ```
 
+## LLM Retrieval Configuration (Local-Only)
+
+`/api/agent/ask` now expects a local semantic embedding setup by default.
+
+- `CODESTORY_EMBED_MODEL_PATH` (required for hybrid retrieval): absolute path to a local embedding model artifact.
+- `CODESTORY_EMBED_MODEL_ID` (optional): identifier recorded with stored embeddings.
+- `CODESTORY_EMBED_TOKENIZER_PATH` (optional): tokenizer JSON path. Defaults to `tokenizer.json` next to the model.
+- `CODESTORY_EMBED_RUNTIME_MODE` (optional, default `onnx`): set to `hash` for deterministic local dev/benchmark embeddings.
+- `CODESTORY_HYBRID_RETRIEVAL_ENABLED` (optional, default `true`): set to `false`/`0` for lexical rollback mode.
+- `CODESTORY_CORS_ALLOW_ANY` (optional, default `false`): set to `true` only when you intentionally need permissive cross-origin access.
+
+Default CORS policy is local-first and explicit:
+- `http://127.0.0.1:<server-port>`
+- `http://localhost:<server-port>`
+- `http://127.0.0.1:5173`
+- `http://localhost:5173`
+
+The server still defaults to `127.0.0.1:7878`. If you bind `--host` to a non-loopback address, startup logs a warning.
+
+Examples:
+
+```powershell
+$env:CODESTORY_EMBED_MODEL_PATH = "C:\models\all-minilm-l6-v2.onnx"
+$env:CODESTORY_EMBED_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
+cargo run -p codestory-server -- --project .
+```
+
+Rollback example:
+
+```powershell
+$env:CODESTORY_HYBRID_RETRIEVAL_ENABLED = "false"
+cargo run -p codestory-server -- --project .
+```
+
 ## Repository Layout
 
 - Workspace manifest: `Cargo.toml`

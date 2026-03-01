@@ -134,6 +134,39 @@ fn test_component_access_round_trip() -> Result<(), StorageError> {
 }
 
 #[test]
+fn test_llm_symbol_doc_round_trip() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[Node {
+        id: NodeId(501),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "do_work".to_string(),
+        ..Default::default()
+    }])?;
+
+    storage.upsert_llm_symbol_docs_batch(&[LlmSymbolDoc {
+        node_id: NodeId(501),
+        file_node_id: None,
+        kind: NodeKind::FUNCTION,
+        display_name: "pkg::do_work".to_string(),
+        qualified_name: Some("pkg::do_work".to_string()),
+        file_path: Some("src/lib.rs".to_string()),
+        start_line: Some(12),
+        doc_text: "function pkg::do_work in src/lib.rs line 12".to_string(),
+        embedding_model: "local-hash-384".to_string(),
+        embedding_dim: 384,
+        embedding: vec![0.25_f32; 384],
+        updated_at_epoch_ms: 123,
+    }])?;
+
+    let docs = storage.get_llm_symbol_docs_by_node_ids(&[NodeId(501)])?;
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].node_id, NodeId(501));
+    assert_eq!(docs[0].embedding_dim, 384);
+    assert_eq!(docs[0].embedding.len(), 384);
+    Ok(())
+}
+
+#[test]
 fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
     let file_node = Node {
@@ -204,6 +237,7 @@ fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
     for table in [
         "occurrence",
         "edge",
+        "llm_symbol_doc",
         "component_access",
         "bookmark_node",
         "local_symbol",
@@ -424,6 +458,20 @@ fn test_delete_file_projection() -> Result<(), StorageError> {
         is_fatal: false,
         index_step: codestory_core::IndexStep::Indexing,
     })?;
+    storage.upsert_llm_symbol_docs_batch(&[LlmSymbolDoc {
+        node_id: func_node.id,
+        file_node_id: Some(file_node.id),
+        kind: NodeKind::FUNCTION,
+        display_name: "foo".to_string(),
+        qualified_name: None,
+        file_path: Some("src/main.rs".to_string()),
+        start_line: Some(1),
+        doc_text: "foo symbol".to_string(),
+        embedding_model: "local-hash-384".to_string(),
+        embedding_dim: 384,
+        embedding: vec![0.1_f32; 384],
+        updated_at_epoch_ms: 1,
+    }])?;
 
     let category_id = storage.create_bookmark_category("Cat")?;
     let _ = storage.add_bookmark(category_id, func_node.id, Some("test"))?;
@@ -439,6 +487,7 @@ fn test_delete_file_projection() -> Result<(), StorageError> {
     assert!(storage.get_nodes()?.is_empty());
     assert!(storage.get_edges()?.is_empty());
     assert!(storage.get_occurrences()?.is_empty());
+    assert!(storage.get_all_llm_symbol_docs()?.is_empty());
     assert!(storage.get_errors(None)?.is_empty());
     assert!(storage.get_bookmarks(Some(category_id))?.is_empty());
 

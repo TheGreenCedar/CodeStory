@@ -1,16 +1,16 @@
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::trace::{TraceRecorder, field};
 use crate::{
-    AppController, FocusedSourceContext, LocalAgentResponse, agent_backend_label,
-    build_local_agent_prompt, configured_agent_command, markdown_snippet, mermaid_flowchart,
-    mermaid_gantt, mermaid_sequence,
+    AppController, FocusedSourceContext, HybridSearchScoredHit, LocalAgentResponse,
+    agent_backend_label, build_local_agent_prompt, configured_agent_command,
+    hybrid_retrieval_enabled, markdown_snippet, mermaid_flowchart, mermaid_gantt, mermaid_sequence,
 };
 use codestory_api::{
-    AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentResponseBlockDto,
+    AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentResponseBlockDto, AgentResponseModeDto,
     AgentResponseSectionDto, AgentRetrievalPolicyModeDto, AgentRetrievalStepKindDto, ApiError,
-    GraphArtifactDto, GraphRequest, GraphResponse, NodeDetailsDto, NodeDetailsRequest,
-    NodeOccurrencesRequest, ReadFileTextRequest, SearchHit, SearchRequest, TrailConfigDto,
-    TrailFilterOptionsDto,
+    EdgeId, GraphArtifactDto, GraphRequest, GraphResponse, NodeDetailsDto, NodeDetailsRequest,
+    NodeOccurrencesRequest, ReadFileTextRequest, RetrievalScoreBreakdownDto, SearchHit,
+    SearchRequest, TrailConfigDto, TrailFilterOptionsDto,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -19,11 +19,44 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_MAX_RESULTS: u32 = 8;
 const DEFAULT_MAX_EDGES: u32 = 260;
-const LATENCY_PHASE_DEADLINE_MS: u128 = 7_000;
 const DEFAULT_SLA_TARGET_MS: u32 = 18_000;
-const SEARCH_LOOP_MAX_TERMS_LATENCY: usize = 3;
-const SEARCH_LOOP_MAX_TERMS_COMPLETENESS: usize = 6;
-const AGENT_TERM_PLANNER_MAX_TERMS: usize = 6;
+const MIN_PHASE_DEADLINE_MS: u128 = 750;
+const RETRIEVAL_VERSION_HYBRID: &str = "hybrid-v1";
+const RETRIEVAL_VERSION_LEXICAL_ROLLBACK: &str = "lexical-rollback-v1";
+
+fn retrieval_version() -> &'static str {
+    if hybrid_retrieval_enabled() {
+        RETRIEVAL_VERSION_HYBRID
+    } else {
+        RETRIEVAL_VERSION_LEXICAL_ROLLBACK
+    }
+}
+
+fn latency_budget_ms(req: &AgentAskRequest) -> u128 {
+    req.latency_budget_ms
+        .unwrap_or(DEFAULT_SLA_TARGET_MS)
+        .clamp(1_000, 120_000) as u128
+}
+
+fn phase_deadline_ms(req: &AgentAskRequest, numerator: u128, denominator: u128) -> u128 {
+    let budget = latency_budget_ms(req);
+    let scaled = budget
+        .saturating_mul(numerator)
+        .checked_div(denominator.max(1))
+        .unwrap_or(budget);
+    scaled.max(MIN_PHASE_DEADLINE_MS).min(budget)
+}
+
+fn should_truncate_phase(
+    resolved_profile: &ResolvedProfile,
+    ask_started_at: Instant,
+    deadline_ms: u128,
+) -> bool {
+    matches!(
+        resolved_profile.policy_mode,
+        AgentRetrievalPolicyModeDto::LatencyFirst
+    ) && ask_started_at.elapsed().as_millis() > deadline_ms
+}
 
 #[derive(Debug, Clone, Default)]
 struct RetrievalBundle {
@@ -46,13 +79,25 @@ pub(crate) fn agent_ask(
 
     let request_id = next_request_id();
     let resolved_profile = resolve_profile(&prompt, &req.retrieval_profile);
-    let mut trace = TraceRecorder::new(Some(DEFAULT_SLA_TARGET_MS));
+    let sla_target_ms = req
+        .latency_budget_ms
+        .unwrap_or(DEFAULT_SLA_TARGET_MS)
+        .clamp(1_000, 120_000);
+    let mut trace = TraceRecorder::new(Some(sla_target_ms));
     let ask_started_at = Instant::now();
 
-    let mut bundle = execute_retrieval(controller, &req, &prompt, &resolved_profile, &mut trace)?;
+    let mut bundle = execute_retrieval(
+        controller,
+        &req,
+        &prompt,
+        ask_started_at,
+        &resolved_profile,
+        &mut trace,
+    )?;
 
     let source_context = maybe_read_source_context(
         controller,
+        &req,
         &prompt,
         &resolved_profile,
         ask_started_at,
@@ -60,7 +105,14 @@ pub(crate) fn agent_ask(
         &mut trace,
     );
 
-    let mermaid_graphs = build_mermaid_artifacts(&resolved_profile, &prompt, &bundle, &mut trace);
+    let mermaid_graphs = build_mermaid_artifacts(
+        &resolved_profile,
+        &req,
+        &prompt,
+        ask_started_at,
+        &bundle,
+        &mut trace,
+    );
     bundle.graphs.extend(mermaid_graphs);
 
     let local_agent_prompt = build_local_agent_prompt(
@@ -143,6 +195,15 @@ pub(crate) fn agent_ask(
         summary,
         sections,
         citations: bundle.citations,
+        subgraph_ids: bundle
+            .graphs
+            .iter()
+            .map(|graph| match graph {
+                GraphArtifactDto::Uml { id, .. } => id.clone(),
+                GraphArtifactDto::Mermaid { id, .. } => id.clone(),
+            })
+            .collect(),
+        retrieval_version: retrieval_version().to_string(),
         graphs: bundle.graphs,
         retrieval_trace: trace_payload,
     })
@@ -152,87 +213,52 @@ fn execute_retrieval(
     controller: &AppController,
     req: &AgentAskRequest,
     prompt: &str,
+    ask_started_at: Instant,
     resolved_profile: &ResolvedProfile,
     trace: &mut TraceRecorder,
 ) -> Result<RetrievalBundle, ApiError> {
     let mut bundle = RetrievalBundle::default();
+    let semantic_required = hybrid_retrieval_enabled();
 
     let search_step = trace.start_step(
         AgentRetrievalStepKindDto::Search,
         vec![field("query_chars", prompt.len().to_string())],
     );
-    let mut hits = controller.search(SearchRequest {
-        query: prompt.to_string(),
-    })?;
+    let semantic_query_step = trace.start_step(
+        AgentRetrievalStepKindDto::SemanticQueryEmbedding,
+        vec![field("required", semantic_required.to_string())],
+    );
+    let semantic_candidates_step = trace.start_step(
+        AgentRetrievalStepKindDto::SemanticCandidateRetrieval,
+        vec![field("required", semantic_required.to_string())],
+    );
+    let hybrid_rerank_step = trace.start_step(
+        AgentRetrievalStepKindDto::HybridRerank,
+        vec![field("required", semantic_required.to_string())],
+    );
 
     let max_results = req.max_results.unwrap_or(DEFAULT_MAX_RESULTS).clamp(1, 25) as usize;
-    if hits.len() < max_results {
-        let loop_budget = if matches!(
-            resolved_profile.policy_mode,
-            AgentRetrievalPolicyModeDto::CompletenessFirst
-        ) {
-            SEARCH_LOOP_MAX_TERMS_COMPLETENESS
-        } else {
-            SEARCH_LOOP_MAX_TERMS_LATENCY
-        };
-
-        let agent_terms = if should_use_agent_term_planner(prompt, hits.len()) {
-            request_agent_search_terms(
-                controller,
-                req,
-                prompt,
-                &hits,
-                trace,
-                AGENT_TERM_PLANNER_MAX_TERMS,
-            )
-        } else {
-            Vec::new()
-        };
-        let heuristic_terms = prompt_search_terms(prompt);
-        let mut combined_terms = Vec::<String>::new();
-        let mut seen_terms = HashSet::<String>::new();
-        for term in agent_terms.into_iter().chain(heuristic_terms.into_iter()) {
-            let key = term.to_ascii_lowercase();
-            if seen_terms.insert(key) {
-                combined_terms.push(term);
-            }
+    let scored_hits = match controller.search_hybrid_scored(
+        SearchRequest {
+            query: prompt.to_string(),
+        },
+        req.focus_node_id.clone(),
+        max_results,
+        req.hybrid_weights.clone(),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            trace.finish_err(search_step, error.message.clone());
+            trace.finish_err(semantic_query_step, error.message.clone());
+            trace.finish_err(semantic_candidates_step, error.message.clone());
+            trace.finish_err(hybrid_rerank_step, error.message.clone());
+            return Err(error);
         }
-
-        let mut loop_runs = 0usize;
-        for term in combined_terms.into_iter().take(loop_budget) {
-            if hits.len() >= max_results {
-                break;
-            }
-
-            match controller.search(SearchRequest {
-                query: term.to_string(),
-            }) {
-                Ok(extra_hits) => {
-                    loop_runs += 1;
-                    merge_search_hits(&mut hits, extra_hits, max_results * 3);
-                }
-                Err(error) => {
-                    trace.annotate(format!(
-                        "Search loop term '{}' failed: {}",
-                        term, error.message
-                    ));
-                }
-            }
-        }
-
-        if loop_runs > 0 {
-            trace.annotate(format!(
-                "Search loop executed {} term query(ies).",
-                loop_runs
-            ));
-        } else {
-            trace.annotate("Search loop did not run additional term queries.");
-        }
-    }
-
-    if hits.len() > max_results {
-        hits.truncate(max_results);
-    }
+    };
+    let hits = scored_hits
+        .iter()
+        .map(|scored| scored.hit.clone())
+        .collect::<Vec<_>>();
 
     trace.finish_ok(
         search_step,
@@ -241,6 +267,38 @@ fn execute_retrieval(
             field("max_results", max_results.to_string()),
         ],
     );
+    if semantic_required {
+        trace.finish_ok(
+            semantic_query_step,
+            vec![
+                field("model_required", "local"),
+                field("query_embedded", "true"),
+            ],
+        );
+        trace.finish_ok(
+            semantic_candidates_step,
+            vec![field("candidates", scored_hits.len().to_string())],
+        );
+        trace.finish_ok(
+            hybrid_rerank_step,
+            vec![field("ranked", hits.len().to_string())],
+        );
+    } else {
+        trace.finish_skipped(
+            semantic_query_step,
+            "Hybrid retrieval disabled by CODESTORY_HYBRID_RETRIEVAL_ENABLED=false.",
+            Vec::new(),
+        );
+        trace.finish_skipped(
+            semantic_candidates_step,
+            "Hybrid retrieval disabled by CODESTORY_HYBRID_RETRIEVAL_ENABLED=false.",
+            Vec::new(),
+        );
+        trace.finish_ok(
+            hybrid_rerank_step,
+            vec![field("ranked", hits.len().to_string())],
+        );
+    }
 
     let focus_node_id = req
         .focus_node_id
@@ -408,26 +466,39 @@ fn execute_retrieval(
         AgentRetrievalStepKindDto::NodeOccurrences,
         vec![field("candidates", hits.len().min(3).to_string())],
     );
-    let mut occurrence_count = 0usize;
-    for hit in hits.iter().take(3) {
-        match controller.node_occurrences(NodeOccurrencesRequest {
-            id: hit.node_id.clone(),
-        }) {
-            Ok(occurrences) => {
-                occurrence_count += occurrences.len();
-            }
-            Err(error) => {
-                trace.annotate(format!(
-                    "Node occurrence lookup failed for {}: {}",
-                    hit.display_name, error.message
-                ));
+    let node_occurrence_deadline = phase_deadline_ms(req, 65, 100);
+    if should_truncate_phase(resolved_profile, ask_started_at, node_occurrence_deadline) {
+        trace.finish_truncated(
+            occurrences_step,
+            "Skipped node occurrence lookups because latency budget was exceeded.",
+            vec![field(
+                "phase_deadline_ms",
+                node_occurrence_deadline.to_string(),
+            )],
+        );
+        trace.annotate("Latency-first cutoff skipped node occurrence lookups.");
+    } else {
+        let mut occurrence_count = 0usize;
+        for hit in hits.iter().take(3) {
+            match controller.node_occurrences(NodeOccurrencesRequest {
+                id: hit.node_id.clone(),
+            }) {
+                Ok(occurrences) => {
+                    occurrence_count += occurrences.len();
+                }
+                Err(error) => {
+                    trace.annotate(format!(
+                        "Node occurrence lookup failed for {}: {}",
+                        hit.display_name, error.message
+                    ));
+                }
             }
         }
+        trace.finish_ok(
+            occurrences_step,
+            vec![field("occurrence_count", occurrence_count.to_string())],
+        );
     }
-    trace.finish_ok(
-        occurrences_step,
-        vec![field("occurrence_count", occurrence_count.to_string())],
-    );
 
     let edge_occurrences_step = trace.start_step(
         AgentRetrievalStepKindDto::EdgeOccurrences,
@@ -436,7 +507,18 @@ fn execute_retrieval(
             resolved_profile.include_edge_occurrences.to_string(),
         )],
     );
-    if !resolved_profile.include_edge_occurrences {
+    let edge_occurrence_deadline = phase_deadline_ms(req, 75, 100);
+    if should_truncate_phase(resolved_profile, ask_started_at, edge_occurrence_deadline) {
+        trace.finish_truncated(
+            edge_occurrences_step,
+            "Skipped edge occurrence lookup because latency budget was exceeded.",
+            vec![field(
+                "phase_deadline_ms",
+                edge_occurrence_deadline.to_string(),
+            )],
+        );
+        trace.annotate("Latency-first cutoff skipped edge occurrence lookups.");
+    } else if !resolved_profile.include_edge_occurrences {
         trace.finish_skipped(
             edge_occurrences_step,
             "Edge occurrences are disabled for this profile.",
@@ -462,15 +544,21 @@ fn execute_retrieval(
         );
     }
 
-    let citations = hits
+    let primary_subgraph_id = bundle.graphs.first().map(|graph| match graph {
+        GraphArtifactDto::Uml { id, .. } => id.clone(),
+        GraphArtifactDto::Mermaid { id, .. } => id.clone(),
+    });
+    let include_structured_evidence =
+        req.include_evidence || matches!(req.response_mode, AgentResponseModeDto::Structured);
+    let citations = scored_hits
         .iter()
-        .map(|hit| AgentCitationDto {
-            node_id: hit.node_id.clone(),
-            display_name: hit.display_name.clone(),
-            kind: hit.kind,
-            file_path: hit.file_path.clone(),
-            line: hit.line,
-            score: hit.score,
+        .map(|scored| {
+            to_citation(
+                scored,
+                primary_subgraph_id.as_deref(),
+                primary_graph.as_ref(),
+                include_structured_evidence,
+            )
         })
         .collect::<Vec<_>>();
 
@@ -481,6 +569,53 @@ fn execute_retrieval(
     bundle.primary_graph = primary_graph;
 
     Ok(bundle)
+}
+
+fn to_citation(
+    scored: &HybridSearchScoredHit,
+    subgraph_id: Option<&str>,
+    primary_graph: Option<&GraphResponse>,
+    include_evidence: bool,
+) -> AgentCitationDto {
+    AgentCitationDto {
+        node_id: scored.hit.node_id.clone(),
+        display_name: scored.hit.display_name.clone(),
+        kind: scored.hit.kind,
+        file_path: scored.hit.file_path.clone(),
+        line: scored.hit.line,
+        score: scored.total_score,
+        subgraph_id: subgraph_id.map(ToOwned::to_owned),
+        evidence_edge_ids: if include_evidence {
+            evidence_edge_ids_for_node(primary_graph, &scored.hit.node_id)
+        } else {
+            Vec::new()
+        },
+        retrieval_score_breakdown: include_evidence.then_some(RetrievalScoreBreakdownDto {
+            lexical: scored.lexical_score,
+            semantic: scored.semantic_score,
+            graph: scored.graph_score,
+            total: scored.total_score,
+        }),
+    }
+}
+
+fn evidence_edge_ids_for_node(
+    primary_graph: Option<&GraphResponse>,
+    node_id: &codestory_api::NodeId,
+) -> Vec<EdgeId> {
+    let Some(graph) = primary_graph else {
+        return Vec::new();
+    };
+
+    let mut edge_ids = graph
+        .edges
+        .iter()
+        .filter(|edge| edge.source == *node_id || edge.target == *node_id)
+        .map(|edge| edge.id.clone())
+        .collect::<Vec<_>>();
+    edge_ids.sort_by(|left, right| left.0.cmp(&right.0));
+    edge_ids.truncate(12);
+    edge_ids
 }
 
 fn sanitize_plan_filters(plan: &TrailPlan, options: &TrailFilterOptionsDto) -> TrailPlan {
@@ -503,6 +638,7 @@ fn sanitize_plan_filters(plan: &TrailPlan, options: &TrailFilterOptionsDto) -> T
 
 fn maybe_read_source_context(
     controller: &AppController,
+    req: &AgentAskRequest,
     prompt: &str,
     resolved_profile: &ResolvedProfile,
     ask_started_at: Instant,
@@ -535,18 +671,12 @@ fn maybe_read_source_context(
         return None;
     }
 
-    if matches!(
-        resolved_profile.policy_mode,
-        AgentRetrievalPolicyModeDto::LatencyFirst
-    ) && ask_started_at.elapsed().as_millis() > LATENCY_PHASE_DEADLINE_MS
-    {
+    let source_deadline = phase_deadline_ms(req, 50, 100);
+    if should_truncate_phase(resolved_profile, ask_started_at, source_deadline) {
         trace.finish_truncated(
             source_step,
             "Skipped source read because latency-first phase budget was exceeded.",
-            vec![field(
-                "phase_deadline_ms",
-                LATENCY_PHASE_DEADLINE_MS.to_string(),
-            )],
+            vec![field("phase_deadline_ms", source_deadline.to_string())],
         );
         trace.annotate("Latency-first cutoff skipped source reads.");
         return None;
@@ -605,7 +735,9 @@ fn needs_source_context(prompt: &str) -> bool {
 
 fn build_mermaid_artifacts(
     profile: &ResolvedProfile,
+    req: &AgentAskRequest,
     prompt: &str,
+    ask_started_at: Instant,
     bundle: &RetrievalBundle,
     trace: &mut TraceRecorder,
 ) -> Vec<GraphArtifactDto> {
@@ -615,6 +747,16 @@ fn build_mermaid_artifacts(
     );
 
     let mut artifacts = Vec::new();
+    let mermaid_deadline = phase_deadline_ms(req, 85, 100);
+    if should_truncate_phase(profile, ask_started_at, mermaid_deadline) {
+        trace.finish_truncated(
+            mermaid_step,
+            "Skipped mermaid synthesis because latency budget was exceeded.",
+            vec![field("phase_deadline_ms", mermaid_deadline.to_string())],
+        );
+        trace.annotate("Latency-first cutoff skipped mermaid synthesis.");
+        return artifacts;
+    }
 
     let primary_graph = bundle
         .primary_graph
@@ -1118,8 +1260,24 @@ mod tests {
     fn mermaid_builder_guarantees_fallback_diagram() {
         let mut trace = TraceRecorder::new(Some(DEFAULT_SLA_TARGET_MS));
         let bundle = RetrievalBundle::default();
-        let artifacts =
-            build_mermaid_artifacts(&latency_profile(), "inspect this", &bundle, &mut trace);
+        let artifacts = build_mermaid_artifacts(
+            &latency_profile(),
+            &AgentAskRequest {
+                prompt: "inspect this".to_string(),
+                retrieval_profile: codestory_api::AgentRetrievalProfileSelectionDto::Auto,
+                focus_node_id: None,
+                max_results: None,
+                response_mode: AgentResponseModeDto::Markdown,
+                latency_budget_ms: None,
+                include_evidence: true,
+                hybrid_weights: None,
+                connection: codestory_api::AgentConnectionSettingsDto::default(),
+            },
+            "inspect this",
+            Instant::now(),
+            &bundle,
+            &mut trace,
+        );
 
         assert_eq!(artifacts.len(), 1);
         assert!(matches!(artifacts[0], GraphArtifactDto::Mermaid { .. }));
@@ -1208,5 +1366,52 @@ mod tests {
         assert_eq!(into.len(), 2);
         assert_eq!(into[0].node_id.0, "1");
         assert_eq!(into[0].score, 42.0);
+    }
+
+    #[test]
+    fn evidence_edge_ids_are_sorted_and_filtered() {
+        let graph = GraphResponse {
+            center_id: codestory_api::NodeId("1".to_string()),
+            nodes: Vec::new(),
+            edges: vec![
+                codestory_api::GraphEdgeDto {
+                    id: EdgeId("8".to_string()),
+                    source: codestory_api::NodeId("2".to_string()),
+                    target: codestory_api::NodeId("3".to_string()),
+                    kind: codestory_api::EdgeKind::CALL,
+                    confidence: None,
+                    certainty: None,
+                    callsite_identity: None,
+                    candidate_targets: Vec::new(),
+                },
+                codestory_api::GraphEdgeDto {
+                    id: EdgeId("3".to_string()),
+                    source: codestory_api::NodeId("4".to_string()),
+                    target: codestory_api::NodeId("2".to_string()),
+                    kind: codestory_api::EdgeKind::CALL,
+                    confidence: None,
+                    certainty: None,
+                    callsite_identity: None,
+                    candidate_targets: Vec::new(),
+                },
+                codestory_api::GraphEdgeDto {
+                    id: EdgeId("9".to_string()),
+                    source: codestory_api::NodeId("7".to_string()),
+                    target: codestory_api::NodeId("8".to_string()),
+                    kind: codestory_api::EdgeKind::CALL,
+                    confidence: None,
+                    certainty: None,
+                    callsite_identity: None,
+                    candidate_targets: Vec::new(),
+                },
+            ],
+            truncated: false,
+            canonical_layout: None,
+        };
+
+        let evidence =
+            evidence_edge_ids_for_node(Some(&graph), &codestory_api::NodeId("2".to_string()));
+        let ids = evidence.into_iter().map(|id| id.0).collect::<Vec<_>>();
+        assert_eq!(ids, vec!["3".to_string(), "8".to_string()]);
     }
 }

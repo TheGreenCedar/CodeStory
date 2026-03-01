@@ -3,6 +3,7 @@ use async_stream::stream;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
+    http::HeaderValue,
     http::StatusCode,
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, patch, post},
@@ -10,28 +11,33 @@ use axum::{
 use clap::Parser;
 use codestory_api::{
     AgentAnswerDto, AgentAskRequest, AgentBackend, AgentCitationDto, AgentConnectionSettingsDto,
-    AgentCustomRetrievalConfigDto, AgentResponseBlockDto, AgentResponseSectionDto,
-    AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto,
-    AgentRetrievalStepDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
-    AgentRetrievalSummaryFieldDto, AgentRetrievalTraceDto, ApiError, AppEventPayload,
-    BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId,
-    EdgeKind, EdgeOccurrencesRequest, GraphArtifactDto, GraphEdgeDto, GraphNodeDto, GraphRequest,
-    GraphResponse, IndexMode, LayoutDirection, ListChildrenSymbolsRequest, ListRootSymbolsRequest,
-    MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest,
+    AgentCustomRetrievalConfigDto, AgentHybridWeightsDto, AgentResponseBlockDto,
+    AgentResponseModeDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
+    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AgentRetrievalStepDto,
+    AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, AgentRetrievalSummaryFieldDto,
+    AgentRetrievalTraceDto, ApiError, AppEventPayload, BookmarkCategoryDto, BookmarkDto,
+    CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest,
+    GraphArtifactDto, GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse, IndexMode,
+    LayoutDirection, ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess,
+    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest,
     OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest, ProjectSummary,
-    ReadFileTextRequest, ReadFileTextResponse, SearchHit, SearchRequest, SetUiLayoutRequest,
-    SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto, SymbolSummaryDto,
-    SystemActionResponse, TrailCallerScope, TrailConfigDto, TrailDirection, TrailFilterOptionsDto,
-    TrailMode, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WriteFileResponse,
-    WriteFileTextRequest,
+    ReadFileTextRequest, ReadFileTextResponse, RetrievalScoreBreakdownDto, SearchHit,
+    SearchRequest, SetUiLayoutRequest, SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto,
+    SymbolSummaryDto, SystemActionResponse, TrailCallerScope, TrailConfigDto, TrailDirection,
+    TrailFilterOptionsDto, TrailMode, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
+    WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_app::AppController;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use specta::TypeCollection;
 use specta_typescript::Typescript;
 use std::convert::Infallible;
+use std::env;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::{Path as StdPath, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -99,10 +105,23 @@ struct HealthResponse {
     status: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+struct ApiCapabilitiesResponse {
+    version: &'static str,
+    retrieval_version: &'static str,
+    retrieval_versions: Vec<&'static str>,
+    local_only: bool,
+    semantic_retrieval_required: bool,
+    rollback_env_flag: &'static str,
+    endpoints: Vec<&'static str>,
+}
+
 #[derive(Debug, Deserialize)]
 struct BookmarksQuery {
     category_id: Option<String>,
 }
+
+const CORS_ALLOW_ANY_ENV: &str = "CODESTORY_CORS_ALLOW_ANY";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -152,6 +171,9 @@ async fn main() -> Result<()> {
         .route("/index/start", post(start_indexing))
         .route("/search", post(search))
         .route("/agent/ask", post(agent_ask))
+        .route("/capabilities", get(capabilities))
+        .route("/schema/agent-ask", get(schema_agent_ask))
+        .route("/schema/agent-answer", get(schema_agent_answer))
         .route("/graph/neighborhood", post(graph_neighborhood))
         .route("/graph/trail", post(graph_trail))
         .route(
@@ -188,12 +210,7 @@ async fn main() -> Result<()> {
     let mut app = Router::new()
         .nest("/api", api_routes)
         .layer(TraceLayer::new_for_http())
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(configure_cors(&args.host, args.port))
         .with_state(state);
 
     if args.frontend_dist.exists() {
@@ -205,11 +222,72 @@ async fn main() -> Result<()> {
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)
         .parse()
         .context("Failed to parse server address")?;
+    if !is_loopback_host(&args.host) {
+        tracing::warn!(
+            host = %args.host,
+            "Binding server to non-loopback host; use only on trusted local networks"
+        );
+    }
     info!(%addr, "Starting CodeStory server");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn configure_cors(host: &str, port: u16) -> CorsLayer {
+    if bool_env(CORS_ALLOW_ANY_ENV) {
+        return CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any);
+    }
+
+    let mut origins = vec![
+        format!("http://127.0.0.1:{port}"),
+        format!("http://localhost:{port}"),
+        "http://127.0.0.1:5173".to_string(),
+        "http://localhost:5173".to_string(),
+    ];
+
+    if !is_loopback_host(host) {
+        origins.push(format!("http://{host}:{port}"));
+    }
+
+    let mut header_origins = Vec::with_capacity(origins.len());
+    for origin in origins {
+        if let Ok(value) = HeaderValue::from_str(&origin) {
+            if !header_origins.iter().any(|existing| existing == &value) {
+                header_origins.push(value);
+            }
+        }
+    }
+
+    CorsLayer::new()
+        .allow_origin(header_origins)
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
+
+fn bool_env(var: &str) -> bool {
+    env::var(var)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    IpAddr::from_str(host)
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 fn collect_types() -> TypeCollection {
@@ -264,12 +342,15 @@ fn collect_types() -> TypeCollection {
         .register::<SetUiLayoutRequest>()
         .register::<AgentBackend>()
         .register::<AgentConnectionSettingsDto>()
+        .register::<AgentResponseModeDto>()
         .register::<AgentRetrievalPresetDto>()
         .register::<AgentRetrievalPolicyModeDto>()
         .register::<AgentCustomRetrievalConfigDto>()
+        .register::<AgentHybridWeightsDto>()
         .register::<AgentRetrievalProfileSelectionDto>()
         .register::<AgentAskRequest>()
         .register::<AgentCitationDto>()
+        .register::<RetrievalScoreBreakdownDto>()
         .register::<AgentResponseBlockDto>()
         .register::<AgentResponseSectionDto>()
         .register::<AgentRetrievalSummaryFieldDto>()
@@ -301,6 +382,80 @@ fn write_typescript_bindings(path: &StdPath) -> Result<()> {
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+async fn capabilities() -> Json<ApiCapabilitiesResponse> {
+    Json(ApiCapabilitiesResponse {
+        version: "v1",
+        retrieval_version: "hybrid-v1",
+        retrieval_versions: vec!["hybrid-v1", "lexical-rollback-v1"],
+        local_only: true,
+        semantic_retrieval_required: true,
+        rollback_env_flag: "CODESTORY_HYBRID_RETRIEVAL_ENABLED",
+        endpoints: vec![
+            "/api/agent/ask",
+            "/api/search",
+            "/api/graph/neighborhood",
+            "/api/graph/trail",
+            "/api/schema/agent-ask",
+            "/api/schema/agent-answer",
+        ],
+    })
+}
+
+async fn schema_agent_ask() -> Json<serde_json::Value> {
+    Json(json!({
+        "title": "AgentAskRequest",
+        "type": "object",
+        "required": ["prompt"],
+        "properties": {
+            "prompt": { "type": "string" },
+            "retrieval_profile": { "type": "object" },
+            "focus_node_id": { "type": ["string", "null"] },
+            "max_results": { "type": ["integer", "null"], "minimum": 1, "maximum": 25 },
+            "response_mode": { "type": "string", "enum": ["markdown", "structured"] },
+            "latency_budget_ms": { "type": ["integer", "null"], "minimum": 1000 },
+            "include_evidence": { "type": "boolean" },
+            "hybrid_weights": {
+                "type": ["object", "null"],
+                "properties": {
+                    "lexical": { "type": ["number", "null"], "minimum": 0.0, "maximum": 1.0 },
+                    "semantic": { "type": ["number", "null"], "minimum": 0.0, "maximum": 1.0 },
+                    "graph": { "type": ["number", "null"], "minimum": 0.0, "maximum": 1.0 }
+                }
+            },
+            "connection": { "type": "object" }
+        }
+    }))
+}
+
+async fn schema_agent_answer() -> Json<serde_json::Value> {
+    Json(json!({
+        "title": "AgentAnswerDto",
+        "type": "object",
+        "required": [
+            "answer_id",
+            "prompt",
+            "summary",
+            "sections",
+            "citations",
+            "subgraph_ids",
+            "retrieval_version",
+            "graphs",
+            "retrieval_trace"
+        ],
+        "properties": {
+            "answer_id": { "type": "string" },
+            "prompt": { "type": "string" },
+            "summary": { "type": "string" },
+            "sections": { "type": "array" },
+            "citations": { "type": "array" },
+            "subgraph_ids": { "type": "array", "items": { "type": "string" } },
+            "retrieval_version": { "type": "string" },
+            "graphs": { "type": "array" },
+            "retrieval_trace": { "type": "object" }
+        }
+    }))
 }
 
 async fn events_stream(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
@@ -629,4 +784,45 @@ async fn list_children_symbols(
         })
         .map(Json)
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn detects_loopback_hosts() {
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("192.168.1.10"));
+    }
+
+    #[test]
+    fn parses_boolean_env_values() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        const KEY: &str = "CODESTORY_TEST_BOOL_ENV";
+
+        // SAFETY: guarded by process-wide test mutex; test-scoped env mutation.
+        unsafe {
+            env::set_var(KEY, "true");
+        }
+        assert!(bool_env(KEY));
+
+        // SAFETY: guarded by process-wide test mutex; test-scoped env mutation.
+        unsafe {
+            env::set_var(KEY, "0");
+        }
+        assert!(!bool_env(KEY));
+
+        // SAFETY: guarded by process-wide test mutex; test-scoped env mutation.
+        unsafe {
+            env::remove_var(KEY);
+        }
+        assert!(!bool_env(KEY));
+    }
 }

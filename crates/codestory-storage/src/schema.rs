@@ -86,6 +86,22 @@ const TABLE_STATEMENTS: &[&str] = &[
         FOREIGN KEY(category_id) REFERENCES bookmark_category(id),
         FOREIGN KEY(node_id) REFERENCES node(id)
     )",
+    "CREATE TABLE IF NOT EXISTS llm_symbol_doc (
+        node_id INTEGER PRIMARY KEY,
+        file_node_id INTEGER,
+        kind INTEGER NOT NULL,
+        display_name TEXT NOT NULL,
+        qualified_name TEXT,
+        file_path TEXT,
+        start_line INTEGER,
+        doc_text TEXT NOT NULL,
+        embedding_model TEXT NOT NULL,
+        embedding_dim INTEGER NOT NULL,
+        embedding_blob BLOB NOT NULL,
+        updated_at_epoch_ms INTEGER NOT NULL,
+        FOREIGN KEY(node_id) REFERENCES node(id),
+        FOREIGN KEY(file_node_id) REFERENCES node(id)
+    )",
 ];
 
 const INDEX_STATEMENTS: &[&str] = &[
@@ -104,6 +120,9 @@ const INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_edge_kind_resolved_target ON edge(kind, resolved_target_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_line ON edge(line)",
     "CREATE INDEX IF NOT EXISTS idx_edge_callsite_identity ON edge(callsite_identity)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_file_node ON llm_symbol_doc(file_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_kind ON llm_symbol_doc(kind)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_updated_at ON llm_symbol_doc(updated_at_epoch_ms)",
 ];
 
 pub(super) fn create_tables(conn: &Connection) -> Result<(), StorageError> {
@@ -134,6 +153,11 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
         storage.set_schema_version(2)?;
     }
 
+    if stored_version < 3 {
+        migrate_v3_llm_symbol_projection(&storage.conn)?;
+        storage.set_schema_version(3)?;
+    }
+
     if stored_version < SCHEMA_VERSION {
         storage.set_schema_version(SCHEMA_VERSION)?;
     }
@@ -146,6 +170,41 @@ pub(super) fn migrate_v2_edge_metadata(conn: &Connection) -> Result<(), StorageE
     try_add_column(conn, "edge", "candidate_target_node_ids TEXT")?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_edge_callsite_identity ON edge(callsite_identity)",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(super) fn migrate_v3_llm_symbol_projection(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS llm_symbol_doc (
+            node_id INTEGER PRIMARY KEY,
+            file_node_id INTEGER,
+            kind INTEGER NOT NULL,
+            display_name TEXT NOT NULL,
+            qualified_name TEXT,
+            file_path TEXT,
+            start_line INTEGER,
+            doc_text TEXT NOT NULL,
+            embedding_model TEXT NOT NULL,
+            embedding_dim INTEGER NOT NULL,
+            embedding_blob BLOB NOT NULL,
+            updated_at_epoch_ms INTEGER NOT NULL,
+            FOREIGN KEY(node_id) REFERENCES node(id),
+            FOREIGN KEY(file_node_id) REFERENCES node(id)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_file_node ON llm_symbol_doc(file_node_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_kind ON llm_symbol_doc(kind)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_updated_at ON llm_symbol_doc(updated_at_epoch_ms)",
         [],
     )?;
     Ok(())
