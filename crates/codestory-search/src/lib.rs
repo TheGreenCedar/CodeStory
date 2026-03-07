@@ -22,6 +22,44 @@ pub const EMBEDDING_MODEL_ID_ENV: &str = "CODESTORY_EMBED_MODEL_ID";
 pub const EMBEDDING_TOKENIZER_ENV: &str = "CODESTORY_EMBED_TOKENIZER_PATH";
 pub const EMBEDDING_MAX_TOKENS_ENV: &str = "CODESTORY_EMBED_MAX_TOKENS";
 pub const EMBEDDING_RUNTIME_MODE_ENV: &str = "CODESTORY_EMBED_RUNTIME_MODE";
+pub const DEFAULT_BUNDLED_EMBED_MODEL_PATH: &str = "models/all-minilm-l6-v2/model.onnx";
+
+fn resolve_bundled_embed_model_path() -> Option<PathBuf> {
+    let relative = PathBuf::from(DEFAULT_BUNDLED_EMBED_MODEL_PATH);
+    let mut candidates = Vec::new();
+
+    // Relative-to-cwd check.
+    candidates.push(relative.clone());
+
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(&relative));
+        for ancestor in cwd.ancestors().skip(1).take(8) {
+            candidates.push(ancestor.join(&relative));
+        }
+    }
+
+    // Cargo and other launchers can start the process from different cwd values.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            candidates.push(exe_dir.join(&relative));
+            for ancestor in exe_dir.ancestors().skip(1).take(8) {
+                candidates.push(ancestor.join(&relative));
+            }
+        }
+    }
+
+    let mut seen = HashSet::new();
+    for candidate in candidates {
+        if !seen.insert(candidate.clone()) {
+            continue;
+        }
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
 
 #[derive(Debug, Clone)]
 pub struct LlmSearchDoc {
@@ -164,12 +202,17 @@ impl EmbeddingRuntime {
             });
         }
 
-        let path = std::env::var(EMBEDDING_MODEL_ENV).with_context(|| {
-            format!(
-                "Missing {EMBEDDING_MODEL_ENV}. Configure a local embedding model artifact path."
-            )
-        })?;
-        Self::from_model_artifact(path, model_id)
+        if let Ok(path) = std::env::var(EMBEDDING_MODEL_ENV) {
+            return Self::from_model_artifact(path, model_id);
+        }
+
+        if let Some(bundled_path) = resolve_bundled_embed_model_path() {
+            return Self::from_model_artifact(bundled_path, model_id);
+        }
+
+        Err(anyhow!(
+            "Missing {EMBEDDING_MODEL_ENV}. Configure a local embedding model artifact path or place a bundled model at {DEFAULT_BUNDLED_EMBED_MODEL_PATH}."
+        ))
     }
 
     pub fn model_id(&self) -> &str {
@@ -257,48 +300,93 @@ impl OnnxEmbeddingRuntime {
             }
         }
 
-        let input_ids_ref = TensorRef::from_array_view(&input_ids)
-            .context("failed to build ONNX input_ids tensor")?;
-        let attention_mask_ref = TensorRef::from_array_view(&attention_mask)
-            .context("failed to build ONNX attention_mask tensor")?;
-
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|_| anyhow!("embedding session lock poisoned"))?;
-        let outputs = session
-            .run(ort::inputs![
+        let token_type_ids = Array2::<i64>::zeros((batch, seq_len));
+        let mut initial_error_text = None;
+        let mut embeddings = {
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| anyhow!("embedding session lock poisoned"))?;
+            let input_ids_ref = TensorRef::from_array_view(&input_ids)
+                .context("failed to build ONNX input_ids tensor")?;
+            let attention_mask_ref = TensorRef::from_array_view(&attention_mask)
+                .context("failed to build ONNX attention_mask tensor")?;
+            let token_type_ids_ref = TensorRef::from_array_view(&token_type_ids)
+                .context("failed to build ONNX token_type_ids tensor")?;
+            match session.run(ort::inputs![
                 "input_ids" => input_ids_ref,
-                "attention_mask" => attention_mask_ref
-            ])
-            .context("ONNX embedding inference failed")?;
-
-        let (name, output) = outputs
-            .iter()
-            .next()
-            .ok_or_else(|| anyhow!("ONNX embedding model produced no outputs"))?;
-        let output_array = output
-            .try_extract_array::<f32>()
-            .with_context(|| format!("failed to extract ONNX output tensor `{name}`"))?;
-
-        let mut embeddings = match output_array.ndim() {
-            2 => rows_to_vecs(output_array.view().into_dimensionality::<ndarray::Ix2>()?),
-            3 => mean_pool_last_hidden(
-                output_array.view().into_dimensionality::<ndarray::Ix3>()?,
-                attention_mask.view(),
-            ),
-            n => {
-                return Err(anyhow!(
-                    "unsupported ONNX embedding output rank {n}; expected 2 or 3"
-                ));
+                "attention_mask" => attention_mask_ref,
+                "token_type_ids" => token_type_ids_ref
+            ]) {
+                Ok(outputs) => extract_onnx_embeddings(outputs, attention_mask.view())?,
+                Err(error) => {
+                    initial_error_text = Some(error.to_string());
+                    Vec::new()
+                }
             }
         };
+
+        if let Some(error_text) = initial_error_text {
+            let needs_two_input_fallback = error_text.contains("token_type_ids")
+                && (error_text.contains("Invalid input name")
+                    || error_text.contains("Invalid Feed Input Name")
+                    || error_text.contains("Unknown input"));
+            if !needs_two_input_fallback {
+                return Err(anyhow!("ONNX embedding inference failed: {error_text}"));
+            }
+
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| anyhow!("embedding session lock poisoned"))?;
+            let input_ids_ref = TensorRef::from_array_view(&input_ids)
+                .context("failed to rebuild ONNX input_ids tensor")?;
+            let attention_mask_ref = TensorRef::from_array_view(&attention_mask)
+                .context("failed to rebuild ONNX attention_mask tensor")?;
+            let outputs = session
+                .run(ort::inputs![
+                    "input_ids" => input_ids_ref,
+                    "attention_mask" => attention_mask_ref
+                ])
+                .with_context(|| {
+                    format!(
+                        "ONNX embedding inference failed while retrying without token_type_ids ({error_text})"
+                    )
+                })?;
+            embeddings = extract_onnx_embeddings(outputs, attention_mask.view())?;
+        }
 
         for embedding in &mut embeddings {
             l2_normalize(embedding);
         }
 
         Ok(embeddings)
+    }
+}
+
+fn extract_onnx_embeddings(
+    outputs: ort::session::SessionOutputs<'_>,
+    attention_mask: ArrayView2<'_, i64>,
+) -> Result<Vec<Vec<f32>>> {
+    let (name, output) = outputs
+        .iter()
+        .next()
+        .ok_or_else(|| anyhow!("ONNX embedding model produced no outputs"))?;
+    let output_array = output
+        .try_extract_array::<f32>()
+        .with_context(|| format!("failed to extract ONNX output tensor `{name}`"))?;
+
+    match output_array.ndim() {
+        2 => Ok(rows_to_vecs(
+            output_array.view().into_dimensionality::<ndarray::Ix2>()?,
+        )),
+        3 => Ok(mean_pool_last_hidden(
+            output_array.view().into_dimensionality::<ndarray::Ix3>()?,
+            attention_mask,
+        )),
+        n => Err(anyhow!(
+            "unsupported ONNX embedding output rank {n}; expected 2 or 3"
+        )),
     }
 }
 

@@ -13,7 +13,8 @@ use codestory_api::{
 };
 use codestory_events::{Event, EventBus};
 use codestory_search::{
-    EMBEDDING_MODEL_ENV, HybridSearchConfig, HybridSearchHit, LlmSearchDoc, SearchEngine,
+    DEFAULT_BUNDLED_EMBED_MODEL_PATH, EMBEDDING_MODEL_ENV, EMBEDDING_RUNTIME_MODE_ENV,
+    HybridSearchConfig, HybridSearchHit, LlmSearchDoc, SearchEngine,
 };
 use codestory_storage::{LlmSymbolDoc, Storage};
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -731,7 +732,7 @@ fn sync_llm_symbol_projection(
 ) -> Result<(), ApiError> {
     if let Err(error) = engine.set_embedding_runtime_from_env() {
         tracing::warn!(
-            "{EMBEDDING_MODEL_ENV} not configured or invalid ({error}); semantic ask retrieval will be unavailable until a local model artifact is configured."
+            "{EMBEDDING_MODEL_ENV} not configured or invalid ({error}); semantic ask retrieval will be unavailable until a local model artifact is configured. Use a bundled model at {DEFAULT_BUNDLED_EMBED_MODEL_PATH}, set {EMBEDDING_RUNTIME_MODE_ENV}=hash for local-dev embeddings, or set {HYBRID_RETRIEVAL_ENABLED_ENV}=false for lexical-only retrieval."
         );
         let existing = storage
             .get_all_llm_symbol_docs()
@@ -1343,7 +1344,7 @@ impl AppController {
                     .search_hybrid_with_scores(&req.query, &graph_boosts, config)
                     .map_err(|e| {
                         ApiError::invalid_argument(format!(
-                            "Semantic retrieval unavailable: {e}. Configure {EMBEDDING_MODEL_ENV} with a local embedding model artifact path."
+                            "Semantic retrieval unavailable: {e}. Configure {EMBEDDING_MODEL_ENV} with a local embedding model artifact path, place a bundled model at {DEFAULT_BUNDLED_EMBED_MODEL_PATH}, set {EMBEDDING_RUNTIME_MODE_ENV}=hash for deterministic local-dev embeddings, or set {HYBRID_RETRIEVAL_ENABLED_ENV}=false for lexical-only retrieval."
                         ))
                     })?
             } else {

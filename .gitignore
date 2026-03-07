@@ -20,6 +20,7 @@ target/
 # Runtime artifacts (generated locally)
 codestory.db
 codestory_ui.json
+models/
 
 # Local environment / editor files
 .env
