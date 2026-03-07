@@ -421,6 +421,19 @@ fn resolve_target(runtime: &RuntimeContext, target: TargetSelection) -> Result<R
             }
 
             alternatives.sort_by(|left, right| compare_resolution_hits(&query, left, right));
+
+            if alternatives.len() > 1 {
+                let rank0 = resolution_rank(&query, &alternatives[0]);
+                let rank1 = resolution_rank(&query, &alternatives[1]);
+                if rank0 == rank1 {
+                    let name0 = &alternatives[0].display_name;
+                    let name1 = &alternatives[1].display_name;
+                    bail!(
+                        "Query `{query}` is ambiguous. It matches multiple distinct symbols equally well, including:\n  • {name0}\n  • {name1}\n\nPlease steer resolution by providing a more qualified name (e.g. `Namespace::Symbol` or a partial path)."
+                    );
+                }
+            }
+
             let selected = alternatives.first().cloned().ok_or_else(|| {
                 anyhow!(
                     "No symbol matched query `{query}`. Run `codestory-cli search --query \"{query}\"` to inspect candidates."
@@ -613,6 +626,8 @@ fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
         file_path: node.file_path.clone(),
         line: node.start_line,
         score: 0.0,
+        origin: codestory_api::SearchHitOrigin::IndexedSymbol,
+        resolvable: true,
     }
 }
 
@@ -635,8 +650,8 @@ fn emit<T: Serialize>(format: OutputFormat, value: &T, markdown: String) -> Resu
 fn render_index_markdown(output: &IndexOutput<'_>) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Index");
-    let _ = writeln!(markdown, "project: `{}`", output.project);
-    let _ = writeln!(markdown, "storage: `{}`", output.storage_path);
+    let _ = writeln!(markdown, "project: `{}`", clean_path_string(output.project));
+    let _ = writeln!(markdown, "storage: `{}`", clean_path_string(output.storage_path));
     let _ = writeln!(markdown, "refresh: `{}`", output.refresh);
     let _ = writeln!(
         markdown,
@@ -671,7 +686,7 @@ fn render_index_markdown(output: &IndexOutput<'_>) -> String {
 fn render_ground_markdown(project_root: &Path, snapshot: &GroundingSnapshotDto) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Grounding Snapshot");
-    let _ = writeln!(markdown, "root: `{}`", snapshot.root);
+    let _ = writeln!(markdown, "root: `{}`", clean_path_string(&snapshot.root));
     let _ = writeln!(markdown, "budget: `{}`", format_budget(snapshot.budget));
     let _ = writeln!(
         markdown,
@@ -990,12 +1005,21 @@ fn render_ground_symbol(symbol: &codestory_api::GroundingSymbolDigestDto) -> Str
     out
 }
 
+fn clean_path_string(path: &str) -> String {
+    let mut stringified = path.replace('\\', "/");
+    if stringified.starts_with("//?/") {
+        stringified = stringified[4..].to_string();
+    }
+    stringified
+}
+
 fn relative_path(project_root: &Path, raw: &str) -> String {
     let path = Path::new(raw);
-    path.strip_prefix(project_root)
+    let relative = path
+        .strip_prefix(project_root)
         .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+        .to_string_lossy();
+    clean_path_string(&relative)
 }
 
 fn looks_like_text_query(query: &str) -> bool {
@@ -1100,6 +1124,8 @@ fn scan_file_text_hit(
         file_path: Some(path.to_string_lossy().to_string()),
         line: Some(line),
         score: 500.0 - rank as f32,
+        origin: codestory_api::SearchHitOrigin::TextMatch,
+        resolvable: false,
     })
 }
 
@@ -1208,6 +1234,8 @@ mod tests {
                 file_path: None,
                 line: None,
                 score: 0.9,
+                origin: codestory_api::SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
             },
             SearchHit {
                 node_id: NodeId("1".to_string()),
@@ -1216,10 +1244,47 @@ mod tests {
                 file_path: None,
                 line: None,
                 score: 0.9,
+                origin: codestory_api::SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
             },
         ];
 
         hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
         assert_eq!(hits[0].display_name, "AppController");
+    }
+
+    #[test]
+    fn clean_path_unix_noop() {
+        assert_eq!(clean_path_string("src/lib.rs"), "src/lib.rs");
+    }
+
+    #[test]
+    fn clean_path_backslash_normalization() {
+        assert_eq!(clean_path_string("C:\\foo\\bar"), "C:/foo/bar");
+    }
+
+    #[test]
+    fn clean_path_extended_prefix_stripped() {
+        assert_eq!(clean_path_string("\\\\?\\C:\\foo\\bar"), "C:/foo/bar");
+    }
+
+    #[test]
+    fn clean_path_extended_prefix_unc() {
+        assert_eq!(
+            clean_path_string("\\\\?\\UNC\\server\\share"),
+            "UNC/server/share"
+        );
+    }
+
+    #[test]
+    fn relative_path_strips_root() {
+        let root = Path::new("C:/repo");
+        assert_eq!(relative_path(root, "C:/repo/src/lib.rs"), "src/lib.rs");
+    }
+
+    #[test]
+    fn relative_path_outside_root() {
+        let root = Path::new("C:/repo");
+        assert_eq!(relative_path(root, "D:\\other\\file.rs"), "D:/other/file.rs");
     }
 }

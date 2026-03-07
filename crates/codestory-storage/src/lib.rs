@@ -789,6 +789,37 @@ impl Storage {
         Ok(())
     }
 
+    pub fn insert_files_batch(&mut self, files: &[FileInfo]) -> Result<(), StorageError> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count) 
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) 
+                 ON CONFLICT(id) DO UPDATE SET 
+                    modification_time=excluded.modification_time, 
+                    indexed=excluded.indexed, 
+                    complete=excluded.complete, 
+                    line_count=excluded.line_count"
+            )?;
+            for info in files {
+                stmt.execute(params![
+                    info.id,
+                    info.path.to_string_lossy(),
+                    info.language,
+                    info.modification_time,
+                    i32::from(info.indexed),
+                    i32::from(info.complete),
+                    info.line_count,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn get_files(&self) -> Result<Vec<FileInfo>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, path, language, modification_time, indexed, complete, line_count FROM file",

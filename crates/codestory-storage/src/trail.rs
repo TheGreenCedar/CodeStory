@@ -79,6 +79,17 @@ pub(super) fn get_trail_bfs(
     }
 
     super::apply_trail_node_filter(&mut result, config);
+    let selected_ids: HashSet<NodeId> = result.nodes.iter().map(|n| n.id).collect();
+    let old_edges = std::mem::take(&mut result.edges);
+    for edge in old_edges {
+        let (src, dst) = edge.effective_endpoints();
+        if selected_ids.contains(&src) && selected_ids.contains(&dst) {
+            result.edges.push(edge);
+        } else {
+            result.omitted_edge_count += 1;
+        }
+    }
+
     Ok(result)
 }
 
@@ -283,6 +294,17 @@ pub(super) fn get_trail_to_target(
     result.edges.sort_by_key(|e| e.id.0);
 
     super::apply_trail_node_filter(&mut result, config);
+    let selected_ids: HashSet<NodeId> = result.nodes.iter().map(|n| n.id).collect();
+    let old_edges = std::mem::take(&mut result.edges);
+    for edge in old_edges {
+        let (src, dst) = edge.effective_endpoints();
+        if selected_ids.contains(&src) && selected_ids.contains(&dst) {
+            result.edges.push(edge);
+        } else {
+            result.omitted_edge_count += 1;
+        }
+    }
+
     Ok(result)
 }
 

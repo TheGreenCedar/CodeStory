@@ -1344,6 +1344,8 @@ mod tests {
             file_path: None,
             line: None,
             score: 10.0,
+            origin: codestory_api::SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
         }];
 
         merge_search_hits(
@@ -1356,6 +1358,8 @@ mod tests {
                     file_path: None,
                     line: None,
                     score: 42.0,
+                    origin: codestory_api::SearchHitOrigin::IndexedSymbol,
+                    resolvable: true,
                 },
                 SearchHit {
                     node_id: codestory_api::NodeId("2".to_string()),
@@ -1364,6 +1368,8 @@ mod tests {
                     file_path: None,
                     line: None,
                     score: 18.0,
+                    origin: codestory_api::SearchHitOrigin::IndexedSymbol,
+                    resolvable: true,
                 },
             ],
             10,
@@ -1413,6 +1419,7 @@ mod tests {
             ],
             truncated: false,
             canonical_layout: None,
+            omitted_edge_count: 0,
         };
 
         let evidence =

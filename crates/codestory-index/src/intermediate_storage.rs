@@ -2,6 +2,7 @@ use codestory_core::{AccessKind, Edge, ErrorInfo, Node, NodeId, Occurrence};
 
 #[derive(Default)]
 pub struct IntermediateStorage {
+    pub files: Vec<codestory_storage::FileInfo>,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub occurrences: Vec<Occurrence>,
@@ -35,6 +36,7 @@ impl IntermediateStorage {
     }
 
     pub fn merge(&mut self, other: IntermediateStorage) {
+        self.files.extend(other.files);
         self.nodes.extend(other.nodes);
         self.edges.extend(other.edges);
         self.occurrences.extend(other.occurrences);
@@ -43,6 +45,7 @@ impl IntermediateStorage {
     }
 
     pub fn clear(&mut self) {
+        self.files.clear();
         self.nodes.clear();
         self.edges.clear();
         self.occurrences.clear();

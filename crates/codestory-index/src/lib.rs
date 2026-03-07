@@ -78,6 +78,7 @@ impl Default for IncrementalIndexingConfig {
 }
 
 pub struct IndexResult {
+    pub files: Vec<codestory_storage::FileInfo>,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub occurrences: Vec<Occurrence>,
@@ -232,7 +233,8 @@ impl WorkspaceIndexer {
                 all_errors.append(&mut local_storage.errors);
                 batched_storage.merge(local_storage);
 
-                let should_flush = !batched_storage.nodes.is_empty()
+                let should_flush = !batched_storage.files.is_empty()
+                    || !batched_storage.nodes.is_empty()
                     || !batched_storage.edges.is_empty()
                     || !batched_storage.occurrences.is_empty();
                 if should_flush
@@ -444,6 +446,11 @@ impl WorkspaceIndexer {
         batched_storage: &mut IntermediateStorage,
         had_edges: &mut bool,
     ) -> Result<()> {
+        if !batched_storage.files.is_empty() {
+            storage
+                .insert_files_batch(&batched_storage.files)
+                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
+        }
         if !batched_storage.nodes.is_empty() {
             storage
                 .insert_nodes_batch(&batched_storage.nodes)
@@ -501,6 +508,7 @@ impl WorkspaceIndexer {
                 Some(Arc::clone(symbol_table)),
             ) {
                 Ok(index_result) => {
+                    local_storage.files = index_result.files;
                     local_storage.nodes = index_result.nodes;
                     local_storage.edges = index_result.edges;
                     local_storage.occurrences = index_result.occurrences;
@@ -881,13 +889,34 @@ pub fn index_file(
         .execute(&tree, source, &config, &NoCancellation)
         .map_err(|e| anyhow!("Graph execution error: {:?}", e))?;
 
+    let mut result_files = Vec::new();
     let mut result_nodes = Vec::new();
     let mut result_edges = Vec::new();
     let mut result_occurrences = Vec::new();
 
-    // 0. Create file node.
+    // 0. Create file node and FileInfo
     let (file_node, file_name, file_id) = file_node_from_source(path, source);
     result_nodes.push(file_node);
+
+    let modification_time = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|systime| {
+            systime
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64
+        })
+        .unwrap_or(0);
+
+    result_files.push(codestory_storage::FileInfo {
+        id: file_id.0,
+        path: path.to_path_buf(),
+        language: language_name.to_string(),
+        modification_time,
+        indexed: true,
+        complete: true, // We will update this if there are syntactic errors later, but for now we assume true
+        line_count: source.lines().count() as u32,
+    });
 
     // 1. First pass: Create nodes and a temporary mapping from GraphNodeId -> OurNodeId
     let mut graph_to_node_id = HashMap::new();
@@ -1067,6 +1096,7 @@ pub fn index_file(
     }
 
     Ok(IndexResult {
+        files: result_files,
         nodes: final_nodes,
         edges: result_edges,
         occurrences: result_occurrences,

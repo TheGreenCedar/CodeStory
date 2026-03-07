@@ -114,6 +114,7 @@ pub(super) fn graph_neighborhood(
         nodes: node_dtos,
         edges: edge_dtos,
         truncated,
+        omitted_edge_count: 0,
         canonical_layout: Some(canonical_layout),
     })
 }
@@ -152,6 +153,7 @@ pub(super) fn graph_trail(
         edges,
         depth_map,
         truncated,
+        omitted_edge_count,
     } = result;
 
     let node_kind_by_id: HashMap<codestory_core::NodeId, codestory_core::NodeKind> =
@@ -228,6 +230,7 @@ pub(super) fn graph_trail(
         nodes: node_dtos,
         edges: edge_dtos,
         truncated,
+        omitted_edge_count,
         canonical_layout: Some(canonical_layout),
     })
 }

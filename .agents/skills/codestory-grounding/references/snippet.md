@@ -1,0 +1,56 @@
+# `snippet` — Fetch Source Code Context Around a Symbol
+
+Resolves a symbol and returns its source code with surrounding context lines. Useful for reading the actual implementation without opening the full file.
+
+## Usage
+
+```
+python scripts/snippet.py [OPTIONS]
+```
+
+## Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--project` | path | `.` | Project root directory (alias: `--path`) |
+| `--cache-dir` | path | *auto* | Override the cache directory |
+| `--id` | string | — | Node ID of the symbol (conflicts with `--query`) |
+| `--query` | string | — | Symbol name to resolve (conflicts with `--id`) |
+| `--context` | integer | `4` | Number of surrounding context lines above and below the symbol |
+| `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
+| `--format` | enum | `markdown` | Output format: `markdown` or `json` |
+
+## Output
+
+```
+# Snippet
+resolved: `AppController::new` -> [abc123] new [FUNCTION] `src/lib.rs`:100
+file: `src/lib.rs`  lines: 96–115
+
+    96: // --- AppController ---
+    97:
+    98: impl AppController {
+    99:     /// Creates a new controller instance.
+   100:     pub fn new() -> Self {
+   101:         Self {
+   102:             storage: None,
+   103:             event_bus: EventBus::new(),
+   104:         }
+   105:     }
+   106:
+   107:     /// Opens a project from the given root.
+   108:     pub fn open_project(&mut self, root: PathBuf) -> Result<()> {
+```
+
+## Examples
+
+```bash
+# Snippet with default 4 lines of context
+python scripts/snippet.py --query "AppController::new"
+
+# More context
+python scripts/snippet.py --query run_indexing --context 10
+
+# By node ID, JSON output
+python scripts/snippet.py --id abc123def456 --format json
+```

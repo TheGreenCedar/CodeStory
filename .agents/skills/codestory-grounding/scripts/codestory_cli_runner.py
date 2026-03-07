@@ -33,6 +33,9 @@ def run(subcommand: str) -> int:
         dry_run = True
         args = args[1:]
 
+    if "--project" not in args:
+        args.extend(["--project", os.getcwd()])
+
     command = build_command(subcommand, args)
     if dry_run:
         print(_quote_command(command))

@@ -1,4 +1,4 @@
 interface:
   display_name: "Codestory Grounding"
-  short_description: "Ground code with codestory-cli workspace queries"
+  short_description: "Repo-local Python wrappers around 'cargo run -p codestory-cli'. Run via python on Windows."
   default_prompt: "Use $codestory-grounding to inspect a workspace with codestory-cli grounding commands before answering or editing."

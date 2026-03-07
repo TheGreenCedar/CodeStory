@@ -19,7 +19,7 @@ pub use dto::{
     ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest,
     NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
     ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, RetrievalScoreBreakdownDto,
-    SearchHit, SearchRequest, SetUiLayoutRequest, SnippetContextDto, SourceOccurrenceDto,
+    SearchHit, SearchHitOrigin, SearchRequest, SetUiLayoutRequest, SnippetContextDto, SourceOccurrenceDto,
     StartIndexingRequest, StorageStatsDto, SymbolContextDto, SymbolSummaryDto,
     SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
     UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WriteFileDataUrlRequest,

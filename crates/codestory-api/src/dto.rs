@@ -45,6 +45,13 @@ pub struct SearchRequest {
     pub query: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchHitOrigin {
+    IndexedSymbol,
+    TextMatch,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchHit {
     pub node_id: NodeId,
@@ -53,6 +60,8 @@ pub struct SearchHit {
     pub file_path: Option<String>,
     pub line: Option<u32>,
     pub score: f32,
+    pub origin: SearchHitOrigin,
+    pub resolvable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -185,6 +194,8 @@ pub struct GraphResponse {
     pub nodes: Vec<GraphNodeDto>,
     pub edges: Vec<GraphEdgeDto>,
     pub truncated: bool,
+    #[serde(default)]
+    pub omitted_edge_count: u32,
     #[serde(default)]
     pub canonical_layout: Option<CanonicalLayoutDto>,
 }

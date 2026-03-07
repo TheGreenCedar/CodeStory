@@ -497,6 +497,7 @@ pub struct TrailResult {
     pub edges: Vec<Edge>,
     pub depth_map: std::collections::HashMap<NodeId, u32>,
     pub truncated: bool,
+    pub omitted_edge_count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

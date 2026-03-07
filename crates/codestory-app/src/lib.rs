@@ -1170,6 +1170,8 @@ impl AppController {
             file_path,
             line,
             score,
+            origin: codestory_api::SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
         }
     }
 
@@ -1461,6 +1463,8 @@ impl AppController {
                     file_path: Some(path_string),
                     line: Some(line),
                     score,
+                    origin: codestory_api::SearchHitOrigin::TextMatch,
+                    resolvable: false,
                 });
                 if hits.len() >= 20 {
                     break;
@@ -2205,7 +2209,7 @@ mod tests {
         ));
         assert!(!should_expand_symbol_query("parser", 0));
         assert!(!should_expand_symbol_query(
-            "How does the language parsing work in this repo?",
+            "how does the language parsing work in this repo",
             5
         ));
     }

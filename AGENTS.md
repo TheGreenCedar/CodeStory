@@ -25,7 +25,11 @@
 
 ## Testing Guidelines
 - Tests live in `#[cfg(test)]` blocks or `*_tests.rs`; name them `test_*`.
-- For indexer regressions, prefer targeted suites such as `cargo test -p codestory-index --test fidelity_regression`.
+- To exercise indexing fidelity and coverage, you must explicitly run full test binaries, not just filters:
+  - `cargo test -p codestory-index --test fidelity_regression`
+  - `cargo test -p codestory-index --test tictactoe_language_coverage`
+  - Note: Using `cargo test -p codestory-index fidelity_regression` will just filter tests instead of running the targeted suites.
+- Cargo verifications (build, check, test) should be serialized when working in this repo because parallel `cargo` commands will contend on the shared package and build locks.
 - For graph perf and fidelity checks, use Criterion benches in `crates/codestory-bench`.
 
 ## Commit & Pull Request Guidelines
