@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codestory Grounding"
+  short_description: "Ground code with codestory-cli workspace queries"
+  default_prompt: "Use $codestory-grounding to inspect a workspace with codestory-cli grounding commands before answering or editing."

@@ -11,6 +11,15 @@ pub struct OpenProjectRequest {
     pub path: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GroundingBudgetDto {
+    Strict,
+    #[default]
+    Balanced,
+    Max,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct StorageStatsDto {
     // Use u32 so TS can safely represent these as `number` without BigInt.
@@ -63,6 +72,65 @@ pub struct SymbolSummaryDto {
     pub kind: NodeKind,
     pub file_path: Option<String>,
     pub has_children: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct GroundingSymbolDigestDto {
+    pub id: NodeId,
+    pub label: String,
+    pub kind: NodeKind,
+    #[serde(default)]
+    pub line: Option<u32>,
+    #[serde(default)]
+    pub member_count: Option<u32>,
+    #[serde(default)]
+    pub edge_digest: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct GroundingFileDigestDto {
+    pub file_path: String,
+    #[serde(default)]
+    pub language: Option<String>,
+    pub symbol_count: u32,
+    pub represented_symbol_count: u32,
+    pub compressed: bool,
+    pub symbols: Vec<GroundingSymbolDigestDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct GroundingCoverageBucketDto {
+    pub label: String,
+    pub file_count: u32,
+    pub symbol_count: u32,
+    #[serde(default)]
+    pub sample_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct GroundingCoverageDto {
+    pub total_files: u32,
+    pub represented_files: u32,
+    pub total_symbols: u32,
+    pub represented_symbols: u32,
+    pub compressed_files: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct GroundingSnapshotDto {
+    pub root: String,
+    pub budget: GroundingBudgetDto,
+    pub generated_at_epoch_ms: i64,
+    pub stats: StorageStatsDto,
+    pub coverage: GroundingCoverageDto,
+    pub root_symbols: Vec<GroundingSymbolDigestDto>,
+    pub files: Vec<GroundingFileDigestDto>,
+    #[serde(default)]
+    pub coverage_buckets: Vec<GroundingCoverageBucketDto>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+    #[serde(default)]
+    pub recommended_queries: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -247,6 +315,12 @@ pub struct TrailFilterOptionsDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct TrailContextDto {
+    pub focus: NodeDetailsDto,
+    pub trail: GraphResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct NodeDetailsRequest {
     pub id: NodeId,
 }
@@ -290,6 +364,17 @@ pub struct NodeDetailsDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SymbolContextDto {
+    pub node: NodeDetailsDto,
+    #[serde(default)]
+    pub children: Vec<SymbolSummaryDto>,
+    #[serde(default)]
+    pub related_hits: Vec<SearchHit>,
+    #[serde(default)]
+    pub edge_digest: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct ReadFileTextRequest {
     pub path: String,
 }
@@ -298,6 +383,14 @@ pub struct ReadFileTextRequest {
 pub struct ReadFileTextResponse {
     pub path: String,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SnippetContextDto {
+    pub node: NodeDetailsDto,
+    pub path: String,
+    pub line: u32,
+    pub snippet: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

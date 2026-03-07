@@ -1,122 +1,1225 @@
-use anyhow::{Result, anyhow};
-use clap::Parser;
-use codestory_index::{IndexResult, get_language_for_ext, index_file};
-use codestory_storage::Storage;
-use crossbeam_channel::bounded;
-use rayon::prelude::*;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread;
+use anyhow::{Context, Result, anyhow, bail};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use codestory_api::{
+    ApiError, GroundingBudgetDto, GroundingSnapshotDto, IndexMode, IndexingPhaseTimings,
+    LayoutDirection, NodeDetailsDto, NodeDetailsRequest, NodeId, ProjectSummary, SearchHit,
+    SearchRequest, SnippetContextDto, SymbolContextDto, TrailCallerScope, TrailConfigDto,
+    TrailContextDto, TrailDirection, TrailMode,
+};
+use codestory_app::AppController;
+use directories::ProjectDirs;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Path to the directory or file to index
-    #[arg(short, long, default_value = ".")]
-    path: PathBuf,
+#[command(author, version, about = "Skill-first repo grounding runtime", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 
-    /// Path to the SQLite database
-    #[arg(short, long)]
-    db: Option<PathBuf>,
+#[derive(Subcommand, Debug)]
+enum Command {
+    Index(IndexCommand),
+    Ground(GroundCommand),
+    Search(SearchCommand),
+    Symbol(SymbolCommand),
+    Trail(TrailCommand),
+    Snippet(SnippetCommand),
+}
+
+#[derive(Args, Debug, Clone)]
+struct ProjectArgs {
+    #[arg(long, alias = "path", default_value = ".")]
+    project: PathBuf,
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    Markdown,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RefreshMode {
+    Auto,
+    Full,
+    Incremental,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliGroundingBudget {
+    Strict,
+    Balanced,
+    Max,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliTrailMode {
+    Neighborhood,
+    Referenced,
+    Referencing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliDirection {
+    Incoming,
+    Outgoing,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliLayout {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Args, Debug)]
+struct IndexCommand {
+    #[command(flatten)]
+    project: ProjectArgs,
+    #[arg(long, value_enum, default_value_t = RefreshMode::Auto)]
+    refresh: RefreshMode,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    format: OutputFormat,
+}
+
+#[derive(Args, Debug)]
+struct GroundCommand {
+    #[command(flatten)]
+    project: ProjectArgs,
+    #[arg(long, value_enum, default_value_t = CliGroundingBudget::Balanced)]
+    budget: CliGroundingBudget,
+    #[arg(long, value_enum, default_value_t = RefreshMode::Auto)]
+    refresh: RefreshMode,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    format: OutputFormat,
+}
+
+#[derive(Args, Debug)]
+struct SearchCommand {
+    #[command(flatten)]
+    project: ProjectArgs,
+    #[arg(long)]
+    query: String,
+    #[arg(long, default_value_t = 10)]
+    limit: u32,
+    #[arg(long, value_enum, default_value_t = RefreshMode::None)]
+    refresh: RefreshMode,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    format: OutputFormat,
+}
+
+#[derive(Args, Debug, Clone)]
+struct TargetArgs {
+    #[arg(long, conflicts_with = "query")]
+    id: Option<String>,
+    #[arg(long, conflicts_with = "id")]
+    query: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct SymbolCommand {
+    #[command(flatten)]
+    project: ProjectArgs,
+    #[command(flatten)]
+    target: TargetArgs,
+    #[arg(long, value_enum, default_value_t = RefreshMode::None)]
+    refresh: RefreshMode,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    format: OutputFormat,
+}
+
+#[derive(Args, Debug)]
+struct TrailCommand {
+    #[command(flatten)]
+    project: ProjectArgs,
+    #[command(flatten)]
+    target: TargetArgs,
+    #[arg(long, value_enum, default_value_t = CliTrailMode::Neighborhood)]
+    mode: CliTrailMode,
+    #[arg(long)]
+    depth: Option<u32>,
+    #[arg(long, value_enum)]
+    direction: Option<CliDirection>,
+    #[arg(long, default_value_t = 24)]
+    max_nodes: u32,
+    #[arg(long)]
+    include_tests: bool,
+    #[arg(long)]
+    show_utility_calls: bool,
+    #[arg(long, value_enum, default_value_t = CliLayout::Horizontal)]
+    layout: CliLayout,
+    #[arg(long, value_enum, default_value_t = RefreshMode::None)]
+    refresh: RefreshMode,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    format: OutputFormat,
+}
+
+#[derive(Args, Debug)]
+struct SnippetCommand {
+    #[command(flatten)]
+    project: ProjectArgs,
+    #[command(flatten)]
+    target: TargetArgs,
+    #[arg(long, default_value_t = 4)]
+    context: usize,
+    #[arg(long, value_enum, default_value_t = RefreshMode::None)]
+    refresh: RefreshMode,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    format: OutputFormat,
+}
+
+struct RuntimeContext {
+    controller: AppController,
+    project_root: PathBuf,
+    storage_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct OpenedProject {
+    summary: ProjectSummary,
+    refresh_mode: Option<IndexMode>,
+    phase_timings: Option<IndexingPhaseTimings>,
+}
+
+#[derive(Debug)]
+enum TargetSelection {
+    Id(NodeId),
+    Query(String),
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedTarget {
+    requested: String,
+    selected: SearchHit,
+    alternatives: Vec<SearchHit>,
+}
+
+#[derive(Debug, Serialize)]
+struct IndexOutput<'a> {
+    project: &'a str,
+    storage_path: &'a str,
+    refresh: &'a str,
+    summary: &'a ProjectSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phase_timings: Option<&'a IndexingPhaseTimings>,
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    // 1. Initialize Storage (Single Writer)
-    let mut storage = if let Some(db_path) = args.db {
-        Storage::open(db_path)?
-    } else {
-        Storage::open("codestory.db")?
+    match cli.command {
+        Command::Index(cmd) => run_index(cmd),
+        Command::Ground(cmd) => run_ground(cmd),
+        Command::Search(cmd) => run_search(cmd),
+        Command::Symbol(cmd) => run_symbol(cmd),
+        Command::Trail(cmd) => run_trail(cmd),
+        Command::Snippet(cmd) => run_snippet(cmd),
+    }
+}
+
+fn run_index(cmd: IndexCommand) -> Result<()> {
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    let opened = runtime.ensure_open(cmd.refresh)?;
+    let refresh_label = refresh_label(cmd.refresh, opened.refresh_mode);
+    let storage_path = runtime.storage_path.to_string_lossy().to_string();
+    let output = IndexOutput {
+        project: &opened.summary.root,
+        storage_path: &storage_path,
+        refresh: &refresh_label,
+        summary: &opened.summary,
+        phase_timings: opened.phase_timings.as_ref(),
     };
 
-    println!("Indexing workspace: {:?}", args.path);
+    let markdown = render_index_markdown(&output);
+    emit(cmd.format, &output, markdown)
+}
 
-    // 2. Discover Files
-    let walker = ignore::WalkBuilder::new(&args.path)
-        .standard_filters(true)
-        .build();
+fn run_ground(cmd: GroundCommand) -> Result<()> {
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    let opened = runtime.ensure_open(cmd.refresh)?;
+    ensure_index_ready(&opened, "ground")?;
 
-    let mut files_to_index = Vec::new();
-    for result in walker {
-        match result {
-            Ok(entry) => {
-                if entry.file_type().is_some_and(|ft| ft.is_file()) {
-                    let path = entry.path().to_path_buf();
-                    files_to_index.push(path);
-                }
+    let snapshot = runtime
+        .controller
+        .grounding_snapshot(cmd.budget.into())
+        .map_err(map_api_error)?;
+    let markdown = render_ground_markdown(&runtime.project_root, &snapshot);
+    emit(cmd.format, &snapshot, markdown)
+}
+
+fn run_search(cmd: SearchCommand) -> Result<()> {
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    let opened = runtime.ensure_open(cmd.refresh)?;
+    ensure_index_ready(&opened, "search")?;
+
+    let limit = cmd.limit.clamp(1, 50) as usize;
+    let mut hits = runtime
+        .controller
+        .search(SearchRequest {
+            query: cmd.query.clone(),
+        })
+        .map_err(map_api_error)?;
+    if looks_like_text_query(&cmd.query) {
+        hits.extend(scan_repo_text_hits(
+            &runtime.project_root,
+            &cmd.query,
+            limit,
+        )?);
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.display_name.cmp(&right.display_name))
+        });
+        hits.dedup_by(|left, right| {
+            left.file_path == right.file_path
+                && left.line == right.line
+                && left.display_name == right.display_name
+                && left.kind == right.kind
+        });
+    }
+    hits.truncate(limit);
+
+    let markdown = render_search_markdown(&runtime.project_root, &cmd.query, &hits);
+    emit(cmd.format, &hits, markdown)
+}
+
+fn run_symbol(cmd: SymbolCommand) -> Result<()> {
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    let opened = runtime.ensure_open(cmd.refresh)?;
+    ensure_index_ready(&opened, "symbol")?;
+
+    let target = resolve_target(&runtime, cmd.target.selection()?)?;
+    let context = runtime
+        .controller
+        .symbol_context(target.selected.node_id.clone())
+        .map_err(map_api_error)?;
+    let markdown = render_symbol_markdown(&runtime.project_root, &target, &context);
+    emit(cmd.format, &context, markdown)
+}
+
+fn run_trail(cmd: TrailCommand) -> Result<()> {
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    let opened = runtime.ensure_open(cmd.refresh)?;
+    ensure_index_ready(&opened, "trail")?;
+
+    let target = resolve_target(&runtime, cmd.target.selection()?)?;
+    let request = build_trail_request(&target.selected.node_id, &cmd);
+    let context = runtime
+        .controller
+        .trail_context(request)
+        .map_err(map_api_error)?;
+    let markdown = render_trail_markdown(&runtime.project_root, &target, &context, &cmd);
+    emit(cmd.format, &context, markdown)
+}
+
+fn run_snippet(cmd: SnippetCommand) -> Result<()> {
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    let opened = runtime.ensure_open(cmd.refresh)?;
+    ensure_index_ready(&opened, "snippet")?;
+
+    let target = resolve_target(&runtime, cmd.target.selection()?)?;
+    let context = runtime
+        .controller
+        .snippet_context(target.selected.node_id.clone(), cmd.context)
+        .map_err(map_api_error)?;
+    let markdown = render_snippet_markdown(&runtime.project_root, &target, &context);
+    emit(cmd.format, &context, markdown)
+}
+
+impl RuntimeContext {
+    fn new(args: &ProjectArgs) -> Result<Self> {
+        let project_root = canonicalize_project_root(&args.project)?;
+        let cache_root = cache_root_for_project(&project_root, args.cache_dir.as_deref())?;
+        let storage_path = cache_root.join("codestory.db");
+        Ok(Self {
+            controller: AppController::new(),
+            project_root,
+            storage_path,
+        })
+    }
+
+    fn ensure_open(&self, refresh: RefreshMode) -> Result<OpenedProject> {
+        let mut summary = self.open_project()?;
+        let refresh_mode = resolve_refresh_request(refresh, &summary);
+        let mut phase_timings = None;
+        if let Some(mode) = refresh_mode {
+            phase_timings = Some(
+                self.controller
+                    .run_indexing_blocking(mode)
+                    .map_err(map_api_error)?,
+            );
+            summary = self.open_project()?;
+        }
+
+        Ok(OpenedProject {
+            summary,
+            refresh_mode,
+            phase_timings,
+        })
+    }
+
+    fn open_project(&self) -> Result<ProjectSummary> {
+        self.controller
+            .open_project_with_storage_path(self.project_root.clone(), self.storage_path.clone())
+            .map_err(map_api_error)
+    }
+}
+
+impl TargetArgs {
+    fn selection(&self) -> Result<TargetSelection> {
+        match (&self.id, &self.query) {
+            (Some(id), None) => Ok(TargetSelection::Id(NodeId(id.trim().to_string()))),
+            (None, Some(query)) if !query.trim().is_empty() => {
+                Ok(TargetSelection::Query(query.trim().to_string()))
             }
-            Err(err) => {
-                eprintln!("Error walking directory: {}", err);
+            (Some(_), Some(_)) => bail!("Pass only one of --id or --query."),
+            (None, None) => bail!("Pass either --id or --query."),
+            (None, Some(_)) => bail!("--query cannot be empty."),
+        }
+    }
+}
+
+fn resolve_target(runtime: &RuntimeContext, target: TargetSelection) -> Result<ResolvedTarget> {
+    match target {
+        TargetSelection::Id(id) => {
+            let details = runtime
+                .controller
+                .node_details(NodeDetailsRequest { id: id.clone() })
+                .map_err(map_api_error)?;
+            Ok(ResolvedTarget {
+                requested: format!("id:{}", id.0),
+                selected: search_hit_from_node(&details),
+                alternatives: Vec::new(),
+            })
+        }
+        TargetSelection::Query(query) => {
+            let mut alternatives = runtime
+                .controller
+                .search_hybrid(
+                    SearchRequest {
+                        query: query.clone(),
+                    },
+                    None,
+                    Some(50),
+                    None,
+                )
+                .map_err(map_api_error)?;
+            if alternatives.is_empty() {
+                return Err(anyhow!(
+                    "No symbol matched query `{query}`. Run `codestory-cli search --query \"{query}\"` to inspect candidates."
+                ));
+            }
+
+            alternatives.sort_by(|left, right| compare_resolution_hits(&query, left, right));
+            let selected = alternatives.first().cloned().ok_or_else(|| {
+                anyhow!(
+                    "No symbol matched query `{query}`. Run `codestory-cli search --query \"{query}\"` to inspect candidates."
+                )
+            })?;
+
+            Ok(ResolvedTarget {
+                requested: query,
+                selected,
+                alternatives,
+            })
+        }
+    }
+}
+
+fn compare_resolution_hits(query: &str, left: &SearchHit, right: &SearchHit) -> std::cmp::Ordering {
+    resolution_rank(query, right)
+        .cmp(&resolution_rank(query, left))
+        .then_with(|| right.score.total_cmp(&left.score))
+        .then_with(|| left.display_name.len().cmp(&right.display_name.len()))
+        .then_with(|| left.display_name.cmp(&right.display_name))
+}
+
+fn resolution_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8) {
+    let query = normalize_symbol_query(query);
+    let display = normalize_symbol_query(&hit.display_name);
+    let terminal = terminal_symbol_segment(&hit.display_name);
+    let leading = leading_symbol_segment(&hit.display_name);
+
+    (
+        u8::from(display == query),
+        u8::from(terminal == query),
+        u8::from(structural_kind(hit.kind)),
+        u8::from(leading == query),
+    )
+}
+
+fn normalize_symbol_query(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn terminal_symbol_segment(value: &str) -> String {
+    value
+        .rsplit([':', '.', '/', '\\'])
+        .next()
+        .map(normalize_symbol_query)
+        .unwrap_or_default()
+}
+
+fn leading_symbol_segment(value: &str) -> String {
+    value
+        .split("::")
+        .next()
+        .map(normalize_symbol_query)
+        .unwrap_or_default()
+}
+
+fn structural_kind(kind: codestory_api::NodeKind) -> bool {
+    matches!(
+        kind,
+        codestory_api::NodeKind::MODULE
+            | codestory_api::NodeKind::NAMESPACE
+            | codestory_api::NodeKind::PACKAGE
+            | codestory_api::NodeKind::STRUCT
+            | codestory_api::NodeKind::CLASS
+            | codestory_api::NodeKind::INTERFACE
+            | codestory_api::NodeKind::ENUM
+            | codestory_api::NodeKind::UNION
+            | codestory_api::NodeKind::TYPEDEF
+    )
+}
+
+fn build_trail_request(root_id: &NodeId, cmd: &TrailCommand) -> TrailConfigDto {
+    let mode = match cmd.mode {
+        CliTrailMode::Neighborhood => TrailMode::Neighborhood,
+        CliTrailMode::Referenced => TrailMode::AllReferenced,
+        CliTrailMode::Referencing => TrailMode::AllReferencing,
+    };
+    let direction = cmd
+        .direction
+        .map(Into::into)
+        .unwrap_or_else(|| default_trail_direction(cmd.mode));
+
+    TrailConfigDto {
+        root_id: root_id.clone(),
+        mode,
+        target_id: None,
+        depth: cmd.depth.unwrap_or(match cmd.mode {
+            CliTrailMode::Neighborhood => 2,
+            CliTrailMode::Referenced | CliTrailMode::Referencing => 0,
+        }),
+        direction,
+        caller_scope: if cmd.include_tests {
+            TrailCallerScope::IncludeTestsAndBenches
+        } else {
+            TrailCallerScope::ProductionOnly
+        },
+        edge_filter: Vec::new(),
+        show_utility_calls: cmd.show_utility_calls,
+        node_filter: Vec::new(),
+        max_nodes: cmd.max_nodes.clamp(1, 200),
+        layout_direction: match cmd.layout {
+            CliLayout::Horizontal => LayoutDirection::Horizontal,
+            CliLayout::Vertical => LayoutDirection::Vertical,
+        },
+    }
+}
+
+fn canonicalize_project_root(project: &Path) -> Result<PathBuf> {
+    let project = if project.is_absolute() {
+        project.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("Failed to resolve current working directory")?
+            .join(project)
+    };
+
+    project.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve project path `{}`. Ensure the directory exists.",
+            project.display()
+        )
+    })
+}
+
+fn cache_root_for_project(project_root: &Path, override_dir: Option<&Path>) -> Result<PathBuf> {
+    let base = match override_dir {
+        Some(path) => path.to_path_buf(),
+        None => ProjectDirs::from("dev", "codestory", "codestory")
+            .map(|dirs| dirs.cache_dir().to_path_buf())
+            .ok_or_else(|| {
+                anyhow!("Failed to determine a user cache directory for codestory-cli")
+            })?,
+    };
+    Ok(base.join(fnv1a_hex(project_root.to_string_lossy().as_bytes())))
+}
+
+fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn resolve_refresh_request(refresh: RefreshMode, summary: &ProjectSummary) -> Option<IndexMode> {
+    match refresh {
+        RefreshMode::Auto => Some(if summary.stats.node_count == 0 {
+            IndexMode::Full
+        } else {
+            IndexMode::Incremental
+        }),
+        RefreshMode::Full => Some(IndexMode::Full),
+        RefreshMode::Incremental => Some(IndexMode::Incremental),
+        RefreshMode::None => None,
+    }
+}
+
+fn refresh_label(requested: RefreshMode, resolved: Option<IndexMode>) -> String {
+    match (requested, resolved) {
+        (RefreshMode::Auto, Some(IndexMode::Full)) => "auto(full)".to_string(),
+        (RefreshMode::Auto, Some(IndexMode::Incremental)) => "auto(incremental)".to_string(),
+        (RefreshMode::Full, Some(_)) => "full".to_string(),
+        (RefreshMode::Incremental, Some(_)) => "incremental".to_string(),
+        (RefreshMode::None, None) => "none".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn ensure_index_ready(opened: &OpenedProject, subcommand: &str) -> Result<()> {
+    if opened.summary.stats.node_count == 0 {
+        bail!(
+            "No indexed files are available for `{subcommand}`. Run `codestory-cli index --project \"{}\" --refresh auto` first or rerun this command with `--refresh auto`.",
+            opened.summary.root
+        );
+    }
+    Ok(())
+}
+
+fn map_api_error(error: ApiError) -> anyhow::Error {
+    anyhow!("{}: {}", error.code, error.message)
+}
+
+fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
+    SearchHit {
+        node_id: node.id.clone(),
+        display_name: node.display_name.clone(),
+        kind: node.kind,
+        file_path: node.file_path.clone(),
+        line: node.start_line,
+        score: 0.0,
+    }
+}
+
+fn emit<T: Serialize>(format: OutputFormat, value: &T, markdown: String) -> Result<()> {
+    match format {
+        OutputFormat::Markdown => {
+            println!("{markdown}");
+            Ok(())
+        }
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(value).context("Failed to serialize JSON output")?
+            );
+            Ok(())
+        }
+    }
+}
+
+fn render_index_markdown(output: &IndexOutput<'_>) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Index");
+    let _ = writeln!(markdown, "project: `{}`", output.project);
+    let _ = writeln!(markdown, "storage: `{}`", output.storage_path);
+    let _ = writeln!(markdown, "refresh: `{}`", output.refresh);
+    let _ = writeln!(
+        markdown,
+        "stats: nodes={} edges={} files={} errors={}",
+        output.summary.stats.node_count,
+        output.summary.stats.edge_count,
+        output.summary.stats.file_count,
+        output.summary.stats.error_count
+    );
+    if let Some(timings) = output.phase_timings {
+        let _ = writeln!(
+            markdown,
+            "timings_ms: parse={} flush={} resolve={} cleanup={} cache_refresh={}",
+            timings.parse_index_ms,
+            timings.projection_flush_ms,
+            timings.edge_resolution_ms,
+            timings.cleanup_ms,
+            timings.cache_refresh_ms.unwrap_or(0)
+        );
+        let _ = writeln!(
+            markdown,
+            "resolution: calls {}->{}, imports {}->{}",
+            timings.unresolved_calls_start,
+            timings.unresolved_calls_end,
+            timings.unresolved_imports_start,
+            timings.unresolved_imports_end
+        );
+    }
+    markdown
+}
+
+fn render_ground_markdown(project_root: &Path, snapshot: &GroundingSnapshotDto) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Grounding Snapshot");
+    let _ = writeln!(markdown, "root: `{}`", snapshot.root);
+    let _ = writeln!(markdown, "budget: `{}`", format_budget(snapshot.budget));
+    let _ = writeln!(
+        markdown,
+        "coverage: files {}/{} symbols {}/{} compressed_files={}",
+        snapshot.coverage.represented_files,
+        snapshot.coverage.total_files,
+        snapshot.coverage.represented_symbols,
+        snapshot.coverage.total_symbols,
+        snapshot.coverage.compressed_files
+    );
+    let _ = writeln!(
+        markdown,
+        "stats: nodes={} edges={} files={} errors={}",
+        snapshot.stats.node_count,
+        snapshot.stats.edge_count,
+        snapshot.stats.file_count,
+        snapshot.stats.error_count
+    );
+    if !snapshot.recommended_queries.is_empty() {
+        let _ = writeln!(
+            markdown,
+            "recommended_queries: {}",
+            snapshot.recommended_queries.join(", ")
+        );
+    }
+    if !snapshot.notes.is_empty() {
+        let _ = writeln!(markdown, "notes:");
+        for note in &snapshot.notes {
+            let _ = writeln!(markdown, "- {note}");
+        }
+    }
+    let _ = writeln!(markdown, "root_symbols:");
+    for symbol in &snapshot.root_symbols {
+        let _ = writeln!(markdown, "- {}", render_ground_symbol(symbol));
+    }
+    let _ = writeln!(markdown, "files:");
+    for file in &snapshot.files {
+        let language = file.language.as_deref().unwrap_or("unknown");
+        let status = if file.compressed {
+            "compressed"
+        } else {
+            "full"
+        };
+        let focus = if file.symbols.is_empty() {
+            "no indexed symbols".to_string()
+        } else {
+            file.symbols
+                .iter()
+                .map(render_ground_symbol)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        let _ = writeln!(
+            markdown,
+            "- `{}` [{}] symbols {}/{} {} | {}",
+            relative_path(project_root, &file.file_path),
+            language,
+            file.represented_symbol_count,
+            file.symbol_count,
+            status,
+            focus
+        );
+    }
+    if !snapshot.coverage_buckets.is_empty() {
+        let _ = writeln!(markdown, "coverage_buckets:");
+        for bucket in &snapshot.coverage_buckets {
+            let sample_paths = if bucket.sample_paths.is_empty() {
+                "no sample paths".to_string()
+            } else {
+                bucket.sample_paths.join(", ")
+            };
+            let _ = writeln!(
+                markdown,
+                "- `{}` files={} symbols={} samples={}",
+                bucket.label, bucket.file_count, bucket.symbol_count, sample_paths
+            );
+        }
+    }
+    markdown
+}
+
+fn render_search_markdown(project_root: &Path, query: &str, hits: &[SearchHit]) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Search");
+    let _ = writeln!(markdown, "query: `{query}`");
+    let _ = writeln!(markdown, "hits: {}", hits.len());
+    for hit in hits {
+        let _ = writeln!(markdown, "- {}", render_search_hit(project_root, hit));
+    }
+    markdown
+}
+
+fn render_symbol_markdown(
+    project_root: &Path,
+    target: &ResolvedTarget,
+    context: &SymbolContextDto,
+) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Symbol");
+    append_resolution(&mut markdown, project_root, target);
+    let _ = writeln!(
+        markdown,
+        "focus: {}",
+        render_node(project_root, &context.node)
+    );
+    let _ = writeln!(markdown, "children: {}", context.children.len());
+    for child in &context.children {
+        let _ = writeln!(
+            markdown,
+            "- [{}] {} [{}]{}",
+            child.id.0,
+            child.label,
+            format_kind(child.kind),
+            if child.has_children { " children" } else { "" }
+        );
+    }
+    if !context.edge_digest.is_empty() {
+        let _ = writeln!(markdown, "edge_digest:");
+        for edge in &context.edge_digest {
+            let _ = writeln!(markdown, "- {edge}");
+        }
+    }
+    if !context.related_hits.is_empty() {
+        let _ = writeln!(markdown, "related_hits:");
+        for hit in &context.related_hits {
+            let _ = writeln!(markdown, "- {}", render_search_hit(project_root, hit));
+        }
+    }
+    markdown
+}
+
+fn render_trail_markdown(
+    project_root: &Path,
+    target: &ResolvedTarget,
+    context: &TrailContextDto,
+    cmd: &TrailCommand,
+) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Trail");
+    append_resolution(&mut markdown, project_root, target);
+    let _ = writeln!(
+        markdown,
+        "focus: {}",
+        render_node(project_root, &context.focus)
+    );
+    let _ = writeln!(
+        markdown,
+        "mode: {} direction: {} depth: {} nodes: {} edges: {} truncated: {}",
+        format_trail_mode(cmd.mode),
+        format_direction(
+            cmd.direction
+                .map(Into::into)
+                .unwrap_or_else(|| default_trail_direction(cmd.mode))
+        ),
+        cmd.depth.unwrap_or(match cmd.mode {
+            CliTrailMode::Neighborhood => 2,
+            CliTrailMode::Referenced | CliTrailMode::Referencing => 0,
+        }),
+        context.trail.nodes.len(),
+        context.trail.edges.len(),
+        context.trail.truncated
+    );
+
+    let labels = context
+        .trail
+        .nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.label.clone()))
+        .collect::<HashMap<_, _>>();
+
+    let _ = writeln!(markdown, "nodes:");
+    for node in &context.trail.nodes {
+        let file = node
+            .file_path
+            .as_deref()
+            .map(|value| relative_path(project_root, value))
+            .unwrap_or_else(|| "-".to_string());
+        let _ = writeln!(
+            markdown,
+            "- [{}] {} [{}] depth={} file={}",
+            node.id.0,
+            node.label,
+            format_kind(node.kind),
+            node.depth,
+            file
+        );
+    }
+
+    let _ = writeln!(markdown, "edges:");
+    for edge in &context.trail.edges {
+        let source = labels
+            .get(&edge.source)
+            .map(String::as_str)
+            .unwrap_or(&edge.source.0);
+        let target = labels
+            .get(&edge.target)
+            .map(String::as_str)
+            .unwrap_or(&edge.target.0);
+        let certainty = edge
+            .certainty
+            .as_deref()
+            .map(|value| format!(" certainty={value}"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            markdown,
+            "- [{}] {} -{}-> {}{}",
+            edge.id.0,
+            source,
+            format!("{:?}", edge.kind).to_lowercase(),
+            target,
+            certainty
+        );
+    }
+    markdown
+}
+
+fn render_snippet_markdown(
+    project_root: &Path,
+    target: &ResolvedTarget,
+    context: &SnippetContextDto,
+) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Snippet");
+    append_resolution(&mut markdown, project_root, target);
+    let _ = writeln!(
+        markdown,
+        "focus: {}",
+        render_node(project_root, &context.node)
+    );
+    let _ = writeln!(
+        markdown,
+        "path: `{}`:{}",
+        relative_path(project_root, &context.path),
+        context.line
+    );
+    let _ = writeln!(markdown, "{}", context.snippet);
+    markdown
+}
+
+fn append_resolution(markdown: &mut String, project_root: &Path, target: &ResolvedTarget) {
+    if target.requested.starts_with("id:") {
+        return;
+    }
+    let _ = writeln!(
+        markdown,
+        "resolved_query: `{}` -> {}",
+        target.requested,
+        render_search_hit(project_root, &target.selected)
+    );
+    if target.alternatives.len() > 1 {
+        let alternatives = target
+            .alternatives
+            .iter()
+            .skip(1)
+            .take(3)
+            .map(|hit| render_search_hit(project_root, hit))
+            .collect::<Vec<_>>();
+        if !alternatives.is_empty() {
+            let _ = writeln!(markdown, "alternate_hits:");
+            for hit in alternatives {
+                let _ = writeln!(markdown, "- {hit}");
+            }
+        }
+    }
+}
+
+fn render_node(project_root: &Path, node: &NodeDetailsDto) -> String {
+    let mut out = format!(
+        "[{}] {} [{}]",
+        node.id.0,
+        node.display_name,
+        format_kind(node.kind)
+    );
+    if let Some(path) = node.file_path.as_deref() {
+        let _ = write!(out, " {}", relative_path(project_root, path));
+    }
+    if let Some(line) = node.start_line {
+        let _ = write!(out, ":{line}");
+    }
+    out
+}
+
+fn render_search_hit(project_root: &Path, hit: &SearchHit) -> String {
+    let mut out = format!(
+        "[{}] {} [{}]",
+        hit.node_id.0,
+        hit.display_name,
+        format_kind(hit.kind)
+    );
+    if let Some(path) = hit.file_path.as_deref() {
+        let _ = write!(out, " {}", relative_path(project_root, path));
+    }
+    if let Some(line) = hit.line {
+        let _ = write!(out, ":{line}");
+    }
+    let _ = write!(out, " score={:.2}", hit.score);
+    out
+}
+
+fn render_ground_symbol(symbol: &codestory_api::GroundingSymbolDigestDto) -> String {
+    let mut out = format!(
+        "[{}] {} [{}]",
+        symbol.id.0,
+        symbol.label,
+        format_kind(symbol.kind)
+    );
+    if let Some(line) = symbol.line {
+        let _ = write!(out, " line={line}");
+    }
+    if let Some(member_count) = symbol.member_count {
+        let _ = write!(out, " members={member_count}");
+    }
+    if !symbol.edge_digest.is_empty() {
+        let _ = write!(out, " edges={}", symbol.edge_digest.join("; "));
+    }
+    out
+}
+
+fn relative_path(project_root: &Path, raw: &str) -> String {
+    let path = Path::new(raw);
+    path.strip_prefix(project_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn looks_like_text_query(query: &str) -> bool {
+    let word_count = query.split_whitespace().count();
+    let has_text_punctuation = query
+        .chars()
+        .any(|ch| matches!(ch, '.' | ',' | ':' | ';' | '!' | '?' | '"' | '\''));
+    (word_count > 1 && has_text_punctuation) || query.len() > 28
+}
+
+fn scan_repo_text_hits(project_root: &Path, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+    let mut hits = Vec::new();
+    if query.trim().is_empty() || limit == 0 {
+        return Ok(hits);
+    }
+    scan_repo_text_hits_inner(project_root, project_root, query, limit, &mut hits)?;
+    Ok(hits)
+}
+
+fn scan_repo_text_hits_inner(
+    project_root: &Path,
+    dir: &Path,
+    query: &str,
+    limit: usize,
+    hits: &mut Vec<SearchHit>,
+) -> Result<()> {
+    if hits.len() >= limit {
+        return Ok(());
+    }
+
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("Failed to read directory {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            if is_ignored_search_dir(&path) {
+                continue;
+            }
+            scan_repo_text_hits_inner(project_root, &path, query, limit, hits)?;
+            if hits.len() >= limit {
+                break;
+            }
+            continue;
+        }
+
+        if let Some(hit) = scan_file_text_hit(project_root, &path, query, hits.len()) {
+            hits.push(hit);
+            if hits.len() >= limit {
+                break;
             }
         }
     }
 
-    println!("Found {} files to process.", files_to_index.len());
-
-    // 3. Setup Channels and Writer Thread
-    // We use a bounded channel to provide backpressure if the writer is slow
-    let (tx, rx) = bounded::<IndexResult>(100);
-
-    let writer_handle = thread::spawn(move || -> Result<usize> {
-        let mut count = 0;
-        for result in rx {
-            // Write nodes, edges, occurrences
-            if !result.nodes.is_empty() {
-                storage.insert_nodes_batch(&result.nodes)?;
-            }
-            if !result.occurrences.is_empty() {
-                storage.insert_occurrences_batch(&result.occurrences)?;
-            }
-            if !result.edges.is_empty() {
-                storage.insert_edges_batch(&result.edges)?;
-            }
-            count += 1;
-        }
-        Ok(count)
-    });
-
-    // 4. Parallel Indexing
-    let files_processed = AtomicUsize::new(0);
-    files_to_index
-        .par_iter()
-        .for_each_with(tx.clone(), |sender, path| {
-            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            let Some((lang, lang_name, graph_query)) = get_language_for_ext(ext) else {
-                return;
-            };
-            let Ok(source) = std::fs::read_to_string(path) else {
-                return;
-            };
-
-            match index_file(path, &source, lang, lang_name, graph_query, None, None) {
-                Ok(result) => {
-                    if sender.send(result).is_ok() {
-                        files_processed.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error indexing {:?}: {}", path, e);
-                }
-            }
-        });
-    let files_processed = files_processed.load(Ordering::Relaxed);
-
-    // Drop the sender to close the channel so the writer thread exits
-    drop(tx);
-
-    // 5. Wait for Writer
-    let files_stored = writer_handle
-        .join()
-        .map_err(|_| anyhow!("writer thread panicked"))??;
-
-    println!("Processed {} files.", files_processed);
-    println!("Stored {} files in database.", files_stored);
-
-    // Re-open storage to verify counts (since storage was moved to thread)
-    // Actually, we can't easily query the same storage struct since it was moved.
-    // We can open a NEW connection or just rely on the logs.
-
     Ok(())
+}
+
+fn is_ignored_search_dir(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(".git" | "target" | "node_modules" | ".next" | "dist")
+    )
+}
+
+fn scan_file_text_hit(
+    project_root: &Path,
+    path: &Path,
+    query: &str,
+    rank: usize,
+) -> Option<SearchHit> {
+    let metadata = path.metadata().ok()?;
+    if metadata.len() > 1_000_000 {
+        return None;
+    }
+
+    let contents = fs::read_to_string(path).ok()?;
+    let normalized_query = query.trim().to_ascii_lowercase();
+    if normalized_query.is_empty() {
+        return None;
+    }
+
+    let mut line_match = None;
+    for (index, line) in contents.lines().enumerate() {
+        if line.to_ascii_lowercase().contains(&normalized_query) {
+            line_match = Some((index + 1).min(u32::MAX as usize) as u32);
+            break;
+        }
+    }
+    let line = line_match?;
+    let relative = path
+        .strip_prefix(project_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let hash_hex = fnv1a_hex(format!("{relative}:{line}").as_bytes());
+    let node_id_raw = i64::from_str_radix(&hash_hex[..15], 16).ok()?;
+
+    Some(SearchHit {
+        node_id: NodeId(node_id_raw.to_string()),
+        display_name: relative.clone(),
+        kind: codestory_api::NodeKind::FILE,
+        file_path: Some(path.to_string_lossy().to_string()),
+        line: Some(line),
+        score: 500.0 - rank as f32,
+    })
+}
+
+fn format_kind(kind: codestory_api::NodeKind) -> String {
+    format!("{kind:?}").to_lowercase()
+}
+
+fn format_budget(budget: GroundingBudgetDto) -> &'static str {
+    match budget {
+        GroundingBudgetDto::Strict => "strict",
+        GroundingBudgetDto::Balanced => "balanced",
+        GroundingBudgetDto::Max => "max",
+    }
+}
+
+fn format_trail_mode(mode: CliTrailMode) -> &'static str {
+    match mode {
+        CliTrailMode::Neighborhood => "neighborhood",
+        CliTrailMode::Referenced => "referenced",
+        CliTrailMode::Referencing => "referencing",
+    }
+}
+
+fn format_direction(direction: TrailDirection) -> &'static str {
+    match direction {
+        TrailDirection::Incoming => "incoming",
+        TrailDirection::Outgoing => "outgoing",
+        TrailDirection::Both => "both",
+    }
+}
+
+fn default_trail_direction(mode: CliTrailMode) -> TrailDirection {
+    match mode {
+        CliTrailMode::Neighborhood => TrailDirection::Both,
+        CliTrailMode::Referenced => TrailDirection::Outgoing,
+        CliTrailMode::Referencing => TrailDirection::Incoming,
+    }
+}
+
+impl From<CliGroundingBudget> for GroundingBudgetDto {
+    fn from(value: CliGroundingBudget) -> Self {
+        match value {
+            CliGroundingBudget::Strict => Self::Strict,
+            CliGroundingBudget::Balanced => Self::Balanced,
+            CliGroundingBudget::Max => Self::Max,
+        }
+    }
+}
+
+impl From<CliDirection> for TrailDirection {
+    fn from(value: CliDirection) -> Self {
+        match value {
+            CliDirection::Incoming => Self::Incoming,
+            CliDirection::Outgoing => Self::Outgoing,
+            CliDirection::Both => Self::Both,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codestory_api::StorageStatsDto;
+
+    fn summary_with_files(file_count: u32) -> ProjectSummary {
+        ProjectSummary {
+            root: "C:/repo".to_string(),
+            stats: StorageStatsDto {
+                node_count: file_count.saturating_mul(10),
+                edge_count: 0,
+                file_count,
+                error_count: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn fnv1a_hash_is_stable() {
+        assert_eq!(fnv1a_hex(b"abc"), "e71fa2190541574b");
+    }
+
+    #[test]
+    fn auto_refresh_uses_full_for_empty_index() {
+        assert_eq!(
+            resolve_refresh_request(RefreshMode::Auto, &summary_with_files(0)),
+            Some(IndexMode::Full)
+        );
+    }
+
+    #[test]
+    fn auto_refresh_uses_incremental_for_existing_index() {
+        assert_eq!(
+            resolve_refresh_request(RefreshMode::Auto, &summary_with_files(3)),
+            Some(IndexMode::Incremental)
+        );
+    }
+
+    #[test]
+    fn resolution_prefers_exact_type_name_over_member_hits() {
+        let query = "AppController";
+        let mut hits = vec![
+            SearchHit {
+                node_id: NodeId("2".to_string()),
+                display_name: "AppController::open_project".to_string(),
+                kind: codestory_api::NodeKind::FUNCTION,
+                file_path: None,
+                line: None,
+                score: 0.9,
+            },
+            SearchHit {
+                node_id: NodeId("1".to_string()),
+                display_name: "AppController".to_string(),
+                kind: codestory_api::NodeKind::CLASS,
+                file_path: None,
+                line: None,
+                score: 0.9,
+            },
+        ];
+
+        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
+        assert_eq!(hits[0].display_name, "AppController");
+    }
 }

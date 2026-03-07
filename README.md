@@ -1,16 +1,19 @@
 # CodeStory
 
-CodeStory is a Rust-first code understanding system with a web UI. It indexes a repository into a local SQLite graph, then uses symbol search, graph exploration, and agent responses to help you inspect unfamiliar code quickly.
+CodeStory is a skill-first codebase grounding engine for local repositories. It builds a SQLite-backed symbol and relationship graph, then exposes grounding primitives that higher-level skills, agents, and runtimes can compose.
 
-The project is actively evolving. Current architecture is centered on a headless app core (`codestory-app`), an HTTP server (`codestory-server`), and a React frontend (`codestory-ui`).
+The canonical packaging target is `codestory-cli`, and the repo-local skill lives at `.agents/skills/codestory-grounding`.
 
-## Highlights
+## Grounding Workflows
 
-- Graph-grounded exploration around symbols
-- Trail controls (mode, direction, depth, edge/node filters, target symbol pathing)
-- Full-text and fuzzy search over indexed symbols
-- Editable code pane with incremental re-index flow
-- Event-streamed status updates from backend to UI
+The repo is organized around six grounding verbs:
+
+- `index`: discover files, parse supported languages, and persist graph/search state locally
+- `ground`: turn a prompt into grounded code context using indexed symbols, snippets, and graph traversal
+- `search`: find likely symbols, files, and matches by name or text
+- `symbol`: inspect one symbol and its indexed metadata
+- `trail`: walk neighborhoods or focused paths through the code graph
+- `snippet`: return focused source context for a symbol or location
 
 ## Supported Languages (Indexer)
 
@@ -27,148 +30,71 @@ The project is actively evolving. Current architecture is centered on a headless
 ### Prerequisites
 
 - Rust toolchain (edition 2024 crates in this workspace)
-- Node.js + npm (for `codestory-ui`)
-- A C/C++ build toolchain may be required on some platforms for native dependencies
+- A native build toolchain may be required on some platforms for parser or dependency builds
 
-### Run Full Stack In Dev Mode
+### Build The CLI Runtime
+
+```powershell
+cargo build -p codestory-cli
+```
+
+### Create Or Refresh A Local Index
+
+```powershell
+cargo run -p codestory-cli -- index --project .
+```
+
+This writes repo-local grounding data into the user cache by default, keyed by the target project path.
+
+### Command Model
+
+The docs and packaging now center on this runtime surface:
+
+```text
+codestory-cli index --project <path> [--refresh auto|full|incremental]
+codestory-cli ground --project <path> [--budget strict|balanced|max]
+codestory-cli search --project <path> --query <query>
+codestory-cli symbol --project <path> (--id <node-id> | --query <query>)
+codestory-cli trail --project <path> (--id <node-id> | --query <query>)
+codestory-cli snippet --project <path> (--id <node-id> | --query <query>)
+```
+
+The bundled skill scripts in `.agents/skills/codestory-grounding/scripts/` are thin wrappers around these commands.
+
+## Common Development Commands
 
 From the workspace root:
 
 ```powershell
-cd codestory-ui
-npm install
-npm run dev:all
-```
-
-This starts:
-
-- Vite UI at `http://127.0.0.1:5173`
-- API server at `http://127.0.0.1:7878`
-
-### Run Backend And Frontend Separately
-
-Terminal 1 (from repo root):
-
-```powershell
-cargo run -p codestory-server -- --project .
-```
-
-Terminal 2 (from repo root):
-
-```powershell
-cd codestory-ui
-npm run dev
-```
-
-### Build For Local Production-Style Serving
-
-```powershell
-cd codestory-ui
-npm run build
-cd ..
-cargo run -p codestory-server -- --project . --frontend-dist codestory-ui/dist
-```
-
-## CLI Indexer
-
-For direct indexing workflows:
-
-```powershell
-cargo run -p codestory-cli -- --path .
-```
-
-Use `--db <path>` to write to a custom SQLite file.
-
-## Common Development Commands
-
-Backend (repo root):
-
-```powershell
+cargo check -p codestory-cli
 cargo build
 cargo test
-cargo check
 cargo fmt
 cargo clippy
 ```
 
-Frontend (`codestory-ui`):
-
-```powershell
-npm run check
-```
-
-Regenerate shared TypeScript API bindings (repo root):
-
-```powershell
-cargo run -p codestory-server -- --types-only --types-out codestory-ui/src/generated/api.ts
-```
-
-## LLM Retrieval Configuration (Local-Only)
-
-`/api/agent/ask` now expects a local semantic embedding setup by default.
-
-- `CODESTORY_EMBED_MODEL_PATH` (optional): absolute path to a local embedding model artifact. If unset, the server auto-checks `models/all-minilm-l6-v2/model.onnx`.
-- `CODESTORY_EMBED_MODEL_ID` (optional): identifier recorded with stored embeddings.
-- `CODESTORY_EMBED_TOKENIZER_PATH` (optional): tokenizer JSON path. Defaults to `tokenizer.json` next to the model.
-- `CODESTORY_EMBED_RUNTIME_MODE` (optional, default `onnx`): set to `hash` for deterministic local dev/benchmark embeddings.
-- `CODESTORY_HYBRID_RETRIEVAL_ENABLED` (optional, default `true`): set to `false`/`0` for lexical rollback mode.
-- `CODESTORY_CORS_ALLOW_ANY` (optional, default `false`): set to `true` only when you intentionally need permissive cross-origin access.
-
-Default CORS policy is local-first and explicit:
-- `http://127.0.0.1:<server-port>`
-- `http://localhost:<server-port>`
-- `http://127.0.0.1:5173`
-- `http://localhost:5173`
-
-The server still defaults to `127.0.0.1:7878`. If you bind `--host` to a non-loopback address, startup logs a warning.
-
-Bundle a local model artifact into the default path:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/bundle-embed-model.ps1
-```
-
-Examples:
-
-```powershell
-# Optional when model is bundled at models/all-minilm-l6-v2/model.onnx
-$env:CODESTORY_EMBED_MODEL_PATH = "C:\models\all-minilm-l6-v2\model.onnx"
-$env:CODESTORY_EMBED_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
-cargo run -p codestory-server -- --project .
-```
-
-Rollback example:
-
-```powershell
-$env:CODESTORY_HYBRID_RETRIEVAL_ENABLED = "false"
-cargo run -p codestory-server -- --project .
-```
+Use `cargo check -p codestory-cli` for the fastest packaging-oriented validation pass when you are working on the grounding runtime surface.
 
 ## Repository Layout
 
-- Workspace manifest: `Cargo.toml`
-- Rust crates: `crates/`
-  - `codestory-core`: shared graph/index domain types
-  - `codestory-events`: event types and event bus
-  - `codestory-project`: workspace discovery/refresh metadata
-  - `codestory-index`: tree-sitter + semantic resolution indexing pipeline
-  - `codestory-storage`: SQLite schema and query layer
-  - `codestory-search`: search primitives over indexed data
-  - `codestory-api`: API DTOs and identifiers shared with frontend
-  - `codestory-app`: headless orchestrator
-  - `codestory-server`: Axum API + SSE + optional static file serving
-  - `codestory-cli`: standalone indexing CLI
-  - `codestory-bench`: Criterion benchmark suite
-- Web UI: `codestory-ui/` (Vite + React + TypeScript)
+- `Cargo.toml`: workspace manifest
+- `crates/codestory-cli`: canonical CLI packaging target for grounding workflows
+- `crates/codestory-app`: headless orchestrator used by higher-level runtimes
+- `crates/codestory-project`: repository discovery and refresh metadata
+- `crates/codestory-index`: tree-sitter plus semantic indexing pipeline
+- `crates/codestory-storage`: SQLite schema, persistence, and trail queries
+- `crates/codestory-search`: lexical and semantic retrieval primitives
+- `crates/codestory-core`: shared graph and domain types
+- `crates/codestory-events`: event types used by adapters and status flows
+- `crates/codestory-api`: DTOs shared by the CLI, skill, and adapter layers
+- `.agents/skills/codestory-grounding`: repo-local skill scripts and instructions
+- `crates/codestory-bench`: Criterion benchmarks for performance and fidelity work
 
-## Generated Runtime Files
+## Runtime Artifacts
 
-Running CodeStory locally creates artifacts such as:
+Running CodeStory locally creates runtime state such as:
 
-- `codestory.db` (SQLite index)
-- `codestory_ui.json` (persisted UI layout/state)
-
-These files are local runtime state and are ignored via `.gitignore`.
+- user-cache SQLite grounding indexes keyed by project path
 
 ## License
 

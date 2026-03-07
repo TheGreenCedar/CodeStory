@@ -1029,6 +1029,7 @@ fn next_request_id() -> String {
     format!("ask-{}", nanos)
 }
 
+#[allow(dead_code)]
 fn should_use_agent_term_planner(prompt: &str, hit_count: usize) -> bool {
     if hit_count >= 3 {
         return false;
@@ -1036,6 +1037,7 @@ fn should_use_agent_term_planner(prompt: &str, hit_count: usize) -> bool {
     prompt.split_whitespace().count() >= 4
 }
 
+#[allow(dead_code)]
 fn build_term_planner_prompt(
     prompt: &str,
     existing_hits: &[SearchHit],
@@ -1062,6 +1064,7 @@ No explanation, no markdown, no numbering.",
     )
 }
 
+#[allow(dead_code)]
 fn parse_agent_terms(markdown: &str, max_terms: usize) -> Vec<String> {
     let normalized = markdown
         .replace('\r', "\n")
@@ -1104,6 +1107,7 @@ fn parse_agent_terms(markdown: &str, max_terms: usize) -> Vec<String> {
     terms
 }
 
+#[allow(dead_code)]
 fn request_agent_search_terms(
     controller: &AppController,
     req: &AgentAskRequest,
@@ -1150,6 +1154,7 @@ fn request_agent_search_terms(
     }
 }
 
+#[allow(dead_code)]
 fn prompt_search_terms(prompt: &str) -> Vec<String> {
     const STOPWORDS: &[&str] = &[
         "a",
@@ -1212,6 +1217,7 @@ fn prompt_search_terms(prompt: &str) -> Vec<String> {
     terms
 }
 
+#[allow(dead_code)]
 fn merge_search_hits(into: &mut Vec<SearchHit>, additional: Vec<SearchHit>, max_candidates: usize) {
     let mut by_id = HashMap::<codestory_api::NodeId, SearchHit>::new();
 

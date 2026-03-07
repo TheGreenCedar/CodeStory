@@ -7,7 +7,6 @@ members = [
     "crates/codestory-storage",
     "crates/codestory-index",
     "crates/codestory-search",
-    "crates/codestory-server",
     "crates/codestory-cli",
     "crates/codestory-events",
     "crates/codestory-project",

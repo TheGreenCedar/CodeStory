@@ -2,12 +2,14 @@ use codestory_api::{
     AgentAnswerDto, AgentAskRequest, AgentBackend, AgentConnectionSettingsDto,
     AgentHybridWeightsDto, ApiError, AppEventPayload, BookmarkCategoryDto, BookmarkDto,
     CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest,
-    GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse, IndexMode, IndexingPhaseTimings,
-    ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess, NodeDetailsDto,
-    NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest, OpenContainingFolderRequest,
-    OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
-    ReadFileTextResponse, SearchHit, SearchRequest, SetUiLayoutRequest, SourceOccurrenceDto,
-    StartIndexingRequest, StorageStatsDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
+    GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto,
+    GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingSnapshotDto,
+    GroundingSymbolDigestDto, IndexMode, IndexingPhaseTimings, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
+    NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
+    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, SearchHit, SearchRequest,
+    SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto,
+    SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto,
     TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WriteFileResponse,
     WriteFileTextRequest,
 };
@@ -30,6 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod agent;
 mod graph_builders;
 mod graph_canonical;
+mod grounding;
 mod path_resolution;
 mod system_actions;
 
@@ -51,7 +54,7 @@ fn env_flag_enabled(var_name: &str, default: bool) -> bool {
 }
 
 pub(crate) fn hybrid_retrieval_enabled() -> bool {
-    env_flag_enabled(HYBRID_RETRIEVAL_ENABLED_ENV, true)
+    env_flag_enabled(HYBRID_RETRIEVAL_ENABLED_ENV, false)
 }
 
 fn normalized_hybrid_weights(
@@ -183,12 +186,49 @@ fn extract_symbol_search_terms(query: &str) -> Vec<String> {
 }
 
 fn should_expand_symbol_query(query: &str, direct_hit_count: usize) -> bool {
+    let word_count = query.split_whitespace().count();
+    let has_text_punctuation = query
+        .chars()
+        .any(|ch| matches!(ch, '.' | ',' | ':' | ';' | '!' | '?' | '"' | '\''));
+    if word_count > 1 && has_text_punctuation {
+        return true;
+    }
     if direct_hit_count >= 3 {
         return false;
     }
-
-    let has_sentence_shape = query.split_whitespace().count() > 2 || query.len() > 28;
+    let has_sentence_shape = word_count > 2 || query.len() > 28;
     has_sentence_shape
+}
+
+fn file_text_match_line(contents: &str, query: &str, terms: &[String]) -> Option<u32> {
+    let normalized_query = query.trim().to_ascii_lowercase();
+    for (index, line) in contents.lines().enumerate() {
+        let normalized_line = line.to_ascii_lowercase();
+        if !normalized_query.is_empty() && normalized_line.contains(&normalized_query) {
+            return Some((index + 1).min(u32::MAX as usize) as u32);
+        }
+        if !terms.is_empty() && terms.iter().all(|term| normalized_line.contains(term)) {
+            return Some((index + 1).min(u32::MAX as usize) as u32);
+        }
+    }
+    None
+}
+
+fn read_searchable_file_contents(path: &str) -> Option<String> {
+    if let Ok(contents) = std::fs::read_to_string(path) {
+        return Some(contents);
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(stripped) = path.strip_prefix(r"\\?\")
+            && let Ok(contents) = std::fs::read_to_string(stripped)
+        {
+            return Some(contents);
+        }
+    }
+
+    None
 }
 
 fn aggregate_symbol_matches(
@@ -675,6 +715,28 @@ fn llm_indexable_kind(kind: codestory_core::NodeKind) -> bool {
     )
 }
 
+fn edge_digest_for_node(
+    storage: &Storage,
+    node_id: codestory_core::NodeId,
+    limit: usize,
+) -> Vec<String> {
+    let mut by_kind = HashMap::<String, usize>::new();
+    if let Ok(edges) = storage.get_edges_for_node_id(node_id) {
+        for edge in edges {
+            let key = format!("{:?}", edge.kind);
+            *by_kind.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    let mut counts = by_kind.into_iter().collect::<Vec<_>>();
+    counts.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    counts
+        .into_iter()
+        .take(limit)
+        .map(|(kind, count)| format!("{kind}={count}"))
+        .collect()
+}
+
 fn build_llm_symbol_doc_text(
     storage: &Storage,
     node: &codestory_core::Node,
@@ -694,20 +756,11 @@ fn build_llm_symbol_doc_text(
         let _ = writeln!(out, "qualified_name: {qualified_name}");
     }
 
-    let mut by_kind = HashMap::<String, usize>::new();
-    if let Ok(edges) = storage.get_edges_for_node_id(node.id) {
-        for edge in edges {
-            let key = format!("{:?}", edge.kind);
-            *by_kind.entry(key).or_insert(0) += 1;
-        }
-    }
-
-    if !by_kind.is_empty() {
-        let mut counts = by_kind.into_iter().collect::<Vec<_>>();
-        counts.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    let edge_digest = edge_digest_for_node(storage, node.id, 6);
+    if !edge_digest.is_empty() {
         out.push_str("edge_digest:");
-        for (kind, count) in counts.into_iter().take(6) {
-            let _ = write!(out, " {kind}={count};");
+        for digest in edge_digest {
+            let _ = write!(out, " {digest};");
         }
         out.push('\n');
     }
@@ -730,6 +783,11 @@ fn sync_llm_symbol_projection(
     engine: &mut SearchEngine,
     llm_refresh_file_scope: Option<&HashSet<codestory_core::NodeId>>,
 ) -> Result<(), ApiError> {
+    if !hybrid_retrieval_enabled() {
+        engine.index_llm_symbol_docs(Vec::new());
+        return Ok(());
+    }
+
     if let Err(error) = engine.set_embedding_runtime_from_env() {
         tracing::warn!(
             "{EMBEDDING_MODEL_ENV} not configured or invalid ({error}); semantic ask retrieval will be unavailable until a local model artifact is configured. Use a bundled model at {DEFAULT_BUNDLED_EMBED_MODEL_PATH}, set {EMBEDDING_RUNTIME_MODE_ENV}=hash for local-dev embeddings, or set {HYBRID_RETRIEVAL_ENABLED_ENV}=false for lexical-only retrieval."
@@ -1115,6 +1173,57 @@ impl AppController {
         }
     }
 
+    fn open_project_with_storage_inner(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+    ) -> Result<ProjectSummary, ApiError> {
+        let mut storage = Storage::open(&storage_path)
+            .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
+
+        let stats = storage
+            .get_stats()
+            .map_err(|e| ApiError::internal(format!("Failed to query stats: {e}")))?;
+
+        let nodes = storage
+            .get_nodes()
+            .map_err(|e| ApiError::internal(format!("Failed to load nodes: {e}")))?;
+        let derived_file_count = if stats.file_count > 0 {
+            stats.file_count
+        } else {
+            nodes
+                .iter()
+                .filter(|node| node.kind == codestory_core::NodeKind::FILE)
+                .count()
+                .min(i64::MAX as usize) as i64
+        };
+        let (node_names, engine) = build_search_state(&mut storage, nodes, None)?;
+
+        {
+            let mut s = self.state.lock();
+            s.project_root = Some(root.clone());
+            s.storage_path = Some(storage_path);
+            s.node_names = node_names;
+            s.search_engine = Some(engine);
+        }
+
+        let dto_stats = StorageStatsDto {
+            node_count: clamp_i64_to_u32(stats.node_count),
+            edge_count: clamp_i64_to_u32(stats.edge_count),
+            file_count: clamp_i64_to_u32(derived_file_count),
+            error_count: clamp_i64_to_u32(stats.error_count),
+        };
+
+        let _ = self.events_tx.send(AppEventPayload::StatusUpdate {
+            message: "Project opened.".to_string(),
+        });
+
+        Ok(ProjectSummary {
+            root: root.to_string_lossy().to_string(),
+            stats: dto_stats,
+        })
+    }
+
     pub fn open_project(&self, req: OpenProjectRequest) -> Result<ProjectSummary, ApiError> {
         let root = PathBuf::from(req.path);
         if !root.exists() {
@@ -1131,42 +1240,36 @@ impl AppController {
         }
 
         let storage_path = root.join("codestory.db");
-        let mut storage = Storage::open(&storage_path)
-            .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
+        self.open_project_with_storage_path(root, storage_path)
+    }
 
-        let stats = storage
-            .get_stats()
-            .map_err(|e| ApiError::internal(format!("Failed to query stats: {e}")))?;
-
-        // Build symbol cache + search index.
-        let nodes = storage
-            .get_nodes()
-            .map_err(|e| ApiError::internal(format!("Failed to load nodes: {e}")))?;
-        let (node_names, engine) = build_search_state(&mut storage, nodes, None)?;
-
-        {
-            let mut s = self.state.lock();
-            s.project_root = Some(root.clone());
-            s.storage_path = Some(storage_path);
-            s.node_names = node_names;
-            s.search_engine = Some(engine);
+    pub fn open_project_with_storage_path(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+    ) -> Result<ProjectSummary, ApiError> {
+        if !root.exists() {
+            return Err(ApiError::not_found(format!(
+                "Project path does not exist: {}",
+                root.display()
+            )));
+        }
+        if !root.is_dir() {
+            return Err(ApiError::invalid_argument(format!(
+                "Project path is not a directory: {}",
+                root.display()
+            )));
+        }
+        if let Some(parent) = storage_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to create storage directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
         }
 
-        let dto_stats = StorageStatsDto {
-            node_count: clamp_i64_to_u32(stats.node_count),
-            edge_count: clamp_i64_to_u32(stats.edge_count),
-            file_count: clamp_i64_to_u32(stats.file_count),
-            error_count: clamp_i64_to_u32(stats.error_count),
-        };
-
-        let _ = self.events_tx.send(AppEventPayload::StatusUpdate {
-            message: "Project opened.".to_string(),
-        });
-
-        Ok(ProjectSummary {
-            root: root.to_string_lossy().to_string(),
-            stats: dto_stats,
-        })
+        self.open_project_with_storage_inner(root, storage_path)
     }
 
     pub fn start_indexing(&self, req: StartIndexingRequest) -> Result<(), ApiError> {
@@ -1234,6 +1337,46 @@ impl AppController {
         Ok(())
     }
 
+    pub fn run_indexing_blocking(&self, mode: IndexMode) -> Result<IndexingPhaseTimings, ApiError> {
+        let (root, storage_path) = {
+            let mut s = self.state.lock();
+            if s.is_indexing {
+                return Err(ApiError::invalid_argument(
+                    "Indexing already in progress for this controller.",
+                ));
+            }
+            s.is_indexing = true;
+            let root = s.project_root.clone().ok_or_else(no_project_error)?;
+            let storage_path = s
+                .storage_path
+                .clone()
+                .unwrap_or_else(|| root.join("codestory.db"));
+            (root, storage_path)
+        };
+
+        let result = match mode {
+            IndexMode::Full => index_full(&root, &storage_path, &self.events_tx),
+            IndexMode::Incremental => index_incremental(&root, &storage_path, &self.events_tx),
+        };
+
+        match result {
+            Ok(summary) => {
+                let mut storage = Storage::open(&storage_path)
+                    .map_err(|e| ApiError::internal(format!("Failed to reopen storage: {e}")))?;
+                refresh_caches(self, &mut storage, summary.llm_refresh_scope.as_ref());
+                Ok(summary.phase_timings)
+            }
+            Err(error) => {
+                if let Ok(mut storage) = Storage::open(&storage_path) {
+                    refresh_caches(self, &mut storage, None);
+                } else {
+                    self.state.lock().is_indexing = false;
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub fn search(&self, req: SearchRequest) -> Result<Vec<SearchHit>, ApiError> {
         let (matches, node_names) = {
             let mut s = self.state.lock();
@@ -1271,10 +1414,70 @@ impl AppController {
         };
 
         let storage = self.open_storage()?;
-        Ok(matches
+        let mut hits = matches
             .into_iter()
             .map(|(id, score)| Self::build_search_hit(&storage, &node_names, id, score))
-            .collect())
+            .collect::<Vec<_>>();
+
+        if should_expand_symbol_query(&req.query, hits.len()) {
+            let terms = extract_symbol_search_terms(&req.query);
+            let mut seen = hits
+                .iter()
+                .map(|hit| hit.node_id.clone())
+                .collect::<HashSet<_>>();
+            let project_root = self.require_project_root().ok();
+            for file in storage.get_files().map_err(|e| {
+                ApiError::internal(format!("Failed to load files for text search: {e}"))
+            })? {
+                let path_string = file.path.to_string_lossy().to_string();
+                let Some(contents) = read_searchable_file_contents(&path_string) else {
+                    continue;
+                };
+                let Some(line) = file_text_match_line(&contents, &req.query, &terms) else {
+                    continue;
+                };
+                let node_id = NodeId::from(codestory_core::NodeId(file.id));
+                if !seen.insert(node_id.clone()) {
+                    continue;
+                }
+                let display_name = project_root
+                    .as_deref()
+                    .and_then(|root| file.path.strip_prefix(root).ok())
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .or_else(|| {
+                        file.path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                    })
+                    .unwrap_or_else(|| path_string.clone());
+                let exact_match = contents
+                    .to_ascii_lowercase()
+                    .contains(&req.query.trim().to_ascii_lowercase());
+                let score = if exact_match { 260.0 } else { 150.0 } - hits.len() as f32;
+                hits.push(SearchHit {
+                    node_id,
+                    display_name,
+                    kind: codestory_api::NodeKind::FILE,
+                    file_path: Some(path_string),
+                    line: Some(line),
+                    score,
+                });
+                if hits.len() >= 20 {
+                    break;
+                }
+            }
+
+            hits.sort_by(|left, right| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| left.display_name.cmp(&right.display_name))
+            });
+            hits.truncate(20);
+        }
+
+        Ok(hits)
     }
 
     pub fn search_hybrid(
@@ -1814,28 +2017,6 @@ impl AppController {
         Ok(WriteFileResponse {
             bytes_written: clamp_i64_to_u32(req.text.len() as i64),
         })
-    }
-
-    pub fn get_ui_layout(&self) -> Result<Option<String>, ApiError> {
-        let root = self.require_project_root()?;
-        let path = root.join("codestory_ui.json");
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => Ok(Some(contents)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(ApiError::internal(format!(
-                "Failed to read UI layout {}: {e}",
-                path.display()
-            ))),
-        }
-    }
-
-    pub fn set_ui_layout(&self, req: SetUiLayoutRequest) -> Result<(), ApiError> {
-        let root = self.require_project_root()?;
-        let path = root.join("codestory_ui.json");
-        std::fs::write(&path, req.json).map_err(|e| {
-            ApiError::internal(format!("Failed to write UI layout {}: {e}", path.display()))
-        })?;
-        Ok(())
     }
 }
 

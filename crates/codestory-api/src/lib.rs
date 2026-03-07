@@ -14,13 +14,16 @@ pub use dto::{
     CanonicalEdgeFamily, CanonicalLayoutDto, CanonicalMemberDto, CanonicalMemberVisibility,
     CanonicalNodeDto, CanonicalNodeStyle, CanonicalRouteKind, CreateBookmarkCategoryRequest,
     CreateBookmarkRequest, EdgeOccurrencesRequest, GraphArtifactDto, GraphEdgeDto, GraphNodeDto,
-    GraphRequest, GraphResponse, ListChildrenSymbolsRequest, ListRootSymbolsRequest,
-    NodeDetailsDto, NodeDetailsRequest, NodeOccurrencesRequest, OpenContainingFolderRequest,
-    OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
-    ReadFileTextResponse, RetrievalScoreBreakdownDto, SearchHit, SearchRequest, SetUiLayoutRequest,
-    SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto, SymbolSummaryDto,
-    SystemActionResponse, TrailConfigDto, TrailFilterOptionsDto, UpdateBookmarkCategoryRequest,
-    UpdateBookmarkRequest, WriteFileDataUrlRequest, WriteFileResponse, WriteFileTextRequest,
+    GraphRequest, GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto,
+    GroundingCoverageDto, GroundingFileDigestDto, GroundingSnapshotDto, GroundingSymbolDigestDto,
+    ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest,
+    NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
+    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, RetrievalScoreBreakdownDto,
+    SearchHit, SearchRequest, SetUiLayoutRequest, SnippetContextDto, SourceOccurrenceDto,
+    StartIndexingRequest, StorageStatsDto, SymbolContextDto, SymbolSummaryDto,
+    SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
+    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WriteFileDataUrlRequest,
+    WriteFileResponse, WriteFileTextRequest,
 };
 pub use errors::ApiError;
 pub use events::{AppEventPayload, IndexingPhaseTimings};
