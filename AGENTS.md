@@ -14,8 +14,8 @@
 
 ## Build, Test, and Development Commands
 - Backend build/test: `cargo build`, `cargo test`, `cargo check`, `cargo fmt`, `cargo clippy`.
-- CLI runtime: `cargo run -p codestory-cli -- index --project .`.
-- Skill-first grounding: `cargo run -p codestory-cli -- ground --project .`.
+- CLI runtime: `cargo run --release -p codestory-cli -- index --project .`.
+- Skill-first grounding: `cargo run --release -p codestory-cli -- ground --project .`.
 - On Windows, the Codex npm shim should be invoked as `codex.cmd` (typically under `%APPDATA%\\npm`); using the extensionless `codex` shim can fail with `os error 193`.
 - In this PowerShell environment, large parallel file reads can truncate output; when investigating a single large file, prefer one direct read command (for example `Get-Content` or `cmd /c type`) before parallelizing.
 

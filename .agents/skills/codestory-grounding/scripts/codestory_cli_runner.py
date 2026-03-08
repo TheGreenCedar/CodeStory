@@ -24,11 +24,11 @@ def _quote_command(command: Sequence[str]) -> str:
 
 def _binary_path() -> Path:
     name = "codestory-cli.exe" if os.name == "nt" else "codestory-cli"
-    return REPO_ROOT / "target" / "debug" / name
+    return REPO_ROOT / "target" / "release" / name
 
 
 def _build_command() -> list[str]:
-    return ["cargo", "build", "-p", "codestory-cli"]
+    return ["cargo", "build", "--release", "-p", "codestory-cli"]
 
 
 def build_command(subcommand: str, args: Sequence[str]) -> list[str]:
@@ -36,7 +36,17 @@ def build_command(subcommand: str, args: Sequence[str]) -> list[str]:
 
 
 def fallback_command(subcommand: str, args: Sequence[str]) -> list[str]:
-    return ["cargo", "run", "--quiet", "-p", "codestory-cli", "--", subcommand, *args]
+    return [
+        "cargo",
+        "run",
+        "--quiet",
+        "--release",
+        "-p",
+        "codestory-cli",
+        "--",
+        subcommand,
+        *args,
+    ]
 
 
 def run(subcommand: str) -> int:

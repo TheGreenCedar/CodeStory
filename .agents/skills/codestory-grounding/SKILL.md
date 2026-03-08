@@ -9,8 +9,8 @@ Use this skill to collect repo evidence with `codestory-cli` before answering ar
 
 ## Workflow
 
-1. Build the CLI first with `cargo build -p codestory-cli` when verification depends on local code changes.
-2. Use the built binary for repeated queries: `target/debug/codestory-cli(.exe) <subcommand> ...`. The repo-local Python wrappers now prefer the built binary automatically.
+1. Build the CLI first with `cargo build --release -p codestory-cli` when verification depends on local code changes.
+2. Use the built binary for repeated queries: `target/release/codestory-cli(.exe) <subcommand> ...`. The repo-local Python wrappers now prefer the built binary automatically.
 3. Run `python scripts/index.py --refresh full` when validating fixes for prior indexing errors, schema/version changes, or graph/query-rule changes. Use `--refresh none` only after a successful fresh build and successful index run in the same verification session.
 4. Run `python scripts/ground.py` for a compact context snapshot, then use `search`, `symbol`, `trail`, or `snippet` to narrow focus.
 5. Treat command output as evidence, then open only the files needed for edits or verification.
@@ -29,7 +29,7 @@ Use this skill to collect repo evidence with `codestory-cli` before answering ar
 
 ## Scripts
 
-These scripts are repo-local wrappers around the built `target/debug/codestory-cli(.exe)` binary and require Python plus a local Rust toolchain. If the binary is missing, the wrapper builds it once with `cargo build -p codestory-cli`. `cargo run` remains a last-resort fallback and is slower because it can contend on Cargo locks. Invoke the wrappers as `python scripts/...` on Windows.
+These scripts are repo-local wrappers around the built `target/release/codestory-cli(.exe)` binary and require Python plus a local Rust toolchain. If the binary is missing, the wrapper builds it once with `cargo build --release -p codestory-cli`. `cargo run --release` remains a last-resort fallback and is slower because it can contend on Cargo locks. Invoke the wrappers as `python scripts/...` on Windows.
 
 - `python scripts/index.py`: Index symbols, edges, and files via tree-sitter + semantic resolution (builds/refreshes the SQLite index)
 - `python scripts/ground.py`: Produce a compact codebase context snapshot — root symbols, file coverage, and recommended queries (requires index)
@@ -40,7 +40,7 @@ These scripts are repo-local wrappers around the built `target/debug/codestory-c
 
 Pass extra arguments through unchanged. The scripts resolve the workspace root automatically, so they can be launched from anywhere inside the repo checkout.
 
-Use `--dry-run` first if you only need to inspect the exact command the wrapper would execute. When the debug binary exists, the dry run prints the exe command; otherwise it prints the one-time build command followed by the expected exe invocation.
+Use `--dry-run` first if you only need to inspect the exact command the wrapper would execute. When the release binary exists, the dry run prints the exe command; otherwise it prints the one-time build command followed by the expected exe invocation.
 
 If a subcommand is unavailable in the current checkout, report that plainly and fall back to direct repo inspection instead of inventing grounded results.
 

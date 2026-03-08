@@ -1,4 +1,4 @@
 interface:
   display_name: "Codestory Grounding"
-  short_description: "Repo-local Python wrappers around the built codestory-cli debug binary. Build once, then query via python on Windows."
+  short_description: "Repo-local Python wrappers around the built codestory-cli release binary. Build once, then query via python on Windows."
   default_prompt: "Use $codestory-grounding to build codestory-cli once, refresh the index deliberately, and inspect a workspace with codestory-cli grounding commands before answering or editing."

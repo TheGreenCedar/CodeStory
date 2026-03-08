@@ -35,13 +35,13 @@ The repo is organized around six grounding verbs:
 ### Build The CLI Runtime
 
 ```powershell
-cargo build -p codestory-cli
+cargo build --release -p codestory-cli
 ```
 
 ### Create Or Refresh A Local Index
 
 ```powershell
-cargo run -p codestory-cli -- index --project .
+cargo run --release -p codestory-cli -- index --project .
 ```
 
 This writes repo-local grounding data into the user cache by default, keyed by the target project path.
