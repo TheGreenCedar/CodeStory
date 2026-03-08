@@ -1,10 +1,10 @@
 use codestory_core::{
-    AccessKind, Bookmark, BookmarkCategory, Edge, EdgeKind, EnumConversionError, Node, NodeId,
-    NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty, TrailCallerScope, TrailConfig,
-    TrailDirection, TrailMode, TrailResult,
+    AccessKind, Bookmark, BookmarkCategory, CallableProjectionState, Edge, EdgeKind,
+    EnumConversionError, Node, NodeId, NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty,
+    TrailCallerScope, TrailConfig, TrailDirection, TrailMode, TrailResult,
 };
 use parking_lot::RwLock;
-use rusqlite::{Connection, Result, Row, params};
+use rusqlite::{Connection, Result, Row, params, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ mod row_mapping;
 mod schema;
 mod trail;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const RELATED_NODE_SUBQUERY: &str = "SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1";
 const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, e.callsite_identity, e.certainty, e.candidate_target_node_ids, t.serialized_name, f.serialized_name
                  FROM edge e
@@ -74,6 +74,15 @@ pub struct FileProjectionRemovalSummary {
     pub removed_component_access_count: usize,
     pub removed_local_symbol_count: usize,
     pub removed_file_row_count: usize,
+    pub removed_callable_projection_state_count: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallerProjectionRemovalSummary {
+    pub file_id: i64,
+    pub removed_edge_count: usize,
+    pub removed_occurrence_count: usize,
+    pub removed_callable_projection_state_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -127,6 +136,7 @@ impl Storage {
 
     pub fn clear(&self) -> Result<(), StorageError> {
         let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM callable_projection_state", [])?;
         tx.execute("DELETE FROM occurrence", [])?;
         tx.execute("DELETE FROM edge", [])?;
         tx.execute("DELETE FROM llm_symbol_doc", [])?;
@@ -426,6 +436,160 @@ impl Storage {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn get_callable_projection_states_for_file(
+        &self,
+        file_id: i64,
+    ) -> Result<Vec<CallableProjectionState>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, symbol_key, node_id, signature_hash, body_hash, start_line, end_line
+             FROM callable_projection_state
+             WHERE file_id = ?1
+             ORDER BY start_line, symbol_key",
+        )?;
+        let rows = stmt.query_map(params![file_id], |row| {
+            Ok(CallableProjectionState {
+                file_id: row.get(0)?,
+                symbol_key: row.get(1)?,
+                node_id: NodeId(row.get(2)?),
+                signature_hash: row.get(3)?,
+                body_hash: row.get(4)?,
+                start_line: row.get(5)?,
+                end_line: row.get(6)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_callable_projection_states(
+        &mut self,
+        states: &[CallableProjectionState],
+    ) -> Result<(), StorageError> {
+        if states.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO callable_projection_state (
+                    file_id, symbol_key, node_id, signature_hash, body_hash, start_line, end_line
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(file_id, symbol_key) DO UPDATE SET
+                    node_id = excluded.node_id,
+                    signature_hash = excluded.signature_hash,
+                    body_hash = excluded.body_hash,
+                    start_line = excluded.start_line,
+                    end_line = excluded.end_line",
+            )?;
+            for state in states {
+                stmt.execute(params![
+                    state.file_id,
+                    state.symbol_key,
+                    state.node_id.0,
+                    state.signature_hash,
+                    state.body_hash,
+                    state.start_line,
+                    state.end_line
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_callable_projection_states_for_file(
+        &mut self,
+        file_id: i64,
+    ) -> Result<usize, StorageError> {
+        Ok(self.conn.execute(
+            "DELETE FROM callable_projection_state WHERE file_id = ?1",
+            params![file_id],
+        )?)
+    }
+
+    pub fn delete_projection_for_callers(
+        &mut self,
+        file_id: i64,
+        caller_ids: &[NodeId],
+    ) -> Result<CallerProjectionRemovalSummary, StorageError> {
+        if caller_ids.is_empty() {
+            return Ok(CallerProjectionRemovalSummary {
+                file_id,
+                ..Default::default()
+            });
+        }
+
+        let caller_raw_ids = caller_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        let placeholders = numbered_placeholders(2, caller_raw_ids.len());
+        let occurrence_placeholders =
+            numbered_placeholders(2 + caller_raw_ids.len(), caller_raw_ids.len());
+        let tx = self.conn.transaction()?;
+
+        let removed_edges = tx.execute(
+            &format!(
+                "DELETE FROM edge
+                 WHERE file_node_id = ?1
+                 AND source_node_id IN ({placeholders})
+                 AND kind IN ({}, {})",
+                EdgeKind::CALL as i32,
+                EdgeKind::USAGE as i32
+            ),
+            params_from_iter(
+                std::iter::once(Value::from(file_id))
+                    .chain(caller_raw_ids.iter().copied().map(Value::from)),
+            ),
+        )?;
+
+        let removed_occurrences = tx.execute(
+            &format!(
+                "DELETE FROM occurrence
+                 WHERE file_node_id = ?1
+                 AND (
+                    element_id IN ({placeholders})
+                    OR EXISTS (
+                        SELECT 1
+                        FROM callable_projection_state cps
+                        WHERE cps.file_id = ?1
+                        AND cps.node_id IN ({occurrence_placeholders})
+                        AND occurrence.start_line >= cps.start_line
+                        AND occurrence.end_line <= cps.end_line
+                    )
+                 )"
+            ),
+            params_from_iter(
+                std::iter::once(Value::from(file_id))
+                    .chain(caller_raw_ids.iter().copied().map(Value::from))
+                    .chain(caller_raw_ids.iter().copied().map(Value::from)),
+            ),
+        )?;
+
+        let removed_callable_projection_state_count = tx.execute(
+            &format!(
+                "DELETE FROM callable_projection_state
+                 WHERE file_id = ?1
+                 AND node_id IN ({placeholders})"
+            ),
+            params_from_iter(
+                std::iter::once(Value::from(file_id))
+                    .chain(caller_raw_ids.iter().copied().map(Value::from)),
+            ),
+        )?;
+
+        tx.commit()?;
+
+        Ok(CallerProjectionRemovalSummary {
+            file_id,
+            removed_edge_count: removed_edges,
+            removed_occurrence_count: removed_occurrences,
+            removed_callable_projection_state_count,
+        })
     }
 
     pub fn get_component_access(
@@ -1028,6 +1192,11 @@ impl Storage {
             params![file_node_id],
         )?;
 
+        let removed_callable_projection_state_count = tx.execute(
+            "DELETE FROM callable_projection_state WHERE file_id = ?1",
+            params![file_node_id],
+        )?;
+
         let removed_local_symbols = tx.execute(
             "DELETE FROM local_symbol WHERE file_id = ?1",
             params![file_node_id],
@@ -1075,6 +1244,7 @@ impl Storage {
             removed_component_access_count: removed_component_access,
             removed_local_symbol_count: removed_local_symbols,
             removed_file_row_count: removed_file_rows,
+            removed_callable_projection_state_count,
         })
     }
 
@@ -1239,6 +1409,13 @@ impl Storage {
     pub fn get_edges_for_node_id(&self, node_id: NodeId) -> Result<Vec<Edge>, StorageError> {
         trail::get_edges_for_node_id(self, node_id)
     }
+}
+
+fn numbered_placeholders(start: usize, count: usize) -> String {
+    (start..start + count)
+        .map(|idx| format!("?{idx}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn serialize_candidate_targets(candidates: &[NodeId]) -> Result<Option<String>, StorageError> {

@@ -64,3 +64,7 @@ python scripts/trail.py --query Storage::open --mode referencing --include-tests
 # Larger trail, vertical layout, JSON
 python scripts/trail.py --query EventBus --max-nodes 50 --layout vertical --format json
 ```
+
+## Interpreting Trail Noise
+
+Focus on whether unrelated resolved targets disappeared after a fix. Local helper calls can still show up as `[unknown]` nodes such as `once`, `from`, or `copied`; that is usually acceptable if they are no longer being resolved to unrelated symbols elsewhere in the repo.

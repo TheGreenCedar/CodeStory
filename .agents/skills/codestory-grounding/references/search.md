@@ -37,6 +37,8 @@ hits: 3
 
 Each hit includes: node ID, display name, kind, file path, line number, and relevance score.
 
+When a name appears more than once, prefer typed symbol hits such as `[function]`, `[struct]`, `[field]`, or `[file]` over `[unknown]` hits when you are verifying symbol surfacing. `[unknown]` results are often usage-like callsite or reference nodes, not the canonical definition.
+
 ## Examples
 
 ```bash

@@ -336,14 +336,11 @@ impl AppController {
         let expanded_files = file_coverages.len().min(config.expanded_files);
         let omitted_files = file_coverages.len().saturating_sub(expanded_files);
 
-        let mut represented_symbols = 0u32;
         let mut compressed_files = omitted_files.min(u32::MAX as usize) as u32;
         let mut file_digests = Vec::with_capacity(expanded_files);
         let mut omitted_coverages = Vec::with_capacity(omitted_files);
         for (index, coverage) in file_coverages.into_iter().enumerate() {
             if index >= expanded_files {
-                represented_symbols =
-                    represented_symbols.saturating_add(coverage.total_symbol_count);
                 omitted_coverages.push(coverage);
                 continue;
             }
@@ -355,8 +352,6 @@ impl AppController {
             if coverage.total_symbol_count > coverage.represented_symbol_count {
                 compressed_files = compressed_files.saturating_add(1);
             }
-            represented_symbols =
-                represented_symbols.saturating_add(coverage.represented_symbol_count);
 
             file_digests.push(GroundingFileDigestDto {
                 file_path: coverage.relative_path,
@@ -381,14 +376,11 @@ impl AppController {
             .iter()
             .map(|bucket| bucket.symbol_count)
             .sum::<u32>();
-        represented_symbols = represented_symbols.max(
-            bucketed_symbols.saturating_add(
-                file_digests
-                    .iter()
-                    .map(|file| file.represented_symbol_count)
-                    .sum::<u32>(),
-            ),
-        );
+        let represented_symbols = file_digests
+            .iter()
+            .map(|file| file.symbol_count)
+            .sum::<u32>()
+            .saturating_add(bucketed_symbols);
 
         let mut roots = storage
             .get_root_symbols()
@@ -737,5 +729,125 @@ mod tests {
                 .first()
                 .is_some_and(|symbol| symbol.label.starts_with("Widget"))
         );
+    }
+
+    #[test]
+    fn grounding_snapshot_represented_symbols_is_monotonic_across_budgets() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            for file_index in 0..24 {
+                let path = temp
+                    .path()
+                    .join("src")
+                    .join(format!("module_{file_index}.rs"));
+                std::fs::create_dir_all(path.parent().expect("path parent")).expect("create src");
+                std::fs::write(&path, format!("fn symbol_{file_index}_0() {{}}\n"))
+                    .expect("write file");
+
+                let file_id = 500 + file_index;
+                let file_node_id = CoreNodeId(file_id);
+                storage
+                    .insert_file(&codestory_storage::FileInfo {
+                        id: file_id,
+                        path: path.clone(),
+                        language: "rust".to_string(),
+                        modification_time: 0,
+                        indexed: true,
+                        complete: true,
+                        line_count: 10,
+                    })
+                    .expect("insert file");
+                storage
+                    .insert_nodes_batch(&[
+                        Node {
+                            id: file_node_id,
+                            kind: NodeKind::FILE,
+                            serialized_name: path.to_string_lossy().to_string(),
+                            ..Default::default()
+                        },
+                        Node {
+                            id: CoreNodeId(5_000 + file_index * 10),
+                            kind: NodeKind::STRUCT,
+                            serialized_name: format!("Controller{file_index}"),
+                            file_node_id: Some(file_node_id),
+                            start_line: Some(1),
+                            ..Default::default()
+                        },
+                        Node {
+                            id: CoreNodeId(5_001 + file_index * 10),
+                            kind: NodeKind::FUNCTION,
+                            serialized_name: format!("check_winner_{file_index}"),
+                            file_node_id: Some(file_node_id),
+                            start_line: Some(2),
+                            ..Default::default()
+                        },
+                        Node {
+                            id: CoreNodeId(5_002 + file_index * 10),
+                            kind: NodeKind::FUNCTION,
+                            serialized_name: format!("min_max_{file_index}"),
+                            file_node_id: Some(file_node_id),
+                            start_line: Some(3),
+                            ..Default::default()
+                        },
+                        Node {
+                            id: CoreNodeId(5_003 + file_index * 10),
+                            kind: NodeKind::FUNCTION,
+                            serialized_name: format!("helper_{file_index}"),
+                            file_node_id: Some(file_node_id),
+                            start_line: Some(4),
+                            ..Default::default()
+                        },
+                        Node {
+                            id: CoreNodeId(5_004 + file_index * 10),
+                            kind: NodeKind::FUNCTION,
+                            serialized_name: format!("extra_{file_index}"),
+                            file_node_id: Some(file_node_id),
+                            start_line: Some(5),
+                            ..Default::default()
+                        },
+                    ])
+                    .expect("insert nodes");
+            }
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+
+        let strict = controller
+            .grounding_snapshot(GroundingBudgetDto::Strict)
+            .expect("strict snapshot");
+        let balanced = controller
+            .grounding_snapshot(GroundingBudgetDto::Balanced)
+            .expect("balanced snapshot");
+        let max = controller
+            .grounding_snapshot(GroundingBudgetDto::Max)
+            .expect("max snapshot");
+
+        assert!(strict.coverage.represented_symbols <= balanced.coverage.represented_symbols);
+        assert!(balanced.coverage.represented_symbols <= max.coverage.represented_symbols);
+        assert!(strict.files.len() <= balanced.files.len());
+        assert!(balanced.files.len() <= max.files.len());
+
+        for snapshot in [&strict, &balanced, &max] {
+            let surfaced_symbols = snapshot
+                .files
+                .iter()
+                .map(|file| file.symbol_count)
+                .sum::<u32>()
+                .saturating_add(
+                    snapshot
+                        .coverage_buckets
+                        .iter()
+                        .map(|bucket| bucket.symbol_count)
+                        .sum::<u32>(),
+                );
+            assert_eq!(snapshot.coverage.represented_symbols, surfaced_symbols);
+        }
     }
 }

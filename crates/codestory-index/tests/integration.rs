@@ -1,4 +1,4 @@
-use codestory_core::{EdgeKind, NodeId, NodeKind, OccurrenceKind};
+use codestory_core::{AccessKind, EdgeKind, NodeId, NodeKind, OccurrenceKind};
 use codestory_events::EventBus;
 use codestory_index::WorkspaceIndexer;
 use codestory_search::SearchEngine;
@@ -64,14 +64,17 @@ int main() {
     // Find MyClass
     let my_class = nodes
         .iter()
-        .find(|n| n.serialized_name == "MyClass")
+        .find(|n| n.serialized_name.ends_with("MyClass"))
         .expect("MyClass node not found");
     assert_eq!(my_class.kind, NodeKind::CLASS);
 
     // Find myMethod
     let my_method = nodes
         .iter()
-        .find(|n| n.serialized_name.ends_with("myMethod") && n.kind == NodeKind::FUNCTION)
+        .find(|n| {
+            n.serialized_name.ends_with("myMethod")
+                && matches!(n.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        })
         .expect("myMethod node not found");
     // In our indexer, methods currently default to FUNCTION if not using specific METHOD kind in TS graph
     // But let's check what it actually is
@@ -137,6 +140,217 @@ fn test_incremental_indexing_modification() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_incremental_indexing_body_only_change_updates_changed_callable_projection()
+-> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let root = dir.path();
+    let file_path = root.join("main.rs");
+
+    fs::write(
+        &file_path,
+        r#"
+fn helper() {}
+fn keep() { helper(); }
+fn changed() { helper(); }
+"#,
+    )?;
+
+    let mut storage = Storage::new_in_memory()?;
+    run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
+
+    let before_nodes = storage.get_nodes()?;
+    let file_id = before_nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::FILE && node.serialized_name.ends_with("main.rs"))
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("missing file node"))?;
+    let keep_id = before_nodes
+        .iter()
+        .find(|node| node.serialized_name == "keep" && node.kind == NodeKind::FUNCTION)
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("missing keep() node"))?;
+    let changed_id = before_nodes
+        .iter()
+        .find(|node| node.serialized_name == "changed" && node.kind == NodeKind::FUNCTION)
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("missing changed() node"))?;
+
+    let states_before = storage.get_callable_projection_states_for_file(file_id.0)?;
+    let keep_before = states_before
+        .iter()
+        .find(|state| state.node_id == keep_id)
+        .map(|state| state.body_hash)
+        .ok_or_else(|| anyhow::anyhow!("missing keep() projection state"))?;
+    let changed_before = states_before
+        .iter()
+        .find(|state| state.node_id == changed_id)
+        .map(|state| state.body_hash)
+        .ok_or_else(|| anyhow::anyhow!("missing changed() projection state"))?;
+
+    fs::write(
+        &file_path,
+        r#"
+fn helper() {}
+fn keep() { helper(); }
+fn changed() { helper(); helper(); }
+"#,
+    )?;
+
+    run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
+
+    let states_after = storage.get_callable_projection_states_for_file(file_id.0)?;
+    let keep_after = states_after
+        .iter()
+        .find(|state| state.node_id == keep_id)
+        .map(|state| state.body_hash)
+        .ok_or_else(|| anyhow::anyhow!("missing keep() projection state after refresh"))?;
+    let changed_after = states_after
+        .iter()
+        .find(|state| state.node_id == changed_id)
+        .map(|state| state.body_hash)
+        .ok_or_else(|| anyhow::anyhow!("missing changed() projection state after refresh"))?;
+
+    assert_eq!(keep_after, keep_before);
+    assert_ne!(changed_after, changed_before);
+
+    let edges = storage.get_edges()?;
+    let keep_calls = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == keep_id)
+        .count();
+    let changed_calls = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == changed_id)
+        .count();
+    assert_eq!(keep_calls, 1);
+    assert_eq!(changed_calls, 2);
+
+    Ok(())
+}
+
+#[test]
+fn test_incremental_indexing_structural_change_removes_stale_projection() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let root = dir.path();
+    let file_path = root.join("main.rs");
+
+    fs::write(
+        &file_path,
+        r#"
+fn stale() {}
+fn keep() { stale(); }
+"#,
+    )?;
+
+    let mut storage = Storage::new_in_memory()?;
+    run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
+
+    fs::write(
+        &file_path,
+        r#"
+fn fresh() {}
+fn keep() { fresh(); }
+"#,
+    )?;
+
+    run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
+
+    let nodes = storage.get_nodes()?;
+    assert!(!nodes.iter().any(|node| node.serialized_name == "stale"));
+    assert!(nodes.iter().any(|node| node.serialized_name == "fresh"));
+
+    let file_id = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::FILE && node.serialized_name.ends_with("main.rs"))
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("missing file node after refresh"))?;
+    let states = storage.get_callable_projection_states_for_file(file_id.0)?;
+    assert!(
+        states
+            .iter()
+            .all(|state| !state.symbol_key.contains("stale"))
+    );
+    assert!(
+        states
+            .iter()
+            .any(|state| state.symbol_key.contains("fresh"))
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_indexing_real_repo_rust_files_does_not_drop_projection_on_graph_error() -> anyhow::Result<()>
+{
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cases = [
+        (
+            PathBuf::from("src/lib.rs"),
+            vec![
+                "build_callable_projection_states",
+                "classify_projection_update",
+                "generate_id",
+                "apply_line_range_call_attribution",
+            ],
+        ),
+        (
+            PathBuf::from("src/semantic/mod.rs"),
+            vec!["SemanticCandidateIndex", "to_candidates"],
+        ),
+        (
+            PathBuf::from("tests/call_resolution_common_methods.rs"),
+            vec!["test_run_incremental_clone_does_not_resolve_to_unrelated_field_clone"],
+        ),
+    ];
+
+    let dir = tempdir()?;
+    let root = dir.path();
+    let mut files_to_index = Vec::new();
+    for (relative_path, _) in &cases {
+        let source_path = manifest_dir.join(relative_path);
+        let target_path = root.join(relative_path);
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&target_path, fs::read_to_string(&source_path)?)?;
+        files_to_index.push(target_path);
+    }
+
+    let mut storage = Storage::new_in_memory()?;
+    run_incremental_indexing(root, &mut storage, files_to_index)?;
+
+    let errors = storage.get_errors(None)?;
+    assert!(
+        errors.is_empty(),
+        "expected repo Rust files to index cleanly, got errors: {errors:?}"
+    );
+
+    let nodes = storage.get_nodes()?;
+    for (relative_path, expected_symbols) in cases {
+        let indexed_file = root.join(&relative_path);
+        assert!(
+            nodes.iter().any(|node| {
+                node.kind == NodeKind::FILE
+                    && node.serialized_name == indexed_file.to_string_lossy()
+            }),
+            "missing file node for {}",
+            indexed_file.display()
+        );
+        for expected_symbol in expected_symbols {
+            assert!(
+                nodes
+                    .iter()
+                    .any(|node| node.serialized_name == expected_symbol),
+                "missing indexed symbol `{expected_symbol}` from {}",
+                relative_path.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_multi_file_cross_references() -> anyhow::Result<()> {
     let storage = index_project(&[
         ("types.rs", "pub struct MyType { pub value: i32 }"),
@@ -161,6 +375,69 @@ fn process(t: MyType) {
 
     // Should have edges (TYPE_USAGE or similar)
     assert!(edges.iter().any(|e| e.kind == EdgeKind::IMPORT));
+
+    Ok(())
+}
+
+#[test]
+fn test_python_module_constants_are_classified_as_constants() -> anyhow::Result<()> {
+    let storage = index_project(&[(
+        "constants.py",
+        r#"
+API_TOKEN = "secret"
+retry_limit = 3
+"#,
+    )])?;
+
+    let nodes = storage.get_nodes()?;
+    assert!(
+        nodes
+            .iter()
+            .any(|node| node.serialized_name == "API_TOKEN" && node.kind == NodeKind::CONSTANT),
+        "expected top-level ALL_CAPS assignment to be classified as CONSTANT"
+    );
+    assert!(
+        nodes.iter().any(|node| {
+            node.serialized_name == "retry_limit" && node.kind == NodeKind::VARIABLE
+        }),
+        "expected mixed-case assignment to remain VARIABLE"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_typescript_type_alias_and_enum_are_indexed() -> anyhow::Result<()> {
+    let storage = index_project(&[(
+        "App.tsx",
+        r#"
+type Props = { label: string };
+
+enum Status {
+    Ready = "ready",
+}
+
+function Badge(props: Props) {
+    return <span>{props.label}</span>;
+}
+
+function App() {
+    return <Badge label="hello" variant={Status.Ready} />;
+}
+"#,
+    )])?;
+
+    let nodes = storage.get_nodes()?;
+    assert!(
+        nodes
+            .iter()
+            .any(|node| node.serialized_name == "Props" && node.kind == NodeKind::TYPEDEF)
+    );
+    assert!(
+        nodes
+            .iter()
+            .any(|node| node.serialized_name == "Status" && node.kind == NodeKind::ENUM)
+    );
 
     Ok(())
 }
@@ -223,6 +500,52 @@ fn test_indexing_and_search_projection_cleanup() -> anyhow::Result<()> {
     let beta_search = engine.search_symbol("Beta");
     assert!(!beta_search.is_empty());
     assert!(beta_search.iter().all(|id| *id != alpha_node_id));
+
+    Ok(())
+}
+
+#[test]
+fn test_cpp_access_specifiers_are_captured_from_rules() -> anyhow::Result<()> {
+    let storage = index_project(&[(
+        "main.cpp",
+        r#"
+class Widget {
+public:
+    void open();
+protected:
+    void guard();
+private:
+    void close();
+};
+"#,
+    )])?;
+
+    let nodes = storage.get_nodes()?;
+    let open = nodes
+        .iter()
+        .find(|n| n.serialized_name.ends_with("open"))
+        .ok_or_else(|| anyhow::anyhow!("open node missing"))?;
+    let guard = nodes
+        .iter()
+        .find(|n| n.serialized_name.ends_with("guard"))
+        .ok_or_else(|| anyhow::anyhow!("guard node missing"))?;
+    let close = nodes
+        .iter()
+        .find(|n| n.serialized_name.ends_with("close"))
+        .ok_or_else(|| anyhow::anyhow!("close node missing"))?;
+
+    assert_eq!(
+        storage.get_component_access(open.id)?,
+        Some(AccessKind::Public)
+    );
+    assert_eq!(
+        storage.get_component_access(guard.id)?,
+        Some(AccessKind::Protected)
+    );
+    assert_eq!(
+        storage.get_component_access(close.id)?,
+        Some(AccessKind::Private)
+    );
 
     Ok(())
 }

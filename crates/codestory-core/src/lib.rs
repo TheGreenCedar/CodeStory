@@ -322,6 +322,17 @@ pub struct SourceLocation {
     pub end_col: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CallableProjectionState {
+    pub file_id: i64,
+    pub symbol_key: String,
+    pub node_id: NodeId,
+    pub signature_hash: i64,
+    pub body_hash: i64,
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
 // Helper types for hierarchical names
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct NameHierarchy {

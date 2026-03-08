@@ -1,10 +1,9 @@
 use super::{
-    SemanticResolutionCandidate, SemanticResolutionRequest, SemanticResolver, kind_clause,
-    resolve_call_candidates, resolve_import_candidates,
+    SemanticCandidateIndex, SemanticResolutionCandidate, SemanticResolutionRequest,
+    SemanticResolver, resolve_call_candidates, resolve_import_candidates,
 };
 use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind};
-use rusqlite::Connection;
 
 pub struct TypeScriptSemanticResolver;
 
@@ -15,12 +14,12 @@ impl SemanticResolver for TypeScriptSemanticResolver {
 
     fn resolve(
         &self,
-        conn: &Connection,
+        index: &SemanticCandidateIndex,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
         match request.edge_kind {
-            EdgeKind::IMPORT => self.resolve_import(conn, request),
-            EdgeKind::CALL => self.resolve_call(conn, request),
+            EdgeKind::IMPORT => self.resolve_import(index, request),
+            EdgeKind::CALL => self.resolve_call(index, request),
             _ => Ok(Vec::new()),
         }
     }
@@ -29,7 +28,7 @@ impl SemanticResolver for TypeScriptSemanticResolver {
 impl TypeScriptSemanticResolver {
     fn resolve_import(
         &self,
-        conn: &Connection,
+        index: &SemanticCandidateIndex,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
         let normalized = request.target_name.trim();
@@ -56,14 +55,15 @@ impl TypeScriptSemanticResolver {
             NodeKind::PACKAGE as i32,
             NodeKind::CLASS as i32,
             NodeKind::INTERFACE as i32,
+            NodeKind::ENUM as i32,
+            NodeKind::TYPEDEF as i32,
         ];
-        let kind_clause = kind_clause(&kinds);
-        resolve_import_candidates(conn, &kind_clause, symbol, request.file_id, 0.58)
+        resolve_import_candidates(index, &kinds, symbol, request.file_id, 0.58)
     }
 
     fn resolve_call(
         &self,
-        conn: &Connection,
+        index: &SemanticCandidateIndex,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
         let target = request.target_name.trim();
@@ -80,8 +80,7 @@ impl TypeScriptSemanticResolver {
         }
 
         let kinds = [NodeKind::METHOD as i32, NodeKind::FUNCTION as i32];
-        let kind_clause = kind_clause(&kinds);
-        resolve_call_candidates(conn, &kind_clause, call_name, request.file_id, 0.88, 0.70)
+        resolve_call_candidates(index, &kinds, call_name, request.file_id, 0.88, 0.70)
     }
 }
 
@@ -122,6 +121,7 @@ mod tests {
             ],
         )?;
 
+        let index = SemanticCandidateIndex::load(&conn, &[NodeKind::METHOD as i32])?;
         let resolver = TypeScriptSemanticResolver;
         let request = SemanticResolutionRequest {
             edge_kind: EdgeKind::CALL,
@@ -131,7 +131,7 @@ mod tests {
             target_name: "clone".to_string(),
         };
 
-        let out = resolver.resolve(&conn, &request)?;
+        let out = resolver.resolve(&index, &request)?;
         assert!(!out.is_empty());
         assert!(out[0].confidence >= ResolutionCertainty::CERTAIN_MIN);
         Ok(())

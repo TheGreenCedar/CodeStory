@@ -131,48 +131,6 @@
   attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
 }
 
-;; Calls (identifier)
-(function_definition
-  declarator: (function_declarator
-    declarator: (_) @caller)
-  body: (compound_statement
-    (expression_statement
-      (call_expression function: (identifier) @callee) @call)))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
-}
-
-;; Calls (field expression)
-(function_definition
-  declarator: (function_declarator
-    declarator: (_) @caller)
-  body: (compound_statement
-    (expression_statement
-      (call_expression function: (field_expression field: (field_identifier) @callee) @call))))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
-}
-
 ;; Calls (global fallback identifier)
 (call_expression
   function: (identifier) @callee_any) @call_any
@@ -356,50 +314,6 @@
 
   edge @template_name.node -> @type_arg.node
   attr (@template_name.node -> @type_arg.node) kind = "TYPE_ARGUMENT"
-}
-
-;; Calls (template function/method)
-(function_definition
-  declarator: (function_declarator
-    declarator: (_) @caller)
-  body: (compound_statement
-    (expression_statement
-      (call_expression
-        function: (template_function name: (identifier) @callee) @call))))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
-}
-
-(function_definition
-  declarator: (function_declarator
-    declarator: (_) @caller)
-  body: (compound_statement
-    (expression_statement
-      (call_expression
-        function: (field_expression
-          field: (template_method name: (field_identifier) @callee)) @call))))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
 }
 
 (call_expression

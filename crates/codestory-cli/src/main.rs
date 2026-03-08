@@ -122,6 +122,8 @@ struct TargetArgs {
     id: Option<String>,
     #[arg(long, conflicts_with = "id")]
     query: Option<String>,
+    #[arg(long, requires = "query")]
+    file: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -298,7 +300,8 @@ fn run_symbol(cmd: SymbolCommand) -> Result<()> {
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "symbol")?;
 
-    let target = resolve_target(&runtime, cmd.target.selection()?)?;
+    let file_filter = cmd.target.file_filter();
+    let target = resolve_target(&runtime, cmd.target.selection()?, file_filter.as_deref())?;
     let context = runtime
         .controller
         .symbol_context(target.selected.node_id.clone())
@@ -312,7 +315,8 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "trail")?;
 
-    let target = resolve_target(&runtime, cmd.target.selection()?)?;
+    let file_filter = cmd.target.file_filter();
+    let target = resolve_target(&runtime, cmd.target.selection()?, file_filter.as_deref())?;
     let request = build_trail_request(&target.selected.node_id, &cmd);
     let context = runtime
         .controller
@@ -327,7 +331,8 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "snippet")?;
 
-    let target = resolve_target(&runtime, cmd.target.selection()?)?;
+    let file_filter = cmd.target.file_filter();
+    let target = resolve_target(&runtime, cmd.target.selection()?, file_filter.as_deref())?;
     let context = runtime
         .controller
         .snippet_context(target.selected.node_id.clone(), cmd.context)
@@ -387,9 +392,21 @@ impl TargetArgs {
             (None, Some(_)) => bail!("--query cannot be empty."),
         }
     }
+
+    fn file_filter(&self) -> Option<String> {
+        self.file
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
 }
 
-fn resolve_target(runtime: &RuntimeContext, target: TargetSelection) -> Result<ResolvedTarget> {
+fn resolve_target(
+    runtime: &RuntimeContext,
+    target: TargetSelection,
+    file_filter: Option<&str>,
+) -> Result<ResolvedTarget> {
     match target {
         TargetSelection::Id(id) => {
             let details = runtime
@@ -414,7 +431,15 @@ fn resolve_target(runtime: &RuntimeContext, target: TargetSelection) -> Result<R
                     None,
                 )
                 .map_err(map_api_error)?;
+            if let Some(file_filter) = file_filter {
+                alternatives.retain(|hit| search_hit_matches_file_filter(hit, file_filter));
+            }
             if alternatives.is_empty() {
+                if let Some(file_filter) = file_filter {
+                    return Err(anyhow!(
+                        "No symbol matched query `{query}` within files matching `{file_filter}`. Run `codestory-cli search --query \"{query}\"` to inspect candidates."
+                    ));
+                }
                 return Err(anyhow!(
                     "No symbol matched query `{query}`. Run `codestory-cli search --query \"{query}\"` to inspect candidates."
                 ));
@@ -435,9 +460,15 @@ fn resolve_target(runtime: &RuntimeContext, target: TargetSelection) -> Result<R
             }
 
             let selected = alternatives.first().cloned().ok_or_else(|| {
-                anyhow!(
-                    "No symbol matched query `{query}`. Run `codestory-cli search --query \"{query}\"` to inspect candidates."
-                )
+                if let Some(file_filter) = file_filter {
+                    anyhow!(
+                        "No symbol matched query `{query}` within files matching `{file_filter}`. Run `codestory-cli search --query \"{query}\"` to inspect candidates."
+                    )
+                } else {
+                    anyhow!(
+                        "No symbol matched query `{query}`. Run `codestory-cli search --query \"{query}\"` to inspect candidates."
+                    )
+                }
             })?;
 
             Ok(ResolvedTarget {
@@ -457,7 +488,7 @@ fn compare_resolution_hits(query: &str, left: &SearchHit, right: &SearchHit) -> 
         .then_with(|| left.display_name.cmp(&right.display_name))
 }
 
-fn resolution_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8) {
+fn resolution_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8, u8) {
     let query = normalize_symbol_query(query);
     let display = normalize_symbol_query(&hit.display_name);
     let terminal = terminal_symbol_segment(&hit.display_name);
@@ -466,7 +497,8 @@ fn resolution_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8) {
     (
         u8::from(display == query),
         u8::from(terminal == query),
-        u8::from(structural_kind(hit.kind)),
+        declaration_anchor_bucket(hit),
+        resolution_kind_bucket(hit.kind),
         u8::from(leading == query),
     )
 }
@@ -491,8 +523,8 @@ fn leading_symbol_segment(value: &str) -> String {
         .unwrap_or_default()
 }
 
-fn structural_kind(kind: codestory_api::NodeKind) -> bool {
-    matches!(
+fn resolution_kind_bucket(kind: codestory_api::NodeKind) -> u8 {
+    if matches!(
         kind,
         codestory_api::NodeKind::MODULE
             | codestory_api::NodeKind::NAMESPACE
@@ -503,7 +535,88 @@ fn structural_kind(kind: codestory_api::NodeKind) -> bool {
             | codestory_api::NodeKind::ENUM
             | codestory_api::NodeKind::UNION
             | codestory_api::NodeKind::TYPEDEF
-    )
+    ) {
+        return 2;
+    }
+
+    if matches!(
+        kind,
+        codestory_api::NodeKind::FUNCTION
+            | codestory_api::NodeKind::METHOD
+            | codestory_api::NodeKind::MACRO
+            | codestory_api::NodeKind::FIELD
+            | codestory_api::NodeKind::VARIABLE
+            | codestory_api::NodeKind::GLOBAL_VARIABLE
+            | codestory_api::NodeKind::CONSTANT
+            | codestory_api::NodeKind::ENUM_CONSTANT
+    ) {
+        return 1;
+    }
+
+    0
+}
+
+fn normalize_path_fragment(value: &str) -> String {
+    clean_path_string(value).to_ascii_lowercase()
+}
+
+fn declaration_anchor_bucket(hit: &SearchHit) -> u8 {
+    if matches!(
+        hit.kind,
+        codestory_api::NodeKind::STRUCT
+            | codestory_api::NodeKind::CLASS
+            | codestory_api::NodeKind::INTERFACE
+            | codestory_api::NodeKind::ENUM
+            | codestory_api::NodeKind::UNION
+            | codestory_api::NodeKind::TYPEDEF
+    ) && !hit_is_impl_anchor(hit)
+    {
+        return 1;
+    }
+
+    0
+}
+
+fn hit_is_impl_anchor(hit: &SearchHit) -> bool {
+    let Some(file_path) = hit.file_path.as_deref() else {
+        return false;
+    };
+    let Some(line) = hit.line else {
+        return false;
+    };
+    let Ok(contents) = read_file_contents_for_resolution(file_path) else {
+        return false;
+    };
+    let Some(source_line) = contents.lines().nth(line.saturating_sub(1) as usize) else {
+        return false;
+    };
+    let trimmed = source_line.trim_start();
+    trimmed.starts_with("impl ") || trimmed.starts_with("unsafe impl ")
+}
+
+fn read_file_contents_for_resolution(path: &str) -> Result<String> {
+    if let Ok(contents) = fs::read_to_string(path) {
+        return Ok(contents);
+    }
+
+    #[cfg(windows)]
+    if let Some(stripped) = path.strip_prefix(r"\\?\") {
+        if let Ok(contents) = fs::read_to_string(stripped) {
+            return Ok(contents);
+        }
+    }
+
+    fs::read_to_string(path).with_context(|| format!("Failed to read file `{path}`"))
+}
+
+fn search_hit_matches_file_filter(hit: &SearchHit, fragment: &str) -> bool {
+    let Some(file_path) = hit.file_path.as_deref() else {
+        return false;
+    };
+
+    let file_path = normalize_path_fragment(file_path);
+    let fragment = normalize_path_fragment(fragment);
+    file_path.contains(&fragment)
 }
 
 fn build_trail_request(root_id: &NodeId, cmd: &TrailCommand) -> TrailConfigDto {
@@ -651,7 +764,11 @@ fn render_index_markdown(output: &IndexOutput<'_>) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Index");
     let _ = writeln!(markdown, "project: `{}`", clean_path_string(output.project));
-    let _ = writeln!(markdown, "storage: `{}`", clean_path_string(output.storage_path));
+    let _ = writeln!(
+        markdown,
+        "storage: `{}`",
+        clean_path_string(output.storage_path)
+    );
     let _ = writeln!(markdown, "refresh: `{}`", output.refresh);
     let _ = writeln!(
         markdown,
@@ -1189,6 +1306,8 @@ impl From<CliDirection> for TrailDirection {
 mod tests {
     use super::*;
     use codestory_api::StorageStatsDto;
+    use std::fs;
+    use tempfile::tempdir;
 
     fn summary_with_files(file_count: u32) -> ProjectSummary {
         ProjectSummary {
@@ -1223,6 +1342,43 @@ mod tests {
         );
     }
 
+    fn copy_tictactoe_workspace() -> tempfile::TempDir {
+        let temp = tempdir().expect("create temp dir");
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace crates dir")
+            .join("codestory-index")
+            .join("tests")
+            .join("fixtures")
+            .join("tictactoe");
+
+        for entry in fs::read_dir(&fixtures).expect("read fixtures") {
+            let entry = entry.expect("fixture entry");
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let target = temp.path().join(entry.file_name());
+            fs::copy(&path, &target).expect("copy fixture");
+        }
+
+        temp
+    }
+
+    fn indexed_runtime(project_root: &Path) -> RuntimeContext {
+        let cache_dir = project_root.join(".cache");
+        let args = ProjectArgs {
+            project: project_root.to_path_buf(),
+            cache_dir: Some(cache_dir),
+        };
+        let runtime = RuntimeContext::new(&args).expect("runtime");
+        let opened = runtime
+            .ensure_open(RefreshMode::Full)
+            .expect("index project");
+        ensure_index_ready(&opened, "test").expect("indexed project");
+        runtime
+    }
+
     #[test]
     fn resolution_prefers_exact_type_name_over_member_hits() {
         let query = "AppController";
@@ -1251,6 +1407,96 @@ mod tests {
 
         hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
         assert_eq!(hits[0].display_name, "AppController");
+    }
+
+    #[test]
+    fn resolution_prefers_declaration_anchor_over_impl_anchor() {
+        let temp = tempdir().expect("create temp dir");
+        let file_path = temp.path().join("lib.rs");
+        fs::write(
+            &file_path,
+            "pub struct AppController;\nimpl AppController {\n    fn open_project(&self) {}\n}\n",
+        )
+        .expect("write file");
+
+        let query = "AppController";
+        let mut hits = vec![
+            SearchHit {
+                node_id: NodeId("2".to_string()),
+                display_name: "AppController".to_string(),
+                kind: codestory_api::NodeKind::CLASS,
+                file_path: Some(file_path.to_string_lossy().to_string()),
+                line: Some(2),
+                score: 1.0,
+                origin: codestory_api::SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
+            },
+            SearchHit {
+                node_id: NodeId("1".to_string()),
+                display_name: "AppController".to_string(),
+                kind: codestory_api::NodeKind::STRUCT,
+                file_path: Some(file_path.to_string_lossy().to_string()),
+                line: Some(1),
+                score: 1.0,
+                origin: codestory_api::SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
+            },
+        ];
+
+        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
+        assert_eq!(hits[0].line, Some(1));
+        assert_eq!(hits[0].kind, codestory_api::NodeKind::STRUCT);
+    }
+
+    #[test]
+    fn resolution_prefers_callable_definitions_over_unknown_hits() {
+        let query = "check_winner";
+        let mut hits = vec![
+            SearchHit {
+                node_id: NodeId("2".to_string()),
+                display_name: "check_winner".to_string(),
+                kind: codestory_api::NodeKind::UNKNOWN,
+                file_path: Some("src/callsite.rs".to_string()),
+                line: Some(20),
+                score: 0.9,
+                origin: codestory_api::SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
+            },
+            SearchHit {
+                node_id: NodeId("1".to_string()),
+                display_name: "check_winner".to_string(),
+                kind: codestory_api::NodeKind::FUNCTION,
+                file_path: Some("src/game.rs".to_string()),
+                line: Some(10),
+                score: 0.8,
+                origin: codestory_api::SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
+            },
+        ];
+
+        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
+        assert_eq!(hits[0].kind, codestory_api::NodeKind::FUNCTION);
+    }
+
+    #[test]
+    fn resolve_target_file_filter_disambiguates_tictactoe_symbol_queries() {
+        let workspace = copy_tictactoe_workspace();
+        let runtime = indexed_runtime(workspace.path());
+
+        let resolved = resolve_target(
+            &runtime,
+            TargetSelection::Query("TicTacToe".to_string()),
+            Some("rust_tictactoe.rs"),
+        )
+        .expect("resolve filtered target");
+
+        assert!(
+            resolved
+                .selected
+                .file_path
+                .as_deref()
+                .is_some_and(|path| path.contains("rust_tictactoe.rs"))
+        );
     }
 
     #[test]
@@ -1285,6 +1531,9 @@ mod tests {
     #[test]
     fn relative_path_outside_root() {
         let root = Path::new("C:/repo");
-        assert_eq!(relative_path(root, "D:\\other\\file.rs"), "D:/other/file.rs");
+        assert_eq!(
+            relative_path(root, "D:\\other\\file.rs"),
+            "D:/other/file.rs"
+        );
     }
 }

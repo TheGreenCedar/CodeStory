@@ -406,6 +406,7 @@ dependencies = [
  "directories",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

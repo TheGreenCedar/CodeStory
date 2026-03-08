@@ -63,47 +63,6 @@
   attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
 }
 
-;; Calls (identifier)
-(function_definition
-  name: (identifier) @caller
-  body: (block
-    (expression_statement
-      (call function: (identifier) @callee) @call)))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
-}
-
-;; Calls (attribute)
-(function_definition
-  name: (identifier) @caller
-  body: (block
-    (expression_statement
-      (call function: (attribute
-        attribute: (identifier) @callee) @call))))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
-}
-
 ;; Calls (global fallback identifier)
 (call
   function: (identifier) @callee_any) @call_any

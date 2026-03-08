@@ -1,10 +1,9 @@
 use super::{
-    SemanticResolutionCandidate, SemanticResolutionRequest, SemanticResolver, kind_clause,
-    resolve_call_candidates, resolve_import_candidates,
+    SemanticCandidateIndex, SemanticResolutionCandidate, SemanticResolutionRequest,
+    SemanticResolver, resolve_call_candidates, resolve_import_candidates,
 };
 use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind};
-use rusqlite::Connection;
 
 pub struct CSemanticResolver;
 
@@ -15,12 +14,12 @@ impl SemanticResolver for CSemanticResolver {
 
     fn resolve(
         &self,
-        conn: &Connection,
+        index: &SemanticCandidateIndex,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
         match request.edge_kind {
-            EdgeKind::IMPORT => self.resolve_import(conn, request),
-            EdgeKind::CALL => self.resolve_call(conn, request),
+            EdgeKind::IMPORT => self.resolve_import(index, request),
+            EdgeKind::CALL => self.resolve_call(index, request),
             _ => Ok(Vec::new()),
         }
     }
@@ -29,7 +28,7 @@ impl SemanticResolver for CSemanticResolver {
 impl CSemanticResolver {
     fn resolve_import(
         &self,
-        conn: &Connection,
+        index: &SemanticCandidateIndex,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
         let target = request.target_name.trim();
@@ -50,14 +49,12 @@ impl CSemanticResolver {
             NodeKind::TYPEDEF as i32,
             NodeKind::FUNCTION as i32,
         ];
-        let kind_clause = kind_clause(&kinds);
-
-        resolve_import_candidates(conn, &kind_clause, &symbol, request.file_id, 0.54)
+        resolve_import_candidates(index, &kinds, &symbol, request.file_id, 0.54)
     }
 
     fn resolve_call(
         &self,
-        conn: &Connection,
+        index: &SemanticCandidateIndex,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
         let target = request.target_name.trim();
@@ -75,8 +72,7 @@ impl CSemanticResolver {
         }
 
         let kinds = [NodeKind::FUNCTION as i32, NodeKind::METHOD as i32];
-        let kind_clause = kind_clause(&kinds);
-        resolve_call_candidates(conn, &kind_clause, call_name, request.file_id, 0.82, 0.66)
+        resolve_call_candidates(index, &kinds, call_name, request.file_id, 0.82, 0.66)
     }
 }
 
@@ -127,6 +123,7 @@ mod tests {
             ],
         )?;
 
+        let index = SemanticCandidateIndex::load(&conn, &[NodeKind::MODULE as i32])?;
         let resolver = CSemanticResolver;
         let request = SemanticResolutionRequest {
             edge_kind: EdgeKind::IMPORT,
@@ -136,7 +133,7 @@ mod tests {
             target_name: "<stdio.h>".to_string(),
         };
 
-        let out = resolver.resolve(&conn, &request)?;
+        let out = resolver.resolve(&index, &request)?;
         assert!(!out.is_empty());
         assert_eq!(out[0].target_node_id, 21_i64);
         Ok(())

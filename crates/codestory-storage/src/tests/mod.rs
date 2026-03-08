@@ -56,6 +56,18 @@ fn test_resolution_indexes_are_created() -> Result<(), StorageError> {
             .any(|name| name == "idx_edge_kind_resolved_target")
     );
 
+    let mut callable_state_stmt = storage
+        .conn
+        .prepare("PRAGMA index_list('callable_projection_state')")?;
+    let callable_state_indexes = callable_state_stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        callable_state_indexes
+            .iter()
+            .any(|name| name == "idx_callable_projection_state_file_node")
+    );
+
     Ok(())
 }
 
@@ -213,6 +225,15 @@ fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
         },
     }])?;
     storage.insert_component_access_batch(&[(function_node.id, AccessKind::Public)])?;
+    storage.upsert_callable_projection_states(&[CallableProjectionState {
+        file_id: file_node.id.0,
+        symbol_key: "src/main.rs::main:FUNCTION".to_string(),
+        node_id: function_node.id,
+        signature_hash: 101,
+        body_hash: 202,
+        start_line: 1,
+        end_line: 1,
+    }])?;
     storage.insert_error(&codestory_core::ErrorInfo {
         message: "test".to_string(),
         file_id: Some(file_node.id),
@@ -238,6 +259,7 @@ fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
         "occurrence",
         "edge",
         "llm_symbol_doc",
+        "callable_projection_state",
         "component_access",
         "bookmark_node",
         "local_symbol",
@@ -257,6 +279,403 @@ fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
     // Categories are user-managed metadata; clear only removes node-linked data.
     assert_eq!(storage.get_bookmark_categories()?.len(), 1);
     assert!(storage.get_node(function_node.id)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn test_callable_projection_state_round_trip() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_file(&FileInfo {
+        id: 11,
+        path: PathBuf::from("src/lib.rs"),
+        language: "rust".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 40,
+    })?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(11),
+            kind: NodeKind::FILE,
+            serialized_name: "src/lib.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(101),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "run".to_string(),
+            file_node_id: Some(NodeId(11)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(102),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "helper".to_string(),
+            file_node_id: Some(NodeId(11)),
+            ..Default::default()
+        },
+    ])?;
+    storage.upsert_callable_projection_states(&[
+        CallableProjectionState {
+            file_id: 11,
+            symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
+            node_id: NodeId(101),
+            signature_hash: 111,
+            body_hash: 211,
+            start_line: 10,
+            end_line: 20,
+        },
+        CallableProjectionState {
+            file_id: 11,
+            symbol_key: "src/lib.rs::helper:FUNCTION".to_string(),
+            node_id: NodeId(102),
+            signature_hash: 112,
+            body_hash: 212,
+            start_line: 30,
+            end_line: 35,
+        },
+    ])?;
+
+    let stored = storage.get_callable_projection_states_for_file(11)?;
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[0].symbol_key, "src/lib.rs::run:FUNCTION");
+
+    storage.upsert_callable_projection_states(&[CallableProjectionState {
+        file_id: 11,
+        symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
+        node_id: NodeId(101),
+        signature_hash: 111,
+        body_hash: 299,
+        start_line: 12,
+        end_line: 22,
+    }])?;
+    let updated = storage.get_callable_projection_states_for_file(11)?;
+    assert_eq!(updated.len(), 2);
+    let run_state = updated
+        .iter()
+        .find(|state| state.symbol_key == "src/lib.rs::run:FUNCTION")
+        .expect("updated run state");
+    assert_eq!(run_state.body_hash, 299);
+    assert_eq!(run_state.start_line, 12);
+    Ok(())
+}
+
+#[test]
+fn test_delete_callable_projection_states_for_file() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_file(&FileInfo {
+        id: 11,
+        path: PathBuf::from("src/lib.rs"),
+        language: "rust".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 40,
+    })?;
+    storage.insert_file(&FileInfo {
+        id: 12,
+        path: PathBuf::from("src/other.rs"),
+        language: "rust".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 10,
+    })?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(11),
+            kind: NodeKind::FILE,
+            serialized_name: "src/lib.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(12),
+            kind: NodeKind::FILE,
+            serialized_name: "src/other.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(101),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "run".to_string(),
+            file_node_id: Some(NodeId(11)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(102),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "helper".to_string(),
+            file_node_id: Some(NodeId(11)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(201),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "keep".to_string(),
+            file_node_id: Some(NodeId(12)),
+            ..Default::default()
+        },
+    ])?;
+    storage.upsert_callable_projection_states(&[
+        CallableProjectionState {
+            file_id: 11,
+            symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
+            node_id: NodeId(101),
+            signature_hash: 111,
+            body_hash: 211,
+            start_line: 10,
+            end_line: 20,
+        },
+        CallableProjectionState {
+            file_id: 11,
+            symbol_key: "src/lib.rs::helper:FUNCTION".to_string(),
+            node_id: NodeId(102),
+            signature_hash: 112,
+            body_hash: 212,
+            start_line: 30,
+            end_line: 35,
+        },
+        CallableProjectionState {
+            file_id: 12,
+            symbol_key: "src/other.rs::keep:FUNCTION".to_string(),
+            node_id: NodeId(201),
+            signature_hash: 311,
+            body_hash: 411,
+            start_line: 1,
+            end_line: 5,
+        },
+    ])?;
+
+    let removed = storage.delete_callable_projection_states_for_file(11)?;
+    assert_eq!(removed, 2);
+    assert!(
+        storage
+            .get_callable_projection_states_for_file(11)?
+            .is_empty()
+    );
+    assert_eq!(
+        storage.get_callable_projection_states_for_file(12)?.len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn test_delete_projection_for_callers_removes_callable_scoped_data() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let file_id = 9_i64;
+    let file_node = Node {
+        id: NodeId(file_id),
+        kind: NodeKind::FILE,
+        serialized_name: "src/lib.rs".to_string(),
+        ..Default::default()
+    };
+    let caller_a = Node {
+        id: NodeId(901),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "run".to_string(),
+        file_node_id: Some(file_node.id),
+        ..Default::default()
+    };
+    let caller_b = Node {
+        id: NodeId(902),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "keep".to_string(),
+        file_node_id: Some(file_node.id),
+        ..Default::default()
+    };
+
+    storage.insert_file(&FileInfo {
+        id: file_id,
+        path: PathBuf::from("src/lib.rs"),
+        language: "rust".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 50,
+    })?;
+    storage.insert_nodes_batch(&[
+        file_node.clone(),
+        caller_a.clone(),
+        caller_b.clone(),
+        Node {
+            id: NodeId(903),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "callee".to_string(),
+            file_node_id: Some(file_node.id),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[
+        Edge {
+            id: EdgeId(1),
+            source: caller_a.id,
+            target: NodeId(903),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(file_node.id),
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(2),
+            source: caller_b.id,
+            target: NodeId(903),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(file_node.id),
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(3),
+            source: caller_a.id,
+            target: NodeId(903),
+            kind: EdgeKind::USAGE,
+            file_node_id: Some(file_node.id),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_occurrences_batch(&[
+        Occurrence {
+            element_id: caller_a.id.0,
+            kind: OccurrenceKind::DEFINITION,
+            location: SourceLocation {
+                file_node_id: file_node.id,
+                start_line: 1,
+                start_col: 0,
+                end_line: 3,
+                end_col: 1,
+            },
+        },
+        Occurrence {
+            element_id: caller_b.id.0,
+            kind: OccurrenceKind::DEFINITION,
+            location: SourceLocation {
+                file_node_id: file_node.id,
+                start_line: 10,
+                start_col: 0,
+                end_line: 12,
+                end_col: 1,
+            },
+        },
+        Occurrence {
+            element_id: NodeId(903).0,
+            kind: OccurrenceKind::REFERENCE,
+            location: SourceLocation {
+                file_node_id: file_node.id,
+                start_line: 2,
+                start_col: 4,
+                end_line: 2,
+                end_col: 10,
+            },
+        },
+        Occurrence {
+            element_id: NodeId(903).0,
+            kind: OccurrenceKind::REFERENCE,
+            location: SourceLocation {
+                file_node_id: file_node.id,
+                start_line: 11,
+                start_col: 4,
+                end_line: 11,
+                end_col: 10,
+            },
+        },
+    ])?;
+    storage.upsert_callable_projection_states(&[
+        CallableProjectionState {
+            file_id,
+            symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
+            node_id: caller_a.id,
+            signature_hash: 111,
+            body_hash: 211,
+            start_line: 1,
+            end_line: 3,
+        },
+        CallableProjectionState {
+            file_id,
+            symbol_key: "src/lib.rs::keep:FUNCTION".to_string(),
+            node_id: caller_b.id,
+            signature_hash: 112,
+            body_hash: 212,
+            start_line: 10,
+            end_line: 12,
+        },
+    ])?;
+
+    let summary = storage.delete_projection_for_callers(file_id, &[caller_a.id])?;
+    assert_eq!(summary.removed_edge_count, 2);
+    assert_eq!(summary.removed_occurrence_count, 2);
+    assert_eq!(summary.removed_callable_projection_state_count, 1);
+
+    let remaining_edges = storage.get_edges()?;
+    assert_eq!(remaining_edges.len(), 1);
+    assert_eq!(remaining_edges[0].source, caller_b.id);
+
+    let remaining_occurrences = storage.get_occurrences()?;
+    assert_eq!(remaining_occurrences.len(), 2);
+    assert!(
+        remaining_occurrences
+            .iter()
+            .any(|occurrence| occurrence.element_id == caller_b.id.0)
+    );
+    assert!(
+        remaining_occurrences
+            .iter()
+            .any(|occurrence| occurrence.element_id == NodeId(903).0)
+    );
+
+    let remaining_states = storage.get_callable_projection_states_for_file(file_id)?;
+    assert_eq!(remaining_states.len(), 1);
+    assert_eq!(remaining_states[0].node_id, caller_b.id);
+    Ok(())
+}
+
+#[test]
+fn test_opening_v3_db_resets_projection_state() -> Result<(), StorageError> {
+    let db_path = std::env::temp_dir().join(format!(
+        "codestory-storage-v3-migration-{}.db",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&db_path);
+    {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        schema::create_tables(&conn)?;
+        schema::create_indexes(&conn)?;
+        conn.pragma_update(None, "user_version", 3)?;
+        conn.execute(
+            "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count)
+             VALUES (1, 'src/lib.rs', 'rust', 1, 1, 1, 10)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name) VALUES (?1, ?2, ?3)",
+            params![1_i64, NodeKind::FILE as i32, "src/lib.rs"],
+        )?;
+        conn.execute(
+            "INSERT INTO callable_projection_state (file_id, symbol_key, node_id, signature_hash, body_hash, start_line, end_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![1_i64, "sym", 1_i64, 11_i64, 22_i64, 1_i64, 2_i64],
+        )?;
+        conn.execute(
+            "INSERT INTO bookmark_category (id, name) VALUES (1, 'Favorites')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO bookmark_node (id, category_id, node_id, comment) VALUES (1, 1, 1, 'saved')",
+            [],
+        )?;
+    }
+
+    let storage = Storage::open(&db_path)?;
+    assert!(storage.get_files()?.is_empty());
+    assert!(storage.get_nodes()?.is_empty());
+    assert!(
+        storage
+            .get_callable_projection_states_for_file(1)?
+            .is_empty()
+    );
+    assert!(storage.get_bookmarks(None)?.is_empty());
+    assert!(storage.get_bookmark_categories()?.is_empty());
+    drop(storage);
+    let _ = std::fs::remove_file(&db_path);
     Ok(())
 }
 
@@ -472,6 +891,15 @@ fn test_delete_file_projection() -> Result<(), StorageError> {
         embedding: vec![0.1_f32; 384],
         updated_at_epoch_ms: 1,
     }])?;
+    storage.upsert_callable_projection_states(&[CallableProjectionState {
+        file_id: file_node_id,
+        symbol_key: "src/main.rs::foo:FUNCTION".to_string(),
+        node_id: func_node.id,
+        signature_hash: 111,
+        body_hash: 211,
+        start_line: 1,
+        end_line: 1,
+    }])?;
 
     let category_id = storage.create_bookmark_category("Cat")?;
     let _ = storage.add_bookmark(category_id, func_node.id, Some("test"))?;
@@ -483,11 +911,17 @@ fn test_delete_file_projection() -> Result<(), StorageError> {
     assert_eq!(summary.removed_occurrence_count, 1);
     assert_eq!(summary.removed_error_count, 1);
     assert_eq!(summary.removed_file_row_count, 1);
+    assert_eq!(summary.removed_callable_projection_state_count, 1);
 
     assert!(storage.get_nodes()?.is_empty());
     assert!(storage.get_edges()?.is_empty());
     assert!(storage.get_occurrences()?.is_empty());
     assert!(storage.get_all_llm_symbol_docs()?.is_empty());
+    assert!(
+        storage
+            .get_callable_projection_states_for_file(file_node_id)?
+            .is_empty()
+    );
     assert!(storage.get_errors(None)?.is_empty());
     assert!(storage.get_bookmarks(Some(category_id))?.is_empty());
 

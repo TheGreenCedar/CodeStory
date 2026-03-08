@@ -1,6 +1,6 @@
 use crate::semantic::{
-    SemanticResolutionCandidate, SemanticResolutionRequest, SemanticResolverRegistry,
-    detect_language as semantic_detect_language,
+    SemanticCandidateIndex, SemanticResolutionCandidate, SemanticResolutionRequest,
+    SemanticResolverRegistry, detect_language as semantic_detect_language,
 };
 use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind, ResolutionCertainty};
@@ -68,15 +68,6 @@ struct ResolvedEdgeUpdate {
     confidence: Option<f32>,
     certainty: Option<&'static str>,
     candidate_payload: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SemanticCacheKey {
-    edge_kind: EdgeKind,
-    file_id: Option<i64>,
-    caller_qualified: Option<String>,
-    target_name: String,
-    language_bucket: Option<String>,
 }
 
 #[derive(Default, Debug)]
@@ -295,7 +286,7 @@ impl ResolutionFlags {
             legacy_mode,
             enable_semantic: env_flag("CODESTORY_RESOLUTION_ENABLE_SEMANTIC", !legacy_mode),
             store_candidates: env_flag("CODESTORY_RESOLUTION_STORE_CANDIDATES", !legacy_mode),
-            parallel_compute: env_flag("CODESTORY_RESOLUTION_PARALLEL_COMPUTE", false),
+            parallel_compute: env_flag("CODESTORY_RESOLUTION_PARALLEL_COMPUTE", !legacy_mode),
         }
     }
 }
@@ -525,7 +516,7 @@ impl ResolutionPass {
 
     fn semantic_candidates_for_rows(
         &self,
-        conn: &rusqlite::Connection,
+        index: &SemanticCandidateIndex,
         rows: &[UnresolvedEdgeRow],
         edge_kind: EdgeKind,
     ) -> Result<Vec<Vec<SemanticResolutionCandidate>>> {
@@ -533,20 +524,37 @@ impl ResolutionPass {
             return Ok(vec![Vec::new(); rows.len()]);
         }
 
-        let mut cache: HashMap<SemanticCacheKey, Vec<SemanticResolutionCandidate>> = HashMap::new();
-        let mut out = Vec::with_capacity(rows.len());
-        for (_, file_id, caller_qualified, target_name, caller_file_path, _) in rows {
-            out.push(self.semantic_candidates_for_edge(
-                conn,
-                &mut cache,
-                edge_kind,
-                *file_id,
-                caller_file_path.as_deref(),
-                caller_qualified.as_deref(),
-                target_name,
-            )?);
+        if self.flags.parallel_compute && rows.len() > 1 {
+            rows.par_iter()
+                .map(
+                    |(_, file_id, caller_qualified, target_name, caller_file_path, _)| {
+                        self.semantic_candidates_for_edge(
+                            index,
+                            edge_kind,
+                            *file_id,
+                            caller_file_path.as_deref(),
+                            caller_qualified.as_deref(),
+                            target_name,
+                        )
+                    },
+                )
+                .collect()
+        } else {
+            rows.iter()
+                .map(
+                    |(_, file_id, caller_qualified, target_name, caller_file_path, _)| {
+                        self.semantic_candidates_for_edge(
+                            index,
+                            edge_kind,
+                            *file_id,
+                            caller_file_path.as_deref(),
+                            caller_qualified.as_deref(),
+                            target_name,
+                        )
+                    },
+                )
+                .collect()
         }
-        Ok(out)
     }
 
     fn compute_call_resolution(
@@ -579,8 +587,7 @@ impl ResolutionPass {
     #[warn(clippy::too_many_arguments)]
     fn semantic_candidates_for_edge(
         &self,
-        conn: &rusqlite::Connection,
-        cache: &mut HashMap<SemanticCacheKey, Vec<SemanticResolutionCandidate>>,
+        index: &SemanticCandidateIndex,
         edge_kind: EdgeKind,
         file_id: Option<i64>,
         file_path: Option<&str>,
@@ -592,18 +599,6 @@ impl ResolutionPass {
             return Ok(Vec::new());
         }
 
-        let key = SemanticCacheKey {
-            edge_kind,
-            file_id,
-            caller_qualified: caller_qualified.map(str::to_string),
-            target_name: target_name.to_string(),
-            language_bucket,
-        };
-
-        if let Some(cached) = cache.get(&key) {
-            return Ok(cached.clone());
-        }
-
         let request = SemanticResolutionRequest {
             edge_kind,
             file_id,
@@ -611,9 +606,7 @@ impl ResolutionPass {
             caller_qualified: caller_qualified.map(str::to_string),
             target_name: target_name.to_string(),
         };
-        let resolved = self.semantic_resolvers.resolve(conn, &request)?;
-        cache.insert(key, resolved.clone());
-        Ok(resolved)
+        self.semantic_resolvers.resolve(index, &request)
     }
 }
 
@@ -708,6 +701,27 @@ fn collect_candidate_pool_from_index(
 
 fn semantic_language_bucket(file_path: Option<&str>) -> Option<&'static str> {
     semantic_detect_language(file_path)
+}
+
+pub(super) fn semantic_candidate_kinds(edge_kind: EdgeKind) -> &'static [i32] {
+    match edge_kind {
+        EdgeKind::CALL => &[NodeKind::FUNCTION as i32, NodeKind::METHOD as i32],
+        EdgeKind::IMPORT => &[
+            NodeKind::MODULE as i32,
+            NodeKind::NAMESPACE as i32,
+            NodeKind::PACKAGE as i32,
+            NodeKind::CLASS as i32,
+            NodeKind::STRUCT as i32,
+            NodeKind::INTERFACE as i32,
+            NodeKind::ANNOTATION as i32,
+            NodeKind::UNION as i32,
+            NodeKind::ENUM as i32,
+            NodeKind::TYPEDEF as i32,
+            NodeKind::FUNCTION as i32,
+            NodeKind::METHOD as i32,
+        ],
+        _ => &[],
+    }
 }
 
 impl CandidateIndex {
@@ -1014,7 +1028,7 @@ fn cleanup_stale_call_resolutions(
             "UPDATE edge SET resolved_target_node_id = NULL, confidence = NULL, certainty = NULL
              WHERE kind = ?
              AND resolved_target_node_id IS NOT NULL
-             AND target_node_id IN (SELECT id FROM node WHERE serialized_name IN ({}))",
+             AND target_node_id IN (SELECT id FROM node WHERE lower(serialized_name) IN ({}))",
             names_placeholders
         );
         if scope_context.is_scoped() {
@@ -1034,7 +1048,7 @@ fn cleanup_stale_call_resolutions(
             "UPDATE edge SET resolved_target_node_id = NULL, confidence = NULL, certainty = NULL
              WHERE kind = ?
              AND resolved_target_node_id IS NOT NULL
-             AND target_node_id IN (SELECT id FROM node WHERE serialized_name IN ({}))
+             AND target_node_id IN (SELECT id FROM node WHERE lower(serialized_name) IN ({}))
              AND (certainty IS NULL OR certainty != ?)",
             names_placeholders
         );
@@ -1551,14 +1565,21 @@ fn common_unqualified_call_names() -> &'static [&'static str] {
         "any",
         "clear",
         "clone",
+        "commit",
         "collect",
+        "copied",
         "dedup",
+        "default",
+        "execute",
         "extend",
+        "from",
         "is_empty",
         "insert",
+        "iter",
         "len",
         "map",
         "map_err",
+        "once",
         "ok",
         "pop",
         "push",
@@ -1574,7 +1595,8 @@ fn is_common_unqualified_call_name(name: &str) -> bool {
     if name.contains("::") || name.contains('.') {
         return false;
     }
-    common_unqualified_call_names().contains(&name)
+    let normalized = name.to_ascii_lowercase();
+    common_unqualified_call_names().contains(&normalized.as_str())
 }
 
 fn should_keep_common_call_resolution(
@@ -1630,6 +1652,8 @@ mod tests {
     fn test_common_unqualified_call_names_include_clone_like_noise() {
         assert!(is_common_unqualified_call_name("clone"));
         assert!(is_common_unqualified_call_name("len"));
+        assert!(is_common_unqualified_call_name("once"));
+        assert!(is_common_unqualified_call_name("Ok"));
         assert!(!is_common_unqualified_call_name(
             "WorkspaceIndexer::run_incremental"
         ));
@@ -1647,6 +1671,27 @@ mod tests {
             "clone",
             ResolutionCertainty::CERTAIN_MIN,
             Some("1:2:3:4")
+        ));
+        for name in [
+            "once", "execute", "Ok", "commit", "default", "iter", "copied", "from",
+        ] {
+            assert!(
+                !should_keep_common_call_resolution(name, 0.95, None),
+                "name={name} should be suppressed without a strict callsite"
+            );
+            assert!(
+                should_keep_common_call_resolution(
+                    name,
+                    ResolutionCertainty::CERTAIN_MIN,
+                    Some("1:2:3:4")
+                ),
+                "name={name} should be kept when certain and tied to a callsite"
+            );
+        }
+        assert!(should_keep_common_call_resolution(
+            "numbered_placeholders",
+            0.80,
+            None
         ));
     }
 

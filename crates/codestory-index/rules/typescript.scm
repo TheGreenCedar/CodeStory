@@ -34,6 +34,30 @@
   attr (@name.node) end_col = (end-column @name)
 }
 
+(type_alias_declaration
+  name: (type_identifier) @typedef_name) @typedef_def
+{
+  node @typedef_def.node
+  attr (@typedef_def.node) kind = "TYPEDEF"
+  attr (@typedef_def.node) name = (source-text @typedef_name)
+  attr (@typedef_def.node) start_row = (start-row @typedef_def)
+  attr (@typedef_def.node) start_col = (start-column @typedef_def)
+  attr (@typedef_def.node) end_row = (end-row @typedef_def)
+  attr (@typedef_def.node) end_col = (end-column @typedef_def)
+}
+
+(enum_declaration
+  name: (identifier) @enum_name) @enum_def
+{
+  node @enum_def.node
+  attr (@enum_def.node) kind = "ENUM"
+  attr (@enum_def.node) name = (source-text @enum_name)
+  attr (@enum_def.node) start_row = (start-row @enum_def)
+  attr (@enum_def.node) start_col = (start-column @enum_def)
+  attr (@enum_def.node) end_row = (end-row @enum_def)
+  attr (@enum_def.node) end_col = (end-column @enum_def)
+}
+
 (method_definition
   name: (_) @name) @def
 {
@@ -92,86 +116,6 @@
 
   edge @class_name.node -> @parent_name.node
   attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
-}
-
-;; Calls (function -> identifier)
-(function_declaration
-  name: (identifier) @caller
-  body: (statement_block
-    (expression_statement
-      (call_expression function: (identifier) @callee) @call)))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
-}
-
-;; Calls (function -> member)
-(function_declaration
-  name: (identifier) @caller
-  body: (statement_block
-    (expression_statement
-      (call_expression function: (member_expression property: (_) @callee) @call))))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
-}
-
-;; Calls (method -> identifier)
-(method_definition
-  name: (_) @caller
-  body: (statement_block
-    (expression_statement
-      (call_expression function: (identifier) @callee) @call)))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
-}
-
-;; Calls (method -> member)
-(method_definition
-  name: (_) @caller
-  body: (statement_block
-    (expression_statement
-      (call_expression function: (member_expression property: (_) @callee) @call))))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
 }
 
 ;; Calls (global fallback identifier)

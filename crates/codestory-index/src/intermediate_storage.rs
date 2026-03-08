@@ -1,4 +1,6 @@
-use codestory_core::{AccessKind, Edge, ErrorInfo, Node, NodeId, Occurrence};
+use codestory_core::{
+    AccessKind, CallableProjectionState, Edge, ErrorInfo, Node, NodeId, Occurrence,
+};
 
 #[derive(Default)]
 pub struct IntermediateStorage {
@@ -7,6 +9,7 @@ pub struct IntermediateStorage {
     pub edges: Vec<Edge>,
     pub occurrences: Vec<Occurrence>,
     pub component_access: Vec<(NodeId, AccessKind)>,
+    pub callable_projection_states: Vec<CallableProjectionState>,
     pub errors: Vec<ErrorInfo>,
 }
 
@@ -41,6 +44,8 @@ impl IntermediateStorage {
         self.edges.extend(other.edges);
         self.occurrences.extend(other.occurrences);
         self.component_access.extend(other.component_access);
+        self.callable_projection_states
+            .extend(other.callable_projection_states);
         self.errors.extend(other.errors);
     }
 
@@ -50,6 +55,7 @@ impl IntermediateStorage {
         self.edges.clear();
         self.occurrences.clear();
         self.component_access.clear();
+        self.callable_projection_states.clear();
         self.errors.clear();
     }
 }

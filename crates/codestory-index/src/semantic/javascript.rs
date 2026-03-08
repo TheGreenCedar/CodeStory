@@ -1,10 +1,9 @@
 use super::{
-    SemanticResolutionCandidate, SemanticResolutionRequest, SemanticResolver, kind_clause,
-    resolve_call_candidates, resolve_import_candidates,
+    SemanticCandidateIndex, SemanticResolutionCandidate, SemanticResolutionRequest,
+    SemanticResolver, resolve_call_candidates, resolve_import_candidates,
 };
 use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind};
-use rusqlite::Connection;
 
 pub struct JavaScriptSemanticResolver;
 
@@ -15,12 +14,12 @@ impl SemanticResolver for JavaScriptSemanticResolver {
 
     fn resolve(
         &self,
-        conn: &Connection,
+        index: &SemanticCandidateIndex,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
         match request.edge_kind {
-            EdgeKind::IMPORT => self.resolve_import(conn, request),
-            EdgeKind::CALL => self.resolve_call(conn, request),
+            EdgeKind::IMPORT => self.resolve_import(index, request),
+            EdgeKind::CALL => self.resolve_call(index, request),
             _ => Ok(Vec::new()),
         }
     }
@@ -29,7 +28,7 @@ impl SemanticResolver for JavaScriptSemanticResolver {
 impl JavaScriptSemanticResolver {
     fn resolve_import(
         &self,
-        conn: &Connection,
+        index: &SemanticCandidateIndex,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
         let target = request.target_name.trim();
@@ -49,14 +48,12 @@ impl JavaScriptSemanticResolver {
             NodeKind::CLASS as i32,
             NodeKind::FUNCTION as i32,
         ];
-        let kind_clause = kind_clause(&kinds);
-
-        resolve_import_candidates(conn, &kind_clause, &symbol, request.file_id, 0.57)
+        resolve_import_candidates(index, &kinds, &symbol, request.file_id, 0.57)
     }
 
     fn resolve_call(
         &self,
-        conn: &Connection,
+        index: &SemanticCandidateIndex,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
         let target = request.target_name.trim();
@@ -73,8 +70,7 @@ impl JavaScriptSemanticResolver {
         }
 
         let kinds = [NodeKind::METHOD as i32, NodeKind::FUNCTION as i32];
-        let kind_clause = kind_clause(&kinds);
-        resolve_call_candidates(conn, &kind_clause, call_name, request.file_id, 0.82, 0.69)
+        resolve_call_candidates(index, &kinds, call_name, request.file_id, 0.82, 0.69)
     }
 }
 
@@ -138,6 +134,7 @@ mod tests {
             ],
         )?;
 
+        let index = SemanticCandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
         let resolver = JavaScriptSemanticResolver;
         let request = SemanticResolutionRequest {
             edge_kind: EdgeKind::CALL,
@@ -147,7 +144,7 @@ mod tests {
             target_name: "logValue".to_string(),
         };
 
-        let out = resolver.resolve(&conn, &request)?;
+        let out = resolver.resolve(&index, &request)?;
         assert!(!out.is_empty());
         assert_eq!(out[0].target_node_id, 10_i64);
         Ok(())
@@ -170,6 +167,7 @@ mod tests {
             ],
         )?;
 
+        let index = SemanticCandidateIndex::load(&conn, &[NodeKind::MODULE as i32])?;
         let resolver = JavaScriptSemanticResolver;
         let request = SemanticResolutionRequest {
             edge_kind: EdgeKind::IMPORT,
@@ -179,7 +177,7 @@ mod tests {
             target_name: "\"./lib/utils.js\"".to_string(),
         };
 
-        let out = resolver.resolve(&conn, &request)?;
+        let out = resolver.resolve(&index, &request)?;
         assert!(!out.is_empty());
         assert_eq!(out[0].target_node_id, 13_i64);
         Ok(())

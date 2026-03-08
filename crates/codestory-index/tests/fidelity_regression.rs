@@ -1,4 +1,4 @@
-use codestory_core::{Edge, EdgeKind, Node};
+use codestory_core::{Edge, EdgeKind, Node, NodeKind};
 use codestory_events::EventBus;
 use codestory_index::WorkspaceIndexer;
 use codestory_storage::Storage;
@@ -33,6 +33,7 @@ struct FidelityCase {
 }
 
 const PYTHON_SYMBOLS: &[&str] = &[
+    "MAX_RETRIES",
     "trace",
     "Notifier",
     "ConsoleNotifier",
@@ -44,6 +45,7 @@ const PYTHON_SYMBOLS: &[&str] = &[
     "orchestrate",
 ];
 const TYPESCRIPT_SYMBOLS: &[&str] = &[
+    "WorkflowMode",
     "Notifier",
     "ConsoleNotifier",
     "Repository",
@@ -302,6 +304,12 @@ fn has_node_name(nodes: &[Node], target_name: &str) -> bool {
         .any(|node| is_matching_name(&node.serialized_name, target_name))
 }
 
+fn has_node_with_kind(nodes: &[Node], target_kind: NodeKind, target_name: &str) -> bool {
+    nodes.iter().any(|node| {
+        node.kind == target_kind && is_matching_name(&node.serialized_name, target_name)
+    })
+}
+
 fn has_call_target_name(edges: &[Edge], nodes: &[Node], target_name: &str) -> bool {
     let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
     edges
@@ -311,6 +319,48 @@ fn has_call_target_name(edges: &[Edge], nodes: &[Node], target_name: &str) -> bo
         .any(|node| is_matching_name(&node.serialized_name, target_name))
 }
 
+fn has_call_from_owner_to_target(
+    edges: &[Edge],
+    nodes: &[Node],
+    owner_name: &str,
+    target_name: &str,
+) -> bool {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .any(|edge| {
+            let Some(source) = node_by_id.get(&edge.source) else {
+                return false;
+            };
+            let Some(target) = node_by_id.get(&edge.target) else {
+                return false;
+            };
+            is_matching_name(&source.serialized_name, owner_name)
+                && is_matching_name(&target.serialized_name, target_name)
+        })
+}
+
+fn has_edge_between_names(
+    edges: &[Edge],
+    nodes: &[Node],
+    kind: EdgeKind,
+    source_name: &str,
+    target_name: &str,
+) -> bool {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    edges.iter().filter(|edge| edge.kind == kind).any(|edge| {
+        let Some(source) = node_by_id.get(&edge.source) else {
+            return false;
+        };
+        let Some(target) = node_by_id.get(&edge.target) else {
+            return false;
+        };
+        is_matching_name(&source.serialized_name, source_name)
+            && is_matching_name(&target.serialized_name, target_name)
+    })
+}
+
 fn has_import_target_fragment(edges: &[Edge], nodes: &[Node], target_fragment: &str) -> bool {
     let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
     edges
@@ -318,6 +368,18 @@ fn has_import_target_fragment(edges: &[Edge], nodes: &[Node], target_fragment: &
         .filter(|edge| edge.kind == EdgeKind::IMPORT)
         .filter_map(|edge| node_by_id.get(&edge.target).copied())
         .any(|node| node.serialized_name.contains(target_fragment))
+}
+
+fn assert_no_self_call_edges(case_name: &str, edges: &[Edge]) {
+    let self_edges: Vec<_> = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == edge.target)
+        .collect();
+    assert!(
+        self_edges.is_empty(),
+        "Case `{case_name}`: persisted CALL self-edges should have been dropped, found {}",
+        self_edges.len()
+    );
 }
 
 fn describe_call_edges(edges: &[Edge], nodes: &[Node]) -> Vec<String> {
@@ -427,6 +489,7 @@ fn test_fidelity_lab_graph_shape_and_semantics() -> anyhow::Result<()> {
             case.min_call_edges,
             call_edges.len()
         );
+        assert_no_self_call_edges(case.language, &edges);
 
         let import_edges: Vec<_> = edges
             .iter()
@@ -467,6 +530,16 @@ fn test_fidelity_lab_graph_shape_and_semantics() -> anyhow::Result<()> {
             );
         }
 
+        assert!(
+            edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::CALL)
+                .all(|edge| edge.source != edge.target),
+            "Case `{}`: CALL graph contains self-edge markers: {:?}",
+            case.language,
+            describe_call_edges(&edges, &nodes)
+        );
+
         let resolved_calls = call_edges
             .iter()
             .filter(|edge| edge.resolved_target.is_some())
@@ -499,6 +572,190 @@ fn test_fidelity_lab_graph_shape_and_semantics() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_context_agnostic_calls_bind_to_enclosing_callable_without_self_edges() -> anyhow::Result<()>
+{
+    let cases = [
+        (
+            "python",
+            "context.py",
+            r#"
+def callee() -> int:
+    return 1
+
+def caller(flag: bool) -> int:
+    value = callee()
+    if callee():
+        while value < 0:
+            callee()
+    return callee() if flag else value
+"#,
+            "caller",
+            "callee",
+            3usize,
+        ),
+        (
+            "typescript",
+            "context.ts",
+            r#"
+function callee(): number { return 1; }
+
+function caller(flag: boolean): number {
+    const value = callee();
+    if (callee()) {
+        while (value < 0) {
+            callee();
+        }
+    }
+    switch (value) {
+        case 0:
+            return callee();
+        default:
+            return flag ? callee() : value;
+    }
+}
+"#,
+            "caller",
+            "callee",
+            5usize,
+        ),
+        (
+            "javascript",
+            "context.js",
+            r#"
+function callee() { return 1; }
+
+function caller(flag) {
+    const value = callee();
+    if (callee()) {
+        while (value < 0) {
+            callee();
+        }
+    }
+    switch (value) {
+        case 0:
+            return callee();
+        default:
+            return flag ? callee() : value;
+    }
+}
+"#,
+            "caller",
+            "callee",
+            5usize,
+        ),
+        (
+            "cpp",
+            "context.cpp",
+            r#"
+int callee() { return 1; }
+
+int caller(bool flag) {
+    int value = callee();
+    if (callee()) {
+        while (value < 0) {
+            callee();
+        }
+    }
+    switch (value) {
+        case 0:
+            return callee();
+        default:
+            return flag ? callee() : value;
+    }
+}
+"#,
+            "caller",
+            "callee",
+            5usize,
+        ),
+        (
+            "c",
+            "context.c",
+            r#"
+int callee(void) { return 1; }
+
+int caller(int flag) {
+    int value = callee();
+    if (callee()) {
+        while (value < 0) {
+            callee();
+        }
+    }
+    switch (value) {
+        case 0:
+            return callee();
+        default:
+            return flag ? callee() : value;
+    }
+}
+"#,
+            "caller",
+            "callee",
+            5usize,
+        ),
+        (
+            "rust",
+            "context.rs",
+            r#"
+fn callee() -> bool { true }
+
+fn caller(flag: bool) -> bool {
+    let value = callee();
+    if callee() {
+        while false {
+            callee();
+        }
+    }
+    match value {
+        true => callee(),
+        false => flag,
+    }
+}
+"#,
+            "caller",
+            "callee",
+            3usize,
+        ),
+    ];
+
+    for (case_name, filename, source, caller_name, callee_name, min_call_count) in cases {
+        let (nodes, edges) = index_single_file(filename, source)?;
+        assert_no_self_call_edges(case_name, &edges);
+
+        let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+        let caller_edges: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL)
+            .filter(|edge| {
+                node_by_id
+                    .get(&edge.source)
+                    .is_some_and(|node| is_matching_name(&node.serialized_name, caller_name))
+            })
+            .collect();
+
+        assert!(
+            caller_edges.len() >= min_call_count,
+            "Case `{case_name}`: expected at least {min_call_count} attributed CALL edges from `{caller_name}`, got {}. Calls: {:?}",
+            caller_edges.len(),
+            describe_call_edges(&edges, &nodes)
+        );
+
+        let target_hits = caller_edges
+            .iter()
+            .filter_map(|edge| node_by_id.get(&edge.target))
+            .filter(|node| is_matching_name(&node.serialized_name, callee_name))
+            .count();
+        assert!(
+            target_hits >= min_call_count,
+            "Case `{case_name}`: expected `{caller_name}` to own at least {min_call_count} CALL edges to `{callee_name}`, got {target_hits}. Calls: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_fidelity_lab_resolved_targets_point_to_existing_nodes() -> anyhow::Result<()> {
     for case in fidelity_cases() {
         let (nodes, edges) = index_single_file(case.filename, case.source)?;
@@ -516,5 +773,77 @@ fn test_fidelity_lab_resolved_targets_point_to_existing_nodes() -> anyhow::Resul
         }
     }
 
+    Ok(())
+}
+
+#[test]
+fn test_nested_call_attribution_follows_enclosing_callable() -> anyhow::Result<()> {
+    for (filename, source, caller, callee) in [
+        ("nested.py", PYTHON_SOURCE, "decorate", "sqrt"),
+        ("nested.ts", TYPESCRIPT_SOURCE, "run", "identity"),
+        ("nested.js", JAVASCRIPT_SOURCE, "run", "identity"),
+        ("nested.rs", RUST_SOURCE, "run", "identity"),
+        ("nested.cpp", CPP_SOURCE, "run", "identity"),
+        ("nested.c", C_SOURCE, "repository_track", "ALIAS_LEN"),
+    ] {
+        let (nodes, edges) = index_single_file(filename, source)?;
+        assert!(
+            has_call_from_owner_to_target(&edges, &nodes, caller, callee),
+            "Expected `{caller}` to own CALL edge to `{callee}`. Calls: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_rust_struct_enum_and_local_bindings_are_indexed() -> anyhow::Result<()> {
+    let (nodes, _) = index_single_file("locals.rs", RUST_SOURCE)?;
+    assert!(has_node_name(&nodes, "MemoryRepository"));
+    assert!(has_node_name(&nodes, "Event"));
+    assert!(has_node_name(&nodes, "ConsoleNotifier"));
+    assert!(has_node_with_kind(&nodes, NodeKind::VARIABLE, "mapped"));
+    Ok(())
+}
+
+#[test]
+fn test_python_module_constants_and_decorators_are_preserved() -> anyhow::Result<()> {
+    let source = r#"
+MAX_RETRIES = 3
+
+def trace(fn):
+    return fn
+
+@trace
+def run():
+    return MAX_RETRIES
+"#;
+    let (nodes, edges) = index_single_file("constants.py", source)?;
+    assert!(has_node_name(&nodes, "MAX_RETRIES"));
+    assert!(has_edge_between_names(
+        &edges,
+        &nodes,
+        EdgeKind::USAGE,
+        "run",
+        "trace"
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_typescript_type_alias_and_enum_are_indexed() -> anyhow::Result<()> {
+    let source = r#"
+type Props = {
+    label: string;
+};
+
+enum Tone {
+    Primary = "primary",
+}
+"#;
+    let (nodes, _) = index_single_file("types.ts", source)?;
+    assert!(has_node_with_kind(&nodes, NodeKind::TYPEDEF, "Props"));
+    assert!(has_node_with_kind(&nodes, NodeKind::ENUM, "Tone"));
     Ok(())
 }

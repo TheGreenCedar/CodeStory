@@ -102,6 +102,18 @@ const TABLE_STATEMENTS: &[&str] = &[
         FOREIGN KEY(node_id) REFERENCES node(id),
         FOREIGN KEY(file_node_id) REFERENCES node(id)
     )",
+    "CREATE TABLE IF NOT EXISTS callable_projection_state (
+        file_id INTEGER NOT NULL,
+        symbol_key TEXT NOT NULL,
+        node_id INTEGER NOT NULL,
+        signature_hash INTEGER NOT NULL,
+        body_hash INTEGER NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        PRIMARY KEY (file_id, symbol_key),
+        FOREIGN KEY(file_id) REFERENCES file(id),
+        FOREIGN KEY(node_id) REFERENCES node(id)
+    )",
 ];
 
 const INDEX_STATEMENTS: &[&str] = &[
@@ -123,6 +135,8 @@ const INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_file_node ON llm_symbol_doc(file_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_kind ON llm_symbol_doc(kind)",
     "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_updated_at ON llm_symbol_doc(updated_at_epoch_ms)",
+    "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_node_id ON callable_projection_state(node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_file_node ON callable_projection_state(file_id, node_id)",
 ];
 
 pub(super) fn create_tables(conn: &Connection) -> Result<(), StorageError> {
@@ -156,6 +170,11 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     if stored_version < 3 {
         migrate_v3_llm_symbol_projection(&storage.conn)?;
         storage.set_schema_version(3)?;
+    }
+
+    if stored_version < 4 {
+        migrate_v4_reset_projection_state(storage)?;
+        storage.set_schema_version(4)?;
     }
 
     if stored_version < SCHEMA_VERSION {
@@ -205,6 +224,20 @@ pub(super) fn migrate_v3_llm_symbol_projection(conn: &Connection) -> Result<(), 
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_updated_at ON llm_symbol_doc(updated_at_epoch_ms)",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(super) fn migrate_v4_reset_projection_state(storage: &Storage) -> Result<(), StorageError> {
+    storage.clear()?;
+    storage.conn.execute("DELETE FROM bookmark_category", [])?;
+    storage.conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_node_id ON callable_projection_state(node_id)",
+        [],
+    )?;
+    storage.conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_file_node ON callable_projection_state(file_id, node_id)",
         [],
     )?;
     Ok(())

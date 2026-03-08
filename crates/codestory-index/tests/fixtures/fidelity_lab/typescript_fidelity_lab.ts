@@ -3,6 +3,10 @@ import { join as pathJoin } from "path";
 
 type Mapper<T> = (value: T) => T;
 
+enum WorkflowMode {
+    Sync = "sync",
+}
+
 interface Notifier {
     notify(value: string): void;
 }
@@ -45,7 +49,7 @@ class Workflow<T extends { name: string }> {
     }
 
     decorate(item: T): string {
-        return pathJoin(item.name, readFile.length.toString());
+        return pathJoin(item.name, WorkflowMode.Sync, readFile.length.toString());
     }
 }
 

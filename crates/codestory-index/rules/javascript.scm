@@ -61,86 +61,6 @@
   attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
 }
 
-;; Calls (function -> identifier)
-(function_declaration
-  name: (identifier) @caller
-  body: (statement_block
-    (expression_statement
-      (call_expression function: (identifier) @callee) @call)))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
-}
-
-;; Calls (function -> member)
-(function_declaration
-  name: (identifier) @caller
-  body: (statement_block
-    (expression_statement
-      (call_expression function: (member_expression property: (property_identifier) @callee) @call))))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
-}
-
-;; Calls (method -> identifier)
-(method_definition
-  name: (property_identifier) @caller
-  body: (statement_block
-    (expression_statement
-      (call_expression function: (identifier) @callee) @call)))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
-}
-
-;; Calls (method -> member)
-(method_definition
-  name: (property_identifier) @caller
-  body: (statement_block
-    (expression_statement
-      (call_expression function: (member_expression property: (property_identifier) @callee) @call))))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
-}
-
 ;; Calls (global fallback identifier)
 (call_expression
   function: (identifier) @callee_any) @call_any
@@ -158,6 +78,7 @@
   attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
 }
 
+
 ;; Calls (global fallback member)
 (call_expression
   function: (member_expression
@@ -174,6 +95,62 @@
   edge @call_any.node -> @call_any.node
   attr (@call_any.node -> @call_any.node) kind = "CALL"
   attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
+}
+
+;; JSX component and prop usage from render paths
+(function_declaration
+  name: (identifier) @caller_name
+  body: (statement_block
+    (return_statement
+      (jsx_self_closing_element
+        name: (_) @component)))) @def
+{
+  node @caller_name.node
+  attr (@caller_name.node) kind = "FUNCTION"
+  attr (@caller_name.node) name = (source-text @caller_name)
+  attr (@caller_name.node) start_row = (start-row @def)
+  attr (@caller_name.node) start_col = (start-column @def)
+  attr (@caller_name.node) end_row = (end-row @def)
+  attr (@caller_name.node) end_col = (end-column @def)
+
+  node @component.node
+  attr (@component.node) kind = "UNKNOWN"
+  attr (@component.node) name = (source-text @component)
+  attr (@component.node) start_row = (start-row @component)
+  attr (@component.node) start_col = (start-column @component)
+  attr (@component.node) end_row = (end-row @component)
+  attr (@component.node) end_col = (end-column @component)
+
+  edge @caller_name.node -> @component.node
+  attr (@caller_name.node -> @component.node) kind = "USAGE"
+}
+
+(function_declaration
+  name: (identifier) @caller_name
+  body: (statement_block
+    (return_statement
+      (jsx_self_closing_element
+        (jsx_attribute
+          (property_identifier) @attribute))))) @def
+{
+  node @caller_name.node
+  attr (@caller_name.node) kind = "FUNCTION"
+  attr (@caller_name.node) name = (source-text @caller_name)
+  attr (@caller_name.node) start_row = (start-row @def)
+  attr (@caller_name.node) start_col = (start-column @def)
+  attr (@caller_name.node) end_row = (end-row @def)
+  attr (@caller_name.node) end_col = (end-column @def)
+
+  node @attribute.node
+  attr (@attribute.node) kind = "FIELD"
+  attr (@attribute.node) name = (source-text @attribute)
+  attr (@attribute.node) start_row = (start-row @attribute)
+  attr (@attribute.node) start_col = (start-column @attribute)
+  attr (@attribute.node) end_row = (end-row @attribute)
+  attr (@attribute.node) end_col = (end-column @attribute)
+
+  edge @caller_name.node -> @attribute.node
+  attr (@caller_name.node -> @attribute.node) kind = "USAGE"
 }
 
 ;; Imports

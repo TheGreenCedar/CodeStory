@@ -26,7 +26,8 @@
   name: (type_identifier) @name)
 {
   node @name.node
-  attr (@name.node) kind = "CLASS"
+  attr (@name.node) kind = "STRUCT"
+  attr (@name.node) canonical_role = "declaration"
   attr (@name.node) name = (source-text @name)
   attr (@name.node) start_row = (start-row @name)
   attr (@name.node) start_col = (start-column @name)
@@ -38,7 +39,8 @@
   name: (type_identifier) @name)
 {
   node @name.node
-  attr (@name.node) kind = "CLASS"
+  attr (@name.node) kind = "ENUM"
+  attr (@name.node) canonical_role = "declaration"
   attr (@name.node) name = (source-text @name)
   attr (@name.node) start_row = (start-row @name)
   attr (@name.node) start_col = (start-column @name)
@@ -51,6 +53,7 @@
 {
   node @name.node
   attr (@name.node) kind = "INTERFACE"
+  attr (@name.node) canonical_role = "declaration"
   attr (@name.node) name = (source-text @name)
   attr (@name.node) start_row = (start-row @name)
   attr (@name.node) start_col = (start-column @name)
@@ -162,6 +165,7 @@
 {
   node @type_name.node
   attr (@type_name.node) kind = "CLASS"
+  attr (@type_name.node) canonical_role = "impl_anchor"
   attr (@type_name.node) name = (source-text @type_name)
   attr (@type_name.node) start_row = (start-row @type_name)
   attr (@type_name.node) start_col = (start-column @type_name)
@@ -186,6 +190,7 @@
 {
   node @trait_name.node
   attr (@trait_name.node) kind = "INTERFACE"
+  attr (@trait_name.node) canonical_role = "impl_anchor"
   attr (@trait_name.node) name = (source-text @trait_name)
   attr (@trait_name.node) start_row = (start-row @trait_name)
   attr (@trait_name.node) start_col = (start-column @trait_name)
@@ -194,68 +199,6 @@
 
   edge @type_name.node -> @trait_name.node
   attr (@type_name.node -> @trait_name.node) kind = "INHERITANCE"
-}
-
-;; Calls (identifier)
-(function_item
-  name: (identifier) @caller
-  body: (block
-    (expression_statement
-      (call_expression function: (identifier) @callee) @call)))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
-}
-
-;; Calls (field expression)
-(function_item
-  name: (identifier) @caller
-  body: (block
-    (expression_statement
-      (call_expression function: (field_expression field: (field_identifier) @callee) @call))))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
-}
-
-;; Calls (scoped identifier, e.g., Self::helper)
-(function_item
-  name: (identifier) @caller
-  body: (block
-    (expression_statement
-      (call_expression
-        function: (scoped_identifier
-          name: (identifier) @callee) @call))))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
 }
 
 ;; Calls (global fallback identifier)
@@ -361,12 +304,29 @@
   attr (@name.node) end_col = (end-column @def)
 }
 
+;; Local bindings
+(let_declaration
+  pattern: (identifier) @name
+  value: (_) @value
+  (#not-match? @value "^(move\\s+)?\\|"))
+{
+  node @name.node
+  attr (@name.node) kind = "VARIABLE"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) value_start_row = (start-row @value)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+}
+
 ;; Impl type/trait variants
 (impl_item
   type: (scoped_type_identifier) @type_name)
 {
   node @type_name.node
   attr (@type_name.node) kind = "CLASS"
+  attr (@type_name.node) canonical_role = "impl_anchor"
   attr (@type_name.node) name = (source-text @type_name)
   attr (@type_name.node) start_row = (start-row @type_name)
   attr (@type_name.node) start_col = (start-column @type_name)
@@ -380,6 +340,7 @@
 {
   node @type_name.node
   attr (@type_name.node) kind = "CLASS"
+  attr (@type_name.node) canonical_role = "impl_anchor"
   attr (@type_name.node) name = (source-text @type_name)
   attr (@type_name.node) start_row = (start-row @type_name)
   attr (@type_name.node) start_col = (start-column @type_name)
@@ -413,6 +374,7 @@
 {
   node @trait_name.node
   attr (@trait_name.node) kind = "INTERFACE"
+  attr (@trait_name.node) canonical_role = "impl_anchor"
   attr (@trait_name.node) name = (source-text @trait_name)
   attr (@trait_name.node) start_row = (start-row @trait_name)
   attr (@trait_name.node) start_col = (start-column @trait_name)
@@ -429,6 +391,7 @@
 {
   node @trait_name.node
   attr (@trait_name.node) kind = "INTERFACE"
+  attr (@trait_name.node) canonical_role = "impl_anchor"
   attr (@trait_name.node) name = (source-text @trait_name)
   attr (@trait_name.node) start_row = (start-row @trait_name)
   attr (@trait_name.node) start_col = (start-column @trait_name)
@@ -446,6 +409,7 @@
 {
   node @trait_name.node
   attr (@trait_name.node) kind = "INTERFACE"
+  attr (@trait_name.node) canonical_role = "impl_anchor"
   attr (@trait_name.node) name = (source-text @trait_name)
   attr (@trait_name.node) start_row = (start-row @trait_name)
   attr (@trait_name.node) start_col = (start-column @trait_name)
@@ -463,6 +427,7 @@
 {
   node @trait_name.node
   attr (@trait_name.node) kind = "INTERFACE"
+  attr (@trait_name.node) canonical_role = "impl_anchor"
   attr (@trait_name.node) name = (source-text @trait_name)
   attr (@trait_name.node) start_row = (start-row @trait_name)
   attr (@trait_name.node) start_col = (start-column @trait_name)
@@ -481,6 +446,7 @@
 {
   node @trait_name.node
   attr (@trait_name.node) kind = "INTERFACE"
+  attr (@trait_name.node) canonical_role = "impl_anchor"
   attr (@trait_name.node) name = (source-text @trait_name)
   attr (@trait_name.node) start_row = (start-row @trait_name)
   attr (@trait_name.node) start_col = (start-column @trait_name)
@@ -497,6 +463,7 @@
 {
   node @trait_name.node
   attr (@trait_name.node) kind = "INTERFACE"
+  attr (@trait_name.node) canonical_role = "impl_anchor"
   attr (@trait_name.node) name = (source-text @trait_name)
   attr (@trait_name.node) start_row = (start-row @trait_name)
   attr (@trait_name.node) start_col = (start-column @trait_name)
@@ -514,6 +481,7 @@
 {
   node @trait_name.node
   attr (@trait_name.node) kind = "INTERFACE"
+  attr (@trait_name.node) canonical_role = "impl_anchor"
   attr (@trait_name.node) name = (source-text @trait_name)
   attr (@trait_name.node) start_row = (start-row @trait_name)
   attr (@trait_name.node) start_col = (start-column @trait_name)
@@ -532,41 +500,6 @@
 {
   edge @method_name.node -> @method_name.node
   attr (@method_name.node -> @method_name.node) kind = "OVERRIDE"
-}
-
-;; Calls (generic function)
-(function_item
-  name: (identifier) @caller
-  body: (block
-    (expression_statement
-      (call_expression
-        function: (generic_function
-          function: (identifier) @callee
-          type_arguments: (type_arguments
-            (_) @type_arg)) @call))))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  node @type_arg.node
-  attr (@type_arg.node) kind = "CLASS"
-  attr (@type_arg.node) name = (source-text @type_arg)
-  attr (@type_arg.node) start_row = (start-row @type_arg)
-  attr (@type_arg.node) start_col = (start-column @type_arg)
-  attr (@type_arg.node) end_row = (end-row @type_arg)
-  attr (@type_arg.node) end_col = (end-column @type_arg)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
-
-  edge @callee.node -> @type_arg.node
-  attr (@callee.node -> @type_arg.node) kind = "TYPE_ARGUMENT"
 }
 
 (call_expression

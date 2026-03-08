@@ -6,6 +6,7 @@ import math as math_mod
 import typing as t
 
 T = t.TypeVar("T")
+MAX_RETRIES = 3
 
 
 def trace(fn):
@@ -63,4 +64,5 @@ def orchestrate() -> None:
     workflow = Workflow()
     notifier = ConsoleNotifier()
     repository: Repository[Event] = Repository()
-    workflow.run(notifier, repository, queue.popleft())
+    if MAX_RETRIES > 0:
+        workflow.run(notifier, repository, queue.popleft())

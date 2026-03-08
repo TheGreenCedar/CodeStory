@@ -1,6 +1,7 @@
 use anyhow::Result;
 use codestory_core::EdgeKind;
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
+use std::collections::{HashMap, HashSet};
 
 mod c;
 mod cpp;
@@ -33,11 +34,166 @@ pub struct SemanticResolutionCandidate {
     pub confidence: f32,
 }
 
+#[derive(Debug, Clone)]
+struct SemanticCandidateNode {
+    id: i64,
+    kind: i32,
+    serialized_name: String,
+    serialized_name_ascii_lower: String,
+    qualified_name: Option<String>,
+    file_node_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SemanticCandidateIndex {
+    nodes: Vec<SemanticCandidateNode>,
+    nodes_by_kind: HashMap<i32, Vec<usize>>,
+    serialized_exact: HashMap<String, Vec<usize>>,
+    qualified_exact: HashMap<String, Vec<usize>>,
+    tail_ascii_lower: HashMap<String, Vec<usize>>,
+}
+
+impl SemanticCandidateIndex {
+    pub fn load(conn: &Connection, kinds: &[i32]) -> Result<Self> {
+        let query = if kinds.is_empty() {
+            "SELECT id, kind, serialized_name, qualified_name, file_node_id
+             FROM node
+             ORDER BY COALESCE(start_line, -9223372036854775808), id"
+                .to_string()
+        } else {
+            let kind_clause = kind_clause(kinds);
+            format!(
+                "SELECT id, kind, serialized_name, qualified_name, file_node_id
+                 FROM node
+                 WHERE kind IN ({kind_clause})
+                 ORDER BY COALESCE(start_line, -9223372036854775808), id"
+            )
+        };
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map([], |row| {
+            let serialized_name: String = row.get(2)?;
+            Ok(SemanticCandidateNode {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                serialized_name_ascii_lower: serialized_name.to_ascii_lowercase(),
+                serialized_name,
+                qualified_name: row.get(3)?,
+                file_node_id: row.get(4)?,
+            })
+        })?;
+
+        let mut index = Self::default();
+        for row in rows {
+            index.nodes.push(row?);
+        }
+
+        for (offset, node) in index.nodes.iter().enumerate() {
+            index
+                .nodes_by_kind
+                .entry(node.kind)
+                .or_default()
+                .push(offset);
+            index
+                .serialized_exact
+                .entry(node.serialized_name.clone())
+                .or_default()
+                .push(offset);
+            if let Some(qualified_name) = node.qualified_name.as_ref() {
+                index
+                    .qualified_exact
+                    .entry(qualified_name.clone())
+                    .or_default()
+                    .push(offset);
+            }
+            for tail in tail_variants(node) {
+                index.tail_ascii_lower.entry(tail).or_default().push(offset);
+            }
+        }
+
+        Ok(index)
+    }
+
+    fn nodes_for_name<'a>(
+        &'a self,
+        kinds: &[i32],
+        name: &str,
+        name_ascii_lower: &str,
+        limit: usize,
+    ) -> Vec<&'a SemanticCandidateNode> {
+        let kind_set = kinds.iter().copied().collect::<HashSet<_>>();
+        let mut out = Vec::with_capacity(limit);
+        let mut seen = HashSet::with_capacity(limit.saturating_mul(2));
+
+        let mut push_offset = |offset: usize| {
+            if out.len() >= limit {
+                return;
+            }
+            let Some(node) = self.nodes.get(offset) else {
+                return;
+            };
+            if !kind_set.contains(&node.kind) || !seen.insert(node.id) {
+                return;
+            }
+            out.push(node);
+        };
+
+        if let Some(offsets) = self.serialized_exact.get(name) {
+            for &offset in offsets {
+                push_offset(offset);
+            }
+        }
+        if let Some(offsets) = self.qualified_exact.get(name) {
+            for &offset in offsets {
+                push_offset(offset);
+            }
+        }
+        if let Some(offsets) = self.tail_ascii_lower.get(name_ascii_lower) {
+            for &offset in offsets {
+                push_offset(offset);
+            }
+        }
+
+        if out.is_empty() {
+            for kind in kinds {
+                let Some(offsets) = self.nodes_by_kind.get(kind) else {
+                    continue;
+                };
+                for &offset in offsets {
+                    let Some(node) = self.nodes.get(offset) else {
+                        continue;
+                    };
+                    if seen.contains(&node.id) {
+                        continue;
+                    }
+                    if node.serialized_name_ascii_lower.contains(name_ascii_lower)
+                        || node.qualified_name.as_ref().is_some_and(|qualified_name| {
+                            qualified_name
+                                .to_ascii_lowercase()
+                                .contains(name_ascii_lower)
+                        })
+                    {
+                        seen.insert(node.id);
+                        out.push(node);
+                        if out.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+
+        out
+    }
+}
+
 pub trait SemanticResolver: Send + Sync {
     fn language(&self) -> &'static str;
     fn resolve(
         &self,
-        conn: &Connection,
+        index: &SemanticCandidateIndex,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>>;
 }
@@ -69,7 +225,7 @@ impl SemanticResolverRegistry {
 
     pub fn resolve(
         &self,
-        conn: &Connection,
+        index: &SemanticCandidateIndex,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
         if !self.enabled {
@@ -77,13 +233,13 @@ impl SemanticResolverRegistry {
         }
 
         match detect_language(request.file_path.as_deref()) {
-            Some("c") => self.c.resolve(conn, request),
-            Some("cpp") => self.cpp.resolve(conn, request),
-            Some("javascript") => self.javascript.resolve(conn, request),
-            Some("python") => self.python.resolve(conn, request),
-            Some("rust") => self.rust.resolve(conn, request),
-            Some("typescript") => self.ts.resolve(conn, request),
-            Some("java") => self.java.resolve(conn, request),
+            Some("c") => self.c.resolve(index, request),
+            Some("cpp") => self.cpp.resolve(index, request),
+            Some("javascript") => self.javascript.resolve(index, request),
+            Some("python") => self.python.resolve(index, request),
+            Some("rust") => self.rust.resolve(index, request),
+            Some("typescript") => self.ts.resolve(index, request),
+            Some("java") => self.java.resolve(index, request),
             _ => Ok(Vec::new()),
         }
     }
@@ -108,7 +264,7 @@ pub(crate) fn detect_language(path: Option<&str>) -> Option<&'static str> {
     }
 }
 
-pub(super) fn kind_clause(kinds: &[i32]) -> String {
+fn kind_clause(kinds: &[i32]) -> String {
     kinds
         .iter()
         .map(|kind| kind.to_string())
@@ -117,73 +273,50 @@ pub(super) fn kind_clause(kinds: &[i32]) -> String {
 }
 
 pub(super) fn resolve_import_candidates(
-    conn: &Connection,
-    kind_clause: &str,
+    index: &SemanticCandidateIndex,
+    kinds: &[i32],
     symbol: &str,
     file_id: Option<i64>,
     confidence: f32,
 ) -> Result<Vec<SemanticResolutionCandidate>> {
-    let query = format!(
-        "SELECT id FROM node
-         WHERE kind IN ({})
-         AND (serialized_name = ?1 OR serialized_name LIKE ?2 OR qualified_name LIKE ?3)
-         AND (?4 IS NULL OR file_node_id IS NULL OR file_node_id != ?4)
-         ORDER BY start_line
-         LIMIT 4",
-        kind_clause
-    );
-    let (suffix_dot, suffix_colon) = qualified_name_suffixes(symbol);
-    let ids = query_node_ids(
-        conn,
-        &query,
-        params![symbol, &suffix_dot, &suffix_colon, file_id],
-    )?;
+    let ids = index
+        .nodes_for_name(kinds, symbol, &symbol.to_ascii_lowercase(), 4)
+        .into_iter()
+        .filter(|node| {
+            file_id.is_none() || node.file_node_id.is_none() || node.file_node_id != file_id
+        })
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
     Ok(to_candidates(ids, confidence))
 }
 
 pub(super) fn resolve_call_candidates(
-    conn: &Connection,
-    kind_clause: &str,
+    index: &SemanticCandidateIndex,
+    kinds: &[i32],
     call_name: &str,
     file_id: Option<i64>,
     same_file_confidence: f32,
     global_confidence: f32,
 ) -> Result<Vec<SemanticResolutionCandidate>> {
-    let (suffix_dot, suffix_colon) = qualified_name_suffixes(call_name);
     let mut out = Vec::new();
+    let name_ascii_lower = call_name.to_ascii_lowercase();
 
     if let Some(file_id) = file_id {
-        let query_same_file = format!(
-            "SELECT id FROM node
-             WHERE kind IN ({})
-             AND file_node_id = ?1
-             AND (serialized_name = ?2 OR serialized_name LIKE ?3 OR qualified_name LIKE ?4)
-             ORDER BY start_line
-             LIMIT 3",
-            kind_clause
-        );
-        let ids = query_node_ids(
-            conn,
-            &query_same_file,
-            params![file_id, call_name, &suffix_dot, &suffix_colon],
-        )?;
+        let ids = index
+            .nodes_for_name(kinds, call_name, &name_ascii_lower, 3)
+            .into_iter()
+            .filter(|node| node.file_node_id == Some(file_id))
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
         out.extend(to_candidates(ids, same_file_confidence));
     }
 
     if out.is_empty() {
-        let query_global = format!(
-            "SELECT id FROM node
-             WHERE kind IN ({})
-             AND (serialized_name = ?1 OR serialized_name LIKE ?2 OR qualified_name LIKE ?3)
-             ORDER BY start_line
-             LIMIT 3",
-            kind_clause
-        );
-        let ids = query_node_ids(
-            conn,
-            &query_global,
-            params![call_name, &suffix_dot, &suffix_colon],
-        )?;
+        let ids = index
+            .nodes_for_name(kinds, call_name, &name_ascii_lower, 3)
+            .into_iter()
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
         out.extend(to_candidates(ids, global_confidence));
     }
 
@@ -199,22 +332,36 @@ fn to_candidates(ids: Vec<i64>, confidence: f32) -> Vec<SemanticResolutionCandid
         .collect()
 }
 
-fn qualified_name_suffixes(symbol: &str) -> (String, String) {
-    (format!("%.{}", symbol), format!("%::{}", symbol))
+fn tail_variants(node: &SemanticCandidateNode) -> Vec<String> {
+    let mut tails = Vec::with_capacity(2);
+    if let Some(tail) = tail_component(&node.serialized_name) {
+        tails.push(tail.to_ascii_lowercase());
+    }
+    if let Some(qualified_name) = node.qualified_name.as_ref()
+        && let Some(tail) = tail_component(qualified_name)
+    {
+        tails.push(tail.to_ascii_lowercase());
+    }
+    tails
 }
 
-fn query_node_ids<P: rusqlite::Params>(
-    conn: &Connection,
-    query: &str,
-    params: P,
-) -> Result<Vec<i64>> {
-    let mut stmt = conn.prepare(query)?;
-    let rows = stmt.query_map(params, |row| row.get(0))?;
-    let mut ids = Vec::new();
-    for row in rows {
-        ids.push(row?);
-    }
-    Ok(ids)
+fn tail_component(value: &str) -> Option<&str> {
+    let dot_idx = value.rfind('.');
+    let colon_idx = value.rfind("::");
+    let start = match (dot_idx, colon_idx) {
+        (Some(dot), Some(colon)) => {
+            if dot > colon {
+                dot + 1
+            } else {
+                colon + 2
+            }
+        }
+        (Some(dot), None) => dot + 1,
+        (None, Some(colon)) => colon + 2,
+        (None, None) => return None,
+    };
+    let tail = &value[start..];
+    if tail.is_empty() { None } else { Some(tail) }
 }
 
 #[cfg(test)]

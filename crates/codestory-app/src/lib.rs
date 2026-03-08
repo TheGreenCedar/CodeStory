@@ -256,6 +256,99 @@ fn aggregate_symbol_matches(
     merged
 }
 
+fn normalize_symbol_query(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn terminal_symbol_segment(value: &str) -> String {
+    value
+        .rsplit([':', '.', '/', '\\'])
+        .next()
+        .map(normalize_symbol_query)
+        .unwrap_or_default()
+}
+
+fn leading_symbol_segment(value: &str) -> String {
+    value
+        .split("::")
+        .next()
+        .map(normalize_symbol_query)
+        .unwrap_or_default()
+}
+
+fn search_kind_bucket(kind: codestory_api::NodeKind, origin: codestory_api::SearchHitOrigin) -> u8 {
+    if origin == codestory_api::SearchHitOrigin::TextMatch {
+        return 0;
+    }
+
+    match kind {
+        codestory_api::NodeKind::MODULE
+        | codestory_api::NodeKind::NAMESPACE
+        | codestory_api::NodeKind::PACKAGE
+        | codestory_api::NodeKind::STRUCT
+        | codestory_api::NodeKind::CLASS
+        | codestory_api::NodeKind::INTERFACE
+        | codestory_api::NodeKind::ENUM
+        | codestory_api::NodeKind::UNION
+        | codestory_api::NodeKind::TYPEDEF => 3,
+        codestory_api::NodeKind::FUNCTION
+        | codestory_api::NodeKind::METHOD
+        | codestory_api::NodeKind::MACRO
+        | codestory_api::NodeKind::FIELD
+        | codestory_api::NodeKind::VARIABLE
+        | codestory_api::NodeKind::GLOBAL_VARIABLE
+        | codestory_api::NodeKind::CONSTANT
+        | codestory_api::NodeKind::ENUM_CONSTANT => 2,
+        codestory_api::NodeKind::UNKNOWN => 0,
+        _ => 1,
+    }
+}
+
+fn search_match_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8, u8) {
+    let query = normalize_symbol_query(query);
+    let display = normalize_symbol_query(&hit.display_name);
+    let terminal = terminal_symbol_segment(&hit.display_name);
+    let leading = leading_symbol_segment(&hit.display_name);
+
+    (
+        u8::from(display == query),
+        u8::from(terminal == query),
+        search_kind_bucket(hit.kind, hit.origin),
+        u8::from(leading == query),
+        u8::from(hit.origin == codestory_api::SearchHitOrigin::IndexedSymbol),
+    )
+}
+
+fn compare_search_hits(query: &str, left: &SearchHit, right: &SearchHit) -> Ordering {
+    search_match_rank(query, right)
+        .cmp(&search_match_rank(query, left))
+        .then_with(|| right.score.total_cmp(&left.score))
+        .then_with(|| left.display_name.len().cmp(&right.display_name.len()))
+        .then_with(|| left.display_name.cmp(&right.display_name))
+}
+
+fn preferred_occurrence(
+    occurrences: &[codestory_core::Occurrence],
+) -> Option<&codestory_core::Occurrence> {
+    fn occurrence_rank(kind: codestory_core::OccurrenceKind) -> u8 {
+        match kind {
+            codestory_core::OccurrenceKind::DECLARATION
+            | codestory_core::OccurrenceKind::DEFINITION
+            | codestory_core::OccurrenceKind::MACRO_DEFINITION => 3,
+            codestory_core::OccurrenceKind::REFERENCE
+            | codestory_core::OccurrenceKind::MACRO_REFERENCE => 2,
+            codestory_core::OccurrenceKind::UNKNOWN => 1,
+        }
+    }
+
+    occurrences.iter().max_by(|left, right| {
+        occurrence_rank(left.kind)
+            .cmp(&occurrence_rank(right.kind))
+            .then_with(|| right.location.start_line.cmp(&left.location.start_line))
+            .then_with(|| right.location.start_col.cmp(&left.location.start_col))
+    })
+}
+
 #[derive(Debug, Clone)]
 struct FocusedSourceContext {
     path: String,
@@ -1141,38 +1234,42 @@ impl AppController {
         node_names: &HashMap<codestory_core::NodeId, String>,
         id: codestory_core::NodeId,
         score: f32,
-    ) -> SearchHit {
+    ) -> Option<SearchHit> {
+        let node = match storage.get_node(id) {
+            Ok(Some(node)) if node.kind != codestory_core::NodeKind::UNKNOWN => node,
+            _ => return None,
+        };
+
         let display_name = node_names
             .get(&id)
             .cloned()
             .unwrap_or_else(|| id.0.to_string());
 
-        let mut file_path = None;
-        let mut line = None;
+        let mut file_path = Self::file_path_for_node(storage, &node).ok().flatten();
+        let mut line = node.start_line;
         if let Ok(occs) = storage.get_occurrences_for_node(id)
-            && let Some(occ) = occs.first()
+            && let Some(occ) = preferred_occurrence(&occs)
         {
-            if let Ok(Some(file_node)) = storage.get_node(occ.location.file_node_id) {
+            if file_path.is_none()
+                && let Ok(Some(file_node)) = storage.get_node(occ.location.file_node_id)
+            {
                 file_path = Some(file_node.serialized_name);
             }
-            line = Some(occ.location.start_line);
+            if line.is_none() {
+                line = Some(occ.location.start_line);
+            }
         }
 
-        let kind = match storage.get_node(id) {
-            Ok(Some(node)) => NodeKind::from(node.kind),
-            _ => NodeKind::UNKNOWN,
-        };
-
-        SearchHit {
+        Some(SearchHit {
             node_id: NodeId::from(id),
             display_name,
-            kind,
+            kind: NodeKind::from(node.kind),
             file_path,
             line,
             score,
             origin: codestory_api::SearchHitOrigin::IndexedSymbol,
             resolvable: true,
-        }
+        })
     }
 
     fn open_project_with_storage_inner(
@@ -1418,7 +1515,7 @@ impl AppController {
         let storage = self.open_storage()?;
         let mut hits = matches
             .into_iter()
-            .map(|(id, score)| Self::build_search_hit(&storage, &node_names, id, score))
+            .filter_map(|(id, score)| Self::build_search_hit(&storage, &node_names, id, score))
             .collect::<Vec<_>>();
 
         if should_expand_symbol_query(&req.query, hits.len()) {
@@ -1471,15 +1568,11 @@ impl AppController {
                 }
             }
 
-            hits.sort_by(|left, right| {
-                right
-                    .score
-                    .partial_cmp(&left.score)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| left.display_name.cmp(&right.display_name))
-            });
+            hits.sort_by(|left, right| compare_search_hits(&req.query, left, right));
             hits.truncate(20);
         }
+
+        hits.sort_by(|left, right| compare_search_hits(&req.query, left, right));
 
         Ok(hits)
     }
@@ -1563,7 +1656,6 @@ impl AppController {
                     .max(1.0);
                 lexical
                     .into_iter()
-                    .take(max_results.clamp(1, 50))
                     .map(|(node_id, score)| {
                         let lexical_score = (score / lexical_max).clamp(0.0, 1.0);
                         let graph_score = graph_boosts
@@ -1588,16 +1680,20 @@ impl AppController {
 
         let mut out = Vec::with_capacity(hybrid.len());
         for scored in hybrid {
-            let hit =
-                Self::build_search_hit(&storage, &node_names, scored.node_id, scored.total_score);
-            out.push(HybridSearchScoredHit {
-                hit,
-                lexical_score: scored.lexical_score,
-                semantic_score: scored.semantic_score,
-                graph_score: scored.graph_score,
-                total_score: scored.total_score,
-            });
+            if let Some(hit) =
+                Self::build_search_hit(&storage, &node_names, scored.node_id, scored.total_score)
+            {
+                out.push(HybridSearchScoredHit {
+                    hit,
+                    lexical_score: scored.lexical_score,
+                    semantic_score: scored.semantic_score,
+                    graph_score: scored.graph_score,
+                    total_score: scored.total_score,
+                });
+            }
         }
+        out.sort_by(|left, right| compare_search_hits(&req.query, &left.hit, &right.hit));
+        out.truncate(max_results.clamp(1, 50));
 
         Ok(out)
     }
@@ -2191,9 +2287,37 @@ fn refresh_caches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codestory_core::{Edge, EdgeId, EdgeKind, Node, NodeId as CoreNodeId, NodeKind};
+    use codestory_core::{
+        Edge, EdgeId, EdgeKind, Node, NodeId as CoreNodeId, NodeKind, Occurrence, OccurrenceKind,
+        SourceLocation,
+    };
     use crossbeam_channel::unbounded;
+    use std::fs;
+    use std::path::PathBuf;
     use tempfile::tempdir;
+
+    fn copy_tictactoe_workspace() -> tempfile::TempDir {
+        let temp = tempdir().expect("create temp dir");
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace crates dir")
+            .join("codestory-index")
+            .join("tests")
+            .join("fixtures")
+            .join("tictactoe");
+
+        for entry in fs::read_dir(&fixtures).expect("read fixtures") {
+            let entry = entry.expect("fixture entry");
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let target = temp.path().join(entry.file_name());
+            fs::copy(&path, &target).expect("copy fixture");
+        }
+
+        temp
+    }
 
     #[test]
     fn extract_symbol_search_terms_removes_stopwords_and_short_tokens() {
@@ -2220,6 +2344,166 @@ mod tests {
         let expanded = vec![(CoreNodeId(7), 99.0), (CoreNodeId(8), 95.0)];
         let merged = aggregate_symbol_matches(direct, expanded);
         assert_eq!(merged.first().map(|(id, _)| *id), Some(CoreNodeId(7)));
+    }
+
+    #[test]
+    fn build_search_hit_prefers_declaration_coordinates_and_filters_unknown_nodes() {
+        let mut storage = Storage::new_in_memory().expect("storage");
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: CoreNodeId(10),
+                    kind: NodeKind::FILE,
+                    serialized_name: "src/lib.rs".to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(11),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "check_winner".to_string(),
+                    file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(42),
+                    start_col: Some(5),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(12),
+                    kind: NodeKind::UNKNOWN,
+                    serialized_name: "check_winner".to_string(),
+                    file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(99),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert nodes");
+        storage
+            .insert_occurrences_batch(&[Occurrence {
+                element_id: 11,
+                kind: OccurrenceKind::REFERENCE,
+                location: SourceLocation {
+                    file_node_id: CoreNodeId(10),
+                    start_line: 87,
+                    start_col: 9,
+                    end_line: 87,
+                    end_col: 20,
+                },
+            }])
+            .expect("insert occurrences");
+
+        let node_names = HashMap::from([
+            (CoreNodeId(11), "check_winner".to_string()),
+            (CoreNodeId(12), "check_winner".to_string()),
+        ]);
+
+        let definition_hit =
+            AppController::build_search_hit(&storage, &node_names, CoreNodeId(11), 1.0)
+                .expect("definition hit");
+        assert_eq!(definition_hit.file_path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(definition_hit.line, Some(42));
+
+        assert!(
+            AppController::build_search_hit(&storage, &node_names, CoreNodeId(12), 1.0).is_none(),
+            "unknown placeholder nodes should be dropped from indexed results"
+        );
+    }
+
+    #[test]
+    fn search_ranks_exact_type_before_members_and_omits_unknown_hits() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("codestory.db");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(10),
+                        kind: NodeKind::FILE,
+                        serialized_name: temp
+                            .path()
+                            .join("src")
+                            .join("lib.rs")
+                            .to_string_lossy()
+                            .to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(11),
+                        kind: NodeKind::STRUCT,
+                        serialized_name: "AppController".to_string(),
+                        file_node_id: Some(CoreNodeId(10)),
+                        start_line: Some(10),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(12),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "AppController::open_project".to_string(),
+                        qualified_name: Some("AppController::open_project".to_string()),
+                        file_node_id: Some(CoreNodeId(10)),
+                        start_line: Some(20),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(13),
+                        kind: NodeKind::UNKNOWN,
+                        serialized_name: "AppController".to_string(),
+                        file_node_id: Some(CoreNodeId(10)),
+                        start_line: Some(30),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert nodes");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+
+        let hits = controller
+            .search(SearchRequest {
+                query: "AppController".to_string(),
+            })
+            .expect("search");
+
+        assert_eq!(
+            hits.first().map(|hit| hit.display_name.as_str()),
+            Some("AppController")
+        );
+        assert!(
+            hits.iter()
+                .all(|hit| hit.kind != codestory_api::NodeKind::UNKNOWN)
+        );
+    }
+
+    #[test]
+    fn search_prefers_real_tictactoe_definitions_for_check_winner_and_min_max() {
+        let workspace = copy_tictactoe_workspace();
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: workspace.path().to_string_lossy().to_string(),
+            })
+            .expect("open workspace");
+        controller
+            .run_indexing_blocking(IndexMode::Full)
+            .expect("index fixtures");
+
+        for query in ["check_winner", "min_max"] {
+            let hits = controller
+                .search(SearchRequest {
+                    query: query.to_string(),
+                })
+                .expect("search fixtures");
+            let first = hits.first().expect("at least one hit");
+            assert_eq!(
+                first.kind,
+                codestory_api::NodeKind::FUNCTION,
+                "expected real definition to outrank loose matches for {query}"
+            );
+            assert_eq!(terminal_symbol_segment(&first.display_name), query);
+        }
     }
 
     #[test]

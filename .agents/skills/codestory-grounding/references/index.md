@@ -52,3 +52,15 @@ python scripts/index.py --refresh full
 # Index a different project, JSON output
 python scripts/index.py --project ../other-repo --format json
 ```
+
+## Refresh Troubleshooting
+
+| Situation | Recommended refresh |
+|----------|----------------------|
+| First-time indexing or after cache deletion | `--refresh full` |
+| Verifying a fix for prior indexing errors | `--refresh full` |
+| Verifying schema/storage-version or graph/query-rule changes | `--refresh full` |
+| Normal follow-up indexing after editing a few files | `--refresh incremental` or `auto` |
+| Reusing a known-good index immediately after a successful fresh build + index run | `--refresh none` |
+
+Prefer `--refresh full` when you need confidence that historical errors are gone. Incremental runs can leave stale error rows behind if the previously failing files are not reprocessed.

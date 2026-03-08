@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use codestory_core::{Edge, EdgeKind, Node, NodeKind};
+use codestory_core::{AccessKind, Edge, EdgeKind, Node, NodeId, NodeKind};
 use codestory_index::{get_language_for_ext, index_file};
 use std::path::Path;
 
@@ -59,15 +59,15 @@ const JAVA_SYMBOLS: &[(NodeKind, &str)] = &[
     (NodeKind::FUNCTION, "_minMax"),
 ];
 const RUST_SYMBOLS: &[(NodeKind, &str)] = &[
-    (NodeKind::CLASS, "GameObject"),
-    (NodeKind::CLASS, "Token"),
-    (NodeKind::CLASS, "Move"),
-    (NodeKind::CLASS, "Field"),
+    (NodeKind::STRUCT, "GameObject"),
+    (NodeKind::ENUM, "Token"),
+    (NodeKind::STRUCT, "Move"),
+    (NodeKind::STRUCT, "Field"),
     (NodeKind::INTERFACE, "Player"),
-    (NodeKind::CLASS, "HumanPlayer"),
-    (NodeKind::CLASS, "ArtificialPlayer"),
-    (NodeKind::CLASS, "Node"),
-    (NodeKind::CLASS, "TicTacToe"),
+    (NodeKind::STRUCT, "HumanPlayer"),
+    (NodeKind::STRUCT, "ArtificialPlayer"),
+    (NodeKind::STRUCT, "Node"),
+    (NodeKind::STRUCT, "TicTacToe"),
     (NodeKind::FUNCTION, "number_in"),
     (NodeKind::FUNCTION, "number_out"),
     (NodeKind::FUNCTION, "string_out"),
@@ -430,6 +430,19 @@ fn has_edge_between_names(
     })
 }
 
+fn access_for_name(
+    component_access: &[(NodeId, AccessKind)],
+    nodes: &[Node],
+    name: &str,
+) -> Option<AccessKind> {
+    component_access.iter().find_map(|(node_id, access)| {
+        nodes
+            .iter()
+            .find(|node| node.id == *node_id && is_matching_name(&node.serialized_name, name))
+            .map(|_| *access)
+    })
+}
+
 #[test]
 fn test_language_extension_coverage_and_names() {
     let expected = [
@@ -532,6 +545,69 @@ export function App() {
 }
 
 #[test]
+fn test_typescript_type_alias_and_enum_are_captured() -> Result<()> {
+    let source = r#"
+type Props = {
+    label: string;
+};
+
+enum Tone {
+    Primary = "primary",
+}
+"#;
+
+    let (lang, lang_name, graph_query) =
+        get_language_for_ext("ts").expect("ts extension should be supported");
+    let result = index_file(
+        Path::new("types.ts"),
+        source,
+        lang,
+        lang_name,
+        graph_query,
+        None,
+        None,
+    )?;
+
+    assert!(has_node(&result.nodes, NodeKind::TYPEDEF, "Props"));
+    assert!(has_node(&result.nodes, NodeKind::ENUM, "Tone"));
+    Ok(())
+}
+
+#[test]
+fn test_cpp_access_specifiers_are_captured_from_rules() -> Result<()> {
+    let source = r#"
+class Widget {
+public:
+    int visible;
+private:
+    void hide();
+};
+"#;
+
+    let (lang, lang_name, graph_query) =
+        get_language_for_ext("cpp").expect("cpp extension should be supported");
+    let result = index_file(
+        Path::new("Widget.cpp"),
+        source,
+        lang,
+        lang_name,
+        graph_query,
+        None,
+        None,
+    )?;
+
+    assert_eq!(
+        access_for_name(&result.component_access, &result.nodes, "visible"),
+        Some(AccessKind::Public)
+    );
+    assert_eq!(
+        access_for_name(&result.component_access, &result.nodes, "hide"),
+        Some(AccessKind::Private)
+    );
+    Ok(())
+}
+
+#[test]
 fn test_tictactoe_fixture_parses_for_all_supported_languages() -> Result<()> {
     for case in fixture_cases() {
         let result = index_case(&case)?;
@@ -558,8 +634,17 @@ fn test_tictactoe_core_symbols_present_per_language() -> Result<()> {
     for case in fixture_cases() {
         let result = index_case(&case)?;
         for (kind, name) in case.required_symbols {
+            let present =
+                if case.language == "rust" && matches!(kind, NodeKind::CLASS | NodeKind::STRUCT) {
+                    result
+                        .nodes
+                        .iter()
+                        .any(|node| is_matching_name(&node.serialized_name, name))
+                } else {
+                    has_node(&result.nodes, *kind, name)
+                };
             assert!(
-                has_node(&result.nodes, *kind, name),
+                present,
                 "Missing {kind:?} node '{name}' for {}",
                 case.language
             );

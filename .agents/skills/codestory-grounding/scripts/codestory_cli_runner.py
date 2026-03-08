@@ -22,7 +22,20 @@ def _quote_command(command: Sequence[str]) -> str:
     return shlex.join(command)
 
 
+def _binary_path() -> Path:
+    name = "codestory-cli.exe" if os.name == "nt" else "codestory-cli"
+    return REPO_ROOT / "target" / "debug" / name
+
+
+def _build_command() -> list[str]:
+    return ["cargo", "build", "-p", "codestory-cli"]
+
+
 def build_command(subcommand: str, args: Sequence[str]) -> list[str]:
+    return [str(_binary_path()), subcommand, *args]
+
+
+def fallback_command(subcommand: str, args: Sequence[str]) -> list[str]:
     return ["cargo", "run", "--quiet", "-p", "codestory-cli", "--", subcommand, *args]
 
 
@@ -36,14 +49,40 @@ def run(subcommand: str) -> int:
     if "--project" not in args:
         args.extend(["--project", os.getcwd()])
 
-    command = build_command(subcommand, args)
     if dry_run:
-        print(_quote_command(command))
+        binary = _binary_path()
+        if binary.exists():
+            print(_quote_command(build_command(subcommand, args)))
+        else:
+            print(_quote_command(_build_command()))
+            print(_quote_command(build_command(subcommand, args)))
         return 0
+
+    binary = _binary_path()
+    if not binary.exists():
+        try:
+            built = subprocess.run(_build_command(), cwd=REPO_ROOT, check=False)
+        except FileNotFoundError as exc:
+            print(f"failed to launch cargo: {exc}", file=sys.stderr)
+            return 1
+        if built.returncode != 0 and not binary.exists():
+            command = fallback_command(subcommand, args)
+        else:
+            command = build_command(subcommand, args)
+    else:
+        command = build_command(subcommand, args)
 
     try:
         completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
     except FileNotFoundError as exc:
+        if command != fallback_command(subcommand, args):
+            fallback = fallback_command(subcommand, args)
+            try:
+                completed = subprocess.run(fallback, cwd=REPO_ROOT, check=False)
+            except FileNotFoundError:
+                print(f"failed to launch codestory-cli or cargo: {exc}", file=sys.stderr)
+                return 1
+            return completed.returncode
         print(f"failed to launch cargo: {exc}", file=sys.stderr)
         return 1
 

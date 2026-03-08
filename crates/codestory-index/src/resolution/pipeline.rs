@@ -118,10 +118,12 @@ where
 
     let candidate_started = Instant::now();
     let candidate_index = CandidateIndex::load(conn, candidate_kinds)?;
+    let semantic_index = SemanticCandidateIndex::load(conn, semantic_candidate_kinds(edge_kind))?;
     *candidate_index_ms =
         candidate_index_ms.saturating_add(duration_ms_u64(candidate_started.elapsed()));
 
-    let semantic_candidates_by_row = pass.semantic_candidates_for_rows(conn, &rows, edge_kind)?;
+    let semantic_candidates_by_row =
+        pass.semantic_candidates_for_rows(&semantic_index, &rows, edge_kind)?;
 
     let compute_started = Instant::now();
     let computed_results: Vec<Result<ComputedResolution>> =

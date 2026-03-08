@@ -1,9 +1,10 @@
 use anyhow::{Result, anyhow};
 use codestory_core::{
-    AccessKind, Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind, Occurrence, SourceLocation,
+    AccessKind, CallableProjectionState, Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind,
+    Occurrence, SourceLocation,
 };
 use codestory_storage::Storage;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -83,6 +84,17 @@ pub struct IndexResult {
     pub edges: Vec<Edge>,
     pub occurrences: Vec<Occurrence>,
     pub component_access: Vec<(NodeId, AccessKind)>,
+    pub callable_projection_states: Vec<CallableProjectionState>,
+}
+
+const FILE_STRUCTURAL_SYMBOL_KEY: &str = "__file_structural__";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProjectionUpdateMode {
+    InsertFresh,
+    NoChanges,
+    Delta { changed_callers: Vec<NodeId> },
+    FullReplace,
 }
 
 pub enum IndexingEvent {
@@ -184,6 +196,9 @@ impl WorkspaceIndexer {
         let processed_count = Arc::new(AtomicUsize::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
         let root = self.root.clone();
+        let existing_projection_ids =
+            Self::existing_projection_ids(storage, &root, &refresh_info.files_to_index);
+        let mut replaced_projection_ids = HashSet::new();
 
         let symbol_table = Arc::new(SymbolTable::new());
         Self::seed_symbol_table(storage, &symbol_table);
@@ -231,6 +246,36 @@ impl WorkspaceIndexer {
 
             for mut local_storage in chunk_results {
                 all_errors.append(&mut local_storage.errors);
+                if let Some(file_info) = local_storage.files.first()
+                    && existing_projection_ids.contains_key(&file_info.path)
+                    && replaced_projection_ids.insert(file_info.id)
+                {
+                    let existing_states = storage
+                        .get_callable_projection_states_for_file(file_info.id)
+                        .map_err(|e| anyhow!("Storage state lookup error: {:?}", e))?;
+                    let cleanup_started = Instant::now();
+                    let update_mode = classify_projection_update(
+                        &existing_states,
+                        &local_storage.callable_projection_states,
+                    );
+                    match update_mode {
+                        ProjectionUpdateMode::InsertFresh => {}
+                        ProjectionUpdateMode::NoChanges => {}
+                        ProjectionUpdateMode::Delta { changed_callers } => {
+                            storage
+                                .delete_projection_for_callers(file_info.id, &changed_callers)
+                                .map_err(|e| anyhow!("Storage delta cleanup error: {:?}", e))?;
+                        }
+                        ProjectionUpdateMode::FullReplace => {
+                            storage
+                                .delete_file_projection(file_info.id)
+                                .map_err(|e| anyhow!("Storage cleanup error: {:?}", e))?;
+                        }
+                    }
+                    stats.cleanup_ms = stats
+                        .cleanup_ms
+                        .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
+                }
                 batched_storage.merge(local_storage);
 
                 let should_flush = !batched_storage.files.is_empty()
@@ -415,6 +460,21 @@ impl WorkspaceIndexer {
         }
     }
 
+    fn existing_projection_ids(
+        storage: &Storage,
+        root: &Path,
+        files_to_index: &[PathBuf],
+    ) -> HashMap<PathBuf, i64> {
+        let mut out = HashMap::new();
+        for path in files_to_index {
+            let full_path = Self::normalize_index_path(root, path);
+            if let Ok(Some(file_info)) = storage.get_file_by_path(&full_path) {
+                out.insert(file_info.path, file_info.id);
+            }
+        }
+        out
+    }
+
     fn canonical_file_node_id_for_path(path: &Path) -> i64 {
         let file_name = path.to_string_lossy();
         let canonical_id = format!("{file_name}:{file_name}:1");
@@ -472,6 +532,11 @@ impl WorkspaceIndexer {
                 .insert_component_access_batch(&batched_storage.component_access)
                 .map_err(|e| anyhow!("Storage error: {:?}", e))?;
         }
+        if !batched_storage.callable_projection_states.is_empty() {
+            storage
+                .upsert_callable_projection_states(&batched_storage.callable_projection_states)
+                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
+        }
 
         batched_storage.clear();
         Ok(())
@@ -513,6 +578,8 @@ impl WorkspaceIndexer {
                     local_storage.edges = index_result.edges;
                     local_storage.occurrences = index_result.occurrences;
                     local_storage.component_access = index_result.component_access;
+                    local_storage.callable_projection_states =
+                        index_result.callable_projection_states;
                 }
                 Err(e) => {
                     local_storage.add_error(codestory_core::ErrorInfo {
@@ -551,7 +618,7 @@ fn duration_ms_u64(duration: std::time::Duration) -> u64 {
 
 fn file_node_from_source(path: &Path, source: &str) -> (Node, String, NodeId) {
     let file_name = path.to_string_lossy().to_string();
-    let file_id = NodeId(generate_id(&file_name));
+    let file_id = NodeId(WorkspaceIndexer::canonical_file_node_id_for_path(path));
     let line_count = source.lines().count() as u32;
     let file_end_line = if line_count == 0 { 1 } else { line_count };
 
@@ -603,6 +670,15 @@ fn access_kind_from_graph_access(value: &str) -> Option<AccessKind> {
         "default" | "package" | "package_private" => Some(AccessKind::Default),
         _ => None,
     }
+}
+
+fn is_python_constant_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        && trimmed.chars().any(|ch| ch.is_ascii_uppercase())
 }
 
 fn source_line(source: &str, line: u32) -> Option<&str> {
@@ -759,52 +835,135 @@ fn apply_qualified_names(nodes: Vec<Node>, edges: &[Edge], language_name: &str) 
     node_map.into_values().collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanonicalNodeRole {
+    Declaration,
+    ImplAnchor,
+    Unspecified,
+}
+
+fn canonical_role_from_graph_attr(value: &str) -> CanonicalNodeRole {
+    match value {
+        "declaration" => CanonicalNodeRole::Declaration,
+        "impl_anchor" => CanonicalNodeRole::ImplAnchor,
+        _ => CanonicalNodeRole::Unspecified,
+    }
+}
+
+fn canonical_role_priority(role: CanonicalNodeRole) -> u8 {
+    match role {
+        CanonicalNodeRole::Declaration => 2,
+        CanonicalNodeRole::Unspecified => 1,
+        CanonicalNodeRole::ImplAnchor => 0,
+    }
+}
+
+fn is_type_like_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::CLASS
+            | NodeKind::STRUCT
+            | NodeKind::INTERFACE
+            | NodeKind::UNION
+            | NodeKind::ENUM
+            | NodeKind::TYPEDEF
+            | NodeKind::TYPE_PARAMETER
+            | NodeKind::BUILTIN_TYPE
+            | NodeKind::ANNOTATION
+    )
+}
+
+fn type_anchor_priority(kind: NodeKind) -> u8 {
+    match kind {
+        NodeKind::STRUCT => 7,
+        NodeKind::ENUM => 6,
+        NodeKind::INTERFACE => 5,
+        NodeKind::UNION => 4,
+        NodeKind::TYPEDEF => 3,
+        NodeKind::CLASS => 2,
+        NodeKind::TYPE_PARAMETER | NodeKind::ANNOTATION | NodeKind::BUILTIN_TYPE => 1,
+        _ => 0,
+    }
+}
+
+fn node_span_width(node: &Node) -> u32 {
+    let start_line = node.start_line.unwrap_or(u32::MAX);
+    let end_line = node.end_line.unwrap_or(start_line);
+    let start_col = node.start_col.unwrap_or(u32::MAX);
+    let end_col = node.end_col.unwrap_or(start_col);
+    end_line
+        .saturating_sub(start_line)
+        .saturating_mul(1_000)
+        .saturating_add(end_col.saturating_sub(start_col))
+}
+
+fn compare_canonical_node_candidates(
+    left: &Node,
+    right: &Node,
+    canonical_roles: &HashMap<NodeId, CanonicalNodeRole>,
+) -> std::cmp::Ordering {
+    let left_role = canonical_roles
+        .get(&left.id)
+        .copied()
+        .unwrap_or(CanonicalNodeRole::Unspecified);
+    let right_role = canonical_roles
+        .get(&right.id)
+        .copied()
+        .unwrap_or(CanonicalNodeRole::Unspecified);
+
+    canonical_role_priority(left_role)
+        .cmp(&canonical_role_priority(right_role))
+        .then_with(|| type_anchor_priority(left.kind).cmp(&type_anchor_priority(right.kind)))
+        .then_with(|| {
+            right
+                .start_line
+                .unwrap_or(u32::MAX)
+                .cmp(&left.start_line.unwrap_or(u32::MAX))
+        })
+        .then_with(|| {
+            right
+                .start_col
+                .unwrap_or(u32::MAX)
+                .cmp(&left.start_col.unwrap_or(u32::MAX))
+        })
+        .then_with(|| node_span_width(right).cmp(&node_span_width(left)))
+        .then_with(|| right.serialized_name.cmp(&left.serialized_name))
+}
+
 fn canonicalize_nodes(
     file_name: &str,
     final_nodes: Vec<Node>,
+    canonical_roles: &HashMap<NodeId, CanonicalNodeRole>,
 ) -> (Vec<Node>, HashMap<NodeId, NodeId>) {
-    let is_type_like = |kind: NodeKind| {
-        matches!(
-            kind,
-            NodeKind::CLASS
-                | NodeKind::STRUCT
-                | NodeKind::INTERFACE
-                | NodeKind::UNION
-                | NodeKind::ENUM
-                | NodeKind::TYPEDEF
-                | NodeKind::TYPE_PARAMETER
-                | NodeKind::BUILTIN_TYPE
-                | NodeKind::ANNOTATION
-        )
-    };
-
-    let mut id_remap: HashMap<NodeId, NodeId> = HashMap::new();
-    let mut canonical_owner: HashMap<String, NodeId> = HashMap::new();
-    let mut deduped_nodes = Vec::with_capacity(final_nodes.len());
+    let mut id_remap = HashMap::<NodeId, NodeId>::new();
+    let mut grouped_nodes = BTreeMap::<String, Vec<Node>>::new();
 
     for mut node in final_nodes {
         let qualified_name = node.serialized_name.clone();
         node.qualified_name = Some(qualified_name.clone());
 
-        let canonical_id = if is_type_like(node.kind) {
+        let canonical_id = if is_type_like_kind(node.kind) {
             format!("{}:{}", file_name, qualified_name)
         } else {
             let start_line = node.start_line.unwrap_or(1);
             format!("{}:{}:{}", file_name, qualified_name, start_line)
         };
+        grouped_nodes.entry(canonical_id).or_default().push(node);
+    }
 
-        if is_type_like(node.kind)
-            && let Some(existing_id) = canonical_owner.get(&canonical_id)
-        {
-            id_remap.insert(node.id, *existing_id);
-            continue;
+    let mut deduped_nodes = Vec::with_capacity(grouped_nodes.len());
+    for (canonical_id, nodes) in grouped_nodes {
+        let new_id = NodeId(generate_id(&canonical_id));
+        for node in &nodes {
+            id_remap.insert(node.id, new_id);
         }
 
-        let new_id = NodeId(generate_id(&canonical_id));
-        node.canonical_id = Some(canonical_id.clone());
-        id_remap.insert(node.id, new_id);
+        let mut node = nodes
+            .into_iter()
+            .max_by(|left, right| compare_canonical_node_candidates(left, right, canonical_roles))
+            .unwrap_or_default();
         node.id = new_id;
-        canonical_owner.insert(canonical_id, new_id);
+        node.canonical_id = Some(canonical_id);
         deduped_nodes.push(node);
     }
 
@@ -922,6 +1081,7 @@ pub fn index_file(
     let mut graph_to_node_id = HashMap::new();
     let mut unique_nodes: HashMap<NodeId, Node> = HashMap::new();
     let mut component_access_by_node_id: HashMap<NodeId, AccessKind> = HashMap::new();
+    let mut canonical_role_by_node_id = HashMap::<NodeId, CanonicalNodeRole>::new();
 
     for node_id in graph.iter_nodes() {
         let node_data = &graph[node_id];
@@ -933,6 +1093,7 @@ pub fn index_file(
         let mut end_row: Option<u32> = None;
         let mut end_col: Option<u32> = None;
         let mut access_kind: Option<AccessKind> = None;
+        let mut canonical_role = CanonicalNodeRole::Unspecified;
 
         for (attr, val) in node_data.attributes.iter() {
             match attr.as_str() {
@@ -947,12 +1108,23 @@ pub fn index_file(
                         access_kind = access_kind_from_graph_access(value);
                     }
                 }
+                "canonical_role" => {
+                    if let Ok(value) = val.as_str() {
+                        canonical_role = canonical_role_from_graph_attr(value);
+                    }
+                }
                 _ => {}
             }
         }
 
         if !kind_str.is_empty() && !name_str.is_empty() {
-            let kind = node_kind_from_graph_kind(kind_str.as_str());
+            let mut kind = node_kind_from_graph_kind(kind_str.as_str());
+            if language_name == "python"
+                && kind == NodeKind::VARIABLE
+                && is_python_constant_name(&name_str)
+            {
+                kind = NodeKind::CONSTANT;
+            }
 
             let start_line = start_row.map(|v| v + 1).unwrap_or(1);
             let canonical_seed = format!("{}:{}:{}", file_name, name_str, start_line);
@@ -974,6 +1146,9 @@ pub fn index_file(
                     ..Default::default()
                 },
             );
+            if canonical_role != CanonicalNodeRole::Unspecified {
+                canonical_role_by_node_id.insert(nid, canonical_role);
+            }
             if let Some(access) = effective_access {
                 component_access_by_node_id.insert(nid, access);
             }
@@ -1075,7 +1250,8 @@ pub fn index_file(
 
     // 3. Resolve qualified names, canonicalize IDs, and remap projections.
     let final_nodes = apply_qualified_names(result_nodes, &result_edges, language_name);
-    let (mut final_nodes, id_remap) = canonicalize_nodes(&file_name, final_nodes);
+    let (mut final_nodes, id_remap) =
+        canonicalize_nodes(&file_name, final_nodes, &canonical_role_by_node_id);
     let new_file_id = id_remap.get(&file_id).copied().unwrap_or(file_id);
     remap_file_affinity(&mut final_nodes, new_file_id);
     remap_edges(&mut result_edges, new_file_id, &id_remap, flags);
@@ -1088,6 +1264,8 @@ pub fn index_file(
     let component_access = remapped_component_access.into_iter().collect::<Vec<_>>();
 
     apply_line_range_call_attribution(&final_nodes, &mut result_edges, flags);
+    let callable_projection_states =
+        build_callable_projection_states(&final_nodes, &result_edges, &result_occurrences);
 
     if let Some(st) = &symbol_table {
         for node in &final_nodes {
@@ -1101,6 +1279,7 @@ pub fn index_file(
         edges: result_edges,
         occurrences: result_occurrences,
         component_access,
+        callable_projection_states,
     })
 }
 
@@ -1152,10 +1331,10 @@ pub fn get_language_for_ext(ext: &str) -> Option<(Language, &'static str, &'stat
 }
 
 pub fn generate_id(name: &str) -> i64 {
-    let mut h: u64 = 0x811c9dc5;
+    let mut h: u64 = 0xcbf29ce484222325;
     for b in name.as_bytes() {
         h ^= *b as u64;
-        h = h.wrapping_mul(0x01000193);
+        h = h.wrapping_mul(0x100000001b3);
     }
     h as i64
 }
@@ -1216,18 +1395,27 @@ struct FunctionRange {
     end: u32,
 }
 
+fn is_callable_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+    )
+}
+
 fn apply_line_range_call_attribution(
     nodes: &[Node],
     edges: &mut Vec<Edge>,
     flags: IndexFeatureFlags,
 ) {
     let mut functions_by_file: HashMap<NodeId, Vec<FunctionRange>> = HashMap::new();
+    let callable_ids: HashSet<NodeId> = nodes
+        .iter()
+        .filter(|node| is_callable_kind(node.kind))
+        .map(|node| node.id)
+        .collect();
 
     for node in nodes {
-        if !matches!(
-            node.kind,
-            NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
-        ) {
+        if !is_callable_kind(node.kind) {
             continue;
         }
         let (Some(file_id), Some(start), Some(end)) =
@@ -1257,6 +1445,7 @@ fn apply_line_range_call_attribution(
 
     for edge in edges.iter_mut() {
         if edge.kind == EdgeKind::CALL {
+            let mut attributed = callable_ids.contains(&edge.source);
             if let (Some(file_id), Some(line)) = (edge.file_node_id, edge.line)
                 && let Some(ranges) = functions_by_file.get(&file_id)
                 && let Some(best) = ranges
@@ -1265,6 +1454,10 @@ fn apply_line_range_call_attribution(
                     .min_by_key(|range| (range.end - range.start, range.start))
             {
                 edge.source = best.id;
+                attributed = true;
+            }
+            if !attributed || edge.source == edge.target {
+                continue;
             }
             if !flags.legacy_edge_identity {
                 ensure_callsite_identity(edge, None);
@@ -1279,6 +1472,266 @@ fn apply_line_range_call_attribution(
     }
 
     *edges = updated_edges;
+}
+
+fn build_callable_projection_states(
+    nodes: &[Node],
+    edges: &[Edge],
+    occurrences: &[Occurrence],
+) -> Vec<CallableProjectionState> {
+    let mut edges_by_source: HashMap<NodeId, Vec<&Edge>> = HashMap::new();
+    for edge in edges {
+        edges_by_source.entry(edge.source).or_default().push(edge);
+    }
+
+    let mut occurrences_by_file: HashMap<NodeId, Vec<&Occurrence>> = HashMap::new();
+    for occurrence in occurrences {
+        occurrences_by_file
+            .entry(occurrence.location.file_node_id)
+            .or_default()
+            .push(occurrence);
+    }
+
+    let node_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<HashMap<_, _>>();
+    let mut states = Vec::new();
+    for node in nodes {
+        if !matches!(
+            node.kind,
+            NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+        ) {
+            continue;
+        }
+        let (Some(file_id), Some(start_line), Some(start_col), Some(end_line)) = (
+            node.file_node_id,
+            node.start_line,
+            node.start_col,
+            node.end_line,
+        ) else {
+            continue;
+        };
+        let symbol_key = format!(
+            "{}:{}",
+            node.kind as i32,
+            node.qualified_name
+                .as_deref()
+                .unwrap_or(node.serialized_name.as_str())
+        );
+        let signature_hash = hash_parts([
+            symbol_key.as_str(),
+            &start_line.to_string(),
+            &start_col.to_string(),
+        ]);
+
+        let mut body_parts = Vec::new();
+        if let Some(source_edges) = edges_by_source.get(&node.id) {
+            let mut edge_parts = source_edges
+                .iter()
+                .filter(|edge| {
+                    !matches!(
+                        edge.kind,
+                        EdgeKind::MEMBER
+                            | EdgeKind::INHERITANCE
+                            | EdgeKind::IMPORT
+                            | EdgeKind::OVERRIDE
+                    )
+                })
+                .map(|edge| {
+                    format!(
+                        "{}:{}:{}:{}",
+                        edge.kind as i32,
+                        edge.target.0,
+                        edge.line.unwrap_or(0),
+                        edge.callsite_identity.as_deref().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>();
+            edge_parts.sort();
+            body_parts.extend(edge_parts);
+        }
+
+        if let Some(file_occurrences) = occurrences_by_file.get(&file_id) {
+            let mut occurrence_parts = file_occurrences
+                .iter()
+                .filter(|occurrence| {
+                    occurrence.location.start_line >= start_line
+                        && occurrence.location.end_line <= end_line
+                        && occurrence.element_id != node.id.0
+                })
+                .map(|occurrence| {
+                    format!(
+                        "{}:{}:{}:{}:{}:{}",
+                        occurrence.element_id,
+                        occurrence.kind as i32,
+                        occurrence.location.start_line,
+                        occurrence.location.start_col,
+                        occurrence.location.end_line,
+                        occurrence.location.end_col
+                    )
+                })
+                .collect::<Vec<_>>();
+            occurrence_parts.sort();
+            body_parts.extend(occurrence_parts);
+        }
+
+        states.push(CallableProjectionState {
+            file_id: file_id.0,
+            symbol_key,
+            node_id: node.id,
+            signature_hash,
+            body_hash: hash_parts(body_parts.iter().map(String::as_str)),
+            start_line,
+            end_line,
+        });
+    }
+
+    if let Some(file_node) = nodes.iter().find(|node| node.kind == NodeKind::FILE) {
+        states.push(CallableProjectionState {
+            file_id: file_node.id.0,
+            symbol_key: FILE_STRUCTURAL_SYMBOL_KEY.to_string(),
+            node_id: file_node.id,
+            signature_hash: hash_parts([FILE_STRUCTURAL_SYMBOL_KEY]),
+            body_hash: structural_projection_hash(file_node.id, nodes, edges, &node_by_id),
+            start_line: 1,
+            end_line: file_node.end_line.unwrap_or(1),
+        });
+    }
+
+    states.sort_by(|lhs, rhs| lhs.symbol_key.cmp(&rhs.symbol_key));
+    states
+}
+
+fn structural_projection_hash(
+    file_id: NodeId,
+    nodes: &[Node],
+    edges: &[Edge],
+    node_by_id: &HashMap<NodeId, &Node>,
+) -> i64 {
+    let mut parts = Vec::new();
+
+    for node in nodes {
+        if node.id == file_id {
+            continue;
+        }
+        if is_callable_kind(node.kind) {
+            parts.push(format!(
+                "callable:{}:{}",
+                node.kind as i32,
+                node.qualified_name
+                    .as_deref()
+                    .unwrap_or(node.serialized_name.as_str())
+            ));
+            continue;
+        }
+        parts.push(format!(
+            "node:{}:{}:{}",
+            node.kind as i32,
+            node.qualified_name
+                .as_deref()
+                .unwrap_or(node.serialized_name.as_str()),
+            node.start_line.unwrap_or(0)
+        ));
+    }
+
+    for edge in edges {
+        if matches!(edge.kind, EdgeKind::CALL | EdgeKind::USAGE) {
+            continue;
+        }
+        let source_name = node_by_id
+            .get(&edge.source)
+            .map(|node| {
+                node.qualified_name
+                    .as_deref()
+                    .unwrap_or(node.serialized_name.as_str())
+            })
+            .unwrap_or_default();
+        let target_name = node_by_id
+            .get(&edge.target)
+            .map(|node| {
+                node.qualified_name
+                    .as_deref()
+                    .unwrap_or(node.serialized_name.as_str())
+            })
+            .unwrap_or_default();
+        parts.push(format!(
+            "edge:{}:{}:{}",
+            edge.kind as i32, source_name, target_name
+        ));
+    }
+
+    parts.sort();
+    hash_parts(parts.iter().map(String::as_str))
+}
+
+fn classify_projection_update(
+    existing: &[CallableProjectionState],
+    current: &[CallableProjectionState],
+) -> ProjectionUpdateMode {
+    if existing.is_empty() {
+        return ProjectionUpdateMode::InsertFresh;
+    }
+    if current.is_empty() {
+        return ProjectionUpdateMode::FullReplace;
+    }
+
+    let existing_by_key = existing
+        .iter()
+        .map(|state| (state.symbol_key.as_str(), state))
+        .collect::<HashMap<_, _>>();
+    let current_by_key = current
+        .iter()
+        .map(|state| (state.symbol_key.as_str(), state))
+        .collect::<HashMap<_, _>>();
+
+    if existing_by_key.len() != current_by_key.len() {
+        return ProjectionUpdateMode::FullReplace;
+    }
+    if existing_by_key
+        .keys()
+        .any(|symbol_key| !current_by_key.contains_key(symbol_key))
+    {
+        return ProjectionUpdateMode::FullReplace;
+    }
+
+    let mut changed_callers = Vec::new();
+    for current_state in current {
+        let Some(existing_state) = existing_by_key.get(current_state.symbol_key.as_str()) else {
+            return ProjectionUpdateMode::FullReplace;
+        };
+        if current_state.symbol_key == FILE_STRUCTURAL_SYMBOL_KEY {
+            if current_state.body_hash != existing_state.body_hash {
+                return ProjectionUpdateMode::FullReplace;
+            }
+            continue;
+        }
+        if current_state.signature_hash != existing_state.signature_hash {
+            return ProjectionUpdateMode::FullReplace;
+        }
+        if current_state.body_hash != existing_state.body_hash {
+            changed_callers.push(current_state.node_id);
+        }
+    }
+
+    if changed_callers.is_empty() {
+        ProjectionUpdateMode::NoChanges
+    } else {
+        ProjectionUpdateMode::Delta { changed_callers }
+    }
+}
+
+fn hash_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> i64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for part in parts {
+        for b in part.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h as i64
 }
 
 fn edge_kind_from_str(kind: &str) -> Option<EdgeKind> {
@@ -1301,11 +1754,11 @@ fn edge_kind_from_str(kind: &str) -> Option<EdgeKind> {
 }
 
 fn generate_edge_id(source: i64, target: i64, kind: codestory_core::EdgeKind) -> i64 {
-    let mut h: u64 = 0x811c9dc5;
+    let mut h: u64 = 0xcbf29ce484222325;
     let mut update = |val: i64| {
         for b in val.to_le_bytes() {
             h ^= b as u64;
-            h = h.wrapping_mul(0x01000193);
+            h = h.wrapping_mul(0x100000001b3);
         }
     };
     update(source);
@@ -1323,7 +1776,7 @@ fn generate_edge_id_with_identity(
     let mut h = generate_edge_id(source, target, kind) as u64;
     for b in identity.as_bytes() {
         h ^= *b as u64;
-        h = h.wrapping_mul(0x01000193);
+        h = h.wrapping_mul(0x100000001b3);
     }
     h as i64
 }
@@ -1443,6 +1896,62 @@ impl MyStruct {
     }
 
     #[test]
+    fn test_rust_type_anchor_prefers_declaration_over_impl_anchor() -> Result<()> {
+        let rust_code = r#"
+pub struct AppController;
+
+impl Default for AppController {
+    fn default() -> Self {
+        Self
+    }
+}
+
+impl AppController {
+    fn open_project(&self) {}
+}
+"#;
+        let (lang, lang_name, graph_query) = get_language_for_ext("rs").unwrap();
+
+        let result = index_file(
+            Path::new("main.rs"),
+            rust_code,
+            lang,
+            lang_name,
+            graph_query,
+            None,
+            None,
+        )?;
+
+        let matching = result
+            .nodes
+            .iter()
+            .filter(|node| node.serialized_name == "AppController")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected one canonical AppController node"
+        );
+
+        let type_node = matching[0];
+        assert_eq!(type_node.kind, NodeKind::STRUCT);
+        assert_eq!(type_node.start_line, Some(2));
+
+        let open_project = result
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name.ends_with("open_project"))
+            .expect("open_project method");
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::MEMBER
+                && edge.source == type_node.id
+                && edge.target == open_project.id
+        }));
+
+        Ok(())
+    }
+
+    #[test]
     fn test_index_cpp_semantics() -> Result<()> {
         let cpp_code = r#"
 class MyClass {
@@ -1549,7 +2058,7 @@ function globalFunc() {}
         assert!(
             nodes
                 .iter()
-                .any(|n| n.serialized_name == "Foo" && n.kind == NodeKind::CLASS)
+                .any(|n| n.serialized_name == "Foo" && n.kind == NodeKind::STRUCT)
         );
         assert!(
             nodes
@@ -1816,7 +2325,9 @@ trait Listener {
     fn on_event(&mut self);
 }
 
-struct Wrapper<T>(T);
+struct Wrapper<T> {
+    inner: T,
+}
 
 impl<T> Listener for Wrapper<T> {
     fn on_event(&mut self) {}
@@ -1841,14 +2352,62 @@ impl<T> Listener for Wrapper<T> {
         let wrapper = result
             .nodes
             .iter()
-            .find(|n| n.serialized_name == "Wrapper" && n.kind == NodeKind::CLASS)
-            .expect("Wrapper type not found");
+            .find(|n| n.serialized_name == "Wrapper" && n.kind == NodeKind::STRUCT)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Wrapper type not found; nodes={:?}",
+                    result
+                        .nodes
+                        .iter()
+                        .map(|n| (&n.serialized_name, &n.kind))
+                        .collect::<Vec<_>>()
+                )
+            });
 
         assert!(
             result.edges.iter().any(|e| e.kind == EdgeKind::INHERITANCE
                 && e.source == wrapper.id
                 && e.target == listener.id),
             "INHERITANCE edge from Wrapper to Listener not found"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_rust_local_binding_and_closure_assignment_distinguish_variable_and_function()
+    -> Result<()> {
+        let code = r#"
+fn sample(value: i32) -> i32 {
+    let local = value + 1;
+    let helper = |input: i32| input + local;
+    helper(value)
+}
+"#;
+        let (lang, lang_name, graph_query) = get_language_for_ext("rs").unwrap();
+        let result = index_file(
+            Path::new("main.rs"),
+            code,
+            lang,
+            lang_name,
+            graph_query,
+            None,
+            None,
+        )?;
+
+        assert!(
+            result
+                .nodes
+                .iter()
+                .any(|n| n.serialized_name == "local" && n.kind == NodeKind::VARIABLE),
+            "plain let binding should be indexed as VARIABLE"
+        );
+        assert!(
+            result
+                .nodes
+                .iter()
+                .any(|n| n.serialized_name == "helper" && n.kind == NodeKind::FUNCTION),
+            "closure-backed let binding should be indexed as FUNCTION"
         );
 
         Ok(())
