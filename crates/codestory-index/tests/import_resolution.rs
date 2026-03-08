@@ -164,10 +164,9 @@ impl Repository {
     );
 
     let mut resolved_to_same_file = 0usize;
-    let mut unresolved_edges = 0usize;
+    let mut resolved_to_other_file = 0usize;
     for edge in import_edges {
         let Some(target_id) = edge.resolved_target else {
-            unresolved_edges += 1;
             continue;
         };
         let Some(target) = node_by_id.get(&target_id) else {
@@ -175,6 +174,8 @@ impl Repository {
         };
         if target.file_node_id == Some(main_file.id) {
             resolved_to_same_file += 1;
+        } else {
+            resolved_to_other_file += 1;
         }
     }
 
@@ -183,8 +184,8 @@ impl Repository {
         "import should not resolve back to symbols in the caller file"
     );
     assert!(
-        unresolved_edges > 0,
-        "expected unresolved imports to remain explicit when cross-file resolution is uncertain"
+        resolved_to_other_file > 0,
+        "expected at least one import to resolve to a symbol outside the caller file"
     );
     Ok(())
 }

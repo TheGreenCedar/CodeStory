@@ -21,6 +21,7 @@ type UnresolvedEdgeRow = (
     Option<i64>,
     Option<String>,
     String,
+    String,
     Option<String>,
     Option<String>,
 );
@@ -527,13 +528,14 @@ impl ResolutionPass {
         if self.flags.parallel_compute && rows.len() > 1 {
             rows.par_iter()
                 .map(
-                    |(_, file_id, caller_qualified, target_name, caller_file_path, _)| {
+                    |(_, file_id, caller_qualified, source_name, target_name, caller_file_path, _)| {
                         self.semantic_candidates_for_edge(
                             index,
                             edge_kind,
                             *file_id,
                             caller_file_path.as_deref(),
                             caller_qualified.as_deref(),
+                            source_name,
                             target_name,
                         )
                     },
@@ -542,13 +544,14 @@ impl ResolutionPass {
         } else {
             rows.iter()
                 .map(
-                    |(_, file_id, caller_qualified, target_name, caller_file_path, _)| {
+                    |(_, file_id, caller_qualified, source_name, target_name, caller_file_path, _)| {
                         self.semantic_candidates_for_edge(
                             index,
                             edge_kind,
                             *file_id,
                             caller_file_path.as_deref(),
                             caller_qualified.as_deref(),
+                            source_name,
                             target_name,
                         )
                     },
@@ -592,6 +595,7 @@ impl ResolutionPass {
         file_id: Option<i64>,
         file_path: Option<&str>,
         caller_qualified: Option<&str>,
+        source_name: &str,
         target_name: &str,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
         let language_bucket = semantic_language_bucket(file_path).map(str::to_string);
@@ -604,7 +608,13 @@ impl ResolutionPass {
             file_id,
             file_path: file_path.map(str::to_string),
             caller_qualified: caller_qualified.map(str::to_string),
-            target_name: target_name.to_string(),
+            target_name: if edge_kind == EdgeKind::IMPORT
+                && import_alias_mismatch(source_name, target_name)
+            {
+                format!("{target_name} as {source_name}")
+            } else {
+                target_name.to_string()
+            },
         };
         self.semantic_resolvers.resolve(index, &request)
     }
@@ -1082,7 +1092,7 @@ fn unresolved_edges(
     }
 
     let mut query = String::from(
-        "SELECT e.id, caller.file_node_id, caller.qualified_name, target.serialized_name, file_node.serialized_name, e.callsite_identity
+        "SELECT e.id, caller.file_node_id, caller.qualified_name, caller.serialized_name, target.serialized_name, file_node.serialized_name, e.callsite_identity
          FROM edge e
          JOIN node caller ON caller.id = e.source_node_id
          JOIN node target ON target.id = e.target_node_id
@@ -1108,9 +1118,27 @@ fn map_unresolved_edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Unresolv
         row.get::<_, Option<i64>>(1)?,
         row.get::<_, Option<String>>(2)?,
         row.get::<_, String>(3)?,
-        row.get::<_, Option<String>>(4)?,
+        row.get::<_, String>(4)?,
         row.get::<_, Option<String>>(5)?,
+        row.get::<_, Option<String>>(6)?,
     ))
+}
+
+fn import_alias_mismatch(source_name: &str, target_name: &str) -> bool {
+    let source = source_name.trim();
+    let target = target_name.trim();
+    if source.is_empty() || target.is_empty() {
+        return false;
+    }
+
+    let target_tail = target
+        .rsplit("::")
+        .next()
+        .and_then(|segment| segment.rsplit_once('.').map(|(_, tail)| tail).or(Some(segment)))
+        .map(str::trim)
+        .unwrap_or(target);
+
+    source != target_tail && (target.contains("::") || target.contains('.'))
 }
 
 fn sorted_scope_file_ids(caller_scope_file_ids: Option<&HashSet<i64>>) -> Option<Vec<i64>> {
