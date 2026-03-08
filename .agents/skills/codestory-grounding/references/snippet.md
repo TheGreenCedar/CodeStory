@@ -5,7 +5,7 @@ Resolves a symbol and returns its source code with surrounding context lines. Us
 ## Usage
 
 ```
-python scripts/snippet.py [OPTIONS]
+target/release/codestory-cli(.exe) snippet [OPTIONS]
 ```
 
 ## Arguments
@@ -46,11 +46,11 @@ file: `src/lib.rs`  lines: 96–115
 
 ```bash
 # Snippet with default 4 lines of context
-python scripts/snippet.py --query "AppController::new"
+target/release/codestory-cli(.exe) snippet --project . --query "AppController::new"
 
 # More context
-python scripts/snippet.py --query run_indexing --context 10
+target/release/codestory-cli(.exe) snippet --project . --query run_indexing --context 10
 
 # By node ID, JSON output
-python scripts/snippet.py --id abc123def456 --format json
+target/release/codestory-cli(.exe) snippet --project . --id abc123def456 --format json
 ```

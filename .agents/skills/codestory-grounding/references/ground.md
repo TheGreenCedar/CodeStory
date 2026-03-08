@@ -5,7 +5,7 @@ Produces a budget-aware grounding snapshot of the entire indexed codebase: root 
 ## Usage
 
 ```
-python scripts/ground.py [OPTIONS]
+target/release/codestory-cli(.exe) ground [OPTIONS]
 ```
 
 ## Arguments
@@ -49,14 +49,14 @@ coverage_buckets:
 
 ```bash
 # Default balanced grounding
-python scripts/ground.py
+target/release/codestory-cli(.exe) ground --project .
 
 # Strict grounding for quick context
-python scripts/ground.py --budget strict
+target/release/codestory-cli(.exe) ground --project . --budget strict
 
 # Max depth, JSON output
-python scripts/ground.py --budget max --format json
+target/release/codestory-cli(.exe) ground --project . --budget max --format json
 
 # Ground without refreshing the index
-python scripts/ground.py --refresh none
+target/release/codestory-cli(.exe) ground --project . --refresh none
 ```

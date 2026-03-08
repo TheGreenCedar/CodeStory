@@ -5,7 +5,7 @@ Resolves a symbol by ID or query, then returns its full metadata: kind, file loc
 ## Usage
 
 ```
-python scripts/symbol.py [OPTIONS]
+target/release/codestory-cli(.exe) symbol [OPTIONS]
 ```
 
 ## Arguments
@@ -47,11 +47,11 @@ outgoing: 2
 
 ```bash
 # Inspect by query
-python scripts/symbol.py --query AppController
+target/release/codestory-cli(.exe) symbol --project . --query AppController
 
 # Inspect by node ID
-python scripts/symbol.py --id abc123def456
+target/release/codestory-cli(.exe) symbol --project . --id abc123def456
 
 # JSON output
-python scripts/symbol.py --query "WorkspaceIndexer" --format json
+target/release/codestory-cli(.exe) symbol --project . --query "WorkspaceIndexer" --format json
 ```

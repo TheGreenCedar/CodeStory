@@ -10,9 +10,9 @@ Use this skill to collect repo evidence with `codestory-cli` before answering ar
 ## Workflow
 
 1. Build the CLI first with `cargo build --release -p codestory-cli` when verification depends on local code changes.
-2. Use the built binary for repeated queries: `target/release/codestory-cli(.exe) <subcommand> ...`. The repo-local Python wrappers now prefer the built binary automatically.
-3. Run `python scripts/index.py --refresh full` when validating fixes for prior indexing errors, schema/version changes, or graph/query-rule changes. Use `--refresh none` only after a successful fresh build and successful index run in the same verification session.
-4. Run `python scripts/ground.py` for a compact context snapshot, then use `search`, `symbol`, `trail`, or `snippet` to narrow focus.
+2. If `target/release/codestory-cli(.exe)` is missing, build it with `cargo build --release -p codestory-cli`. If it already exists and is fresh enough for the code you are verifying, use it directly.
+3. Run `target/release/codestory-cli(.exe) index --project <workspace> --refresh full` when validating fixes for prior indexing errors, schema/version changes, or graph/query-rule changes. Use `--refresh none` only after a successful fresh build and successful index run in the same verification session.
+4. Run `target/release/codestory-cli(.exe) ground --project <workspace>` for a compact context snapshot, then use `search`, `symbol`, `trail`, or `snippet` to narrow focus.
 5. Treat command output as evidence, then open only the files needed for edits or verification.
 
 ## Freshness Rules
@@ -27,22 +27,18 @@ Use this skill to collect repo evidence with `codestory-cli` before answering ar
 - `trail` should be judged by whether unrelated resolved targets disappeared. Local helper names like `once`, `from`, or `copied` can still appear as `[unknown]` nodes without indicating bad semantic resolution.
 - If `index` still reports errors after a fix, rerun with `--refresh full` before concluding the fix failed.
 
-## Scripts
+## Prerequisite
 
-These scripts are repo-local wrappers around the built `target/release/codestory-cli(.exe)` binary and require Python plus a local Rust toolchain. If the binary is missing, the wrapper builds it once with `cargo build --release -p codestory-cli`. `cargo run --release` remains a last-resort fallback and is slower because it can contend on Cargo locks. Invoke the wrappers as `python scripts/...` on Windows.
+Use the release binary directly. This skill requires a local Rust toolchain and a built `target/release/codestory-cli(.exe)` binary. If the binary is missing, or stale relative to CLI-facing code changes, run `cargo build --release -p codestory-cli` from the repo root before querying. Prefer the built binary over `cargo run --release` for repeated queries because it avoids repeated Cargo startup and shared build-lock contention on this workspace.
 
-- `python scripts/index.py`: Index symbols, edges, and files via tree-sitter + semantic resolution (builds/refreshes the SQLite index)
-- `python scripts/ground.py`: Produce a compact codebase context snapshot — root symbols, file coverage, and recommended queries (requires index)
-- `python scripts/search.py`: Search indexed symbols and repo text (requires index)
-- `python scripts/symbol.py`: Inspect a single symbol's details, children, and relationships (requires index)
-- `python scripts/trail.py`: Follow a symbol's call/reference graph as a directed trail (requires index)
-- `python scripts/snippet.py`: Fetch source code context around a symbol (requires index)
+- `target/release/codestory-cli(.exe) index`: Index symbols, edges, and files via tree-sitter + semantic resolution
+- `target/release/codestory-cli(.exe) ground`: Produce a compact codebase context snapshot
+- `target/release/codestory-cli(.exe) search`: Search indexed symbols and repo text
+- `target/release/codestory-cli(.exe) symbol`: Inspect a single symbol's details, children, and relationships
+- `target/release/codestory-cli(.exe) trail`: Follow a symbol's call/reference graph as a directed trail
+- `target/release/codestory-cli(.exe) snippet`: Fetch source code context around a symbol
 
-Pass extra arguments through unchanged. The scripts resolve the workspace root automatically, so they can be launched from anywhere inside the repo checkout.
-
-Use `--dry-run` first if you only need to inspect the exact command the wrapper would execute. When the release binary exists, the dry run prints the exe command; otherwise it prints the one-time build command followed by the expected exe invocation.
-
-If a subcommand is unavailable in the current checkout, report that plainly and fall back to direct repo inspection instead of inventing grounded results.
+Always pass `--project <workspace>` explicitly so queries target the intended checkout even when you invoke the binary from the repo root. If a subcommand is unavailable in the current checkout, report that plainly and fall back to direct repo inspection instead of inventing grounded results.
 
 ## References
 

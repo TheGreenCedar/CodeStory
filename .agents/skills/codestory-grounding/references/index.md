@@ -5,7 +5,7 @@ Discovers project files, extracts symbols and edges via tree-sitter + semantic r
 ## Usage
 
 ```
-python scripts/index.py [OPTIONS]
+target/release/codestory-cli(.exe) index [OPTIONS]
 ```
 
 ## Arguments
@@ -44,13 +44,13 @@ resolution: calls 120->15, imports 42->3
 
 ```bash
 # First-time index of the current repo
-python scripts/index.py
+target/release/codestory-cli(.exe) index --project .
 
 # Force full re-index
-python scripts/index.py --refresh full
+target/release/codestory-cli(.exe) index --project . --refresh full
 
 # Index a different project, JSON output
-python scripts/index.py --project ../other-repo --format json
+target/release/codestory-cli(.exe) index --project ../other-repo --format json
 ```
 
 ## Refresh Troubleshooting

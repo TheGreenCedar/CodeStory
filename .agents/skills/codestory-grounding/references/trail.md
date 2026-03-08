@@ -5,7 +5,7 @@ Builds a directed graph trail starting from a target symbol. Supports neighborho
 ## Usage
 
 ```
-python scripts/trail.py [OPTIONS]
+target/release/codestory-cli(.exe) trail [OPTIONS]
 ```
 
 ## Arguments
@@ -53,16 +53,16 @@ edges:
 
 ```bash
 # Neighborhood trail (default)
-python scripts/trail.py --query AppController
+target/release/codestory-cli(.exe) trail --project . --query AppController
 
 # Follow all outgoing references, deeper
-python scripts/trail.py --query "run_indexing" --mode referenced --depth 3
+target/release/codestory-cli(.exe) trail --project . --query "run_indexing" --mode referenced --depth 3
 
 # Incoming callers only, include tests
-python scripts/trail.py --query Storage::open --mode referencing --include-tests
+target/release/codestory-cli(.exe) trail --project . --query Storage::open --mode referencing --include-tests
 
 # Larger trail, vertical layout, JSON
-python scripts/trail.py --query EventBus --max-nodes 50 --layout vertical --format json
+target/release/codestory-cli(.exe) trail --project . --query EventBus --max-nodes 50 --layout vertical --format json
 ```
 
 ## Interpreting Trail Noise

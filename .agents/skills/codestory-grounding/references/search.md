@@ -5,7 +5,7 @@ Searches the symbol index for matching nodes, optionally augmented with grep-sty
 ## Usage
 
 ```
-python scripts/search.py [OPTIONS]
+target/release/codestory-cli(.exe) search [OPTIONS]
 ```
 
 ## Arguments
@@ -43,11 +43,11 @@ When a name appears more than once, prefer typed symbol hits such as `[function]
 
 ```bash
 # Search for a symbol
-python scripts/search.py --query AppController
+target/release/codestory-cli(.exe) search --project . --query AppController
 
 # Natural-language search, more results
-python scripts/search.py --query "how does the grounding snapshot work" --limit 20
+target/release/codestory-cli(.exe) search --project . --query "how does the grounding snapshot work" --limit 20
 
 # JSON output
-python scripts/search.py --query TrailResult --format json
+target/release/codestory-cli(.exe) search --project . --query TrailResult --format json
 ```
