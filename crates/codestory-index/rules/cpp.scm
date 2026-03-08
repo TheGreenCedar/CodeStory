@@ -22,6 +22,18 @@
   attr (@name.node) end_col = (end-column @name)
 }
 
+(struct_specifier
+  name: (_) @name)
+{
+  node @name.node
+  attr (@name.node) kind = "CLASS"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+}
+
 (function_definition
   declarator: (function_declarator
     declarator: (_) @name)) @def
@@ -114,10 +126,52 @@
   attr (@class_name.node -> @field_name.node) kind = "MEMBER"
 }
 
+(struct_specifier
+  name: (_) @class_name
+  body: (field_declaration_list
+    (function_definition
+      declarator: (function_declarator
+        declarator: (_) @method_name))))
+{
+  edge @class_name.node -> @method_name.node
+  attr (@class_name.node -> @method_name.node) kind = "MEMBER"
+}
+
+(struct_specifier
+  name: (_) @class_name
+  body: (field_declaration_list
+    (field_declaration declarator: (field_identifier) @field_name)))
+{
+  edge @class_name.node -> @field_name.node
+  attr (@class_name.node -> @field_name.node) kind = "MEMBER"
+}
+
+(template_declaration
+  (struct_specifier
+    name: (_) @class_name
+    body: (field_declaration_list
+      (function_definition
+        declarator: (function_declarator
+          declarator: (_) @method_name)))))
+{
+  edge @class_name.node -> @method_name.node
+  attr (@class_name.node -> @method_name.node) kind = "MEMBER"
+}
+
+(template_declaration
+  (struct_specifier
+    name: (_) @class_name
+    body: (field_declaration_list
+      (field_declaration declarator: (field_identifier) @field_name))))
+{
+  edge @class_name.node -> @field_name.node
+  attr (@class_name.node -> @field_name.node) kind = "MEMBER"
+}
+
 ;; Inheritance
 (class_specifier
   name: (_) @class_name
-  (base_class_clause (_) @parent_name))
+  (base_class_clause (type_identifier) @parent_name))
 {
   node @parent_name.node
   attr (@parent_name.node) kind = "CLASS"
@@ -127,6 +181,65 @@
   attr (@parent_name.node) end_row = (end-row @parent_name)
   attr (@parent_name.node) end_col = (end-column @parent_name)
 
+  edge @class_name.node -> @parent_name.node
+  attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
+}
+
+(class_specifier
+  name: (_) @class_name
+  (base_class_clause (qualified_identifier) @parent_name))
+{
+  node @parent_name.node
+  attr (@parent_name.node) kind = "CLASS"
+  attr (@parent_name.node) name = (source-text @parent_name)
+  attr (@parent_name.node) start_row = (start-row @parent_name)
+  attr (@parent_name.node) start_col = (start-column @parent_name)
+  attr (@parent_name.node) end_row = (end-row @parent_name)
+  attr (@parent_name.node) end_col = (end-column @parent_name)
+
+  edge @class_name.node -> @parent_name.node
+  attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
+}
+
+(struct_specifier
+  name: (_) @class_name
+  (base_class_clause (type_identifier) @parent_name))
+{
+  node @parent_name.node
+  attr (@parent_name.node) kind = "CLASS"
+  attr (@parent_name.node) name = (source-text @parent_name)
+  attr (@parent_name.node) start_row = (start-row @parent_name)
+  attr (@parent_name.node) start_col = (start-column @parent_name)
+  attr (@parent_name.node) end_row = (end-row @parent_name)
+  attr (@parent_name.node) end_col = (end-column @parent_name)
+
+  edge @class_name.node -> @parent_name.node
+  attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
+}
+
+(struct_specifier
+  name: (_) @class_name
+  (base_class_clause (template_type
+    name: (type_identifier) @parent_name)))
+{
+  node @parent_name.node
+  attr (@parent_name.node) kind = "CLASS"
+  attr (@parent_name.node) name = (source-text @parent_name)
+  attr (@parent_name.node) start_row = (start-row @parent_name)
+  attr (@parent_name.node) start_col = (start-column @parent_name)
+  attr (@parent_name.node) end_row = (end-row @parent_name)
+  attr (@parent_name.node) end_col = (end-column @parent_name)
+
+  edge @class_name.node -> @parent_name.node
+  attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
+}
+
+(template_declaration
+  (struct_specifier
+    name: (_) @class_name
+    (base_class_clause (template_type
+      name: (type_identifier) @parent_name))))
+{
   edge @class_name.node -> @parent_name.node
   attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
 }
@@ -294,6 +407,7 @@
 (template_type
   name: (type_identifier) @template_name
   arguments: (template_argument_list
+    .
     (type_descriptor) @type_arg))
 {
   node @template_name.node

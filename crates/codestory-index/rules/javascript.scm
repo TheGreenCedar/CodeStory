@@ -23,7 +23,7 @@
 }
 
 (method_definition
-  name: (property_identifier) @name) @def
+  name: (_) @name) @def
 {
   node @name.node
   attr (@name.node) kind = "METHOD"
@@ -38,7 +38,7 @@
 (class_declaration
   name: (identifier) @class_name
   body: (class_body
-    (method_definition name: (property_identifier) @method_name)))
+    (method_definition name: (_) @method_name)))
 {
   edge @class_name.node -> @method_name.node
   attr (@class_name.node -> @method_name.node) kind = "MEMBER"
@@ -47,7 +47,25 @@
 ;; Inheritance
 (class_declaration
   name: (identifier) @class_name
-  (class_heritage (_) @parent_name))
+  (class_heritage (identifier) @parent_name))
+{
+  node @parent_name.node
+  attr (@parent_name.node) kind = "CLASS"
+  attr (@parent_name.node) name = (source-text @parent_name)
+  attr (@parent_name.node) start_row = (start-row @parent_name)
+  attr (@parent_name.node) start_col = (start-column @parent_name)
+  attr (@parent_name.node) end_row = (end-row @parent_name)
+  attr (@parent_name.node) end_col = (end-column @parent_name)
+
+  edge @class_name.node -> @parent_name.node
+  attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
+}
+
+(class_declaration
+  name: (identifier) @class_name
+  (class_heritage
+    (member_expression
+      property: (property_identifier) @parent_name)))
 {
   node @parent_name.node
   attr (@parent_name.node) kind = "CLASS"
@@ -170,54 +188,9 @@
 }
 
 (import_statement
-  (import_clause (identifier) @module))
-{
-  node @module.node
-  attr (@module.node) kind = "MODULE"
-  attr (@module.node) name = (source-text @module)
-  attr (@module.node) start_row = (start-row @module)
-  attr (@module.node) start_col = (start-column @module)
-  attr (@module.node) end_row = (end-row @module)
-  attr (@module.node) end_col = (end-column @module)
-
-  edge @module.node -> @module.node
-  attr (@module.node -> @module.node) kind = "IMPORT"
-}
-
-(import_statement
-  (import_clause (namespace_import (identifier) @module)))
-{
-  node @module.node
-  attr (@module.node) kind = "MODULE"
-  attr (@module.node) name = (source-text @module)
-  attr (@module.node) start_row = (start-row @module)
-  attr (@module.node) start_col = (start-column @module)
-  attr (@module.node) end_row = (end-row @module)
-  attr (@module.node) end_col = (end-column @module)
-
-  edge @module.node -> @module.node
-  attr (@module.node -> @module.node) kind = "IMPORT"
-}
-
-(import_statement
   (import_clause
     (named_imports
       (import_specifier name: (identifier) @module))))
-{
-  node @module.node
-  attr (@module.node) kind = "MODULE"
-  attr (@module.node) name = (source-text @module)
-  attr (@module.node) start_row = (start-row @module)
-  attr (@module.node) start_col = (start-column @module)
-  attr (@module.node) end_row = (end-row @module)
-  attr (@module.node) end_col = (end-column @module)
-
-  edge @module.node -> @module.node
-  attr (@module.node -> @module.node) kind = "IMPORT"
-}
-
-;; Fallback import capture (ensures module imports are represented)
-(import_statement) @module
 {
   node @module.node
   attr (@module.node) kind = "MODULE"
@@ -265,6 +238,23 @@
 (import_statement
   (import_clause
     (namespace_import (identifier) @alias_name)))
+{
+  node @alias_name.node
+  attr (@alias_name.node) kind = "MODULE"
+  attr (@alias_name.node) name = (source-text @alias_name)
+  attr (@alias_name.node) start_row = (start-row @alias_name)
+  attr (@alias_name.node) start_col = (start-column @alias_name)
+  attr (@alias_name.node) end_row = (end-row @alias_name)
+  attr (@alias_name.node) end_col = (end-column @alias_name)
+
+  edge @alias_name.node -> @alias_name.node
+  attr (@alias_name.node -> @alias_name.node) kind = "IMPORT"
+}
+
+(import_statement
+  (import_clause
+    (named_imports
+      (import_specifier alias: (identifier) @alias_name))))
 {
   node @alias_name.node
   attr (@alias_name.node) kind = "MODULE"

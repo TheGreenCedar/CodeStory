@@ -34,6 +34,30 @@
   attr (@name.node) end_col = (end-column @name)
 }
 
+(record_declaration
+  name: (identifier) @name)
+{
+  node @name.node
+  attr (@name.node) kind = "CLASS"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+}
+
+(enum_declaration
+  name: (identifier) @name)
+{
+  node @name.node
+  attr (@name.node) kind = "ENUM"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+}
+
 (field_declaration
   (variable_declarator name: (identifier) @name))
 {
@@ -173,26 +197,6 @@
   attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
 }
 
-;; Calls
-(method_declaration
-  name: (identifier) @caller
-  body: (block
-    (expression_statement
-      (method_invocation name: (identifier) @callee) @call)))
-{
-  node @callee.node
-  attr (@callee.node) kind = "UNKNOWN"
-  attr (@callee.node) name = (source-text @callee)
-  attr (@callee.node) start_row = (start-row @callee)
-  attr (@callee.node) start_col = (start-column @callee)
-  attr (@callee.node) end_row = (end-row @callee)
-  attr (@callee.node) end_col = (end-column @callee)
-
-  edge @caller.node -> @callee.node
-  attr (@caller.node -> @callee.node) kind = "CALL"
-  attr (@caller.node -> @callee.node) line = (start-row @call)
-}
-
 ;; Calls (global fallback)
 (method_invocation
   name: (identifier) @callee_any) @call_any
@@ -296,7 +300,7 @@
       (_) @parent_name)))
 {
   node @parent_name.node
-  attr (@parent_name.node) kind = "CLASS"
+  attr (@parent_name.node) kind = "INTERFACE"
   attr (@parent_name.node) name = (source-text @parent_name)
   attr (@parent_name.node) start_row = (start-row @parent_name)
   attr (@parent_name.node) start_col = (start-column @parent_name)
@@ -314,7 +318,7 @@
       (_) @parent_name)))
 {
   node @parent_name.node
-  attr (@parent_name.node) kind = "CLASS"
+  attr (@parent_name.node) kind = "INTERFACE"
   attr (@parent_name.node) name = (source-text @parent_name)
   attr (@parent_name.node) start_row = (start-row @parent_name)
   attr (@parent_name.node) start_col = (start-column @parent_name)

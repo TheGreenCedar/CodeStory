@@ -123,6 +123,66 @@
   attr (@struct_name.node -> @field_name.node) kind = "MEMBER"
 }
 
+(struct_specifier
+  name: (type_identifier) @struct_name
+  body: (field_declaration_list
+    (field_declaration
+      declarator: (pointer_declarator
+        declarator: (field_identifier) @field_name))))
+{
+  node @field_name.node
+  attr (@field_name.node) kind = "FIELD"
+  attr (@field_name.node) name = (source-text @field_name)
+  attr (@field_name.node) start_row = (start-row @field_name)
+  attr (@field_name.node) start_col = (start-column @field_name)
+  attr (@field_name.node) end_row = (end-row @field_name)
+  attr (@field_name.node) end_col = (end-column @field_name)
+
+  edge @struct_name.node -> @field_name.node
+  attr (@struct_name.node -> @field_name.node) kind = "MEMBER"
+}
+
+(struct_specifier
+  name: (type_identifier) @struct_name
+  body: (field_declaration_list
+    (field_declaration
+      declarator: (function_declarator
+        declarator: (pointer_declarator
+          declarator: (field_identifier) @field_name)))))
+{
+  node @field_name.node
+  attr (@field_name.node) kind = "FIELD"
+  attr (@field_name.node) name = (source-text @field_name)
+  attr (@field_name.node) start_row = (start-row @field_name)
+  attr (@field_name.node) start_col = (start-column @field_name)
+  attr (@field_name.node) end_row = (end-row @field_name)
+  attr (@field_name.node) end_col = (end-column @field_name)
+
+  edge @struct_name.node -> @field_name.node
+  attr (@struct_name.node -> @field_name.node) kind = "MEMBER"
+}
+
+(struct_specifier
+  name: (type_identifier) @struct_name
+  body: (field_declaration_list
+    (field_declaration
+      declarator: (function_declarator
+        declarator: (parenthesized_declarator
+          (pointer_declarator
+            declarator: (field_identifier) @field_name))))))
+{
+  node @field_name.node
+  attr (@field_name.node) kind = "FIELD"
+  attr (@field_name.node) name = (source-text @field_name)
+  attr (@field_name.node) start_row = (start-row @field_name)
+  attr (@field_name.node) start_col = (start-column @field_name)
+  attr (@field_name.node) end_row = (end-row @field_name)
+  attr (@field_name.node) end_col = (end-column @field_name)
+
+  edge @struct_name.node -> @field_name.node
+  attr (@struct_name.node -> @field_name.node) kind = "MEMBER"
+}
+
 ;; Type alias usage
 (type_definition
   type: (type_identifier) @target_type
@@ -146,6 +206,85 @@
 
   edge @alias_name.node -> @target_type.node
   attr (@alias_name.node -> @target_type.node) kind = "TYPE_USAGE"
+}
+
+(type_definition
+  type: (struct_specifier)
+  declarator: (type_identifier) @alias_name)
+{
+  node @alias_name.node
+  attr (@alias_name.node) kind = "CLASS"
+  attr (@alias_name.node) name = (source-text @alias_name)
+  attr (@alias_name.node) start_row = (start-row @alias_name)
+  attr (@alias_name.node) start_col = (start-column @alias_name)
+  attr (@alias_name.node) end_row = (end-row @alias_name)
+  attr (@alias_name.node) end_col = (end-column @alias_name)
+}
+
+(type_definition
+  type: (struct_specifier
+    !name
+    body: (field_declaration_list
+      (field_declaration
+        declarator: (pointer_declarator
+          declarator: (field_identifier) @field_name))))
+  declarator: (type_identifier) @alias_name)
+{
+  node @field_name.node
+  attr (@field_name.node) kind = "FIELD"
+  attr (@field_name.node) name = (source-text @field_name)
+  attr (@field_name.node) start_row = (start-row @field_name)
+  attr (@field_name.node) start_col = (start-column @field_name)
+  attr (@field_name.node) end_row = (end-row @field_name)
+  attr (@field_name.node) end_col = (end-column @field_name)
+
+  edge @alias_name.node -> @field_name.node
+  attr (@alias_name.node -> @field_name.node) kind = "MEMBER"
+}
+
+(type_definition
+  type: (struct_specifier
+    !name
+    body: (field_declaration_list
+      (field_declaration
+        declarator: (function_declarator
+          declarator: (pointer_declarator
+            declarator: (field_identifier) @field_name)))))
+  declarator: (type_identifier) @alias_name)
+{
+  node @field_name.node
+  attr (@field_name.node) kind = "FIELD"
+  attr (@field_name.node) name = (source-text @field_name)
+  attr (@field_name.node) start_row = (start-row @field_name)
+  attr (@field_name.node) start_col = (start-column @field_name)
+  attr (@field_name.node) end_row = (end-row @field_name)
+  attr (@field_name.node) end_col = (end-column @field_name)
+
+  edge @alias_name.node -> @field_name.node
+  attr (@alias_name.node -> @field_name.node) kind = "MEMBER"
+}
+
+(type_definition
+  type: (struct_specifier
+    !name
+    body: (field_declaration_list
+      (field_declaration
+        declarator: (function_declarator
+          declarator: (parenthesized_declarator
+            (pointer_declarator
+              declarator: (field_identifier) @field_name))))))
+  declarator: (type_identifier) @alias_name)
+{
+  node @field_name.node
+  attr (@field_name.node) kind = "FIELD"
+  attr (@field_name.node) name = (source-text @field_name)
+  attr (@field_name.node) start_row = (start-row @field_name)
+  attr (@field_name.node) start_col = (start-column @field_name)
+  attr (@field_name.node) end_row = (end-row @field_name)
+  attr (@field_name.node) end_col = (end-column @field_name)
+
+  edge @alias_name.node -> @field_name.node
+  attr (@alias_name.node -> @field_name.node) kind = "MEMBER"
 }
 
 (call_expression
