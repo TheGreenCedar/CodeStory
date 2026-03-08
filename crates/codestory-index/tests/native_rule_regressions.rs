@@ -217,3 +217,66 @@ struct Holder {
 
     Ok(())
 }
+
+#[test]
+fn test_cpp_template_base_class_with_type_argument_does_not_duplicate_nodes() -> anyhow::Result<()> {
+    let (nodes, edges) = index_project(&[(
+        "main.cpp",
+        r#"
+struct MatcherUntypedBase {};
+
+template <typename ObjectT>
+struct MatcherMethod {};
+
+template <typename T>
+struct MatcherBase : MatcherUntypedBase, MatcherMethod<T> {};
+"#,
+    )])?;
+
+    assert!(has_node_kind(&nodes, "MatcherBase", NodeKind::CLASS));
+    assert!(has_node_kind(&nodes, "MatcherMethod", NodeKind::CLASS));
+    assert!(
+        edge_between(
+            &nodes,
+            &edges,
+            EdgeKind::INHERITANCE,
+            "MatcherBase",
+            "MatcherMethod"
+        ),
+        "expected MatcherBase -> MatcherMethod inheritance edge"
+    );
+    assert!(
+        edge_between(
+            &nodes,
+            &edges,
+            EdgeKind::TYPE_ARGUMENT,
+            "MatcherMethod",
+            "T"
+        ),
+        "expected MatcherMethod<T> to retain its type argument"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_cpp_template_specialization_name_does_not_duplicate_nodes() -> anyhow::Result<()> {
+    let (nodes, _edges) = index_project(&[(
+        "main.cpp",
+        r#"
+template <typename StringT>
+class StringTraits {};
+
+template <>
+class StringTraits<int> {};
+"#,
+    )])?;
+
+    assert!(has_node_kind(&nodes, "StringTraits", NodeKind::CLASS));
+    assert!(
+        has_node_kind(&nodes, "StringTraits<int>", NodeKind::CLASS),
+        "expected specialized class declaration to index without duplicate-node errors"
+    );
+
+    Ok(())
+}

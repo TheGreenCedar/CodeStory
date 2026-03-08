@@ -42,6 +42,7 @@ struct SemanticCandidateNode {
     serialized_name_ascii_lower: String,
     qualified_name: Option<String>,
     file_node_id: Option<i64>,
+    language_family: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -56,22 +57,25 @@ pub struct SemanticCandidateIndex {
 impl SemanticCandidateIndex {
     pub fn load(conn: &Connection, kinds: &[i32]) -> Result<Self> {
         let query = if kinds.is_empty() {
-            "SELECT id, kind, serialized_name, qualified_name, file_node_id
-             FROM node
-             ORDER BY COALESCE(start_line, -9223372036854775808), id"
+            "SELECT n.id, n.kind, n.serialized_name, n.qualified_name, n.file_node_id, file_node.serialized_name
+             FROM node n
+             LEFT JOIN node file_node ON file_node.id = n.file_node_id
+             ORDER BY COALESCE(n.start_line, -9223372036854775808), n.id"
                 .to_string()
         } else {
             let kind_clause = kind_clause(kinds);
             format!(
-                "SELECT id, kind, serialized_name, qualified_name, file_node_id
-                 FROM node
-                 WHERE kind IN ({kind_clause})
-                 ORDER BY COALESCE(start_line, -9223372036854775808), id"
+                "SELECT n.id, n.kind, n.serialized_name, n.qualified_name, n.file_node_id, file_node.serialized_name
+                 FROM node n
+                 LEFT JOIN node file_node ON file_node.id = n.file_node_id
+                 WHERE n.kind IN ({kind_clause})
+                 ORDER BY COALESCE(n.start_line, -9223372036854775808), n.id"
             )
         };
         let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map([], |row| {
             let serialized_name: String = row.get(2)?;
+            let file_path: Option<String> = row.get(5)?;
             Ok(SemanticCandidateNode {
                 id: row.get(0)?,
                 kind: row.get(1)?,
@@ -79,6 +83,7 @@ impl SemanticCandidateIndex {
                 serialized_name,
                 qualified_name: row.get(3)?,
                 file_node_id: row.get(4)?,
+                language_family: detect_language(file_path.as_deref()).map(language_family_bucket),
             })
         })?;
 
@@ -118,11 +123,14 @@ impl SemanticCandidateIndex {
         kinds: &[i32],
         name: &str,
         name_ascii_lower: &str,
+        caller_language: Option<&'static str>,
+        allow_fuzzy: bool,
         limit: usize,
     ) -> Vec<&'a SemanticCandidateNode> {
         let kind_set = kinds.iter().copied().collect::<HashSet<_>>();
         let mut out = Vec::with_capacity(limit);
         let mut seen = HashSet::with_capacity(limit.saturating_mul(2));
+        let caller_language_family = caller_language.map(language_family_bucket);
 
         let mut push_offset = |offset: usize| {
             if out.len() >= limit {
@@ -131,7 +139,10 @@ impl SemanticCandidateIndex {
             let Some(node) = self.nodes.get(offset) else {
                 return;
             };
-            if !kind_set.contains(&node.kind) || !seen.insert(node.id) {
+            if !kind_set.contains(&node.kind)
+                || !compatible_language_families(caller_language_family, node.language_family)
+                || !seen.insert(node.id)
+            {
                 return;
             }
             out.push(node);
@@ -153,7 +164,7 @@ impl SemanticCandidateIndex {
             }
         }
 
-        if out.is_empty() {
+        if allow_fuzzy && out.is_empty() {
             for kind in kinds {
                 let Some(offsets) = self.nodes_by_kind.get(kind) else {
                     continue;
@@ -277,10 +288,11 @@ pub(super) fn resolve_import_candidates(
     kinds: &[i32],
     symbol: &str,
     file_id: Option<i64>,
+    caller_language: Option<&'static str>,
     confidence: f32,
 ) -> Result<Vec<SemanticResolutionCandidate>> {
     let ids = index
-        .nodes_for_name(kinds, symbol, &symbol.to_ascii_lowercase(), 4)
+        .nodes_for_name(kinds, symbol, &symbol.to_ascii_lowercase(), caller_language, true, 4)
         .into_iter()
         .filter(|node| {
             file_id.is_none() || node.file_node_id.is_none() || node.file_node_id != file_id
@@ -295,6 +307,7 @@ pub(super) fn resolve_call_candidates(
     kinds: &[i32],
     call_name: &str,
     file_id: Option<i64>,
+    caller_language: Option<&'static str>,
     same_file_confidence: f32,
     global_confidence: f32,
 ) -> Result<Vec<SemanticResolutionCandidate>> {
@@ -303,7 +316,7 @@ pub(super) fn resolve_call_candidates(
 
     if let Some(file_id) = file_id {
         let ids = index
-            .nodes_for_name(kinds, call_name, &name_ascii_lower, 3)
+            .nodes_for_name(kinds, call_name, &name_ascii_lower, caller_language, false, 3)
             .into_iter()
             .filter(|node| node.file_node_id == Some(file_id))
             .map(|node| node.id)
@@ -313,7 +326,7 @@ pub(super) fn resolve_call_candidates(
 
     if out.is_empty() {
         let ids = index
-            .nodes_for_name(kinds, call_name, &name_ascii_lower, 3)
+            .nodes_for_name(kinds, call_name, &name_ascii_lower, caller_language, false, 3)
             .into_iter()
             .map(|node| node.id)
             .collect::<Vec<_>>();
@@ -364,9 +377,56 @@ fn tail_component(value: &str) -> Option<&str> {
     if tail.is_empty() { None } else { Some(tail) }
 }
 
+fn language_family_bucket(language: &'static str) -> &'static str {
+    match language {
+        "c" | "cpp" => "native",
+        "javascript" | "typescript" => "webscript",
+        "python" => "python",
+        "rust" => "rust",
+        "java" => "java",
+        _ => language,
+    }
+}
+
+fn compatible_language_families(
+    caller_language: Option<&'static str>,
+    candidate_language: Option<&'static str>,
+) -> bool {
+    match (caller_language, candidate_language) {
+        (Some(lhs), Some(rhs)) => lhs == rhs,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::detect_language;
+    use super::{SemanticCandidateIndex, detect_language, resolve_call_candidates};
+    use anyhow::Result;
+    use codestory_core::NodeKind;
+    use rusqlite::{Connection, params};
+
+    fn create_node_table(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE node (
+                id INTEGER PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                serialized_name TEXT NOT NULL,
+                qualified_name TEXT,
+                file_node_id INTEGER,
+                start_line INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        Ok(())
+    }
+
+    fn insert_file_node(conn: &Connection, id: i64, path: &str) -> Result<()> {
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, NULL, NULL, 1)",
+            params![id, NodeKind::FILE as i32, path],
+        )?;
+        Ok(())
+    }
 
     #[test]
     fn test_detect_language_extension_matrix() {
@@ -392,5 +452,73 @@ mod tests {
         for (path, language) in expected {
             assert_eq!(detect_language(Some(path)), language, "path={path}");
         }
+    }
+
+    #[test]
+    fn test_resolve_call_candidates_ignores_substring_fuzzy_matches() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        insert_file_node(&conn, 1, "app.tsx")?;
+        insert_file_node(&conn, 2, "boundary.tsx")?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                10_i64,
+                NodeKind::METHOD as i32,
+                "getDerivedStateFromError",
+                "ErrorBoundary.getDerivedStateFromError",
+                2_i64,
+                25_i64
+            ],
+        )?;
+
+        let index = SemanticCandidateIndex::load(&conn, &[NodeKind::METHOD as i32])?;
+        let out = resolve_call_candidates(
+            &index,
+            &[NodeKind::METHOD as i32],
+            "error",
+            Some(1),
+            detect_language(Some("app.tsx")),
+            0.82,
+            0.70,
+        )?;
+
+        assert!(out.is_empty(), "unexpected fuzzy candidates: {out:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_call_candidates_filter_cross_language_matches() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        insert_file_node(&conn, 1, "app.js")?;
+        insert_file_node(&conn, 2, "lib.rs")?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                20_i64,
+                NodeKind::FUNCTION as i32,
+                "helper",
+                "crate::helper",
+                2_i64,
+                5_i64
+            ],
+        )?;
+
+        let index = SemanticCandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
+        let out = resolve_call_candidates(
+            &index,
+            &[NodeKind::FUNCTION as i32],
+            "helper",
+            Some(1),
+            detect_language(Some("app.js")),
+            0.82,
+            0.70,
+        )?;
+
+        assert!(out.is_empty(), "unexpected cross-language candidates: {out:?}");
+        Ok(())
     }
 }

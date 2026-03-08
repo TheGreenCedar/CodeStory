@@ -1,6 +1,7 @@
 use super::{
     SemanticCandidateIndex, SemanticResolutionCandidate, SemanticResolutionRequest,
     SemanticResolver, resolve_call_candidates, resolve_import_candidates,
+    detect_language,
 };
 use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind};
@@ -51,7 +52,14 @@ impl JavaSemanticResolver {
             NodeKind::ANNOTATION as i32,
             NodeKind::ENUM as i32,
         ];
-        resolve_import_candidates(index, &kinds, symbol, request.file_id, 0.60)
+        resolve_import_candidates(
+            index,
+            &kinds,
+            symbol,
+            request.file_id,
+            detect_language(request.file_path.as_deref()),
+            0.60,
+        )
     }
 
     fn resolve_call(
@@ -73,7 +81,15 @@ impl JavaSemanticResolver {
         }
 
         let kinds = [NodeKind::METHOD as i32, NodeKind::FUNCTION as i32];
-        resolve_call_candidates(index, &kinds, call_name, request.file_id, 0.89, 0.72)
+        resolve_call_candidates(
+            index,
+            &kinds,
+            call_name,
+            request.file_id,
+            detect_language(request.file_path.as_deref()),
+            0.89,
+            0.72,
+        )
     }
 }
 

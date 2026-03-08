@@ -1,6 +1,7 @@
 use super::{
     SemanticCandidateIndex, SemanticResolutionCandidate, SemanticResolutionRequest,
     SemanticResolver, resolve_call_candidates, resolve_import_candidates,
+    detect_language,
 };
 use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind};
@@ -58,7 +59,14 @@ impl RustSemanticResolver {
             NodeKind::FUNCTION as i32,
             NodeKind::METHOD as i32,
         ];
-        resolve_import_candidates(index, &kinds, symbol, request.file_id, 0.61)
+        resolve_import_candidates(
+            index,
+            &kinds,
+            symbol,
+            request.file_id,
+            detect_language(request.file_path.as_deref()),
+            0.61,
+        )
     }
 
     fn resolve_call(
@@ -81,7 +89,15 @@ impl RustSemanticResolver {
         }
 
         let kinds = [NodeKind::METHOD as i32, NodeKind::FUNCTION as i32];
-        resolve_call_candidates(index, &kinds, call_name, request.file_id, 0.82, 0.73)
+        resolve_call_candidates(
+            index,
+            &kinds,
+            call_name,
+            request.file_id,
+            detect_language(request.file_path.as_deref()),
+            0.82,
+            0.73,
+        )
     }
 }
 

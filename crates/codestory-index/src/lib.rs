@@ -562,40 +562,45 @@ impl WorkspaceIndexer {
             .as_ref()
             .and_then(|db| db.get_parsed_info(&full_path));
 
-        match std::fs::read_to_string(&full_path) {
-            Ok(source) => match index_file(
-                &full_path,
-                &source,
-                lang,
-                lang_name,
-                graph_query,
-                compilation_info,
-                Some(Arc::clone(symbol_table)),
-            ) {
-                Ok(index_result) => {
-                    local_storage.files = index_result.files;
-                    local_storage.nodes = index_result.nodes;
-                    local_storage.edges = index_result.edges;
-                    local_storage.occurrences = index_result.occurrences;
-                    local_storage.component_access = index_result.component_access;
-                    local_storage.callable_projection_states =
-                        index_result.callable_projection_states;
+        match std::fs::read(&full_path) {
+            Ok(bytes) => {
+                // Some third-party/vendor sources contain legacy bytes but are still parseable enough
+                // for indexing once we decode them lossily.
+                let source = String::from_utf8_lossy(&bytes).into_owned();
+                match index_file(
+                    &full_path,
+                    &source,
+                    lang,
+                    lang_name,
+                    graph_query,
+                    compilation_info,
+                    Some(Arc::clone(symbol_table)),
+                ) {
+                    Ok(index_result) => {
+                        local_storage.files = index_result.files;
+                        local_storage.nodes = index_result.nodes;
+                        local_storage.edges = index_result.edges;
+                        local_storage.occurrences = index_result.occurrences;
+                        local_storage.component_access = index_result.component_access;
+                        local_storage.callable_projection_states =
+                            index_result.callable_projection_states;
+                    }
+                    Err(e) => {
+                        local_storage.add_error(codestory_core::ErrorInfo {
+                            message: format!(
+                                "Failed to index {:?}: {}",
+                                full_path.strip_prefix(root).unwrap_or(&full_path),
+                                e
+                            ),
+                            file_id: None,
+                            line: None,
+                            column: None,
+                            is_fatal: false,
+                            index_step: codestory_core::IndexStep::Indexing,
+                        });
+                    }
                 }
-                Err(e) => {
-                    local_storage.add_error(codestory_core::ErrorInfo {
-                        message: format!(
-                            "Failed to index {:?}: {}",
-                            full_path.strip_prefix(root).unwrap_or(&full_path),
-                            e
-                        ),
-                        file_id: None,
-                        line: None,
-                        column: None,
-                        is_fatal: false,
-                        index_step: codestory_core::IndexStep::Indexing,
-                    });
-                }
-            },
+            }
             Err(e) => {
                 local_storage.add_error(codestory_core::ErrorInfo {
                     message: format!("Failed to read {:?}: {}", path, e),
