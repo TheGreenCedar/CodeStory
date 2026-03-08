@@ -6,7 +6,7 @@ pub(super) fn compute_call_resolution(
     row: &UnresolvedEdgeRow,
     semantic_candidates: &[SemanticResolutionCandidate],
 ) -> Result<ComputedResolution> {
-    let (edge_id, file_id, caller_qualified, target_name, _, callsite_identity) = row;
+    let (edge_id, file_id, caller_qualified, _, target_name, _, callsite_identity) = row;
     let prepared_name = PreparedName::new(target_name.clone());
     let is_common_unqualified = is_common_unqualified_call_name(&prepared_name.original);
     let mut selected: Option<(i64, f32, ResolutionStrategy)> = None;
@@ -109,7 +109,8 @@ pub(super) fn compute_import_resolution(
     row: &UnresolvedEdgeRow,
     semantic_candidates: &[SemanticResolutionCandidate],
 ) -> Result<ComputedResolution> {
-    let (edge_id, file_id, caller_qualified, target_name, _, _) = row;
+    let (edge_id, file_id, caller_qualified, source_name, target_name, _, _) = row;
+    let has_alias = import_alias_mismatch(source_name, target_name);
     let caller_prefix = caller_qualified.as_deref().and_then(module_prefix);
     let name_candidates = import_name_candidates(target_name, pass.flags.legacy_mode)
         .into_iter()
@@ -230,7 +231,12 @@ pub(super) fn compute_import_resolution(
             None
         };
 
+    if has_alias && !matches!(selected, Some((_, _, ResolutionStrategy::ImportSameFile))) {
+        selected = None;
+    }
+
     if selected.is_none()
+        && !has_alias
         && let Some((candidate, confidence)) = semantic_fallback
     {
         selected = Some((
