@@ -33,6 +33,9 @@
 (type_item
   name: (type_identifier) @definition.typedef)
 
+(macro_definition
+  name: (identifier) @definition.macro)
+
 (function_item
   (visibility_modifier) @access
   name: (identifier) @definition.function)

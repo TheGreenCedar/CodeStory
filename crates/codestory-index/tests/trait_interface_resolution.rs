@@ -285,6 +285,36 @@ void EventBus::dispatchTo(EventListener& listener) {
 }
 
 #[test]
+fn test_rust_macro_calls_resolve_to_macro_definition() -> anyhow::Result<()> {
+    let (nodes, edges) = index_single_file(
+        "main.rs",
+        r#"
+macro_rules! dispatch {
+    ($listener:expr) => {
+        $listener.handle_event();
+    };
+}
+
+trait EventListener {
+    fn handle_event(&mut self);
+}
+
+struct EventBus;
+
+impl EventBus {
+    fn dispatch_to<L: EventListener>(&self, listener: &mut L) {
+        dispatch!(listener);
+    }
+}
+"#,
+    )?;
+
+    assert_resolved_call_to_name("main.rs", &nodes, &edges, "dispatch_to", "dispatch");
+
+    Ok(())
+}
+
+#[test]
 fn test_simple_call_resolution_across_all_supported_languages() -> anyhow::Result<()> {
     let cases = [
         (

@@ -10,10 +10,10 @@ use std::sync::OnceLock;
 
 use codestory_events::{Event, EventBus};
 use rayon::prelude::*;
-use streaming_iterator::StreamingIterator;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
+use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Node as TsNode, Parser, Point, Query, QueryCursor, Tree};
 use tree_sitter_graph::ast::File as GraphFile;
 use tree_sitter_graph::functions::Functions;
@@ -32,6 +32,7 @@ use symbol_table::SymbolTable;
 #[derive(Debug, Clone, Copy)]
 struct IndexFeatureFlags {
     legacy_edge_identity: bool,
+    lazy_graph_execution: bool,
 }
 
 impl IndexFeatureFlags {
@@ -39,6 +40,7 @@ impl IndexFeatureFlags {
         Self {
             legacy_edge_identity: env_flag("CODESTORY_INDEX_LEGACY_EDGE_IDENTITY", false)
                 || env_flag("CODESTORY_INDEX_LEGACY_DEDUP", false),
+            lazy_graph_execution: env_flag("CODESTORY_INDEX_GRAPH_LAZY", true),
         }
     }
 }
@@ -150,7 +152,12 @@ impl TagDefinitionIndex {
         }
     }
 
-    fn take(&mut self, name: &str, start_line: u32, start_col: Option<u32>) -> Option<TagDefinition> {
+    fn take(
+        &mut self,
+        name: &str,
+        start_line: u32,
+        start_col: Option<u32>,
+    ) -> Option<TagDefinition> {
         if let Some(start_col) = start_col {
             let exact_key = TagDefinitionKey {
                 name: name.to_string(),
@@ -183,33 +190,33 @@ impl LanguageConfig {
 impl LanguageRuleset {
     fn compiled_rules(&self, language: Language) -> Result<&'static CompiledLanguageRules> {
         match self {
-            LanguageRuleset::Python => compiled_rules_cache(language, PYTHON_GRAPH_QUERY, None, &PYTHON_RULES),
-            LanguageRuleset::Java => compiled_rules_cache(language, JAVA_GRAPH_QUERY, None, &JAVA_RULES),
+            LanguageRuleset::Python => {
+                compiled_rules_cache(language, PYTHON_GRAPH_QUERY, None, &PYTHON_RULES)
+            }
+            LanguageRuleset::Java => {
+                compiled_rules_cache(language, JAVA_GRAPH_QUERY, None, &JAVA_RULES)
+            }
             LanguageRuleset::Rust => compiled_rules_cache(
                 language,
                 RUST_GRAPH_QUERY,
                 Some(RUST_TAGS_QUERY),
                 &RUST_RULES,
             ),
-            LanguageRuleset::JavaScript => compiled_rules_cache(
-                language,
-                JAVASCRIPT_GRAPH_QUERY,
-                None,
-                &JAVASCRIPT_RULES,
-            ),
+            LanguageRuleset::JavaScript => {
+                compiled_rules_cache(language, JAVASCRIPT_GRAPH_QUERY, None, &JAVASCRIPT_RULES)
+            }
             LanguageRuleset::TypeScript => compiled_rules_cache(
                 language,
                 TYPESCRIPT_GRAPH_QUERY,
                 Some(TYPESCRIPT_TAGS_QUERY),
                 &TYPESCRIPT_RULES,
             ),
-            LanguageRuleset::Tsx => compiled_rules_cache(
-                language,
-                TSX_GRAPH_QUERY,
-                Some(TSX_TAGS_QUERY),
-                &TSX_RULES,
-            ),
-            LanguageRuleset::Cpp => compiled_rules_cache(language, CPP_GRAPH_QUERY, None, &CPP_RULES),
+            LanguageRuleset::Tsx => {
+                compiled_rules_cache(language, TSX_GRAPH_QUERY, Some(TSX_TAGS_QUERY), &TSX_RULES)
+            }
+            LanguageRuleset::Cpp => {
+                compiled_rules_cache(language, CPP_GRAPH_QUERY, None, &CPP_RULES)
+            }
             LanguageRuleset::C => compiled_rules_cache(language, C_GRAPH_QUERY, None, &C_RULES),
         }
     }
@@ -226,7 +233,9 @@ fn compiled_rules_cache(
             .map_err(|e| format!("Graph DSL error: {:?}", e))?;
         let tags_query = tags_query
             .filter(|query| !query.trim().is_empty())
-            .map(|query| Query::new(&language, query).map_err(|e| format!("Tag query error: {:?}", e)))
+            .map(|query| {
+                Query::new(&language, query).map_err(|e| format!("Tag query error: {:?}", e))
+            })
             .transpose()?;
         Ok::<CompiledLanguageRules, String>(CompiledLanguageRules {
             graph_file,
@@ -234,7 +243,9 @@ fn compiled_rules_cache(
         })
     });
 
-    compiled.as_ref().map_err(|message| anyhow!(message.clone()))
+    compiled
+        .as_ref()
+        .map_err(|message| anyhow!(message.clone()))
 }
 
 static PYTHON_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
@@ -274,6 +285,7 @@ fn tag_definition_kind(kind: &str) -> Option<NodeKind> {
         "struct" => Some(NodeKind::STRUCT),
         "interface" => Some(NodeKind::INTERFACE),
         "enum" => Some(NodeKind::ENUM),
+        "macro" => Some(NodeKind::MACRO),
         "typedef" => Some(NodeKind::TYPEDEF),
         "union" => Some(NodeKind::UNION),
         "function" => Some(NodeKind::FUNCTION),
@@ -639,7 +651,6 @@ impl WorkspaceIndexer {
                         .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
                 }
                 batched_storage.merge(local_storage);
-                reconcile_rust_impl_anchors(storage, &mut batched_storage)?;
 
                 let should_flush = !batched_storage.files.is_empty()
                     || !batched_storage.nodes.is_empty()
@@ -700,7 +711,8 @@ impl WorkspaceIndexer {
                     edge.kind == EdgeKind::OVERRIDE
                         && edge.resolved_target.is_none()
                         && resolution_scope.is_none_or(|scope| {
-                            edge.file_node_id.is_some_and(|file_id| scope.contains(&file_id.0))
+                            edge.file_node_id
+                                .is_some_and(|file_id| scope.contains(&file_id.0))
                         })
                 })
                 .count();
@@ -749,14 +761,12 @@ impl WorkspaceIndexer {
                 .scope_prepare_ms
                 .saturating_add(resolution_stats.telemetry.call_cleanup_ms);
             stats.resolved_calls_same_file = resolution_stats.strategy_counters.call_same_file;
-            stats.resolved_calls_same_module =
-                resolution_stats.strategy_counters.call_same_module;
+            stats.resolved_calls_same_module = resolution_stats.strategy_counters.call_same_module;
             stats.resolved_calls_global_unique =
                 resolution_stats.strategy_counters.call_global_unique;
             stats.resolved_calls_semantic =
                 resolution_stats.strategy_counters.call_semantic_fallback;
-            stats.resolved_imports_same_file =
-                resolution_stats.strategy_counters.import_same_file;
+            stats.resolved_imports_same_file = resolution_stats.strategy_counters.import_same_file;
             stats.resolved_imports_same_module =
                 resolution_stats.strategy_counters.import_same_module;
             stats.resolved_imports_global_unique =
@@ -1112,7 +1122,10 @@ fn infer_cpp_access_from_tree(tree: &Tree, source: &str, start_line: u32) -> Opt
 
     loop {
         if node.kind() == "field_declaration_list" {
-            let container_kind = node.parent().map(|parent| parent.kind()).unwrap_or_default();
+            let container_kind = node
+                .parent()
+                .map(|parent| parent.kind())
+                .unwrap_or_default();
             let mut current = if container_kind == "struct_specifier" {
                 AccessKind::Public
             } else {
@@ -1154,8 +1167,620 @@ struct ManualEdgeSpec {
     line: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GraphNodeSpan {
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+}
+
+fn graph_subspan_from_text_range(
+    parent: GraphNodeSpan,
+    text: &str,
+    start_offset: usize,
+    end_offset: usize,
+) -> Option<GraphNodeSpan> {
+    if start_offset >= end_offset
+        || end_offset > text.len()
+        || !text.is_char_boundary(start_offset)
+        || !text.is_char_boundary(end_offset)
+    {
+        return None;
+    }
+
+    let prefix = &text[..start_offset];
+    let matched = &text[start_offset..end_offset];
+    let start_line = parent.start_line + prefix.bytes().filter(|b| *b == b'\n').count() as u32;
+    let start_col = if let Some(last_newline) = prefix.rfind('\n') {
+        prefix[last_newline + 1..].len() as u32 + 1
+    } else {
+        parent.start_col + prefix.len() as u32
+    };
+    let end_line = start_line + matched.bytes().filter(|b| *b == b'\n').count() as u32;
+    let end_col = if let Some(last_newline) = matched.rfind('\n') {
+        matched[last_newline + 1..].len() as u32 + 1
+    } else {
+        start_col + matched.len() as u32
+    };
+
+    Some(GraphNodeSpan {
+        start_line,
+        start_col,
+        end_line,
+        end_col,
+    })
+}
+
+fn normalize_rust_impl_expr_surface(
+    text: &str,
+    span: GraphNodeSpan,
+) -> Option<(String, GraphNodeSpan)> {
+    let leading_ws = text.len().saturating_sub(text.trim_start().len());
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let base_end = trimmed.find('<').unwrap_or(trimmed.len());
+    let base = trimmed[..base_end].trim_end();
+    let segment_start = base.rfind("::").map(|idx| idx + 2).unwrap_or(0);
+    let terminal = base[segment_start..].trim();
+    if terminal.is_empty() {
+        return None;
+    }
+
+    let start_offset = leading_ws + segment_start;
+    let end_offset = start_offset + terminal.len();
+    let normalized_span = graph_subspan_from_text_range(span, text, start_offset, end_offset)?;
+    Some((terminal.to_string(), normalized_span))
+}
+
+fn rust_impl_expr_qualified_name(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let base_end = strip_trailing_generic_suffix_end(trimmed);
+    let qualified = trimmed[..base_end].trim();
+    (!qualified.is_empty()).then(|| qualified.to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DeclarationSpanOverrideKey {
+    kind: NodeKind,
+    name: String,
+    token_line: u32,
+    token_col: u32,
+}
+
+fn trimmed_node_text(node: TsNode<'_>, source: &str) -> Option<String> {
+    node_source_text(node, source)
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn ts_node_graph_span(node: TsNode<'_>) -> GraphNodeSpan {
+    let start = node.start_position();
+    let end = node.end_position();
+    GraphNodeSpan {
+        start_line: start.row as u32 + 1,
+        start_col: start.column as u32 + 1,
+        end_line: end.row as u32 + 1,
+        end_col: end.column as u32 + 1,
+    }
+}
+
+fn insert_declaration_span_override(
+    overrides: &mut HashMap<DeclarationSpanOverrideKey, GraphNodeSpan>,
+    kind: NodeKind,
+    name: String,
+    token_node: TsNode<'_>,
+    full_node: TsNode<'_>,
+) {
+    let token_span = ts_node_graph_span(token_node);
+    overrides.insert(
+        DeclarationSpanOverrideKey {
+            kind,
+            name,
+            token_line: token_span.start_line,
+            token_col: token_span.start_col,
+        },
+        ts_node_graph_span(full_node),
+    );
+}
+
+fn first_named_child_with_kind<'tree>(node: TsNode<'tree>, kind: &str) -> Option<TsNode<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
+}
+
+fn c_like_declarator_name_node(node: TsNode<'_>) -> Option<TsNode<'_>> {
+    match node.kind() {
+        "identifier"
+        | "field_identifier"
+        | "type_identifier"
+        | "qualified_identifier"
+        | "namespace_identifier"
+        | "destructor_name"
+        | "operator_name" => Some(node),
+        _ => node
+            .child_by_field_name("declarator")
+            .and_then(c_like_declarator_name_node)
+            .or_else(|| {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor)
+                    .find_map(c_like_declarator_name_node)
+            }),
+    }
+}
+
+fn c_specifier_span_node(node: TsNode<'_>) -> TsNode<'_> {
+    node.parent()
+        .filter(|parent| {
+            parent.kind() == "declaration" && parent.child_by_field_name("declarator").is_none()
+        })
+        .unwrap_or(node)
+}
+
+fn java_named_child(node: TsNode<'_>) -> Option<TsNode<'_>> {
+    node.child_by_field_name("name")
+        .or_else(|| first_named_child_with_kind(node, "identifier"))
+}
+
+fn collect_c_declaration_span_overrides(
+    tree: &Tree,
+    source: &str,
+    overrides: &mut HashMap<DeclarationSpanOverrideKey, GraphNodeSpan>,
+) {
+    walk_tree_nodes(tree.root_node(), &mut |node| match node.kind() {
+        "struct_specifier" => {
+            if let Some(name_node) = node.child_by_field_name("name")
+                && let Some(name) = trimmed_node_text(name_node, source)
+            {
+                insert_declaration_span_override(overrides, NodeKind::CLASS, name, name_node, node);
+            }
+        }
+        "union_specifier" => {
+            if let Some(name_node) = node.child_by_field_name("name")
+                && let Some(name) = trimmed_node_text(name_node, source)
+            {
+                insert_declaration_span_override(
+                    overrides,
+                    NodeKind::UNION,
+                    name,
+                    name_node,
+                    c_specifier_span_node(node),
+                );
+            }
+        }
+        "enum_specifier" => {
+            if let Some(name_node) = node.child_by_field_name("name")
+                && let Some(name) = trimmed_node_text(name_node, source)
+            {
+                insert_declaration_span_override(
+                    overrides,
+                    NodeKind::ENUM,
+                    name,
+                    name_node,
+                    c_specifier_span_node(node),
+                );
+            }
+        }
+        "enumerator" => {
+            if let Some(name_node) = node.child_by_field_name("name")
+                && let Some(name) = trimmed_node_text(name_node, source)
+            {
+                insert_declaration_span_override(
+                    overrides,
+                    NodeKind::ENUM_CONSTANT,
+                    name,
+                    name_node,
+                    node,
+                );
+            }
+        }
+        "function_definition" | "declaration" => {
+            if let Some(declarator) = node.child_by_field_name("declarator")
+                && let Some(name_node) = c_like_declarator_name_node(declarator)
+                && let Some(name) = trimmed_node_text(name_node, source)
+            {
+                insert_declaration_span_override(
+                    overrides,
+                    NodeKind::FUNCTION,
+                    name,
+                    name_node,
+                    node,
+                );
+            }
+        }
+        _ => {}
+    });
+}
+
+fn collect_cpp_declaration_span_overrides(
+    tree: &Tree,
+    source: &str,
+    overrides: &mut HashMap<DeclarationSpanOverrideKey, GraphNodeSpan>,
+) {
+    walk_tree_nodes(tree.root_node(), &mut |node| match node.kind() {
+        "class_specifier" | "struct_specifier" => {
+            if let Some(name_node) = node.child_by_field_name("name")
+                && let Some(name) = trimmed_node_text(name_node, source)
+            {
+                insert_declaration_span_override(overrides, NodeKind::CLASS, name, name_node, node);
+            }
+        }
+        "function_definition" => {
+            if let Some(declarator) = node.child_by_field_name("declarator")
+                && let Some(name_node) = c_like_declarator_name_node(declarator)
+                && let Some(name) = trimmed_node_text(name_node, source)
+            {
+                insert_declaration_span_override(
+                    overrides,
+                    NodeKind::FUNCTION,
+                    name,
+                    name_node,
+                    node,
+                );
+            }
+        }
+        _ => {}
+    });
+}
+
+fn collect_java_declaration_span_overrides(
+    tree: &Tree,
+    source: &str,
+    overrides: &mut HashMap<DeclarationSpanOverrideKey, GraphNodeSpan>,
+) {
+    walk_tree_nodes(tree.root_node(), &mut |node| match node.kind() {
+        "class_declaration" => {
+            if let Some(name_node) = java_named_child(node)
+                && let Some(name) = trimmed_node_text(name_node, source)
+            {
+                insert_declaration_span_override(overrides, NodeKind::CLASS, name, name_node, node);
+            }
+        }
+        "interface_declaration" => {
+            if let Some(name_node) = java_named_child(node)
+                && let Some(name) = trimmed_node_text(name_node, source)
+            {
+                insert_declaration_span_override(
+                    overrides,
+                    NodeKind::INTERFACE,
+                    name,
+                    name_node,
+                    node,
+                );
+            }
+        }
+        "record_declaration" => {
+            if let Some(name_node) = java_named_child(node)
+                && let Some(name) = trimmed_node_text(name_node, source)
+            {
+                insert_declaration_span_override(overrides, NodeKind::CLASS, name, name_node, node);
+            }
+        }
+        "enum_declaration" => {
+            if let Some(name_node) = java_named_child(node)
+                && let Some(name) = trimmed_node_text(name_node, source)
+            {
+                insert_declaration_span_override(overrides, NodeKind::ENUM, name, name_node, node);
+            }
+        }
+        "annotation_type_declaration" => {
+            if let Some(name_node) = java_named_child(node)
+                && let Some(name) = trimmed_node_text(name_node, source)
+            {
+                insert_declaration_span_override(
+                    overrides,
+                    NodeKind::ANNOTATION,
+                    name,
+                    name_node,
+                    node,
+                );
+            }
+        }
+        "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
+            if let Some(name_node) = java_named_child(node)
+                && let Some(name) = trimmed_node_text(name_node, source)
+            {
+                insert_declaration_span_override(
+                    overrides,
+                    NodeKind::METHOD,
+                    name,
+                    name_node,
+                    node,
+                );
+            }
+        }
+        "field_declaration" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() != "variable_declarator" {
+                    continue;
+                }
+                if let Some(name_node) = child.child_by_field_name("name")
+                    && let Some(name) = trimmed_node_text(name_node, source)
+                {
+                    insert_declaration_span_override(
+                        overrides,
+                        NodeKind::FIELD,
+                        name,
+                        name_node,
+                        node,
+                    );
+                }
+            }
+        }
+        "enum_constant" => {
+            if let Some(name_node) = java_named_child(node)
+                && let Some(name) = trimmed_node_text(name_node, source)
+            {
+                insert_declaration_span_override(
+                    overrides,
+                    NodeKind::ENUM_CONSTANT,
+                    name,
+                    name_node,
+                    node,
+                );
+            }
+        }
+        _ => {}
+    });
+}
+
+fn collect_declaration_span_overrides(
+    language_name: &str,
+    tree: &Tree,
+    source: &str,
+) -> HashMap<DeclarationSpanOverrideKey, GraphNodeSpan> {
+    let mut overrides = HashMap::new();
+    match language_name {
+        "c" => collect_c_declaration_span_overrides(tree, source, &mut overrides),
+        "cpp" => collect_cpp_declaration_span_overrides(tree, source, &mut overrides),
+        "java" => collect_java_declaration_span_overrides(tree, source, &mut overrides),
+        _ => {}
+    }
+    overrides
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeImportSpec {
+    binding_node_id: Option<NodeId>,
+    module_node_id: NodeId,
+    line: u32,
+    suppress_callee_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeSpanPolicy {
+    Definition,
+    Token,
+}
+
 fn node_source_text(node: TsNode<'_>, source: &str) -> Option<String> {
     source.get(node.byte_range()).map(ToString::to_string)
+}
+
+fn graph_capture_span_policy(
+    language_name: &str,
+    kind: NodeKind,
+    canonical_role: CanonicalNodeRole,
+    rust_impl_expr: bool,
+    name: &str,
+    has_token_surface_edge: bool,
+) -> NodeSpanPolicy {
+    if rust_impl_expr || has_token_surface_edge {
+        return NodeSpanPolicy::Token;
+    }
+
+    match (language_name, kind, canonical_role) {
+        ("java", NodeKind::ANNOTATION, CanonicalNodeRole::Declaration) => {
+            NodeSpanPolicy::Definition
+        }
+        ("java", NodeKind::ANNOTATION, _) => NodeSpanPolicy::Token,
+        ("cpp", NodeKind::UNKNOWN, _) if name.contains("::") || name.contains('<') => {
+            NodeSpanPolicy::Token
+        }
+        _ => NodeSpanPolicy::Definition,
+    }
+}
+
+fn is_ascii_identifier_start(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphabetic()
+}
+
+fn is_ascii_identifier_continue(byte: u8) -> bool {
+    is_ascii_identifier_start(byte) || byte.is_ascii_digit()
+}
+
+fn trim_ascii_end_index(text: &str) -> usize {
+    let mut end = text.len();
+    let bytes = text.as_bytes();
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    end
+}
+
+fn strip_trailing_generic_suffix_end(text: &str) -> usize {
+    let mut end = trim_ascii_end_index(text);
+    let bytes = text.as_bytes();
+    if end == 0 || bytes[end - 1] != b'>' {
+        return end;
+    }
+
+    let mut depth = 0usize;
+    let mut idx = end;
+    while idx > 0 {
+        idx -= 1;
+        match bytes[idx] {
+            b'>' => depth += 1,
+            b'<' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    end = idx;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    end
+}
+
+fn terminal_identifier_range(text: &str) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut end = strip_trailing_generic_suffix_end(text);
+    while end > 0 && !is_ascii_identifier_continue(bytes[end - 1]) {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+
+    let mut start = end - 1;
+    while start > 0 && is_ascii_identifier_continue(bytes[start - 1]) {
+        start -= 1;
+    }
+    is_ascii_identifier_start(bytes[start]).then_some((start, end))
+}
+
+fn line_col_to_byte_offset(source: &str, line: u32, col: u32) -> Option<usize> {
+    if line == 0 || col == 0 {
+        return None;
+    }
+
+    let mut current_line = 1u32;
+    let mut line_start = 0usize;
+    if current_line < line {
+        for (idx, byte) in source.bytes().enumerate() {
+            if byte == b'\n' {
+                current_line += 1;
+                line_start = idx + 1;
+                if current_line == line {
+                    break;
+                }
+            }
+        }
+    }
+
+    (current_line == line).then_some(line_start + col as usize - 1)
+}
+
+fn byte_offset_to_line_col(source: &str, offset: usize) -> Option<(u32, u32)> {
+    if offset > source.len() {
+        return None;
+    }
+
+    let mut line = 1u32;
+    let mut line_start = 0usize;
+    for (idx, byte) in source.bytes().enumerate() {
+        if idx == offset {
+            break;
+        }
+        if byte == b'\n' {
+            line += 1;
+            line_start = idx + 1;
+        }
+    }
+
+    Some((line, offset.saturating_sub(line_start) as u32 + 1))
+}
+
+fn source_span_text(
+    source: &str,
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+) -> Option<(usize, &str)> {
+    let start = line_col_to_byte_offset(source, start_line, start_col)?;
+    let end = line_col_to_byte_offset(source, end_line, end_col)?;
+    (start <= end && end <= source.len()).then_some((start, &source[start..end]))
+}
+
+fn extract_terminal_identifier_from_span(
+    source: &str,
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+) -> Option<(String, u32, u32, u32, u32)> {
+    let (base_offset, text) = source_span_text(source, start_line, start_col, end_line, end_col)?;
+    let (relative_start, relative_end) = terminal_identifier_range(text)?;
+    let absolute_start = base_offset + relative_start;
+    let absolute_end = base_offset + relative_end;
+    let (token_start_line, token_start_col) = byte_offset_to_line_col(source, absolute_start)?;
+    let (token_end_line, token_end_col) = byte_offset_to_line_col(source, absolute_end)?;
+    Some((
+        text[relative_start..relative_end].to_string(),
+        token_start_line,
+        token_start_col,
+        token_end_line,
+        token_end_col,
+    ))
+}
+
+fn normalize_graph_capture(
+    language_name: &str,
+    kind: NodeKind,
+    canonical_role: CanonicalNodeRole,
+    rust_impl_expr: bool,
+    name: &str,
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+    source: &str,
+    has_token_surface_edge: bool,
+) -> Option<(String, u32, u32, u32, u32)> {
+    let graph_span = GraphNodeSpan {
+        start_line,
+        start_col,
+        end_line,
+        end_col,
+    };
+
+    if language_name == "rust" && rust_impl_expr {
+        let (normalized_name, normalized_span) =
+            normalize_rust_impl_expr_surface(name, graph_span)?;
+        return Some((
+            normalized_name,
+            normalized_span.start_line,
+            normalized_span.start_col,
+            normalized_span.end_line,
+            normalized_span.end_col,
+        ));
+    }
+
+    if language_name == "rust" && canonical_role == CanonicalNodeRole::ImplAnchor {
+        return extract_terminal_identifier_from_span(
+            source, start_line, start_col, end_line, end_col,
+        );
+    }
+
+    if language_name == "cpp"
+        && kind == NodeKind::UNKNOWN
+        && (name.contains("::") || name.contains('<') || has_token_surface_edge)
+    {
+        return extract_terminal_identifier_from_span(
+            source, start_line, start_col, end_line, end_col,
+        );
+    }
+
+    None
 }
 
 fn split_top_level_type_arguments(raw: &str) -> Vec<String> {
@@ -1295,7 +1920,8 @@ fn collect_cpp_template_type_argument_edges(tree: &Tree, source: &str) -> Vec<Ma
         if node.kind() != "template_type" {
             return;
         }
-        let Some(template_name) = cpp_named_type_text(node.child_by_field_name("name"), source) else {
+        let Some(template_name) = cpp_named_type_text(node.child_by_field_name("name"), source)
+        else {
             return;
         };
         let Some(arguments) = node.child_by_field_name("arguments") else {
@@ -1337,16 +1963,18 @@ fn cpp_named_type_text(node: Option<TsNode<'_>>, source: &str) -> Option<String>
                     .to_string()
             })
         }
-        "type_identifier" | "qualified_identifier" | "primitive_type" | "identifier"
-        | "namespace_identifier" | "field_identifier" => {
-            node_source_text(node, source).map(|text| {
-                text.trim()
-                    .trim_start_matches("typename ")
-                    .trim_start_matches("class ")
-                    .trim()
-                    .to_string()
-            })
-        }
+        "type_identifier"
+        | "qualified_identifier"
+        | "primitive_type"
+        | "identifier"
+        | "namespace_identifier"
+        | "field_identifier" => node_source_text(node, source).map(|text| {
+            text.trim()
+                .trim_start_matches("typename ")
+                .trim_start_matches("class ")
+                .trim()
+                .to_string()
+        }),
         _ => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
@@ -1359,108 +1987,414 @@ fn cpp_named_type_text(node: Option<TsNode<'_>>, source: &str) -> Option<String>
     }
 }
 
+fn tsx_owner_name(mut node: TsNode<'_>, source: &str) -> Option<String> {
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "function_declaration" | "method_definition" => {
+                return parent
+                    .child_by_field_name("name")
+                    .and_then(|name| node_source_text(name, source))
+                    .map(|name| name.trim().to_string());
+            }
+            "arrow_function" | "function_expression" => {
+                return parent
+                    .parent()
+                    .and_then(|owner| tsx_callable_binding_name(owner, source));
+            }
+            _ => {
+                node = parent;
+            }
+        }
+    }
+    None
+}
+
+fn tsx_callable_binding_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "variable_declarator" | "public_field_definition" | "property_signature" => node
+            .child_by_field_name("name")
+            .and_then(|name| node_source_text(name, source))
+            .map(|name| name.trim().to_string()),
+        "pair" | "property_assignment" => node
+            .child_by_field_name("key")
+            .and_then(|name| node_source_text(name, source))
+            .map(|name| name.trim().to_string()),
+        _ => None,
+    }
+}
+
+fn is_probable_jsx_component_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains('.') {
+        return true;
+    }
+    trimmed
+        .chars()
+        .next()
+        .map(|ch| ch.is_ascii_uppercase())
+        .unwrap_or(false)
+}
+
+fn jsx_element_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("name")
+        .and_then(|name| node_source_text(name, source))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+fn jsx_attribute_target_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    let parent = node.parent()?;
+    if !matches!(
+        parent.kind(),
+        "jsx_opening_element" | "jsx_self_closing_element"
+    ) {
+        return None;
+    }
+    let element_name = jsx_element_name(parent, source)?;
+    if !is_probable_jsx_component_name(&element_name) {
+        return None;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == "property_identifier")
+        .and_then(|child| node_source_text(child, source))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
 fn collect_tsx_jsx_usage_edges(tree: &Tree, source: &str) -> Vec<ManualEdgeSpec> {
     let mut edges = Vec::new();
     walk_tree_nodes(tree.root_node(), &mut |node| {
-        let source_name = match node.kind() {
-            "function_declaration" | "method_definition" => node
-                .child_by_field_name("name")
-                .and_then(|name| node_source_text(name, source))
-                .map(|name| name.trim().to_string()),
-            _ => None,
-        };
-        let Some(source_name) = source_name else {
+        let Some(source_name) = tsx_owner_name(node, source) else {
             return;
         };
-        let Some(body) = node.child_by_field_name("body") else {
-            return;
-        };
-        collect_tsx_return_usage_edges(Some(body), &source_name, source, &mut edges);
-    });
-    edges
-}
-
-fn collect_tsx_return_usage_edges(
-    node: Option<TsNode<'_>>,
-    source_name: &str,
-    source: &str,
-    edges: &mut Vec<ManualEdgeSpec>,
-) {
-    let Some(node) = node else {
-        return;
-    };
-    if node.kind() == "return_statement" {
         let line = Some(node.start_position().row as u32 + 1);
-        collect_tsx_jsx_targets(Some(node), source_name, source, line, edges);
-        return;
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_tsx_return_usage_edges(Some(child), source_name, source, edges);
-    }
-}
-
-fn collect_tsx_jsx_targets(
-    node: Option<TsNode<'_>>,
-    source_name: &str,
-    source: &str,
-    line: Option<u32>,
-    edges: &mut Vec<ManualEdgeSpec>,
-) {
-    let Some(node) = node else {
-        return;
-    };
-    match node.kind() {
-        "jsx_self_closing_element" => {
-            if let Some(name) = node
-                .child_by_field_name("name")
-                .and_then(|name| node_source_text(name, source))
-            {
-                edges.push(ManualEdgeSpec {
-                    source_name: source_name.to_string(),
-                    target_name: name.trim().to_string(),
-                    kind: EdgeKind::USAGE,
-                    line,
-                });
-            }
-        }
-        "jsx_opening_element" => {
-            if let Some(name) = node
-                .child_by_field_name("name")
-                .and_then(|name| node_source_text(name, source))
-            {
-                edges.push(ManualEdgeSpec {
-                    source_name: source_name.to_string(),
-                    target_name: name.trim().to_string(),
-                    kind: EdgeKind::USAGE,
-                    line,
-                });
-            }
-        }
-        "jsx_attribute" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                if child.kind() != "property_identifier" {
-                    continue;
-                }
-                if let Some(name) = node_source_text(child, source) {
+        match node.kind() {
+            "jsx_self_closing_element" | "jsx_opening_element" => {
+                if let Some(name) = jsx_element_name(node, source)
+                    .filter(|name| is_probable_jsx_component_name(name))
+                {
                     edges.push(ManualEdgeSpec {
-                        source_name: source_name.to_string(),
-                        target_name: name.trim().to_string(),
+                        source_name,
+                        target_name: name,
+                        kind: EdgeKind::CALL,
+                        line,
+                    });
+                }
+            }
+            "jsx_attribute" => {
+                if let Some(name) = jsx_attribute_target_name(node, source) {
+                    edges.push(ManualEdgeSpec {
+                        source_name,
+                        target_name: name,
                         kind: EdgeKind::USAGE,
                         line,
                     });
                 }
             }
+            _ => {}
         }
-        _ => {}
+    });
+    edges
+}
+
+fn rust_macro_owner_name(mut node: TsNode<'_>, source: &str) -> Option<String> {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "function_item" {
+            return parent
+                .child_by_field_name("name")
+                .and_then(|name| node_source_text(name, source))
+                .map(|name| name.trim().to_string());
+        }
+        node = parent;
+    }
+    None
+}
+
+fn rust_macro_target_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("macro")
+        .and_then(|macro_node| node_source_text(macro_node, source))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+fn collect_rust_macro_call_edges(tree: &Tree, source: &str) -> Vec<ManualEdgeSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "macro_invocation" {
+            return;
+        }
+        let Some(source_name) = rust_macro_owner_name(node, source) else {
+            return;
+        };
+        let Some(target_name) = rust_macro_target_name(node, source) else {
+            return;
+        };
+        edges.push(ManualEdgeSpec {
+            source_name,
+            target_name,
+            kind: EdgeKind::CALL,
+            line: Some(node.start_position().row as u32 + 1),
+        });
+    });
+    edges
+}
+
+fn python_decorator_target_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "decorator" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find_map(|child| python_decorator_target_name(child, source))
+        }
+        "call" => node
+            .child_by_field_name("function")
+            .and_then(|function| python_decorator_target_name(function, source)),
+        "attribute" => node
+            .child_by_field_name("attribute")
+            .and_then(|attribute| node_source_text(attribute, source))
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty()),
+        "identifier" => node_source_text(node, source)
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty()),
+        _ => None,
+    }
+}
+
+fn collect_python_decorator_call_edges(tree: &Tree, source: &str) -> Vec<ManualEdgeSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "decorated_definition" {
+            return;
+        }
+        let Some(definition) = node.child_by_field_name("definition") else {
+            return;
+        };
+        let Some(source_name) = definition
+            .child_by_field_name("name")
+            .and_then(|name| node_source_text(name, source))
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+        else {
+            return;
+        };
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() != "decorator" {
+                continue;
+            }
+            let Some(target_name) = python_decorator_target_name(child, source) else {
+                continue;
+            };
+            edges.push(ManualEdgeSpec {
+                source_name: source_name.clone(),
+                target_name,
+                kind: EdgeKind::CALL,
+                line: Some(child.start_position().row as u32 + 1),
+            });
+        }
+    });
+    edges
+}
+
+fn node_matches_name(node: &Node, name: &str) -> bool {
+    node.serialized_name == name
+        || short_member_name(&node.serialized_name) == name
+        || node
+            .qualified_name
+            .as_deref()
+            .map(|qualified_name| {
+                qualified_name == name || short_member_name(qualified_name) == name
+            })
+            .unwrap_or(false)
+}
+
+fn runtime_import_binding_target_id(
+    node: TsNode<'_>,
+    source: &str,
+    file_name: &str,
+    unique_nodes: &mut HashMap<NodeId, Node>,
+    symbol_table: Option<&Arc<SymbolTable>>,
+) -> Option<NodeId> {
+    let name = node_source_text(node, source)?.trim().to_string();
+    if name.is_empty() {
+        return None;
     }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_tsx_jsx_targets(Some(child), source_name, source, line, edges);
+    let span = ts_node_graph_span(node);
+    if let Some(node_id) = unique_nodes
+        .values()
+        .filter(|candidate| !matches!(candidate.kind, NodeKind::FILE | NodeKind::MODULE))
+        .filter(|candidate| {
+            candidate.start_line == Some(span.start_line)
+                && candidate.start_col == Some(span.start_col)
+                && candidate.end_line == Some(span.end_line)
+                && candidate.end_col == Some(span.end_col)
+        })
+        .filter(|candidate| node_matches_name(candidate, &name))
+        .min_by_key(|candidate| candidate.id)
+        .map(|candidate| candidate.id)
+    {
+        return Some(node_id);
     }
+
+    let canonical_seed = format!(
+        "{file_name}:{name}:runtime_import_binding:{}:{}",
+        span.start_line, span.start_col
+    );
+    let node_id = NodeId(generate_id(&canonical_seed));
+    unique_nodes.entry(node_id).or_insert_with(|| Node {
+        id: node_id,
+        kind: NodeKind::UNKNOWN,
+        serialized_name: name.clone(),
+        start_line: Some(span.start_line),
+        start_col: Some(span.start_col),
+        end_line: Some(span.end_line),
+        end_col: Some(span.end_col),
+        ..Default::default()
+    });
+    if let Some(table) = symbol_table {
+        table.insert(node_id.0, NodeKind::UNKNOWN);
+    }
+    Some(node_id)
+}
+
+fn runtime_import_binding_node_id(
+    node: TsNode<'_>,
+    source: &str,
+    file_name: &str,
+    unique_nodes: &mut HashMap<NodeId, Node>,
+    symbol_table: Option<&Arc<SymbolTable>>,
+) -> Option<NodeId> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "parenthesized_expression"
+            | "await_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "type_assertion"
+            | "non_null_expression" => {
+                current = parent;
+            }
+            "variable_declarator" => {
+                return parent.child_by_field_name("name").and_then(|binding| {
+                    runtime_import_binding_target_id(
+                        binding,
+                        source,
+                        file_name,
+                        unique_nodes,
+                        symbol_table,
+                    )
+                });
+            }
+            "assignment_expression" => {
+                return parent.child_by_field_name("left").and_then(|binding| {
+                    runtime_import_binding_target_id(
+                        binding,
+                        source,
+                        file_name,
+                        unique_nodes,
+                        symbol_table,
+                    )
+                });
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn collect_runtime_import_specs(
+    language_name: &str,
+    file_name: &str,
+    tree: &Tree,
+    source: &str,
+    unique_nodes: &mut HashMap<NodeId, Node>,
+    symbol_table: Option<&Arc<SymbolTable>>,
+) -> Vec<RuntimeImportSpec> {
+    if !matches!(language_name, "javascript" | "typescript" | "tsx") {
+        return Vec::new();
+    }
+
+    let mut specs = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "call_expression" {
+            return;
+        }
+        let Some(function_node) = node.child_by_field_name("function") else {
+            return;
+        };
+        let Some(callee_name) =
+            node_source_text(function_node, source).map(|name| name.trim().to_string())
+        else {
+            return;
+        };
+        if callee_name != "require" && callee_name != "import" {
+            return;
+        }
+        let Some(arguments) = node.child_by_field_name("arguments") else {
+            return;
+        };
+        let mut cursor = arguments.walk();
+        let Some(module_node) =
+            arguments
+                .named_children(&mut cursor)
+                .find(|child| match child.kind() {
+                    "string" | "string_literal" => true,
+                    "template_string" => {
+                        let mut template_cursor = child.walk();
+                        !child
+                            .named_children(&mut template_cursor)
+                            .any(|part| part.kind() == "template_substitution")
+                    }
+                    _ => false,
+                })
+        else {
+            return;
+        };
+        let Some(module_name) = node_source_text(module_node, source)
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+        else {
+            return;
+        };
+        let start = module_node.start_position();
+        let end = module_node.end_position();
+        let line = start.row as u32 + 1;
+        let canonical_seed = format!("{file_name}:{module_name}:{line}");
+        let module_node_id = NodeId(generate_id(&canonical_seed));
+        unique_nodes.entry(module_node_id).or_insert_with(|| Node {
+            id: module_node_id,
+            kind: NodeKind::MODULE,
+            serialized_name: module_name,
+            start_line: Some(line),
+            start_col: Some(start.column as u32 + 1),
+            end_line: Some(end.row as u32 + 1),
+            end_col: Some(end.column as u32 + 1),
+            ..Default::default()
+        });
+        if let Some(table) = symbol_table {
+            table.insert(module_node_id.0, NodeKind::MODULE);
+        }
+        specs.push(RuntimeImportSpec {
+            binding_node_id: runtime_import_binding_node_id(
+                node,
+                source,
+                file_name,
+                unique_nodes,
+                symbol_table,
+            ),
+            module_node_id,
+            line,
+            suppress_callee_name: callee_name,
+        });
+    });
+    specs
 }
 
 fn unique_node_id_by_name<F>(
@@ -1480,7 +2414,9 @@ where
                 || node
                     .qualified_name
                     .as_deref()
-                    .map(|qualified_name| qualified_name == name || short_member_name(qualified_name) == name)
+                    .map(|qualified_name| {
+                        qualified_name == name || short_member_name(qualified_name) == name
+                    })
                     .unwrap_or(false)
         })
         .collect::<Vec<_>>();
@@ -1503,6 +2439,7 @@ fn append_manual_type_argument_edges(
     result_edges: &mut Vec<Edge>,
     edge_keys: &mut HashSet<EdgeDedupKey>,
     flags: IndexFeatureFlags,
+    callsite_ordinals: &mut HashMap<(NodeId, Option<u32>), u32>,
 ) {
     let specs = match language_name {
         "rust" => collect_rust_generic_type_argument_edges(tree, source),
@@ -1513,11 +2450,17 @@ fn append_manual_type_argument_edges(
     for spec in specs {
         let source_id = match spec.kind {
             EdgeKind::CALL => unique_node_id_by_name(unique_nodes, &spec.source_name, |kind| {
-                matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO)
+                matches!(
+                    kind,
+                    NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+                )
             }),
             EdgeKind::TYPE_ARGUMENT if language_name == "rust" => {
                 unique_node_id_by_name(unique_nodes, &spec.source_name, |kind| {
-                    matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO)
+                    matches!(
+                        kind,
+                        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+                    )
                 })
             }
             _ => unique_node_id_by_name(unique_nodes, &spec.source_name, is_type_like_kind),
@@ -1527,7 +2470,10 @@ fn append_manual_type_argument_edges(
         };
         let target_id = match spec.kind {
             EdgeKind::CALL => unique_node_id_by_name(unique_nodes, &spec.target_name, |kind| {
-                matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO)
+                matches!(
+                    kind,
+                    NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+                )
             }),
             _ => unique_node_id_by_name(unique_nodes, &spec.target_name, is_type_like_kind),
         };
@@ -1545,7 +2491,10 @@ fn append_manual_type_argument_edges(
             ..Default::default()
         };
         if edge.kind == EdgeKind::CALL && !flags.legacy_edge_identity {
-            ensure_callsite_identity(&mut edge, None);
+            let key = (edge.target, edge.line);
+            let next = callsite_ordinals.entry(key).or_insert(0);
+            *next = next.saturating_add(1);
+            ensure_callsite_identity(&mut edge, Some(*next));
         }
         if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
             continue;
@@ -1556,6 +2505,7 @@ fn append_manual_type_argument_edges(
 }
 
 fn append_manual_usage_edges(
+    language_name: &str,
     is_tsx_file: bool,
     tree: &Tree,
     source: &str,
@@ -1564,38 +2514,234 @@ fn append_manual_usage_edges(
     result_edges: &mut Vec<Edge>,
     edge_keys: &mut HashSet<EdgeDedupKey>,
     flags: IndexFeatureFlags,
+    callsite_ordinals: &mut HashMap<(NodeId, Option<u32>), u32>,
 ) {
-    if !is_tsx_file {
+    let mut specs = Vec::new();
+    if is_tsx_file {
+        specs.extend(collect_tsx_jsx_usage_edges(tree, source));
+    }
+    if language_name == "rust" {
+        specs.extend(collect_rust_macro_call_edges(tree, source));
+    }
+    if language_name == "python" {
+        specs.extend(collect_python_decorator_call_edges(tree, source));
+    }
+    if specs.is_empty() {
         return;
     }
 
-    for spec in collect_tsx_jsx_usage_edges(tree, source) {
+    for spec in specs {
         let Some(source_id) = unique_node_id_by_name(unique_nodes, &spec.source_name, |kind| {
-            matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD)
+            if language_name == "python" {
+                matches!(
+                    kind,
+                    NodeKind::CLASS | NodeKind::FUNCTION | NodeKind::METHOD
+                )
+            } else {
+                matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD)
+            }
         }) else {
             continue;
         };
-        let Some(target_id) = unique_node_id_by_name(unique_nodes, &spec.target_name, |kind| {
-            matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::FIELD)
-        }) else {
+        let target_id = match spec.kind {
+            EdgeKind::CALL => unique_node_id_by_name(unique_nodes, &spec.target_name, |kind| {
+                if is_tsx_file || language_name == "python" {
+                    matches!(
+                        kind,
+                        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO | NodeKind::UNKNOWN
+                    )
+                } else {
+                    matches!(
+                        kind,
+                        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+                    )
+                }
+            }),
+            _ => unique_node_id_by_name(unique_nodes, &spec.target_name, |kind| {
+                matches!(
+                    kind,
+                    NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::FIELD
+                )
+            }),
+        };
+        let Some(target_id) = target_id else {
             continue;
         };
+        if is_tsx_file
+            && result_edges.iter().any(|edge| {
+                edge.source == source_id
+                    && edge.target == target_id
+                    && edge.kind == spec.kind
+                    && edge.line == spec.line
+            })
+        {
+            continue;
+        }
 
         let mut edge = Edge {
             id: EdgeId(0),
             source: source_id,
             target: target_id,
-            kind: EdgeKind::USAGE,
+            kind: spec.kind,
             file_node_id: Some(file_id),
             line: spec.line,
             ..Default::default()
         };
+        if edge.kind == EdgeKind::CALL && !flags.legacy_edge_identity {
+            let key = (edge.target, edge.line);
+            let next = callsite_ordinals.entry(key).or_insert(0);
+            *next = next.saturating_add(1);
+            ensure_callsite_identity(&mut edge, Some(*next));
+        }
         if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
             continue;
         }
         edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
         result_edges.push(edge);
     }
+}
+
+fn append_runtime_import_edges(
+    specs: &[RuntimeImportSpec],
+    unique_nodes: &HashMap<NodeId, Node>,
+    file_id: NodeId,
+    result_edges: &mut Vec<Edge>,
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+) {
+    for spec in specs {
+        let source_id = spec
+            .binding_node_id
+            .filter(|node_id| unique_nodes.contains_key(node_id))
+            .unwrap_or(spec.module_node_id);
+        let edge = Edge {
+            id: EdgeId(generate_edge_id(
+                source_id.0,
+                spec.module_node_id.0,
+                EdgeKind::IMPORT,
+            )),
+            source: source_id,
+            target: spec.module_node_id,
+            kind: EdgeKind::IMPORT,
+            file_node_id: Some(file_id),
+            line: Some(spec.line),
+            ..Default::default()
+        };
+        if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
+            continue;
+        }
+        result_edges.push(edge);
+    }
+}
+
+fn collect_c_enum_member_pairs(tree: &Tree, source: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "enum_specifier" {
+            return;
+        }
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
+        };
+        let Some(enum_name) = trimmed_node_text(name_node, source) else {
+            return;
+        };
+        let Some(body) = node
+            .child_by_field_name("body")
+            .or_else(|| first_named_child_with_kind(node, "enumerator_list"))
+        else {
+            return;
+        };
+
+        let mut cursor = body.walk();
+        for child in body.named_children(&mut cursor) {
+            if child.kind() != "enumerator" {
+                continue;
+            }
+            if let Some(constant_name_node) = child.child_by_field_name("name")
+                && let Some(constant_name) = trimmed_node_text(constant_name_node, source)
+            {
+                pairs.push((enum_name.clone(), constant_name));
+            }
+        }
+    });
+    pairs
+}
+
+fn append_manual_c_enum_member_edges(
+    language_name: &str,
+    tree: &Tree,
+    source: &str,
+    unique_nodes: &HashMap<NodeId, Node>,
+    file_id: NodeId,
+    result_edges: &mut Vec<Edge>,
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+) {
+    if language_name != "c" {
+        return;
+    }
+
+    for (enum_name, constant_name) in collect_c_enum_member_pairs(tree, source) {
+        let Some(source_id) =
+            unique_node_id_by_name(unique_nodes, &enum_name, |kind| kind == NodeKind::ENUM)
+        else {
+            continue;
+        };
+        let Some(target_id) = unique_node_id_by_name(unique_nodes, &constant_name, |kind| {
+            kind == NodeKind::ENUM_CONSTANT
+        }) else {
+            continue;
+        };
+
+        let edge = Edge {
+            id: EdgeId(generate_edge_id(source_id.0, target_id.0, EdgeKind::MEMBER)),
+            source: source_id,
+            target: target_id,
+            kind: EdgeKind::MEMBER,
+            file_node_id: Some(file_id),
+            ..Default::default()
+        };
+        if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
+            continue;
+        }
+        result_edges.push(edge);
+    }
+}
+
+fn suppress_runtime_import_call_edges(
+    nodes: &[Node],
+    edges: &mut Vec<Edge>,
+    runtime_import_specs: &[RuntimeImportSpec],
+) {
+    if runtime_import_specs.is_empty() {
+        return;
+    }
+
+    let suppressed = runtime_import_specs
+        .iter()
+        .map(|spec| (spec.line, spec.suppress_callee_name.as_str()))
+        .collect::<HashSet<_>>();
+    let node_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<HashMap<_, _>>();
+
+    edges.retain(|edge| {
+        if edge.kind != EdgeKind::CALL {
+            return true;
+        }
+        let Some(line) = edge.line else {
+            return true;
+        };
+        let Some(target_name) = node_by_id
+            .get(&edge.target)
+            .map(|node| short_member_name(&node.serialized_name))
+        else {
+            return true;
+        };
+        !suppressed.contains(&(line, target_name))
+    });
 }
 
 fn infer_access_from_source(
@@ -1625,7 +2771,10 @@ fn infer_access_from_source(
             return access;
         }
     }
-    if let Some(prev_line) = start_line.checked_sub(1).and_then(|line| source_line(source, line)) {
+    if let Some(prev_line) = start_line
+        .checked_sub(1)
+        .and_then(|line| source_line(source, line))
+    {
         let access = match language_name {
             "rust" => classify_rust_visibility(prev_line),
             _ => classify_keyword_access(prev_line),
@@ -1713,11 +2862,22 @@ fn apply_qualified_names(nodes: Vec<Node>, edges: &[Edge], language_name: &str) 
         if !has_parent.contains_key(id)
             && let Some(node) = node_map.get(id)
         {
-            queue.push((*id, node.serialized_name.clone()));
+            let qualified_name = node
+                .qualified_name
+                .clone()
+                .unwrap_or_else(|| node.serialized_name.clone());
+            queue.push((*id, qualified_name));
         }
     }
 
     while let Some((parent_id, parent_qualified_name)) = queue.pop() {
+        let parent_serialized_name = node_map
+            .get(&parent_id)
+            .map(|parent_node| parent_node.serialized_name.clone())
+            .unwrap_or_else(|| parent_qualified_name.clone());
+        let parent_is_type_like = node_map
+            .get(&parent_id)
+            .is_some_and(|parent_node| is_type_like_kind(parent_node.kind));
         if let Some(children) = parent_map.get(&parent_id) {
             for child_id in children {
                 if let Some(child_node) = node_map.get_mut(child_id) {
@@ -1729,7 +2889,17 @@ fn apply_qualified_names(nodes: Vec<Node>, edges: &[Edge], language_name: &str) 
                         "{}{}{}",
                         parent_qualified_name, delimiter, child_node.serialized_name
                     );
-                    child_node.serialized_name = new_name.clone();
+                    // Keep members of type-like owners owner-qualified in both name fields so
+                    // downstream resolution can distinguish declared members from
+                    // placeholder/reference nodes that share the same terminal token,
+                    // without changing terminal names for module-owned type declarations.
+                    if parent_is_type_like {
+                        child_node.serialized_name = format!(
+                            "{}{}{}",
+                            parent_serialized_name, delimiter, child_node.serialized_name
+                        );
+                    }
+                    child_node.qualified_name = Some(new_name.clone());
                     queue.push((*child_id, new_name));
                 }
             }
@@ -1773,7 +2943,6 @@ fn is_type_like_kind(kind: NodeKind) -> bool {
             | NodeKind::TYPEDEF
             | NodeKind::TYPE_PARAMETER
             | NodeKind::BUILTIN_TYPE
-            | NodeKind::ANNOTATION
     )
 }
 
@@ -1843,7 +3012,10 @@ fn canonicalize_nodes(
     let mut grouped_nodes = BTreeMap::<String, Vec<Node>>::new();
 
     for mut node in final_nodes {
-        let qualified_name = node.serialized_name.clone();
+        let qualified_name = node
+            .qualified_name
+            .clone()
+            .unwrap_or_else(|| node.serialized_name.clone());
         node.qualified_name = Some(qualified_name.clone());
 
         let canonical_id = if is_type_like_kind(node.kind) {
@@ -1920,6 +3092,75 @@ fn remap_occurrences(occurrences: &mut [Occurrence], id_remap: &HashMap<NodeId, 
     }
 }
 
+fn remap_local_node_id(
+    edges: &mut [Edge],
+    occurrences: &mut [Occurrence],
+    from: NodeId,
+    to: NodeId,
+) {
+    for edge in edges {
+        if edge.source == from {
+            edge.source = to;
+        }
+        if edge.target == from {
+            edge.target = to;
+        }
+        if edge.resolved_source == Some(from) {
+            edge.resolved_source = Some(to);
+        }
+        if edge.resolved_target == Some(from) {
+            edge.resolved_target = Some(to);
+        }
+    }
+
+    for occurrence in occurrences {
+        if occurrence.element_id == from.0 {
+            occurrence.element_id = to.0;
+        }
+    }
+}
+
+fn reconcile_local_rust_impl_anchors(
+    nodes: &mut Vec<Node>,
+    edges: &mut [Edge],
+    occurrences: &mut [Occurrence],
+    canonical_roles: &HashMap<NodeId, CanonicalNodeRole>,
+) {
+    let impl_anchor_ids = nodes
+        .iter()
+        .filter_map(|node| {
+            (canonical_roles.get(&node.id) == Some(&CanonicalNodeRole::ImplAnchor))
+                .then_some(node.id)
+        })
+        .collect::<HashSet<_>>();
+    if impl_anchor_ids.is_empty() {
+        return;
+    }
+
+    let anchors = nodes
+        .iter()
+        .filter(|node| impl_anchor_ids.contains(&node.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut remaps = Vec::new();
+    for anchor in anchors {
+        if let Some(target_id) = choose_pending_impl_anchor_target(&anchor, nodes, &impl_anchor_ids)
+        {
+            remaps.push((anchor.id, target_id));
+        }
+    }
+    if remaps.is_empty() {
+        return;
+    }
+
+    for (from, to) in &remaps {
+        remap_local_node_id(edges, occurrences, *from, *to);
+    }
+
+    let removed_ids = remaps.iter().map(|(from, _)| *from).collect::<HashSet<_>>();
+    nodes.retain(|node| !removed_ids.contains(&node.id));
+}
+
 fn short_member_name(name: &str) -> &str {
     let colon = name.rfind("::").map(|idx| idx + 2).unwrap_or(0);
     let dot = name.rfind('.').map(|idx| idx + 1).unwrap_or(0);
@@ -1935,7 +3176,10 @@ fn rewrite_override_placeholders(file_id: NodeId, nodes: &mut Vec<Node>, edges: 
     let mut synthetic_nodes = Vec::new();
     let mut placeholder_by_source = HashMap::<NodeId, NodeId>::new();
 
-    for edge in edges.iter_mut().filter(|edge| edge.kind == EdgeKind::OVERRIDE) {
+    for edge in edges
+        .iter_mut()
+        .filter(|edge| edge.kind == EdgeKind::OVERRIDE)
+    {
         if edge.source != edge.target {
             continue;
         }
@@ -1974,10 +3218,16 @@ fn rewrite_override_placeholders(file_id: NodeId, nodes: &mut Vec<Node>, edges: 
 }
 
 fn reconcile_tsx_usage_targets(nodes: &[Node], edges: &mut [Edge]) {
-    let node_by_id = nodes.iter().map(|node| (node.id, node)).collect::<HashMap<_, _>>();
+    let node_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<HashMap<_, _>>();
     let mut best_by_key = HashMap::<(NodeKind, String), NodeId>::new();
     for node in nodes {
-        let key = (node.kind, short_member_name(&node.serialized_name).to_string());
+        let key = (
+            node.kind,
+            short_member_name(&node.serialized_name).to_string(),
+        );
         let replace = best_by_key
             .get(&key)
             .and_then(|current_id| node_by_id.get(current_id))
@@ -1994,7 +3244,10 @@ fn reconcile_tsx_usage_targets(nodes: &[Node], edges: &mut [Edge]) {
         }
     }
 
-    for edge in edges.iter_mut().filter(|edge| edge.kind == EdgeKind::USAGE) {
+    for edge in edges
+        .iter_mut()
+        .filter(|edge| matches!(edge.kind, EdgeKind::USAGE | EdgeKind::CALL))
+    {
         let Some(target_node) = node_by_id.get(&edge.target).copied() else {
             continue;
         };
@@ -2030,13 +3283,19 @@ fn prune_tsx_duplicate_reference_nodes(
         .flatten()
         .collect::<HashSet<_>>();
 
-    let node_by_id = nodes.iter().map(|node| (node.id, node)).collect::<HashMap<_, _>>();
+    let node_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<HashMap<_, _>>();
     let mut best_by_key = HashMap::<(NodeKind, String), NodeId>::new();
     for node in nodes.iter() {
         if !matches!(node.kind, NodeKind::FUNCTION | NodeKind::FIELD) {
             continue;
         }
-        let key = (node.kind, short_member_name(&node.serialized_name).to_string());
+        let key = (
+            node.kind,
+            short_member_name(&node.serialized_name).to_string(),
+        );
         let should_replace = best_by_key
             .get(&key)
             .and_then(|current_id| node_by_id.get(current_id))
@@ -2059,7 +3318,10 @@ fn prune_tsx_duplicate_reference_nodes(
             if !matches!(node.kind, NodeKind::FUNCTION | NodeKind::FIELD) {
                 return None;
             }
-            let key = (node.kind, short_member_name(&node.serialized_name).to_string());
+            let key = (
+                node.kind,
+                short_member_name(&node.serialized_name).to_string(),
+            );
             let preferred_id = best_by_key.get(&key).copied()?;
             (preferred_id != node.id && !referenced_ids.contains(&node.id)).then_some(node.id)
         })
@@ -2082,10 +3344,19 @@ fn post_process_index_results(
     language_name: &str,
     canonical_role_by_node_id: &HashMap<NodeId, CanonicalNodeRole>,
     is_tsx_file: bool,
+    runtime_import_specs: &[RuntimeImportSpec],
     flags: IndexFeatureFlags,
 ) -> (Vec<Node>, NodeId, HashMap<NodeId, NodeId>) {
     // Stage 1: qualify names before deduplication so canonical IDs are stable.
-    let final_nodes = apply_qualified_names(result_nodes, result_edges, language_name);
+    let mut final_nodes = apply_qualified_names(result_nodes, result_edges, language_name);
+    if language_name == "rust" {
+        reconcile_local_rust_impl_anchors(
+            &mut final_nodes,
+            result_edges,
+            result_occurrences,
+            canonical_role_by_node_id,
+        );
+    }
     // Stage 2: canonicalize nodes and capture the remap used by later repair stages.
     let (mut final_nodes, id_remap) =
         canonicalize_nodes(file_name, final_nodes, canonical_role_by_node_id);
@@ -2106,6 +3377,8 @@ fn post_process_index_results(
     rewrite_override_placeholders(new_file_id, &mut final_nodes, result_edges);
     // Stage 6: attribute calls to enclosing callables after the structural rewrites settle.
     apply_line_range_call_attribution(&final_nodes, result_edges, flags);
+    // Stage 7: runtime module imports should not retain generic CALL placeholders.
+    suppress_runtime_import_call_edges(&final_nodes, result_edges, runtime_import_specs);
 
     (final_nodes, new_file_id, id_remap)
 }
@@ -2167,14 +3440,60 @@ fn choose_pending_impl_anchor_target(
     nodes: &[Node],
     impl_anchor_ids: &HashSet<NodeId>,
 ) -> Option<NodeId> {
-    let mut matches = nodes
+    let candidates = nodes
         .iter()
         .filter(|candidate| {
             candidate.id != anchor.id
                 && is_type_like_kind(candidate.kind)
                 && !impl_anchor_ids.contains(&candidate.id)
-                && candidate.serialized_name == anchor.serialized_name
+                && (candidate.serialized_name == anchor.serialized_name
+                    || short_member_name(&candidate.serialized_name) == anchor.serialized_name)
         })
+        .collect::<Vec<_>>();
+
+    if let Some(anchor_qualified_name) = anchor.qualified_name.as_deref() {
+        let mut qualified_matches = candidates
+            .iter()
+            .filter(|candidate| candidate.qualified_name.as_deref() == Some(anchor_qualified_name))
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>();
+        qualified_matches.sort_unstable();
+        qualified_matches.dedup();
+        if let Some(anchor_file_id) = anchor.file_node_id {
+            let same_file = qualified_matches
+                .iter()
+                .copied()
+                .filter(|candidate_id| {
+                    candidates
+                        .iter()
+                        .find(|candidate| candidate.id == *candidate_id)
+                        .is_some_and(|candidate| candidate.file_node_id == Some(anchor_file_id))
+                })
+                .collect::<Vec<_>>();
+            if same_file.len() == 1 {
+                return Some(same_file[0]);
+            }
+        }
+        if qualified_matches.len() == 1 {
+            return Some(qualified_matches[0]);
+        }
+    }
+
+    if let Some(anchor_file_id) = anchor.file_node_id {
+        let mut same_file_matches = candidates
+            .iter()
+            .filter(|candidate| candidate.file_node_id == Some(anchor_file_id))
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>();
+        same_file_matches.sort_unstable();
+        same_file_matches.dedup();
+        if same_file_matches.len() == 1 {
+            return Some(same_file_matches[0]);
+        }
+    }
+
+    let mut matches = candidates
+        .iter()
         .map(|candidate| candidate.id)
         .collect::<Vec<_>>();
     matches.sort_unstable();
@@ -2186,16 +3505,13 @@ fn choose_pending_impl_anchor_target(
     }
 }
 
-fn choose_existing_impl_anchor_target(
-    storage: &Storage,
-    anchor: &Node,
-) -> Result<Option<NodeId>> {
+fn choose_existing_impl_anchor_target(storage: &Storage, anchor: &Node) -> Result<Option<NodeId>> {
     let mut query = String::from(
-        "SELECT id, qualified_name
+        "SELECT id, serialized_name, qualified_name, file_node_id
          FROM node
-         WHERE serialized_name = ?1
-           AND (canonical_id IS NULL OR canonical_id NOT LIKE 'impl_anchor:%')
-           AND kind IN (",
+         WHERE (serialized_name = ?1 OR serialized_name LIKE ?2)
+            AND (canonical_id IS NULL OR canonical_id NOT LIKE 'impl_anchor:%')
+            AND kind IN (",
     );
     let kind_values = rust_type_like_kind_values();
     for (idx, _) in kind_values.iter().enumerate() {
@@ -2211,7 +3527,10 @@ fn choose_existing_impl_anchor_target(
         .get_connection()
         .prepare(&query)
         .map_err(|e| anyhow!("Storage query error: {:?}", e))?;
-    let mut params = vec![rusqlite::types::Value::from(anchor.serialized_name.clone())];
+    let mut params = vec![
+        rusqlite::types::Value::from(anchor.serialized_name.clone()),
+        rusqlite::types::Value::from(format!("%::{}", anchor.serialized_name)),
+    ];
     params.extend(
         kind_values
             .iter()
@@ -2220,16 +3539,59 @@ fn choose_existing_impl_anchor_target(
     );
     let rows = stmt
         .query_map(rusqlite::params_from_iter(params), |row| {
-            Ok((NodeId(row.get::<_, i64>(0)?), row.get::<_, Option<String>>(1)?))
+            Ok((
+                NodeId(row.get::<_, i64>(0)?),
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?.map(NodeId),
+            ))
         })
         .map_err(|e| anyhow!("Storage query error: {:?}", e))?;
 
+    let anchor_qualified_name = anchor.qualified_name.as_deref();
+    let anchor_file_id = anchor.file_node_id;
+    let mut qualified_matches = Vec::new();
+    let mut same_file_matches = Vec::new();
     let mut matches = Vec::new();
     for row in rows {
-        let (node_id, qualified_name) = row.map_err(|e| anyhow!("Storage row error: {:?}", e))?;
-        let _ = qualified_name;
+        let (node_id, serialized_name, qualified_name, file_node_id) =
+            row.map_err(|e| anyhow!("Storage row error: {:?}", e))?;
+        if serialized_name != anchor.serialized_name
+            && short_member_name(&serialized_name) != anchor.serialized_name
+        {
+            continue;
+        }
+        if qualified_name.as_deref() == anchor_qualified_name {
+            qualified_matches.push(node_id);
+        }
+        if anchor_file_id.is_some() && file_node_id == anchor_file_id {
+            same_file_matches.push(node_id);
+        }
         matches.push(node_id);
     }
+
+    qualified_matches.sort_unstable();
+    qualified_matches.dedup();
+    if anchor_file_id.is_some() {
+        let qualified_same_file = qualified_matches
+            .iter()
+            .copied()
+            .filter(|node_id| same_file_matches.contains(node_id))
+            .collect::<Vec<_>>();
+        if qualified_same_file.len() == 1 {
+            return Ok(Some(qualified_same_file[0]));
+        }
+    }
+    if qualified_matches.len() == 1 {
+        return Ok(Some(qualified_matches[0]));
+    }
+
+    same_file_matches.sort_unstable();
+    same_file_matches.dedup();
+    if same_file_matches.len() == 1 {
+        return Ok(Some(same_file_matches[0]));
+    }
+
     matches.sort_unstable();
     matches.dedup();
     Ok(if matches.len() == 1 {
@@ -2239,10 +3601,7 @@ fn choose_existing_impl_anchor_target(
     })
 }
 
-fn reconcile_rust_impl_anchors(
-    storage: &Storage,
-    pending: &mut IntermediateStorage,
-) -> Result<()> {
+fn reconcile_rust_impl_anchors(storage: &Storage, pending: &mut IntermediateStorage) -> Result<()> {
     if pending.impl_anchor_node_ids.is_empty() {
         return Ok(());
     }
@@ -2256,7 +3615,12 @@ fn reconcile_rust_impl_anchors(
     let mut remaps = Vec::<(NodeId, NodeId)>::new();
 
     for anchor_id in anchor_ids {
-        let Some(anchor) = pending.nodes.iter().find(|node| node.id == anchor_id).cloned() else {
+        let Some(anchor) = pending
+            .nodes
+            .iter()
+            .find(|node| node.id == anchor_id)
+            .cloned()
+        else {
             continue;
         };
         if !is_type_like_kind(anchor.kind) {
@@ -2264,7 +3628,11 @@ fn reconcile_rust_impl_anchors(
         }
 
         let target = choose_pending_impl_anchor_target(&anchor, &pending.nodes, &impl_anchor_ids)
-            .or_else(|| choose_existing_impl_anchor_target(storage, &anchor).ok().flatten());
+            .or_else(|| {
+                choose_existing_impl_anchor_target(storage, &anchor)
+                    .ok()
+                    .flatten()
+            });
         if let Some(target_id) = target {
             remaps.push((anchor.id, target_id));
         }
@@ -2280,11 +3648,88 @@ fn reconcile_rust_impl_anchors(
 
     let removed_ids = remaps.iter().map(|(from, _)| *from).collect::<HashSet<_>>();
     pending.nodes.retain(|node| !removed_ids.contains(&node.id));
-    pending.impl_anchor_node_ids.retain(|node_id| !removed_ids.contains(node_id));
+    pending
+        .impl_anchor_node_ids
+        .retain(|node_id| !removed_ids.contains(node_id));
     pending.impl_anchor_node_ids.sort_unstable();
     pending.impl_anchor_node_ids.dedup();
 
     Ok(())
+}
+
+fn reconcile_local_impl_anchor_nodes(
+    nodes: &mut Vec<Node>,
+    edges: &mut [Edge],
+    occurrences: &mut [Occurrence],
+    component_access: &mut [(NodeId, AccessKind)],
+    impl_anchor_node_ids: &mut Vec<NodeId>,
+) {
+    if impl_anchor_node_ids.is_empty() {
+        return;
+    }
+
+    let impl_anchor_ids = impl_anchor_node_ids.iter().copied().collect::<HashSet<_>>();
+    let anchor_ids = impl_anchor_node_ids.clone();
+    let mut remaps = Vec::<(NodeId, NodeId)>::new();
+
+    for anchor_id in anchor_ids {
+        let Some(anchor) = nodes.iter().find(|node| node.id == anchor_id).cloned() else {
+            continue;
+        };
+        if !is_type_like_kind(anchor.kind) {
+            continue;
+        }
+
+        if let Some(target_id) = choose_pending_impl_anchor_target(&anchor, nodes, &impl_anchor_ids)
+        {
+            remaps.push((anchor.id, target_id));
+        }
+    }
+
+    if remaps.is_empty() {
+        return;
+    }
+
+    for (from, to) in &remaps {
+        for edge in edges.iter_mut() {
+            if edge.source == *from {
+                edge.source = *to;
+            }
+            if edge.target == *from {
+                edge.target = *to;
+            }
+            if edge.resolved_source == Some(*from) {
+                edge.resolved_source = Some(*to);
+            }
+            if edge.resolved_target == Some(*from) {
+                edge.resolved_target = Some(*to);
+            }
+        }
+
+        for occurrence in occurrences.iter_mut() {
+            if occurrence.element_id == from.0 {
+                occurrence.element_id = to.0;
+            }
+        }
+
+        for (node_id, _) in component_access.iter_mut() {
+            if *node_id == *from {
+                *node_id = *to;
+            }
+        }
+
+        for node_id in impl_anchor_node_ids.iter_mut() {
+            if *node_id == *from {
+                *node_id = *to;
+            }
+        }
+    }
+
+    let removed_ids = remaps.iter().map(|(from, _)| *from).collect::<HashSet<_>>();
+    nodes.retain(|node| !removed_ids.contains(&node.id));
+    impl_anchor_node_ids.retain(|node_id| !removed_ids.contains(node_id));
+    impl_anchor_node_ids.sort_unstable();
+    impl_anchor_node_ids.dedup();
 }
 
 /// Index a file and return the results.
@@ -2312,6 +3757,8 @@ pub fn index_file(
         .parse(source, None)
         .ok_or_else(|| anyhow!("Failed to parse source"))?;
     let mut tag_definitions = extract_tag_definitions(compiled_rules, &tree, source)?;
+    let declaration_span_overrides =
+        collect_declaration_span_overrides(language_config.language_name, &tree, source);
 
     let mut variables = Variables::new();
     if let Some(info) = &compilation_info {
@@ -2323,7 +3770,7 @@ pub fn index_file(
     }
 
     let functions = Functions::stdlib();
-    let config = ExecutionConfig::new(&functions, &variables);
+    let config = ExecutionConfig::new(&functions, &variables).lazy(flags.lazy_graph_execution);
 
     let graph = compiled_rules
         .graph_file
@@ -2376,6 +3823,7 @@ pub fn index_file(
         let mut end_col: Option<u32> = None;
         let mut access_kind: Option<AccessKind> = None;
         let mut canonical_role = CanonicalNodeRole::Unspecified;
+        let mut rust_impl_expr = false;
 
         for (attr, val) in node_data.attributes.iter() {
             match attr.as_str() {
@@ -2395,9 +3843,23 @@ pub fn index_file(
                         canonical_role = canonical_role_from_graph_attr(value);
                     }
                 }
+                "rust_impl_expr" => rust_impl_expr = true,
                 _ => {}
             }
         }
+        let has_token_surface_edge = node_data.iter_edges().any(|(_, edge)| {
+            edge.attributes
+                .iter()
+                .find_map(|(attr, val)| {
+                    if attr.as_str() != "kind" {
+                        return None;
+                    }
+                    val.as_str()
+                        .ok()
+                        .map(|kind| matches!(kind, "CALL" | "IMPORT" | "ANNOTATION_USAGE"))
+                })
+                .unwrap_or(false)
+        });
 
         if language_config.language_name == "rust"
             && kind_str == "MODULE"
@@ -2414,13 +3876,59 @@ pub fn index_file(
             {
                 kind = NodeKind::CONSTANT;
             }
+            let qualified_name_override =
+                if language_config.language_name == "rust" && rust_impl_expr {
+                    rust_impl_expr_qualified_name(&name_str)
+                } else {
+                    None
+                };
+            let span_policy = graph_capture_span_policy(
+                language_config.language_name,
+                kind,
+                canonical_role,
+                rust_impl_expr,
+                &name_str,
+                has_token_surface_edge,
+            );
 
             let mut start_line = start_row.map(|v| v + 1).unwrap_or(1);
             let mut start_col_1 = start_col.map(|v| v + 1).unwrap_or(1);
             let mut end_line_1 = end_row.map(|v| v + 1).unwrap_or(start_line);
             let mut end_col_1 = end_col.map(|v| v + 1).unwrap_or(start_col_1);
-            if let Some(definition) =
-                tag_definitions.take(&name_str, start_line, start_col.map(|v| v + 1))
+            if let Some((
+                normalized_name,
+                normalized_start_line,
+                normalized_start_col,
+                normalized_end_line,
+                normalized_end_col,
+            )) = normalize_graph_capture(
+                language_config.language_name,
+                kind,
+                canonical_role,
+                rust_impl_expr,
+                &name_str,
+                start_line,
+                start_col_1,
+                end_line_1,
+                end_col_1,
+                source,
+                has_token_surface_edge,
+            ) {
+                name_str = normalized_name;
+                start_line = normalized_start_line;
+                start_col_1 = normalized_start_col;
+                end_line_1 = normalized_end_line;
+                end_col_1 = normalized_end_col;
+            }
+            let declaration_span_key = DeclarationSpanOverrideKey {
+                kind,
+                name: name_str.clone(),
+                token_line: start_line,
+                token_col: start_col_1,
+            };
+            if span_policy == NodeSpanPolicy::Definition
+                && let Some(definition) =
+                    tag_definitions.take(&name_str, start_line, Some(start_col_1))
             {
                 kind = definition.kind;
                 access_kind = definition.access.or(access_kind);
@@ -2440,19 +3948,26 @@ pub fn index_file(
                     end_col_1 = end_col_1.max(definition.end_col);
                 }
             }
+            if span_policy == NodeSpanPolicy::Definition
+                && let Some(override_span) = declaration_span_overrides.get(&declaration_span_key)
+            {
+                start_line = override_span.start_line;
+                start_col_1 = override_span.start_col;
+                end_line_1 = override_span.end_line;
+                end_col_1 = override_span.end_col;
+            }
             let canonical_seed = format!("{}:{}:{}", file_name, name_str, start_line);
             let nid = NodeId(generate_id(&canonical_seed));
             graph_to_node_id.insert(node_id, nid);
-            let effective_access = access_kind
-                .or_else(|| {
-                    infer_access_from_source(
-                        language_config.language_name,
-                        &tree,
-                        source,
-                        start_line,
-                        kind,
-                    )
-                });
+            let effective_access = access_kind.or_else(|| {
+                infer_access_from_source(
+                    language_config.language_name,
+                    &tree,
+                    source,
+                    start_line,
+                    kind,
+                )
+            });
 
             unique_nodes.insert(
                 nid,
@@ -2460,6 +3975,7 @@ pub fn index_file(
                     id: nid,
                     kind,
                     serialized_name: name_str,
+                    qualified_name: qualified_name_override,
                     start_line: Some(start_line),
                     start_col: Some(start_col_1),
                     end_line: Some(end_line_1),
@@ -2506,6 +4022,15 @@ pub fn index_file(
             st.insert(nid.0, definition.kind);
         }
     }
+
+    let runtime_import_specs = collect_runtime_import_specs(
+        language_config.language_name,
+        &file_name,
+        &tree,
+        source,
+        &mut unique_nodes,
+        symbol_table.as_ref(),
+    );
 
     if !unique_nodes.is_empty() {
         result_nodes.extend(unique_nodes.values().cloned());
@@ -2603,11 +4128,32 @@ pub fn index_file(
         &mut result_edges,
         &mut edge_keys,
         flags,
+        &mut callsite_ordinals,
     );
     append_manual_usage_edges(
+        language_config.language_name,
         is_tsx_file,
         &tree,
         source,
+        &unique_nodes,
+        file_id,
+        &mut result_edges,
+        &mut edge_keys,
+        flags,
+        &mut callsite_ordinals,
+    );
+    append_manual_c_enum_member_edges(
+        language_config.language_name,
+        &tree,
+        source,
+        &unique_nodes,
+        file_id,
+        &mut result_edges,
+        &mut edge_keys,
+        flags,
+    );
+    append_runtime_import_edges(
+        &runtime_import_specs,
         &unique_nodes,
         file_id,
         &mut result_edges,
@@ -2627,9 +4173,13 @@ pub fn index_file(
         language_config.language_name,
         &canonical_role_by_node_id,
         is_tsx_file,
+        &runtime_import_specs,
         flags,
     );
-    let final_node_ids = final_nodes.iter().map(|node| node.id).collect::<HashSet<_>>();
+    let final_node_ids = final_nodes
+        .iter()
+        .map(|node| node.id)
+        .collect::<HashSet<_>>();
     let mut remapped_component_access: HashMap<NodeId, AccessKind> = HashMap::new();
     for (original_id, access) in component_access_by_node_id {
         let remapped_id = id_remap.get(&original_id).copied().unwrap_or(original_id);
@@ -2647,6 +4197,16 @@ pub fn index_file(
         .collect::<Vec<_>>();
     impl_anchor_node_ids.sort_unstable();
     impl_anchor_node_ids.dedup();
+
+    let mut final_nodes = final_nodes;
+    let mut component_access = component_access;
+    reconcile_local_impl_anchor_nodes(
+        &mut final_nodes,
+        &mut result_edges,
+        &mut result_occurrences,
+        &mut component_access,
+        &mut impl_anchor_node_ids,
+    );
 
     let callable_projection_states =
         build_callable_projection_states(&final_nodes, &result_edges, &result_occurrences);
@@ -2847,8 +4407,9 @@ fn apply_line_range_call_attribution(
 
     for edge in edges.iter_mut() {
         if edge.kind == EdgeKind::CALL {
-            let mut attributed = callable_ids.contains(&edge.source);
-            if let (Some(file_id), Some(line)) = (edge.file_node_id, edge.line)
+            let placeholder_source = edge.source == edge.target;
+            if placeholder_source
+                && let (Some(file_id), Some(line)) = (edge.file_node_id, edge.line)
                 && let Some(ranges) = functions_by_file.get(&file_id)
                 && let Some(best) = ranges
                     .iter()
@@ -2856,9 +4417,10 @@ fn apply_line_range_call_attribution(
                     .min_by_key(|range| (range.end - range.start, range.start))
             {
                 edge.source = best.id;
-                attributed = true;
             }
-            if !attributed || edge.source == edge.target {
+            if placeholder_source
+                && (!callable_ids.contains(&edge.source) || edge.source == edge.target)
+            {
                 continue;
             }
             if !flags.legacy_edge_identity {
@@ -3223,7 +4785,8 @@ mod tests {
             .ok_or_else(|| anyhow!("parser did not produce a tree"))?;
         let variables = Variables::new();
         let functions = Functions::stdlib();
-        let config = ExecutionConfig::new(&functions, &variables);
+        let config = ExecutionConfig::new(&functions, &variables)
+            .lazy(index_feature_flags().lazy_graph_execution);
         let graph = language_config
             .compiled_rules()?
             .graph_file
@@ -3428,6 +4991,245 @@ impl AppController {
     }
 
     #[test]
+    fn test_rust_impl_queries_normalize_plain_scoped_and_generic_type_expressions() -> Result<()> {
+        let rust_code = r#"
+mod api {
+    pub trait Runner {}
+}
+
+struct Plain;
+struct Generic<T>(T);
+
+mod nested {
+    pub struct Scoped;
+    pub struct ScopedGeneric<T>(pub T);
+}
+
+impl Plain {
+    fn plain(&self) {}
+}
+
+impl<T> Generic<T> {
+    fn generic(&self) {}
+}
+
+impl nested::Scoped {
+    fn scoped(&self) {}
+}
+
+impl<T> nested::ScopedGeneric<T> {
+    fn scoped_generic(&self) {}
+}
+
+impl api::Runner for nested::ScopedGeneric<String> {}
+"#;
+        let language_config = get_language_for_ext("rs").unwrap();
+
+        let result = index_file(
+            Path::new("main.rs"),
+            rust_code,
+            &language_config,
+            None,
+            None,
+        )?;
+
+        for (type_name, method_name) in [
+            ("Plain", "plain"),
+            ("Generic", "generic"),
+            ("Scoped", "scoped"),
+            ("ScopedGeneric", "scoped_generic"),
+        ] {
+            let matching = result
+                .nodes
+                .iter()
+                .filter(|node| {
+                    short_member_name(&node.serialized_name) == type_name
+                        && node.kind == NodeKind::STRUCT
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1, "expected one canonical {type_name} node");
+
+            let method = result
+                .nodes
+                .iter()
+                .find(|node| short_member_name(&node.serialized_name) == method_name)
+                .expect("expected impl method node");
+            assert!(result.edges.iter().any(|edge| {
+                edge.kind == EdgeKind::MEMBER
+                    && edge.source == matching[0].id
+                    && edge.target == method.id
+            }));
+        }
+
+        let runner = result
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name.ends_with("Runner"))
+            .expect("expected Runner node");
+        let scoped_generic = result
+            .nodes
+            .iter()
+            .find(|node| {
+                node.serialized_name.ends_with("ScopedGeneric") && node.kind == NodeKind::STRUCT
+            })
+            .expect("expected ScopedGeneric node");
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::INHERITANCE
+                && edge.source == scoped_generic.id
+                && edge.target == runner.id
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_runtime_import_edges_bind_to_the_exact_shadowed_binding() -> Result<()> {
+        let js_code = r#"
+const pkg = "outer";
+
+function load() {
+    const pkg = require("./pkg.js");
+    return pkg;
+}
+"#;
+        let language_config = get_language_for_ext("js").unwrap();
+        let result = index_file(Path::new("main.js"), js_code, &language_config, None, None)?;
+
+        let pkg_module = result
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::MODULE && node.serialized_name == "\"./pkg.js\"")
+            .expect("pkg module node");
+        let shadowed_pkg = result
+            .nodes
+            .iter()
+            .find(|node| {
+                node.kind == NodeKind::UNKNOWN
+                    && node.serialized_name == "pkg"
+                    && node.start_line == Some(5)
+            })
+            .expect("shadowed runtime import binding");
+
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::IMPORT
+                && edge.source == shadowed_pkg.id
+                && edge.target == pkg_module.id
+        }));
+        assert!(!result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::IMPORT
+                && edge.target == pkg_module.id
+                && edge.source != shadowed_pkg.id
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_rust_impl_query_simplification_keeps_terminal_type_names() -> Result<()> {
+        let rust_code = r#"
+mod outer {
+    pub struct Thing<T>(pub T);
+}
+
+trait Runner {
+    fn run(&self);
+}
+
+impl Runner for outer::Thing<String> {
+    fn run(&self) {}
+}
+
+impl outer::Thing<String> {
+    fn open(&self) {}
+}
+"#;
+        let language_config = get_language_for_ext("rs").unwrap();
+
+        let result = index_file(
+            Path::new("main.rs"),
+            rust_code,
+            &language_config,
+            None,
+            None,
+        )?;
+
+        let thing_nodes = result
+            .nodes
+            .iter()
+            .filter(|node| node.serialized_name.ends_with("Thing") && node.kind == NodeKind::STRUCT)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            thing_nodes.len(),
+            1,
+            "expected impl captures to normalize scoped generic type expressions to Thing"
+        );
+        assert_eq!(thing_nodes[0].kind, NodeKind::STRUCT);
+
+        let runner = result
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name.ends_with("Runner"))
+            .expect("Runner trait");
+        let open = result
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name.ends_with("open"))
+            .expect("open method");
+
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::INHERITANCE
+                && edge.source == thing_nodes[0].id
+                && edge.target == runner.id
+        }));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::MEMBER
+                && edge.source == thing_nodes[0].id
+                && edge.target == open.id
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_normalize_graph_capture_for_rust_impl_expr_uses_terminal_identifier_span() {
+        let source = "impl crate::api::Worker<T> {\n    fn run(&self) {}\n}\n";
+        let raw = "crate::api::Worker<T>";
+        let raw_start = source.find(raw).expect("raw impl type span");
+        let raw_end = raw_start + raw.len();
+        let worker_start = source.find("Worker").expect("terminal identifier start");
+        let worker_end = worker_start + "Worker".len();
+        let (start_line, start_col) =
+            byte_offset_to_line_col(source, raw_start).expect("raw start location");
+        let (end_line, end_col) =
+            byte_offset_to_line_col(source, raw_end).expect("raw end location");
+        let (worker_line, worker_col) =
+            byte_offset_to_line_col(source, worker_start).expect("worker start location");
+        let (worker_end_line, worker_end_col) =
+            byte_offset_to_line_col(source, worker_end).expect("worker end location");
+
+        let normalized = normalize_graph_capture(
+            "rust",
+            NodeKind::CLASS,
+            CanonicalNodeRole::ImplAnchor,
+            true,
+            raw,
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+            source,
+            false,
+        )
+        .expect("normalized Rust impl expression");
+
+        assert_eq!(normalized.0, "Worker");
+        assert_eq!(normalized.1, worker_line);
+        assert_eq!(normalized.2, worker_col);
+        assert_eq!(normalized.3, worker_end_line);
+        assert_eq!(normalized.4, worker_end_col);
+    }
+
+    #[test]
     fn test_index_cpp_semantics() -> Result<()> {
         let cpp_code = r#"
 class MyClass {
@@ -3461,13 +5263,7 @@ function globalFunc() {}
 "#;
         let language_config = get_language_for_ext("ts").unwrap();
 
-        let result = index_file(
-            Path::new("test.ts"),
-            ts_code,
-            &language_config,
-            None,
-            None,
-        )?;
+        let result = index_file(Path::new("test.ts"), ts_code, &language_config, None, None)?;
 
         // Find MyClass
         assert!(
@@ -3520,7 +5316,10 @@ function globalFunc() {}
         )?;
 
         assert_eq!(result.files.len(), 1);
-        assert!(!result.files[0].complete, "malformed Rust source should be incomplete");
+        assert!(
+            !result.files[0].complete,
+            "malformed Rust source should be incomplete"
+        );
         Ok(())
     }
 
@@ -3722,13 +5521,7 @@ class Derived : public Base {
 };
 "#;
         let language_config = get_language_for_ext("cpp").unwrap();
-        let result = index_file(
-            Path::new("test.cpp"),
-            code,
-            &language_config,
-            None,
-            None,
-        )?;
+        let result = index_file(Path::new("test.cpp"), code, &language_config, None, None)?;
 
         // Verify Membership
         assert!(
@@ -3759,13 +5552,7 @@ class MyClass:
     x = 1
 "#;
         let language_config = get_language_for_ext("py").unwrap();
-        let result = index_file(
-            Path::new("test.py"),
-            code,
-            &language_config,
-            None,
-            None,
-        )?;
+        let result = index_file(Path::new("test.py"), code, &language_config, None, None)?;
 
         // Verify Assignment Node
         assert!(
@@ -3776,8 +5563,8 @@ class MyClass:
         );
         // Verify IMPORT for import statement
         assert!(result.edges.iter().any(|e| e.kind == EdgeKind::IMPORT));
-        // Verify USAGE for decorator
-        assert!(result.edges.iter().any(|e| e.kind == EdgeKind::USAGE));
+        // Verify CALL for decorator
+        assert!(result.edges.iter().any(|e| e.kind == EdgeKind::CALL));
         Ok(())
     }
 
@@ -3792,13 +5579,7 @@ fn main() {
 }
 "#;
         let language_config = get_language_for_ext("rs").unwrap();
-        let result = index_file(
-            Path::new("main.rs"),
-            code,
-            &language_config,
-            None,
-            None,
-        )?;
+        let result = index_file(Path::new("main.rs"), code, &language_config, None, None)?;
 
         // Verify Trait Node
         assert!(
@@ -3809,8 +5590,8 @@ fn main() {
         );
         // Verify Impl Inheritance
         assert!(result.edges.iter().any(|e| e.kind == EdgeKind::INHERITANCE));
-        // Verify Macro usage
-        assert!(result.edges.iter().any(|e| e.kind == EdgeKind::USAGE));
+        // Verify macro CALL
+        assert!(result.edges.iter().any(|e| e.kind == EdgeKind::CALL));
         Ok(())
     }
 
@@ -3830,13 +5611,7 @@ impl<T> Listener for Wrapper<T> {
 }
 "#;
         let language_config = get_language_for_ext("rs").unwrap();
-        let result = index_file(
-            Path::new("main.rs"),
-            code,
-            &language_config,
-            None,
-            None,
-        )?;
+        let result = index_file(Path::new("main.rs"), code, &language_config, None, None)?;
 
         let listener = result
             .nodes
@@ -3869,6 +5644,101 @@ impl<T> Listener for Wrapper<T> {
     }
 
     #[test]
+    fn test_rust_impl_anchor_normalization_handles_plain_scoped_and_generic_forms() -> Result<()> {
+        let code = r#"
+mod inner {
+    pub trait Paint {}
+    pub trait Label<T> {}
+}
+
+struct Widget;
+struct Wrapper<T>(T);
+
+impl Widget {
+    fn plain(&self) {}
+}
+
+impl inner::Paint for Widget {}
+
+impl Wrapper<Widget> {
+    fn wrapped(&self) {}
+}
+
+impl inner::Label<Widget> for crate::Wrapper<Widget> {}
+"#;
+        let language_config = get_language_for_ext("rs").unwrap();
+        let result = index_file(Path::new("main.rs"), code, &language_config, None, None)?;
+
+        let widgets = result
+            .nodes
+            .iter()
+            .filter(|node| node.serialized_name == "Widget" && node.kind == NodeKind::STRUCT)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            widgets.len(),
+            1,
+            "expected one canonical Widget struct node"
+        );
+
+        let wrappers = result
+            .nodes
+            .iter()
+            .filter(|node| node.serialized_name == "Wrapper" && node.kind == NodeKind::STRUCT)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            wrappers.len(),
+            1,
+            "expected one canonical Wrapper struct node"
+        );
+
+        let paints = result
+            .nodes
+            .iter()
+            .filter(|node| node.serialized_name == "Paint" && node.kind == NodeKind::INTERFACE)
+            .collect::<Vec<_>>();
+        assert_eq!(paints.len(), 1, "expected one canonical Paint trait node");
+
+        let labels = result
+            .nodes
+            .iter()
+            .filter(|node| node.serialized_name == "Label" && node.kind == NodeKind::INTERFACE)
+            .collect::<Vec<_>>();
+        assert_eq!(labels.len(), 1, "expected one canonical Label trait node");
+
+        let plain = result
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name.ends_with("plain"))
+            .expect("plain method");
+        let wrapped = result
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name.ends_with("wrapped"))
+            .expect("wrapped method");
+
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::MEMBER && edge.source == widgets[0].id && edge.target == plain.id
+        }));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::MEMBER
+                && edge.source == wrappers[0].id
+                && edge.target == wrapped.id
+        }));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::INHERITANCE
+                && edge.source == widgets[0].id
+                && edge.target == paints[0].id
+        }));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::INHERITANCE
+                && edge.source == wrappers[0].id
+                && edge.target == labels[0].id
+        }));
+
+        Ok(())
+    }
+
+    #[test]
     fn test_index_rust_local_binding_and_closure_assignment_distinguish_variable_and_function()
     -> Result<()> {
         let code = r#"
@@ -3879,13 +5749,7 @@ fn sample(value: i32) -> i32 {
 }
 "#;
         let language_config = get_language_for_ext("rs").unwrap();
-        let result = index_file(
-            Path::new("main.rs"),
-            code,
-            &language_config,
-            None,
-            None,
-        )?;
+        let result = index_file(Path::new("main.rs"), code, &language_config, None, None)?;
 
         assert!(
             result
@@ -3928,14 +5792,16 @@ class Test {
             result
                 .nodes
                 .iter()
-                .any(|n| n.serialized_name.ends_with(".caller") && n.kind == NodeKind::METHOD),
+                .any(|n| short_member_name(&n.serialized_name) == "caller"
+                    && n.kind == NodeKind::METHOD),
             "Caller node not found"
         );
         assert!(
             result
                 .nodes
                 .iter()
-                .any(|n| n.serialized_name.ends_with(".callee") && n.kind == NodeKind::METHOD),
+                .any(|n| short_member_name(&n.serialized_name) == "callee"
+                    && n.kind == NodeKind::METHOD),
             "Callee node not found"
         );
         assert!(
@@ -3968,7 +5834,7 @@ class Test {
         let caller = result
             .nodes
             .iter()
-            .find(|n| n.serialized_name.ends_with(".second"))
+            .find(|n| short_member_name(&n.serialized_name) == "second")
             .expect("second() node not found");
 
         let call_edge = result
@@ -3987,6 +5853,7 @@ class Test {
 
         let flags = IndexFeatureFlags {
             legacy_edge_identity: false,
+            lazy_graph_execution: false,
         };
         let file_id = NodeId(1);
         let mut edges = vec![
@@ -4062,9 +5929,11 @@ class Test {
 
         let modern_flags = IndexFeatureFlags {
             legacy_edge_identity: false,
+            lazy_graph_execution: false,
         };
         let legacy_flags = IndexFeatureFlags {
             legacy_edge_identity: true,
+            lazy_graph_execution: false,
         };
         assert_ne!(
             edge_dedup_key(&edge_a, modern_flags),
@@ -4170,7 +6039,10 @@ class Test {
         let config = get_language_for_ext("tsx").expect("tsx config");
         let first = config.compiled_rules()? as *const CompiledLanguageRules;
         let second = config.compiled_rules()? as *const CompiledLanguageRules;
-        assert_eq!(first, second, "compiled rules should be cached per language");
+        assert_eq!(
+            first, second,
+            "compiled rules should be cached per language"
+        );
         Ok(())
     }
 
@@ -4187,7 +6059,11 @@ class Worker:
 "#,
             &get_language_for_ext("py").expect("python config"),
         )?;
-        assert!(python.nodes.contains(&("CLASS".to_string(), "Worker".to_string())));
+        assert!(
+            python
+                .nodes
+                .contains(&("CLASS".to_string(), "Worker".to_string()))
+        );
         assert!(python.edges.contains(&(
             "Worker".to_string(),
             "run".to_string(),
@@ -4225,7 +6101,10 @@ impl Worker {
 "#,
             &get_language_for_ext("rs").expect("rust config"),
         )?;
-        assert!(rust.nodes.contains(&("STRUCT".to_string(), "Worker".to_string())));
+        assert!(
+            rust.nodes
+                .contains(&("STRUCT".to_string(), "Worker".to_string()))
+        );
         assert!(rust.edges.contains(&(
             "crate::helpers::tool".to_string(),
             "crate::helpers::tool".to_string(),
@@ -4288,7 +6167,7 @@ class View {
         assert!(tsx.edges.contains(&(
             "render".to_string(),
             "Badge".to_string(),
-            "USAGE".to_string()
+            "CALL".to_string()
         )));
         assert!(tsx.edges.contains(&(
             "render".to_string(),
@@ -4345,7 +6224,11 @@ typedef struct Worker {
         }
 
         let java_kinds = parser_node_kinds(tree_sitter_java::LANGUAGE.into());
-        for kind in ["class_declaration", "method_declaration", "method_invocation"] {
+        for kind in [
+            "class_declaration",
+            "method_declaration",
+            "method_invocation",
+        ] {
             assert!(
                 java_kinds.contains(kind),
                 "java grammar should expose {kind}"
@@ -4353,7 +6236,12 @@ typedef struct Worker {
         }
 
         let rust_kinds = parser_node_kinds(tree_sitter_rust::LANGUAGE.into());
-        for kind in ["struct_item", "impl_item", "call_expression", "use_declaration"] {
+        for kind in [
+            "struct_item",
+            "impl_item",
+            "call_expression",
+            "use_declaration",
+        ] {
             assert!(
                 rust_kinds.contains(kind),
                 "rust grammar should expose {kind}"

@@ -154,7 +154,7 @@
   attr (@component.node) end_col = (end-column @component)
 
   edge @name.node -> @component.node
-  attr (@name.node -> @component.node) kind = "USAGE"
+  attr (@name.node -> @component.node) kind = "CALL"
 }
 
 (function_declaration
@@ -165,6 +165,25 @@
         (jsx_element
           (jsx_opening_element
             (jsx_attribute (property_identifier) @attribute)))))))
+{
+  node @attribute.node
+  attr (@attribute.node) kind = "FIELD"
+  attr (@attribute.node) name = (source-text @attribute)
+  attr (@attribute.node) start_row = (start-row @attribute)
+  attr (@attribute.node) start_col = (start-column @attribute)
+  attr (@attribute.node) end_row = (end-row @attribute)
+  attr (@attribute.node) end_col = (end-column @attribute)
+
+  edge @name.node -> @attribute.node
+  attr (@name.node -> @attribute.node) kind = "USAGE"
+}
+
+(function_declaration
+  name: (identifier) @name
+  body: (statement_block
+    (return_statement
+      (jsx_self_closing_element
+        (jsx_attribute (property_identifier) @attribute)))))
 {
   node @attribute.node
   attr (@attribute.node) kind = "FIELD"
@@ -199,7 +218,7 @@
   attr (@component.node) end_col = (end-column @component)
 
   edge @caller_name.node -> @component.node
-  attr (@caller_name.node -> @component.node) kind = "USAGE"
+  attr (@caller_name.node -> @component.node) kind = "CALL"
 }
 
 (method_definition
@@ -224,7 +243,7 @@
   attr (@component.node) end_col = (end-column @component)
 
   edge @caller_name.node -> @component.node
-  attr (@caller_name.node -> @component.node) kind = "USAGE"
+  attr (@caller_name.node -> @component.node) kind = "CALL"
 }
 
 
@@ -300,67 +319,71 @@
 }
 
 (import_statement
-  (import_clause (identifier) @module))
+  (import_clause (identifier) @binding_name)
+  source: (string) @module)
 {
-  node @module.node
-  attr (@module.node) kind = "MODULE"
-  attr (@module.node) name = (source-text @module)
-  attr (@module.node) start_row = (start-row @module)
-  attr (@module.node) start_col = (start-column @module)
-  attr (@module.node) end_row = (end-row @module)
-  attr (@module.node) end_col = (end-column @module)
+  node @binding_name.node
+  attr (@binding_name.node) kind = "UNKNOWN"
+  attr (@binding_name.node) name = (source-text @binding_name)
+  attr (@binding_name.node) start_row = (start-row @binding_name)
+  attr (@binding_name.node) start_col = (start-column @binding_name)
+  attr (@binding_name.node) end_row = (end-row @binding_name)
+  attr (@binding_name.node) end_col = (end-column @binding_name)
 
-  edge @module.node -> @module.node
-  attr (@module.node -> @module.node) kind = "IMPORT"
+  edge @binding_name.node -> @module.node
+  attr (@binding_name.node -> @module.node) kind = "IMPORT"
 }
 
 (import_statement
-  (import_clause (namespace_import (identifier) @module)))
+  (import_clause (namespace_import (identifier) @binding_name))
+  source: (string) @module)
 {
-  node @module.node
-  attr (@module.node) kind = "MODULE"
-  attr (@module.node) name = (source-text @module)
-  attr (@module.node) start_row = (start-row @module)
-  attr (@module.node) start_col = (start-column @module)
-  attr (@module.node) end_row = (end-row @module)
-  attr (@module.node) end_col = (end-column @module)
+  node @binding_name.node
+  attr (@binding_name.node) kind = "UNKNOWN"
+  attr (@binding_name.node) name = (source-text @binding_name)
+  attr (@binding_name.node) start_row = (start-row @binding_name)
+  attr (@binding_name.node) start_col = (start-column @binding_name)
+  attr (@binding_name.node) end_row = (end-row @binding_name)
+  attr (@binding_name.node) end_col = (end-column @binding_name)
 
-  edge @module.node -> @module.node
-  attr (@module.node -> @module.node) kind = "IMPORT"
-}
-
-(import_statement
-  (import_clause
-    (named_imports
-      (import_specifier name: (identifier) @module))))
-{
-  node @module.node
-  attr (@module.node) kind = "MODULE"
-  attr (@module.node) name = (source-text @module)
-  attr (@module.node) start_row = (start-row @module)
-  attr (@module.node) start_col = (start-column @module)
-  attr (@module.node) end_row = (end-row @module)
-  attr (@module.node) end_col = (end-column @module)
-
-  edge @module.node -> @module.node
-  attr (@module.node -> @module.node) kind = "IMPORT"
+  edge @binding_name.node -> @module.node
+  attr (@binding_name.node -> @module.node) kind = "IMPORT"
 }
 
 (import_statement
   (import_clause
     (named_imports
-      (import_specifier alias: (identifier) @module))))
+      (import_specifier name: (identifier) @binding_name)))
+  source: (string) @module)
 {
-  node @module.node
-  attr (@module.node) kind = "MODULE"
-  attr (@module.node) name = (source-text @module)
-  attr (@module.node) start_row = (start-row @module)
-  attr (@module.node) start_col = (start-column @module)
-  attr (@module.node) end_row = (end-row @module)
-  attr (@module.node) end_col = (end-column @module)
+  node @binding_name.node
+  attr (@binding_name.node) kind = "UNKNOWN"
+  attr (@binding_name.node) name = (source-text @binding_name)
+  attr (@binding_name.node) start_row = (start-row @binding_name)
+  attr (@binding_name.node) start_col = (start-column @binding_name)
+  attr (@binding_name.node) end_row = (end-row @binding_name)
+  attr (@binding_name.node) end_col = (end-column @binding_name)
 
-  edge @module.node -> @module.node
-  attr (@module.node -> @module.node) kind = "IMPORT"
+  edge @binding_name.node -> @module.node
+  attr (@binding_name.node -> @module.node) kind = "IMPORT"
+}
+
+(import_statement
+  (import_clause
+    (named_imports
+      (import_specifier alias: (identifier) @binding_name)))
+  source: (string) @module)
+{
+  node @binding_name.node
+  attr (@binding_name.node) kind = "UNKNOWN"
+  attr (@binding_name.node) name = (source-text @binding_name)
+  attr (@binding_name.node) start_row = (start-row @binding_name)
+  attr (@binding_name.node) start_col = (start-column @binding_name)
+  attr (@binding_name.node) end_row = (end-row @binding_name)
+  attr (@binding_name.node) end_col = (end-column @binding_name)
+
+  edge @binding_name.node -> @module.node
+  attr (@binding_name.node -> @module.node) kind = "IMPORT"
 }
 
 ;; Lambda assignment
@@ -502,7 +525,7 @@
   (nested_identifier) @target_name)
 {
   node @target_name.node
-  attr (@target_name.node) kind = "MODULE"
+  attr (@target_name.node) kind = "UNKNOWN"
   attr (@target_name.node) name = (source-text @target_name)
   attr (@target_name.node) start_row = (start-row @target_name)
   attr (@target_name.node) start_col = (start-column @target_name)
@@ -510,7 +533,7 @@
   attr (@target_name.node) end_col = (end-column @target_name)
 
   node @alias_name.node
-  attr (@alias_name.node) kind = "MODULE"
+  attr (@alias_name.node) kind = "UNKNOWN"
   attr (@alias_name.node) name = (source-text @alias_name)
   attr (@alias_name.node) start_row = (start-row @alias_name)
   attr (@alias_name.node) start_col = (start-column @alias_name)
@@ -535,7 +558,7 @@
   attr (@module.node) end_col = (end-column @module)
 
   node @alias_name.node
-  attr (@alias_name.node) kind = "MODULE"
+  attr (@alias_name.node) kind = "UNKNOWN"
   attr (@alias_name.node) name = (source-text @alias_name)
   attr (@alias_name.node) start_row = (start-row @alias_name)
   attr (@alias_name.node) start_col = (start-column @alias_name)
@@ -545,5 +568,3 @@
   edge @alias_name.node -> @module.node
   attr (@alias_name.node -> @module.node) kind = "IMPORT"
 }
-
-

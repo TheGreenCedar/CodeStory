@@ -491,10 +491,10 @@ fn test_language_extension_coverage_is_case_insensitive() {
         ("CPP", "cpp"),
     ];
     for (ext, expected_name) in expected {
-        let language_config = get_language_for_ext(ext).expect("Uppercase extension should resolve");
+        let language_config =
+            get_language_for_ext(ext).expect("Uppercase extension should resolve");
         assert_eq!(
-            language_config.language_name,
-            expected_name,
+            language_config.language_name, expected_name,
             "Wrong language for ext={ext}"
         );
         assert!(
@@ -522,13 +522,7 @@ export function App() {
 "#;
 
     let language_config = get_language_for_ext("tsx").expect("tsx extension should be supported");
-    let result = index_file(
-        Path::new("App.tsx"),
-        source,
-        &language_config,
-        None,
-        None,
-    )?;
+    let result = index_file(Path::new("App.tsx"), source, &language_config, None, None)?;
 
     assert!(
         !result.nodes.is_empty(),
@@ -546,11 +540,17 @@ export function App() {
         "Expected TSX parse to yield CALL edges"
     );
     assert!(
-        has_edge_between_names(&result.edges, &result.nodes, EdgeKind::USAGE, "App", "Badge"),
+        has_edge_between_names(&result.edges, &result.nodes, EdgeKind::CALL, "App", "Badge"),
         "Expected TSX parse to yield App -> Badge JSX usage"
     );
     assert!(
-        has_edge_between_names(&result.edges, &result.nodes, EdgeKind::USAGE, "App", "title"),
+        has_edge_between_names(
+            &result.edges,
+            &result.nodes,
+            EdgeKind::USAGE,
+            "App",
+            "title"
+        ),
         "Expected TSX parse to yield App -> title prop usage"
     );
     assert!(
@@ -573,13 +573,7 @@ enum Tone {
 "#;
 
     let language_config = get_language_for_ext("ts").expect("ts extension should be supported");
-    let result = index_file(
-        Path::new("types.ts"),
-        source,
-        &language_config,
-        None,
-        None,
-    )?;
+    let result = index_file(Path::new("types.ts"), source, &language_config, None, None)?;
 
     assert!(has_node(&result.nodes, NodeKind::TYPEDEF, "Props"));
     assert!(has_node(&result.nodes, NodeKind::ENUM, "Tone"));

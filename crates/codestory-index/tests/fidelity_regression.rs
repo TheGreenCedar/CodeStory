@@ -824,7 +824,7 @@ def run():
     assert!(has_edge_between_names(
         &edges,
         &nodes,
-        EdgeKind::USAGE,
+        EdgeKind::CALL,
         "run",
         "trace"
     ));

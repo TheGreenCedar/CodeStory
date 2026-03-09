@@ -48,6 +48,19 @@
   attr (@name.node) end_col = (end-column @name)
 }
 
+(union_item
+  name: (type_identifier) @name)
+{
+  node @name.node
+  attr (@name.node) kind = "UNION"
+  attr (@name.node) canonical_role = "declaration"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+}
+
 (trait_item
   name: (type_identifier) @name)
 {
@@ -59,6 +72,32 @@
   attr (@name.node) start_col = (start-column @name)
   attr (@name.node) end_row = (end-row @name)
   attr (@name.node) end_col = (end-column @name)
+}
+
+(type_item
+  name: (type_identifier) @name)
+{
+  node @name.node
+  attr (@name.node) kind = "TYPEDEF"
+  attr (@name.node) canonical_role = "declaration"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+}
+
+(macro_definition
+  name: (identifier) @name) @def
+{
+  node @name.node
+  attr (@name.node) kind = "MACRO"
+  attr (@name.node) canonical_role = "declaration"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
 }
 
 (mod_item
@@ -159,46 +198,47 @@
   attr (@mod_name.node -> @member_name.node) kind = "MEMBER"
 }
 
-;; Impl type node (ensure single capture per impl_item)
+;; Impl type node (normalize broad type expressions in Rust post-processing)
 (impl_item
-  type: (type_identifier) @type_name)
+  type: (_) @impl_type_expr)
 {
-  node @type_name.node
-  attr (@type_name.node) kind = "CLASS"
-  attr (@type_name.node) canonical_role = "impl_anchor"
-  attr (@type_name.node) name = (source-text @type_name)
-  attr (@type_name.node) start_row = (start-row @type_name)
-  attr (@type_name.node) start_col = (start-column @type_name)
-  attr (@type_name.node) end_row = (end-row @type_name)
-  attr (@type_name.node) end_col = (end-column @type_name)
+  node @impl_type_expr.node
+  attr (@impl_type_expr.node) kind = "CLASS"
+  attr (@impl_type_expr.node) canonical_role = "impl_anchor"
+  attr (@impl_type_expr.node) rust_impl_expr = "type"
+  attr (@impl_type_expr.node) name = (source-text @impl_type_expr)
+  attr (@impl_type_expr.node) start_row = (start-row @impl_type_expr)
+  attr (@impl_type_expr.node) start_col = (start-column @impl_type_expr)
+  attr (@impl_type_expr.node) end_row = (end-row @impl_type_expr)
+  attr (@impl_type_expr.node) end_col = (end-column @impl_type_expr)
 }
 
 ;; Impl method membership
 (impl_item
-  type: (type_identifier) @type_name
+  type: (_) @impl_type_expr
   body: (declaration_list
     (function_item name: (identifier) @method_name)))
 {
-  edge @type_name.node -> @method_name.node
-  attr (@type_name.node -> @method_name.node) kind = "MEMBER"
+  edge @impl_type_expr.node -> @method_name.node
+  attr (@impl_type_expr.node -> @method_name.node) kind = "MEMBER"
 }
 
 ;; Trait implementation (inheritance)
 (impl_item
-  trait: (type_identifier) @trait_name
-  type: (type_identifier) @type_name)
+  trait: (_) @impl_trait_expr
+  type: (_) @impl_type_expr)
 {
-  node @trait_name.node
-  attr (@trait_name.node) kind = "INTERFACE"
-  attr (@trait_name.node) canonical_role = "impl_anchor"
-  attr (@trait_name.node) name = (source-text @trait_name)
-  attr (@trait_name.node) start_row = (start-row @trait_name)
-  attr (@trait_name.node) start_col = (start-column @trait_name)
-  attr (@trait_name.node) end_row = (end-row @trait_name)
-  attr (@trait_name.node) end_col = (end-column @trait_name)
+  node @impl_trait_expr.node
+  attr (@impl_trait_expr.node) kind = "INTERFACE"
+  attr (@impl_trait_expr.node) rust_impl_expr = "trait"
+  attr (@impl_trait_expr.node) name = (source-text @impl_trait_expr)
+  attr (@impl_trait_expr.node) start_row = (start-row @impl_trait_expr)
+  attr (@impl_trait_expr.node) start_col = (start-column @impl_trait_expr)
+  attr (@impl_trait_expr.node) end_row = (end-row @impl_trait_expr)
+  attr (@impl_trait_expr.node) end_col = (end-column @impl_trait_expr)
 
-  edge @type_name.node -> @trait_name.node
-  attr (@type_name.node -> @trait_name.node) kind = "INHERITANCE"
+  edge @impl_type_expr.node -> @impl_trait_expr.node
+  attr (@impl_type_expr.node -> @impl_trait_expr.node) kind = "INHERITANCE"
 }
 
 ;; Calls (global fallback identifier)
@@ -270,6 +310,21 @@
   attr (@module.node -> @module.node) kind = "IMPORT"
 }
 
+(use_declaration
+  argument: (use_wildcard) @module)
+{
+  node @module.node
+  attr (@module.node) kind = "MODULE"
+  attr (@module.node) name = (source-text @module)
+  attr (@module.node) start_row = (start-row @module)
+  attr (@module.node) start_col = (start-column @module)
+  attr (@module.node) end_row = (end-row @module)
+  attr (@module.node) end_col = (end-column @module)
+
+  edge @module.node -> @module.node
+  attr (@module.node -> @module.node) kind = "IMPORT"
+}
+
 ;; Macro usage
 (function_item
   name: (identifier) @caller
@@ -278,7 +333,7 @@
       (macro_invocation macro: (identifier) @macro) @call)))
 {
   node @macro.node
-  attr (@macro.node) kind = "UNKNOWN"
+  attr (@macro.node) kind = "MACRO"
   attr (@macro.node) name = (source-text @macro)
   attr (@macro.node) start_row = (start-row @macro)
   attr (@macro.node) start_col = (start-column @macro)
@@ -286,7 +341,7 @@
   attr (@macro.node) end_col = (end-column @macro)
 
   edge @caller.node -> @macro.node
-  attr (@caller.node -> @macro.node) kind = "USAGE"
+  attr (@caller.node -> @macro.node) kind = "CALL"
   attr (@caller.node -> @macro.node) line = (start-row @call)
 }
 
@@ -318,271 +373,6 @@
   attr (@name.node) start_col = (start-column @name)
   attr (@name.node) end_row = (end-row @name)
   attr (@name.node) end_col = (end-column @name)
-}
-
-;; Impl type/trait variants
-(impl_item
-  type: (scoped_type_identifier
-    name: (type_identifier) @type_name))
-{
-  node @type_name.node
-  attr (@type_name.node) kind = "CLASS"
-  attr (@type_name.node) canonical_role = "impl_anchor"
-  attr (@type_name.node) name = (source-text @type_name)
-  attr (@type_name.node) start_row = (start-row @type_name)
-  attr (@type_name.node) start_col = (start-column @type_name)
-  attr (@type_name.node) end_row = (end-row @type_name)
-  attr (@type_name.node) end_col = (end-column @type_name)
-}
-
-(impl_item
-  type: (generic_type
-    type: (type_identifier) @type_name))
-{
-  node @type_name.node
-  attr (@type_name.node) kind = "CLASS"
-  attr (@type_name.node) canonical_role = "impl_anchor"
-  attr (@type_name.node) name = (source-text @type_name)
-  attr (@type_name.node) start_row = (start-row @type_name)
-  attr (@type_name.node) start_col = (start-column @type_name)
-  attr (@type_name.node) end_row = (end-row @type_name)
-  attr (@type_name.node) end_col = (end-column @type_name)
-}
-
-(impl_item
-  type: (generic_type
-    type: (scoped_type_identifier
-      name: (type_identifier) @type_name)))
-{
-  node @type_name.node
-  attr (@type_name.node) kind = "CLASS"
-  attr (@type_name.node) canonical_role = "impl_anchor"
-  attr (@type_name.node) name = (source-text @type_name)
-  attr (@type_name.node) start_row = (start-row @type_name)
-  attr (@type_name.node) start_col = (start-column @type_name)
-  attr (@type_name.node) end_row = (end-row @type_name)
-  attr (@type_name.node) end_col = (end-column @type_name)
-}
-
-(impl_item
-  type: (scoped_type_identifier
-    name: (type_identifier) @type_name)
-  body: (declaration_list
-    (function_item name: (identifier) @method_name)))
-{
-  edge @type_name.node -> @method_name.node
-  attr (@type_name.node -> @method_name.node) kind = "MEMBER"
-}
-
-(impl_item
-  type: (generic_type
-    type: (type_identifier) @type_name)
-  body: (declaration_list
-    (function_item name: (identifier) @method_name)))
-{
-  edge @type_name.node -> @method_name.node
-  attr (@type_name.node -> @method_name.node) kind = "MEMBER"
-}
-
-(impl_item
-  type: (generic_type
-    type: (scoped_type_identifier
-      name: (type_identifier) @type_name))
-  body: (declaration_list
-    (function_item name: (identifier) @method_name)))
-{
-  edge @type_name.node -> @method_name.node
-  attr (@type_name.node -> @method_name.node) kind = "MEMBER"
-}
-
-(impl_item
-  trait: (type_identifier) @trait_name
-  type: (generic_type
-    type: (type_identifier) @type_name))
-{
-  node @trait_name.node
-  attr (@trait_name.node) kind = "INTERFACE"
-  attr (@trait_name.node) canonical_role = "impl_anchor"
-  attr (@trait_name.node) name = (source-text @trait_name)
-  attr (@trait_name.node) start_row = (start-row @trait_name)
-  attr (@trait_name.node) start_col = (start-column @trait_name)
-  attr (@trait_name.node) end_row = (end-row @trait_name)
-  attr (@trait_name.node) end_col = (end-column @trait_name)
-
-  edge @type_name.node -> @trait_name.node
-  attr (@type_name.node -> @trait_name.node) kind = "INHERITANCE"
-}
-
-(impl_item
-  trait: (scoped_type_identifier
-    name: (type_identifier) @trait_name)
-  type: (type_identifier) @type_name)
-{
-  node @trait_name.node
-  attr (@trait_name.node) kind = "INTERFACE"
-  attr (@trait_name.node) canonical_role = "impl_anchor"
-  attr (@trait_name.node) name = (source-text @trait_name)
-  attr (@trait_name.node) start_row = (start-row @trait_name)
-  attr (@trait_name.node) start_col = (start-column @trait_name)
-  attr (@trait_name.node) end_row = (end-row @trait_name)
-  attr (@trait_name.node) end_col = (end-column @trait_name)
-
-  edge @type_name.node -> @trait_name.node
-  attr (@type_name.node -> @trait_name.node) kind = "INHERITANCE"
-}
-
-(impl_item
-  trait: (scoped_type_identifier
-    name: (type_identifier) @trait_name)
-  type: (generic_type
-    type: (type_identifier) @type_name))
-{
-  node @trait_name.node
-  attr (@trait_name.node) kind = "INTERFACE"
-  attr (@trait_name.node) canonical_role = "impl_anchor"
-  attr (@trait_name.node) name = (source-text @trait_name)
-  attr (@trait_name.node) start_row = (start-row @trait_name)
-  attr (@trait_name.node) start_col = (start-column @trait_name)
-  attr (@trait_name.node) end_row = (end-row @trait_name)
-  attr (@trait_name.node) end_col = (end-column @trait_name)
-
-  edge @type_name.node -> @trait_name.node
-  attr (@type_name.node -> @trait_name.node) kind = "INHERITANCE"
-}
-
-(impl_item
-  trait: (generic_type
-    type: (type_identifier) @trait_name)
-  type: (type_identifier) @type_name)
-{
-  node @trait_name.node
-  attr (@trait_name.node) kind = "INTERFACE"
-  attr (@trait_name.node) canonical_role = "impl_anchor"
-  attr (@trait_name.node) name = (source-text @trait_name)
-  attr (@trait_name.node) start_row = (start-row @trait_name)
-  attr (@trait_name.node) start_col = (start-column @trait_name)
-  attr (@trait_name.node) end_row = (end-row @trait_name)
-  attr (@trait_name.node) end_col = (end-column @trait_name)
-
-  edge @type_name.node -> @trait_name.node
-  attr (@type_name.node -> @trait_name.node) kind = "INHERITANCE"
-}
-
-(impl_item
-  trait: (generic_type
-    type: (type_identifier) @trait_name)
-  type: (generic_type
-    type: (type_identifier) @type_name))
-{
-  node @trait_name.node
-  attr (@trait_name.node) kind = "INTERFACE"
-  attr (@trait_name.node) canonical_role = "impl_anchor"
-  attr (@trait_name.node) name = (source-text @trait_name)
-  attr (@trait_name.node) start_row = (start-row @trait_name)
-  attr (@trait_name.node) start_col = (start-column @trait_name)
-  attr (@trait_name.node) end_row = (end-row @trait_name)
-  attr (@trait_name.node) end_col = (end-column @trait_name)
-
-  edge @type_name.node -> @trait_name.node
-  attr (@type_name.node -> @trait_name.node) kind = "INHERITANCE"
-}
-
-(impl_item
-  trait: (scoped_type_identifier
-    name: (type_identifier) @trait_name)
-  type: (scoped_type_identifier
-    name: (type_identifier) @type_name))
-{
-  node @trait_name.node
-  attr (@trait_name.node) kind = "INTERFACE"
-  attr (@trait_name.node) canonical_role = "impl_anchor"
-  attr (@trait_name.node) name = (source-text @trait_name)
-  attr (@trait_name.node) start_row = (start-row @trait_name)
-  attr (@trait_name.node) start_col = (start-column @trait_name)
-  attr (@trait_name.node) end_row = (end-row @trait_name)
-  attr (@trait_name.node) end_col = (end-column @trait_name)
-
-  edge @type_name.node -> @trait_name.node
-  attr (@type_name.node -> @trait_name.node) kind = "INHERITANCE"
-}
-
-(impl_item
-  trait: (generic_type
-    type: (type_identifier) @trait_name)
-  type: (scoped_type_identifier
-    name: (type_identifier) @type_name))
-{
-  node @trait_name.node
-  attr (@trait_name.node) kind = "INTERFACE"
-  attr (@trait_name.node) canonical_role = "impl_anchor"
-  attr (@trait_name.node) name = (source-text @trait_name)
-  attr (@trait_name.node) start_row = (start-row @trait_name)
-  attr (@trait_name.node) start_col = (start-column @trait_name)
-  attr (@trait_name.node) end_row = (end-row @trait_name)
-  attr (@trait_name.node) end_col = (end-column @trait_name)
-
-  edge @type_name.node -> @trait_name.node
-  attr (@type_name.node -> @trait_name.node) kind = "INHERITANCE"
-}
-
-(impl_item
-  trait: (generic_type
-    type: (scoped_type_identifier
-      name: (type_identifier) @trait_name))
-  type: (type_identifier) @type_name)
-{
-  node @trait_name.node
-  attr (@trait_name.node) kind = "INTERFACE"
-  attr (@trait_name.node) canonical_role = "impl_anchor"
-  attr (@trait_name.node) name = (source-text @trait_name)
-  attr (@trait_name.node) start_row = (start-row @trait_name)
-  attr (@trait_name.node) start_col = (start-column @trait_name)
-  attr (@trait_name.node) end_row = (end-row @trait_name)
-  attr (@trait_name.node) end_col = (end-column @trait_name)
-
-  edge @type_name.node -> @trait_name.node
-  attr (@type_name.node -> @trait_name.node) kind = "INHERITANCE"
-}
-
-(impl_item
-  trait: (generic_type
-    type: (scoped_type_identifier
-      name: (type_identifier) @trait_name))
-  type: (generic_type
-    type: (type_identifier) @type_name))
-{
-  node @trait_name.node
-  attr (@trait_name.node) kind = "INTERFACE"
-  attr (@trait_name.node) canonical_role = "impl_anchor"
-  attr (@trait_name.node) name = (source-text @trait_name)
-  attr (@trait_name.node) start_row = (start-row @trait_name)
-  attr (@trait_name.node) start_col = (start-column @trait_name)
-  attr (@trait_name.node) end_row = (end-row @trait_name)
-  attr (@trait_name.node) end_col = (end-column @trait_name)
-
-  edge @type_name.node -> @trait_name.node
-  attr (@type_name.node -> @trait_name.node) kind = "INHERITANCE"
-}
-
-(impl_item
-  trait: (generic_type
-    type: (scoped_type_identifier
-      name: (type_identifier) @trait_name))
-  type: (generic_type
-    type: (scoped_type_identifier
-      name: (type_identifier) @type_name)))
-{
-  node @trait_name.node
-  attr (@trait_name.node) kind = "INTERFACE"
-  attr (@trait_name.node) canonical_role = "impl_anchor"
-  attr (@trait_name.node) name = (source-text @trait_name)
-  attr (@trait_name.node) start_row = (start-row @trait_name)
-  attr (@trait_name.node) start_col = (start-column @trait_name)
-  attr (@trait_name.node) end_row = (end-row @trait_name)
-  attr (@trait_name.node) end_col = (end-column @trait_name)
-
-  edge @type_name.node -> @trait_name.node
-  attr (@type_name.node -> @trait_name.node) kind = "INHERITANCE"
 }
 
 ;; Imports (aliases and list forms)

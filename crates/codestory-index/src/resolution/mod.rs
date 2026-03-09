@@ -524,7 +524,15 @@ impl ResolutionPass {
         if self.flags.parallel_compute && rows.len() > 1 {
             rows.par_iter()
                 .map(
-                    |(_, file_id, caller_qualified, source_name, target_name, caller_file_path, _)| {
+                    |(
+                        _,
+                        file_id,
+                        caller_qualified,
+                        source_name,
+                        target_name,
+                        caller_file_path,
+                        _,
+                    )| {
                         self.semantic_candidates_for_edge(
                             index,
                             edge_kind,
@@ -540,7 +548,15 @@ impl ResolutionPass {
         } else {
             rows.iter()
                 .map(
-                    |(_, file_id, caller_qualified, source_name, target_name, caller_file_path, _)| {
+                    |(
+                        _,
+                        file_id,
+                        caller_qualified,
+                        source_name,
+                        target_name,
+                        caller_file_path,
+                        _,
+                    )| {
                         self.semantic_candidates_for_edge(
                             index,
                             edge_kind,
@@ -1130,7 +1146,12 @@ fn import_alias_mismatch(source_name: &str, target_name: &str) -> bool {
     let target_tail = target
         .rsplit("::")
         .next()
-        .and_then(|segment| segment.rsplit_once('.').map(|(_, tail)| tail).or(Some(segment)))
+        .and_then(|segment| {
+            segment
+                .rsplit_once('.')
+                .map(|(_, tail)| tail)
+                .or(Some(segment))
+        })
         .map(str::trim)
         .unwrap_or(target);
 

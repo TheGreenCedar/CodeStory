@@ -11,63 +11,88 @@
 }
 
 (class_declaration
-  name: (identifier) @name)
+  name: (identifier) @name) @def
 {
   node @name.node
   attr (@name.node) kind = "CLASS"
   attr (@name.node) name = (source-text @name)
-  attr (@name.node) start_row = (start-row @name)
-  attr (@name.node) start_col = (start-column @name)
-  attr (@name.node) end_row = (end-row @name)
-  attr (@name.node) end_col = (end-column @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
 }
 
 (interface_declaration
-  name: (identifier) @name)
+  name: (identifier) @name) @def
 {
   node @name.node
   attr (@name.node) kind = "INTERFACE"
   attr (@name.node) name = (source-text @name)
-  attr (@name.node) start_row = (start-row @name)
-  attr (@name.node) start_col = (start-column @name)
-  attr (@name.node) end_row = (end-row @name)
-  attr (@name.node) end_col = (end-column @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
 }
 
 (record_declaration
-  name: (identifier) @name)
+  name: (identifier) @name) @def
 {
   node @name.node
   attr (@name.node) kind = "CLASS"
   attr (@name.node) name = (source-text @name)
-  attr (@name.node) start_row = (start-row @name)
-  attr (@name.node) start_col = (start-column @name)
-  attr (@name.node) end_row = (end-row @name)
-  attr (@name.node) end_col = (end-column @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
 }
 
 (enum_declaration
-  name: (identifier) @name)
+  name: (identifier) @name) @def
 {
   node @name.node
   attr (@name.node) kind = "ENUM"
   attr (@name.node) name = (source-text @name)
-  attr (@name.node) start_row = (start-row @name)
-  attr (@name.node) start_col = (start-column @name)
-  attr (@name.node) end_row = (end-row @name)
-  attr (@name.node) end_col = (end-column @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
+(annotation_type_declaration
+  name: (identifier) @name) @def
+{
+  node @name.node
+  attr (@name.node) kind = "ANNOTATION"
+  attr (@name.node) canonical_role = "declaration"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
+(enum_constant
+  name: (identifier) @name) @def
+{
+  node @name.node
+  attr (@name.node) kind = "ENUM_CONSTANT"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
 }
 
 (field_declaration
-  (variable_declarator name: (identifier) @name))
+  (variable_declarator name: (identifier) @name)) @def
 {
   node @name.node
   attr (@name.node) kind = "FIELD"
   attr (@name.node) name = (source-text @name)
-  attr (@name.node) start_row = (start-row @name)
-  attr (@name.node) start_col = (start-column @name)
-  attr (@name.node) end_row = (end-row @name)
-  attr (@name.node) end_col = (end-column @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
 }
 
 (package_declaration
@@ -137,6 +162,57 @@
   attr (@interface_name.node -> @method_name.node) kind = "MEMBER"
 }
 
+(class_declaration
+  name: (identifier) @class_name
+  body: (class_body
+    (constructor_declaration name: (identifier) @method_name) @method_def))
+{
+  node @method_name.node
+  attr (@method_name.node) kind = "METHOD"
+  attr (@method_name.node) name = (source-text @method_name)
+  attr (@method_name.node) start_row = (start-row @method_def)
+  attr (@method_name.node) start_col = (start-column @method_def)
+  attr (@method_name.node) end_row = (end-row @method_def)
+  attr (@method_name.node) end_col = (end-column @method_def)
+
+  edge @class_name.node -> @method_name.node
+  attr (@class_name.node -> @method_name.node) kind = "MEMBER"
+}
+
+(record_declaration
+  name: (identifier) @class_name
+  body: (class_body
+    (constructor_declaration name: (identifier) @method_name) @method_def))
+{
+  node @method_name.node
+  attr (@method_name.node) kind = "METHOD"
+  attr (@method_name.node) name = (source-text @method_name)
+  attr (@method_name.node) start_row = (start-row @method_def)
+  attr (@method_name.node) start_col = (start-column @method_def)
+  attr (@method_name.node) end_row = (end-row @method_def)
+  attr (@method_name.node) end_col = (end-column @method_def)
+
+  edge @class_name.node -> @method_name.node
+  attr (@class_name.node -> @method_name.node) kind = "MEMBER"
+}
+
+(record_declaration
+  name: (identifier) @class_name
+  body: (class_body
+    (compact_constructor_declaration name: (identifier) @method_name) @method_def))
+{
+  node @method_name.node
+  attr (@method_name.node) kind = "METHOD"
+  attr (@method_name.node) name = (source-text @method_name)
+  attr (@method_name.node) start_row = (start-row @method_def)
+  attr (@method_name.node) start_col = (start-column @method_def)
+  attr (@method_name.node) end_row = (end-row @method_def)
+  attr (@method_name.node) end_col = (end-column @method_def)
+
+  edge @class_name.node -> @method_name.node
+  attr (@class_name.node -> @method_name.node) kind = "MEMBER"
+}
+
 ;; Membership (fields)
 (class_declaration
   name: (identifier) @class_name
@@ -145,6 +221,236 @@
 {
   edge @class_name.node -> @field_name.node
   attr (@class_name.node -> @field_name.node) kind = "MEMBER"
+}
+
+(enum_declaration
+  name: (identifier) @enum_name
+  body: (enum_body
+    (enum_constant name: (identifier) @constant_name)))
+{
+  edge @enum_name.node -> @constant_name.node
+  attr (@enum_name.node -> @constant_name.node) kind = "MEMBER"
+}
+
+(class_declaration
+  name: (identifier) @class_name
+  body: (class_body
+    (class_declaration name: (identifier) @member_name)))
+{
+  edge @class_name.node -> @member_name.node
+  attr (@class_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(class_declaration
+  name: (identifier) @class_name
+  body: (class_body
+    (interface_declaration name: (identifier) @member_name)))
+{
+  edge @class_name.node -> @member_name.node
+  attr (@class_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(class_declaration
+  name: (identifier) @class_name
+  body: (class_body
+    (enum_declaration name: (identifier) @member_name)))
+{
+  edge @class_name.node -> @member_name.node
+  attr (@class_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(class_declaration
+  name: (identifier) @class_name
+  body: (class_body
+    (record_declaration name: (identifier) @member_name)))
+{
+  edge @class_name.node -> @member_name.node
+  attr (@class_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(class_declaration
+  name: (identifier) @class_name
+  body: (class_body
+    (annotation_type_declaration name: (identifier) @member_name)))
+{
+  edge @class_name.node -> @member_name.node
+  attr (@class_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(interface_declaration
+  name: (identifier) @interface_name
+  body: (interface_body
+    (class_declaration name: (identifier) @member_name)))
+{
+  edge @interface_name.node -> @member_name.node
+  attr (@interface_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(interface_declaration
+  name: (identifier) @interface_name
+  body: (interface_body
+    (interface_declaration name: (identifier) @member_name)))
+{
+  edge @interface_name.node -> @member_name.node
+  attr (@interface_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(interface_declaration
+  name: (identifier) @interface_name
+  body: (interface_body
+    (enum_declaration name: (identifier) @member_name)))
+{
+  edge @interface_name.node -> @member_name.node
+  attr (@interface_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(interface_declaration
+  name: (identifier) @interface_name
+  body: (interface_body
+    (record_declaration name: (identifier) @member_name)))
+{
+  edge @interface_name.node -> @member_name.node
+  attr (@interface_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(interface_declaration
+  name: (identifier) @interface_name
+  body: (interface_body
+    (annotation_type_declaration name: (identifier) @member_name)))
+{
+  edge @interface_name.node -> @member_name.node
+  attr (@interface_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(record_declaration
+  name: (identifier) @record_name
+  body: (class_body
+    (class_declaration name: (identifier) @member_name)))
+{
+  edge @record_name.node -> @member_name.node
+  attr (@record_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(record_declaration
+  name: (identifier) @record_name
+  body: (class_body
+    (interface_declaration name: (identifier) @member_name)))
+{
+  edge @record_name.node -> @member_name.node
+  attr (@record_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(record_declaration
+  name: (identifier) @record_name
+  body: (class_body
+    (enum_declaration name: (identifier) @member_name)))
+{
+  edge @record_name.node -> @member_name.node
+  attr (@record_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(record_declaration
+  name: (identifier) @record_name
+  body: (class_body
+    (record_declaration name: (identifier) @member_name)))
+{
+  edge @record_name.node -> @member_name.node
+  attr (@record_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(record_declaration
+  name: (identifier) @record_name
+  body: (class_body
+    (annotation_type_declaration name: (identifier) @member_name)))
+{
+  edge @record_name.node -> @member_name.node
+  attr (@record_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(enum_declaration
+  name: (identifier) @enum_name
+  body: (enum_body
+    (enum_body_declarations
+      (class_declaration name: (identifier) @member_name))))
+{
+  edge @enum_name.node -> @member_name.node
+  attr (@enum_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(enum_declaration
+  name: (identifier) @enum_name
+  body: (enum_body
+    (enum_body_declarations
+      (interface_declaration name: (identifier) @member_name))))
+{
+  edge @enum_name.node -> @member_name.node
+  attr (@enum_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(enum_declaration
+  name: (identifier) @enum_name
+  body: (enum_body
+    (enum_body_declarations
+      (enum_declaration name: (identifier) @member_name))))
+{
+  edge @enum_name.node -> @member_name.node
+  attr (@enum_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(enum_declaration
+  name: (identifier) @enum_name
+  body: (enum_body
+    (enum_body_declarations
+      (record_declaration name: (identifier) @member_name))))
+{
+  edge @enum_name.node -> @member_name.node
+  attr (@enum_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(enum_declaration
+  name: (identifier) @enum_name
+  body: (enum_body
+    (enum_body_declarations
+      (annotation_type_declaration name: (identifier) @member_name))))
+{
+  edge @enum_name.node -> @member_name.node
+  attr (@enum_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(annotation_type_declaration
+  name: (identifier) @annotation_name
+  body: (annotation_type_body
+    (class_declaration name: (identifier) @member_name)))
+{
+  edge @annotation_name.node -> @member_name.node
+  attr (@annotation_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(annotation_type_declaration
+  name: (identifier) @annotation_name
+  body: (annotation_type_body
+    (interface_declaration name: (identifier) @member_name)))
+{
+  edge @annotation_name.node -> @member_name.node
+  attr (@annotation_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(annotation_type_declaration
+  name: (identifier) @annotation_name
+  body: (annotation_type_body
+    (enum_declaration name: (identifier) @member_name)))
+{
+  edge @annotation_name.node -> @member_name.node
+  attr (@annotation_name.node -> @member_name.node) kind = "MEMBER"
+}
+
+(annotation_type_declaration
+  name: (identifier) @annotation_name
+  body: (annotation_type_body
+    (annotation_type_declaration name: (identifier) @member_name)))
+{
+  edge @annotation_name.node -> @member_name.node
+  attr (@annotation_name.node -> @member_name.node) kind = "MEMBER"
 }
 
 ;; Package membership
@@ -212,6 +518,38 @@
   edge @call_any.node -> @call_any.node
   attr (@call_any.node -> @call_any.node) kind = "CALL"
   attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
+}
+
+(annotation
+  name: (_) @annotation_name) @annotation_use
+{
+  node @annotation_name.node
+  attr (@annotation_name.node) kind = "ANNOTATION"
+  attr (@annotation_name.node) name = (source-text @annotation_name)
+  attr (@annotation_name.node) start_row = (start-row @annotation_name)
+  attr (@annotation_name.node) start_col = (start-column @annotation_name)
+  attr (@annotation_name.node) end_row = (end-row @annotation_name)
+  attr (@annotation_name.node) end_col = (end-column @annotation_name)
+
+  edge @annotation_name.node -> @annotation_name.node
+  attr (@annotation_name.node -> @annotation_name.node) kind = "ANNOTATION_USAGE"
+  attr (@annotation_name.node -> @annotation_name.node) line = (start-row @annotation_use)
+}
+
+(marker_annotation
+  name: (_) @annotation_name) @annotation_use
+{
+  node @annotation_name.node
+  attr (@annotation_name.node) kind = "ANNOTATION"
+  attr (@annotation_name.node) name = (source-text @annotation_name)
+  attr (@annotation_name.node) start_row = (start-row @annotation_name)
+  attr (@annotation_name.node) start_col = (start-column @annotation_name)
+  attr (@annotation_name.node) end_row = (end-row @annotation_name)
+  attr (@annotation_name.node) end_col = (end-column @annotation_name)
+
+  edge @annotation_name.node -> @annotation_name.node
+  attr (@annotation_name.node -> @annotation_name.node) kind = "ANNOTATION_USAGE"
+  attr (@annotation_name.node -> @annotation_name.node) line = (start-row @annotation_use)
 }
 
 ;; Imports

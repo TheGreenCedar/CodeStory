@@ -2,7 +2,7 @@ use codestory_core::{Edge, EdgeKind, Node};
 use codestory_events::EventBus;
 use codestory_index::WorkspaceIndexer;
 use codestory_storage::Storage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use tempfile::tempdir;
 
@@ -256,6 +256,7 @@ fn is_matching_name(serialized_name: &str, wanted_name: &str) -> bool {
         || serialized_name.starts_with(&format!("{wanted_name}<"))
         || serialized_name.ends_with(&format!(".{wanted_name}"))
         || serialized_name.ends_with(&format!("::{wanted_name}"))
+        || serialized_name.ends_with(&format!(" {wanted_name}"))
     {
         return true;
     }
@@ -295,6 +296,34 @@ fn has_call_target_name(edges: &[Edge], nodes: &[Node], target_name: &str) -> bo
         .filter(|edge| edge.kind == EdgeKind::CALL)
         .filter_map(|edge| node_by_id.get(&edge.target).copied())
         .any(|node| is_matching_name(&node.serialized_name, target_name))
+}
+
+fn byte_offset_for_line_col(source: &str, line: u32, col: u32) -> Option<usize> {
+    if line == 0 || col == 0 {
+        return None;
+    }
+
+    let mut current_line = 1u32;
+    let mut line_start = 0usize;
+    if current_line < line {
+        for (idx, byte) in source.bytes().enumerate() {
+            if byte == b'\n' {
+                current_line += 1;
+                line_start = idx + 1;
+                if current_line == line {
+                    break;
+                }
+            }
+        }
+    }
+
+    (current_line == line).then_some(line_start + col as usize - 1)
+}
+
+fn snippet_for_node<'a>(source: &'a str, node: &Node) -> Option<&'a str> {
+    let start = byte_offset_for_line_col(source, node.start_line?, node.start_col?)?;
+    let end = byte_offset_for_line_col(source, node.end_line?, node.end_col?)?;
+    (start <= end && end <= source.len()).then_some(&source[start..end])
 }
 
 fn describe_call_edges(edges: &[Edge], nodes: &[Node]) -> Vec<String> {
@@ -501,6 +530,211 @@ impl WorkspaceIndexer {
         clone_edges_from_run >= 1,
         "expected at least one clone call edge from run_incremental"
     );
+    Ok(())
+}
+
+#[test]
+fn test_same_line_duplicate_calls_keep_distinct_callsite_identities() -> anyhow::Result<()> {
+    let source = "fn helper() {}\nfn run() { helper(); helper(); }\n";
+    let (nodes, edges) = index_single_file("main.rs", source)?;
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+
+    let run_id = nodes
+        .iter()
+        .find(|node| is_matching_name(&node.serialized_name, "run"))
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("expected run node"))?;
+
+    let helper_calls = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == run_id)
+        .filter(|edge| {
+            node_by_id
+                .get(&edge.effective_target())
+                .or_else(|| node_by_id.get(&edge.target))
+                .is_some_and(|node| is_matching_name(&node.serialized_name, "helper"))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        helper_calls.len(),
+        2,
+        "expected both helper() invocations on the same line to survive as separate CALL edges"
+    );
+
+    let unique_edge_ids = helper_calls
+        .iter()
+        .map(|edge| edge.id)
+        .collect::<HashSet<_>>();
+    let unique_callsites = helper_calls
+        .iter()
+        .map(|edge| edge.callsite_identity.clone().unwrap_or_default())
+        .collect::<HashSet<_>>();
+
+    assert_eq!(
+        unique_edge_ids.len(),
+        2,
+        "expected distinct edge ids per callsite"
+    );
+    assert_eq!(
+        unique_callsites.len(),
+        2,
+        "expected distinct callsite identities per callsite"
+    );
+    assert!(
+        helper_calls.iter().all(|edge| edge
+            .callsite_identity
+            .as_deref()
+            .is_some_and(|identity| !identity.is_empty())),
+        "expected every helper() call edge to carry a non-empty callsite identity"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_python_attribute_call_placeholder_span_tracks_terminal_identifier() -> anyhow::Result<()> {
+    let source = "class Runner:\n    def run(self):\n        self.client.session.send()\n";
+    let (nodes, edges) = index_single_file("main.py", source)?;
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+
+    let run_id = nodes
+        .iter()
+        .find(|node| is_matching_name(&node.serialized_name, "run"))
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("expected run node"))?;
+
+    let send_target = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == run_id)
+        .filter_map(|edge| node_by_id.get(&edge.target).copied())
+        .find(|node| is_matching_name(&node.serialized_name, "send"))
+        .ok_or_else(|| anyhow::anyhow!("expected send placeholder node"))?;
+
+    assert_eq!(send_target.start_line, Some(3));
+    assert_eq!(send_target.end_line, Some(3));
+    assert_eq!(
+        snippet_for_node(source, send_target),
+        Some("send"),
+        "expected Python attribute-call placeholder to cover only the terminal identifier"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_cpp_qualified_call_placeholder_span_tracks_terminal_identifier() -> anyhow::Result<()> {
+    let source = "namespace ns { int make() { return 1; } }\nint run() { return ns::make(); }\n";
+    let (nodes, edges) = index_single_file("main.cpp", source)?;
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+
+    let run_id = nodes
+        .iter()
+        .find(|node| is_matching_name(&node.serialized_name, "run"))
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("expected run node"))?;
+
+    let make_target = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == run_id)
+        .filter_map(|edge| node_by_id.get(&edge.target).copied())
+        .find(|node| is_matching_name(&node.serialized_name, "make"))
+        .ok_or_else(|| anyhow::anyhow!("expected make placeholder node"))?;
+
+    assert_eq!(
+        snippet_for_node(source, make_target),
+        Some("make"),
+        "expected C++ qualified-call placeholder to cover only the terminal identifier"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_java_annotation_usage_span_tracks_terminal_identifier() -> anyhow::Result<()> {
+    let source = "@Deprecated\nclass Example {}\n";
+    let (nodes, edges) = index_single_file("Main.java", source)?;
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+
+    let deprecated_target = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::ANNOTATION_USAGE)
+        .filter_map(|edge| node_by_id.get(&edge.target).copied())
+        .find(|node| is_matching_name(&node.serialized_name, "Deprecated"))
+        .ok_or_else(|| anyhow::anyhow!("expected Deprecated annotation usage node"))?;
+
+    assert_eq!(
+        snippet_for_node(source, deprecated_target),
+        Some("Deprecated"),
+        "expected Java annotation usage placeholder to cover only the annotation token"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_rust_impl_expr_span_tracks_terminal_identifier() -> anyhow::Result<()> {
+    let source = "impl crate::api::Worker<T> {\n    fn run(&self) {}\n}\n";
+    let (nodes, _edges) = index_single_file("main.rs", source)?;
+    let worker_node = nodes
+        .iter()
+        .find(|node| is_matching_name(&node.serialized_name, "Worker"))
+        .ok_or_else(|| anyhow::anyhow!("expected Worker impl anchor node"))?;
+
+    assert_eq!(
+        snippet_for_node(source, worker_node),
+        Some("Worker"),
+        "expected Rust impl surface to normalize to the terminal identifier span"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_java_annotation_usage_placeholder_span_tracks_terminal_identifier() -> anyhow::Result<()> {
+    let source = "@Marker\nclass Example {}\n";
+    let (nodes, edges) = index_single_file("Main.java", source)?;
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+
+    let marker_target = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::ANNOTATION_USAGE)
+        .filter_map(|edge| node_by_id.get(&edge.target).copied())
+        .find(|node| is_matching_name(&node.serialized_name, "Marker"))
+        .ok_or_else(|| anyhow::anyhow!("expected Marker annotation placeholder node"))?;
+
+    assert_eq!(marker_target.start_line, Some(1));
+    assert_eq!(marker_target.end_line, Some(1));
+    assert_eq!(
+        snippet_for_node(source, marker_target),
+        Some("Marker"),
+        "expected Java annotation placeholder to cover only the annotation token"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_java_annotation_usage_placeholder_span_tracks_annotation_token() -> anyhow::Result<()> {
+    let source = "@Logged\nclass Example {}\n";
+    let (nodes, edges) = index_single_file("Main.java", source)?;
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+
+    let logged_target = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::ANNOTATION_USAGE)
+        .filter_map(|edge| node_by_id.get(&edge.target).copied())
+        .find(|node| is_matching_name(&node.serialized_name, "Logged"))
+        .ok_or_else(|| anyhow::anyhow!("expected Logged annotation node"))?;
+
+    assert_eq!(logged_target.start_line, Some(1));
+    assert_eq!(logged_target.end_line, Some(1));
+    assert_eq!(
+        snippet_for_node(source, logged_target),
+        Some("Logged"),
+        "expected Java annotation usage placeholder to cover only the annotation token"
+    );
+
     Ok(())
 }
 

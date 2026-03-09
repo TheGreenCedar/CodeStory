@@ -159,7 +159,11 @@ pub(super) fn resolve_overrides_on_conn(
             } else {
                 &[]
             };
-            updates.push(build_resolved_edge_update(edge_id, selected, candidate_slice)?);
+            updates.push(build_resolved_edge_update(
+                edge_id,
+                selected,
+                candidate_slice,
+            )?);
             continue;
         }
         let Some(owner_ids) = owner_by_method.get(&source_id) else {
@@ -216,7 +220,11 @@ pub(super) fn resolve_overrides_on_conn(
         } else {
             &[]
         };
-        updates.push(build_resolved_edge_update(edge_id, selected, candidate_slice)?);
+        updates.push(build_resolved_edge_update(
+            edge_id,
+            selected,
+            candidate_slice,
+        )?);
     }
 
     sql::apply_resolution_updates(conn, &updates)?;
@@ -361,7 +369,9 @@ fn load_override_membership(
         let (owner_id, owner_name, method_id, serialized_name) = row?;
         let method_name = short_member_name(&serialized_name).to_string();
         owner_by_method.entry(method_id).or_default().push(owner_id);
-        owner_name_by_id.entry(owner_id).or_insert(owner_name.clone());
+        owner_name_by_id
+            .entry(owner_id)
+            .or_insert(owner_name.clone());
         methods_by_owner_and_name
             .entry((owner_id, method_name.clone()))
             .or_default()
@@ -495,8 +505,8 @@ fn collect_override_candidates_by_owner_name(
             continue;
         }
         if current_owner != owner_name
-            && let Some(method_ids) = methods_by_owner_name_and_name
-                .get(&(current_owner.clone(), method_name.clone()))
+            && let Some(method_ids) =
+                methods_by_owner_name_and_name.get(&(current_owner.clone(), method_name.clone()))
         {
             candidates.extend_stage(method_ids, usize::MAX);
         }

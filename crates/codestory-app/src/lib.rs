@@ -304,7 +304,21 @@ fn search_kind_bucket(kind: codestory_api::NodeKind, origin: codestory_api::Sear
     }
 }
 
-fn search_match_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8, u8) {
+fn search_kind_tiebreak(kind: codestory_api::NodeKind) -> u8 {
+    match kind {
+        codestory_api::NodeKind::FUNCTION => 4,
+        codestory_api::NodeKind::METHOD => 3,
+        codestory_api::NodeKind::MACRO => 2,
+        codestory_api::NodeKind::FIELD
+        | codestory_api::NodeKind::VARIABLE
+        | codestory_api::NodeKind::GLOBAL_VARIABLE
+        | codestory_api::NodeKind::CONSTANT
+        | codestory_api::NodeKind::ENUM_CONSTANT => 1,
+        _ => 0,
+    }
+}
+
+fn search_match_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8, u8, u8) {
     let query = normalize_symbol_query(query);
     let display = normalize_symbol_query(&hit.display_name);
     let terminal = terminal_symbol_segment(&hit.display_name);
@@ -314,6 +328,7 @@ fn search_match_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8, u8) {
         u8::from(display == query),
         u8::from(terminal == query),
         search_kind_bucket(hit.kind, hit.origin),
+        search_kind_tiebreak(hit.kind),
         u8::from(leading == query),
         u8::from(hit.origin == codestory_api::SearchHitOrigin::IndexedSymbol),
     )
@@ -2475,6 +2490,35 @@ mod tests {
             hits.iter()
                 .all(|hit| hit.kind != codestory_api::NodeKind::UNKNOWN)
         );
+    }
+
+    #[test]
+    fn compare_search_hits_prefers_function_over_method_for_equal_symbol_matches() {
+        let function = SearchHit {
+            node_id: NodeId("function".to_string()),
+            display_name: "ArtificialPlayer::min_max".to_string(),
+            kind: codestory_api::NodeKind::FUNCTION,
+            file_path: None,
+            line: None,
+            score: 184.0,
+            origin: codestory_api::SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+        };
+        let method = SearchHit {
+            node_id: NodeId("method".to_string()),
+            display_name: "ArtificialPlayer::min_max".to_string(),
+            kind: codestory_api::NodeKind::METHOD,
+            file_path: None,
+            line: None,
+            score: 184.0,
+            origin: codestory_api::SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+        };
+
+        let mut hits = vec![method, function.clone()];
+        hits.sort_by(|left, right| compare_search_hits("min_max", left, right));
+
+        assert_eq!(hits.first().map(|hit| hit.kind), Some(function.kind));
     }
 
     #[test]

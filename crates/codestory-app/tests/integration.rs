@@ -138,7 +138,7 @@ fn test_repo_scale_call_resolution() -> anyhow::Result<()> {
     let storage_path = cache_dir.path().join("codestory.db");
 
     println!("Indexing repo root: {:?}", root_path);
-    let summary = controller
+    let _summary = controller
         .open_project_with_storage_path(root_path.clone(), storage_path.clone())
         .unwrap();
 
@@ -153,7 +153,7 @@ fn test_repo_scale_call_resolution() -> anyhow::Result<()> {
     // Let's assert that we don't just have 0 usable call edges
     // Actually, "zero post-pass resolutions on this workspace is measurable and not confused with zero usable call graph"
     // implies that we still have CALL edges in the DB
-    let mut storage = codestory_storage::Storage::open(&storage_path).unwrap();
+    let storage = codestory_storage::Storage::open(&storage_path).unwrap();
     let edges = storage.get_edges().unwrap();
     let call_edges = edges
         .iter()

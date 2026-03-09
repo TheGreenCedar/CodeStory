@@ -1,7 +1,6 @@
 use super::{
     SemanticCandidateIndex, SemanticResolutionCandidate, SemanticResolutionRequest,
-    SemanticResolver, resolve_call_candidates, resolve_import_candidates,
-    detect_language,
+    SemanticResolver, detect_language, resolve_call_candidates, resolve_import_candidates,
 };
 use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind};

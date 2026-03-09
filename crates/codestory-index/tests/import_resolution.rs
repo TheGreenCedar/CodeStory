@@ -1,4 +1,4 @@
-use codestory_core::EdgeKind;
+use codestory_core::{EdgeKind, NodeKind};
 use codestory_events::EventBus;
 use codestory_index::WorkspaceIndexer;
 use codestory_storage::Storage;
@@ -70,6 +70,18 @@ fn assert_imports_resolved(edges: &[codestory_core::Edge]) {
             );
         }
     }
+}
+
+fn matches_name(actual: &str, wanted: &str) -> bool {
+    actual == wanted
+        || actual.ends_with(&format!(".{wanted}"))
+        || actual.ends_with(&format!("::{wanted}"))
+}
+
+fn has_node_kind(nodes: &[codestory_core::Node], name: &str, kind: NodeKind) -> bool {
+    nodes
+        .iter()
+        .any(|node| matches_name(&node.serialized_name, name) && node.kind == kind)
 }
 
 #[test]
@@ -186,5 +198,67 @@ impl Repository {
         unresolved_edges > 0,
         "expected unresolved imports to remain explicit when cross-file resolution is uncertain"
     );
+    Ok(())
+}
+
+#[test]
+fn test_javascript_require_and_dynamic_import_surface_as_import_edges() -> anyhow::Result<()> {
+    let (nodes, edges) = index_workspace(&[
+        (
+            "main.js",
+            r#"
+const pkg = require("./pkg.js");
+
+async function load() {
+    const feature = await import("./feature.js");
+    return [pkg, feature];
+}
+"#,
+        ),
+        ("pkg.js", "export const value = 1;\n"),
+        ("feature.js", "export default 1;\n"),
+    ])?;
+
+    assert!(has_node_kind(&nodes, "\"./pkg.js\"", NodeKind::MODULE));
+    assert!(has_node_kind(&nodes, "\"./feature.js\"", NodeKind::MODULE));
+
+    let node_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let import_targets = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::IMPORT)
+        .filter_map(|edge| node_by_id.get(&edge.effective_target()).copied())
+        .map(|node| node.serialized_name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        import_targets
+            .iter()
+            .any(|name| matches_name(name, "\"./pkg.js\"")),
+        "expected require(\"./pkg.js\") to surface as IMPORT"
+    );
+    assert!(
+        import_targets
+            .iter()
+            .any(|name| matches_name(name, "\"./feature.js\"")),
+        "expected dynamic import(\"./feature.js\") to surface as IMPORT"
+    );
+
+    let generic_runtime_calls = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter_map(|edge| node_by_id.get(&edge.target).copied())
+        .map(|node| node.serialized_name.as_str())
+        .filter(|name| matches_name(name, "require") || matches_name(name, "import"))
+        .collect::<Vec<_>>();
+
+    assert!(
+        generic_runtime_calls.is_empty(),
+        "expected runtime module loading to avoid generic CALL placeholders, found {generic_runtime_calls:?}"
+    );
+
     Ok(())
 }

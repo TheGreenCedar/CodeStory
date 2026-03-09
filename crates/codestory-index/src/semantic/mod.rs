@@ -292,7 +292,14 @@ pub(super) fn resolve_import_candidates(
     confidence: f32,
 ) -> Result<Vec<SemanticResolutionCandidate>> {
     let ids = index
-        .nodes_for_name(kinds, symbol, &symbol.to_ascii_lowercase(), caller_language, true, 4)
+        .nodes_for_name(
+            kinds,
+            symbol,
+            &symbol.to_ascii_lowercase(),
+            caller_language,
+            true,
+            4,
+        )
         .into_iter()
         .filter(|node| {
             file_id.is_none() || node.file_node_id.is_none() || node.file_node_id != file_id
@@ -316,7 +323,14 @@ pub(super) fn resolve_call_candidates(
 
     if let Some(file_id) = file_id {
         let ids = index
-            .nodes_for_name(kinds, call_name, &name_ascii_lower, caller_language, false, 3)
+            .nodes_for_name(
+                kinds,
+                call_name,
+                &name_ascii_lower,
+                caller_language,
+                false,
+                3,
+            )
             .into_iter()
             .filter(|node| node.file_node_id == Some(file_id))
             .map(|node| node.id)
@@ -326,7 +340,14 @@ pub(super) fn resolve_call_candidates(
 
     if out.is_empty() {
         let ids = index
-            .nodes_for_name(kinds, call_name, &name_ascii_lower, caller_language, false, 3)
+            .nodes_for_name(
+                kinds,
+                call_name,
+                &name_ascii_lower,
+                caller_language,
+                false,
+                3,
+            )
             .into_iter()
             .map(|node| node.id)
             .collect::<Vec<_>>();
@@ -518,7 +539,10 @@ mod tests {
             0.70,
         )?;
 
-        assert!(out.is_empty(), "unexpected cross-language candidates: {out:?}");
+        assert!(
+            out.is_empty(),
+            "unexpected cross-language candidates: {out:?}"
+        );
         Ok(())
     }
 }

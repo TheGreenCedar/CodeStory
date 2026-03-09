@@ -460,19 +460,13 @@ function App() {
         .map(|node| node.id)
         .expect("variant prop node not found");
     assert!(edges.iter().any(|edge| {
-        edge.kind == EdgeKind::USAGE
-            && edge.source == app_id
-            && edge.target == badge_id
+        edge.kind == EdgeKind::CALL && edge.source == app_id && edge.target == badge_id
     }));
     assert!(edges.iter().any(|edge| {
-        edge.kind == EdgeKind::USAGE
-            && edge.source == app_id
-            && edge.target == label_id
+        edge.kind == EdgeKind::USAGE && edge.source == app_id && edge.target == label_id
     }));
     assert!(edges.iter().any(|edge| {
-        edge.kind == EdgeKind::USAGE
-            && edge.source == app_id
-            && edge.target == variant_id
+        edge.kind == EdgeKind::USAGE && edge.source == app_id && edge.target == variant_id
     }));
 
     Ok(())

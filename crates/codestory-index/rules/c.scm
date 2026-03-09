@@ -92,6 +92,42 @@
   attr (@module.node -> @module.node) kind = "IMPORT"
 }
 
+(union_specifier
+  name: (type_identifier) @union_name) @def
+{
+  node @union_name.node
+  attr (@union_name.node) kind = "UNION"
+  attr (@union_name.node) name = (source-text @union_name)
+  attr (@union_name.node) start_row = (start-row @def)
+  attr (@union_name.node) start_col = (start-column @def)
+  attr (@union_name.node) end_row = (end-row @def)
+  attr (@union_name.node) end_col = (end-column @def)
+}
+
+(enum_specifier
+  name: (type_identifier) @enum_name) @def
+{
+  node @enum_name.node
+  attr (@enum_name.node) kind = "ENUM"
+  attr (@enum_name.node) name = (source-text @enum_name)
+  attr (@enum_name.node) start_row = (start-row @def)
+  attr (@enum_name.node) start_col = (start-column @def)
+  attr (@enum_name.node) end_row = (end-row @def)
+  attr (@enum_name.node) end_col = (end-column @def)
+}
+
+(enumerator
+  name: (identifier) @constant_name) @constant
+{
+  node @constant_name.node
+  attr (@constant_name.node) kind = "ENUM_CONSTANT"
+  attr (@constant_name.node) name = (source-text @constant_name)
+  attr (@constant_name.node) start_row = (start-row @constant)
+  attr (@constant_name.node) start_col = (start-column @constant)
+  attr (@constant_name.node) end_row = (end-row @constant)
+  attr (@constant_name.node) end_col = (end-column @constant)
+}
+
 ;; Structs and members
 (struct_specifier
   name: (type_identifier) @name)
@@ -285,6 +321,19 @@
 
   edge @alias_name.node -> @field_name.node
   attr (@alias_name.node -> @field_name.node) kind = "MEMBER"
+}
+
+(declaration
+  declarator: (function_declarator
+    declarator: (identifier) @name)) @def
+{
+  node @name.node
+  attr (@name.node) kind = "FUNCTION"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
 }
 
 (call_expression

@@ -93,15 +93,16 @@
 
 ;; Calls (global fallback attribute)
 (call
-  function: (attribute) @call_any)
+  function: (attribute
+    attribute: (identifier) @callee_any) @call_any)
 {
   node @call_any.node
   attr (@call_any.node) kind = "UNKNOWN"
-  attr (@call_any.node) name = (source-text @call_any)
-  attr (@call_any.node) start_row = (start-row @call_any)
-  attr (@call_any.node) start_col = (start-column @call_any)
-  attr (@call_any.node) end_row = (end-row @call_any)
-  attr (@call_any.node) end_col = (end-column @call_any)
+  attr (@call_any.node) name = (source-text @callee_any)
+  attr (@call_any.node) start_row = (start-row @callee_any)
+  attr (@call_any.node) start_col = (start-column @callee_any)
+  attr (@call_any.node) end_row = (end-row @callee_any)
+  attr (@call_any.node) end_col = (end-column @callee_any)
 
   edge @call_any.node -> @call_any.node
   attr (@call_any.node -> @call_any.node) kind = "CALL"
@@ -123,7 +124,7 @@
   attr (@decorator.node) end_col = (end-column @decorator)
 
   edge @target.node -> @decorator.node
-  attr (@target.node -> @decorator.node) kind = "USAGE"
+  attr (@target.node -> @decorator.node) kind = "CALL"
 }
 
 ;; Decorator usage (function)
@@ -141,7 +142,7 @@
   attr (@decorator.node) end_col = (end-column @decorator)
 
   edge @target.node -> @decorator.node
-  attr (@target.node -> @decorator.node) kind = "USAGE"
+  attr (@target.node -> @decorator.node) kind = "CALL"
 }
 
 ;; Decorator usage (class call)
@@ -160,7 +161,7 @@
   attr (@decorator.node) end_col = (end-column @decorator)
 
   edge @target.node -> @decorator.node
-  attr (@target.node -> @decorator.node) kind = "USAGE"
+  attr (@target.node -> @decorator.node) kind = "CALL"
 }
 
 ;; Decorator usage (function call)
@@ -179,7 +180,7 @@
   attr (@decorator.node) end_col = (end-column @decorator)
 
   edge @target.node -> @decorator.node
-  attr (@target.node -> @decorator.node) kind = "USAGE"
+  attr (@target.node -> @decorator.node) kind = "CALL"
 }
 
 ;; Imports

@@ -314,6 +314,58 @@
   attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
 }
 
+;; Calls (qualified fallback)
+(call_expression
+  function: (qualified_identifier
+    name: (identifier)) @call_any)
+{
+  node @call_any.node
+  attr (@call_any.node) kind = "UNKNOWN"
+  attr (@call_any.node) name = (source-text @call_any)
+  attr (@call_any.node) start_row = (start-row @call_any)
+  attr (@call_any.node) start_col = (start-column @call_any)
+  attr (@call_any.node) end_row = (end-row @call_any)
+  attr (@call_any.node) end_col = (end-column @call_any)
+
+  edge @call_any.node -> @call_any.node
+  attr (@call_any.node -> @call_any.node) kind = "CALL"
+  attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
+}
+
+(call_expression
+  function: (qualified_identifier
+    name: (template_function)) @call_any)
+{
+  node @call_any.node
+  attr (@call_any.node) kind = "UNKNOWN"
+  attr (@call_any.node) name = (source-text @call_any)
+  attr (@call_any.node) start_row = (start-row @call_any)
+  attr (@call_any.node) start_col = (start-column @call_any)
+  attr (@call_any.node) end_row = (end-row @call_any)
+  attr (@call_any.node) end_col = (end-column @call_any)
+
+  edge @call_any.node -> @call_any.node
+  attr (@call_any.node -> @call_any.node) kind = "CALL"
+  attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
+}
+
+(call_expression
+  function: (qualified_identifier
+    name: (qualified_identifier)) @call_any)
+{
+  node @call_any.node
+  attr (@call_any.node) kind = "UNKNOWN"
+  attr (@call_any.node) name = (source-text @call_any)
+  attr (@call_any.node) start_row = (start-row @call_any)
+  attr (@call_any.node) start_col = (start-column @call_any)
+  attr (@call_any.node) end_row = (end-row @call_any)
+  attr (@call_any.node) end_col = (end-column @call_any)
+
+  edge @call_any.node -> @call_any.node
+  attr (@call_any.node -> @call_any.node) kind = "CALL"
+  attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
+}
+
 ;; Includes
 (preproc_include
   path: (system_lib_string) @module)
@@ -373,7 +425,7 @@
   attr (@target_name.node) end_col = (end-column @target_name)
 
   node @alias_name.node
-  attr (@alias_name.node) kind = "MODULE"
+  attr (@alias_name.node) kind = "UNKNOWN"
   attr (@alias_name.node) name = (source-text @alias_name)
   attr (@alias_name.node) start_row = (start-row @alias_name)
   attr (@alias_name.node) start_col = (start-column @alias_name)
@@ -397,7 +449,7 @@
   attr (@target_name.node) end_col = (end-column @target_name)
 
   node @alias_name.node
-  attr (@alias_name.node) kind = "MODULE"
+  attr (@alias_name.node) kind = "UNKNOWN"
   attr (@alias_name.node) name = (source-text @alias_name)
   attr (@alias_name.node) start_row = (start-row @alias_name)
   attr (@alias_name.node) start_col = (start-column @alias_name)
@@ -409,6 +461,7 @@
 }
 
 (using_declaration
+  "namespace"
   (identifier) @module)
 {
   node @module.node
@@ -424,18 +477,19 @@
 }
 
 (using_declaration
-  (qualified_identifier) @module)
+  "namespace"
+  (qualified_identifier) @module_path)
 {
-  node @module.node
-  attr (@module.node) kind = "MODULE"
-  attr (@module.node) name = (source-text @module)
-  attr (@module.node) start_row = (start-row @module)
-  attr (@module.node) start_col = (start-column @module)
-  attr (@module.node) end_row = (end-row @module)
-  attr (@module.node) end_col = (end-column @module)
+  node @module_path.node
+  attr (@module_path.node) kind = "MODULE"
+  attr (@module_path.node) name = (source-text @module_path)
+  attr (@module_path.node) start_row = (start-row @module_path)
+  attr (@module_path.node) start_col = (start-column @module_path)
+  attr (@module_path.node) end_row = (end-row @module_path)
+  attr (@module_path.node) end_col = (end-column @module_path)
 
-  edge @module.node -> @module.node
-  attr (@module.node -> @module.node) kind = "IMPORT"
+  edge @module_path.node -> @module_path.node
+  attr (@module_path.node -> @module_path.node) kind = "IMPORT"
 }
 
 ;; Template/type arguments
