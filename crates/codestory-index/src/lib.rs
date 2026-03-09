@@ -10,10 +10,11 @@ use std::sync::OnceLock;
 
 use codestory_events::{Event, EventBus};
 use rayon::prelude::*;
+use streaming_iterator::StreamingIterator;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
-use tree_sitter::{Language, Parser};
+use tree_sitter::{Language, Node as TsNode, Parser, Point, Query, QueryCursor, Tree};
 use tree_sitter_graph::ast::File as GraphFile;
 use tree_sitter_graph::functions::Functions;
 use tree_sitter_graph::{ExecutionConfig, NoCancellation, Variables};
@@ -57,6 +58,309 @@ fn env_flag(name: &str, default: bool) -> bool {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct LanguageConfig {
+    pub language: Language,
+    pub language_name: &'static str,
+    pub graph_query: &'static str,
+    pub tags_query: Option<&'static str>,
+    pub locals_query: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TagDefinitionKey {
+    name: String,
+    start_line: u32,
+    start_col: u32,
+}
+
+#[derive(Debug, Clone)]
+struct TagDefinition {
+    key: TagDefinitionKey,
+    kind: NodeKind,
+    access: Option<AccessKind>,
+    canonical_role: CanonicalNodeRole,
+    end_line: u32,
+    end_col: u32,
+}
+
+#[derive(Default)]
+struct TagDefinitionIndex {
+    by_key: HashMap<TagDefinitionKey, TagDefinition>,
+    fallback_index: HashMap<(String, u32), TagDefinitionKey>,
+}
+
+#[derive(Default)]
+struct LocalQuerySummary {
+    scope_count: usize,
+}
+
+fn make_language_config(
+    language: Language,
+    language_name: &'static str,
+    graph_query: &'static str,
+    tags_query: Option<&'static str>,
+    locals_query: Option<&'static str>,
+) -> LanguageConfig {
+    LanguageConfig {
+        language,
+        language_name,
+        graph_query,
+        tags_query,
+        locals_query,
+    }
+}
+
+impl TagDefinitionIndex {
+    fn insert(&mut self, definition: TagDefinition) {
+        let key = definition.key.clone();
+        match self.by_key.get(&key) {
+            Some(existing) if !should_replace_tag_definition(existing, &definition) => {}
+            _ => {
+                self.fallback_index
+                    .insert((key.name.clone(), key.start_line), key.clone());
+                self.by_key.insert(key, definition);
+            }
+        }
+    }
+
+    fn take(&mut self, name: &str, start_line: u32, start_col: Option<u32>) -> Option<TagDefinition> {
+        if let Some(start_col) = start_col {
+            let exact_key = TagDefinitionKey {
+                name: name.to_string(),
+                start_line,
+                start_col,
+            };
+            if let Some(definition) = self.by_key.remove(&exact_key) {
+                self.fallback_index.remove(&(name.to_string(), start_line));
+                return Some(definition);
+            }
+        }
+
+        let fallback_key = self
+            .fallback_index
+            .remove(&(name.to_string(), start_line))?;
+        self.by_key.remove(&fallback_key)
+    }
+
+    fn into_remaining(self) -> Vec<TagDefinition> {
+        self.by_key.into_values().collect()
+    }
+}
+
+fn tag_definition_priority(definition: &TagDefinition) -> (u8, u8, u8) {
+    let role_priority = canonical_role_priority(definition.canonical_role);
+    let kind_priority = match definition.kind {
+        NodeKind::METHOD => 7,
+        NodeKind::FUNCTION => 6,
+        NodeKind::FIELD => 5,
+        NodeKind::STRUCT => 4,
+        NodeKind::CLASS => 4,
+        NodeKind::INTERFACE => 4,
+        NodeKind::ENUM => 4,
+        NodeKind::UNION => 4,
+        NodeKind::TYPEDEF => 4,
+        _ => 1,
+    };
+    let access_priority = u8::from(definition.access.is_some());
+    (role_priority, kind_priority, access_priority)
+}
+
+fn should_replace_tag_definition(existing: &TagDefinition, candidate: &TagDefinition) -> bool {
+    tag_definition_priority(candidate) > tag_definition_priority(existing)
+}
+
+fn tag_definition_kind(kind: &str) -> Option<NodeKind> {
+    match kind {
+        "class" => Some(NodeKind::CLASS),
+        "struct" => Some(NodeKind::STRUCT),
+        "interface" => Some(NodeKind::INTERFACE),
+        "enum" => Some(NodeKind::ENUM),
+        "typedef" => Some(NodeKind::TYPEDEF),
+        "union" => Some(NodeKind::UNION),
+        "function" => Some(NodeKind::FUNCTION),
+        "method" => Some(NodeKind::METHOD),
+        "field" => Some(NodeKind::FIELD),
+        "variable" => Some(NodeKind::VARIABLE),
+        _ => None,
+    }
+}
+
+fn parse_access_capture_text(text: &str) -> Option<AccessKind> {
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("pub") {
+        return Some(AccessKind::Public);
+    }
+    access_kind_from_graph_access(&lower).or_else(|| classify_keyword_access(trimmed))
+}
+
+fn extract_tag_definitions(
+    language: Language,
+    tree: &Tree,
+    source: &str,
+    tags_query: Option<&str>,
+) -> Result<TagDefinitionIndex> {
+    let Some(tags_query) = tags_query.filter(|query| !query.trim().is_empty()) else {
+        return Ok(TagDefinitionIndex::default());
+    };
+
+    let query = Query::new(&language, tags_query)
+        .map_err(|err| anyhow!("Tag query error: {:?}", err))?;
+    let capture_names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+    let mut index = TagDefinitionIndex::default();
+    let source_bytes = source.as_bytes();
+
+    let mut matches = cursor.matches(&query, tree.root_node(), source_bytes);
+    while {
+        matches.advance();
+        matches.get().is_some()
+    } {
+        let Some(query_match) = matches.get() else {
+            continue;
+        };
+        let mut definition: Option<TagDefinition> = None;
+        let mut access = None;
+        let mut canonical_role = CanonicalNodeRole::Unspecified;
+
+        for capture in query_match.captures {
+            let capture_name = capture_names
+                .get(capture.index as usize)
+                .map(|name| *name)
+                .unwrap_or_default();
+            let capture_node = capture.node;
+            if let Some(kind_name) = capture_name.strip_prefix("definition.") {
+                let Some(kind) = tag_definition_kind(kind_name) else {
+                    continue;
+                };
+                let name = capture_node
+                    .utf8_text(source_bytes)
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                let start = capture_node.start_position();
+                let end = capture_node.end_position();
+                definition = Some(TagDefinition {
+                    key: TagDefinitionKey {
+                        name,
+                        start_line: start.row as u32 + 1,
+                        start_col: start.column as u32 + 1,
+                    },
+                    kind,
+                    access: None,
+                    canonical_role: CanonicalNodeRole::Unspecified,
+                    end_line: end.row as u32 + 1,
+                    end_col: end.column as u32 + 1,
+                });
+            } else if capture_name == "access" {
+                let text = capture_node.utf8_text(source_bytes).unwrap_or_default();
+                access = parse_access_capture_text(text);
+            } else if capture_name == "canonical.impl_anchor" {
+                canonical_role = CanonicalNodeRole::ImplAnchor;
+            }
+        }
+
+        if let Some(mut definition) = definition {
+            definition.access = access;
+            definition.canonical_role = canonical_role;
+            index.insert(definition);
+        }
+    }
+
+    Ok(index)
+}
+
+fn collect_local_query_summary(
+    language: Language,
+    tree: &Tree,
+    source: &str,
+    locals_query: Option<&str>,
+) -> Result<LocalQuerySummary> {
+    let Some(locals_query) = locals_query.filter(|query| !query.trim().is_empty()) else {
+        return Ok(LocalQuerySummary::default());
+    };
+
+    let query = Query::new(&language, locals_query)
+        .map_err(|err| anyhow!("Locals query error: {:?}", err))?;
+    let capture_names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+    let mut summary = LocalQuerySummary::default();
+
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    while {
+        matches.advance();
+        matches.get().is_some()
+    } {
+        let Some(query_match) = matches.get() else {
+            continue;
+        };
+        for capture in query_match.captures {
+            let capture_name = capture_names
+                .get(capture.index as usize)
+                .map(|name| *name)
+                .unwrap_or_default();
+            if capture_name == "local.scope" {
+                summary.scope_count += 1;
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+fn infer_header_language_config(
+    compilation_info: Option<&compilation_database::CompilationInfo>,
+) -> LanguageConfig {
+    let use_cpp = compilation_info
+        .and_then(|info| info.standard)
+        .map(|standard| {
+            matches!(
+                standard,
+                compilation_database::CxxStandard::Cxx98
+                    | compilation_database::CxxStandard::Cxx03
+                    | compilation_database::CxxStandard::Cxx11
+                    | compilation_database::CxxStandard::Cxx14
+                    | compilation_database::CxxStandard::Cxx17
+                    | compilation_database::CxxStandard::Cxx20
+                    | compilation_database::CxxStandard::Cxx23
+            )
+        })
+        .unwrap_or(false);
+
+    if use_cpp {
+        make_language_config(
+            tree_sitter_cpp::LANGUAGE.into(),
+            "cpp",
+            include_str!("../rules/cpp.scm"),
+            None,
+            None,
+        )
+    } else {
+        make_language_config(
+            tree_sitter_c::LANGUAGE.into(),
+            "c",
+            include_str!("../rules/c.scm"),
+            None,
+            None,
+        )
+    }
+}
+
+fn get_language_config_for_path(
+    path: &Path,
+    compilation_info: Option<&compilation_database::CompilationInfo>,
+) -> Option<LanguageConfig> {
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    if ext.trim().trim_start_matches('.').eq_ignore_ascii_case("h") {
+        return Some(infer_header_language_config(compilation_info));
+    }
+    get_language_for_ext(ext)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct IncrementalIndexingConfig {
     pub file_batch_size: usize,
@@ -85,6 +389,7 @@ pub struct IndexResult {
     pub occurrences: Vec<Occurrence>,
     pub component_access: Vec<(NodeId, AccessKind)>,
     pub callable_projection_states: Vec<CallableProjectionState>,
+    pub impl_anchor_node_ids: Vec<NodeId>,
 }
 
 const FILE_STRUCTURAL_SYMBOL_KEY: &str = "__file_structural__";
@@ -277,6 +582,7 @@ impl WorkspaceIndexer {
                         .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
                 }
                 batched_storage.merge(local_storage);
+                reconcile_rust_impl_anchors(storage, &mut batched_storage)?;
 
                 let should_flush = !batched_storage.files.is_empty()
                     || !batched_storage.nodes.is_empty()
@@ -330,76 +636,77 @@ impl WorkspaceIndexer {
                 (!resolution_scope_file_ids.is_empty()).then_some(&resolution_scope_file_ids);
             let (unresolved_calls_start, unresolved_imports_start) =
                 resolver.unresolved_counts_with_scope(storage, resolution_scope)?;
+            let unresolved_overrides_start = storage
+                .get_edges()?
+                .into_iter()
+                .filter(|edge| {
+                    edge.kind == EdgeKind::OVERRIDE
+                        && edge.resolved_target.is_none()
+                        && resolution_scope.is_none_or(|scope| {
+                            edge.file_node_id.is_some_and(|file_id| scope.contains(&file_id.0))
+                        })
+                })
+                .count();
             stats.unresolved_calls_start = unresolved_calls_start;
             stats.unresolved_imports_start = unresolved_imports_start;
             let scope_suffix = resolution_scope
                 .map(|scope| format!(" (scoped to {} touched files)", scope.len()))
                 .unwrap_or_default();
-            if unresolved_calls_start == 0 && unresolved_imports_start == 0 {
-                stats.unresolved_calls_end = unresolved_calls_start;
-                stats.unresolved_imports_end = unresolved_imports_start;
-                event_bus.publish(Event::StatusUpdate {
-                    message: format!(
-                        "Resolution pass skipped because there are no unresolved CALL/IMPORT edges{scope_suffix}."
-                    ),
-                });
-            } else {
-                event_bus.publish(Event::StatusUpdate {
-                    message: format!(
-                        "Resolution pass starting with {unresolved_calls_start} unresolved CALL edges and {unresolved_imports_start} unresolved IMPORT edges{scope_suffix}."
-                    ),
-                });
-                let resolution_started = Instant::now();
-                let resolution_stats = resolver
-                    .run_with_scope(storage, resolution_scope)
-                    .map_err(|e| anyhow!("Resolution error: {:?}", e))?;
-                stats.edge_resolution_ms = stats
-                    .edge_resolution_ms
-                    .saturating_add(duration_ms_u64(resolution_started.elapsed()));
-                stats.resolution_ran = true;
-                stats.resolved_calls = resolution_stats.resolved_calls;
-                stats.resolved_imports = resolution_stats.resolved_imports;
-                stats.unresolved_calls_end = resolution_stats.unresolved_calls;
-                stats.unresolved_imports_end = resolution_stats.unresolved_imports;
-                stats.resolution_unresolved_counts_ms = resolution_stats
-                    .telemetry
-                    .unresolved_count_start_ms
-                    .saturating_add(resolution_stats.telemetry.unresolved_count_end_ms);
-                stats.resolution_calls_ms = resolution_stats
-                    .telemetry
-                    .call_prepare_ms
-                    .saturating_add(resolution_stats.telemetry.call_unresolved_load_ms)
-                    .saturating_add(resolution_stats.telemetry.call_candidate_index_ms)
-                    .saturating_add(resolution_stats.telemetry.call_compute_ms)
-                    .saturating_add(resolution_stats.telemetry.call_apply_ms);
-                stats.resolution_imports_ms = resolution_stats
-                    .telemetry
-                    .import_prepare_ms
-                    .saturating_add(resolution_stats.telemetry.import_unresolved_load_ms)
-                    .saturating_add(resolution_stats.telemetry.import_candidate_index_ms)
-                    .saturating_add(resolution_stats.telemetry.import_compute_ms)
-                    .saturating_add(resolution_stats.telemetry.import_apply_ms);
-                stats.resolution_cleanup_ms = resolution_stats
-                    .telemetry
-                    .scope_prepare_ms
-                    .saturating_add(resolution_stats.telemetry.call_cleanup_ms);
-                stats.resolved_calls_same_file = resolution_stats.strategy_counters.call_same_file;
-                stats.resolved_calls_same_module =
-                    resolution_stats.strategy_counters.call_same_module;
-                stats.resolved_calls_global_unique =
-                    resolution_stats.strategy_counters.call_global_unique;
-                stats.resolved_calls_semantic =
-                    resolution_stats.strategy_counters.call_semantic_fallback;
-                stats.resolved_imports_same_file =
-                    resolution_stats.strategy_counters.import_same_file;
-                stats.resolved_imports_same_module =
-                    resolution_stats.strategy_counters.import_same_module;
-                stats.resolved_imports_global_unique =
-                    resolution_stats.strategy_counters.import_global_unique;
-                stats.resolved_imports_fuzzy = resolution_stats.strategy_counters.import_fuzzy;
-                stats.resolved_imports_semantic =
-                    resolution_stats.strategy_counters.import_semantic_fallback;
-            }
+            event_bus.publish(Event::StatusUpdate {
+                message: format!(
+                    "Resolution pass starting with {unresolved_calls_start} unresolved CALL edges, {unresolved_imports_start} unresolved IMPORT edges, and {unresolved_overrides_start} unresolved OVERRIDE edges{scope_suffix}."
+                ),
+            });
+            let resolution_started = Instant::now();
+            let resolution_stats = resolver
+                .run_with_scope(storage, resolution_scope)
+                .map_err(|e| anyhow!("Resolution error: {:?}", e))?;
+            stats.edge_resolution_ms = stats
+                .edge_resolution_ms
+                .saturating_add(duration_ms_u64(resolution_started.elapsed()));
+            stats.resolution_ran = true;
+            stats.resolved_calls = resolution_stats.resolved_calls;
+            stats.resolved_imports = resolution_stats.resolved_imports;
+            stats.unresolved_calls_end = resolution_stats.unresolved_calls;
+            stats.unresolved_imports_end = resolution_stats.unresolved_imports;
+            stats.resolution_unresolved_counts_ms = resolution_stats
+                .telemetry
+                .unresolved_count_start_ms
+                .saturating_add(resolution_stats.telemetry.unresolved_count_end_ms);
+            stats.resolution_calls_ms = resolution_stats
+                .telemetry
+                .call_prepare_ms
+                .saturating_add(resolution_stats.telemetry.call_unresolved_load_ms)
+                .saturating_add(resolution_stats.telemetry.call_candidate_index_ms)
+                .saturating_add(resolution_stats.telemetry.call_compute_ms)
+                .saturating_add(resolution_stats.telemetry.call_apply_ms);
+            stats.resolution_imports_ms = resolution_stats
+                .telemetry
+                .import_prepare_ms
+                .saturating_add(resolution_stats.telemetry.import_unresolved_load_ms)
+                .saturating_add(resolution_stats.telemetry.import_candidate_index_ms)
+                .saturating_add(resolution_stats.telemetry.import_compute_ms)
+                .saturating_add(resolution_stats.telemetry.import_apply_ms);
+            stats.resolution_cleanup_ms = resolution_stats
+                .telemetry
+                .scope_prepare_ms
+                .saturating_add(resolution_stats.telemetry.call_cleanup_ms);
+            stats.resolved_calls_same_file = resolution_stats.strategy_counters.call_same_file;
+            stats.resolved_calls_same_module =
+                resolution_stats.strategy_counters.call_same_module;
+            stats.resolved_calls_global_unique =
+                resolution_stats.strategy_counters.call_global_unique;
+            stats.resolved_calls_semantic =
+                resolution_stats.strategy_counters.call_semantic_fallback;
+            stats.resolved_imports_same_file =
+                resolution_stats.strategy_counters.import_same_file;
+            stats.resolved_imports_same_module =
+                resolution_stats.strategy_counters.import_same_module;
+            stats.resolved_imports_global_unique =
+                resolution_stats.strategy_counters.import_global_unique;
+            stats.resolved_imports_fuzzy = resolution_stats.strategy_counters.import_fuzzy;
+            stats.resolved_imports_semantic =
+                resolution_stats.strategy_counters.import_semantic_fallback;
         }
 
         // Write errors
@@ -506,6 +813,7 @@ impl WorkspaceIndexer {
         batched_storage: &mut IntermediateStorage,
         had_edges: &mut bool,
     ) -> Result<()> {
+        reconcile_rust_impl_anchors(storage, batched_storage)?;
         if !batched_storage.files.is_empty() {
             storage
                 .insert_files_batch(&batched_storage.files)
@@ -551,16 +859,15 @@ impl WorkspaceIndexer {
         let full_path = Self::normalize_index_path(root, path);
 
         let mut local_storage = IntermediateStorage::default();
-        let Some((lang, lang_name, graph_query)) =
-            get_language_for_ext(full_path.extension().and_then(|s| s.to_str()).unwrap_or(""))
-        else {
-            return local_storage;
-        };
-
         let compilation_info = self
             .compilation_db
             .as_ref()
             .and_then(|db| db.get_parsed_info(&full_path));
+        let Some(language_config) =
+            get_language_config_for_path(&full_path, compilation_info.as_ref())
+        else {
+            return local_storage;
+        };
 
         match std::fs::read(&full_path) {
             Ok(bytes) => {
@@ -570,9 +877,7 @@ impl WorkspaceIndexer {
                 match index_file(
                     &full_path,
                     &source,
-                    lang,
-                    lang_name,
-                    graph_query,
+                    &language_config,
                     compilation_info,
                     Some(Arc::clone(symbol_table)),
                 ) {
@@ -584,6 +889,7 @@ impl WorkspaceIndexer {
                         local_storage.component_access = index_result.component_access;
                         local_storage.callable_projection_states =
                             index_result.callable_projection_states;
+                        local_storage.impl_anchor_node_ids = index_result.impl_anchor_node_ids;
                     }
                     Err(e) => {
                         local_storage.add_error(codestory_core::ErrorInfo {
@@ -693,22 +999,397 @@ fn source_line(source: &str, line: u32) -> Option<&str> {
     source.lines().nth((line - 1) as usize)
 }
 
-fn classify_access_from_text(text: &str) -> Option<AccessKind> {
-    let normalized = text.to_ascii_lowercase();
-    if normalized.contains("private") {
+fn classify_keyword_access(text: &str) -> Option<AccessKind> {
+    let trimmed = text.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "private" | "private:" | "private =" | "private{" | "private("
+    ) || lower.starts_with("private ")
+        || lower.starts_with("private\t")
+    {
         return Some(AccessKind::Private);
     }
-    if normalized.contains("protected") {
+    if matches!(
+        lower.as_str(),
+        "protected" | "protected:" | "protected =" | "protected{" | "protected("
+    ) || lower.starts_with("protected ")
+        || lower.starts_with("protected\t")
+    {
         return Some(AccessKind::Protected);
     }
-    if normalized.contains("public") {
+    if matches!(
+        lower.as_str(),
+        "public" | "public:" | "public =" | "public{" | "public("
+    ) || lower.starts_with("public ")
+        || lower.starts_with("public\t")
+    {
         return Some(AccessKind::Public);
     }
     None
 }
 
+fn classify_rust_visibility(text: &str) -> Option<AccessKind> {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("pub(")
+        || trimmed.starts_with("pub ")
+        || trimmed.starts_with("pub\t")
+        || trimmed == "pub"
+    {
+        return Some(AccessKind::Public);
+    }
+    None
+}
+
+fn point_for_line_start(line: u32) -> Point {
+    Point {
+        row: line.saturating_sub(1) as usize,
+        column: 0,
+    }
+}
+
+fn infer_cpp_access_from_tree(tree: &Tree, source: &str, start_line: u32) -> Option<AccessKind> {
+    let root = tree.root_node();
+    let point = point_for_line_start(start_line);
+    let mut node = root.named_descendant_for_point_range(point, point)?;
+
+    loop {
+        if node.kind() == "field_declaration_list" {
+            let container_kind = node.parent().map(|parent| parent.kind()).unwrap_or_default();
+            let mut current = if container_kind == "struct_specifier" {
+                AccessKind::Public
+            } else {
+                AccessKind::Private
+            };
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "access_specifier" {
+                    let text = child.utf8_text(source.as_bytes()).unwrap_or_default();
+                    if let Some(access) = classify_keyword_access(text) {
+                        current = access;
+                    }
+                    continue;
+                }
+
+                let start_row = child.start_position().row as u32 + 1;
+                let end_row = child.end_position().row as u32 + 1;
+                if start_line >= start_row && start_line <= end_row {
+                    return Some(current);
+                }
+            }
+            return Some(current);
+        }
+
+        let Some(parent) = node.parent() else {
+            break;
+        };
+        node = parent;
+    }
+
+    None
+}
+
+#[derive(Debug, Clone)]
+struct ManualEdgeSpec {
+    source_name: String,
+    target_name: String,
+    kind: EdgeKind,
+    line: Option<u32>,
+}
+
+fn node_source_text(node: TsNode<'_>, source: &str) -> Option<String> {
+    source.get(node.byte_range()).map(ToString::to_string)
+}
+
+fn split_top_level_type_arguments(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    let inner = if let (Some(start), Some(end)) = (trimmed.find('<'), trimmed.rfind('>')) {
+        if end > start {
+            &trimmed[start + 1..end]
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+            .strip_prefix('<')
+            .and_then(|value| value.strip_suffix('>'))
+            .unwrap_or(trimmed)
+    };
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut angle_depth = 0i32;
+    let mut paren_depth = 0i32;
+    let mut bracket_depth = 0i32;
+
+    for ch in inner.chars() {
+        match ch {
+            '<' => {
+                angle_depth += 1;
+                current.push(ch);
+            }
+            '>' => {
+                angle_depth = (angle_depth - 1).max(0);
+                current.push(ch);
+            }
+            '(' => {
+                paren_depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                paren_depth = (paren_depth - 1).max(0);
+                current.push(ch);
+            }
+            '[' => {
+                bracket_depth += 1;
+                current.push(ch);
+            }
+            ']' => {
+                bracket_depth = (bracket_depth - 1).max(0);
+                current.push(ch);
+            }
+            ',' if angle_depth == 0 && paren_depth == 0 && bracket_depth == 0 => {
+                let part = current.trim();
+                if !part.is_empty() {
+                    parts.push(part.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let tail = current.trim();
+    if !tail.is_empty() {
+        parts.push(tail.to_string());
+    }
+    parts
+}
+
+fn walk_tree_nodes<F>(node: TsNode<'_>, visit: &mut F)
+where
+    F: FnMut(TsNode<'_>),
+{
+    visit(node);
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_tree_nodes(child, visit);
+    }
+}
+
+fn is_rust_local_symbol_import_path(name: &str) -> bool {
+    let Some(last_segment) = name.rsplit("::").next() else {
+        return false;
+    };
+    (name.starts_with("crate::") || name.starts_with("self::") || name.starts_with("super::"))
+        && last_segment
+            .chars()
+            .next()
+            .map(|ch| ch.is_ascii_uppercase())
+            .unwrap_or(false)
+}
+
+fn collect_rust_generic_type_argument_edges(tree: &Tree, source: &str) -> Vec<ManualEdgeSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "call_expression" {
+            return;
+        }
+        let Some(function_node) = node.child_by_field_name("function") else {
+            return;
+        };
+        if function_node.kind() != "generic_function" {
+            return;
+        }
+        let Some(callee_node) = function_node.child_by_field_name("function") else {
+            return;
+        };
+        let Some(callee_name) = node_source_text(callee_node, source) else {
+            return;
+        };
+        let Some(type_arguments_node) = function_node.child_by_field_name("type_arguments") else {
+            return;
+        };
+        let line = Some(node.start_position().row as u32 + 1);
+        edges.push(ManualEdgeSpec {
+            source_name: callee_name.clone(),
+            target_name: callee_name.clone(),
+            kind: EdgeKind::CALL,
+            line,
+        });
+
+        let Some(raw_arguments) = node_source_text(type_arguments_node, source) else {
+            return;
+        };
+        for type_name in split_top_level_type_arguments(&raw_arguments) {
+            edges.push(ManualEdgeSpec {
+                source_name: callee_name.clone(),
+                target_name: type_name,
+                kind: EdgeKind::TYPE_ARGUMENT,
+                line,
+            });
+        }
+    });
+    edges
+}
+
+fn collect_cpp_template_type_argument_edges(tree: &Tree, source: &str) -> Vec<ManualEdgeSpec> {
+    let _ = tree;
+    let mut edges = Vec::new();
+    for (line_index, line) in source.lines().enumerate() {
+        let chars = line.char_indices().collect::<Vec<_>>();
+        for (idx, ch) in &chars {
+            if *ch != '<' {
+                continue;
+            }
+
+            let mut name_end = *idx;
+            while name_end > 0 && line.as_bytes()[name_end - 1].is_ascii_whitespace() {
+                name_end -= 1;
+            }
+            let mut name_start = name_end;
+            while name_start > 0 {
+                let byte = line.as_bytes()[name_start - 1];
+                if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b':' {
+                    name_start -= 1;
+                } else {
+                    break;
+                }
+            }
+            if name_start == name_end {
+                continue;
+            }
+            let template_name = line[name_start..name_end].trim().to_string();
+            if template_name.is_empty() {
+                continue;
+            }
+
+            let mut depth = 0i32;
+            let mut end_idx = None;
+            for (candidate_idx, candidate_ch) in line[*idx..].char_indices() {
+                match candidate_ch {
+                    '<' => depth += 1,
+                    '>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end_idx = Some(*idx + candidate_idx);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(end_idx) = end_idx else {
+                continue;
+            };
+            let raw_arguments = &line[*idx..=end_idx];
+            for argument_name in split_top_level_type_arguments(raw_arguments) {
+                edges.push(ManualEdgeSpec {
+                    source_name: template_name.clone(),
+                    target_name: argument_name,
+                    kind: EdgeKind::TYPE_ARGUMENT,
+                    line: Some(line_index as u32 + 1),
+                });
+            }
+        }
+    }
+    edges
+}
+
+fn unique_node_id_by_name<F>(
+    nodes: &HashMap<NodeId, Node>,
+    name: &str,
+    predicate: F,
+) -> Option<NodeId>
+where
+    F: Fn(NodeKind) -> bool,
+{
+    let mut matches = nodes
+        .values()
+        .filter(|node| predicate(node.kind))
+        .filter(|node| {
+            node.serialized_name == name
+                || short_member_name(&node.serialized_name) == name
+                || node
+                    .qualified_name
+                    .as_deref()
+                    .map(|qualified_name| qualified_name == name || short_member_name(qualified_name) == name)
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.start_line
+            .unwrap_or(u32::MAX)
+            .cmp(&right.start_line.unwrap_or(u32::MAX))
+            .then_with(|| node_span_width(right).cmp(&node_span_width(left)))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    matches.first().map(|node| node.id)
+}
+
+fn append_manual_type_argument_edges(
+    language_name: &str,
+    tree: &Tree,
+    source: &str,
+    unique_nodes: &HashMap<NodeId, Node>,
+    file_id: NodeId,
+    result_edges: &mut Vec<Edge>,
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+) {
+    let specs = match language_name {
+        "rust" => collect_rust_generic_type_argument_edges(tree, source),
+        "cpp" => collect_cpp_template_type_argument_edges(tree, source),
+        _ => Vec::new(),
+    };
+
+    for spec in specs {
+        let source_id = match spec.kind {
+            EdgeKind::CALL => unique_node_id_by_name(unique_nodes, &spec.source_name, |kind| {
+                matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO)
+            }),
+            EdgeKind::TYPE_ARGUMENT if language_name == "rust" => {
+                unique_node_id_by_name(unique_nodes, &spec.source_name, |kind| {
+                    matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO)
+                })
+            }
+            _ => unique_node_id_by_name(unique_nodes, &spec.source_name, is_type_like_kind),
+        };
+        let Some(source_id) = source_id else {
+            continue;
+        };
+        let target_id = match spec.kind {
+            EdgeKind::CALL => unique_node_id_by_name(unique_nodes, &spec.target_name, |kind| {
+                matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO)
+            }),
+            _ => unique_node_id_by_name(unique_nodes, &spec.target_name, is_type_like_kind),
+        };
+        let Some(target_id) = target_id else {
+            continue;
+        };
+
+        let mut edge = Edge {
+            id: EdgeId(0),
+            source: source_id,
+            target: target_id,
+            kind: spec.kind,
+            file_node_id: Some(file_id),
+            line: spec.line,
+            ..Default::default()
+        };
+        if edge.kind == EdgeKind::CALL && !flags.legacy_edge_identity {
+            ensure_callsite_identity(&mut edge, None);
+        }
+        if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
+            continue;
+        }
+        edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
+        result_edges.push(edge);
+    }
+}
+
 fn infer_access_from_source(
     language_name: &str,
+    tree: &Tree,
     source: &str,
     start_line: u32,
     kind: NodeKind,
@@ -724,23 +1405,30 @@ fn infer_access_from_source(
         return None;
     }
 
-    if let Some(line_text) = source_line(source, start_line)
-        && let Some(access) = classify_access_from_text(line_text)
-    {
-        return Some(access);
+    if let Some(line_text) = source_line(source, start_line) {
+        let access = match language_name {
+            "rust" => classify_rust_visibility(line_text),
+            _ => classify_keyword_access(line_text),
+        };
+        if access.is_some() {
+            return access;
+        }
     }
-    if let Some(prev_line) = start_line
-        .checked_sub(1)
-        .and_then(|line| source_line(source, line))
-        && let Some(access) = classify_access_from_text(prev_line)
-    {
-        return Some(access);
+    if let Some(prev_line) = start_line.checked_sub(1).and_then(|line| source_line(source, line)) {
+        let access = match language_name {
+            "rust" => classify_rust_visibility(prev_line),
+            _ => classify_keyword_access(prev_line),
+        };
+        if access.is_some() {
+            return access;
+        }
     }
 
     match language_name {
+        "rust" => Some(AccessKind::Private),
         "java" => Some(AccessKind::Default),
         "typescript" | "javascript" => Some(AccessKind::Public),
-        "cpp" | "c" => {
+        "cpp" | "c" => infer_cpp_access_from_tree(tree, source, start_line).or_else(|| {
             let lines: Vec<&str> = source.lines().collect();
             let mut idx = start_line.saturating_sub(1) as i32;
             let mut remaining = 40;
@@ -765,7 +1453,7 @@ fn infer_access_from_source(
                 remaining -= 1;
             }
             Some(AccessKind::Private)
-        }
+        }),
         _ => Some(AccessKind::Public),
     }
 }
@@ -967,8 +1655,16 @@ fn canonicalize_nodes(
             .into_iter()
             .max_by(|left, right| compare_canonical_node_candidates(left, right, canonical_roles))
             .unwrap_or_default();
+        let selected_role = canonical_roles
+            .get(&node.id)
+            .copied()
+            .unwrap_or(CanonicalNodeRole::Unspecified);
         node.id = new_id;
-        node.canonical_id = Some(canonical_id);
+        node.canonical_id = Some(if selected_role == CanonicalNodeRole::ImplAnchor {
+            format!("impl_anchor:{canonical_id}")
+        } else {
+            canonical_id
+        });
         deduped_nodes.push(node);
     }
 
@@ -1013,28 +1709,373 @@ fn remap_occurrences(occurrences: &mut [Occurrence], id_remap: &HashMap<NodeId, 
     }
 }
 
+fn short_member_name(name: &str) -> &str {
+    let colon = name.rfind("::").map(|idx| idx + 2).unwrap_or(0);
+    let dot = name.rfind('.').map(|idx| idx + 1).unwrap_or(0);
+    let split = colon.max(dot);
+    &name[split..]
+}
+
+fn rewrite_override_placeholders(file_id: NodeId, nodes: &mut Vec<Node>, edges: &mut [Edge]) {
+    let node_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut synthetic_nodes = Vec::new();
+    let mut placeholder_by_source = HashMap::<NodeId, NodeId>::new();
+
+    for edge in edges.iter_mut().filter(|edge| edge.kind == EdgeKind::OVERRIDE) {
+        if edge.source != edge.target {
+            continue;
+        }
+        let Some(source_node) = node_by_id.get(&edge.source) else {
+            continue;
+        };
+        let placeholder_id = *placeholder_by_source.entry(edge.source).or_insert_with(|| {
+            let method_name = short_member_name(&source_node.serialized_name);
+            let canonical_seed = format!(
+                "override:{}:{}:{}",
+                file_id.0,
+                source_node.id.0,
+                source_node.start_line.unwrap_or(0)
+            );
+            let node_id = NodeId(generate_id(&canonical_seed));
+            synthetic_nodes.push(Node {
+                id: node_id,
+                kind: NodeKind::METHOD,
+                serialized_name: format!("override::{method_name}"),
+                qualified_name: Some(format!("override::{method_name}")),
+                canonical_id: Some(canonical_seed),
+                file_node_id: Some(file_id),
+                start_line: source_node.start_line,
+                start_col: source_node.start_col,
+                end_line: source_node.end_line,
+                end_col: source_node.end_col,
+            });
+            node_id
+        });
+        edge.target = placeholder_id;
+    }
+
+    if !synthetic_nodes.is_empty() {
+        nodes.extend(synthetic_nodes);
+    }
+}
+
+fn reconcile_tsx_usage_targets(nodes: &[Node], edges: &mut [Edge]) {
+    let node_by_id = nodes.iter().map(|node| (node.id, node)).collect::<HashMap<_, _>>();
+    let mut best_by_key = HashMap::<(NodeKind, String), NodeId>::new();
+    for node in nodes {
+        let key = (node.kind, short_member_name(&node.serialized_name).to_string());
+        let replace = best_by_key
+            .get(&key)
+            .and_then(|current_id| node_by_id.get(current_id))
+            .map(|current| {
+                node.start_line
+                    .unwrap_or(u32::MAX)
+                    .cmp(&current.start_line.unwrap_or(u32::MAX))
+                    .then_with(|| node_span_width(current).cmp(&node_span_width(node)))
+                    .is_lt()
+            })
+            .unwrap_or(true);
+        if replace {
+            best_by_key.insert(key, node.id);
+        }
+    }
+
+    for edge in edges.iter_mut().filter(|edge| edge.kind == EdgeKind::USAGE) {
+        let Some(target_node) = node_by_id.get(&edge.target).copied() else {
+            continue;
+        };
+        let key = (
+            target_node.kind,
+            short_member_name(&target_node.serialized_name).to_string(),
+        );
+        let Some(candidate_id) = best_by_key.get(&key).copied() else {
+            continue;
+        };
+        edge.target = candidate_id;
+        if edge.resolved_target.is_some() {
+            edge.resolved_target = Some(candidate_id);
+        }
+    }
+}
+
+fn prune_tsx_duplicate_reference_nodes(
+    nodes: &mut Vec<Node>,
+    edges: &[Edge],
+    occurrences: &mut Vec<Occurrence>,
+) {
+    let referenced_ids = edges
+        .iter()
+        .flat_map(|edge| {
+            [
+                Some(edge.source),
+                Some(edge.target),
+                edge.resolved_source,
+                edge.resolved_target,
+            ]
+        })
+        .flatten()
+        .collect::<HashSet<_>>();
+
+    let node_by_id = nodes.iter().map(|node| (node.id, node)).collect::<HashMap<_, _>>();
+    let mut best_by_key = HashMap::<(NodeKind, String), NodeId>::new();
+    for node in nodes.iter() {
+        if !matches!(node.kind, NodeKind::FUNCTION | NodeKind::FIELD) {
+            continue;
+        }
+        let key = (node.kind, short_member_name(&node.serialized_name).to_string());
+        let should_replace = best_by_key
+            .get(&key)
+            .and_then(|current_id| node_by_id.get(current_id))
+            .map(|current| {
+                node.start_line
+                    .unwrap_or(u32::MAX)
+                    .cmp(&current.start_line.unwrap_or(u32::MAX))
+                    .then_with(|| node_span_width(current).cmp(&node_span_width(node)))
+                    .is_lt()
+            })
+            .unwrap_or(true);
+        if should_replace {
+            best_by_key.insert(key, node.id);
+        }
+    }
+
+    let removed_ids = nodes
+        .iter()
+        .filter_map(|node| {
+            if !matches!(node.kind, NodeKind::FUNCTION | NodeKind::FIELD) {
+                return None;
+            }
+            let key = (node.kind, short_member_name(&node.serialized_name).to_string());
+            let preferred_id = best_by_key.get(&key).copied()?;
+            (preferred_id != node.id && !referenced_ids.contains(&node.id)).then_some(node.id)
+        })
+        .collect::<HashSet<_>>();
+
+    if removed_ids.is_empty() {
+        return;
+    }
+
+    nodes.retain(|node| !removed_ids.contains(&node.id));
+    occurrences.retain(|occurrence| !removed_ids.contains(&NodeId(occurrence.element_id)));
+}
+
+fn remap_pending_node_id(storage: &mut IntermediateStorage, from: NodeId, to: NodeId) {
+    for edge in &mut storage.edges {
+        if edge.source == from {
+            edge.source = to;
+        }
+        if edge.target == from {
+            edge.target = to;
+        }
+        if edge.resolved_source == Some(from) {
+            edge.resolved_source = Some(to);
+        }
+        if edge.resolved_target == Some(from) {
+            edge.resolved_target = Some(to);
+        }
+    }
+
+    for occurrence in &mut storage.occurrences {
+        if occurrence.element_id == from.0 {
+            occurrence.element_id = to.0;
+        }
+    }
+
+    for (node_id, _) in &mut storage.component_access {
+        if *node_id == from {
+            *node_id = to;
+        }
+    }
+
+    for state in &mut storage.callable_projection_states {
+        if state.node_id == from {
+            state.node_id = to;
+        }
+    }
+
+    for node_id in &mut storage.impl_anchor_node_ids {
+        if *node_id == from {
+            *node_id = to;
+        }
+    }
+}
+
+fn rust_type_like_kind_values() -> [i32; 6] {
+    [
+        NodeKind::STRUCT as i32,
+        NodeKind::CLASS as i32,
+        NodeKind::INTERFACE as i32,
+        NodeKind::ENUM as i32,
+        NodeKind::UNION as i32,
+        NodeKind::TYPEDEF as i32,
+    ]
+}
+
+fn choose_pending_impl_anchor_target(
+    anchor: &Node,
+    nodes: &[Node],
+    impl_anchor_ids: &HashSet<NodeId>,
+) -> Option<NodeId> {
+    let mut matches = nodes
+        .iter()
+        .filter(|candidate| {
+            candidate.id != anchor.id
+                && is_type_like_kind(candidate.kind)
+                && !impl_anchor_ids.contains(&candidate.id)
+                && candidate.serialized_name == anchor.serialized_name
+        })
+        .map(|candidate| candidate.id)
+        .collect::<Vec<_>>();
+    matches.sort_unstable();
+    matches.dedup();
+    if matches.len() == 1 {
+        Some(matches[0])
+    } else {
+        None
+    }
+}
+
+fn choose_existing_impl_anchor_target(
+    storage: &Storage,
+    anchor: &Node,
+) -> Result<Option<NodeId>> {
+    let mut query = String::from(
+        "SELECT id, qualified_name
+         FROM node
+         WHERE serialized_name = ?1
+           AND (canonical_id IS NULL OR canonical_id NOT LIKE 'impl_anchor:%')
+           AND kind IN (",
+    );
+    let kind_values = rust_type_like_kind_values();
+    for (idx, _) in kind_values.iter().enumerate() {
+        if idx > 0 {
+            query.push_str(", ");
+        }
+        query.push('?');
+        query.push_str(&(idx + 2).to_string());
+    }
+    query.push(')');
+
+    let mut stmt = storage
+        .get_connection()
+        .prepare(&query)
+        .map_err(|e| anyhow!("Storage query error: {:?}", e))?;
+    let mut params = vec![rusqlite::types::Value::from(anchor.serialized_name.clone())];
+    params.extend(
+        kind_values
+            .iter()
+            .copied()
+            .map(rusqlite::types::Value::from),
+    );
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            Ok((NodeId(row.get::<_, i64>(0)?), row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|e| anyhow!("Storage query error: {:?}", e))?;
+
+    let mut matches = Vec::new();
+    for row in rows {
+        let (node_id, qualified_name) = row.map_err(|e| anyhow!("Storage row error: {:?}", e))?;
+        let _ = qualified_name;
+        matches.push(node_id);
+    }
+    matches.sort_unstable();
+    matches.dedup();
+    Ok(if matches.len() == 1 {
+        Some(matches[0])
+    } else {
+        None
+    })
+}
+
+fn reconcile_rust_impl_anchors(
+    storage: &Storage,
+    pending: &mut IntermediateStorage,
+) -> Result<()> {
+    if pending.impl_anchor_node_ids.is_empty() {
+        return Ok(());
+    }
+
+    let impl_anchor_ids = pending
+        .impl_anchor_node_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let anchor_ids = pending.impl_anchor_node_ids.clone();
+    let mut remaps = Vec::<(NodeId, NodeId)>::new();
+
+    for anchor_id in anchor_ids {
+        let Some(anchor) = pending.nodes.iter().find(|node| node.id == anchor_id).cloned() else {
+            continue;
+        };
+        if !is_type_like_kind(anchor.kind) {
+            continue;
+        }
+
+        let target = choose_pending_impl_anchor_target(&anchor, &pending.nodes, &impl_anchor_ids)
+            .or_else(|| choose_existing_impl_anchor_target(storage, &anchor).ok().flatten());
+        if let Some(target_id) = target {
+            remaps.push((anchor.id, target_id));
+        }
+    }
+
+    if remaps.is_empty() {
+        return Ok(());
+    }
+
+    for (from, to) in &remaps {
+        remap_pending_node_id(pending, *from, *to);
+    }
+
+    let removed_ids = remaps.iter().map(|(from, _)| *from).collect::<HashSet<_>>();
+    pending.nodes.retain(|node| !removed_ids.contains(&node.id));
+    pending.impl_anchor_node_ids.retain(|node_id| !removed_ids.contains(node_id));
+    pending.impl_anchor_node_ids.sort_unstable();
+    pending.impl_anchor_node_ids.dedup();
+
+    Ok(())
+}
+
 /// Index a file and return the results.
 pub fn index_file(
     path: &Path,
     source: &str,
-    language: Language,
-    language_name: &str,
-    graph_query: &str,
+    language_config: &LanguageConfig,
     compilation_info: Option<compilation_database::CompilationInfo>,
     symbol_table: Option<Arc<SymbolTable>>,
 ) -> Result<IndexResult> {
     let flags = index_feature_flags();
+    let is_tsx_file = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("tsx"))
+        .unwrap_or(false);
 
     let mut parser = Parser::new();
     parser
-        .set_language(&language)
+        .set_language(&language_config.language)
         .map_err(|e| anyhow!("Language error: {:?}", e))?;
 
     let tree = parser
         .parse(source, None)
         .ok_or_else(|| anyhow!("Failed to parse source"))?;
+    let mut tag_definitions = extract_tag_definitions(
+        language_config.language.clone(),
+        &tree,
+        source,
+        language_config.tags_query,
+    )?;
+    let _local_query_summary = collect_local_query_summary(
+        language_config.language.clone(),
+        &tree,
+        source,
+        language_config.locals_query,
+    )?;
 
-    let file = GraphFile::from_str(language.clone(), graph_query)
+    let file = GraphFile::from_str(language_config.language.clone(), language_config.graph_query)
         .map_err(|e| anyhow!("Graph DSL error: {:?}", e))?;
 
     let mut variables = Variables::new();
@@ -1075,10 +2116,10 @@ pub fn index_file(
     result_files.push(codestory_storage::FileInfo {
         id: file_id.0,
         path: path.to_path_buf(),
-        language: language_name.to_string(),
+        language: language_config.language_name.to_string(),
         modification_time,
         indexed: true,
-        complete: true, // We will update this if there are syntactic errors later, but for now we assume true
+        complete: !tree.root_node().has_error(),
         line_count: source.lines().count() as u32,
     });
 
@@ -1122,21 +2163,60 @@ pub fn index_file(
             }
         }
 
+        if language_config.language_name == "rust"
+            && kind_str == "MODULE"
+            && is_rust_local_symbol_import_path(&name_str)
+        {
+            name_str = format!("{name_str} (import)");
+        }
+
         if !kind_str.is_empty() && !name_str.is_empty() {
             let mut kind = node_kind_from_graph_kind(kind_str.as_str());
-            if language_name == "python"
+            if language_config.language_name == "python"
                 && kind == NodeKind::VARIABLE
                 && is_python_constant_name(&name_str)
             {
                 kind = NodeKind::CONSTANT;
             }
 
-            let start_line = start_row.map(|v| v + 1).unwrap_or(1);
+            let mut start_line = start_row.map(|v| v + 1).unwrap_or(1);
+            let mut start_col_1 = start_col.map(|v| v + 1).unwrap_or(1);
+            let mut end_line_1 = end_row.map(|v| v + 1).unwrap_or(start_line);
+            let mut end_col_1 = end_col.map(|v| v + 1).unwrap_or(start_col_1);
+            if let Some(definition) =
+                tag_definitions.take(&name_str, start_line, start_col.map(|v| v + 1))
+            {
+                kind = definition.kind;
+                access_kind = definition.access.or(access_kind);
+                if definition.canonical_role != CanonicalNodeRole::Unspecified {
+                    canonical_role = definition.canonical_role;
+                }
+                if definition.key.start_line < start_line {
+                    start_line = definition.key.start_line;
+                    start_col_1 = definition.key.start_col;
+                } else if definition.key.start_line == start_line {
+                    start_col_1 = start_col_1.min(definition.key.start_col);
+                }
+                if definition.end_line > end_line_1 {
+                    end_line_1 = definition.end_line;
+                    end_col_1 = definition.end_col;
+                } else if definition.end_line == end_line_1 {
+                    end_col_1 = end_col_1.max(definition.end_col);
+                }
+            }
             let canonical_seed = format!("{}:{}:{}", file_name, name_str, start_line);
             let nid = NodeId(generate_id(&canonical_seed));
             graph_to_node_id.insert(node_id, nid);
             let effective_access = access_kind
-                .or_else(|| infer_access_from_source(language_name, source, start_line, kind));
+                .or_else(|| {
+                    infer_access_from_source(
+                        language_config.language_name,
+                        &tree,
+                        source,
+                        start_line,
+                        kind,
+                    )
+                });
 
             unique_nodes.insert(
                 nid,
@@ -1145,9 +2225,9 @@ pub fn index_file(
                     kind,
                     serialized_name: name_str,
                     start_line: Some(start_line),
-                    start_col: start_col.map(|v| v + 1),
-                    end_line: end_row.map(|v| v + 1),
-                    end_col: end_col.map(|v| v + 1),
+                    start_col: Some(start_col_1),
+                    end_line: Some(end_line_1),
+                    end_col: Some(end_col_1),
                     ..Default::default()
                 },
             );
@@ -1161,6 +2241,33 @@ pub fn index_file(
             if let Some(st) = &symbol_table {
                 st.insert(nid.0, kind);
             }
+        }
+    }
+
+    for definition in tag_definitions.into_remaining() {
+        let canonical_seed = format!(
+            "{}:{}:{}",
+            file_name, definition.key.name, definition.key.start_line
+        );
+        let nid = NodeId(generate_id(&canonical_seed));
+        unique_nodes.entry(nid).or_insert_with(|| Node {
+            id: nid,
+            kind: definition.kind,
+            serialized_name: definition.key.name.clone(),
+            start_line: Some(definition.key.start_line),
+            start_col: Some(definition.key.start_col),
+            end_line: Some(definition.end_line),
+            end_col: Some(definition.end_col),
+            ..Default::default()
+        });
+        if definition.canonical_role != CanonicalNodeRole::Unspecified {
+            canonical_role_by_node_id.insert(nid, definition.canonical_role);
+        }
+        if let Some(access) = definition.access {
+            component_access_by_node_id.insert(nid, access);
+        }
+        if let Some(st) = &symbol_table {
+            st.insert(nid.0, definition.kind);
         }
     }
 
@@ -1251,23 +2358,54 @@ pub fn index_file(
         }
     }
 
+    append_manual_type_argument_edges(
+        language_config.language_name,
+        &tree,
+        source,
+        &unique_nodes,
+        file_id,
+        &mut result_edges,
+        &mut edge_keys,
+        flags,
+    );
+
     result_occurrences.extend(definition_occurrences(&unique_nodes, file_id));
 
     // 3. Resolve qualified names, canonicalize IDs, and remap projections.
-    let final_nodes = apply_qualified_names(result_nodes, &result_edges, language_name);
+    let final_nodes =
+        apply_qualified_names(result_nodes, &result_edges, language_config.language_name);
     let (mut final_nodes, id_remap) =
         canonicalize_nodes(&file_name, final_nodes, &canonical_role_by_node_id);
     let new_file_id = id_remap.get(&file_id).copied().unwrap_or(file_id);
     remap_file_affinity(&mut final_nodes, new_file_id);
     remap_edges(&mut result_edges, new_file_id, &id_remap, flags);
+    if is_tsx_file {
+        reconcile_tsx_usage_targets(&final_nodes, &mut result_edges);
+    }
     remap_occurrences(&mut result_occurrences, &id_remap);
+    if is_tsx_file {
+        prune_tsx_duplicate_reference_nodes(&mut final_nodes, &result_edges, &mut result_occurrences);
+    }
+    let final_node_ids = final_nodes.iter().map(|node| node.id).collect::<HashSet<_>>();
     let mut remapped_component_access: HashMap<NodeId, AccessKind> = HashMap::new();
     for (original_id, access) in component_access_by_node_id {
         let remapped_id = id_remap.get(&original_id).copied().unwrap_or(original_id);
-        remapped_component_access.insert(remapped_id, access);
+        if final_node_ids.contains(&remapped_id) {
+            remapped_component_access.insert(remapped_id, access);
+        }
     }
     let component_access = remapped_component_access.into_iter().collect::<Vec<_>>();
+    let mut impl_anchor_node_ids = canonical_role_by_node_id
+        .iter()
+        .filter_map(|(node_id, role)| {
+            (*role == CanonicalNodeRole::ImplAnchor)
+                .then(|| id_remap.get(node_id).copied().unwrap_or(*node_id))
+        })
+        .collect::<Vec<_>>();
+    impl_anchor_node_ids.sort_unstable();
+    impl_anchor_node_ids.dedup();
 
+    rewrite_override_placeholders(new_file_id, &mut final_nodes, &mut result_edges);
     apply_line_range_call_attribution(&final_nodes, &mut result_edges, flags);
     let callable_projection_states =
         build_callable_projection_states(&final_nodes, &result_edges, &result_occurrences);
@@ -1285,51 +2423,68 @@ pub fn index_file(
         occurrences: result_occurrences,
         component_access,
         callable_projection_states,
+        impl_anchor_node_ids,
     })
 }
 
-pub fn get_language_for_ext(ext: &str) -> Option<(Language, &'static str, &'static str)> {
+pub fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
     let ext = ext.trim().trim_start_matches('.').to_ascii_lowercase();
     match ext.as_str() {
-        "py" | "pyi" => Some((
+        "py" | "pyi" => Some(make_language_config(
             tree_sitter_python::LANGUAGE.into(),
             "python",
             include_str!("../rules/python.scm"),
+            None,
+            None,
         )),
-        "java" => Some((
+        "java" => Some(make_language_config(
             tree_sitter_java::LANGUAGE.into(),
             "java",
             include_str!("../rules/java.scm"),
+            None,
+            None,
         )),
-        "rs" => Some((
+        "rs" => Some(make_language_config(
             tree_sitter_rust::LANGUAGE.into(),
             "rust",
-            include_str!("../rules/rust.scm"),
+            include_str!("../rules/rust.graph.scm"),
+            Some(include_str!("../rules/rust.tags.scm")),
+            Some(include_str!("../rules/rust.locals.scm")),
         )),
-        "js" | "jsx" | "mjs" | "cjs" => Some((
+        "js" | "jsx" | "mjs" | "cjs" => Some(make_language_config(
             tree_sitter_javascript::LANGUAGE.into(),
             "javascript",
             include_str!("../rules/javascript.scm"),
+            None,
+            None,
         )),
-        "ts" | "mts" | "cts" => Some((
+        "ts" | "mts" | "cts" => Some(make_language_config(
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             "typescript",
-            include_str!("../rules/typescript.scm"),
+            include_str!("../rules/typescript.graph.scm"),
+            Some(include_str!("../rules/typescript.tags.scm")),
+            Some(include_str!("../rules/typescript.locals.scm")),
         )),
-        "tsx" => Some((
+        "tsx" => Some(make_language_config(
             tree_sitter_typescript::LANGUAGE_TSX.into(),
             "typescript",
-            include_str!("../rules/typescript.scm"),
+            include_str!("../rules/tsx.graph.scm"),
+            Some(include_str!("../rules/tsx.tags.scm")),
+            Some(include_str!("../rules/tsx.locals.scm")),
         )),
-        "cpp" | "cc" | "cxx" | "h" | "hpp" | "hh" | "hxx" => Some((
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(make_language_config(
             tree_sitter_cpp::LANGUAGE.into(),
             "cpp",
             include_str!("../rules/cpp.scm"),
+            None,
+            None,
         )),
-        "c" => Some((
+        "c" | "h" => Some(make_language_config(
             tree_sitter_c::LANGUAGE.into(),
             "c",
             include_str!("../rules/c.scm"),
+            None,
+            None,
         )),
         _ => None,
     }
@@ -1817,14 +2972,12 @@ class MyClass(Parent):
     def my_method(self):
         pass
 "#;
-        let (lang, lang_name, graph_query) = get_language_for_ext("py").unwrap();
+        let language_config = get_language_for_ext("py").unwrap();
 
         let result = index_file(
             Path::new("test.py"),
             python_code,
-            lang,
-            lang_name,
-            graph_query,
+            &language_config,
             None,
             None,
         )?;
@@ -1850,14 +3003,12 @@ class MyClass extends Parent {
     void myMethod() {}
 }
 "#;
-        let (lang, lang_name, graph_query) = get_language_for_ext("java").unwrap();
+        let language_config = get_language_for_ext("java").unwrap();
 
         let result = index_file(
             Path::new("Test.java"),
             java_code,
-            lang,
-            lang_name,
-            graph_query,
+            &language_config,
             None,
             None,
         )?;
@@ -1881,14 +3032,12 @@ impl MyStruct {
     fn my_fn(&self) {}
 }
 "#;
-        let (lang, lang_name, graph_query) = get_language_for_ext("rs").unwrap();
+        let language_config = get_language_for_ext("rs").unwrap();
 
         let result = index_file(
             Path::new("main.rs"),
             rust_code,
-            lang,
-            lang_name,
-            graph_query,
+            &language_config,
             None,
             None,
         )?;
@@ -1915,14 +3064,12 @@ impl AppController {
     fn open_project(&self) {}
 }
 "#;
-        let (lang, lang_name, graph_query) = get_language_for_ext("rs").unwrap();
+        let language_config = get_language_for_ext("rs").unwrap();
 
         let result = index_file(
             Path::new("main.rs"),
             rust_code,
-            lang,
-            lang_name,
-            graph_query,
+            &language_config,
             None,
             None,
         )?;
@@ -1963,14 +3110,12 @@ class MyClass {
     void myMethod() {}
 };
 "#;
-        let (lang, lang_name, graph_query) = get_language_for_ext("cpp").unwrap();
+        let language_config = get_language_for_ext("cpp").unwrap();
 
         let result = index_file(
             Path::new("test.cpp"),
             cpp_code,
-            lang,
-            lang_name,
-            graph_query,
+            &language_config,
             None,
             None,
         )?;
@@ -1990,14 +3135,12 @@ class MyClass {
 }
 function globalFunc() {}
 "#;
-        let (lang, lang_name, graph_query) = get_language_for_ext("ts").unwrap();
+        let language_config = get_language_for_ext("ts").unwrap();
 
         let result = index_file(
             Path::new("test.ts"),
             ts_code,
-            lang,
-            lang_name,
-            graph_query,
+            &language_config,
             None,
             None,
         )?;
@@ -2024,6 +3167,36 @@ function globalFunc() {}
             "MEMBER edge not found in TypeScript index result"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_header_language_defaults_to_c_and_can_upgrade_to_cpp_from_compile_info() {
+        let default_config = get_language_for_ext("h").expect("header extension should resolve");
+        assert_eq!(default_config.language_name, "c");
+
+        let cpp_info = compilation_database::CompilationInfo {
+            standard: Some(compilation_database::CxxStandard::Cxx20),
+            ..Default::default()
+        };
+        let config = get_language_config_for_path(Path::new("widget.h"), Some(&cpp_info))
+            .expect("path-based header config should resolve");
+        assert_eq!(config.language_name, "cpp");
+    }
+
+    #[test]
+    fn test_file_completeness_tracks_parse_errors() -> Result<()> {
+        let language_config = get_language_for_ext("rs").unwrap();
+        let result = index_file(
+            Path::new("broken.rs"),
+            "fn broken( {",
+            &language_config,
+            None,
+            None,
+        )?;
+
+        assert_eq!(result.files.len(), 1);
+        assert!(!result.files[0].complete, "malformed Rust source should be incomplete");
         Ok(())
     }
 
@@ -2224,13 +3397,11 @@ class Derived : public Base {
     void foo() {}
 };
 "#;
-        let (lang, lang_name, graph_query) = get_language_for_ext("cpp").unwrap();
+        let language_config = get_language_for_ext("cpp").unwrap();
         let result = index_file(
             Path::new("test.cpp"),
             code,
-            lang,
-            lang_name,
-            graph_query,
+            &language_config,
             None,
             None,
         )?;
@@ -2263,13 +3434,11 @@ from os import path
 class MyClass:
     x = 1
 "#;
-        let (lang, lang_name, graph_query) = get_language_for_ext("py").unwrap();
+        let language_config = get_language_for_ext("py").unwrap();
         let result = index_file(
             Path::new("test.py"),
             code,
-            lang,
-            lang_name,
-            graph_query,
+            &language_config,
             None,
             None,
         )?;
@@ -2298,13 +3467,11 @@ fn main() {
     println!("Hello");
 }
 "#;
-        let (lang, lang_name, graph_query) = get_language_for_ext("rs").unwrap();
+        let language_config = get_language_for_ext("rs").unwrap();
         let result = index_file(
             Path::new("main.rs"),
             code,
-            lang,
-            lang_name,
-            graph_query,
+            &language_config,
             None,
             None,
         )?;
@@ -2338,13 +3505,11 @@ impl<T> Listener for Wrapper<T> {
     fn on_event(&mut self) {}
 }
 "#;
-        let (lang, lang_name, graph_query) = get_language_for_ext("rs").unwrap();
+        let language_config = get_language_for_ext("rs").unwrap();
         let result = index_file(
             Path::new("main.rs"),
             code,
-            lang,
-            lang_name,
-            graph_query,
+            &language_config,
             None,
             None,
         )?;
@@ -2389,13 +3554,11 @@ fn sample(value: i32) -> i32 {
     helper(value)
 }
 "#;
-        let (lang, lang_name, graph_query) = get_language_for_ext("rs").unwrap();
+        let language_config = get_language_for_ext("rs").unwrap();
         let result = index_file(
             Path::new("main.rs"),
             code,
-            lang,
-            lang_name,
-            graph_query,
+            &language_config,
             None,
             None,
         )?;
@@ -2428,13 +3591,11 @@ class Test {
     void callee() {}
 }
 "#;
-        let (lang, lang_name, graph_query) = get_language_for_ext("java").unwrap();
+        let language_config = get_language_for_ext("java").unwrap();
         let result = index_file(
             Path::new("Test.java"),
             java_code,
-            lang,
-            lang_name,
-            graph_query,
+            &language_config,
             None,
             None,
         )?;
@@ -2471,13 +3632,11 @@ class Test {
     }
 }
 "#;
-        let (lang, lang_name, graph_query) = get_language_for_ext("java").unwrap();
+        let language_config = get_language_for_ext("java").unwrap();
         let result = index_file(
             Path::new("Test.java"),
             java_code,
-            lang,
-            lang_name,
-            graph_query,
+            &language_config,
             None,
             None,
         )?;
@@ -2648,5 +3807,35 @@ class Test {
         assert_eq!(node_kind_from_graph_kind("METHOD"), NodeKind::METHOD);
         assert_eq!(node_kind_from_graph_kind("FIELD"), NodeKind::FIELD);
         assert_eq!(node_kind_from_graph_kind("INTERFACE"), NodeKind::INTERFACE);
+    }
+
+    #[test]
+    fn test_header_language_defaults_to_c_without_compilation_metadata() {
+        let config = get_language_for_ext("h").expect("header extension should resolve");
+        assert_eq!(config.language_name, "c");
+    }
+
+    #[test]
+    fn test_header_language_uses_cpp_when_compilation_standard_is_cxx() {
+        let info = compilation_database::CompilationInfo {
+            standard: Some(compilation_database::CxxStandard::Cxx20),
+            ..Default::default()
+        };
+        let config =
+            get_language_config_for_path(Path::new("widget.h"), Some(&info)).expect("config");
+        assert_eq!(config.language_name, "cpp");
+    }
+
+    #[test]
+    fn test_incomplete_parse_marks_file_incomplete() -> Result<()> {
+        let code = "fn broken( {\n";
+        let language_config = get_language_for_ext("rs").unwrap();
+        let result = index_file(Path::new("broken.rs"), code, &language_config, None, None)?;
+        assert_eq!(result.files.len(), 1);
+        assert!(
+            !result.files[0].complete,
+            "malformed syntax should mark the file incomplete"
+        );
+        Ok(())
     }
 }

@@ -444,15 +444,15 @@
     name: (type_identifier) @template_name
     arguments: (template_argument_list
       .
-      (type_descriptor) @type_arg)) @template_expr)
+      (type_descriptor) @type_arg)))
 {
-  node @template_expr.node
-  attr (@template_expr.node) kind = "CLASS"
-  attr (@template_expr.node) name = (source-text @template_name)
-  attr (@template_expr.node) start_row = (start-row @template_name)
-  attr (@template_expr.node) start_col = (start-column @template_name)
-  attr (@template_expr.node) end_row = (end-row @template_name)
-  attr (@template_expr.node) end_col = (end-column @template_name)
+  node @template_name.node
+  attr (@template_name.node) kind = "CLASS"
+  attr (@template_name.node) name = (source-text @template_name)
+  attr (@template_name.node) start_row = (start-row @template_name)
+  attr (@template_name.node) start_col = (start-column @template_name)
+  attr (@template_name.node) end_row = (end-row @template_name)
+  attr (@template_name.node) end_col = (end-column @template_name)
 
   node @type_arg.node
   attr (@type_arg.node) kind = "CLASS"
@@ -462,8 +462,8 @@
   attr (@type_arg.node) end_row = (end-row @type_arg)
   attr (@type_arg.node) end_col = (end-column @type_arg)
 
-  edge @template_expr.node -> @type_arg.node
-  attr (@template_expr.node -> @type_arg.node) kind = "TYPE_ARGUMENT"
+  edge @template_name.node -> @type_arg.node
+  attr (@template_name.node -> @type_arg.node) kind = "TYPE_ARGUMENT"
 }
 
 (declaration
@@ -471,15 +471,15 @@
     name: (type_identifier) @template_name
     arguments: (template_argument_list
       .
-      (type_descriptor) @type_arg)) @template_expr)
+      (type_descriptor) @type_arg)))
 {
-  node @template_expr.node
-  attr (@template_expr.node) kind = "CLASS"
-  attr (@template_expr.node) name = (source-text @template_name)
-  attr (@template_expr.node) start_row = (start-row @template_name)
-  attr (@template_expr.node) start_col = (start-column @template_name)
-  attr (@template_expr.node) end_row = (end-row @template_name)
-  attr (@template_expr.node) end_col = (end-column @template_name)
+  node @template_name.node
+  attr (@template_name.node) kind = "CLASS"
+  attr (@template_name.node) name = (source-text @template_name)
+  attr (@template_name.node) start_row = (start-row @template_name)
+  attr (@template_name.node) start_col = (start-column @template_name)
+  attr (@template_name.node) end_row = (end-row @template_name)
+  attr (@template_name.node) end_col = (end-column @template_name)
 
   node @type_arg.node
   attr (@type_arg.node) kind = "CLASS"
@@ -489,8 +489,8 @@
   attr (@type_arg.node) end_row = (end-row @type_arg)
   attr (@type_arg.node) end_col = (end-column @type_arg)
 
-  edge @template_expr.node -> @type_arg.node
-  attr (@template_expr.node -> @type_arg.node) kind = "TYPE_ARGUMENT"
+  edge @template_name.node -> @type_arg.node
+  attr (@template_name.node -> @type_arg.node) kind = "TYPE_ARGUMENT"
 }
 
 (parameter_declaration
@@ -553,15 +553,15 @@
       name: (type_identifier) @template_name
       arguments: (template_argument_list
         .
-        (type_descriptor) @type_arg)) @template_expr))
+        (type_descriptor) @type_arg))))
 {
-  node @template_expr.node
-  attr (@template_expr.node) kind = "CLASS"
-  attr (@template_expr.node) name = (source-text @template_name)
-  attr (@template_expr.node) start_row = (start-row @template_name)
-  attr (@template_expr.node) start_col = (start-column @template_name)
-  attr (@template_expr.node) end_row = (end-row @template_name)
-  attr (@template_expr.node) end_col = (end-column @template_name)
+  node @template_name.node
+  attr (@template_name.node) kind = "CLASS"
+  attr (@template_name.node) name = (source-text @template_name)
+  attr (@template_name.node) start_row = (start-row @template_name)
+  attr (@template_name.node) start_col = (start-column @template_name)
+  attr (@template_name.node) end_row = (end-row @template_name)
+  attr (@template_name.node) end_col = (end-column @template_name)
 
   node @type_arg.node
   attr (@type_arg.node) kind = "CLASS"
@@ -571,8 +571,8 @@
   attr (@type_arg.node) end_row = (end-row @type_arg)
   attr (@type_arg.node) end_col = (end-column @type_arg)
 
-  edge @template_expr.node -> @type_arg.node
-  attr (@template_expr.node -> @type_arg.node) kind = "TYPE_ARGUMENT"
+  edge @template_name.node -> @type_arg.node
+  attr (@template_name.node -> @type_arg.node) kind = "TYPE_ARGUMENT"
 }
 
 (call_expression

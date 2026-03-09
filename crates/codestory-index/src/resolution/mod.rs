@@ -378,19 +378,6 @@ impl ResolutionPass {
                 Self::count_unresolved_on_conn(conn, EdgeKind::IMPORT, &scope_context)?;
             telemetry.unresolved_count_start_ms = duration_ms_u64(counts_started.elapsed());
 
-            if unresolved_calls_before == 0 && unresolved_imports_before == 0 {
-                return Ok(ResolutionStats {
-                    unresolved_calls_before,
-                    resolved_calls: 0,
-                    unresolved_calls: unresolved_calls_before,
-                    unresolved_imports_before,
-                    resolved_imports: 0,
-                    unresolved_imports: unresolved_imports_before,
-                    telemetry,
-                    strategy_counters: ResolutionStrategyCounters::default(),
-                });
-            }
-
             let mut strategy_counters = ResolutionStrategyCounters::default();
             let resolved_calls = self.resolve_calls_on_conn(
                 conn,
@@ -404,6 +391,7 @@ impl ResolutionPass {
                 &mut telemetry,
                 &mut strategy_counters,
             )?;
+            let _resolved_overrides = self.resolve_overrides_on_conn(conn, &scope_context)?;
 
             let counts_finished = Instant::now();
             let unresolved_calls =
@@ -513,6 +501,14 @@ impl ResolutionPass {
         strategy_counters: &mut ResolutionStrategyCounters,
     ) -> Result<usize> {
         pipeline::resolve_imports_on_conn(self, conn, scope_context, telemetry, strategy_counters)
+    }
+
+    fn resolve_overrides_on_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        scope_context: &ScopeCallerContext,
+    ) -> Result<usize> {
+        pipeline::resolve_overrides_on_conn(self, conn, scope_context)
     }
 
     fn semantic_candidates_for_rows(

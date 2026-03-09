@@ -10,6 +10,7 @@ pub struct IntermediateStorage {
     pub occurrences: Vec<Occurrence>,
     pub component_access: Vec<(NodeId, AccessKind)>,
     pub callable_projection_states: Vec<CallableProjectionState>,
+    pub impl_anchor_node_ids: Vec<NodeId>,
     pub errors: Vec<ErrorInfo>,
 }
 
@@ -46,6 +47,7 @@ impl IntermediateStorage {
         self.component_access.extend(other.component_access);
         self.callable_projection_states
             .extend(other.callable_projection_states);
+        self.impl_anchor_node_ids.extend(other.impl_anchor_node_ids);
         self.errors.extend(other.errors);
     }
 
@@ -56,6 +58,7 @@ impl IntermediateStorage {
         self.occurrences.clear();
         self.component_access.clear();
         self.callable_projection_states.clear();
+        self.impl_anchor_node_ids.clear();
         self.errors.clear();
     }
 }

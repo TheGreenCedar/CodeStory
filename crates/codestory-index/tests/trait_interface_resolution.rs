@@ -67,6 +67,30 @@ fn describe_call_edges(edges: &[Edge], nodes: &[Node]) -> Vec<String> {
         .collect()
 }
 
+fn describe_override_edges(edges: &[Edge], nodes: &[Node]) -> Vec<String> {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::OVERRIDE)
+        .map(|edge| {
+            let source = node_by_id
+                .get(&edge.source)
+                .map(|n| n.serialized_name.clone())
+                .unwrap_or_else(|| format!("<missing:{}>", edge.source.0));
+            let unresolved_target = node_by_id
+                .get(&edge.target)
+                .map(|n| n.serialized_name.clone())
+                .unwrap_or_else(|| format!("<missing:{}>", edge.target.0));
+            let resolved = edge
+                .resolved_target
+                .and_then(|resolved_id| node_by_id.get(&resolved_id).copied())
+                .map(|n| n.serialized_name.clone())
+                .unwrap_or_else(|| "<none>".to_string());
+            format!("{source} -> {unresolved_target} (resolved: {resolved})")
+        })
+        .collect()
+}
+
 fn assert_resolved_call_to_method_owner(
     case_name: &str,
     nodes: &[Node],
@@ -123,6 +147,44 @@ fn assert_resolved_call_to_name(
         found,
         "Case `{case_name}`: expected CALL from `{caller_name}` to resolve to `{callee_name}`. Calls: {:?}",
         describe_call_edges(edges, nodes)
+    );
+}
+
+fn assert_resolved_override_to_method_owner(
+    case_name: &str,
+    nodes: &[Node],
+    edges: &[Edge],
+    overriding_owner: &str,
+    overriding_method: &str,
+    base_owner: &str,
+    base_method: &str,
+) {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    let found = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::OVERRIDE)
+        .filter_map(|edge| {
+            let source = node_by_id.get(&edge.source)?;
+            if !is_matching_owned_method(
+                &source.serialized_name,
+                overriding_owner,
+                overriding_method,
+            ) {
+                return None;
+            }
+            let resolved_id = edge.resolved_target?;
+            let resolved_node = node_by_id.get(&resolved_id)?;
+            Some((edge, resolved_node.serialized_name.as_str()))
+        })
+        .any(|(edge, resolved_name)| {
+            edge.source != edge.target
+                && is_matching_owned_method(resolved_name, base_owner, base_method)
+        });
+
+    assert!(
+        found,
+        "Case `{case_name}`: expected OVERRIDE from `{overriding_owner}::{overriding_method}` to resolve to `{base_owner}::{base_method}`. Overrides: {:?}",
+        describe_override_edges(edges, nodes)
     );
 }
 
@@ -300,6 +362,38 @@ int caller() { callee(); return 1; }
         let (nodes, edges) = index_single_file(filename, source)?;
         assert_resolved_call_to_name(filename, &nodes, &edges, caller_name, callee_name);
     }
+
+    Ok(())
+}
+
+#[test]
+fn test_override_resolution_binds_to_inherited_method_owner() -> anyhow::Result<()> {
+    let (nodes, edges) = index_single_file(
+        "main.ts",
+        r#"
+class BaseGreeter {
+    greet(): string {
+        return "hello";
+    }
+}
+
+class ChildGreeter extends BaseGreeter {
+    override greet(): string {
+        return super.greet();
+    }
+}
+"#,
+    )?;
+
+    assert_resolved_override_to_method_owner(
+        "main.ts",
+        &nodes,
+        &edges,
+        "ChildGreeter",
+        "greet",
+        "BaseGreeter",
+        "greet",
+    );
 
     Ok(())
 }

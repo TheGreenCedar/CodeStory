@@ -108,6 +108,37 @@ use crate::{Action, Thing};
 }
 
 #[test]
+fn test_rust_cross_file_inherent_impl_attaches_members_to_declared_type() -> anyhow::Result<()> {
+    let (nodes, edges) = index_project(&[
+        ("main.rs", "mod a; mod b;\n"),
+        ("a.rs", "pub struct Thing;\n"),
+        (
+            "b.rs",
+            r#"
+use crate::a::Thing;
+
+impl Thing {
+    pub fn run(&self) {}
+}
+"#,
+        ),
+    ])?;
+
+    let thing_nodes = nodes
+        .iter()
+        .filter(|node| matches_name(&node.serialized_name, "Thing"))
+        .collect::<Vec<_>>();
+    assert_eq!(thing_nodes.len(), 1, "expected one logical Thing node");
+    assert_eq!(thing_nodes[0].kind, NodeKind::STRUCT);
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::MEMBER, "Thing", "run"),
+        "expected Thing -> run member edge"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_c_typedef_struct_members_cover_pointer_and_function_pointer_declarators() -> anyhow::Result<()> {
     let (nodes, edges) = index_project(&[(
         "main.c",
@@ -166,16 +197,17 @@ struct Child : Base {
 
 #[test]
 fn test_rust_generic_calls_with_multiple_type_arguments_do_not_duplicate_nodes() -> anyhow::Result<()> {
-    let (_nodes, edges) = index_project(&[(
+    let (nodes, edges) = index_project(&[(
         "main.rs",
         r#"
 struct Left;
+struct Middle;
 struct Right;
 
-fn pair<T, U>() {}
+fn pair<T, U, V>() {}
 
 fn run() {
-    pair::<Left, Right>();
+    pair::<Left, Middle, Right>();
 }
 "#,
     )])?;
@@ -183,6 +215,18 @@ fn run() {
     assert!(
         edges.iter().any(|edge| edge.kind == EdgeKind::CALL),
         "expected generic call to retain a CALL edge"
+    );
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::TYPE_ARGUMENT, "pair", "Left"),
+        "expected pair::<Left, Middle, Right> to retain the first type argument"
+    );
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::TYPE_ARGUMENT, "pair", "Middle"),
+        "expected pair::<Left, Middle, Right> to retain the middle type argument"
+    );
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::TYPE_ARGUMENT, "pair", "Right"),
+        "expected pair::<Left, Middle, Right> to retain the third type argument"
     );
 
     Ok(())
@@ -213,6 +257,112 @@ struct Holder {
     assert!(
         edge_between(&nodes, &edges, EdgeKind::TYPE_ARGUMENT, "PairStore", "Key"),
         "expected template type to retain at least the first type argument"
+    );
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::TYPE_ARGUMENT, "PairStore", "Value"),
+        "expected template type to retain the second type argument"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_cpp_template_aliases_with_multiple_arguments_keep_all_arguments() -> anyhow::Result<()> {
+    let (nodes, edges) = index_project(&[(
+        "main.cpp",
+        r#"
+struct Key {};
+struct Value {};
+
+template <typename T, typename U>
+struct PairStore {};
+
+using StoreAlias = PairStore<Key, Value>;
+"#,
+    )])?;
+
+    assert!(has_node_kind(&nodes, "PairStore", NodeKind::CLASS));
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::TYPE_ARGUMENT, "PairStore", "Key"),
+        "expected alias template type to retain the first type argument"
+    );
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::TYPE_ARGUMENT, "PairStore", "Value"),
+        "expected alias template type to retain the second type argument"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_typescript_override_resolves_to_base_method() -> anyhow::Result<()> {
+    let (nodes, edges) = index_project(&[(
+        "main.ts",
+        r#"
+class Base {
+    greet() {}
+}
+
+class Child extends Base {
+    override greet() {}
+}
+"#,
+    )])?;
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::OVERRIDE, "Child.greet", "Base.greet"),
+        "expected override edge to resolve Child.greet -> Base.greet"
+    );
+    assert!(
+        edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::OVERRIDE)
+            .all(|edge| edge.source != edge.target),
+        "override edges should not remain reflexive after placeholder rewrite"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_tsx_override_render_keeps_jsx_usage_edges() -> anyhow::Result<()> {
+    let (nodes, edges) = index_project(&[(
+        "main.tsx",
+        r#"
+type Props = { label: string };
+
+function Badge(props: Props) {
+    return <span>{props.label}</span>;
+}
+
+class BaseView {
+    render() {
+        return <div />;
+    }
+}
+
+class View extends BaseView {
+    override render() {
+        return (
+            <>
+                <Badge label="hello" />
+            </>
+        );
+    }
+}
+"#,
+    )])?;
+
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::OVERRIDE, "View.render", "BaseView.render"),
+        "expected TSX override edge to resolve View.render -> BaseView.render"
+    );
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::USAGE, "View.render", "Badge"),
+        "expected View.render to retain Badge JSX usage"
+    );
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::USAGE, "View.render", "label"),
+        "expected View.render to retain label prop usage"
     );
 
     Ok(())

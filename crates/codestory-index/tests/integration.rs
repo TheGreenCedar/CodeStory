@@ -428,6 +428,7 @@ function App() {
     )])?;
 
     let nodes = storage.get_nodes()?;
+    let edges = storage.get_edges()?;
     assert!(
         nodes
             .iter()
@@ -438,6 +439,41 @@ function App() {
             .iter()
             .any(|node| node.serialized_name == "Status" && node.kind == NodeKind::ENUM)
     );
+    let app_id = nodes
+        .iter()
+        .find(|node| node.serialized_name == "App" && node.kind == NodeKind::FUNCTION)
+        .map(|node| node.id)
+        .expect("App function node not found");
+    let badge_id = nodes
+        .iter()
+        .find(|node| node.serialized_name == "Badge")
+        .map(|node| node.id)
+        .expect("Badge usage node not found");
+    let label_id = nodes
+        .iter()
+        .find(|node| node.serialized_name == "label" && node.kind == NodeKind::FIELD)
+        .map(|node| node.id)
+        .expect("label prop node not found");
+    let variant_id = nodes
+        .iter()
+        .find(|node| node.serialized_name == "variant" && node.kind == NodeKind::FIELD)
+        .map(|node| node.id)
+        .expect("variant prop node not found");
+    assert!(edges.iter().any(|edge| {
+        edge.kind == EdgeKind::USAGE
+            && edge.source == app_id
+            && edge.target == badge_id
+    }));
+    assert!(edges.iter().any(|edge| {
+        edge.kind == EdgeKind::USAGE
+            && edge.source == app_id
+            && edge.target == label_id
+    }));
+    assert!(edges.iter().any(|edge| {
+        edge.kind == EdgeKind::USAGE
+            && edge.source == app_id
+            && edge.target == variant_id
+    }));
 
     Ok(())
 }

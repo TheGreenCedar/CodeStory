@@ -357,15 +357,13 @@ fn fixture_cases() -> Vec<FixtureCase> {
 }
 
 fn index_case(case: &FixtureCase) -> Result<codestory_index::IndexResult> {
-    let (language, language_name, graph_query) = get_language_for_ext(case.extension)
+    let language_config = get_language_for_ext(case.extension)
         .ok_or_else(|| anyhow!("No language mapping for extension '{}'", case.extension))?;
 
     index_file(
         Path::new(case.filename),
         case.source,
-        language,
-        language_name,
-        graph_query,
+        &language_config,
         None,
         None,
     )
@@ -461,7 +459,7 @@ fn test_language_extension_coverage_and_names() {
         ("cpp", "cpp"),
         ("cc", "cpp"),
         ("cxx", "cpp"),
-        ("h", "cpp"),
+        ("h", "c"),
         ("hh", "cpp"),
         ("hpp", "cpp"),
         ("hxx", "cpp"),
@@ -469,14 +467,14 @@ fn test_language_extension_coverage_and_names() {
     ];
 
     for (ext, expected_name) in expected {
-        let (_, language_name, graph_query) =
+        let language_config =
             get_language_for_ext(ext).expect("Extension should resolve to a language");
         assert_eq!(
-            language_name, expected_name,
+            language_config.language_name, expected_name,
             "Wrong language name for extension {ext}"
         );
         assert!(
-            !graph_query.trim().is_empty(),
+            !language_config.graph_query.trim().is_empty(),
             "Expected non-empty graph query for extension {ext}"
         );
     }
@@ -493,11 +491,14 @@ fn test_language_extension_coverage_is_case_insensitive() {
         ("CPP", "cpp"),
     ];
     for (ext, expected_name) in expected {
-        let (_, language_name, graph_query) =
-            get_language_for_ext(ext).expect("Uppercase extension should resolve");
-        assert_eq!(language_name, expected_name, "Wrong language for ext={ext}");
+        let language_config = get_language_for_ext(ext).expect("Uppercase extension should resolve");
+        assert_eq!(
+            language_config.language_name,
+            expected_name,
+            "Wrong language for ext={ext}"
+        );
         assert!(
-            !graph_query.trim().is_empty(),
+            !language_config.graph_query.trim().is_empty(),
             "Missing graph query for ext={ext}"
         );
     }
@@ -508,20 +509,23 @@ fn test_tsx_file_with_jsx_parses() -> Result<()> {
     let source = r#"
 const helper = (name: string) => name.toUpperCase();
 
+function Badge(props: { title: string; tone: string }) {
+    return <section>{props.title}</section>;
+}
+
 export function App() {
     const title = helper("hello");
-    return <div className="title">{title}</div>;
+    return (
+        <Badge title={title} tone="title"></Badge>
+    );
 }
 "#;
 
-    let (lang, lang_name, graph_query) =
-        get_language_for_ext("tsx").expect("tsx extension should be supported");
+    let language_config = get_language_for_ext("tsx").expect("tsx extension should be supported");
     let result = index_file(
         Path::new("App.tsx"),
         source,
-        lang,
-        lang_name,
-        graph_query,
+        &language_config,
         None,
         None,
     )?;
@@ -541,6 +545,18 @@ export function App() {
         result.edges.iter().any(|edge| edge.kind == EdgeKind::CALL),
         "Expected TSX parse to yield CALL edges"
     );
+    assert!(
+        has_edge_between_names(&result.edges, &result.nodes, EdgeKind::USAGE, "App", "Badge"),
+        "Expected TSX parse to yield App -> Badge JSX usage"
+    );
+    assert!(
+        has_edge_between_names(&result.edges, &result.nodes, EdgeKind::USAGE, "App", "title"),
+        "Expected TSX parse to yield App -> title prop usage"
+    );
+    assert!(
+        has_edge_between_names(&result.edges, &result.nodes, EdgeKind::USAGE, "App", "tone"),
+        "Expected TSX parse to yield App -> tone prop usage"
+    );
     Ok(())
 }
 
@@ -556,14 +572,11 @@ enum Tone {
 }
 "#;
 
-    let (lang, lang_name, graph_query) =
-        get_language_for_ext("ts").expect("ts extension should be supported");
+    let language_config = get_language_for_ext("ts").expect("ts extension should be supported");
     let result = index_file(
         Path::new("types.ts"),
         source,
-        lang,
-        lang_name,
-        graph_query,
+        &language_config,
         None,
         None,
     )?;
@@ -584,14 +597,11 @@ private:
 };
 "#;
 
-    let (lang, lang_name, graph_query) =
-        get_language_for_ext("cpp").expect("cpp extension should be supported");
+    let language_config = get_language_for_ext("cpp").expect("cpp extension should be supported");
     let result = index_file(
         Path::new("Widget.cpp"),
         source,
-        lang,
-        lang_name,
-        graph_query,
+        &language_config,
         None,
         None,
     )?;

@@ -39,26 +39,31 @@ fn matches_name(actual: &str, wanted: &str) -> bool {
         || actual.ends_with(&format!(" {wanted}"))
 }
 
-fn find_node<'a>(nodes: &'a [Node], name: &str) -> Option<&'a Node> {
-    nodes.iter().find(|node| matches_name(&node.serialized_name, name))
-}
-
 fn has_node_kind(nodes: &[Node], name: &str, kind: NodeKind) -> bool {
     nodes.iter()
         .any(|node| matches_name(&node.serialized_name, name) && node.kind == kind)
 }
 
 fn edge_between(nodes: &[Node], edges: &[Edge], kind: EdgeKind, source: &str, target: &str) -> bool {
-    let source_id = find_node(nodes, source).map(|node| node.id);
-    let target_id = find_node(nodes, target).map(|node| node.id);
-    match (source_id, target_id) {
-        (Some(source_id), Some(target_id)) => edges.iter().any(|edge| {
+    let source_ids = nodes
+        .iter()
+        .filter(|node| matches_name(&node.serialized_name, source))
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    let target_ids = nodes
+        .iter()
+        .filter(|node| matches_name(&node.serialized_name, target))
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    !source_ids.is_empty()
+        && !target_ids.is_empty()
+        && edges.iter().any(|edge| {
+            let edge_source = edge.resolved_source.unwrap_or(edge.source);
+            let edge_target = edge.resolved_target.unwrap_or(edge.target);
             edge.kind == kind
-                && (edge.source == source_id || edge.resolved_source == Some(source_id))
-                && (edge.target == target_id || edge.resolved_target == Some(target_id))
-        }),
-        _ => false,
-    }
+                && source_ids.contains(&edge_source)
+                && target_ids.contains(&edge_target)
+        })
 }
 
 fn edge_between_matching(
@@ -169,6 +174,44 @@ class Example extends Base implements IFoo {
     assert!(
         edge_between(&nodes, &edges, EdgeKind::INHERITANCE, "Child", "IBase"),
         "expected Child -> IBase inheritance edge"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_tsx_parenthesized_jsx_component_and_props_are_tracked() -> anyhow::Result<()> {
+    let (nodes, edges) = index_project(&[(
+        "App.tsx",
+        r#"
+type Props = { label: string };
+
+function Badge(props: Props) {
+  return <span>{props.label}</span>;
+}
+
+function App() {
+  return (
+    <Badge label="hello" variant="primary"></Badge>
+  );
+}
+"#,
+    )])?;
+
+    assert!(has_node_kind(&nodes, "Props", NodeKind::TYPEDEF));
+    assert!(has_node_kind(&nodes, "Badge", NodeKind::FUNCTION));
+    assert!(has_node_kind(&nodes, "App", NodeKind::FUNCTION));
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::USAGE, "App", "Badge"),
+        "expected TSX JSX usage to retain App -> Badge"
+    );
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::USAGE, "App", "label"),
+        "expected TSX JSX usage to retain App -> label"
+    );
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::USAGE, "App", "variant"),
+        "expected TSX JSX usage to retain App -> variant"
     );
 
     Ok(())
