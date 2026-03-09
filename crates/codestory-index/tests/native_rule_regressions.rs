@@ -267,6 +267,46 @@ struct Holder {
 }
 
 #[test]
+fn test_cpp_template_types_with_multiline_and_nested_arguments_stay_ast_driven() -> anyhow::Result<()> {
+    let (nodes, edges) = index_project(&[(
+        "main.cpp",
+        r#"
+struct Key {};
+struct Value {};
+
+template <typename T>
+struct Wrapper {};
+
+template <typename T, typename U>
+struct PairStore {};
+
+struct Holder {
+    PairStore<
+        Key,
+        Wrapper<Value> // nested template with comment
+    > store;
+};
+"#,
+    )])?;
+
+    assert!(has_node_kind(&nodes, "Holder", NodeKind::CLASS));
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::MEMBER, "Holder", "store"),
+        "expected Holder -> store member edge"
+    );
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::TYPE_ARGUMENT, "PairStore", "Key"),
+        "expected multiline template type to retain the first type argument"
+    );
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::TYPE_ARGUMENT, "PairStore", "Wrapper"),
+        "expected multiline template type to retain the nested template owner"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_cpp_template_aliases_with_multiple_arguments_keep_all_arguments() -> anyhow::Result<()> {
     let (nodes, edges) = index_project(&[(
         "main.cpp",
@@ -363,6 +403,49 @@ class View extends BaseView {
     assert!(
         edge_between(&nodes, &edges, EdgeKind::USAGE, "View.render", "label"),
         "expected View.render to retain label prop usage"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_tsx_nested_fragments_and_parenthesized_usage_keep_component_edges() -> anyhow::Result<()> {
+    let (nodes, edges) = index_project(&[(
+        "main.tsx",
+        r#"
+type Props = { label: string; tone: string };
+
+function Badge(props: Props) {
+    return <span>{props.label}{props.tone}</span>;
+}
+
+class View {
+    render() {
+        return (
+            <>
+                <section>
+                    <>
+                        <Badge label="hello" tone="warm" />
+                    </>
+                </section>
+            </>
+        );
+    }
+}
+"#,
+    )])?;
+
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::USAGE, "View.render", "Badge"),
+        "expected nested TSX usage to retain View.render -> Badge"
+    );
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::USAGE, "View.render", "label"),
+        "expected nested TSX usage to retain View.render -> label"
+    );
+    assert!(
+        edge_between(&nodes, &edges, EdgeKind::USAGE, "View.render", "tone"),
+        "expected nested TSX usage to retain View.render -> tone"
     );
 
     Ok(())

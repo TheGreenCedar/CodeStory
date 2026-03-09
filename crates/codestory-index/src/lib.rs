@@ -58,13 +58,44 @@ fn env_flag(name: &str, default: bool) -> bool {
     }
 }
 
+// Source of truth for live rule assets. Keep this registry aligned with
+// `get_language_for_ext` so dead rule files do not silently linger.
+const PYTHON_GRAPH_QUERY: &str = include_str!("../rules/python.scm");
+const JAVA_GRAPH_QUERY: &str = include_str!("../rules/java.scm");
+const RUST_GRAPH_QUERY: &str = include_str!("../rules/rust.graph.scm");
+const RUST_TAGS_QUERY: &str = include_str!("../rules/rust.tags.scm");
+const JAVASCRIPT_GRAPH_QUERY: &str = include_str!("../rules/javascript.scm");
+const TYPESCRIPT_GRAPH_QUERY: &str = include_str!("../rules/typescript.graph.scm");
+const TYPESCRIPT_TAGS_QUERY: &str = include_str!("../rules/typescript.tags.scm");
+const TSX_GRAPH_QUERY: &str = include_str!("../rules/tsx.graph.scm");
+const TSX_TAGS_QUERY: &str = TYPESCRIPT_TAGS_QUERY;
+const CPP_GRAPH_QUERY: &str = include_str!("../rules/cpp.scm");
+const C_GRAPH_QUERY: &str = include_str!("../rules/c.scm");
+
+#[derive(Debug, Clone, Copy)]
+enum LanguageRuleset {
+    Python,
+    Java,
+    Rust,
+    JavaScript,
+    TypeScript,
+    Tsx,
+    Cpp,
+    C,
+}
+
 #[derive(Debug, Clone)]
 pub struct LanguageConfig {
     pub language: Language,
     pub language_name: &'static str,
     pub graph_query: &'static str,
     pub tags_query: Option<&'static str>,
-    pub locals_query: Option<&'static str>,
+    ruleset: LanguageRuleset,
+}
+
+struct CompiledLanguageRules {
+    graph_file: GraphFile,
+    tags_query: Option<Query>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -90,24 +121,19 @@ struct TagDefinitionIndex {
     fallback_index: HashMap<(String, u32), TagDefinitionKey>,
 }
 
-#[derive(Default)]
-struct LocalQuerySummary {
-    scope_count: usize,
-}
-
 fn make_language_config(
     language: Language,
     language_name: &'static str,
     graph_query: &'static str,
     tags_query: Option<&'static str>,
-    locals_query: Option<&'static str>,
+    ruleset: LanguageRuleset,
 ) -> LanguageConfig {
     LanguageConfig {
         language,
         language_name,
         graph_query,
         tags_query,
-        locals_query,
+        ruleset,
     }
 }
 
@@ -147,6 +173,78 @@ impl TagDefinitionIndex {
         self.by_key.into_values().collect()
     }
 }
+
+impl LanguageConfig {
+    fn compiled_rules(&self) -> Result<&'static CompiledLanguageRules> {
+        self.ruleset.compiled_rules(self.language.clone())
+    }
+}
+
+impl LanguageRuleset {
+    fn compiled_rules(&self, language: Language) -> Result<&'static CompiledLanguageRules> {
+        match self {
+            LanguageRuleset::Python => compiled_rules_cache(language, PYTHON_GRAPH_QUERY, None, &PYTHON_RULES),
+            LanguageRuleset::Java => compiled_rules_cache(language, JAVA_GRAPH_QUERY, None, &JAVA_RULES),
+            LanguageRuleset::Rust => compiled_rules_cache(
+                language,
+                RUST_GRAPH_QUERY,
+                Some(RUST_TAGS_QUERY),
+                &RUST_RULES,
+            ),
+            LanguageRuleset::JavaScript => compiled_rules_cache(
+                language,
+                JAVASCRIPT_GRAPH_QUERY,
+                None,
+                &JAVASCRIPT_RULES,
+            ),
+            LanguageRuleset::TypeScript => compiled_rules_cache(
+                language,
+                TYPESCRIPT_GRAPH_QUERY,
+                Some(TYPESCRIPT_TAGS_QUERY),
+                &TYPESCRIPT_RULES,
+            ),
+            LanguageRuleset::Tsx => compiled_rules_cache(
+                language,
+                TSX_GRAPH_QUERY,
+                Some(TSX_TAGS_QUERY),
+                &TSX_RULES,
+            ),
+            LanguageRuleset::Cpp => compiled_rules_cache(language, CPP_GRAPH_QUERY, None, &CPP_RULES),
+            LanguageRuleset::C => compiled_rules_cache(language, C_GRAPH_QUERY, None, &C_RULES),
+        }
+    }
+}
+
+fn compiled_rules_cache(
+    language: Language,
+    graph_query: &'static str,
+    tags_query: Option<&'static str>,
+    cache: &'static OnceLock<Result<CompiledLanguageRules, String>>,
+) -> Result<&'static CompiledLanguageRules> {
+    let compiled = cache.get_or_init(|| {
+        let graph_file = GraphFile::from_str(language.clone(), graph_query)
+            .map_err(|e| format!("Graph DSL error: {:?}", e))?;
+        let tags_query = tags_query
+            .filter(|query| !query.trim().is_empty())
+            .map(|query| Query::new(&language, query).map_err(|e| format!("Tag query error: {:?}", e)))
+            .transpose()?;
+        Ok::<CompiledLanguageRules, String>(CompiledLanguageRules {
+            graph_file,
+            tags_query,
+        })
+    });
+
+    compiled.as_ref().map_err(|message| anyhow!(message.clone()))
+}
+
+static PYTHON_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
+static JAVA_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
+static RUST_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
+static JAVASCRIPT_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
+static TYPESCRIPT_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
+static TSX_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
+static CPP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
+static C_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 
 fn tag_definition_priority(definition: &TagDefinition) -> (u8, u8, u8) {
     let role_priority = canonical_role_priority(definition.canonical_role);
@@ -196,17 +294,14 @@ fn parse_access_capture_text(text: &str) -> Option<AccessKind> {
 }
 
 fn extract_tag_definitions(
-    language: Language,
+    compiled_rules: &CompiledLanguageRules,
     tree: &Tree,
     source: &str,
-    tags_query: Option<&str>,
 ) -> Result<TagDefinitionIndex> {
-    let Some(tags_query) = tags_query.filter(|query| !query.trim().is_empty()) else {
+    let Some(query) = compiled_rules.tags_query.as_ref() else {
         return Ok(TagDefinitionIndex::default());
     };
 
-    let query = Query::new(&language, tags_query)
-        .map_err(|err| anyhow!("Tag query error: {:?}", err))?;
     let capture_names = query.capture_names();
     let mut cursor = QueryCursor::new();
     let mut index = TagDefinitionIndex::default();
@@ -274,44 +369,6 @@ fn extract_tag_definitions(
     Ok(index)
 }
 
-fn collect_local_query_summary(
-    language: Language,
-    tree: &Tree,
-    source: &str,
-    locals_query: Option<&str>,
-) -> Result<LocalQuerySummary> {
-    let Some(locals_query) = locals_query.filter(|query| !query.trim().is_empty()) else {
-        return Ok(LocalQuerySummary::default());
-    };
-
-    let query = Query::new(&language, locals_query)
-        .map_err(|err| anyhow!("Locals query error: {:?}", err))?;
-    let capture_names = query.capture_names();
-    let mut cursor = QueryCursor::new();
-    let mut summary = LocalQuerySummary::default();
-
-    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
-    while {
-        matches.advance();
-        matches.get().is_some()
-    } {
-        let Some(query_match) = matches.get() else {
-            continue;
-        };
-        for capture in query_match.captures {
-            let capture_name = capture_names
-                .get(capture.index as usize)
-                .map(|name| *name)
-                .unwrap_or_default();
-            if capture_name == "local.scope" {
-                summary.scope_count += 1;
-            }
-        }
-    }
-
-    Ok(summary)
-}
-
 fn infer_header_language_config(
     compilation_info: Option<&compilation_database::CompilationInfo>,
 ) -> LanguageConfig {
@@ -335,17 +392,17 @@ fn infer_header_language_config(
         make_language_config(
             tree_sitter_cpp::LANGUAGE.into(),
             "cpp",
-            include_str!("../rules/cpp.scm"),
+            CPP_GRAPH_QUERY,
             None,
-            None,
+            LanguageRuleset::Cpp,
         )
     } else {
         make_language_config(
             tree_sitter_c::LANGUAGE.into(),
             "c",
-            include_str!("../rules/c.scm"),
+            C_GRAPH_QUERY,
             None,
-            None,
+            LanguageRuleset::C,
         )
     }
 }
@@ -1233,66 +1290,177 @@ fn collect_rust_generic_type_argument_edges(tree: &Tree, source: &str) -> Vec<Ma
 }
 
 fn collect_cpp_template_type_argument_edges(tree: &Tree, source: &str) -> Vec<ManualEdgeSpec> {
-    let _ = tree;
     let mut edges = Vec::new();
-    for (line_index, line) in source.lines().enumerate() {
-        let chars = line.char_indices().collect::<Vec<_>>();
-        for (idx, ch) in &chars {
-            if *ch != '<' {
-                continue;
-            }
-
-            let mut name_end = *idx;
-            while name_end > 0 && line.as_bytes()[name_end - 1].is_ascii_whitespace() {
-                name_end -= 1;
-            }
-            let mut name_start = name_end;
-            while name_start > 0 {
-                let byte = line.as_bytes()[name_start - 1];
-                if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b':' {
-                    name_start -= 1;
-                } else {
-                    break;
-                }
-            }
-            if name_start == name_end {
-                continue;
-            }
-            let template_name = line[name_start..name_end].trim().to_string();
-            if template_name.is_empty() {
-                continue;
-            }
-
-            let mut depth = 0i32;
-            let mut end_idx = None;
-            for (candidate_idx, candidate_ch) in line[*idx..].char_indices() {
-                match candidate_ch {
-                    '<' => depth += 1,
-                    '>' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end_idx = Some(*idx + candidate_idx);
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let Some(end_idx) = end_idx else {
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "template_type" {
+            return;
+        }
+        let Some(template_name) = cpp_named_type_text(node.child_by_field_name("name"), source) else {
+            return;
+        };
+        let Some(arguments) = node.child_by_field_name("arguments") else {
+            return;
+        };
+        let line = Some(node.start_position().row as u32 + 1);
+        let mut cursor = arguments.walk();
+        for argument in arguments.named_children(&mut cursor) {
+            let Some(argument_name) = cpp_named_type_text(Some(argument), source) else {
                 continue;
             };
-            let raw_arguments = &line[*idx..=end_idx];
-            for argument_name in split_top_level_type_arguments(raw_arguments) {
+            edges.push(ManualEdgeSpec {
+                source_name: template_name.clone(),
+                target_name: argument_name,
+                kind: EdgeKind::TYPE_ARGUMENT,
+                line,
+            });
+        }
+    });
+    edges
+}
+
+fn cpp_named_type_text(node: Option<TsNode<'_>>, source: &str) -> Option<String> {
+    let node = node?;
+    match node.kind() {
+        "template_type" => cpp_named_type_text(node.child_by_field_name("name"), source),
+        "type_descriptor" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if let Some(text) = cpp_named_type_text(Some(child), source) {
+                    return Some(text);
+                }
+            }
+            node_source_text(node, source).map(|text| {
+                text.trim()
+                    .trim_start_matches("typename ")
+                    .trim_start_matches("class ")
+                    .trim()
+                    .to_string()
+            })
+        }
+        "type_identifier" | "qualified_identifier" | "primitive_type" | "identifier"
+        | "namespace_identifier" | "field_identifier" => {
+            node_source_text(node, source).map(|text| {
+                text.trim()
+                    .trim_start_matches("typename ")
+                    .trim_start_matches("class ")
+                    .trim()
+                    .to_string()
+            })
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if let Some(text) = cpp_named_type_text(Some(child), source) {
+                    return Some(text);
+                }
+            }
+            None
+        }
+    }
+}
+
+fn collect_tsx_jsx_usage_edges(tree: &Tree, source: &str) -> Vec<ManualEdgeSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        let source_name = match node.kind() {
+            "function_declaration" | "method_definition" => node
+                .child_by_field_name("name")
+                .and_then(|name| node_source_text(name, source))
+                .map(|name| name.trim().to_string()),
+            _ => None,
+        };
+        let Some(source_name) = source_name else {
+            return;
+        };
+        let Some(body) = node.child_by_field_name("body") else {
+            return;
+        };
+        collect_tsx_return_usage_edges(Some(body), &source_name, source, &mut edges);
+    });
+    edges
+}
+
+fn collect_tsx_return_usage_edges(
+    node: Option<TsNode<'_>>,
+    source_name: &str,
+    source: &str,
+    edges: &mut Vec<ManualEdgeSpec>,
+) {
+    let Some(node) = node else {
+        return;
+    };
+    if node.kind() == "return_statement" {
+        let line = Some(node.start_position().row as u32 + 1);
+        collect_tsx_jsx_targets(Some(node), source_name, source, line, edges);
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_tsx_return_usage_edges(Some(child), source_name, source, edges);
+    }
+}
+
+fn collect_tsx_jsx_targets(
+    node: Option<TsNode<'_>>,
+    source_name: &str,
+    source: &str,
+    line: Option<u32>,
+    edges: &mut Vec<ManualEdgeSpec>,
+) {
+    let Some(node) = node else {
+        return;
+    };
+    match node.kind() {
+        "jsx_self_closing_element" => {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|name| node_source_text(name, source))
+            {
                 edges.push(ManualEdgeSpec {
-                    source_name: template_name.clone(),
-                    target_name: argument_name,
-                    kind: EdgeKind::TYPE_ARGUMENT,
-                    line: Some(line_index as u32 + 1),
+                    source_name: source_name.to_string(),
+                    target_name: name.trim().to_string(),
+                    kind: EdgeKind::USAGE,
+                    line,
                 });
             }
         }
+        "jsx_opening_element" => {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|name| node_source_text(name, source))
+            {
+                edges.push(ManualEdgeSpec {
+                    source_name: source_name.to_string(),
+                    target_name: name.trim().to_string(),
+                    kind: EdgeKind::USAGE,
+                    line,
+                });
+            }
+        }
+        "jsx_attribute" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() != "property_identifier" {
+                    continue;
+                }
+                if let Some(name) = node_source_text(child, source) {
+                    edges.push(ManualEdgeSpec {
+                        source_name: source_name.to_string(),
+                        target_name: name.trim().to_string(),
+                        kind: EdgeKind::USAGE,
+                        line,
+                    });
+                }
+            }
+        }
+        _ => {}
     }
-    edges
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_tsx_jsx_targets(Some(child), source_name, source, line, edges);
+    }
 }
 
 fn unique_node_id_by_name<F>(
@@ -1379,6 +1547,49 @@ fn append_manual_type_argument_edges(
         if edge.kind == EdgeKind::CALL && !flags.legacy_edge_identity {
             ensure_callsite_identity(&mut edge, None);
         }
+        if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
+            continue;
+        }
+        edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
+        result_edges.push(edge);
+    }
+}
+
+fn append_manual_usage_edges(
+    is_tsx_file: bool,
+    tree: &Tree,
+    source: &str,
+    unique_nodes: &HashMap<NodeId, Node>,
+    file_id: NodeId,
+    result_edges: &mut Vec<Edge>,
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+) {
+    if !is_tsx_file {
+        return;
+    }
+
+    for spec in collect_tsx_jsx_usage_edges(tree, source) {
+        let Some(source_id) = unique_node_id_by_name(unique_nodes, &spec.source_name, |kind| {
+            matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        }) else {
+            continue;
+        };
+        let Some(target_id) = unique_node_id_by_name(unique_nodes, &spec.target_name, |kind| {
+            matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::FIELD)
+        }) else {
+            continue;
+        };
+
+        let mut edge = Edge {
+            id: EdgeId(0),
+            source: source_id,
+            target: target_id,
+            kind: EdgeKind::USAGE,
+            file_node_id: Some(file_id),
+            line: spec.line,
+            ..Default::default()
+        };
         if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
             continue;
         }
@@ -1862,6 +2073,43 @@ fn prune_tsx_duplicate_reference_nodes(
     occurrences.retain(|occurrence| !removed_ids.contains(&NodeId(occurrence.element_id)));
 }
 
+fn post_process_index_results(
+    result_nodes: Vec<Node>,
+    result_edges: &mut Vec<Edge>,
+    result_occurrences: &mut Vec<Occurrence>,
+    file_name: &str,
+    file_id: NodeId,
+    language_name: &str,
+    canonical_role_by_node_id: &HashMap<NodeId, CanonicalNodeRole>,
+    is_tsx_file: bool,
+    flags: IndexFeatureFlags,
+) -> (Vec<Node>, NodeId, HashMap<NodeId, NodeId>) {
+    // Stage 1: qualify names before deduplication so canonical IDs are stable.
+    let final_nodes = apply_qualified_names(result_nodes, result_edges, language_name);
+    // Stage 2: canonicalize nodes and capture the remap used by later repair stages.
+    let (mut final_nodes, id_remap) =
+        canonicalize_nodes(file_name, final_nodes, canonical_role_by_node_id);
+    let new_file_id = id_remap.get(&file_id).copied().unwrap_or(file_id);
+
+    // Stage 3: remap nodes, edges, and occurrences to the canonical IDs.
+    remap_file_affinity(&mut final_nodes, new_file_id);
+    remap_edges(result_edges, new_file_id, &id_remap, flags);
+    remap_occurrences(result_occurrences, &id_remap);
+
+    // Stage 4: TSX-only reconciliation runs after remap so it targets canonical nodes.
+    if is_tsx_file {
+        reconcile_tsx_usage_targets(&final_nodes, result_edges);
+        prune_tsx_duplicate_reference_nodes(&mut final_nodes, result_edges, result_occurrences);
+    }
+
+    // Stage 5: rewrite override placeholders after remap so synthetic nodes are canonical.
+    rewrite_override_placeholders(new_file_id, &mut final_nodes, result_edges);
+    // Stage 6: attribute calls to enclosing callables after the structural rewrites settle.
+    apply_line_range_call_attribution(&final_nodes, result_edges, flags);
+
+    (final_nodes, new_file_id, id_remap)
+}
+
 fn remap_pending_node_id(storage: &mut IntermediateStorage, from: NodeId, to: NodeId) {
     for edge in &mut storage.edges {
         if edge.source == from {
@@ -2058,25 +2306,12 @@ pub fn index_file(
     parser
         .set_language(&language_config.language)
         .map_err(|e| anyhow!("Language error: {:?}", e))?;
+    let compiled_rules = language_config.compiled_rules()?;
 
     let tree = parser
         .parse(source, None)
         .ok_or_else(|| anyhow!("Failed to parse source"))?;
-    let mut tag_definitions = extract_tag_definitions(
-        language_config.language.clone(),
-        &tree,
-        source,
-        language_config.tags_query,
-    )?;
-    let _local_query_summary = collect_local_query_summary(
-        language_config.language.clone(),
-        &tree,
-        source,
-        language_config.locals_query,
-    )?;
-
-    let file = GraphFile::from_str(language_config.language.clone(), language_config.graph_query)
-        .map_err(|e| anyhow!("Graph DSL error: {:?}", e))?;
+    let mut tag_definitions = extract_tag_definitions(compiled_rules, &tree, source)?;
 
     let mut variables = Variables::new();
     if let Some(info) = &compilation_info {
@@ -2090,7 +2325,8 @@ pub fn index_file(
     let functions = Functions::stdlib();
     let config = ExecutionConfig::new(&functions, &variables);
 
-    let graph = file
+    let graph = compiled_rules
+        .graph_file
         .execute(&tree, source, &config, &NoCancellation)
         .map_err(|e| anyhow!("Graph execution error: {:?}", e))?;
 
@@ -2368,24 +2604,31 @@ pub fn index_file(
         &mut edge_keys,
         flags,
     );
+    append_manual_usage_edges(
+        is_tsx_file,
+        &tree,
+        source,
+        &unique_nodes,
+        file_id,
+        &mut result_edges,
+        &mut edge_keys,
+        flags,
+    );
 
     result_occurrences.extend(definition_occurrences(&unique_nodes, file_id));
 
     // 3. Resolve qualified names, canonicalize IDs, and remap projections.
-    let final_nodes =
-        apply_qualified_names(result_nodes, &result_edges, language_config.language_name);
-    let (mut final_nodes, id_remap) =
-        canonicalize_nodes(&file_name, final_nodes, &canonical_role_by_node_id);
-    let new_file_id = id_remap.get(&file_id).copied().unwrap_or(file_id);
-    remap_file_affinity(&mut final_nodes, new_file_id);
-    remap_edges(&mut result_edges, new_file_id, &id_remap, flags);
-    if is_tsx_file {
-        reconcile_tsx_usage_targets(&final_nodes, &mut result_edges);
-    }
-    remap_occurrences(&mut result_occurrences, &id_remap);
-    if is_tsx_file {
-        prune_tsx_duplicate_reference_nodes(&mut final_nodes, &result_edges, &mut result_occurrences);
-    }
+    let (final_nodes, _new_file_id, id_remap) = post_process_index_results(
+        result_nodes,
+        &mut result_edges,
+        &mut result_occurrences,
+        &file_name,
+        file_id,
+        language_config.language_name,
+        &canonical_role_by_node_id,
+        is_tsx_file,
+        flags,
+    );
     let final_node_ids = final_nodes.iter().map(|node| node.id).collect::<HashSet<_>>();
     let mut remapped_component_access: HashMap<NodeId, AccessKind> = HashMap::new();
     for (original_id, access) in component_access_by_node_id {
@@ -2405,8 +2648,6 @@ pub fn index_file(
     impl_anchor_node_ids.sort_unstable();
     impl_anchor_node_ids.dedup();
 
-    rewrite_override_placeholders(new_file_id, &mut final_nodes, &mut result_edges);
-    apply_line_range_call_attribution(&final_nodes, &mut result_edges, flags);
     let callable_projection_states =
         build_callable_projection_states(&final_nodes, &result_edges, &result_occurrences);
 
@@ -2430,61 +2671,62 @@ pub fn index_file(
 pub fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
     let ext = ext.trim().trim_start_matches('.').to_ascii_lowercase();
     match ext.as_str() {
+        // Keep this extension map aligned with the top-level live rule registry.
         "py" | "pyi" => Some(make_language_config(
             tree_sitter_python::LANGUAGE.into(),
             "python",
-            include_str!("../rules/python.scm"),
+            PYTHON_GRAPH_QUERY,
             None,
-            None,
+            LanguageRuleset::Python,
         )),
         "java" => Some(make_language_config(
             tree_sitter_java::LANGUAGE.into(),
             "java",
-            include_str!("../rules/java.scm"),
+            JAVA_GRAPH_QUERY,
             None,
-            None,
+            LanguageRuleset::Java,
         )),
         "rs" => Some(make_language_config(
             tree_sitter_rust::LANGUAGE.into(),
             "rust",
-            include_str!("../rules/rust.graph.scm"),
-            Some(include_str!("../rules/rust.tags.scm")),
-            Some(include_str!("../rules/rust.locals.scm")),
+            RUST_GRAPH_QUERY,
+            Some(RUST_TAGS_QUERY),
+            LanguageRuleset::Rust,
         )),
         "js" | "jsx" | "mjs" | "cjs" => Some(make_language_config(
             tree_sitter_javascript::LANGUAGE.into(),
             "javascript",
-            include_str!("../rules/javascript.scm"),
+            JAVASCRIPT_GRAPH_QUERY,
             None,
-            None,
+            LanguageRuleset::JavaScript,
         )),
         "ts" | "mts" | "cts" => Some(make_language_config(
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             "typescript",
-            include_str!("../rules/typescript.graph.scm"),
-            Some(include_str!("../rules/typescript.tags.scm")),
-            Some(include_str!("../rules/typescript.locals.scm")),
+            TYPESCRIPT_GRAPH_QUERY,
+            Some(TYPESCRIPT_TAGS_QUERY),
+            LanguageRuleset::TypeScript,
         )),
         "tsx" => Some(make_language_config(
             tree_sitter_typescript::LANGUAGE_TSX.into(),
             "typescript",
-            include_str!("../rules/tsx.graph.scm"),
-            Some(include_str!("../rules/tsx.tags.scm")),
-            Some(include_str!("../rules/tsx.locals.scm")),
+            TSX_GRAPH_QUERY,
+            Some(TSX_TAGS_QUERY),
+            LanguageRuleset::Tsx,
         )),
         "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(make_language_config(
             tree_sitter_cpp::LANGUAGE.into(),
             "cpp",
-            include_str!("../rules/cpp.scm"),
+            CPP_GRAPH_QUERY,
             None,
-            None,
+            LanguageRuleset::Cpp,
         )),
         "c" | "h" => Some(make_language_config(
             tree_sitter_c::LANGUAGE.into(),
             "c",
-            include_str!("../rules/c.scm"),
+            C_GRAPH_QUERY,
             None,
-            None,
+            LanguageRuleset::C,
         )),
         _ => None,
     }
@@ -2959,6 +3201,88 @@ fn generate_edge_id_for_edge(edge: &Edge, flags: IndexFeatureFlags) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    #[derive(Debug)]
+    struct RawGraphContract {
+        nodes: HashSet<(String, String)>,
+        edges: HashSet<(String, String, String)>,
+    }
+
+    fn execute_raw_graph_contract(
+        path: &Path,
+        source: &str,
+        language_config: &LanguageConfig,
+    ) -> Result<RawGraphContract> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&language_config.language)
+            .map_err(|e| anyhow!("parser language error: {e}"))?;
+        let tree = parser
+            .parse(source, None)
+            .ok_or_else(|| anyhow!("parser did not produce a tree"))?;
+        let variables = Variables::new();
+        let functions = Functions::stdlib();
+        let config = ExecutionConfig::new(&functions, &variables);
+        let graph = language_config
+            .compiled_rules()?
+            .graph_file
+            .execute(&tree, source, &config, &NoCancellation)
+            .map_err(|e| anyhow!("Graph execution error: {:?}", e))?;
+
+        let mut node_names = HashMap::new();
+        let mut nodes = HashSet::new();
+        for node_id in graph.iter_nodes() {
+            let node_data = &graph[node_id];
+            let mut kind = None;
+            let mut name = None;
+            for (attr, val) in node_data.attributes.iter() {
+                match attr.as_str() {
+                    "kind" => kind = val.as_str().ok().map(str::to_string),
+                    "name" => name = val.as_str().ok().map(str::to_string),
+                    _ => {}
+                }
+            }
+            let (Some(kind), Some(name)) = (kind, name) else {
+                continue;
+            };
+            node_names.insert(node_id, name.clone());
+            nodes.insert((kind, name));
+        }
+
+        let mut edges = HashSet::new();
+        for source_ref in graph.iter_nodes() {
+            let Some(source_name) = node_names.get(&source_ref).cloned() else {
+                continue;
+            };
+            let graph_node = &graph[source_ref];
+            for (target_ref, edge) in graph_node.iter_edges() {
+                let Some(target_name) = node_names.get(&target_ref).cloned() else {
+                    continue;
+                };
+                let mut kind = None;
+                for (attr, val) in edge.attributes.iter() {
+                    if attr.as_str() == "kind" {
+                        kind = val.as_str().ok().map(str::to_string);
+                    }
+                }
+                let Some(kind) = kind else {
+                    continue;
+                };
+                edges.insert((source_name.clone(), target_name, kind));
+            }
+        }
+
+        let _ = path;
+        Ok(RawGraphContract { nodes, edges })
+    }
+
+    fn parser_node_kinds(language: Language) -> HashSet<String> {
+        (0..language.node_kind_count())
+            .filter_map(|id| language.node_kind_for_id(id as u16))
+            .map(str::to_string)
+            .collect()
+    }
 
     #[test]
     fn test_index_python_semantics() -> Result<()> {
@@ -3824,6 +4148,319 @@ class Test {
         let config =
             get_language_config_for_path(Path::new("widget.h"), Some(&info)).expect("config");
         assert_eq!(config.language_name, "cpp");
+    }
+
+    #[test]
+    fn test_live_rule_registry_uses_split_rule_assets() {
+        let rust = get_language_for_ext("rs").expect("rust config");
+        assert_eq!(rust.graph_query, RUST_GRAPH_QUERY);
+        assert_eq!(rust.tags_query, Some(RUST_TAGS_QUERY));
+
+        let ts = get_language_for_ext("ts").expect("ts config");
+        assert_eq!(ts.graph_query, TYPESCRIPT_GRAPH_QUERY);
+        assert_eq!(ts.tags_query, Some(TYPESCRIPT_TAGS_QUERY));
+
+        let tsx = get_language_for_ext("tsx").expect("tsx config");
+        assert_eq!(tsx.graph_query, TSX_GRAPH_QUERY);
+        assert_eq!(tsx.tags_query, Some(TSX_TAGS_QUERY));
+    }
+
+    #[test]
+    fn test_compiled_rules_cache_reuses_compiled_artifacts() -> Result<()> {
+        let config = get_language_for_ext("tsx").expect("tsx config");
+        let first = config.compiled_rules()? as *const CompiledLanguageRules;
+        let second = config.compiled_rules()? as *const CompiledLanguageRules;
+        assert_eq!(first, second, "compiled rules should be cached per language");
+        Ok(())
+    }
+
+    #[test]
+    fn test_raw_graph_contracts_cover_supported_languages() -> Result<()> {
+        let python = execute_raw_graph_contract(
+            Path::new("sample.py"),
+            r#"
+from app.helpers import tool
+
+class Worker:
+    def run(self):
+        tool()
+"#,
+            &get_language_for_ext("py").expect("python config"),
+        )?;
+        assert!(python.nodes.contains(&("CLASS".to_string(), "Worker".to_string())));
+        assert!(python.edges.contains(&(
+            "Worker".to_string(),
+            "run".to_string(),
+            "MEMBER".to_string()
+        )));
+
+        let java = execute_raw_graph_contract(
+            Path::new("Sample.java"),
+            r#"
+class Base {}
+class Child extends Base {
+    void run() {}
+}
+"#,
+            &get_language_for_ext("java").expect("java config"),
+        )?;
+        assert!(java.edges.contains(&(
+            "Child".to_string(),
+            "Base".to_string(),
+            "INHERITANCE".to_string()
+        )));
+
+        let rust = execute_raw_graph_contract(
+            Path::new("main.rs"),
+            r#"
+use crate::helpers::tool;
+
+struct Worker;
+
+impl Worker {
+    fn run(&self) {
+        tool::<u32>();
+    }
+}
+"#,
+            &get_language_for_ext("rs").expect("rust config"),
+        )?;
+        assert!(rust.nodes.contains(&("STRUCT".to_string(), "Worker".to_string())));
+        assert!(rust.edges.contains(&(
+            "crate::helpers::tool".to_string(),
+            "crate::helpers::tool".to_string(),
+            "IMPORT".to_string()
+        )));
+
+        let javascript = execute_raw_graph_contract(
+            Path::new("main.js"),
+            r#"
+import thing from "./dep";
+
+function run() {
+    thing();
+}
+"#,
+            &get_language_for_ext("js").expect("javascript config"),
+        )?;
+        assert!(javascript.edges.contains(&(
+            "\"./dep\"".to_string(),
+            "\"./dep\"".to_string(),
+            "IMPORT".to_string()
+        )));
+        assert!(javascript.edges.contains(&(
+            "thing".to_string(),
+            "thing".to_string(),
+            "CALL".to_string()
+        )));
+
+        let typescript = execute_raw_graph_contract(
+            Path::new("main.ts"),
+            r#"
+interface Base {}
+interface Child extends Base {}
+"#,
+            &get_language_for_ext("ts").expect("typescript config"),
+        )?;
+        assert!(typescript.edges.contains(&(
+            "Child".to_string(),
+            "Base".to_string(),
+            "INHERITANCE".to_string()
+        )));
+
+        let tsx = execute_raw_graph_contract(
+            Path::new("main.tsx"),
+            r#"
+type Props = { label: string };
+
+function Badge(props: Props) {
+    return <span>{props.label}</span>;
+}
+
+class View {
+    render() {
+        return <Badge label="hi" />;
+    }
+}
+"#,
+            &get_language_for_ext("tsx").expect("tsx config"),
+        )?;
+        assert!(tsx.edges.contains(&(
+            "render".to_string(),
+            "Badge".to_string(),
+            "USAGE".to_string()
+        )));
+        assert!(tsx.edges.contains(&(
+            "render".to_string(),
+            "label".to_string(),
+            "USAGE".to_string()
+        )));
+
+        let cpp = execute_raw_graph_contract(
+            Path::new("main.cpp"),
+            r#"
+struct Base {};
+
+template <typename T>
+struct Wrapper {};
+
+struct Child : Base {
+    Wrapper<int> value;
+};
+"#,
+            &get_language_for_ext("cpp").expect("cpp config"),
+        )?;
+        assert!(cpp.edges.contains(&(
+            "Child".to_string(),
+            "Base".to_string(),
+            "INHERITANCE".to_string()
+        )));
+
+        let c = execute_raw_graph_contract(
+            Path::new("main.h"),
+            r#"
+typedef struct Worker {
+    int value;
+} Worker;
+"#,
+            &get_language_for_ext("h").expect("c config"),
+        )?;
+        assert!(c.edges.contains(&(
+            "Worker".to_string(),
+            "value".to_string(),
+            "MEMBER".to_string()
+        )));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_live_rule_parsers_expose_key_node_kinds() {
+        let python_kinds = parser_node_kinds(tree_sitter_python::LANGUAGE.into());
+        for kind in ["class_definition", "function_definition", "call"] {
+            assert!(
+                python_kinds.contains(kind),
+                "python grammar should expose {kind}"
+            );
+        }
+
+        let java_kinds = parser_node_kinds(tree_sitter_java::LANGUAGE.into());
+        for kind in ["class_declaration", "method_declaration", "method_invocation"] {
+            assert!(
+                java_kinds.contains(kind),
+                "java grammar should expose {kind}"
+            );
+        }
+
+        let rust_kinds = parser_node_kinds(tree_sitter_rust::LANGUAGE.into());
+        for kind in ["struct_item", "impl_item", "call_expression", "use_declaration"] {
+            assert!(
+                rust_kinds.contains(kind),
+                "rust grammar should expose {kind}"
+            );
+        }
+
+        let js_kinds = parser_node_kinds(tree_sitter_javascript::LANGUAGE.into());
+        for kind in [
+            "function_declaration",
+            "call_expression",
+            "import_statement",
+        ] {
+            assert!(
+                js_kinds.contains(kind),
+                "javascript grammar should expose {kind}"
+            );
+        }
+
+        let ts_kinds = parser_node_kinds(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into());
+        for kind in [
+            "interface_declaration",
+            "class_declaration",
+            "method_definition",
+            "generic_type",
+        ] {
+            assert!(
+                ts_kinds.contains(kind),
+                "typescript grammar should expose {kind}"
+            );
+        }
+
+        let tsx_kinds = parser_node_kinds(tree_sitter_typescript::LANGUAGE_TSX.into());
+        for kind in [
+            "jsx_element",
+            "jsx_self_closing_element",
+            "jsx_expression",
+            "jsx_attribute",
+        ] {
+            assert!(tsx_kinds.contains(kind), "tsx grammar should expose {kind}");
+        }
+
+        let cpp_kinds = parser_node_kinds(tree_sitter_cpp::LANGUAGE.into());
+        for kind in ["template_type", "field_declaration", "class_specifier"] {
+            assert!(cpp_kinds.contains(kind), "cpp grammar should expose {kind}");
+        }
+
+        let c_kinds = parser_node_kinds(tree_sitter_c::LANGUAGE.into());
+        for kind in ["struct_specifier", "field_declaration", "type_definition"] {
+            assert!(c_kinds.contains(kind), "c grammar should expose {kind}");
+        }
+    }
+
+    #[test]
+    fn test_cpp_template_type_arguments_support_multiline_and_nested_templates() -> Result<()> {
+        let cpp_code = r#"
+struct Key {};
+struct Value {};
+
+template <typename T>
+struct Wrapper {};
+
+template <typename T, typename U>
+struct PairStore {};
+
+struct Holder {
+    PairStore<
+        Key,
+        Wrapper<Value> // keep nested templates and comments parse-driven
+    > store;
+};
+"#;
+        let language_config = get_language_for_ext("cpp").expect("cpp config");
+        let result = index_file(
+            Path::new("holder.cpp"),
+            cpp_code,
+            &language_config,
+            None,
+            None,
+        )?;
+
+        let node_by_id = result
+            .nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<HashMap<_, _>>();
+        let has_type_argument = |source_suffix: &str, target_suffix: &str| {
+            result.edges.iter().any(|edge| {
+                edge.kind == EdgeKind::TYPE_ARGUMENT
+                    && node_by_id
+                        .get(&edge.source)
+                        .is_some_and(|node| node.serialized_name.ends_with(source_suffix))
+                    && node_by_id
+                        .get(&edge.target)
+                        .is_some_and(|node| node.serialized_name.ends_with(target_suffix))
+            })
+        };
+
+        assert!(
+            has_type_argument("PairStore", "Key"),
+            "expected PairStore -> Key type argument edge"
+        );
+        assert!(
+            has_type_argument("PairStore", "Wrapper"),
+            "expected PairStore -> Wrapper type argument edge"
+        );
+
+        Ok(())
     }
 
     #[test]
