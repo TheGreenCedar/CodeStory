@@ -1,5 +1,27 @@
 use super::*;
 
+struct PreparedResolutionJob<'a> {
+    edge_kind: EdgeKind,
+    candidate_kinds: &'a [i32],
+    unresolved_load_ms: &'a mut u64,
+    candidate_index_ms: &'a mut u64,
+    compute_ms: &'a mut u64,
+    apply_ms: &'a mut u64,
+    strategy_counters: &'a mut ResolutionStrategyCounters,
+}
+
+type OwnerByMethod = HashMap<i64, Vec<i64>>;
+type MethodsByOwnerAndName = HashMap<(i64, String), Vec<i64>>;
+type OwnerNameById = HashMap<i64, String>;
+type MethodsByOwnerNameAndName = HashMap<(String, String), Vec<i64>>;
+
+struct OverrideMembership {
+    owner_by_method: OwnerByMethod,
+    methods_by_owner_and_name: MethodsByOwnerAndName,
+    owner_name_by_id: OwnerNameById,
+    methods_by_owner_name_and_name: MethodsByOwnerNameAndName,
+}
+
 pub(super) fn resolve_calls_on_conn(
     pass: &ResolutionPass,
     conn: &rusqlite::Connection,
@@ -31,17 +53,19 @@ pub(super) fn resolve_calls_on_conn(
         pass,
         conn,
         scope_context,
-        EdgeKind::CALL,
-        &[
-            NodeKind::FUNCTION as i32,
-            NodeKind::METHOD as i32,
-            NodeKind::MACRO as i32,
-        ],
-        &mut telemetry.call_unresolved_load_ms,
-        &mut telemetry.call_candidate_index_ms,
-        &mut telemetry.call_compute_ms,
-        &mut telemetry.call_apply_ms,
-        strategy_counters,
+        PreparedResolutionJob {
+            edge_kind: EdgeKind::CALL,
+            candidate_kinds: &[
+                NodeKind::FUNCTION as i32,
+                NodeKind::METHOD as i32,
+                NodeKind::MACRO as i32,
+            ],
+            unresolved_load_ms: &mut telemetry.call_unresolved_load_ms,
+            candidate_index_ms: &mut telemetry.call_candidate_index_ms,
+            compute_ms: &mut telemetry.call_compute_ms,
+            apply_ms: &mut telemetry.call_apply_ms,
+            strategy_counters,
+        },
         ResolutionPass::compute_call_resolution,
     )
 }
@@ -71,17 +95,19 @@ pub(super) fn resolve_imports_on_conn(
         pass,
         conn,
         scope_context,
-        EdgeKind::IMPORT,
-        &[
-            NodeKind::MODULE as i32,
-            NodeKind::NAMESPACE as i32,
-            NodeKind::PACKAGE as i32,
-        ],
-        &mut telemetry.import_unresolved_load_ms,
-        &mut telemetry.import_candidate_index_ms,
-        &mut telemetry.import_compute_ms,
-        &mut telemetry.import_apply_ms,
-        strategy_counters,
+        PreparedResolutionJob {
+            edge_kind: EdgeKind::IMPORT,
+            candidate_kinds: &[
+                NodeKind::MODULE as i32,
+                NodeKind::NAMESPACE as i32,
+                NodeKind::PACKAGE as i32,
+            ],
+            unresolved_load_ms: &mut telemetry.import_unresolved_load_ms,
+            candidate_index_ms: &mut telemetry.import_candidate_index_ms,
+            compute_ms: &mut telemetry.import_compute_ms,
+            apply_ms: &mut telemetry.import_apply_ms,
+            strategy_counters,
+        },
         ResolutionPass::compute_import_resolution,
     )
 }
@@ -116,12 +142,12 @@ pub(super) fn resolve_overrides_on_conn(
         return Ok(0);
     }
 
-    let (
+    let OverrideMembership {
         owner_by_method,
         methods_by_owner_and_name,
         mut owner_name_by_id,
         methods_by_owner_name_and_name,
-    ) = load_override_membership(conn)?;
+    } = load_override_membership(conn)?;
     for (node_id, node_name) in load_node_names(conn)? {
         owner_name_by_id.entry(node_id).or_insert(node_name);
     }
@@ -235,13 +261,7 @@ fn resolve_edges_after_prepare<F>(
     pass: &ResolutionPass,
     conn: &rusqlite::Connection,
     scope_context: &ScopeCallerContext,
-    edge_kind: EdgeKind,
-    candidate_kinds: &[i32],
-    unresolved_load_ms: &mut u64,
-    candidate_index_ms: &mut u64,
-    compute_ms: &mut u64,
-    apply_ms: &mut u64,
-    strategy_counters: &mut ResolutionStrategyCounters,
+    job: PreparedResolutionJob<'_>,
     compute: F,
 ) -> Result<usize>
 where
@@ -254,21 +274,24 @@ where
         + Sync,
 {
     let rows_started = Instant::now();
-    let rows = sql::unresolved_edges(conn, edge_kind, scope_context)?;
-    *unresolved_load_ms =
-        unresolved_load_ms.saturating_add(duration_ms_u64(rows_started.elapsed()));
+    let rows = sql::unresolved_edges(conn, job.edge_kind, scope_context)?;
+    *job.unresolved_load_ms = job
+        .unresolved_load_ms
+        .saturating_add(duration_ms_u64(rows_started.elapsed()));
     if rows.is_empty() {
         return Ok(0);
     }
 
     let candidate_started = Instant::now();
-    let candidate_index = CandidateIndex::load(conn, candidate_kinds)?;
-    let semantic_index = SemanticCandidateIndex::load(conn, semantic_candidate_kinds(edge_kind))?;
-    *candidate_index_ms =
-        candidate_index_ms.saturating_add(duration_ms_u64(candidate_started.elapsed()));
+    let candidate_index = CandidateIndex::load(conn, job.candidate_kinds)?;
+    let semantic_index =
+        SemanticCandidateIndex::load(conn, semantic_candidate_kinds(job.edge_kind))?;
+    *job.candidate_index_ms = job
+        .candidate_index_ms
+        .saturating_add(duration_ms_u64(candidate_started.elapsed()));
 
     let semantic_candidates_by_row =
-        pass.semantic_candidates_for_rows(&semantic_index, &rows, edge_kind)?;
+        pass.semantic_candidates_for_rows(&semantic_index, &rows, job.edge_kind)?;
 
     let compute_started = Instant::now();
     let computed_results: Vec<Result<ComputedResolution>> =
@@ -287,7 +310,9 @@ where
                 })
                 .collect()
         };
-    *compute_ms = compute_ms.saturating_add(duration_ms_u64(compute_started.elapsed()));
+    *job.compute_ms = job
+        .compute_ms
+        .saturating_add(duration_ms_u64(compute_started.elapsed()));
 
     let mut resolved = 0usize;
     let mut updates = Vec::with_capacity(rows.len());
@@ -296,13 +321,15 @@ where
         if computed.strategy.is_some() {
             resolved += 1;
         }
-        strategy_counters.record(computed.strategy);
+        job.strategy_counters.record(computed.strategy);
         updates.push(computed.update);
     }
 
     let apply_started = Instant::now();
     sql::apply_resolution_updates(conn, &updates)?;
-    *apply_ms = apply_ms.saturating_add(duration_ms_u64(apply_started.elapsed()));
+    *job.apply_ms = job
+        .apply_ms
+        .saturating_add(duration_ms_u64(apply_started.elapsed()));
     Ok(resolved)
 }
 
@@ -334,14 +361,7 @@ fn unresolved_override_edges(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-fn load_override_membership(
-    conn: &rusqlite::Connection,
-) -> Result<(
-    HashMap<i64, Vec<i64>>,
-    HashMap<(i64, String), Vec<i64>>,
-    HashMap<i64, String>,
-    HashMap<(String, String), Vec<i64>>,
-)> {
+fn load_override_membership(conn: &rusqlite::Connection) -> Result<OverrideMembership> {
     let mut stmt = conn.prepare(
         "SELECT member.source_node_id, owner.serialized_name, member.target_node_id, method.serialized_name
          FROM edge member
@@ -361,10 +381,10 @@ fn load_override_membership(
         },
     )?;
 
-    let mut owner_by_method = HashMap::<i64, Vec<i64>>::new();
-    let mut methods_by_owner_and_name = HashMap::<(i64, String), Vec<i64>>::new();
-    let mut owner_name_by_id = HashMap::<i64, String>::new();
-    let mut methods_by_owner_name_and_name = HashMap::<(String, String), Vec<i64>>::new();
+    let mut owner_by_method = OwnerByMethod::new();
+    let mut methods_by_owner_and_name = MethodsByOwnerAndName::new();
+    let mut owner_name_by_id = OwnerNameById::new();
+    let mut methods_by_owner_name_and_name = MethodsByOwnerNameAndName::new();
     for row in rows {
         let (owner_id, owner_name, method_id, serialized_name) = row?;
         let method_name = short_member_name(&serialized_name).to_string();
@@ -382,12 +402,12 @@ fn load_override_membership(
             .push(method_id);
     }
 
-    Ok((
+    Ok(OverrideMembership {
         owner_by_method,
         methods_by_owner_and_name,
         owner_name_by_id,
         methods_by_owner_name_and_name,
-    ))
+    })
 }
 
 fn load_override_inheritance(conn: &rusqlite::Connection) -> Result<HashMap<i64, Vec<i64>>> {

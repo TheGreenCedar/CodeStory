@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
 use thiserror::Error;
 
 pub mod access;
@@ -204,13 +205,21 @@ impl ResolutionCertainty {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn from_label(value: &str) -> Option<Self> {
         match value {
             "certain" => Some(Self::Certain),
             "probable" => Some(Self::Probable),
             "uncertain" => Some(Self::Uncertain),
             _ => None,
         }
+    }
+}
+
+impl FromStr for ResolutionCertainty {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::from_label(value).ok_or(())
     }
 }
 

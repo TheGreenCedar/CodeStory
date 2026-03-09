@@ -1441,7 +1441,7 @@ fn deserialize_candidate_targets(payload: Option<&str>) -> Result<Vec<NodeId>, S
 }
 
 fn encode_embedding_blob(values: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(values.len() * std::mem::size_of::<f32>());
+    let mut out = Vec::with_capacity(std::mem::size_of_val(values));
     for value in values {
         out.extend_from_slice(&value.to_le_bytes());
     }
@@ -1449,7 +1449,7 @@ fn encode_embedding_blob(values: &[f32]) -> Vec<u8> {
 }
 
 fn decode_embedding_blob(blob: &[u8]) -> Result<Vec<f32>, StorageError> {
-    if blob.len() % std::mem::size_of::<f32>() != 0 {
+    if !blob.len().is_multiple_of(std::mem::size_of::<f32>()) {
         return Err(StorageError::Other(
             "invalid embedding blob length: expected multiple of 4 bytes".to_string(),
         ));

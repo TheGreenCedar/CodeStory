@@ -21,7 +21,7 @@ pub(super) fn edge_from_row(row: &Row) -> Result<Edge, StorageError> {
     let certainty = row
         .get::<_, Option<String>>(10)?
         .as_deref()
-        .and_then(ResolutionCertainty::from_str);
+        .and_then(|value| value.parse().ok());
     let candidate_targets =
         deserialize_candidate_targets(row.get::<_, Option<String>>(11)?.as_deref())?;
     Ok(Edge {

@@ -600,10 +600,10 @@ fn read_file_contents_for_resolution(path: &str) -> Result<String> {
     }
 
     #[cfg(windows)]
-    if let Some(stripped) = path.strip_prefix(r"\\?\") {
-        if let Ok(contents) = fs::read_to_string(stripped) {
-            return Ok(contents);
-        }
+    if let Some(stripped) = path.strip_prefix(r"\\?\")
+        && let Ok(contents) = fs::read_to_string(stripped)
+    {
+        return Ok(contents);
     }
 
     fs::read_to_string(path).with_context(|| format!("Failed to read file `{path}`"))

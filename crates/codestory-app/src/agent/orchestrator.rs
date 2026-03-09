@@ -824,7 +824,7 @@ fn fallback_mermaid(prompt: &str, hit_count: usize) -> String {
 }
 
 fn sanitize_mermaid_text(input: &str) -> String {
-    let mut sanitized = input.replace('"', "").replace('\n', " ").replace('\r', " ");
+    let mut sanitized = input.replace('"', "").replace(['\n', '\r'], " ");
     sanitized = sanitized
         .chars()
         .map(|ch| if ch.is_ascii_control() { ' ' } else { ch })
@@ -1066,10 +1066,7 @@ No explanation, no markdown, no numbering.",
 
 #[allow(dead_code)]
 fn parse_agent_terms(markdown: &str, max_terms: usize) -> Vec<String> {
-    let normalized = markdown
-        .replace('\r', "\n")
-        .replace('\n', ",")
-        .replace(';', ",");
+    let normalized = markdown.replace('\r', "\n").replace(['\n', ';'], ",");
 
     let mut terms = Vec::new();
     let mut seen = HashSet::<String>::new();

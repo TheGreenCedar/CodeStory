@@ -1,5 +1,13 @@
 use super::*;
 
+struct BfsTraversalOptions<'a> {
+    edge_filter: &'a [EdgeKind],
+    caller_scope: TrailCallerScope,
+    show_utility_calls: bool,
+    max_depth: u32,
+    max_nodes: usize,
+}
+
 pub(super) fn get_trail(
     storage: &Storage,
     config: &TrailConfig,
@@ -112,25 +120,25 @@ pub(super) fn get_trail_to_target(
         .max(config.max_nodes)
         .min(100_000);
 
+    let traversal_options = BfsTraversalOptions {
+        edge_filter: &config.edge_filter,
+        caller_scope: config.caller_scope,
+        show_utility_calls: config.show_utility_calls,
+        max_depth,
+        max_nodes: bfs_cap,
+    };
+
     let (dist_from_root, truncated_from_root) = bfs_distances(
         storage,
         config.root_id,
         TrailDirection::Outgoing,
-        &config.edge_filter,
-        config.caller_scope,
-        config.show_utility_calls,
-        max_depth,
-        bfs_cap,
+        &traversal_options,
     )?;
     let (dist_to_target, truncated_to_target) = bfs_distances(
         storage,
         target_id,
         TrailDirection::Incoming,
-        &config.edge_filter,
-        config.caller_scope,
-        config.show_utility_calls,
-        max_depth,
-        bfs_cap,
+        &traversal_options,
     )?;
 
     if !dist_from_root.contains_key(&target_id) {
@@ -308,15 +316,11 @@ pub(super) fn get_trail_to_target(
     Ok(result)
 }
 
-pub(super) fn bfs_distances(
+fn bfs_distances(
     storage: &Storage,
     start: NodeId,
     direction: TrailDirection,
-    edge_filter: &[EdgeKind],
-    caller_scope: TrailCallerScope,
-    show_utility_calls: bool,
-    max_depth: u32,
-    max_nodes: usize,
+    options: &BfsTraversalOptions<'_>,
 ) -> Result<(HashMap<NodeId, u32>, bool), StorageError> {
     let mut dist: HashMap<NodeId, u32> = HashMap::new();
     let mut queue: VecDeque<(NodeId, u32)> = VecDeque::new();
@@ -326,11 +330,11 @@ pub(super) fn bfs_distances(
     queue.push_back((start, 0));
 
     while let Some((current_id, depth)) = queue.pop_front() {
-        if dist.len() >= max_nodes {
+        if dist.len() >= options.max_nodes {
             truncated = true;
             break;
         }
-        if depth >= max_depth {
+        if depth >= options.max_depth {
             continue;
         }
 
@@ -338,9 +342,9 @@ pub(super) fn bfs_distances(
             storage,
             current_id,
             &direction,
-            edge_filter,
-            caller_scope,
-            show_utility_calls,
+            options.edge_filter,
+            options.caller_scope,
+            options.show_utility_calls,
         )?;
         for edge in edges {
             let Some(neighbor_id) = super::neighbor_for_direction(current_id, direction, &edge)

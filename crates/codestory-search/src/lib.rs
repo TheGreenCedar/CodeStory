@@ -39,12 +39,12 @@ fn resolve_bundled_embed_model_path() -> Option<PathBuf> {
     }
 
     // Cargo and other launchers can start the process from different cwd values.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            candidates.push(exe_dir.join(&relative));
-            for ancestor in exe_dir.ancestors().skip(1).take(8) {
-                candidates.push(ancestor.join(&relative));
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+    {
+        candidates.push(exe_dir.join(&relative));
+        for ancestor in exe_dir.ancestors().skip(1).take(8) {
+            candidates.push(ancestor.join(&relative));
         }
     }
 

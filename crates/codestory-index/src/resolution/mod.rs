@@ -26,6 +26,15 @@ type UnresolvedEdgeRow = (
     Option<String>,
 );
 
+struct SemanticEdgeLookup<'a> {
+    edge_kind: EdgeKind,
+    file_id: Option<i64>,
+    file_path: Option<&'a str>,
+    caller_qualified: Option<&'a str>,
+    source_name: &'a str,
+    target_name: &'a str,
+}
+
 const SCOPED_CALLER_TABLE: &str = "resolution_scoped_caller_ids";
 
 #[cfg(test)]
@@ -535,12 +544,14 @@ impl ResolutionPass {
                     )| {
                         self.semantic_candidates_for_edge(
                             index,
-                            edge_kind,
-                            *file_id,
-                            caller_file_path.as_deref(),
-                            caller_qualified.as_deref(),
-                            source_name,
-                            target_name,
+                            &SemanticEdgeLookup {
+                                edge_kind,
+                                file_id: *file_id,
+                                file_path: caller_file_path.as_deref(),
+                                caller_qualified: caller_qualified.as_deref(),
+                                source_name,
+                                target_name,
+                            },
                         )
                     },
                 )
@@ -559,12 +570,14 @@ impl ResolutionPass {
                     )| {
                         self.semantic_candidates_for_edge(
                             index,
-                            edge_kind,
-                            *file_id,
-                            caller_file_path.as_deref(),
-                            caller_qualified.as_deref(),
-                            source_name,
-                            target_name,
+                            &SemanticEdgeLookup {
+                                edge_kind,
+                                file_id: *file_id,
+                                file_path: caller_file_path.as_deref(),
+                                caller_qualified: caller_qualified.as_deref(),
+                                source_name,
+                                target_name,
+                            },
                         )
                     },
                 )
@@ -599,33 +612,27 @@ impl ResolutionPass {
             semantic_candidates,
         )
     }
-    #[warn(clippy::too_many_arguments)]
     fn semantic_candidates_for_edge(
         &self,
         index: &SemanticCandidateIndex,
-        edge_kind: EdgeKind,
-        file_id: Option<i64>,
-        file_path: Option<&str>,
-        caller_qualified: Option<&str>,
-        source_name: &str,
-        target_name: &str,
+        lookup: &SemanticEdgeLookup<'_>,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
-        let language_bucket = semantic_language_bucket(file_path).map(str::to_string);
+        let language_bucket = semantic_language_bucket(lookup.file_path).map(str::to_string);
         if language_bucket.is_none() {
             return Ok(Vec::new());
         }
 
         let request = SemanticResolutionRequest {
-            edge_kind,
-            file_id,
-            file_path: file_path.map(str::to_string),
-            caller_qualified: caller_qualified.map(str::to_string),
-            target_name: if edge_kind == EdgeKind::IMPORT
-                && import_alias_mismatch(source_name, target_name)
+            edge_kind: lookup.edge_kind,
+            file_id: lookup.file_id,
+            file_path: lookup.file_path.map(str::to_string),
+            caller_qualified: lookup.caller_qualified.map(str::to_string),
+            target_name: if lookup.edge_kind == EdgeKind::IMPORT
+                && import_alias_mismatch(lookup.source_name, lookup.target_name)
             {
-                format!("{target_name} as {source_name}")
+                format!("{} as {}", lookup.target_name, lookup.source_name)
             } else {
-                target_name.to_string()
+                lookup.target_name.to_string()
             },
         };
         self.semantic_resolvers.resolve(index, &request)
@@ -897,10 +904,10 @@ impl CandidateIndex {
             }
             return None;
         }
-        if let Some(suffix) = self.suffix_map_ascii_lower.get(name_ascii_lower) {
-            if suffix.len() == 1 {
-                return Some(self.nodes[suffix[0]].id);
-            }
+        if let Some(suffix) = self.suffix_map_ascii_lower.get(name_ascii_lower)
+            && suffix.len() == 1
+        {
+            return Some(self.nodes[suffix[0]].id);
         }
         None
     }
@@ -947,16 +954,16 @@ impl CandidateIndex {
                 }
             }
         }
-        if out.len() < limit {
-            if let Some(suffix) = self.suffix_map_ascii_lower.get(name_ascii_lower) {
-                for &idx in suffix {
-                    let candidate = self.nodes[idx].id;
-                    if seen.insert(candidate) {
-                        out.push(candidate);
-                    }
-                    if out.len() >= limit {
-                        break;
-                    }
+        if out.len() < limit
+            && let Some(suffix) = self.suffix_map_ascii_lower.get(name_ascii_lower)
+        {
+            for &idx in suffix {
+                let candidate = self.nodes[idx].id;
+                if seen.insert(candidate) {
+                    out.push(candidate);
+                }
+                if out.len() >= limit {
+                    break;
                 }
             }
         }

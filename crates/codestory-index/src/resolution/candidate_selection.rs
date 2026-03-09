@@ -139,14 +139,14 @@ pub(super) fn compute_import_resolution(
     let mut fuzzy_selected: Option<i64> = None;
 
     for name in &name_candidates {
-        if pass.flags.legacy_mode && same_file_selected.is_none() {
-            if let Some(candidate) =
+        if pass.flags.legacy_mode
+            && same_file_selected.is_none()
+            && let Some(candidate) =
                 candidate_index.find_same_file_readonly(*file_id, &name.original, &name.ascii_lower)
-            {
-                same_file_stage.push(candidate);
-                same_file_selected = Some(candidate);
-                break;
-            }
+        {
+            same_file_stage.push(candidate);
+            same_file_selected = Some(candidate);
+            break;
         }
 
         if same_module_selected.is_none()
@@ -221,14 +221,14 @@ pub(super) fn compute_import_resolution(
                 pass.policy.import_global_unique,
                 ResolutionStrategy::ImportGlobalUnique,
             ))
-        } else if let Some(candidate) = fuzzy_selected {
-            Some((
-                candidate,
-                pass.policy.import_fuzzy,
-                ResolutionStrategy::ImportFuzzy,
-            ))
         } else {
-            None
+            fuzzy_selected.map(|candidate| {
+                (
+                    candidate,
+                    pass.policy.import_fuzzy,
+                    ResolutionStrategy::ImportFuzzy,
+                )
+            })
         };
 
     if has_alias && !matches!(selected, Some((_, _, ResolutionStrategy::ImportSameFile))) {

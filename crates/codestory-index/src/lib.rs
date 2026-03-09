@@ -319,7 +319,7 @@ fn extract_tag_definitions(
     let mut index = TagDefinitionIndex::default();
     let source_bytes = source.as_bytes();
 
-    let mut matches = cursor.matches(&query, tree.root_node(), source_bytes);
+    let mut matches = cursor.matches(query, tree.root_node(), source_bytes);
     while {
         matches.advance();
         matches.get().is_some()
@@ -334,7 +334,7 @@ fn extract_tag_definitions(
         for capture in query_match.captures {
             let capture_name = capture_names
                 .get(capture.index as usize)
-                .map(|name| *name)
+                .copied()
                 .unwrap_or_default();
             let capture_node = capture.node;
             if let Some(kind_name) = capture_name.strip_prefix("definition.") {
@@ -1733,29 +1733,23 @@ fn extract_terminal_identifier_from_span(
     ))
 }
 
-fn normalize_graph_capture(
-    language_name: &str,
+struct GraphCaptureNormalizationInput<'a> {
+    language_name: &'a str,
     kind: NodeKind,
     canonical_role: CanonicalNodeRole,
     rust_impl_expr: bool,
-    name: &str,
-    start_line: u32,
-    start_col: u32,
-    end_line: u32,
-    end_col: u32,
-    source: &str,
+    name: &'a str,
+    graph_span: GraphNodeSpan,
+    source: &'a str,
     has_token_surface_edge: bool,
-) -> Option<(String, u32, u32, u32, u32)> {
-    let graph_span = GraphNodeSpan {
-        start_line,
-        start_col,
-        end_line,
-        end_col,
-    };
+}
 
-    if language_name == "rust" && rust_impl_expr {
+fn normalize_graph_capture(
+    input: &GraphCaptureNormalizationInput<'_>,
+) -> Option<(String, u32, u32, u32, u32)> {
+    if input.language_name == "rust" && input.rust_impl_expr {
         let (normalized_name, normalized_span) =
-            normalize_rust_impl_expr_surface(name, graph_span)?;
+            normalize_rust_impl_expr_surface(input.name, input.graph_span)?;
         return Some((
             normalized_name,
             normalized_span.start_line,
@@ -1765,18 +1759,26 @@ fn normalize_graph_capture(
         ));
     }
 
-    if language_name == "rust" && canonical_role == CanonicalNodeRole::ImplAnchor {
+    if input.language_name == "rust" && input.canonical_role == CanonicalNodeRole::ImplAnchor {
         return extract_terminal_identifier_from_span(
-            source, start_line, start_col, end_line, end_col,
+            input.source,
+            input.graph_span.start_line,
+            input.graph_span.start_col,
+            input.graph_span.end_line,
+            input.graph_span.end_col,
         );
     }
 
-    if language_name == "cpp"
-        && kind == NodeKind::UNKNOWN
-        && (name.contains("::") || name.contains('<') || has_token_surface_edge)
+    if input.language_name == "cpp"
+        && input.kind == NodeKind::UNKNOWN
+        && (input.name.contains("::") || input.name.contains('<') || input.has_token_surface_edge)
     {
         return extract_terminal_identifier_from_span(
-            source, start_line, start_col, end_line, end_col,
+            input.source,
+            input.graph_span.start_line,
+            input.graph_span.start_col,
+            input.graph_span.end_line,
+            input.graph_span.end_col,
         );
     }
 
@@ -2430,6 +2432,7 @@ where
     matches.first().map(|node| node.id)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_manual_type_argument_edges(
     language_name: &str,
     tree: &Tree,
@@ -2504,6 +2507,7 @@ fn append_manual_type_argument_edges(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_manual_usage_edges(
     language_name: &str,
     is_tsx_file: bool,
@@ -2668,6 +2672,7 @@ fn collect_c_enum_member_pairs(tree: &Tree, source: &str) -> Vec<(String, String
     pairs
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_manual_c_enum_member_edges(
     language_name: &str,
     tree: &Tree,
@@ -3335,6 +3340,7 @@ fn prune_tsx_duplicate_reference_nodes(
     occurrences.retain(|occurrence| !removed_ids.contains(&NodeId(occurrence.element_id)));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn post_process_index_results(
     result_nodes: Vec<Node>,
     result_edges: &mut Vec<Edge>,
@@ -3901,19 +3907,21 @@ pub fn index_file(
                 normalized_start_col,
                 normalized_end_line,
                 normalized_end_col,
-            )) = normalize_graph_capture(
-                language_config.language_name,
+            )) = normalize_graph_capture(&GraphCaptureNormalizationInput {
+                language_name: language_config.language_name,
                 kind,
                 canonical_role,
                 rust_impl_expr,
-                &name_str,
-                start_line,
-                start_col_1,
-                end_line_1,
-                end_col_1,
+                name: &name_str,
+                graph_span: GraphNodeSpan {
+                    start_line,
+                    start_col: start_col_1,
+                    end_line: end_line_1,
+                    end_col: end_col_1,
+                },
                 source,
                 has_token_surface_edge,
-            ) {
+            }) {
                 name_str = normalized_name;
                 start_line = normalized_start_line;
                 start_col_1 = normalized_start_col;
@@ -4190,10 +4198,8 @@ pub fn index_file(
     let component_access = remapped_component_access.into_iter().collect::<Vec<_>>();
     let mut impl_anchor_node_ids = canonical_role_by_node_id
         .iter()
-        .filter_map(|(node_id, role)| {
-            (*role == CanonicalNodeRole::ImplAnchor)
-                .then(|| id_remap.get(node_id).copied().unwrap_or(*node_id))
-        })
+        .filter(|(_, role)| **role == CanonicalNodeRole::ImplAnchor)
+        .map(|(node_id, _)| id_remap.get(node_id).copied().unwrap_or(*node_id))
         .collect::<Vec<_>>();
     impl_anchor_node_ids.sort_unstable();
     impl_anchor_node_ids.dedup();
@@ -5207,19 +5213,21 @@ impl outer::Thing<String> {
         let (worker_end_line, worker_end_col) =
             byte_offset_to_line_col(source, worker_end).expect("worker end location");
 
-        let normalized = normalize_graph_capture(
-            "rust",
-            NodeKind::CLASS,
-            CanonicalNodeRole::ImplAnchor,
-            true,
-            raw,
-            start_line,
-            start_col,
-            end_line,
-            end_col,
+        let normalized = normalize_graph_capture(&GraphCaptureNormalizationInput {
+            language_name: "rust",
+            kind: NodeKind::CLASS,
+            canonical_role: CanonicalNodeRole::ImplAnchor,
+            rust_impl_expr: true,
+            name: raw,
+            graph_span: GraphNodeSpan {
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+            },
             source,
-            false,
-        )
+            has_token_surface_edge: false,
+        })
         .expect("normalized Rust impl expression");
 
         assert_eq!(normalized.0, "Worker");

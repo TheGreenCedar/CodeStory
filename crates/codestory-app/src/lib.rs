@@ -196,8 +196,8 @@ fn should_expand_symbol_query(query: &str, direct_hit_count: usize) -> bool {
     if direct_hit_count >= 3 {
         return false;
     }
-    let has_sentence_shape = word_count > 2 || query.len() > 28;
-    has_sentence_shape
+
+    word_count > 2 || query.len() > 28
 }
 
 fn file_text_match_line(contents: &str, query: &str, terms: &[String]) -> Option<u32> {
@@ -786,7 +786,7 @@ fn build_search_state(
     let mut node_names = HashMap::new();
     let mut search_nodes = Vec::with_capacity(nodes.len());
     for node in &nodes {
-        let display_name = node_display_name(&node);
+        let display_name = node_display_name(node);
         node_names.insert(node.id, display_name.clone());
         search_nodes.push((node.id, display_name));
     }
