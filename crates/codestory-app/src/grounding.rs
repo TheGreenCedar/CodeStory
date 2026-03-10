@@ -1,7 +1,7 @@
 use super::*;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy)]
 struct GroundingBudgetConfig {
@@ -119,7 +119,6 @@ fn bucket_label_for_path(path: &str) -> String {
 struct FileCoverage {
     file: codestory_storage::FileInfo,
     relative_path: String,
-    nodes: Vec<codestory_core::Node>,
     total_symbol_count: u32,
     represented_symbol_count: u32,
     best_node_rank: u8,
@@ -200,57 +199,81 @@ fn build_coverage_buckets(
 }
 
 fn symbol_digest(
-    storage: &Storage,
-    root: &Path,
     node: &codestory_core::Node,
-) -> Result<GroundingSymbolDigestDto, ApiError> {
-    let display_name = node_display_name(node);
+    display_name: &str,
+    relative_file_path: Option<&str>,
+    member_counts: &HashMap<codestory_core::NodeId, u32>,
+    fallback_lines: &HashMap<codestory_core::NodeId, u32>,
+    edge_digests: &HashMap<codestory_core::NodeId, Vec<String>>,
+) -> GroundingSymbolDigestDto {
     let member_count = if is_structural_kind(node.kind) {
-        Some(
-            storage
-                .get_children_symbols(node.id)
-                .map_err(|e| ApiError::internal(format!("Failed to load child symbols: {e}")))?
-                .len()
-                .min(u32::MAX as usize) as u32,
-        )
+        Some(*member_counts.get(&node.id).unwrap_or(&0))
     } else {
         None
     };
 
-    let line = node.start_line.or_else(|| {
-        storage
-            .get_occurrences_for_node(node.id)
-            .ok()
-            .and_then(|occurrences| {
-                occurrences
-                    .first()
-                    .map(|occurrence| occurrence.location.start_line)
-            })
-    });
+    let line = node
+        .start_line
+        .or_else(|| fallback_lines.get(&node.id).copied());
 
-    let label = if let Some(file_path) = AppController::file_path_for_node(storage, node)? {
-        let path = Path::new(&file_path);
-        if let Ok(stripped) = path.strip_prefix(root) {
-            format!(
-                "{} @ {}",
-                display_name,
-                stripped.to_string_lossy().replace('\\', "/")
-            )
-        } else {
-            display_name
-        }
+    let label = if let Some(file_path) = relative_file_path {
+        format!("{display_name} @ {file_path}")
     } else {
-        display_name
+        display_name.to_string()
     };
 
-    Ok(GroundingSymbolDigestDto {
+    GroundingSymbolDigestDto {
         id: NodeId::from(node.id),
         label,
         kind: NodeKind::from(node.kind),
         line,
         member_count,
-        edge_digest: edge_digest_for_node(storage, node.id, 4),
-    })
+        edge_digest: edge_digests.get(&node.id).cloned().unwrap_or_default(),
+    }
+}
+
+fn dedupe_grounding_node_records(
+    nodes: Vec<codestory_storage::GroundingNodeRecord>,
+) -> Vec<codestory_storage::GroundingNodeRecord> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(nodes.len());
+    for record in nodes {
+        let key = (
+            record.node.kind as i32,
+            record.display_name.clone(),
+            record.node.file_node_id,
+        );
+        if seen.insert(key) {
+            deduped.push(record);
+        }
+    }
+    deduped
+}
+
+fn build_edge_digest_map(
+    counts: Vec<codestory_storage::GroundingEdgeKindCount>,
+    limit: usize,
+) -> HashMap<codestory_core::NodeId, Vec<String>> {
+    let mut grouped = HashMap::<codestory_core::NodeId, Vec<(String, u32)>>::new();
+    for entry in counts {
+        grouped
+            .entry(entry.node_id)
+            .or_default()
+            .push((format!("{:?}", entry.kind), entry.count));
+    }
+
+    grouped
+        .into_iter()
+        .map(|(node_id, mut digests)| {
+            digests.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+            let items = digests
+                .into_iter()
+                .take(limit)
+                .map(|(kind, count)| format!("{kind}={count}"))
+                .collect::<Vec<_>>();
+            (node_id, items)
+        })
+        .collect()
 }
 
 impl AppController {
@@ -265,36 +288,13 @@ impl AppController {
         let stats = storage
             .get_stats()
             .map_err(|e| ApiError::internal(format!("Failed to query stats: {e}")))?;
-        let all_nodes = storage
-            .get_nodes()
-            .map_err(|e| ApiError::internal(format!("Failed to load nodes: {e}")))?;
-        let mut file_entries = BTreeMap::<i64, codestory_storage::FileInfo>::new();
-        for file in storage
-            .get_files()
-            .map_err(|e| ApiError::internal(format!("Failed to load files: {e}")))?
-        {
-            file_entries.insert(file.id, file);
-        }
-        for node in &all_nodes {
-            if node.kind == codestory_core::NodeKind::FILE {
-                file_entries
-                    .entry(node.id.0)
-                    .or_insert_with(|| codestory_storage::FileInfo {
-                        id: node.id.0,
-                        path: PathBuf::from(&node.serialized_name),
-                        language: String::new(),
-                        modification_time: 0,
-                        indexed: true,
-                        complete: true,
-                        line_count: 0,
-                    });
-            }
-        }
-
+        let file_summaries = storage.get_grounding_file_summaries().map_err(|e| {
+            ApiError::internal(format!("Failed to load grounding file summaries: {e}"))
+        })?;
         let derived_file_count = if stats.file_count > 0 {
             stats.file_count
         } else {
-            file_entries.len().min(i64::MAX as usize) as i64
+            file_summaries.len().min(i64::MAX as usize) as i64
         };
         let dto_stats = StorageStatsDto {
             node_count: clamp_i64_to_u32(stats.node_count),
@@ -303,51 +303,156 @@ impl AppController {
             error_count: clamp_i64_to_u32(stats.error_count),
         };
 
-        let mut all_nodes = all_nodes;
-        all_nodes.retain(|node| llm_indexable_kind(node.kind));
-        all_nodes.sort_by(compare_nodes);
-
-        let mut nodes_by_file = BTreeMap::<i64, Vec<codestory_core::Node>>::new();
-        for node in all_nodes {
-            if let Some(file_node_id) = node.file_node_id {
-                nodes_by_file.entry(file_node_id.0).or_default().push(node);
-            }
-        }
-
-        let mut files = file_entries.into_values().collect::<Vec<_>>();
-        files.sort_by(|left, right| left.path.cmp(&right.path));
-
-        let mut file_coverages = Vec::with_capacity(files.len());
-        for file in files {
-            let mut file_nodes = nodes_by_file.remove(&file.id).unwrap_or_default();
-            file_nodes.sort_by(compare_nodes);
-
+        let mut file_coverages = Vec::with_capacity(file_summaries.len());
+        for summary in file_summaries {
             file_coverages.push(FileCoverage {
-                relative_path: relative_path(&root, &file.path),
-                total_symbol_count: file_nodes.len().min(u32::MAX as usize) as u32,
-                represented_symbol_count: file_nodes.len().min(config.symbols_per_file) as u32,
-                best_node_rank: file_nodes.first().map(node_rank).unwrap_or(u8::MAX),
-                nodes: file_nodes,
-                file,
+                relative_path: relative_path(&root, &summary.file.path),
+                total_symbol_count: summary.symbol_count,
+                represented_symbol_count: summary.symbol_count.min(config.symbols_per_file as u32),
+                best_node_rank: summary.best_node_rank,
+                file: summary.file,
             });
         }
         file_coverages.sort_by(compare_file_coverage);
 
         let expanded_files = file_coverages.len().min(config.expanded_files);
         let omitted_files = file_coverages.len().saturating_sub(expanded_files);
+        let expanded_file_ids = file_coverages
+            .iter()
+            .take(expanded_files)
+            .map(|coverage| coverage.file.id)
+            .collect::<Vec<_>>();
+        let mut file_nodes_by_id =
+            BTreeMap::<i64, Vec<codestory_storage::GroundingNodeRecord>>::new();
+        for record in storage
+            .get_grounding_top_symbols_for_files(&expanded_file_ids, config.symbols_per_file)
+            .map_err(|e| {
+                ApiError::internal(format!("Failed to load grounding file symbols: {e}"))
+            })?
+        {
+            if let Some(file_node_id) = record.node.file_node_id {
+                file_nodes_by_id
+                    .entry(file_node_id.0)
+                    .or_default()
+                    .push(record);
+            }
+        }
 
         let mut compressed_files = omitted_files.min(u32::MAX as usize) as u32;
         let mut file_digests = Vec::with_capacity(expanded_files);
         let mut omitted_coverages = Vec::with_capacity(omitted_files);
+        let mut selected_coverages = Vec::with_capacity(expanded_files);
+        let mut displayed_file_nodes = Vec::<codestory_storage::GroundingNodeRecord>::new();
         for (index, coverage) in file_coverages.into_iter().enumerate() {
             if index >= expanded_files {
                 omitted_coverages.push(coverage);
                 continue;
             }
+            displayed_file_nodes.extend(
+                file_nodes_by_id
+                    .get(&coverage.file.id)
+                    .into_iter()
+                    .flat_map(|records| records.iter().cloned()),
+            );
+            selected_coverages.push(coverage);
+        }
+        let coverage_buckets = build_coverage_buckets(
+            &omitted_coverages,
+            config.coverage_buckets,
+            config.sample_paths_per_bucket,
+        );
+        let bucketed_files = coverage_buckets
+            .iter()
+            .map(|bucket| bucket.file_count)
+            .sum::<u32>();
+        let bucketed_symbols = coverage_buckets
+            .iter()
+            .map(|bucket| bucket.symbol_count)
+            .sum::<u32>();
+        let root_fetch_limit = config
+            .root_symbols
+            .saturating_mul(8)
+            .max(config.root_symbols);
+        let mut root_records = Vec::new();
+        let mut root_offset = 0usize;
+        loop {
+            let page = storage
+                .get_grounding_root_symbol_candidates(root_fetch_limit, root_offset)
+                .map_err(|e| {
+                    ApiError::internal(format!("Failed to load grounding root symbols: {e}"))
+                })?;
+            if page.is_empty() {
+                break;
+            }
+            let fetched = page.len();
+            root_offset = root_offset.saturating_add(page.len());
+            root_records.extend(page);
+            root_records = dedupe_grounding_node_records(root_records);
+            if root_records.len() >= config.root_symbols || fetched < root_fetch_limit {
+                break;
+            }
+        }
+        root_records.truncate(config.root_symbols);
 
+        let mut structural_ids = displayed_file_nodes
+            .iter()
+            .chain(root_records.iter())
+            .filter(|record| is_structural_kind(record.node.kind))
+            .map(|record| record.node.id)
+            .collect::<Vec<_>>();
+        structural_ids.sort_by_key(|id| id.0);
+        structural_ids.dedup();
+        let member_counts = storage
+            .get_grounding_member_counts(&structural_ids)
+            .map_err(|e| {
+                ApiError::internal(format!("Failed to load grounding member counts: {e}"))
+            })?;
+        let mut missing_line_ids = displayed_file_nodes
+            .iter()
+            .chain(root_records.iter())
+            .filter(|record| record.node.start_line.is_none())
+            .map(|record| record.node.id)
+            .collect::<Vec<_>>();
+        missing_line_ids.sort_by_key(|id| id.0);
+        missing_line_ids.dedup();
+        let fallback_lines = storage
+            .get_grounding_min_occurrence_lines(&missing_line_ids)
+            .map_err(|e| {
+                ApiError::internal(format!("Failed to load grounding line fallbacks: {e}"))
+            })?;
+        let mut displayed_node_ids = displayed_file_nodes
+            .iter()
+            .chain(root_records.iter())
+            .map(|record| record.node.id)
+            .collect::<Vec<_>>();
+        displayed_node_ids.sort_by_key(|id| id.0);
+        displayed_node_ids.dedup();
+        let edge_digests = build_edge_digest_map(
+            storage
+                .get_grounding_edge_digest_counts(&displayed_node_ids)
+                .map_err(|e| {
+                    ApiError::internal(format!("Failed to load grounding edge digests: {e}"))
+                })?,
+            4,
+        );
+
+        for coverage in selected_coverages {
             let mut symbols = Vec::with_capacity(coverage.represented_symbol_count as usize);
-            for node in coverage.nodes.iter().take(config.symbols_per_file) {
-                symbols.push(symbol_digest(&storage, &root, node)?);
+            if let Some(records) = file_nodes_by_id.get(&coverage.file.id) {
+                for record in records {
+                    let relative_file_path = record
+                        .file_path
+                        .as_deref()
+                        .map(|path| relative_path(&root, path));
+                    symbols.push(symbol_digest(
+                        &record.node,
+                        &record.display_name,
+                        relative_file_path.as_deref(),
+                        &member_counts,
+                        &fallback_lines,
+                        &edge_digests,
+                    ));
+                }
             }
             if coverage.total_symbol_count > coverage.represented_symbol_count {
                 compressed_files = compressed_files.saturating_add(1);
@@ -363,35 +468,27 @@ impl AppController {
                 symbols,
             });
         }
-        let coverage_buckets = build_coverage_buckets(
-            &omitted_coverages,
-            config.coverage_buckets,
-            config.sample_paths_per_bucket,
-        );
-        let bucketed_files = coverage_buckets
-            .iter()
-            .map(|bucket| bucket.file_count)
-            .sum::<u32>();
-        let bucketed_symbols = coverage_buckets
-            .iter()
-            .map(|bucket| bucket.symbol_count)
-            .sum::<u32>();
+
         let represented_symbols = file_digests
             .iter()
             .map(|file| file.symbol_count)
             .sum::<u32>()
             .saturating_add(bucketed_symbols);
 
-        let mut roots = storage
-            .get_root_symbols()
-            .map_err(|e| ApiError::internal(format!("Failed to load root symbols: {e}")))?;
-        roots.sort_by(compare_nodes);
-        let labels_by_id = self.cached_labels(roots.iter().map(|node| node.id));
-        roots = Self::dedupe_symbol_nodes(roots, &labels_by_id);
-
         let mut root_symbols = Vec::new();
-        for node in roots.iter().take(config.root_symbols) {
-            root_symbols.push(symbol_digest(&storage, &root, node)?);
+        for record in &root_records {
+            let relative_file_path = record
+                .file_path
+                .as_deref()
+                .map(|path| relative_path(&root, path));
+            root_symbols.push(symbol_digest(
+                &record.node,
+                &record.display_name,
+                relative_file_path.as_deref(),
+                &member_counts,
+                &fallback_lines,
+                &edge_digests,
+            ));
         }
 
         let mut recommended_queries = Vec::new();
@@ -525,7 +622,10 @@ impl AppController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codestory_core::{Node, NodeId as CoreNodeId, NodeKind};
+    use codestory_core::{
+        Edge, EdgeId, EdgeKind, Node, NodeId as CoreNodeId, NodeKind, Occurrence, OccurrenceKind,
+        SourceLocation,
+    };
     use tempfile::tempdir;
 
     fn insert_file_node(
@@ -849,5 +949,102 @@ mod tests {
                 );
             assert_eq!(snapshot.coverage.represented_symbols, surfaced_symbols);
         }
+    }
+
+    #[test]
+    fn grounding_snapshot_batches_member_counts_line_fallbacks_and_edge_digests() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            let path = temp.path().join("src").join("lib.rs");
+            std::fs::create_dir_all(path.parent().expect("path parent")).expect("create src");
+            std::fs::write(&path, "struct Controller { value: i32 }\n").expect("write file");
+            storage
+                .insert_file(&codestory_storage::FileInfo {
+                    id: 11,
+                    path: path.clone(),
+                    language: "rust".to_string(),
+                    modification_time: 0,
+                    indexed: true,
+                    complete: true,
+                    line_count: 10,
+                })
+                .expect("insert file");
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(11),
+                        kind: NodeKind::FILE,
+                        serialized_name: path.to_string_lossy().to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(101),
+                        kind: NodeKind::STRUCT,
+                        serialized_name: "Controller".to_string(),
+                        file_node_id: Some(CoreNodeId(11)),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(102),
+                        kind: NodeKind::FIELD,
+                        serialized_name: "value".to_string(),
+                        file_node_id: Some(CoreNodeId(11)),
+                        start_line: Some(4),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert nodes");
+            storage
+                .insert_edges_batch(&[Edge {
+                    id: EdgeId(501),
+                    source: CoreNodeId(101),
+                    target: CoreNodeId(102),
+                    kind: EdgeKind::MEMBER,
+                    file_node_id: Some(CoreNodeId(11)),
+                    line: Some(3),
+                    resolved_source: None,
+                    resolved_target: None,
+                    confidence: None,
+                    certainty: None,
+                    callsite_identity: None,
+                    candidate_targets: Vec::new(),
+                }])
+                .expect("insert edges");
+            storage
+                .insert_occurrences_batch(&[Occurrence {
+                    element_id: 101,
+                    kind: OccurrenceKind::DEFINITION,
+                    location: SourceLocation {
+                        file_node_id: CoreNodeId(11),
+                        start_line: 3,
+                        start_col: 1,
+                        end_line: 3,
+                        end_col: 10,
+                    },
+                }])
+                .expect("insert occurrences");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+
+        let snapshot = controller
+            .grounding_snapshot(GroundingBudgetDto::Strict)
+            .expect("grounding snapshot");
+
+        let symbol = snapshot
+            .root_symbols
+            .iter()
+            .find(|symbol| symbol.label.starts_with("Controller"))
+            .expect("controller root symbol");
+        assert_eq!(symbol.line, Some(3));
+        assert_eq!(symbol.member_count, Some(1));
+        assert!(symbol.edge_digest.iter().any(|digest| digest == "MEMBER=1"));
     }
 }

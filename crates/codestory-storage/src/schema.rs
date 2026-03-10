@@ -118,10 +118,13 @@ const TABLE_STATEMENTS: &[&str] = &[
 
 const INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_occurrence_element ON occurrence(element_id)",
+    "CREATE INDEX IF NOT EXISTS idx_occurrence_element_start_line ON occurrence(element_id, start_line)",
     "CREATE INDEX IF NOT EXISTS idx_occurrence_file ON occurrence(file_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_source ON edge(source_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_target ON edge(target_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_node_file ON node(file_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_node_file_kind_line ON node(file_node_id, kind, start_line)",
+    "CREATE INDEX IF NOT EXISTS idx_node_file_kind_name ON node(file_node_id, kind, qualified_name, serialized_name)",
     "CREATE INDEX IF NOT EXISTS idx_node_qualified_name ON node(qualified_name)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_component_access_node ON component_access(node_id)",
     "CREATE INDEX IF NOT EXISTS idx_bookmark_node_category ON bookmark_node(category_id)",
@@ -129,6 +132,8 @@ const INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_node_kind_serialized_name ON node(kind, serialized_name)",
     "CREATE INDEX IF NOT EXISTS idx_edge_resolved_source ON edge(resolved_source_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_resolved_target ON edge(resolved_target_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_edge_kind_source ON edge(kind, source_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_edge_kind_target ON edge(kind, target_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_kind_resolved_target ON edge(kind, resolved_target_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_line ON edge(line)",
     "CREATE INDEX IF NOT EXISTS idx_edge_callsite_identity ON edge(callsite_identity)",

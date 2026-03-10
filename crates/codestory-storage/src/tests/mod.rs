@@ -1,8 +1,9 @@
 use super::*;
 use codestory_core::{
-    AccessKind, Edge, EdgeId, EdgeKind, NodeId, NodeKind, SourceLocation, TrailConfig,
-    TrailDirection,
+    AccessKind, Edge, EdgeId, EdgeKind, NodeId, NodeKind, ResolutionCertainty, SourceLocation,
+    TrailConfig, TrailDirection,
 };
+use std::path::PathBuf;
 
 #[test]
 fn test_batch_inserts() -> Result<(), StorageError> {
@@ -1556,6 +1557,228 @@ fn test_safe_enum_conversion() -> Result<(), StorageError> {
 
     let edges = storage.get_edges()?;
     assert_eq!(edges[0].kind, EdgeKind::ANNOTATION_USAGE);
+
+    Ok(())
+}
+
+#[test]
+fn test_grounding_queries_rank_symbols_and_roots() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+
+    storage.insert_file(&FileInfo {
+        id: 100,
+        path: PathBuf::from("src/a.rs"),
+        language: "rust".to_string(),
+        modification_time: 0,
+        indexed: true,
+        complete: true,
+        line_count: 10,
+    })?;
+    storage.insert_file(&FileInfo {
+        id: 200,
+        path: PathBuf::from("src/b.rs"),
+        language: "rust".to_string(),
+        modification_time: 0,
+        indexed: true,
+        complete: true,
+        line_count: 10,
+    })?;
+    storage.insert_nodes_batch(&[
+        codestory_core::Node {
+            id: NodeId(100),
+            kind: NodeKind::FILE,
+            serialized_name: "src/a.rs".to_string(),
+            ..Default::default()
+        },
+        codestory_core::Node {
+            id: NodeId(200),
+            kind: NodeKind::FILE,
+            serialized_name: "src/b.rs".to_string(),
+            ..Default::default()
+        },
+        codestory_core::Node {
+            id: NodeId(101),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "zeta".to_string(),
+            file_node_id: Some(NodeId(100)),
+            start_line: Some(8),
+            ..Default::default()
+        },
+        codestory_core::Node {
+            id: NodeId(102),
+            kind: NodeKind::STRUCT,
+            serialized_name: "Alpha".to_string(),
+            file_node_id: Some(NodeId(100)),
+            start_line: Some(2),
+            ..Default::default()
+        },
+        codestory_core::Node {
+            id: NodeId(201),
+            kind: NodeKind::MODULE,
+            serialized_name: "\"./types\"".to_string(),
+            file_node_id: Some(NodeId(200)),
+            start_line: Some(1),
+            ..Default::default()
+        },
+        codestory_core::Node {
+            id: NodeId(202),
+            kind: NodeKind::CLASS,
+            serialized_name: "Widget".to_string(),
+            file_node_id: Some(NodeId(200)),
+            start_line: Some(2),
+            ..Default::default()
+        },
+    ])?;
+
+    let summaries = storage.get_grounding_file_summaries()?;
+    assert_eq!(summaries.len(), 2);
+    assert_eq!(summaries[0].file.id, 100);
+    assert_eq!(summaries[0].symbol_count, 2);
+    assert_eq!(summaries[0].best_node_rank, 0);
+
+    let top = storage.get_grounding_top_symbols_for_files(&[100, 200], 1)?;
+    assert_eq!(top.len(), 2);
+    assert_eq!(top[0].node.id, NodeId(102));
+    assert_eq!(top[1].node.id, NodeId(202));
+
+    let roots = storage.get_grounding_root_symbol_candidates(2, 0)?;
+    assert_eq!(roots.len(), 2);
+    assert_eq!(roots[0].node.id, NodeId(102));
+    assert_eq!(roots[1].node.id, NodeId(202));
+
+    Ok(())
+}
+
+#[test]
+fn test_grounding_member_counts_and_occurrence_lines() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+
+    storage.insert_nodes_batch(&[
+        codestory_core::Node {
+            id: NodeId(1),
+            kind: NodeKind::STRUCT,
+            serialized_name: "Widget".to_string(),
+            ..Default::default()
+        },
+        codestory_core::Node {
+            id: NodeId(2),
+            kind: NodeKind::FIELD,
+            serialized_name: "title".to_string(),
+            ..Default::default()
+        },
+        codestory_core::Node {
+            id: NodeId(3),
+            kind: NodeKind::FIELD,
+            serialized_name: "count".to_string(),
+            ..Default::default()
+        },
+        codestory_core::Node {
+            id: NodeId(10),
+            kind: NodeKind::FILE,
+            serialized_name: "src/lib.rs".to_string(),
+            ..Default::default()
+        },
+        codestory_core::Node {
+            id: NodeId(11),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "render".to_string(),
+            file_node_id: Some(NodeId(10)),
+            start_line: None,
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[
+        Edge {
+            id: EdgeId(1),
+            source: NodeId(1),
+            target: NodeId(2),
+            kind: EdgeKind::MEMBER,
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(2),
+            source: NodeId(1),
+            target: NodeId(3),
+            kind: EdgeKind::MEMBER,
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_occurrences_batch(&[
+        codestory_core::Occurrence {
+            element_id: 11,
+            kind: codestory_core::OccurrenceKind::REFERENCE,
+            location: SourceLocation {
+                file_node_id: NodeId(10),
+                start_line: 20,
+                start_col: 1,
+                end_line: 20,
+                end_col: 5,
+            },
+        },
+        codestory_core::Occurrence {
+            element_id: 11,
+            kind: codestory_core::OccurrenceKind::REFERENCE,
+            location: SourceLocation {
+                file_node_id: NodeId(10),
+                start_line: 5,
+                start_col: 1,
+                end_line: 5,
+                end_col: 5,
+            },
+        },
+    ])?;
+
+    let member_counts = storage.get_grounding_member_counts(&[NodeId(1)])?;
+    assert_eq!(member_counts.get(&NodeId(1)), Some(&2));
+
+    let fallback_lines = storage.get_grounding_min_occurrence_lines(&[NodeId(11)])?;
+    assert_eq!(fallback_lines.get(&NodeId(11)), Some(&20));
+
+    Ok(())
+}
+
+#[test]
+fn test_grounding_edge_digests_ignore_ambiguous_resolved_targets() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+
+    storage.insert_nodes_batch(&[
+        codestory_core::Node {
+            id: NodeId(1),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "caller".to_string(),
+            ..Default::default()
+        },
+        codestory_core::Node {
+            id: NodeId(2),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: "len".to_string(),
+            ..Default::default()
+        },
+        codestory_core::Node {
+            id: NodeId(3),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "Vec::len".to_string(),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[Edge {
+        id: EdgeId(10),
+        source: NodeId(1),
+        target: NodeId(2),
+        kind: EdgeKind::CALL,
+        resolved_target: Some(NodeId(3)),
+        certainty: Some(ResolutionCertainty::Uncertain),
+        ..Default::default()
+    }])?;
+
+    let counts = storage.get_grounding_edge_digest_counts(&[NodeId(1), NodeId(2), NodeId(3)])?;
+    assert!(counts.iter().any(|entry| {
+        entry.node_id == NodeId(1) && entry.kind == EdgeKind::CALL && entry.count == 1
+    }));
+    assert!(counts.iter().any(|entry| {
+        entry.node_id == NodeId(2) && entry.kind == EdgeKind::CALL && entry.count == 1
+    }));
+    assert!(!counts.iter().any(|entry| entry.node_id == NodeId(3)));
 
     Ok(())
 }

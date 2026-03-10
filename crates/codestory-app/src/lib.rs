@@ -928,6 +928,12 @@ impl AppController {
             .collect()
     }
 
+    fn clear_search_state(&self) {
+        let mut s = self.state.lock();
+        s.node_names.clear();
+        s.search_engine = None;
+    }
+
     fn file_path_for_node(
         storage: &Storage,
         node: &codestory_core::Node,
@@ -1066,40 +1072,21 @@ impl AppController {
         })
     }
 
-    fn open_project_with_storage_inner(
+    fn project_summary_from_storage(
         &self,
-        root: PathBuf,
-        storage_path: PathBuf,
+        root: &Path,
+        storage: &Storage,
     ) -> Result<ProjectSummary, ApiError> {
-        let mut storage = Storage::open(&storage_path)
-            .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
-
         let stats = storage
             .get_stats()
             .map_err(|e| ApiError::internal(format!("Failed to query stats: {e}")))?;
-
-        let nodes = storage
-            .get_nodes()
-            .map_err(|e| ApiError::internal(format!("Failed to load nodes: {e}")))?;
         let derived_file_count = if stats.file_count > 0 {
             stats.file_count
         } else {
-            nodes
-                .iter()
-                .filter(|node| node.kind == codestory_core::NodeKind::FILE)
-                .count()
-                .min(i64::MAX as usize) as i64
+            storage
+                .get_file_node_count()
+                .map_err(|e| ApiError::internal(format!("Failed to query file nodes: {e}")))?
         };
-        let (node_names, engine) = build_search_state(&mut storage, nodes, None)?;
-
-        {
-            let mut s = self.state.lock();
-            s.project_root = Some(root.clone());
-            s.storage_path = Some(storage_path);
-            s.node_names = node_names;
-            s.search_engine = Some(engine);
-        }
-
         let dto_stats = StorageStatsDto {
             node_count: clamp_i64_to_u32(stats.node_count),
             edge_count: clamp_i64_to_u32(stats.edge_count),
@@ -1107,14 +1094,58 @@ impl AppController {
             error_count: clamp_i64_to_u32(stats.error_count),
         };
 
-        let _ = self.events_tx.send(AppEventPayload::StatusUpdate {
-            message: "Project opened.".to_string(),
-        });
-
         Ok(ProjectSummary {
             root: root.to_string_lossy().to_string(),
             stats: dto_stats,
         })
+    }
+
+    fn open_project_summary_with_storage_inner(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+    ) -> Result<ProjectSummary, ApiError> {
+        let storage = Storage::open(&storage_path)
+            .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
+        let summary = self.project_summary_from_storage(&root, &storage)?;
+
+        {
+            let mut s = self.state.lock();
+            s.project_root = Some(root);
+            s.storage_path = Some(storage_path);
+            s.node_names.clear();
+            s.search_engine = None;
+        }
+
+        Ok(summary)
+    }
+
+    fn open_project_with_storage_inner(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+    ) -> Result<ProjectSummary, ApiError> {
+        let mut storage = Storage::open(&storage_path)
+            .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
+        let nodes = storage
+            .get_nodes()
+            .map_err(|e| ApiError::internal(format!("Failed to load nodes: {e}")))?;
+        let (node_names, engine) = build_search_state(&mut storage, nodes, None)?;
+        let summary = self.project_summary_from_storage(&root, &storage)?;
+
+        {
+            let mut s = self.state.lock();
+            s.project_root = Some(root);
+            s.storage_path = Some(storage_path);
+            s.node_names = node_names;
+            s.search_engine = Some(engine);
+        }
+
+        let _ = self.events_tx.send(AppEventPayload::StatusUpdate {
+            message: "Project opened.".to_string(),
+        });
+
+        Ok(summary)
     }
 
     pub fn open_project(&self, req: OpenProjectRequest) -> Result<ProjectSummary, ApiError> {
@@ -1163,6 +1194,35 @@ impl AppController {
         }
 
         self.open_project_with_storage_inner(root, storage_path)
+    }
+
+    pub fn open_project_summary_with_storage_path(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+    ) -> Result<ProjectSummary, ApiError> {
+        if !root.exists() {
+            return Err(ApiError::not_found(format!(
+                "Project path does not exist: {}",
+                root.display()
+            )));
+        }
+        if !root.is_dir() {
+            return Err(ApiError::invalid_argument(format!(
+                "Project path is not a directory: {}",
+                root.display()
+            )));
+        }
+        if let Some(parent) = storage_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to create storage directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+
+        self.open_project_summary_with_storage_inner(root, storage_path)
     }
 
     pub fn start_indexing(&self, req: StartIndexingRequest) -> Result<(), ApiError> {
@@ -1230,7 +1290,11 @@ impl AppController {
         Ok(())
     }
 
-    pub fn run_indexing_blocking(&self, mode: IndexMode) -> Result<IndexingPhaseTimings, ApiError> {
+    fn run_indexing_blocking_inner(
+        &self,
+        mode: IndexMode,
+        refresh_runtime_caches: bool,
+    ) -> Result<IndexingPhaseTimings, ApiError> {
         let (root, storage_path) = {
             let mut s = self.state.lock();
             if s.is_indexing {
@@ -1254,20 +1318,43 @@ impl AppController {
 
         match result {
             Ok(summary) => {
-                let mut storage = Storage::open(&storage_path)
-                    .map_err(|e| ApiError::internal(format!("Failed to reopen storage: {e}")))?;
-                refresh_caches(self, &mut storage, summary.llm_refresh_scope.as_ref());
+                if refresh_runtime_caches {
+                    let mut storage = Storage::open(&storage_path).map_err(|e| {
+                        ApiError::internal(format!("Failed to reopen storage: {e}"))
+                    })?;
+                    refresh_caches(self, &mut storage, summary.llm_refresh_scope.as_ref());
+                } else {
+                    self.clear_search_state();
+                    self.state.lock().is_indexing = false;
+                }
                 Ok(summary.phase_timings)
             }
             Err(error) => {
-                if let Ok(mut storage) = Storage::open(&storage_path) {
-                    refresh_caches(self, &mut storage, None);
+                if refresh_runtime_caches {
+                    if let Ok(mut storage) = Storage::open(&storage_path) {
+                        refresh_caches(self, &mut storage, None);
+                    } else {
+                        self.clear_search_state();
+                        self.state.lock().is_indexing = false;
+                    }
                 } else {
+                    self.clear_search_state();
                     self.state.lock().is_indexing = false;
                 }
                 Err(error)
             }
         }
+    }
+
+    pub fn run_indexing_blocking(&self, mode: IndexMode) -> Result<IndexingPhaseTimings, ApiError> {
+        self.run_indexing_blocking_inner(mode, true)
+    }
+
+    pub fn run_indexing_blocking_without_runtime_refresh(
+        &self,
+        mode: IndexMode,
+    ) -> Result<IndexingPhaseTimings, ApiError> {
+        self.run_indexing_blocking_inner(mode, false)
     }
 
     pub fn search(&self, req: SearchRequest) -> Result<Vec<SearchHit>, ApiError> {
@@ -2393,6 +2480,47 @@ mod tests {
 
         let hits = engine.search_symbol("pkg.mod");
         assert_eq!(hits.first().copied(), Some(CoreNodeId(1)));
+    }
+
+    #[test]
+    fn open_project_summary_clears_search_state() {
+        let temp = tempdir().expect("create temp dir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), storage_path.clone())
+            .expect("open project with search state");
+        assert!(
+            controller.state.lock().search_engine.is_some(),
+            "expected full open to initialize search state"
+        );
+
+        controller
+            .open_project_summary_with_storage_path(temp.path().to_path_buf(), storage_path)
+            .expect("open project summary");
+        let state = controller.state.lock();
+        assert!(state.search_engine.is_none());
+        assert!(state.node_names.is_empty());
+    }
+
+    #[test]
+    fn run_indexing_without_runtime_refresh_keeps_search_uninitialized() {
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_summary_with_storage_path(workspace.path().to_path_buf(), storage_path)
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("index without runtime refresh");
+
+        let state = controller.state.lock();
+        assert!(!state.is_indexing);
+        assert!(state.search_engine.is_none());
+        assert!(state.node_names.is_empty());
     }
 
     #[test]

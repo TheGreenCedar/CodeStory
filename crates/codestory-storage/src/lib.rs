@@ -30,6 +30,73 @@ const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id,
                  JOIN node t ON t.id = e.target_node_id
                  LEFT JOIN node f ON f.id = e.file_node_id";
 
+fn clamp_i64_to_u32(value: i64) -> u32 {
+    if value <= 0 {
+        0
+    } else if value > u32::MAX as i64 {
+        u32::MAX
+    } else {
+        value as u32
+    }
+}
+
+fn grounding_display_name_expr(alias: &str) -> String {
+    format!("COALESCE({alias}.qualified_name, {alias}.serialized_name)")
+}
+
+fn grounding_trimmed_name_expr(alias: &str) -> String {
+    format!("TRIM({})", grounding_display_name_expr(alias))
+}
+
+fn grounding_indexable_predicate(alias: &str) -> String {
+    format!(
+        "{alias}.kind NOT IN ({}, {}, {})",
+        NodeKind::FILE as i32,
+        NodeKind::UNKNOWN as i32,
+        NodeKind::BUILTIN_TYPE as i32
+    )
+}
+
+fn grounding_node_rank_sql(alias: &str) -> String {
+    let display_name = grounding_trimmed_name_expr(alias);
+    format!(
+        "CASE
+            WHEN {alias}.kind IN ({module_kind}, {namespace_kind}, {package_kind}) AND (
+                (substr({display_name}, 1, 1) = char(34) AND substr({display_name}, length({display_name}), 1) = char(34))
+                OR (substr({display_name}, 1, 1) = char(39) AND substr({display_name}, length({display_name}), 1) = char(39))
+                OR (substr({display_name}, 1, 1) = '<' AND substr({display_name}, length({display_name}), 1) = '>')
+                OR {display_name} LIKE './%'
+                OR {display_name} LIKE '../%'
+                OR instr({display_name}, '/') > 0
+            ) THEN 5
+            WHEN {alias}.kind IN ({class_kind}, {struct_kind}, {interface_kind}, {enum_kind}, {union_kind}, {annotation_kind}, {typedef_kind}) THEN 0
+            WHEN {alias}.kind IN ({function_kind}, {method_kind}, {macro_kind}) THEN 1
+            WHEN {alias}.kind IN ({module_kind}, {namespace_kind}, {package_kind}) THEN 2
+            WHEN {alias}.kind IN ({field_kind}, {variable_kind}, {global_variable_kind}, {constant_kind}, {enum_constant_kind}, {type_parameter_kind}) THEN 3
+            ELSE 4
+        END",
+        module_kind = NodeKind::MODULE as i32,
+        namespace_kind = NodeKind::NAMESPACE as i32,
+        package_kind = NodeKind::PACKAGE as i32,
+        class_kind = NodeKind::CLASS as i32,
+        struct_kind = NodeKind::STRUCT as i32,
+        interface_kind = NodeKind::INTERFACE as i32,
+        enum_kind = NodeKind::ENUM as i32,
+        union_kind = NodeKind::UNION as i32,
+        annotation_kind = NodeKind::ANNOTATION as i32,
+        typedef_kind = NodeKind::TYPEDEF as i32,
+        function_kind = NodeKind::FUNCTION as i32,
+        method_kind = NodeKind::METHOD as i32,
+        macro_kind = NodeKind::MACRO as i32,
+        field_kind = NodeKind::FIELD as i32,
+        variable_kind = NodeKind::VARIABLE as i32,
+        global_variable_kind = NodeKind::GLOBAL_VARIABLE as i32,
+        constant_kind = NodeKind::CONSTANT as i32,
+        enum_constant_kind = NodeKind::ENUM_CONSTANT as i32,
+        type_parameter_kind = NodeKind::TYPE_PARAMETER as i32,
+    )
+}
+
 #[derive(Error, Debug)]
 pub enum StorageError {
     #[error("Database error: {0}")]
@@ -67,6 +134,27 @@ pub struct StorageStats {
     pub edge_count: i64,
     pub file_count: i64,
     pub error_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct GroundingFileSummary {
+    pub file: FileInfo,
+    pub symbol_count: u32,
+    pub best_node_rank: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct GroundingNodeRecord {
+    pub node: Node,
+    pub display_name: String,
+    pub file_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroundingEdgeKindCount {
+    pub node_id: NodeId,
+    pub kind: EdgeKind,
+    pub count: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -998,6 +1086,346 @@ impl Storage {
             files.push(file?);
         }
         Ok(files)
+    }
+
+    pub fn get_file_node_count(&self) -> Result<i64, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM node WHERE kind = ?1",
+                params![NodeKind::FILE as i32],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)
+    }
+
+    pub fn get_grounding_file_summaries(&self) -> Result<Vec<GroundingFileSummary>, StorageError> {
+        let rank_sql = grounding_node_rank_sql("n");
+        let indexable = grounding_indexable_predicate("n");
+        let query = format!(
+            "WITH all_files AS (
+                SELECT id, path, language, modification_time, indexed, complete, line_count
+                FROM file
+                UNION ALL
+                SELECT
+                    n.id,
+                    n.serialized_name,
+                    '',
+                    0,
+                    1,
+                    1,
+                    0
+                FROM node n
+                WHERE n.kind = {file_kind}
+                    AND NOT EXISTS (SELECT 1 FROM file f WHERE f.id = n.id)
+            )
+            SELECT
+                f.id,
+                f.path,
+                f.language,
+                f.modification_time,
+                f.indexed,
+                f.complete,
+                f.line_count,
+                COUNT(n.id) AS symbol_count,
+                MIN(CASE WHEN n.id IS NULL THEN 255 ELSE {rank_sql} END) AS best_node_rank
+            FROM all_files f
+            LEFT JOIN node n
+                ON n.file_node_id = f.id
+               AND {indexable}
+            GROUP BY
+                f.id,
+                f.path,
+                f.language,
+                f.modification_time,
+                f.indexed,
+                f.complete,
+                f.line_count
+            ORDER BY f.path",
+            file_kind = NodeKind::FILE as i32,
+        );
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query([])?;
+        let mut summaries = Vec::new();
+        while let Some(row) = rows.next()? {
+            let symbol_count: i64 = row.get(7)?;
+            let best_node_rank: i64 = row.get(8)?;
+            summaries.push(GroundingFileSummary {
+                file: FileInfo {
+                    id: row.get(0)?,
+                    path: PathBuf::from(row.get::<_, String>(1)?),
+                    language: row.get(2)?,
+                    modification_time: row.get(3)?,
+                    indexed: row.get::<_, i32>(4)? != 0,
+                    complete: row.get::<_, i32>(5)? != 0,
+                    line_count: row.get(6)?,
+                },
+                symbol_count: clamp_i64_to_u32(symbol_count),
+                best_node_rank: best_node_rank.min(u8::MAX as i64) as u8,
+            });
+        }
+        Ok(summaries)
+    }
+
+    pub fn get_grounding_top_symbols_for_files(
+        &self,
+        file_ids: &[i64],
+        per_file_limit: usize,
+    ) -> Result<Vec<GroundingNodeRecord>, StorageError> {
+        if file_ids.is_empty() || per_file_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = numbered_placeholders(2, file_ids.len());
+        let rank_sql = grounding_node_rank_sql("n");
+        let indexable = grounding_indexable_predicate("n");
+        let display_name = grounding_display_name_expr("n");
+        let query = format!(
+            "WITH ranked AS (
+                SELECT
+                    n.id,
+                    n.kind,
+                    n.serialized_name,
+                    n.qualified_name,
+                    n.canonical_id,
+                    n.file_node_id,
+                    n.start_line,
+                    n.start_col,
+                    n.end_line,
+                    n.end_col,
+                    {display_name} AS display_name,
+                    COALESCE(f.path, file_node.serialized_name) AS file_path,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY n.file_node_id
+                        ORDER BY
+                            {rank_sql},
+                            COALESCE(n.start_line, 2147483647),
+                            {display_name},
+                            n.id
+                    ) AS row_num
+                FROM node n
+                LEFT JOIN file f ON f.id = n.file_node_id
+                LEFT JOIN node file_node
+                    ON file_node.id = n.file_node_id
+                   AND file_node.kind = {file_kind}
+                WHERE {indexable}
+                  AND n.file_node_id IN ({placeholders})
+            )
+            SELECT
+                id,
+                kind,
+                serialized_name,
+                qualified_name,
+                canonical_id,
+                file_node_id,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                display_name,
+                file_path
+            FROM ranked
+            WHERE row_num <= ?1
+            ORDER BY file_node_id, row_num",
+            file_kind = NodeKind::FILE as i32,
+        );
+        let mut params = Vec::with_capacity(file_ids.len() + 1);
+        params.push(Value::Integer(per_file_limit.min(i64::MAX as usize) as i64));
+        params.extend(file_ids.iter().map(|id| Value::Integer(*id)));
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query(params_from_iter(params))?;
+        let mut nodes = Vec::new();
+        while let Some(row) = rows.next()? {
+            nodes.push(GroundingNodeRecord {
+                node: Self::node_from_row(row)?,
+                display_name: row.get(10)?,
+                file_path: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
+            });
+        }
+        Ok(nodes)
+    }
+
+    pub fn get_grounding_root_symbol_candidates(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<GroundingNodeRecord>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let rank_sql = grounding_node_rank_sql("n");
+        let display_name = grounding_display_name_expr("n");
+        let indexable = grounding_indexable_predicate("n");
+        let query = format!(
+            "SELECT
+                n.id,
+                n.kind,
+                n.serialized_name,
+                n.qualified_name,
+                n.canonical_id,
+                n.file_node_id,
+                n.start_line,
+                n.start_col,
+                n.end_line,
+                n.end_col,
+                {display_name} AS display_name,
+                COALESCE(f.path, file_node.serialized_name) AS file_path
+            FROM node n
+            LEFT JOIN file f ON f.id = n.file_node_id
+            LEFT JOIN node file_node
+                ON file_node.id = n.file_node_id
+               AND file_node.kind = {file_kind}
+            WHERE {indexable}
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM edge e
+                    WHERE e.kind = {member_kind}
+                      AND e.target_node_id = n.id
+                )
+            ORDER BY
+                {rank_sql},
+                COALESCE(n.start_line, 2147483647),
+                {display_name},
+                n.id
+            LIMIT ?1 OFFSET ?2",
+            file_kind = NodeKind::FILE as i32,
+            member_kind = EdgeKind::MEMBER as i32,
+        );
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query(params![
+            limit.min(i64::MAX as usize) as i64,
+            offset.min(i64::MAX as usize) as i64
+        ])?;
+        let mut nodes = Vec::new();
+        while let Some(row) = rows.next()? {
+            nodes.push(GroundingNodeRecord {
+                node: Self::node_from_row(row)?,
+                display_name: row.get(10)?,
+                file_path: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
+            });
+        }
+        Ok(nodes)
+    }
+
+    pub fn get_grounding_member_counts(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<HashMap<NodeId, u32>, StorageError> {
+        if node_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let placeholders = question_placeholders(node_ids.len());
+        let query = format!(
+            "SELECT source_node_id, COUNT(*)
+            FROM edge
+            WHERE kind = ?1
+              AND source_node_id IN ({placeholders})
+            GROUP BY source_node_id"
+        );
+        let mut params = Vec::with_capacity(node_ids.len() + 1);
+        params.push(Value::Integer(EdgeKind::MEMBER as i32 as i64));
+        params.extend(node_ids.iter().map(|id| Value::Integer(id.0)));
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query(params_from_iter(params))?;
+        let mut counts = HashMap::new();
+        while let Some(row) = rows.next()? {
+            counts.insert(NodeId(row.get(0)?), clamp_i64_to_u32(row.get::<_, i64>(1)?));
+        }
+        Ok(counts)
+    }
+
+    pub fn get_grounding_min_occurrence_lines(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<HashMap<NodeId, u32>, StorageError> {
+        if node_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let placeholders = question_placeholders(node_ids.len());
+        let query = format!(
+            "SELECT element_id, start_line
+            FROM occurrence
+            WHERE element_id IN ({placeholders})
+            ORDER BY element_id ASC, rowid ASC"
+        );
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query(params_from_iter(node_ids.iter().map(|id| id.0)))?;
+        let mut counts = HashMap::new();
+        while let Some(row) = rows.next()? {
+            counts.entry(NodeId(row.get(0)?)).or_insert(row.get(1)?);
+        }
+        Ok(counts)
+    }
+
+    pub fn get_grounding_edge_digest_counts(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<Vec<GroundingEdgeKindCount>, StorageError> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let source_placeholders = numbered_placeholders(1, node_ids.len());
+        let target_placeholders = numbered_placeholders(1 + node_ids.len(), node_ids.len());
+        let resolved_source_placeholders =
+            numbered_placeholders(1 + node_ids.len() * 2, node_ids.len());
+        let resolved_target_placeholders =
+            numbered_placeholders(1 + node_ids.len() * 3, node_ids.len());
+        let query = format!(
+            "{EDGE_SELECT_BASE}
+             WHERE e.source_node_id IN ({source_placeholders})
+                OR e.target_node_id IN ({target_placeholders})
+                OR e.resolved_source_node_id IN ({resolved_source_placeholders})
+                OR e.resolved_target_node_id IN ({resolved_target_placeholders})
+             ORDER BY e.id"
+        );
+        let params = node_ids
+            .iter()
+            .map(|id| Value::from(id.0))
+            .chain(node_ids.iter().map(|id| Value::from(id.0)))
+            .chain(node_ids.iter().map(|id| Value::from(id.0)))
+            .chain(node_ids.iter().map(|id| Value::from(id.0)));
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query(params_from_iter(params))?;
+        let node_id_set = node_ids.iter().copied().collect::<HashSet<_>>();
+        let mut counts_by_node = HashMap::<(NodeId, EdgeKind), u32>::new();
+        while let Some(row) = rows.next()? {
+            let mut edge = Self::edge_from_row(row)?;
+            let target_symbol: String = row.get(12)?;
+            if edge.kind == EdgeKind::CALL
+                && edge.resolved_target.is_some()
+                && should_ignore_call_resolution(&target_symbol, edge.certainty, edge.confidence)
+            {
+                edge.resolved_target = None;
+                edge.confidence = None;
+                edge.certainty = None;
+            }
+
+            let (source, target) = edge.effective_endpoints();
+            if node_id_set.contains(&source) {
+                *counts_by_node.entry((source, edge.kind)).or_insert(0) += 1;
+            }
+            if target != source && node_id_set.contains(&target) {
+                *counts_by_node.entry((target, edge.kind)).or_insert(0) += 1;
+            }
+        }
+        let mut counts = Vec::new();
+        for ((node_id, kind), count) in counts_by_node {
+            counts.push(GroundingEdgeKindCount {
+                node_id,
+                kind,
+                count,
+            });
+        }
+        counts.sort_by(|left, right| {
+            left.node_id
+                .0
+                .cmp(&right.node_id.0)
+                .then((left.kind as i32).cmp(&(right.kind as i32)))
+        });
+        Ok(counts)
     }
 
     pub fn get_file_by_path(&self, path: &Path) -> Result<Option<FileInfo>, StorageError> {

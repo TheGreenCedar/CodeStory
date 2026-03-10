@@ -250,7 +250,7 @@ fn run_index(cmd: IndexCommand) -> Result<()> {
 
 fn run_ground(cmd: GroundCommand) -> Result<()> {
     let runtime = RuntimeContext::new(&cmd.project)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
+    let opened = runtime.ensure_ground_open(cmd.refresh)?;
     ensure_index_ready(&opened, "ground")?;
 
     let snapshot = runtime
@@ -377,9 +377,38 @@ impl RuntimeContext {
         })
     }
 
+    fn ensure_ground_open(&self, refresh: RefreshMode) -> Result<OpenedProject> {
+        let mut summary = self.open_project_summary()?;
+        let refresh_mode = resolve_refresh_request(refresh, &summary);
+        let mut phase_timings = None;
+        if let Some(mode) = refresh_mode {
+            phase_timings = Some(
+                self.controller
+                    .run_indexing_blocking_without_runtime_refresh(mode)
+                    .map_err(map_api_error)?,
+            );
+            summary = self.open_project_summary()?;
+        }
+
+        Ok(OpenedProject {
+            summary,
+            refresh_mode,
+            phase_timings,
+        })
+    }
+
     fn open_project(&self) -> Result<ProjectSummary> {
         self.controller
             .open_project_with_storage_path(self.project_root.clone(), self.storage_path.clone())
+            .map_err(map_api_error)
+    }
+
+    fn open_project_summary(&self) -> Result<ProjectSummary> {
+        self.controller
+            .open_project_summary_with_storage_path(
+                self.project_root.clone(),
+                self.storage_path.clone(),
+            )
             .map_err(map_api_error)
     }
 }
@@ -1242,6 +1271,19 @@ mod tests {
             .expect("index project");
         ensure_index_ready(&opened, "test").expect("indexed project");
         runtime
+    }
+
+    #[test]
+    fn ground_open_preserves_current_auto_refresh_semantics() {
+        let temp = copy_tictactoe_workspace();
+        let runtime = indexed_runtime(temp.path());
+
+        let opened = runtime
+            .ensure_ground_open(RefreshMode::Auto)
+            .expect("ground open");
+
+        assert_eq!(opened.refresh_mode, Some(IndexMode::Incremental));
+        ensure_index_ready(&opened, "ground").expect("ground ready");
     }
 
     #[test]
