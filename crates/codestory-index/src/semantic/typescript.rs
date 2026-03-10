@@ -1,6 +1,7 @@
 use super::{
     SemanticCandidateIndex, SemanticResolutionCandidate, SemanticResolutionRequest,
-    SemanticResolver, detect_language, resolve_call_candidates, resolve_import_candidates,
+    SemanticResolver, alias_target, call_target_name, request_language, request_target,
+    resolve_call_candidates, resolve_import_candidates, tail_segment,
 };
 use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind};
@@ -31,23 +32,14 @@ impl TypeScriptSemanticResolver {
         index: &SemanticCandidateIndex,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
-        let normalized = request.target_name.trim();
-        if normalized.is_empty() {
+        let Some(target) = request_target(request) else {
             return Ok(Vec::new());
-        }
+        };
 
         // Phase 1: derive likely exported symbol from import path/alias and suggest package/module nodes.
-        let symbol = normalized
-            .split_once(" as ")
-            .map(|(_, rhs)| rhs.trim())
-            .unwrap_or(normalized)
-            .rsplit(['/', '.', ':'])
-            .next()
-            .unwrap_or(normalized)
-            .trim();
-        if symbol.is_empty() {
+        let Some(symbol) = tail_segment(alias_target(target), &['/', '.', ':']) else {
             return Ok(Vec::new());
-        }
+        };
 
         let kinds = [
             NodeKind::MODULE as i32,
@@ -63,7 +55,7 @@ impl TypeScriptSemanticResolver {
             &kinds,
             symbol,
             request.file_id,
-            detect_language(request.file_path.as_deref()),
+            request_language(request),
             0.58,
         )
     }
@@ -73,18 +65,13 @@ impl TypeScriptSemanticResolver {
         index: &SemanticCandidateIndex,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
-        let target = request.target_name.trim();
-        if target.is_empty() {
+        let Some(target) = request_target(request) else {
             return Ok(Vec::new());
-        }
+        };
 
-        let call_name = target
-            .rsplit_once('.')
-            .map(|(_, tail)| tail.trim())
-            .unwrap_or(target);
-        if call_name.is_empty() {
+        let Some(call_name) = call_target_name(target) else {
             return Ok(Vec::new());
-        }
+        };
 
         let kinds = [NodeKind::METHOD as i32, NodeKind::FUNCTION as i32];
         resolve_call_candidates(
@@ -92,7 +79,7 @@ impl TypeScriptSemanticResolver {
             &kinds,
             call_name,
             request.file_id,
-            detect_language(request.file_path.as_deref()),
+            request_language(request),
             0.88,
             0.70,
         )

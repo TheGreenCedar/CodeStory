@@ -1,6 +1,7 @@
 use super::{
     SemanticCandidateIndex, SemanticResolutionCandidate, SemanticResolutionRequest,
-    SemanticResolver, detect_language, resolve_call_candidates, resolve_import_candidates,
+    SemanticResolver, alias_target, call_target_name, namespace_tail, request_language,
+    request_target, resolve_call_candidates, resolve_import_candidates,
 };
 use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind};
@@ -31,22 +32,13 @@ impl RustSemanticResolver {
         index: &SemanticCandidateIndex,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
-        let target = request.target_name.trim();
-        if target.is_empty() {
+        let Some(target) = request_target(request) else {
             return Ok(Vec::new());
-        }
+        };
 
-        let symbol = target
-            .split_once(" as ")
-            .map(|(_, rhs)| rhs.trim())
-            .unwrap_or(target)
-            .rsplit("::")
-            .next()
-            .unwrap_or(target)
-            .trim();
-        if symbol.is_empty() {
+        let Some(symbol) = namespace_tail(alias_target(target), "::") else {
             return Ok(Vec::new());
-        }
+        };
 
         let kinds = [
             NodeKind::MODULE as i32,
@@ -63,7 +55,7 @@ impl RustSemanticResolver {
             &kinds,
             symbol,
             request.file_id,
-            detect_language(request.file_path.as_deref()),
+            request_language(request),
             0.61,
         )
     }
@@ -73,19 +65,13 @@ impl RustSemanticResolver {
         index: &SemanticCandidateIndex,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
-        let target = request.target_name.trim();
-        if target.is_empty() {
+        let Some(target) = request_target(request) else {
             return Ok(Vec::new());
-        }
+        };
 
-        let call_name = target
-            .rsplit_once("::")
-            .map(|(_, tail)| tail.trim())
-            .or_else(|| target.rsplit_once('.').map(|(_, tail)| tail.trim()))
-            .unwrap_or(target);
-        if call_name.is_empty() {
+        let Some(call_name) = call_target_name(target) else {
             return Ok(Vec::new());
-        }
+        };
 
         let kinds = [NodeKind::METHOD as i32, NodeKind::FUNCTION as i32];
         resolve_call_candidates(
@@ -93,7 +79,7 @@ impl RustSemanticResolver {
             &kinds,
             call_name,
             request.file_id,
-            detect_language(request.file_path.as_deref()),
+            request_language(request),
             0.82,
             0.73,
         )

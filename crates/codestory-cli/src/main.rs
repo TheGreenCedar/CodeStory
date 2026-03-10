@@ -14,6 +14,10 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod query_resolution;
+
+use query_resolution::{compare_resolution_hits, resolution_rank, search_hit_matches_file_filter};
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Skill-first repo grounding runtime", long_about = None)]
 struct Cli {
@@ -478,145 +482,6 @@ fn resolve_target(
             })
         }
     }
-}
-
-fn compare_resolution_hits(query: &str, left: &SearchHit, right: &SearchHit) -> std::cmp::Ordering {
-    resolution_rank(query, right)
-        .cmp(&resolution_rank(query, left))
-        .then_with(|| right.score.total_cmp(&left.score))
-        .then_with(|| left.display_name.len().cmp(&right.display_name.len()))
-        .then_with(|| left.display_name.cmp(&right.display_name))
-}
-
-fn resolution_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8, u8) {
-    let query = normalize_symbol_query(query);
-    let display = normalize_symbol_query(&hit.display_name);
-    let terminal = terminal_symbol_segment(&hit.display_name);
-    let leading = leading_symbol_segment(&hit.display_name);
-
-    (
-        u8::from(display == query),
-        u8::from(terminal == query),
-        declaration_anchor_bucket(hit),
-        resolution_kind_bucket(hit.kind),
-        u8::from(leading == query),
-    )
-}
-
-fn normalize_symbol_query(value: &str) -> String {
-    value.trim().to_ascii_lowercase()
-}
-
-fn terminal_symbol_segment(value: &str) -> String {
-    value
-        .rsplit([':', '.', '/', '\\'])
-        .next()
-        .map(normalize_symbol_query)
-        .unwrap_or_default()
-}
-
-fn leading_symbol_segment(value: &str) -> String {
-    value
-        .split("::")
-        .next()
-        .map(normalize_symbol_query)
-        .unwrap_or_default()
-}
-
-fn resolution_kind_bucket(kind: codestory_api::NodeKind) -> u8 {
-    if matches!(
-        kind,
-        codestory_api::NodeKind::MODULE
-            | codestory_api::NodeKind::NAMESPACE
-            | codestory_api::NodeKind::PACKAGE
-            | codestory_api::NodeKind::STRUCT
-            | codestory_api::NodeKind::CLASS
-            | codestory_api::NodeKind::INTERFACE
-            | codestory_api::NodeKind::ENUM
-            | codestory_api::NodeKind::UNION
-            | codestory_api::NodeKind::TYPEDEF
-    ) {
-        return 2;
-    }
-
-    if matches!(
-        kind,
-        codestory_api::NodeKind::FUNCTION
-            | codestory_api::NodeKind::METHOD
-            | codestory_api::NodeKind::MACRO
-            | codestory_api::NodeKind::FIELD
-            | codestory_api::NodeKind::VARIABLE
-            | codestory_api::NodeKind::GLOBAL_VARIABLE
-            | codestory_api::NodeKind::CONSTANT
-            | codestory_api::NodeKind::ENUM_CONSTANT
-    ) {
-        return 1;
-    }
-
-    0
-}
-
-fn normalize_path_fragment(value: &str) -> String {
-    clean_path_string(value).to_ascii_lowercase()
-}
-
-fn declaration_anchor_bucket(hit: &SearchHit) -> u8 {
-    if matches!(
-        hit.kind,
-        codestory_api::NodeKind::STRUCT
-            | codestory_api::NodeKind::CLASS
-            | codestory_api::NodeKind::INTERFACE
-            | codestory_api::NodeKind::ENUM
-            | codestory_api::NodeKind::UNION
-            | codestory_api::NodeKind::TYPEDEF
-    ) && !hit_is_impl_anchor(hit)
-    {
-        return 1;
-    }
-
-    0
-}
-
-fn hit_is_impl_anchor(hit: &SearchHit) -> bool {
-    let Some(file_path) = hit.file_path.as_deref() else {
-        return false;
-    };
-    let Some(line) = hit.line else {
-        return false;
-    };
-    let Ok(contents) = read_file_contents_for_resolution(file_path) else {
-        return false;
-    };
-    let Some(source_line) = contents.lines().nth(line.saturating_sub(1) as usize) else {
-        return false;
-    };
-    let trimmed = source_line.trim_start();
-    trimmed.starts_with("impl ") || trimmed.starts_with("unsafe impl ")
-}
-
-fn read_file_contents_for_resolution(path: &str) -> Result<String> {
-    if let Ok(contents) = fs::read_to_string(path) {
-        return Ok(contents);
-    }
-
-    #[cfg(windows)]
-    if let Some(stripped) = path.strip_prefix(r"\\?\")
-        && let Ok(contents) = fs::read_to_string(stripped)
-    {
-        return Ok(contents);
-    }
-
-    fs::read_to_string(path).with_context(|| format!("Failed to read file `{path}`"))
-}
-
-fn search_hit_matches_file_filter(hit: &SearchHit, fragment: &str) -> bool {
-    let Some(file_path) = hit.file_path.as_deref() else {
-        return false;
-    };
-
-    let file_path = normalize_path_fragment(file_path);
-    let fragment = normalize_path_fragment(fragment);
-    file_path.contains(&fragment)
 }
 
 fn build_trail_request(root_id: &NodeId, cmd: &TrailCommand) -> TrailConfigDto {

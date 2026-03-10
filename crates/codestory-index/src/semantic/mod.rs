@@ -275,6 +275,46 @@ pub(crate) fn detect_language(path: Option<&str>) -> Option<&'static str> {
     }
 }
 
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+pub(super) fn request_target(request: &SemanticResolutionRequest) -> Option<&str> {
+    non_empty_trimmed(&request.target_name)
+}
+
+pub(super) fn request_language(request: &SemanticResolutionRequest) -> Option<&'static str> {
+    detect_language(request.file_path.as_deref())
+}
+
+pub(super) fn alias_target(target: &str) -> &str {
+    target
+        .split_once(" as ")
+        .map(|(_, rhs)| rhs.trim())
+        .unwrap_or(target)
+        .trim()
+}
+
+pub(super) fn tail_segment<'a>(value: &'a str, separators: &[char]) -> Option<&'a str> {
+    let tail = value.rsplit(separators).next().unwrap_or(value);
+    non_empty_trimmed(tail)
+}
+
+pub(super) fn namespace_tail<'a>(value: &'a str, separator: &str) -> Option<&'a str> {
+    let tail = value.rsplit(separator).next().unwrap_or(value);
+    non_empty_trimmed(tail)
+}
+
+pub(super) fn call_target_name(target: &str) -> Option<&str> {
+    let tail = target
+        .rsplit_once("::")
+        .map(|(_, tail)| tail)
+        .or_else(|| target.rsplit_once('.').map(|(_, tail)| tail))
+        .unwrap_or(target);
+    non_empty_trimmed(tail)
+}
+
 fn kind_clause(kinds: &[i32]) -> String {
     kinds
         .iter()
@@ -421,7 +461,10 @@ fn compatible_language_families(
 
 #[cfg(test)]
 mod tests {
-    use super::{SemanticCandidateIndex, detect_language, resolve_call_candidates};
+    use super::{
+        SemanticCandidateIndex, alias_target, call_target_name, detect_language, namespace_tail,
+        resolve_call_candidates, tail_segment,
+    };
     use anyhow::Result;
     use codestory_core::NodeKind;
     use rusqlite::{Connection, params};
@@ -473,6 +516,16 @@ mod tests {
         for (path, language) in expected {
             assert_eq!(detect_language(Some(path)), language, "path={path}");
         }
+    }
+
+    #[test]
+    fn test_shared_name_helpers_trim_aliases_and_tails() {
+        assert_eq!(alias_target("pkg.mod as alias"), "alias");
+        assert_eq!(tail_segment("pkg/mod/file.ts", &['/', '.']), Some("ts"));
+        assert_eq!(namespace_tail("crate::module::Type", "::"), Some("Type"));
+        assert_eq!(call_target_name("crate::module::call"), Some("call"));
+        assert_eq!(call_target_name("obj.method"), Some("method"));
+        assert_eq!(call_target_name("standalone"), Some("standalone"));
     }
 
     #[test]

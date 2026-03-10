@@ -1,6 +1,7 @@
 use super::{
     SemanticCandidateIndex, SemanticResolutionCandidate, SemanticResolutionRequest,
-    SemanticResolver, detect_language, resolve_call_candidates, resolve_import_candidates,
+    SemanticResolver, call_target_name, request_language, request_target, resolve_call_candidates,
+    resolve_import_candidates,
 };
 use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind};
@@ -31,10 +32,9 @@ impl CSemanticResolver {
         index: &SemanticCandidateIndex,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
-        let target = request.target_name.trim();
-        if target.is_empty() {
+        let Some(target) = request_target(request) else {
             return Ok(Vec::new());
-        }
+        };
 
         let symbol = normalize_include_symbol(target);
         if symbol.is_empty() {
@@ -54,7 +54,7 @@ impl CSemanticResolver {
             &kinds,
             &symbol,
             request.file_id,
-            detect_language(request.file_path.as_deref()),
+            request_language(request),
             0.54,
         )
     }
@@ -64,19 +64,13 @@ impl CSemanticResolver {
         index: &SemanticCandidateIndex,
         request: &SemanticResolutionRequest,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
-        let target = request.target_name.trim();
-        if target.is_empty() {
+        let Some(target) = request_target(request) else {
             return Ok(Vec::new());
-        }
+        };
 
-        let call_name = target
-            .rsplit_once("::")
-            .map(|(_, tail)| tail.trim())
-            .or_else(|| target.rsplit_once('.').map(|(_, tail)| tail.trim()))
-            .unwrap_or(target);
-        if call_name.is_empty() {
+        let Some(call_name) = call_target_name(target) else {
             return Ok(Vec::new());
-        }
+        };
 
         let kinds = [NodeKind::FUNCTION as i32, NodeKind::METHOD as i32];
         resolve_call_candidates(
@@ -84,7 +78,7 @@ impl CSemanticResolver {
             &kinds,
             call_name,
             request.file_id,
-            detect_language(request.file_path.as_deref()),
+            request_language(request),
             0.82,
             0.66,
         )

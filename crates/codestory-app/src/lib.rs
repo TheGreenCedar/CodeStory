@@ -30,11 +30,24 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod agent;
+mod agent_commands;
 mod graph_builders;
 mod graph_canonical;
 mod grounding;
+mod mermaid;
 mod path_resolution;
+mod symbol_query;
 mod system_actions;
+
+pub(crate) use agent_commands::{
+    agent_backend_label, configured_agent_command, resolve_agent_command,
+};
+pub(crate) use mermaid::{fallback_mermaid, mermaid_flowchart, mermaid_gantt, mermaid_sequence};
+pub(crate) use symbol_query::compare_search_hits;
+pub use symbol_query::{
+    SymbolNameMatchRank, compare_ranked_hits, leading_symbol_segment, normalize_symbol_query,
+    symbol_name_match_rank, terminal_symbol_segment,
+};
 
 const HYBRID_RETRIEVAL_ENABLED_ENV: &str = "CODESTORY_HYBRID_RETRIEVAL_ENABLED";
 
@@ -256,92 +269,6 @@ fn aggregate_symbol_matches(
     merged
 }
 
-fn normalize_symbol_query(value: &str) -> String {
-    value.trim().to_ascii_lowercase()
-}
-
-fn terminal_symbol_segment(value: &str) -> String {
-    value
-        .rsplit([':', '.', '/', '\\'])
-        .next()
-        .map(normalize_symbol_query)
-        .unwrap_or_default()
-}
-
-fn leading_symbol_segment(value: &str) -> String {
-    value
-        .split("::")
-        .next()
-        .map(normalize_symbol_query)
-        .unwrap_or_default()
-}
-
-fn search_kind_bucket(kind: codestory_api::NodeKind, origin: codestory_api::SearchHitOrigin) -> u8 {
-    if origin == codestory_api::SearchHitOrigin::TextMatch {
-        return 0;
-    }
-
-    match kind {
-        codestory_api::NodeKind::MODULE
-        | codestory_api::NodeKind::NAMESPACE
-        | codestory_api::NodeKind::PACKAGE
-        | codestory_api::NodeKind::STRUCT
-        | codestory_api::NodeKind::CLASS
-        | codestory_api::NodeKind::INTERFACE
-        | codestory_api::NodeKind::ENUM
-        | codestory_api::NodeKind::UNION
-        | codestory_api::NodeKind::TYPEDEF => 3,
-        codestory_api::NodeKind::FUNCTION
-        | codestory_api::NodeKind::METHOD
-        | codestory_api::NodeKind::MACRO
-        | codestory_api::NodeKind::FIELD
-        | codestory_api::NodeKind::VARIABLE
-        | codestory_api::NodeKind::GLOBAL_VARIABLE
-        | codestory_api::NodeKind::CONSTANT
-        | codestory_api::NodeKind::ENUM_CONSTANT => 2,
-        codestory_api::NodeKind::UNKNOWN => 0,
-        _ => 1,
-    }
-}
-
-fn search_kind_tiebreak(kind: codestory_api::NodeKind) -> u8 {
-    match kind {
-        codestory_api::NodeKind::FUNCTION => 4,
-        codestory_api::NodeKind::METHOD => 3,
-        codestory_api::NodeKind::MACRO => 2,
-        codestory_api::NodeKind::FIELD
-        | codestory_api::NodeKind::VARIABLE
-        | codestory_api::NodeKind::GLOBAL_VARIABLE
-        | codestory_api::NodeKind::CONSTANT
-        | codestory_api::NodeKind::ENUM_CONSTANT => 1,
-        _ => 0,
-    }
-}
-
-fn search_match_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8, u8, u8) {
-    let query = normalize_symbol_query(query);
-    let display = normalize_symbol_query(&hit.display_name);
-    let terminal = terminal_symbol_segment(&hit.display_name);
-    let leading = leading_symbol_segment(&hit.display_name);
-
-    (
-        u8::from(display == query),
-        u8::from(terminal == query),
-        search_kind_bucket(hit.kind, hit.origin),
-        search_kind_tiebreak(hit.kind),
-        u8::from(leading == query),
-        u8::from(hit.origin == codestory_api::SearchHitOrigin::IndexedSymbol),
-    )
-}
-
-fn compare_search_hits(query: &str, left: &SearchHit, right: &SearchHit) -> Ordering {
-    search_match_rank(query, right)
-        .cmp(&search_match_rank(query, left))
-        .then_with(|| right.score.total_cmp(&left.score))
-        .then_with(|| left.display_name.len().cmp(&right.display_name.len()))
-        .then_with(|| left.display_name.cmp(&right.display_name))
-}
-
 fn preferred_occurrence(
     occurrences: &[codestory_core::Occurrence],
 ) -> Option<&codestory_core::Occurrence> {
@@ -376,75 +303,6 @@ struct LocalAgentResponse {
     backend_label: &'static str,
     command: String,
     markdown: String,
-}
-
-fn agent_backend_label(backend: AgentBackend) -> &'static str {
-    match backend {
-        AgentBackend::Codex => "Codex",
-        AgentBackend::ClaudeCode => "Claude Code",
-    }
-}
-
-fn default_agent_command(backend: AgentBackend) -> &'static str {
-    match backend {
-        AgentBackend::Codex => {
-            if cfg!(target_os = "windows") {
-                "codex.cmd"
-            } else {
-                "codex"
-            }
-        }
-        AgentBackend::ClaudeCode => "claude",
-    }
-}
-
-fn configured_agent_command(connection: &AgentConnectionSettingsDto) -> String {
-    connection
-        .command
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| default_agent_command(connection.backend).to_string())
-}
-
-fn resolve_agent_command(command: &str) -> String {
-    if !cfg!(target_os = "windows") {
-        return command.to_string();
-    }
-
-    if command.contains('\\') || command.contains('/') {
-        return command.to_string();
-    }
-
-    let mut candidates = Vec::new();
-    if let Ok(app_data) = std::env::var("APPDATA") {
-        let npm_bin = PathBuf::from(app_data).join("npm");
-        candidates.push(npm_bin.join(format!("{command}.cmd")));
-        candidates.push(npm_bin.join(format!("{command}.exe")));
-        candidates.push(npm_bin.join(command));
-    }
-    if let Ok(user_profile) = std::env::var("USERPROFILE") {
-        let local_bin = PathBuf::from(user_profile).join(".local").join("bin");
-        candidates.push(local_bin.join(format!("{command}.exe")));
-        candidates.push(local_bin.join(format!("{command}.cmd")));
-        candidates.push(local_bin.join(command));
-    }
-    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-        let windows_apps = PathBuf::from(local_app_data)
-            .join("Microsoft")
-            .join("WindowsApps");
-        candidates.push(windows_apps.join(format!("{command}.exe")));
-        candidates.push(windows_apps.join(command));
-    }
-
-    for candidate in candidates {
-        if candidate.is_file() {
-            return candidate.to_string_lossy().to_string();
-        }
-    }
-
-    command.to_string()
 }
 
 fn truncate_for_diagnostic(raw: &str, max_chars: usize) -> String {
@@ -669,10 +527,6 @@ fn graph_edge_dto(edge: codestory_core::Edge, flags: AppGraphFeatureFlags) -> Gr
     }
 }
 
-fn sanitize_mermaid_label(input: &str) -> String {
-    input.replace('"', "'").replace('\n', " ")
-}
-
 fn markdown_snippet(text: &str, focus_line: Option<u32>, context: usize) -> String {
     let all_lines: Vec<&str> = text.lines().collect();
     if all_lines.is_empty() {
@@ -700,81 +554,6 @@ fn markdown_snippet(text: &str, focus_line: Option<u32>, context: usize) -> Stri
         let _ = writeln!(out, "{marker}{source_line:>5} | {line}");
     }
     out.push_str("```");
-    out
-}
-
-fn mermaid_flowchart(graph: &GraphResponse) -> String {
-    let mut out = String::from("flowchart LR\n");
-    for node in graph.nodes.iter().take(14) {
-        let _ = writeln!(
-            out,
-            "    N{}[\"{}\"]",
-            node.id.0,
-            sanitize_mermaid_label(&node.label)
-        );
-    }
-
-    for edge in graph.edges.iter().take(20) {
-        let _ = writeln!(
-            out,
-            "    N{} -->|\"{:?}\"| N{}",
-            edge.source.0, edge.kind, edge.target.0
-        );
-    }
-
-    out
-}
-
-fn mermaid_sequence(graph: &GraphResponse) -> String {
-    let mut out = String::from("sequenceDiagram\n");
-    let mut labels: HashMap<String, String> = HashMap::new();
-    for node in graph.nodes.iter().take(10) {
-        labels.insert(node.id.0.clone(), node.label.clone());
-    }
-
-    let mut emitted = 0usize;
-    for edge in graph.edges.iter().take(14) {
-        let Some(source) = labels.get(&edge.source.0) else {
-            continue;
-        };
-        let Some(target) = labels.get(&edge.target.0) else {
-            continue;
-        };
-
-        emitted += 1;
-        let _ = writeln!(
-            out,
-            "    {}->>{}: {:?}",
-            sanitize_mermaid_label(source),
-            sanitize_mermaid_label(target),
-            edge.kind
-        );
-    }
-
-    if emitted == 0 {
-        out.push_str("    User->>System: No sequencing data available\n");
-    }
-    out
-}
-
-fn mermaid_gantt(citations: &[SearchHit]) -> String {
-    let mut out = String::from("gantt\n    title Investigation Plan\n    dateFormat X\n");
-    let mut current = 0u32;
-    for (idx, hit) in citations.iter().take(5).enumerate() {
-        let duration = 1 + (idx as u32 % 2);
-        let _ = writeln!(
-            out,
-            "    {} :{}, {}, {}",
-            sanitize_mermaid_label(&hit.display_name),
-            idx + 1,
-            current,
-            duration
-        );
-        current += duration;
-    }
-    if citations.is_empty() {
-        out.push_str("    Baseline scan :1, 0, 1\n");
-    }
     out
 }
 

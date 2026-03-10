@@ -13,9 +13,15 @@ use std::time::Duration;
 use thiserror::Error;
 
 mod bookmarks;
+mod helpers;
 mod row_mapping;
 mod schema;
 mod trail;
+
+use helpers::{
+    decode_embedding_blob, deserialize_candidate_targets, encode_embedding_blob,
+    numbered_placeholders, question_placeholders, serialize_candidate_targets,
+};
 
 const SCHEMA_VERSION: u32 = 4;
 const RELATED_NODE_SUBQUERY: &str = "SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1";
@@ -195,18 +201,6 @@ impl Storage {
         row_mapping::occurrence_from_row(row)
     }
 
-    fn certainty_db_value(certainty: Option<ResolutionCertainty>) -> Option<&'static str> {
-        row_mapping::certainty_db_value(certainty)
-    }
-
-    fn access_kind_db_value(access: AccessKind) -> i32 {
-        row_mapping::access_kind_db_value(access)
-    }
-
-    fn access_kind_from_db(value: i32) -> AccessKind {
-        row_mapping::access_kind_from_db(value)
-    }
-
     fn insert_node_with_stmt(
         stmt: &mut rusqlite::Statement<'_>,
         node: &Node,
@@ -262,7 +256,7 @@ impl Storage {
                 edge.resolved_target.map(|id| id.0),
                 edge.confidence,
                 edge.callsite_identity.as_deref(),
-                Self::certainty_db_value(edge.certainty),
+                row_mapping::certainty_db_value(edge.certainty),
                 serialize_candidate_targets(&edge.candidate_targets)?
             ],
         )?;
@@ -316,7 +310,7 @@ impl Storage {
                     edge.resolved_target.map(|id| id.0),
                     edge.confidence,
                     edge.callsite_identity.as_deref(),
-                    Self::certainty_db_value(edge.certainty),
+                    row_mapping::certainty_db_value(edge.certainty),
                     serialize_candidate_targets(&edge.candidate_targets)?
                 ])?;
             }
@@ -431,7 +425,10 @@ impl Storage {
                  ON CONFLICT(node_id) DO UPDATE SET type = excluded.type",
             )?;
             for (node_id, access) in entries {
-                stmt.execute(params![node_id.0, Self::access_kind_db_value(*access)])?;
+                stmt.execute(params![
+                    node_id.0,
+                    row_mapping::access_kind_db_value(*access)
+                ])?;
             }
         }
         tx.commit()?;
@@ -602,7 +599,7 @@ impl Storage {
         let mut rows = stmt.query(params![node_id.0])?;
         if let Some(row) = rows.next()? {
             let raw: i32 = row.get(0)?;
-            return Ok(Some(Self::access_kind_from_db(raw)));
+            return Ok(Some(row_mapping::access_kind_from_db(raw)));
         }
         Ok(None)
     }
@@ -615,9 +612,7 @@ impl Storage {
             return Ok(HashMap::new());
         }
 
-        let placeholders = std::iter::repeat_n("?", node_ids.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = question_placeholders(node_ids.len());
         let sql =
             format!("SELECT node_id, type FROM component_access WHERE node_id IN ({placeholders})");
         let mut stmt = self.conn.prepare(&sql)?;
@@ -626,7 +621,7 @@ impl Storage {
         while let Some(row) = rows.next()? {
             let node_id: i64 = row.get(0)?;
             let raw: i32 = row.get(1)?;
-            map.insert(NodeId(node_id), Self::access_kind_from_db(raw));
+            map.insert(NodeId(node_id), row_mapping::access_kind_from_db(raw));
         }
         Ok(map)
     }
@@ -700,9 +695,7 @@ impl Storage {
         if node_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders = std::iter::repeat_n("?", node_ids.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = question_placeholders(node_ids.len());
         let sql = format!(
             "SELECT
                 node_id,
@@ -1409,58 +1402,6 @@ impl Storage {
     pub fn get_edges_for_node_id(&self, node_id: NodeId) -> Result<Vec<Edge>, StorageError> {
         trail::get_edges_for_node_id(self, node_id)
     }
-}
-
-fn numbered_placeholders(start: usize, count: usize) -> String {
-    (start..start + count)
-        .map(|idx| format!("?{idx}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn serialize_candidate_targets(candidates: &[NodeId]) -> Result<Option<String>, StorageError> {
-    if candidates.is_empty() {
-        return Ok(None);
-    }
-    let raw: Vec<i64> = candidates.iter().map(|id| id.0).collect();
-    Ok(Some(serde_json::to_string(&raw).map_err(|e| {
-        StorageError::Other(format!("failed to serialize edge candidates: {e}"))
-    })?))
-}
-
-fn deserialize_candidate_targets(payload: Option<&str>) -> Result<Vec<NodeId>, StorageError> {
-    let Some(payload) = payload else {
-        return Ok(Vec::new());
-    };
-    if payload.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let parsed: Vec<i64> = serde_json::from_str(payload)
-        .map_err(|e| StorageError::Other(format!("failed to parse edge candidate payload: {e}")))?;
-    Ok(parsed.into_iter().map(NodeId).collect())
-}
-
-fn encode_embedding_blob(values: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(std::mem::size_of_val(values));
-    for value in values {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
-    out
-}
-
-fn decode_embedding_blob(blob: &[u8]) -> Result<Vec<f32>, StorageError> {
-    if !blob.len().is_multiple_of(std::mem::size_of::<f32>()) {
-        return Err(StorageError::Other(
-            "invalid embedding blob length: expected multiple of 4 bytes".to_string(),
-        ));
-    }
-
-    let mut out = Vec::with_capacity(blob.len() / std::mem::size_of::<f32>());
-    for chunk in blob.chunks_exact(std::mem::size_of::<f32>()) {
-        let bytes: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
-        out.push(f32::from_le_bytes(bytes));
-    }
-    Ok(out)
 }
 
 fn neighbor_for_direction(

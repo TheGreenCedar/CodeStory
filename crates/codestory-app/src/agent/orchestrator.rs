@@ -2,7 +2,7 @@ use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::trace::{TraceRecorder, field};
 use crate::{
     AppController, FocusedSourceContext, HybridSearchScoredHit, LocalAgentResponse,
-    agent_backend_label, build_local_agent_prompt, configured_agent_command,
+    agent_backend_label, build_local_agent_prompt, configured_agent_command, fallback_mermaid,
     hybrid_retrieval_enabled, markdown_snippet, mermaid_flowchart, mermaid_gantt, mermaid_sequence,
 };
 use codestory_api::{
@@ -807,34 +807,6 @@ fn build_mermaid_artifacts(
         vec![field("mermaid_count", artifacts.len().to_string())],
     );
     artifacts
-}
-
-fn fallback_mermaid(prompt: &str, hit_count: usize) -> String {
-    let prompt_summary = prompt
-        .split_whitespace()
-        .take(6)
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    format!(
-        "flowchart LR\n    A[\"Prompt\"] --> B[\"{}\"]\n    B --> C[\"Indexed hits: {}\"]\n    C --> D[\"Refine symbol names or run indexing\"]\n",
-        sanitize_mermaid_text(&prompt_summary),
-        hit_count
-    )
-}
-
-fn sanitize_mermaid_text(input: &str) -> String {
-    let mut sanitized = input.replace('"', "").replace(['\n', '\r'], " ");
-    sanitized = sanitized
-        .chars()
-        .map(|ch| if ch.is_ascii_control() { ' ' } else { ch })
-        .collect::<String>();
-    let collapsed = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.is_empty() {
-        "request".to_string()
-    } else {
-        collapsed
-    }
 }
 
 fn first_uml_graph(graphs: &[GraphArtifactDto]) -> Option<GraphResponse> {
