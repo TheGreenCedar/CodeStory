@@ -283,6 +283,19 @@ impl AppController {
     ) -> Result<GroundingSnapshotDto, ApiError> {
         let root = self.require_project_root()?;
         let storage = self.open_storage()?;
+        if matches!(budget, GroundingBudgetDto::Max)
+            && !storage
+                .has_ready_grounding_detail_snapshots()
+                .map_err(|e| {
+                    ApiError::internal(format!(
+                        "Failed to query grounding detail snapshot readiness: {e}"
+                    ))
+                })?
+        {
+            storage.hydrate_grounding_detail_snapshots().map_err(|e| {
+                ApiError::internal(format!("Failed to hydrate grounding detail snapshots: {e}"))
+            })?;
+        }
         let config = budget_config(budget);
 
         let stats = storage
@@ -1046,5 +1059,294 @@ mod tests {
         assert_eq!(symbol.line, Some(3));
         assert_eq!(symbol.member_count, Some(1));
         assert!(symbol.edge_digest.iter().any(|digest| digest == "MEMBER=1"));
+    }
+
+    #[test]
+    fn grounding_snapshot_uses_materialized_snapshot_after_summary_open() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            let path = temp.path().join("src").join("lib.rs");
+            std::fs::create_dir_all(path.parent().expect("path parent")).expect("create src");
+            std::fs::write(&path, "struct Controller {}\nfn helper() {}\n").expect("write file");
+            storage
+                .insert_file(&codestory_storage::FileInfo {
+                    id: 11,
+                    path: path.clone(),
+                    language: "rust".to_string(),
+                    modification_time: 0,
+                    indexed: true,
+                    complete: true,
+                    line_count: 10,
+                })
+                .expect("insert file");
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(11),
+                        kind: NodeKind::FILE,
+                        serialized_name: path.to_string_lossy().to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(101),
+                        kind: NodeKind::STRUCT,
+                        serialized_name: "Controller".to_string(),
+                        file_node_id: Some(CoreNodeId(11)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(102),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "helper".to_string(),
+                        file_node_id: Some(CoreNodeId(11)),
+                        start_line: Some(2),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert nodes");
+            storage
+                .refresh_grounding_snapshots()
+                .expect("refresh grounding snapshots");
+            assert!(
+                storage
+                    .has_ready_grounding_summary_snapshots()
+                    .expect("summary snapshot readiness"),
+                "expected ready grounding summary snapshot after refresh"
+            );
+            assert!(
+                storage
+                    .has_ready_grounding_detail_snapshots()
+                    .expect("detail snapshot readiness"),
+                "expected ready grounding detail snapshot after refresh"
+            );
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project summary");
+
+        let snapshot = controller
+            .grounding_snapshot(GroundingBudgetDto::Balanced)
+            .expect("grounding snapshot");
+
+        assert_eq!(snapshot.coverage.total_files, 1);
+        assert_eq!(snapshot.files.len(), 1);
+        assert!(
+            snapshot
+                .root_symbols
+                .iter()
+                .any(|symbol| symbol.label.starts_with("Controller")),
+            "expected materialized root symbol to be surfaced"
+        );
+    }
+
+    #[test]
+    fn balanced_grounding_falls_back_to_live_detail_queries_when_detail_tier_is_dirty() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            let path = temp.path().join("src").join("lib.rs");
+            std::fs::create_dir_all(path.parent().expect("path parent")).expect("create src");
+            std::fs::write(&path, "struct Controller { value: i32 }\n").expect("write file");
+            storage
+                .insert_file(&codestory_storage::FileInfo {
+                    id: 11,
+                    path: path.clone(),
+                    language: "rust".to_string(),
+                    modification_time: 0,
+                    indexed: true,
+                    complete: true,
+                    line_count: 10,
+                })
+                .expect("insert file");
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(11),
+                        kind: NodeKind::FILE,
+                        serialized_name: path.to_string_lossy().to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(101),
+                        kind: NodeKind::STRUCT,
+                        serialized_name: "Controller".to_string(),
+                        file_node_id: Some(CoreNodeId(11)),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(102),
+                        kind: NodeKind::FIELD,
+                        serialized_name: "value".to_string(),
+                        file_node_id: Some(CoreNodeId(11)),
+                        start_line: Some(4),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert nodes");
+            storage
+                .insert_edges_batch(&[Edge {
+                    id: EdgeId(501),
+                    source: CoreNodeId(101),
+                    target: CoreNodeId(102),
+                    kind: EdgeKind::MEMBER,
+                    file_node_id: Some(CoreNodeId(11)),
+                    line: Some(3),
+                    resolved_source: None,
+                    resolved_target: None,
+                    confidence: None,
+                    certainty: None,
+                    callsite_identity: None,
+                    candidate_targets: Vec::new(),
+                }])
+                .expect("insert edges");
+            storage
+                .insert_occurrences_batch(&[Occurrence {
+                    element_id: 101,
+                    kind: OccurrenceKind::DEFINITION,
+                    location: SourceLocation {
+                        file_node_id: CoreNodeId(11),
+                        start_line: 3,
+                        start_col: 1,
+                        end_line: 3,
+                        end_col: 10,
+                    },
+                }])
+                .expect("insert occurrences");
+            storage
+                .refresh_grounding_summary_snapshots()
+                .expect("refresh summary snapshots");
+            assert!(
+                storage
+                    .has_ready_grounding_summary_snapshots()
+                    .expect("summary snapshot readiness"),
+                "expected ready grounding summary snapshots"
+            );
+            assert!(
+                !storage
+                    .has_ready_grounding_detail_snapshots()
+                    .expect("detail snapshot readiness"),
+                "expected detail snapshots to stay dirty"
+            );
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(temp.path().to_path_buf(), db_path.clone())
+            .expect("open project summary");
+
+        let snapshot = controller
+            .grounding_snapshot(GroundingBudgetDto::Balanced)
+            .expect("balanced snapshot");
+        let symbol = snapshot
+            .root_symbols
+            .iter()
+            .find(|symbol| symbol.label.starts_with("Controller"))
+            .expect("controller root symbol");
+        assert_eq!(symbol.line, Some(3));
+        assert_eq!(symbol.member_count, Some(1));
+        assert!(symbol.edge_digest.iter().any(|digest| digest == "MEMBER=1"));
+
+        let storage = Storage::open(&db_path).expect("reopen storage");
+        assert!(
+            !storage
+                .has_ready_grounding_detail_snapshots()
+                .expect("detail snapshot readiness"),
+            "balanced should not eagerly hydrate detail snapshots"
+        );
+    }
+
+    #[test]
+    fn max_grounding_hydrates_detail_snapshots_when_unavailable() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            let path = temp.path().join("src").join("lib.rs");
+            std::fs::create_dir_all(path.parent().expect("path parent")).expect("create src");
+            std::fs::write(&path, "struct Controller { value: i32 }\n").expect("write file");
+            storage
+                .insert_file(&codestory_storage::FileInfo {
+                    id: 11,
+                    path: path.clone(),
+                    language: "rust".to_string(),
+                    modification_time: 0,
+                    indexed: true,
+                    complete: true,
+                    line_count: 10,
+                })
+                .expect("insert file");
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(11),
+                        kind: NodeKind::FILE,
+                        serialized_name: path.to_string_lossy().to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(101),
+                        kind: NodeKind::STRUCT,
+                        serialized_name: "Controller".to_string(),
+                        file_node_id: Some(CoreNodeId(11)),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(102),
+                        kind: NodeKind::FIELD,
+                        serialized_name: "value".to_string(),
+                        file_node_id: Some(CoreNodeId(11)),
+                        start_line: Some(4),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert nodes");
+            storage
+                .insert_edges_batch(&[Edge {
+                    id: EdgeId(501),
+                    source: CoreNodeId(101),
+                    target: CoreNodeId(102),
+                    kind: EdgeKind::MEMBER,
+                    file_node_id: Some(CoreNodeId(11)),
+                    line: Some(3),
+                    resolved_source: None,
+                    resolved_target: None,
+                    confidence: None,
+                    certainty: None,
+                    callsite_identity: None,
+                    candidate_targets: Vec::new(),
+                }])
+                .expect("insert edges");
+            storage
+                .refresh_grounding_summary_snapshots()
+                .expect("refresh summary snapshots");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(temp.path().to_path_buf(), db_path.clone())
+            .expect("open project summary");
+        controller
+            .grounding_snapshot(GroundingBudgetDto::Max)
+            .expect("max snapshot");
+
+        let storage = Storage::open(&db_path).expect("reopen storage");
+        assert!(
+            storage
+                .has_ready_grounding_detail_snapshots()
+                .expect("detail snapshot readiness"),
+            "max should hydrate detail snapshots when needed"
+        );
     }
 }

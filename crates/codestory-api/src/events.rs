@@ -9,12 +9,38 @@ pub struct IndexingPhaseTimings {
     pub error_flush_ms: u32,
     pub cleanup_ms: u32,
     pub cache_refresh_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_indexes_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_snapshot_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_snapshot_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_existing_projection_ids_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_seed_symbol_table_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_files_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_nodes_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_edges_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_occurrences_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_component_access_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_callable_projection_ms: Option<u32>,
     pub unresolved_calls_start: u32,
     pub unresolved_imports_start: u32,
     pub resolved_calls: u32,
     pub resolved_imports: u32,
     pub unresolved_calls_end: u32,
     pub unresolved_imports_end: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_override_count_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_unresolved_counts_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -23,6 +49,40 @@ pub struct IndexingPhaseTimings {
     pub resolution_imports_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_cleanup_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_call_candidate_index_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_import_candidate_index_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_call_semantic_index_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_import_semantic_index_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_call_semantic_candidates_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_import_semantic_candidates_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_call_semantic_requests: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_call_semantic_unique_requests: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_call_semantic_skipped_requests: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_import_semantic_requests: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_import_semantic_unique_requests: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_import_semantic_skipped_requests: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_call_compute_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_import_compute_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_call_apply_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_import_apply_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_override_resolution_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_calls_same_file: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -87,16 +147,46 @@ mod tests {
             error_flush_ms: 4,
             cleanup_ms: 5,
             cache_refresh_ms: None,
+            deferred_indexes_ms: None,
+            summary_snapshot_ms: None,
+            detail_snapshot_ms: None,
+            publish_ms: None,
+            setup_existing_projection_ids_ms: None,
+            setup_seed_symbol_table_ms: None,
+            flush_files_ms: None,
+            flush_nodes_ms: None,
+            flush_edges_ms: None,
+            flush_occurrences_ms: None,
+            flush_component_access_ms: None,
+            flush_callable_projection_ms: None,
             unresolved_calls_start: 6,
             unresolved_imports_start: 7,
             resolved_calls: 8,
             resolved_imports: 9,
             unresolved_calls_end: 10,
             unresolved_imports_end: 11,
+            resolution_override_count_ms: None,
             resolution_unresolved_counts_ms: None,
             resolution_calls_ms: None,
             resolution_imports_ms: None,
             resolution_cleanup_ms: None,
+            resolution_call_candidate_index_ms: None,
+            resolution_import_candidate_index_ms: None,
+            resolution_call_semantic_index_ms: None,
+            resolution_import_semantic_index_ms: None,
+            resolution_call_semantic_candidates_ms: None,
+            resolution_import_semantic_candidates_ms: None,
+            resolution_call_semantic_requests: None,
+            resolution_call_semantic_unique_requests: None,
+            resolution_call_semantic_skipped_requests: None,
+            resolution_import_semantic_requests: None,
+            resolution_import_semantic_unique_requests: None,
+            resolution_import_semantic_skipped_requests: None,
+            resolution_call_compute_ms: None,
+            resolution_import_compute_ms: None,
+            resolution_call_apply_ms: None,
+            resolution_import_apply_ms: None,
+            resolution_override_resolution_ms: None,
             resolved_calls_same_file: None,
             resolved_calls_same_module: None,
             resolved_calls_global_unique: None,
@@ -113,6 +203,38 @@ mod tests {
         assert!(value.get("resolution_calls_ms").is_none());
         assert!(value.get("resolution_imports_ms").is_none());
         assert!(value.get("resolution_cleanup_ms").is_none());
+        assert!(value.get("resolution_call_candidate_index_ms").is_none());
+        assert!(value.get("resolution_import_candidate_index_ms").is_none());
+        assert!(value.get("resolution_call_semantic_index_ms").is_none());
+        assert!(value.get("resolution_import_semantic_index_ms").is_none());
+        assert!(
+            value
+                .get("resolution_call_semantic_candidates_ms")
+                .is_none()
+        );
+        assert!(
+            value
+                .get("resolution_import_semantic_candidates_ms")
+                .is_none()
+        );
+        assert!(value.get("resolution_call_compute_ms").is_none());
+        assert!(value.get("resolution_import_compute_ms").is_none());
+        assert!(value.get("resolution_call_apply_ms").is_none());
+        assert!(value.get("resolution_import_apply_ms").is_none());
+        assert!(value.get("resolution_override_resolution_ms").is_none());
+        assert!(value.get("deferred_indexes_ms").is_none());
+        assert!(value.get("summary_snapshot_ms").is_none());
+        assert!(value.get("detail_snapshot_ms").is_none());
+        assert!(value.get("publish_ms").is_none());
+        assert!(value.get("setup_existing_projection_ids_ms").is_none());
+        assert!(value.get("setup_seed_symbol_table_ms").is_none());
+        assert!(value.get("flush_files_ms").is_none());
+        assert!(value.get("flush_nodes_ms").is_none());
+        assert!(value.get("flush_edges_ms").is_none());
+        assert!(value.get("flush_occurrences_ms").is_none());
+        assert!(value.get("flush_component_access_ms").is_none());
+        assert!(value.get("flush_callable_projection_ms").is_none());
+        assert!(value.get("resolution_override_count_ms").is_none());
         assert!(value.get("resolved_calls_same_file").is_none());
         assert!(value.get("resolved_calls_same_module").is_none());
         assert!(value.get("resolved_calls_global_unique").is_none());

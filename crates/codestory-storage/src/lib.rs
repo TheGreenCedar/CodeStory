@@ -4,12 +4,14 @@ use codestory_core::{
     TrailCallerScope, TrailConfig, TrailDirection, TrailMode, TrailResult,
 };
 use parking_lot::RwLock;
-use rusqlite::{Connection, Result, Row, params, params_from_iter, types::Value};
+use rusqlite::{Connection, MAIN_DB, Result, Row, params, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 mod bookmarks;
@@ -23,8 +25,14 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 9;
+const GROUNDING_SNAPSHOT_VERSION: i64 = 1;
+const GROUNDING_SNAPSHOT_STATE_DIRTY: i64 = 0;
+const GROUNDING_SNAPSHOT_STATE_BUILDING: i64 = 1;
+const GROUNDING_SNAPSHOT_STATE_READY: i64 = 2;
 const RELATED_NODE_SUBQUERY: &str = "SELECT id FROM node WHERE id = ?1 OR file_node_id = ?1";
+const CALLER_CLEANUP_IDS_TABLE: &str = "caller_cleanup_ids";
+const RELATED_NODE_IDS_TABLE: &str = "related_node_ids";
 const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, e.callsite_identity, e.certainty, e.candidate_target_node_ids, t.serialized_name, f.serialized_name
                  FROM edge e
                  JOIN node t ON t.id = e.target_node_id
@@ -38,6 +46,46 @@ fn clamp_i64_to_u32(value: i64) -> u32 {
     } else {
         value as u32
     }
+}
+
+fn current_epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+fn compare_grounding_file_summaries(
+    left: &GroundingFileSummary,
+    right: &GroundingFileSummary,
+) -> Ordering {
+    left.best_node_rank
+        .cmp(&right.best_node_rank)
+        .then(right.symbol_count.cmp(&left.symbol_count))
+        .then_with(|| left.file.path.cmp(&right.file.path))
+}
+
+fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 3] {
+    [
+        path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ]
+}
+
+fn cleanup_sqlite_sidecars(path: &Path) -> Result<(), StorageError> {
+    for candidate in sqlite_sidecar_paths(path) {
+        if candidate.exists() {
+            fs::remove_file(&candidate).map_err(|err| {
+                StorageError::Other(format!(
+                    "Failed to remove SQLite artifact {}: {err}",
+                    candidate.display()
+                ))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn grounding_display_name_expr(alias: &str) -> String {
@@ -110,6 +158,32 @@ pub enum StorageError {
 pub struct Storage {
     conn: Connection,
     cache: StorageCache,
+    deferred_secondary_indexes: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageOpenMode {
+    Live,
+    Build,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectionFlushBreakdown {
+    pub files_ms: u32,
+    pub nodes_ms: u32,
+    pub edges_ms: u32,
+    pub occurrences_ms: u32,
+    pub component_access_ms: u32,
+    pub callable_projection_ms: u32,
+}
+
+pub struct ProjectionBatch<'a> {
+    pub files: &'a [FileInfo],
+    pub nodes: &'a [Node],
+    pub edges: &'a [Edge],
+    pub occurrences: &'a [Occurrence],
+    pub component_access: &'a [(NodeId, AccessKind)],
+    pub callable_projection_states: &'a [CallableProjectionState],
 }
 
 #[derive(Default)]
@@ -134,6 +208,53 @@ pub struct StorageStats {
     pub edge_count: i64,
     pub file_count: i64,
     pub error_count: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroundingSnapshotState {
+    Dirty,
+    Building,
+    Ready,
+}
+
+impl GroundingSnapshotState {
+    fn from_db(value: i64) -> Option<Self> {
+        match value {
+            GROUNDING_SNAPSHOT_STATE_DIRTY => Some(Self::Dirty),
+            GROUNDING_SNAPSHOT_STATE_BUILDING => Some(Self::Building),
+            GROUNDING_SNAPSHOT_STATE_READY => Some(Self::Ready),
+            _ => None,
+        }
+    }
+
+    fn db_value(self) -> i64 {
+        match self {
+            Self::Dirty => GROUNDING_SNAPSHOT_STATE_DIRTY,
+            Self::Building => GROUNDING_SNAPSHOT_STATE_BUILDING,
+            Self::Ready => GROUNDING_SNAPSHOT_STATE_READY,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroundingSnapshotMetadata {
+    pub version: i64,
+    pub summary_state: GroundingSnapshotState,
+    pub detail_state: GroundingSnapshotState,
+    pub summary_built_at_epoch_ms: Option<i64>,
+    pub detail_built_at_epoch_ms: Option<i64>,
+}
+
+impl GroundingSnapshotMetadata {
+    fn has_ready_summary(self) -> bool {
+        self.version == GROUNDING_SNAPSHOT_VERSION
+            && self.summary_state == GroundingSnapshotState::Ready
+    }
+
+    fn has_ready_detail(self) -> bool {
+        self.version == GROUNDING_SNAPSHOT_VERSION
+            && self.detail_state == GroundingSnapshotState::Ready
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +318,20 @@ pub struct LlmSymbolDoc {
 
 impl Storage {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        Self::open_with_mode(path, StorageOpenMode::Live)
+    }
+
+    pub fn open_build<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        cleanup_sqlite_sidecars(path)?;
+        Self::open_with_mode(path, StorageOpenMode::Build)
+    }
+
+    pub fn open_with_mode<P: AsRef<Path>>(
+        path: P,
+        mode: StorageOpenMode,
+    ) -> Result<Self, StorageError> {
+        let path = path.as_ref();
         let conn = Connection::open(path)?;
         // Allow concurrent reads while indexing writes, and avoid flaky "database is locked" errors
         // in app shells when users query mid-index.
@@ -204,11 +339,19 @@ impl Storage {
         let _ = conn.pragma_update(None, "foreign_keys", "ON");
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+        if matches!(mode, StorageOpenMode::Build) {
+            // Favor fewer temp-file round trips and larger page caches while building
+            // the staged full-refresh snapshot.
+            let _ = conn.pragma_update(None, "temp_store", "MEMORY");
+            let _ = conn.pragma_update(None, "cache_size", "-131072");
+            let _ = conn.pragma_update(None, "mmap_size", "268435456");
+        }
         let storage = Self {
             conn,
             cache: StorageCache::default(),
+            deferred_secondary_indexes: matches!(mode, StorageOpenMode::Build),
         };
-        storage.init()?;
+        storage.init(mode)?;
         Ok(storage)
     }
 
@@ -218,14 +361,627 @@ impl Storage {
         let storage = Self {
             conn,
             cache: StorageCache::default(),
+            deferred_secondary_indexes: false,
         };
-        storage.init()?;
+        storage.init(StorageOpenMode::Live)?;
         Ok(storage)
     }
 
     /// Expose raw connection for advanced operations (like batch processing).
     pub fn get_connection(&self) -> &Connection {
         &self.conn
+    }
+
+    pub fn get_index_artifact_cache(
+        &self,
+        path: &Path,
+        cache_key: &str,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT artifact_blob
+             FROM index_artifact_cache
+             WHERE file_path = ?1
+               AND cache_key = ?2",
+        )?;
+        let mut rows = stmt.query(params![path.to_string_lossy().to_string(), cache_key])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(row.get(0)?));
+        }
+        Ok(None)
+    }
+
+    pub fn upsert_index_artifact_cache(
+        &self,
+        path: &Path,
+        cache_key: &str,
+        artifact_blob: &[u8],
+    ) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT INTO index_artifact_cache (
+                file_path,
+                cache_key,
+                artifact_blob,
+                updated_at_epoch_ms
+             )
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file_path) DO UPDATE SET
+                cache_key = excluded.cache_key,
+                artifact_blob = excluded.artifact_blob,
+                updated_at_epoch_ms = excluded.updated_at_epoch_ms",
+            params![
+                path.to_string_lossy().to_string(),
+                cache_key,
+                artifact_blob,
+                current_epoch_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn has_ready_resolution_support_snapshot(
+        &self,
+        snapshot_version: i64,
+    ) -> Result<bool, StorageError> {
+        Ok(self
+            .get_resolution_support_snapshot(snapshot_version)?
+            .is_some())
+    }
+
+    pub fn get_resolution_support_snapshot(
+        &self,
+        snapshot_version: i64,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT snapshot_blob
+             FROM resolution_support_snapshot
+             WHERE id = 1
+               AND snapshot_version = ?1
+               AND state = ?2
+               AND snapshot_blob IS NOT NULL",
+        )?;
+        let mut rows = stmt.query(params![
+            snapshot_version,
+            GroundingSnapshotState::Ready.db_value()
+        ])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(row.get(0)?));
+        }
+        Ok(None)
+    }
+
+    pub fn put_resolution_support_snapshot(
+        &self,
+        snapshot_version: i64,
+        snapshot_blob: &[u8],
+    ) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT INTO resolution_support_snapshot (
+                id,
+                snapshot_version,
+                state,
+                snapshot_blob,
+                built_at_epoch_ms
+             )
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                snapshot_version = excluded.snapshot_version,
+                state = excluded.state,
+                snapshot_blob = excluded.snapshot_blob,
+                built_at_epoch_ms = excluded.built_at_epoch_ms",
+            params![
+                snapshot_version,
+                GroundingSnapshotState::Ready.db_value(),
+                snapshot_blob,
+                current_epoch_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn invalidate_resolution_support_snapshot(&self) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT INTO resolution_support_snapshot (
+                id,
+                snapshot_version,
+                state,
+                snapshot_blob,
+                built_at_epoch_ms
+             )
+             VALUES (1, 0, ?1, NULL, NULL)
+             ON CONFLICT(id) DO UPDATE SET
+                state = excluded.state,
+                snapshot_blob = NULL,
+                built_at_epoch_ms = NULL",
+            params![GroundingSnapshotState::Dirty.db_value()],
+        )?;
+        Ok(())
+    }
+
+    pub fn has_ready_grounding_summary_snapshots(&self) -> Result<bool, StorageError> {
+        Ok(self
+            .get_grounding_snapshot_metadata()?
+            .is_some_and(GroundingSnapshotMetadata::has_ready_summary))
+    }
+
+    pub fn has_ready_grounding_detail_snapshots(&self) -> Result<bool, StorageError> {
+        Ok(self
+            .get_grounding_snapshot_metadata()?
+            .is_some_and(GroundingSnapshotMetadata::has_ready_detail))
+    }
+
+    pub fn has_ready_grounding_snapshots(&self) -> Result<bool, StorageError> {
+        Ok(self.has_ready_grounding_summary_snapshots()?
+            && self.has_ready_grounding_detail_snapshots()?)
+    }
+
+    pub fn get_grounding_snapshot_metadata(
+        &self,
+    ) -> Result<Option<GroundingSnapshotMetadata>, StorageError> {
+        self.grounding_snapshot_metadata()
+    }
+
+    fn ensure_grounding_snapshot_meta_row(&self) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO grounding_snapshot_meta (
+                id,
+                snapshot_version,
+                summary_state,
+                detail_state,
+                summary_built_at_epoch_ms,
+                detail_built_at_epoch_ms
+             )
+             VALUES (1, ?1, ?2, ?2, NULL, NULL)",
+            params![
+                GROUNDING_SNAPSHOT_VERSION,
+                GroundingSnapshotState::Dirty.db_value()
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn write_grounding_snapshot_states(
+        &self,
+        summary_state: GroundingSnapshotState,
+        detail_state: GroundingSnapshotState,
+        summary_built_at_epoch_ms: Option<i64>,
+        detail_built_at_epoch_ms: Option<i64>,
+    ) -> Result<(), StorageError> {
+        self.ensure_grounding_snapshot_meta_row()?;
+        self.conn.execute(
+            "UPDATE grounding_snapshot_meta
+             SET snapshot_version = ?1,
+                 summary_state = ?2,
+                 detail_state = ?3,
+                 summary_built_at_epoch_ms = ?4,
+                 detail_built_at_epoch_ms = ?5
+             WHERE id = 1",
+            params![
+                GROUNDING_SNAPSHOT_VERSION,
+                summary_state.db_value(),
+                detail_state.db_value(),
+                summary_built_at_epoch_ms,
+                detail_built_at_epoch_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn mark_grounding_snapshots_dirty(&self) -> Result<(), StorageError> {
+        self.write_grounding_snapshot_states(
+            GroundingSnapshotState::Dirty,
+            GroundingSnapshotState::Dirty,
+            None,
+            None,
+        )
+    }
+
+    pub fn mark_grounding_detail_snapshots_dirty(&self) -> Result<(), StorageError> {
+        self.ensure_grounding_snapshot_meta_row()?;
+        self.conn.execute(
+            "UPDATE grounding_snapshot_meta
+             SET snapshot_version = ?1,
+                 detail_state = ?2,
+                 detail_built_at_epoch_ms = NULL
+             WHERE id = 1",
+            params![
+                GROUNDING_SNAPSHOT_VERSION,
+                GroundingSnapshotState::Dirty.db_value()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn invalidate_grounding_snapshots(&self) -> Result<(), StorageError> {
+        self.mark_grounding_snapshots_dirty()?;
+        self.invalidate_resolution_support_snapshot()?;
+        Ok(())
+    }
+
+    pub fn update_file_metadata(&self, info: &FileInfo) -> Result<(), StorageError> {
+        self.conn.execute(
+            "UPDATE file
+             SET path = ?2,
+                 language = ?3,
+                 modification_time = ?4,
+                 indexed = ?5,
+                 complete = ?6,
+                 line_count = ?7
+             WHERE id = ?1",
+            params![
+                info.id,
+                info.path.to_string_lossy(),
+                info.language,
+                info.modification_time,
+                i32::from(info.indexed),
+                i32::from(info.complete),
+                info.line_count,
+            ],
+        )?;
+        self.mark_grounding_snapshots_dirty()?;
+        Ok(())
+    }
+
+    pub fn refresh_grounding_summary_snapshots(&self) -> Result<(), StorageError> {
+        let rank_sql = grounding_node_rank_sql("n");
+        let display_name = grounding_display_name_expr("n");
+        let indexable = grounding_indexable_predicate("n");
+        let tx = self.conn.unchecked_transaction()?;
+
+        tx.execute(
+            "INSERT INTO grounding_snapshot_meta (
+                id,
+                snapshot_version,
+                summary_state,
+                detail_state,
+                summary_built_at_epoch_ms,
+                detail_built_at_epoch_ms
+             )
+             VALUES (1, ?1, ?2, ?3, NULL, NULL)
+             ON CONFLICT(id) DO UPDATE SET
+                snapshot_version = excluded.snapshot_version,
+                summary_state = excluded.summary_state,
+                detail_state = excluded.detail_state,
+                summary_built_at_epoch_ms = NULL,
+                detail_built_at_epoch_ms = NULL",
+            params![
+                GROUNDING_SNAPSHOT_VERSION,
+                GroundingSnapshotState::Building.db_value(),
+                GroundingSnapshotState::Dirty.db_value(),
+            ],
+        )?;
+        tx.execute("DELETE FROM grounding_repo_stats_snapshot", [])?;
+        tx.execute("DELETE FROM grounding_file_snapshot", [])?;
+        tx.execute("DELETE FROM grounding_node_snapshot", [])?;
+        tx.execute("DELETE FROM grounding_node_summary_snapshot", [])?;
+        tx.execute("DELETE FROM grounding_node_edge_digest_snapshot", [])?;
+
+        let node_snapshot_sql = format!(
+            "WITH indexable_nodes AS (
+                SELECT
+                    n.id,
+                    n.kind,
+                    n.serialized_name,
+                    n.qualified_name,
+                    n.canonical_id,
+                    n.file_node_id,
+                    n.start_line,
+                    n.start_col,
+                    n.end_line,
+                    n.end_col,
+                    {display_name} AS display_name,
+                    COALESCE(f.path, file_node.serialized_name) AS file_path,
+                    {rank_sql} AS node_rank,
+                    COALESCE(n.start_line, 2147483647) AS sort_start_line,
+                    CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM edge e
+                            WHERE e.kind = {member_kind}
+                              AND e.target_node_id = n.id
+                        ) THEN 0
+                        ELSE 1
+                    END AS is_root,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY n.file_node_id
+                        ORDER BY
+                            {rank_sql},
+                            COALESCE(n.start_line, 2147483647),
+                            {display_name},
+                            n.id
+                    ) AS file_symbol_rank
+                FROM node n
+                LEFT JOIN file f ON f.id = n.file_node_id
+                LEFT JOIN node file_node
+                    ON file_node.id = n.file_node_id
+                   AND file_node.kind = {file_kind}
+                WHERE {indexable}
+            )
+            INSERT INTO grounding_node_snapshot (
+                node_id,
+                kind,
+                serialized_name,
+                qualified_name,
+                canonical_id,
+                file_node_id,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                display_name,
+                file_path,
+                node_rank,
+                sort_start_line,
+                is_root,
+                file_symbol_rank
+            )
+            SELECT
+                id,
+                kind,
+                serialized_name,
+                qualified_name,
+                canonical_id,
+                file_node_id,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                display_name,
+                file_path,
+                node_rank,
+                sort_start_line,
+                is_root,
+                file_symbol_rank
+            FROM indexable_nodes",
+            member_kind = EdgeKind::MEMBER as i32,
+            file_kind = NodeKind::FILE as i32,
+        );
+        tx.execute(&node_snapshot_sql, [])?;
+
+        let file_snapshot_sql = format!(
+            "WITH all_files AS (
+                SELECT id, path, language, modification_time, indexed, complete, line_count
+                FROM file
+                UNION ALL
+                SELECT
+                    n.id,
+                    n.serialized_name,
+                    '',
+                    0,
+                    1,
+                    1,
+                    0
+                FROM node n
+                WHERE n.kind = {file_kind}
+                  AND NOT EXISTS (SELECT 1 FROM file f WHERE f.id = n.id)
+            )
+            INSERT INTO grounding_file_snapshot (
+                file_id,
+                path,
+                language,
+                modification_time,
+                indexed,
+                complete,
+                line_count,
+                symbol_count,
+                best_node_rank
+            )
+            SELECT
+                f.id,
+                f.path,
+                f.language,
+                f.modification_time,
+                f.indexed,
+                f.complete,
+                f.line_count,
+                COUNT(gs.node_id) AS symbol_count,
+                MIN(CASE WHEN gs.node_id IS NULL THEN 255 ELSE gs.node_rank END) AS best_node_rank
+            FROM all_files f
+            LEFT JOIN grounding_node_snapshot gs
+              ON gs.file_node_id = f.id
+            GROUP BY
+                f.id,
+                f.path,
+                f.language,
+                f.modification_time,
+                f.indexed,
+                f.complete,
+                f.line_count",
+            file_kind = NodeKind::FILE as i32,
+        );
+        tx.execute(&file_snapshot_sql, [])?;
+
+        tx.execute(
+            "UPDATE grounding_snapshot_meta
+             SET snapshot_version = ?1,
+                 summary_state = ?2,
+                 detail_state = ?3,
+                 summary_built_at_epoch_ms = ?4,
+                 detail_built_at_epoch_ms = NULL
+             WHERE id = 1",
+            params![
+                GROUNDING_SNAPSHOT_VERSION,
+                GroundingSnapshotState::Ready.db_value(),
+                GroundingSnapshotState::Dirty.db_value(),
+                current_epoch_ms(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn hydrate_grounding_detail_snapshots(&self) -> Result<(), StorageError> {
+        if !self.has_ready_grounding_summary_snapshots()? {
+            self.refresh_grounding_summary_snapshots()?;
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE grounding_snapshot_meta
+             SET snapshot_version = ?1,
+                 detail_state = ?2,
+                 detail_built_at_epoch_ms = NULL
+             WHERE id = 1",
+            params![
+                GROUNDING_SNAPSHOT_VERSION,
+                GroundingSnapshotState::Building.db_value()
+            ],
+        )?;
+        tx.execute("DELETE FROM grounding_node_summary_snapshot", [])?;
+        tx.execute("DELETE FROM grounding_node_edge_digest_snapshot", [])?;
+
+        let node_summary_sql = format!(
+            "WITH snapshot_nodes AS (
+                SELECT node_id
+                FROM grounding_node_snapshot
+            ),
+            member_counts AS (
+                SELECT e.source_node_id AS node_id, COUNT(*) AS member_count
+                FROM edge e
+                JOIN snapshot_nodes snapshot_nodes
+                  ON snapshot_nodes.node_id = e.source_node_id
+                WHERE e.kind = {member_kind}
+                GROUP BY e.source_node_id
+            ),
+            first_occurrences AS (
+                SELECT o.element_id AS node_id, o.start_line
+                FROM occurrence o
+                JOIN (
+                    SELECT o.element_id, MIN(o.rowid) AS first_rowid
+                    FROM occurrence o
+                    JOIN snapshot_nodes snapshot_nodes
+                      ON snapshot_nodes.node_id = o.element_id
+                    GROUP BY o.element_id
+                ) first_seen
+                  ON first_seen.first_rowid = o.rowid
+            )
+            INSERT INTO grounding_node_summary_snapshot (
+                node_id,
+                member_count,
+                fallback_occurrence_line
+            )
+            SELECT
+                snapshot_nodes.node_id,
+                COALESCE(member_counts.member_count, 0),
+                first_occurrences.start_line
+            FROM snapshot_nodes
+            LEFT JOIN member_counts
+              ON member_counts.node_id = snapshot_nodes.node_id
+            LEFT JOIN first_occurrences
+              ON first_occurrences.node_id = snapshot_nodes.node_id",
+            member_kind = EdgeKind::MEMBER as i32,
+        );
+        tx.execute(&node_summary_sql, [])?;
+
+        let edge_digest_sql = format!(
+            "WITH snapshot_nodes AS (
+                SELECT node_id
+                FROM grounding_node_snapshot
+            ),
+            edge_effective AS (
+                SELECT
+                    COALESCE(e.resolved_source_node_id, e.source_node_id) AS effective_source_node_id,
+                    CASE
+                        WHEN e.kind = {call_kind}
+                         AND (
+                            CASE
+                                WHEN t.serialized_name LIKE '%seed_symbol_table%'
+                                  OR t.serialized_name LIKE '%flush_projection_batch%'
+                                  OR t.serialized_name LIKE '%flush_errors%' THEN 0
+                                WHEN COALESCE(
+                                    e.certainty,
+                                    CASE
+                                        WHEN e.confidence IS NULL THEN NULL
+                                        WHEN e.confidence >= {certain_min} THEN 'certain'
+                                        WHEN e.confidence >= {probable_min} THEN 'probable'
+                                        ELSE 'uncertain'
+                                    END
+                                ) = 'uncertain' THEN 1
+                                WHEN instr(t.serialized_name, '::') = 0
+                                 AND instr(t.serialized_name, '.') = 0
+                                 AND t.serialized_name IN (
+                                    'add', 'all', 'any', 'append', 'clear', 'collect', 'contains',
+                                    'dedup', 'extend', 'filter', 'insert', 'into_iter', 'iter',
+                                    'iter_mut', 'len', 'map', 'pop', 'push', 'remove', 'retain',
+                                    'sort', 'sort_by', 'sort_by_key', 'truncate'
+                                 )
+                                 AND COALESCE(
+                                    e.certainty,
+                                    CASE
+                                        WHEN e.confidence IS NULL THEN NULL
+                                        WHEN e.confidence >= {certain_min} THEN 'certain'
+                                        WHEN e.confidence >= {probable_min} THEN 'probable'
+                                        ELSE 'uncertain'
+                                    END
+                                 ) != 'certain' THEN 1
+                                ELSE 0
+                            END
+                         ) = 1
+                        THEN e.target_node_id
+                        ELSE COALESCE(e.resolved_target_node_id, e.target_node_id)
+                    END AS effective_target_node_id,
+                    e.kind
+                FROM edge e
+                JOIN node t ON t.id = e.target_node_id
+            ),
+            per_endpoint AS (
+                SELECT effective_source_node_id AS node_id, kind, effective_target_node_id
+                FROM edge_effective
+                UNION ALL
+                SELECT effective_target_node_id AS node_id, kind, effective_source_node_id
+                FROM edge_effective
+                WHERE effective_target_node_id != effective_source_node_id
+            ),
+            filtered AS (
+                SELECT per_endpoint.node_id, per_endpoint.kind
+                FROM per_endpoint
+                JOIN snapshot_nodes snapshot_nodes
+                  ON snapshot_nodes.node_id = per_endpoint.node_id
+            )
+            INSERT INTO grounding_node_edge_digest_snapshot (node_id, kind, count)
+            SELECT node_id, kind, COUNT(*)
+            FROM filtered
+            GROUP BY node_id, kind",
+            call_kind = EdgeKind::CALL as i32,
+            certain_min = ResolutionCertainty::CERTAIN_MIN,
+            probable_min = ResolutionCertainty::PROBABLE_MIN,
+        );
+        tx.execute(&edge_digest_sql, [])?;
+
+        tx.execute(
+            "INSERT INTO grounding_repo_stats_snapshot (
+                id,
+                node_count,
+                edge_count,
+                file_count,
+                error_count
+             )
+             SELECT
+                1,
+                (SELECT COUNT(*) FROM node),
+                (SELECT COUNT(*) FROM edge),
+                (SELECT COUNT(*) FROM grounding_file_snapshot),
+                (SELECT COUNT(*) FROM error)",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE grounding_snapshot_meta
+             SET snapshot_version = ?1,
+                 detail_state = ?2,
+                 detail_built_at_epoch_ms = ?3
+             WHERE id = 1",
+            params![
+                GROUNDING_SNAPSHOT_VERSION,
+                GroundingSnapshotState::Ready.db_value(),
+                current_epoch_ms()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn refresh_grounding_snapshots(&self) -> Result<(), StorageError> {
+        self.refresh_grounding_summary_snapshots()?;
+        self.hydrate_grounding_detail_snapshots()
     }
 
     pub fn clear(&self) -> Result<(), StorageError> {
@@ -240,15 +996,119 @@ impl Storage {
         tx.execute("DELETE FROM error", [])?;
         tx.execute("DELETE FROM node", [])?;
         tx.execute("DELETE FROM file", [])?;
+        tx.execute("DELETE FROM grounding_repo_stats_snapshot", [])?;
+        tx.execute("DELETE FROM grounding_file_snapshot", [])?;
+        tx.execute("DELETE FROM grounding_node_snapshot", [])?;
+        tx.execute("DELETE FROM grounding_node_summary_snapshot", [])?;
+        tx.execute("DELETE FROM grounding_node_edge_digest_snapshot", [])?;
+        tx.execute("DELETE FROM resolution_support_snapshot", [])?;
+        tx.execute(
+            "INSERT INTO grounding_snapshot_meta (
+                id,
+                snapshot_version,
+                summary_state,
+                detail_state,
+                summary_built_at_epoch_ms,
+                detail_built_at_epoch_ms
+             )
+             VALUES (1, ?1, ?2, ?2, NULL, NULL)
+             ON CONFLICT(id) DO UPDATE SET
+                snapshot_version = excluded.snapshot_version,
+                summary_state = excluded.summary_state,
+                detail_state = excluded.detail_state,
+                summary_built_at_epoch_ms = NULL,
+                detail_built_at_epoch_ms = NULL",
+            params![
+                GROUNDING_SNAPSHOT_VERSION,
+                GroundingSnapshotState::Dirty.db_value()
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO resolution_support_snapshot (
+                id,
+                snapshot_version,
+                state,
+                snapshot_blob,
+                built_at_epoch_ms
+             )
+             VALUES (1, 0, ?1, NULL, NULL)",
+            params![GroundingSnapshotState::Dirty.db_value()],
+        )?;
         tx.commit()?;
 
         self.cache.nodes.write().clear();
         Ok(())
     }
 
-    fn init(&self) -> Result<(), StorageError> {
+    pub fn finalize_staged_snapshot(&self) -> Result<(), StorageError> {
+        self.refresh_grounding_summary_snapshots()?;
+        if self.deferred_secondary_indexes {
+            schema::create_deferred_indexes(&self.conn)?;
+        }
+        Ok(())
+    }
+
+    pub fn create_deferred_secondary_indexes(&self) -> Result<(), StorageError> {
+        if self.deferred_secondary_indexes {
+            schema::create_deferred_indexes(&self.conn)?;
+        }
+        Ok(())
+    }
+
+    pub fn promote_staged_snapshot(
+        staged_path: &Path,
+        live_path: &Path,
+    ) -> Result<(), StorageError> {
+        let backup_path = live_path.with_extension("sqlite.backup");
+        let live_exists = live_path.exists();
+        cleanup_sqlite_sidecars(&backup_path)?;
+        let mut live_conn = Connection::open(live_path)?;
+        let _ = live_conn.busy_timeout(Duration::from_millis(2_500));
+
+        if live_exists {
+            live_conn.backup(
+                MAIN_DB,
+                &backup_path,
+                None::<fn(rusqlite::backup::Progress)>,
+            )?;
+        }
+
+        if let Err(err) =
+            live_conn.restore(MAIN_DB, staged_path, None::<fn(rusqlite::backup::Progress)>)
+        {
+            if live_exists && backup_path.exists() {
+                let _ = live_conn.restore(
+                    MAIN_DB,
+                    &backup_path,
+                    None::<fn(rusqlite::backup::Progress)>,
+                );
+            } else {
+                let _ = cleanup_sqlite_sidecars(live_path);
+            }
+            return Err(StorageError::Other(format!(
+                "Failed to promote staged snapshot {} -> {}: {err}",
+                staged_path.display(),
+                live_path.display()
+            )));
+        }
+        drop(live_conn);
+        cleanup_sqlite_sidecars(staged_path)?;
+        if backup_path.exists() {
+            let _ = cleanup_sqlite_sidecars(&backup_path);
+        }
+        Ok(())
+    }
+
+    pub fn discard_staged_snapshot(staged_path: &Path) -> Result<(), StorageError> {
+        cleanup_sqlite_sidecars(staged_path)
+    }
+
+    fn init(&self, mode: StorageOpenMode) -> Result<(), StorageError> {
         self.create_tables()?;
-        self.create_indexes()?;
+        self.create_indexes(mode)?;
+        if self.schema_version()? == 0 {
+            self.set_schema_version(SCHEMA_VERSION)?;
+        }
         self.apply_schema_migrations()
     }
 
@@ -256,8 +1116,8 @@ impl Storage {
         schema::create_tables(&self.conn)
     }
 
-    fn create_indexes(&self) -> Result<(), StorageError> {
-        schema::create_indexes(&self.conn)
+    fn create_indexes(&self, mode: StorageOpenMode) -> Result<(), StorageError> {
+        schema::create_indexes(&self.conn, mode)
     }
 
     fn schema_version(&self) -> Result<u32, StorageError> {
@@ -275,6 +1135,76 @@ impl Storage {
 
     fn apply_schema_migrations(&self) -> Result<(), StorageError> {
         schema::apply_schema_migrations(self)
+    }
+
+    fn grounding_snapshot_metadata(
+        &self,
+    ) -> Result<Option<GroundingSnapshotMetadata>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                snapshot_version,
+                summary_state,
+                detail_state,
+                summary_built_at_epoch_ms,
+                detail_built_at_epoch_ms
+             FROM grounding_snapshot_meta
+             WHERE id = 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let version: i64 = row.get(0)?;
+            let raw_summary_state: i64 = row.get(1)?;
+            let raw_detail_state: i64 = row.get(2)?;
+            let Some(summary_state) = GroundingSnapshotState::from_db(raw_summary_state) else {
+                return Ok(None);
+            };
+            let Some(detail_state) = GroundingSnapshotState::from_db(raw_detail_state) else {
+                return Ok(None);
+            };
+            return Ok(Some(GroundingSnapshotMetadata {
+                version,
+                summary_state,
+                detail_state,
+                summary_built_at_epoch_ms: row.get(3)?,
+                detail_built_at_epoch_ms: row.get(4)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    fn effective_grounding_file_count(&self) -> Result<i64, StorageError> {
+        self.conn
+            .query_row(
+                "WITH all_files AS (
+                    SELECT id
+                    FROM file
+                    UNION
+                    SELECT n.id
+                    FROM node n
+                    WHERE n.kind = ?1
+                )
+                SELECT COUNT(*)
+                FROM all_files",
+                params![NodeKind::FILE as i32],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)
+    }
+
+    fn grounding_file_summary_from_row(row: &Row) -> Result<GroundingFileSummary, StorageError> {
+        Ok(GroundingFileSummary {
+            file: FileInfo {
+                id: row.get(0)?,
+                path: PathBuf::from(row.get::<_, String>(1)?),
+                language: row.get(2)?,
+                modification_time: row.get(3)?,
+                indexed: row.get::<_, i32>(4)? != 0,
+                complete: row.get::<_, i32>(5)? != 0,
+                line_count: row.get(6)?,
+            },
+            symbol_count: clamp_i64_to_u32(row.get::<_, i64>(7)?),
+            best_node_rank: row.get::<_, i64>(8)?.min(u8::MAX as i64) as u8,
+        })
     }
 
     fn node_from_row(row: &Row) -> Result<Node, StorageError> {
@@ -326,6 +1256,7 @@ impl Storage {
         )?;
         // Update cache
         self.cache.nodes.write().insert(node.id, node.clone());
+        self.invalidate_grounding_snapshots()?;
         Ok(())
     }
 
@@ -348,6 +1279,7 @@ impl Storage {
                 serialize_candidate_targets(&edge.candidate_targets)?
             ],
         )?;
+        self.invalidate_grounding_snapshots()?;
         Ok(())
     }
 
@@ -376,6 +1308,7 @@ impl Storage {
             cache.insert(node.id, node.clone());
         }
 
+        self.invalidate_grounding_snapshots()?;
         Ok(())
     }
 
@@ -404,6 +1337,7 @@ impl Storage {
             }
         }
         tx.commit()?;
+        self.invalidate_grounding_snapshots()?;
         Ok(())
     }
 
@@ -429,6 +1363,7 @@ impl Storage {
             }
         }
         tx.commit()?;
+        self.invalidate_grounding_snapshots()?;
         Ok(())
     }
     pub fn get_node_count(&self) -> Result<i64, StorageError> {
@@ -589,6 +1524,172 @@ impl Storage {
         Ok(())
     }
 
+    pub fn flush_projection_batch(
+        &mut self,
+        batch: ProjectionBatch<'_>,
+    ) -> Result<ProjectionFlushBreakdown, StorageError> {
+        let mut breakdown = ProjectionFlushBreakdown::default();
+        if batch.files.is_empty()
+            && batch.nodes.is_empty()
+            && batch.edges.is_empty()
+            && batch.occurrences.is_empty()
+            && batch.component_access.is_empty()
+            && batch.callable_projection_states.is_empty()
+        {
+            return Ok(breakdown);
+        }
+
+        let tx = self.conn.transaction()?;
+
+        if !batch.files.is_empty() {
+            let started = std::time::Instant::now();
+            let mut stmt = tx.prepare(
+                "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                    modification_time=excluded.modification_time,
+                    indexed=excluded.indexed,
+                    complete=excluded.complete,
+                    line_count=excluded.line_count",
+            )?;
+            for info in batch.files {
+                stmt.execute(params![
+                    info.id,
+                    info.path.to_string_lossy(),
+                    info.language,
+                    info.modification_time,
+                    i32::from(info.indexed),
+                    i32::from(info.complete),
+                    info.line_count,
+                ])?;
+            }
+            breakdown.files_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+        }
+
+        if !batch.nodes.is_empty() {
+            let started = std::time::Instant::now();
+            let mut stmt = tx.prepare(
+                "INSERT INTO node (id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(id) DO NOTHING",
+            )?;
+            for node in batch
+                .nodes
+                .iter()
+                .filter(|node| node.kind == NodeKind::FILE)
+                .chain(
+                    batch
+                        .nodes
+                        .iter()
+                        .filter(|node| node.kind != NodeKind::FILE),
+                )
+            {
+                Self::insert_node_with_stmt(&mut stmt, node)?;
+            }
+            breakdown.nodes_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+        }
+
+        if !batch.edges.is_empty() {
+            let started = std::time::Instant::now();
+            let mut stmt = tx.prepare(
+                "INSERT INTO edge (id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence, callsite_identity, certainty, candidate_target_node_ids)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT(id) DO NOTHING",
+            )?;
+            for edge in batch.edges {
+                stmt.execute(params![
+                    edge.id.0,
+                    edge.source.0,
+                    edge.target.0,
+                    edge.kind as i32,
+                    edge.file_node_id.map(|id| id.0),
+                    edge.line,
+                    edge.resolved_source.map(|id| id.0),
+                    edge.resolved_target.map(|id| id.0),
+                    edge.confidence,
+                    edge.callsite_identity.as_deref(),
+                    row_mapping::certainty_db_value(edge.certainty),
+                    serialize_candidate_targets(&edge.candidate_targets)?
+                ])?;
+            }
+            breakdown.edges_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+        }
+
+        if !batch.occurrences.is_empty() {
+            let started = std::time::Instant::now();
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO occurrence (element_id, kind, file_node_id, start_line, start_col, end_line, end_col)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for occ in batch.occurrences {
+                stmt.execute(params![
+                    occ.element_id,
+                    occ.kind as i32,
+                    occ.location.file_node_id.0,
+                    occ.location.start_line,
+                    occ.location.start_col,
+                    occ.location.end_line,
+                    occ.location.end_col,
+                ])?;
+            }
+            breakdown.occurrences_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+        }
+
+        if !batch.component_access.is_empty() {
+            let started = std::time::Instant::now();
+            let mut stmt = tx.prepare(
+                "INSERT INTO component_access (node_id, type)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(node_id) DO UPDATE SET type = excluded.type",
+            )?;
+            for (node_id, access) in batch.component_access {
+                stmt.execute(params![
+                    node_id.0,
+                    row_mapping::access_kind_db_value(*access),
+                ])?;
+            }
+            breakdown.component_access_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+        }
+
+        if !batch.callable_projection_states.is_empty() {
+            let started = std::time::Instant::now();
+            let mut stmt = tx.prepare(
+                "INSERT INTO callable_projection_state (
+                    file_id, symbol_key, node_id, signature_hash, body_hash, start_line, end_line
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(file_id, symbol_key) DO UPDATE SET
+                    node_id = excluded.node_id,
+                    signature_hash = excluded.signature_hash,
+                    body_hash = excluded.body_hash,
+                    start_line = excluded.start_line,
+                    end_line = excluded.end_line",
+            )?;
+            for state in batch.callable_projection_states {
+                stmt.execute(params![
+                    state.file_id,
+                    state.symbol_key,
+                    state.node_id.0,
+                    state.signature_hash,
+                    state.body_hash,
+                    state.start_line,
+                    state.end_line,
+                ])?;
+            }
+            breakdown.callable_projection_ms =
+                clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+        }
+
+        tx.commit()?;
+
+        if !batch.nodes.is_empty() {
+            let mut cache = self.cache.nodes.write();
+            for node in batch.nodes {
+                cache.insert(node.id, node.clone());
+            }
+        }
+
+        self.invalidate_grounding_snapshots()?;
+        Ok(breakdown)
+    }
+
     pub fn delete_callable_projection_states_for_file(
         &mut self,
         file_id: i64,
@@ -611,25 +1712,31 @@ impl Storage {
             });
         }
 
-        let caller_raw_ids = caller_ids.iter().map(|id| id.0).collect::<Vec<_>>();
-        let placeholders = numbered_placeholders(2, caller_raw_ids.len());
-        let occurrence_placeholders =
-            numbered_placeholders(2 + caller_raw_ids.len(), caller_raw_ids.len());
         let tx = self.conn.transaction()?;
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS caller_cleanup_ids (
+                caller_id INTEGER PRIMARY KEY
+             );
+             DELETE FROM caller_cleanup_ids;",
+        )?;
+        {
+            let mut insert_ids =
+                tx.prepare("INSERT INTO caller_cleanup_ids (caller_id) VALUES (?1)")?;
+            for caller_id in caller_ids {
+                insert_ids.execute(params![caller_id.0])?;
+            }
+        }
 
         let removed_edges = tx.execute(
             &format!(
                 "DELETE FROM edge
                  WHERE file_node_id = ?1
-                 AND source_node_id IN ({placeholders})
+                 AND source_node_id IN (SELECT caller_id FROM {CALLER_CLEANUP_IDS_TABLE})
                  AND kind IN ({}, {})",
                 EdgeKind::CALL as i32,
                 EdgeKind::USAGE as i32
             ),
-            params_from_iter(
-                std::iter::once(Value::from(file_id))
-                    .chain(caller_raw_ids.iter().copied().map(Value::from)),
-            ),
+            params![file_id],
         )?;
 
         let removed_occurrences = tx.execute(
@@ -637,37 +1744,32 @@ impl Storage {
                 "DELETE FROM occurrence
                  WHERE file_node_id = ?1
                  AND (
-                    element_id IN ({placeholders})
+                    element_id IN (SELECT caller_id FROM {CALLER_CLEANUP_IDS_TABLE})
                     OR EXISTS (
                         SELECT 1
                         FROM callable_projection_state cps
+                        JOIN {CALLER_CLEANUP_IDS_TABLE} cleanup
+                          ON cleanup.caller_id = cps.node_id
                         WHERE cps.file_id = ?1
-                        AND cps.node_id IN ({occurrence_placeholders})
                         AND occurrence.start_line >= cps.start_line
                         AND occurrence.end_line <= cps.end_line
                     )
                  )"
             ),
-            params_from_iter(
-                std::iter::once(Value::from(file_id))
-                    .chain(caller_raw_ids.iter().copied().map(Value::from))
-                    .chain(caller_raw_ids.iter().copied().map(Value::from)),
-            ),
+            params![file_id],
         )?;
 
         let removed_callable_projection_state_count = tx.execute(
             &format!(
                 "DELETE FROM callable_projection_state
                  WHERE file_id = ?1
-                 AND node_id IN ({placeholders})"
+                 AND node_id IN (SELECT caller_id FROM {CALLER_CLEANUP_IDS_TABLE})"
             ),
-            params_from_iter(
-                std::iter::once(Value::from(file_id))
-                    .chain(caller_raw_ids.iter().copied().map(Value::from)),
-            ),
+            params![file_id],
         )?;
 
         tx.commit()?;
+        self.invalidate_grounding_snapshots()?;
 
         Ok(CallerProjectionRemovalSummary {
             file_id,
@@ -1031,6 +2133,7 @@ impl Storage {
                 info.line_count,
             ],
         )?;
+        self.invalidate_grounding_snapshots()?;
         Ok(())
     }
 
@@ -1062,6 +2165,7 @@ impl Storage {
             }
         }
         tx.commit()?;
+        self.invalidate_grounding_snapshots()?;
         Ok(())
     }
 
@@ -1088,6 +2192,41 @@ impl Storage {
         Ok(files)
     }
 
+    pub fn get_files_by_paths(
+        &self,
+        paths: &[PathBuf],
+    ) -> Result<HashMap<PathBuf, FileInfo>, StorageError> {
+        if paths.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut files = HashMap::with_capacity(paths.len());
+        for chunk in paths.chunks(500) {
+            let placeholders = question_placeholders(chunk.len());
+            let sql = format!(
+                "SELECT id, path, language, modification_time, indexed, complete, line_count
+                 FROM file
+                 WHERE path IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(
+                chunk.iter().map(|path| path.to_string_lossy().to_string()),
+            ))?;
+            while let Some(row) = rows.next()? {
+                let file = FileInfo {
+                    id: row.get(0)?,
+                    path: PathBuf::from(row.get::<_, String>(1)?),
+                    language: row.get(2)?,
+                    modification_time: row.get(3)?,
+                    indexed: row.get::<_, i32>(4)? != 0,
+                    complete: row.get::<_, i32>(5)? != 0,
+                    line_count: row.get(6)?,
+                };
+                files.insert(file.path.clone(), file);
+            }
+        }
+        Ok(files)
+    }
+
     pub fn get_file_node_count(&self) -> Result<i64, StorageError> {
         self.conn
             .query_row(
@@ -1098,7 +2237,43 @@ impl Storage {
             .map_err(StorageError::from)
     }
 
+    pub fn get_grounding_file_summary_count(&self) -> Result<u32, StorageError> {
+        if self.has_ready_grounding_summary_snapshots()? {
+            let snapshot_count: i64 =
+                self.conn
+                    .query_row("SELECT COUNT(*) FROM grounding_file_snapshot", [], |row| {
+                        row.get(0)
+                    })?;
+            return Ok(clamp_i64_to_u32(snapshot_count));
+        }
+
+        Ok(clamp_i64_to_u32(self.effective_grounding_file_count()?))
+    }
+
     pub fn get_grounding_file_summaries(&self) -> Result<Vec<GroundingFileSummary>, StorageError> {
+        if self.has_ready_grounding_summary_snapshots()? {
+            let mut stmt = self.conn.prepare(
+                "SELECT
+                    file_id,
+                    path,
+                    language,
+                    modification_time,
+                    indexed,
+                    complete,
+                    line_count,
+                    symbol_count,
+                    best_node_rank
+                 FROM grounding_file_snapshot
+                 ORDER BY path",
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut summaries = Vec::new();
+            while let Some(row) = rows.next()? {
+                summaries.push(Self::grounding_file_summary_from_row(row)?);
+            }
+            return Ok(summaries);
+        }
+
         let rank_sql = grounding_node_rank_sql("n");
         let indexable = grounding_indexable_predicate("n");
         let query = format!(
@@ -1147,23 +2322,55 @@ impl Storage {
         let mut rows = stmt.query([])?;
         let mut summaries = Vec::new();
         while let Some(row) = rows.next()? {
-            let symbol_count: i64 = row.get(7)?;
-            let best_node_rank: i64 = row.get(8)?;
-            summaries.push(GroundingFileSummary {
-                file: FileInfo {
-                    id: row.get(0)?,
-                    path: PathBuf::from(row.get::<_, String>(1)?),
-                    language: row.get(2)?,
-                    modification_time: row.get(3)?,
-                    indexed: row.get::<_, i32>(4)? != 0,
-                    complete: row.get::<_, i32>(5)? != 0,
-                    line_count: row.get(6)?,
-                },
-                symbol_count: clamp_i64_to_u32(symbol_count),
-                best_node_rank: best_node_rank.min(u8::MAX as i64) as u8,
-            });
+            summaries.push(Self::grounding_file_summary_from_row(row)?);
         }
         Ok(summaries)
+    }
+
+    pub fn get_grounding_ranked_file_summaries(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<GroundingFileSummary>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        if self.has_ready_grounding_summary_snapshots()? {
+            let mut stmt = self.conn.prepare(
+                "SELECT
+                    file_id,
+                    path,
+                    language,
+                    modification_time,
+                    indexed,
+                    complete,
+                    line_count,
+                    symbol_count,
+                    best_node_rank
+                 FROM grounding_file_snapshot
+                 ORDER BY
+                    best_node_rank ASC,
+                    symbol_count DESC,
+                    path ASC
+                 LIMIT ?1 OFFSET ?2",
+            )?;
+            let mut rows = stmt.query(params![
+                limit.min(i64::MAX as usize) as i64,
+                offset.min(i64::MAX as usize) as i64
+            ])?;
+            let mut summaries = Vec::new();
+            while let Some(row) = rows.next()? {
+                summaries.push(Self::grounding_file_summary_from_row(row)?);
+            }
+            return Ok(summaries);
+        }
+
+        let mut summaries = self.get_grounding_file_summaries()?;
+        summaries.sort_by(compare_grounding_file_summaries);
+        let start = offset.min(summaries.len());
+        let end = start.saturating_add(limit).min(summaries.len());
+        Ok(summaries[start..end].to_vec())
     }
 
     pub fn get_grounding_top_symbols_for_files(
@@ -1173,6 +2380,43 @@ impl Storage {
     ) -> Result<Vec<GroundingNodeRecord>, StorageError> {
         if file_ids.is_empty() || per_file_limit == 0 {
             return Ok(Vec::new());
+        }
+
+        if self.has_ready_grounding_summary_snapshots()? {
+            let placeholders = numbered_placeholders(2, file_ids.len());
+            let query = format!(
+                "SELECT
+                    node_id,
+                    kind,
+                    serialized_name,
+                    qualified_name,
+                    canonical_id,
+                    file_node_id,
+                    start_line,
+                    start_col,
+                    end_line,
+                    end_col,
+                    display_name,
+                    file_path
+                 FROM grounding_node_snapshot
+                 WHERE file_symbol_rank <= ?1
+                   AND file_node_id IN ({placeholders})
+                 ORDER BY file_node_id, file_symbol_rank"
+            );
+            let mut params = Vec::with_capacity(file_ids.len() + 1);
+            params.push(Value::Integer(per_file_limit.min(i64::MAX as usize) as i64));
+            params.extend(file_ids.iter().map(|id| Value::Integer(*id)));
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(params))?;
+            let mut nodes = Vec::new();
+            while let Some(row) = rows.next()? {
+                nodes.push(GroundingNodeRecord {
+                    node: Self::node_from_row(row)?,
+                    display_name: row.get(10)?,
+                    file_path: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
+                });
+            }
+            return Ok(nodes);
         }
 
         let placeholders = numbered_placeholders(2, file_ids.len());
@@ -1253,6 +2497,45 @@ impl Storage {
             return Ok(Vec::new());
         }
 
+        if self.has_ready_grounding_summary_snapshots()? {
+            let mut stmt = self.conn.prepare(
+                "SELECT
+                    node_id,
+                    kind,
+                    serialized_name,
+                    qualified_name,
+                    canonical_id,
+                    file_node_id,
+                    start_line,
+                    start_col,
+                    end_line,
+                    end_col,
+                    display_name,
+                    file_path
+                 FROM grounding_node_snapshot
+                 WHERE is_root = 1
+                 ORDER BY
+                    node_rank,
+                    sort_start_line,
+                    display_name,
+                    node_id
+                 LIMIT ?1 OFFSET ?2",
+            )?;
+            let mut rows = stmt.query(params![
+                limit.min(i64::MAX as usize) as i64,
+                offset.min(i64::MAX as usize) as i64
+            ])?;
+            let mut nodes = Vec::new();
+            while let Some(row) = rows.next()? {
+                nodes.push(GroundingNodeRecord {
+                    node: Self::node_from_row(row)?,
+                    display_name: row.get(10)?,
+                    file_path: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
+                });
+            }
+            return Ok(nodes);
+        }
+
         let rank_sql = grounding_node_rank_sql("n");
         let display_name = grounding_display_name_expr("n");
         let indexable = grounding_indexable_predicate("n");
@@ -1315,6 +2598,23 @@ impl Storage {
             return Ok(HashMap::new());
         }
 
+        if self.has_ready_grounding_detail_snapshots()? {
+            let placeholders = question_placeholders(node_ids.len());
+            let query = format!(
+                "SELECT node_id, member_count
+                 FROM grounding_node_summary_snapshot
+                 WHERE node_id IN ({placeholders})
+                   AND member_count > 0"
+            );
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(node_ids.iter().map(|id| id.0)))?;
+            let mut counts = HashMap::new();
+            while let Some(row) = rows.next()? {
+                counts.insert(NodeId(row.get(0)?), clamp_i64_to_u32(row.get::<_, i64>(1)?));
+            }
+            return Ok(counts);
+        }
+
         let placeholders = question_placeholders(node_ids.len());
         let query = format!(
             "SELECT source_node_id, COUNT(*)
@@ -1343,6 +2643,23 @@ impl Storage {
             return Ok(HashMap::new());
         }
 
+        if self.has_ready_grounding_detail_snapshots()? {
+            let placeholders = question_placeholders(node_ids.len());
+            let query = format!(
+                "SELECT node_id, fallback_occurrence_line
+                 FROM grounding_node_summary_snapshot
+                 WHERE node_id IN ({placeholders})
+                   AND fallback_occurrence_line IS NOT NULL"
+            );
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(node_ids.iter().map(|id| id.0)))?;
+            let mut counts = HashMap::new();
+            while let Some(row) = rows.next()? {
+                counts.insert(NodeId(row.get(0)?), row.get(1)?);
+            }
+            return Ok(counts);
+        }
+
         let placeholders = question_placeholders(node_ids.len());
         let query = format!(
             "SELECT element_id, start_line
@@ -1365,6 +2682,27 @@ impl Storage {
     ) -> Result<Vec<GroundingEdgeKindCount>, StorageError> {
         if node_ids.is_empty() {
             return Ok(Vec::new());
+        }
+
+        if self.has_ready_grounding_detail_snapshots()? {
+            let placeholders = question_placeholders(node_ids.len());
+            let query = format!(
+                "SELECT node_id, kind, count
+                 FROM grounding_node_edge_digest_snapshot
+                 WHERE node_id IN ({placeholders})
+                 ORDER BY node_id ASC, kind ASC"
+            );
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(node_ids.iter().map(|id| id.0)))?;
+            let mut counts = Vec::new();
+            while let Some(row) = rows.next()? {
+                counts.push(GroundingEdgeKindCount {
+                    node_id: NodeId(row.get(0)?),
+                    kind: EdgeKind::try_from(row.get::<_, i32>(1)?)?,
+                    count: clamp_i64_to_u32(row.get::<_, i64>(2)?),
+                });
+            }
+            return Ok(counts);
         }
 
         let source_placeholders = numbered_placeholders(1, node_ids.len());
@@ -1449,6 +2787,38 @@ impl Storage {
         }
     }
 
+    pub fn get_node_kinds_for_files(
+        &self,
+        file_ids: &[i64],
+    ) -> Result<Vec<(NodeId, NodeKind)>, StorageError> {
+        if file_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let file_placeholders = question_placeholders(file_ids.len());
+        let sql = format!(
+            "SELECT id, kind
+             FROM node
+             WHERE id IN ({file_placeholders})
+                OR file_node_id IN ({file_placeholders})"
+        );
+        let params = file_ids
+            .iter()
+            .copied()
+            .chain(file_ids.iter().copied())
+            .collect::<Vec<_>>();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(params))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let raw_kind: i32 = row.get(1)?;
+            if let Ok(kind) = NodeKind::try_from(raw_kind) {
+                out.push((NodeId(row.get(0)?), kind));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn get_nodes_for_file_line(
         &self,
         path: &str,
@@ -1480,6 +2850,37 @@ impl Storage {
                 (error.index_step == codestory_core::IndexStep::Indexing) as i32,
             ],
         )?;
+        self.invalidate_grounding_snapshots()?;
+        Ok(())
+    }
+
+    pub fn insert_errors_batch(
+        &mut self,
+        errors: &[codestory_core::ErrorInfo],
+    ) -> Result<(), StorageError> {
+        if errors.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO error (message, file_id, line, column, fatal, indexed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for error in errors {
+                stmt.execute(params![
+                    error.message,
+                    error.file_id.map(|id| id.0),
+                    error.line,
+                    error.column,
+                    error.is_fatal as i32,
+                    (error.index_step == codestory_core::IndexStep::Indexing) as i32,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        self.invalidate_grounding_snapshots()?;
         Ok(())
     }
 
@@ -1519,15 +2920,30 @@ impl Storage {
     }
 
     pub fn get_stats(&self) -> Result<StorageStats, StorageError> {
+        if self.has_ready_grounding_summary_snapshots()? {
+            let mut stmt = self.conn.prepare(
+                "SELECT node_count, edge_count, file_count, error_count
+                 FROM grounding_repo_stats_snapshot
+                 WHERE id = 1",
+            )?;
+            let mut rows = stmt.query([])?;
+            if let Some(row) = rows.next()? {
+                return Ok(StorageStats {
+                    node_count: row.get(0)?,
+                    edge_count: row.get(1)?,
+                    file_count: row.get(2)?,
+                    error_count: row.get(3)?,
+                });
+            }
+        }
+
         let node_count: i64 = self
             .conn
             .query_row("SELECT count(*) FROM node", [], |r| r.get(0))?;
         let edge_count: i64 = self
             .conn
             .query_row("SELECT count(*) FROM edge", [], |r| r.get(0))?;
-        let file_count: i64 = self
-            .conn
-            .query_row("SELECT count(*) FROM file", [], |r| r.get(0))?;
+        let file_count = self.effective_grounding_file_count()?;
         let error_count: i64 = self
             .conn
             .query_row("SELECT count(*) FROM error", [], |r| r.get(0))?;
@@ -1546,12 +2962,25 @@ impl Storage {
         file_node_id: i64,
     ) -> Result<FileProjectionRemovalSummary, StorageError> {
         let tx = self.conn.transaction()?;
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS related_node_ids (
+                node_id INTEGER PRIMARY KEY
+             );
+             DELETE FROM related_node_ids;",
+        )?;
+        tx.execute(
+            &format!(
+                "INSERT INTO {RELATED_NODE_IDS_TABLE} (node_id)
+                 SELECT DISTINCT id FROM ({RELATED_NODE_SUBQUERY})"
+            ),
+            params![file_node_id],
+        )?;
 
-        let node_ids_query = format!("SELECT DISTINCT id FROM ({RELATED_NODE_SUBQUERY})");
         let mut related_node_ids = Vec::new();
         {
-            let mut node_ids_stmt = tx.prepare(&node_ids_query)?;
-            let mut node_rows = node_ids_stmt.query(params![file_node_id])?;
+            let mut node_ids_stmt =
+                tx.prepare(&format!("SELECT node_id FROM {RELATED_NODE_IDS_TABLE}"))?;
+            let mut node_rows = node_ids_stmt.query([])?;
             while let Some(row) = node_rows.next()? {
                 related_node_ids.push(row.get::<_, i64>(0)?);
             }
@@ -1561,9 +2990,9 @@ impl Storage {
             &format!(
                 "UPDATE edge
                  SET resolved_source_node_id = NULL
-                 WHERE resolved_source_node_id IN ({RELATED_NODE_SUBQUERY})
-                 AND source_node_id NOT IN ({RELATED_NODE_SUBQUERY})
-                 AND target_node_id NOT IN ({RELATED_NODE_SUBQUERY})
+                 WHERE resolved_source_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+                 AND source_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+                 AND target_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
                  AND (file_node_id IS NULL OR file_node_id != ?1)"
             ),
             params![file_node_id],
@@ -1576,9 +3005,9 @@ impl Storage {
                      confidence = NULL,
                      certainty = NULL,
                      candidate_target_node_ids = NULL
-                 WHERE resolved_target_node_id IN ({RELATED_NODE_SUBQUERY})
-                 AND source_node_id NOT IN ({RELATED_NODE_SUBQUERY})
-                 AND target_node_id NOT IN ({RELATED_NODE_SUBQUERY})
+                 WHERE resolved_target_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+                 AND source_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+                 AND target_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
                  AND (file_node_id IS NULL OR file_node_id != ?1)"
             ),
             params![file_node_id],
@@ -1587,8 +3016,8 @@ impl Storage {
         let removed_edges = tx.execute(
             &format!(
                 "DELETE FROM edge
-                 WHERE source_node_id IN ({RELATED_NODE_SUBQUERY})
-                 OR target_node_id IN ({RELATED_NODE_SUBQUERY})
+                 WHERE source_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+                 OR target_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
                  OR file_node_id = ?1"
             ),
             params![file_node_id],
@@ -1598,19 +3027,23 @@ impl Storage {
             &format!(
                 "DELETE FROM occurrence
                  WHERE file_node_id = ?1
-                 OR element_id IN ({RELATED_NODE_SUBQUERY})"
+                 OR element_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})"
             ),
             params![file_node_id],
         )?;
 
         let removed_bookmarks = tx.execute(
-            &format!("DELETE FROM bookmark_node WHERE node_id IN ({RELATED_NODE_SUBQUERY})"),
-            params![file_node_id],
+            &format!(
+                "DELETE FROM bookmark_node WHERE node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})"
+            ),
+            [],
         )?;
 
         let removed_component_access = tx.execute(
-            &format!("DELETE FROM component_access WHERE node_id IN ({RELATED_NODE_SUBQUERY})"),
-            params![file_node_id],
+            &format!(
+                "DELETE FROM component_access WHERE node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})"
+            ),
+            [],
         )?;
 
         let removed_callable_projection_state_count = tx.execute(
@@ -1626,7 +3059,7 @@ impl Storage {
         tx.execute(
             &format!(
                 "DELETE FROM llm_symbol_doc
-                 WHERE node_id IN ({RELATED_NODE_SUBQUERY})
+                 WHERE node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
                  OR file_node_id = ?1"
             ),
             params![file_node_id],
@@ -1634,8 +3067,8 @@ impl Storage {
 
         // Remove any node references in other projection tables.
         let removed_nodes = tx.execute(
-            "DELETE FROM node WHERE id = ?1 OR file_node_id = ?1",
-            params![file_node_id],
+            &format!("DELETE FROM node WHERE id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})"),
+            [],
         )?;
 
         let removed_errors = tx.execute(
@@ -1647,6 +3080,7 @@ impl Storage {
             tx.execute("DELETE FROM file WHERE id = ?1", params![file_node_id])?;
 
         tx.commit()?;
+        self.invalidate_grounding_snapshots()?;
 
         {
             let mut nodes = self.cache.nodes.write();
@@ -1736,6 +3170,7 @@ impl Storage {
     /// Clear all errors
     pub fn clear_errors(&self) -> Result<(), StorageError> {
         self.conn.execute("DELETE FROM error", [])?;
+        self.invalidate_grounding_snapshots()?;
         Ok(())
     }
 
@@ -1990,6 +3425,162 @@ fn is_common_unqualified_call_name(name: &str) -> bool {
             | "sort_by_key"
             | "truncate"
     )
+}
+
+#[cfg(test)]
+mod grounding_snapshot_fast_path_tests {
+    use super::*;
+
+    fn insert_grounding_test_file(
+        storage: &mut Storage,
+        file_id: i64,
+        path: &str,
+        symbols: &[(i64, NodeKind, &str, u32)],
+    ) -> Result<(), StorageError> {
+        storage.insert_file(&FileInfo {
+            id: file_id,
+            path: PathBuf::from(path),
+            language: "rust".to_string(),
+            modification_time: 0,
+            indexed: true,
+            complete: true,
+            line_count: 32,
+        })?;
+
+        let mut nodes = vec![Node {
+            id: NodeId(file_id),
+            kind: NodeKind::FILE,
+            serialized_name: path.to_string(),
+            ..Default::default()
+        }];
+        for (node_id, kind, name, start_line) in symbols {
+            nodes.push(Node {
+                id: NodeId(*node_id),
+                kind: *kind,
+                serialized_name: (*name).to_string(),
+                file_node_id: Some(NodeId(file_id)),
+                start_line: Some(*start_line),
+                ..Default::default()
+            });
+        }
+        storage.insert_nodes_batch(&nodes)
+    }
+
+    #[test]
+    fn test_grounding_file_summary_count_includes_file_nodes_without_file_rows()
+    -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        storage.insert_nodes_batch(&[Node {
+            id: NodeId(700),
+            kind: NodeKind::FILE,
+            serialized_name: "orphan.rs".to_string(),
+            ..Default::default()
+        }])?;
+
+        assert_eq!(storage.get_grounding_file_summary_count()?, 1);
+        assert_eq!(storage.get_stats()?.file_count, 1);
+
+        storage.refresh_grounding_snapshots()?;
+
+        assert_eq!(storage.get_grounding_file_summary_count()?, 1);
+        assert_eq!(storage.get_stats()?.file_count, 1);
+        assert_eq!(storage.get_grounding_file_summaries()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_grounding_ranked_file_summaries_match_snapshot_ordering() -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        insert_grounding_test_file(
+            &mut storage,
+            10,
+            "src/a.rs",
+            &[(101, NodeKind::FUNCTION, "alpha", 10)],
+        )?;
+        insert_grounding_test_file(
+            &mut storage,
+            20,
+            "src/b.rs",
+            &[
+                (201, NodeKind::CLASS, "Widget", 2),
+                (202, NodeKind::FUNCTION, "helper", 20),
+            ],
+        )?;
+        insert_grounding_test_file(
+            &mut storage,
+            30,
+            "src/c.rs",
+            &[(301, NodeKind::CLASS, "Controller", 3)],
+        )?;
+
+        let fallback_ids = storage
+            .get_grounding_ranked_file_summaries(2, 1)?
+            .into_iter()
+            .map(|summary| summary.file.id)
+            .collect::<Vec<_>>();
+        assert_eq!(fallback_ids, vec![30, 10]);
+
+        storage.refresh_grounding_snapshots()?;
+
+        let snapshot_ids = storage
+            .get_grounding_ranked_file_summaries(2, 1)?
+            .into_iter()
+            .map(|summary| summary.file.id)
+            .collect::<Vec<_>>();
+        assert_eq!(snapshot_ids, vec![30, 10]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_grounding_summary_refresh_keeps_detail_tier_dirty() -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        insert_grounding_test_file(
+            &mut storage,
+            10,
+            "src/lib.rs",
+            &[(101, NodeKind::STRUCT, "Controller", 2)],
+        )?;
+        storage.insert_nodes_batch(&[Node {
+            id: NodeId(102),
+            kind: NodeKind::FIELD,
+            serialized_name: "value".to_string(),
+            file_node_id: Some(NodeId(10)),
+            start_line: Some(3),
+            ..Default::default()
+        }])?;
+        storage.insert_edges_batch(&[Edge {
+            id: codestory_core::EdgeId(1),
+            source: NodeId(101),
+            target: NodeId(102),
+            kind: EdgeKind::MEMBER,
+            ..Default::default()
+        }])?;
+
+        storage.refresh_grounding_summary_snapshots()?;
+
+        assert!(storage.has_ready_grounding_summary_snapshots()?);
+        assert!(!storage.has_ready_grounding_detail_snapshots()?);
+        assert_eq!(storage.get_grounding_file_summary_count()?, 1);
+        assert_eq!(
+            storage
+                .get_grounding_member_counts(&[NodeId(101)])?
+                .get(&NodeId(101)),
+            Some(&1)
+        );
+
+        storage.hydrate_grounding_detail_snapshots()?;
+
+        assert!(storage.has_ready_grounding_summary_snapshots()?);
+        assert!(storage.has_ready_grounding_detail_snapshots()?);
+        assert_eq!(
+            storage
+                .get_grounding_member_counts(&[NodeId(101)])?
+                .get(&NodeId(101)),
+            Some(&1)
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]

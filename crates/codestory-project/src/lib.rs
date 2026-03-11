@@ -70,6 +70,20 @@ pub struct Project {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BuildMode {
+    Incremental,
+    FullRefresh,
+}
+
+#[derive(Debug, Clone)]
+pub struct RefreshExecutionPlan {
+    pub mode: BuildMode,
+    pub files_to_index: Vec<PathBuf>,
+    pub files_to_remove: Vec<i64>,
+    pub existing_file_ids: HashMap<PathBuf, i64>,
+}
+
 impl Project {
     pub fn load(path: PathBuf) -> Result<Self> {
         let content = fs::read_to_string(&path)?;
@@ -141,27 +155,35 @@ impl Project {
         &self,
         storage: &codestory_storage::Storage,
     ) -> Result<RefreshInfo> {
-        self.build_refresh_plan(storage)
+        self.build_execution_plan(storage)
     }
 
     /// Build a single-pass refresh plan with files to index and file projections to remove.
     pub fn build_refresh_plan(&self, storage: &codestory_storage::Storage) -> Result<RefreshPlan> {
-        let current_files = self.get_source_files()?;
-        let stored_files = storage.get_files()?;
+        let execution_plan = self.build_execution_plan(storage)?;
+        Ok(RefreshPlan {
+            files_to_index: execution_plan.files_to_index,
+            files_to_remove: execution_plan.files_to_remove,
+        })
+    }
 
-        let stored_map: HashMap<PathBuf, codestory_storage::FileInfo> = stored_files
-            .into_iter()
-            .map(|f| (f.path.clone(), f))
-            .collect();
+    pub fn build_execution_plan(
+        &self,
+        storage: &codestory_storage::Storage,
+    ) -> Result<RefreshExecutionPlan> {
+        let current_files = self.get_source_files()?;
+        let stored_map = storage.get_files_by_paths(&current_files)?;
 
         let mut files_to_index = Vec::new();
         let mut files_to_remove = Vec::new();
+        let mut existing_file_ids = HashMap::new();
         let mut current_file_set = HashSet::with_capacity(current_files.len());
 
         for path in current_files {
             current_file_set.insert(path.clone());
             let needs_index = match stored_map.get(&path) {
                 Some(info) => {
+                    existing_file_ids.insert(path.clone(), info.id);
                     let mtime = modification_time_nanos(&path)?;
                     mtime > info.modification_time || !info.indexed
                 }
@@ -174,15 +196,21 @@ impl Project {
         }
 
         // Files in storage but not in project
-        for (path, info) in stored_map {
+        for (path, info) in storage
+            .get_files()?
+            .into_iter()
+            .map(|f| (f.path.clone(), f))
+        {
             if !current_file_set.contains(&path) {
                 files_to_remove.push(info.id);
             }
         }
 
-        Ok(RefreshInfo {
+        Ok(RefreshExecutionPlan {
+            mode: BuildMode::Incremental,
             files_to_index,
             files_to_remove,
+            existing_file_ids,
         })
     }
 
@@ -224,9 +252,15 @@ impl Project {
 
     /// Returns a RefreshInfo for a full re-index (all source files, no removals).
     pub fn full_refresh(&self) -> Result<RefreshInfo> {
-        Ok(RefreshInfo {
+        self.full_refresh_execution_plan()
+    }
+
+    pub fn full_refresh_execution_plan(&self) -> Result<RefreshExecutionPlan> {
+        Ok(RefreshExecutionPlan {
+            mode: BuildMode::FullRefresh,
             files_to_index: self.get_source_files()?,
             files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
         })
     }
 }
@@ -245,9 +279,18 @@ pub struct RefreshPlan {
     pub files_to_remove: Vec<i64>, // List of IDs to remove from storage
 }
 
+impl From<RefreshExecutionPlan> for RefreshPlan {
+    fn from(value: RefreshExecutionPlan) -> Self {
+        Self {
+            files_to_index: value.files_to_index,
+            files_to_remove: value.files_to_remove,
+        }
+    }
+}
+
 /// Public alias retained for existing call sites while aligning naming with
 /// workspace refresh plans in the project architecture plan.
-pub type RefreshInfo = RefreshPlan;
+pub type RefreshInfo = RefreshExecutionPlan;
 
 #[cfg(test)]
 mod tests {

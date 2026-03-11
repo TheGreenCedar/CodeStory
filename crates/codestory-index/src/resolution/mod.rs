@@ -1,6 +1,7 @@
 use crate::semantic::{
-    SemanticCandidateIndex, SemanticResolutionCandidate, SemanticResolutionRequest,
-    SemanticResolverRegistry, detect_language as semantic_detect_language,
+    SemanticCandidateIndex, SemanticCandidateNodeSnapshot, SemanticResolutionCandidate,
+    SemanticResolutionRequest, SemanticResolverRegistry,
+    detect_language as semantic_detect_language,
 };
 use anyhow::Result;
 use codestory_core::{EdgeKind, NodeKind, ResolutionCertainty};
@@ -9,7 +10,9 @@ use rayon::prelude::*;
 #[cfg(test)]
 use rusqlite::OptionalExtension;
 use rusqlite::{params, params_from_iter, types::Value};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::RwLock;
 use std::time::Instant;
 
 mod candidate_selection;
@@ -36,9 +39,31 @@ struct SemanticEdgeLookup<'a> {
     caller_qualified: Option<&'a str>,
     source_name: &'a str,
     target_name: &'a str,
+    callsite_identity: Option<&'a str>,
 }
 
 const SCOPED_CALLER_TABLE: &str = "resolution_scoped_caller_ids";
+
+type SameFileCacheKey = (i64, String, String);
+type SameModuleCacheKey = (String, String, String);
+type NameCacheKey = (String, String);
+const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SemanticResolutionRequestKey {
+    edge_kind: i32,
+    file_id: Option<i64>,
+    file_path: Option<String>,
+    caller_qualified: Option<String>,
+    target_name: String,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+struct SemanticRequestStats {
+    total_requests: usize,
+    unique_requests: usize,
+    skipped_requests: usize,
+}
 
 #[cfg(test)]
 #[allow(dead_code)]
@@ -58,20 +83,24 @@ struct CandidateNode {
     qualified_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CandidateNodeSnapshot {
+    id: i64,
+    file_node_id: Option<i64>,
+    serialized_name: String,
+    qualified_name: Option<String>,
+}
+
 #[derive(Default, Debug)]
 struct CandidateIndex {
     nodes: Vec<CandidateNode>,
     node_offset_by_id: HashMap<i64, usize>,
     exact_map: HashMap<String, Vec<usize>>,
     suffix_map_ascii_lower: HashMap<String, Vec<usize>>,
-    #[cfg(test)]
-    same_file_cache: HashMap<(i64, String), Option<i64>>,
-    #[cfg(test)]
-    same_module_cache: HashMap<(String, String), Option<i64>>,
-    #[cfg(test)]
-    global_unique_cache: HashMap<String, Option<i64>>,
-    #[cfg(test)]
-    fuzzy_cache_ascii_lower: HashMap<String, Option<i64>>,
+    same_file_cache: RwLock<HashMap<SameFileCacheKey, Option<i64>>>,
+    same_module_cache: RwLock<HashMap<SameModuleCacheKey, Option<i64>>>,
+    global_unique_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
+    fuzzy_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,22 +124,218 @@ pub struct ResolutionStats {
     pub strategy_counters: ResolutionStrategyCounters,
 }
 
+struct PreparedResolutionState {
+    call_candidate_index: CandidateIndex,
+    import_candidate_index: CandidateIndex,
+    call_semantic_index: SemanticCandidateIndex,
+    import_semantic_index: SemanticCandidateIndex,
+    override_support: OverrideSupport,
+}
+
+type OwnerByMethod = HashMap<i64, Vec<i64>>;
+type MethodsByOwnerAndName = HashMap<(i64, String), Vec<i64>>;
+type OwnerNameById = HashMap<i64, String>;
+type MethodsByOwnerNameAndName = HashMap<(String, String), Vec<i64>>;
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct OverrideSupport {
+    pub(super) owner_by_method: OwnerByMethod,
+    pub(super) methods_by_owner_and_name: MethodsByOwnerAndName,
+    pub(super) owner_name_by_id: OwnerNameById,
+    pub(super) methods_by_owner_name_and_name: MethodsByOwnerNameAndName,
+    pub(super) inheritance_by_type: HashMap<i64, Vec<i64>>,
+    pub(super) inheritance_by_owner_name: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OverrideMemberSnapshot {
+    owner_id: i64,
+    owner_name: String,
+    method_id: i64,
+    method_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResolutionSupportSnapshot {
+    #[serde(default)]
+    enable_semantic: bool,
+    call_candidates: Vec<CandidateNodeSnapshot>,
+    import_candidates: Vec<CandidateNodeSnapshot>,
+    call_semantic_nodes: Vec<SemanticCandidateNodeSnapshot>,
+    import_semantic_nodes: Vec<SemanticCandidateNodeSnapshot>,
+    override_members: Vec<OverrideMemberSnapshot>,
+    override_inheritance: Vec<(i64, i64)>,
+    override_inheritance_by_name: Vec<(String, String)>,
+    node_names: Vec<(i64, String)>,
+}
+
+impl OverrideSupport {
+    fn from_snapshot(
+        override_members: Vec<OverrideMemberSnapshot>,
+        override_inheritance: Vec<(i64, i64)>,
+        override_inheritance_by_name: Vec<(String, String)>,
+        node_names: Vec<(i64, String)>,
+    ) -> Self {
+        let mut owner_by_method = OwnerByMethod::new();
+        let mut methods_by_owner_and_name = MethodsByOwnerAndName::new();
+        let mut owner_name_by_id = OwnerNameById::new();
+        let mut methods_by_owner_name_and_name = MethodsByOwnerNameAndName::new();
+        for entry in override_members {
+            owner_by_method
+                .entry(entry.method_id)
+                .or_default()
+                .push(entry.owner_id);
+            owner_name_by_id
+                .entry(entry.owner_id)
+                .or_insert(entry.owner_name.clone());
+            methods_by_owner_and_name
+                .entry((entry.owner_id, entry.method_name.clone()))
+                .or_default()
+                .push(entry.method_id);
+            methods_by_owner_name_and_name
+                .entry((entry.owner_name, entry.method_name))
+                .or_default()
+                .push(entry.method_id);
+        }
+        for (node_id, node_name) in node_names {
+            owner_name_by_id.entry(node_id).or_insert(node_name);
+        }
+
+        let mut inheritance_by_type = HashMap::<i64, Vec<i64>>::new();
+        for (source_id, target_id) in override_inheritance {
+            inheritance_by_type
+                .entry(source_id)
+                .or_default()
+                .push(target_id);
+        }
+
+        let mut inheritance_by_owner_name = HashMap::<String, Vec<String>>::new();
+        for (source_name, target_name) in override_inheritance_by_name {
+            inheritance_by_owner_name
+                .entry(source_name)
+                .or_default()
+                .push(target_name);
+        }
+
+        Self {
+            owner_by_method,
+            methods_by_owner_and_name,
+            owner_name_by_id,
+            methods_by_owner_name_and_name,
+            inheritance_by_type,
+            inheritance_by_owner_name,
+        }
+    }
+
+    fn override_member_rows(&self) -> Vec<OverrideMemberSnapshot> {
+        let mut rows = Vec::new();
+        for ((owner_id, method_name), method_ids) in &self.methods_by_owner_and_name {
+            let owner_name = self
+                .owner_name_by_id
+                .get(owner_id)
+                .cloned()
+                .unwrap_or_default();
+            for method_id in method_ids {
+                rows.push(OverrideMemberSnapshot {
+                    owner_id: *owner_id,
+                    owner_name: owner_name.clone(),
+                    method_id: *method_id,
+                    method_name: method_name.clone(),
+                });
+            }
+        }
+        rows
+    }
+
+    fn override_inheritance_rows(&self) -> Vec<(i64, i64)> {
+        let mut rows = Vec::new();
+        for (source_id, target_ids) in &self.inheritance_by_type {
+            for target_id in target_ids {
+                rows.push((*source_id, *target_id));
+            }
+        }
+        rows
+    }
+
+    fn override_inheritance_by_name_rows(&self) -> Vec<(String, String)> {
+        let mut rows = Vec::new();
+        for (source_name, target_names) in &self.inheritance_by_owner_name {
+            for target_name in target_names {
+                rows.push((source_name.clone(), target_name.clone()));
+            }
+        }
+        rows
+    }
+
+    fn node_name_rows(&self) -> Vec<(i64, String)> {
+        self.owner_name_by_id
+            .iter()
+            .map(|(node_id, node_name)| (*node_id, node_name.clone()))
+            .collect()
+    }
+}
+
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ResolutionPhaseTelemetry {
     pub scope_prepare_ms: u64,
     pub unresolved_count_start_ms: u64,
+    pub unresolved_override_count_ms: u64,
+    pub support_snapshot_load_ms: u64,
+    pub support_snapshot_store_ms: u64,
+    pub support_snapshot_hit: bool,
     pub call_prepare_ms: u64,
     pub call_cleanup_ms: u64,
     pub call_unresolved_load_ms: u64,
     pub call_candidate_index_ms: u64,
+    pub call_semantic_index_ms: u64,
+    pub call_semantic_candidates_ms: u64,
     pub call_compute_ms: u64,
     pub call_apply_ms: u64,
     pub import_prepare_ms: u64,
     pub import_unresolved_load_ms: u64,
     pub import_candidate_index_ms: u64,
+    pub import_semantic_index_ms: u64,
+    pub import_semantic_candidates_ms: u64,
+    pub import_semantic_requests: usize,
+    pub import_semantic_unique_requests: usize,
+    pub import_semantic_skipped_requests: usize,
     pub import_compute_ms: u64,
     pub import_apply_ms: u64,
+    pub call_semantic_requests: usize,
+    pub call_semantic_unique_requests: usize,
+    pub call_semantic_skipped_requests: usize,
+    pub override_resolution_ms: u64,
     pub unresolved_count_end_ms: u64,
+}
+
+impl ResolutionPhaseTelemetry {
+    fn record_semantic_request_stats(&mut self, edge_kind: EdgeKind, stats: SemanticRequestStats) {
+        match edge_kind {
+            EdgeKind::CALL => {
+                self.call_semantic_requests = self
+                    .call_semantic_requests
+                    .saturating_add(stats.total_requests);
+                self.call_semantic_unique_requests = self
+                    .call_semantic_unique_requests
+                    .saturating_add(stats.unique_requests);
+                self.call_semantic_skipped_requests = self
+                    .call_semantic_skipped_requests
+                    .saturating_add(stats.skipped_requests);
+            }
+            EdgeKind::IMPORT => {
+                self.import_semantic_requests = self
+                    .import_semantic_requests
+                    .saturating_add(stats.total_requests);
+                self.import_semantic_unique_requests = self
+                    .import_semantic_unique_requests
+                    .saturating_add(stats.unique_requests);
+                self.import_semantic_skipped_requests = self
+                    .import_semantic_skipped_requests
+                    .saturating_add(stats.skipped_requests);
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -298,7 +523,7 @@ impl ResolutionFlags {
         Self {
             legacy_mode,
             enable_semantic: env_flag("CODESTORY_RESOLUTION_ENABLE_SEMANTIC", !legacy_mode),
-            store_candidates: env_flag("CODESTORY_RESOLUTION_STORE_CANDIDATES", !legacy_mode),
+            store_candidates: env_flag("CODESTORY_RESOLUTION_STORE_CANDIDATES", false),
             parallel_compute: env_flag("CODESTORY_RESOLUTION_PARALLEL_COMPUTE", !legacy_mode),
         }
     }
@@ -389,21 +614,31 @@ impl ResolutionPass {
             let unresolved_imports_before =
                 Self::count_unresolved_on_conn(conn, EdgeKind::IMPORT, &scope_context)?;
             telemetry.unresolved_count_start_ms = duration_ms_u64(counts_started.elapsed());
+            let override_count_started = Instant::now();
+            let _unresolved_overrides_before =
+                Self::count_unresolved_on_conn(conn, EdgeKind::OVERRIDE, &scope_context)?;
+            telemetry.unresolved_override_count_ms =
+                duration_ms_u64(override_count_started.elapsed());
+
+            let prepared = PreparedResolutionState::load(storage, self.flags, &mut telemetry)?;
 
             let mut strategy_counters = ResolutionStrategyCounters::default();
             let resolved_calls = self.resolve_calls_on_conn(
                 conn,
                 &scope_context,
+                &prepared,
                 &mut telemetry,
                 &mut strategy_counters,
             )?;
             let resolved_imports = self.resolve_imports_on_conn(
                 conn,
                 &scope_context,
+                &prepared,
                 &mut telemetry,
                 &mut strategy_counters,
             )?;
-            let _resolved_overrides = self.resolve_overrides_on_conn(conn, &scope_context)?;
+            let _resolved_overrides =
+                self.resolve_overrides_on_conn(conn, &scope_context, &prepared, &mut telemetry)?;
 
             let counts_finished = Instant::now();
             let unresolved_calls =
@@ -442,6 +677,17 @@ impl ResolutionPass {
         ))
     }
 
+    pub fn unresolved_edge_count_with_scope(
+        &self,
+        storage: &Storage,
+        kind: EdgeKind,
+        caller_scope_file_ids: Option<&HashSet<i64>>,
+    ) -> Result<usize> {
+        let conn = storage.get_connection();
+        let scope_context = ScopeCallerContext::prepare(conn, caller_scope_file_ids)?;
+        Self::count_unresolved_on_conn(conn, kind, &scope_context)
+    }
+
     fn count_unresolved_on_conn(
         conn: &rusqlite::Connection,
         kind: EdgeKind,
@@ -475,18 +721,33 @@ impl ResolutionPass {
         let conn = storage.get_connection();
         let scope_context = ScopeCallerContext::prepare(conn, caller_scope_file_ids)?;
         let mut telemetry = ResolutionPhaseTelemetry::default();
+        let prepared = PreparedResolutionState::load(storage, self.flags, &mut telemetry)?;
         let mut strategy_counters = ResolutionStrategyCounters::default();
-        self.resolve_calls_on_conn(conn, &scope_context, &mut telemetry, &mut strategy_counters)
+        self.resolve_calls_on_conn(
+            conn,
+            &scope_context,
+            &prepared,
+            &mut telemetry,
+            &mut strategy_counters,
+        )
     }
 
     fn resolve_calls_on_conn(
         &self,
         conn: &rusqlite::Connection,
         scope_context: &ScopeCallerContext,
+        prepared: &PreparedResolutionState,
         telemetry: &mut ResolutionPhaseTelemetry,
         strategy_counters: &mut ResolutionStrategyCounters,
     ) -> Result<usize> {
-        pipeline::resolve_calls_on_conn(self, conn, scope_context, telemetry, strategy_counters)
+        pipeline::resolve_calls_on_conn(
+            self,
+            conn,
+            scope_context,
+            prepared,
+            telemetry,
+            strategy_counters,
+        )
     }
 
     pub fn resolve_imports(&self, storage: &mut Storage) -> Result<usize> {
@@ -501,91 +762,43 @@ impl ResolutionPass {
         let conn = storage.get_connection();
         let scope_context = ScopeCallerContext::prepare(conn, caller_scope_file_ids)?;
         let mut telemetry = ResolutionPhaseTelemetry::default();
+        let prepared = PreparedResolutionState::load(storage, self.flags, &mut telemetry)?;
         let mut strategy_counters = ResolutionStrategyCounters::default();
-        self.resolve_imports_on_conn(conn, &scope_context, &mut telemetry, &mut strategy_counters)
+        self.resolve_imports_on_conn(
+            conn,
+            &scope_context,
+            &prepared,
+            &mut telemetry,
+            &mut strategy_counters,
+        )
     }
 
     fn resolve_imports_on_conn(
         &self,
         conn: &rusqlite::Connection,
         scope_context: &ScopeCallerContext,
+        prepared: &PreparedResolutionState,
         telemetry: &mut ResolutionPhaseTelemetry,
         strategy_counters: &mut ResolutionStrategyCounters,
     ) -> Result<usize> {
-        pipeline::resolve_imports_on_conn(self, conn, scope_context, telemetry, strategy_counters)
+        pipeline::resolve_imports_on_conn(
+            self,
+            conn,
+            scope_context,
+            prepared,
+            telemetry,
+            strategy_counters,
+        )
     }
 
     fn resolve_overrides_on_conn(
         &self,
         conn: &rusqlite::Connection,
         scope_context: &ScopeCallerContext,
+        prepared: &PreparedResolutionState,
+        telemetry: &mut ResolutionPhaseTelemetry,
     ) -> Result<usize> {
-        pipeline::resolve_overrides_on_conn(self, conn, scope_context)
-    }
-
-    fn semantic_candidates_for_rows(
-        &self,
-        index: &SemanticCandidateIndex,
-        rows: &[UnresolvedEdgeRow],
-        edge_kind: EdgeKind,
-    ) -> Result<Vec<Vec<SemanticResolutionCandidate>>> {
-        if !self.flags.enable_semantic {
-            return Ok(vec![Vec::new(); rows.len()]);
-        }
-
-        if self.flags.parallel_compute && rows.len() > 1 {
-            rows.par_iter()
-                .map(
-                    |(
-                        _,
-                        file_id,
-                        caller_qualified,
-                        source_name,
-                        target_name,
-                        caller_file_path,
-                        _,
-                    )| {
-                        self.semantic_candidates_for_edge(
-                            index,
-                            &SemanticEdgeLookup {
-                                edge_kind,
-                                file_id: *file_id,
-                                file_path: caller_file_path.as_deref(),
-                                caller_qualified: caller_qualified.as_deref(),
-                                source_name,
-                                target_name,
-                            },
-                        )
-                    },
-                )
-                .collect()
-        } else {
-            rows.iter()
-                .map(
-                    |(
-                        _,
-                        file_id,
-                        caller_qualified,
-                        source_name,
-                        target_name,
-                        caller_file_path,
-                        _,
-                    )| {
-                        self.semantic_candidates_for_edge(
-                            index,
-                            &SemanticEdgeLookup {
-                                edge_kind,
-                                file_id: *file_id,
-                                file_path: caller_file_path.as_deref(),
-                                caller_qualified: caller_qualified.as_deref(),
-                                source_name,
-                                target_name,
-                            },
-                        )
-                    },
-                )
-                .collect()
-        }
+        pipeline::resolve_overrides_on_conn(self, conn, scope_context, prepared, telemetry)
     }
 
     fn compute_call_resolution(
@@ -618,27 +831,83 @@ impl ResolutionPass {
     fn semantic_candidates_for_edge(
         &self,
         index: &SemanticCandidateIndex,
-        lookup: &SemanticEdgeLookup<'_>,
+        request_key: &SemanticResolutionRequestKey,
     ) -> Result<Vec<SemanticResolutionCandidate>> {
-        let language_bucket = semantic_language_bucket(lookup.file_path).map(str::to_string);
-        if language_bucket.is_none() {
-            return Ok(Vec::new());
-        }
-
         let request = SemanticResolutionRequest {
-            edge_kind: lookup.edge_kind,
-            file_id: lookup.file_id,
-            file_path: lookup.file_path.map(str::to_string),
-            caller_qualified: lookup.caller_qualified.map(str::to_string),
-            target_name: if lookup.edge_kind == EdgeKind::IMPORT
-                && import_alias_mismatch(lookup.source_name, lookup.target_name)
-            {
-                format!("{} as {}", lookup.target_name, lookup.source_name)
-            } else {
-                lookup.target_name.to_string()
-            },
+            edge_kind: EdgeKind::try_from(request_key.edge_kind)?,
+            file_id: request_key.file_id,
+            file_path: request_key.file_path.clone(),
+            caller_qualified: request_key.caller_qualified.clone(),
+            target_name: request_key.target_name.clone(),
         };
         self.semantic_resolvers.resolve(index, &request)
+    }
+
+    fn semantic_candidates_for_rows(
+        &self,
+        index: &SemanticCandidateIndex,
+        rows: &[UnresolvedEdgeRow],
+        edge_kind: EdgeKind,
+    ) -> Result<(Vec<Vec<SemanticResolutionCandidate>>, SemanticRequestStats)> {
+        if !self.flags.enable_semantic {
+            return Ok((
+                vec![Vec::new(); rows.len()],
+                SemanticRequestStats::default(),
+            ));
+        }
+        let mut request_indexes = Vec::with_capacity(rows.len());
+        let mut unique_keys = Vec::new();
+        let mut unique_key_indexes = HashMap::new();
+        let mut stats = SemanticRequestStats {
+            total_requests: rows.len(),
+            ..Default::default()
+        };
+
+        for row in rows {
+            let lookup = semantic_lookup_from_row(edge_kind, row);
+            let Some(request_key) = semantic_request_key(&lookup) else {
+                stats.skipped_requests += 1;
+                request_indexes.push(None);
+                continue;
+            };
+
+            let request_index = if let Some(existing) = unique_key_indexes.get(&request_key) {
+                *existing
+            } else {
+                let next_index = unique_keys.len();
+                unique_key_indexes.insert(request_key.clone(), next_index);
+                unique_keys.push(request_key);
+                next_index
+            };
+            request_indexes.push(Some(request_index));
+        }
+
+        stats.unique_requests = unique_keys.len();
+
+        let unique_results: Vec<Vec<SemanticResolutionCandidate>> =
+            if self.flags.parallel_compute && unique_keys.len() > 1 {
+                unique_keys
+                    .par_iter()
+                    .map(|request_key| self.semantic_candidates_for_edge(index, request_key))
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                unique_keys
+                    .iter()
+                    .map(|request_key| self.semantic_candidates_for_edge(index, request_key))
+                    .collect::<Result<Vec<_>>>()?
+            };
+
+        Ok((
+            request_indexes
+                .into_iter()
+                .map(|request_index| {
+                    request_index
+                        .map(|idx| unique_results[idx].clone())
+                        .unwrap_or_default()
+                })
+                .collect(),
+            stats,
+        ))
     }
 }
 
@@ -708,6 +977,65 @@ fn semantic_language_bucket(file_path: Option<&str>) -> Option<&'static str> {
     semantic_detect_language(file_path)
 }
 
+fn semantic_lookup_from_row<'a>(
+    edge_kind: EdgeKind,
+    row: &'a UnresolvedEdgeRow,
+) -> SemanticEdgeLookup<'a> {
+    let (
+        _,
+        file_id,
+        caller_qualified,
+        source_name,
+        target_name,
+        caller_file_path,
+        callsite_identity,
+    ) = row;
+    SemanticEdgeLookup {
+        edge_kind,
+        file_id: *file_id,
+        file_path: caller_file_path.as_deref(),
+        caller_qualified: caller_qualified.as_deref(),
+        source_name,
+        target_name,
+        callsite_identity: callsite_identity.as_deref(),
+    }
+}
+
+fn semantic_request_key(lookup: &SemanticEdgeLookup<'_>) -> Option<SemanticResolutionRequestKey> {
+    if semantic_language_bucket(lookup.file_path).is_none()
+        || should_skip_semantic_candidates(lookup)
+    {
+        return None;
+    }
+
+    Some(SemanticResolutionRequestKey {
+        edge_kind: lookup.edge_kind as i32,
+        file_id: lookup.file_id,
+        file_path: lookup.file_path.map(str::to_string),
+        caller_qualified: lookup.caller_qualified.map(str::to_string),
+        target_name: semantic_request_target_name(lookup),
+    })
+}
+
+fn semantic_request_target_name(lookup: &SemanticEdgeLookup<'_>) -> String {
+    if lookup.edge_kind == EdgeKind::IMPORT
+        && import_alias_mismatch(lookup.source_name, lookup.target_name)
+    {
+        format!("{} as {}", lookup.target_name, lookup.source_name)
+    } else {
+        lookup.target_name.to_string()
+    }
+}
+
+fn should_skip_semantic_candidates(lookup: &SemanticEdgeLookup<'_>) -> bool {
+    lookup.edge_kind == EdgeKind::CALL
+        && !should_keep_common_call_resolution(
+            lookup.target_name,
+            ResolutionCertainty::CERTAIN_MIN,
+            lookup.callsite_identity,
+        )
+}
+
 pub(super) fn semantic_candidate_kinds(edge_kind: EdgeKind) -> &'static [i32] {
     match edge_kind {
         EdgeKind::CALL => &[NodeKind::FUNCTION as i32, NodeKind::METHOD as i32],
@@ -726,6 +1054,129 @@ pub(super) fn semantic_candidate_kinds(edge_kind: EdgeKind) -> &'static [i32] {
             NodeKind::METHOD as i32,
         ],
         _ => &[],
+    }
+}
+
+impl PreparedResolutionState {
+    fn load(
+        storage: &Storage,
+        flags: ResolutionFlags,
+        telemetry: &mut ResolutionPhaseTelemetry,
+    ) -> Result<Self> {
+        let snapshot_load_started = Instant::now();
+        if let Some(snapshot_blob) =
+            storage.get_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION)?
+        {
+            match serde_json::from_slice::<ResolutionSupportSnapshot>(&snapshot_blob) {
+                Ok(snapshot) if snapshot.enable_semantic == flags.enable_semantic => {
+                    telemetry.support_snapshot_load_ms =
+                        duration_ms_u64(snapshot_load_started.elapsed());
+                    telemetry.support_snapshot_hit = true;
+                    return Ok(Self::from_snapshot(snapshot, flags));
+                }
+                Ok(_) | Err(_) => {
+                    storage.invalidate_resolution_support_snapshot()?;
+                }
+            }
+        }
+        telemetry.support_snapshot_load_ms = duration_ms_u64(snapshot_load_started.elapsed());
+
+        let conn = storage.get_connection();
+        let call_candidate_started = Instant::now();
+        let call_candidate_index = CandidateIndex::load(
+            conn,
+            &[
+                NodeKind::FUNCTION as i32,
+                NodeKind::METHOD as i32,
+                NodeKind::MACRO as i32,
+            ],
+        )?;
+        telemetry.call_candidate_index_ms = duration_ms_u64(call_candidate_started.elapsed());
+
+        let import_candidate_started = Instant::now();
+        let import_candidate_index = CandidateIndex::load(
+            conn,
+            &[
+                NodeKind::MODULE as i32,
+                NodeKind::NAMESPACE as i32,
+                NodeKind::PACKAGE as i32,
+            ],
+        )?;
+        telemetry.import_candidate_index_ms = duration_ms_u64(import_candidate_started.elapsed());
+
+        let (call_semantic_index, import_semantic_index) = if flags.enable_semantic {
+            let call_semantic_started = Instant::now();
+            let call_semantic_index =
+                SemanticCandidateIndex::load(conn, semantic_candidate_kinds(EdgeKind::CALL))?;
+            telemetry.call_semantic_index_ms = duration_ms_u64(call_semantic_started.elapsed());
+
+            let import_semantic_started = Instant::now();
+            let import_semantic_index =
+                SemanticCandidateIndex::load(conn, semantic_candidate_kinds(EdgeKind::IMPORT))?;
+            telemetry.import_semantic_index_ms = duration_ms_u64(import_semantic_started.elapsed());
+            (call_semantic_index, import_semantic_index)
+        } else {
+            (
+                SemanticCandidateIndex::default(),
+                SemanticCandidateIndex::default(),
+            )
+        };
+
+        let override_support = pipeline::load_override_support(conn)?;
+
+        let prepared = Self {
+            call_candidate_index,
+            import_candidate_index,
+            call_semantic_index,
+            import_semantic_index,
+            override_support,
+        };
+
+        let snapshot_store_started = Instant::now();
+        let snapshot_blob = serde_json::to_vec(&prepared.snapshot(flags))?;
+        storage
+            .put_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION, &snapshot_blob)?;
+        telemetry.support_snapshot_store_ms = duration_ms_u64(snapshot_store_started.elapsed());
+
+        Ok(prepared)
+    }
+
+    fn from_snapshot(snapshot: ResolutionSupportSnapshot, flags: ResolutionFlags) -> Self {
+        let override_support = OverrideSupport::from_snapshot(
+            snapshot.override_members,
+            snapshot.override_inheritance,
+            snapshot.override_inheritance_by_name,
+            snapshot.node_names,
+        );
+        Self {
+            call_candidate_index: CandidateIndex::from_snapshot_nodes(snapshot.call_candidates),
+            import_candidate_index: CandidateIndex::from_snapshot_nodes(snapshot.import_candidates),
+            call_semantic_index: if flags.enable_semantic {
+                SemanticCandidateIndex::from_snapshot_nodes(snapshot.call_semantic_nodes)
+            } else {
+                SemanticCandidateIndex::default()
+            },
+            import_semantic_index: if flags.enable_semantic {
+                SemanticCandidateIndex::from_snapshot_nodes(snapshot.import_semantic_nodes)
+            } else {
+                SemanticCandidateIndex::default()
+            },
+            override_support,
+        }
+    }
+
+    fn snapshot(&self, flags: ResolutionFlags) -> ResolutionSupportSnapshot {
+        ResolutionSupportSnapshot {
+            enable_semantic: flags.enable_semantic,
+            call_candidates: self.call_candidate_index.snapshot_nodes(),
+            import_candidates: self.import_candidate_index.snapshot_nodes(),
+            call_semantic_nodes: self.call_semantic_index.snapshot_nodes(),
+            import_semantic_nodes: self.import_semantic_index.snapshot_nodes(),
+            override_members: self.override_support.override_member_rows(),
+            override_inheritance: self.override_support.override_inheritance_rows(),
+            override_inheritance_by_name: self.override_support.override_inheritance_by_name_rows(),
+            node_names: self.override_support.node_name_rows(),
+        }
     }
 }
 
@@ -751,11 +1202,46 @@ impl CandidateIndex {
             })
         })?;
 
-        let mut index = CandidateIndex::default();
+        let mut nodes = Vec::new();
         for row in rows {
-            index.nodes.push(row?);
+            nodes.push(row?);
         }
 
+        Ok(Self::from_nodes(nodes))
+    }
+
+    fn from_snapshot_nodes(nodes: Vec<CandidateNodeSnapshot>) -> Self {
+        Self::from_nodes(
+            nodes
+                .into_iter()
+                .map(|node| CandidateNode {
+                    id: node.id,
+                    file_node_id: node.file_node_id,
+                    serialized_name_ascii_lower: node.serialized_name.to_ascii_lowercase(),
+                    serialized_name: node.serialized_name,
+                    qualified_name: node.qualified_name,
+                })
+                .collect(),
+        )
+    }
+
+    fn snapshot_nodes(&self) -> Vec<CandidateNodeSnapshot> {
+        self.nodes
+            .iter()
+            .map(|node| CandidateNodeSnapshot {
+                id: node.id,
+                file_node_id: node.file_node_id,
+                serialized_name: node.serialized_name.clone(),
+                qualified_name: node.qualified_name.clone(),
+            })
+            .collect()
+    }
+
+    fn from_nodes(nodes: Vec<CandidateNode>) -> Self {
+        let mut index = CandidateIndex {
+            nodes,
+            ..CandidateIndex::default()
+        };
         for (offset, node) in index.nodes.iter().enumerate() {
             index.node_offset_by_id.insert(node.id, offset);
             index
@@ -771,30 +1257,13 @@ impl CandidateIndex {
                     .push(offset);
             }
         }
-        Ok(index)
+        index
     }
 
     #[cfg(test)]
-    fn find_same_file(&mut self, file_id: Option<i64>, name: &str) -> Option<i64> {
+    fn find_same_file(&self, file_id: Option<i64>, name: &str) -> Option<i64> {
         let name_ascii_lower = name.to_ascii_lowercase();
-        self.find_same_file_prepared(file_id, name, &name_ascii_lower)
-    }
-
-    #[cfg(test)]
-    fn find_same_file_prepared(
-        &mut self,
-        file_id: Option<i64>,
-        name: &str,
-        name_ascii_lower: &str,
-    ) -> Option<i64> {
-        let file_id = file_id?;
-        let key = (file_id, name.to_string());
-        if let Some(cached) = self.same_file_cache.get(&key) {
-            return *cached;
-        }
-        let resolved = self.find_same_file_readonly(Some(file_id), name, name_ascii_lower);
-        self.same_file_cache.insert(key, resolved);
-        resolved
+        self.find_same_file_readonly(file_id, name, &name_ascii_lower)
     }
 
     fn find_same_file_readonly(
@@ -804,40 +1273,19 @@ impl CandidateIndex {
         name_ascii_lower: &str,
     ) -> Option<i64> {
         let file_id = file_id?;
-        self.first_in_file(self.exact_map.get(name), file_id)
-            .or_else(|| {
-                self.first_in_file(self.suffix_map_ascii_lower.get(name_ascii_lower), file_id)
-            })
+        let key = (file_id, name.to_string(), name_ascii_lower.to_string());
+        self.cached_lookup(&self.same_file_cache, key, || {
+            self.first_in_file(self.exact_map.get(name), file_id)
+                .or_else(|| {
+                    self.first_in_file(self.suffix_map_ascii_lower.get(name_ascii_lower), file_id)
+                })
+        })
     }
 
     #[cfg(test)]
-    fn find_same_module(
-        &mut self,
-        module_prefix: &str,
-        delimiter: &str,
-        name: &str,
-    ) -> Option<i64> {
+    fn find_same_module(&self, module_prefix: &str, delimiter: &str, name: &str) -> Option<i64> {
         let name_ascii_lower = name.to_ascii_lowercase();
-        self.find_same_module_prepared(module_prefix, delimiter, name, &name_ascii_lower)
-    }
-
-    #[cfg(test)]
-    fn find_same_module_prepared(
-        &mut self,
-        module_prefix: &str,
-        delimiter: &str,
-        name: &str,
-        name_ascii_lower: &str,
-    ) -> Option<i64> {
-        let qualified_prefix = format!("{module_prefix}{delimiter}");
-        let key = (qualified_prefix.clone(), name.to_string());
-        if let Some(cached) = self.same_module_cache.get(&key) {
-            return *cached;
-        }
-        let resolved =
-            self.find_same_module_readonly(module_prefix, delimiter, name, name_ascii_lower);
-        self.same_module_cache.insert(key, resolved);
-        resolved
+        self.find_same_module_readonly(module_prefix, delimiter, name, &name_ascii_lower)
     }
 
     fn find_same_module_readonly(
@@ -848,75 +1296,72 @@ impl CandidateIndex {
         name_ascii_lower: &str,
     ) -> Option<i64> {
         let qualified_prefix = format!("{module_prefix}{delimiter}");
-        self.first_in_module(self.exact_map.get(name), &qualified_prefix)
-            .or_else(|| {
-                self.first_in_module(
-                    self.suffix_map_ascii_lower.get(name_ascii_lower),
-                    &qualified_prefix,
-                )
-            })
+        let key = (
+            qualified_prefix.clone(),
+            name.to_string(),
+            name_ascii_lower.to_string(),
+        );
+        self.cached_lookup(&self.same_module_cache, key, || {
+            self.first_in_module(self.exact_map.get(name), &qualified_prefix)
+                .or_else(|| {
+                    self.first_in_module(
+                        self.suffix_map_ascii_lower.get(name_ascii_lower),
+                        &qualified_prefix,
+                    )
+                })
+        })
     }
 
     #[cfg(test)]
-    fn find_global_unique(&mut self, name: &str) -> Option<i64> {
+    fn find_global_unique(&self, name: &str) -> Option<i64> {
         let name_ascii_lower = name.to_ascii_lowercase();
-        self.find_global_unique_prepared(name, &name_ascii_lower)
-    }
-
-    #[cfg(test)]
-    fn find_global_unique_prepared(&mut self, name: &str, name_ascii_lower: &str) -> Option<i64> {
-        if let Some(cached) = self.global_unique_cache.get(name) {
-            return *cached;
-        }
-        let resolved = self.find_global_unique_readonly(name, name_ascii_lower);
-        self.global_unique_cache.insert(name.to_string(), resolved);
-        resolved
+        self.find_global_unique_readonly(name, &name_ascii_lower)
     }
 
     fn find_global_unique_readonly(&self, name: &str, name_ascii_lower: &str) -> Option<i64> {
-        if let Some(exact) = self.exact_map.get(name) {
-            if exact.len() == 1 {
-                return Some(self.nodes[exact[0]].id);
+        let key = (name.to_string(), name_ascii_lower.to_string());
+        self.cached_lookup(&self.global_unique_cache, key, || {
+            if let Some(exact) = self.exact_map.get(name) {
+                if exact.len() == 1 {
+                    return Some(self.nodes[exact[0]].id);
+                }
+                return None;
             }
-            return None;
-        }
-        if let Some(suffix) = self.suffix_map_ascii_lower.get(name_ascii_lower)
-            && suffix.len() == 1
-        {
-            return Some(self.nodes[suffix[0]].id);
-        }
-        None
+            if let Some(suffix) = self.suffix_map_ascii_lower.get(name_ascii_lower)
+                && suffix.len() == 1
+            {
+                return Some(self.nodes[suffix[0]].id);
+            }
+            None
+        })
     }
 
     #[cfg(test)]
-    fn find_fuzzy(&mut self, name: &str) -> Option<i64> {
+    fn find_fuzzy(&self, name: &str) -> Option<i64> {
         let name_ascii_lower = name.to_ascii_lowercase();
-        if let Some(cached) = self.fuzzy_cache_ascii_lower.get(&name_ascii_lower) {
-            return *cached;
-        }
-        let resolved = self.find_fuzzy_readonly(name, &name_ascii_lower);
-        self.fuzzy_cache_ascii_lower
-            .insert(name_ascii_lower, resolved);
-        resolved
+        self.find_fuzzy_readonly(name, &name_ascii_lower)
     }
 
     fn find_fuzzy_readonly(&self, name: &str, name_ascii_lower: &str) -> Option<i64> {
-        if let Some(exact) = self.exact_map.get(name)
-            && let Some(&idx) = exact.first()
-        {
-            return Some(self.nodes[idx].id);
-        }
+        let key = (name.to_string(), name_ascii_lower.to_string());
+        self.cached_lookup(&self.fuzzy_cache, key, || {
+            if let Some(exact) = self.exact_map.get(name)
+                && let Some(&idx) = exact.first()
+            {
+                return Some(self.nodes[idx].id);
+            }
 
-        if let Some(suffix) = self.suffix_map_ascii_lower.get(name_ascii_lower)
-            && let Some(&idx) = suffix.first()
-        {
-            return Some(self.nodes[idx].id);
-        }
+            if let Some(suffix) = self.suffix_map_ascii_lower.get(name_ascii_lower)
+                && let Some(&idx) = suffix.first()
+            {
+                return Some(self.nodes[idx].id);
+            }
 
-        self.nodes
-            .iter()
-            .find(|node| node.serialized_name_ascii_lower.contains(name_ascii_lower))
-            .map(|node| node.id)
+            self.nodes
+                .iter()
+                .find(|node| node.serialized_name_ascii_lower.contains(name_ascii_lower))
+                .map(|node| node.id)
+        })
     }
 
     fn top_matches_readonly(&self, name: &str, name_ascii_lower: &str, limit: usize) -> Vec<i64> {
@@ -975,6 +1420,33 @@ impl CandidateIndex {
                     .then_some(node.id)
             })
         })
+    }
+
+    fn cached_lookup<K, F>(
+        &self,
+        cache: &RwLock<HashMap<K, Option<i64>>>,
+        key: K,
+        compute: F,
+    ) -> Option<i64>
+    where
+        K: Clone + Eq + std::hash::Hash,
+        F: FnOnce() -> Option<i64>,
+    {
+        if let Some(cached) = cache
+            .read()
+            .expect("candidate lookup cache poisoned")
+            .get(&key)
+            .copied()
+        {
+            return cached;
+        }
+        let resolved = compute();
+        cache
+            .write()
+            .expect("candidate lookup cache poisoned")
+            .entry(key)
+            .or_insert(resolved);
+        resolved
     }
 }
 
@@ -1512,6 +1984,70 @@ mod tests {
     }
 
     #[test]
+    fn test_prepared_resolution_state_rebuilds_snapshot_when_semantic_mode_changes() -> Result<()> {
+        let mut storage = Storage::new_in_memory()?;
+        storage.insert_nodes_batch(&[
+            codestory_core::Node {
+                id: codestory_core::NodeId(1),
+                kind: NodeKind::FILE,
+                serialized_name: "/repo/lib.rs".to_string(),
+                ..Default::default()
+            },
+            codestory_core::Node {
+                id: codestory_core::NodeId(2),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "target".to_string(),
+                qualified_name: Some("pkg::target".to_string()),
+                file_node_id: Some(codestory_core::NodeId(1)),
+                ..Default::default()
+            },
+        ])?;
+
+        let stale_snapshot = ResolutionSupportSnapshot {
+            enable_semantic: false,
+            call_candidates: Vec::new(),
+            import_candidates: Vec::new(),
+            call_semantic_nodes: Vec::new(),
+            import_semantic_nodes: Vec::new(),
+            override_members: Vec::new(),
+            override_inheritance: Vec::new(),
+            override_inheritance_by_name: Vec::new(),
+            node_names: Vec::new(),
+        };
+        storage.put_resolution_support_snapshot(
+            RESOLUTION_SUPPORT_SNAPSHOT_VERSION,
+            &serde_json::to_vec(&stale_snapshot)?,
+        )?;
+
+        let flags = ResolutionFlags {
+            legacy_mode: false,
+            enable_semantic: true,
+            store_candidates: false,
+            parallel_compute: false,
+        };
+        let mut telemetry = ResolutionPhaseTelemetry::default();
+        let prepared = PreparedResolutionState::load(&storage, flags, &mut telemetry)?;
+
+        assert!(
+            !telemetry.support_snapshot_hit,
+            "semantic mode mismatch should force a snapshot rebuild"
+        );
+        assert!(
+            !prepared.call_semantic_index.snapshot_nodes().is_empty(),
+            "rebuilt state should include semantic candidates from storage"
+        );
+
+        let rebuilt_blob = storage
+            .get_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION)?
+            .expect("rebuilt snapshot");
+        let rebuilt: ResolutionSupportSnapshot = serde_json::from_slice(&rebuilt_blob)?;
+        assert!(rebuilt.enable_semantic);
+        assert!(!rebuilt.call_semantic_nodes.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
     fn test_common_unqualified_call_names_include_clone_like_noise() {
         assert!(is_common_unqualified_call_name("clone"));
         assert!(is_common_unqualified_call_name("len"));
@@ -1556,6 +2092,184 @@ mod tests {
             0.80,
             None
         ));
+    }
+
+    #[test]
+    fn test_semantic_candidates_for_rows_dedupe_identical_requests() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        let index = SemanticCandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
+        let flags = ResolutionFlags {
+            legacy_mode: false,
+            enable_semantic: true,
+            store_candidates: false,
+            parallel_compute: false,
+        };
+        let pass = ResolutionPass {
+            flags,
+            policy: ResolutionPolicy::for_flags(flags),
+            semantic_resolvers: SemanticResolverRegistry::new(true),
+        };
+        let rows = vec![
+            (
+                1_i64,
+                Some(100_i64),
+                Some("pkg::core::caller".to_string()),
+                "caller".to_string(),
+                "target".to_string(),
+                Some("/repo/lib.rs".to_string()),
+                Some("1:2:3:4".to_string()),
+            ),
+            (
+                2_i64,
+                Some(100_i64),
+                Some("pkg::core::caller".to_string()),
+                "caller".to_string(),
+                "target".to_string(),
+                Some("/repo/lib.rs".to_string()),
+                Some("1:2:3:4".to_string()),
+            ),
+        ];
+
+        let (candidates, stats) =
+            pass.semantic_candidates_for_rows(&index, &rows, EdgeKind::CALL)?;
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(stats.total_requests, 2);
+        assert_eq!(stats.unique_requests, 1);
+        assert_eq!(stats.skipped_requests, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_common_call_without_callsite_skips_semantic_requests() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        let index = SemanticCandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
+        let flags = ResolutionFlags {
+            legacy_mode: false,
+            enable_semantic: true,
+            store_candidates: false,
+            parallel_compute: false,
+        };
+        let pass = ResolutionPass {
+            flags,
+            policy: ResolutionPolicy::for_flags(flags),
+            semantic_resolvers: SemanticResolverRegistry::new(true),
+        };
+        let rows = vec![(
+            1_i64,
+            Some(100_i64),
+            Some("pkg::core::caller".to_string()),
+            "caller".to_string(),
+            "clone".to_string(),
+            Some("/repo/lib.rs".to_string()),
+            None,
+        )];
+
+        let (candidates, stats) =
+            pass.semantic_candidates_for_rows(&index, &rows, EdgeKind::CALL)?;
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].is_empty());
+        assert_eq!(stats.total_requests, 1);
+        assert_eq!(stats.unique_requests, 0);
+        assert_eq!(stats.skipped_requests, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_common_call_same_module_candidate_is_not_selected_but_is_retained_for_candidates()
+    -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                10_i64,
+                NodeKind::FUNCTION as i32,
+                "clone",
+                "pkg::core::clone",
+                100_i64,
+                1_i64
+            ],
+        )?;
+        let index = CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
+        let flags = ResolutionFlags {
+            legacy_mode: false,
+            enable_semantic: false,
+            store_candidates: true,
+            parallel_compute: false,
+        };
+        let pass = ResolutionPass {
+            flags,
+            policy: ResolutionPolicy::for_flags(flags),
+            semantic_resolvers: SemanticResolverRegistry::new(false),
+        };
+        let row = (
+            1_i64,
+            Some(100_i64),
+            Some("pkg::core::caller".to_string()),
+            "caller".to_string(),
+            "clone".to_string(),
+            Some("/repo/lib.rs".to_string()),
+            Some("1:2:3:4".to_string()),
+        );
+
+        let computed = candidate_selection::compute_call_resolution(&pass, &index, &row, &[])?;
+        assert_eq!(computed.strategy, None);
+        assert_eq!(computed.update.resolved_target_node_id, None);
+        let payload = computed
+            .update
+            .candidate_payload
+            .as_deref()
+            .expect("candidate payload");
+        let candidates: Vec<i64> = serde_json::from_str(payload)?;
+        assert_eq!(candidates, vec![10_i64]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_common_call_certain_semantic_candidate_still_resolves() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        let index = CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
+        let flags = ResolutionFlags {
+            legacy_mode: false,
+            enable_semantic: true,
+            store_candidates: false,
+            parallel_compute: false,
+        };
+        let pass = ResolutionPass {
+            flags,
+            policy: ResolutionPolicy::for_flags(flags),
+            semantic_resolvers: SemanticResolverRegistry::new(true),
+        };
+        let row = (
+            2_i64,
+            Some(100_i64),
+            Some("pkg::core::caller".to_string()),
+            "caller".to_string(),
+            "clone".to_string(),
+            Some("/repo/lib.rs".to_string()),
+            Some("1:2:3:4".to_string()),
+        );
+        let semantic_candidates = vec![SemanticResolutionCandidate {
+            target_node_id: 77_i64,
+            confidence: ResolutionCertainty::CERTAIN_MIN,
+        }];
+
+        let computed = candidate_selection::compute_call_resolution(
+            &pass,
+            &index,
+            &row,
+            &semantic_candidates,
+        )?;
+        assert_eq!(
+            computed.strategy,
+            Some(ResolutionStrategy::CallSemanticFallback)
+        );
+        assert_eq!(computed.update.resolved_target_node_id, Some(77_i64));
+        Ok(())
     }
 
     #[test]
@@ -1758,8 +2472,118 @@ mod tests {
             ],
         )?;
 
-        let mut index = CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
+        let index = CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
         assert_eq!(index.find_same_file(Some(101_i64), "target"), Some(10_i64));
+        Ok(())
+    }
+
+    #[test]
+    fn test_candidate_index_lookup_caches_stay_stable_across_repeated_reads() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                10_i64,
+                NodeKind::FUNCTION as i32,
+                "build",
+                "pkg::core::build",
+                101_i64,
+                1_i64
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                11_i64,
+                NodeKind::MODULE as i32,
+                "UniqueThing",
+                "pkg::UniqueThing",
+                102_i64,
+                1_i64
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                12_i64,
+                NodeKind::MODULE as i32,
+                "pkg::ContainsOnlyTarget",
+                "pkg::ContainsOnlyTarget",
+                103_i64,
+                1_i64
+            ],
+        )?;
+
+        let index =
+            CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32, NodeKind::MODULE as i32])?;
+        assert_eq!(
+            index.find_same_file_readonly(Some(101_i64), "build", "build"),
+            Some(10_i64)
+        );
+        assert_eq!(
+            index.find_same_file_readonly(Some(101_i64), "build", "build"),
+            Some(10_i64)
+        );
+        assert_eq!(
+            index.find_same_module_readonly("pkg::core", "::", "build", "build"),
+            Some(10_i64)
+        );
+        assert_eq!(
+            index.find_same_module_readonly("pkg::core", "::", "build", "build"),
+            Some(10_i64)
+        );
+        assert_eq!(
+            index.find_global_unique_readonly("UniqueThing", "uniquething"),
+            Some(11_i64)
+        );
+        assert_eq!(
+            index.find_global_unique_readonly("UniqueThing", "uniquething"),
+            Some(11_i64)
+        );
+        assert_eq!(
+            index.find_fuzzy_readonly("ContainsOnlyTarget", "containsonlytarget"),
+            Some(12_i64)
+        );
+        assert_eq!(
+            index.find_fuzzy_readonly("ContainsOnlyTarget", "containsonlytarget"),
+            Some(12_i64)
+        );
+        assert_eq!(
+            index
+                .same_file_cache
+                .read()
+                .expect("same-file cache readable")
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .same_module_cache
+                .read()
+                .expect("same-module cache readable")
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .global_unique_cache
+                .read()
+                .expect("global cache readable")
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .fuzzy_cache
+                .read()
+                .expect("fuzzy cache readable")
+                .len(),
+            1
+        );
         Ok(())
     }
 
@@ -1804,7 +2628,7 @@ mod tests {
             ],
         )?;
 
-        let mut index = CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
+        let index = CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
         assert_eq!(
             index.find_same_module("pkg::core", "::", "build"),
             Some(20_i64)
@@ -1869,7 +2693,7 @@ mod tests {
             ],
         )?;
 
-        let mut index = CandidateIndex::load(&conn, &[NodeKind::MODULE as i32])?;
+        let index = CandidateIndex::load(&conn, &[NodeKind::MODULE as i32])?;
         assert_eq!(index.find_global_unique("UniqueThing"), Some(30_i64));
         assert_eq!(index.find_global_unique("AliasThing"), None);
         assert_eq!(index.find_fuzzy("ContainsOnlyTarget"), Some(33_i64));

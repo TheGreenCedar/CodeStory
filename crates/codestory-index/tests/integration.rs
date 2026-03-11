@@ -1,6 +1,7 @@
 use codestory_core::{AccessKind, EdgeKind, NodeId, NodeKind, OccurrenceKind};
 use codestory_events::EventBus;
-use codestory_index::WorkspaceIndexer;
+use codestory_index::resolution::ResolutionPass;
+use codestory_index::{IncrementalIndexingStats, WorkspaceIndexer};
 use codestory_search::SearchEngine;
 use codestory_storage::Storage;
 use std::fs;
@@ -11,15 +12,16 @@ fn run_incremental_indexing(
     root: &Path,
     storage: &mut Storage,
     files_to_index: Vec<PathBuf>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<IncrementalIndexingStats> {
     let indexer = WorkspaceIndexer::new(root.to_path_buf());
     let event_bus = EventBus::new();
     let refresh_info = codestory_project::RefreshInfo {
+        mode: codestory_project::BuildMode::Incremental,
         files_to_index,
         files_to_remove: vec![],
+        existing_file_ids: std::collections::HashMap::new(),
     };
-    indexer.run_incremental(storage, &refresh_info, &event_bus, None)?;
-    Ok(())
+    indexer.run_incremental(storage, &refresh_info, &event_bus, None)
 }
 
 fn index_project(files: &[(&str, &str)]) -> anyhow::Result<Storage> {
@@ -135,6 +137,34 @@ fn test_incremental_indexing_modification() -> anyhow::Result<()> {
     assert!(nodes.iter().any(|n| n.serialized_name == "Foo"));
     assert!(nodes.iter().any(|n| n.serialized_name == "Bar"));
     assert!(nodes.len() > initial_count);
+
+    Ok(())
+}
+
+#[test]
+fn test_incremental_indexing_second_run_reuses_unchanged_extraction_cache_and_resolution_support()
+-> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let root = dir.path();
+    let file_path = root.join("main.rs");
+    fs::write(&file_path, "fn helper() {}\nfn run() { helper(); }\n")?;
+
+    let mut storage = Storage::new_in_memory()?;
+    let first_stats = run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
+    assert_eq!(first_stats.artifact_cache_hits, 0);
+    assert_eq!(first_stats.artifact_cache_misses, 1);
+    assert!(!first_stats.resolution_support_snapshot_hit);
+    assert!(storage.has_ready_resolution_support_snapshot(1)?);
+
+    let second_stats = run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
+    assert_eq!(second_stats.artifact_cache_hits, 1);
+    assert_eq!(second_stats.artifact_cache_misses, 0);
+
+    let resolution_stats = ResolutionPass::new().run(&mut storage)?;
+    assert!(resolution_stats.telemetry.support_snapshot_hit);
+
+    let nodes = storage.get_nodes()?;
+    assert!(nodes.iter().any(|node| node.serialized_name == "run"));
 
     Ok(())
 }

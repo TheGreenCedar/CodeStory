@@ -3,7 +3,19 @@ use codestory_core::{
     AccessKind, Edge, EdgeId, EdgeKind, NodeId, NodeKind, ResolutionCertainty, SourceLocation,
     TrailConfig, TrailDirection,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn unique_temp_db_path(label: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "codestory-storage-{label}-{}-{stamp}.sqlite",
+        std::process::id()
+    ))
+}
 
 #[test]
 fn test_batch_inserts() -> Result<(), StorageError> {
@@ -69,6 +81,76 @@ fn test_resolution_indexes_are_created() -> Result<(), StorageError> {
             .any(|name| name == "idx_callable_projection_state_file_node")
     );
 
+    Ok(())
+}
+
+#[test]
+fn test_index_artifact_cache_round_trip() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    let payload = br#"{"cached":true}"#;
+
+    storage.upsert_index_artifact_cache(Path::new("src/lib.rs"), "cache-key", payload)?;
+
+    assert_eq!(
+        storage.get_index_artifact_cache(Path::new("src/lib.rs"), "cache-key")?,
+        Some(payload.to_vec())
+    );
+    assert_eq!(
+        storage.get_index_artifact_cache(Path::new("src/lib.rs"), "other-key")?,
+        None
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_resolution_support_snapshot_round_trip_and_invalidation() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    let payload = br#"{"support":1}"#;
+
+    assert!(!storage.has_ready_resolution_support_snapshot(1)?);
+
+    storage.put_resolution_support_snapshot(1, payload)?;
+
+    assert!(storage.has_ready_resolution_support_snapshot(1)?);
+    assert_eq!(
+        storage.get_resolution_support_snapshot(1)?,
+        Some(payload.to_vec())
+    );
+
+    storage.invalidate_resolution_support_snapshot()?;
+
+    assert!(!storage.has_ready_resolution_support_snapshot(1)?);
+    assert_eq!(storage.get_resolution_support_snapshot(1)?, None);
+
+    Ok(())
+}
+
+#[test]
+fn test_update_file_metadata_preserves_resolution_support_snapshot() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    storage.insert_file(&FileInfo {
+        id: 11,
+        path: PathBuf::from("src/lib.rs"),
+        language: "rust".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 10,
+    })?;
+    storage.put_resolution_support_snapshot(1, br#"{"hot":true}"#)?;
+
+    storage.update_file_metadata(&FileInfo {
+        id: 11,
+        path: PathBuf::from("src/lib.rs"),
+        language: "rust".to_string(),
+        modification_time: 2,
+        indexed: true,
+        complete: true,
+        line_count: 10,
+    })?;
+
+    assert!(storage.has_ready_resolution_support_snapshot(1)?);
     Ok(())
 }
 
@@ -639,7 +721,7 @@ fn test_opening_v3_db_resets_projection_state() -> Result<(), StorageError> {
     {
         let conn = rusqlite::Connection::open(&db_path)?;
         schema::create_tables(&conn)?;
-        schema::create_indexes(&conn)?;
+        schema::create_indexes(&conn, StorageOpenMode::Live)?;
         conn.pragma_update(None, "user_version", 3)?;
         conn.execute(
             "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count)
@@ -677,6 +759,65 @@ fn test_opening_v3_db_resets_projection_state() -> Result<(), StorageError> {
     assert!(storage.get_bookmark_categories()?.is_empty());
     drop(storage);
     let _ = std::fs::remove_file(&db_path);
+    Ok(())
+}
+
+#[test]
+fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
+-> Result<(), StorageError> {
+    let live_path = unique_temp_db_path("live");
+    let staged_path = unique_temp_db_path("staged");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let _ = cleanup_sqlite_sidecars(&staged_path);
+    let _ = cleanup_sqlite_sidecars(&backup_path);
+
+    {
+        let mut live = Storage::open(&live_path)?;
+        live.insert_files_batch(&[FileInfo {
+            id: 1,
+            path: PathBuf::from("live.rs"),
+            language: "rust".to_string(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 10,
+        }])?;
+
+        {
+            let mut staged = Storage::open_build(&staged_path)?;
+            staged.insert_files_batch(&[FileInfo {
+                id: 2,
+                path: PathBuf::from("staged.rs"),
+                language: "rust".to_string(),
+                modification_time: 2,
+                indexed: true,
+                complete: true,
+                line_count: 20,
+            }])?;
+            staged.finalize_staged_snapshot()?;
+        }
+
+        Storage::promote_staged_snapshot(&staged_path, &live_path)?;
+
+        let live_reader_files = live.get_files()?;
+        assert_eq!(live_reader_files.len(), 1);
+    }
+
+    let promoted = Storage::open(&live_path)?;
+    let promoted_files = promoted.get_files()?;
+    assert_eq!(promoted_files.len(), 1);
+    assert_eq!(promoted_files[0].id, 2);
+    assert_eq!(promoted_files[0].path, PathBuf::from("staged.rs"));
+    drop(promoted);
+
+    assert!(!staged_path.exists());
+    assert!(!PathBuf::from(format!("{}-wal", staged_path.display())).exists());
+    assert!(!PathBuf::from(format!("{}-shm", staged_path.display())).exists());
+
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let _ = cleanup_sqlite_sidecars(&staged_path);
+    let _ = cleanup_sqlite_sidecars(&backup_path);
     Ok(())
 }
 

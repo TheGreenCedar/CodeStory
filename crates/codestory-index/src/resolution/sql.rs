@@ -117,23 +117,49 @@ pub(super) fn apply_resolution_updates(
     if updates.is_empty() {
         return Ok(());
     }
-    let mut stmt = conn.prepare(
-        "UPDATE edge
-         SET resolved_target_node_id = ?1,
-             confidence = ?2,
-             certainty = ?3,
-             candidate_target_node_ids = ?4
-         WHERE id = ?5",
+
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS resolution_edge_updates (
+            edge_id INTEGER PRIMARY KEY,
+            resolved_target_node_id INTEGER,
+            confidence REAL,
+            certainty TEXT,
+            candidate_target_node_ids TEXT
+         );
+         DELETE FROM resolution_edge_updates;",
     )?;
-    for update in updates {
-        stmt.execute(params![
-            update.resolved_target_node_id,
-            update.confidence,
-            update.certainty,
-            update.candidate_payload.as_deref(),
-            update.edge_id
-        ])?;
+
+    {
+        let mut insert = conn.prepare(
+            "INSERT INTO resolution_edge_updates (
+                edge_id,
+                resolved_target_node_id,
+                confidence,
+                certainty,
+                candidate_target_node_ids
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for update in updates {
+            insert.execute(params![
+                update.edge_id,
+                update.resolved_target_node_id,
+                update.confidence,
+                update.certainty,
+                update.candidate_payload.as_deref(),
+            ])?;
+        }
     }
+
+    conn.execute(
+        "UPDATE edge
+         SET resolved_target_node_id = staged.resolved_target_node_id,
+             confidence = staged.confidence,
+             certainty = staged.certainty,
+             candidate_target_node_ids = staged.candidate_target_node_ids
+         FROM resolution_edge_updates AS staged
+         WHERE edge.id = staged.edge_id",
+        [],
+    )?;
     Ok(())
 }
 

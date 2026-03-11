@@ -1,6 +1,7 @@
 use anyhow::Result;
 use codestory_core::EdgeKind;
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 mod c;
@@ -41,8 +42,19 @@ struct SemanticCandidateNode {
     serialized_name: String,
     serialized_name_ascii_lower: String,
     qualified_name: Option<String>,
+    qualified_name_ascii_lower: Option<String>,
     file_node_id: Option<i64>,
-    language_family: Option<&'static str>,
+    language_family: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SemanticCandidateNodeSnapshot {
+    pub id: i64,
+    pub kind: i32,
+    pub serialized_name: String,
+    pub qualified_name: Option<String>,
+    pub file_node_id: Option<i64>,
+    pub language_family: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -76,22 +88,71 @@ impl SemanticCandidateIndex {
         let rows = stmt.query_map([], |row| {
             let serialized_name: String = row.get(2)?;
             let file_path: Option<String> = row.get(5)?;
+            let qualified_name: Option<String> = row.get(3)?;
             Ok(SemanticCandidateNode {
                 id: row.get(0)?,
                 kind: row.get(1)?,
                 serialized_name_ascii_lower: serialized_name.to_ascii_lowercase(),
                 serialized_name,
-                qualified_name: row.get(3)?,
+                qualified_name_ascii_lower: qualified_name
+                    .as_ref()
+                    .map(|qualified_name| qualified_name.to_ascii_lowercase()),
+                qualified_name,
                 file_node_id: row.get(4)?,
-                language_family: detect_language(file_path.as_deref()).map(language_family_bucket),
+                language_family: detect_language(file_path.as_deref())
+                    .map(language_family_bucket)
+                    .map(str::to_string),
             })
         })?;
 
-        let mut index = Self::default();
+        let mut nodes = Vec::new();
         for row in rows {
-            index.nodes.push(row?);
+            nodes.push(row?);
         }
 
+        Ok(Self::from_nodes(nodes))
+    }
+
+    pub(crate) fn from_snapshot_nodes(nodes: Vec<SemanticCandidateNodeSnapshot>) -> Self {
+        Self::from_nodes(
+            nodes
+                .into_iter()
+                .map(|node| SemanticCandidateNode {
+                    id: node.id,
+                    kind: node.kind,
+                    serialized_name_ascii_lower: node.serialized_name.to_ascii_lowercase(),
+                    serialized_name: node.serialized_name,
+                    qualified_name_ascii_lower: node
+                        .qualified_name
+                        .as_ref()
+                        .map(|qualified_name| qualified_name.to_ascii_lowercase()),
+                    qualified_name: node.qualified_name,
+                    file_node_id: node.file_node_id,
+                    language_family: node.language_family,
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn snapshot_nodes(&self) -> Vec<SemanticCandidateNodeSnapshot> {
+        self.nodes
+            .iter()
+            .map(|node| SemanticCandidateNodeSnapshot {
+                id: node.id,
+                kind: node.kind,
+                serialized_name: node.serialized_name.clone(),
+                qualified_name: node.qualified_name.clone(),
+                file_node_id: node.file_node_id,
+                language_family: node.language_family.clone(),
+            })
+            .collect()
+    }
+
+    fn from_nodes(nodes: Vec<SemanticCandidateNode>) -> Self {
+        let mut index = Self {
+            nodes,
+            ..Self::default()
+        };
         for (offset, node) in index.nodes.iter().enumerate() {
             index
                 .nodes_by_kind
@@ -114,8 +175,7 @@ impl SemanticCandidateIndex {
                 index.tail_ascii_lower.entry(tail).or_default().push(offset);
             }
         }
-
-        Ok(index)
+        index
     }
 
     fn nodes_for_name<'a>(
@@ -140,7 +200,10 @@ impl SemanticCandidateIndex {
                 return;
             };
             if !kind_set.contains(&node.kind)
-                || !compatible_language_families(caller_language_family, node.language_family)
+                || !compatible_language_families(
+                    caller_language_family,
+                    node.language_family.as_deref(),
+                )
                 || !seen.insert(node.id)
             {
                 return;
@@ -173,15 +236,19 @@ impl SemanticCandidateIndex {
                     let Some(node) = self.nodes.get(offset) else {
                         continue;
                     };
-                    if seen.contains(&node.id) {
+                    if seen.contains(&node.id)
+                        || !compatible_language_families(
+                            caller_language_family,
+                            node.language_family.as_deref(),
+                        )
+                    {
                         continue;
                     }
                     if node.serialized_name_ascii_lower.contains(name_ascii_lower)
-                        || node.qualified_name.as_ref().is_some_and(|qualified_name| {
-                            qualified_name
-                                .to_ascii_lowercase()
-                                .contains(name_ascii_lower)
-                        })
+                        || node
+                            .qualified_name_ascii_lower
+                            .as_deref()
+                            .is_some_and(|qualified_name| qualified_name.contains(name_ascii_lower))
                     {
                         seen.insert(node.id);
                         out.push(node);
@@ -450,8 +517,8 @@ fn language_family_bucket(language: &'static str) -> &'static str {
 }
 
 fn compatible_language_families(
-    caller_language: Option<&'static str>,
-    candidate_language: Option<&'static str>,
+    caller_language: Option<&str>,
+    candidate_language: Option<&str>,
 ) -> bool {
     match (caller_language, candidate_language) {
         (Some(lhs), Some(rhs)) => lhs == rhs,
@@ -463,7 +530,7 @@ fn compatible_language_families(
 mod tests {
     use super::{
         SemanticCandidateIndex, alias_target, call_target_name, detect_language, namespace_tail,
-        resolve_call_candidates, tail_segment,
+        resolve_call_candidates, resolve_import_candidates, tail_segment,
     };
     use anyhow::Result;
     use codestory_core::NodeKind;
@@ -595,6 +662,42 @@ mod tests {
         assert!(
             out.is_empty(),
             "unexpected cross-language candidates: {out:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_import_candidates_filter_cross_language_fuzzy_matches() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        insert_file_node(&conn, 1, "app.js")?;
+        insert_file_node(&conn, 2, "lib.rs")?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                30_i64,
+                NodeKind::MODULE as i32,
+                "error_boundary_helpers",
+                "crate::error_boundary_helpers",
+                2_i64,
+                5_i64
+            ],
+        )?;
+
+        let index = SemanticCandidateIndex::load(&conn, &[NodeKind::MODULE as i32])?;
+        let out = resolve_import_candidates(
+            &index,
+            &[NodeKind::MODULE as i32],
+            "error",
+            Some(1),
+            detect_language(Some("app.js")),
+            0.55,
+        )?;
+
+        assert!(
+            out.is_empty(),
+            "unexpected cross-language fuzzy import candidates: {out:?}"
         );
         Ok(())
     }

@@ -19,12 +19,14 @@ use tree_sitter_graph::ast::File as GraphFile;
 use tree_sitter_graph::functions::Functions;
 use tree_sitter_graph::{ExecutionConfig, NoCancellation, Variables};
 
+mod cache;
 pub mod cancellation;
 pub mod compilation_database;
 pub mod intermediate_storage;
 pub mod resolution;
 pub mod semantic;
 pub mod symbol_table;
+use cache::{CachedIndexArtifact, build_index_artifact_cache_key};
 pub use cancellation::CancellationToken;
 use intermediate_storage::IntermediateStorage;
 use symbol_table::SymbolTable;
@@ -451,6 +453,24 @@ impl Default for IncrementalIndexingConfig {
     }
 }
 
+impl IncrementalIndexingConfig {
+    fn for_mode(mode: codestory_project::BuildMode) -> Self {
+        match mode {
+            codestory_project::BuildMode::Incremental => Self::default(),
+            codestory_project::BuildMode::FullRefresh => Self {
+                // Full refresh writes into a staged SQLite snapshot with deferred
+                // secondary indexes, so larger batches reduce flush frequency
+                // without paying the live-write amplification cost.
+                file_batch_size: 128,
+                node_batch_size: 400_000,
+                edge_batch_size: 400_000,
+                occurrence_batch_size: 400_000,
+                error_batch_size: 8_000,
+            },
+        }
+    }
+}
+
 pub struct IndexResult {
     pub files: Vec<codestory_storage::FileInfo>,
     pub nodes: Vec<Node>,
@@ -479,8 +499,22 @@ pub enum IndexingEvent {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IncrementalIndexingStats {
+    pub setup_existing_projection_ids_ms: u64,
+    pub setup_seed_symbol_table_ms: u64,
+    pub artifact_cache_lookup_ms: u64,
+    pub artifact_cache_write_ms: u64,
+    pub artifact_cache_hits: usize,
+    pub artifact_cache_misses: usize,
+    pub artifact_cache_invalid_entries: usize,
+    pub artifact_cache_writes: usize,
     pub parse_index_ms: u64,
     pub projection_flush_ms: u64,
+    pub flush_files_ms: u64,
+    pub flush_nodes_ms: u64,
+    pub flush_edges_ms: u64,
+    pub flush_occurrences_ms: u64,
+    pub flush_component_access_ms: u64,
+    pub flush_callable_projection_ms: u64,
     pub edge_resolution_ms: u64,
     pub error_flush_ms: u64,
     pub cleanup_ms: u64,
@@ -492,9 +526,30 @@ pub struct IncrementalIndexingStats {
     pub unresolved_imports_end: usize,
     pub resolution_ran: bool,
     pub resolution_unresolved_counts_ms: u64,
+    pub resolution_override_count_ms: u64,
     pub resolution_calls_ms: u64,
     pub resolution_imports_ms: u64,
     pub resolution_cleanup_ms: u64,
+    pub resolution_call_candidate_index_ms: u64,
+    pub resolution_import_candidate_index_ms: u64,
+    pub resolution_call_semantic_index_ms: u64,
+    pub resolution_import_semantic_index_ms: u64,
+    pub resolution_support_snapshot_load_ms: u64,
+    pub resolution_support_snapshot_store_ms: u64,
+    pub resolution_support_snapshot_hit: bool,
+    pub resolution_call_semantic_candidates_ms: u64,
+    pub resolution_import_semantic_candidates_ms: u64,
+    pub resolution_call_semantic_requests: usize,
+    pub resolution_call_semantic_unique_requests: usize,
+    pub resolution_call_semantic_skipped_requests: usize,
+    pub resolution_import_semantic_requests: usize,
+    pub resolution_import_semantic_unique_requests: usize,
+    pub resolution_import_semantic_skipped_requests: usize,
+    pub resolution_call_compute_ms: u64,
+    pub resolution_import_compute_ms: u64,
+    pub resolution_call_apply_ms: u64,
+    pub resolution_import_apply_ms: u64,
+    pub resolution_override_resolution_ms: u64,
     pub resolved_calls_same_file: usize,
     pub resolved_calls_same_module: usize,
     pub resolved_calls_global_unique: usize,
@@ -504,6 +559,31 @@ pub struct IncrementalIndexingStats {
     pub resolved_imports_global_unique: usize,
     pub resolved_imports_fuzzy: usize,
     pub resolved_imports_semantic: usize,
+}
+
+#[derive(Debug)]
+struct PreparedIndexInput {
+    full_path: PathBuf,
+    source: String,
+    compilation_info: Option<compilation_database::CompilationInfo>,
+    language_config: LanguageConfig,
+    artifact_cache_key: String,
+}
+
+enum PreparedIndexWork {
+    Immediate(IntermediateStorage),
+    Parse(PreparedIndexInput),
+}
+
+struct PreparedIndexJobResult {
+    local_storage: IntermediateStorage,
+    cache_write: Option<ArtifactCacheWrite>,
+}
+
+struct ArtifactCacheWrite {
+    path: PathBuf,
+    cache_key: String,
+    artifact_blob: Vec<u8>,
 }
 
 pub struct WorkspaceIndexer {
@@ -557,8 +637,26 @@ impl WorkspaceIndexer {
         event_bus: &EventBus,
         cancel_token: Option<&CancellationToken>,
     ) -> Result<IncrementalIndexingStats> {
+        let existing_file_ids =
+            Self::existing_projection_ids(storage, &self.root, &refresh_info.files_to_index)?;
+        let plan = codestory_project::RefreshExecutionPlan {
+            mode: codestory_project::BuildMode::Incremental,
+            files_to_index: refresh_info.files_to_index.clone(),
+            files_to_remove: refresh_info.files_to_remove.clone(),
+            existing_file_ids,
+        };
+        self.run(storage, &plan, event_bus, cancel_token)
+    }
+
+    pub fn run(
+        &self,
+        storage: &mut Storage,
+        plan: &codestory_project::RefreshExecutionPlan,
+        event_bus: &EventBus,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<IncrementalIndexingStats> {
         event_bus.publish(Event::IndexingStarted {
-            file_count: refresh_info.files_to_index.len(),
+            file_count: plan.files_to_index.len(),
         });
         if let Some(message) = &self.compilation_db_warning {
             event_bus.publish(Event::ShowWarning {
@@ -566,16 +664,20 @@ impl WorkspaceIndexer {
             });
         }
         let mut stats = IncrementalIndexingStats::default();
-        let total_files = refresh_info.files_to_index.len();
+        let total_files = plan.files_to_index.len();
         let processed_count = Arc::new(AtomicUsize::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
         let root = self.root.clone();
-        let existing_projection_ids =
-            Self::existing_projection_ids(storage, &root, &refresh_info.files_to_index);
-        let mut replaced_projection_ids = HashSet::new();
+        let existing_projection_ids = plan.existing_file_ids.clone();
+        let existing_projection_setup_started = Instant::now();
+        stats.setup_existing_projection_ids_ms =
+            duration_ms_u64(existing_projection_setup_started.elapsed());
 
+        let mut replaced_projection_ids = HashSet::new();
+        let symbol_seed_started = Instant::now();
         let symbol_table = Arc::new(SymbolTable::new());
-        Self::seed_symbol_table(storage, &symbol_table);
+        Self::seed_symbol_table(storage, &symbol_table, plan.mode, &existing_projection_ids)?;
+        stats.setup_seed_symbol_table_ms = duration_ms_u64(symbol_seed_started.elapsed());
 
         // Clone for parallel closure
         let cancelled_clone = cancelled.clone();
@@ -587,40 +689,133 @@ impl WorkspaceIndexer {
         let mut batched_storage = IntermediateStorage::default();
         let mut all_errors = Vec::new();
         let mut had_edges = false;
-        let file_batch_size = self.batch_config.file_batch_size.max(1);
-        let batch_config = self.batch_config;
+        let full_refresh_defaults =
+            IncrementalIndexingConfig::for_mode(codestory_project::BuildMode::FullRefresh);
+        let batch_config = match plan.mode {
+            codestory_project::BuildMode::Incremental => self.batch_config,
+            codestory_project::BuildMode::FullRefresh => IncrementalIndexingConfig {
+                file_batch_size: self
+                    .batch_config
+                    .file_batch_size
+                    .max(full_refresh_defaults.file_batch_size),
+                node_batch_size: self
+                    .batch_config
+                    .node_batch_size
+                    .max(full_refresh_defaults.node_batch_size),
+                edge_batch_size: self
+                    .batch_config
+                    .edge_batch_size
+                    .max(full_refresh_defaults.edge_batch_size),
+                occurrence_batch_size: self
+                    .batch_config
+                    .occurrence_batch_size
+                    .max(full_refresh_defaults.occurrence_batch_size),
+                error_batch_size: self
+                    .batch_config
+                    .error_batch_size
+                    .max(full_refresh_defaults.error_batch_size),
+            },
+        };
+        let file_batch_size = batch_config.file_batch_size.max(1);
 
-        for file_chunk in refresh_info.files_to_index.chunks(file_batch_size) {
-            let chunk_started = Instant::now();
-            let chunk_results: Vec<IntermediateStorage> = file_chunk
+        for file_chunk in plan.files_to_index.chunks(file_batch_size) {
+            let lookup_started = Instant::now();
+            let mut chunk_results = Vec::with_capacity(file_chunk.len());
+            let mut parse_jobs = Vec::new();
+            for path in file_chunk {
+                if let Some(token) = cancel_token
+                    && token.is_cancelled()
+                {
+                    cancelled_clone.store(true, Ordering::Relaxed);
+                    break;
+                }
+
+                let normalized_path = Self::normalize_index_path(&root, path);
+                let existing_projection_id = (plan.mode
+                    == codestory_project::BuildMode::Incremental)
+                    .then(|| existing_projection_ids.get(&normalized_path).copied())
+                    .flatten();
+                match self.prepare_index_work(
+                    storage,
+                    path,
+                    &root,
+                    existing_projection_id,
+                    &symbol_table,
+                    &mut stats,
+                ) {
+                    Ok(PreparedIndexWork::Immediate(local_storage)) => {
+                        let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        event_bus.publish(Event::IndexingProgress {
+                            current,
+                            total: total_files,
+                        });
+                        chunk_results.push(local_storage);
+                    }
+                    Ok(PreparedIndexWork::Parse(prepared_input)) => {
+                        parse_jobs.push(prepared_input);
+                    }
+                    Err(err_storage) => {
+                        let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        event_bus.publish(Event::IndexingProgress {
+                            current,
+                            total: total_files,
+                        });
+                        chunk_results.push(err_storage);
+                    }
+                }
+            }
+            stats.artifact_cache_lookup_ms = stats
+                .artifact_cache_lookup_ms
+                .saturating_add(duration_ms_u64(lookup_started.elapsed()));
+
+            let parse_started = Instant::now();
+            let parse_results: Vec<PreparedIndexJobResult> = parse_jobs
                 .par_iter()
-                .map(|path| {
-                    // Check cancellation
+                .map(|prepared_input| {
                     if let Some(token) = cancel_token
                         && token.is_cancelled()
                     {
                         cancelled_clone.store(true, Ordering::Relaxed);
-                        return IntermediateStorage::default();
+                        return PreparedIndexJobResult {
+                            local_storage: IntermediateStorage::default(),
+                            cache_write: None,
+                        };
                     }
-
-                    let local_storage = self.index_path(path, &root, &symbol_table);
-
-                    let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    event_bus.publish(Event::IndexingProgress {
-                        current,
-                        total: total_files,
-                    });
-
-                    local_storage
+                    self.execute_prepared_index(prepared_input, &symbol_table)
                 })
                 .collect();
             stats.parse_index_ms = stats
                 .parse_index_ms
-                .saturating_add(duration_ms_u64(chunk_started.elapsed()));
+                .saturating_add(duration_ms_u64(parse_started.elapsed()));
+
+            for parsed in parse_results {
+                if let Some(cache_write) = parsed.cache_write {
+                    let cache_write_started = Instant::now();
+                    storage
+                        .upsert_index_artifact_cache(
+                            &cache_write.path,
+                            &cache_write.cache_key,
+                            &cache_write.artifact_blob,
+                        )
+                        .map_err(|e| anyhow!("Storage cache write error: {:?}", e))?;
+                    stats.artifact_cache_write_ms = stats
+                        .artifact_cache_write_ms
+                        .saturating_add(duration_ms_u64(cache_write_started.elapsed()));
+                    stats.artifact_cache_writes += 1;
+                }
+
+                let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                event_bus.publish(Event::IndexingProgress {
+                    current,
+                    total: total_files,
+                });
+                chunk_results.push(parsed.local_storage);
+            }
 
             for mut local_storage in chunk_results {
                 all_errors.append(&mut local_storage.errors);
                 if let Some(file_info) = local_storage.files.first()
+                    && plan.mode == codestory_project::BuildMode::Incremental
                     && existing_projection_ids.contains_key(&file_info.path)
                     && replaced_projection_ids.insert(file_info.id)
                 {
@@ -661,11 +856,12 @@ impl WorkspaceIndexer {
                         || batched_storage.edges.len() >= batch_config.edge_batch_size
                         || batched_storage.occurrences.len() >= batch_config.occurrence_batch_size)
                 {
-                    let flush_started = Instant::now();
-                    Self::flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
-                    stats.projection_flush_ms = stats
-                        .projection_flush_ms
-                        .saturating_add(duration_ms_u64(flush_started.elapsed()));
+                    let breakdown = Self::flush_projection_batch(
+                        storage,
+                        &mut batched_storage,
+                        &mut had_edges,
+                    )?;
+                    accumulate_flush_breakdown(&mut stats, breakdown);
                 }
 
                 if all_errors.len() >= batch_config.error_batch_size {
@@ -689,33 +885,26 @@ impl WorkspaceIndexer {
             return Ok(stats);
         }
 
-        let flush_started = Instant::now();
-        Self::flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
-        stats.projection_flush_ms = stats
-            .projection_flush_ms
-            .saturating_add(duration_ms_u64(flush_started.elapsed()));
+        let breakdown =
+            Self::flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
+        accumulate_flush_breakdown(&mut stats, breakdown);
 
         // 3.5 Resolve call/import edges post-pass
         if had_edges {
             let resolver = resolution::ResolutionPass::new();
-            let resolution_scope_file_ids =
-                Self::collect_touched_file_ids(&root, &refresh_info.files_to_index);
-            let resolution_scope =
-                (!resolution_scope_file_ids.is_empty()).then_some(&resolution_scope_file_ids);
+            let resolution_scope_file_ids = if plan.mode == codestory_project::BuildMode::Incremental { Self::collect_touched_file_ids(&root, &plan.files_to_index) } else { Default::default() };
+            let resolution_scope = if plan.mode == codestory_project::BuildMode::Incremental {
+                (!resolution_scope_file_ids.is_empty()).then_some(&resolution_scope_file_ids)
+            } else {
+                None
+            };
             let (unresolved_calls_start, unresolved_imports_start) =
                 resolver.unresolved_counts_with_scope(storage, resolution_scope)?;
-            let unresolved_overrides_start = storage
-                .get_edges()?
-                .into_iter()
-                .filter(|edge| {
-                    edge.kind == EdgeKind::OVERRIDE
-                        && edge.resolved_target.is_none()
-                        && resolution_scope.is_none_or(|scope| {
-                            edge.file_node_id
-                                .is_some_and(|file_id| scope.contains(&file_id.0))
-                        })
-                })
-                .count();
+            let unresolved_overrides_start = resolver.unresolved_edge_count_with_scope(
+                storage,
+                EdgeKind::OVERRIDE,
+                resolution_scope,
+            )?;
             stats.unresolved_calls_start = unresolved_calls_start;
             stats.unresolved_imports_start = unresolved_imports_start;
             let scope_suffix = resolution_scope
@@ -742,6 +931,43 @@ impl WorkspaceIndexer {
                 .telemetry
                 .unresolved_count_start_ms
                 .saturating_add(resolution_stats.telemetry.unresolved_count_end_ms);
+            stats.resolution_override_count_ms =
+                resolution_stats.telemetry.unresolved_override_count_ms;
+            stats.resolution_call_candidate_index_ms =
+                resolution_stats.telemetry.call_candidate_index_ms;
+            stats.resolution_import_candidate_index_ms =
+                resolution_stats.telemetry.import_candidate_index_ms;
+            stats.resolution_call_semantic_index_ms =
+                resolution_stats.telemetry.call_semantic_index_ms;
+            stats.resolution_import_semantic_index_ms =
+                resolution_stats.telemetry.import_semantic_index_ms;
+            stats.resolution_support_snapshot_load_ms =
+                resolution_stats.telemetry.support_snapshot_load_ms;
+            stats.resolution_support_snapshot_store_ms =
+                resolution_stats.telemetry.support_snapshot_store_ms;
+            stats.resolution_support_snapshot_hit = resolution_stats.telemetry.support_snapshot_hit;
+            stats.resolution_call_semantic_candidates_ms =
+                resolution_stats.telemetry.call_semantic_candidates_ms;
+            stats.resolution_import_semantic_candidates_ms =
+                resolution_stats.telemetry.import_semantic_candidates_ms;
+            stats.resolution_call_semantic_requests =
+                resolution_stats.telemetry.call_semantic_requests;
+            stats.resolution_call_semantic_unique_requests =
+                resolution_stats.telemetry.call_semantic_unique_requests;
+            stats.resolution_call_semantic_skipped_requests =
+                resolution_stats.telemetry.call_semantic_skipped_requests;
+            stats.resolution_import_semantic_requests =
+                resolution_stats.telemetry.import_semantic_requests;
+            stats.resolution_import_semantic_unique_requests =
+                resolution_stats.telemetry.import_semantic_unique_requests;
+            stats.resolution_import_semantic_skipped_requests =
+                resolution_stats.telemetry.import_semantic_skipped_requests;
+            stats.resolution_call_compute_ms = resolution_stats.telemetry.call_compute_ms;
+            stats.resolution_import_compute_ms = resolution_stats.telemetry.import_compute_ms;
+            stats.resolution_call_apply_ms = resolution_stats.telemetry.call_apply_ms;
+            stats.resolution_import_apply_ms = resolution_stats.telemetry.import_apply_ms;
+            stats.resolution_override_resolution_ms =
+                resolution_stats.telemetry.override_resolution_ms;
             stats.resolution_calls_ms = resolution_stats
                 .telemetry
                 .call_prepare_ms
@@ -786,10 +1012,12 @@ impl WorkspaceIndexer {
         }
 
         // 4. Cleanup removed files
-        if !refresh_info.files_to_remove.is_empty() {
+        if plan.mode == codestory_project::BuildMode::Incremental
+            && !plan.files_to_remove.is_empty()
+        {
             let cleanup_started = Instant::now();
             storage
-                .delete_files_batch(&refresh_info.files_to_remove)
+                .delete_files_batch(&plan.files_to_remove)
                 .map_err(|e| anyhow!("Storage cleanup error: {:?}", e))?;
             stats.cleanup_ms = stats
                 .cleanup_ms
@@ -806,12 +1034,26 @@ impl WorkspaceIndexer {
             .unwrap_or(false)
     }
 
-    fn seed_symbol_table(storage: &Storage, symbol_table: &SymbolTable) {
-        if let Ok(nodes) = storage.get_nodes() {
-            for node in nodes {
-                symbol_table.insert(node.id.0, node.kind);
-            }
+    fn seed_symbol_table(
+        storage: &Storage,
+        symbol_table: &SymbolTable,
+        mode: codestory_project::BuildMode,
+        existing_projection_ids: &HashMap<PathBuf, i64>,
+    ) -> Result<()> {
+        if mode == codestory_project::BuildMode::FullRefresh {
+            return Ok(());
         }
+        let file_ids = existing_projection_ids
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        let node_kinds = storage
+            .get_node_kinds_for_files(&file_ids)
+            .map_err(|e| anyhow!("Storage symbol seed error: {:?}", e))?;
+        for (node_id, kind) in node_kinds {
+            symbol_table.insert(node_id.0, kind);
+        }
+        Ok(())
     }
 
     fn collect_touched_file_ids(root: &Path, files_to_index: &[PathBuf]) -> HashSet<i64> {
@@ -838,15 +1080,18 @@ impl WorkspaceIndexer {
         storage: &Storage,
         root: &Path,
         files_to_index: &[PathBuf],
-    ) -> HashMap<PathBuf, i64> {
-        let mut out = HashMap::new();
-        for path in files_to_index {
-            let full_path = Self::normalize_index_path(root, path);
-            if let Ok(Some(file_info)) = storage.get_file_by_path(&full_path) {
-                out.insert(file_info.path, file_info.id);
-            }
-        }
-        out
+    ) -> Result<HashMap<PathBuf, i64>> {
+        let normalized_paths = files_to_index
+            .iter()
+            .map(|path| Self::normalize_index_path(root, path))
+            .collect::<Vec<_>>();
+        let files = storage
+            .get_files_by_paths(&normalized_paths)
+            .map_err(|e| anyhow!("Storage path lookup error: {:?}", e))?;
+        Ok(files
+            .into_iter()
+            .map(|(path, file_info)| (path, file_info.id))
+            .collect())
     }
 
     fn canonical_file_node_id_for_path(path: &Path) -> i64 {
@@ -866,11 +1111,9 @@ impl WorkspaceIndexer {
 
         let take_count = errors.len().min(error_batch_size.max(1));
         let drain = errors.drain(..take_count).collect::<Vec<_>>();
-        for error in drain {
-            storage
-                .insert_error(&error)
-                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
-        }
+        storage
+            .insert_errors_batch(&drain)
+            .map_err(|e| anyhow!("Storage error: {:?}", e))?;
 
         Ok(())
     }
@@ -879,53 +1122,36 @@ impl WorkspaceIndexer {
         storage: &mut Storage,
         batched_storage: &mut IntermediateStorage,
         had_edges: &mut bool,
-    ) -> Result<()> {
+    ) -> Result<codestory_storage::ProjectionFlushBreakdown> {
         reconcile_rust_impl_anchors(storage, batched_storage)?;
-        if !batched_storage.files.is_empty() {
-            storage
-                .insert_files_batch(&batched_storage.files)
-                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
-        }
-        if !batched_storage.nodes.is_empty() {
-            storage
-                .insert_nodes_batch(&batched_storage.nodes)
-                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
-        }
+        let breakdown = storage
+            .flush_projection_batch(codestory_storage::ProjectionBatch {
+                files: &batched_storage.files,
+                nodes: &batched_storage.nodes,
+                edges: &batched_storage.edges,
+                occurrences: &batched_storage.occurrences,
+                component_access: &batched_storage.component_access,
+                callable_projection_states: &batched_storage.callable_projection_states,
+            })
+            .map_err(|e| anyhow!("Storage error: {:?}", e))?;
         if !batched_storage.edges.is_empty() {
-            storage
-                .insert_edges_batch(&batched_storage.edges)
-                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
             *had_edges = true;
-        }
-        if !batched_storage.occurrences.is_empty() {
-            storage
-                .insert_occurrences_batch(&batched_storage.occurrences)
-                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
-        }
-        if !batched_storage.component_access.is_empty() {
-            storage
-                .insert_component_access_batch(&batched_storage.component_access)
-                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
-        }
-        if !batched_storage.callable_projection_states.is_empty() {
-            storage
-                .upsert_callable_projection_states(&batched_storage.callable_projection_states)
-                .map_err(|e| anyhow!("Storage error: {:?}", e))?;
         }
 
         batched_storage.clear();
-        Ok(())
+        Ok(breakdown)
     }
 
-    fn index_path(
+    fn prepare_index_work(
         &self,
+        storage: &Storage,
         path: &PathBuf,
         root: &Path,
+        existing_projection_id: Option<i64>,
         symbol_table: &Arc<SymbolTable>,
-    ) -> IntermediateStorage {
+        stats: &mut IncrementalIndexingStats,
+    ) -> std::result::Result<PreparedIndexWork, IntermediateStorage> {
         let full_path = Self::normalize_index_path(root, path);
-
-        let mut local_storage = IntermediateStorage::default();
         let compilation_info = self
             .compilation_db
             .as_ref()
@@ -933,48 +1159,13 @@ impl WorkspaceIndexer {
         let Some(language_config) =
             get_language_config_for_path(&full_path, compilation_info.as_ref())
         else {
-            return local_storage;
+            return Ok(PreparedIndexWork::Immediate(IntermediateStorage::default()));
         };
 
-        match std::fs::read(&full_path) {
-            Ok(bytes) => {
-                // Some third-party/vendor sources contain legacy bytes but are still parseable enough
-                // for indexing once we decode them lossily.
-                let source = String::from_utf8_lossy(&bytes).into_owned();
-                match index_file(
-                    &full_path,
-                    &source,
-                    &language_config,
-                    compilation_info,
-                    Some(Arc::clone(symbol_table)),
-                ) {
-                    Ok(index_result) => {
-                        local_storage.files = index_result.files;
-                        local_storage.nodes = index_result.nodes;
-                        local_storage.edges = index_result.edges;
-                        local_storage.occurrences = index_result.occurrences;
-                        local_storage.component_access = index_result.component_access;
-                        local_storage.callable_projection_states =
-                            index_result.callable_projection_states;
-                        local_storage.impl_anchor_node_ids = index_result.impl_anchor_node_ids;
-                    }
-                    Err(e) => {
-                        local_storage.add_error(codestory_core::ErrorInfo {
-                            message: format!(
-                                "Failed to index {:?}: {}",
-                                full_path.strip_prefix(root).unwrap_or(&full_path),
-                                e
-                            ),
-                            file_id: None,
-                            line: None,
-                            column: None,
-                            is_fatal: false,
-                            index_step: codestory_core::IndexStep::Indexing,
-                        });
-                    }
-                }
-            }
+        let bytes = match std::fs::read(&full_path) {
+            Ok(bytes) => bytes,
             Err(e) => {
+                let mut local_storage = IntermediateStorage::default();
                 local_storage.add_error(codestory_core::ErrorInfo {
                     message: format!("Failed to read {:?}: {}", path, e),
                     file_id: None,
@@ -983,15 +1174,187 @@ impl WorkspaceIndexer {
                     is_fatal: true,
                     index_step: codestory_core::IndexStep::Collection,
                 });
+                return Err(local_storage);
+            }
+        };
+        // Some third-party/vendor sources contain legacy bytes but are still parseable enough
+        // for indexing once we decode them lossily.
+        let source = String::from_utf8_lossy(&bytes).into_owned();
+        let flags = index_feature_flags();
+        let artifact_cache_key = build_index_artifact_cache_key(
+            &full_path,
+            &bytes,
+            &language_config,
+            compilation_info.as_ref(),
+            flags.legacy_edge_identity,
+            flags.lazy_graph_execution,
+        );
+
+        match storage.get_index_artifact_cache(&full_path, &artifact_cache_key) {
+            Ok(Some(blob)) => match serde_json::from_slice::<CachedIndexArtifact>(&blob) {
+                Ok(mut artifact) => {
+                    if let Some(file_info) = artifact.files.first_mut() {
+                        file_info.modification_time = file_modification_time(&full_path);
+                        file_info.path = full_path.clone();
+                    }
+                    stats.artifact_cache_hits += 1;
+                    if existing_projection_id.is_some() {
+                        if let Some(file_info) = artifact.files.first()
+                            && let Err(error) = storage.update_file_metadata(file_info) {
+                                let mut local_storage = IntermediateStorage::default();
+                                local_storage.add_error(codestory_core::ErrorInfo {
+                                    message: format!(
+                                        "Failed to refresh cached file metadata for {:?}: {:?}",
+                                        full_path, error
+                                    ),
+                                    file_id: None,
+                                    line: None,
+                                    column: None,
+                                    is_fatal: false,
+                                    index_step: codestory_core::IndexStep::Indexing,
+                                });
+                                return Err(local_storage);
+                            }
+                        return Ok(PreparedIndexWork::Immediate(IntermediateStorage::default()));
+                    }
+                    Self::seed_symbol_table_from_nodes(symbol_table, &artifact.nodes);
+                    Ok(PreparedIndexWork::Immediate(
+                        artifact.into_intermediate_storage(),
+                    ))
+                }
+                Err(_) => {
+                    stats.artifact_cache_invalid_entries += 1;
+                    stats.artifact_cache_misses += 1;
+                    Ok(PreparedIndexWork::Parse(PreparedIndexInput {
+                        full_path,
+                        source,
+                        compilation_info,
+                        language_config,
+                        artifact_cache_key,
+                    }))
+                }
+            },
+            Ok(None) => {
+                stats.artifact_cache_misses += 1;
+                Ok(PreparedIndexWork::Parse(PreparedIndexInput {
+                    full_path,
+                    source,
+                    compilation_info,
+                    language_config,
+                    artifact_cache_key,
+                }))
+            }
+            Err(_) => {
+                stats.artifact_cache_misses += 1;
+                Ok(PreparedIndexWork::Parse(PreparedIndexInput {
+                    full_path,
+                    source,
+                    compilation_info,
+                    language_config,
+                    artifact_cache_key,
+                }))
             }
         }
-
-        local_storage
     }
+
+    fn execute_prepared_index(
+        &self,
+        prepared_input: &PreparedIndexInput,
+        symbol_table: &Arc<SymbolTable>,
+    ) -> PreparedIndexJobResult {
+        let mut local_storage = IntermediateStorage::default();
+        match index_file(
+            &prepared_input.full_path,
+            &prepared_input.source,
+            &prepared_input.language_config,
+            prepared_input.compilation_info.clone(),
+            Some(Arc::clone(symbol_table)),
+        ) {
+            Ok(index_result) => {
+                let artifact = CachedIndexArtifact::from_index_result(index_result);
+                let cache_write =
+                    serde_json::to_vec(&artifact)
+                        .ok()
+                        .map(|artifact_blob| ArtifactCacheWrite {
+                            path: prepared_input.full_path.clone(),
+                            cache_key: prepared_input.artifact_cache_key.clone(),
+                            artifact_blob,
+                        });
+                local_storage = artifact.into_intermediate_storage();
+                PreparedIndexJobResult {
+                    local_storage,
+                    cache_write,
+                }
+            }
+            Err(e) => {
+                local_storage.add_error(codestory_core::ErrorInfo {
+                    message: format!("Failed to index {:?}: {}", prepared_input.full_path, e),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: codestory_core::IndexStep::Indexing,
+                });
+                PreparedIndexJobResult {
+                    local_storage,
+                    cache_write: None,
+                }
+            }
+        }
+    }
+
+    fn seed_symbol_table_from_nodes(symbol_table: &SymbolTable, nodes: &[Node]) {
+        for node in nodes {
+            symbol_table.insert(node.id.0, node.kind);
+        }
+    }
+}
+
+fn file_modification_time(path: &Path) -> i64 {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map(|system_time| {
+            system_time
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64
+        })
+        .unwrap_or(0)
 }
 
 fn duration_ms_u64(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn accumulate_flush_breakdown(
+    stats: &mut IncrementalIndexingStats,
+    breakdown: codestory_storage::ProjectionFlushBreakdown,
+) {
+    let total = u64::from(breakdown.files_ms)
+        .saturating_add(u64::from(breakdown.nodes_ms))
+        .saturating_add(u64::from(breakdown.edges_ms))
+        .saturating_add(u64::from(breakdown.occurrences_ms))
+        .saturating_add(u64::from(breakdown.component_access_ms))
+        .saturating_add(u64::from(breakdown.callable_projection_ms));
+    stats.projection_flush_ms = stats.projection_flush_ms.saturating_add(total);
+    stats.flush_files_ms = stats
+        .flush_files_ms
+        .saturating_add(u64::from(breakdown.files_ms));
+    stats.flush_nodes_ms = stats
+        .flush_nodes_ms
+        .saturating_add(u64::from(breakdown.nodes_ms));
+    stats.flush_edges_ms = stats
+        .flush_edges_ms
+        .saturating_add(u64::from(breakdown.edges_ms));
+    stats.flush_occurrences_ms = stats
+        .flush_occurrences_ms
+        .saturating_add(u64::from(breakdown.occurrences_ms));
+    stats.flush_component_access_ms = stats
+        .flush_component_access_ms
+        .saturating_add(u64::from(breakdown.component_access_ms));
+    stats.flush_callable_projection_ms = stats
+        .flush_callable_projection_ms
+        .saturating_add(u64::from(breakdown.callable_projection_ms));
 }
 
 fn file_node_from_source(path: &Path, source: &str) -> (Node, String, NodeId) {
@@ -5356,8 +5719,10 @@ function globalFunc() {}
 
         // Create RefreshInfo manually
         let refresh_info = RefreshInfo {
+            mode: codestory_project::BuildMode::Incremental,
             files_to_index: vec![f1.clone()],
             files_to_remove: vec![],
+            existing_file_ids: std::collections::HashMap::new(),
         };
 
         indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
@@ -5422,8 +5787,10 @@ function globalFunc() {}
         );
 
         let refresh_info = RefreshInfo {
+            mode: codestory_project::BuildMode::Incremental,
             files_to_index: files,
             files_to_remove: vec![],
+            existing_file_ids: std::collections::HashMap::new(),
         };
 
         indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
@@ -5466,8 +5833,10 @@ function globalFunc() {}
         let bus = EventBus::new();
         let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
         let refresh_info = RefreshInfo {
+            mode: codestory_project::BuildMode::Incremental,
             files_to_index: vec![f1.clone()],
             files_to_remove: vec![],
+            existing_file_ids: std::collections::HashMap::new(),
         };
 
         indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
@@ -5976,8 +6345,10 @@ class Test {
         let rx = bus.receiver();
         let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
         let refresh_info = RefreshInfo {
+            mode: codestory_project::BuildMode::Incremental,
             files_to_index: vec![file],
             files_to_remove: vec![],
+            existing_file_ids: std::collections::HashMap::new(),
         };
 
         indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;

@@ -14,12 +14,22 @@ pub(super) fn compute_call_resolution(
     let mut candidate_ids = OrderedCandidateIds::with_capacity(8);
 
     for candidate in semantic_candidates {
-        candidate_ids.push(candidate.target_node_id);
-        consider_selected(
-            &mut semantic_fallback,
-            candidate.target_node_id,
-            candidate.confidence,
-        );
+        if pass.flags.store_candidates {
+            candidate_ids.push(candidate.target_node_id);
+        }
+        if !is_common_unqualified
+            || should_keep_common_call_resolution(
+                &prepared_name.original,
+                candidate.confidence,
+                callsite_identity.as_deref(),
+            )
+        {
+            consider_selected(
+                &mut semantic_fallback,
+                candidate.target_node_id,
+                candidate.confidence,
+            );
+        }
     }
 
     if selected.is_none()
@@ -30,7 +40,9 @@ pub(super) fn compute_call_resolution(
             &prepared_name.ascii_lower,
         )
     {
-        candidate_ids.push(candidate);
+        if pass.flags.store_candidates {
+            candidate_ids.push(candidate);
+        }
         selected = Some((
             candidate,
             pass.policy.call_same_file,
@@ -39,6 +51,7 @@ pub(super) fn compute_call_resolution(
     }
 
     if selected.is_none()
+        && (!is_common_unqualified || pass.flags.store_candidates)
         && let Some(prefix) = caller_qualified.as_deref().and_then(module_prefix)
         && let Some(candidate) = candidate_index.find_same_module_readonly(
             &prefix.0,
@@ -47,12 +60,16 @@ pub(super) fn compute_call_resolution(
             &prepared_name.ascii_lower,
         )
     {
-        candidate_ids.push(candidate);
-        selected = Some((
-            candidate,
-            pass.policy.call_same_module,
-            ResolutionStrategy::CallSameModule,
-        ));
+        if pass.flags.store_candidates {
+            candidate_ids.push(candidate);
+        }
+        if !is_common_unqualified {
+            selected = Some((
+                candidate,
+                pass.policy.call_same_module,
+                ResolutionStrategy::CallSameModule,
+            ));
+        }
     }
 
     if selected.is_none()
@@ -60,7 +77,9 @@ pub(super) fn compute_call_resolution(
         && let Some(candidate) = candidate_index
             .find_global_unique_readonly(&prepared_name.original, &prepared_name.ascii_lower)
     {
-        candidate_ids.push(candidate);
+        if pass.flags.store_candidates {
+            candidate_ids.push(candidate);
+        }
         selected = Some((
             candidate,
             pass.policy.call_global_unique,
@@ -120,7 +139,9 @@ pub(super) fn compute_import_resolution(
     let mut semantic_fallback: Option<(i64, f32)> = None;
     let mut candidate_ids = OrderedCandidateIds::with_capacity(10);
     for candidate in semantic_candidates {
-        candidate_ids.push(candidate.target_node_id);
+        if pass.flags.store_candidates {
+            candidate_ids.push(candidate.target_node_id);
+        }
         consider_selected(
             &mut semantic_fallback,
             candidate.target_node_id,
@@ -184,11 +205,17 @@ pub(super) fn compute_import_resolution(
                 fuzzy_selected = Some(candidate);
             }
         }
+
+        if same_module_selected.is_some() || global_selected.is_some() || fuzzy_selected.is_some() {
+            break;
+        }
     }
 
     if pass.flags.legacy_mode && same_file_selected.is_some() {
-        candidate_ids.extend_stage(&same_file_stage.into_vec(), usize::MAX);
-    } else {
+        if pass.flags.store_candidates {
+            candidate_ids.extend_stage(&same_file_stage.into_vec(), usize::MAX);
+        }
+    } else if pass.flags.store_candidates {
         candidate_ids.extend_stage(&same_module_stage.into_vec(), usize::MAX);
         if same_module_selected.is_none() {
             candidate_ids.extend_stage(&global_stage.into_vec(), usize::MAX);
@@ -250,4 +277,144 @@ pub(super) fn compute_import_resolution(
     let selected_pair = selected.map(|(candidate, confidence, _)| (candidate, confidence));
     let update = build_resolved_edge_update(*edge_id, selected_pair, candidate_ids.as_slice())?;
     Ok(ComputedResolution { update, strategy })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codestory_core::NodeKind;
+    use rusqlite::{Connection, params};
+
+    fn create_node_table(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE node (
+                id INTEGER PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                serialized_name TEXT NOT NULL,
+                qualified_name TEXT,
+                file_node_id INTEGER,
+                start_line INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        Ok(())
+    }
+
+    fn insert_callable(
+        conn: &Connection,
+        id: i64,
+        serialized_name: &str,
+        qualified_name: &str,
+        file_node_id: i64,
+        start_line: i64,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                id,
+                NodeKind::FUNCTION as i32,
+                serialized_name,
+                qualified_name,
+                file_node_id,
+                start_line
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn call_row(
+        edge_id: i64,
+        file_id: i64,
+        caller_qualified: &str,
+        target_name: &str,
+        callsite_identity: Option<&str>,
+    ) -> UnresolvedEdgeRow {
+        (
+            edge_id,
+            Some(file_id),
+            Some(caller_qualified.to_string()),
+            "caller".to_string(),
+            target_name.to_string(),
+            Some("src/main.ts".to_string()),
+            callsite_identity.map(str::to_string),
+        )
+    }
+
+    fn resolution_pass(store_candidates: bool) -> ResolutionPass {
+        let flags = ResolutionFlags {
+            legacy_mode: false,
+            enable_semantic: true,
+            store_candidates,
+            parallel_compute: false,
+        };
+        ResolutionPass {
+            flags,
+            policy: ResolutionPolicy::for_flags(flags),
+            semantic_resolvers: SemanticResolverRegistry::new(flags.enable_semantic),
+        }
+    }
+
+    #[test]
+    fn common_name_same_module_only_stays_unresolved() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        insert_callable(&conn, 10, "clone", "pkg::core::clone", 1, 1)?;
+
+        let index = CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
+        let row = call_row(1, 1, "pkg::core::caller", "clone", Some("1:1:1:1"));
+        let computed = compute_call_resolution(&resolution_pass(false), &index, &row, &[])?;
+
+        assert_eq!(computed.strategy, None);
+        assert_eq!(computed.update.resolved_target_node_id, None);
+        Ok(())
+    }
+
+    #[test]
+    fn common_name_certain_semantic_candidate_with_callsite_resolves() -> Result<()> {
+        let row = call_row(2, 1, "pkg::core::caller", "clone", Some("1:1:1:1"));
+        let computed = compute_call_resolution(
+            &resolution_pass(false),
+            &CandidateIndex::default(),
+            &row,
+            &[SemanticResolutionCandidate {
+                target_node_id: 88,
+                confidence: ResolutionCertainty::CERTAIN_MIN,
+            }],
+        )?;
+
+        assert_eq!(
+            computed.strategy,
+            Some(ResolutionStrategy::CallSemanticFallback)
+        );
+        assert_eq!(computed.update.resolved_target_node_id, Some(88));
+        Ok(())
+    }
+
+    #[test]
+    fn common_name_candidate_payload_keeps_semantic_and_index_candidates() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        insert_callable(&conn, 10, "clone", "pkg::core::clone", 1, 1)?;
+
+        let index = CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
+        let row = call_row(3, 1, "pkg::core::caller", "clone", Some("1:1:1:1"));
+        let computed = compute_call_resolution(
+            &resolution_pass(true),
+            &index,
+            &row,
+            &[SemanticResolutionCandidate {
+                target_node_id: 88,
+                confidence: 0.70,
+            }],
+        )?;
+
+        assert_eq!(computed.strategy, None);
+        let payload = computed
+            .update
+            .candidate_payload
+            .expect("candidate payload should be stored");
+        let parsed: Vec<i64> = serde_json::from_str(&payload)?;
+        assert_eq!(parsed, vec![88, 10]);
+        Ok(())
+    }
 }

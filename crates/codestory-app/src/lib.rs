@@ -373,10 +373,36 @@ fn build_local_agent_prompt(
 
 #[derive(Debug, Clone, Default)]
 struct OptionalResolutionTelemetry {
+    setup_existing_projection_ids_ms: Option<u32>,
+    setup_seed_symbol_table_ms: Option<u32>,
+    flush_files_ms: Option<u32>,
+    flush_nodes_ms: Option<u32>,
+    flush_edges_ms: Option<u32>,
+    flush_occurrences_ms: Option<u32>,
+    flush_component_access_ms: Option<u32>,
+    flush_callable_projection_ms: Option<u32>,
+    resolution_override_count_ms: Option<u32>,
     resolution_unresolved_counts_ms: Option<u32>,
     resolution_calls_ms: Option<u32>,
     resolution_imports_ms: Option<u32>,
     resolution_cleanup_ms: Option<u32>,
+    resolution_call_candidate_index_ms: Option<u32>,
+    resolution_import_candidate_index_ms: Option<u32>,
+    resolution_call_semantic_index_ms: Option<u32>,
+    resolution_import_semantic_index_ms: Option<u32>,
+    resolution_call_semantic_candidates_ms: Option<u32>,
+    resolution_import_semantic_candidates_ms: Option<u32>,
+    resolution_call_semantic_requests: Option<u32>,
+    resolution_call_semantic_unique_requests: Option<u32>,
+    resolution_call_semantic_skipped_requests: Option<u32>,
+    resolution_import_semantic_requests: Option<u32>,
+    resolution_import_semantic_unique_requests: Option<u32>,
+    resolution_import_semantic_skipped_requests: Option<u32>,
+    resolution_call_compute_ms: Option<u32>,
+    resolution_import_compute_ms: Option<u32>,
+    resolution_call_apply_ms: Option<u32>,
+    resolution_import_apply_ms: Option<u32>,
+    resolution_override_resolution_ms: Option<u32>,
     resolved_calls_same_file: Option<u32>,
     resolved_calls_same_module: Option<u32>,
     resolved_calls_global_unique: Option<u32>,
@@ -390,40 +416,133 @@ struct OptionalResolutionTelemetry {
 
 impl OptionalResolutionTelemetry {
     fn from_incremental_stats(index_stats: &codestory_index::IncrementalIndexingStats) -> Self {
+        let mut telemetry = Self {
+            setup_existing_projection_ids_ms: Some(clamp_u64_to_u32(
+                index_stats.setup_existing_projection_ids_ms,
+            )),
+            setup_seed_symbol_table_ms: Some(clamp_u64_to_u32(
+                index_stats.setup_seed_symbol_table_ms,
+            )),
+            flush_files_ms: Some(clamp_u64_to_u32(index_stats.flush_files_ms)),
+            flush_nodes_ms: Some(clamp_u64_to_u32(index_stats.flush_nodes_ms)),
+            flush_edges_ms: Some(clamp_u64_to_u32(index_stats.flush_edges_ms)),
+            flush_occurrences_ms: Some(clamp_u64_to_u32(index_stats.flush_occurrences_ms)),
+            flush_component_access_ms: Some(clamp_u64_to_u32(
+                index_stats.flush_component_access_ms,
+            )),
+            flush_callable_projection_ms: Some(clamp_u64_to_u32(
+                index_stats.flush_callable_projection_ms,
+            )),
+            resolution_override_count_ms: None,
+            resolution_unresolved_counts_ms: None,
+            resolution_calls_ms: None,
+            resolution_imports_ms: None,
+            resolution_cleanup_ms: None,
+            resolution_call_candidate_index_ms: None,
+            resolution_import_candidate_index_ms: None,
+            resolution_call_semantic_index_ms: None,
+            resolution_import_semantic_index_ms: None,
+            resolution_call_semantic_candidates_ms: None,
+            resolution_import_semantic_candidates_ms: None,
+            resolution_call_semantic_requests: None,
+            resolution_call_semantic_unique_requests: None,
+            resolution_call_semantic_skipped_requests: None,
+            resolution_import_semantic_requests: None,
+            resolution_import_semantic_unique_requests: None,
+            resolution_import_semantic_skipped_requests: None,
+            resolution_call_compute_ms: None,
+            resolution_import_compute_ms: None,
+            resolution_call_apply_ms: None,
+            resolution_import_apply_ms: None,
+            resolution_override_resolution_ms: None,
+            resolved_calls_same_file: None,
+            resolved_calls_same_module: None,
+            resolved_calls_global_unique: None,
+            resolved_calls_semantic: None,
+            resolved_imports_same_file: None,
+            resolved_imports_same_module: None,
+            resolved_imports_global_unique: None,
+            resolved_imports_fuzzy: None,
+            resolved_imports_semantic: None,
+        };
         if !index_stats.resolution_ran {
-            return Self::default();
+            return telemetry;
         }
-        Self {
-            resolution_unresolved_counts_ms: Some(clamp_u64_to_u32(
-                index_stats.resolution_unresolved_counts_ms,
-            )),
-            resolution_calls_ms: Some(clamp_u64_to_u32(index_stats.resolution_calls_ms)),
-            resolution_imports_ms: Some(clamp_u64_to_u32(index_stats.resolution_imports_ms)),
-            resolution_cleanup_ms: Some(clamp_u64_to_u32(index_stats.resolution_cleanup_ms)),
-            resolved_calls_same_file: Some(clamp_usize_to_u32(
-                index_stats.resolved_calls_same_file,
-            )),
-            resolved_calls_same_module: Some(clamp_usize_to_u32(
-                index_stats.resolved_calls_same_module,
-            )),
-            resolved_calls_global_unique: Some(clamp_usize_to_u32(
-                index_stats.resolved_calls_global_unique,
-            )),
-            resolved_calls_semantic: Some(clamp_usize_to_u32(index_stats.resolved_calls_semantic)),
-            resolved_imports_same_file: Some(clamp_usize_to_u32(
-                index_stats.resolved_imports_same_file,
-            )),
-            resolved_imports_same_module: Some(clamp_usize_to_u32(
-                index_stats.resolved_imports_same_module,
-            )),
-            resolved_imports_global_unique: Some(clamp_usize_to_u32(
-                index_stats.resolved_imports_global_unique,
-            )),
-            resolved_imports_fuzzy: Some(clamp_usize_to_u32(index_stats.resolved_imports_fuzzy)),
-            resolved_imports_semantic: Some(clamp_usize_to_u32(
-                index_stats.resolved_imports_semantic,
-            )),
-        }
+        telemetry.resolution_override_count_ms =
+            Some(clamp_u64_to_u32(index_stats.resolution_override_count_ms));
+        telemetry.resolution_unresolved_counts_ms = Some(clamp_u64_to_u32(
+            index_stats.resolution_unresolved_counts_ms,
+        ));
+        telemetry.resolution_calls_ms = Some(clamp_u64_to_u32(index_stats.resolution_calls_ms));
+        telemetry.resolution_imports_ms = Some(clamp_u64_to_u32(index_stats.resolution_imports_ms));
+        telemetry.resolution_cleanup_ms = Some(clamp_u64_to_u32(index_stats.resolution_cleanup_ms));
+        telemetry.resolution_call_candidate_index_ms = Some(clamp_u64_to_u32(
+            index_stats.resolution_call_candidate_index_ms,
+        ));
+        telemetry.resolution_import_candidate_index_ms = Some(clamp_u64_to_u32(
+            index_stats.resolution_import_candidate_index_ms,
+        ));
+        telemetry.resolution_call_semantic_index_ms = Some(clamp_u64_to_u32(
+            index_stats.resolution_call_semantic_index_ms,
+        ));
+        telemetry.resolution_import_semantic_index_ms = Some(clamp_u64_to_u32(
+            index_stats.resolution_import_semantic_index_ms,
+        ));
+        telemetry.resolution_call_semantic_candidates_ms = Some(clamp_u64_to_u32(
+            index_stats.resolution_call_semantic_candidates_ms,
+        ));
+        telemetry.resolution_import_semantic_candidates_ms = Some(clamp_u64_to_u32(
+            index_stats.resolution_import_semantic_candidates_ms,
+        ));
+        telemetry.resolution_call_semantic_requests = Some(clamp_usize_to_u32(
+            index_stats.resolution_call_semantic_requests,
+        ));
+        telemetry.resolution_call_semantic_unique_requests = Some(clamp_usize_to_u32(
+            index_stats.resolution_call_semantic_unique_requests,
+        ));
+        telemetry.resolution_call_semantic_skipped_requests = Some(clamp_usize_to_u32(
+            index_stats.resolution_call_semantic_skipped_requests,
+        ));
+        telemetry.resolution_import_semantic_requests = Some(clamp_usize_to_u32(
+            index_stats.resolution_import_semantic_requests,
+        ));
+        telemetry.resolution_import_semantic_unique_requests = Some(clamp_usize_to_u32(
+            index_stats.resolution_import_semantic_unique_requests,
+        ));
+        telemetry.resolution_import_semantic_skipped_requests = Some(clamp_usize_to_u32(
+            index_stats.resolution_import_semantic_skipped_requests,
+        ));
+        telemetry.resolution_call_compute_ms =
+            Some(clamp_u64_to_u32(index_stats.resolution_call_compute_ms));
+        telemetry.resolution_import_compute_ms =
+            Some(clamp_u64_to_u32(index_stats.resolution_import_compute_ms));
+        telemetry.resolution_call_apply_ms =
+            Some(clamp_u64_to_u32(index_stats.resolution_call_apply_ms));
+        telemetry.resolution_import_apply_ms =
+            Some(clamp_u64_to_u32(index_stats.resolution_import_apply_ms));
+        telemetry.resolution_override_resolution_ms = Some(clamp_u64_to_u32(
+            index_stats.resolution_override_resolution_ms,
+        ));
+        telemetry.resolved_calls_same_file =
+            Some(clamp_usize_to_u32(index_stats.resolved_calls_same_file));
+        telemetry.resolved_calls_same_module =
+            Some(clamp_usize_to_u32(index_stats.resolved_calls_same_module));
+        telemetry.resolved_calls_global_unique =
+            Some(clamp_usize_to_u32(index_stats.resolved_calls_global_unique));
+        telemetry.resolved_calls_semantic =
+            Some(clamp_usize_to_u32(index_stats.resolved_calls_semantic));
+        telemetry.resolved_imports_same_file =
+            Some(clamp_usize_to_u32(index_stats.resolved_imports_same_file));
+        telemetry.resolved_imports_same_module =
+            Some(clamp_usize_to_u32(index_stats.resolved_imports_same_module));
+        telemetry.resolved_imports_global_unique = Some(clamp_usize_to_u32(
+            index_stats.resolved_imports_global_unique,
+        ));
+        telemetry.resolved_imports_fuzzy =
+            Some(clamp_usize_to_u32(index_stats.resolved_imports_fuzzy));
+        telemetry.resolved_imports_semantic =
+            Some(clamp_usize_to_u32(index_stats.resolved_imports_semantic));
+        telemetry
     }
 }
 
@@ -934,6 +1053,31 @@ impl AppController {
         s.search_engine = None;
     }
 
+    fn ensure_search_state(&self) -> Result<(), ApiError> {
+        {
+            let s = self.state.lock();
+            if s.search_engine.is_some() {
+                return Ok(());
+            }
+        }
+
+        let storage_path = self.require_storage_path()?;
+        let mut storage = Storage::open(&storage_path)
+            .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
+        let nodes = storage
+            .get_nodes()
+            .map_err(|e| ApiError::internal(format!("Failed to load nodes: {e}")))?;
+        let (node_names, engine) = build_search_state(&mut storage, nodes, None)?;
+
+        let mut s = self.state.lock();
+        if s.search_engine.is_none() {
+            s.node_names = node_names;
+            s.search_engine = Some(engine);
+        }
+
+        Ok(())
+    }
+
     fn file_path_for_node(
         storage: &Storage,
         node: &codestory_core::Node,
@@ -1254,23 +1398,9 @@ impl AppController {
             };
 
             match result {
-                Ok(mut summary) => {
-                    let _ = events_tx.send(AppEventPayload::StatusUpdate {
-                        message: "Indexing finished. Refreshing caches...".to_string(),
-                    });
-                    let cache_started = std::time::Instant::now();
-                    if let Ok(mut storage) = Storage::open(&storage_path) {
-                        refresh_caches(
-                            &controller,
-                            &mut storage,
-                            summary.llm_refresh_scope.as_ref(),
-                        );
-                        summary.phase_timings.cache_refresh_ms =
-                            Some(clamp_u128_to_u32(cache_started.elapsed().as_millis()));
-                    } else {
-                        controller.state.lock().is_indexing = false;
-                    }
-
+                Ok(summary) => {
+                    controller.clear_search_state();
+                    controller.state.lock().is_indexing = false;
                     let _ = events_tx.send(AppEventPayload::IndexingComplete {
                         duration_ms: clamp_u128_to_u32(indexing_started.elapsed().as_millis()),
                         phase_timings: summary.phase_timings,
@@ -1278,11 +1408,8 @@ impl AppController {
                 }
                 Err(err) => {
                     let _ = events_tx.send(AppEventPayload::IndexingFailed { error: err.message });
-                    if let Ok(mut storage) = Storage::open(&storage_path) {
-                        refresh_caches(&controller, &mut storage, None);
-                    } else {
-                        controller.state.lock().is_indexing = false;
-                    }
+                    controller.clear_search_state();
+                    controller.state.lock().is_indexing = false;
                 }
             }
         });
@@ -1358,6 +1485,7 @@ impl AppController {
     }
 
     pub fn search(&self, req: SearchRequest) -> Result<Vec<SearchHit>, ApiError> {
+        self.ensure_search_state()?;
         let (matches, node_names) = {
             let mut s = self.state.lock();
             let engine = s.search_engine.as_mut().ok_or_else(|| {
@@ -1481,6 +1609,7 @@ impl AppController {
         max_results: usize,
         request_weights: Option<AgentHybridWeightsDto>,
     ) -> Result<Vec<HybridSearchScoredHit>, ApiError> {
+        self.ensure_search_state()?;
         let hybrid_enabled = hybrid_retrieval_enabled();
         let storage = self.open_storage()?;
         let mut graph_boosts = HashMap::<codestory_core::NodeId, f32>::new();
@@ -1583,6 +1712,7 @@ impl AppController {
         &self,
         req: ListRootSymbolsRequest,
     ) -> Result<Vec<SymbolSummaryDto>, ApiError> {
+        self.ensure_search_state()?;
         let storage = self.open_storage()?;
 
         let mut roots = storage
@@ -1608,6 +1738,7 @@ impl AppController {
         &self,
         req: ListChildrenSymbolsRequest,
     ) -> Result<Vec<SymbolSummaryDto>, ApiError> {
+        self.ensure_search_state()?;
         let parent_id = req.parent_id.to_core()?;
         let storage = self.open_storage()?;
 
@@ -2012,10 +2143,139 @@ fn index_full(
     storage_path: &Path,
     events_tx: &Sender<AppEventPayload>,
 ) -> Result<IndexingRunSummary, ApiError> {
-    run_indexing_common(root, storage_path, events_tx, true, |project, _storage| {
-        project
-            .full_refresh()
-            .map_err(|e| ApiError::internal(format!("Failed to collect files: {e}")))
+    let project = codestory_project::Project::open(root.to_path_buf())
+        .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
+    let execution_plan = project
+        .full_refresh_execution_plan()
+        .map_err(|e| ApiError::internal(format!("Failed to collect files: {e}")))?;
+
+    let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
+    let _ = events_tx.send(AppEventPayload::IndexingStarted {
+        file_count: total_files,
+    });
+
+    let staged_storage_path = staged_storage_path(storage_path);
+    let mut storage = Storage::open_build(&staged_storage_path)
+        .map_err(|e| ApiError::internal(format!("Failed to open staged storage: {e}")))?;
+
+    let bus = EventBus::new();
+    let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
+    let indexer = codestory_index::WorkspaceIndexer::new(root.to_path_buf());
+    let result = indexer.run(&mut storage, &execution_plan, &bus, None);
+
+    drop(bus);
+    let _ = forwarder.join();
+
+    let index_stats = match result {
+        Ok(stats) => stats,
+        Err(err) => {
+            drop(storage);
+            let _ = Storage::discard_staged_snapshot(&staged_storage_path);
+            return Err(ApiError::internal(format!("Indexing failed: {err}")));
+        }
+    };
+    let deferred_indexes_started = std::time::Instant::now();
+    if let Err(err) = storage.create_deferred_secondary_indexes() {
+        drop(storage);
+        let _ = Storage::discard_staged_snapshot(&staged_storage_path);
+        return Err(ApiError::internal(format!(
+            "Failed to create deferred staged indexes: {err}"
+        )));
+    }
+    let deferred_indexes_ms = clamp_u128_to_u32(deferred_indexes_started.elapsed().as_millis());
+
+    let summary_snapshot_started = std::time::Instant::now();
+    if let Err(err) = storage.refresh_grounding_summary_snapshots() {
+        drop(storage);
+        let _ = Storage::discard_staged_snapshot(&staged_storage_path);
+        return Err(ApiError::internal(format!(
+            "Failed to refresh staged grounding summary snapshots: {err}"
+        )));
+    }
+    let summary_snapshot_ms = clamp_u128_to_u32(summary_snapshot_started.elapsed().as_millis());
+    drop(storage);
+    let publish_started = std::time::Instant::now();
+    if let Err(err) = Storage::promote_staged_snapshot(&staged_storage_path, storage_path) {
+        let _ = Storage::discard_staged_snapshot(&staged_storage_path);
+        return Err(ApiError::internal(format!(
+            "Failed to publish staged storage: {err}"
+        )));
+    }
+    let publish_ms = clamp_u128_to_u32(publish_started.elapsed().as_millis());
+
+    let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
+    Ok(IndexingRunSummary {
+        phase_timings: IndexingPhaseTimings {
+            parse_index_ms: clamp_u64_to_u32(index_stats.parse_index_ms),
+            projection_flush_ms: clamp_u64_to_u32(index_stats.projection_flush_ms),
+            edge_resolution_ms: clamp_u64_to_u32(index_stats.edge_resolution_ms),
+            error_flush_ms: clamp_u64_to_u32(index_stats.error_flush_ms),
+            cleanup_ms: clamp_u64_to_u32(index_stats.cleanup_ms),
+            cache_refresh_ms: None,
+            deferred_indexes_ms: Some(deferred_indexes_ms),
+            summary_snapshot_ms: Some(summary_snapshot_ms),
+            detail_snapshot_ms: None,
+            publish_ms: Some(publish_ms),
+            setup_existing_projection_ids_ms: resolution_telemetry.setup_existing_projection_ids_ms,
+            setup_seed_symbol_table_ms: resolution_telemetry.setup_seed_symbol_table_ms,
+            flush_files_ms: resolution_telemetry.flush_files_ms,
+            flush_nodes_ms: resolution_telemetry.flush_nodes_ms,
+            flush_edges_ms: resolution_telemetry.flush_edges_ms,
+            flush_occurrences_ms: resolution_telemetry.flush_occurrences_ms,
+            flush_component_access_ms: resolution_telemetry.flush_component_access_ms,
+            flush_callable_projection_ms: resolution_telemetry.flush_callable_projection_ms,
+            unresolved_calls_start: clamp_usize_to_u32(index_stats.unresolved_calls_start),
+            unresolved_imports_start: clamp_usize_to_u32(index_stats.unresolved_imports_start),
+            resolved_calls: clamp_usize_to_u32(index_stats.resolved_calls),
+            resolved_imports: clamp_usize_to_u32(index_stats.resolved_imports),
+            unresolved_calls_end: clamp_usize_to_u32(index_stats.unresolved_calls_end),
+            unresolved_imports_end: clamp_usize_to_u32(index_stats.unresolved_imports_end),
+            resolution_override_count_ms: resolution_telemetry.resolution_override_count_ms,
+            resolution_unresolved_counts_ms: resolution_telemetry.resolution_unresolved_counts_ms,
+            resolution_calls_ms: resolution_telemetry.resolution_calls_ms,
+            resolution_imports_ms: resolution_telemetry.resolution_imports_ms,
+            resolution_cleanup_ms: resolution_telemetry.resolution_cleanup_ms,
+            resolution_call_candidate_index_ms: resolution_telemetry
+                .resolution_call_candidate_index_ms,
+            resolution_import_candidate_index_ms: resolution_telemetry
+                .resolution_import_candidate_index_ms,
+            resolution_call_semantic_index_ms: resolution_telemetry
+                .resolution_call_semantic_index_ms,
+            resolution_import_semantic_index_ms: resolution_telemetry
+                .resolution_import_semantic_index_ms,
+            resolution_call_semantic_candidates_ms: resolution_telemetry
+                .resolution_call_semantic_candidates_ms,
+            resolution_import_semantic_candidates_ms: resolution_telemetry
+                .resolution_import_semantic_candidates_ms,
+            resolution_call_semantic_requests: resolution_telemetry
+                .resolution_call_semantic_requests,
+            resolution_call_semantic_unique_requests: resolution_telemetry
+                .resolution_call_semantic_unique_requests,
+            resolution_call_semantic_skipped_requests: resolution_telemetry
+                .resolution_call_semantic_skipped_requests,
+            resolution_import_semantic_requests: resolution_telemetry
+                .resolution_import_semantic_requests,
+            resolution_import_semantic_unique_requests: resolution_telemetry
+                .resolution_import_semantic_unique_requests,
+            resolution_import_semantic_skipped_requests: resolution_telemetry
+                .resolution_import_semantic_skipped_requests,
+            resolution_call_compute_ms: resolution_telemetry.resolution_call_compute_ms,
+            resolution_import_compute_ms: resolution_telemetry.resolution_import_compute_ms,
+            resolution_call_apply_ms: resolution_telemetry.resolution_call_apply_ms,
+            resolution_import_apply_ms: resolution_telemetry.resolution_import_apply_ms,
+            resolution_override_resolution_ms: resolution_telemetry
+                .resolution_override_resolution_ms,
+            resolved_calls_same_file: resolution_telemetry.resolved_calls_same_file,
+            resolved_calls_same_module: resolution_telemetry.resolved_calls_same_module,
+            resolved_calls_global_unique: resolution_telemetry.resolved_calls_global_unique,
+            resolved_calls_semantic: resolution_telemetry.resolved_calls_semantic,
+            resolved_imports_same_file: resolution_telemetry.resolved_imports_same_file,
+            resolved_imports_same_module: resolution_telemetry.resolved_imports_same_module,
+            resolved_imports_global_unique: resolution_telemetry.resolved_imports_global_unique,
+            resolved_imports_fuzzy: resolution_telemetry.resolved_imports_fuzzy,
+            resolved_imports_semantic: resolution_telemetry.resolved_imports_semantic,
+        },
+        llm_refresh_scope: None,
     })
 }
 
@@ -2024,9 +2284,9 @@ fn index_incremental(
     storage_path: &Path,
     events_tx: &Sender<AppEventPayload>,
 ) -> Result<IndexingRunSummary, ApiError> {
-    run_indexing_common(root, storage_path, events_tx, false, |project, storage| {
+    run_incremental_indexing_common(root, storage_path, events_tx, |project, storage| {
         project
-            .generate_refresh_info(storage)
+            .build_execution_plan(storage)
             .map_err(|e| ApiError::internal(format!("Failed to generate refresh info: {e}")))
     })
 }
@@ -2053,34 +2313,40 @@ fn spawn_progress_forwarder(
     })
 }
 
-fn run_indexing_common<F>(
+fn staged_storage_path(storage_path: &Path) -> PathBuf {
+    let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = storage_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("codestory-index");
+    let extension = storage_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("sqlite");
+    parent.join(format!("{stem}.staged.{extension}"))
+}
+
+fn run_incremental_indexing_common<F>(
     root: &Path,
     storage_path: &Path,
     events_tx: &Sender<AppEventPayload>,
-    clear_storage: bool,
     refresh_builder: F,
 ) -> Result<IndexingRunSummary, ApiError>
 where
     F: FnOnce(
         &codestory_project::Project,
         &Storage,
-    ) -> Result<codestory_project::RefreshInfo, ApiError>,
+    ) -> Result<codestory_project::RefreshExecutionPlan, ApiError>,
 {
     let mut storage = Storage::open(storage_path)
         .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
 
-    if clear_storage {
-        storage
-            .clear()
-            .map_err(|e| ApiError::internal(format!("Failed to clear storage: {e}")))?;
-    }
-
     let project = codestory_project::Project::open(root.to_path_buf())
         .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
 
-    let refresh_info = refresh_builder(&project, &storage)?;
+    let execution_plan = refresh_builder(&project, &storage)?;
 
-    let total_files = refresh_info.files_to_index.len().min(u32::MAX as usize) as u32;
+    let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
     let _ = events_tx.send(AppEventPayload::IndexingStarted {
         file_count: total_files,
     });
@@ -2089,30 +2355,40 @@ where
     let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
 
     let indexer = codestory_index::WorkspaceIndexer::new(root.to_path_buf());
-    let result = indexer.run_incremental(&mut storage, &refresh_info, &bus, None);
+    let result = indexer.run(&mut storage, &execution_plan, &bus, None);
 
     // Drop bus so forwarder unblocks.
     drop(bus);
     let _ = forwarder.join();
 
     let index_stats = result.map_err(|e| ApiError::internal(format!("Indexing failed: {e}")))?;
+    let summary_snapshot_started = std::time::Instant::now();
+    storage.refresh_grounding_summary_snapshots().map_err(|e| {
+        ApiError::internal(format!(
+            "Failed to refresh grounding summary snapshots: {e}"
+        ))
+    })?;
+    let summary_snapshot_ms = clamp_u128_to_u32(summary_snapshot_started.elapsed().as_millis());
+    let detail_snapshot_started = std::time::Instant::now();
+    storage.hydrate_grounding_detail_snapshots().map_err(|e| {
+        ApiError::internal(format!("Failed to hydrate grounding detail snapshots: {e}"))
+    })?;
+    let detail_snapshot_ms = clamp_u128_to_u32(detail_snapshot_started.elapsed().as_millis());
     let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
 
     let mut llm_refresh_scope = HashSet::new();
-    if !clear_storage {
-        for path in &refresh_info.files_to_index {
-            let normalized_path = if path.is_absolute() {
-                path.clone()
-            } else {
-                root.join(path)
-            };
-            if let Ok(Some(file_info)) = storage.get_file_by_path(&normalized_path) {
-                llm_refresh_scope.insert(codestory_core::NodeId(file_info.id));
-            }
+    for path in &execution_plan.files_to_index {
+        let normalized_path = if path.is_absolute() {
+            path.clone()
+        } else {
+            root.join(path)
+        };
+        if let Ok(Some(file_info)) = storage.get_file_by_path(&normalized_path) {
+            llm_refresh_scope.insert(codestory_core::NodeId(file_info.id));
         }
-        for file_id in &refresh_info.files_to_remove {
-            llm_refresh_scope.insert(codestory_core::NodeId(*file_id));
-        }
+    }
+    for file_id in &execution_plan.files_to_remove {
+        llm_refresh_scope.insert(codestory_core::NodeId(*file_id));
     }
 
     Ok(IndexingRunSummary {
@@ -2123,16 +2399,59 @@ where
             error_flush_ms: clamp_u64_to_u32(index_stats.error_flush_ms),
             cleanup_ms: clamp_u64_to_u32(index_stats.cleanup_ms),
             cache_refresh_ms: None,
+            deferred_indexes_ms: None,
+            summary_snapshot_ms: Some(summary_snapshot_ms),
+            detail_snapshot_ms: Some(detail_snapshot_ms),
+            publish_ms: None,
+            setup_existing_projection_ids_ms: resolution_telemetry.setup_existing_projection_ids_ms,
+            setup_seed_symbol_table_ms: resolution_telemetry.setup_seed_symbol_table_ms,
+            flush_files_ms: resolution_telemetry.flush_files_ms,
+            flush_nodes_ms: resolution_telemetry.flush_nodes_ms,
+            flush_edges_ms: resolution_telemetry.flush_edges_ms,
+            flush_occurrences_ms: resolution_telemetry.flush_occurrences_ms,
+            flush_component_access_ms: resolution_telemetry.flush_component_access_ms,
+            flush_callable_projection_ms: resolution_telemetry.flush_callable_projection_ms,
             unresolved_calls_start: clamp_usize_to_u32(index_stats.unresolved_calls_start),
             unresolved_imports_start: clamp_usize_to_u32(index_stats.unresolved_imports_start),
             resolved_calls: clamp_usize_to_u32(index_stats.resolved_calls),
             resolved_imports: clamp_usize_to_u32(index_stats.resolved_imports),
             unresolved_calls_end: clamp_usize_to_u32(index_stats.unresolved_calls_end),
             unresolved_imports_end: clamp_usize_to_u32(index_stats.unresolved_imports_end),
+            resolution_override_count_ms: resolution_telemetry.resolution_override_count_ms,
             resolution_unresolved_counts_ms: resolution_telemetry.resolution_unresolved_counts_ms,
             resolution_calls_ms: resolution_telemetry.resolution_calls_ms,
             resolution_imports_ms: resolution_telemetry.resolution_imports_ms,
             resolution_cleanup_ms: resolution_telemetry.resolution_cleanup_ms,
+            resolution_call_candidate_index_ms: resolution_telemetry
+                .resolution_call_candidate_index_ms,
+            resolution_import_candidate_index_ms: resolution_telemetry
+                .resolution_import_candidate_index_ms,
+            resolution_call_semantic_index_ms: resolution_telemetry
+                .resolution_call_semantic_index_ms,
+            resolution_import_semantic_index_ms: resolution_telemetry
+                .resolution_import_semantic_index_ms,
+            resolution_call_semantic_candidates_ms: resolution_telemetry
+                .resolution_call_semantic_candidates_ms,
+            resolution_import_semantic_candidates_ms: resolution_telemetry
+                .resolution_import_semantic_candidates_ms,
+            resolution_call_semantic_requests: resolution_telemetry
+                .resolution_call_semantic_requests,
+            resolution_call_semantic_unique_requests: resolution_telemetry
+                .resolution_call_semantic_unique_requests,
+            resolution_call_semantic_skipped_requests: resolution_telemetry
+                .resolution_call_semantic_skipped_requests,
+            resolution_import_semantic_requests: resolution_telemetry
+                .resolution_import_semantic_requests,
+            resolution_import_semantic_unique_requests: resolution_telemetry
+                .resolution_import_semantic_unique_requests,
+            resolution_import_semantic_skipped_requests: resolution_telemetry
+                .resolution_import_semantic_skipped_requests,
+            resolution_call_compute_ms: resolution_telemetry.resolution_call_compute_ms,
+            resolution_import_compute_ms: resolution_telemetry.resolution_import_compute_ms,
+            resolution_call_apply_ms: resolution_telemetry.resolution_call_apply_ms,
+            resolution_import_apply_ms: resolution_telemetry.resolution_import_apply_ms,
+            resolution_override_resolution_ms: resolution_telemetry
+                .resolution_override_resolution_ms,
             resolved_calls_same_file: resolution_telemetry.resolved_calls_same_file,
             resolved_calls_same_module: resolution_telemetry.resolved_calls_same_module,
             resolved_calls_global_unique: resolution_telemetry.resolved_calls_global_unique,
@@ -2143,7 +2462,7 @@ where
             resolved_imports_fuzzy: resolution_telemetry.resolved_imports_fuzzy,
             resolved_imports_semantic: resolution_telemetry.resolved_imports_semantic,
         },
-        llm_refresh_scope: (!clear_storage).then_some(llm_refresh_scope),
+        llm_refresh_scope: Some(llm_refresh_scope),
     })
 }
 
@@ -2521,6 +2840,65 @@ mod tests {
         assert!(!state.is_indexing);
         assert!(state.search_engine.is_none());
         assert!(state.node_names.is_empty());
+    }
+
+    #[test]
+    fn search_lazily_initializes_search_state_after_summary_open() {
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_summary_with_storage_path(workspace.path().to_path_buf(), storage_path)
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("index without runtime refresh");
+
+        let hits = controller
+            .search(SearchRequest {
+                query: "check_winner".to_string(),
+            })
+            .expect("lazy search should succeed");
+
+        assert!(
+            !hits.is_empty(),
+            "expected search to return indexed symbols"
+        );
+        let state = controller.state.lock();
+        assert!(state.search_engine.is_some());
+        assert!(!state.node_names.is_empty());
+    }
+
+    #[test]
+    fn full_refresh_returns_with_summary_ready_and_detail_dirty() {
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("index without runtime refresh");
+
+        let storage = Storage::open(&storage_path).expect("reopen storage");
+        assert!(
+            storage
+                .has_ready_grounding_summary_snapshots()
+                .expect("summary snapshot readiness"),
+            "full refresh should publish ready grounding summary snapshots"
+        );
+        assert!(
+            !storage
+                .has_ready_grounding_detail_snapshots()
+                .expect("detail snapshot readiness"),
+            "full refresh should leave grounding detail snapshots dirty"
+        );
     }
 
     #[test]

@@ -17,8 +17,10 @@ fn index_single_file(filename: &str, contents: &str) -> anyhow::Result<(Vec<Node
     let event_bus = EventBus::new();
 
     let refresh_info = codestory_project::RefreshInfo {
+        mode: codestory_project::BuildMode::Incremental,
         files_to_index: vec![file_path],
         files_to_remove: vec![],
+        existing_file_ids: std::collections::HashMap::new(),
     };
     indexer.run_incremental(&mut storage, &refresh_info, &event_bus, None)?;
     let errors = storage.get_errors(None)?;

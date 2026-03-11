@@ -358,16 +358,16 @@ impl RuntimeContext {
     }
 
     fn ensure_open(&self, refresh: RefreshMode) -> Result<OpenedProject> {
-        let mut summary = self.open_project()?;
+        let mut summary = self.open_project_summary()?;
         let refresh_mode = resolve_refresh_request(refresh, &summary);
         let mut phase_timings = None;
         if let Some(mode) = refresh_mode {
             phase_timings = Some(
                 self.controller
-                    .run_indexing_blocking(mode)
+                    .run_indexing_blocking_without_runtime_refresh(mode)
                     .map_err(map_api_error)?,
             );
-            summary = self.open_project()?;
+            summary = self.open_project_summary()?;
         }
 
         Ok(OpenedProject {
@@ -395,12 +395,6 @@ impl RuntimeContext {
             refresh_mode,
             phase_timings,
         })
-    }
-
-    fn open_project(&self) -> Result<ProjectSummary> {
-        self.controller
-            .open_project_with_storage_path(self.project_root.clone(), self.storage_path.clone())
-            .map_err(map_api_error)
     }
 
     fn open_project_summary(&self) -> Result<ProjectSummary> {
@@ -690,8 +684,126 @@ fn render_index_markdown(output: &IndexOutput<'_>) -> String {
             timings.unresolved_imports_start,
             timings.unresolved_imports_end
         );
+        append_optional_timings_line(
+            &mut markdown,
+            "staged_publish_ms",
+            &[
+                ("deferred_indexes", timings.deferred_indexes_ms),
+                ("summary_snapshot", timings.summary_snapshot_ms),
+                ("detail_snapshot", timings.detail_snapshot_ms),
+                ("publish", timings.publish_ms),
+            ],
+        );
+        append_optional_timings_line(
+            &mut markdown,
+            "setup_ms",
+            &[
+                (
+                    "existing_projection_ids",
+                    timings.setup_existing_projection_ids_ms,
+                ),
+                ("seed_symbol_table", timings.setup_seed_symbol_table_ms),
+            ],
+        );
+        append_optional_timings_line(
+            &mut markdown,
+            "flush_breakdown_ms",
+            &[
+                ("files", timings.flush_files_ms),
+                ("nodes", timings.flush_nodes_ms),
+                ("edges", timings.flush_edges_ms),
+                ("occurrences", timings.flush_occurrences_ms),
+                ("component_access", timings.flush_component_access_ms),
+                ("callable_projection", timings.flush_callable_projection_ms),
+            ],
+        );
+        append_optional_timings_line(
+            &mut markdown,
+            "resolution_ms",
+            &[
+                ("override_count", timings.resolution_override_count_ms),
+                ("unresolved_counts", timings.resolution_unresolved_counts_ms),
+                ("calls", timings.resolution_calls_ms),
+                ("imports", timings.resolution_imports_ms),
+                ("cleanup", timings.resolution_cleanup_ms),
+            ],
+        );
+        append_optional_timings_line(
+            &mut markdown,
+            "resolution_indexes_ms",
+            &[
+                ("call_candidate", timings.resolution_call_candidate_index_ms),
+                (
+                    "import_candidate",
+                    timings.resolution_import_candidate_index_ms,
+                ),
+                ("call_semantic", timings.resolution_call_semantic_index_ms),
+                (
+                    "import_semantic",
+                    timings.resolution_import_semantic_index_ms,
+                ),
+            ],
+        );
+        append_optional_timings_line(
+            &mut markdown,
+            "resolution_detail_ms",
+            &[
+                (
+                    "call_semantic_candidates",
+                    timings.resolution_call_semantic_candidates_ms,
+                ),
+                (
+                    "import_semantic_candidates",
+                    timings.resolution_import_semantic_candidates_ms,
+                ),
+                ("call_compute", timings.resolution_call_compute_ms),
+                ("import_compute", timings.resolution_import_compute_ms),
+                ("call_apply", timings.resolution_call_apply_ms),
+                ("import_apply", timings.resolution_import_apply_ms),
+                ("overrides", timings.resolution_override_resolution_ms),
+            ],
+        );
+        append_optional_timings_line(
+            &mut markdown,
+            "resolution_semantic_requests",
+            &[
+                ("call_rows", timings.resolution_call_semantic_requests),
+                (
+                    "call_unique",
+                    timings.resolution_call_semantic_unique_requests,
+                ),
+                (
+                    "call_skipped",
+                    timings.resolution_call_semantic_skipped_requests,
+                ),
+                ("import_rows", timings.resolution_import_semantic_requests),
+                (
+                    "import_unique",
+                    timings.resolution_import_semantic_unique_requests,
+                ),
+                (
+                    "import_skipped",
+                    timings.resolution_import_semantic_skipped_requests,
+                ),
+            ],
+        );
     }
     markdown
+}
+
+fn append_optional_timings_line(
+    markdown: &mut String,
+    label: &str,
+    entries: &[(&str, Option<u32>)],
+) {
+    let rendered = entries
+        .iter()
+        .filter_map(|(name, value)| value.map(|value| format!("{name}={value}")))
+        .collect::<Vec<_>>();
+    if rendered.is_empty() {
+        return;
+    }
+    let _ = writeln!(markdown, "{label}: {}", rendered.join(" "));
 }
 
 fn render_ground_markdown(project_root: &Path, snapshot: &GroundingSnapshotDto) -> String {
@@ -1199,7 +1311,7 @@ impl From<CliDirection> for TrailDirection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codestory_api::StorageStatsDto;
+    use codestory_api::{IndexingPhaseTimings, StorageStatsDto};
     use std::fs;
     use tempfile::tempdir;
 
@@ -1212,6 +1324,66 @@ mod tests {
                 file_count,
                 error_count: 0,
             },
+        }
+    }
+
+    fn sample_phase_timings() -> IndexingPhaseTimings {
+        IndexingPhaseTimings {
+            parse_index_ms: 10,
+            projection_flush_ms: 20,
+            edge_resolution_ms: 30,
+            error_flush_ms: 4,
+            cleanup_ms: 5,
+            cache_refresh_ms: Some(6),
+            deferred_indexes_ms: Some(7),
+            summary_snapshot_ms: Some(8),
+            detail_snapshot_ms: Some(9),
+            publish_ms: Some(10),
+            setup_existing_projection_ids_ms: Some(11),
+            setup_seed_symbol_table_ms: Some(12),
+            flush_files_ms: Some(13),
+            flush_nodes_ms: Some(14),
+            flush_edges_ms: Some(15),
+            flush_occurrences_ms: Some(16),
+            flush_component_access_ms: Some(17),
+            flush_callable_projection_ms: Some(18),
+            unresolved_calls_start: 19,
+            unresolved_imports_start: 20,
+            resolved_calls: 21,
+            resolved_imports: 22,
+            unresolved_calls_end: 23,
+            unresolved_imports_end: 24,
+            resolution_override_count_ms: Some(25),
+            resolution_unresolved_counts_ms: Some(26),
+            resolution_calls_ms: Some(27),
+            resolution_imports_ms: Some(28),
+            resolution_cleanup_ms: Some(29),
+            resolution_call_candidate_index_ms: Some(30),
+            resolution_import_candidate_index_ms: Some(31),
+            resolution_call_semantic_index_ms: Some(32),
+            resolution_import_semantic_index_ms: Some(33),
+            resolution_call_semantic_candidates_ms: Some(34),
+            resolution_import_semantic_candidates_ms: Some(35),
+            resolution_call_semantic_requests: Some(36),
+            resolution_call_semantic_unique_requests: Some(37),
+            resolution_call_semantic_skipped_requests: Some(38),
+            resolution_import_semantic_requests: Some(39),
+            resolution_import_semantic_unique_requests: Some(40),
+            resolution_import_semantic_skipped_requests: Some(41),
+            resolution_call_compute_ms: Some(42),
+            resolution_import_compute_ms: Some(43),
+            resolution_call_apply_ms: Some(44),
+            resolution_import_apply_ms: Some(45),
+            resolution_override_resolution_ms: Some(46),
+            resolved_calls_same_file: Some(47),
+            resolved_calls_same_module: Some(48),
+            resolved_calls_global_unique: Some(49),
+            resolved_calls_semantic: Some(50),
+            resolved_imports_same_file: Some(51),
+            resolved_imports_same_module: Some(52),
+            resolved_imports_global_unique: Some(53),
+            resolved_imports_fuzzy: Some(54),
+            resolved_imports_semantic: Some(55),
         }
     }
 
@@ -1234,6 +1406,43 @@ mod tests {
             resolve_refresh_request(RefreshMode::Auto, &summary_with_files(3)),
             Some(IndexMode::Incremental)
         );
+    }
+
+    #[test]
+    fn render_index_markdown_includes_rich_timing_breakdown_when_available() {
+        let summary = summary_with_files(3);
+        let timings = sample_phase_timings();
+        let output = IndexOutput {
+            project: &summary.root,
+            storage_path: "C:/repo/.cache/index.sqlite",
+            refresh: "full",
+            summary: &summary,
+            phase_timings: Some(&timings),
+        };
+
+        let markdown = render_index_markdown(&output);
+
+        assert!(markdown.contains(
+            "staged_publish_ms: deferred_indexes=7 summary_snapshot=8 detail_snapshot=9 publish=10"
+        ));
+        assert!(markdown.contains("setup_ms: existing_projection_ids=11 seed_symbol_table=12"));
+        assert!(
+            markdown.contains(
+                "flush_breakdown_ms: files=13 nodes=14 edges=15 occurrences=16 component_access=17 callable_projection=18"
+            )
+        );
+        assert!(markdown.contains(
+            "resolution_ms: override_count=25 unresolved_counts=26 calls=27 imports=28 cleanup=29"
+        ));
+        assert!(markdown.contains(
+            "resolution_indexes_ms: call_candidate=30 import_candidate=31 call_semantic=32 import_semantic=33"
+        ));
+        assert!(markdown.contains(
+            "resolution_detail_ms: call_semantic_candidates=34 import_semantic_candidates=35 call_compute=42 import_compute=43 call_apply=44 import_apply=45 overrides=46"
+        ));
+        assert!(markdown.contains(
+            "resolution_semantic_requests: call_rows=36 call_unique=37 call_skipped=38 import_rows=39 import_unique=40 import_skipped=41"
+        ));
     }
 
     fn copy_tictactoe_workspace() -> tempfile::TempDir {

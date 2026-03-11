@@ -22,8 +22,10 @@ fn index_project(files: &[(&str, &str)]) -> anyhow::Result<(Vec<Node>, Vec<Edge>
     let indexer = WorkspaceIndexer::new(root.to_path_buf());
     let event_bus = EventBus::new();
     let refresh_info = codestory_project::RefreshInfo {
+        mode: codestory_project::BuildMode::Incremental,
         files_to_index,
         files_to_remove: vec![],
+        existing_file_ids: std::collections::HashMap::new(),
     };
     indexer.run_incremental(&mut storage, &refresh_info, &event_bus, None)?;
 

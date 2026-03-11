@@ -77,8 +77,10 @@ fn bench_graph_fidelity(c: &mut Criterion) {
                 .to_path_buf();
 
             let refresh_info = codestory_project::RefreshInfo {
+                mode: codestory_project::BuildMode::Incremental,
                 files_to_index,
                 files_to_remove: Vec::new(),
+                existing_file_ids: std::collections::HashMap::new(),
             };
             let event_bus = EventBus::new();
             let mut storage = Storage::new_in_memory().expect("in-memory storage");

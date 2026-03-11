@@ -41,7 +41,7 @@ tree-sitter-graph = "0.12"
 streaming-iterator = "0.1"
 
 # Storage
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["backup", "bundled"] }
 
 # Search
 nucleo-matcher = "0.3"
