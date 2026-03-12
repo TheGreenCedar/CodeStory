@@ -1,8 +1,8 @@
-use codestory_core::{
+use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind,
     Occurrence, OccurrenceKind, SourceLocation,
 };
-use codestory_storage::{FileInfo, Storage};
+use codestory_store::{FileInfo, Store as Storage};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::path::PathBuf;

@@ -1,13 +1,13 @@
-use codestory_api::{GroundingBudgetDto, GroundingSnapshotDto, ProjectSummary};
-use codestory_app::AppController;
-use codestory_events::EventBus;
-use codestory_index::WorkspaceIndexer;
-use codestory_project::Project;
-use codestory_storage::Storage;
+use codestory_contracts::api::{GroundingBudgetDto, GroundingSnapshotDto, ProjectSummary};
+use codestory_contracts::events::EventBus;
+use codestory_indexer::WorkspaceIndexer;
+use codestory_runtime::AppController;
+use codestory_store::Store as Storage;
+use codestory_workspace::WorkspaceManifest;
 use criterion::measurement::WallTime;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 use codestory_bench::util;
@@ -26,8 +26,8 @@ fn build_indexed_controller(
 
     let storage_path = temp.path().join("codestory.db");
     let mut storage = Storage::open(&storage_path)?;
-    let project = Project::open(project_root.clone())?;
-    let refresh_info = project.full_refresh()?;
+    let project = WorkspaceManifest::open(project_root.clone())?;
+    let refresh_info = project.full_refresh_execution_plan()?;
     let event_bus = EventBus::new();
     let indexer = WorkspaceIndexer::new(project_root.clone());
     indexer.run_incremental(&mut storage, &refresh_info, &event_bus, None)?;
@@ -37,10 +37,13 @@ fn build_indexed_controller(
     Ok((temp, project_root, storage_path, controller))
 }
 
-fn validate_grounding_scenario(project_root: &PathBuf, storage_path: &PathBuf) {
+fn validate_grounding_scenario(project_root: &Path, storage_path: &Path) {
     let summary_controller = AppController::new();
     summary_controller
-        .open_project_summary_with_storage_path(project_root.clone(), storage_path.clone())
+        .open_project_summary_with_storage_path(
+            project_root.to_path_buf(),
+            storage_path.to_path_buf(),
+        )
         .expect("summary open should succeed");
     let strict = summary_controller
         .grounding_snapshot(GroundingBudgetDto::Strict)
@@ -60,7 +63,7 @@ fn validate_grounding_scenario(project_root: &PathBuf, storage_path: &PathBuf) {
 
     let full_controller = AppController::new();
     full_controller
-        .open_project_with_storage_path(project_root.clone(), storage_path.clone())
+        .open_project_with_storage_path(project_root.to_path_buf(), storage_path.to_path_buf())
         .expect("full open should succeed");
     let full_snapshot = full_controller
         .grounding_snapshot(GroundingBudgetDto::Balanced)

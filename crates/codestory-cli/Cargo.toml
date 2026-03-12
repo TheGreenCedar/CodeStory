@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-codestory-api = { workspace = true }
-codestory-app = { workspace = true }
+codestory-contracts = { workspace = true }
+codestory-runtime = { workspace = true }
 clap = { workspace = true }
 directories = { workspace = true }
 anyhow = { workspace = true }

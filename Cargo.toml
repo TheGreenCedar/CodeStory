@@ -1,28 +1,22 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/codestory-core",
-    "crates/codestory-api",
-    "crates/codestory-app",
-    "crates/codestory-storage",
-    "crates/codestory-index",
-    "crates/codestory-search",
+    "crates/codestory-contracts",
+    "crates/codestory-workspace",
+    "crates/codestory-store",
+    "crates/codestory-indexer",
+    "crates/codestory-runtime",
     "crates/codestory-cli",
-    "crates/codestory-events",
-    "crates/codestory-project",
     "crates/codestory-bench",
 ]
 
 [workspace.dependencies]
 # Internal crates
-codestory-core = { path = "crates/codestory-core" }
-codestory-api = { path = "crates/codestory-api" }
-codestory-app = { path = "crates/codestory-app" }
-codestory-storage = { path = "crates/codestory-storage" }
-codestory-index = { path = "crates/codestory-index" }
-codestory-search = { path = "crates/codestory-search" }
-codestory-events = { path = "crates/codestory-events" }
-codestory-project = { path = "crates/codestory-project" }
+codestory-contracts = { path = "crates/codestory-contracts" }
+codestory-workspace = { path = "crates/codestory-workspace" }
+codestory-store = { path = "crates/codestory-store" }
+codestory-indexer = { path = "crates/codestory-indexer" }
+codestory-runtime = { path = "crates/codestory-runtime" }
 codestory-bench = { path = "crates/codestory-bench" }
 
 # Parsing (tree-sitter) - Aligning to 0.24 for tree-sitter-graph 0.12
@@ -85,3 +79,4 @@ incremental = true
 [profile.dev.package."*"]
 opt-level = 3 # Optimize dependencies for faster execution
 debug = false # optional: reduces compile time + binary size for deps
+

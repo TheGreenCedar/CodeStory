@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use codestory_api::{NodeKind, SearchHit};
-use codestory_app::{compare_ranked_hits, symbol_name_match_rank};
+use codestory_contracts::api::{NodeKind, SearchHit};
+use codestory_runtime::{compare_ranked_hits, symbol_name_match_rank};
 use std::fs;
 
 pub(crate) fn compare_resolution_hits(
@@ -72,7 +72,7 @@ fn resolution_kind_bucket(kind: NodeKind) -> u8 {
 }
 
 fn normalize_path_fragment(value: &str) -> String {
-    crate::clean_path_string(value).to_ascii_lowercase()
+    crate::display::clean_path_string(value).to_ascii_lowercase()
 }
 
 fn declaration_anchor_bucket(hit: &SearchHit) -> u8 {

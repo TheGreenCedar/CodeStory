@@ -5,17 +5,15 @@ edition = "2024"
 publish = false
 
 [dependencies]
-codestory-core = { workspace = true }
-codestory-index = { workspace = true }
-codestory-storage = { workspace = true }
-codestory-app = { workspace = true }
-codestory-api = { workspace = true }
+codestory-contracts = { workspace = true }
+codestory-indexer = { workspace = true }
+codestory-runtime = { workspace = true }
+codestory-store = { workspace = true }
+codestory-workspace = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
-codestory-events = { workspace = true }
-codestory-project = { workspace = true }
 
 [[bench]]
 name = "indexing"
@@ -40,3 +38,4 @@ harness = false
 [[bench]]
 name = "incremental_cleanup"
 harness = false
+

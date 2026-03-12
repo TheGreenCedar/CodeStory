@@ -1,100 +1,129 @@
 # CodeStory
 
-CodeStory is a skill-first codebase grounding engine for local repositories. It builds a SQLite-backed symbol and relationship graph, then exposes grounding primitives that higher-level skills, agents, and runtimes can compose.
+CodeStory is a local codebase grounding engine. It indexes a repository into a SQLite-backed graph, keeps grounding-oriented read models up to date, and exposes six workflows through `codestory-cli`.
 
-The canonical packaging target is `codestory-cli`, and the repo-local skill lives at `.agents/skills/codestory-grounding`.
+## System Map
+
+```mermaid
+flowchart LR
+    User["Human or tool"] --> CLI["codestory-cli"]
+    CLI["codestory-cli"] --> Runtime["codestory-runtime"]
+    Runtime --> Workspace["codestory-workspace"]
+    Runtime --> Indexer["codestory-indexer"]
+    Runtime --> Store["codestory-store"]
+    Indexer --> Store
+    Contracts["codestory-contracts"] -->|"shared types"| Workspace
+    Contracts -->|"shared types"| Indexer
+    Contracts -->|"shared types"| Store
+    Contracts -->|"shared types"| Runtime
+    Bench["codestory-bench"] -->|"benchmarks"| Indexer
+    Bench -->|"benchmarks"| Runtime
+```
+
+## Use CodeStory
+
+Use this path if you want to run the tool against a repository.
+
+1. Build the CLI.
+   ```powershell
+   cargo build --release -p codestory-cli
+   ```
+2. Create or refresh the local index.
+   ```powershell
+   cargo run --release -p codestory-cli -- index --project .
+   ```
+3. Run the grounding workflows.
+   ```text
+   codestory-cli ground --project <path>
+   codestory-cli search --project <path> --query <query>
+   codestory-cli symbol --project <path> (--id <node-id> | --query <query>)
+   codestory-cli trail --project <path> (--id <node-id> | --query <query>)
+   codestory-cli snippet --project <path> (--id <node-id> | --query <query>)
+   ```
+
+Start here when you are using the tool:
+
+- [Runtime execution path](docs/architecture/runtime-execution-path.md)
+- [CLI subsystem](docs/architecture/subsystems/cli.md)
+- [Glossary](docs/glossary.md)
+
+## Hack on CodeStory
+
+Use this path if you want to change the codebase.
+
+1. Read the architecture overview and the subsystem page that owns your change.
+2. Run Cargo verification serially because the workspace shares build locks.
+3. Make changes in the owning crate instead of threading behavior through the CLI.
+
+Start here when you are contributing:
+
+- [Architecture overview](docs/architecture/overview.md)
+- [Contributor setup](docs/contributors/getting-started.md)
+- [Debugging guide](docs/contributors/debugging.md)
+- [Testing matrix](docs/contributors/testing-matrix.md)
+- [Decision log](docs/decision-log.md)
+- [Contracts subsystem](docs/architecture/subsystems/contracts.md)
+- [Workspace subsystem](docs/architecture/subsystems/workspace.md)
+- [Indexer subsystem](docs/architecture/subsystems/indexer.md)
+- [Store subsystem](docs/architecture/subsystems/store.md)
+- [Runtime subsystem](docs/architecture/subsystems/runtime.md)
+- [CLI subsystem](docs/architecture/subsystems/cli.md)
 
 ## Grounding Workflows
 
-The repo is organized around six grounding verbs:
+The product surface remains organized around six workflows:
 
-- `index`: discover files, parse supported languages, and persist graph/search state locally
-- `ground`: turn a prompt into grounded code context using indexed symbols, snippets, and graph traversal
-- `search`: find likely symbols, files, and matches by name or text
-- `symbol`: inspect one symbol and its indexed metadata
-- `trail`: walk neighborhoods or focused paths through the code graph
-- `snippet`: return focused source context for a symbol or location
-
-## Supported Languages (Indexer)
-
-- Python
-- Java
-- Rust
-- JavaScript
-- TypeScript/TSX
-- C
-- C++
-
-## Quickstart
-
-### Prerequisites
-
-- Rust toolchain (edition 2024 crates in this workspace)
-- A native build toolchain may be required on some platforms for parser or dependency builds
-
-### Build The CLI Runtime
-
-```powershell
-cargo build --release -p codestory-cli
+```mermaid
+flowchart LR
+    Project["Repository"] --> Index["index"]
+    Index["index"] --> LocalState["SQLite graph + snapshots"]
+    LocalState --> Ground["ground"]
+    LocalState --> Search["search"]
+    LocalState --> Symbol["symbol"]
+    LocalState --> Trail["trail"]
+    LocalState --> Snippet["snippet"]
 ```
 
-### Create Or Refresh A Local Index
+- `index`: discover files, parse supported languages, resolve semantics, and persist graph/search state locally
+- `ground`: build grounded context from indexed symbols, snippets, graph traversal, and search results
+- `search`: find symbols, files, and query matches
+- `symbol`: inspect one symbol and its indexed relationships
+- `trail`: walk caller/callee and usage neighborhoods through the graph
+- `snippet`: fetch focused source context for a symbol or file location
+
+## Workspace Shape
+
+The workspace is organized into seven durable crates:
+
+- `codestory-contracts`: shared graph, API, grounding, trail, and event types
+- `codestory-workspace`: manifest loading, file discovery, and refresh-plan computation
+- `codestory-store`: SQLite persistence, snapshots, trails, bookmarks, and search docs
+- `codestory-indexer`: parsing, extraction, resolution, batching, and indexing tests
+- `codestory-runtime`: orchestration, grounding, search, trail, and agent flows
+- `codestory-cli`: thin adapter and renderer for the six workflows
+- `codestory-bench`: criterion benches for indexing, grounding, resolution, and cleanup work
+
+## Build And Verification
+
+Run Cargo commands serially in this repo:
 
 ```powershell
-cargo run --release -p codestory-cli -- index --project .
-```
-
-This writes repo-local grounding data into the user cache by default, keyed by the target project path.
-
-### Command Model
-
-The docs and packaging now center on this runtime surface:
-
-```text
-codestory-cli index --project <path> [--refresh auto|full|incremental]
-codestory-cli ground --project <path> [--budget strict|balanced|max]
-codestory-cli search --project <path> --query <query>
-codestory-cli symbol --project <path> (--id <node-id> | --query <query>)
-codestory-cli trail --project <path> (--id <node-id> | --query <query>)
-codestory-cli snippet --project <path> (--id <node-id> | --query <query>)
-```
-
-The bundled skill scripts in `.agents/skills/codestory-grounding/scripts/` are thin wrappers around these commands.
-
-## Common Development Commands
-
-From the workspace root:
-
-```powershell
-cargo check -p codestory-cli
-cargo build
+cargo fmt --check
+cargo check
 cargo test
-cargo fmt
-cargo clippy
+cargo clippy --all-targets -- -D warnings
 ```
 
-Use `cargo check -p codestory-cli` for the fastest packaging-oriented validation pass when you are working on the grounding runtime surface.
+Release-blocking fidelity suites:
 
-## Repository Layout
-
-- `Cargo.toml`: workspace manifest
-- `crates/codestory-cli`: canonical CLI packaging target for grounding workflows
-- `crates/codestory-app`: headless orchestrator used by higher-level runtimes
-- `crates/codestory-project`: repository discovery and refresh metadata
-- `crates/codestory-index`: tree-sitter plus semantic indexing pipeline
-- `crates/codestory-storage`: SQLite schema, persistence, and trail queries
-- `crates/codestory-search`: lexical and semantic retrieval primitives
-- `crates/codestory-core`: shared graph and domain types
-- `crates/codestory-events`: event types used by adapters and status flows
-- `crates/codestory-api`: DTOs shared by the CLI, skill, and adapter layers
-- `.agents/skills/codestory-grounding`: repo-local skill scripts and instructions
-- `crates/codestory-bench`: Criterion benchmarks for performance and fidelity work
+```powershell
+cargo test -p codestory-indexer --test fidelity_regression
+cargo test -p codestory-indexer --test tictactoe_language_coverage
+```
 
 ## Runtime Artifacts
 
-Running CodeStory locally creates runtime state such as:
-
-- user-cache SQLite grounding indexes keyed by project path
+CodeStory writes user-cache SQLite indexes keyed by the target project path. Build outputs live under `target/`.
 
 ## License
 

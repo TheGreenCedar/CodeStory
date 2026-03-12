@@ -1,9 +1,9 @@
-use codestory_api::{AgentHybridWeightsDto, NodeId, OpenProjectRequest, SearchRequest};
-use codestory_app::AppController;
-use codestory_events::EventBus;
-use codestory_index::WorkspaceIndexer;
-use codestory_project::Project;
-use codestory_storage::Storage;
+use codestory_contracts::api::{AgentHybridWeightsDto, NodeId, OpenProjectRequest, SearchRequest};
+use codestory_contracts::events::EventBus;
+use codestory_indexer::WorkspaceIndexer;
+use codestory_runtime::AppController;
+use codestory_store::Store as Storage;
+use codestory_workspace::WorkspaceManifest;
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -42,8 +42,8 @@ fn build_indexed_controller(file_count: usize) -> anyhow::Result<(TempDir, AppCo
 
     let storage_path = temp.path().join("codestory.db");
     let mut storage = Storage::open(&storage_path)?;
-    let project = Project::open(temp.path().to_path_buf())?;
-    let refresh_info = project.full_refresh()?;
+    let project = WorkspaceManifest::open(temp.path().to_path_buf())?;
+    let refresh_info = project.full_refresh_execution_plan()?;
     let event_bus = EventBus::new();
     let indexer = WorkspaceIndexer::new(temp.path().to_path_buf());
     indexer.run_incremental(&mut storage, &refresh_info, &event_bus, None)?;

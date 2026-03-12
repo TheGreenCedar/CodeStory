@@ -1,6 +1,6 @@
-use codestory_core::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind};
-use codestory_index::resolution::ResolutionPass;
-use codestory_storage::Storage;
+use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind};
+use codestory_indexer::resolution::ResolutionPass;
+use codestory_store::Store as Storage;
 use criterion::{Criterion, criterion_group, criterion_main};
 
 const FILE_COUNT: usize = 140;

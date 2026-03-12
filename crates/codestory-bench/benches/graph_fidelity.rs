@@ -1,7 +1,7 @@
-use codestory_core::{EdgeKind, ResolutionCertainty};
-use codestory_events::EventBus;
-use codestory_index::WorkspaceIndexer;
-use codestory_storage::Storage;
+use codestory_contracts::events::EventBus;
+use codestory_contracts::graph::{EdgeKind, ResolutionCertainty};
+use codestory_indexer::WorkspaceIndexer;
+use codestory_store::Store as Storage;
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -16,41 +16,43 @@ const FIXTURES: &[FidelityFixture] = &[
     FidelityFixture {
         path: "python_fidelity_lab.py",
         source: include_str!(
-            "../../codestory-index/tests/fixtures/fidelity_lab/python_fidelity_lab.py"
+            "../../codestory-indexer/tests/fixtures/fidelity_lab/python_fidelity_lab.py"
         ),
     },
     FidelityFixture {
         path: "typescript_fidelity_lab.ts",
         source: include_str!(
-            "../../codestory-index/tests/fixtures/fidelity_lab/typescript_fidelity_lab.ts"
+            "../../codestory-indexer/tests/fixtures/fidelity_lab/typescript_fidelity_lab.ts"
         ),
     },
     FidelityFixture {
         path: "javascript_fidelity_lab.js",
         source: include_str!(
-            "../../codestory-index/tests/fixtures/fidelity_lab/javascript_fidelity_lab.js"
+            "../../codestory-indexer/tests/fixtures/fidelity_lab/javascript_fidelity_lab.js"
         ),
     },
     FidelityFixture {
         path: "java_fidelity_lab.java",
         source: include_str!(
-            "../../codestory-index/tests/fixtures/fidelity_lab/java_fidelity_lab.java"
+            "../../codestory-indexer/tests/fixtures/fidelity_lab/java_fidelity_lab.java"
         ),
     },
     FidelityFixture {
         path: "cpp_fidelity_lab.cpp",
         source: include_str!(
-            "../../codestory-index/tests/fixtures/fidelity_lab/cpp_fidelity_lab.cpp"
+            "../../codestory-indexer/tests/fixtures/fidelity_lab/cpp_fidelity_lab.cpp"
         ),
     },
     FidelityFixture {
         path: "c_fidelity_lab.c",
-        source: include_str!("../../codestory-index/tests/fixtures/fidelity_lab/c_fidelity_lab.c"),
+        source: include_str!(
+            "../../codestory-indexer/tests/fixtures/fidelity_lab/c_fidelity_lab.c"
+        ),
     },
     FidelityFixture {
         path: "rust_fidelity_lab.rs",
         source: include_str!(
-            "../../codestory-index/tests/fixtures/fidelity_lab/rust_fidelity_lab.rs"
+            "../../codestory-indexer/tests/fixtures/fidelity_lab/rust_fidelity_lab.rs"
         ),
     },
 ];
@@ -76,8 +78,8 @@ fn bench_graph_fidelity(c: &mut Criterion) {
                 .expect("fixture root")
                 .to_path_buf();
 
-            let refresh_info = codestory_project::RefreshInfo {
-                mode: codestory_project::BuildMode::Incremental,
+            let refresh_info = codestory_workspace::RefreshInfo {
+                mode: codestory_workspace::BuildMode::Incremental,
                 files_to_index,
                 files_to_remove: Vec::new(),
                 existing_file_ids: std::collections::HashMap::new(),

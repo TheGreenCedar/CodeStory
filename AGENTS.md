@@ -3,13 +3,13 @@
 ## Project Structure & Module Organization
 - Rust workspace is defined in `Cargo.toml`; crates live under `crates/`.
 - Primary runtime surface is `crates/codestory-cli`; the repo-local skill lives under `.agents/skills/codestory-grounding`.
-- Core crates: `codestory-core`, `codestory-events`, `codestory-storage`, `codestory-index`, `codestory-search`, `codestory-app`, `codestory-api`, `codestory-project`, `codestory-cli`.
+- Core crates: `codestory-contracts`, `codestory-workspace`, `codestory-store`, `codestory-indexer`, `codestory-runtime`, `codestory-core`, `codestory-events`, `codestory-storage`, `codestory-index`, `codestory-search`, `codestory-api`, `codestory-cli`.
 - Runtime artifacts: user-cache SQLite grounding indexes keyed by repo path; build outputs in `target/`.
 
 ## Architecture Overview
-- `codestory-app` is the headless orchestrator used by the CLI and skill scripts.
+- `codestory-runtime` is the headless orchestrator used by the CLI and skill scripts.
 - `codestory-events::EventBus` decouples indexing/storage progress from API and UI updates.
-- Indexing pipeline: `codestory-project` discovers files, `codestory-index` extracts symbols/edges via tree-sitter + semantic resolution, `codestory-storage` persists to SQLite.
+- Indexing pipeline: `codestory-workspace` discovers files and refresh plans, `codestory-index` extracts symbols/edges via tree-sitter + semantic resolution, `codestory-storage` persists to SQLite.
 - `codestory-api` holds DTOs shared across the CLI and any higher-level adapters.
 
 ## Build, Test, and Development Commands
@@ -38,3 +38,5 @@
 
 ## Security & Configuration Tips
 - Keep secrets out of the repo; pass credentials via environment variables.
+
+

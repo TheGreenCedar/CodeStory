@@ -1,0 +1,23 @@
+[package]
+name = "codestory-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+codestory-contracts = { workspace = true }
+codestory-indexer = { workspace = true }
+codestory-store = { workspace = true }
+codestory-workspace = { workspace = true }
+crossbeam-channel = { workspace = true }
+feature-probe = { workspace = true }
+ndarray = { workspace = true }
+nucleo-matcher = { workspace = true }
+ort = { workspace = true }
+parking_lot = { workspace = true }
+tantivy = { workspace = true }
+tokenizers = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

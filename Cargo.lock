@@ -275,10 +275,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
  "serde",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -350,46 +348,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 
 [[package]]
-name = "codestory-api"
-version = "0.1.0"
-dependencies = [
- "codestory-core",
- "serde",
- "serde_json",
- "serde_with",
- "specta",
-]
-
-[[package]]
-name = "codestory-app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "codestory-api",
- "codestory-core",
- "codestory-events",
- "codestory-index",
- "codestory-project",
- "codestory-search",
- "codestory-storage",
- "crossbeam-channel",
- "parking_lot",
- "tempfile",
- "tracing",
-]
-
-[[package]]
 name = "codestory-bench"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "codestory-api",
- "codestory-app",
- "codestory-core",
- "codestory-events",
- "codestory-index",
- "codestory-project",
- "codestory-storage",
+ "codestory-contracts",
+ "codestory-indexer",
+ "codestory-runtime",
+ "codestory-store",
+ "codestory-workspace",
  "criterion",
  "serde_json",
  "tempfile",
@@ -401,8 +368,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "codestory-api",
- "codestory-app",
+ "codestory-contracts",
+ "codestory-runtime",
  "directories",
  "serde",
  "serde_json",
@@ -410,37 +377,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "codestory-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "codestory-events"
+name = "codestory-contracts"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "codestory-core",
  "crossbeam-channel",
  "serde",
  "serde_json",
+ "serde_with",
+ "specta",
+ "thiserror 2.0.18",
  "tracing",
  "uuid",
 ]
 
 [[package]]
-name = "codestory-index"
+name = "codestory-indexer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "codestory-core",
- "codestory-events",
- "codestory-project",
- "codestory-search",
- "codestory-storage",
+ "codestory-contracts",
+ "codestory-store",
+ "codestory-workspace",
  "crossbeam-channel",
  "ignore",
  "parking_lot",
@@ -465,49 +423,53 @@ dependencies = [
 ]
 
 [[package]]
-name = "codestory-project"
+name = "codestory-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
- "codestory-core",
- "codestory-storage",
+ "codestory-contracts",
+ "codestory-indexer",
+ "codestory-store",
+ "codestory-workspace",
+ "crossbeam-channel",
+ "feature-probe",
+ "ndarray",
+ "nucleo-matcher",
+ "ort",
+ "parking_lot",
+ "tantivy",
+ "tempfile",
+ "tokenizers",
+ "tracing",
+]
+
+[[package]]
+name = "codestory-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "codestory-contracts",
+ "codestory-workspace",
+ "parking_lot",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "codestory-workspace"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "glob",
  "ignore",
  "serde",
  "serde_json",
  "tempfile",
  "uuid",
- "walkdir",
-]
-
-[[package]]
-name = "codestory-search"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "codestory-core",
- "feature-probe",
- "ndarray",
- "nucleo-matcher",
- "ort",
- "tantivy",
- "tokenizers",
- "tracing",
-]
-
-[[package]]
-name = "codestory-storage"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "codestory-core",
- "parking_lot",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]

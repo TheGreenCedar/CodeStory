@@ -1,9 +1,9 @@
-use codestory_api::{IndexMode, IndexingPhaseTimings};
-use codestory_app::AppController;
-use codestory_events::EventBus;
-use codestory_index::{IncrementalIndexingStats, WorkspaceIndexer};
-use codestory_project::{BuildMode, Project, RefreshExecutionPlan};
-use codestory_storage::Storage;
+use codestory_contracts::api::{IndexMode, IndexingPhaseTimings};
+use codestory_contracts::events::EventBus;
+use codestory_indexer::{IncrementalIndexingStats, WorkspaceIndexer};
+use codestory_runtime::AppController;
+use codestory_store::Store as Storage;
+use codestory_workspace::{BuildMode, RefreshExecutionPlan, WorkspaceManifest};
 use criterion::measurement::WallTime;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -38,6 +38,23 @@ fn open_temp_storage() -> (TempDir, Storage) {
     let storage_path = storage_temp.path().join("codestory.db");
     let storage = Storage::open(&storage_path).expect("open benchmark storage");
     (storage_temp, storage)
+}
+
+fn refresh_inputs_from_storage(storage: &Storage) -> codestory_workspace::RefreshInputs {
+    codestory_workspace::RefreshInputs {
+        stored_files: storage
+            .get_files()
+            .expect("list benchmark storage files")
+            .into_iter()
+            .map(|file| codestory_workspace::StoredFileState {
+                id: file.id,
+                path: file.path,
+                modification_time: file.modification_time,
+                indexed: file.indexed,
+            })
+            .collect(),
+        inventory: Default::default(),
+    }
 }
 
 fn bench_indexing_100_files_incremental_cold(c: &mut Criterion) {
@@ -241,9 +258,9 @@ fn run_incremental_touched_subset(
     fixture.touch_cursor = (fixture.touch_cursor + touched.len()) % fixture.files.len().max(1);
 
     let mut storage = Storage::open(&fixture.storage_path).expect("open benchmark storage");
-    let project = Project::open(fixture.root.clone()).expect("open benchmark project");
+    let project = WorkspaceManifest::open(fixture.root.clone()).expect("open benchmark project");
     let plan = project
-        .build_execution_plan(&storage)
+        .build_execution_plan(&refresh_inputs_from_storage(&storage))
         .expect("build incremental plan");
     let planned_files = plan.files_to_index.len();
     assert!(
@@ -261,9 +278,10 @@ fn run_incremental_touched_subset(
 
 fn validate_incremental_fixture(fixture: &mut PersistentIndexFixture, touched_files: usize) {
     let storage = Storage::open(&fixture.storage_path).expect("open seeded benchmark storage");
-    let project = Project::open(fixture.root.clone()).expect("open seeded benchmark project");
+    let project =
+        WorkspaceManifest::open(fixture.root.clone()).expect("open seeded benchmark project");
     let idle_plan = project
-        .build_execution_plan(&storage)
+        .build_execution_plan(&refresh_inputs_from_storage(&storage))
         .expect("build idle incremental plan");
     assert_eq!(
         idle_plan.files_to_index.len(),
