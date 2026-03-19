@@ -1,5 +1,8 @@
 # Runtime Execution Path
 
+This page describes the current command path for the six supported CLI workflows:
+`index`, `ground`, `search`, `symbol`, `trail`, and `snippet`.
+
 ## Index Command
 
 ```mermaid
@@ -59,9 +62,10 @@ flowchart LR
     Assembly --> CLI["codestory-cli rendering"]
 ```
 
-1. Runtime reads graph rows, occurrences, trail data, or snapshot digests from the store.
-2. Runtime adds ranking, deduplication, and grounding-specific assembly.
-3. CLI formats the resulting DTOs without reimplementing orchestration.
+1. CLI resolves the project root plus any query or location inputs.
+2. Runtime reads graph rows, occurrences, trail data, search docs, or snapshot digests from the store.
+3. Runtime adds ranking, deduplication, and grounding-specific assembly on top of store-owned state.
+4. CLI formats the resulting DTOs without reimplementing orchestration.
 
 ## Ownership Notes
 
@@ -69,3 +73,4 @@ flowchart LR
 - The indexer layer owns parse/extract/resolve behavior.
 - The store layer owns persistence and snapshot lifecycle.
 - The CLI layer owns rendering only.
+- The contracts layer defines the DTOs and graph types that move between these layers.

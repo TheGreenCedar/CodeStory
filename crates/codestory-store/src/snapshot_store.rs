@@ -33,7 +33,7 @@ impl<'a> SnapshotStore<'a> {
         let stem = live_path
             .file_stem()
             .and_then(|value| value.to_str())
-            .unwrap_or("codestory-index");
+            .unwrap_or("codestory");
         let extension = live_path
             .extension()
             .and_then(|value| value.to_str())

@@ -1,6 +1,7 @@
 # Architecture Overview
 
-CodeStory has one delivery path and six owning layers.
+CodeStory has seven workspace crates: six owning layers plus one support crate for
+benchmarks and perf validation.
 
 ```mermaid
 flowchart LR
@@ -10,6 +11,7 @@ flowchart LR
     Indexer["codestory-indexer"]
     Runtime["codestory-runtime"]
     CLI["codestory-cli"]
+    Bench["codestory-bench"]
 
     Contracts --> Workspace
     Contracts --> Store
@@ -20,6 +22,9 @@ flowchart LR
     Store --> Indexer
     Indexer --> Runtime
     Runtime --> CLI
+    Runtime -. bench inputs .-> Bench
+    Indexer -. bench inputs .-> Bench
+    Store -. bench inputs .-> Bench
 ```
 
 ## Layers
@@ -30,6 +35,7 @@ flowchart LR
 - `codestory-indexer` parses files, extracts symbols and edges, flushes batches to the store, and runs semantic resolution.
 - `codestory-runtime` orchestrates indexing, search, grounding, trail building, project summaries, and agent flows.
 - `codestory-cli` is the thin command adapter that parses args, calls runtime services, and renders text or JSON.
+- `codestory-bench` measures indexing, grounding, resolution, and cleanup-sensitive paths without owning product behavior.
 
 ## Dependency Direction
 
@@ -43,10 +49,18 @@ Important rules:
 - `indexer` depends on `store`, not the reverse.
 - `runtime` is the only orchestration layer.
 - `cli` does not import indexing or storage crates directly.
+- `bench` can depend on runtime-facing crates for measurement, but it does not define product contracts.
+
+## Operating Constraints
+
+- Keep the public command surface small and centered on the six CLI workflows.
+- Add shared graph, DTO, grounding, and event types to `codestory-contracts`, not to adapter crates.
+- Put source-of-truth persistence and snapshot lifecycle in `codestory-store`.
+- Keep rendering and argument parsing in `codestory-cli`; orchestration belongs in `codestory-runtime`.
+- When a behavior changes, update the owning subsystem page instead of layering a new migration-only guide on top.
 
 ## Where To Start
 
 - System behavior: [runtime-execution-path.md](runtime-execution-path.md)
-- Ownership map: [crate-map.md](crate-map.md)
-- Constraints: [invariants.md](invariants.md)
-- Failure patterns: [failure-modes.md](failure-modes.md)
+- Ownership details: [subsystems/contracts.md](subsystems/contracts.md), [subsystems/workspace.md](subsystems/workspace.md), [subsystems/indexer.md](subsystems/indexer.md), [subsystems/store.md](subsystems/store.md), [subsystems/runtime.md](subsystems/runtime.md), [subsystems/cli.md](subsystems/cli.md)
+- Architectural history: [../decision-log.md](../decision-log.md)

@@ -1,6 +1,7 @@
 # Decision Log
 
-This file is the index for architecture decisions that matter during the V2 cutover.
+This file is the landing page for architecture decisions that still shape the current
+CodeStory workspace.
 
 - [ADR 0001: V2 boundary reset](adrs/0001-v2-boundaries.md)
 - [ADR 0002: Workspace and store decoupling](adrs/0002-workspace-store-decoupling.md)
@@ -13,6 +14,6 @@ Add a new ADR when one of these changes:
 - dependency direction between subsystems
 - source-of-truth location for persisted or derived data
 - public service or contract surface
-- rollout policy for staged versus live indexing behavior
+- retrieval, staging, or fallback policy that changes how the runtime behaves
 
 

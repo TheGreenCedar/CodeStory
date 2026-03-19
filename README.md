@@ -50,6 +50,7 @@ Use this path if you want to change the codebase.
 1. Read the architecture overview and the subsystem page that owns your change.
 2. Run Cargo verification serially because the workspace shares build locks.
 3. Make changes in the owning crate instead of threading behavior through the CLI.
+4. Use the contributor docs as a short path through architecture, debugging, and test coverage.
 
 Start here when you are contributing:
 

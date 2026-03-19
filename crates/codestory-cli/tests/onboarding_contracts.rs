@@ -16,11 +16,13 @@ fn readme_keeps_dual_track_onboarding() {
     let readme = fs::read_to_string(root.join("README.md")).expect("README should exist");
     assert!(readme.contains("Use CodeStory"));
     assert!(readme.contains("Hack on CodeStory"));
+    assert!(readme.contains("docs/architecture/overview.md"));
     assert!(readme.contains("docs/architecture/runtime-execution-path.md"));
     assert!(readme.contains("docs/contributors/debugging.md"));
     assert!(readme.contains("docs/contributors/testing-matrix.md"));
 
     for path in [
+        "docs/architecture/overview.md",
         "docs/architecture/runtime-execution-path.md",
         "docs/architecture/subsystems/contracts.md",
         "docs/architecture/subsystems/workspace.md",
@@ -32,7 +34,6 @@ fn readme_keeps_dual_track_onboarding() {
         "docs/contributors/debugging.md",
         "docs/contributors/testing-matrix.md",
         "docs/decision-log.md",
-        "docs/reference/cli-parity.md",
     ] {
         assert!(
             root.join(path).exists(),

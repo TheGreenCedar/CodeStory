@@ -12,6 +12,19 @@ cargo test
 
 Run them serially. This workspace shares Cargo build locks.
 
+If you touch graph extraction or semantic resolution, plan to run the fidelity suites from the testing matrix before you finish.
+
+## Recommended Reading Order
+
+Build a mental model in this order before editing the biggest implementation paths:
+
+1. [README](../../README.md)
+2. [Architecture overview](../architecture/overview.md)
+3. [Runtime execution path](../architecture/runtime-execution-path.md)
+4. the subsystem page for the owning crate
+5. [Debugging guide](debugging.md)
+6. [Testing matrix](testing-matrix.md)
+
 ## Mental Model
 
 Before changing code, answer these two questions:
@@ -47,6 +60,7 @@ Use this mapping:
 Read these pages first:
 
 - `docs/architecture/overview.md`
-- `docs/architecture/invariants.md`
+- `docs/architecture/runtime-execution-path.md`
 - the subsystem page for the owning crate
+- `docs/contributors/debugging.md`
 - `docs/contributors/testing-matrix.md`

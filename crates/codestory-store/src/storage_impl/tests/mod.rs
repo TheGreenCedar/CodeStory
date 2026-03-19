@@ -12,7 +12,7 @@ fn unique_temp_db_path(label: &str) -> PathBuf {
         .expect("clock before unix epoch")
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "codestory-storage-{label}-{}-{stamp}.sqlite",
+        "codestory-store-{label}-{}-{stamp}.sqlite",
         std::process::id()
     ))
 }
@@ -714,7 +714,7 @@ fn test_delete_projection_for_callers_removes_callable_scoped_data() -> Result<(
 #[test]
 fn test_opening_v3_db_resets_projection_state() -> Result<(), StorageError> {
     let db_path = std::env::temp_dir().join(format!(
-        "codestory-storage-v3-migration-{}.db",
+        "codestory-store-v3-migration-{}.db",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&db_path);

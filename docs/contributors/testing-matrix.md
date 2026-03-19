@@ -1,5 +1,7 @@
 # Testing Matrix
 
+Run Cargo verifications serially in this repo. The workspace shares build locks.
+
 ```mermaid
 flowchart TD
     change["What changed?"] --> always["Always run whole-workspace checks"]
@@ -25,6 +27,8 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
+These are the default checks for any contributor change.
+
 ## Indexer And Graph Fidelity
 
 ```powershell
@@ -32,6 +36,9 @@ cargo test -p codestory-indexer --test fidelity_regression
 cargo test -p codestory-indexer --test tictactoe_language_coverage
 cargo test -p codestory-indexer --test integration
 ```
+
+Run these whenever the change affects parsing, extraction, semantic resolution, or graph fidelity.
+Use the full test binaries above instead of filtered `cargo test` invocations.
 
 ## Store Changes
 
@@ -45,6 +52,8 @@ cargo test -p codestory-store
 cargo test -p codestory-runtime
 cargo test -p codestory-runtime --test retrieval_eval
 ```
+
+Run `retrieval_eval` when search or grounding quality may have changed.
 
 ## CLI Boundary And Output Changes
 

@@ -3,14 +3,14 @@
 ## Project Structure & Module Organization
 - Rust workspace is defined in `Cargo.toml`; crates live under `crates/`.
 - Primary runtime surface is `crates/codestory-cli`; the repo-local skill lives under `.agents/skills/codestory-grounding`.
-- Core crates: `codestory-contracts`, `codestory-workspace`, `codestory-store`, `codestory-indexer`, `codestory-runtime`, `codestory-core`, `codestory-events`, `codestory-storage`, `codestory-index`, `codestory-search`, `codestory-api`, `codestory-cli`.
+- Workspace crates: `codestory-contracts`, `codestory-workspace`, `codestory-store`, `codestory-indexer`, `codestory-runtime`, `codestory-cli`, `codestory-bench`.
 - Runtime artifacts: user-cache SQLite grounding indexes keyed by repo path; build outputs in `target/`.
 
 ## Architecture Overview
 - `codestory-runtime` is the headless orchestrator used by the CLI and skill scripts.
-- `codestory-events::EventBus` decouples indexing/storage progress from API and UI updates.
-- Indexing pipeline: `codestory-workspace` discovers files and refresh plans, `codestory-index` extracts symbols/edges via tree-sitter + semantic resolution, `codestory-storage` persists to SQLite.
-- `codestory-api` holds DTOs shared across the CLI and any higher-level adapters.
+- `codestory-contracts` holds the shared graph model, DTOs, grounding/trail types, and shared events.
+- Indexing pipeline: `codestory-workspace` discovers files and refresh plans, `codestory-indexer` extracts symbols/edges via tree-sitter + semantic resolution, and `codestory-store` persists graph/search/snapshot state to SQLite.
+- `codestory-bench` contains Criterion benches for indexing, grounding, resolution, and cleanup work.
 
 ## Build, Test, and Development Commands
 - Backend build/test: `cargo build`, `cargo test`, `cargo check`, `cargo fmt`, `cargo clippy`.
@@ -38,4 +38,3 @@
 
 ## Security & Configuration Tips
 - Keep secrets out of the repo; pass credentials via environment variables.
-
