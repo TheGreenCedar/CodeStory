@@ -12,12 +12,6 @@ flowchart LR
     Runtime --> Indexer["codestory-indexer"]
     Runtime --> Store["codestory-store"]
     Indexer --> Store
-    Contracts["codestory-contracts"] -->|"shared types"| Workspace
-    Contracts -->|"shared types"| Indexer
-    Contracts -->|"shared types"| Store
-    Contracts -->|"shared types"| Runtime
-    Bench["codestory-bench"] -->|"benchmarks"| Indexer
-    Bench -->|"benchmarks"| Runtime
 ```
 
 ## Use CodeStory
@@ -88,8 +82,14 @@ flowchart LR
 - `ground`: build grounded context from indexed symbols, snippets, graph traversal, and search results
 - `search`: find symbols, files, and query matches
 - `symbol`: inspect one symbol and its indexed relationships
+
+Hybrid retrieval is the intended default when local embedding assets are available. `index`, `ground`, and `search` now report retrieval mode, semantic doc counts, and explicit fallback reasons when the runtime drops back to symbolic ranking.
 - `trail`: walk caller/callee and usage neighborhoods through the graph
 - `snippet`: fetch focused source context for a symbol or file location
+
+## Retrieval Defaults
+
+`index`, `ground`, and `search` now report the active retrieval mode. Hybrid retrieval is the default when local embedding assets are available; otherwise CodeStory falls back to symbolic or lexical ranking and reports why.
 
 ## Workspace Shape
 
@@ -119,6 +119,7 @@ Release-blocking fidelity suites:
 ```powershell
 cargo test -p codestory-indexer --test fidelity_regression
 cargo test -p codestory-indexer --test tictactoe_language_coverage
+cargo test -p codestory-runtime --test retrieval_eval
 ```
 
 ## Runtime Artifacts
@@ -128,3 +129,4 @@ CodeStory writes user-cache SQLite indexes keyed by the target project path. Bui
 ## License
 
 MIT. See `LICENSE`.
+
