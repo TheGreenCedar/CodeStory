@@ -35,6 +35,8 @@ Use this path if you want to run the tool against a repository.
    codestory-cli snippet --project <path> (--id <node-id> | --query <query>)
    ```
 
+If you are using an agent in this repo, point it at the available `codestory-grounding` skill in `.agents/skills/codestory-grounding/SKILL.md` so it can use the indexed grounding workflows directly.
+
 Start here when you are using the tool:
 
 - [Runtime execution path](docs/architecture/runtime-execution-path.md)
