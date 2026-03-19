@@ -7,7 +7,8 @@ use codestory_contracts::api::{
     GroundingSymbolDigestDto, IndexMode, IndexingPhaseTimings, ListChildrenSymbolsRequest,
     ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
     NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
-    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, SearchHit, SearchRequest,
+    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, RetrievalFallbackReasonDto,
+    RetrievalModeDto, RetrievalStateDto, SearchHit, SearchRequest, SearchResultsDto,
     SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto,
     SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto,
     TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WriteFileResponse,
@@ -17,7 +18,8 @@ use codestory_contracts::events::{Event, EventBus};
 use codestory_indexer::IncrementalIndexingStats;
 use codestory_indexer::WorkspaceIndexer as V2WorkspaceIndexer;
 use codestory_store::{
-    FileInfo, GroundingEdgeKindCount, GroundingNodeRecord, LlmSymbolDoc, SnapshotStore, Store,
+    FileInfo, GroundingEdgeKindCount, GroundingNodeRecord, LlmSymbolDoc, LlmSymbolDocStats,
+    SnapshotStore, Store,
 };
 use codestory_workspace::{
     IndexedFileRecord, RefreshExecutionPlan, RefreshInputs, Workspace, WorkspaceInventory,
@@ -426,10 +428,18 @@ fn markdown_snippet(text: &str, focus_line: Option<u32>, context: usize) -> Stri
     out
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticProjectionMode {
+    PersistBackedDocs,
+    SkipPersistence,
+}
+
 fn build_search_state(
     storage: &mut Storage,
     nodes: Vec<codestory_contracts::graph::Node>,
     llm_refresh_file_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
+    semantic_projection_mode: SemanticProjectionMode,
 ) -> Result<
     (
         HashMap<codestory_contracts::graph::NodeId, String>,
@@ -450,13 +460,20 @@ fn build_search_state(
     engine
         .index_nodes(search_nodes)
         .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
-    sync_llm_symbol_projection(
-        storage,
-        &nodes,
-        &node_names,
-        &mut engine,
-        llm_refresh_file_scope,
-    )?;
+    if semantic_projection_mode == SemanticProjectionMode::PersistBackedDocs {
+        sync_llm_symbol_projection(
+            storage,
+            &nodes,
+            &node_names,
+            &mut engine,
+            llm_refresh_file_scope,
+        )?;
+    } else {
+        tracing::debug!(
+            "Skipping semantic doc persistence for transient build_search_state invocation"
+        );
+        engine.index_llm_symbol_docs(Vec::new());
+    }
 
     Ok((node_names, engine))
 }
@@ -466,6 +483,86 @@ fn current_epoch_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
+}
+
+const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 2;
+const LLM_SYMBOL_DOC_VERSION_PREFIX: &str = "semantic_doc_version:";
+
+fn retrieval_state_from_parts(
+    semantic_doc_count: u32,
+    embedding_model: Option<String>,
+    embedding_runtime_available: bool,
+    fallback_message: Option<String>,
+) -> RetrievalStateDto {
+    let hybrid_configured = hybrid_retrieval_enabled();
+    let fallback_reason = if !hybrid_configured {
+        Some(RetrievalFallbackReasonDto::DisabledByConfig)
+    } else if !embedding_runtime_available {
+        Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime)
+    } else if semantic_doc_count == 0 {
+        Some(RetrievalFallbackReasonDto::MissingSemanticDocs)
+    } else {
+        None
+    };
+    let semantic_ready = hybrid_configured && embedding_runtime_available && semantic_doc_count > 0;
+    let mode = if semantic_ready {
+        RetrievalModeDto::Hybrid
+    } else {
+        RetrievalModeDto::Symbolic
+    };
+    let fallback_message = fallback_message.or_else(|| match fallback_reason {
+        Some(RetrievalFallbackReasonDto::DisabledByConfig) => Some(format!(
+            "Hybrid retrieval disabled by {HYBRID_RETRIEVAL_ENABLED_ENV}=false; using symbolic ranking."
+        )),
+        Some(RetrievalFallbackReasonDto::MissingSemanticDocs) => Some(
+            "Semantic assets are available, but semantic symbol docs have not been built yet. Run `index` or reopen the project to populate them."
+                .to_string(),
+        ),
+        _ => None,
+    });
+
+    RetrievalStateDto {
+        mode,
+        hybrid_configured,
+        semantic_ready,
+        semantic_doc_count,
+        embedding_model,
+        fallback_reason,
+        fallback_message,
+    }
+}
+
+fn retrieval_state_from_engine(engine: &SearchEngine) -> RetrievalStateDto {
+    let probe = embedding_runtime_availability_from_env();
+    retrieval_state_from_parts(
+        engine.semantic_doc_count(),
+        engine
+            .embedding_model_id()
+            .map(str::to_string)
+            .or(probe.model_id),
+        engine.embedding_runtime_configured(),
+        if engine.embedding_runtime_configured() {
+            None
+        } else {
+            probe.fallback_message
+        },
+    )
+}
+
+fn retrieval_state_from_storage(storage: &Storage) -> Result<RetrievalStateDto, ApiError> {
+    let LlmSymbolDocStats {
+        doc_count,
+        embedding_model,
+    } = storage
+        .get_llm_symbol_doc_stats()
+        .map_err(|e| ApiError::internal(format!("Failed to query LLM symbol doc stats: {e}")))?;
+    let probe = embedding_runtime_availability_from_env();
+    Ok(retrieval_state_from_parts(
+        doc_count,
+        embedding_model.or(probe.model_id),
+        probe.available,
+        probe.fallback_message,
+    ))
 }
 
 fn llm_indexable_kind(kind: codestory_contracts::graph::NodeKind) -> bool {
@@ -499,23 +596,191 @@ fn edge_digest_for_node(
         .collect()
 }
 
+fn referenced_symbol_labels(
+    storage: &Storage,
+    node: &codestory_contracts::graph::Node,
+    limit: usize,
+) -> Vec<String> {
+    let mut labels = Vec::new();
+    let Ok(edges) = storage.get_edges_for_node_id(node.id) else {
+        return labels;
+    };
+
+    for edge in edges {
+        let (source, target) = edge.effective_endpoints();
+        let other = if source == node.id {
+            target
+        } else if target == node.id {
+            source
+        } else {
+            continue;
+        };
+        let Ok(Some(other_node)) = storage.get_node(other) else {
+            continue;
+        };
+        if !llm_indexable_kind(other_node.kind) {
+            continue;
+        }
+        let label = node_display_name(&other_node);
+        if label.is_empty() || labels.contains(&label) {
+            continue;
+        }
+        labels.push(label);
+        if labels.len() >= limit {
+            break;
+        }
+    }
+
+    labels
+}
+
+fn child_symbol_labels(
+    storage: &Storage,
+    node: &codestory_contracts::graph::Node,
+    limit: usize,
+) -> Vec<String> {
+    let Ok(children) = storage.get_children_symbols(node.id) else {
+        return Vec::new();
+    };
+    children
+        .into_iter()
+        .filter(|child| llm_indexable_kind(child.kind))
+        .map(|child| node_display_name(&child))
+        .filter(|label| !label.is_empty())
+        .take(limit)
+        .collect()
+}
+
+fn compact_doc_lines(lines: impl Iterator<Item = String>, limit: usize) -> Vec<String> {
+    lines
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .take(limit)
+        .collect()
+}
+
+fn comment_block_before(lines: &[&str], start_idx: usize, limit: usize) -> Vec<String> {
+    if start_idx == 0 {
+        return Vec::new();
+    }
+
+    let mut block = Vec::new();
+    for idx in (0..start_idx).rev() {
+        let trimmed = lines[idx].trim();
+        if trimmed.is_empty() {
+            if block.is_empty() {
+                continue;
+            }
+            break;
+        }
+        if trimmed.starts_with("//")
+            || trimmed.starts_with("///")
+            || trimmed.starts_with('#')
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with('*')
+        {
+            block.push(trimmed.to_string());
+            if block.len() >= limit {
+                break;
+            }
+            continue;
+        }
+        break;
+    }
+    block.reverse();
+    block
+}
+
+fn symbol_excerpt(
+    node: &codestory_contracts::graph::Node,
+    file_path: Option<&str>,
+    file_text_cache: &mut HashMap<String, Option<String>>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let Some(path) = file_path else {
+        return (Vec::new(), Vec::new(), Vec::new());
+    };
+    let contents = file_text_cache
+        .entry(path.to_string())
+        .or_insert_with(|| read_searchable_file_contents(path));
+    let Some(contents) = contents.as_deref() else {
+        return (Vec::new(), Vec::new(), Vec::new());
+    };
+
+    let lines = contents.lines().collect::<Vec<_>>();
+    let start_idx = node.start_line.unwrap_or(1).saturating_sub(1) as usize;
+    let mut signature = Vec::new();
+    if let Some(line) = lines.get(start_idx) {
+        signature.push(line.trim().to_string());
+    }
+
+    let end_idx = node
+        .end_line
+        .map(|value| value as usize)
+        .unwrap_or_else(|| start_idx.saturating_add(8).saturating_add(1))
+        .min(lines.len());
+    let body_start = start_idx.saturating_add(1).min(lines.len());
+    let body = compact_doc_lines(
+        lines[body_start..end_idx]
+            .iter()
+            .map(|line| (*line).to_string()),
+        6,
+    );
+    let comments = comment_block_before(&lines, start_idx.min(lines.len()), 4);
+    (signature, comments, body)
+}
+
 fn build_llm_symbol_doc_text(
     storage: &Storage,
     node: &codestory_contracts::graph::Node,
     display_name: &str,
     file_path: Option<&str>,
+    file_text_cache: &mut HashMap<String, Option<String>>,
 ) -> String {
     let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{LLM_SYMBOL_DOC_VERSION_PREFIX} {LLM_SYMBOL_DOC_SCHEMA_VERSION}"
+    );
     let _ = writeln!(out, "symbol: {display_name}");
     let _ = writeln!(out, "kind: {:?}", node.kind);
     if let Some(path) = file_path {
         let _ = writeln!(out, "file: {path}");
+        let path_lower = path.to_ascii_lowercase();
+        if path_lower.contains("/tests/") || path_lower.contains("\\tests\\") {
+            let _ = writeln!(out, "file_role: test");
+        } else if path_lower.contains("/docs/")
+            || path_lower.contains("\\docs\\")
+            || path_lower.ends_with(".md")
+        {
+            let _ = writeln!(out, "file_role: docs");
+        }
     }
     if let Some(line) = node.start_line {
         let _ = writeln!(out, "line: {line}");
     }
     if let Some(qualified_name) = node.qualified_name.as_deref() {
         let _ = writeln!(out, "qualified_name: {qualified_name}");
+    }
+
+    let (signature, comments, body) = symbol_excerpt(node, file_path, file_text_cache);
+    if !signature.is_empty() {
+        let _ = writeln!(out, "signature: {}", signature.join(" "));
+    }
+    if !comments.is_empty() {
+        let _ = writeln!(out, "comments: {}", comments.join(" "));
+    }
+    if !body.is_empty() {
+        let _ = writeln!(out, "body_summary: {}", body.join(" "));
+    }
+
+    let children = child_symbol_labels(storage, node, 6);
+    if !children.is_empty() {
+        let _ = writeln!(out, "members: {}", children.join(", "));
+    }
+
+    let related = referenced_symbol_labels(storage, node, 6);
+    if !related.is_empty() {
+        let _ = writeln!(out, "related_symbols: {}", related.join(", "));
     }
 
     let edge_digest = edge_digest_for_node(storage, node.id, 6);
@@ -567,7 +832,11 @@ fn sync_llm_symbol_projection(
         .to_string();
     let updated_at_epoch_ms = current_epoch_ms();
 
-    if let Some(scope) = llm_refresh_file_scope {
+    if llm_refresh_file_scope.is_none() {
+        storage
+            .clear_llm_symbol_docs()
+            .map_err(|e| ApiError::internal(format!("Failed to clear stale LLM docs: {e}")))?;
+    } else if let Some(scope) = llm_refresh_file_scope {
         if scope.is_empty() {
             let persisted = storage.get_all_llm_symbol_docs().map_err(|e| {
                 ApiError::internal(format!("Failed to reload LLM symbol docs: {e}"))
@@ -595,6 +864,7 @@ fn sync_llm_symbol_projection(
         String,
     )>::new();
     let mut payloads = Vec::<String>::new();
+    let mut file_text_cache = HashMap::<String, Option<String>>::new();
 
     for node in nodes {
         if !llm_indexable_kind(node.kind) {
@@ -613,8 +883,13 @@ fn sync_llm_symbol_projection(
             .cloned()
             .unwrap_or_else(|| node_display_name(node));
         let file_path = AppController::file_path_for_node(storage, node)?;
-        let doc_text =
-            build_llm_symbol_doc_text(storage, node, &display_name, file_path.as_deref());
+        let doc_text = build_llm_symbol_doc_text(
+            storage,
+            node,
+            &display_name,
+            file_path.as_deref(),
+            &mut file_text_cache,
+        );
         payloads.push(doc_text.clone());
         metadata.push((
             node.id,
@@ -693,6 +968,57 @@ pub(crate) struct HybridSearchScoredHit {
     pub semantic_score: f32,
     pub graph_score: f32,
     pub total_score: f32,
+}
+
+fn lexical_hybrid_hits(
+    engine: &mut SearchEngine,
+    query: &str,
+    graph_boosts: &HashMap<codestory_contracts::graph::NodeId, f32>,
+) -> Vec<HybridSearchHit> {
+    let lexical = engine.search_symbol_with_scores(query);
+    let lexical_max = lexical
+        .iter()
+        .map(|(_, score)| *score)
+        .fold(0.0_f32, f32::max)
+        .max(1.0);
+    lexical
+        .into_iter()
+        .map(|(node_id, score)| {
+            let lexical_score = (score / lexical_max).clamp(0.0, 1.0);
+            let graph_score = graph_boosts
+                .get(&node_id)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            HybridSearchHit {
+                node_id,
+                lexical_score,
+                semantic_score: 0.0,
+                graph_score,
+                total_score: (0.85 * lexical_score + 0.15 * graph_score).clamp(0.0, 1.0),
+            }
+        })
+        .collect::<Vec<_>>()
+}
+
+fn merge_search_hits_by_node_id(hits: &mut Vec<SearchHit>, additional: Vec<SearchHit>) {
+    let mut existing = hits
+        .iter()
+        .enumerate()
+        .map(|(index, hit)| (hit.node_id.clone(), index))
+        .collect::<HashMap<_, _>>();
+
+    for hit in additional {
+        if let Some(index) = existing.get(&hit.node_id).copied() {
+            if hit.score > hits[index].score {
+                hits[index] = hit;
+            }
+            continue;
+        }
+
+        existing.insert(hit.node_id.clone(), hits.len());
+        hits.push(hit);
+    }
 }
 
 struct AppState {
@@ -847,7 +1173,12 @@ impl AppController {
         let nodes = storage
             .get_nodes()
             .map_err(|e| ApiError::internal(format!("Failed to load nodes: {e}")))?;
-        let (node_names, engine) = build_search_state(&mut storage, nodes, None)?;
+        let (node_names, engine) = build_search_state(
+            &mut storage,
+            nodes,
+            None,
+            SemanticProjectionMode::PersistBackedDocs,
+        )?;
 
         let mut s = self.state.lock();
         if s.search_engine.is_none() {
@@ -856,6 +1187,15 @@ impl AppController {
         }
 
         Ok(())
+    }
+
+    pub fn retrieval_state(&self) -> Result<RetrievalStateDto, ApiError> {
+        self.ensure_search_state()?;
+        let s = self.state.lock();
+        let engine = s.search_engine.as_ref().ok_or_else(|| {
+            ApiError::invalid_argument("Search engine not initialized. Open a project first.")
+        })?;
+        Ok(retrieval_state_from_engine(engine))
     }
 
     fn file_path_for_node(
@@ -1021,6 +1361,7 @@ impl AppController {
         Ok(ProjectSummary {
             root: root.to_string_lossy().to_string(),
             stats: dto_stats,
+            retrieval: Some(retrieval_state_from_storage(storage)?),
         })
     }
 
@@ -1054,8 +1395,14 @@ impl AppController {
         let nodes = storage
             .get_nodes()
             .map_err(|e| ApiError::internal(format!("Failed to load nodes: {e}")))?;
-        let (node_names, engine) = build_search_state(&mut storage, nodes, None)?;
-        let summary = self.project_summary_from_storage(&root, &storage)?;
+        let (node_names, engine) = build_search_state(
+            &mut storage,
+            nodes,
+            None,
+            SemanticProjectionMode::PersistBackedDocs,
+        )?;
+        let mut summary = self.project_summary_from_storage(&root, &storage)?;
+        summary.retrieval = Some(retrieval_state_from_engine(&engine));
 
         {
             let mut s = self.state.lock();
@@ -1231,8 +1578,14 @@ impl AppController {
                     })?;
                     refresh_caches(self, &mut storage, summary.llm_refresh_scope.as_ref());
                 } else {
-                    self.clear_search_state();
-                    self.state.lock().is_indexing = false;
+                    self.finalize_indexing_without_runtime_refresh_with(
+                        &storage_path,
+                        summary.llm_refresh_scope.as_ref(),
+                        |storage, llm_refresh_scope| {
+                            rebuild_search_state_from_storage(storage, llm_refresh_scope)
+                                .map(|_| ())
+                        },
+                    )?;
                 }
                 Ok(summary.phase_timings)
             }
@@ -1264,26 +1617,57 @@ impl AppController {
         self.run_indexing_blocking_inner(mode, false)
     }
 
+    fn finalize_indexing_without_runtime_refresh_with<F>(
+        &self,
+        storage_path: &Path,
+        llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
+        rebuild: F,
+    ) -> Result<(), ApiError>
+    where
+        F: FnOnce(
+            &mut Storage,
+            Option<&HashSet<codestory_contracts::graph::NodeId>>,
+        ) -> Result<(), ApiError>,
+    {
+        let result = (|| {
+            let mut storage = Storage::open(storage_path)
+                .map_err(|e| ApiError::internal(format!("Failed to reopen storage: {e}")))?;
+            rebuild(&mut storage, llm_refresh_scope)
+        })();
+
+        self.clear_search_state();
+        self.state.lock().is_indexing = false;
+
+        result
+    }
+
     pub fn search(&self, req: SearchRequest) -> Result<Vec<SearchHit>, ApiError> {
-        self.ensure_search_state()?;
-        let (matches, node_names) = {
-            let mut s = self.state.lock();
-            let engine = s.search_engine.as_mut().ok_or_else(|| {
-                ApiError::invalid_argument("Search engine not initialized. Open a project first.")
-            })?;
-            let direct_matches = engine.search_symbol_with_scores(&req.query);
-            let matches = if should_expand_symbol_query(&req.query, direct_matches.len()) {
-                let terms = extract_symbol_search_terms(&req.query);
+        Ok(self.search_results(req)?.hits)
+    }
+
+    pub fn search_results(&self, req: SearchRequest) -> Result<SearchResultsDto, ApiError> {
+        let query = req.query.clone();
+        let (mut hits, retrieval) = self.search_hybrid_results(req, None, 20, None)?;
+        let storage = self.open_storage()?;
+
+        if should_expand_symbol_query(&query, hits.len()) {
+            let expanded = {
+                let mut s = self.state.lock();
+                let engine = s.search_engine.as_mut().ok_or_else(|| {
+                    ApiError::invalid_argument(
+                        "Search engine not initialized. Open a project first.",
+                    )
+                })?;
+                let direct_matches = engine.search_symbol_with_scores(&query);
+                let terms = extract_symbol_search_terms(&query);
                 if terms.is_empty() {
-                    direct_matches
+                    None
                 } else {
                     let mut expanded = Vec::<(codestory_contracts::graph::NodeId, f32)>::new();
-
                     for term in terms {
                         for (id, score) in engine.search_symbol_with_scores(&term) {
                             expanded.push((id, score));
                         }
-
                         if let Ok(ids) = engine.search_full_text(&term) {
                             for (rank, id) in ids.into_iter().enumerate() {
                                 let text_score = 40.0_f32 - (rank as f32 * 1.5);
@@ -1291,24 +1675,23 @@ impl AppController {
                             }
                         }
                     }
-
-                    aggregate_symbol_matches(direct_matches, expanded)
+                    Some((
+                        aggregate_symbol_matches(direct_matches, expanded),
+                        s.node_names.clone(),
+                    ))
                 }
-            } else {
-                direct_matches
             };
-            let node_names = s.node_names.clone();
-            (matches, node_names)
-        };
+            if let Some((expanded_matches, node_names)) = expanded {
+                let expanded_hits = expanded_matches
+                    .into_iter()
+                    .filter_map(|(id, score)| {
+                        Self::build_search_hit(&storage, &node_names, id, score)
+                    })
+                    .collect::<Vec<_>>();
+                merge_search_hits_by_node_id(&mut hits, expanded_hits);
+            }
 
-        let storage = self.open_storage()?;
-        let mut hits = matches
-            .into_iter()
-            .filter_map(|(id, score)| Self::build_search_hit(&storage, &node_names, id, score))
-            .collect::<Vec<_>>();
-
-        if should_expand_symbol_query(&req.query, hits.len()) {
-            let terms = extract_symbol_search_terms(&req.query);
+            let terms = extract_symbol_search_terms(&query);
             let mut seen = hits
                 .iter()
                 .map(|hit| hit.node_id.clone())
@@ -1321,7 +1704,7 @@ impl AppController {
                 let Some(contents) = read_searchable_file_contents(&path_string) else {
                     continue;
                 };
-                let Some(line) = file_text_match_line(&contents, &req.query, &terms) else {
+                let Some(line) = file_text_match_line(&contents, &query, &terms) else {
                     continue;
                 };
                 let node_id = NodeId::from(codestory_contracts::graph::NodeId(file.id));
@@ -1340,7 +1723,7 @@ impl AppController {
                     .unwrap_or_else(|| path_string.clone());
                 let exact_match = contents
                     .to_ascii_lowercase()
-                    .contains(&req.query.trim().to_ascii_lowercase());
+                    .contains(&query.trim().to_ascii_lowercase());
                 let score = if exact_match { 260.0 } else { 150.0 } - hits.len() as f32;
                 hits.push(SearchHit {
                     node_id,
@@ -1357,13 +1740,32 @@ impl AppController {
                 }
             }
 
-            hits.sort_by(|left, right| compare_search_hits(&req.query, left, right));
+            hits.sort_by(|left, right| compare_search_hits(&query, left, right));
             hits.truncate(20);
         }
 
-        hits.sort_by(|left, right| compare_search_hits(&req.query, left, right));
+        hits.sort_by(|left, right| compare_search_hits(&query, left, right));
 
-        Ok(hits)
+        Ok(SearchResultsDto {
+            query,
+            hits,
+            retrieval,
+        })
+    }
+
+    fn search_hybrid_results(
+        &self,
+        req: SearchRequest,
+        focus_node_id: Option<NodeId>,
+        max_results: usize,
+        request_weights: Option<AgentHybridWeightsDto>,
+    ) -> Result<(Vec<SearchHit>, RetrievalStateDto), ApiError> {
+        let (scored_hits, retrieval) =
+            self.search_hybrid_scored_inner(req, focus_node_id, max_results, request_weights)?;
+        Ok((
+            scored_hits.into_iter().map(|scored| scored.hit).collect(),
+            retrieval,
+        ))
     }
 
     pub fn search_hybrid(
@@ -1373,13 +1775,13 @@ impl AppController {
         max_results: Option<u32>,
         hybrid_weights: Option<AgentHybridWeightsDto>,
     ) -> Result<Vec<SearchHit>, ApiError> {
-        let hits = self.search_hybrid_scored(
+        let (hits, _) = self.search_hybrid_results(
             req,
             focus_node_id,
             max_results.unwrap_or(20).clamp(1, 50) as usize,
             hybrid_weights,
         )?;
-        Ok(hits.into_iter().map(|scored| scored.hit).collect())
+        Ok(hits)
     }
 
     pub(crate) fn search_hybrid_scored(
@@ -1389,8 +1791,19 @@ impl AppController {
         max_results: usize,
         request_weights: Option<AgentHybridWeightsDto>,
     ) -> Result<Vec<HybridSearchScoredHit>, ApiError> {
+        Ok(self
+            .search_hybrid_scored_inner(req, focus_node_id, max_results, request_weights)?
+            .0)
+    }
+
+    fn search_hybrid_scored_inner(
+        &self,
+        req: SearchRequest,
+        focus_node_id: Option<NodeId>,
+        max_results: usize,
+        request_weights: Option<AgentHybridWeightsDto>,
+    ) -> Result<(Vec<HybridSearchScoredHit>, RetrievalStateDto), ApiError> {
         self.ensure_search_state()?;
-        let hybrid_enabled = hybrid_retrieval_enabled();
         let storage = self.open_storage()?;
         let mut graph_boosts = HashMap::<codestory_contracts::graph::NodeId, f32>::new();
 
@@ -1413,13 +1826,14 @@ impl AppController {
             }
         }
 
-        let (hybrid, node_names) = {
+        let (hybrid, node_names, retrieval) = {
             let mut s = self.state.lock();
             let engine = s.search_engine.as_mut().ok_or_else(|| {
                 ApiError::invalid_argument("Search engine not initialized. Open a project first.")
             })?;
+            let mut retrieval = retrieval_state_from_engine(engine);
 
-            let hits = if hybrid_enabled {
+            let hits = if retrieval.mode == RetrievalModeDto::Hybrid {
                 let mut config = HybridSearchConfig {
                     max_results: max_results.clamp(1, 50),
                     ..HybridSearchConfig::default()
@@ -1430,42 +1844,30 @@ impl AppController {
                 config.semantic_weight = semantic_weight;
                 config.graph_weight = graph_weight;
 
-                engine
-                    .search_hybrid_with_scores(&req.query, &graph_boosts, config)
-                    .map_err(|e| {
-                        ApiError::invalid_argument(format!(
-                            "Semantic retrieval unavailable: {e}. Configure {EMBEDDING_MODEL_ENV} with a local embedding model artifact path, place a bundled model at {DEFAULT_BUNDLED_EMBED_MODEL_PATH}, set {EMBEDDING_RUNTIME_MODE_ENV}=hash for deterministic local-dev embeddings, or set {HYBRID_RETRIEVAL_ENABLED_ENV}=false for lexical-only retrieval."
-                        ))
-                    })?
+                match engine.search_hybrid_with_scores(&req.query, &graph_boosts, config) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            "Hybrid retrieval failed for query {:?}; falling back to symbolic ranking: {}",
+                            req.query,
+                            error
+                        );
+                        retrieval = retrieval_state_from_parts(
+                            engine.semantic_doc_count(),
+                            engine.embedding_model_id().map(str::to_string),
+                            false,
+                            Some(format!(
+                                "Semantic query fallback engaged after runtime error: {error}"
+                            )),
+                        );
+                        lexical_hybrid_hits(engine, &req.query, &graph_boosts)
+                    }
+                }
             } else {
-                let lexical = engine.search_symbol_with_scores(&req.query);
-                let lexical_max = lexical
-                    .iter()
-                    .map(|(_, score)| *score)
-                    .fold(0.0_f32, f32::max)
-                    .max(1.0);
-                lexical
-                    .into_iter()
-                    .map(|(node_id, score)| {
-                        let lexical_score = (score / lexical_max).clamp(0.0, 1.0);
-                        let graph_score = graph_boosts
-                            .get(&node_id)
-                            .copied()
-                            .unwrap_or(0.0)
-                            .clamp(0.0, 1.0);
-                        HybridSearchHit {
-                            node_id,
-                            lexical_score,
-                            semantic_score: 0.0,
-                            graph_score,
-                            total_score: (0.85 * lexical_score + 0.15 * graph_score)
-                                .clamp(0.0, 1.0),
-                        }
-                    })
-                    .collect::<Vec<_>>()
+                lexical_hybrid_hits(engine, &req.query, &graph_boosts)
             };
 
-            (hits, s.node_names.clone())
+            (hits, s.node_names.clone(), retrieval)
         };
 
         let mut out = Vec::with_capacity(hybrid.len());
@@ -1485,7 +1887,7 @@ impl AppController {
         out.sort_by(|left, right| compare_search_hits(&req.query, &left.hit, &right.hit));
         out.truncate(max_results.clamp(1, 50));
 
-        Ok(out)
+        Ok((out, retrieval))
     }
 
     pub fn list_root_symbols(
@@ -2235,20 +2637,51 @@ fn workspace_refresh_inputs(store: &Store) -> Result<RefreshInputs, ApiError> {
     })
 }
 
+fn rebuild_search_state_from_storage(
+    storage: &mut Storage,
+    llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
+) -> Result<
+    (
+        HashMap<codestory_contracts::graph::NodeId, String>,
+        SearchEngine,
+    ),
+    ApiError,
+> {
+    match storage.get_nodes() {
+        Ok(nodes) => build_search_state(
+            storage,
+            nodes,
+            llm_refresh_scope,
+            SemanticProjectionMode::PersistBackedDocs,
+        )
+        .map_err(|e| ApiError::internal(format!("Failed to rebuild search state: {}", e.message))),
+        Err(e) => Err(ApiError::internal(format!(
+            "Failed to load nodes for search rebuild: {e}"
+        ))),
+    }
+}
+
 fn refresh_caches(
     controller: &AppController,
     storage: &mut Storage,
     llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
 ) {
-    let refreshed = match storage.get_nodes() {
-        Ok(nodes) => build_search_state(storage, nodes, llm_refresh_scope).ok(),
-        Err(_) => None,
-    };
+    let refreshed = rebuild_search_state_from_storage(storage, llm_refresh_scope);
 
     let mut s = controller.state.lock();
-    if let Some((node_names, engine)) = refreshed {
-        s.node_names = node_names;
-        s.search_engine = Some(engine);
+    match refreshed {
+        Ok((node_names, engine)) => {
+            s.node_names = node_names;
+            s.search_engine = Some(engine);
+        }
+        Err(error) => {
+            tracing::warn!(
+                "Failed to rebuild search caches from storage: {}",
+                error.message
+            );
+            s.node_names.clear();
+            s.search_engine = None;
+        }
     }
     s.is_indexing = false;
 }
@@ -2264,6 +2697,50 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(value) = self.previous.as_deref() {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn hybrid_test_env() -> Vec<EnvGuard> {
+        vec![
+            EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "true"),
+            EnvGuard::set(EMBEDDING_RUNTIME_MODE_ENV, "hash"),
+            EnvGuard::remove(EMBEDDING_MODEL_ENV),
+            EnvGuard::remove(EMBEDDING_TOKENIZER_ENV),
+        ]
+    }
 
     fn copy_tictactoe_workspace() -> tempfile::TempDir {
         let temp = tempdir().expect("create temp dir");
@@ -2286,6 +2763,74 @@ mod tests {
         }
 
         temp
+    }
+
+    fn write_semantic_fixture(root: &std::path::Path) -> PathBuf {
+        let file_path = root.join("semantic_fixture.rs");
+        fs::write(
+            &file_path,
+            r#"
+pub fn alpha() {
+    beta();
+}
+
+pub fn beta() {}
+"#,
+        )
+        .expect("write semantic fixture");
+        file_path
+    }
+
+    fn write_reindex_semantic_fixture(root: &std::path::Path, digest_text: &str) {
+        let src = root.join("src");
+        fs::create_dir_all(&src).expect("create src dir");
+        fs::write(
+            src.join("lib.rs"),
+            format!(
+                r#"
+/// {digest_text}
+pub fn build_snapshot_digest() -> &'static str {{
+    "{digest_text}"
+}}
+
+pub fn exact_symbol_anchor() {{}}
+"#
+            ),
+        )
+        .expect("write reindex fixture");
+    }
+
+    fn insert_semantic_fixture_nodes(storage: &mut Storage, file_path: &std::path::Path) {
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: CoreNodeId(1),
+                    kind: NodeKind::FILE,
+                    serialized_name: file_path.to_string_lossy().to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(2),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "alpha".to_string(),
+                    qualified_name: Some("pkg::alpha".to_string()),
+                    file_node_id: Some(CoreNodeId(1)),
+                    start_line: Some(2),
+                    end_line: Some(4),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(3),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "beta".to_string(),
+                    qualified_name: Some("pkg::beta".to_string()),
+                    file_node_id: Some(CoreNodeId(1)),
+                    start_line: Some(6),
+                    end_line: Some(6),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert semantic fixture nodes");
     }
 
     #[test]
@@ -2311,7 +2856,7 @@ mod tests {
     fn aggregate_symbol_matches_prioritizes_direct_matches() {
         let direct = vec![(CoreNodeId(7), 2.0)];
         let expanded = vec![(CoreNodeId(7), 99.0), (CoreNodeId(8), 95.0)];
-        let merged = aggregate_symbol_matches(direct, expanded);
+        let merged = crate::support::aggregate_symbol_matches(direct, expanded);
         assert_eq!(merged.first().map(|(id, _)| *id), Some(CoreNodeId(7)));
     }
 
@@ -2559,8 +3104,13 @@ mod tests {
             ..Default::default()
         }];
 
-        let (node_names, mut engine) =
-            build_search_state(&mut storage, nodes, None).expect("build search state");
+        let (node_names, mut engine) = build_search_state(
+            &mut storage,
+            nodes,
+            None,
+            SemanticProjectionMode::SkipPersistence,
+        )
+        .expect("build search state");
         assert_eq!(
             node_names.get(&CoreNodeId(1)).map(String::as_str),
             Some("pkg.mod.short_name")
@@ -2604,6 +3154,217 @@ mod tests {
         controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("index without runtime refresh");
+
+        let state = controller.state.lock();
+        assert!(!state.is_indexing);
+        assert!(state.search_engine.is_none());
+        assert!(state.node_names.is_empty());
+    }
+
+    #[test]
+    fn run_indexing_without_runtime_refresh_populates_semantic_docs_in_storage() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("index without runtime refresh");
+
+        let state = controller.state.lock();
+        assert!(!state.is_indexing);
+        assert!(state.search_engine.is_none());
+        assert!(state.node_names.is_empty());
+        drop(state);
+
+        let storage = Storage::open(&storage_path).expect("reopen storage");
+        let stats = storage
+            .get_llm_symbol_doc_stats()
+            .expect("semantic doc stats");
+        assert!(
+            stats.doc_count > 0,
+            "expected full indexing to persist semantic docs without requiring a follow-up open"
+        );
+    }
+
+    #[test]
+    fn rebuild_search_state_rebuilds_mixed_model_docs() {
+        let temp = tempdir().expect("create temp dir");
+        let file_path = write_semantic_fixture(temp.path());
+        let mut storage = Storage::new_in_memory().expect("storage");
+        insert_semantic_fixture_nodes(&mut storage, &file_path);
+
+        let mut env = hybrid_test_env();
+        env.push(EnvGuard::set(EMBEDDING_MODEL_ID_ENV, "model-a"));
+        rebuild_search_state_from_storage(&mut storage, None).expect("initial rebuild");
+        assert_eq!(
+            storage
+                .get_llm_symbol_doc_stats()
+                .expect("initial doc stats")
+                .embedding_model
+                .as_deref(),
+            Some("model-a")
+        );
+
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE llm_symbol_doc
+                 SET embedding_model = CASE
+                     WHEN node_id = 2 THEN 'model-b'
+                     ELSE embedding_model
+                 END",
+                [],
+            )
+            .expect("mark one semantic doc as mixed");
+        assert_eq!(
+            storage
+                .get_llm_symbol_doc_stats()
+                .expect("mixed doc stats")
+                .embedding_model,
+            None
+        );
+
+        env.push(EnvGuard::set(EMBEDDING_MODEL_ID_ENV, "model-b"));
+        rebuild_search_state_from_storage(&mut storage, None)
+            .expect("mixed corpus should force rebuild");
+
+        let docs = storage
+            .get_all_llm_symbol_docs()
+            .expect("reloaded semantic docs");
+        assert!(!docs.is_empty(), "expected rebuilt semantic docs");
+        assert!(
+            docs.iter().all(|doc| doc.embedding_model == "model-b"),
+            "expected mixed semantic docs to be rebuilt to a uniform model"
+        );
+    }
+
+    #[test]
+    fn merge_search_hits_by_node_id_keeps_stronger_expanded_score() {
+        let mut hits = vec![
+            SearchHit {
+                node_id: NodeId("primary".to_string()),
+                display_name: "alpha".to_string(),
+                kind: codestory_contracts::api::NodeKind::FUNCTION,
+                file_path: Some("src/lib.rs".to_string()),
+                line: Some(10),
+                score: 0.25,
+                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
+            },
+            SearchHit {
+                node_id: NodeId("secondary".to_string()),
+                display_name: "alpha".to_string(),
+                kind: codestory_contracts::api::NodeKind::FUNCTION,
+                file_path: Some("src/lib.rs".to_string()),
+                line: Some(20),
+                score: 0.75,
+                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
+            },
+        ];
+
+        merge_search_hits_by_node_id(
+            &mut hits,
+            vec![SearchHit {
+                node_id: NodeId("primary".to_string()),
+                display_name: "alpha".to_string(),
+                kind: codestory_contracts::api::NodeKind::FUNCTION,
+                file_path: Some("src/lib.rs".to_string()),
+                line: Some(10),
+                score: 250.0,
+                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
+            }],
+        );
+
+        hits.sort_by(|left, right| compare_search_hits("alpha", left, right));
+
+        assert_eq!(hits[0].node_id, NodeId("primary".to_string()));
+        assert_eq!(hits[0].score, 250.0);
+    }
+
+    #[test]
+    fn full_index_rebuilds_semantic_docs_when_source_text_changes() {
+        let _env = hybrid_test_env();
+        let workspace = tempdir().expect("workspace dir");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        write_reindex_semantic_fixture(workspace.path(), "initial compressed digest");
+        controller
+            .open_project_with_storage_path(workspace.path().to_path_buf(), storage_path.clone())
+            .expect("open project");
+        controller
+            .run_indexing_blocking(IndexMode::Full)
+            .expect("initial full index");
+
+        let storage = Storage::open(&storage_path).expect("open storage after initial index");
+        let initial_doc = storage
+            .get_all_llm_symbol_docs()
+            .expect("load initial semantic docs")
+            .into_iter()
+            .find(|doc| doc.display_name == "build_snapshot_digest")
+            .expect("initial digest doc");
+        assert!(initial_doc.doc_text.contains("initial compressed digest"));
+        drop(storage);
+
+        write_reindex_semantic_fixture(workspace.path(), "updated compressed digest");
+        controller
+            .run_indexing_blocking(IndexMode::Full)
+            .expect("rerun full index");
+
+        let storage = Storage::open(&storage_path).expect("open storage after rerun");
+        let updated_doc = storage
+            .get_all_llm_symbol_docs()
+            .expect("load updated semantic docs")
+            .into_iter()
+            .find(|doc| doc.display_name == "build_snapshot_digest")
+            .expect("updated digest doc");
+        assert!(updated_doc.doc_text.contains("updated compressed digest"));
+        assert!(
+            !updated_doc.doc_text.contains("initial compressed digest"),
+            "full index should rebuild semantic docs instead of reusing stale persisted content"
+        );
+    }
+
+    #[test]
+    fn finalize_indexing_without_runtime_refresh_propagates_rebuild_failure() {
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+
+        {
+            let mut state = controller.state.lock();
+            state.is_indexing = true;
+            state
+                .node_names
+                .insert(CoreNodeId(999), "stale_symbol".to_string());
+            state.search_engine = Some(SearchEngine::new(None).expect("search engine"));
+        }
+
+        let error = controller
+            .finalize_indexing_without_runtime_refresh_with(&storage_path, None, |_storage, _| {
+                Err(ApiError::internal("forced rebuild failure".to_string()))
+            })
+            .expect_err("forced rebuild failure should propagate");
+
+        assert_eq!(error.code, "internal");
+        assert_eq!(error.message, "forced rebuild failure");
 
         let state = controller.state.lock();
         assert!(!state.is_indexing);

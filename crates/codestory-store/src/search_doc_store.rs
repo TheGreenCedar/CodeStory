@@ -1,5 +1,5 @@
 use crate::Store;
-use crate::{LlmSymbolDoc, StorageError};
+use crate::{LlmSymbolDoc, LlmSymbolDocStats, StorageError};
 use codestory_contracts::graph::NodeId;
 
 pub struct SearchDocStore<'a> {
@@ -13,6 +13,10 @@ impl<'a> SearchDocStore<'a> {
 
     pub fn get_all(&self) -> Result<Vec<LlmSymbolDoc>, StorageError> {
         self.storage.get_all_llm_symbol_docs()
+    }
+
+    pub fn get_stats(&self) -> Result<LlmSymbolDocStats, StorageError> {
+        self.storage.get_llm_symbol_doc_stats()
     }
 
     pub fn get_by_node_ids(&self, node_ids: &[NodeId]) -> Result<Vec<LlmSymbolDoc>, StorageError> {

@@ -38,15 +38,17 @@ sequenceDiagram
     CLI->>Runtime: resolve command and query options
     Runtime->>Store: open store and read graph/search state
     Store-->>Runtime: rows, snapshots, and search docs
-    Runtime->>Runtime: rank, dedupe, and map into DTOs
+    Runtime->>Runtime: prefer hybrid ranking, or fall back to symbolic ranking
+    Runtime->>Runtime: map retrieval state and hits into DTOs
     Runtime-->>CLI: result DTOs
     CLI->>CLI: render markdown or JSON
 ```
 
 1. CLI resolves the project and query options.
 2. Runtime opens the store and ensures runtime-owned search state is available.
-3. Runtime search combines lexical, semantic, and graph-informed ranking.
-4. Runtime maps matches into contract DTOs and CLI renders them.
+3. Runtime search prefers hybrid ranking when semantic docs and a local embedding runtime are ready.
+4. When semantic retrieval is unavailable, runtime falls back to symbolic ranking and records the fallback reason in the DTO surface.
+5. Runtime maps retrieval state plus matches into contract DTOs and CLI renders them.
 
 ## Ground, Symbol, Trail, and Snippet Commands
 

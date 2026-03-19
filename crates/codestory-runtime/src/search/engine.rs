@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tantivy::collector::TopDocs;
 use tantivy::doc;
 use tantivy::query::QueryParser;
-use tantivy::schema::{FAST, INDEXED, STORED, Schema, TEXT, Value};
+use tantivy::schema::Value;
+use tantivy::schema::{FAST, INDEXED, STORED, Schema, TEXT};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 
@@ -23,6 +24,13 @@ pub const EMBEDDING_TOKENIZER_ENV: &str = "CODESTORY_EMBED_TOKENIZER_PATH";
 pub const EMBEDDING_MAX_TOKENS_ENV: &str = "CODESTORY_EMBED_MAX_TOKENS";
 pub const EMBEDDING_RUNTIME_MODE_ENV: &str = "CODESTORY_EMBED_RUNTIME_MODE";
 pub const DEFAULT_BUNDLED_EMBED_MODEL_PATH: &str = "models/all-minilm-l6-v2/model.onnx";
+
+#[derive(Debug, Clone)]
+pub struct EmbeddingRuntimeAvailability {
+    pub available: bool,
+    pub model_id: Option<String>,
+    pub fallback_message: Option<String>,
+}
 
 fn resolve_bundled_embed_model_path() -> Option<PathBuf> {
     let relative = PathBuf::from(DEFAULT_BUNDLED_EMBED_MODEL_PATH);
@@ -61,11 +69,81 @@ fn resolve_bundled_embed_model_path() -> Option<PathBuf> {
     None
 }
 
+pub fn embedding_runtime_availability_from_env() -> EmbeddingRuntimeAvailability {
+    let runtime_mode = std::env::var(EMBEDDING_RUNTIME_MODE_ENV)
+        .unwrap_or_else(|_| "onnx".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    let model_id = std::env::var(EMBEDDING_MODEL_ID_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "sentence-transformers/all-MiniLM-L6-v2-local".to_string());
+
+    if runtime_mode == "hash" || runtime_mode == "hash_projection" {
+        return EmbeddingRuntimeAvailability {
+            available: true,
+            model_id: Some(model_id),
+            fallback_message: None,
+        };
+    }
+
+    let model_path = if let Ok(path) = std::env::var(EMBEDDING_MODEL_ENV) {
+        PathBuf::from(path)
+    } else if let Some(path) = resolve_bundled_embed_model_path() {
+        path
+    } else {
+        return EmbeddingRuntimeAvailability {
+            available: false,
+            model_id: Some(model_id),
+            fallback_message: Some(format!(
+                "Missing {EMBEDDING_MODEL_ENV}. Configure a local embedding model artifact path or place a bundled model at {DEFAULT_BUNDLED_EMBED_MODEL_PATH}."
+            )),
+        };
+    };
+
+    if !model_path.is_file() {
+        return EmbeddingRuntimeAvailability {
+            available: false,
+            model_id: Some(model_id),
+            fallback_message: Some(format!(
+                "embedding model artifact not found at {}",
+                model_path.display()
+            )),
+        };
+    }
+
+    let tokenizer_path = std::env::var(EMBEDDING_TOKENIZER_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| model_path.with_file_name("tokenizer.json"));
+    if !tokenizer_path.is_file() {
+        return EmbeddingRuntimeAvailability {
+            available: false,
+            model_id: Some(model_id),
+            fallback_message: Some(format!(
+                "embedding tokenizer not found at {} (set {EMBEDDING_TOKENIZER_ENV})",
+                tokenizer_path.display()
+            )),
+        };
+    }
+
+    EmbeddingRuntimeAvailability {
+        available: true,
+        model_id: Some(model_id),
+        fallback_message: None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LlmSearchDoc {
     pub node_id: NodeId,
     pub doc_text: String,
     pub embedding: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbeddingRuntimeProbe {
+    pub model_path: PathBuf,
+    pub model_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -121,20 +199,17 @@ struct OnnxEmbeddingRuntime {
 }
 
 impl EmbeddingRuntime {
-    fn ensure_onnx_initialized() -> Result<()> {
-        static INIT: OnceLock<()> = OnceLock::new();
-        let _ = INIT.get_or_init(|| {
-            // `commit()` returns false when another global environment is already configured.
-            let _ = ort::init().with_name("codestory-embeddings").commit();
-        });
-        Ok(())
+    fn model_id_from_env() -> String {
+        std::env::var(EMBEDDING_MODEL_ID_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "sentence-transformers/all-MiniLM-L6-v2-local".to_string())
     }
 
-    pub fn from_model_artifact<P: AsRef<Path>>(
+    fn probe_model_artifact<P: AsRef<Path>>(
         path: P,
         model_id: impl Into<String>,
-    ) -> Result<Self> {
-        Self::ensure_onnx_initialized()?;
+    ) -> Result<EmbeddingRuntimeProbe> {
         let model_path = path.as_ref().to_path_buf();
         if !model_path.is_file() {
             return Err(anyhow!(
@@ -151,6 +226,32 @@ impl EmbeddingRuntime {
                 tokenizer_path.display()
             ));
         }
+
+        Ok(EmbeddingRuntimeProbe {
+            model_path,
+            model_id: model_id.into(),
+        })
+    }
+
+    fn ensure_onnx_initialized() -> Result<()> {
+        static INIT: OnceLock<()> = OnceLock::new();
+        let _ = INIT.get_or_init(|| {
+            // `commit()` returns false when another global environment is already configured.
+            let _ = ort::init().with_name("codestory-embeddings").commit();
+        });
+        Ok(())
+    }
+
+    pub fn from_model_artifact<P: AsRef<Path>>(
+        path: P,
+        model_id: impl Into<String>,
+    ) -> Result<Self> {
+        Self::ensure_onnx_initialized()?;
+        let model_path = path.as_ref().to_path_buf();
+        let probe = Self::probe_model_artifact(&model_path, model_id)?;
+        let tokenizer_path = std::env::var(EMBEDDING_TOKENIZER_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| model_path.with_file_name("tokenizer.json"));
 
         let max_tokens = std::env::var(EMBEDDING_MAX_TOKENS_ENV)
             .ok()
@@ -175,7 +276,7 @@ impl EmbeddingRuntime {
 
         Ok(Self {
             model_path,
-            model_id: model_id.into(),
+            model_id: probe.model_id,
             backend: EmbeddingBackend::Onnx(Arc::new(OnnxEmbeddingRuntime {
                 session: Mutex::new(session),
                 tokenizer: Mutex::new(tokenizer),
@@ -184,15 +285,39 @@ impl EmbeddingRuntime {
         })
     }
 
+    pub fn probe_from_env() -> Result<EmbeddingRuntimeProbe> {
+        let runtime_mode = std::env::var(EMBEDDING_RUNTIME_MODE_ENV)
+            .unwrap_or_else(|_| "onnx".to_string())
+            .trim()
+            .to_ascii_lowercase();
+        let model_id = Self::model_id_from_env();
+
+        if runtime_mode == "hash" || runtime_mode == "hash_projection" {
+            return Ok(EmbeddingRuntimeProbe {
+                model_path: PathBuf::from("hash-projection"),
+                model_id,
+            });
+        }
+
+        if let Ok(path) = std::env::var(EMBEDDING_MODEL_ENV) {
+            return Self::probe_model_artifact(path, model_id);
+        }
+
+        if let Some(bundled_path) = resolve_bundled_embed_model_path() {
+            return Self::probe_model_artifact(bundled_path, model_id);
+        }
+
+        Err(anyhow!(
+            "Missing {EMBEDDING_MODEL_ENV}. Configure a local embedding model artifact path or place a bundled model at {DEFAULT_BUNDLED_EMBED_MODEL_PATH}."
+        ))
+    }
+
     pub fn from_env() -> Result<Self> {
         let runtime_mode = std::env::var(EMBEDDING_RUNTIME_MODE_ENV)
             .unwrap_or_else(|_| "onnx".to_string())
             .trim()
             .to_ascii_lowercase();
-        let model_id = std::env::var(EMBEDDING_MODEL_ID_ENV)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "sentence-transformers/all-MiniLM-L6-v2-local".to_string());
+        let model_id = Self::model_id_from_env();
 
         if runtime_mode == "hash" || runtime_mode == "hash_projection" {
             return Ok(Self {
@@ -495,8 +620,16 @@ impl SearchEngine {
             .map(EmbeddingRuntime::model_id)
     }
 
+    pub fn embedding_runtime_configured(&self) -> bool {
+        self.embedding_runtime.is_some()
+    }
+
     pub fn semantic_index_ready(&self) -> bool {
         self.embedding_runtime.is_some() && !self.llm_docs.is_empty()
+    }
+
+    pub fn semantic_doc_count(&self) -> u32 {
+        self.llm_docs.len().min(u32::MAX as usize) as u32
     }
 
     pub fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {

@@ -11,7 +11,7 @@ flowchart TD
     always --> workspace["fmt, check, test, clippy"]
     indexer --> fidelity["fidelity_regression, tictactoe_language_coverage, integration"]
     store --> store_tests["cargo test -p codestory-store"]
-    runtime --> runtime_tests["cargo test -p codestory-runtime"]
+    runtime --> runtime_tests["cargo test -p codestory-runtime and retrieval_eval"]
     cli --> cli_tests["cargo test -p codestory-cli"]
     bench --> bench_checks["cargo check -p codestory-bench --benches"]
 ```
@@ -43,6 +43,7 @@ cargo test -p codestory-store
 
 ```powershell
 cargo test -p codestory-runtime
+cargo test -p codestory-runtime --test retrieval_eval
 ```
 
 ## CLI Boundary And Output Changes

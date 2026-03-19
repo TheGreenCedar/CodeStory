@@ -2,7 +2,8 @@ pub(crate) use crate::search::engine::SearchEngine;
 pub use crate::search::engine::{
     DEFAULT_BUNDLED_EMBED_MODEL_PATH, EMBEDDING_MAX_TOKENS_ENV, EMBEDDING_MODEL_ENV,
     EMBEDDING_MODEL_ID_ENV, EMBEDDING_RUNTIME_MODE_ENV, EMBEDDING_TOKENIZER_ENV,
-    HybridSearchConfig, HybridSearchHit, LlmSearchDoc,
+    EmbeddingRuntimeAvailability, HybridSearchConfig, HybridSearchHit, LlmSearchDoc,
+    embedding_runtime_availability_from_env,
 };
 
 pub mod embedding {

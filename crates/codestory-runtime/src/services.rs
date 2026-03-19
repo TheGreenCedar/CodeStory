@@ -1,8 +1,9 @@
 use codestory_contracts::api::{
     AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto, ApiError, GroundingBudgetDto,
     GroundingSnapshotDto, IndexMode, IndexingPhaseTimings, NodeDetailsDto, NodeDetailsRequest,
-    NodeId, OpenProjectRequest, ProjectSummary, SearchHit, SearchRequest, SnippetContextDto,
-    StartIndexingRequest, SymbolContextDto, TrailConfigDto, TrailContextDto,
+    NodeId, OpenProjectRequest, ProjectSummary, RetrievalStateDto, SearchHit, SearchRequest,
+    SearchResultsDto, SnippetContextDto, StartIndexingRequest, SymbolContextDto, TrailConfigDto,
+    TrailContextDto,
 };
 
 use crate::AppController;
@@ -93,8 +94,16 @@ impl SearchService {
         Self { controller }
     }
 
+    pub fn retrieval_state(&self) -> Result<RetrievalStateDto, ApiError> {
+        self.controller.retrieval_state()
+    }
+
     pub fn search(&self, req: SearchRequest) -> Result<Vec<SearchHit>, ApiError> {
         self.controller.search(req)
+    }
+
+    pub fn search_results(&self, req: SearchRequest) -> Result<SearchResultsDto, ApiError> {
+        self.controller.search_results(req)
     }
 
     pub fn search_hybrid(

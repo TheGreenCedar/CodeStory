@@ -536,12 +536,39 @@ impl AppController {
         }
 
         let total_file_count = dto_stats.file_count;
+        let retrieval = self.retrieval_state().ok();
+        if let Some(state) = retrieval.as_ref() {
+            let mode = match state.mode {
+                codestory_contracts::api::RetrievalModeDto::Hybrid => "hybrid",
+                codestory_contracts::api::RetrievalModeDto::Symbolic => "symbolic",
+            };
+            let mut retrieval_note = format!(
+                "Retrieval mode: {mode} (semantic_docs={}).",
+                state.semantic_doc_count
+            );
+            if let Some(reason) = state.fallback_reason {
+                let reason = match reason {
+                    codestory_contracts::api::RetrievalFallbackReasonDto::DisabledByConfig => {
+                        "disabled_by_config"
+                    }
+                    codestory_contracts::api::RetrievalFallbackReasonDto::MissingEmbeddingRuntime => {
+                        "missing_embedding_runtime"
+                    }
+                    codestory_contracts::api::RetrievalFallbackReasonDto::MissingSemanticDocs => {
+                        "missing_semantic_docs"
+                    }
+                };
+                retrieval_note.push_str(&format!(" fallback={reason}."));
+            }
+            notes.push(retrieval_note);
+        }
 
         Ok(GroundingSnapshotDto {
             root: root.to_string_lossy().to_string(),
             budget,
             generated_at_epoch_ms: current_epoch_ms(),
             stats: dto_stats,
+            retrieval,
             coverage: codestory_contracts::api::GroundingCoverageDto {
                 total_files: total_file_count,
                 represented_files: (file_digests.len().min(u32::MAX as usize) as u32)

@@ -317,6 +317,12 @@ pub struct LlmSymbolDoc {
     pub updated_at_epoch_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmSymbolDocStats {
+    pub doc_count: u32,
+    pub embedding_model: Option<String>,
+}
+
 impl Storage {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         Self::open_with_mode(path, StorageOpenMode::Live)
@@ -1933,6 +1939,29 @@ impl Storage {
         Ok(docs)
     }
 
+    pub fn get_llm_symbol_doc_stats(&self) -> Result<LlmSymbolDocStats, StorageError> {
+        let (doc_count, min_model, max_model) = self.conn.query_row(
+            "SELECT COUNT(*), MIN(embedding_model), MAX(embedding_model) FROM llm_symbol_doc",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )?;
+        let embedding_model = match (min_model, max_model) {
+            (Some(min_model), Some(max_model)) if min_model == max_model => Some(min_model),
+            _ => None,
+        };
+
+        Ok(LlmSymbolDocStats {
+            doc_count: doc_count.max(0).min(u32::MAX as i64) as u32,
+            embedding_model,
+        })
+    }
+
     pub fn get_all_llm_symbol_docs(&self) -> Result<Vec<LlmSymbolDoc>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT
@@ -1973,6 +2002,11 @@ impl Storage {
             });
         }
         Ok(docs)
+    }
+
+    pub fn clear_llm_symbol_docs(&mut self) -> Result<usize, StorageError> {
+        let removed = self.conn.execute("DELETE FROM llm_symbol_doc", [])?;
+        Ok(removed)
     }
 
     pub fn delete_llm_symbol_docs_for_file(

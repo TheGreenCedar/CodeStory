@@ -1,13 +1,14 @@
 use crate::search_runtime::HybridSearchConfig;
 use codestory_contracts::api::{AgentHybridWeightsDto, NodeDetailsDto, SearchHit};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Write as _;
 
 pub(crate) const HYBRID_RETRIEVAL_ENABLED_ENV: &str = "CODESTORY_HYBRID_RETRIEVAL_ENABLED";
 
 pub(crate) fn hybrid_retrieval_enabled() -> bool {
-    env_flag_enabled(HYBRID_RETRIEVAL_ENABLED_ENV, false)
+    env_flag_enabled(HYBRID_RETRIEVAL_ENABLED_ENV, true)
 }
 
 fn env_flag_enabled(var_name: &str, default: bool) -> bool {

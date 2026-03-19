@@ -1,20 +1,20 @@
 use anyhow::{Context, Result};
 use codestory_contracts::api::{
-    GroundingSnapshotDto, NodeDetailsDto, SearchHit, SnippetContextDto, SymbolContextDto,
-    TrailContextDto,
+    GroundingSnapshotDto, NodeDetailsDto, RetrievalFallbackReasonDto, RetrievalModeDto,
+    RetrievalStateDto, SearchHit, SnippetContextDto, SymbolContextDto, TrailContextDto,
 };
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use crate::IndexOutput;
 use crate::args::{CliTrailMode, OutputFormat, TrailCommand};
 use crate::display::{
     clean_path_string, default_trail_direction, format_budget, format_direction, format_kind,
     format_trail_mode, relative_path,
 };
 use crate::runtime::ResolvedTarget;
+use crate::{IndexOutput, SearchOutput};
 
 pub(crate) fn emit<T: Serialize>(format: OutputFormat, value: &T, markdown: String) -> Result<()> {
     match format {
@@ -49,6 +49,11 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
         output.summary.stats.edge_count,
         output.summary.stats.file_count,
         output.summary.stats.error_count
+    );
+    let _ = writeln!(
+        markdown,
+        "retrieval: {}",
+        render_retrieval_state(output.retrieval)
     );
     if let Some(timings) = output.phase_timings {
         let _ = writeln!(
@@ -215,6 +220,9 @@ pub(crate) fn render_ground_markdown(
         snapshot.stats.file_count,
         snapshot.stats.error_count
     );
+    if let Some(retrieval) = snapshot.retrieval.as_ref() {
+        let _ = writeln!(markdown, "retrieval: {}", render_retrieval_state(retrieval));
+    }
     if !snapshot.recommended_queries.is_empty() {
         let _ = writeln!(
             markdown,
@@ -278,16 +286,17 @@ pub(crate) fn render_ground_markdown(
     markdown
 }
 
-pub(crate) fn render_search_markdown(
-    project_root: &Path,
-    query: &str,
-    hits: &[SearchHit],
-) -> String {
+pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput<'_>) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Search");
-    let _ = writeln!(markdown, "query: `{query}`");
-    let _ = writeln!(markdown, "hits: {}", hits.len());
-    for hit in hits {
+    let _ = writeln!(markdown, "query: `{}`", output.query);
+    let _ = writeln!(
+        markdown,
+        "retrieval: {}",
+        render_retrieval_state(output.retrieval)
+    );
+    let _ = writeln!(markdown, "hits: {}", output.hits.len());
+    for hit in output.hits {
         let _ = writeln!(markdown, "- {}", render_search_hit(project_root, hit));
     }
     markdown
@@ -479,6 +488,29 @@ fn render_node(project_root: &Path, node: &NodeDetailsDto) -> String {
     }
     if let Some(line) = node.start_line {
         let _ = write!(out, ":{line}");
+    }
+    out
+}
+
+fn render_retrieval_state(state: &RetrievalStateDto) -> String {
+    let mode = match state.mode {
+        RetrievalModeDto::Hybrid => "hybrid",
+        RetrievalModeDto::Symbolic => "symbolic",
+    };
+    let mut out = format!("{mode} semantic_docs={}", state.semantic_doc_count);
+    if let Some(model) = state.embedding_model.as_deref() {
+        let _ = write!(out, " model={model}");
+    }
+    if let Some(reason) = state.fallback_reason {
+        let reason = match reason {
+            RetrievalFallbackReasonDto::DisabledByConfig => "disabled_by_config",
+            RetrievalFallbackReasonDto::MissingEmbeddingRuntime => "missing_embedding_runtime",
+            RetrievalFallbackReasonDto::MissingSemanticDocs => "missing_semantic_docs",
+        };
+        let _ = write!(out, " fallback={reason}");
+    }
+    if let Some(message) = state.fallback_message.as_deref() {
+        let _ = write!(out, " note={}", message.replace('\n', " "));
     }
     out
 }

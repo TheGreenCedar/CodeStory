@@ -6,6 +6,7 @@ This file is the index for architecture decisions that matter during the V2 cuto
 - [ADR 0002: Workspace and store decoupling](adrs/0002-workspace-store-decoupling.md)
 - [ADR 0003: Search stays behind runtime services](adrs/0003-search-placement.md)
 - [ADR 0004: Snapshot lifecycle stays store-owned](adrs/0004-snapshot-lifecycle.md)
+- [ADR 0005: Hybrid retrieval defaults and visible fallbacks](adrs/0005-hybrid-default-retrieval.md)
 
 Add a new ADR when one of these changes:
 
@@ -13,3 +14,5 @@ Add a new ADR when one of these changes:
 - source-of-truth location for persisted or derived data
 - public service or contract surface
 - rollout policy for staged versus live indexing behavior
+
+

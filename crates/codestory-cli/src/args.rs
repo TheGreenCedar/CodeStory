@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
     GroundingBudgetDto, IndexingPhaseTimings, LayoutDirection, NodeId, ProjectSummary,
-    TrailCallerScope, TrailDirection, TrailMode,
+    RetrievalStateDto, SearchHit, TrailCallerScope, TrailDirection, TrailMode,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -176,8 +176,16 @@ pub(crate) struct IndexOutput<'a> {
     pub(crate) storage_path: &'a str,
     pub(crate) refresh: &'a str,
     pub(crate) summary: &'a ProjectSummary,
+    pub(crate) retrieval: &'a RetrievalStateDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) phase_timings: Option<&'a IndexingPhaseTimings>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SearchOutput<'a> {
+    pub(crate) query: &'a str,
+    pub(crate) retrieval: &'a RetrievalStateDto,
+    pub(crate) hits: &'a [SearchHit],
 }
 
 #[derive(Debug)]

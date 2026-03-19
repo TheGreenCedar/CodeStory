@@ -16,4 +16,6 @@ cargo clippy --all-targets -- -D warnings
 ```powershell
 cargo test -p codestory-indexer --test fidelity_regression
 cargo test -p codestory-indexer --test tictactoe_language_coverage
+cargo test -p codestory-runtime --test retrieval_eval
 ```
+

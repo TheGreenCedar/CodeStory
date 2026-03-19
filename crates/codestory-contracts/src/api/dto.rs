@@ -33,6 +33,8 @@ pub struct StorageStatsDto {
 pub struct ProjectSummary {
     pub root: String,
     pub stats: StorageStatsDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval: Option<RetrievalStateDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -52,6 +54,35 @@ pub enum SearchHitOrigin {
     TextMatch,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalModeDto {
+    Hybrid,
+    Symbolic,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalFallbackReasonDto {
+    DisabledByConfig,
+    MissingEmbeddingRuntime,
+    MissingSemanticDocs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct RetrievalStateDto {
+    pub mode: RetrievalModeDto,
+    pub hybrid_configured: bool,
+    pub semantic_ready: bool,
+    pub semantic_doc_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<RetrievalFallbackReasonDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchHit {
     pub node_id: NodeId,
@@ -62,6 +93,13 @@ pub struct SearchHit {
     pub score: f32,
     pub origin: SearchHitOrigin,
     pub resolvable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SearchResultsDto {
+    pub query: String,
+    pub hits: Vec<SearchHit>,
+    pub retrieval: RetrievalStateDto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -131,6 +169,8 @@ pub struct GroundingSnapshotDto {
     pub budget: GroundingBudgetDto,
     pub generated_at_epoch_ms: i64,
     pub stats: StorageStatsDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval: Option<RetrievalStateDto>,
     pub coverage: GroundingCoverageDto,
     pub root_symbols: Vec<GroundingSymbolDigestDto>,
     pub files: Vec<GroundingFileDigestDto>,

@@ -37,7 +37,8 @@ Check:
 
 - whether the symbol exists in store-backed search docs
 - whether runtime rebuilt its search state after indexing
-- whether semantic retrieval is disabled or missing model assets
+- what retrieval mode `index`, `ground`, or `search` reported for the current run
+- whether semantic retrieval is disabled, missing model assets, or missing semantic docs
 - whether graph-based boosts are overwhelming lexical matches
 
 ## If Grounding Is Wrong
@@ -65,3 +66,4 @@ Check:
 - trail mode and direction
 - edge and occurrence presence in store
 - stale projections after incremental indexing
+

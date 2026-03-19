@@ -1,7 +1,8 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use codestory_contracts::api::SearchRequest;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 mod args;
 mod display;
@@ -11,8 +12,8 @@ mod runtime;
 mod text_search;
 
 use args::{
-    Cli, Command, GroundCommand, IndexCommand, IndexOutput, SearchCommand, SnippetCommand,
-    SymbolCommand, TrailCommand, build_trail_request,
+    Cli, Command, GroundCommand, IndexCommand, IndexOutput, SearchCommand, SearchOutput,
+    SnippetCommand, SymbolCommand, TrailCommand, build_trail_request,
 };
 use output::{
     emit, render_ground_markdown, render_index_markdown, render_search_markdown,
@@ -33,9 +34,46 @@ fn main() -> Result<()> {
     }
 }
 
+fn score_first_search_hit_cmp(
+    left: &codestory_contracts::api::SearchHit,
+    right: &codestory_contracts::api::SearchHit,
+) -> Ordering {
+    right
+        .score
+        .partial_cmp(&left.score)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| left.display_name.cmp(&right.display_name))
+}
+
+fn merge_repo_text_hits(
+    hits: &mut Vec<codestory_contracts::api::SearchHit>,
+    repo_text_hits: Vec<codestory_contracts::api::SearchHit>,
+    limit: usize,
+) {
+    hits.extend(repo_text_hits);
+    let mut seen = HashSet::new();
+    hits.retain(|hit| {
+        let key = format!(
+            "{}|{}|{}|{:?}",
+            hit.file_path.as_deref().unwrap_or_default(),
+            hit.line.unwrap_or_default(),
+            hit.display_name,
+            hit.kind
+        );
+        seen.insert(key)
+    });
+    hits.sort_by(score_first_search_hit_cmp);
+    hits.truncate(limit);
+}
+
 fn run_index(cmd: IndexCommand) -> Result<()> {
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
+    let retrieval = opened
+        .summary
+        .retrieval
+        .as_ref()
+        .context("Open project summary did not include retrieval state")?;
     let refresh_label = refresh_label(cmd.refresh, opened.refresh_mode);
     let storage_path = runtime.storage_path.to_string_lossy().to_string();
     let output = IndexOutput {
@@ -43,6 +81,7 @@ fn run_index(cmd: IndexCommand) -> Result<()> {
         storage_path: &storage_path,
         refresh: &refresh_label,
         summary: &opened.summary,
+        retrieval: &retrieval,
         phase_timings: opened.phase_timings.as_ref(),
     };
 
@@ -69,36 +108,27 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
     ensure_index_ready(&opened, "search")?;
 
     let limit = cmd.limit.clamp(1, 50) as usize;
-    let mut hits = runtime
+    let mut search_results = runtime
         .search
-        .search(SearchRequest {
+        .search_results(SearchRequest {
             query: cmd.query.clone(),
         })
         .map_err(map_api_error)?;
     if text_search::looks_like_text_query(&cmd.query) {
-        hits.extend(text_search::scan_repo_text_hits(
-            &runtime.project_root,
-            &cmd.query,
-            limit,
-        )?);
-        hits.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| left.display_name.cmp(&right.display_name))
-        });
-        hits.dedup_by(|left, right| {
-            left.file_path == right.file_path
-                && left.line == right.line
-                && left.display_name == right.display_name
-                && left.kind == right.kind
-        });
+        let repo_text_hits =
+            text_search::scan_repo_text_hits(&runtime.project_root, &cmd.query, limit)?;
+        merge_repo_text_hits(&mut search_results.hits, repo_text_hits, limit);
+    } else {
+        search_results.hits.truncate(limit);
     }
-    hits.truncate(limit);
 
-    let markdown = render_search_markdown(&runtime.project_root, &cmd.query, &hits);
-    emit(cmd.format, &hits, markdown)
+    let output = SearchOutput {
+        query: &search_results.query,
+        retrieval: &search_results.retrieval,
+        hits: &search_results.hits,
+    };
+    let markdown = render_search_markdown(&runtime.project_root, &output);
+    emit(cmd.format, &search_results, markdown)
 }
 
 fn run_symbol(cmd: SymbolCommand) -> Result<()> {
@@ -155,11 +185,24 @@ mod tests {
     use crate::query_resolution::compare_resolution_hits;
     use crate::runtime::{fnv1a_hex, resolve_refresh_request};
     use codestory_contracts::api::{
-        IndexMode, IndexingPhaseTimings, NodeId, ProjectSummary, SearchHit, StorageStatsDto,
+        IndexMode, IndexingPhaseTimings, NodeId, ProjectSummary, RetrievalModeDto,
+        RetrievalStateDto, SearchHit, StorageStatsDto,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    fn sample_retrieval() -> RetrievalStateDto {
+        RetrievalStateDto {
+            mode: RetrievalModeDto::Hybrid,
+            hybrid_configured: true,
+            semantic_ready: true,
+            semantic_doc_count: 42,
+            embedding_model: Some("sentence-transformers/all-MiniLM-L6-v2-local".to_string()),
+            fallback_reason: None,
+            fallback_message: None,
+        }
+    }
 
     fn summary_with_files(file_count: u32) -> ProjectSummary {
         ProjectSummary {
@@ -170,6 +213,7 @@ mod tests {
                 file_count,
                 error_count: 0,
             },
+            retrieval: None,
         }
     }
 
@@ -258,11 +302,13 @@ mod tests {
     fn render_index_markdown_includes_rich_timing_breakdown_when_available() {
         let summary = summary_with_files(3);
         let timings = sample_phase_timings();
+        let retrieval = sample_retrieval();
         let output = IndexOutput {
             project: &summary.root,
             storage_path: "C:/repo/.cache/index.sqlite",
             refresh: "full",
             summary: &summary,
+            retrieval: &retrieval,
             phase_timings: Some(&timings),
         };
 
@@ -289,6 +335,51 @@ mod tests {
         assert!(markdown.contains(
             "resolution_semantic_requests: call_rows=36 call_unique=37 call_skipped=38 import_rows=39 import_unique=40 import_skipped=41"
         ));
+    }
+
+    #[test]
+    fn merge_repo_text_hits_resorts_before_truncating() {
+        let mut hits = vec![
+            SearchHit {
+                node_id: NodeId("1".to_string()),
+                display_name: "indexed_symbol".to_string(),
+                kind: codestory_contracts::api::NodeKind::FUNCTION,
+                file_path: Some("src/lib.rs".to_string()),
+                line: Some(10),
+                score: 0.9,
+                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
+            },
+            SearchHit {
+                node_id: NodeId("2".to_string()),
+                display_name: "secondary_symbol".to_string(),
+                kind: codestory_contracts::api::NodeKind::FUNCTION,
+                file_path: Some("src/lib.rs".to_string()),
+                line: Some(20),
+                score: 0.8,
+                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
+            },
+        ];
+        let repo_text_hits = vec![SearchHit {
+            node_id: NodeId("repo-text".to_string()),
+            display_name: "README.md".to_string(),
+            kind: codestory_contracts::api::NodeKind::FILE,
+            file_path: Some("README.md".to_string()),
+            line: Some(3),
+            score: 500.0,
+            origin: codestory_contracts::api::SearchHitOrigin::TextMatch,
+            resolvable: false,
+        }];
+
+        merge_repo_text_hits(&mut hits, repo_text_hits, 1);
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].display_name, "README.md");
+        assert_eq!(
+            hits[0].origin,
+            codestory_contracts::api::SearchHitOrigin::TextMatch
+        );
     }
 
     fn copy_tictactoe_workspace() -> tempfile::TempDir {
