@@ -21,9 +21,10 @@ Build a mental model in this order before editing the biggest implementation pat
 1. [README](../../README.md)
 2. [Architecture overview](../architecture/overview.md)
 3. [Runtime execution path](../architecture/runtime-execution-path.md)
-4. the subsystem page for the owning crate
-5. [Debugging guide](debugging.md)
-6. [Testing matrix](testing-matrix.md)
+4. [Indexing pipeline](../architecture/indexing-pipeline.md)
+5. the subsystem page for the owning crate
+6. [Debugging guide](debugging.md)
+7. [Testing matrix](testing-matrix.md)
 
 ## Mental Model
 
@@ -61,6 +62,7 @@ Read these pages first:
 
 - `docs/architecture/overview.md`
 - `docs/architecture/runtime-execution-path.md`
+- `docs/architecture/indexing-pipeline.md`
 - the subsystem page for the owning crate
 - `docs/contributors/debugging.md`
 - `docs/contributors/testing-matrix.md`

@@ -47,7 +47,7 @@ Start here when you are using the tool:
 
 Use this path if you want to change the codebase.
 
-1. Read the architecture overview and the subsystem page that owns your change.
+1. Read the architecture overview, runtime execution path, and indexing pipeline before you jump into crate-specific details.
 2. Run Cargo verification serially because the workspace shares build locks.
 3. Make changes in the owning crate instead of threading behavior through the CLI.
 4. Use the contributor docs as a short path through architecture, debugging, and test coverage.
@@ -56,9 +56,10 @@ Start here when you are contributing:
 
 - [Architecture overview](docs/architecture/overview.md)
 - [Contributor setup](docs/contributors/getting-started.md)
+- [Indexing pipeline](docs/architecture/indexing-pipeline.md)
 - [Debugging guide](docs/contributors/debugging.md)
 - [Testing matrix](docs/contributors/testing-matrix.md)
-- [Decision log](docs/decision-log.md)
+- [Architecture history](docs/decision-log.md)
 - [Contracts subsystem](docs/architecture/subsystems/contracts.md)
 - [Workspace subsystem](docs/architecture/subsystems/workspace.md)
 - [Indexer subsystem](docs/architecture/subsystems/indexer.md)
