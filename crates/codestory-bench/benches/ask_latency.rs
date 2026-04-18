@@ -71,6 +71,8 @@ fn bench_ask_retrieval_latency(c: &mut Criterion) {
     let (_temp, controller) = build_indexed_controller(80).expect("prepare benchmark workspace");
     let query = SearchRequest {
         query: "permission policy checks".to_string(),
+        repo_text: codestory_contracts::api::SearchRepoTextMode::Off,
+        limit_per_source: 12,
     };
 
     c.bench_function("ask_retrieval_hybrid_latency", |b| {
@@ -82,6 +84,8 @@ fn bench_ask_retrieval_latency(c: &mut Criterion) {
                     .search_hybrid(
                         SearchRequest {
                             query: query.query.clone(),
+                            repo_text: codestory_contracts::api::SearchRepoTextMode::Off,
+                            limit_per_source: 12,
                         },
                         None::<NodeId>,
                         Some(12),

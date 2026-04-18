@@ -262,6 +262,52 @@ fn test_llm_symbol_doc_round_trip() -> Result<(), StorageError> {
 }
 
 #[test]
+fn test_search_symbol_projection_round_trip_and_backfill() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(700),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "short_name".to_string(),
+            qualified_name: Some("pkg::short_name".to_string()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(701),
+            kind: NodeKind::METHOD,
+            serialized_name: "secondary".to_string(),
+            ..Default::default()
+        },
+    ])?;
+
+    storage.upsert_search_symbol_projection_batch(&[
+        SearchSymbolProjection {
+            node_id: NodeId(700),
+            display_name: "pkg::short_name".to_string(),
+        },
+        SearchSymbolProjection {
+            node_id: NodeId(701),
+            display_name: "secondary".to_string(),
+        },
+    ])?;
+    assert_eq!(storage.get_search_symbol_projection_count()?, 2);
+    let projection = storage.get_search_symbol_projection_batch_after(None, 10)?;
+    assert_eq!(projection.len(), 2);
+    assert_eq!(projection[0].display_name, "pkg::short_name");
+
+    storage.clear_search_symbol_projection()?;
+    assert_eq!(storage.get_search_symbol_projection_count()?, 0);
+
+    let rebuilt = storage.rebuild_search_symbol_projection_from_node_table()?;
+    assert_eq!(rebuilt, 2);
+    let projection = storage.get_search_symbol_projection_batch_after(None, 10)?;
+    assert_eq!(projection.len(), 2);
+    assert_eq!(projection[0].display_name, "pkg::short_name");
+    assert_eq!(projection[1].display_name, "secondary");
+    Ok(())
+}
+
+#[test]
 fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
     let file_node = Node {
@@ -1033,6 +1079,10 @@ fn test_delete_file_projection() -> Result<(), StorageError> {
         embedding: vec![0.1_f32; 384],
         updated_at_epoch_ms: 1,
     }])?;
+    storage.upsert_search_symbol_projection_batch(&[SearchSymbolProjection {
+        node_id: func_node.id,
+        display_name: "foo".to_string(),
+    }])?;
     storage.upsert_callable_projection_states(&[CallableProjectionState {
         file_id: file_node_id,
         symbol_key: "src/main.rs::foo:FUNCTION".to_string(),
@@ -1059,6 +1109,7 @@ fn test_delete_file_projection() -> Result<(), StorageError> {
     assert!(storage.get_edges()?.is_empty());
     assert!(storage.get_occurrences()?.is_empty());
     assert!(storage.get_all_llm_symbol_docs()?.is_empty());
+    assert_eq!(storage.get_search_symbol_projection_count()?, 0);
     assert!(
         storage
             .get_callable_projection_states_for_file(file_node_id)?

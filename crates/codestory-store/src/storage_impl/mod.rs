@@ -25,7 +25,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 const GROUNDING_SNAPSHOT_VERSION: i64 = 1;
 const GROUNDING_SNAPSHOT_STATE_DIRTY: i64 = 0;
 const GROUNDING_SNAPSHOT_STATE_BUILDING: i64 = 1;
@@ -299,6 +299,12 @@ pub struct CallerProjectionRemovalSummary {
     pub removed_edge_count: usize,
     pub removed_occurrence_count: usize,
     pub removed_callable_projection_state_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchSymbolProjection {
+    pub node_id: NodeId,
+    pub display_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1002,6 +1008,7 @@ impl Storage {
         tx.execute("DELETE FROM occurrence", [])?;
         tx.execute("DELETE FROM edge", [])?;
         tx.execute("DELETE FROM llm_symbol_doc", [])?;
+        tx.execute("DELETE FROM search_symbol_projection", [])?;
         tx.execute("DELETE FROM component_access", [])?;
         tx.execute("DELETE FROM bookmark_node", [])?;
         tx.execute("DELETE FROM local_symbol", [])?;
@@ -1846,6 +1853,96 @@ impl Storage {
             map.insert(NodeId(node_id), row_mapping::access_kind_from_db(raw));
         }
         Ok(map)
+    }
+
+    pub fn upsert_search_symbol_projection_batch(
+        &mut self,
+        symbols: &[SearchSymbolProjection],
+    ) -> Result<(), StorageError> {
+        if symbols.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO search_symbol_projection (
+                    node_id,
+                    display_name
+                 ) VALUES (?1, ?2)
+                 ON CONFLICT(node_id) DO UPDATE SET
+                    display_name = excluded.display_name",
+            )?;
+            for symbol in symbols {
+                stmt.execute(params![symbol.node_id.0, symbol.display_name])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_search_symbol_projection_batch_after(
+        &self,
+        after_node_id: Option<NodeId>,
+        limit: usize,
+    ) -> Result<Vec<SearchSymbolProjection>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, display_name
+             FROM search_symbol_projection
+             WHERE (?1 IS NULL OR node_id > ?1)
+             ORDER BY node_id ASC
+             LIMIT ?2",
+        )?;
+        let after_node_id = after_node_id.map(|id| id.0);
+        let limit = limit.min(i64::MAX as usize) as i64;
+        let mut rows = stmt.query(params![after_node_id, limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(SearchSymbolProjection {
+                node_id: NodeId(row.get(0)?),
+                display_name: row.get(1)?,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn get_search_symbol_projection_count(&self) -> Result<u32, StorageError> {
+        let count =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM search_symbol_projection", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+        Ok(clamp_i64_to_u32(count))
+    }
+
+    pub fn clear_search_symbol_projection(&mut self) -> Result<usize, StorageError> {
+        let removed = self
+            .conn
+            .execute("DELETE FROM search_symbol_projection", [])?;
+        Ok(removed)
+    }
+
+    pub fn rebuild_search_symbol_projection_from_node_table(
+        &mut self,
+    ) -> Result<u32, StorageError> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM search_symbol_projection", [])?;
+        let inserted = tx.execute(
+            "INSERT INTO search_symbol_projection (
+                node_id,
+                display_name
+             )
+             SELECT
+                id,
+                CASE
+                    WHEN qualified_name IS NOT NULL AND TRIM(qualified_name) != '' THEN qualified_name
+                    ELSE serialized_name
+                END
+             FROM node",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(inserted.min(u32::MAX as usize) as u32)
     }
 
     pub fn upsert_llm_symbol_docs_batch(
@@ -3142,6 +3239,13 @@ impl Storage {
                  OR file_node_id = ?1"
             ),
             params![file_node_id],
+        )?;
+        tx.execute(
+            &format!(
+                "DELETE FROM search_symbol_projection
+                 WHERE node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})"
+            ),
+            [],
         )?;
 
         // Remove any node references in other projection tables.

@@ -568,20 +568,14 @@ pub struct SearchEngine {
 }
 
 impl SearchEngine {
-    pub fn new(storage_path: Option<&Path>) -> Result<Self> {
+    fn build_schema() -> Schema {
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("name", TEXT | STORED);
         schema_builder.add_i64_field("node_id", INDEXED | STORED | FAST);
-        let schema = schema_builder.build();
+        schema_builder.build()
+    }
 
-        let index = if let Some(path) = storage_path {
-            recreate_search_storage_dir(path)?;
-            Index::create_in_dir(path, schema.clone())
-                .with_context(|| format!("Failed to create tantivy index at {}", path.display()))?
-        } else {
-            Index::create_in_ram(schema)
-        };
-
+    fn new_with_index(index: Index) -> Result<Self> {
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -595,6 +589,24 @@ impl SearchEngine {
             llm_docs: HashMap::new(),
             embedding_runtime: None,
         })
+    }
+
+    pub fn new(storage_path: Option<&Path>) -> Result<Self> {
+        let schema = Self::build_schema();
+        let index = if let Some(path) = storage_path {
+            recreate_search_storage_dir(path)?;
+            Index::create_in_dir(path, schema.clone())
+                .with_context(|| format!("Failed to create tantivy index at {}", path.display()))?
+        } else {
+            Index::create_in_ram(schema)
+        };
+        Self::new_with_index(index)
+    }
+
+    pub fn open_existing(path: &Path) -> Result<Self> {
+        let index = Index::open_in_dir(path)
+            .with_context(|| format!("Failed to open tantivy index at {}", path.display()))?;
+        Self::new_with_index(index)
     }
 
     #[cfg(test)]
@@ -616,6 +628,10 @@ impl SearchEngine {
 
     pub fn embedding_runtime_configured(&self) -> bool {
         self.embedding_runtime.is_some()
+    }
+
+    pub fn full_text_doc_count(&self) -> usize {
+        self.reader.searcher().num_docs() as usize
     }
 
     pub fn semantic_index_ready(&self) -> bool {
@@ -672,6 +688,18 @@ impl SearchEngine {
         index_writer.commit()?;
         self.reader.reload()?;
         Ok(())
+    }
+
+    pub fn load_symbol_projection<I>(&mut self, symbols: I)
+    where
+        I: IntoIterator<Item = (NodeId, String)>,
+    {
+        self.symbols.clear();
+        self.symbols.extend(
+            symbols
+                .into_iter()
+                .map(|(id, name)| (Utf32String::from(name.as_str()), id)),
+        );
     }
 
     #[cfg(test)]
@@ -925,6 +953,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_search_engine() -> Result<()> {
@@ -979,6 +1008,35 @@ mod tests {
         let remaining = engine.search_symbol("Gamma");
         assert!(remaining.contains(&NodeId(3)));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_open_existing_reuses_persisted_index_without_recreating_dir() -> Result<()> {
+        let dir = tempdir()?;
+        let search_dir = dir.path().join("search");
+        let marker = search_dir.join("keep.txt");
+
+        let mut engine = SearchEngine::new(Some(search_dir.as_path()))?;
+        engine.index_nodes(vec![
+            (NodeId(1), "AlphaSymbol".to_string()),
+            (NodeId(2), "BetaSymbol".to_string()),
+        ])?;
+        std::fs::write(&marker, "marker")?;
+        drop(engine);
+
+        let mut reopened = SearchEngine::open_existing(search_dir.as_path())?;
+        reopened.load_symbol_projection(vec![
+            (NodeId(1), "AlphaSymbol".to_string()),
+            (NodeId(2), "BetaSymbol".to_string()),
+        ]);
+
+        assert!(
+            marker.exists(),
+            "opening an existing index should not recreate the dir"
+        );
+        assert_eq!(reopened.search_full_text("betasymbol")?, vec![NodeId(2)]);
+        assert_eq!(reopened.search_symbol("Beta"), vec![NodeId(2)]);
         Ok(())
     }
 

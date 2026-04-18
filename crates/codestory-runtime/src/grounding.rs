@@ -544,7 +544,7 @@ impl AppController {
         }
 
         let total_file_count = dto_stats.file_count;
-        let retrieval = self.retrieval_state().ok();
+        let retrieval = retrieval_state_from_storage(&storage).ok();
         if let Some(state) = retrieval.as_ref() {
             let mode = match state.mode {
                 codestory_contracts::api::RetrievalModeDto::Hybrid => "hybrid",
@@ -617,9 +617,7 @@ impl AppController {
             .collect::<Result<Vec<_>, ApiError>>()?;
 
         let related_hits = self
-            .search(SearchRequest {
-                query: node.display_name.clone(),
-            })?
+            .lexical_symbol_hits(&node.display_name, 6)?
             .into_iter()
             .filter(|hit| hit.node_id != node_id)
             .take(6)

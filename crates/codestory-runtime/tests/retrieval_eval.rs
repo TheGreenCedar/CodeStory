@@ -102,6 +102,8 @@ fn retrieval_eval_exact_symbol_queries_prefer_exact_symbol_hits() {
         .search_hybrid(
             SearchRequest {
                 query: "exact_symbol_anchor".to_string(),
+                repo_text: codestory_contracts::api::SearchRepoTextMode::Off,
+                limit_per_source: 5,
             },
             None,
             Some(5),
@@ -123,6 +125,8 @@ fn retrieval_eval_natural_language_queries_hit_semantic_symbol_docs() {
         .search_hybrid(
             SearchRequest {
                 query: "compressed grounding summary for oss users".to_string(),
+                repo_text: codestory_contracts::api::SearchRepoTextMode::Off,
+                limit_per_source: 5,
             },
             None,
             Some(5),
@@ -163,6 +167,8 @@ fn retrieval_eval_trail_context_keeps_grounded_neighbors() {
         .search_hybrid(
             SearchRequest {
                 query: "follow_edges".to_string(),
+                repo_text: codestory_contracts::api::SearchRepoTextMode::Off,
+                limit_per_source: 3,
             },
             None,
             Some(3),

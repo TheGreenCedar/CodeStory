@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use codestory_contracts::api::{SearchHit, SearchRequest};
+use codestory_contracts::api::{SearchHit, SearchRepoTextMode, SearchRequest};
 use std::fs;
 
 mod args;
@@ -8,7 +8,6 @@ mod display;
 mod output;
 mod query_resolution;
 mod runtime;
-mod text_search;
 
 use args::{
     Cli, Command, GroundCommand, IndexCommand, IndexOutput, QueryResolutionOutput, RepoTextMode,
@@ -25,6 +24,22 @@ use runtime::{RuntimeContext, ensure_index_ready, map_api_error, refresh_label, 
 struct RepoTextOutputConfig {
     mode: RepoTextMode,
     enabled: bool,
+}
+
+fn to_api_repo_text_mode(mode: RepoTextMode) -> SearchRepoTextMode {
+    match mode {
+        RepoTextMode::Auto => SearchRepoTextMode::Auto,
+        RepoTextMode::On => SearchRepoTextMode::On,
+        RepoTextMode::Off => SearchRepoTextMode::Off,
+    }
+}
+
+fn from_api_repo_text_mode(mode: SearchRepoTextMode) -> RepoTextMode {
+    match mode {
+        SearchRepoTextMode::Auto => RepoTextMode::Auto,
+        SearchRepoTextMode::On => RepoTextMode::On,
+        SearchRepoTextMode::Off => RepoTextMode::Off,
+    }
 }
 
 fn main() -> Result<()> {
@@ -81,34 +96,24 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "search")?;
 
-    let limit = cmd.limit.clamp(1, 50) as usize;
-    let mut search_results = runtime
+    let search_results = runtime
         .search
         .search_results(SearchRequest {
             query: cmd.query.clone(),
+            repo_text: to_api_repo_text_mode(cmd.repo_text),
+            limit_per_source: cmd.limit.clamp(1, 50),
         })
         .map_err(map_api_error)?;
-    search_results.hits.truncate(limit);
-    let repo_text_enabled = match cmd.repo_text {
-        RepoTextMode::Auto => text_search::looks_like_text_query(&cmd.query),
-        RepoTextMode::On => true,
-        RepoTextMode::Off => false,
-    };
-    let repo_text_hits = if repo_text_enabled {
-        text_search::scan_repo_text_hits(&runtime.project_root, &cmd.query, limit)?
-    } else {
-        Vec::new()
-    };
     let output = build_search_output(
         &runtime.project_root,
         &search_results.query,
         &search_results.retrieval,
-        &search_results.hits,
-        &repo_text_hits,
-        cmd.limit.clamp(1, 50),
+        &search_results.indexed_symbol_hits,
+        &search_results.repo_text_hits,
+        search_results.limit_per_source,
         RepoTextOutputConfig {
-            mode: cmd.repo_text,
-            enabled: repo_text_enabled,
+            mode: from_api_repo_text_mode(search_results.repo_text_mode),
+            enabled: search_results.repo_text_enabled,
         },
     );
     let markdown = render_search_markdown(&runtime.project_root, &output);

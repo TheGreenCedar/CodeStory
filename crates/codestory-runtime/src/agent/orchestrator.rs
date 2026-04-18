@@ -241,6 +241,8 @@ fn execute_retrieval(
     let scored_hits = match controller.search_hybrid_scored(
         SearchRequest {
             query: prompt.to_string(),
+            repo_text: codestory_contracts::api::SearchRepoTextMode::Off,
+            limit_per_source: max_results as u32,
         },
         req.focus_node_id.clone(),
         max_results,

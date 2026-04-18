@@ -8,18 +8,18 @@ use codestory_contracts::api::{
     ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
     NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
     ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, RetrievalFallbackReasonDto,
-    RetrievalModeDto, RetrievalStateDto, SearchHit, SearchRequest, SearchResultsDto,
-    SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto,
-    SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto,
-    TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WriteFileResponse,
-    WriteFileTextRequest,
+    RetrievalModeDto, RetrievalStateDto, SearchHit, SearchRepoTextMode, SearchRequest,
+    SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
+    StorageStatsDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
+    TrailContextDto, TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
+    WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
 use codestory_indexer::IncrementalIndexingStats;
 use codestory_indexer::WorkspaceIndexer as V2WorkspaceIndexer;
 use codestory_store::{
     FileInfo, GroundingEdgeKindCount, GroundingNodeRecord, LlmSymbolDoc, LlmSymbolDocStats,
-    SnapshotStore, Store,
+    SearchSymbolProjection, SnapshotStore, Store,
 };
 use codestory_workspace::{
     IndexedFileRecord, RefreshExecutionPlan, RefreshInputs, Workspace, WorkspaceInventory,
@@ -61,8 +61,9 @@ pub(crate) use support::{
     FocusedSourceContext, HYBRID_RETRIEVAL_ENABLED_ENV, LocalAgentResponse,
     aggregate_symbol_matches, build_local_agent_prompt, clamp_i64_to_u32, clamp_u64_to_u32,
     clamp_u128_to_u32, clamp_usize_to_u32, extract_symbol_search_terms, file_text_match_line,
-    hybrid_retrieval_enabled, node_display_name, normalized_hybrid_weights, preferred_occurrence,
-    read_searchable_file_contents, should_expand_symbol_query, truncate_for_diagnostic,
+    hybrid_retrieval_enabled, looks_like_repo_text_query, node_display_name,
+    normalized_hybrid_weights, preferred_occurrence, read_searchable_file_contents,
+    should_expand_symbol_query, truncate_for_diagnostic,
 };
 pub(crate) use symbol_query::compare_search_hits;
 pub use symbol_query::{
@@ -448,6 +449,11 @@ fn build_search_state(
     ),
     ApiError,
 > {
+    storage
+        .rebuild_search_symbol_projection_from_node_table()
+        .map_err(|e| {
+            ApiError::internal(format!("Failed to rebuild search symbol projection: {e}"))
+        })?;
     let mut node_names = HashMap::new();
     let mut engine = SearchEngine::new(search_storage_path)
         .map_err(|e| ApiError::internal(format!("Failed to init search engine: {e}")))?;
@@ -495,7 +501,10 @@ fn current_epoch_ms() -> i64 {
 const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 2;
 const LLM_SYMBOL_DOC_VERSION_PREFIX: &str = "semantic_doc_version:";
 const SEARCH_NODE_BATCH_SIZE: usize = 8_192;
+const SEARCH_SYMBOL_PROJECTION_BATCH_SIZE: usize = 4_096;
 const LLM_DOC_RELOAD_BATCH_SIZE: usize = 256;
+const LLM_DOC_EMBED_BATCH_SIZE_ENV: &str = "CODESTORY_EMBED_MAX_BATCH_SIZE";
+const DEFAULT_LLM_DOC_EMBED_BATCH_SIZE: usize = 64;
 
 fn search_index_storage_path(storage_path: &Path) -> PathBuf {
     let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
@@ -504,6 +513,120 @@ fn search_index_storage_path(storage_path: &Path) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("codestory");
     parent.join(format!("{stem}.search"))
+}
+
+fn ensure_search_symbol_projection(storage: &mut Storage) -> Result<u32, ApiError> {
+    let count = storage.get_search_symbol_projection_count().map_err(|e| {
+        ApiError::internal(format!(
+            "Failed to query search symbol projection count: {e}"
+        ))
+    })?;
+    if count > 0 {
+        return Ok(count);
+    }
+
+    storage
+        .rebuild_search_symbol_projection_from_node_table()
+        .map_err(|e| ApiError::internal(format!("Failed to rebuild search symbol projection: {e}")))
+}
+
+fn load_search_symbol_projection(
+    storage: &Storage,
+    batch_size: usize,
+) -> Result<
+    (
+        HashMap<codestory_contracts::graph::NodeId, String>,
+        Vec<SearchSymbolProjection>,
+    ),
+    ApiError,
+> {
+    let mut node_names = HashMap::new();
+    let mut entries = Vec::new();
+    let mut after_node_id = None;
+    let batch_size = batch_size.max(1);
+    loop {
+        let batch = storage
+            .get_search_symbol_projection_batch_after(after_node_id, batch_size)
+            .map_err(|e| {
+                ApiError::internal(format!("Failed to load search symbol projection: {e}"))
+            })?;
+        if batch.is_empty() {
+            break;
+        }
+        after_node_id = batch.last().map(|entry| entry.node_id);
+        for entry in batch {
+            node_names.insert(entry.node_id, entry.display_name.clone());
+            entries.push(entry);
+        }
+    }
+    Ok((node_names, entries))
+}
+
+fn build_search_engine_from_projection(
+    search_storage_path: &Path,
+    projection: &[SearchSymbolProjection],
+) -> Result<SearchEngine, ApiError> {
+    let mut engine = SearchEngine::new(Some(search_storage_path))
+        .map_err(|e| ApiError::internal(format!("Failed to init search engine: {e}")))?;
+    let mut search_nodes = Vec::with_capacity(projection.len().min(SEARCH_NODE_BATCH_SIZE));
+    for entry in projection {
+        search_nodes.push((entry.node_id, entry.display_name.clone()));
+        if search_nodes.len() >= SEARCH_NODE_BATCH_SIZE {
+            engine
+                .index_nodes(std::mem::take(&mut search_nodes))
+                .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
+        }
+    }
+    if !search_nodes.is_empty() {
+        engine
+            .index_nodes(search_nodes)
+            .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
+    }
+    Ok(engine)
+}
+
+fn load_persisted_search_state(
+    storage: &mut Storage,
+    storage_path: &Path,
+) -> Result<
+    (
+        HashMap<codestory_contracts::graph::NodeId, String>,
+        SearchEngine,
+    ),
+    ApiError,
+> {
+    ensure_search_symbol_projection(storage)?;
+    let (node_names, projection) =
+        load_search_symbol_projection(storage, SEARCH_SYMBOL_PROJECTION_BATCH_SIZE)?;
+    let search_storage_path = search_index_storage_path(storage_path);
+
+    let engine = if projection.is_empty() {
+        build_search_engine_from_projection(search_storage_path.as_path(), &projection)?
+    } else {
+        match SearchEngine::open_existing(search_storage_path.as_path()) {
+            Ok(mut engine) => {
+                engine.load_symbol_projection(
+                    projection
+                        .iter()
+                        .map(|entry| (entry.node_id, entry.display_name.clone())),
+                );
+                if engine.full_text_doc_count() != projection.len() {
+                    build_search_engine_from_projection(search_storage_path.as_path(), &projection)?
+                } else {
+                    engine
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to open persisted search index at {}: {}. Rebuilding from projection.",
+                    search_storage_path.display(),
+                    error
+                );
+                build_search_engine_from_projection(search_storage_path.as_path(), &projection)?
+            }
+        }
+    };
+    Ok((node_names, engine))
 }
 
 fn reload_llm_docs_from_storage(
@@ -525,6 +648,14 @@ fn reload_llm_docs_from_storage(
         engine.extend_llm_symbol_docs(docs.into_iter().map(map_llm_doc_to_search));
     }
     Ok(())
+}
+
+fn llm_doc_embed_batch_size() -> usize {
+    std::env::var(LLM_DOC_EMBED_BATCH_SIZE_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map(|value| value.clamp(1, 256))
+        .unwrap_or(DEFAULT_LLM_DOC_EMBED_BATCH_SIZE)
 }
 
 fn retrieval_state_from_parts(
@@ -842,6 +973,65 @@ fn map_llm_doc_to_search(doc: LlmSymbolDoc) -> LlmSearchDoc {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PendingLlmSymbolDoc {
+    node_id: codestory_contracts::graph::NodeId,
+    file_node_id: Option<codestory_contracts::graph::NodeId>,
+    kind: codestory_contracts::graph::NodeKind,
+    display_name: String,
+    qualified_name: Option<String>,
+    file_path: Option<String>,
+    start_line: Option<u32>,
+    doc_text: String,
+}
+
+fn flush_pending_llm_symbol_docs(
+    storage: &mut Storage,
+    engine: &mut SearchEngine,
+    pending: &mut Vec<PendingLlmSymbolDoc>,
+    model_id: &str,
+    updated_at_epoch_ms: i64,
+) -> Result<(), ApiError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let model_id = model_id.to_string();
+    let batch = std::mem::take(pending);
+    let payloads = batch
+        .iter()
+        .map(|doc| doc.doc_text.clone())
+        .collect::<Vec<_>>();
+    let embeddings = engine
+        .embed_texts(&payloads)
+        .map_err(|e| ApiError::internal(format!("Failed to embed symbol docs: {e}")))?;
+
+    let docs = batch
+        .into_iter()
+        .zip(embeddings)
+        .map(|(doc, embedding)| LlmSymbolDoc {
+            node_id: doc.node_id,
+            file_node_id: doc.file_node_id,
+            kind: doc.kind,
+            display_name: doc.display_name,
+            qualified_name: doc.qualified_name,
+            file_path: doc.file_path,
+            start_line: doc.start_line,
+            doc_text: doc.doc_text,
+            embedding_model: model_id.clone(),
+            embedding_dim: embedding.len() as u32,
+            embedding,
+            updated_at_epoch_ms,
+        })
+        .collect::<Vec<_>>();
+
+    storage
+        .upsert_llm_symbol_docs_batch(&docs)
+        .map_err(|e| ApiError::internal(format!("Failed to upsert LLM symbol docs: {e}")))?;
+
+    Ok(())
+}
+
 fn sync_llm_symbol_projection(
     storage: &mut Storage,
     nodes: &[codestory_contracts::graph::Node],
@@ -885,17 +1075,9 @@ fn sync_llm_symbol_projection(
         }
     }
 
-    let mut metadata = Vec::<(
-        codestory_contracts::graph::NodeId,
-        Option<codestory_contracts::graph::NodeId>,
-        codestory_contracts::graph::NodeKind,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<u32>,
-        String,
-    )>::new();
-    let mut payloads = Vec::<String>::new();
+    let embed_batch_size = llm_doc_embed_batch_size();
+    let mut pending_docs = Vec::<PendingLlmSymbolDoc>::with_capacity(embed_batch_size);
+    let mut has_indexable_docs = false;
     let mut file_text_cache = HashMap::<String, Option<String>>::new();
 
     for node in nodes {
@@ -922,66 +1104,40 @@ fn sync_llm_symbol_projection(
             file_path.as_deref(),
             &mut file_text_cache,
         );
-        payloads.push(doc_text.clone());
-        metadata.push((
-            node.id,
-            node.file_node_id,
-            node.kind,
+        has_indexable_docs = true;
+        pending_docs.push(PendingLlmSymbolDoc {
+            node_id: node.id,
+            file_node_id: node.file_node_id,
+            kind: node.kind,
             display_name,
-            node.qualified_name.clone(),
+            qualified_name: node.qualified_name.clone(),
             file_path,
-            node.start_line,
+            start_line: node.start_line,
             doc_text,
-        ));
+        });
+        if pending_docs.len() >= embed_batch_size {
+            flush_pending_llm_symbol_docs(
+                storage,
+                engine,
+                &mut pending_docs,
+                &model_id,
+                updated_at_epoch_ms,
+            )?;
+        }
     }
 
-    if metadata.is_empty() {
+    if !has_indexable_docs {
         reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
         return Ok(());
     }
 
-    let embeddings = engine
-        .embed_texts(&payloads)
-        .map_err(|e| ApiError::internal(format!("Failed to embed symbol docs: {e}")))?;
-
-    let docs = metadata
-        .into_iter()
-        .zip(embeddings)
-        .map(
-            |(
-                (
-                    node_id,
-                    file_node_id,
-                    kind,
-                    display_name,
-                    qualified_name,
-                    file_path,
-                    start_line,
-                    doc_text,
-                ),
-                embedding,
-            )| {
-                LlmSymbolDoc {
-                    node_id,
-                    file_node_id,
-                    kind,
-                    display_name,
-                    qualified_name,
-                    file_path,
-                    start_line,
-                    doc_text,
-                    embedding_model: model_id.clone(),
-                    embedding_dim: embedding.len() as u32,
-                    embedding,
-                    updated_at_epoch_ms,
-                }
-            },
-        )
-        .collect::<Vec<_>>();
-
-    storage
-        .upsert_llm_symbol_docs_batch(&docs)
-        .map_err(|e| ApiError::internal(format!("Failed to upsert LLM symbol docs: {e}")))?;
+    flush_pending_llm_symbol_docs(
+        storage,
+        engine,
+        &mut pending_docs,
+        &model_id,
+        updated_at_epoch_ms,
+    )?;
     reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
 
     Ok(())
@@ -1207,16 +1363,7 @@ impl AppController {
         let storage_path = self.require_storage_path()?;
         let mut storage = Storage::open(&storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
-        let nodes = storage
-            .get_nodes()
-            .map_err(|e| ApiError::internal(format!("Failed to load nodes: {e}")))?;
-        let (node_names, engine) = build_search_state(
-            &mut storage,
-            Some(search_index_storage_path(&storage_path).as_path()),
-            nodes,
-            None,
-            SemanticProjectionMode::PersistBackedDocs,
-        )?;
+        let (node_names, engine) = load_persisted_search_state(&mut storage, &storage_path)?;
 
         let mut s = self.state.lock();
         if s.search_engine.is_none() {
@@ -1228,12 +1375,8 @@ impl AppController {
     }
 
     pub fn retrieval_state(&self) -> Result<RetrievalStateDto, ApiError> {
-        self.ensure_search_state()?;
-        let s = self.state.lock();
-        let engine = s.search_engine.as_ref().ok_or_else(|| {
-            ApiError::invalid_argument("Search engine not initialized. Open a project first.")
-        })?;
-        Ok(retrieval_state_from_engine(engine))
+        let storage = self.open_storage()?;
+        retrieval_state_from_storage(&storage)
     }
 
     fn file_path_for_node(
@@ -1345,7 +1488,7 @@ impl AppController {
         let display_name = node_names
             .get(&id)
             .cloned()
-            .unwrap_or_else(|| id.0.to_string());
+            .unwrap_or_else(|| node_display_name(&node));
 
         let mut file_path = Self::file_path_for_node(storage, &node).ok().flatten();
         let mut line = node.start_line;
@@ -1372,6 +1515,108 @@ impl AppController {
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             resolvable: true,
         })
+    }
+
+    fn repo_text_enabled_for_mode(mode: SearchRepoTextMode, query: &str) -> bool {
+        match mode {
+            SearchRepoTextMode::Auto => looks_like_repo_text_query(query),
+            SearchRepoTextMode::On => true,
+            SearchRepoTextMode::Off => false,
+        }
+    }
+
+    fn collect_repo_text_hits(
+        storage: &Storage,
+        project_root: Option<&Path>,
+        query: &str,
+        limit: usize,
+        indexed_hit_ids: &HashSet<NodeId>,
+    ) -> Result<Vec<SearchHit>, ApiError> {
+        if query.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut hits = Vec::new();
+        let mut seen = indexed_hit_ids.clone();
+        let terms = extract_symbol_search_terms(query);
+        let normalized_query = query.trim().to_ascii_lowercase();
+        for file in storage
+            .get_files()
+            .map_err(|e| ApiError::internal(format!("Failed to load files for text search: {e}")))?
+        {
+            if hits.len() >= limit {
+                break;
+            }
+
+            let path_string = file.path.to_string_lossy().to_string();
+            let Some(contents) = read_searchable_file_contents(&path_string) else {
+                continue;
+            };
+            if contents.len() > 1_000_000 {
+                continue;
+            }
+            let Some(line) = file_text_match_line(&contents, query, &terms) else {
+                continue;
+            };
+            let node_id = NodeId::from(codestory_contracts::graph::NodeId(file.id));
+            if !seen.insert(node_id.clone()) {
+                continue;
+            }
+
+            let display_name = project_root
+                .and_then(|root| file.path.strip_prefix(root).ok())
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .or_else(|| {
+                    file.path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                })
+                .unwrap_or_else(|| path_string.clone());
+            let exact_match = !normalized_query.is_empty()
+                && contents.to_ascii_lowercase().contains(&normalized_query);
+            let score = if exact_match { 260.0 } else { 150.0 } - hits.len() as f32;
+            hits.push(SearchHit {
+                node_id,
+                display_name,
+                kind: codestory_contracts::api::NodeKind::FILE,
+                file_path: Some(path_string),
+                line: Some(line),
+                score,
+                origin: codestory_contracts::api::SearchHitOrigin::TextMatch,
+                resolvable: false,
+            });
+        }
+
+        hits.sort_by(|left, right| compare_search_hits(query, left, right));
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    fn lexical_symbol_hits(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Result<Vec<SearchHit>, ApiError> {
+        self.ensure_search_state()?;
+        let storage = self.open_storage()?;
+        let (matches, node_names) = {
+            let mut s = self.state.lock();
+            let engine = s.search_engine.as_mut().ok_or_else(|| {
+                ApiError::invalid_argument("Search engine not initialized. Open a project first.")
+            })?;
+            (
+                engine.search_symbol_with_scores(query),
+                s.node_names.clone(),
+            )
+        };
+
+        let mut hits = matches
+            .into_iter()
+            .filter_map(|(id, score)| Self::build_search_hit(&storage, &node_names, id, score))
+            .collect::<Vec<_>>();
+        hits.sort_by(|left, right| compare_search_hits(query, left, right));
+        hits.truncate(max_results.clamp(1, 50));
+        Ok(hits)
     }
 
     fn project_summary_from_storage(
@@ -1430,18 +1675,9 @@ impl AppController {
     ) -> Result<ProjectSummary, ApiError> {
         let mut storage = Storage::open(&storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
-        let nodes = storage
-            .get_nodes()
-            .map_err(|e| ApiError::internal(format!("Failed to load nodes: {e}")))?;
-        let (node_names, engine) = build_search_state(
-            &mut storage,
-            Some(search_index_storage_path(&storage_path).as_path()),
-            nodes,
-            None,
-            SemanticProjectionMode::PersistBackedDocs,
-        )?;
+        let (node_names, engine) = load_persisted_search_state(&mut storage, &storage_path)?;
         let mut summary = self.project_summary_from_storage(&root, &storage)?;
-        summary.retrieval = Some(retrieval_state_from_engine(&engine));
+        summary.retrieval = Some(retrieval_state_from_storage(&storage)?);
 
         {
             let mut s = self.state.lock();
@@ -1698,10 +1934,21 @@ impl AppController {
     pub fn search_results(&self, req: SearchRequest) -> Result<SearchResultsDto, ApiError> {
         self.ensure_consistent_read_state("Search")?;
         let query = req.query.clone();
-        let (mut hits, retrieval) = self.search_hybrid_results(req, None, 20, None)?;
+        let limit_per_source = req.limit_per_source.clamp(1, 50) as usize;
+        let repo_text_mode = req.repo_text;
+        let (mut indexed_symbol_hits, retrieval) = self.search_hybrid_results(
+            SearchRequest {
+                query: query.clone(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: req.limit_per_source,
+            },
+            None,
+            limit_per_source,
+            None,
+        )?;
         let storage = self.open_storage()?;
 
-        if should_expand_symbol_query(&query, hits.len()) {
+        if should_expand_symbol_query(&query, indexed_symbol_hits.len()) {
             let expanded = {
                 let mut s = self.state.lock();
                 let engine = s.search_engine.as_mut().ok_or_else(|| {
@@ -1739,68 +1986,42 @@ impl AppController {
                         Self::build_search_hit(&storage, &node_names, id, score)
                     })
                     .collect::<Vec<_>>();
-                merge_search_hits_by_node_id(&mut hits, expanded_hits);
+                merge_search_hits_by_node_id(&mut indexed_symbol_hits, expanded_hits);
             }
-
-            let terms = extract_symbol_search_terms(&query);
-            let mut seen = hits
-                .iter()
-                .map(|hit| hit.node_id.clone())
-                .collect::<HashSet<_>>();
-            let project_root = self.require_project_root().ok();
-            for file in storage.get_files().map_err(|e| {
-                ApiError::internal(format!("Failed to load files for text search: {e}"))
-            })? {
-                let path_string = file.path.to_string_lossy().to_string();
-                let Some(contents) = read_searchable_file_contents(&path_string) else {
-                    continue;
-                };
-                let Some(line) = file_text_match_line(&contents, &query, &terms) else {
-                    continue;
-                };
-                let node_id = NodeId::from(codestory_contracts::graph::NodeId(file.id));
-                if !seen.insert(node_id.clone()) {
-                    continue;
-                }
-                let display_name = project_root
-                    .as_deref()
-                    .and_then(|root| file.path.strip_prefix(root).ok())
-                    .map(|path| path.to_string_lossy().replace('\\', "/"))
-                    .or_else(|| {
-                        file.path
-                            .file_name()
-                            .map(|name| name.to_string_lossy().to_string())
-                    })
-                    .unwrap_or_else(|| path_string.clone());
-                let exact_match = contents
-                    .to_ascii_lowercase()
-                    .contains(&query.trim().to_ascii_lowercase());
-                let score = if exact_match { 260.0 } else { 150.0 } - hits.len() as f32;
-                hits.push(SearchHit {
-                    node_id,
-                    display_name,
-                    kind: codestory_contracts::api::NodeKind::FILE,
-                    file_path: Some(path_string),
-                    line: Some(line),
-                    score,
-                    origin: codestory_contracts::api::SearchHitOrigin::TextMatch,
-                    resolvable: false,
-                });
-                if hits.len() >= 20 {
-                    break;
-                }
-            }
-
-            hits.sort_by(|left, right| compare_search_hits(&query, left, right));
-            hits.truncate(20);
         }
 
-        hits.sort_by(|left, right| compare_search_hits(&query, left, right));
+        indexed_symbol_hits.sort_by(|left, right| compare_search_hits(&query, left, right));
+        indexed_symbol_hits.truncate(limit_per_source);
+
+        let repo_text_enabled = Self::repo_text_enabled_for_mode(repo_text_mode, &query);
+        let indexed_hit_ids = indexed_symbol_hits
+            .iter()
+            .map(|hit| hit.node_id.clone())
+            .collect::<HashSet<_>>();
+        let repo_text_hits = if repo_text_enabled {
+            Self::collect_repo_text_hits(
+                &storage,
+                self.require_project_root().ok().as_deref(),
+                &query,
+                limit_per_source,
+                &indexed_hit_ids,
+            )?
+        } else {
+            Vec::new()
+        };
+        let mut hits = Vec::with_capacity(indexed_symbol_hits.len() + repo_text_hits.len());
+        hits.extend(indexed_symbol_hits.iter().cloned());
+        hits.extend(repo_text_hits.iter().cloned());
 
         Ok(SearchResultsDto {
             query,
-            hits,
             retrieval,
+            limit_per_source: limit_per_source as u32,
+            repo_text_mode,
+            repo_text_enabled,
+            indexed_symbol_hits,
+            repo_text_hits,
+            hits,
         })
     }
 
@@ -1856,6 +2077,7 @@ impl AppController {
     ) -> Result<(Vec<HybridSearchScoredHit>, RetrievalStateDto), ApiError> {
         self.ensure_search_state()?;
         let storage = self.open_storage()?;
+        let storage_retrieval = retrieval_state_from_storage(&storage)?;
         let mut graph_boosts = HashMap::<codestory_contracts::graph::NodeId, f32>::new();
 
         let focus_core_id = match focus_node_id {
@@ -1882,7 +2104,23 @@ impl AppController {
             let engine = s.search_engine.as_mut().ok_or_else(|| {
                 ApiError::invalid_argument("Search engine not initialized. Open a project first.")
             })?;
-            let mut retrieval = retrieval_state_from_engine(engine);
+            let mut retrieval = storage_retrieval.clone();
+
+            if retrieval.mode == RetrievalModeDto::Hybrid && engine.semantic_doc_count() == 0 {
+                if !engine.embedding_runtime_configured()
+                    && let Err(error) = engine.set_embedding_runtime_from_env()
+                {
+                    tracing::warn!(
+                        "Search embedding runtime unavailable during hybrid load: {error}"
+                    );
+                }
+                if engine.embedding_runtime_configured() && engine.semantic_doc_count() == 0 {
+                    reload_llm_docs_from_storage(&storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
+                }
+                retrieval = retrieval_state_from_engine(engine);
+            } else if engine.semantic_doc_count() > 0 || engine.embedding_runtime_configured() {
+                retrieval = retrieval_state_from_engine(engine);
+            }
 
             let hits = if retrieval.mode == RetrievalModeDto::Hybrid {
                 let mut config = HybridSearchConfig {
@@ -2811,6 +3049,20 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn llm_doc_embed_batch_size_defaults_and_clamps_env_values() {
+        let _unset = EnvGuard::remove(LLM_DOC_EMBED_BATCH_SIZE_ENV);
+        assert_eq!(llm_doc_embed_batch_size(), DEFAULT_LLM_DOC_EMBED_BATCH_SIZE);
+        drop(_unset);
+
+        let _zero = EnvGuard::set(LLM_DOC_EMBED_BATCH_SIZE_ENV, "0");
+        assert_eq!(llm_doc_embed_batch_size(), 1);
+        drop(_zero);
+
+        let _large = EnvGuard::set(LLM_DOC_EMBED_BATCH_SIZE_ENV, "999");
+        assert_eq!(llm_doc_embed_batch_size(), 256);
+    }
+
     fn copy_tictactoe_workspace() -> tempfile::TempDir {
         let temp = tempdir().expect("create temp dir");
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -3047,6 +3299,8 @@ pub fn exact_symbol_anchor() {{}}
         let hits = controller
             .search(SearchRequest {
                 query: "AppController".to_string(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 10,
             })
             .expect("search");
 
@@ -3109,6 +3363,8 @@ pub fn exact_symbol_anchor() {{}}
             let hits = controller
                 .search(SearchRequest {
                     query: query.to_string(),
+                    repo_text: SearchRepoTextMode::Off,
+                    limit_per_source: 10,
                 })
                 .expect("search fixtures");
             let first = hits.first().expect("at least one hit");
@@ -3155,6 +3411,8 @@ pub fn exact_symbol_anchor() {{}}
         let hits = controller
             .search(SearchRequest {
                 query: "How does the language parsing work in this repo?".to_string(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 20,
             })
             .expect("search with natural language");
 
@@ -3235,7 +3493,8 @@ pub fn exact_symbol_anchor() {{}}
 
     #[test]
     fn run_indexing_without_runtime_refresh_populates_semantic_docs_in_storage() {
-        let _env = hybrid_test_env();
+        let mut env = hybrid_test_env();
+        env.push(EnvGuard::set(LLM_DOC_EMBED_BATCH_SIZE_ENV, "1"));
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
         let controller = AppController::new();
@@ -3264,6 +3523,200 @@ pub fn exact_symbol_anchor() {{}}
             stats.doc_count > 0,
             "expected full indexing to persist semantic docs without requiring a follow-up open"
         );
+    }
+
+    #[test]
+    fn grounding_snapshot_from_summary_open_keeps_search_state_cold() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("index without runtime refresh");
+
+        {
+            let state = controller.state.lock();
+            assert!(
+                state.search_engine.is_none(),
+                "summary open plus indexing should leave search state unloaded"
+            );
+            assert!(
+                state.node_names.is_empty(),
+                "summary open plus indexing should leave node label cache empty"
+            );
+        }
+
+        let snapshot = controller
+            .grounding_snapshot(GroundingBudgetDto::Balanced)
+            .expect("grounding snapshot");
+        assert_eq!(
+            snapshot.retrieval.as_ref().map(|state| state.mode),
+            Some(RetrievalModeDto::Hybrid)
+        );
+
+        let state = controller.state.lock();
+        assert!(
+            state.search_engine.is_none(),
+            "grounding snapshot should not rebuild the full search engine"
+        );
+        assert!(
+            state.node_names.is_empty(),
+            "grounding snapshot should not repopulate node labels from search state"
+        );
+    }
+
+    #[test]
+    fn retrieval_state_from_summary_open_keeps_search_state_cold() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_summary_with_storage_path(workspace.path().to_path_buf(), storage_path)
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("index without runtime refresh");
+
+        let retrieval = controller.retrieval_state().expect("retrieval state");
+        assert_eq!(retrieval.mode, RetrievalModeDto::Hybrid);
+
+        let state = controller.state.lock();
+        assert!(
+            state.search_engine.is_none(),
+            "retrieval_state should stay storage-backed on a cold controller"
+        );
+        assert!(
+            state.node_names.is_empty(),
+            "retrieval_state should not populate search labels on a cold controller"
+        );
+    }
+
+    #[test]
+    fn search_results_group_runtime_owned_repo_text_hits() {
+        let temp = tempdir().expect("temp dir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(storage_path.parent().expect("db parent")).expect("create db dir");
+        let source_path = temp.path().join("src").join("lib.rs");
+        std::fs::create_dir_all(source_path.parent().expect("src parent")).expect("create src");
+        std::fs::write(
+            &source_path,
+            "fn alpha() {}\n// this explains how alpha work items flow through the runtime\n",
+        )
+        .expect("write source");
+
+        {
+            let mut storage = Storage::open(&storage_path).expect("open storage");
+            storage
+                .insert_file(&FileInfo {
+                    id: 11,
+                    path: source_path.clone(),
+                    language: "rust".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 2,
+                })
+                .expect("insert file");
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(11),
+                        kind: NodeKind::FILE,
+                        serialized_name: source_path.to_string_lossy().to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(101),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "alpha".to_string(),
+                        file_node_id: Some(CoreNodeId(11)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert nodes");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
+            .expect("open project");
+
+        let results = controller
+            .search_results(SearchRequest {
+                query: "how does alpha work".to_string(),
+                repo_text: SearchRepoTextMode::On,
+                limit_per_source: 5,
+            })
+            .expect("search results");
+
+        assert!(results.repo_text_enabled);
+        assert!(!results.indexed_symbol_hits.is_empty());
+        assert!(!results.repo_text_hits.is_empty());
+        assert_eq!(
+            results.hits.len(),
+            results.indexed_symbol_hits.len() + results.repo_text_hits.len()
+        );
+        assert_eq!(
+            results.repo_text_hits[0].origin,
+            codestory_contracts::api::SearchHitOrigin::TextMatch
+        );
+    }
+
+    #[test]
+    fn symbol_context_by_id_does_not_mutate_persisted_semantic_docs() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("index without runtime refresh");
+
+        let storage = Storage::open(&storage_path).expect("reopen storage");
+        let before = storage
+            .get_llm_symbol_doc_stats()
+            .expect("semantic doc stats before");
+        let symbol_id = storage
+            .get_nodes()
+            .expect("load nodes")
+            .into_iter()
+            .find(|node| node.kind == NodeKind::FUNCTION)
+            .map(|node| NodeId::from(node.id))
+            .expect("function node");
+        drop(storage);
+
+        let context = controller
+            .symbol_context(symbol_id)
+            .expect("symbol context by id");
+        assert!(
+            !context.related_hits.is_empty(),
+            "expected lexical related hits for symbol context"
+        );
+
+        let storage = Storage::open(&storage_path).expect("reopen storage after read");
+        let after = storage
+            .get_llm_symbol_doc_stats()
+            .expect("semantic doc stats after");
+        assert_eq!(after.doc_count, before.doc_count);
+        assert_eq!(after.embedding_model, before.embedding_model);
     }
 
     #[test]
@@ -3468,6 +3921,8 @@ pub fn exact_symbol_anchor() {{}}
         let error = controller
             .search_results(SearchRequest {
                 query: "check_winner".to_string(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 10,
             })
             .expect_err("search should be blocked while indexing");
 
@@ -3491,6 +3946,8 @@ pub fn exact_symbol_anchor() {{}}
         let hits = controller
             .search(SearchRequest {
                 query: "check_winner".to_string(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 10,
             })
             .expect("lazy search should succeed");
 

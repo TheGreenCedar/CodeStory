@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use codestory_contracts::api::{
     ApiError, IndexMode, IndexingPhaseTimings, NodeDetailsDto, NodeDetailsRequest, ProjectSummary,
-    SearchHit, SearchRequest,
+    SearchHit, SearchRepoTextMode, SearchRequest,
 };
 use codestory_runtime::{GroundingService, IndexService, ProjectService, Runtime, SearchService};
 use directories::ProjectDirs;
@@ -114,6 +114,8 @@ pub(crate) fn resolve_target(
                 .search_hybrid(
                     SearchRequest {
                         query: query.clone(),
+                        repo_text: SearchRepoTextMode::Off,
+                        limit_per_source: 50,
                     },
                     None,
                     Some(50),

@@ -100,6 +100,11 @@ const TABLE_STATEMENTS: &[&str] = &[
         FOREIGN KEY(node_id) REFERENCES node(id),
         FOREIGN KEY(file_node_id) REFERENCES node(id)
     )",
+    "CREATE TABLE IF NOT EXISTS search_symbol_projection (
+        node_id INTEGER PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        FOREIGN KEY(node_id) REFERENCES node(id)
+    )",
     "CREATE TABLE IF NOT EXISTS callable_projection_state (
         file_id INTEGER NOT NULL,
         symbol_key TEXT NOT NULL,
@@ -221,6 +226,8 @@ const SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_file_node ON llm_symbol_doc(file_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_kind ON llm_symbol_doc(kind)",
     "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_updated_at ON llm_symbol_doc(updated_at_epoch_ms)",
+    "CREATE INDEX IF NOT EXISTS idx_search_symbol_projection_display_name
+     ON search_symbol_projection(display_name)",
     "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_node_id ON callable_projection_state(node_id)",
     "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_file_node ON callable_projection_state(file_id, node_id)",
     "CREATE INDEX IF NOT EXISTS idx_grounding_file_snapshot_path ON grounding_file_snapshot(path)",
@@ -314,6 +321,11 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     if stored_version < 9 {
         migrate_v9_grounding_snapshot_tiers(&storage.conn)?;
         storage.set_schema_version(9)?;
+    }
+
+    if stored_version < 10 {
+        migrate_v10_search_symbol_projection(&storage.conn)?;
+        storage.set_schema_version(10)?;
     }
 
     if storage.deferred_secondary_indexes {
@@ -601,6 +613,18 @@ pub(super) fn migrate_v9_grounding_snapshot_tiers(conn: &Connection) -> Result<(
         )
          VALUES (1, ?1, ?2, ?2, NULL, NULL)",
         params![GROUNDING_SNAPSHOT_VERSION, GROUNDING_SNAPSHOT_STATE_DIRTY],
+    )?;
+    Ok(())
+}
+
+pub(super) fn migrate_v10_search_symbol_projection(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS search_symbol_projection (
+            node_id INTEGER PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            FOREIGN KEY(node_id) REFERENCES node(id)
+        )",
+        [],
     )?;
     Ok(())
 }

@@ -165,6 +165,44 @@ pub(crate) fn should_expand_symbol_query(query: &str, direct_hit_count: usize) -
     word_count > 2 || query.len() > 28
 }
 
+pub(crate) fn looks_like_repo_text_query(query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let word_count = trimmed.split_whitespace().count();
+    let has_text_punctuation = query
+        .chars()
+        .any(|ch| matches!(ch, '.' | ',' | ':' | ';' | '!' | '?' | '"' | '\''));
+    if (word_count > 1 && has_text_punctuation) || trimmed.len() > 28 || word_count >= 4 {
+        return true;
+    }
+
+    if word_count < 2 {
+        return false;
+    }
+
+    trimmed.split_whitespace().any(|term| {
+        matches!(
+            term.to_ascii_lowercase().as_str(),
+            "how"
+                | "what"
+                | "why"
+                | "where"
+                | "when"
+                | "which"
+                | "who"
+                | "does"
+                | "do"
+                | "is"
+                | "are"
+                | "should"
+                | "can"
+        )
+    })
+}
+
 pub(crate) fn file_text_match_line(contents: &str, query: &str, terms: &[String]) -> Option<u32> {
     let normalized_query = query.trim().to_ascii_lowercase();
     for (index, line) in contents.lines().enumerate() {

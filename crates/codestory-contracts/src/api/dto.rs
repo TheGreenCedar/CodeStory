@@ -42,9 +42,26 @@ pub struct StartIndexingRequest {
     pub mode: IndexMode,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchRepoTextMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+fn default_search_limit_per_source() -> u32 {
+    10
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchRequest {
     pub query: String,
+    #[serde(default)]
+    pub repo_text: SearchRepoTextMode,
+    #[serde(default = "default_search_limit_per_source")]
+    pub limit_per_source: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -113,8 +130,15 @@ impl SearchHit {
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchResultsDto {
     pub query: String,
-    pub hits: Vec<SearchHit>,
     pub retrieval: RetrievalStateDto,
+    pub limit_per_source: u32,
+    pub repo_text_mode: SearchRepoTextMode,
+    pub repo_text_enabled: bool,
+    #[serde(default)]
+    pub indexed_symbol_hits: Vec<SearchHit>,
+    #[serde(default)]
+    pub repo_text_hits: Vec<SearchHit>,
+    pub hits: Vec<SearchHit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

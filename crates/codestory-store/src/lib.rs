@@ -16,8 +16,8 @@ pub use snapshot_store::{
 pub use storage_impl::{
     CallerProjectionRemovalSummary, FileInfo, FileProjectionRemovalSummary, GroundingEdgeKindCount,
     GroundingFileSummary, GroundingNodeRecord, GroundingSnapshotMetadata, GroundingSnapshotState,
-    LlmSymbolDoc, LlmSymbolDocStats, ProjectionFlushBreakdown, Storage as Store, StorageError,
-    StorageOpenMode, StorageStats,
+    LlmSymbolDoc, LlmSymbolDocStats, ProjectionFlushBreakdown, SearchSymbolProjection,
+    Storage as Store, StorageError, StorageOpenMode, StorageStats,
 };
 pub use trail_store::TrailStore;
 
