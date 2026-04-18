@@ -503,8 +503,7 @@ const LLM_SYMBOL_DOC_VERSION_PREFIX: &str = "semantic_doc_version:";
 const SEARCH_NODE_BATCH_SIZE: usize = 8_192;
 const SEARCH_SYMBOL_PROJECTION_BATCH_SIZE: usize = 4_096;
 const LLM_DOC_RELOAD_BATCH_SIZE: usize = 256;
-const LLM_DOC_EMBED_BATCH_SIZE_ENV: &str = "CODESTORY_EMBED_MAX_BATCH_SIZE";
-const DEFAULT_LLM_DOC_EMBED_BATCH_SIZE: usize = 64;
+const LLM_DOC_EMBED_BATCH_SIZE: usize = 16;
 
 fn search_index_storage_path(storage_path: &Path) -> PathBuf {
     let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
@@ -651,11 +650,7 @@ fn reload_llm_docs_from_storage(
 }
 
 fn llm_doc_embed_batch_size() -> usize {
-    std::env::var(LLM_DOC_EMBED_BATCH_SIZE_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .map(|value| value.clamp(1, 256))
-        .unwrap_or(DEFAULT_LLM_DOC_EMBED_BATCH_SIZE)
+    LLM_DOC_EMBED_BATCH_SIZE
 }
 
 fn retrieval_state_from_parts(
@@ -1076,6 +1071,7 @@ fn sync_llm_symbol_projection(
     }
 
     let embed_batch_size = llm_doc_embed_batch_size();
+    tracing::debug!(embed_batch_size, "Using semantic doc embedding batch size");
     let mut pending_docs = Vec::<PendingLlmSymbolDoc>::with_capacity(embed_batch_size);
     let mut has_indexable_docs = false;
     let mut file_text_cache = HashMap::<String, Option<String>>::new();
@@ -3050,17 +3046,8 @@ mod tests {
     }
 
     #[test]
-    fn llm_doc_embed_batch_size_defaults_and_clamps_env_values() {
-        let _unset = EnvGuard::remove(LLM_DOC_EMBED_BATCH_SIZE_ENV);
-        assert_eq!(llm_doc_embed_batch_size(), DEFAULT_LLM_DOC_EMBED_BATCH_SIZE);
-        drop(_unset);
-
-        let _zero = EnvGuard::set(LLM_DOC_EMBED_BATCH_SIZE_ENV, "0");
-        assert_eq!(llm_doc_embed_batch_size(), 1);
-        drop(_zero);
-
-        let _large = EnvGuard::set(LLM_DOC_EMBED_BATCH_SIZE_ENV, "999");
-        assert_eq!(llm_doc_embed_batch_size(), 256);
+    fn llm_doc_embed_batch_size_uses_throughput_default() {
+        assert_eq!(llm_doc_embed_batch_size(), 16);
     }
 
     fn copy_tictactoe_workspace() -> tempfile::TempDir {
@@ -3493,8 +3480,7 @@ pub fn exact_symbol_anchor() {{}}
 
     #[test]
     fn run_indexing_without_runtime_refresh_populates_semantic_docs_in_storage() {
-        let mut env = hybrid_test_env();
-        env.push(EnvGuard::set(LLM_DOC_EMBED_BATCH_SIZE_ENV, "1"));
+        let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
         let controller = AppController::new();
