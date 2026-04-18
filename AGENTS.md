@@ -25,6 +25,9 @@
 
 ## Testing Guidelines
 - Tests live in `#[cfg(test)]` blocks or `*_tests.rs`; name them `test_*`.
+- Before committing, run the repo-scale CLI e2e stats test and append the emitted stats to `docs/testing/codestory-e2e-stats-log.md`:
+  - `cargo build --release -p codestory-cli`
+  - `cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture`
 - To exercise indexing fidelity and coverage, you must explicitly run full test binaries, not just filters:
   - `cargo test -p codestory-indexer --test fidelity_regression`
   - `cargo test -p codestory-indexer --test tictactoe_language_coverage`
