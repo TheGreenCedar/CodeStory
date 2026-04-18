@@ -54,6 +54,15 @@ pub enum SearchHitOrigin {
     TextMatch,
 }
 
+impl SearchHitOrigin {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IndexedSymbol => "indexed_symbol",
+            Self::TextMatch => "text_match",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalModeDto {
@@ -93,6 +102,12 @@ pub struct SearchHit {
     pub score: f32,
     pub origin: SearchHitOrigin,
     pub resolvable: bool,
+}
+
+impl SearchHit {
+    pub const fn is_text_match(&self) -> bool {
+        matches!(self.origin, SearchHitOrigin::TextMatch)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

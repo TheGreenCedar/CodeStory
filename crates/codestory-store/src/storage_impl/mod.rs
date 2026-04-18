@@ -342,16 +342,16 @@ impl Storage {
         let conn = Connection::open(path)?;
         // Allow concurrent reads while indexing writes, and avoid flaky "database is locked" errors
         // in app shells when users query mid-index.
-        let _ = conn.busy_timeout(Duration::from_millis(2_500));
-        let _ = conn.pragma_update(None, "foreign_keys", "ON");
-        let _ = conn.pragma_update(None, "journal_mode", "WAL");
-        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+        conn.busy_timeout(Duration::from_millis(2_500))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         if matches!(mode, StorageOpenMode::Build) {
             // Favor fewer temp-file round trips and larger page caches while building
             // the staged full-refresh snapshot.
-            let _ = conn.pragma_update(None, "temp_store", "MEMORY");
-            let _ = conn.pragma_update(None, "cache_size", "-131072");
-            let _ = conn.pragma_update(None, "mmap_size", "268435456");
+            conn.pragma_update(None, "temp_store", "MEMORY")?;
+            conn.pragma_update(None, "cache_size", "-131072")?;
+            conn.pragma_update(None, "mmap_size", "268435456")?;
         }
         let storage = Self {
             conn,
@@ -364,7 +364,7 @@ impl Storage {
 
     pub fn new_in_memory() -> Result<Self, StorageError> {
         let conn = Connection::open_in_memory()?;
-        let _ = conn.pragma_update(None, "foreign_keys", "ON");
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         let storage = Self {
             conn,
             cache: StorageCache::default(),
@@ -967,7 +967,12 @@ impl Storage {
                 (SELECT COUNT(*) FROM node),
                 (SELECT COUNT(*) FROM edge),
                 (SELECT COUNT(*) FROM grounding_file_snapshot),
-                (SELECT COUNT(*) FROM error)",
+                (SELECT COUNT(*) FROM error)
+             ON CONFLICT(id) DO UPDATE SET
+                node_count = excluded.node_count,
+                edge_count = excluded.edge_count,
+                file_count = excluded.file_count,
+                error_count = excluded.error_count",
             [],
         )?;
         tx.execute(
@@ -1247,7 +1252,17 @@ impl Storage {
     pub fn insert_node(&self, node: &Node) -> Result<(), StorageError> {
         self.conn.execute(
             "INSERT INTO node (id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(id) DO NOTHING",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+                kind = excluded.kind,
+                serialized_name = excluded.serialized_name,
+                qualified_name = excluded.qualified_name,
+                canonical_id = excluded.canonical_id,
+                file_node_id = excluded.file_node_id,
+                start_line = excluded.start_line,
+                start_col = excluded.start_col,
+                end_line = excluded.end_line,
+                end_col = excluded.end_col",
             params![
                 node.id.0,
                 node.kind as i32,
@@ -1296,7 +1311,17 @@ impl Storage {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO node (id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(id) DO NOTHING",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                    kind = excluded.kind,
+                    serialized_name = excluded.serialized_name,
+                    qualified_name = excluded.qualified_name,
+                    canonical_id = excluded.canonical_id,
+                    file_node_id = excluded.file_node_id,
+                    start_line = excluded.start_line,
+                    start_col = excluded.start_col,
+                    end_line = excluded.end_line,
+                    end_col = excluded.end_col",
             )?;
             // Insert FILE nodes first so foreign keys to file_node_id are satisfied.
             for node in nodes
@@ -1963,6 +1988,14 @@ impl Storage {
     }
 
     pub fn get_all_llm_symbol_docs(&self) -> Result<Vec<LlmSymbolDoc>, StorageError> {
+        self.get_llm_symbol_docs_batch_after(None, usize::MAX)
+    }
+
+    pub fn get_llm_symbol_docs_batch_after(
+        &self,
+        after_node_id: Option<NodeId>,
+        limit: usize,
+    ) -> Result<Vec<LlmSymbolDoc>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT
                 node_id,
@@ -1978,9 +2011,13 @@ impl Storage {
                 embedding_blob,
                 updated_at_epoch_ms
              FROM llm_symbol_doc
-             ORDER BY node_id ASC",
+             WHERE (?1 IS NULL OR node_id > ?1)
+             ORDER BY node_id ASC
+             LIMIT ?2",
         )?;
-        let mut rows = stmt.query([])?;
+        let after_node_id = after_node_id.map(|id| id.0);
+        let limit = limit.min(i64::MAX as usize) as i64;
+        let mut rows = stmt.query(params![after_node_id, limit])?;
         let mut docs = Vec::new();
         while let Some(row) = rows.next()? {
             let kind: i32 = row.get(2)?;
@@ -2154,6 +2191,8 @@ impl Storage {
             "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count) 
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) 
              ON CONFLICT(id) DO UPDATE SET 
+                path=excluded.path, 
+                language=excluded.language, 
                 modification_time=excluded.modification_time, 
                 indexed=excluded.indexed, 
                 complete=excluded.complete, 
@@ -2182,6 +2221,8 @@ impl Storage {
                 "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count) 
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) 
                  ON CONFLICT(id) DO UPDATE SET 
+                    path=excluded.path, 
+                    language=excluded.language, 
                     modification_time=excluded.modification_time, 
                     indexed=excluded.indexed, 
                     complete=excluded.complete, 

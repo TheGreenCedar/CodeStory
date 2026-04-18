@@ -23,11 +23,16 @@ pub(super) fn resolve_calls_on_conn(
     }
 
     let prepare_started = Instant::now();
-    conn.execute(
+    let mut prepare_query = String::from(
         "UPDATE edge SET resolved_source_node_id = source_node_id
          WHERE kind = ?1 AND resolved_source_node_id IS NULL",
-        params![EdgeKind::CALL as i32],
-    )?;
+    );
+    if scope_context.is_scoped() {
+        prepare_query.push_str(&format!(
+            " AND source_node_id IN (SELECT caller_id FROM {SCOPED_CALLER_TABLE})"
+        ));
+    }
+    conn.execute(&prepare_query, params![EdgeKind::CALL as i32])?;
     telemetry.call_prepare_ms = telemetry
         .call_prepare_ms
         .saturating_add(duration_ms_u64(prepare_started.elapsed()));
@@ -73,11 +78,16 @@ pub(super) fn resolve_imports_on_conn(
     }
 
     let prepare_started = Instant::now();
-    conn.execute(
+    let mut prepare_query = String::from(
         "UPDATE edge SET resolved_source_node_id = source_node_id
          WHERE kind = ?1 AND resolved_source_node_id IS NULL",
-        params![EdgeKind::IMPORT as i32],
-    )?;
+    );
+    if scope_context.is_scoped() {
+        prepare_query.push_str(&format!(
+            " AND source_node_id IN (SELECT caller_id FROM {SCOPED_CALLER_TABLE})"
+        ));
+    }
+    conn.execute(&prepare_query, params![EdgeKind::IMPORT as i32])?;
     telemetry.import_prepare_ms = telemetry
         .import_prepare_ms
         .saturating_add(duration_ms_u64(prepare_started.elapsed()));

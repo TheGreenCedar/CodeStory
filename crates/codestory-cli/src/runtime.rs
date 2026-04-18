@@ -7,9 +7,11 @@ use codestory_runtime::{GroundingService, IndexService, ProjectService, Runtime,
 use directories::ProjectDirs;
 use std::path::{Path, PathBuf};
 
-use crate::args::{ProjectArgs, RefreshMode, TargetSelection};
+use crate::args::{ProjectArgs, QuerySelectorOutput, RefreshMode, TargetSelection};
+use crate::display::{clean_path_string, format_search_hit_target};
 use crate::query_resolution::{
-    compare_resolution_hits, resolution_rank, search_hit_matches_file_filter,
+    compare_resolution_hits, file_filter_match_bucket, resolution_rank,
+    search_hit_matches_file_filter,
 };
 
 #[derive(Debug)]
@@ -30,7 +32,9 @@ pub(crate) struct RuntimeContext {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedTarget {
+    pub(crate) selector: QuerySelectorOutput,
     pub(crate) requested: String,
+    pub(crate) file_filter: Option<String>,
     pub(crate) selected: SearchHit,
     pub(crate) alternatives: Vec<SearchHit>,
 }
@@ -97,7 +101,9 @@ pub(crate) fn resolve_target(
                 .node_details(NodeDetailsRequest { id: id.clone() })
                 .map_err(map_api_error)?;
             Ok(ResolvedTarget {
-                requested: format!("id:{}", id.0),
+                selector: QuerySelectorOutput::Id,
+                requested: id.0,
+                file_filter: None,
                 selected: search_hit_from_node(&details),
                 alternatives: Vec::new(),
             })
@@ -115,47 +121,63 @@ pub(crate) fn resolve_target(
                 )
                 .map_err(map_api_error)?;
             if let Some(file_filter) = file_filter {
-                alternatives.retain(|hit| search_hit_matches_file_filter(hit, file_filter));
+                alternatives.retain(|hit| {
+                    search_hit_matches_file_filter(&runtime.project_root, hit, file_filter)
+                });
             }
             if alternatives.is_empty() {
-                if let Some(file_filter) = file_filter {
-                    return Err(anyhow!(
-                        "No symbol matched query `{query}` within files matching `{file_filter}`. Run `codestory-cli search --query \"{query}\"` to inspect candidates."
-                    ));
-                }
-                return Err(anyhow!(
-                    "No symbol matched query `{query}`. Run `codestory-cli search --query \"{query}\"` to inspect candidates."
+                return Err(no_query_match_error(
+                    &runtime.project_root,
+                    &query,
+                    file_filter,
                 ));
             }
 
-            alternatives.sort_by(|left, right| compare_resolution_hits(&query, left, right));
+            alternatives.sort_by(|left, right| {
+                compare_resolution_candidates(
+                    &runtime.project_root,
+                    &query,
+                    file_filter,
+                    left,
+                    right,
+                )
+            });
 
             if alternatives.len() > 1 {
-                let rank0 = resolution_rank(&query, &alternatives[0]);
-                let rank1 = resolution_rank(&query, &alternatives[1]);
+                let rank0 = resolution_candidate_rank(
+                    &runtime.project_root,
+                    &query,
+                    file_filter,
+                    &alternatives[0],
+                );
+                let rank1 = resolution_candidate_rank(
+                    &runtime.project_root,
+                    &query,
+                    file_filter,
+                    &alternatives[1],
+                );
                 if rank0 == rank1 {
-                    let name0 = &alternatives[0].display_name;
-                    let name1 = &alternatives[1].display_name;
                     bail!(
-                        "Query `{query}` is ambiguous. It matches multiple distinct symbols equally well, including:\n  • {name0}\n  • {name1}\n\nPlease steer resolution by providing a more qualified name (e.g. `Namespace::Symbol` or a partial path)."
+                        "{}",
+                        ambiguous_query_error(
+                            &runtime.project_root,
+                            &query,
+                            file_filter,
+                            &alternatives,
+                        )
                     );
                 }
             }
 
-            let selected = alternatives.first().cloned().ok_or_else(|| {
-                if let Some(file_filter) = file_filter {
-                    anyhow!(
-                        "No symbol matched query `{query}` within files matching `{file_filter}`. Run `codestory-cli search --query \"{query}\"` to inspect candidates."
-                    )
-                } else {
-                    anyhow!(
-                        "No symbol matched query `{query}`. Run `codestory-cli search --query \"{query}\"` to inspect candidates."
-                    )
-                }
-            })?;
+            let selected = alternatives
+                .first()
+                .cloned()
+                .ok_or_else(|| no_query_match_error(&runtime.project_root, &query, file_filter))?;
 
             Ok(ResolvedTarget {
+                selector: QuerySelectorOutput::Query,
                 requested: query,
+                file_filter: file_filter.map(ToOwned::to_owned),
                 selected,
                 alternatives,
             })
@@ -175,7 +197,7 @@ pub(crate) fn canonicalize_project_root(project: &Path) -> Result<PathBuf> {
     project.canonicalize().with_context(|| {
         format!(
             "Failed to resolve project path `{}`. Ensure the directory exists.",
-            project.display()
+            clean_path_string(&project.to_string_lossy())
         )
     })
 }
@@ -184,15 +206,17 @@ pub(crate) fn cache_root_for_project(
     project_root: &Path,
     override_dir: Option<&Path>,
 ) -> Result<PathBuf> {
-    let base = match override_dir {
-        Some(path) => path.to_path_buf(),
-        None => ProjectDirs::from("dev", "codestory", "codestory")
-            .map(|dirs| dirs.cache_dir().to_path_buf())
-            .ok_or_else(|| {
-                anyhow!("Failed to determine a user cache directory for codestory-cli")
-            })?,
-    };
-    Ok(base.join(fnv1a_hex(project_root.to_string_lossy().as_bytes())))
+    match override_dir {
+        Some(path) => Ok(path.to_path_buf()),
+        None => {
+            let base = ProjectDirs::from("dev", "codestory", "codestory")
+                .map(|dirs| dirs.cache_dir().to_path_buf())
+                .ok_or_else(|| {
+                    anyhow!("Failed to determine a user cache directory for codestory-cli")
+                })?;
+            Ok(base.join(fnv1a_hex(project_root.to_string_lossy().as_bytes())))
+        }
+    }
 }
 
 pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
@@ -233,9 +257,9 @@ pub(crate) fn refresh_label(requested: RefreshMode, resolved: Option<IndexMode>)
 
 pub(crate) fn ensure_index_ready(opened: &OpenedProject, subcommand: &str) -> Result<()> {
     if opened.summary.stats.node_count == 0 {
+        let project = clean_path_string(&opened.summary.root);
         bail!(
-            "No indexed files are available for `{subcommand}`. Run `codestory-cli index --project \"{}\" --refresh auto` first or rerun this command with `--refresh auto`.",
-            opened.summary.root
+            "No indexed files are available for `{subcommand}` in `{project}`.\n\n`{subcommand}` only reads the existing cache unless you pass `--refresh`.\nRun `codestory-cli index --project \"{project}\" --refresh full` to build the cache first.\nIf you want the read command to refresh on demand, rerun it with `--refresh incremental` or `--refresh full`."
         );
     }
     Ok(())
@@ -256,4 +280,86 @@ pub(crate) fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
         origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
         resolvable: true,
     }
+}
+
+fn resolution_candidate_rank(
+    project_root: &Path,
+    query: &str,
+    file_filter: Option<&str>,
+    hit: &SearchHit,
+) -> (u8, u8, u8, u8, u8, u8) {
+    let rank = resolution_rank(query, hit);
+    (
+        file_filter
+            .map(|filter| file_filter_match_bucket(project_root, hit, filter))
+            .unwrap_or(0),
+        rank.0,
+        rank.1,
+        rank.2,
+        rank.3,
+        rank.4,
+    )
+}
+
+fn compare_resolution_candidates(
+    project_root: &Path,
+    query: &str,
+    file_filter: Option<&str>,
+    left: &SearchHit,
+    right: &SearchHit,
+) -> std::cmp::Ordering {
+    resolution_candidate_rank(project_root, query, file_filter, right)
+        .cmp(&resolution_candidate_rank(
+            project_root,
+            query,
+            file_filter,
+            left,
+        ))
+        .then_with(|| compare_resolution_hits(query, left, right))
+}
+
+fn no_query_match_error(
+    _project_root: &Path,
+    query: &str,
+    file_filter: Option<&str>,
+) -> anyhow::Error {
+    match file_filter {
+        Some(file_filter) => anyhow!(
+            "No symbol matched query `{query}` within files matching `{}`. Run `codestory-cli search --query \"{query}\" --limit 10` to inspect candidates, or relax `--file`.",
+            clean_path_string(file_filter)
+        ),
+        None => anyhow!(
+            "No symbol matched query `{query}`. Run `codestory-cli search --query \"{query}\" --limit 10` to inspect candidates."
+        ),
+    }
+}
+
+fn ambiguous_query_error(
+    project_root: &Path,
+    query: &str,
+    file_filter: Option<&str>,
+    alternatives: &[SearchHit],
+) -> String {
+    let mut message = String::new();
+    let scope = file_filter
+        .map(|value| format!(" even after applying `--file {}`", clean_path_string(value)))
+        .unwrap_or_default();
+    message.push_str(&format!(
+        "Query `{query}` is ambiguous{scope}. Top equally ranked matches:\n"
+    ));
+    for hit in alternatives.iter().take(4) {
+        message.push_str("  - ");
+        message.push_str(&format_search_hit_target(project_root, hit));
+        message.push('\n');
+    }
+    if file_filter.is_some() {
+        message.push_str(
+            "\nPlease pass a more qualified symbol name or an exact `--id` from `search` output.",
+        );
+    } else {
+        message.push_str(
+            "\nPlease pass a more qualified symbol name, add `--file <path-fragment>`, or resolve the exact `--id` from `search` output.",
+        );
+    }
+    message
 }

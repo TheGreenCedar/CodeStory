@@ -8,13 +8,12 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use crate::args::{CliTrailMode, OutputFormat, TrailCommand};
+use crate::args::{CliTrailMode, IndexOutput, OutputFormat, SearchOutput, TrailCommand};
 use crate::display::{
     clean_path_string, default_trail_direction, format_budget, format_direction, format_kind,
     format_trail_mode, relative_path,
 };
 use crate::runtime::ResolvedTarget;
-use crate::{IndexOutput, SearchOutput};
 
 pub(crate) fn emit<T: Serialize>(format: OutputFormat, value: &T, markdown: String) -> Result<()> {
     match format {
@@ -286,18 +285,44 @@ pub(crate) fn render_ground_markdown(
     markdown
 }
 
-pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput<'_>) -> String {
+pub(crate) fn render_search_markdown(_project_root: &Path, output: &SearchOutput) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Search");
     let _ = writeln!(markdown, "query: `{}`", output.query);
     let _ = writeln!(
         markdown,
         "retrieval: {}",
-        render_retrieval_state(output.retrieval)
+        render_retrieval_state(&output.retrieval)
     );
-    let _ = writeln!(markdown, "hits: {}", output.hits.len());
-    for hit in output.hits {
-        let _ = writeln!(markdown, "- {}", render_search_hit(project_root, hit));
+    let _ = writeln!(markdown, "limit_per_source: {}", output.limit_per_source);
+    let _ = writeln!(
+        markdown,
+        "repo_text: {} ({})",
+        match output.repo_text_mode {
+            crate::args::RepoTextMode::Auto => "auto",
+            crate::args::RepoTextMode::On => "on",
+            crate::args::RepoTextMode::Off => "off",
+        },
+        if output.repo_text_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    let _ = writeln!(
+        markdown,
+        "indexed_symbol_hits: {}",
+        output.indexed_symbol_hits.len()
+    );
+    for hit in &output.indexed_symbol_hits {
+        let _ = writeln!(markdown, "- {}", render_search_hit_output(hit));
+    }
+    let _ = writeln!(markdown, "repo_text_hits: {}", output.repo_text_hits.len());
+    for hit in &output.repo_text_hits {
+        let _ = writeln!(markdown, "- {}", render_search_hit_output(hit));
+        if let Some(excerpt) = hit.excerpt.as_deref() {
+            let _ = writeln!(markdown, "  excerpt: {}", excerpt);
+        }
     }
     markdown
 }
@@ -445,13 +470,29 @@ pub(crate) fn render_snippet_markdown(
         relative_path(project_root, &context.path),
         context.line
     );
+    let fence = snippet_fence(&context.snippet);
+    let _ = writeln!(markdown, "{fence}{}", snippet_language(&context.path));
     let _ = writeln!(markdown, "{}", context.snippet);
+    let _ = writeln!(markdown, "{fence}");
     markdown
 }
 
 fn append_resolution(markdown: &mut String, project_root: &Path, target: &ResolvedTarget) {
-    if target.requested.starts_with("id:") {
+    if matches!(target.selector, crate::args::QuerySelectorOutput::Id) {
+        let _ = writeln!(
+            markdown,
+            "resolved_id: `{}` -> {}",
+            target.requested,
+            render_search_hit(project_root, &target.selected)
+        );
         return;
+    }
+    if let Some(file_filter) = target.file_filter.as_deref() {
+        let _ = writeln!(
+            markdown,
+            "file_filter: `{}`",
+            clean_path_string(file_filter)
+        );
     }
     let _ = writeln!(
         markdown,
@@ -529,7 +570,65 @@ fn render_search_hit(project_root: &Path, hit: &SearchHit) -> String {
         let _ = write!(out, ":{line}");
     }
     let _ = write!(out, " score={:.2}", hit.score);
+    let _ = write!(out, " origin={}", hit.origin.as_str());
     out
+}
+
+fn render_search_hit_output(hit: &crate::args::SearchHitOutput) -> String {
+    let mut out = format!(
+        "[{}] {} [{}]",
+        hit.node_id,
+        hit.display_name,
+        format_kind(hit.kind)
+    );
+    if let Some(path) = hit.file_path.as_deref() {
+        let _ = write!(out, " {}", path);
+    }
+    if let Some(line) = hit.line {
+        let _ = write!(out, ":{line}");
+    }
+    let _ = write!(out, " score={:.2}", hit.score);
+    let _ = write!(out, " origin={}", hit.origin.as_str());
+    out
+}
+
+fn snippet_language(path: &str) -> &'static str {
+    match Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "rs" => "rust",
+        "ts" => "typescript",
+        "tsx" => "tsx",
+        "js" => "javascript",
+        "jsx" => "jsx",
+        "py" => "python",
+        "go" => "go",
+        "java" => "java",
+        "kt" => "kotlin",
+        "cs" => "csharp",
+        "cpp" | "cc" | "cxx" => "cpp",
+        "h" | "hpp" => "cpp",
+        "rb" => "ruby",
+        "php" => "php",
+        "swift" => "swift",
+        "json" => "json",
+        "toml" => "toml",
+        "md" => "markdown",
+        "yml" | "yaml" => "yaml",
+        _ => "",
+    }
+}
+
+fn snippet_fence(snippet: &str) -> &'static str {
+    if snippet.contains("```") {
+        "````"
+    } else {
+        "```"
+    }
 }
 
 fn render_ground_symbol(symbol: &codestory_contracts::api::GroundingSymbolDigestDto) -> String {

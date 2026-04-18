@@ -31,6 +31,12 @@ Check:
 - whether projection flushing completed
 - whether resolution ran and updated the expected edges
 
+Recovery order:
+
+1. Run `index --refresh full` once to rule out stale incremental state.
+2. If a delete or rename still looks stale, inspect `codestory-workspace` path normalization and the file rows in the SQLite cache.
+3. If the same repo repeatedly forces full rebuilds or looks perpetually dirty, inspect stored modification times versus filesystem times before changing resolution logic.
+
 ## If Store Or Snapshot State Is Wrong
 
 Common symptoms:
@@ -52,6 +58,12 @@ Check:
 - whether invalidation and refresh touched the expected projections
 - whether search-doc and trail rows were refreshed alongside graph writes
 
+Recovery order:
+
+1. If a full refresh fails during publish, keep the staged snapshot path from the error output and inspect that database before deleting it.
+2. If grounding snapshots look stale, force a fresh `index --refresh full` before debugging higher-level runtime assembly.
+3. If file metadata looks wrong after a rename or move, inspect the `file` table values for `path`, `language`, and `modification_time`.
+
 ## If Search Is Wrong
 
 Common symptoms:
@@ -72,7 +84,18 @@ Check:
 - whether runtime rebuilt its search state after indexing
 - what retrieval mode `index`, `ground`, or `search` reported for the current run
 - whether semantic retrieval is disabled, missing model assets, or missing semantic docs
+- whether `CODESTORY_HYBRID_RETRIEVAL_ENABLED`, `CODESTORY_EMBED_RUNTIME_MODE`, `CODESTORY_EMBED_MODEL_PATH`, or `CODESTORY_EMBED_TOKENIZER_PATH` changed between runs
 - whether graph-based boosts are overwhelming lexical matches
+
+Recovery order:
+
+1. Confirm whether the miss is in `indexed_symbol_hits`, `repo_text_hits`, or both.
+2. Confirm the reported retrieval mode and fallback reason before touching search ranking code.
+3. For lightweight local-dev semantic checks, set `CODESTORY_EMBED_RUNTIME_MODE=hash`.
+4. For real local model assets, set `CODESTORY_EMBED_MODEL_PATH` and let the tokenizer default to a sibling `tokenizer.json` or set `CODESTORY_EMBED_TOKENIZER_PATH` explicitly.
+5. If the current machine should stay lexical only, set `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false` and verify the fallback messaging instead of treating it as a runtime regression.
+6. Rebuild once with `index --refresh full`.
+7. If semantic retrieval is still the only failing part, inspect the reported fallback reason before touching lexical ranking or CLI rendering.
 
 ## If Grounding Is Wrong
 
@@ -86,6 +109,8 @@ Check:
 - summary versus detail snapshot readiness
 - recent invalidation after writes
 - whether the candidate set was expanded by trail/search logic correctly
+
+If `ground --budget max` is the only failing path, check detail-snapshot readiness first. Summary-ready and detail-ready are separate states.
 
 ## If Trail Output Is Wrong
 
@@ -119,4 +144,25 @@ Check:
 - whether the CLI maps directly to runtime services
 - whether JSON and markdown output still match the runtime DTO shape
 - whether the change belongs in runtime rather than the adapter layer
+
+## Cache Reset Cookbook
+
+Use this when you need to wipe state instead of debugging a clearly broken cache:
+
+```powershell
+.\target\release\codestory-cli.exe index --project . --refresh full
+```
+
+If the cache directory itself needs to go:
+
+```powershell
+Remove-Item -LiteralPath <cache-dir> -Recurse -Force
+.\target\release\codestory-cli.exe index --project . --refresh full
+```
+
+Keep the work serialized. Running multiple cargo or CLI indexing commands at once can hide the real failure behind lock contention and avoidable memory pressure.
+
+If the repo-scale runtime integration gate hits memory pressure, do not keep retrying it in a loop. Capture the failing command, confirm the default runtime and retrieval lanes still pass, and treat the repo-scale run as a heavy manual follow-up on a roomier machine or after further containment work.
+
+If retrieval behavior changes at the same time, walk the recovery order above before assuming the memory event and the ranking regression share the same cause.
 

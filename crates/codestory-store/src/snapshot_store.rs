@@ -1,6 +1,6 @@
 use crate::{GroundingSnapshotMetadata, StorageError, Store};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotRefreshStats {
@@ -38,7 +38,8 @@ impl<'a> SnapshotStore<'a> {
             .extension()
             .and_then(|value| value.to_str())
             .unwrap_or("sqlite");
-        parent.join(format!("{stem}.staged.{extension}"))
+        let unique = unique_staged_suffix();
+        parent.join(format!("{stem}.staged.{unique}.{extension}"))
     }
 
     pub fn open_staged(live_path: &Path) -> Result<StagedSnapshot, StorageError> {
@@ -148,18 +149,20 @@ impl StagedSnapshot {
     pub fn publish(self, live_path: &Path) -> Result<(), StorageError> {
         let path = self.path;
         drop(self.store);
-        match SnapshotStore::promote_staged(&path, live_path) {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                let _ = SnapshotStore::discard_staged(&path);
-                Err(err)
-            }
-        }
+        SnapshotStore::promote_staged(&path, live_path)
     }
 }
 
 fn clamp_u128_to_u32(value: u128) -> u32 {
     value.min(u32::MAX as u128) as u32
+}
+
+fn unique_staged_suffix() -> String {
+    let epoch_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{}", std::process::id(), epoch_ns)
 }
 
 #[cfg(test)]
@@ -257,6 +260,22 @@ mod tests {
 
         staged.discard().expect("discard staged snapshot");
         assert!(!staged_path.exists(), "staged database should be removed");
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn staged_paths_are_unique_per_open() {
+        let temp = fresh_temp_root("unique");
+        let live_path = temp.join("live.sqlite");
+
+        let staged_a = SnapshotStore::open_staged(&live_path).expect("open staged a");
+        let staged_b = SnapshotStore::open_staged(&live_path).expect("open staged b");
+
+        assert_ne!(staged_a.path(), staged_b.path());
+
+        staged_a.discard().expect("discard staged a");
+        staged_b.discard().expect("discard staged b");
 
         let _ = fs::remove_dir_all(&temp);
     }

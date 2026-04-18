@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use codestory_contracts::api::SearchRequest;
-use std::cmp::Ordering;
-use std::collections::HashSet;
+use codestory_contracts::api::{SearchHit, SearchRequest};
+use std::fs;
 
 mod args;
 mod display;
@@ -12,14 +11,21 @@ mod runtime;
 mod text_search;
 
 use args::{
-    Cli, Command, GroundCommand, IndexCommand, IndexOutput, SearchCommand, SearchOutput,
-    SnippetCommand, SymbolCommand, TrailCommand, build_trail_request,
+    Cli, Command, GroundCommand, IndexCommand, IndexOutput, QueryResolutionOutput, RepoTextMode,
+    SearchCommand, SearchHitOutput, SearchOutput, SnippetCommand, SnippetJsonOutput, SymbolCommand,
+    SymbolJsonOutput, TrailCommand, TrailJsonOutput, build_trail_request,
 };
 use output::{
     emit, render_ground_markdown, render_index_markdown, render_search_markdown,
     render_snippet_markdown, render_symbol_markdown, render_trail_markdown,
 };
 use runtime::{RuntimeContext, ensure_index_ready, map_api_error, refresh_label, resolve_target};
+
+#[derive(Debug, Clone, Copy)]
+struct RepoTextOutputConfig {
+    mode: RepoTextMode,
+    enabled: bool,
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -32,38 +38,6 @@ fn main() -> Result<()> {
         Command::Trail(cmd) => run_trail(cmd),
         Command::Snippet(cmd) => run_snippet(cmd),
     }
-}
-
-fn score_first_search_hit_cmp(
-    left: &codestory_contracts::api::SearchHit,
-    right: &codestory_contracts::api::SearchHit,
-) -> Ordering {
-    right
-        .score
-        .partial_cmp(&left.score)
-        .unwrap_or(Ordering::Equal)
-        .then_with(|| left.display_name.cmp(&right.display_name))
-}
-
-fn merge_repo_text_hits(
-    hits: &mut Vec<codestory_contracts::api::SearchHit>,
-    repo_text_hits: Vec<codestory_contracts::api::SearchHit>,
-    limit: usize,
-) {
-    hits.extend(repo_text_hits);
-    let mut seen = HashSet::new();
-    hits.retain(|hit| {
-        let key = format!(
-            "{}|{}|{}|{:?}",
-            hit.file_path.as_deref().unwrap_or_default(),
-            hit.line.unwrap_or_default(),
-            hit.display_name,
-            hit.kind
-        );
-        seen.insert(key)
-    });
-    hits.sort_by(score_first_search_hit_cmp);
-    hits.truncate(limit);
 }
 
 fn run_index(cmd: IndexCommand) -> Result<()> {
@@ -81,7 +55,7 @@ fn run_index(cmd: IndexCommand) -> Result<()> {
         storage_path: &storage_path,
         refresh: &refresh_label,
         summary: &opened.summary,
-        retrieval: &retrieval,
+        retrieval,
         phase_timings: opened.phase_timings.as_ref(),
     };
 
@@ -114,21 +88,31 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
             query: cmd.query.clone(),
         })
         .map_err(map_api_error)?;
-    if text_search::looks_like_text_query(&cmd.query) {
-        let repo_text_hits =
-            text_search::scan_repo_text_hits(&runtime.project_root, &cmd.query, limit)?;
-        merge_repo_text_hits(&mut search_results.hits, repo_text_hits, limit);
-    } else {
-        search_results.hits.truncate(limit);
-    }
-
-    let output = SearchOutput {
-        query: &search_results.query,
-        retrieval: &search_results.retrieval,
-        hits: &search_results.hits,
+    search_results.hits.truncate(limit);
+    let repo_text_enabled = match cmd.repo_text {
+        RepoTextMode::Auto => text_search::looks_like_text_query(&cmd.query),
+        RepoTextMode::On => true,
+        RepoTextMode::Off => false,
     };
+    let repo_text_hits = if repo_text_enabled {
+        text_search::scan_repo_text_hits(&runtime.project_root, &cmd.query, limit)?
+    } else {
+        Vec::new()
+    };
+    let output = build_search_output(
+        &runtime.project_root,
+        &search_results.query,
+        &search_results.retrieval,
+        &search_results.hits,
+        &repo_text_hits,
+        cmd.limit.clamp(1, 50),
+        RepoTextOutputConfig {
+            mode: cmd.repo_text,
+            enabled: repo_text_enabled,
+        },
+    );
     let markdown = render_search_markdown(&runtime.project_root, &output);
-    emit(cmd.format, &search_results, markdown)
+    emit(cmd.format, &output, markdown)
 }
 
 fn run_symbol(cmd: SymbolCommand) -> Result<()> {
@@ -143,7 +127,11 @@ fn run_symbol(cmd: SymbolCommand) -> Result<()> {
         .symbol_context(target.selected.node_id.clone())
         .map_err(map_api_error)?;
     let markdown = render_symbol_markdown(&runtime.project_root, &target, &context);
-    emit(cmd.format, &context, markdown)
+    let output = SymbolJsonOutput {
+        resolution: build_query_resolution_output(&runtime.project_root, &target),
+        symbol: &context,
+    };
+    emit(cmd.format, &output, markdown)
 }
 
 fn run_trail(cmd: TrailCommand) -> Result<()> {
@@ -159,7 +147,11 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
         .trail_context(request)
         .map_err(map_api_error)?;
     let markdown = render_trail_markdown(&runtime.project_root, &target, &context, &cmd);
-    emit(cmd.format, &context, markdown)
+    let output = TrailJsonOutput {
+        resolution: build_query_resolution_output(&runtime.project_root, &target),
+        trail: &context,
+    };
+    emit(cmd.format, &output, markdown)
 }
 
 fn run_snippet(cmd: SnippetCommand) -> Result<()> {
@@ -174,16 +166,116 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
         .snippet_context(target.selected.node_id.clone(), cmd.context)
         .map_err(map_api_error)?;
     let markdown = render_snippet_markdown(&runtime.project_root, &target, &context);
-    emit(cmd.format, &context, markdown)
+    let output = SnippetJsonOutput {
+        resolution: build_query_resolution_output(&runtime.project_root, &target),
+        snippet: &context,
+    };
+    emit(cmd.format, &output, markdown)
+}
+
+fn build_search_output(
+    project_root: &std::path::Path,
+    query: &str,
+    retrieval: &codestory_contracts::api::RetrievalStateDto,
+    symbol_hits: &[SearchHit],
+    repo_text_hits: &[SearchHit],
+    limit_per_source: u32,
+    repo_text: RepoTextOutputConfig,
+) -> SearchOutput {
+    SearchOutput {
+        query: query.to_string(),
+        retrieval: retrieval.clone(),
+        limit_per_source,
+        repo_text_mode: repo_text.mode,
+        repo_text_enabled: repo_text.enabled,
+        indexed_symbol_hits: symbol_hits
+            .iter()
+            .map(|hit| build_search_hit_output(project_root, hit))
+            .collect(),
+        repo_text_hits: repo_text_hits
+            .iter()
+            .map(|hit| build_search_hit_output(project_root, hit))
+            .collect(),
+    }
+}
+
+fn build_query_resolution_output(
+    project_root: &std::path::Path,
+    target: &runtime::ResolvedTarget,
+) -> QueryResolutionOutput {
+    QueryResolutionOutput {
+        selector: target.selector,
+        requested: target.requested.clone(),
+        file_filter: target
+            .file_filter
+            .as_deref()
+            .map(crate::display::clean_path_string),
+        resolved: build_search_hit_output(project_root, &target.selected),
+        alternatives: target
+            .alternatives
+            .iter()
+            .skip(1)
+            .map(|hit| build_search_hit_output(project_root, hit))
+            .collect(),
+    }
+}
+
+fn build_search_hit_output(project_root: &std::path::Path, hit: &SearchHit) -> SearchHitOutput {
+    SearchHitOutput {
+        node_id: hit.node_id.0.clone(),
+        display_name: hit.display_name.clone(),
+        kind: hit.kind,
+        file_path: hit
+            .file_path
+            .as_deref()
+            .map(|value| crate::display::relative_path(project_root, value)),
+        line: hit.line,
+        score: hit.score,
+        origin: hit.origin,
+        resolvable: hit.resolvable,
+        excerpt: repo_text_excerpt(project_root, hit),
+    }
+}
+
+fn repo_text_excerpt(project_root: &std::path::Path, hit: &SearchHit) -> Option<String> {
+    if !hit.is_text_match() {
+        return None;
+    }
+    let path = std::path::Path::new(hit.file_path.as_deref()?);
+    let line = hit.line?;
+    let resolved_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_root.join(path)
+    };
+    let contents = fs::read_to_string(resolved_path).ok()?;
+    let source_line = contents
+        .lines()
+        .nth(line.saturating_sub(1) as usize)?
+        .trim();
+    Some(compact_excerpt(source_line, 140))
+}
+
+fn compact_excerpt(line: &str, max_len: usize) -> String {
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.len() <= max_len {
+        return collapsed;
+    }
+    let clipped = collapsed
+        .char_indices()
+        .take_while(|(idx, _)| *idx < max_len.saturating_sub(1))
+        .map(|(_, ch)| ch)
+        .collect::<String>();
+    format!("{clipped}…")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::args::{ProjectArgs, RefreshMode, TargetSelection};
+    use crate::args::RefreshMode;
     use crate::display::{clean_path_string, relative_path};
     use crate::query_resolution::compare_resolution_hits;
-    use crate::runtime::{fnv1a_hex, resolve_refresh_request};
+    use crate::runtime::{cache_root_for_project, fnv1a_hex, resolve_refresh_request};
     use codestory_contracts::api::{
         IndexMode, IndexingPhaseTimings, NodeId, ProjectSummary, RetrievalModeDto,
         RetrievalStateDto, SearchHit, StorageStatsDto,
@@ -338,29 +430,18 @@ mod tests {
     }
 
     #[test]
-    fn merge_repo_text_hits_resorts_before_truncating() {
-        let mut hits = vec![
-            SearchHit {
-                node_id: NodeId("1".to_string()),
-                display_name: "indexed_symbol".to_string(),
-                kind: codestory_contracts::api::NodeKind::FUNCTION,
-                file_path: Some("src/lib.rs".to_string()),
-                line: Some(10),
-                score: 0.9,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                resolvable: true,
-            },
-            SearchHit {
-                node_id: NodeId("2".to_string()),
-                display_name: "secondary_symbol".to_string(),
-                kind: codestory_contracts::api::NodeKind::FUNCTION,
-                file_path: Some("src/lib.rs".to_string()),
-                line: Some(20),
-                score: 0.8,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                resolvable: true,
-            },
-        ];
+    fn build_search_output_preserves_separate_provenance_groups() {
+        let root = Path::new("C:/repo");
+        let symbol_hits = vec![SearchHit {
+            node_id: NodeId("1".to_string()),
+            display_name: "indexed_symbol".to_string(),
+            kind: codestory_contracts::api::NodeKind::FUNCTION,
+            file_path: Some("src/lib.rs".to_string()),
+            line: Some(10),
+            score: 0.9,
+            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+        }];
         let repo_text_hits = vec![SearchHit {
             node_id: NodeId("repo-text".to_string()),
             display_name: "README.md".to_string(),
@@ -372,64 +453,50 @@ mod tests {
             resolvable: false,
         }];
 
-        merge_repo_text_hits(&mut hits, repo_text_hits, 1);
+        let output = build_search_output(
+            root,
+            "needle",
+            &sample_retrieval(),
+            &symbol_hits,
+            &repo_text_hits,
+            5,
+            RepoTextOutputConfig {
+                mode: RepoTextMode::Auto,
+                enabled: true,
+            },
+        );
 
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].display_name, "README.md");
+        assert_eq!(output.repo_text_mode, RepoTextMode::Auto);
+        assert!(output.repo_text_enabled);
+        assert_eq!(output.indexed_symbol_hits.len(), 1);
+        assert_eq!(output.repo_text_hits.len(), 1);
+        assert_eq!(output.indexed_symbol_hits[0].display_name, "indexed_symbol");
+        assert_eq!(output.repo_text_hits[0].display_name, "README.md");
         assert_eq!(
-            hits[0].origin,
+            output.repo_text_hits[0].origin,
             codestory_contracts::api::SearchHitOrigin::TextMatch
         );
     }
 
-    fn copy_tictactoe_workspace() -> tempfile::TempDir {
-        let temp = tempdir().expect("create temp dir");
-        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("workspace crates dir")
-            .join("codestory-indexer")
-            .join("tests")
-            .join("fixtures")
-            .join("tictactoe");
-
-        for entry in fs::read_dir(&fixtures).expect("read fixtures") {
-            let entry = entry.expect("fixture entry");
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let target = temp.path().join(entry.file_name());
-            fs::copy(&path, &target).expect("copy fixture");
-        }
-
-        temp
-    }
-
-    fn indexed_runtime(project_root: &Path) -> RuntimeContext {
-        let cache_dir = project_root.join(".cache");
-        let args = ProjectArgs {
-            project: project_root.to_path_buf(),
-            cache_dir: Some(cache_dir),
-        };
-        let runtime = RuntimeContext::new(&args).expect("runtime");
-        let opened = runtime
-            .ensure_open(RefreshMode::Full)
-            .expect("index project");
-        ensure_index_ready(&opened, "test").expect("indexed project");
-        runtime
+    #[test]
+    fn explicit_cache_dir_is_not_hashed() {
+        let root = Path::new("C:/repo");
+        let cache_dir = Path::new("C:/cache/custom");
+        assert_eq!(
+            cache_root_for_project(root, Some(cache_dir)).expect("cache dir"),
+            cache_dir
+        );
     }
 
     #[test]
-    fn ground_open_preserves_current_auto_refresh_semantics() {
-        let temp = copy_tictactoe_workspace();
-        let runtime = indexed_runtime(temp.path());
-
-        let opened = runtime
-            .ensure_ground_open(RefreshMode::Auto)
-            .expect("ground open");
-
-        assert_eq!(opened.refresh_mode, Some(IndexMode::Incremental));
-        ensure_index_ready(&opened, "ground").expect("ground ready");
+    fn default_cache_root_uses_project_hash() {
+        let root = Path::new("C:/repo");
+        let cache_root = cache_root_for_project(root, None).expect("cache root");
+        let cache_root = cache_root.to_string_lossy();
+        assert!(
+            cache_root.ends_with(&fnv1a_hex(b"C:/repo")),
+            "default cache root should end with the project hash"
+        );
     }
 
     #[test]
@@ -532,27 +599,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_target_file_filter_disambiguates_tictactoe_symbol_queries() {
-        let workspace = copy_tictactoe_workspace();
-        let runtime = indexed_runtime(workspace.path());
-
-        let resolved = resolve_target(
-            &runtime,
-            TargetSelection::Query("TicTacToe".to_string()),
-            Some("rust_tictactoe.rs"),
-        )
-        .expect("resolve filtered target");
-
-        assert!(
-            resolved
-                .selected
-                .file_path
-                .as_deref()
-                .is_some_and(|path| path.contains("rust_tictactoe.rs"))
-        );
-    }
-
-    #[test]
     fn clean_path_unix_noop() {
         assert_eq!(clean_path_string("src/lib.rs"), "src/lib.rs");
     }
@@ -571,7 +617,7 @@ mod tests {
     fn clean_path_extended_prefix_unc() {
         assert_eq!(
             clean_path_string("\\\\?\\UNC\\server\\share"),
-            "UNC/server/share"
+            "//server/share"
         );
     }
 
@@ -587,6 +633,15 @@ mod tests {
         assert_eq!(
             relative_path(root, "D:\\other\\file.rs"),
             "D:/other/file.rs"
+        );
+    }
+
+    #[test]
+    fn relative_path_extended_prefix_unc_keeps_share_format() {
+        let root = Path::new("C:/repo");
+        assert_eq!(
+            relative_path(root, "\\\\?\\UNC\\server\\share\\file.rs"),
+            "//server/share/file.rs"
         );
     }
 

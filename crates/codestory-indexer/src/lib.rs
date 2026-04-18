@@ -458,14 +458,14 @@ impl IncrementalIndexingConfig {
         match mode {
             codestory_workspace::BuildMode::Incremental => Self::default(),
             codestory_workspace::BuildMode::FullRefresh => Self {
-                // Full refresh writes into a staged SQLite snapshot with deferred
-                // secondary indexes, so larger batches reduce flush frequency
-                // without paying the live-write amplification cost.
-                file_batch_size: 128,
-                node_batch_size: 400_000,
-                edge_batch_size: 400_000,
-                occurrence_batch_size: 400_000,
-                error_batch_size: 8_000,
+                // Full refresh is the highest-risk path for transient memory spikes,
+                // so keep batch sizes conservative even though the staged store can
+                // absorb larger write bursts.
+                file_batch_size: 24,
+                node_batch_size: 120_000,
+                edge_batch_size: 120_000,
+                occurrence_batch_size: 120_000,
+                error_batch_size: 2_000,
             },
         }
     }
@@ -698,23 +698,23 @@ impl WorkspaceIndexer {
                 file_batch_size: self
                     .batch_config
                     .file_batch_size
-                    .max(full_refresh_defaults.file_batch_size),
+                    .min(full_refresh_defaults.file_batch_size),
                 node_batch_size: self
                     .batch_config
                     .node_batch_size
-                    .max(full_refresh_defaults.node_batch_size),
+                    .min(full_refresh_defaults.node_batch_size),
                 edge_batch_size: self
                     .batch_config
                     .edge_batch_size
-                    .max(full_refresh_defaults.edge_batch_size),
+                    .min(full_refresh_defaults.edge_batch_size),
                 occurrence_batch_size: self
                     .batch_config
                     .occurrence_batch_size
-                    .max(full_refresh_defaults.occurrence_batch_size),
+                    .min(full_refresh_defaults.occurrence_batch_size),
                 error_batch_size: self
                     .batch_config
                     .error_batch_size
-                    .max(full_refresh_defaults.error_batch_size),
+                    .min(full_refresh_defaults.error_batch_size),
             },
         };
         let file_batch_size = batch_config.file_batch_size.max(1);
@@ -770,21 +770,40 @@ impl WorkspaceIndexer {
                 .saturating_add(duration_ms_u64(lookup_started.elapsed()));
 
             let parse_started = Instant::now();
-            let parse_results: Vec<PreparedIndexJobResult> = parse_jobs
-                .par_iter()
-                .map(|prepared_input| {
-                    if let Some(token) = cancel_token
-                        && token.is_cancelled()
-                    {
-                        cancelled_clone.store(true, Ordering::Relaxed);
-                        return PreparedIndexJobResult {
-                            local_storage: IntermediateStorage::default(),
-                            cache_write: None,
-                        };
-                    }
-                    self.execute_prepared_index(prepared_input, &symbol_table)
-                })
-                .collect();
+            let parse_results: Vec<PreparedIndexJobResult> =
+                if plan.mode == codestory_workspace::BuildMode::FullRefresh {
+                    parse_jobs
+                        .iter()
+                        .map(|prepared_input| {
+                            if let Some(token) = cancel_token
+                                && token.is_cancelled()
+                            {
+                                cancelled_clone.store(true, Ordering::Relaxed);
+                                return PreparedIndexJobResult {
+                                    local_storage: IntermediateStorage::default(),
+                                    cache_write: None,
+                                };
+                            }
+                            self.execute_prepared_index(prepared_input, &symbol_table)
+                        })
+                        .collect()
+                } else {
+                    parse_jobs
+                        .par_iter()
+                        .map(|prepared_input| {
+                            if let Some(token) = cancel_token
+                                && token.is_cancelled()
+                            {
+                                cancelled_clone.store(true, Ordering::Relaxed);
+                                return PreparedIndexJobResult {
+                                    local_storage: IntermediateStorage::default(),
+                                    cache_write: None,
+                                };
+                            }
+                            self.execute_prepared_index(prepared_input, &symbol_table)
+                        })
+                        .collect()
+                };
             stats.parse_index_ms = stats
                 .parse_index_ms
                 .saturating_add(duration_ms_u64(parse_started.elapsed()));
@@ -889,6 +908,18 @@ impl WorkspaceIndexer {
         let breakdown =
             Self::flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
         accumulate_flush_breakdown(&mut stats, breakdown);
+
+        if plan.mode == codestory_workspace::BuildMode::Incremental
+            && !plan.files_to_remove.is_empty()
+        {
+            let cleanup_started = Instant::now();
+            storage
+                .delete_files_batch(&plan.files_to_remove)
+                .map_err(|e| anyhow!("Storage cleanup error: {:?}", e))?;
+            stats.cleanup_ms = stats
+                .cleanup_ms
+                .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
+        }
 
         // 3.5 Resolve call/import edges post-pass
         if had_edges {
@@ -1015,19 +1046,6 @@ impl WorkspaceIndexer {
             stats.error_flush_ms = stats
                 .error_flush_ms
                 .saturating_add(duration_ms_u64(error_flush_started.elapsed()));
-        }
-
-        // 4. Cleanup removed files
-        if plan.mode == codestory_workspace::BuildMode::Incremental
-            && !plan.files_to_remove.is_empty()
-        {
-            let cleanup_started = Instant::now();
-            storage
-                .delete_files_batch(&plan.files_to_remove)
-                .map_err(|e| anyhow!("Storage cleanup error: {:?}", e))?;
-            stats.cleanup_ms = stats
-                .cleanup_ms
-                .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
         }
 
         event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
@@ -1185,9 +1203,6 @@ impl WorkspaceIndexer {
                 return Err(local_storage);
             }
         };
-        // Some third-party/vendor sources contain legacy bytes but are still parseable enough
-        // for indexing once we decode them lossily.
-        let source = String::from_utf8_lossy(&bytes).into_owned();
         let flags = index_feature_flags();
         let artifact_cache_key = build_index_artifact_cache_key(
             &full_path,
@@ -1197,6 +1212,12 @@ impl WorkspaceIndexer {
             flags.legacy_edge_identity,
             flags.lazy_graph_execution,
         );
+        // Consume the raw bytes once the cache key is built so valid UTF-8 files do not
+        // hold both the byte buffer and a second owned String allocation at the same time.
+        let source = match String::from_utf8(bytes) {
+            Ok(source) => source,
+            Err(error) => String::from_utf8_lossy(&error.into_bytes()).into_owned(),
+        };
 
         match storage.get_index_artifact_cache(&full_path, &artifact_cache_key) {
             Ok(Some(blob)) => match serde_json::from_slice::<CachedIndexArtifact>(&blob) {
@@ -4119,10 +4140,10 @@ pub fn index_file(
     symbol_table: Option<Arc<SymbolTable>>,
 ) -> Result<IndexResult> {
     let flags = index_feature_flags();
-    let is_tsx_file = path
+    let is_jsx_like_file = path
         .extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("tsx"))
+        .map(|ext| ext.eq_ignore_ascii_case("tsx") || ext.eq_ignore_ascii_case("jsx"))
         .unwrap_or(false);
 
     let mut parser = Parser::new();
@@ -4512,7 +4533,7 @@ pub fn index_file(
     );
     append_manual_usage_edges(
         language_config.language_name,
-        is_tsx_file,
+        is_jsx_like_file,
         &tree,
         source,
         &unique_nodes,
@@ -4552,7 +4573,7 @@ pub fn index_file(
         file_id,
         language_config.language_name,
         &canonical_role_by_node_id,
-        is_tsx_file,
+        is_jsx_like_file,
         &runtime_import_specs,
         flags,
     );
@@ -6748,6 +6769,52 @@ struct Holder {
         assert!(
             !result.files[0].complete,
             "malformed syntax should mark the file incomplete"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_jsx_component_and_prop_usage_recovery_matches_tsx_behavior() -> Result<()> {
+        let code = r#"
+function Badge(props) {
+    return <span>{props.label}</span>;
+}
+
+function render() {
+    return <Badge label="hi" />;
+}
+"#;
+        let language_config = get_language_for_ext("jsx").expect("jsx config");
+        let result = index_file(Path::new("App.jsx"), code, &language_config, None, None)?;
+        let node_by_id = result
+            .nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<HashMap<_, _>>();
+
+        assert!(
+            result.edges.iter().any(|edge| {
+                edge.kind == EdgeKind::CALL
+                    && node_by_id
+                        .get(&edge.source)
+                        .is_some_and(|node| node.serialized_name == "render")
+                    && node_by_id
+                        .get(&edge.target)
+                        .is_some_and(|node| node.serialized_name == "Badge")
+            }),
+            "expected JSX component call recovery to link render() to Badge"
+        );
+        assert!(
+            result.edges.iter().any(|edge| {
+                edge.kind == EdgeKind::USAGE
+                    && node_by_id
+                        .get(&edge.source)
+                        .is_some_and(|node| node.serialized_name == "render")
+                    && node_by_id
+                        .get(&edge.target)
+                        .is_some_and(|node| node.serialized_name == "label")
+            }),
+            "expected JSX prop usage recovery to link render() to label"
         );
         Ok(())
     }

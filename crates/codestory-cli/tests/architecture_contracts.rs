@@ -1,5 +1,7 @@
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use toml::Value;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -14,35 +16,90 @@ fn read(path: &str) -> String {
     fs::read_to_string(repo_root().join(path)).expect("file should be readable")
 }
 
+fn manifest(path: &str) -> Value {
+    read(path).parse::<Value>().expect("valid Cargo.toml")
+}
+
+fn dependency_names(path: &str) -> BTreeSet<String> {
+    let manifest = manifest(path);
+    let mut names = BTreeSet::new();
+    for table_name in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if let Some(table) = manifest.get(table_name).and_then(Value::as_table) {
+            names.extend(table.keys().cloned());
+        }
+    }
+    names
+}
+
+fn workspace_members() -> BTreeSet<String> {
+    manifest("Cargo.toml")
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(Value::as_array)
+        .expect("workspace members")
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn collect_rs_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).expect("read source dir") {
+        let entry = entry.expect("source entry");
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, files);
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            files.push(path);
+        }
+    }
+}
+
+fn source_tree_contains(dir: &str, needle: &str) -> bool {
+    let mut files = Vec::new();
+    collect_rs_files(&repo_root().join(dir), &mut files);
+    files.into_iter().any(|path| {
+        fs::read_to_string(path)
+            .expect("read source")
+            .contains(needle)
+    })
+}
+
 #[test]
 fn workspace_crate_stays_decoupled_from_store_and_runtime() {
-    let cargo_toml = read("crates/codestory-workspace/Cargo.toml");
+    let dependencies = dependency_names("crates/codestory-workspace/Cargo.toml");
     assert!(
-        !cargo_toml.contains("codestory-store")
-            && !cargo_toml.contains("codestory-runtime")
-            && !cargo_toml.contains("codestory-cli"),
+        !dependencies.contains("codestory-store")
+            && !dependencies.contains("codestory-runtime")
+            && !dependencies.contains("codestory-cli"),
         "workspace crate should only own discovery and planning inputs"
     );
 }
 
 #[test]
 fn indexer_crate_stays_decoupled_from_runtime_and_cli() {
-    let cargo_toml = read("crates/codestory-indexer/Cargo.toml");
+    let dependencies = dependency_names("crates/codestory-indexer/Cargo.toml");
     assert!(
-        !cargo_toml.contains("codestory-runtime") && !cargo_toml.contains("codestory-cli"),
+        !dependencies.contains("codestory-runtime") && !dependencies.contains("codestory-cli"),
         "indexer crate should not depend on runtime or cli"
     );
 }
 
 #[test]
 fn runtime_crate_depends_on_v2_surfaces_only() {
-    let cargo_toml = read("crates/codestory-runtime/Cargo.toml");
-    assert!(
-        cargo_toml.contains("codestory-contracts")
-            && cargo_toml.contains("codestory-indexer")
-            && cargo_toml.contains("codestory-store"),
-        "runtime should depend on contracts, indexer, and store"
-    );
+    let dependencies = dependency_names("crates/codestory-runtime/Cargo.toml");
+    for required in [
+        "codestory-contracts",
+        "codestory-indexer",
+        "codestory-store",
+    ] {
+        assert!(
+            dependencies.contains(required),
+            "runtime should depend on {required}"
+        );
+    }
     for legacy in [
         "codestory-app",
         "codestory-search",
@@ -50,21 +107,18 @@ fn runtime_crate_depends_on_v2_surfaces_only() {
         "codestory-api",
         "codestory-events",
         "codestory-core",
+        "codestory-index",
     ] {
         assert!(
-            !cargo_toml.contains(legacy),
+            !dependencies.contains(legacy),
             "runtime should not depend on removed legacy crate {legacy}"
         );
     }
-    assert!(
-        !cargo_toml.contains("codestory-index ="),
-        "runtime should not depend on removed legacy crate codestory-index"
-    );
 }
 
 #[test]
 fn store_crate_owns_persistence_without_legacy_escape_hatches() {
-    let cargo_toml = read("crates/codestory-store/Cargo.toml");
+    let dependencies = dependency_names("crates/codestory-store/Cargo.toml");
     for legacy in [
         "codestory-storage",
         "codestory-core",
@@ -72,7 +126,7 @@ fn store_crate_owns_persistence_without_legacy_escape_hatches() {
         "codestory-events",
     ] {
         assert!(
-            !cargo_toml.contains(legacy),
+            !dependencies.contains(legacy),
             "store should not depend on removed legacy crate {legacy}"
         );
     }
@@ -91,15 +145,21 @@ fn store_crate_owns_persistence_without_legacy_escape_hatches() {
 
 #[test]
 fn cli_stays_thin() {
-    let cargo_toml = read("crates/codestory-cli/Cargo.toml");
+    let dependencies = dependency_names("crates/codestory-cli/Cargo.toml");
     assert!(
-        cargo_toml.contains("codestory-runtime"),
+        dependencies.contains("codestory-runtime"),
         "cli should depend on runtime surface"
     );
     assert!(
-        !cargo_toml.contains("codestory-store") && !cargo_toml.contains("codestory-indexer"),
+        !dependencies.contains("codestory-store") && !dependencies.contains("codestory-indexer"),
         "cli should not reach directly into store or indexer"
     );
+    for forbidden in ["codestory_store::", "codestory_indexer::"] {
+        assert!(
+            !source_tree_contains("crates/codestory-cli/src", forbidden),
+            "CLI source tree should not reference {forbidden} directly"
+        );
+    }
 }
 
 #[test]
@@ -125,20 +185,19 @@ fn runtime_snapshot_lifecycle_flows_through_store_snapshot_surface() {
 
 #[test]
 fn legacy_crates_are_removed_from_the_workspace() {
-    let workspace = read("Cargo.toml");
+    let members = workspace_members();
     for legacy in [
-        "codestory-app",
-        "codestory-project",
-        "codestory-search",
-        "codestory-core",
-        "codestory-api",
-        "codestory-events",
-        "codestory-storage",
-        "codestory-index",
+        "crates/codestory-app",
+        "crates/codestory-project",
+        "crates/codestory-search",
+        "crates/codestory-core",
+        "crates/codestory-api",
+        "crates/codestory-events",
+        "crates/codestory-storage",
+        "crates/codestory-index",
     ] {
         assert!(
-            !workspace.contains(&format!("\"crates/{legacy}\""))
-                && !workspace.contains(&format!("{legacy} = {{ path = \"crates/{legacy}\" }}")),
+            !members.contains(legacy),
             "workspace should not register removed crate {legacy}"
         );
     }

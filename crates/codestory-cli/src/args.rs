@@ -1,10 +1,17 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
-    GroundingBudgetDto, IndexingPhaseTimings, LayoutDirection, NodeId, ProjectSummary,
-    RetrievalStateDto, SearchHit, TrailCallerScope, TrailDirection, TrailMode,
+    GroundingBudgetDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind, ProjectSummary,
+    RetrievalStateDto, SearchHitOrigin, SnippetContextDto, SymbolContextDto, TrailCallerScope,
+    TrailContextDto, TrailDirection, TrailMode,
 };
 use serde::Serialize;
 use std::path::PathBuf;
+
+const INDEX_REFRESH_HELP: &str = "Index defaults to `auto`: it chooses `full` for an empty cache and `incremental` once the \
+cache already has indexed files.";
+const READ_REFRESH_HELP: &str = "Read commands default to `none` so they only query the existing cache. Use `incremental` to \
+refresh an existing cache in place, or `full` after a cache reset, schema change, or indexing \
+failure.";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Skill-first repo grounding runtime", long_about = None)]
@@ -25,9 +32,17 @@ pub(crate) enum Command {
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct ProjectArgs {
-    #[arg(long, alias = "path", default_value = ".")]
+    #[arg(
+        long,
+        alias = "path",
+        default_value = ".",
+        help = "Repository root to index or query."
+    )]
     pub(crate) project: PathBuf,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Cache directory to use exactly as passed. If omitted, codestory-cli uses the system cache root with a per-project hashed subdirectory."
+    )]
     pub(crate) cache_dir: Option<PathBuf>,
 }
 
@@ -43,6 +58,14 @@ pub(crate) enum RefreshMode {
     Full,
     Incremental,
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RepoTextMode {
+    Auto,
+    On,
+    Off,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -76,7 +99,12 @@ pub(crate) enum CliLayout {
 pub(crate) struct IndexCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
-    #[arg(long, value_enum, default_value_t = RefreshMode::Auto)]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::Auto,
+        long_help = INDEX_REFRESH_HELP
+    )]
     pub(crate) refresh: RefreshMode,
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
     pub(crate) format: OutputFormat,
@@ -88,7 +116,12 @@ pub(crate) struct GroundCommand {
     pub(crate) project: ProjectArgs,
     #[arg(long, value_enum, default_value_t = CliGroundingBudget::Balanced)]
     pub(crate) budget: CliGroundingBudget,
-    #[arg(long, value_enum, default_value_t = RefreshMode::Auto)]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
     pub(crate) refresh: RefreshMode,
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
     pub(crate) format: OutputFormat,
@@ -100,21 +133,55 @@ pub(crate) struct SearchCommand {
     pub(crate) project: ProjectArgs,
     #[arg(long)]
     pub(crate) query: String,
-    #[arg(long, default_value_t = 10)]
+    #[arg(
+        long,
+        default_value_t = 10,
+        help = "Maximum results per provenance group (`indexed_symbol` and `text_match`)."
+    )]
     pub(crate) limit: u32,
-    #[arg(long, value_enum, default_value_t = RefreshMode::None)]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RepoTextMode::Auto,
+        help = "Whether to scan repo text in addition to indexed symbols: `auto` enables it for natural-language queries, `on` always scans repo text, and `off` keeps the search index only."
+    )]
+    pub(crate) repo_text: RepoTextMode,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
     pub(crate) refresh: RefreshMode,
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
     pub(crate) format: OutputFormat,
 }
 
 #[derive(Args, Debug, Clone)]
+#[command(group(
+    ArgGroup::new("selector")
+        .args(["id", "query"])
+        .required(true)
+        .multiple(false)
+))]
 pub(crate) struct TargetArgs {
-    #[arg(long, conflicts_with = "query")]
+    #[arg(
+        long,
+        group = "selector",
+        help = "Resolve the target from an exact node id returned by `search`, `symbol`, or `trail`."
+    )]
     pub(crate) id: Option<String>,
-    #[arg(long, conflicts_with = "id")]
+    #[arg(
+        long,
+        group = "selector",
+        help = "Resolve the target from a symbol query. Required if you also pass `--file`."
+    )]
     pub(crate) query: Option<String>,
-    #[arg(long, requires = "query")]
+    #[arg(
+        long,
+        requires = "query",
+        help = "Limit query resolution to files whose path matches this fragment."
+    )]
     pub(crate) file: Option<String>,
 }
 
@@ -124,7 +191,12 @@ pub(crate) struct SymbolCommand {
     pub(crate) project: ProjectArgs,
     #[command(flatten)]
     pub(crate) target: TargetArgs,
-    #[arg(long, value_enum, default_value_t = RefreshMode::None)]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
     pub(crate) refresh: RefreshMode,
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
     pub(crate) format: OutputFormat,
@@ -150,7 +222,12 @@ pub(crate) struct TrailCommand {
     pub(crate) show_utility_calls: bool,
     #[arg(long, value_enum, default_value_t = CliLayout::Horizontal)]
     pub(crate) layout: CliLayout,
-    #[arg(long, value_enum, default_value_t = RefreshMode::None)]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
     pub(crate) refresh: RefreshMode,
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
     pub(crate) format: OutputFormat,
@@ -164,7 +241,12 @@ pub(crate) struct SnippetCommand {
     pub(crate) target: TargetArgs,
     #[arg(long, default_value_t = 4)]
     pub(crate) context: usize,
-    #[arg(long, value_enum, default_value_t = RefreshMode::None)]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
     pub(crate) refresh: RefreshMode,
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
     pub(crate) format: OutputFormat,
@@ -181,11 +263,67 @@ pub(crate) struct IndexOutput<'a> {
     pub(crate) phase_timings: Option<&'a IndexingPhaseTimings>,
 }
 
-#[derive(Debug)]
-pub(crate) struct SearchOutput<'a> {
-    pub(crate) query: &'a str,
-    pub(crate) retrieval: &'a RetrievalStateDto,
-    pub(crate) hits: &'a [SearchHit],
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QuerySelectorOutput {
+    Id,
+    Query,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SearchHitOutput {
+    pub(crate) node_id: String,
+    pub(crate) display_name: String,
+    pub(crate) kind: NodeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) line: Option<u32>,
+    pub(crate) score: f32,
+    pub(crate) origin: SearchHitOrigin,
+    pub(crate) resolvable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) excerpt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SearchOutput {
+    pub(crate) query: String,
+    pub(crate) retrieval: RetrievalStateDto,
+    pub(crate) limit_per_source: u32,
+    pub(crate) repo_text_mode: RepoTextMode,
+    pub(crate) repo_text_enabled: bool,
+    pub(crate) indexed_symbol_hits: Vec<SearchHitOutput>,
+    pub(crate) repo_text_hits: Vec<SearchHitOutput>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct QueryResolutionOutput {
+    pub(crate) selector: QuerySelectorOutput,
+    pub(crate) requested: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) file_filter: Option<String>,
+    pub(crate) resolved: SearchHitOutput,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) alternatives: Vec<SearchHitOutput>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SymbolJsonOutput<'a> {
+    pub(crate) resolution: QueryResolutionOutput,
+    pub(crate) symbol: &'a SymbolContextDto,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct TrailJsonOutput<'a> {
+    pub(crate) resolution: QueryResolutionOutput,
+    pub(crate) trail: &'a TrailContextDto,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SnippetJsonOutput<'a> {
+    pub(crate) resolution: QueryResolutionOutput,
+    pub(crate) snippet: &'a SnippetContextDto,
 }
 
 #[derive(Debug)]
@@ -287,5 +425,51 @@ pub(crate) fn default_trail_direction(mode: CliTrailMode) -> TrailDirection {
         CliTrailMode::Neighborhood => TrailDirection::Both,
         CliTrailMode::Referenced => TrailDirection::Outgoing,
         CliTrailMode::Referencing => TrailDirection::Incoming,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn render_subcommand_help(name: &str) -> String {
+        let mut command = Cli::command();
+        let subcommand = command
+            .find_subcommand_mut(name)
+            .expect("subcommand should exist");
+        subcommand.render_long_help().to_string()
+    }
+
+    #[test]
+    fn symbol_help_requires_exactly_one_selector() {
+        let help = render_subcommand_help("symbol");
+        assert!(help.contains("--id <ID>"));
+        assert!(help.contains("--query <QUERY>"));
+        assert!(help.contains("--file <FILE>"));
+        assert!(
+            help.contains("<--id <ID>|--query <QUERY>>"),
+            "selector help should surface the required selector group in the usage line: {help}"
+        );
+    }
+
+    #[test]
+    fn read_commands_explain_refresh_none_default() {
+        for name in ["ground", "search", "symbol", "trail", "snippet"] {
+            let help = render_subcommand_help(name);
+            assert!(
+                help.contains("Read commands default to `none`"),
+                "{name} help should explain refresh semantics"
+            );
+        }
+    }
+
+    #[test]
+    fn search_help_explains_repo_text_modes() {
+        let help = render_subcommand_help("search");
+        assert!(help.contains("--repo-text <REPO_TEXT>"));
+        assert!(help.contains("auto"));
+        assert!(help.contains("on"));
+        assert!(help.contains("off"));
     }
 }

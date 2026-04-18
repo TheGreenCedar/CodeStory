@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use codestory_contracts::api::{NodeKind, SearchHit};
 use codestory_runtime::{compare_ranked_hits, symbol_name_match_rank};
 use std::fs;
+use std::path::Path;
 
 pub(crate) fn compare_resolution_hits(
     query: &str,
@@ -28,14 +29,48 @@ pub(crate) fn resolution_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8, 
     )
 }
 
-pub(crate) fn search_hit_matches_file_filter(hit: &SearchHit, fragment: &str) -> bool {
+pub(crate) fn search_hit_matches_file_filter(
+    project_root: &Path,
+    hit: &SearchHit,
+    fragment: &str,
+) -> bool {
+    file_filter_match_bucket(project_root, hit, fragment) > 0
+}
+
+pub(crate) fn file_filter_match_bucket(project_root: &Path, hit: &SearchHit, fragment: &str) -> u8 {
     let Some(file_path) = hit.file_path.as_deref() else {
-        return false;
+        return 0;
     };
 
-    let file_path = normalize_path_fragment(file_path);
+    let absolute = normalize_path_fragment(file_path);
+    let relative = normalize_path_fragment(&crate::display::relative_path(project_root, file_path));
     let fragment = normalize_path_fragment(fragment);
-    file_path.contains(&fragment)
+    let fragment = fragment.trim_matches('/').to_string();
+    if fragment.is_empty() {
+        return 0;
+    }
+
+    if relative == fragment || absolute == fragment {
+        return 4;
+    }
+
+    if relative.ends_with(&format!("/{fragment}")) || absolute.ends_with(&format!("/{fragment}")) {
+        return 3;
+    }
+
+    if relative
+        .rsplit('/')
+        .next()
+        .is_some_and(|file_name| file_name == fragment)
+    {
+        return 2;
+    }
+
+    if relative.contains(&fragment) || absolute.contains(&fragment) {
+        return 1;
+    }
+
+    0
 }
 
 fn resolution_kind_bucket(kind: NodeKind) -> u8 {

@@ -4,11 +4,41 @@ use std::fs;
 use std::path::Path;
 
 pub(crate) fn looks_like_text_query(query: &str) -> bool {
-    let word_count = query.split_whitespace().count();
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let word_count = trimmed.split_whitespace().count();
     let has_text_punctuation = query
         .chars()
         .any(|ch| matches!(ch, '.' | ',' | ':' | ';' | '!' | '?' | '"' | '\''));
-    (word_count > 1 && has_text_punctuation) || query.len() > 28
+    if (word_count > 1 && has_text_punctuation) || trimmed.len() > 28 || word_count >= 4 {
+        return true;
+    }
+
+    if word_count < 2 {
+        return false;
+    }
+
+    trimmed.split_whitespace().any(|term| {
+        matches!(
+            term.to_ascii_lowercase().as_str(),
+            "how"
+                | "what"
+                | "why"
+                | "where"
+                | "when"
+                | "which"
+                | "who"
+                | "does"
+                | "do"
+                | "is"
+                | "are"
+                | "should"
+                | "can"
+        )
+    })
 }
 
 pub(crate) fn scan_repo_text_hits(
@@ -85,10 +115,14 @@ fn scan_file_text_hit(
     if normalized_query.is_empty() {
         return None;
     }
+    let terms = text_query_terms(&normalized_query);
 
     let mut line_match = None;
     for (index, line) in contents.lines().enumerate() {
-        if line.to_ascii_lowercase().contains(&normalized_query) {
+        let normalized_line = line.to_ascii_lowercase();
+        if normalized_line.contains(&normalized_query)
+            || (terms.len() >= 2 && terms.iter().all(|term| normalized_line.contains(term)))
+        {
             line_match = Some((index + 1).min(u32::MAX as usize) as u32);
             break;
         }
@@ -112,4 +146,65 @@ fn scan_file_text_hit(
         origin: SearchHitOrigin::TextMatch,
         resolvable: false,
     })
+}
+
+fn text_query_terms(query: &str) -> Vec<&str> {
+    query
+        .split_whitespace()
+        .map(|term| term.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_'))
+        .filter(|term| term.len() >= 3)
+        .filter(|term| {
+            !matches!(
+                *term,
+                "how"
+                    | "what"
+                    | "why"
+                    | "where"
+                    | "when"
+                    | "which"
+                    | "who"
+                    | "does"
+                    | "do"
+                    | "is"
+                    | "are"
+                    | "should"
+                    | "can"
+                    | "the"
+                    | "this"
+                    | "that"
+                    | "with"
+                    | "from"
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn natural_language_queries_trigger_repo_text_without_punctuation() {
+        assert!(looks_like_text_query("how does cli work"));
+        assert!(looks_like_text_query("what stores grounding snapshots"));
+        assert!(!looks_like_text_query("WorkspaceIndexer"));
+        assert!(!looks_like_text_query("AppController open_project"));
+    }
+
+    #[test]
+    fn repo_text_scan_can_match_term_sets_without_full_phrase() {
+        let dir = tempdir().expect("temp dir");
+        let file = dir.path().join("README.md");
+        fs::write(
+            &file,
+            "This guide explains how the cli runtime executes the search workflow.\n",
+        )
+        .expect("write fixture");
+
+        let hit = scan_file_text_hit(dir.path(), &file, "how does cli work", 0).expect("text hit");
+
+        assert_eq!(hit.line, Some(1));
+        assert_eq!(hit.origin, SearchHitOrigin::TextMatch);
+    }
 }

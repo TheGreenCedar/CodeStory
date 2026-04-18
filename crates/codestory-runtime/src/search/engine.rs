@@ -18,6 +18,7 @@ use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 
 pub const EMBEDDING_DIM: usize = 384;
+const SEARCH_WRITER_HEAP_BYTES: usize = 20_000_000;
 pub const EMBEDDING_MODEL_ENV: &str = "CODESTORY_EMBED_MODEL_PATH";
 pub const EMBEDDING_MODEL_ID_ENV: &str = "CODESTORY_EMBED_MODEL_ID";
 pub const EMBEDDING_TOKENIZER_ENV: &str = "CODESTORY_EMBED_TOKENIZER_PATH";
@@ -574,16 +575,9 @@ impl SearchEngine {
         let schema = schema_builder.build();
 
         let index = if let Some(path) = storage_path {
-            std::fs::create_dir_all(path)?;
-            match Index::open_in_dir(path) {
-                Ok(index) => index,
-                Err(open_err) => Index::create_in_dir(path, schema.clone()).with_context(|| {
-                    format!(
-                        "Failed to open existing tantivy index at {}: {open_err}",
-                        path.display()
-                    )
-                })?,
-            }
+            recreate_search_storage_dir(path)?;
+            Index::create_in_dir(path, schema.clone())
+                .with_context(|| format!("Failed to create tantivy index at {}", path.display()))?
         } else {
             Index::create_in_ram(schema)
         };
@@ -647,8 +641,22 @@ impl SearchEngine {
         }
     }
 
+    pub fn clear_llm_symbol_docs(&mut self) {
+        self.llm_docs.clear();
+    }
+
+    pub fn extend_llm_symbol_docs<I>(&mut self, docs: I)
+    where
+        I: IntoIterator<Item = LlmSearchDoc>,
+    {
+        for doc in docs {
+            self.llm_docs.insert(doc.node_id, doc);
+        }
+    }
+
     pub fn index_nodes(&mut self, nodes: Vec<(NodeId, String)>) -> Result<()> {
-        let mut index_writer: IndexWriter<TantivyDocument> = self.index.writer(50_000_000)?;
+        let mut index_writer: IndexWriter<TantivyDocument> =
+            self.index.writer(SEARCH_WRITER_HEAP_BYTES)?;
         let schema = self.index.schema();
         let name_field = schema.get_field("name")?;
         let id_field = schema.get_field("node_id")?;
@@ -814,7 +822,8 @@ impl SearchEngine {
         self.symbols.retain(|(_, id)| !remove_ids.contains(&id.0));
         self.llm_docs.retain(|id, _| !remove_ids.contains(&id.0));
 
-        let mut index_writer: IndexWriter<TantivyDocument> = self.index.writer(50_000_000)?;
+        let mut index_writer: IndexWriter<TantivyDocument> =
+            self.index.writer(SEARCH_WRITER_HEAP_BYTES)?;
         let schema = self.index.schema();
         let node_field = schema.get_field("node_id")?;
         for id in &remove_ids {
@@ -856,6 +865,16 @@ impl SearchEngine {
 
         Ok(results)
     }
+}
+
+fn recreate_search_storage_dir(path: &Path) -> Result<()> {
+    if path.exists() {
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("Failed to clear search index dir {}", path.display()))?;
+    }
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("Failed to create search index dir {}", path.display()))?;
+    Ok(())
 }
 
 fn embed_text_with_hash_projection(text: &str, dim: usize) -> Vec<f32> {

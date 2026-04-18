@@ -282,6 +282,7 @@ impl AppController {
         &self,
         budget: GroundingBudgetDto,
     ) -> Result<GroundingSnapshotDto, ApiError> {
+        self.ensure_consistent_read_state("Grounding")?;
         let root = self.require_project_root()?;
         let storage = self.open_storage()?;
         if matches!(budget, GroundingBudgetDto::Max)
@@ -291,9 +292,16 @@ impl AppController {
                 ))
             })?
         {
-            storage.snapshots().refresh_detail().map_err(|e| {
-                ApiError::internal(format!("Failed to hydrate grounding detail snapshots: {e}"))
-            })?;
+            let _guard = self.grounding_detail_refresh.lock();
+            if !storage.snapshots().has_ready_detail().map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to query grounding detail snapshot readiness: {e}"
+                ))
+            })? {
+                storage.snapshots().refresh_detail().map_err(|e| {
+                    ApiError::internal(format!("Failed to hydrate grounding detail snapshots: {e}"))
+                })?;
+            }
         }
         let config = budget_config(budget);
 

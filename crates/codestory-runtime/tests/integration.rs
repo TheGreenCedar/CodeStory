@@ -6,6 +6,13 @@ use codestory_store::Store;
 use std::fs;
 use tempfile::tempdir;
 
+fn should_run_repo_scale_test() -> bool {
+    matches!(
+        std::env::var("CODESTORY_RUN_REPO_SCALE_TEST").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
 #[test]
 fn test_cli_app_indexer_smoke() -> anyhow::Result<()> {
     // This test exercises CLI -> runtime -> project/storage -> indexer lifecycle without being a benchmark.
@@ -123,7 +130,15 @@ fn test_cli_app_indexer_smoke() -> anyhow::Result<()> {
 }
 
 #[test]
+#[ignore = "indexes the full codestory repo and can exhaust memory; set CODESTORY_RUN_REPO_SCALE_TEST=1 and run this test explicitly"]
 fn test_repo_scale_call_resolution() -> anyhow::Result<()> {
+    if !should_run_repo_scale_test() {
+        println!(
+            "Skipping repo-scale test; set CODESTORY_RUN_REPO_SCALE_TEST=1 to run it explicitly."
+        );
+        return Ok(());
+    }
+
     // We only run this if we are running in the codestory repo so we can index ourselves
     let root_path = std::env::current_dir()?.join("../../").canonicalize()?;
     if !root_path.join("Cargo.toml").exists() {

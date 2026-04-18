@@ -118,17 +118,29 @@ fn search_json_emits_search_results_dto_after_repo_text_merge() {
         json["query"],
         Value::String("compressed grounding summary for oss users".to_string())
     );
+    assert_eq!(json["repo_text_mode"], Value::String("auto".to_string()));
+    assert_eq!(json["repo_text_enabled"], Value::Bool(true));
     assert!(
         json["retrieval"].is_object(),
         "search json should include retrieval metadata"
     );
     assert!(
-        json["hits"].is_array(),
-        "search json should include hits array"
+        json["indexed_symbol_hits"].is_array(),
+        "search json should include indexed symbol hits"
     );
     assert_eq!(
-        json["hits"].as_array().map(Vec::len),
+        json["indexed_symbol_hits"].as_array().map(Vec::len),
         Some(1),
-        "final CLI JSON should reflect the post-merge limit"
+        "search json should preserve the indexed symbol bucket"
     );
+    assert!(
+        json["repo_text_hits"].is_array(),
+        "search json should include repo-text hits"
+    );
+    assert_eq!(
+        json["repo_text_hits"].as_array().map(Vec::len),
+        Some(1),
+        "repo-text hits should respect the per-source limit"
+    );
+    assert_eq!(json["limit_per_source"], Value::from(1));
 }

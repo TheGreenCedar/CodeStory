@@ -309,6 +309,95 @@ fn keep() { fresh(); }
 }
 
 #[test]
+fn test_incremental_indexing_deletes_removed_files_before_resolution() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let root = dir.path();
+    let removed = root.join("lib.rs");
+    let caller = root.join("main.rs");
+    fs::write(&removed, "pub fn helper() {}\n")?;
+    fs::write(
+        &caller,
+        "mod lib;\nuse crate::lib::helper;\n\nfn run() {\n    helper();\n}\n",
+    )?;
+
+    let mut storage = Storage::new_in_memory()?;
+    let indexer = WorkspaceIndexer::new(root.to_path_buf());
+    let event_bus = EventBus::new();
+    let initial = codestory_workspace::RefreshInfo {
+        mode: codestory_workspace::BuildMode::Incremental,
+        files_to_index: vec![removed.clone(), caller.clone()],
+        files_to_remove: vec![],
+        existing_file_ids: std::collections::HashMap::new(),
+    };
+    indexer.run_incremental(&mut storage, &initial, &event_bus, None)?;
+
+    let helper_id = storage
+        .get_nodes()?
+        .into_iter()
+        .find(|node| node.serialized_name.ends_with("helper") && node.kind == NodeKind::FUNCTION)
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("missing helper() node after initial index"))?;
+    let run_id = storage
+        .get_nodes()?
+        .into_iter()
+        .find(|node| node.serialized_name == "run" && node.kind == NodeKind::FUNCTION)
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("missing run() node after initial index"))?;
+    assert!(
+        storage
+            .get_edges()?
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::CALL
+                && edge.source == run_id
+                && edge.resolved_target == Some(helper_id)),
+        "expected initial run() call to resolve to helper()"
+    );
+
+    let removed_file_id = storage
+        .get_file_by_path(&removed)?
+        .ok_or_else(|| anyhow::anyhow!("missing removed.py file record"))?
+        .id;
+    fs::remove_file(&removed)?;
+
+    let refresh = codestory_workspace::RefreshInfo {
+        mode: codestory_workspace::BuildMode::Incremental,
+        files_to_index: vec![caller.clone()],
+        files_to_remove: vec![removed_file_id],
+        existing_file_ids: std::collections::HashMap::new(),
+    };
+    let stats = indexer.run_incremental(&mut storage, &refresh, &event_bus, None)?;
+
+    let nodes = storage.get_nodes()?;
+    assert!(
+        !nodes
+            .iter()
+            .any(|node| node.serialized_name.ends_with("helper") && node.kind == NodeKind::FUNCTION),
+        "deleted helper() symbol should be removed after cleanup"
+    );
+    let call_edges = storage
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == run_id)
+        .collect::<Vec<_>>();
+    assert!(
+        !call_edges.is_empty(),
+        "expected run() to keep its call edge after refresh"
+    );
+    assert!(
+        call_edges
+            .iter()
+            .all(|edge| edge.resolved_target != Some(helper_id) && edge.resolved_target.is_none()),
+        "calls should not resolve against symbols from the deleted file: {call_edges:?}"
+    );
+    assert_eq!(
+        stats.resolved_calls, 0,
+        "incremental resolution should not count deleted-file targets as valid resolutions"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_indexing_real_repo_rust_files_does_not_drop_projection_on_graph_error() -> anyhow::Result<()>
 {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

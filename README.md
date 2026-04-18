@@ -22,18 +22,24 @@ Use this path if you want to run the tool against a repository.
    ```powershell
    cargo build --release -p codestory-cli
    ```
-2. Create or refresh the local index.
+2. Use the built binary from this repo checkout.
    ```powershell
-   cargo run --release -p codestory-cli -- index --project .
+   .\target\release\codestory-cli.exe --help
    ```
-3. Run the grounding workflows.
+3. Create or refresh the local index.
+   ```powershell
+   .\target\release\codestory-cli.exe index --project . --refresh auto
+   ```
+4. Run the grounding workflows against the existing cache.
    ```text
-   codestory-cli ground --project <path>
-   codestory-cli search --project <path> --query <query>
-   codestory-cli symbol --project <path> (--id <node-id> | --query <query>)
-   codestory-cli trail --project <path> (--id <node-id> | --query <query>)
-   codestory-cli snippet --project <path> (--id <node-id> | --query <query>)
+   .\target\release\codestory-cli.exe ground --project <path>
+   .\target\release\codestory-cli.exe search --project <path> --query <query>
+   .\target\release\codestory-cli.exe symbol --project <path> (--id <node-id> | --query <query>)
+   .\target\release\codestory-cli.exe trail --project <path> (--id <node-id> | --query <query>)
+   .\target\release\codestory-cli.exe snippet --project <path> (--id <node-id> | --query <query>)
    ```
+
+Read commands default to `--refresh none`. They query the current cache unless you explicitly ask them to refresh.
 
 If you are using an agent in this repo, point it at the available `codestory-grounding` skill in `.agents/skills/codestory-grounding/SKILL.md` so it can use the indexed grounding workflows directly.
 
@@ -95,6 +101,45 @@ Hybrid retrieval is the intended default when local embedding assets are availab
 
 `index`, `ground`, and `search` now report the active retrieval mode. Hybrid retrieval is the default when local embedding assets are available; otherwise CodeStory falls back to symbolic or lexical ranking and reports why.
 
+Hybrid retrieval setup:
+
+- fast local-dev semantic mode: set `CODESTORY_EMBED_RUNTIME_MODE=hash`
+- local model artifacts: set `CODESTORY_EMBED_MODEL_PATH` to the ONNX model; `CODESTORY_EMBED_TOKENIZER_PATH` defaults to a sibling `tokenizer.json`
+- lexical-only mode: set `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false`
+- verification: `index`, `ground`, and `search` will report the retrieval mode plus any fallback reason
+
+Refresh behavior:
+
+- `index --refresh auto`: full on an empty cache, incremental once indexed files already exist
+- `ground`, `search`, `symbol`, `trail`, `snippet`: default to `--refresh none`
+- use `--refresh incremental` when you want a read command to refresh an existing cache first
+- use `--refresh full` after a cache reset, schema change, or suspected stale-state incident
+
+## Cache Hygiene
+
+By default, `codestory-cli` stores per-project caches under the user cache root using a hash of the project path. If you pass `--cache-dir`, that directory is used exactly as written.
+
+Typical recovery flow:
+
+```powershell
+.\target\release\codestory-cli.exe index --project . --refresh full
+.\target\release\codestory-cli.exe search --project . --query WorkspaceIndexer
+```
+
+If the cache itself is suspect, remove the project cache directory and rebuild:
+
+```powershell
+Remove-Item -LiteralPath <cache-dir> -Recurse -Force
+.\target\release\codestory-cli.exe index --project . --refresh full
+```
+
+Low-memory guidance:
+
+- prefer `index --refresh incremental` over repeated full refreshes
+- avoid running multiple cargo commands at once in this repo
+- if semantic retrieval assets are unavailable or too heavy for the current machine, symbolic retrieval remains supported and is reported explicitly
+- if the repo-scale runtime integration gate exceeds local memory, stop there and fall back to the smaller runtime lanes before escalating to a larger machine
+
 ## Workspace Shape
 
 The workspace is organized into seven durable crates:
@@ -124,6 +169,20 @@ Release-blocking fidelity suites:
 cargo test -p codestory-indexer --test fidelity_regression
 cargo test -p codestory-indexer --test tictactoe_language_coverage
 cargo test -p codestory-runtime --test retrieval_eval
+```
+
+Runtime-backed CLI fixture flows are an explicit heavier lane now:
+
+```powershell
+cargo test -p codestory-cli --test runtime_backed_flows -- --ignored
+```
+
+The repo-scale runtime integration smoke test is ignored by default because it indexes the full
+`codestory` workspace and can exhaust memory. Run it only as an explicit heavy lane:
+
+```powershell
+$env:CODESTORY_RUN_REPO_SCALE_TEST = "1"
+cargo test -p codestory-runtime --test integration test_repo_scale_call_resolution -- --ignored --nocapture
 ```
 
 ## Runtime Artifacts

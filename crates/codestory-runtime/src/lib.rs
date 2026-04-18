@@ -437,6 +437,7 @@ enum SemanticProjectionMode {
 
 fn build_search_state(
     storage: &mut Storage,
+    search_storage_path: Option<&Path>,
     nodes: Vec<codestory_contracts::graph::Node>,
     llm_refresh_file_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
     semantic_projection_mode: SemanticProjectionMode,
@@ -448,18 +449,24 @@ fn build_search_state(
     ApiError,
 > {
     let mut node_names = HashMap::new();
-    let mut search_nodes = Vec::with_capacity(nodes.len());
+    let mut engine = SearchEngine::new(search_storage_path)
+        .map_err(|e| ApiError::internal(format!("Failed to init search engine: {e}")))?;
+    let mut search_nodes = Vec::with_capacity(nodes.len().min(SEARCH_NODE_BATCH_SIZE));
     for node in &nodes {
         let display_name = node_display_name(node);
         node_names.insert(node.id, display_name.clone());
         search_nodes.push((node.id, display_name));
+        if search_nodes.len() >= SEARCH_NODE_BATCH_SIZE {
+            engine
+                .index_nodes(std::mem::take(&mut search_nodes))
+                .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
+        }
     }
-
-    let mut engine = SearchEngine::new(None)
-        .map_err(|e| ApiError::internal(format!("Failed to init search engine: {e}")))?;
-    engine
-        .index_nodes(search_nodes)
-        .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
+    if !search_nodes.is_empty() {
+        engine
+            .index_nodes(search_nodes)
+            .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
+    }
     if semantic_projection_mode == SemanticProjectionMode::PersistBackedDocs {
         sync_llm_symbol_projection(
             storage,
@@ -487,6 +494,38 @@ fn current_epoch_ms() -> i64 {
 
 const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 2;
 const LLM_SYMBOL_DOC_VERSION_PREFIX: &str = "semantic_doc_version:";
+const SEARCH_NODE_BATCH_SIZE: usize = 8_192;
+const LLM_DOC_RELOAD_BATCH_SIZE: usize = 256;
+
+fn search_index_storage_path(storage_path: &Path) -> PathBuf {
+    let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = storage_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("codestory");
+    parent.join(format!("{stem}.search"))
+}
+
+fn reload_llm_docs_from_storage(
+    storage: &Storage,
+    engine: &mut SearchEngine,
+    batch_size: usize,
+) -> Result<(), ApiError> {
+    engine.clear_llm_symbol_docs();
+    let mut after_node_id = None;
+    let batch_size = batch_size.max(1);
+    loop {
+        let docs = storage
+            .get_llm_symbol_docs_batch_after(after_node_id, batch_size)
+            .map_err(|e| ApiError::internal(format!("Failed to load LLM symbol docs: {e}")))?;
+        if docs.is_empty() {
+            break;
+        }
+        after_node_id = docs.last().map(|doc| doc.node_id);
+        engine.extend_llm_symbol_docs(docs.into_iter().map(map_llm_doc_to_search));
+    }
+    Ok(())
+}
 
 fn retrieval_state_from_parts(
     semantic_doc_count: u32,
@@ -819,10 +858,7 @@ fn sync_llm_symbol_projection(
         tracing::warn!(
             "{EMBEDDING_MODEL_ENV} not configured or invalid ({error}); semantic ask retrieval will be unavailable until a local model artifact is configured. Use a bundled model at {DEFAULT_BUNDLED_EMBED_MODEL_PATH}, set {EMBEDDING_RUNTIME_MODE_ENV}=hash for local-dev embeddings, or set {HYBRID_RETRIEVAL_ENABLED_ENV}=false for lexical-only retrieval."
         );
-        let existing = storage
-            .get_all_llm_symbol_docs()
-            .map_err(|e| ApiError::internal(format!("Failed to load LLM symbol docs: {e}")))?;
-        engine.index_llm_symbol_docs(existing.into_iter().map(map_llm_doc_to_search).collect());
+        reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
         return Ok(());
     }
 
@@ -838,11 +874,7 @@ fn sync_llm_symbol_projection(
             .map_err(|e| ApiError::internal(format!("Failed to clear stale LLM docs: {e}")))?;
     } else if let Some(scope) = llm_refresh_file_scope {
         if scope.is_empty() {
-            let persisted = storage.get_all_llm_symbol_docs().map_err(|e| {
-                ApiError::internal(format!("Failed to reload LLM symbol docs: {e}"))
-            })?;
-            engine
-                .index_llm_symbol_docs(persisted.into_iter().map(map_llm_doc_to_search).collect());
+            reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
             return Ok(());
         }
 
@@ -904,10 +936,7 @@ fn sync_llm_symbol_projection(
     }
 
     if metadata.is_empty() {
-        let persisted = storage
-            .get_all_llm_symbol_docs()
-            .map_err(|e| ApiError::internal(format!("Failed to reload LLM symbol docs: {e}")))?;
-        engine.index_llm_symbol_docs(persisted.into_iter().map(map_llm_doc_to_search).collect());
+        reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
         return Ok(());
     }
 
@@ -953,10 +982,7 @@ fn sync_llm_symbol_projection(
     storage
         .upsert_llm_symbol_docs_batch(&docs)
         .map_err(|e| ApiError::internal(format!("Failed to upsert LLM symbol docs: {e}")))?;
-    let persisted = storage
-        .get_all_llm_symbol_docs()
-        .map_err(|e| ApiError::internal(format!("Failed to reload LLM symbol docs: {e}")))?;
-    engine.index_llm_symbol_docs(persisted.into_iter().map(map_llm_doc_to_search).collect());
+    reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
 
     Ok(())
 }
@@ -1036,6 +1062,7 @@ struct AppState {
 #[derive(Clone)]
 pub struct AppController {
     state: Arc<Mutex<AppState>>,
+    grounding_detail_refresh: Arc<Mutex<()>>,
     events_tx: Sender<AppEventPayload>,
     events_rx: Receiver<AppEventPayload>,
 }
@@ -1057,6 +1084,7 @@ impl AppController {
                 search_engine: None,
                 is_indexing: false,
             })),
+            grounding_detail_refresh: Arc::new(Mutex::new(())),
             events_tx,
             events_rx,
         }
@@ -1159,6 +1187,15 @@ impl AppController {
         s.search_engine = None;
     }
 
+    fn ensure_consistent_read_state(&self, operation: &str) -> Result<(), ApiError> {
+        if self.state.lock().is_indexing {
+            return Err(ApiError::invalid_argument(format!(
+                "{operation} is unavailable while indexing is in progress. Retry after indexing completes."
+            )));
+        }
+        Ok(())
+    }
+
     fn ensure_search_state(&self) -> Result<(), ApiError> {
         {
             let s = self.state.lock();
@@ -1175,6 +1212,7 @@ impl AppController {
             .map_err(|e| ApiError::internal(format!("Failed to load nodes: {e}")))?;
         let (node_names, engine) = build_search_state(
             &mut storage,
+            Some(search_index_storage_path(&storage_path).as_path()),
             nodes,
             None,
             SemanticProjectionMode::PersistBackedDocs,
@@ -1397,6 +1435,7 @@ impl AppController {
             .map_err(|e| ApiError::internal(format!("Failed to load nodes: {e}")))?;
         let (node_names, engine) = build_search_state(
             &mut storage,
+            Some(search_index_storage_path(&storage_path).as_path()),
             nodes,
             None,
             SemanticProjectionMode::PersistBackedDocs,
@@ -1500,7 +1539,9 @@ impl AppController {
         let (root, storage_path) = {
             let mut s = self.state.lock();
             if s.is_indexing {
-                return Ok(());
+                return Err(ApiError::invalid_argument(
+                    "Indexing already in progress for this controller.",
+                ));
             }
             let root = s.project_root.clone().ok_or_else(|| {
                 ApiError::invalid_argument("No project open. Call open_project first.")
@@ -1556,12 +1597,12 @@ impl AppController {
                     "Indexing already in progress for this controller.",
                 ));
             }
-            s.is_indexing = true;
             let root = s.project_root.clone().ok_or_else(no_project_error)?;
             let storage_path = s
                 .storage_path
                 .clone()
                 .unwrap_or_else(|| root.join("codestory.db"));
+            s.is_indexing = true;
             (root, storage_path)
         };
 
@@ -1576,14 +1617,23 @@ impl AppController {
                     let mut storage = Storage::open(&storage_path).map_err(|e| {
                         ApiError::internal(format!("Failed to reopen storage: {e}"))
                     })?;
-                    refresh_caches(self, &mut storage, summary.llm_refresh_scope.as_ref());
+                    refresh_caches(
+                        self,
+                        &mut storage,
+                        &storage_path,
+                        summary.llm_refresh_scope.as_ref(),
+                    )?;
                 } else {
                     self.finalize_indexing_without_runtime_refresh_with(
                         &storage_path,
                         summary.llm_refresh_scope.as_ref(),
                         |storage, llm_refresh_scope| {
-                            rebuild_search_state_from_storage(storage, llm_refresh_scope)
-                                .map(|_| ())
+                            rebuild_search_state_from_storage(
+                                storage,
+                                &storage_path,
+                                llm_refresh_scope,
+                            )
+                            .map(|_| ())
                         },
                     )?;
                 }
@@ -1592,7 +1642,7 @@ impl AppController {
             Err(error) => {
                 if refresh_runtime_caches {
                     if let Ok(mut storage) = Storage::open(&storage_path) {
-                        refresh_caches(self, &mut storage, None);
+                        let _ = refresh_caches(self, &mut storage, &storage_path, None);
                     } else {
                         self.clear_search_state();
                         self.state.lock().is_indexing = false;
@@ -1646,6 +1696,7 @@ impl AppController {
     }
 
     pub fn search_results(&self, req: SearchRequest) -> Result<SearchResultsDto, ApiError> {
+        self.ensure_consistent_read_state("Search")?;
         let query = req.query.clone();
         let (mut hits, retrieval) = self.search_hybrid_results(req, None, 20, None)?;
         let storage = self.open_storage()?;
@@ -2365,10 +2416,12 @@ fn index_full(
     };
     let deferred_indexes_ms = staged_finalize_stats.deferred_indexes_ms;
     let summary_snapshot_ms = staged_finalize_stats.summary_snapshot_ms;
+    let staged_path = staged.path().to_path_buf();
     let publish_started = std::time::Instant::now();
     if let Err(err) = staged.publish(storage_path) {
         return Err(ApiError::internal(format!(
-            "Failed to publish staged storage: {err}"
+            "Failed to publish staged storage: {err}. Preserved staged snapshot at {}",
+            staged_path.display()
         )));
     }
     let publish_ms = clamp_u128_to_u32(publish_started.elapsed().as_millis());
@@ -2615,11 +2668,12 @@ where
 }
 
 fn workspace_refresh_inputs(store: &Store) -> Result<RefreshInputs, ApiError> {
-    let inventory = store
+    let files = store
         .files()
         .get_files()
-        .map_err(|e| ApiError::internal(format!("Failed to read workspace inventory: {e}")))?
-        .into_iter()
+        .map_err(|e| ApiError::internal(format!("Failed to read workspace inventory: {e}")))?;
+    let inventory = files
+        .iter()
         .map(|file| {
             (
                 file.path.clone(),
@@ -2629,16 +2683,26 @@ fn workspace_refresh_inputs(store: &Store) -> Result<RefreshInputs, ApiError> {
                     indexed: file.indexed,
                 },
             )
+        })
+        .collect::<Vec<_>>();
+    let stored_files = files
+        .into_iter()
+        .map(|file| codestory_workspace::StoredFileState {
+            id: file.id,
+            path: file.path,
+            modification_time: file.modification_time,
+            indexed: file.indexed,
         });
 
     Ok(RefreshInputs {
-        stored_files: Vec::new(),
+        stored_files: stored_files.collect(),
         inventory: WorkspaceInventory::from_records(inventory),
     })
 }
 
 fn rebuild_search_state_from_storage(
     storage: &mut Storage,
+    storage_path: &Path,
     llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
 ) -> Result<
     (
@@ -2650,6 +2714,7 @@ fn rebuild_search_state_from_storage(
     match storage.get_nodes() {
         Ok(nodes) => build_search_state(
             storage,
+            Some(search_index_storage_path(storage_path).as_path()),
             nodes,
             llm_refresh_scope,
             SemanticProjectionMode::PersistBackedDocs,
@@ -2664,15 +2729,18 @@ fn rebuild_search_state_from_storage(
 fn refresh_caches(
     controller: &AppController,
     storage: &mut Storage,
+    storage_path: &Path,
     llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
-) {
-    let refreshed = rebuild_search_state_from_storage(storage, llm_refresh_scope);
+) -> Result<(), ApiError> {
+    let refreshed = rebuild_search_state_from_storage(storage, storage_path, llm_refresh_scope);
 
     let mut s = controller.state.lock();
     match refreshed {
         Ok((node_names, engine)) => {
             s.node_names = node_names;
             s.search_engine = Some(engine);
+            s.is_indexing = false;
+            Ok(())
         }
         Err(error) => {
             tracing::warn!(
@@ -2681,9 +2749,10 @@ fn refresh_caches(
             );
             s.node_names.clear();
             s.search_engine = None;
+            s.is_indexing = false;
+            Err(error)
         }
     }
-    s.is_indexing = false;
 }
 
 #[cfg(test)]
@@ -3033,7 +3102,10 @@ pub fn exact_symbol_anchor() {{}}
             .run_indexing_blocking(IndexMode::Full)
             .expect("index fixtures");
 
-        for query in ["check_winner", "min_max"] {
+        for (query, expected_kind) in [
+            ("check_winner", codestory_contracts::api::NodeKind::FUNCTION),
+            ("min_max", codestory_contracts::api::NodeKind::METHOD),
+        ] {
             let hits = controller
                 .search(SearchRequest {
                     query: query.to_string(),
@@ -3041,8 +3113,7 @@ pub fn exact_symbol_anchor() {{}}
                 .expect("search fixtures");
             let first = hits.first().expect("at least one hit");
             assert_eq!(
-                first.kind,
-                codestory_contracts::api::NodeKind::FUNCTION,
+                first.kind, expected_kind,
                 "expected real definition to outrank loose matches for {query}"
             );
             assert_eq!(terminal_symbol_segment(&first.display_name), query);
@@ -3106,6 +3177,7 @@ pub fn exact_symbol_anchor() {{}}
 
         let (node_names, mut engine) = build_search_state(
             &mut storage,
+            None,
             nodes,
             None,
             SemanticProjectionMode::SkipPersistence,
@@ -3203,7 +3275,8 @@ pub fn exact_symbol_anchor() {{}}
 
         let mut env = hybrid_test_env();
         env.push(EnvGuard::set(EMBEDDING_MODEL_ID_ENV, "model-a"));
-        rebuild_search_state_from_storage(&mut storage, None).expect("initial rebuild");
+        rebuild_search_state_from_storage(&mut storage, temp.path(), None)
+            .expect("initial rebuild");
         assert_eq!(
             storage
                 .get_llm_symbol_doc_stats()
@@ -3233,7 +3306,7 @@ pub fn exact_symbol_anchor() {{}}
         );
 
         env.push(EnvGuard::set(EMBEDDING_MODEL_ID_ENV, "model-b"));
-        rebuild_search_state_from_storage(&mut storage, None)
+        rebuild_search_state_from_storage(&mut storage, temp.path(), None)
             .expect("mixed corpus should force rebuild");
 
         let docs = storage
@@ -3370,6 +3443,36 @@ pub fn exact_symbol_anchor() {{}}
         assert!(!state.is_indexing);
         assert!(state.search_engine.is_none());
         assert!(state.node_names.is_empty());
+    }
+
+    #[test]
+    fn blocking_index_without_open_project_does_not_leave_indexing_stuck() {
+        let controller = AppController::new();
+
+        let error = controller
+            .run_indexing_blocking(IndexMode::Full)
+            .expect_err("missing project should error");
+
+        assert_eq!(error.code, "invalid_argument");
+        assert!(!controller.state.lock().is_indexing);
+    }
+
+    #[test]
+    fn search_rejects_reads_while_indexing_is_active() {
+        let controller = AppController::new();
+        {
+            let mut state = controller.state.lock();
+            state.is_indexing = true;
+        }
+
+        let error = controller
+            .search_results(SearchRequest {
+                query: "check_winner".to_string(),
+            })
+            .expect_err("search should be blocked while indexing");
+
+        assert_eq!(error.code, "invalid_argument");
+        assert!(error.message.contains("indexing is in progress"));
     }
 
     #[test]
