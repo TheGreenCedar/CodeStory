@@ -9,10 +9,14 @@ use ort::session::{
 };
 use ort::value::TensorRef;
 use rayon::prelude::*;
+use serde_json::{Value as JsonValue, json};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use tantivy::collector::TopDocs;
 use tantivy::doc;
 use tantivy::query::QueryParser;
@@ -28,12 +32,23 @@ pub const EMBEDDING_MODEL_ID_ENV: &str = "CODESTORY_EMBED_MODEL_ID";
 pub const EMBEDDING_TOKENIZER_ENV: &str = "CODESTORY_EMBED_TOKENIZER_PATH";
 pub const EMBEDDING_MAX_TOKENS_ENV: &str = "CODESTORY_EMBED_MAX_TOKENS";
 pub const EMBEDDING_RUNTIME_MODE_ENV: &str = "CODESTORY_EMBED_RUNTIME_MODE";
-pub const DEFAULT_BUNDLED_EMBED_MODEL_PATH: &str = "models/all-minilm-l6-v2/model.onnx";
+pub const EMBEDDING_BACKEND_ENV: &str = "CODESTORY_EMBED_BACKEND";
+pub const EMBEDDING_PROFILE_ENV: &str = "CODESTORY_EMBED_PROFILE";
+pub const EMBEDDING_POOLING_ENV: &str = "CODESTORY_EMBED_POOLING";
+pub const EMBEDDING_QUERY_PREFIX_ENV: &str = "CODESTORY_EMBED_QUERY_PREFIX";
+pub const EMBEDDING_DOCUMENT_PREFIX_ENV: &str = "CODESTORY_EMBED_DOCUMENT_PREFIX";
+pub const EMBEDDING_LAYER_NORM_ENV: &str = "CODESTORY_EMBED_LAYER_NORM";
+pub const EMBEDDING_TRUNCATE_DIM_ENV: &str = "CODESTORY_EMBED_TRUNCATE_DIM";
+pub const EMBEDDING_EXPECTED_DIM_ENV: &str = "CODESTORY_EMBED_EXPECTED_DIM";
+pub const LLAMACPP_EMBEDDINGS_URL_ENV: &str = "CODESTORY_EMBED_LLAMACPP_URL";
+pub const LLAMACPP_REQUEST_COUNT_ENV: &str = "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT";
+pub const DEFAULT_BUNDLED_EMBED_MODEL_PATH: &str = "models/bge-small-en-v1.5/onnx/model.onnx";
 const EMBEDDING_INTRA_THREADS_ENV: &str = "CODESTORY_EMBED_INTRA_THREADS";
 const EMBEDDING_INTER_THREADS_ENV: &str = "CODESTORY_EMBED_INTER_THREADS";
 const EMBEDDING_PARALLEL_EXECUTION_ENV: &str = "CODESTORY_EMBED_PARALLEL_EXECUTION";
 const EMBEDDING_EXECUTION_PROVIDER_ENV: &str = "CODESTORY_EMBED_EXECUTION_PROVIDER";
 const EMBEDDING_SESSION_COUNT_ENV: &str = "CODESTORY_EMBED_SESSION_COUNT";
+const DEFAULT_LLAMACPP_EMBEDDINGS_URL: &str = "http://127.0.0.1:8080/v1/embeddings";
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingRuntimeAvailability {
@@ -79,6 +94,24 @@ fn resolve_bundled_embed_model_path() -> Option<PathBuf> {
     None
 }
 
+fn default_tokenizer_path_for_model(model_path: &Path) -> PathBuf {
+    let sibling = model_path.with_file_name("tokenizer.json");
+    if sibling.is_file() {
+        return sibling;
+    }
+
+    if let Some(parent_tokenizer) = model_path
+        .parent()
+        .and_then(Path::parent)
+        .map(|parent| parent.join("tokenizer.json"))
+        && parent_tokenizer.is_file()
+    {
+        return parent_tokenizer;
+    }
+
+    sibling
+}
+
 fn env_usize(key: &str, min: usize, max: usize) -> Option<usize> {
     std::env::var(key)
         .ok()
@@ -96,6 +129,17 @@ fn env_bool(key: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn env_bool_override(key: &str) -> Option<bool> {
+    std::env::var(key).ok().and_then(|raw| {
+        let normalized = raw.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    })
 }
 
 fn embedding_session_count_from_env() -> usize {
@@ -160,17 +204,285 @@ fn configure_embedding_execution_provider(builder: SessionBuilder) -> Result<Ses
     }
 }
 
-pub fn embedding_runtime_availability_from_env() -> EmbeddingRuntimeAvailability {
-    let runtime_mode = std::env::var(EMBEDDING_RUNTIME_MODE_ENV)
-        .unwrap_or_else(|_| "onnx".to_string())
-        .trim()
-        .to_ascii_lowercase();
-    let model_id = std::env::var(EMBEDDING_MODEL_ID_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "sentence-transformers/all-MiniLM-L6-v2-local".to_string());
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingBackendSelection {
+    Onnx,
+    LlamaCpp,
+    HashProjection,
+}
 
-    if runtime_mode == "hash" || runtime_mode == "hash_projection" {
+impl EmbeddingBackendSelection {
+    fn from_env() -> Result<Self> {
+        let runtime_mode = std::env::var(EMBEDDING_RUNTIME_MODE_ENV)
+            .unwrap_or_else(|_| "onnx".to_string())
+            .trim()
+            .to_ascii_lowercase();
+        if runtime_mode == "hash" || runtime_mode == "hash_projection" {
+            return Ok(Self::HashProjection);
+        }
+
+        let backend = std::env::var(EMBEDDING_BACKEND_ENV)
+            .unwrap_or_else(|_| runtime_mode)
+            .trim()
+            .to_ascii_lowercase();
+        match backend.as_str() {
+            "" | "auto" | "onnx" => Ok(Self::Onnx),
+            "hash" | "hash_projection" => Ok(Self::HashProjection),
+            "llamacpp" | "llama.cpp" | "llama-cpp" | "gguf" => Ok(Self::LlamaCpp),
+            other => Err(anyhow!(
+                "unsupported embedding backend `{other}` (set {EMBEDDING_BACKEND_ENV}=onnx, hash, or llamacpp)"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Onnx => "onnx",
+            Self::LlamaCpp => "llamacpp",
+            Self::HashProjection => "hash",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingPooling {
+    Mean,
+    Cls,
+    LastToken,
+}
+
+impl EmbeddingPooling {
+    fn from_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "mean" | "avg" | "average" => Some(Self::Mean),
+            "cls" | "first" => Some(Self::Cls),
+            "last" | "last_token" | "last-token" => Some(Self::LastToken),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EmbeddingProfile {
+    name: String,
+    model_id: String,
+    max_tokens: usize,
+    pooling: EmbeddingPooling,
+    query_prefix: String,
+    document_prefix: String,
+    layer_norm: bool,
+    truncate_dim: Option<usize>,
+    expected_dim: Option<usize>,
+}
+
+impl EmbeddingProfile {
+    fn from_env() -> Result<Self> {
+        let name = std::env::var(EMBEDDING_PROFILE_ENV)
+            .unwrap_or_else(|_| "bge-small-en-v1.5".to_string())
+            .trim()
+            .to_ascii_lowercase();
+
+        let mut profile = match name.as_str() {
+            "" | "minilm" | "all-minilm-l6-v2" => Self {
+                name: "minilm".to_string(),
+                model_id: "sentence-transformers/all-MiniLM-L6-v2-local".to_string(),
+                max_tokens: 256,
+                pooling: EmbeddingPooling::Mean,
+                query_prefix: String::new(),
+                document_prefix: String::new(),
+                layer_norm: false,
+                truncate_dim: None,
+                expected_dim: Some(384),
+            },
+            "bge-small" | "bge-small-en-v1.5" => Self {
+                name: "bge-small-en-v1.5".to_string(),
+                model_id: "BAAI/bge-small-en-v1.5-local".to_string(),
+                max_tokens: 512,
+                pooling: EmbeddingPooling::Cls,
+                query_prefix: "Represent this sentence for searching relevant passages: "
+                    .to_string(),
+                document_prefix: String::new(),
+                layer_norm: false,
+                truncate_dim: None,
+                expected_dim: Some(384),
+            },
+            "bge-base" | "bge-base-en-v1.5" => Self {
+                name: "bge-base-en-v1.5".to_string(),
+                model_id: "BAAI/bge-base-en-v1.5-local".to_string(),
+                max_tokens: 512,
+                pooling: EmbeddingPooling::Cls,
+                query_prefix: "Represent this sentence for searching relevant passages: "
+                    .to_string(),
+                document_prefix: String::new(),
+                layer_norm: false,
+                truncate_dim: None,
+                expected_dim: Some(768),
+            },
+            "qwen" | "qwen3" | "qwen3-embedding-0.6b" => Self {
+                name: "qwen3-embedding-0.6b".to_string(),
+                model_id: "Qwen/Qwen3-Embedding-0.6B-local".to_string(),
+                max_tokens: 32_768,
+                pooling: EmbeddingPooling::LastToken,
+                query_prefix:
+                    "Instruct: Retrieve relevant code symbols and implementation details\nQuery: "
+                        .to_string(),
+                document_prefix: String::new(),
+                layer_norm: false,
+                truncate_dim: None,
+                expected_dim: Some(1024),
+            },
+            "embeddinggemma" | "embeddinggemma-300m" | "gemma" | "gemma-embedding-300m" => Self {
+                name: "embeddinggemma-300m".to_string(),
+                model_id: "google/embeddinggemma-300m-local".to_string(),
+                max_tokens: 2048,
+                pooling: EmbeddingPooling::Mean,
+                query_prefix: "task: search result | query: ".to_string(),
+                document_prefix: "title: none | text: ".to_string(),
+                layer_norm: false,
+                truncate_dim: None,
+                expected_dim: Some(768),
+            },
+            "nomic" | "nomic-v1.5" | "nomic-embed-text-v1.5" => Self {
+                name: "nomic-embed-text-v1.5".to_string(),
+                model_id: "nomic-ai/nomic-embed-text-v1.5-local".to_string(),
+                max_tokens: 8192,
+                pooling: EmbeddingPooling::Mean,
+                query_prefix: "search_query: ".to_string(),
+                document_prefix: "search_document: ".to_string(),
+                layer_norm: true,
+                truncate_dim: None,
+                expected_dim: Some(768),
+            },
+            "nomic-v2" | "nomic-embed-text-v2" | "nomic-embed-text-v2-moe" => Self {
+                name: "nomic-embed-text-v2-moe".to_string(),
+                model_id: "nomic-ai/nomic-embed-text-v2-moe-local".to_string(),
+                max_tokens: 512,
+                pooling: EmbeddingPooling::Mean,
+                query_prefix: "search_query: ".to_string(),
+                document_prefix: "search_document: ".to_string(),
+                layer_norm: true,
+                truncate_dim: None,
+                expected_dim: Some(768),
+            },
+            "custom" | "custom-onnx" => Self {
+                name: "custom-onnx".to_string(),
+                model_id: "custom-onnx-local".to_string(),
+                max_tokens: 256,
+                pooling: EmbeddingPooling::Mean,
+                query_prefix: String::new(),
+                document_prefix: String::new(),
+                layer_norm: false,
+                truncate_dim: None,
+                expected_dim: None,
+            },
+            other => {
+                return Err(anyhow!(
+                    "unsupported embedding profile `{other}` (set {EMBEDDING_PROFILE_ENV}=minilm, bge-small-en-v1.5, bge-base-en-v1.5, qwen3-embedding-0.6b, embeddinggemma-300m, nomic-embed-text-v1.5, nomic-embed-text-v2-moe, or custom-onnx)"
+                ));
+            }
+        };
+
+        if let Ok(model_id) = std::env::var(EMBEDDING_MODEL_ID_ENV)
+            && !model_id.trim().is_empty()
+        {
+            profile.model_id = model_id;
+        }
+        if let Some(max_tokens) = env_usize(EMBEDDING_MAX_TOKENS_ENV, 8, 32_768) {
+            profile.max_tokens = max_tokens;
+        }
+        if let Ok(raw) = std::env::var(EMBEDDING_POOLING_ENV) {
+            profile.pooling = EmbeddingPooling::from_value(&raw)
+                .ok_or_else(|| anyhow!("unsupported {EMBEDDING_POOLING_ENV} value `{raw}`"))?;
+        }
+        if let Ok(prefix) = std::env::var(EMBEDDING_QUERY_PREFIX_ENV) {
+            profile.query_prefix = prefix;
+        }
+        if let Ok(prefix) = std::env::var(EMBEDDING_DOCUMENT_PREFIX_ENV) {
+            profile.document_prefix = prefix;
+        }
+        if let Some(layer_norm) = env_bool_override(EMBEDDING_LAYER_NORM_ENV) {
+            profile.layer_norm = layer_norm;
+        }
+        if let Some(truncate_dim) = env_usize(EMBEDDING_TRUNCATE_DIM_ENV, 1, 8192) {
+            profile.truncate_dim = Some(truncate_dim);
+            profile.expected_dim = Some(truncate_dim);
+        }
+        if let Some(expected_dim) = env_usize(EMBEDDING_EXPECTED_DIM_ENV, 1, 8192) {
+            profile.expected_dim = Some(expected_dim);
+        }
+
+        Ok(profile)
+    }
+
+    fn cache_model_id(&self, backend: EmbeddingBackendSelection) -> String {
+        if backend == EmbeddingBackendSelection::HashProjection {
+            return self.model_id.clone();
+        }
+
+        if self.name == "minilm"
+            && backend == EmbeddingBackendSelection::Onnx
+            && self.query_prefix.is_empty()
+            && self.document_prefix.is_empty()
+            && !self.layer_norm
+            && self.truncate_dim.is_none()
+            && self.expected_dim == Some(384)
+        {
+            return self.model_id.clone();
+        }
+
+        format!(
+            "{}|backend={}|pool={:?}|query_prefix={}|document_prefix={}|layer_norm={}|truncate_dim={:?}|expected_dim={:?}",
+            self.model_id,
+            backend.as_str(),
+            self.pooling,
+            self.query_prefix,
+            self.document_prefix,
+            self.layer_norm,
+            self.truncate_dim,
+            self.expected_dim
+        )
+    }
+}
+
+pub fn embedding_runtime_availability_from_env() -> EmbeddingRuntimeAvailability {
+    let profile = match EmbeddingProfile::from_env() {
+        Ok(profile) => profile,
+        Err(error) => {
+            return EmbeddingRuntimeAvailability {
+                available: false,
+                model_id: None,
+                fallback_message: Some(error.to_string()),
+            };
+        }
+    };
+    let backend = match EmbeddingBackendSelection::from_env() {
+        Ok(backend) => backend,
+        Err(error) => {
+            return EmbeddingRuntimeAvailability {
+                available: false,
+                model_id: Some(profile.model_id.clone()),
+                fallback_message: Some(error.to_string()),
+            };
+        }
+    };
+    let model_id = profile.cache_model_id(backend);
+
+    if backend == EmbeddingBackendSelection::HashProjection {
+        return EmbeddingRuntimeAvailability {
+            available: true,
+            model_id: Some(model_id),
+            fallback_message: None,
+        };
+    }
+
+    if backend == EmbeddingBackendSelection::LlamaCpp {
+        if let Err(error) = LlamaCppEndpoint::from_env() {
+            return EmbeddingRuntimeAvailability {
+                available: false,
+                model_id: Some(model_id),
+                fallback_message: Some(error.to_string()),
+            };
+        }
         return EmbeddingRuntimeAvailability {
             available: true,
             model_id: Some(model_id),
@@ -205,7 +517,7 @@ pub fn embedding_runtime_availability_from_env() -> EmbeddingRuntimeAvailability
 
     let tokenizer_path = std::env::var(EMBEDDING_TOKENIZER_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(|_| model_path.with_file_name("tokenizer.json"));
+        .unwrap_or_else(|_| default_tokenizer_path_for_model(&model_path));
     if !tokenizer_path.is_file() {
         return EmbeddingRuntimeAvailability {
             available: false,
@@ -273,12 +585,14 @@ impl Default for HybridSearchConfig {
 pub struct EmbeddingRuntime {
     model_path: PathBuf,
     model_id: String,
+    profile: EmbeddingProfile,
     backend: EmbeddingBackend,
 }
 
 #[derive(Debug, Clone)]
 enum EmbeddingBackend {
     Onnx(Arc<OnnxEmbeddingRuntime>),
+    LlamaCpp(Arc<LlamaCppEmbeddingRuntime>),
     HashProjection,
 }
 
@@ -292,17 +606,239 @@ struct OnnxEmbeddingWorker {
     session: Mutex<Session>,
     tokenizer: Mutex<Tokenizer>,
     max_tokens: usize,
+    pooling: EmbeddingPooling,
     accepts_token_type_ids: bool,
 }
 
-impl EmbeddingRuntime {
-    fn model_id_from_env() -> String {
-        std::env::var(EMBEDDING_MODEL_ID_ENV)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "sentence-transformers/all-MiniLM-L6-v2-local".to_string())
+#[derive(Debug, Clone)]
+struct LlamaCppEndpoint {
+    host: String,
+    port: u16,
+    path: String,
+}
+
+impl LlamaCppEndpoint {
+    fn from_env() -> Result<Self> {
+        let raw = std::env::var(LLAMACPP_EMBEDDINGS_URL_ENV)
+            .unwrap_or_else(|_| DEFAULT_LLAMACPP_EMBEDDINGS_URL.to_string());
+        Self::parse(&raw)
     }
 
+    fn parse(raw: &str) -> Result<Self> {
+        let trimmed = raw.trim();
+        let rest = trimmed
+            .strip_prefix("http://")
+            .ok_or_else(|| anyhow!("{LLAMACPP_EMBEDDINGS_URL_ENV} must be an http:// URL"))?;
+        let (authority, path) = rest
+            .split_once('/')
+            .map(|(authority, path)| (authority, format!("/{path}")))
+            .unwrap_or((rest, "/v1/embeddings".to_string()));
+        let (host, port) = if let Some((host, raw_port)) = authority.rsplit_once(':') {
+            let port = raw_port
+                .parse::<u16>()
+                .with_context(|| format!("invalid port in {LLAMACPP_EMBEDDINGS_URL_ENV}"))?;
+            (host.to_string(), port)
+        } else {
+            (authority.to_string(), 80)
+        };
+        if host.trim().is_empty() {
+            return Err(anyhow!("{LLAMACPP_EMBEDDINGS_URL_ENV} must include a host"));
+        }
+        Ok(Self { host, port, path })
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}:{}{}", self.host, self.port, self.path)
+    }
+}
+
+#[derive(Debug)]
+struct LlamaCppEmbeddingRuntime {
+    endpoint: LlamaCppEndpoint,
+    request_count: usize,
+}
+
+impl LlamaCppEmbeddingRuntime {
+    fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.request_count > 1 && texts.len() > 1 {
+            let chunk_size = embedding_parallel_chunk_size(texts.len(), self.request_count);
+            let chunks = texts
+                .par_chunks(chunk_size)
+                .map(|chunk| self.embed_texts_serial(chunk))
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(chunks.into_iter().flatten().collect());
+        }
+        self.embed_texts_serial(texts)
+    }
+
+    fn embed_texts_serial(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let request = json!({
+            "input": texts,
+            "model": "codestory-local-embedding"
+        });
+        let response = post_json_to_http_endpoint(&self.endpoint, &request)?;
+        parse_openai_embeddings_response(response, texts.len())
+    }
+}
+
+fn post_json_to_http_endpoint(
+    endpoint: &LlamaCppEndpoint,
+    request: &JsonValue,
+) -> Result<JsonValue> {
+    let body = serde_json::to_vec(request).context("failed to serialize llama.cpp request")?;
+    let mut stream =
+        TcpStream::connect((endpoint.host.as_str(), endpoint.port)).with_context(|| {
+            format!(
+                "failed to connect to llama.cpp embeddings endpoint {}",
+                endpoint.url()
+            )
+        })?;
+    stream.set_read_timeout(Some(Duration::from_secs(300)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let request = format!(
+        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nAccept: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        endpoint.path,
+        endpoint.host,
+        endpoint.port,
+        body.len()
+    );
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let (status_code, headers, body) = split_http_response(&response)?;
+    if !(200..300).contains(&status_code) {
+        return Err(anyhow!(
+            "llama.cpp embeddings endpoint {} returned HTTP {status_code}: {}",
+            endpoint.url(),
+            String::from_utf8_lossy(&body)
+        ));
+    }
+
+    let body = if headers
+        .iter()
+        .any(|(key, value)| key == "transfer-encoding" && value.contains("chunked"))
+    {
+        decode_chunked_http_body(&body)?
+    } else {
+        body
+    };
+
+    serde_json::from_slice(&body).with_context(|| {
+        format!(
+            "failed to parse JSON response from llama.cpp endpoint {}",
+            endpoint.url()
+        )
+    })
+}
+
+fn split_http_response(response: &[u8]) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| anyhow!("invalid HTTP response from llama.cpp endpoint"))?;
+    let header_text = String::from_utf8_lossy(&response[..header_end]);
+    let mut lines = header_text.lines();
+    let status_line = lines
+        .next()
+        .ok_or_else(|| anyhow!("missing HTTP status line from llama.cpp endpoint"))?;
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| anyhow!("missing HTTP status code from llama.cpp endpoint"))?
+        .parse::<u16>()
+        .context("invalid HTTP status code from llama.cpp endpoint")?;
+    let headers = lines
+        .filter_map(|line| {
+            line.split_once(':').map(|(key, value)| {
+                (
+                    key.trim().to_ascii_lowercase(),
+                    value.trim().to_ascii_lowercase(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok((status_code, headers, response[header_end + 4..].to_vec()))
+}
+
+fn decode_chunked_http_body(body: &[u8]) -> Result<Vec<u8>> {
+    let mut offset = 0;
+    let mut decoded = Vec::new();
+    while offset < body.len() {
+        let line_end = body[offset..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .ok_or_else(|| anyhow!("invalid chunked response from llama.cpp endpoint"))?
+            + offset;
+        let size_text = String::from_utf8_lossy(&body[offset..line_end]);
+        let size_hex = size_text.split(';').next().unwrap_or_default().trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .context("invalid chunk size from llama.cpp endpoint")?;
+        offset = line_end + 2;
+        if size == 0 {
+            break;
+        }
+        if offset + size > body.len() {
+            return Err(anyhow!(
+                "truncated chunked response from llama.cpp endpoint"
+            ));
+        }
+        decoded.extend_from_slice(&body[offset..offset + size]);
+        offset += size + 2;
+    }
+    Ok(decoded)
+}
+
+fn parse_openai_embeddings_response(
+    response: JsonValue,
+    expected_count: usize,
+) -> Result<Vec<Vec<f32>>> {
+    let data = response
+        .get("data")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| anyhow!("llama.cpp embeddings response missing `data` array"))?;
+    if data.len() != expected_count {
+        return Err(anyhow!(
+            "llama.cpp embeddings response returned {} vectors for {} inputs",
+            data.len(),
+            expected_count
+        ));
+    }
+
+    let mut indexed = Vec::with_capacity(data.len());
+    for (fallback_index, item) in data.iter().enumerate() {
+        let index = item
+            .get("index")
+            .and_then(JsonValue::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(fallback_index);
+        let embedding = item
+            .get("embedding")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| anyhow!("llama.cpp embeddings response item missing `embedding`"))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_f64()
+                    .map(|number| number as f32)
+                    .ok_or_else(|| anyhow!("llama.cpp embedding contained a non-numeric value"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        indexed.push((index, embedding));
+    }
+    indexed.sort_by_key(|(index, _)| *index);
+    Ok(indexed
+        .into_iter()
+        .map(|(_, embedding)| embedding)
+        .collect())
+}
+
+impl EmbeddingRuntime {
     fn probe_model_artifact<P: AsRef<Path>>(
         path: P,
         model_id: impl Into<String>,
@@ -316,7 +852,7 @@ impl EmbeddingRuntime {
         }
         let tokenizer_path = std::env::var(EMBEDDING_TOKENIZER_ENV)
             .map(PathBuf::from)
-            .unwrap_or_else(|_| model_path.with_file_name("tokenizer.json"));
+            .unwrap_or_else(|_| default_tokenizer_path_for_model(&model_path));
         if !tokenizer_path.is_file() {
             return Err(anyhow!(
                 "embedding tokenizer not found at {} (set {EMBEDDING_TOKENIZER_ENV})",
@@ -343,24 +879,28 @@ impl EmbeddingRuntime {
         path: P,
         model_id: impl Into<String>,
     ) -> Result<Self> {
+        let mut profile = EmbeddingProfile::from_env()?;
+        profile.model_id = model_id.into();
+        Self::from_onnx_model_artifact(path, profile)
+    }
+
+    fn from_onnx_model_artifact<P: AsRef<Path>>(
+        path: P,
+        profile: EmbeddingProfile,
+    ) -> Result<Self> {
         Self::ensure_onnx_initialized()?;
         let model_path = path.as_ref().to_path_buf();
+        let model_id = profile.cache_model_id(EmbeddingBackendSelection::Onnx);
         let probe = Self::probe_model_artifact(&model_path, model_id)?;
         let tokenizer_path = std::env::var(EMBEDDING_TOKENIZER_ENV)
             .map(PathBuf::from)
-            .unwrap_or_else(|_| model_path.with_file_name("tokenizer.json"));
-
-        let max_tokens = std::env::var(EMBEDDING_MAX_TOKENS_ENV)
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .map(|value| value.clamp(8, 1024))
-            .unwrap_or(256);
+            .unwrap_or_else(|_| default_tokenizer_path_for_model(&model_path));
 
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
         tokenizer
             .with_truncation(Some(TruncationParams {
-                max_length: max_tokens,
+                max_length: profile.max_tokens,
                 ..Default::default()
             }))
             .map_err(|error| anyhow!("failed to configure tokenizer truncation: {error}"))?;
@@ -378,7 +918,8 @@ impl EmbeddingRuntime {
             workers.push(OnnxEmbeddingWorker {
                 session: Mutex::new(session),
                 tokenizer: Mutex::new(tokenizer.clone()),
-                max_tokens,
+                max_tokens: profile.max_tokens,
+                pooling: profile.pooling,
                 accepts_token_type_ids,
             });
         }
@@ -386,20 +927,27 @@ impl EmbeddingRuntime {
         Ok(Self {
             model_path,
             model_id: probe.model_id,
+            profile,
             backend: EmbeddingBackend::Onnx(Arc::new(OnnxEmbeddingRuntime { workers })),
         })
     }
 
     pub fn probe_from_env() -> Result<EmbeddingRuntimeProbe> {
-        let runtime_mode = std::env::var(EMBEDDING_RUNTIME_MODE_ENV)
-            .unwrap_or_else(|_| "onnx".to_string())
-            .trim()
-            .to_ascii_lowercase();
-        let model_id = Self::model_id_from_env();
+        let profile = EmbeddingProfile::from_env()?;
+        let backend = EmbeddingBackendSelection::from_env()?;
+        let model_id = profile.cache_model_id(backend);
 
-        if runtime_mode == "hash" || runtime_mode == "hash_projection" {
+        if backend == EmbeddingBackendSelection::HashProjection {
             return Ok(EmbeddingRuntimeProbe {
                 model_path: PathBuf::from("hash-projection"),
+                model_id,
+            });
+        }
+
+        if backend == EmbeddingBackendSelection::LlamaCpp {
+            let endpoint = LlamaCppEndpoint::from_env()?;
+            return Ok(EmbeddingRuntimeProbe {
+                model_path: PathBuf::from(endpoint.url()),
                 model_id,
             });
         }
@@ -418,26 +966,40 @@ impl EmbeddingRuntime {
     }
 
     pub fn from_env() -> Result<Self> {
-        let runtime_mode = std::env::var(EMBEDDING_RUNTIME_MODE_ENV)
-            .unwrap_or_else(|_| "onnx".to_string())
-            .trim()
-            .to_ascii_lowercase();
-        let model_id = Self::model_id_from_env();
+        let profile = EmbeddingProfile::from_env()?;
+        let backend = EmbeddingBackendSelection::from_env()?;
+        let model_id = profile.cache_model_id(backend);
 
-        if runtime_mode == "hash" || runtime_mode == "hash_projection" {
-            return Ok(Self {
-                model_path: PathBuf::from("hash-projection"),
-                model_id,
-                backend: EmbeddingBackend::HashProjection,
-            });
+        match backend {
+            EmbeddingBackendSelection::HashProjection => {
+                return Ok(Self {
+                    model_path: PathBuf::from("hash-projection"),
+                    model_id,
+                    profile,
+                    backend: EmbeddingBackend::HashProjection,
+                });
+            }
+            EmbeddingBackendSelection::LlamaCpp => {
+                let endpoint = LlamaCppEndpoint::from_env()?;
+                return Ok(Self {
+                    model_path: PathBuf::from(endpoint.url()),
+                    model_id,
+                    profile,
+                    backend: EmbeddingBackend::LlamaCpp(Arc::new(LlamaCppEmbeddingRuntime {
+                        endpoint,
+                        request_count: env_usize(LLAMACPP_REQUEST_COUNT_ENV, 1, 16).unwrap_or(1),
+                    })),
+                });
+            }
+            EmbeddingBackendSelection::Onnx => {}
         }
 
         if let Ok(path) = std::env::var(EMBEDDING_MODEL_ENV) {
-            return Self::from_model_artifact(path, model_id);
+            return Self::from_onnx_model_artifact(path, profile);
         }
 
         if let Some(bundled_path) = resolve_bundled_embed_model_path() {
-            return Self::from_model_artifact(bundled_path, model_id);
+            return Self::from_onnx_model_artifact(bundled_path, profile);
         }
 
         Err(anyhow!(
@@ -457,34 +1019,64 @@ impl EmbeddingRuntime {
         if query.trim().is_empty() {
             return Err(anyhow!("query cannot be empty for semantic retrieval"));
         }
-        let mut vectors = self.embed_texts(&[query.to_string()])?;
+        let prepared = format!("{}{}", self.profile.query_prefix, query);
+        let mut vectors = self.embed_prepared_texts(&[prepared])?;
         vectors
             .pop()
             .ok_or_else(|| anyhow!("embedding runtime returned no query embedding"))
     }
 
     pub fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        match &self.backend {
+        let prepared = texts
+            .iter()
+            .map(|text| format!("{}{}", self.profile.document_prefix, text))
+            .collect::<Vec<_>>();
+        self.embed_prepared_texts(&prepared)
+    }
+
+    fn embed_prepared_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let mut embeddings = match &self.backend {
             EmbeddingBackend::HashProjection => {
                 let mut out = Vec::with_capacity(texts.len());
                 for text in texts {
                     if text.trim().is_empty() {
-                        out.push(vec![0.0; EMBEDDING_DIM]);
+                        out.push(vec![
+                            0.0;
+                            self.profile.expected_dim.unwrap_or(EMBEDDING_DIM)
+                        ]);
                     } else {
-                        out.push(embed_text_with_hash_projection(text, EMBEDDING_DIM));
+                        out.push(embed_text_with_hash_projection(
+                            text,
+                            self.profile.expected_dim.unwrap_or(EMBEDDING_DIM),
+                        ));
                     }
                 }
                 Ok(out)
             }
             EmbeddingBackend::Onnx(runtime) => runtime.embed_texts(texts),
-        }
+            EmbeddingBackend::LlamaCpp(runtime) => runtime.embed_texts(texts),
+        }?;
+        postprocess_embeddings(&mut embeddings, &self.profile)?;
+        Ok(embeddings)
     }
 
     #[cfg(test)]
     pub fn test_runtime() -> Self {
+        let profile = EmbeddingProfile {
+            name: "test".to_string(),
+            model_id: "test-model".to_string(),
+            max_tokens: 256,
+            pooling: EmbeddingPooling::Mean,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
+            layer_norm: false,
+            truncate_dim: None,
+            expected_dim: Some(EMBEDDING_DIM),
+        };
         Self {
             model_path: PathBuf::from("test-model.onnx"),
             model_id: "test-model".to_string(),
+            profile,
             backend: EmbeddingBackend::HashProjection,
         }
     }
@@ -612,7 +1204,9 @@ impl OnnxEmbeddingWorker {
                 ])
             };
             match run_result {
-                Ok(outputs) => extract_onnx_embeddings(outputs, attention_mask.view())?,
+                Ok(outputs) => {
+                    extract_onnx_embeddings(outputs, attention_mask.view(), self.pooling)?
+                }
                 Err(error) => {
                     initial_error_text = Some(error.to_string());
                     Vec::new()
@@ -648,11 +1242,7 @@ impl OnnxEmbeddingWorker {
                         "ONNX embedding inference failed while retrying without token_type_ids ({error_text})"
                     )
                 })?;
-            embeddings = extract_onnx_embeddings(outputs, attention_mask.view())?;
-        }
-
-        for embedding in &mut embeddings {
-            l2_normalize(embedding);
+            embeddings = extract_onnx_embeddings(outputs, attention_mask.view(), self.pooling)?;
         }
 
         Ok(embeddings)
@@ -662,6 +1252,7 @@ impl OnnxEmbeddingWorker {
 fn extract_onnx_embeddings(
     outputs: ort::session::SessionOutputs<'_>,
     attention_mask: ArrayView2<'_, i64>,
+    pooling: EmbeddingPooling,
 ) -> Result<Vec<Vec<f32>>> {
     let (name, output) = outputs
         .iter()
@@ -675,9 +1266,10 @@ fn extract_onnx_embeddings(
         2 => Ok(rows_to_vecs(
             output_array.view().into_dimensionality::<ndarray::Ix2>()?,
         )),
-        3 => Ok(mean_pool_last_hidden(
+        3 => Ok(pool_last_hidden(
             output_array.view().into_dimensionality::<ndarray::Ix3>()?,
             attention_mask,
+            pooling,
         )),
         n => Err(anyhow!(
             "unsupported ONNX embedding output rank {n}; expected 2 or 3"
@@ -690,6 +1282,27 @@ fn rows_to_vecs(values: ArrayView2<'_, f32>) -> Vec<Vec<f32>> {
         .axis_iter(Axis(0))
         .map(|row| row.iter().copied().collect::<Vec<_>>())
         .collect()
+}
+
+fn pool_last_hidden(
+    values: ArrayView3<'_, f32>,
+    attention_mask: ArrayView2<'_, i64>,
+    pooling: EmbeddingPooling,
+) -> Vec<Vec<f32>> {
+    match pooling {
+        EmbeddingPooling::Mean => mean_pool_last_hidden(values, attention_mask),
+        EmbeddingPooling::Cls => values
+            .axis_iter(Axis(0))
+            .map(|token_matrix| {
+                token_matrix
+                    .index_axis(Axis(0), 0)
+                    .iter()
+                    .copied()
+                    .collect()
+            })
+            .collect(),
+        EmbeddingPooling::LastToken => last_token_pool_last_hidden(values, attention_mask),
+    }
 }
 
 fn mean_pool_last_hidden(
@@ -725,6 +1338,34 @@ fn mean_pool_last_hidden(
         pooled.push(sum);
     }
     pooled
+}
+
+fn last_token_pool_last_hidden(
+    values: ArrayView3<'_, f32>,
+    attention_mask: ArrayView2<'_, i64>,
+) -> Vec<Vec<f32>> {
+    values
+        .axis_iter(Axis(0))
+        .enumerate()
+        .map(|(batch_index, token_matrix)| {
+            let token_count = token_matrix.len_of(Axis(0));
+            let last_index = (0..token_count)
+                .rev()
+                .find(|token_index| {
+                    attention_mask
+                        .get((batch_index, *token_index))
+                        .copied()
+                        .unwrap_or(0)
+                        > 0
+                })
+                .unwrap_or(0);
+            token_matrix
+                .index_axis(Axis(0), last_index)
+                .iter()
+                .copied()
+                .collect()
+        })
+        .collect()
 }
 
 pub struct SearchEngine {
@@ -1099,6 +1740,56 @@ fn embed_text_with_hash_projection(text: &str, dim: usize) -> Vec<f32> {
     vector
 }
 
+fn postprocess_embeddings(embeddings: &mut [Vec<f32>], profile: &EmbeddingProfile) -> Result<()> {
+    for embedding in embeddings {
+        if let Some(truncate_dim) = profile.truncate_dim {
+            if embedding.len() < truncate_dim {
+                return Err(anyhow!(
+                    "embedding from profile `{}` has dimension {}, cannot truncate to {}",
+                    profile.name,
+                    embedding.len(),
+                    truncate_dim
+                ));
+            }
+            embedding.truncate(truncate_dim);
+        }
+        if let Some(expected_dim) = profile.expected_dim
+            && embedding.len() != expected_dim
+        {
+            return Err(anyhow!(
+                "embedding from profile `{}` has dimension {}, expected {}",
+                profile.name,
+                embedding.len(),
+                expected_dim
+            ));
+        }
+        if profile.layer_norm {
+            layer_normalize(embedding);
+        }
+        l2_normalize(embedding);
+    }
+    Ok(())
+}
+
+fn layer_normalize(values: &mut [f32]) {
+    if values.is_empty() {
+        return;
+    }
+    let mean = values.iter().sum::<f32>() / values.len() as f32;
+    let variance = values
+        .iter()
+        .map(|value| {
+            let centered = *value - mean;
+            centered * centered
+        })
+        .sum::<f32>()
+        / values.len() as f32;
+    let denom = (variance + 1.0e-12).sqrt();
+    for value in values {
+        *value = (*value - mean) / denom;
+    }
+}
+
 fn l2_normalize(values: &mut [f32]) {
     let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
     if norm <= f32::EPSILON {
@@ -1122,7 +1813,13 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Mutex as StdMutex;
+    use std::thread;
     use tempfile::tempdir;
+
+    static ENV_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     struct EnvGuard {
         key: &'static str,
@@ -1161,6 +1858,9 @@ mod tests {
 
     #[test]
     fn embedding_session_count_env_override_is_clamped() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _guard = EnvGuard::set(EMBEDDING_SESSION_COUNT_ENV, "999");
         assert_eq!(embedding_session_count_from_env(), 16);
 
@@ -1173,6 +1873,9 @@ mod tests {
 
     #[test]
     fn embedding_session_count_defaults_to_bounded_parallelism() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _guard = EnvGuard::remove(EMBEDDING_SESSION_COUNT_ENV);
         let expected = std::thread::available_parallelism()
             .map(|threads| threads.get().clamp(1, 2))
@@ -1187,6 +1890,113 @@ mod tests {
         assert_eq!(embedding_parallel_chunk_size(65, 4), 17);
         assert_eq!(embedding_parallel_chunk_size(7, 16), 1);
         assert_eq!(embedding_parallel_chunk_size(0, 4), 1);
+    }
+
+    fn run_one_fake_embedding_server(
+        response_body: &'static str,
+    ) -> Result<(String, thread::JoinHandle<String>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fake embedding request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let mut expected_len = None;
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .expect("read fake embedding request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if expected_len.is_none()
+                    && let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            if key.eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    expected_len = Some(header_end + 4 + content_len);
+                }
+                if let Some(expected_len) = expected_len
+                    && request.len() >= expected_len
+                {
+                    break;
+                }
+            }
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write fake embedding response");
+            String::from_utf8_lossy(&request).to_string()
+        });
+        Ok((format!("http://{addr}/v1/embeddings"), handle))
+    }
+
+    #[test]
+    fn llamacpp_backend_uses_openai_embedding_endpoint() -> Result<()> {
+        let response = r#"{"data":[{"index":0,"embedding":[1.0,0.0,0.0]},{"index":1,"embedding":[0.0,2.0,0.0]}]}"#;
+        let (url, handle) = run_one_fake_embedding_server(response)?;
+        let profile = EmbeddingProfile {
+            name: "custom-onnx".to_string(),
+            model_id: "custom-onnx-local".to_string(),
+            max_tokens: 256,
+            pooling: EmbeddingPooling::Mean,
+            query_prefix: String::new(),
+            document_prefix: "doc: ".to_string(),
+            layer_norm: false,
+            truncate_dim: None,
+            expected_dim: Some(3),
+        };
+        let runtime = EmbeddingRuntime {
+            model_path: PathBuf::from(&url),
+            model_id: profile.cache_model_id(EmbeddingBackendSelection::LlamaCpp),
+            profile,
+            backend: EmbeddingBackend::LlamaCpp(Arc::new(LlamaCppEmbeddingRuntime {
+                endpoint: LlamaCppEndpoint::parse(&url)?,
+                request_count: 1,
+            })),
+        };
+        let embeddings = runtime.embed_texts(&["alpha".to_string(), "beta".to_string()])?;
+        let request = handle.join().expect("fake embedding server should finish");
+
+        assert_eq!(embeddings.len(), 2);
+        assert_eq!(embeddings[0], vec![1.0, 0.0, 0.0]);
+        assert_eq!(embeddings[1], vec![0.0, 1.0, 0.0]);
+        assert!(
+            request.contains("doc: alpha") && request.contains("doc: beta"),
+            "request did not include document prefixes: {request}"
+        );
+        assert_eq!(
+            runtime.model_id(),
+            "custom-onnx-local|backend=llamacpp|pool=Mean|query_prefix=|document_prefix=doc: |layer_norm=false|truncate_dim=None|expected_dim=Some(3)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn llamacpp_endpoint_parse_accepts_openai_embeddings_url() -> Result<()> {
+        let endpoint = LlamaCppEndpoint::parse("http://127.0.0.1:8080/v1/embeddings")?;
+
+        assert_eq!(endpoint.host, "127.0.0.1");
+        assert_eq!(endpoint.port, 8080);
+        assert_eq!(endpoint.path, "/v1/embeddings");
+        Ok(())
     }
 
     #[test]

@@ -111,6 +111,7 @@ Start with:
 - `crates/codestory-runtime/src/search/engine.rs`
 - `crates/codestory-store/src/search_doc_store.rs`
 - `docs/testing/codestory-e2e-stats-log.md`
+- `docs/testing/embedding-backend-benchmarks.md`
 
 Check:
 
@@ -120,6 +121,8 @@ Check:
 - whether `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` was changed from the profiled default of `64`
 - whether `CODESTORY_EMBED_SESSION_COUNT` or ONNX thread settings are oversubscribing the machine
 - whether `CODESTORY_EMBED_EXECUTION_PROVIDER` names a provider that was not compiled into this binary
+- whether `CODESTORY_EMBED_BACKEND=llamacpp` is pointing at a real `llama-server --embedding` endpoint before trusting GGUF speed claims
+- whether llama.cpp request concurrency is matched on both sides: `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT` in CodeStory and `-np` in the server
 
 Recovery order:
 
@@ -127,7 +130,8 @@ Recovery order:
 2. Compare semantic embedded/reused counts before changing graph code.
 3. For reuse regressions, inspect semantic doc version, generated text hash, embedding model, and embedding dimension.
 4. For cold-only regressions, inspect durable semantic scope, length-bucket ordering, embedding batch size, and ONNX session count.
-5. For hardware-provider experiments, first verify CPU behavior is correct and then check `cargo check -p codestory-runtime --features onnx-cuda` or `onnx-directml`.
+5. For backend experiments, first verify the runtime is using the backend under test, then rerun the speed and quality comparisons documented in `docs/testing/embedding-backend-benchmarks.md`.
+6. For ONNX hardware-provider experiments, check `cargo check -p codestory-runtime --features onnx-cuda` or `onnx-directml`.
 
 ## If Grounding Is Wrong
 

@@ -113,6 +113,11 @@ Run that lane only when the change crosses CLI and runtime behavior together, su
 cargo check -p codestory-bench --benches
 ```
 
+When changing embedding backends, model profiles, pooling, prefixes, batching,
+or hardware-provider settings, also rerun the speed and retrieval-quality
+comparison described in
+[`embedding-backend-benchmarks.md`](../testing/embedding-backend-benchmarks.md).
+
 For indexing performance work, run the full bench when practical:
 
 ```powershell

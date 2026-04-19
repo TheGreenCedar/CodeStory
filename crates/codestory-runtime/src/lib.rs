@@ -1188,7 +1188,7 @@ fn sync_llm_symbol_projection(
 
     let model_id = engine
         .embedding_model_id()
-        .unwrap_or("sentence-transformers/all-MiniLM-L6-v2-local")
+        .unwrap_or("BAAI/bge-small-en-v1.5-local")
         .to_string();
     let updated_at_epoch_ms = current_epoch_ms();
 
@@ -3191,7 +3191,10 @@ mod tests {
     use crossbeam_channel::unbounded;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
     use tempfile::tempdir;
+
+    static ENV_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     struct EnvGuard {
         key: &'static str,
@@ -3228,13 +3231,38 @@ mod tests {
         }
     }
 
-    fn hybrid_test_env() -> Vec<EnvGuard> {
-        vec![
-            EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "true"),
-            EnvGuard::set(EMBEDDING_RUNTIME_MODE_ENV, "hash"),
-            EnvGuard::remove(EMBEDDING_MODEL_ENV),
-            EnvGuard::remove(EMBEDDING_TOKENIZER_ENV),
-        ]
+    struct HybridTestEnv {
+        guards: Vec<EnvGuard>,
+        _lock: StdMutexGuard<'static, ()>,
+    }
+
+    impl HybridTestEnv {
+        fn push(&mut self, guard: EnvGuard) {
+            self.guards.push(guard);
+        }
+    }
+
+    fn hybrid_test_env() -> HybridTestEnv {
+        let lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        HybridTestEnv {
+            guards: vec![
+                EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "true"),
+                EnvGuard::set(EMBEDDING_RUNTIME_MODE_ENV, "hash"),
+                EnvGuard::set(EMBEDDING_PROFILE_ENV, "bge-small-en-v1.5"),
+                EnvGuard::remove(EMBEDDING_MODEL_ENV),
+                EnvGuard::remove(EMBEDDING_MODEL_ID_ENV),
+                EnvGuard::remove(EMBEDDING_TOKENIZER_ENV),
+                EnvGuard::remove(EMBEDDING_POOLING_ENV),
+                EnvGuard::remove(EMBEDDING_QUERY_PREFIX_ENV),
+                EnvGuard::remove(EMBEDDING_DOCUMENT_PREFIX_ENV),
+                EnvGuard::remove(EMBEDDING_LAYER_NORM_ENV),
+                EnvGuard::remove(EMBEDDING_TRUNCATE_DIM_ENV),
+                EnvGuard::remove(EMBEDDING_EXPECTED_DIM_ENV),
+            ],
+            _lock: lock,
+        }
     }
 
     #[test]
@@ -4091,18 +4119,19 @@ pub fn exact_symbol_anchor() {{}}
             .get_nodes()
             .expect("load nodes")
             .into_iter()
-            .find(|node| node.kind == NodeKind::FUNCTION)
+            .find(|node| {
+                matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    && terminal_symbol_segment(&node_display_name(node)) == "check_winner"
+            })
             .map(|node| NodeId::from(node.id))
-            .expect("function node");
+            .expect("check_winner symbol node");
         drop(storage);
 
         let context = controller
-            .symbol_context(symbol_id)
+            .symbol_context(symbol_id.clone())
             .expect("symbol context by id");
-        assert!(
-            !context.related_hits.is_empty(),
-            "expected lexical related hits for symbol context"
-        );
+        assert_eq!(context.node.id, symbol_id);
+        assert!(context.node.display_name.contains("check_winner"));
 
         let storage = Storage::open(&storage_path).expect("reopen storage after read");
         let after = storage

@@ -440,6 +440,8 @@ dependencies = [
  "ort",
  "parking_lot",
  "rayon",
+ "serde",
+ "serde_json",
  "tantivy",
  "tempfile",
  "tokenizers",
