@@ -10,7 +10,7 @@ you need per-query ranks or logs.
 | Question | Decision |
 | --- | --- |
 | Default self-contained backend | `CODESTORY_EMBED_BACKEND=onnx` |
-| Default model/profile | `CODESTORY_EMBED_PROFILE=bge-base-en-v1.5` |
+| Default model/profile | `CODESTORY_EMBED_PROFILE=bge-small-en-v1.5` |
 | Default semantic doc alias mode | `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=alias_variant` |
 | Default client batch size | `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE=128` |
 | Default ONNX sessions | Keep the runtime default cap of `2`; `4` was not repeat-stable enough to become default |
