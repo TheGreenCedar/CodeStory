@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use codestory_contracts::api::{SearchHit, SearchRepoTextMode, SearchRequest};
+use codestory_contracts::api::{
+    AgentHybridWeightsDto, SearchHit, SearchRepoTextMode, SearchRequest,
+};
 use std::fs;
 
 mod args;
@@ -95,6 +97,14 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "search")?;
+    let hybrid_weights = (cmd.hybrid_lexical.is_some()
+        || cmd.hybrid_semantic.is_some()
+        || cmd.hybrid_graph.is_some())
+    .then_some(AgentHybridWeightsDto {
+        lexical: cmd.hybrid_lexical,
+        semantic: cmd.hybrid_semantic,
+        graph: cmd.hybrid_graph,
+    });
 
     let search_results = runtime
         .search
@@ -102,6 +112,7 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
             query: cmd.query.clone(),
             repo_text: to_api_repo_text_mode(cmd.repo_text),
             limit_per_source: cmd.limit.clamp(1, 50),
+            hybrid_weights,
         })
         .map_err(map_api_error)?;
     let output = build_search_output(

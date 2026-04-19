@@ -243,6 +243,7 @@ fn execute_retrieval(
             query: prompt.to_string(),
             repo_text: codestory_contracts::api::SearchRepoTextMode::Off,
             limit_per_source: max_results as u32,
+            hybrid_weights: None,
         },
         req.focus_node_id.clone(),
         max_results,

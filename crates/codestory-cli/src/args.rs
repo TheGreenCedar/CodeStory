@@ -155,6 +155,24 @@ pub(crate) struct SearchCommand {
     pub(crate) refresh: RefreshMode,
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
     pub(crate) format: OutputFormat,
+    #[arg(
+        long = "hybrid-lexical",
+        value_name = "WEIGHT",
+        help = "Override the lexical component weight for hybrid search research runs."
+    )]
+    pub(crate) hybrid_lexical: Option<f32>,
+    #[arg(
+        long = "hybrid-semantic",
+        value_name = "WEIGHT",
+        help = "Override the semantic component weight for hybrid search research runs."
+    )]
+    pub(crate) hybrid_semantic: Option<f32>,
+    #[arg(
+        long = "hybrid-graph",
+        value_name = "WEIGHT",
+        help = "Override the graph component weight for hybrid search research runs."
+    )]
+    pub(crate) hybrid_graph: Option<f32>,
 }
 
 #[derive(Args, Debug, Clone)]

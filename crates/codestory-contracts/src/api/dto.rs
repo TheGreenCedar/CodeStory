@@ -62,6 +62,8 @@ pub struct SearchRequest {
     pub repo_text: SearchRepoTextMode,
     #[serde(default = "default_search_limit_per_source")]
     pub limit_per_source: u32,
+    #[serde(default)]
+    pub hybrid_weights: Option<AgentHybridWeightsDto>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]

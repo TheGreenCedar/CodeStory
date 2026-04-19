@@ -132,7 +132,8 @@ Hybrid retrieval setup:
 - local ONNX artifacts: set `CODESTORY_EMBED_MODEL_PATH` to the ONNX model; `CODESTORY_EMBED_TOKENIZER_PATH` defaults to a sibling `tokenizer.json`, or a parent-directory tokenizer for layouts like `models/bge-small-en-v1.5/onnx/model.onnx`
 - llama.cpp GGUF server: run `llama-server --embedding` and set `CODESTORY_EMBED_LLAMACPP_URL` if it is not listening at `http://127.0.0.1:8080/v1/embeddings`; tune concurrent embedding requests with `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT`
 - durable semantic docs are the default; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` to include lower-signal local/member/module symbols for investigation
-- embedding batch size defaults to `64`; override with `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` only while profiling
+- embedding batch size defaults to `128`; override with `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` only while profiling
+- search research can override hybrid ranking weights with `search --hybrid-lexical <WEIGHT> --hybrid-semantic <WEIGHT> --hybrid-graph <WEIGHT>`; omit these flags for the runtime defaults
 - ONNX CPU tuning: `CODESTORY_EMBED_SESSION_COUNT`, `CODESTORY_EMBED_INTRA_THREADS`, `CODESTORY_EMBED_INTER_THREADS`, and `CODESTORY_EMBED_PARALLEL_EXECUTION`
 - optional ONNX providers: build `codestory-runtime` with `onnx-cuda` or `onnx-directml` and set `CODESTORY_EMBED_EXECUTION_PROVIDER=cuda` or `directml`
 - lexical-only mode: set `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false`

@@ -116,6 +116,7 @@ pub(crate) fn resolve_target(
                         query: query.clone(),
                         repo_text: SearchRepoTextMode::Off,
                         limit_per_source: 50,
+                        hybrid_weights: None,
                     },
                     None,
                     Some(50),

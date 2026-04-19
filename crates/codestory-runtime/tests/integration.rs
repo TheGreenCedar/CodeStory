@@ -61,6 +61,7 @@ fn test_cli_app_indexer_smoke() -> anyhow::Result<()> {
             query: "f0".to_string(),
             repo_text: codestory_contracts::api::SearchRepoTextMode::Off,
             limit_per_source: 10,
+            hybrid_weights: None,
         })
         .unwrap();
     assert!(!hits.is_empty(), "Search should find f0");

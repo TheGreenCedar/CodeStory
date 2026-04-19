@@ -51,6 +51,21 @@ Index output should expose:
 - semantic timings and doc counts when semantic sync was considered
 - resolution diagnostics when the indexer reports them
 
+## `search` Command Research Options
+
+`codestory-cli search` keeps production behavior on the runtime defaults unless
+a caller explicitly passes hybrid research weights:
+
+| Option | Default | Runtime effect |
+| --- | --- | --- |
+| `--hybrid-lexical <WEIGHT>` | runtime default | Overrides the lexical component weight for this search request. |
+| `--hybrid-semantic <WEIGHT>` | runtime default | Overrides the semantic embedding component weight for this search request. |
+| `--hybrid-graph <WEIGHT>` | runtime default | Overrides the graph-neighborhood component weight for this search request. |
+
+The runtime clamps and normalizes supplied weights before ranking. These flags
+exist so benchmark runs can sweep retrieval settings without changing global
+environment variables or production defaults.
+
 ## Failure Signatures
 
 - CLI depends directly on `codestory-store` or `codestory-indexer`

@@ -16,13 +16,18 @@ target/release/codestory-cli(.exe) search [OPTIONS]
 | `--cache-dir` | path | *auto* | Override the cache directory |
 | `--query` | string | **required** | Search term — symbol name or natural-language text |
 | `--limit` | integer | `10` | Maximum number of results (capped at 50) |
+| `--repo-text` | enum | `auto` | Text-match mode: `auto`, `on`, or `off` |
 | `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
 | `--format` | enum | `markdown` | Output format: `markdown` or `json` |
+| `--hybrid-lexical` | float | runtime default | Override lexical weight for hybrid-search research |
+| `--hybrid-semantic` | float | runtime default | Override semantic weight for hybrid-search research |
+| `--hybrid-graph` | float | runtime default | Override graph-neighborhood weight for hybrid-search research |
 
 ## Query Behavior
 
 - **Symbol-like queries** (e.g. `AppController`, `run_indexing`) search the indexed symbol table.
 - **Natural-language queries** (e.g. `"how does incremental indexing work"`) also perform a repo-wide text scan and merge results by score.
+- **Hybrid weight overrides** are intended for benchmarking and tuning. Omit all three `--hybrid-*` flags for production-like runtime defaults.
 
 ## Output
 

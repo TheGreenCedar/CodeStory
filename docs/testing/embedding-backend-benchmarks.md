@@ -14,16 +14,41 @@ you need per-query ranks or logs.
 | Default semantic doc alias mode | `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=alias_variant` |
 | Default client batch size | `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE=128` |
 | Default ONNX sessions | Keep the runtime default cap of `2`; `4` was not repeat-stable enough to become default |
+| Best prior quality candidate | BGE-base ONNX DirectML, `alias_variant`, batch `128`, sessions `2` |
 | Best llama.cpp throughput profile | BGE-base GGUF, `--pooling cls`, CodeStory request count `4`, server `-np 4` |
 | Fast lower-quality profile | ONNX BGE-small with `no_alias`, batch `256` |
 | Quality experiment, not default | Qwen3 0.6B GGUF with `alias_variant`, context `2048`, `r1/np1` |
 | Blocked candidate | `nomic-embed-text-v2-moe` until semantic docs have a hard token budget |
+
+The shipped runtime default remains BGE-small because it is the current
+self-contained baseline in code and docs. The Stage 4 table below is retained as
+prior benchmark evidence, not as authority to silently flip the default without
+the broader Run 2 research pass.
 
 The alias feature stays, but the older full alias text does not become the
 default. The default is the compact alias variant: language, terminal name,
 owner names, and symbol-role hints are kept; full name-alias and path-alias
 lists are excluded unless `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=current_alias` is
 set for reproduction.
+
+## Run 2 Controls Snapshot
+
+The first expanded Run 2 controls stage ran on 2026-04-19 with artifacts in
+`target/embedding-research/controls-run2-20260419`. It used 70 queries and
+three repeats per control row.
+
+| Rank | Profile | Backend | Doc mode | Scope | Settings | MRR@10 | Hit@1 | Hit@10 | Persistent Hit@10 | Docs/sec | Index s | Decision |
+| ---: | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | BGE-small | ONNX DirectML | `no_alias` | `all` | b256, s2 | 0.6130 | 0.4571 | 0.9143 | 0.2500 | 740.528 | 31.642 | Best Run 2 controls score; promote to retrieval sweep, not default yet |
+| 2 | BGE-base | llama.cpp Vulkan | `alias_variant` | `all` | b128, r4/np4, ctx4096, cls pool | 0.6362 | 0.4857 | 0.9143 | 0.0000 | 399.220 | 42.175 | Best footprint/speed among BGE-base quality controls |
+| 3 | BGE-base | ONNX DirectML | `alias_variant` | `all` | b128, s2 | 0.6379 | 0.4857 | 0.9143 | 0.0000 | 301.715 | 50.642 | Highest MRR, but worst footprint and slower than llama.cpp |
+| 4 | BGE-small | ONNX DirectML | `alias_variant` | `durable` | b128, s2 | 0.5268 | 0.3286 | 0.9143 | 0.0000 | 404.451 | 19.556 | Current default baseline; fastest cold index because it embeds fewer docs |
+
+Controls are not enough to change the runtime default. The main signal is that
+`semantic_scope=all` plus BGE-small `no_alias` deserves the next retrieval sweep:
+it recovered one persistent-miss bucket while staying much faster and smaller
+than BGE-base. The cost is a larger semantic corpus, so compare it against
+hybrid weights and alias variants before promoting anything.
 
 ## Final Accepted Table
 
@@ -38,7 +63,7 @@ remain visible so the score cannot hide lower Hit@10 or persistent misses.
 
 | Rank | Profile | Backend | Doc mode | Settings | MRR@10 | Hit@1 | Hit@10 | Mean rank | Docs/sec | Index s | Score | Use |
 | ---: | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 1 | BGE-base | ONNX DirectML | `alias_variant` | b128, s2 | 0.5006 | 0.3035 | 0.8214 | 2.2391 | 301.899 | 50.524 | 0.7683 | Default self-contained runtime |
+| 1 | BGE-base | ONNX DirectML | `alias_variant` | b128, s2 | 0.5006 | 0.3035 | 0.8214 | 2.2391 | 301.899 | 50.524 | 0.7683 | Best prior quality candidate |
 | 2 | Qwen3 0.6B | llama.cpp Vulkan | `alias_variant` | b128, r1/np1, ctx2048, last pool | 0.5060 | 0.3571 | 0.7857 | 2.1364 | 73.214 | 160.122 | 0.7000 | Quality experiment only: slower and lower Hit@10 |
 | 3 | BGE-base | llama.cpp Vulkan | `alias_variant` | b128, r4/np4, ctx4096, cls pool | 0.4881 | 0.2857 | 0.8214 | 2.3043 | 388.447 | 44.205 | 0.6674 | Best llama.cpp throughput profile |
 | 4 | BGE-base | ONNX DirectML | `alias_variant` | b128, s4 | 0.4881 | 0.2857 | 0.8214 | 2.3043 | 303.456 | 50.978 | 0.6176 | Not enough gain over s2 to become default |
@@ -65,9 +90,9 @@ The result is not a universal "aliases are always better" result:
 | llama.cpp EmbeddingGemma | `no_alias` | `current_alias` was -0.0504 | Do not use as a default candidate |
 
 Because model responses differ, alias mode is a runtime and harness variable.
-The shipped default follows the chosen default model: BGE-base with
-`alias_variant`. The harness can still reproduce `no_alias` and `current_alias`
-without hand-editing code.
+The shipped default is BGE-small with `alias_variant`, while the prior BGE-base
+candidate also uses `alias_variant`. The harness can still reproduce `no_alias`
+and `current_alias` without hand-editing code.
 
 ## Tuning Summary
 
@@ -76,7 +101,7 @@ without hand-editing code.
 | ONNX BGE-base sessions | Stage 2 showed s4 can be faster, but Stage 4 repeats did not preserve a quality or speed advantage over s2. Keep s2/default session cap for now. |
 | ONNX BGE-base batch | Batch 128 remains the comparison and default value. Batch 256 did not improve quality and was not clearly faster in the clean tuning run. |
 | llama.cpp BGE-base parallelism | `r4/np4` gave the best repeat throughput while preserving Hit@10. The earlier `r1/np1` MRR bump did not repeat. |
-| BGE-small | Best treated as a fast no-alias profile. It is not a default because MRR lags BGE-base. |
+| BGE-small | Shipped default profile remains BGE-small with compact aliases. The faster no-alias BGE-small row stays a speed tradeoff, not the default. |
 | Qwen3 0.6B | Strong MRR but lower Hit@10 and about 4x slower than ONNX BGE-base in finalists. Keep as an experiment. |
 | Prompt/pooling sweeps | BGE code-query prefix hurt MRR and Hit@10. BGE no-query-prefix hurt ONNX MRR. BGE mean pooling improved Hit@10 but reduced primary MRR. Qwen symbol instruction hurt MRR. |
 | Nomic v1.5 prompt sweep | The no-prefix variant failed with a Windows search-index permission error, not a quality result. Keep the existing Nomic prompt/profile until retested. |
@@ -91,11 +116,14 @@ without hand-editing code.
 | Stage 2 tuning | `target/embedding-research/tuning-stage2-clean-20260419` | Clean batch/session/parallelism tuning subset. |
 | Stage 3 prompt | `target/embedding-research/prompt-stage3-20260419` | Prompt, pooling, context, and profile-specific toggles. |
 | Stage 4 finalists | `target/embedding-research/finalists-stage4-20260419` | Two-repeat finalist run used for the accepted table. |
+| Run 2 controls | `target/embedding-research/controls-run2-20260419` | Expanded 70-query controls for default, prior BGE-base candidates, and fast BGE-small. |
 | Superseded raw run | `target/embedding-research/tuning-stage2-20260419` | Kept as provenance only; it mixed selected IDs across stages before the harness selection bug was fixed. |
 
 Each current run writes `results.csv`, `results.json`, `query-ranks.csv`,
 `alias-comparisons.csv`, `cases.json`, `queries.json`, raw per-case logs, and a
 Markdown report. New finalist/repeat runs also write `repeat-summary.csv`.
+Run 2 additionally writes `manifest.json` and `sources.md`; see
+[embedding-research-run-2.md](embedding-research-run-2.md).
 
 ## Recovered Evidence
 
@@ -117,6 +145,9 @@ Historical rows are useful provenance, but they do not decide defaults:
 Decision-grade rows must follow this contract:
 
 - Use `scripts/embedding-gpu-fair-benchmark.mjs` or its successor.
+- Start with the source-led stage contract in
+  [embedding-research-run-2.md](embedding-research-run-2.md) before adding new
+  tuning cases.
 - Use the CodeStory runtime indexing path, not a standalone embedding probe.
 - Use isolated cache directories per row under `target/embedding-research/<run>/`.
 - Keep one comparison table to one semantic doc mode and one batch-size policy,
@@ -125,6 +156,9 @@ Decision-grade rows must follow this contract:
 - For llama.cpp rows, require a GPU device log plus full model-layer offload.
 - Store raw logs and per-query ranks. Do not collapse the result to only the
   final score.
+- Treat skipped rows as real research findings when the blocker is missing
+  artifacts, absent vector-quant storage support, or an incompatible model
+  context window.
 
 Useful commands:
 
@@ -132,6 +166,16 @@ Useful commands:
 cargo build --release -p codestory-cli --features codestory-runtime/onnx-directml
 
 $env:CODESTORY_EMBED_RESEARCH_STAGE = 'smoke'
+node scripts/embedding-gpu-fair-benchmark.mjs
+
+$env:CODESTORY_EMBED_RESEARCH_STAGE = 'source-scan'
+node scripts/embedding-gpu-fair-benchmark.mjs
+
+$env:CODESTORY_EMBED_RESEARCH_STAGE = 'controls'
+node scripts/embedding-gpu-fair-benchmark.mjs
+
+$env:CODESTORY_EMBED_RESEARCH_STAGE = 'retrieval'
+$env:CODESTORY_EMBED_RESEARCH_LIST = '1'
 node scripts/embedding-gpu-fair-benchmark.mjs
 
 $env:CODESTORY_EMBED_RESEARCH_STAGE = 'alias'
@@ -153,10 +197,9 @@ This is the planned follow-up work, in priority order:
 
 | Priority | Work | Why |
 | ---: | --- | --- |
-| 1 | Stabilize finalist repeat noise by checking deterministic ordering, tie breaks, and cache/index rebuild differences. | Stage 4 showed BGE-base MRR can move between 0.4881 and 0.5131 across repeats. |
-| 2 | Add a token-aware semantic-doc budget and retest `nomic-embed-text-v2-moe`. | It cannot be fairly judged while alias docs can overflow its context. |
-| 3 | Expand the query suite beyond 28 queries and weight persistent-miss buckets explicitly. | Four persistent misses still dominate the failure story. |
-| 4 | Sweep hybrid weights and semantic doc scope (`durable` vs `all`) for BGE-base finalists. | Retrieval settings may move quality more than backend settings now. |
-| 5 | Fill the remaining llama.cpp equivalents for smaller models under the new alias modes. | Older BGE-small/MiniLM llama rows exist, but not all were rerun under this staged GPU-only harness. |
-| 6 | Sweep llama server `--batch-size`, `--ubatch-size`, flash attention, and context for BGE-base and Qwen. | Current llama results mostly vary request/server parallelism and context. |
-| 7 | Try additional compact alias variants rather than restoring full aliases. | Full aliases helped some models but hurt others; compact variants are the promising path. |
+| 1 | Run `retrieval` to sweep hybrid weights, semantic scope, and alias mode. | Run 2 controls made `scope=all`, BGE-small, and `no_alias` look promising, but retrieval settings may be the real quality lever. |
+| 2 | Add a token-aware semantic-doc budget and retest `nomic-embed-text-v2-moe`. | It cannot be fairly judged while alias docs can overflow its context; Run 2 records it as skipped until then. |
+| 3 | Implement quantized-vector storage/search with full-precision rescoring, then run `vector-quant`. | Source scan says vector quantization is separate from model quantization, but CodeStory cannot benchmark it honestly until the store/search path exists. |
+| 4 | Generate missing GGUF/ONNX quantized artifacts and run `weight-quant`. | The harness now records missing artifacts as skipped rows instead of false failures. |
+| 5 | Run `dimension` for Nomic v1.5 and compare against BGE-small negative controls. | Nomic documents Matryoshka dimensions; BGE truncation should stay a negative control. |
+| 6 | Promote only repeat-stable rows into `finalists2`. | Defaults should not change from a single mixed tuning pass. |

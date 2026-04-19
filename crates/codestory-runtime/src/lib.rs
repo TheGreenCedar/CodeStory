@@ -2178,10 +2178,11 @@ impl AppController {
                 query: query.clone(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: req.limit_per_source,
+                hybrid_weights: req.hybrid_weights.clone(),
             },
             None,
             limit_per_source,
-            None,
+            req.hybrid_weights.clone(),
         )?;
         let storage = self.open_storage()?;
 
@@ -3897,6 +3898,7 @@ pub fn exact_symbol_anchor() {{}}
                 query: "AppController".to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 10,
+                hybrid_weights: None,
             })
             .expect("search");
 
@@ -3965,6 +3967,7 @@ pub fn exact_symbol_anchor() {{}}
                     query: query.to_string(),
                     repo_text: SearchRepoTextMode::Off,
                     limit_per_source: 10,
+                    hybrid_weights: None,
                 })
                 .expect("search fixtures");
             let first = hits.first().expect("at least one hit");
@@ -4013,6 +4016,7 @@ pub fn exact_symbol_anchor() {{}}
                 query: "How does the language parsing work in this repo?".to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 20,
+                hybrid_weights: None,
             })
             .expect("search with natural language");
 
@@ -4372,6 +4376,7 @@ pub fn exact_symbol_anchor() {{}}
                 query: "how does alpha work".to_string(),
                 repo_text: SearchRepoTextMode::On,
                 limit_per_source: 5,
+                hybrid_weights: None,
             })
             .expect("search results");
 
@@ -4639,6 +4644,7 @@ pub fn exact_symbol_anchor() {{}}
                 query: "check_winner".to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 10,
+                hybrid_weights: None,
             })
             .expect_err("search should be blocked while indexing");
 
@@ -4664,6 +4670,7 @@ pub fn exact_symbol_anchor() {{}}
                 query: "check_winner".to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 10,
+                hybrid_weights: None,
             })
             .expect("lazy search should succeed");
 

@@ -38,6 +38,66 @@ const blockedCandidates = [
   },
 ];
 
+const researchSources = [
+  {
+    id: "sentence-transformers-embedding-quantization",
+    url: "https://www.sbert.net/docs/package_reference/util/quantization.html",
+    claim:
+      "Embedding quantization is separate from model-weight quantization and supports float32, int8, uint8, binary, and ubinary corpus encodings with optional rescoring.",
+  },
+  {
+    id: "onnx-runtime-quantization",
+    url: "https://onnxruntime.ai/docs/performance/model-optimizations/quantization.html",
+    claim:
+      "ONNX Runtime supports dynamic/static int8 quantization and selected int4 weight-only quantization, but accuracy and operator support must be verified per model.",
+  },
+  {
+    id: "onnx-directml-execution-provider",
+    url: "https://onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html",
+    claim:
+      "DirectML requires sequential execution per session, so CodeStory benchmarks use separate ONNX sessions rather than parallel Run calls on one session.",
+  },
+  {
+    id: "llama-cpp-quantize",
+    url: "https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md",
+    claim:
+      "llama.cpp quantization reduces GGUF weight precision and model size, can affect quality, and can use imatrix calibration for better low-bit results.",
+  },
+  {
+    id: "qdrant-vector-quantization",
+    url: "https://qdrant.tech/documentation/manage-data/quantization/",
+    claim:
+      "Vector database quantization is a storage/search optimization lane distinct from embedding model inference.",
+  },
+  {
+    id: "nomic-v15-matryoshka",
+    url: "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5",
+    claim:
+      "Nomic v1.5 documents Matryoshka dimensionality tradeoffs at 768, 512, 256, 128, and 64 dimensions.",
+  },
+  {
+    id: "nomic-v2-moe",
+    url: "https://huggingface.co/nomic-ai/nomic-embed-text-v2-moe",
+    claim:
+      "Nomic v2 MoE remains a candidate only after CodeStory can enforce a semantic-doc token budget compatible with its context limits.",
+  },
+  {
+    id: "qwen3-embedding-06b",
+    url: "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B",
+    claim:
+      "Qwen3 0.6B remains a quality experiment candidate; CodeStory should not assume Matryoshka support unless the model card or implementation proves it.",
+  },
+];
+
+const precisionBytes = {
+  float32: 4,
+  float16: 2,
+  int8: 1,
+  uint8: 1,
+  binary: 1 / 8,
+  ubinary: 1 / 8,
+};
+
 const queries = [
   {
     id: "project-storage-open",
@@ -207,6 +267,258 @@ const queries = [
     expect: ["NodeKind"],
     bucket: "language-terms",
   },
+  {
+    id: "canonical-member-layout",
+    query: "extract members and fold parallel edges for canonical graph layout",
+    expect: ["extract_members", "fold_edges"],
+    bucket: "expanded-suite",
+  },
+  {
+    id: "canonical-depth",
+    query: "compute signed depth by graph node for canonical visualization",
+    expect: ["compute_signed_depth_by_node"],
+    bucket: "expanded-suite",
+  },
+  {
+    id: "canonical-visibility",
+    query: "infer visibility for canonical member extraction",
+    expect: ["infer_member_visibility"],
+    bucket: "expanded-suite",
+  },
+  {
+    id: "refresh-request",
+    query: "resolve refresh request auto full incremental none for CLI reads",
+    expect: ["resolve_refresh_request"],
+    bucket: "expanded-suite",
+  },
+  {
+    id: "cache-root-hash",
+    query: "cache root for project hashes canonical project path",
+    expect: ["cache_root_for_project"],
+    bucket: "expanded-suite",
+  },
+  {
+    id: "fnv1a-cache-hash",
+    query: "fnv1a hex hash bytes for cache directory names",
+    expect: ["fnv1a_hex"],
+    bucket: "expanded-suite",
+  },
+  {
+    id: "resolution-file-filter",
+    query: "search hit matches file filter path fragment during target resolution",
+    expect: ["search_hit_matches_file_filter"],
+    bucket: "expanded-suite",
+  },
+  {
+    id: "resolution-rank",
+    query: "compare resolution hits exact symbol before ambiguous candidates",
+    expect: ["compare_resolution_hits"],
+    bucket: "expanded-suite",
+  },
+  {
+    id: "normalize-path-fragment",
+    query: "normalize path fragment for query resolution file filters",
+    expect: ["normalize_path_fragment"],
+    bucket: "path-terms",
+  },
+  {
+    id: "semantic-symbol-aliases",
+    query: "semantic symbol aliases split namespaces camel snake acronyms",
+    expect: ["semantic_symbol_aliases"],
+    bucket: "alias-sensitive",
+  },
+  {
+    id: "semantic-path-aliases",
+    query: "semantic path aliases from runtime lib path components",
+    expect: ["semantic_path_aliases"],
+    bucket: "alias-sensitive",
+  },
+  {
+    id: "semantic-role-aliases",
+    query: "semantic symbol role aliases for methods structs enums",
+    expect: ["semantic_symbol_role_aliases"],
+    bucket: "role-terms",
+  },
+  {
+    id: "pending-doc-length-sort",
+    query: "sort pending LLM symbol docs for embedding batches by text length",
+    expect: ["sort_pending_llm_symbol_docs_for_embedding_batches"],
+    bucket: "semantic-indexing",
+  },
+  {
+    id: "flush-pending-docs",
+    query: "flush pending LLM symbol docs into SQLite storage and search engine",
+    expect: ["flush_pending_llm_symbol_docs"],
+    bucket: "semantic-indexing",
+  },
+  {
+    id: "llm-doc-hash",
+    query: "LLM symbol document hash includes semantic doc version prefix",
+    expect: ["llm_symbol_doc_hash"],
+    bucket: "semantic-indexing",
+  },
+  {
+    id: "map-llm-search-doc",
+    query: "map persisted LLM symbol document to search document embedding",
+    expect: ["map_llm_doc_to_search"],
+    bucket: "semantic-indexing",
+  },
+  {
+    id: "lexical-hybrid-fallback",
+    query: "lexical hybrid hits fallback when semantic runtime unavailable",
+    expect: ["lexical_hybrid_hits"],
+    bucket: "retrieval-weights",
+  },
+  {
+    id: "merge-search-hits",
+    query: "merge search hits by node id preserving stronger expanded score",
+    expect: ["merge_search_hits_by_node_id"],
+    bucket: "retrieval-weights",
+  },
+  {
+    id: "repo-text-hits",
+    query: "collect repo text hits grouped by runtime owned source files",
+    expect: ["collect_repo_text_hits"],
+    bucket: "repo-text",
+  },
+  {
+    id: "repo-text-mode",
+    query: "repo text enabled for mode auto off on",
+    expect: ["repo_text_enabled_for_mode"],
+    bucket: "repo-text",
+  },
+  {
+    id: "build-search-hit",
+    query: "build search hit with declaration coordinates and occurrence fallback",
+    expect: ["build_search_hit"],
+    bucket: "search-output",
+  },
+  {
+    id: "project-summary-storage",
+    query: "project summary from storage with retrieval state",
+    expect: ["project_summary_from_storage"],
+    bucket: "runtime-state",
+  },
+  {
+    id: "incremental-indexing-common",
+    query: "run incremental indexing common refresh for changed files",
+    expect: ["run_incremental_indexing_common"],
+    bucket: "runtime-state",
+  },
+  {
+    id: "workspace-refresh-inputs",
+    query: "workspace refresh inputs from store inventory",
+    expect: ["workspace_refresh_inputs"],
+    bucket: "runtime-state",
+  },
+  {
+    id: "rebuild-search-state",
+    query: "rebuild search state from storage after indexing",
+    expect: ["rebuild_search_state_from_storage"],
+    bucket: "runtime-state",
+  },
+  {
+    id: "refresh-caches",
+    query: "refresh caches after indexing semantic docs",
+    expect: ["refresh_caches"],
+    bucket: "runtime-state",
+  },
+  {
+    id: "search-hybrid-scored-inner",
+    query: "search hybrid scored inner with graph boosts and weights",
+    expect: ["search_hybrid_scored_inner"],
+    bucket: "retrieval-weights",
+  },
+  {
+    id: "node-details",
+    query: "node details source occurrence edge digest for a symbol",
+    expect: ["node_details"],
+    bucket: "baseline",
+  },
+  {
+    id: "read-file-text",
+    query: "read file text from project path through runtime controller",
+    expect: ["read_file_text"],
+    bucket: "file-io",
+  },
+  {
+    id: "write-file-text",
+    query: "write file text validates path stays inside project root",
+    expect: ["write_file_text"],
+    bucket: "file-io",
+  },
+  {
+    id: "agent-command-resolution",
+    query: "resolve agent command local bin windows npm shim",
+    expect: ["resolve_agent_command"],
+    bucket: "agent",
+  },
+  {
+    id: "codex-agent-runner",
+    query: "run Codex agent and detect Windows batch command",
+    expect: ["run_codex_agent", "is_windows_batch_command"],
+    bucket: "agent",
+  },
+  {
+    id: "trail-bfs",
+    query: "trail store breadth first search distances outgoing incoming edges",
+    expect: ["get_trail_bfs", "bfs_distances"],
+    bucket: "trail",
+  },
+  {
+    id: "trail-to-target",
+    query: "get trail to target graph path",
+    expect: ["get_trail_to_target"],
+    bucket: "trail",
+  },
+  {
+    id: "trail-edges-for-node",
+    query: "get edges for node id in trail store",
+    expect: ["get_edges_for_node_id"],
+    bucket: "trail",
+  },
+  {
+    id: "workspace-exclude-patterns",
+    query: "compile exclude patterns for workspace source discovery",
+    expect: ["compile_exclude_patterns"],
+    bucket: "workspace",
+  },
+  {
+    id: "workspace-normalize-path",
+    query: "normalize lexical path for workspace file inventory",
+    expect: ["normalize_lexical_path"],
+    bucket: "workspace",
+  },
+  {
+    id: "source-files-discovery",
+    query: "workspace source files apply language filters and excludes",
+    expect: ["source_files"],
+    bucket: "workspace",
+  },
+  {
+    id: "aggregate-symbol-matches",
+    query: "aggregate symbol matches from direct and expanded search terms",
+    expect: ["aggregate_symbol_matches"],
+    bucket: "search-ranking",
+  },
+  {
+    id: "expand-symbol-query",
+    query: "should expand symbol query for sentence prompts",
+    expect: ["should_expand_symbol_query"],
+    bucket: "search-ranking",
+  },
+  {
+    id: "file-text-match-line",
+    query: "file text match line for repo text search terms",
+    expect: ["file_text_match_line"],
+    bucket: "repo-text",
+  },
+  {
+    id: "preferred-occurrence",
+    query: "preferred occurrence uses declaration before fallback occurrences",
+    expect: ["preferred_occurrence"],
+    bucket: "search-output",
+  },
 ];
 
 const modelPaths = {
@@ -216,12 +528,37 @@ const modelPaths = {
   minilmGguf: path.join(root, "models/gguf/all-minilm-l6-v2/all-minilm-l6-v2-q8_0.gguf"),
   bgeSmallGguf: path.join(root, "models/gguf/bge-small-en-v1.5/bge-small-en-v1.5-q8_0.gguf"),
   bgeBaseGguf: path.join(root, "models/gguf/bge-base-en-v1.5/bge-base-en-v1.5.Q8_0.gguf"),
+  bgeBaseGgufQ6: path.join(root, "models/gguf/bge-base-en-v1.5/bge-base-en-v1.5.Q6_K.gguf"),
+  bgeBaseGgufQ5: path.join(root, "models/gguf/bge-base-en-v1.5/bge-base-en-v1.5.Q5_K_M.gguf"),
+  bgeBaseGgufQ4: path.join(root, "models/gguf/bge-base-en-v1.5/bge-base-en-v1.5.Q4_K_M.gguf"),
+  bgeSmallGgufQ6: path.join(root, "models/gguf/bge-small-en-v1.5/bge-small-en-v1.5-q6_k.gguf"),
+  bgeSmallGgufQ5: path.join(root, "models/gguf/bge-small-en-v1.5/bge-small-en-v1.5-q5_k_m.gguf"),
+  bgeSmallGgufQ4: path.join(root, "models/gguf/bge-small-en-v1.5/bge-small-en-v1.5-q4_k_m.gguf"),
+  bgeSmallOnnxInt8: path.join(root, "models/bge-small-en-v1.5/onnx/model.int8.onnx"),
+  bgeBaseOnnxInt8: path.join(root, "models/bge-base-en-v1.5/onnx/model.int8.onnx"),
+  bgeSmallOnnxInt4: path.join(root, "models/bge-small-en-v1.5/onnx/model.int4.onnx"),
+  bgeBaseOnnxInt4: path.join(root, "models/bge-base-en-v1.5/onnx/model.int4.onnx"),
   nomicV15Gguf: path.join(
     root,
     "models/gguf/nomic-embed-text-v1.5/nomic-embed-text-v1.5.Q8_0.gguf",
   ),
+  nomicV15GgufQ6: path.join(
+    root,
+    "models/gguf/nomic-embed-text-v1.5/nomic-embed-text-v1.5.Q6_K.gguf",
+  ),
+  nomicV15GgufQ5: path.join(
+    root,
+    "models/gguf/nomic-embed-text-v1.5/nomic-embed-text-v1.5.Q5_K_M.gguf",
+  ),
+  nomicV15GgufQ4: path.join(
+    root,
+    "models/gguf/nomic-embed-text-v1.5/nomic-embed-text-v1.5.Q4_K_M.gguf",
+  ),
   gemmaGguf: path.join(root, "models/gguf/embeddinggemma-300m/embeddinggemma-300m-q8_0.gguf"),
   qwenGguf: path.join(root, "models/gguf/qwen3-embedding-0.6b/Qwen3-Embedding-0.6B-Q8_0.gguf"),
+  qwenGgufQ6: path.join(root, "models/gguf/qwen3-embedding-0.6b/Qwen3-Embedding-0.6B-Q6_K.gguf"),
+  qwenGgufQ5: path.join(root, "models/gguf/qwen3-embedding-0.6b/Qwen3-Embedding-0.6B-Q5_K_M.gguf"),
+  qwenGgufQ4: path.join(root, "models/gguf/qwen3-embedding-0.6b/Qwen3-Embedding-0.6B-Q4_K_M.gguf"),
 };
 
 function onnxBase(id, profile, modelPath) {
@@ -288,6 +625,7 @@ function caseId(config) {
   const parts = [
     config.id,
     config.docMode,
+    config.semanticScope ? `scope-${config.semanticScope}` : "",
     `b${config.batch}`,
     config.kind === "onnx" ? `s${config.sessions}` : `r${config.requests}-np${config.parallel}`,
   ];
@@ -301,10 +639,25 @@ function caseId(config) {
   if (config.variant) {
     parts.push(config.variant);
   }
+  if (config.quantization) {
+    parts.push(`q-${config.quantization}`);
+  }
+  if (config.vectorEncoding) {
+    parts.push(`vec-${config.vectorEncoding}`);
+  }
+  if (config.truncateDim !== undefined) {
+    parts.push(`dim${config.truncateDim}`);
+  }
+  if (config.hybridWeights) {
+    parts.push(
+      `w${config.hybridWeights.lexical}-${config.hybridWeights.semantic}-${config.hybridWeights.graph}`,
+    );
+  }
   if (config.repeatIndex !== undefined) {
     parts.push(`run${config.repeatIndex}`);
   }
   return parts
+    .filter(Boolean)
     .join("-")
     .replaceAll(/[^a-zA-Z0-9._-]+/g, "-")
     .replaceAll(/-+/g, "-")
@@ -316,6 +669,50 @@ function stageSmoke() {
     cloneCase(baseProfiles.onnxBgeBase, { stage: "smoke" }),
     cloneCase(baseProfiles.llamaBgeBase, { stage: "smoke" }),
   ];
+}
+
+function withRepeats(profiles, stage, repeats = 3) {
+  return profiles.flatMap((profile) =>
+    Array.from({ length: repeats }, (_, index) =>
+      cloneCase(profile, { stage, repeatIndex: index + 1 }),
+    ),
+  );
+}
+
+function stageControls() {
+  return withRepeats(
+    [
+      cloneCase(baseProfiles.onnxBgeSmall, {
+        variant: "current-default",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+        batch: 128,
+        sessions: 2,
+      }),
+      cloneCase(baseProfiles.onnxBgeBase, {
+        variant: "prior-best-onnx",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 128,
+        sessions: 2,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "prior-best-llama",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        requests: 4,
+        parallel: 4,
+      }),
+      cloneCase(baseProfiles.onnxBgeSmall, {
+        variant: "fast-bge-small",
+        docMode: "no_alias",
+        semanticScope: "all",
+        batch: 256,
+        sessions: 2,
+      }),
+    ],
+    "controls",
+  );
 }
 
 function stageAlias() {
@@ -331,6 +728,135 @@ function stageAlias() {
   return profiles.flatMap((profile) =>
     docModes.map((docMode) => cloneCase(profile, { stage: "alias", docMode })),
   );
+}
+
+function stageWeightQuant() {
+  const llamaRows = [
+    [baseProfiles.llamaBgeBase, modelPaths.bgeBaseGgufQ6, "q6_k"],
+    [baseProfiles.llamaBgeBase, modelPaths.bgeBaseGgufQ5, "q5_k_m"],
+    [baseProfiles.llamaBgeBase, modelPaths.bgeBaseGgufQ4, "q4_k_m"],
+    [baseProfiles.llamaBgeSmall, modelPaths.bgeSmallGgufQ6, "q6_k"],
+    [baseProfiles.llamaBgeSmall, modelPaths.bgeSmallGgufQ5, "q5_k_m"],
+    [baseProfiles.llamaBgeSmall, modelPaths.bgeSmallGgufQ4, "q4_k_m"],
+    [baseProfiles.llamaNomicV15, modelPaths.nomicV15GgufQ6, "q6_k"],
+    [baseProfiles.llamaNomicV15, modelPaths.nomicV15GgufQ5, "q5_k_m"],
+    [baseProfiles.llamaNomicV15, modelPaths.nomicV15GgufQ4, "q4_k_m"],
+    [baseProfiles.llamaQwen, modelPaths.qwenGgufQ6, "q6_k"],
+    [baseProfiles.llamaQwen, modelPaths.qwenGgufQ5, "q5_k_m"],
+    [baseProfiles.llamaQwen, modelPaths.qwenGgufQ4, "q4_k_m"],
+  ].map(([base, modelPath, quantization]) =>
+    cloneCase(base, {
+      stage: "weight-quant",
+      modelPath,
+      quantization,
+      variant: "gguf",
+      allowMissingArtifact: true,
+    }),
+  );
+
+  const onnxRows = [
+    [baseProfiles.onnxBgeSmall, modelPaths.bgeSmallOnnxInt8, "int8-dynamic"],
+    [baseProfiles.onnxBgeBase, modelPaths.bgeBaseOnnxInt8, "int8-dynamic"],
+    [baseProfiles.onnxBgeSmall, modelPaths.bgeSmallOnnxInt4, "int4-weight-only"],
+    [baseProfiles.onnxBgeBase, modelPaths.bgeBaseOnnxInt4, "int4-weight-only"],
+  ].map(([base, modelPath, quantization]) =>
+    cloneCase(base, {
+      stage: "weight-quant",
+      modelPath,
+      quantization,
+      variant: "onnx",
+      allowMissingArtifact: true,
+    }),
+  );
+
+  return [...llamaRows, ...onnxRows];
+}
+
+function stageVectorQuant() {
+  return ["float16", "int8", "uint8", "binary", "ubinary"].map((vectorEncoding) =>
+    cloneCase(baseProfiles.onnxBgeSmall, {
+      stage: "vector-quant",
+      variant: `stored-${vectorEncoding}`,
+      vectorEncoding,
+      skipReason:
+        "CodeStory does not yet have a quantized-vector storage/search implementation; this source-led lane is manifest-only until that lands.",
+    }),
+  );
+}
+
+function stageDimension() {
+  const nomicDims = [768, 512, 256, 128, 64].map((dimension) =>
+    cloneCase(baseProfiles.llamaNomicV15, {
+      stage: "dimension",
+      variant: `nomic-dim-${dimension}`,
+      truncateDim: dimension,
+      expectedDim: dimension,
+      vectorEncoding: "float32",
+      docMode: "current_alias",
+    }),
+  );
+
+  const negativeControls = [384, 256].map((dimension) =>
+    cloneCase(baseProfiles.onnxBgeSmall, {
+      stage: "dimension",
+      variant: `bge-small-negative-dim-${dimension}`,
+      truncateDim: dimension,
+      expectedDim: dimension,
+      vectorEncoding: "float32",
+      docMode: "no_alias",
+    }),
+  );
+
+  return [...nomicDims, ...negativeControls];
+}
+
+function stageRetrieval() {
+  const weightSweeps = [
+    ["default-weights", undefined],
+    ["lexical-heavy", { lexical: 0.65, semantic: 0.3, graph: 0.05 }],
+    ["semantic-heavy", { lexical: 0.15, semantic: 0.8, graph: 0.05 }],
+    ["balanced", { lexical: 0.45, semantic: 0.45, graph: 0.1 }],
+  ].map(([variant, hybridWeights]) =>
+    cloneCase(baseProfiles.onnxBgeSmall, {
+      stage: "retrieval",
+      variant,
+      semanticScope: "durable",
+      docMode: "alias_variant",
+      hybridWeights,
+    }),
+  );
+
+  const docSweeps = [
+    cloneCase(baseProfiles.onnxBgeSmall, {
+      stage: "retrieval",
+      variant: "scope-all",
+      semanticScope: "all",
+      docMode: "alias_variant",
+    }),
+    cloneCase(baseProfiles.onnxBgeSmall, {
+      stage: "retrieval",
+      variant: "no-alias",
+      semanticScope: "durable",
+      docMode: "no_alias",
+    }),
+    cloneCase(baseProfiles.onnxBgeSmall, {
+      stage: "retrieval",
+      variant: "full-alias",
+      semanticScope: "durable",
+      docMode: "current_alias",
+    }),
+    cloneCase(baseProfiles.llamaNomicV15, {
+      stage: "retrieval",
+      variant: "nomic-v2-token-budget-needed",
+      id: "llama-nomic-v2",
+      profile: "nomic-embed-text-v2-moe",
+      docMode: "current_alias",
+      skipReason:
+        "Blocked until semantic docs expose a hard token budget; previous alias docs exceeded the model context limit.",
+    }),
+  ];
+
+  return [...weightSweeps, ...docSweeps];
 }
 
 function stageTuning() {
@@ -475,17 +1001,64 @@ function stageFinalists() {
   );
 }
 
-function allCases() {
-  return [...stageSmoke(), ...stageAlias(), ...stageTuning(), ...stagePrompt(), ...stageFinalists()].map(
-    (config, index) => {
-      const withPort = config.kind === "llama" ? { port: portBase + index } : {};
-      return {
-        ...config,
-        ...withPort,
-        case_id: caseId(config),
-      };
-    },
+function stageFinalistsRun2() {
+  return withRepeats(
+    [
+      cloneCase(baseProfiles.onnxBgeSmall, {
+        variant: "current-default",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+      }),
+      cloneCase(baseProfiles.onnxBgeBase, {
+        variant: "best-prior-quality",
+        docMode: "alias_variant",
+        semanticScope: "all",
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "best-prior-throughput",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        requests: 4,
+        parallel: 4,
+      }),
+      cloneCase(baseProfiles.onnxBgeSmall, {
+        variant: "fast-profile",
+        docMode: "no_alias",
+        semanticScope: "all",
+        batch: 256,
+      }),
+      cloneCase(baseProfiles.llamaNomicV15, {
+        variant: "nomic-dim-256",
+        docMode: "current_alias",
+        truncateDim: 256,
+        expectedDim: 256,
+      }),
+    ],
+    "finalists2",
   );
+}
+
+function allCases() {
+  return [
+    ...stageSmoke(),
+    ...stageControls(),
+    ...stageAlias(),
+    ...stageWeightQuant(),
+    ...stageVectorQuant(),
+    ...stageDimension(),
+    ...stageRetrieval(),
+    ...stageTuning(),
+    ...stagePrompt(),
+    ...stageFinalists(),
+    ...stageFinalistsRun2(),
+  ].map((config, index) => {
+    const withPort = config.kind === "llama" ? { port: portBase + index } : {};
+    return {
+      ...config,
+      ...withPort,
+      case_id: caseId(config),
+    };
+  });
 }
 
 function selectedCases() {
@@ -733,6 +1306,8 @@ function findRank(hits, query) {
 function score(searchResults) {
   const ranks = searchResults.map((result) => result.rank).filter((rank) => rank !== null);
   const count = searchResults.length;
+  const persistent = searchResults.filter((result) => result.bucket === "persistent-miss");
+  const persistentHits = persistent.filter((result) => result.rank !== null && result.rank <= 10);
   const hitAt = (k) => ranks.filter((rank) => rank <= k).length / count;
   const reciprocalSum = searchResults.reduce(
     (sum, result) => sum + (result.rank && result.rank <= 10 ? 1 / result.rank : 0),
@@ -745,6 +1320,7 @@ function score(searchResults) {
     hit_at_10: hitAt(10),
     mrr_at_10: reciprocalSum / count,
     mean_rank_when_found: ranks.length ? ranks.reduce((a, b) => a + b, 0) / ranks.length : null,
+    persistent_hit_at_10: persistent.length ? persistentHits.length / persistent.length : null,
     misses: searchResults.filter((result) => result.rank === null).map((result) => result.id),
     regressions: [],
   };
@@ -758,6 +1334,54 @@ function requiredFiles(config) {
   return files;
 }
 
+function hybridWeightArgs(config) {
+  if (!config.hybridWeights) {
+    return [];
+  }
+  return [
+    "--hybrid-lexical",
+    String(config.hybridWeights.lexical),
+    "--hybrid-semantic",
+    String(config.hybridWeights.semantic),
+    "--hybrid-graph",
+    String(config.hybridWeights.graph),
+  ];
+}
+
+function fileSizeMb(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    return null;
+  }
+  return fs.statSync(filePath).size / 1024 / 1024;
+}
+
+function embeddingDimension(config) {
+  if (config.expectedDim) {
+    return config.expectedDim;
+  }
+  if (config.truncateDim) {
+    return config.truncateDim;
+  }
+  if (config.profile === "qwen3-embedding-0.6b") {
+    return 1024;
+  }
+  if (
+    config.profile === "bge-base-en-v1.5" ||
+    config.profile === "nomic-embed-text-v1.5" ||
+    config.profile === "nomic-embed-text-v2-moe" ||
+    config.profile === "embeddinggemma-300m"
+  ) {
+    return 768;
+  }
+  return 384;
+}
+
+function vectorBytesPerDoc(config) {
+  const precision = config.vectorEncoding ?? "float32";
+  const bytes = precisionBytes[precision] ?? precisionBytes.float32;
+  return embeddingDimension(config) * bytes;
+}
+
 async function runCase(config) {
   const caseDir = path.join(outDir, config.case_id);
   const cacheDir = path.join(caseDir, "cache");
@@ -765,8 +1389,31 @@ async function runCase(config) {
   fs.rmSync(caseDir, { recursive: true, force: true });
   fs.mkdirSync(logsDir, { recursive: true });
 
+  if (config.skipReason) {
+    const skipped = {
+      ...config,
+      skipped: true,
+      error: config.skipReason,
+      model_size_mb: fileSizeMb(config.modelPath),
+      vector_bytes_per_doc: vectorBytesPerDoc(config),
+    };
+    fs.writeFileSync(path.join(caseDir, "result.json"), JSON.stringify(skipped, null, 2));
+    return skipped;
+  }
+
   for (const required of requiredFiles(config)) {
     if (!fs.existsSync(required)) {
+      if (config.allowMissingArtifact && required === config.modelPath) {
+        const skipped = {
+          ...config,
+          skipped: true,
+          error: `missing optional research artifact: ${required}`,
+          model_size_mb: null,
+          vector_bytes_per_doc: vectorBytesPerDoc(config),
+        };
+        fs.writeFileSync(path.join(caseDir, "result.json"), JSON.stringify(skipped, null, 2));
+        return skipped;
+      }
       throw new Error(`missing required file: ${required}`);
     }
   }
@@ -811,6 +1458,7 @@ async function runCase(config) {
           "none",
           "--format",
           "json",
+          ...hybridWeightArgs(config),
         ],
         env,
         path.join(logsDir, `${q.id}.log`),
@@ -844,6 +1492,8 @@ async function runCase(config) {
       embedding_model:
         indexJson.retrieval?.embedding_model ?? indexJson.summary?.retrieval?.embedding_model ?? "",
       retrieval_mode: indexJson.retrieval?.mode ?? indexJson.summary?.retrieval?.mode ?? "",
+      model_size_mb: fileSizeMb(config.modelPath),
+      vector_bytes_per_doc: vectorBytesPerDoc(config),
       score: score(searchResults),
       queries: searchResults,
     };
@@ -861,18 +1511,42 @@ function normalizedCombined(results) {
   }
   const mrrValues = ok.map((result) => result.score.mrr_at_10);
   const speedValues = ok.map((result) => result.docs_per_second);
+  const footprintValues = ok
+    .map((result) => result.model_size_mb)
+    .filter((value) => Number.isFinite(value));
   const minMrr = Math.min(...mrrValues);
   const maxMrr = Math.max(...mrrValues);
   const minSpeed = Math.min(...speedValues);
   const maxSpeed = Math.max(...speedValues);
+  const minFootprint = footprintValues.length ? Math.min(...footprintValues) : 0;
+  const maxFootprint = footprintValues.length ? Math.max(...footprintValues) : 0;
   for (const result of ok) {
-    const quality =
+    const normalizedMrr =
       maxMrr === minMrr ? 1 : (result.score.mrr_at_10 - minMrr) / (maxMrr - minMrr);
     const speed =
       maxSpeed === minSpeed ? 1 : (result.docs_per_second - minSpeed) / (maxSpeed - minSpeed);
-    result.combined_score = 0.7 * quality + 0.3 * speed;
+    const footprint =
+      !Number.isFinite(result.model_size_mb) || maxFootprint === minFootprint
+        ? 1
+        : (maxFootprint - result.model_size_mb) / (maxFootprint - minFootprint);
+    const quality =
+      0.45 * normalizedMrr +
+      0.2 * result.score.hit_at_10 +
+      0.2 * result.score.hit_at_1 +
+      0.15 * (result.score.persistent_hit_at_10 ?? result.score.hit_at_10);
+    const reliability = result.skipped ? 0 : 1;
+    result.quality_score = quality;
+    result.speed_score = speed;
+    result.footprint_score = footprint;
+    result.reliability_score = reliability;
+    result.decision_quality_gate = result.score.hit_at_10 >= 0.75;
+    result.combined_score = 0.5 * quality + 0.25 * speed + 0.15 * footprint + 0.1 * reliability;
   }
-  return [...ok].sort((a, b) => b.combined_score - a.combined_score);
+  return [...ok].sort(
+    (a, b) =>
+      Number(b.decision_quality_gate) - Number(a.decision_quality_gate) ||
+      b.combined_score - a.combined_score,
+  );
 }
 
 function aliasComparisons(results) {
@@ -889,6 +1563,10 @@ function aliasComparisons(results) {
       result.parallel ?? "",
       result.ctx ?? "",
       result.pooling ?? "",
+      result.semanticScope ?? "",
+      result.quantization ?? "",
+      result.vectorEncoding ?? "",
+      result.truncateDim ?? "",
       result.variant ?? "",
     ].join("|");
     const group = groups.get(key) ?? {};
@@ -958,6 +1636,10 @@ function repeatSummaries(results) {
       docMode: group[0].docMode,
       kind: group[0].kind,
       profile: group[0].profile,
+      semanticScope: group[0].semanticScope ?? "",
+      quantization: group[0].quantization ?? "",
+      vectorEncoding: group[0].vectorEncoding ?? "",
+      truncateDim: group[0].truncateDim ?? "",
       batch: group[0].batch,
       sessions: group[0].sessions ?? "",
       requests: group[0].requests ?? "",
@@ -969,6 +1651,7 @@ function repeatSummaries(results) {
       docs_per_second: mean(group.map((result) => result.docs_per_second)),
       hit_at_1: mean(group.map((result) => result.score?.hit_at_1)),
       hit_at_10: mean(group.map((result) => result.score?.hit_at_10)),
+      persistent_hit_at_10: mean(group.map((result) => result.score?.persistent_hit_at_10)),
       mrr_at_10: mean(group.map((result) => result.score?.mrr_at_10)),
       mean_rank_when_found: mean(group.map((result) => result.score?.mean_rank_when_found)),
       misses: group[0].score?.misses?.join(";") ?? "",
@@ -978,6 +1661,77 @@ function repeatSummaries(results) {
         (right.mrr_at_10 ?? 0) - (left.mrr_at_10 ?? 0) ||
         (right.docs_per_second ?? 0) - (left.docs_per_second ?? 0),
     );
+}
+
+function writeManifest(cases) {
+  const manifest = {
+    generated_at: new Date().toISOString(),
+    artifact_root: outDir,
+    requested_stages: [...requestedStages],
+    case_count: cases.length,
+    query_count: queries.length,
+    scoring:
+      "Decision ranking applies a quality gate, then 50% quality, 25% speed, 15% footprint, and 10% reliability.",
+    source_references: researchSources,
+    blocked_candidates: blockedCandidates,
+    stages: {
+      "source-scan":
+        "Read primary sources and generate this manifest; no model rows run in this stage.",
+      controls:
+        "Three-repeat baselines for current default, prior BGE-base candidates, and fast BGE-small.",
+      "weight-quant":
+        "GGUF and ONNX model-weight quantization rows. Missing quantized artifacts are reported as skipped rows.",
+      "vector-quant":
+        "Stored-vector quantization lane. Manifest-only until CodeStory has quantized-vector storage/search support.",
+      dimension:
+        "Matryoshka/dimension-shortening rows, plus BGE-small negative controls.",
+      retrieval:
+        "Hybrid weight, semantic scope, and alias-mode sweeps using the CLI search weight flags.",
+      finalists2:
+        "Run only after earlier lanes produce candidates; three-repeat comparison of selected rows.",
+    },
+    cases: cases.map((config) => ({
+      case_id: config.case_id,
+      stage: config.stage,
+      id: config.id,
+      kind: config.kind,
+      hardware: config.hardware,
+      profile: config.profile,
+      semantic_scope: config.semanticScope,
+      doc_mode: config.docMode,
+      quantization: config.quantization,
+      vector_encoding: config.vectorEncoding,
+      truncate_dim: config.truncateDim,
+      expected_dim: config.expectedDim,
+      model_path: config.modelPath,
+      model_size_mb: fileSizeMb(config.modelPath),
+      vector_bytes_per_doc: vectorBytesPerDoc(config),
+      batch: config.batch,
+      sessions: config.sessions,
+      requests: config.requests,
+      parallel: config.parallel,
+      ctx: config.ctx,
+      pooling: config.pooling,
+      hybrid_weights: config.hybridWeights,
+      variant: config.variant,
+      skip_reason: config.skipReason,
+      allow_missing_artifact: config.allowMissingArtifact,
+    })),
+  };
+  fs.writeFileSync(path.join(outDir, "manifest.json"), JSON.stringify(manifest, null, 2));
+  fs.writeFileSync(
+    path.join(outDir, "sources.md"),
+    [
+      "# Embedding Research Sources",
+      "",
+      ...researchSources.map((source) => `- [${source.id}](${source.url}): ${source.claim}`),
+      "",
+      "## Blocked Candidates",
+      "",
+      ...blockedCandidates.map((candidate) => `- \`${candidate.id}\`: ${candidate.reason}`),
+      "",
+    ].join("\n"),
+  );
 }
 
 function writeReports(results, cases) {
@@ -991,13 +1745,20 @@ function writeReports(results, cases) {
     "kind",
     "hardware",
     "profile",
+    "semantic_scope",
+    "quantization",
+    "vector_encoding",
+    "truncate_dim",
     "batch",
     "sessions",
     "requests",
     "parallel",
+    "hybrid_weights",
     "ctx",
     "pooling",
     "variant",
+    "model_size_mb",
+    "vector_bytes_per_doc",
     "index_seconds",
     "semantic_seconds",
     "semantic_doc_count",
@@ -1005,10 +1766,17 @@ function writeReports(results, cases) {
     "docs_per_second",
     "hit_at_1",
     "hit_at_10",
+    "persistent_hit_at_10",
     "mrr_at_10",
     "mean_rank_when_found",
+    "quality_score",
+    "speed_score",
+    "footprint_score",
+    "reliability_score",
+    "decision_quality_gate",
     "combined_score",
     "misses",
+    "skipped",
     "error",
   ];
   const rows = results.map((result) => [
@@ -1019,13 +1787,22 @@ function writeReports(results, cases) {
     result.kind,
     result.hardware,
     result.profile,
+    result.semanticScope ?? "",
+    result.quantization ?? "",
+    result.vectorEncoding ?? "",
+    result.truncateDim ?? "",
     result.batch,
     result.sessions ?? "",
     result.requests ?? "",
     result.parallel ?? "",
+    result.hybridWeights
+      ? `${result.hybridWeights.lexical}/${result.hybridWeights.semantic}/${result.hybridWeights.graph}`
+      : "",
     result.ctx ?? "",
     result.pooling ?? "",
     result.variant ?? "",
+    fmt(result.model_size_mb),
+    fmt(result.vector_bytes_per_doc),
     fmt(result.index_seconds),
     fmt(result.semantic_seconds),
     result.semantic_doc_count ?? "",
@@ -1033,10 +1810,17 @@ function writeReports(results, cases) {
     fmt(result.docs_per_second),
     fmt(result.score?.hit_at_1),
     fmt(result.score?.hit_at_10),
+    fmt(result.score?.persistent_hit_at_10),
     fmt(result.score?.mrr_at_10),
     fmt(result.score?.mean_rank_when_found),
+    fmt(result.quality_score),
+    fmt(result.speed_score),
+    fmt(result.footprint_score),
+    fmt(result.reliability_score),
+    result.decision_quality_gate ?? "",
     fmt(result.combined_score),
     result.score?.misses?.join(";") ?? "",
+    result.skipped ? "true" : "",
     result.error ?? "",
   ]);
   fs.writeFileSync(
@@ -1101,6 +1885,10 @@ function writeReports(results, cases) {
     "doc_mode",
     "kind",
     "profile",
+    "semantic_scope",
+    "quantization",
+    "vector_encoding",
+    "truncate_dim",
     "batch",
     "sessions",
     "requests",
@@ -1112,6 +1900,7 @@ function writeReports(results, cases) {
     "avg_docs_per_second",
     "avg_hit_at_1",
     "avg_hit_at_10",
+    "avg_persistent_hit_at_10",
     "avg_mrr_at_10",
     "avg_mean_rank_when_found",
     "misses",
@@ -1127,6 +1916,10 @@ function writeReports(results, cases) {
           row.docMode,
           row.kind,
           row.profile,
+          row.semanticScope,
+          row.quantization,
+          row.vectorEncoding,
+          row.truncateDim,
           row.batch,
           row.sessions,
           row.requests,
@@ -1138,6 +1931,7 @@ function writeReports(results, cases) {
           fmt(row.docs_per_second),
           fmt(row.hit_at_1),
           fmt(row.hit_at_10),
+          fmt(row.persistent_hit_at_10),
           fmt(row.mrr_at_10),
           fmt(row.mean_rank_when_found),
           row.misses,
@@ -1162,16 +1956,21 @@ function writeReports(results, cases) {
     `Queries: \`${queries.length}\``,
     "",
     "All decision-grade rows are GPU-only. ONNX rows require DirectML; llama.cpp rows require Vulkan0 and full model-layer offload.",
+    "Source-led lanes are recorded in `manifest.json` and `sources.md`; skipped rows mean an artifact or implementation prerequisite is still missing.",
     "",
     "## Ranking",
     "",
-    "| Rank | Case | Doc mode | Backend | MRR@10 | Hit@10 | Docs/sec | Score |",
-    "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: |",
+    "| Rank | Case | Stage | Doc mode | Backend | Quality gate | MRR@10 | Hit@10 | Persistent Hit@10 | Docs/sec | Footprint MB | Score |",
+    "| ---: | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ...ranked.map(
       (result, index) =>
-        `| ${index + 1} | \`${result.case_id}\` | ${result.docMode} | ${result.kind} | ${fmt(
+        `| ${index + 1} | \`${result.case_id}\` | ${result.stage} | ${result.docMode} | ${result.kind} | ${
+          result.decision_quality_gate ? "pass" : "fail"
+        } | ${fmt(
           result.score.mrr_at_10,
-        )} | ${fmt(result.score.hit_at_10)} | ${fmt(result.docs_per_second)} | ${fmt(
+        )} | ${fmt(result.score.hit_at_10)} | ${fmt(
+          result.score.persistent_hit_at_10,
+        )} | ${fmt(result.docs_per_second)} | ${fmt(result.model_size_mb)} | ${fmt(
           result.combined_score,
         )} |`,
     ),
@@ -1207,13 +2006,13 @@ function writeReports(results, cases) {
     "",
     ...blockedCandidates.map((candidate) => `- \`${candidate.id}\`: ${candidate.reason}`),
     "",
-    failed.length ? "## Failures" : "## Failures",
+    "## Skipped Or Failed Rows",
     "",
     ...(failed.length
       ? failed.map((result) => `- \`${result.case_id}\`: ${result.error}`)
       : ["- none"]),
     "",
-    "Combined score: `0.70 * normalized(MRR@10) + 0.30 * normalized(docs/sec)` within this run.",
+    "Combined score: quality gate first, then `0.50 * quality + 0.25 * speed + 0.15 * footprint + 0.10 * reliability` within this run.",
   ].join("\n");
   fs.writeFileSync(path.join(outDir, "report.md"), md);
 }
@@ -1221,6 +2020,7 @@ function writeReports(results, cases) {
 const cases = selectedCases();
 const results = [];
 fs.mkdirSync(outDir, { recursive: true });
+writeManifest(cases);
 if (process.env.CODESTORY_EMBED_RESEARCH_LIST === "1") {
   for (const config of cases) {
     console.log(config.case_id);
