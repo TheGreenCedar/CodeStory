@@ -84,13 +84,59 @@ fn main() -> Result<()> {
 
 fn run_index(cmd: IndexCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "index")?;
-    if cmd.watch && cmd.output_file.is_some() {
-        eprintln!("watch mode rewrites the configured output file after each refresh");
-    }
+    validate_index_watch_output_file(&cmd)?;
     run_index_once(&cmd)?;
     if cmd.watch {
         run_index_watch(cmd)?;
     }
+    Ok(())
+}
+
+fn validate_index_watch_output_file(cmd: &IndexCommand) -> Result<()> {
+    if !cmd.watch {
+        return Ok(());
+    }
+    let Some(output_file) = cmd.output_file.as_deref() else {
+        return Ok(());
+    };
+
+    let project_root = fs::canonicalize(&cmd.project.project).with_context(|| {
+        format!(
+            "Failed to resolve project root {}",
+            display::clean_path_string(&cmd.project.project.to_string_lossy())
+        )
+    })?;
+    let output_path = if output_file.is_absolute() {
+        output_file.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("Failed to resolve current directory")?
+            .join(output_file)
+    };
+    let Some(output_parent) = output_path.parent() else {
+        return Ok(());
+    };
+    if !output_parent.exists() {
+        return Ok(());
+    }
+    let resolved_parent = fs::canonicalize(output_parent).with_context(|| {
+        format!(
+            "Failed to resolve output parent {}",
+            display::clean_path_string(&output_parent.to_string_lossy())
+        )
+    })?;
+    let resolved_output = output_path
+        .file_name()
+        .map(|file_name| resolved_parent.join(file_name))
+        .unwrap_or(resolved_parent);
+
+    if resolved_output.starts_with(&project_root) {
+        bail!(
+            "--watch cannot write --output-file inside the watched project tree: {}",
+            display::clean_path_string(&resolved_output.to_string_lossy())
+        );
+    }
+
     Ok(())
 }
 
@@ -1703,6 +1749,36 @@ mod tests {
         for command in commands {
             Cli::try_parse_from(command).expect("command should parse --output-file");
         }
+    }
+
+    #[test]
+    fn index_watch_rejects_output_file_inside_project_tree() {
+        let temp = tempdir().expect("create temp dir");
+        let project = temp.path().join("repo");
+        fs::create_dir_all(&project).expect("create project");
+        let cmd = IndexCommand {
+            project: args::ProjectArgs {
+                project: project.clone(),
+                cache_dir: None,
+            },
+            refresh: args::RefreshMode::Auto,
+            format: args::OutputFormat::Markdown,
+            output_file: Some(project.join("index.md")),
+            dry_run: false,
+            summarize: false,
+            progress: false,
+            watch: true,
+        };
+
+        let error =
+            validate_index_watch_output_file(&cmd).expect_err("in-tree output should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--watch cannot write --output-file inside the watched project"),
+            "{error:#}"
+        );
     }
 
     #[test]

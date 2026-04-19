@@ -4473,7 +4473,7 @@ fn collect_api_endpoint_calls(source: &str) -> Vec<ApiEndpointCall> {
     let mut calls = Vec::new();
     for (line_index, line) in source.lines().enumerate() {
         for (literal, col) in quoted_string_literals(line) {
-            if !is_api_path_literal(&literal) {
+            if !is_api_path_literal(&literal) || !is_api_endpoint_call_context(line, col) {
                 continue;
             }
             calls.push(ApiEndpointCall {
@@ -4524,6 +4524,48 @@ fn is_api_path_literal(value: &str) -> bool {
         && !path.starts_with("//")
         && !path.chars().any(char::is_whitespace)
         && path.chars().any(|ch| ch.is_ascii_alphabetic())
+}
+
+fn is_api_endpoint_call_context(line: &str, literal_col: u32) -> bool {
+    let literal_start = literal_col.saturating_sub(1) as usize;
+    let Some(before_literal) = line.get(..literal_start) else {
+        return false;
+    };
+    let trimmed_before = before_literal.trim_start();
+    if trimmed_before.starts_with("//") || trimmed_before.starts_with('#') {
+        return false;
+    }
+
+    let compact_before = compact_lowercase(before_literal);
+    if compact_before.contains("fetch(") || compact_before.contains("axios(") {
+        return true;
+    }
+
+    let methods = ["delete", "patch", "post", "put", "head", "options", "get"];
+    let client_receivers = [
+        "axios",
+        "requests",
+        "reqwest",
+        "http",
+        "$http",
+        "ky",
+        "got",
+        "httpclient",
+    ];
+    client_receivers.iter().any(|receiver| {
+        methods.iter().any(|method| {
+            compact_before.contains(&format!("{receiver}.{method}("))
+                || compact_before.contains(&format!("{receiver}::{method}("))
+        })
+    })
+}
+
+fn compact_lowercase(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn infer_http_method(line: &str) -> String {
@@ -7331,6 +7373,34 @@ export async function createUser() {
                 && edge.target == post_endpoint
                 && edge.certainty == Some(ResolutionCertainty::Uncertain)
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_typescript_api_path_literals_without_client_calls_do_not_create_edges() -> Result<()> {
+        let code = r#"
+const docsPath = "/api/users";
+export const routeMap = {
+    users: "/api/users",
+};
+app.get("/api/users", handler);
+export function handler() {}
+"#;
+        let language_config = get_language_for_ext("ts").expect("typescript config");
+        let result = index_file(Path::new("routes.ts"), code, &language_config, None, None)?;
+        let endpoint = schema_endpoint_node_id("GET", "/api/users");
+
+        assert!(
+            result.nodes.iter().all(|node| node.id != endpoint),
+            "plain path literals and route declarations should not create endpoint nodes"
+        );
+        assert!(
+            result
+                .edges
+                .iter()
+                .all(|edge| edge.kind != EdgeKind::CALL || edge.target != endpoint),
+            "plain path literals and route declarations should not create endpoint call edges"
+        );
         Ok(())
     }
 }
