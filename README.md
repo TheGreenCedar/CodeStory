@@ -41,6 +41,28 @@ Use this path if you want to run the tool against a repository.
 
 Read commands default to `--refresh none`. They query the current cache unless you explicitly ask them to refresh.
 
+### `index` Options
+
+`codestory-cli index` accepts these CLI options:
+
+| Option | Default | How it works |
+| --- | --- | --- |
+| `--project <PROJECT>` | `.` | Repository root to index. `--path` is an alias. Paths are resolved before CodeStory chooses the cache key. |
+| `--cache-dir <CACHE_DIR>` | user cache root plus a per-project hash | Uses the exact directory passed for the SQLite database and sibling search directory. Use this for temp-cache benchmarks or isolated repros. |
+| `--refresh <auto\|full\|incremental\|none>` | `auto` | Controls whether indexing work runs before the summary is returned. See the refresh table below. |
+| `--format <markdown\|json>` | `markdown` | Markdown is for humans. JSON exposes the same summary, retrieval state, and phase timings for tests and automation. |
+
+Refresh modes:
+
+| Mode | Behavior |
+| --- | --- |
+| `auto` | Chooses `full` when the cache has no indexed files; chooses `incremental` once stored inventory exists. |
+| `full` | Builds a staged SQLite database from the full workspace, copies reusable semantic docs forward from the previous live DB when present, finalizes snapshots, publishes the staged DB, and syncs semantic docs before returning. |
+| `incremental` | Opens the live DB, asks `codestory-workspace` for changed/new/removed files, reindexes only that refresh scope, refreshes live snapshots, and rebuilds semantic docs only for touched files. |
+| `none` | Opens the existing cache and returns a summary without running graph or semantic indexing. This is mainly for inspecting a known-good cache. |
+
+There is intentionally no `index --semantic off` option in the current CLI. Default `index` completes semantic docs when embedding assets are available. Semantic behavior is controlled by retrieval environment settings such as `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false`, `CODESTORY_SEMANTIC_DOC_SCOPE=all`, and the `CODESTORY_EMBED_*` variables documented below.
+
 If you are using an agent in this repo, point it at the available `codestory-grounding` skill in `.agents/skills/codestory-grounding/SKILL.md` so it can use the indexed grounding workflows directly.
 
 Start here when you are using the tool:
@@ -88,23 +110,29 @@ flowchart LR
     LocalState --> Snippet["snippet"]
 ```
 
-- `index`: discover files, parse supported languages, resolve semantics, and persist graph/search state locally
+- `index`: discover files, parse supported languages, resolve graph edges, persist search projections, and complete semantic docs before returning
 - `ground`: build grounded context from indexed symbols, snippets, graph traversal, and search results
 - `search`: find symbols, files, and query matches
 - `symbol`: inspect one symbol and its indexed relationships
-
-Hybrid retrieval is the intended default when local embedding assets are available. `index`, `ground`, and `search` now report retrieval mode, semantic doc counts, and explicit fallback reasons when the runtime drops back to symbolic ranking.
 - `trail`: walk caller/callee and usage neighborhoods through the graph
 - `snippet`: fetch focused source context for a symbol or file location
+
+Hybrid retrieval is the intended default when local embedding assets are available. `index`, `ground`, and `search` now report retrieval mode, semantic doc counts, and explicit fallback reasons when the runtime drops back to symbolic ranking.
 
 ## Retrieval Defaults
 
 `index`, `ground`, and `search` now report the active retrieval mode. Hybrid retrieval is the default when local embedding assets are available; otherwise CodeStory falls back to symbolic or lexical ranking and reports why.
 
+The default `index` path is a full semantic sync, not a deferred background task. When embedding assets are available, the command returns after graph state, snapshots, lexical search state, and durable semantic docs are all ready. The index summary reports semantic timing and reuse counts so cold-start and repeated-refresh costs stay visible.
+
 Hybrid retrieval setup:
 
 - fast local-dev semantic mode: set `CODESTORY_EMBED_RUNTIME_MODE=hash`
 - local model artifacts: set `CODESTORY_EMBED_MODEL_PATH` to the ONNX model; `CODESTORY_EMBED_TOKENIZER_PATH` defaults to a sibling `tokenizer.json`
+- durable semantic docs are the default; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` to include lower-signal local/member/module symbols for investigation
+- embedding batch size defaults to `64`; override with `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` only while profiling
+- ONNX CPU tuning: `CODESTORY_EMBED_SESSION_COUNT`, `CODESTORY_EMBED_INTRA_THREADS`, `CODESTORY_EMBED_INTER_THREADS`, and `CODESTORY_EMBED_PARALLEL_EXECUTION`
+- optional ONNX providers: build `codestory-runtime` with `onnx-cuda` or `onnx-directml` and set `CODESTORY_EMBED_EXECUTION_PROVIDER=cuda` or `directml`
 - lexical-only mode: set `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false`
 - verification: `index`, `ground`, and `search` will report the retrieval mode plus any fallback reason
 
@@ -138,6 +166,7 @@ Low-memory guidance:
 - prefer `index --refresh incremental` over repeated full refreshes
 - avoid running multiple cargo commands at once in this repo
 - if semantic retrieval assets are unavailable or too heavy for the current machine, symbolic retrieval remains supported and is reported explicitly
+- if a cold index is slow, inspect `semantic_ms` and `semantic_docs` in the index output before changing parser or graph code
 - if the repo-scale runtime integration gate exceeds local memory, stop there and fall back to the smaller runtime lanes before escalating to a larger machine
 
 ## Workspace Shape
@@ -192,4 +221,3 @@ CodeStory writes user-cache SQLite indexes keyed by the target project path. Bui
 ## License
 
 MIT. See `LICENSE`.
-

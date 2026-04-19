@@ -34,4 +34,12 @@ Search ranking, grounding assembly, fallback reporting, and other workflow orche
 - runtime ownership: [runtime subsystem](architecture/subsystems/runtime.md)
 - command path context: [runtime execution path](architecture/runtime-execution-path.md)
 
+## Default Index Includes Semantic Docs
+
+Semantic docs are part of the default `codestory-cli index` contract. Runtime synchronizes durable semantic docs before returning instead of relying on a later read command to hydrate them.
+
+- semantic sync behavior: [indexing pipeline](architecture/indexing-pipeline.md)
+- tuning and ownership: [runtime subsystem](architecture/subsystems/runtime.md)
+- measured repo-scale baselines: [codestory e2e stats log](testing/codestory-e2e-stats-log.md)
+
 Keep future architecture guidance in the owning architecture pages instead of reviving a separate ADR track.

@@ -11,4 +11,6 @@
 - contracts: shared graph, DTO, and event types that are safe to depend on across boundaries
 - repo-text hit: a direct file-content match surfaced alongside indexed-symbol search results
 - retrieval mode: whether runtime search is operating in symbolic or hybrid mode for the current command
+- semantic doc: generated per-symbol text plus an embedding stored in SQLite for hybrid retrieval
+- semantic ready: retrieval state where hybrid retrieval is enabled, an embedding runtime is available, and persisted semantic docs exist
 - cache root: the directory that owns one project cache; by default this is under the user cache directory, but `--cache-dir` can override it

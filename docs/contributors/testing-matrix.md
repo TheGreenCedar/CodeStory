@@ -11,6 +11,7 @@ flowchart TD
     change --> runtime["Runtime, search, grounding, or orchestration work"]
     change --> cli["CLI args or output boundary work"]
     change --> bench["Bench or perf-surface work"]
+    change --> e2e["Repo-scale semantic or cold-start behavior"]
     docs --> docs_checks["markdown/link checks + any touched doc contracts"]
     always --> workspace["fmt, check, targeted tests, clippy"]
     indexer --> fidelity["fidelity_regression, tictactoe_language_coverage, integration"]
@@ -18,6 +19,7 @@ flowchart TD
     runtime --> runtime_tests["cargo test -p codestory-runtime and retrieval_eval"]
     cli --> cli_tests["cargo test -p codestory-cli"]
     bench --> bench_checks["cargo check -p codestory-bench --benches"]
+    e2e --> e2e_stats["release build + codestory_repo_e2e_stats"]
 ```
 
 ## Whole Workspace
@@ -76,6 +78,19 @@ $env:CODESTORY_RUN_REPO_SCALE_TEST = "1"
 cargo test -p codestory-runtime --test integration test_repo_scale_call_resolution -- --ignored --nocapture
 ```
 
+## Repo-Scale Semantic And Cold-Start Checks
+
+Run this lane when default `index` behavior, semantic doc persistence, embedding reuse, or cold-start performance changes:
+
+```powershell
+cargo build --release -p codestory-cli
+cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
+```
+
+Append the emitted headline metrics to `docs/testing/codestory-e2e-stats-log.md`. Include graph seconds, semantic seconds, semantic docs reused, semantic docs embedded, total index seconds, and whether `retrieval.semantic_ready` was true.
+
+The 2026-04-18 repo-scale baseline for the default durable semantic scope is `38.43s` cold index, `2.92s` graph phase, `32.07s` semantic phase, and `3,690` embedded semantic docs. A repeat full refresh on the same cache was `7.56s` with `3,690` docs reused and `0` embedded.
+
 ## CLI Boundary And Output Changes
 
 ```powershell
@@ -96,4 +111,10 @@ Run that lane only when the change crosses CLI and runtime behavior together, su
 
 ```powershell
 cargo check -p codestory-bench --benches
+```
+
+For indexing performance work, run the full bench when practical:
+
+```powershell
+cargo bench -p codestory-bench --bench indexing
 ```

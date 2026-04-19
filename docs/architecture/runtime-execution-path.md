@@ -12,6 +12,7 @@ sequenceDiagram
     participant Workspace as codestory-workspace
     participant Indexer as codestory-indexer
     participant Store as codestory-store
+    participant Search as runtime search
 
     CLI->>Runtime: parse args and build context
     Runtime->>Workspace: open project and compute refresh inputs
@@ -20,6 +21,8 @@ sequenceDiagram
     Runtime->>Indexer: run WorkspaceIndexer
     Indexer->>Store: flush graph, projections, search docs
     Runtime->>Store: publish staged snapshot when a full refresh completes
+    Runtime->>Search: sync lexical projection and semantic docs
+    Search->>Store: reuse, embed, upsert, reload, and prune semantic docs
 ```
 
 1. `codestory-cli` parses the request and builds a runtime context.
@@ -29,6 +32,9 @@ sequenceDiagram
 5. `codestory-indexer::WorkspaceIndexer` parses files, extracts graph artifacts, flushes projection batches, and runs resolution.
 6. `codestory-store` updates graph rows, occurrence rows, callable projection state, search-doc rows, and snapshot invalidation state.
 7. Runtime finalizes staged builds through `SnapshotStore` and publishes the finished snapshot when a full refresh completes.
+8. Runtime refreshes the search-symbol projection and synchronizes semantic docs before returning the index summary.
+
+Default index runs do not defer semantic docs. When embedding assets are available, the returned retrieval state should have `semantic_ready = true` and a non-zero semantic doc count. If semantic assets are missing or hybrid retrieval is disabled, runtime still completes graph and lexical state and reports the fallback reason.
 
 ## Search Command
 

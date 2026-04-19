@@ -84,7 +84,7 @@ Check:
 - whether runtime rebuilt its search state after indexing
 - what retrieval mode `index`, `ground`, or `search` reported for the current run
 - whether semantic retrieval is disabled, missing model assets, or missing semantic docs
-- whether `CODESTORY_HYBRID_RETRIEVAL_ENABLED`, `CODESTORY_EMBED_RUNTIME_MODE`, `CODESTORY_EMBED_MODEL_PATH`, or `CODESTORY_EMBED_TOKENIZER_PATH` changed between runs
+- whether `CODESTORY_HYBRID_RETRIEVAL_ENABLED`, `CODESTORY_SEMANTIC_DOC_SCOPE`, `CODESTORY_EMBED_RUNTIME_MODE`, `CODESTORY_EMBED_MODEL_PATH`, or `CODESTORY_EMBED_TOKENIZER_PATH` changed between runs
 - whether graph-based boosts are overwhelming lexical matches
 
 Recovery order:
@@ -96,6 +96,38 @@ Recovery order:
 5. If the current machine should stay lexical only, set `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false` and verify the fallback messaging instead of treating it as a runtime regression.
 6. Rebuild once with `index --refresh full`.
 7. If semantic retrieval is still the only failing part, inspect the reported fallback reason before touching lexical ranking or CLI rendering.
+
+## If Cold Indexing Is Slow
+
+Common symptoms:
+
+- `index --refresh full` is much slower on an empty cache than on a repeat full refresh
+- graph timings are small but total index time is dominated by semantic work
+- semantic docs are embedded again when they should be reused
+
+Start with:
+
+- `crates/codestory-runtime/src/lib.rs`
+- `crates/codestory-runtime/src/search/engine.rs`
+- `crates/codestory-store/src/search_doc_store.rs`
+- `docs/testing/codestory-e2e-stats-log.md`
+
+Check:
+
+- `semantic_ms.doc_build`, `semantic_ms.embedding`, `semantic_ms.db_upsert`, and `semantic_ms.reload`
+- `semantic_docs.reused`, `semantic_docs.embedded`, `semantic_docs.pending`, and `semantic_docs.stale`
+- whether `CODESTORY_SEMANTIC_DOC_SCOPE=all` is forcing the broad all-symbol semantic set
+- whether `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` was changed from the profiled default of `64`
+- whether `CODESTORY_EMBED_SESSION_COUNT` or ONNX thread settings are oversubscribing the machine
+- whether `CODESTORY_EMBED_EXECUTION_PROVIDER` names a provider that was not compiled into this binary
+
+Recovery order:
+
+1. Run one measured cold E2E and append the headline numbers to `docs/testing/codestory-e2e-stats-log.md`.
+2. Compare semantic embedded/reused counts before changing graph code.
+3. For reuse regressions, inspect semantic doc version, generated text hash, embedding model, and embedding dimension.
+4. For cold-only regressions, inspect durable semantic scope, length-bucket ordering, embedding batch size, and ONNX session count.
+5. For hardware-provider experiments, first verify CPU behavior is correct and then check `cargo check -p codestory-runtime --features onnx-cuda` or `onnx-directml`.
 
 ## If Grounding Is Wrong
 
@@ -165,4 +197,3 @@ Keep the work serialized. Running multiple cargo or CLI indexing commands at onc
 If the repo-scale runtime integration gate hits memory pressure, do not keep retrying it in a loop. Capture the failing command, confirm the default runtime and retrieval lanes still pass, and treat the repo-scale run as a heavy manual follow-up on a roomier machine or after further containment work.
 
 If retrieval behavior changes at the same time, walk the recovery order above before assuming the memory event and the ranking regression share the same cause.
-
