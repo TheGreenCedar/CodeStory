@@ -206,7 +206,9 @@ Incremental refresh scopes semantic invalidation by touched file. Untouched file
 
 The default semantic scope is durable symbols: classes, structs, interfaces, annotations, unions, enums, typedefs, functions, methods, macros, global variables, constants, and enum constants. Lower-signal module, namespace, package, field, local variable, and type-parameter docs stay out of semantic retrieval by default while remaining present in graph and lexical search. Set `CODESTORY_SEMANTIC_DOC_SCOPE=all` to restore the broader semantic doc set for investigations.
 
-Embedding throughput is optimized for the CPU default path:
+The default semantic text alias policy is `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=alias_variant`. It keeps compact language, terminal-name, owner-name, and symbol-role hints, but leaves out the noisier full name-alias and path-alias lists from the earlier `current_alias` research variant. Use `no_alias` for baseline research rows and `current_alias` only when reproducing older alias-enriched runs.
+
+Embedding throughput is optimized for the local embedding path:
 
 - pending semantic docs are sorted by generated text length before embedding, which keeps padded ONNX batches close to uniform length
 - the default semantic embedding batch size is `128`, with `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` available for profiling

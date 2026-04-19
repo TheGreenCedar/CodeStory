@@ -118,6 +118,7 @@ Check:
 - `semantic_ms.doc_build`, `semantic_ms.embedding`, `semantic_ms.db_upsert`, and `semantic_ms.reload`
 - `semantic_docs.reused`, `semantic_docs.embedded`, `semantic_docs.pending`, and `semantic_docs.stale`
 - whether `CODESTORY_SEMANTIC_DOC_SCOPE=all` is forcing the broad all-symbol semantic set
+- whether `CODESTORY_SEMANTIC_DOC_ALIAS_MODE` was changed from the profiled default of `alias_variant`
 - whether `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` was changed from the profiled default of `128`
 - whether `CODESTORY_EMBED_SESSION_COUNT` or ONNX thread settings are oversubscribing the machine
 - whether `CODESTORY_EMBED_EXECUTION_PROVIDER` names a provider that was not compiled into this binary

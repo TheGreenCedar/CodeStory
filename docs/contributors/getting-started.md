@@ -34,6 +34,7 @@ Use one of these modes before debugging ranking quality:
 - fast local-dev semantic mode: `CODESTORY_EMBED_RUNTIME_MODE=hash`
 - local model artifacts: set `CODESTORY_EMBED_MODEL_PATH` to the ONNX model; `CODESTORY_EMBED_TOKENIZER_PATH` defaults to a sibling `tokenizer.json`
 - default semantic scope: durable symbols only; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` when you intentionally need the broad all-symbol semantic doc set
+- default semantic alias mode: compact aliases; set `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=no_alias` or `current_alias` only when reproducing benchmark rows
 - embedding throughput tuning: `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE`, `CODESTORY_EMBED_SESSION_COUNT`, `CODESTORY_EMBED_INTRA_THREADS`, `CODESTORY_EMBED_INTER_THREADS`, and `CODESTORY_EMBED_PARALLEL_EXECUTION`
 - optional hardware providers: build with `onnx-cuda` or `onnx-directml`, then set `CODESTORY_EMBED_EXECUTION_PROVIDER=cuda` or `directml`
 - lexical-only mode: `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false`

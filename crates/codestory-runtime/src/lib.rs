@@ -551,11 +551,29 @@ const LLM_DOC_RELOAD_BATCH_SIZE: usize = 256;
 const LLM_DOC_EMBED_BATCH_SIZE: usize = 128;
 const LLM_DOC_EMBED_BATCH_SIZE_ENV: &str = "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE";
 const SEMANTIC_DOC_SCOPE_ENV: &str = "CODESTORY_SEMANTIC_DOC_SCOPE";
+const SEMANTIC_DOC_ALIAS_MODE_ENV: &str = "CODESTORY_SEMANTIC_DOC_ALIAS_MODE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SemanticDocScope {
     DurableSymbols,
     AllSymbols,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticDocAliasMode {
+    NoAlias,
+    CurrentAlias,
+    AliasVariant,
+}
+
+impl SemanticDocAliasMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoAlias => "no_alias",
+            Self::CurrentAlias => "current_alias",
+            Self::AliasVariant => "alias_variant",
+        }
+    }
 }
 
 fn search_index_storage_path(storage_path: &Path) -> PathBuf {
@@ -798,6 +816,24 @@ fn semantic_doc_scope_from_value(value: &str) -> SemanticDocScope {
     }
 }
 
+fn semantic_doc_alias_mode_from_env() -> SemanticDocAliasMode {
+    semantic_doc_alias_mode_from_value(
+        &std::env::var(SEMANTIC_DOC_ALIAS_MODE_ENV).unwrap_or_default(),
+    )
+}
+
+fn semantic_doc_alias_mode_from_value(value: &str) -> SemanticDocAliasMode {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "default" | "auto" => SemanticDocAliasMode::AliasVariant,
+        "none" | "no_alias" | "no-alias" | "off" | "false" | "0" => SemanticDocAliasMode::NoAlias,
+        "current_alias" | "current-alias" | "full" | "full_alias" | "full-alias" | "on"
+        | "true" | "1" => SemanticDocAliasMode::CurrentAlias,
+        "variant" | "alias_variant" | "alias-variant" | "compact" | "compact_alias"
+        | "compact-alias" => SemanticDocAliasMode::AliasVariant,
+        _ => SemanticDocAliasMode::AliasVariant,
+    }
+}
+
 fn llm_indexable_kind_for_scope(
     kind: codestory_contracts::graph::NodeKind,
     scope: SemanticDocScope,
@@ -994,6 +1030,7 @@ fn build_llm_symbol_doc_text(
     file_path: Option<&str>,
     file_text_cache: &mut HashMap<String, Option<String>>,
 ) -> String {
+    let alias_mode = semantic_doc_alias_mode_from_env();
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -1019,29 +1056,33 @@ fn build_llm_symbol_doc_text(
     if let Some(qualified_name) = node.qualified_name.as_deref() {
         let _ = writeln!(out, "qualified_name: {qualified_name}");
     }
-    if let Some(language) = semantic_doc_language_from_path(file_path) {
-        let _ = writeln!(out, "language: {language}");
-    }
+    if alias_mode != SemanticDocAliasMode::NoAlias {
+        if let Some(language) = semantic_doc_language_from_path(file_path) {
+            let _ = writeln!(out, "language: {language}");
+        }
 
-    let aliases = semantic_symbol_aliases(display_name, node.qualified_name.as_deref());
-    if !aliases.name_aliases.is_empty() {
-        let _ = writeln!(out, "name_aliases: {}", aliases.name_aliases.join(", "));
+        let aliases = semantic_symbol_aliases(display_name, node.qualified_name.as_deref());
+        if alias_mode == SemanticDocAliasMode::CurrentAlias && !aliases.name_aliases.is_empty() {
+            let _ = writeln!(out, "name_aliases: {}", aliases.name_aliases.join(", "));
+        }
+        if let Some(terminal_alias) = aliases.terminal_alias {
+            let _ = writeln!(out, "terminal_alias: {terminal_alias}");
+        }
+        if !aliases.owner_aliases.is_empty() {
+            let _ = writeln!(out, "owner_aliases: {}", aliases.owner_aliases.join(", "));
+        }
+        if alias_mode == SemanticDocAliasMode::CurrentAlias {
+            let path_aliases = semantic_path_aliases(file_path, 8);
+            if !path_aliases.is_empty() {
+                let _ = writeln!(out, "path_aliases: {}", path_aliases.join(", "));
+            }
+        }
+        let _ = writeln!(
+            out,
+            "symbol_role: {}",
+            semantic_symbol_role_aliases(node.kind)
+        );
     }
-    if let Some(terminal_alias) = aliases.terminal_alias {
-        let _ = writeln!(out, "terminal_alias: {terminal_alias}");
-    }
-    if !aliases.owner_aliases.is_empty() {
-        let _ = writeln!(out, "owner_aliases: {}", aliases.owner_aliases.join(", "));
-    }
-    let path_aliases = semantic_path_aliases(file_path, 8);
-    if !path_aliases.is_empty() {
-        let _ = writeln!(out, "path_aliases: {}", path_aliases.join(", "));
-    }
-    let _ = writeln!(
-        out,
-        "symbol_role: {}",
-        semantic_symbol_role_aliases(node.kind)
-    );
 
     let (signature, comments, body) = symbol_excerpt(node, file_path, file_text_cache);
     if !signature.is_empty() {
@@ -1102,9 +1143,12 @@ fn llm_symbol_doc_hash(doc_text: &str) -> String {
     const FNV_PRIME: u64 = 0x100000001b3;
 
     let mut hash = FNV_OFFSET;
+    let alias_mode = semantic_doc_alias_mode_from_env();
     for byte in LLM_SYMBOL_DOC_SCHEMA_VERSION
         .to_le_bytes()
         .into_iter()
+        .chain(alias_mode.as_str().as_bytes().iter().copied())
+        .chain(std::iter::once(0))
         .chain(doc_text.as_bytes().iter().copied())
     {
         hash ^= byte as u64;
@@ -3288,6 +3332,7 @@ mod tests {
                 EnvGuard::remove(EMBEDDING_LAYER_NORM_ENV),
                 EnvGuard::remove(EMBEDDING_TRUNCATE_DIM_ENV),
                 EnvGuard::remove(EMBEDDING_EXPECTED_DIM_ENV),
+                EnvGuard::remove(SEMANTIC_DOC_ALIAS_MODE_ENV),
             ],
             _lock: lock,
         }
@@ -3346,6 +3391,30 @@ mod tests {
             NodeKind::BUILTIN_TYPE,
             SemanticDocScope::AllSymbols
         ));
+    }
+
+    #[test]
+    fn semantic_doc_alias_mode_defaults_to_alias_variant() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvGuard::remove(SEMANTIC_DOC_ALIAS_MODE_ENV);
+        assert_eq!(
+            semantic_doc_alias_mode_from_env(),
+            SemanticDocAliasMode::AliasVariant
+        );
+        assert_eq!(
+            semantic_doc_alias_mode_from_value("current_alias"),
+            SemanticDocAliasMode::CurrentAlias
+        );
+        assert_eq!(
+            semantic_doc_alias_mode_from_value("no_alias"),
+            SemanticDocAliasMode::NoAlias
+        );
+        assert_eq!(
+            semantic_doc_alias_mode_from_value("compact"),
+            SemanticDocAliasMode::AliasVariant
+        );
     }
 
     fn pending_semantic_doc_for_test(node_id: i64, doc_text: &str) -> PendingLlmSymbolDoc {
@@ -3425,6 +3494,10 @@ mod tests {
 
     #[test]
     fn semantic_doc_text_adds_symbol_aliases_for_supported_language_naming_styles() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
         let cases = [
             (
                 "rust",
@@ -3509,6 +3582,10 @@ mod tests {
 
     #[test]
     fn semantic_doc_text_adds_kind_role_owner_and_path_alias_context() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
         let doc = semantic_doc_text_for_test(
             "AppController::openProjectWithStoragePath",
             Some("codestory_runtime::AppController::openProjectWithStoragePath"),
@@ -3534,6 +3611,52 @@ mod tests {
             doc.contains("path_aliases: crates, codestory-runtime, codestory runtime, src, lib"),
             "method docs should expose file path aliases:\n{doc}"
         );
+    }
+
+    #[test]
+    fn semantic_doc_text_alias_modes_are_switchable_for_research() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let no_alias = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "no_alias");
+        let no_alias_doc = semantic_doc_text_for_test(
+            "AppController::openProjectWithStoragePath",
+            Some("codestory_runtime::AppController::openProjectWithStoragePath"),
+            "crates/codestory-runtime/src/lib.rs",
+            NodeKind::METHOD,
+        );
+        let no_alias_hash = llm_symbol_doc_hash(&no_alias_doc);
+        assert!(!no_alias_doc.contains("terminal_alias:"));
+        assert!(!no_alias_doc.contains("path_aliases:"));
+        drop(no_alias);
+
+        let variant = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "alias_variant");
+        let variant_doc = semantic_doc_text_for_test(
+            "AppController::openProjectWithStoragePath",
+            Some("codestory_runtime::AppController::openProjectWithStoragePath"),
+            "crates/codestory-runtime/src/lib.rs",
+            NodeKind::METHOD,
+        );
+        let variant_hash = llm_symbol_doc_hash(&variant_doc);
+        assert!(variant_doc.contains("terminal_alias: open project with storage path"));
+        assert!(variant_doc.contains("owner_aliases: AppController, app controller"));
+        assert!(variant_doc.contains("symbol_role: method member function"));
+        assert!(!variant_doc.contains("name_aliases:"));
+        assert!(!variant_doc.contains("path_aliases:"));
+        assert_ne!(no_alias_hash, variant_hash);
+        drop(variant);
+
+        let current = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
+        let current_doc = semantic_doc_text_for_test(
+            "AppController::openProjectWithStoragePath",
+            Some("codestory_runtime::AppController::openProjectWithStoragePath"),
+            "crates/codestory-runtime/src/lib.rs",
+            NodeKind::METHOD,
+        );
+        assert!(current_doc.contains("name_aliases:"));
+        assert!(current_doc.contains("path_aliases:"));
+        assert_ne!(variant_hash, llm_symbol_doc_hash(&current_doc));
+        drop(current);
     }
 
     fn copy_tictactoe_workspace() -> tempfile::TempDir {

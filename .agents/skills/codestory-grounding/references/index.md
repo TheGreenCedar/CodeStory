@@ -36,6 +36,7 @@ Runtime environment variables control semantic retrieval and tuning:
 |----------|----------|
 | `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false` | Disable hybrid retrieval and use symbolic ranking. |
 | `CODESTORY_SEMANTIC_DOC_SCOPE=all` | Include the broader all-symbol semantic doc set. The default is durable symbols only. |
+| `CODESTORY_SEMANTIC_DOC_ALIAS_MODE` | Semantic document alias policy: `alias_variant` default, `current_alias` full legacy alias text, or `no_alias` baseline research mode. |
 | `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` | Override semantic doc embedding batch size. Default is `128`; use this only while profiling. |
 | `CODESTORY_EMBED_RUNTIME_MODE=hash` | Use lightweight deterministic hash embeddings for local-dev semantic checks. |
 | `CODESTORY_EMBED_MODEL_PATH` | Path to the ONNX embedding model artifact. |
