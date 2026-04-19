@@ -439,6 +439,7 @@ dependencies = [
  "nucleo-matcher",
  "ort",
  "parking_lot",
+ "rayon",
  "tantivy",
  "tempfile",
  "tokenizers",

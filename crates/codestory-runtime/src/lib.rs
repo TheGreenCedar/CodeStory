@@ -545,6 +545,13 @@ const SEARCH_SYMBOL_PROJECTION_BATCH_SIZE: usize = 4_096;
 const LLM_DOC_RELOAD_BATCH_SIZE: usize = 256;
 const LLM_DOC_EMBED_BATCH_SIZE: usize = 64;
 const LLM_DOC_EMBED_BATCH_SIZE_ENV: &str = "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE";
+const SEMANTIC_DOC_SCOPE_ENV: &str = "CODESTORY_SEMANTIC_DOC_SCOPE";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticDocScope {
+    DurableSymbols,
+    AllSymbols,
+}
 
 fn search_index_storage_path(storage_path: &Path) -> PathBuf {
     let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
@@ -775,13 +782,49 @@ fn retrieval_state_from_storage(storage: &Storage) -> Result<RetrievalStateDto, 
     ))
 }
 
+fn semantic_doc_scope_from_env() -> SemanticDocScope {
+    semantic_doc_scope_from_value(&std::env::var(SEMANTIC_DOC_SCOPE_ENV).unwrap_or_default())
+}
+
+fn semantic_doc_scope_from_value(value: &str) -> SemanticDocScope {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "all" | "full" | "all-symbols" | "all_symbols" => SemanticDocScope::AllSymbols,
+        _ => SemanticDocScope::DurableSymbols,
+    }
+}
+
+fn llm_indexable_kind_for_scope(
+    kind: codestory_contracts::graph::NodeKind,
+    scope: SemanticDocScope,
+) -> bool {
+    match scope {
+        SemanticDocScope::AllSymbols => !matches!(
+            kind,
+            codestory_contracts::graph::NodeKind::FILE
+                | codestory_contracts::graph::NodeKind::UNKNOWN
+                | codestory_contracts::graph::NodeKind::BUILTIN_TYPE
+        ),
+        SemanticDocScope::DurableSymbols => matches!(
+            kind,
+            codestory_contracts::graph::NodeKind::STRUCT
+                | codestory_contracts::graph::NodeKind::CLASS
+                | codestory_contracts::graph::NodeKind::INTERFACE
+                | codestory_contracts::graph::NodeKind::ANNOTATION
+                | codestory_contracts::graph::NodeKind::UNION
+                | codestory_contracts::graph::NodeKind::ENUM
+                | codestory_contracts::graph::NodeKind::TYPEDEF
+                | codestory_contracts::graph::NodeKind::FUNCTION
+                | codestory_contracts::graph::NodeKind::METHOD
+                | codestory_contracts::graph::NodeKind::MACRO
+                | codestory_contracts::graph::NodeKind::GLOBAL_VARIABLE
+                | codestory_contracts::graph::NodeKind::CONSTANT
+                | codestory_contracts::graph::NodeKind::ENUM_CONSTANT
+        ),
+    }
+}
+
 fn llm_indexable_kind(kind: codestory_contracts::graph::NodeKind) -> bool {
-    !matches!(
-        kind,
-        codestory_contracts::graph::NodeKind::FILE
-            | codestory_contracts::graph::NodeKind::UNKNOWN
-            | codestory_contracts::graph::NodeKind::BUILTIN_TYPE
-    )
+    llm_indexable_kind_for_scope(kind, semantic_doc_scope_from_env())
 }
 
 fn edge_digest_for_node(
@@ -1042,20 +1085,28 @@ fn llm_symbol_doc_hash(doc_text: &str) -> String {
     format!("{hash:016x}")
 }
 
+fn sort_pending_llm_symbol_docs_for_embedding_batches(docs: &mut [PendingLlmSymbolDoc]) {
+    docs.sort_by(|left, right| {
+        left.doc_text
+            .len()
+            .cmp(&right.doc_text.len())
+            .then_with(|| left.node_id.0.cmp(&right.node_id.0))
+    });
+}
+
 fn flush_pending_llm_symbol_docs(
     storage: &mut Storage,
     engine: &mut SearchEngine,
-    pending: &mut Vec<PendingLlmSymbolDoc>,
+    batch: &[PendingLlmSymbolDoc],
     model_id: &str,
     updated_at_epoch_ms: i64,
     stats: &mut SemanticProjectionStats,
 ) -> Result<(), ApiError> {
-    if pending.is_empty() {
+    if batch.is_empty() {
         return Ok(());
     }
 
     let model_id = model_id.to_string();
-    let batch = std::mem::take(pending);
     let payloads = batch
         .iter()
         .map(|doc| doc.doc_text.clone())
@@ -1069,19 +1120,19 @@ fn flush_pending_llm_symbol_docs(
         .saturating_add(clamp_u128_to_u32(embedding_started.elapsed().as_millis()));
 
     let docs = batch
-        .into_iter()
+        .iter()
         .zip(embeddings)
         .map(|(doc, embedding)| LlmSymbolDoc {
             node_id: doc.node_id,
             file_node_id: doc.file_node_id,
             kind: doc.kind,
-            display_name: doc.display_name,
-            qualified_name: doc.qualified_name,
-            file_path: doc.file_path,
+            display_name: doc.display_name.clone(),
+            qualified_name: doc.qualified_name.clone(),
+            file_path: doc.file_path.clone(),
             start_line: doc.start_line,
-            doc_text: doc.doc_text,
+            doc_text: doc.doc_text.clone(),
             doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
-            doc_hash: doc.doc_hash,
+            doc_hash: doc.doc_hash.clone(),
             embedding_model: model_id.clone(),
             embedding_dim: embedding.len() as u32,
             embedding,
@@ -1161,7 +1212,7 @@ fn sync_llm_symbol_projection(
 
     let embed_batch_size = llm_doc_embed_batch_size();
     tracing::debug!(embed_batch_size, "Using semantic doc embedding batch size");
-    let mut pending_docs = Vec::<PendingLlmSymbolDoc>::with_capacity(embed_batch_size);
+    let mut pending_docs = Vec::<PendingLlmSymbolDoc>::new();
     let mut seen_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
     let mut file_text_cache = HashMap::<String, Option<String>>::new();
 
@@ -1216,26 +1267,19 @@ fn sync_llm_symbol_projection(
             doc_text,
             doc_hash,
         });
-        if pending_docs.len() >= embed_batch_size {
-            flush_pending_llm_symbol_docs(
-                storage,
-                engine,
-                &mut pending_docs,
-                &model_id,
-                updated_at_epoch_ms,
-                &mut stats,
-            )?;
-        }
     }
 
-    flush_pending_llm_symbol_docs(
-        storage,
-        engine,
-        &mut pending_docs,
-        &model_id,
-        updated_at_epoch_ms,
-        &mut stats,
-    )?;
+    sort_pending_llm_symbol_docs_for_embedding_batches(&mut pending_docs);
+    for batch in pending_docs.chunks(embed_batch_size) {
+        flush_pending_llm_symbol_docs(
+            storage,
+            engine,
+            batch,
+            &model_id,
+            updated_at_epoch_ms,
+            &mut stats,
+        )?;
+    }
 
     let stale_docs = if let Some(scope) = llm_refresh_file_scope {
         let file_node_ids = scope.iter().copied().collect::<Vec<_>>();
@@ -3196,6 +3240,105 @@ mod tests {
     #[test]
     fn llm_doc_embed_batch_size_uses_throughput_default() {
         assert_eq!(llm_doc_embed_batch_size(), 64);
+    }
+
+    #[test]
+    fn semantic_doc_scope_defaults_to_durable_symbols_and_all_scope_is_opt_in() {
+        let _env = EnvGuard::remove(SEMANTIC_DOC_SCOPE_ENV);
+        assert_eq!(
+            semantic_doc_scope_from_env(),
+            SemanticDocScope::DurableSymbols
+        );
+        assert_eq!(
+            semantic_doc_scope_from_value("all"),
+            SemanticDocScope::AllSymbols
+        );
+        assert_eq!(
+            semantic_doc_scope_from_value("full"),
+            SemanticDocScope::AllSymbols
+        );
+
+        assert!(llm_indexable_kind(NodeKind::FUNCTION));
+        assert!(llm_indexable_kind(NodeKind::STRUCT));
+        assert!(llm_indexable_kind(NodeKind::GLOBAL_VARIABLE));
+        assert!(llm_indexable_kind(NodeKind::CONSTANT));
+        assert!(!llm_indexable_kind(NodeKind::MODULE));
+        assert!(!llm_indexable_kind(NodeKind::FIELD));
+        assert!(!llm_indexable_kind(NodeKind::VARIABLE));
+
+        assert!(llm_indexable_kind_for_scope(
+            NodeKind::MODULE,
+            SemanticDocScope::AllSymbols
+        ));
+        assert!(llm_indexable_kind_for_scope(
+            NodeKind::FIELD,
+            SemanticDocScope::AllSymbols
+        ));
+        assert!(llm_indexable_kind_for_scope(
+            NodeKind::VARIABLE,
+            SemanticDocScope::AllSymbols
+        ));
+        assert!(!llm_indexable_kind_for_scope(
+            NodeKind::FILE,
+            SemanticDocScope::AllSymbols
+        ));
+        assert!(!llm_indexable_kind_for_scope(
+            NodeKind::UNKNOWN,
+            SemanticDocScope::AllSymbols
+        ));
+        assert!(!llm_indexable_kind_for_scope(
+            NodeKind::BUILTIN_TYPE,
+            SemanticDocScope::AllSymbols
+        ));
+    }
+
+    fn pending_semantic_doc_for_test(node_id: i64, doc_text: &str) -> PendingLlmSymbolDoc {
+        PendingLlmSymbolDoc {
+            node_id: CoreNodeId(node_id),
+            file_node_id: Some(CoreNodeId(1)),
+            kind: NodeKind::FUNCTION,
+            display_name: format!("doc_{node_id}"),
+            qualified_name: None,
+            file_path: None,
+            start_line: None,
+            doc_text: doc_text.to_string(),
+            doc_hash: llm_symbol_doc_hash(doc_text),
+        }
+    }
+
+    fn padded_char_cost(docs: &[PendingLlmSymbolDoc], batch_size: usize) -> usize {
+        docs.chunks(batch_size)
+            .map(|batch| {
+                let max_len = batch
+                    .iter()
+                    .map(|doc| doc.doc_text.len())
+                    .max()
+                    .unwrap_or(0);
+                max_len * batch.len()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn semantic_docs_are_length_bucketed_before_embedding() {
+        let mut docs = vec![
+            pending_semantic_doc_for_test(1, &"x".repeat(900)),
+            pending_semantic_doc_for_test(2, "tiny"),
+            pending_semantic_doc_for_test(3, &"m".repeat(880)),
+            pending_semantic_doc_for_test(4, "small"),
+        ];
+        let original_cost = padded_char_cost(&docs, 2);
+
+        sort_pending_llm_symbol_docs_for_embedding_batches(&mut docs);
+
+        assert_eq!(
+            docs.iter().map(|doc| doc.node_id.0).collect::<Vec<_>>(),
+            vec![2, 4, 3, 1]
+        );
+        assert!(
+            padded_char_cost(&docs, 2) < (original_cost * 3 / 5),
+            "length bucketing should avoid padding tiny docs to long-doc batches"
+        );
     }
 
     fn copy_tictactoe_workspace() -> tempfile::TempDir {

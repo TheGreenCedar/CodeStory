@@ -19,6 +19,7 @@ ndarray = { workspace = true }
 nucleo-matcher = { workspace = true }
 ort = { workspace = true }
 parking_lot = { workspace = true }
+rayon = { workspace = true }
 tantivy = { workspace = true }
 tokenizers = { workspace = true }
 tracing = { workspace = true }

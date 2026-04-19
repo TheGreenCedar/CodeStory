@@ -5,9 +5,10 @@ use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32String};
 use ort::session::{
     Session,
-    builder::{GraphOptimizationLevel, SessionBuilder},
+    builder::{GraphOptimizationLevel, PrepackedWeights, SessionBuilder},
 };
 use ort::value::TensorRef;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -32,6 +33,7 @@ const EMBEDDING_INTRA_THREADS_ENV: &str = "CODESTORY_EMBED_INTRA_THREADS";
 const EMBEDDING_INTER_THREADS_ENV: &str = "CODESTORY_EMBED_INTER_THREADS";
 const EMBEDDING_PARALLEL_EXECUTION_ENV: &str = "CODESTORY_EMBED_PARALLEL_EXECUTION";
 const EMBEDDING_EXECUTION_PROVIDER_ENV: &str = "CODESTORY_EMBED_EXECUTION_PROVIDER";
+const EMBEDDING_SESSION_COUNT_ENV: &str = "CODESTORY_EMBED_SESSION_COUNT";
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingRuntimeAvailability {
@@ -94,6 +96,19 @@ fn env_bool(key: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn embedding_session_count_from_env() -> usize {
+    env_usize(EMBEDDING_SESSION_COUNT_ENV, 1, 16).unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|threads| threads.get().clamp(1, 2))
+            .unwrap_or(1)
+    })
+}
+
+fn embedding_parallel_chunk_size(text_count: usize, worker_count: usize) -> usize {
+    let workers = worker_count.max(1).min(text_count.max(1));
+    text_count.max(1).div_ceil(workers).max(1)
 }
 
 #[cfg(feature = "onnx-cuda")]
@@ -269,6 +284,11 @@ enum EmbeddingBackend {
 
 #[derive(Debug)]
 struct OnnxEmbeddingRuntime {
+    workers: Vec<OnnxEmbeddingWorker>,
+}
+
+#[derive(Debug)]
+struct OnnxEmbeddingWorker {
     session: Mutex<Session>,
     tokenizer: Mutex<Tokenizer>,
     max_tokens: usize,
@@ -346,44 +366,27 @@ impl EmbeddingRuntime {
             .map_err(|error| anyhow!("failed to configure tokenizer truncation: {error}"))?;
         tokenizer.with_padding(Some(PaddingParams::default()));
 
-        let mut builder = Session::builder()
-            .context("failed to create ONNX session builder")?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .context("failed to configure ONNX graph optimization")?;
-        if let Some(threads) = env_usize(EMBEDDING_INTRA_THREADS_ENV, 1, 128) {
-            builder = builder
-                .with_intra_threads(threads)
-                .context("failed to configure ONNX intra-op threads")?;
+        let session_count = embedding_session_count_from_env();
+        let prepacked_weights = PrepackedWeights::new();
+        let mut workers = Vec::with_capacity(session_count);
+        for _ in 0..session_count {
+            let session = build_onnx_embedding_session(&model_path, Some(&prepacked_weights))?;
+            let accepts_token_type_ids = session
+                .inputs()
+                .iter()
+                .any(|input| input.name() == "token_type_ids");
+            workers.push(OnnxEmbeddingWorker {
+                session: Mutex::new(session),
+                tokenizer: Mutex::new(tokenizer.clone()),
+                max_tokens,
+                accepts_token_type_ids,
+            });
         }
-        if let Some(threads) = env_usize(EMBEDDING_INTER_THREADS_ENV, 1, 128) {
-            builder = builder
-                .with_inter_threads(threads)
-                .context("failed to configure ONNX inter-op threads")?;
-        }
-        if env_bool(EMBEDDING_PARALLEL_EXECUTION_ENV) {
-            builder = builder
-                .with_parallel_execution(true)
-                .context("failed to configure ONNX parallel execution")?;
-        }
-        builder = configure_embedding_execution_provider(builder)?;
-
-        let session = builder
-            .commit_from_file(&model_path)
-            .with_context(|| format!("failed to load ONNX model {}", model_path.display()))?;
-        let accepts_token_type_ids = session
-            .inputs()
-            .iter()
-            .any(|input| input.name() == "token_type_ids");
 
         Ok(Self {
             model_path,
             model_id: probe.model_id,
-            backend: EmbeddingBackend::Onnx(Arc::new(OnnxEmbeddingRuntime {
-                session: Mutex::new(session),
-                tokenizer: Mutex::new(tokenizer),
-                max_tokens,
-                accepts_token_type_ids,
-            })),
+            backend: EmbeddingBackend::Onnx(Arc::new(OnnxEmbeddingRuntime { workers })),
         })
     }
 
@@ -487,12 +490,68 @@ impl EmbeddingRuntime {
     }
 }
 
+fn build_onnx_embedding_session(
+    model_path: &Path,
+    prepacked_weights: Option<&PrepackedWeights>,
+) -> Result<Session> {
+    let mut builder = Session::builder()
+        .context("failed to create ONNX session builder")?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .context("failed to configure ONNX graph optimization")?;
+    if let Some(threads) = env_usize(EMBEDDING_INTRA_THREADS_ENV, 1, 128) {
+        builder = builder
+            .with_intra_threads(threads)
+            .context("failed to configure ONNX intra-op threads")?;
+    }
+    if let Some(threads) = env_usize(EMBEDDING_INTER_THREADS_ENV, 1, 128) {
+        builder = builder
+            .with_inter_threads(threads)
+            .context("failed to configure ONNX inter-op threads")?;
+    }
+    if env_bool(EMBEDDING_PARALLEL_EXECUTION_ENV) {
+        builder = builder
+            .with_parallel_execution(true)
+            .context("failed to configure ONNX parallel execution")?;
+    }
+    if let Some(prepacked_weights) = prepacked_weights {
+        builder = builder
+            .with_prepacked_weights(prepacked_weights)
+            .context("failed to configure ONNX prepacked weights")?;
+    }
+    builder = configure_embedding_execution_provider(builder)?;
+
+    builder
+        .commit_from_file(model_path)
+        .with_context(|| format!("failed to load ONNX model {}", model_path.display()))
+}
+
 impl OnnxEmbeddingRuntime {
     fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+        if self.workers.len() <= 1 || texts.len() <= 1 {
+            return self.workers[0].embed_texts(texts);
+        }
 
+        let chunk_size = embedding_parallel_chunk_size(texts.len(), self.workers.len());
+        let chunks = texts
+            .par_chunks(chunk_size)
+            .enumerate()
+            .map(|(chunk_index, chunk)| {
+                let worker = &self.workers[chunk_index % self.workers.len()];
+                worker.embed_texts(chunk)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(chunks.into_iter().flatten().collect())
+    }
+}
+
+impl OnnxEmbeddingWorker {
+    fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
         let tokenizer = self
             .tokenizer
             .lock()
@@ -1064,6 +1123,71 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(value) = self.previous.as_deref() {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn embedding_session_count_env_override_is_clamped() {
+        let _guard = EnvGuard::set(EMBEDDING_SESSION_COUNT_ENV, "999");
+        assert_eq!(embedding_session_count_from_env(), 16);
+
+        let _guard = EnvGuard::set(EMBEDDING_SESSION_COUNT_ENV, "0");
+        assert_eq!(embedding_session_count_from_env(), 1);
+
+        let _guard = EnvGuard::set(EMBEDDING_SESSION_COUNT_ENV, "3");
+        assert_eq!(embedding_session_count_from_env(), 3);
+    }
+
+    #[test]
+    fn embedding_session_count_defaults_to_bounded_parallelism() {
+        let _guard = EnvGuard::remove(EMBEDDING_SESSION_COUNT_ENV);
+        let expected = std::thread::available_parallelism()
+            .map(|threads| threads.get().clamp(1, 2))
+            .unwrap_or(1);
+
+        assert_eq!(embedding_session_count_from_env(), expected);
+    }
+
+    #[test]
+    fn embedding_parallel_chunk_size_spreads_batches_across_workers() {
+        assert_eq!(embedding_parallel_chunk_size(64, 4), 16);
+        assert_eq!(embedding_parallel_chunk_size(65, 4), 17);
+        assert_eq!(embedding_parallel_chunk_size(7, 16), 1);
+        assert_eq!(embedding_parallel_chunk_size(0, 4), 1);
+    }
 
     #[test]
     fn test_search_engine() -> Result<()> {
