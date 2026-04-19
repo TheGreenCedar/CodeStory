@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use codestory_contracts::api::{
     GroundingSnapshotDto, NodeDetailsDto, RetrievalFallbackReasonDto, RetrievalModeDto,
     RetrievalStateDto, SearchHit, SnippetContextDto, SymbolContextDto, TrailContextDto,
@@ -6,6 +6,8 @@ use codestory_contracts::api::{
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use crate::args::{CliTrailMode, IndexOutput, OutputFormat, SearchOutput, TrailCommand};
@@ -15,20 +17,78 @@ use crate::display::{
 };
 use crate::runtime::ResolvedTarget;
 
-pub(crate) fn emit<T: Serialize>(format: OutputFormat, value: &T, markdown: String) -> Result<()> {
-    match format {
-        OutputFormat::Markdown => {
-            println!("{markdown}");
-            Ok(())
-        }
-        OutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(value).context("Failed to serialize JSON output")?
-            );
-            Ok(())
-        }
+pub(crate) fn emit<T: Serialize>(
+    format: OutputFormat,
+    value: &T,
+    markdown: String,
+    output_file: Option<&Path>,
+) -> Result<()> {
+    let content = render_output_content(format, value, &markdown)?;
+    if let Some(path) = output_file {
+        write_output_file(path, &content)?;
+    } else {
+        print!("{content}");
     }
+    Ok(())
+}
+
+pub(crate) fn emit_text(content: String, output_file: Option<&Path>) -> Result<()> {
+    let mut content = content;
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if let Some(path) = output_file {
+        write_output_file(path, &content)?;
+    } else {
+        print!("{content}");
+    }
+    Ok(())
+}
+
+fn render_output_content<T: Serialize>(
+    format: OutputFormat,
+    value: &T,
+    markdown: &str,
+) -> Result<String> {
+    let mut content = match format {
+        OutputFormat::Markdown => markdown.to_string(),
+        OutputFormat::Json => {
+            serde_json::to_string_pretty(value).context("Failed to serialize JSON output")?
+        }
+        OutputFormat::Dot => bail!("--format dot is only supported by `trail`"),
+    };
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    Ok(content)
+}
+
+fn write_output_file(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        && !parent.exists()
+    {
+        bail!(
+            "Output parent directory does not exist: {}",
+            clean_path_string(&parent.to_string_lossy())
+        );
+    }
+
+    let file = File::create(path).with_context(|| {
+        format!(
+            "Failed to create output file {}",
+            clean_path_string(&path.to_string_lossy())
+        )
+    })?;
+    let mut writer = BufWriter::new(file);
+    writer
+        .write_all(content.as_bytes())
+        .with_context(|| format!("Failed to write output file {}", path.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("Failed to flush output file {}", path.display()))?;
+    Ok(())
 }
 
 pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
@@ -453,22 +513,42 @@ pub(crate) fn render_trail_markdown(
             .get(&edge.target)
             .map(String::as_str)
             .unwrap_or(&edge.target.0);
-        let certainty = edge
-            .certainty
-            .as_deref()
-            .map(|value| format!(" certainty={value}"))
-            .unwrap_or_default();
+        let edge_kind = format!("{:?}", edge.kind).to_lowercase();
+        let (connector, certainty) =
+            render_trail_edge_notation(&edge_kind, edge.certainty.as_deref());
         let _ = writeln!(
             markdown,
-            "- [{}] {} -{}-> {}{}",
-            edge.id.0,
-            source,
-            format!("{:?}", edge.kind).to_lowercase(),
-            target,
-            certainty
+            "- [{}] {} {} {}{}",
+            edge.id.0, source, connector, target, certainty
         );
     }
     markdown
+}
+
+pub(crate) fn render_trail_dot(_project_root: &Path, context: &TrailContextDto) -> String {
+    let mut dot = String::new();
+    let _ = writeln!(dot, "digraph codestory_trail {{");
+    let _ = writeln!(dot, "  rankdir=LR;");
+    for node in &context.trail.nodes {
+        let _ = writeln!(
+            dot,
+            "  \"{}\" [label=\"{}\\n[{}]\"];",
+            escape_dot(&node.id.0),
+            escape_dot(&node.label),
+            format_kind(node.kind)
+        );
+    }
+    for edge in &context.trail.edges {
+        let _ = writeln!(
+            dot,
+            "  \"{}\" -> \"{}\" [label=\"{}\"];",
+            escape_dot(&edge.source.0),
+            escape_dot(&edge.target.0),
+            escape_dot(&format!("{:?}", edge.kind).to_lowercase())
+        );
+    }
+    let _ = writeln!(dot, "}}");
+    dot
 }
 
 pub(crate) fn render_snippet_markdown(
@@ -591,6 +671,14 @@ fn render_search_hit(project_root: &Path, hit: &SearchHit) -> String {
     }
     let _ = write!(out, " score={:.2}", hit.score);
     let _ = write!(out, " origin={}", hit.origin.as_str());
+    if let Some(node_ref) = node_ref(
+        project_root,
+        hit.file_path.as_deref(),
+        hit.line,
+        &hit.display_name,
+    ) {
+        let _ = write!(out, " ref=`{node_ref}`");
+    }
     out
 }
 
@@ -609,7 +697,47 @@ fn render_search_hit_output(hit: &crate::args::SearchHitOutput) -> String {
     }
     let _ = write!(out, " score={:.2}", hit.score);
     let _ = write!(out, " origin={}", hit.origin.as_str());
+    if let Some(node_ref) = hit.node_ref.as_deref() {
+        let _ = write!(out, " ref=`{node_ref}`");
+    }
+    if hit.duplicate_of.is_some() {
+        let _ = write!(out, " (see above)");
+    }
     out
+}
+
+pub(crate) fn node_ref(
+    project_root: &Path,
+    file_path: Option<&str>,
+    line: Option<u32>,
+    display_name: &str,
+) -> Option<String> {
+    let file_path = file_path?;
+    let line = line?;
+    Some(format!(
+        "{}:{line}:{display_name}",
+        relative_path(project_root, file_path)
+    ))
+}
+
+fn render_trail_edge_notation(edge_kind: &str, certainty: Option<&str>) -> (String, String) {
+    let normalized = certainty.map(|value| value.to_ascii_lowercase());
+    let connector = match normalized.as_deref() {
+        Some("probable") => format!("~{edge_kind}~>"),
+        Some("uncertain" | "speculative") => format!("?{edge_kind}?>"),
+        _ => format!("-{edge_kind}->"),
+    };
+    let suffix = certainty
+        .map(|value| format!(" certainty={value}"))
+        .unwrap_or_else(|| " [unresolved]".to_string());
+    (connector, suffix)
+}
+
+fn escape_dot(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 fn snippet_language(path: &str) -> &'static str {
@@ -668,4 +796,150 @@ fn render_ground_symbol(symbol: &codestory_contracts::api::GroundingSymbolDigest
         let _ = write!(out, " edges={}", symbol.edge_digest.join("; "));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codestory_contracts::api::{
+        EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse, NodeDetailsDto, NodeId,
+        TrailContextDto,
+    };
+    use serde_json::json;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    fn sample_node_details(id: &str, display_name: &str) -> NodeDetailsDto {
+        NodeDetailsDto {
+            id: NodeId(id.to_string()),
+            kind: codestory_contracts::api::NodeKind::FUNCTION,
+            display_name: display_name.to_string(),
+            serialized_name: display_name.to_string(),
+            qualified_name: None,
+            canonical_id: None,
+            file_path: None,
+            start_line: None,
+            start_col: None,
+            end_line: None,
+            end_col: None,
+            member_access: None,
+        }
+    }
+
+    fn sample_graph_node(id: &str, label: &str) -> GraphNodeDto {
+        GraphNodeDto {
+            id: NodeId(id.to_string()),
+            label: label.to_string(),
+            kind: codestory_contracts::api::NodeKind::FUNCTION,
+            depth: 0,
+            label_policy: None,
+            badge_visible_members: None,
+            badge_total_members: None,
+            merged_symbol_examples: Vec::new(),
+            file_path: None,
+            qualified_name: None,
+            member_access: None,
+        }
+    }
+
+    fn sample_graph_edge(id: &str, source: &str, target: &str) -> GraphEdgeDto {
+        GraphEdgeDto {
+            id: EdgeId(id.to_string()),
+            source: NodeId(source.to_string()),
+            target: NodeId(target.to_string()),
+            kind: EdgeKind::CALL,
+            confidence: None,
+            certainty: None,
+            callsite_identity: None,
+            candidate_targets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn render_output_content_uses_selected_format() {
+        let markdown = render_output_content(OutputFormat::Markdown, &json!({"ok": true}), "hello")
+            .expect("render markdown");
+        assert_eq!(markdown, "hello\n");
+
+        let json_output =
+            render_output_content(OutputFormat::Json, &json!({"ok": true}), "ignored")
+                .expect("render json");
+        assert!(json_output.contains("\"ok\": true"));
+    }
+
+    #[test]
+    fn render_output_content_rejects_dot_without_trail_renderer() {
+        let error = render_output_content(OutputFormat::Dot, &json!({"ok": true}), "ignored")
+            .expect_err("generic emit should reject dot");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--format dot is only supported by `trail`"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn write_output_file_rejects_missing_parent_directory() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("missing").join("out.md");
+
+        let error = write_output_file(&path, "content").expect_err("missing parent should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Output parent directory does not exist"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn trail_edge_notation_reflects_certainty() {
+        assert_eq!(
+            render_trail_edge_notation("call", Some("certain")),
+            ("-call->".to_string(), " certainty=certain".to_string())
+        );
+        assert_eq!(
+            render_trail_edge_notation("call", Some("definite")),
+            ("-call->".to_string(), " certainty=definite".to_string())
+        );
+        assert_eq!(
+            render_trail_edge_notation("call", Some("probable")),
+            ("~call~>".to_string(), " certainty=probable".to_string())
+        );
+        assert_eq!(
+            render_trail_edge_notation("call", Some("uncertain")),
+            ("?call?>".to_string(), " certainty=uncertain".to_string())
+        );
+        assert_eq!(
+            render_trail_edge_notation("call", Some("speculative")),
+            ("?call?>".to_string(), " certainty=speculative".to_string())
+        );
+        assert_eq!(
+            render_trail_edge_notation("call", None),
+            ("-call->".to_string(), " [unresolved]".to_string())
+        );
+    }
+
+    #[test]
+    fn render_trail_dot_emits_graphviz_nodes_and_edges() {
+        let context = TrailContextDto {
+            focus: sample_node_details("a", "A"),
+            trail: GraphResponse {
+                center_id: NodeId("a".to_string()),
+                nodes: vec![sample_graph_node("a", "A"), sample_graph_node("b", "B")],
+                edges: vec![sample_graph_edge("edge-1", "a", "b")],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        };
+
+        let dot = render_trail_dot(Path::new("C:/repo"), &context);
+
+        assert!(dot.contains("\"a\" [label=\"A\\n[function]\"];"));
+        assert!(dot.contains("\"a\" -> \"b\" [label=\"call\"];"));
+    }
 }

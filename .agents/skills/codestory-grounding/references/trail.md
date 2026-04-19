@@ -22,9 +22,11 @@ target/release/codestory-cli(.exe) trail [OPTIONS]
 | `--max-nodes` | integer | `24` | Maximum nodes in the trail (clamped 1–200) |
 | `--include-tests` | flag | `false` | Include test and bench callers |
 | `--show-utility-calls` | flag | `false` | Include utility/helper call edges |
+| `--hide-speculative` | flag | `false` | Hide uncertain/speculative edges and remove nodes disconnected from the trail focus |
 | `--layout` | enum | `horizontal` | Layout direction: `horizontal` or `vertical` |
 | `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
-| `--format` | enum | `markdown` | Output format: `markdown` or `json` |
+| `--format` | enum | `markdown` | Output format: `markdown`, `json`, or trail-only `dot` |
+| `--output-file` | path | *stdout* | Write command output to a file; the parent directory must already exist |
 
 ## Trail Modes
 
@@ -45,9 +47,21 @@ nodes: 8  edges: 12  omitted_edges: 3  truncated: false
 - [def456] Storage::open [FUNCTION] `src/storage.rs`:20 (depth 1)
 - [ghi789] main [FUNCTION] `src/main.rs`:5 (depth 1)
 edges:
-- [abc123] -> [def456] CALL
-- [ghi789] -> [abc123] CALL
+- [edge1] open_project -call-> Storage::open certainty=certain
+- [edge2] main ~call~> open_project certainty=probable
+- [edge3] open_project ?call?> maybe_helper certainty=uncertain
 ```
+
+## Edge Certainty Notation
+
+Markdown trail output renders edge certainty directly in the arrow shape:
+
+| Certainty | Arrow | Meaning |
+|-----------|-------|---------|
+| `certain` / `definite` | `-call->` | Verified or high-confidence edge |
+| `probable` | `~call~>` | Likely edge inferred from available evidence |
+| `uncertain` / `speculative` | `?call?>` | Low-confidence edge; hide with `--hide-speculative` |
+| missing certainty | `-call-> [unresolved]` | Legacy or unresolved certainty metadata |
 
 ## Examples
 
@@ -63,6 +77,12 @@ target/release/codestory-cli(.exe) trail --project . --query Storage::open --mod
 
 # Larger trail, vertical layout, JSON
 target/release/codestory-cli(.exe) trail --project . --query EventBus --max-nodes 50 --layout vertical --format json
+
+# Hide low-confidence edges in Markdown or JSON output
+target/release/codestory-cli(.exe) trail --project . --query ResolutionPass --hide-speculative
+
+# Export a Graphviz DOT graph
+target/release/codestory-cli(.exe) trail --project . --query ResolutionPass --format dot --output-file trail.dot
 ```
 
 ## Interpreting Trail Noise

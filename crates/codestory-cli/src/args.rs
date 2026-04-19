@@ -50,6 +50,7 @@ pub(crate) struct ProjectArgs {
 pub(crate) enum OutputFormat {
     Markdown,
     Json,
+    Dot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -108,6 +109,12 @@ pub(crate) struct IndexCommand {
     pub(crate) refresh: RefreshMode,
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
     pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -125,6 +132,12 @@ pub(crate) struct GroundCommand {
     pub(crate) refresh: RefreshMode,
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
     pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -155,6 +168,12 @@ pub(crate) struct SearchCommand {
     pub(crate) refresh: RefreshMode,
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
     pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -200,6 +219,12 @@ pub(crate) struct SymbolCommand {
     pub(crate) refresh: RefreshMode,
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
     pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -220,6 +245,11 @@ pub(crate) struct TrailCommand {
     pub(crate) include_tests: bool,
     #[arg(long)]
     pub(crate) show_utility_calls: bool,
+    #[arg(
+        long,
+        help = "Hide uncertain/speculative edges and remove nodes disconnected from the trail focus."
+    )]
+    pub(crate) hide_speculative: bool,
     #[arg(long, value_enum, default_value_t = CliLayout::Horizontal)]
     pub(crate) layout: CliLayout,
     #[arg(
@@ -231,6 +261,12 @@ pub(crate) struct TrailCommand {
     pub(crate) refresh: RefreshMode,
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
     pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -250,6 +286,12 @@ pub(crate) struct SnippetCommand {
     pub(crate) refresh: RefreshMode,
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
     pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -273,6 +315,8 @@ pub(crate) enum QuerySelectorOutput {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SearchHitOutput {
     pub(crate) node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) node_ref: Option<String>,
     pub(crate) display_name: String,
     pub(crate) kind: NodeKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -282,6 +326,8 @@ pub(crate) struct SearchHitOutput {
     pub(crate) score: f32,
     pub(crate) origin: SearchHitOrigin,
     pub(crate) resolvable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) duplicate_of: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) excerpt: Option<String>,
 }

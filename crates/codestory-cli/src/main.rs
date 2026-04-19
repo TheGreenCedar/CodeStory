@@ -1,7 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
-use codestory_contracts::api::{SearchHit, SearchRepoTextMode, SearchRequest};
-use std::fs;
+use codestory_contracts::api::{SearchHit, SearchRepoTextMode, SearchRequest, TrailContextDto};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    fs,
+};
 
 mod args;
 mod display;
@@ -15,8 +18,8 @@ use args::{
     SymbolJsonOutput, TrailCommand, TrailJsonOutput, build_trail_request,
 };
 use output::{
-    emit, render_ground_markdown, render_index_markdown, render_search_markdown,
-    render_snippet_markdown, render_symbol_markdown, render_trail_markdown,
+    emit, emit_text, render_ground_markdown, render_index_markdown, render_search_markdown,
+    render_snippet_markdown, render_symbol_markdown, render_trail_dot, render_trail_markdown,
 };
 use runtime::{RuntimeContext, ensure_index_ready, map_api_error, refresh_label, resolve_target};
 
@@ -56,6 +59,7 @@ fn main() -> Result<()> {
 }
 
 fn run_index(cmd: IndexCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "index")?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     let retrieval = opened
@@ -75,10 +79,11 @@ fn run_index(cmd: IndexCommand) -> Result<()> {
     };
 
     let markdown = render_index_markdown(&output);
-    emit(cmd.format, &output, markdown)
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
 fn run_ground(cmd: GroundCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "ground")?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_ground_open(cmd.refresh)?;
     ensure_index_ready(&opened, "ground")?;
@@ -88,10 +93,11 @@ fn run_ground(cmd: GroundCommand) -> Result<()> {
         .grounding_snapshot(cmd.budget.into())
         .map_err(map_api_error)?;
     let markdown = render_ground_markdown(&runtime.project_root, &snapshot);
-    emit(cmd.format, &snapshot, markdown)
+    emit(cmd.format, &snapshot, markdown, cmd.output_file.as_deref())
 }
 
 fn run_search(cmd: SearchCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "search")?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "search")?;
@@ -117,10 +123,11 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
         },
     );
     let markdown = render_search_markdown(&runtime.project_root, &output);
-    emit(cmd.format, &output, markdown)
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
 fn run_symbol(cmd: SymbolCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "symbol")?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "symbol")?;
@@ -136,7 +143,7 @@ fn run_symbol(cmd: SymbolCommand) -> Result<()> {
         resolution: build_query_resolution_output(&runtime.project_root, &target),
         symbol: &context,
     };
-    emit(cmd.format, &output, markdown)
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
 fn run_trail(cmd: TrailCommand) -> Result<()> {
@@ -147,19 +154,29 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
     let file_filter = cmd.target.file_filter();
     let target = resolve_target(&runtime, cmd.target.selection()?, file_filter.as_deref())?;
     let request = build_trail_request(&target.selected.node_id, &cmd);
-    let context = runtime
+    let mut context = runtime
         .grounding
         .trail_context(request)
         .map_err(map_api_error)?;
+    if cmd.hide_speculative {
+        context = hide_speculative_trail_edges(context);
+    }
+    if cmd.format == args::OutputFormat::Dot {
+        return emit_text(
+            render_trail_dot(&runtime.project_root, &context),
+            cmd.output_file.as_deref(),
+        );
+    }
     let markdown = render_trail_markdown(&runtime.project_root, &target, &context, &cmd);
     let output = TrailJsonOutput {
         resolution: build_query_resolution_output(&runtime.project_root, &target),
         trail: &context,
     };
-    emit(cmd.format, &output, markdown)
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
 fn run_snippet(cmd: SnippetCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "snippet")?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "snippet")?;
@@ -175,7 +192,14 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
         resolution: build_query_resolution_output(&runtime.project_root, &target),
         snippet: &context,
     };
-    emit(cmd.format, &output, markdown)
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn ensure_dot_only_for_trail(format: args::OutputFormat, command: &str) -> Result<()> {
+    if format == args::OutputFormat::Dot {
+        bail!("--format dot is only supported by `trail`; `{command}` supports markdown and json");
+    }
+    Ok(())
 }
 
 fn build_search_output(
@@ -187,20 +211,37 @@ fn build_search_output(
     limit_per_source: u32,
     repo_text: RepoTextOutputConfig,
 ) -> SearchOutput {
+    let indexed_symbol_hits = symbol_hits
+        .iter()
+        .map(|hit| build_search_hit_output(project_root, hit))
+        .collect::<Vec<_>>();
+    let mut duplicate_index = HashMap::new();
+    for hit in &indexed_symbol_hits {
+        if let Some(key) = search_hit_location_key(hit) {
+            duplicate_index
+                .entry(key)
+                .or_insert_with(|| hit.node_id.clone());
+        }
+    }
+    let repo_text_hits = repo_text_hits
+        .iter()
+        .map(|hit| {
+            let mut output = build_search_hit_output(project_root, hit);
+            if let Some(key) = search_hit_location_key(&output) {
+                output.duplicate_of = duplicate_index.get(&key).cloned();
+            }
+            output
+        })
+        .collect();
+
     SearchOutput {
         query: query.to_string(),
         retrieval: retrieval.clone(),
         limit_per_source,
         repo_text_mode: repo_text.mode,
         repo_text_enabled: repo_text.enabled,
-        indexed_symbol_hits: symbol_hits
-            .iter()
-            .map(|hit| build_search_hit_output(project_root, hit))
-            .collect(),
-        repo_text_hits: repo_text_hits
-            .iter()
-            .map(|hit| build_search_hit_output(project_root, hit))
-            .collect(),
+        indexed_symbol_hits,
+        repo_text_hits,
     }
 }
 
@@ -226,20 +267,100 @@ fn build_query_resolution_output(
 }
 
 fn build_search_hit_output(project_root: &std::path::Path, hit: &SearchHit) -> SearchHitOutput {
+    let file_path = hit
+        .file_path
+        .as_deref()
+        .map(|value| crate::display::relative_path(project_root, value));
     SearchHitOutput {
         node_id: hit.node_id.0.clone(),
+        node_ref: crate::output::node_ref(
+            project_root,
+            hit.file_path.as_deref(),
+            hit.line,
+            &hit.display_name,
+        ),
         display_name: hit.display_name.clone(),
         kind: hit.kind,
-        file_path: hit
-            .file_path
-            .as_deref()
-            .map(|value| crate::display::relative_path(project_root, value)),
+        file_path,
         line: hit.line,
         score: hit.score,
         origin: hit.origin,
         resolvable: hit.resolvable,
+        duplicate_of: None,
         excerpt: repo_text_excerpt(project_root, hit),
     }
+}
+
+fn search_hit_location_key(hit: &SearchHitOutput) -> Option<(String, u32)> {
+    Some((hit.file_path.clone()?, hit.line?))
+}
+
+fn hide_speculative_trail_edges(mut context: TrailContextDto) -> TrailContextDto {
+    let original_edge_count = context.trail.edges.len();
+    let retained_edges = context
+        .trail
+        .edges
+        .into_iter()
+        .filter(|edge| !is_speculative_certainty(edge.certainty.as_deref()))
+        .collect::<Vec<_>>();
+
+    let mut adjacency = HashMap::new();
+    for edge in &retained_edges {
+        adjacency
+            .entry(edge.source.clone())
+            .or_insert_with(Vec::new)
+            .push(edge.target.clone());
+        adjacency
+            .entry(edge.target.clone())
+            .or_insert_with(Vec::new)
+            .push(edge.source.clone());
+    }
+
+    let mut reachable = HashSet::new();
+    let mut queue = VecDeque::new();
+    reachable.insert(context.trail.center_id.clone());
+    queue.push_back(context.trail.center_id.clone());
+    while let Some(node_id) = queue.pop_front() {
+        if let Some(next_nodes) = adjacency.get(&node_id) {
+            for next in next_nodes {
+                if reachable.insert(next.clone()) {
+                    queue.push_back(next.clone());
+                }
+            }
+        }
+    }
+
+    context
+        .trail
+        .nodes
+        .retain(|node| reachable.contains(&node.id));
+    context.trail.edges = retained_edges
+        .into_iter()
+        .filter(|edge| reachable.contains(&edge.source) && reachable.contains(&edge.target))
+        .collect();
+    let omitted_edges = original_edge_count.saturating_sub(context.trail.edges.len()) as u32;
+    context.trail.omitted_edge_count = context
+        .trail
+        .omitted_edge_count
+        .saturating_add(omitted_edges);
+
+    if let Some(layout) = context.trail.canonical_layout.as_mut() {
+        layout.nodes.retain(|node| reachable.contains(&node.id));
+        layout.edges.retain(|edge| {
+            !is_speculative_certainty(edge.certainty.as_deref())
+                && reachable.contains(&edge.source)
+                && reachable.contains(&edge.target)
+        });
+    }
+
+    context
+}
+
+fn is_speculative_certainty(certainty: Option<&str>) -> bool {
+    matches!(
+        certainty.map(|value| value.to_ascii_lowercase()).as_deref(),
+        Some("uncertain" | "speculative")
+    )
 }
 
 fn repo_text_excerpt(project_root: &std::path::Path, hit: &SearchHit) -> Option<String> {
@@ -282,8 +403,9 @@ mod tests {
     use crate::query_resolution::compare_resolution_hits;
     use crate::runtime::{cache_root_for_project, fnv1a_hex, resolve_refresh_request};
     use codestory_contracts::api::{
-        IndexMode, IndexingPhaseTimings, NodeId, ProjectSummary, RetrievalModeDto,
-        RetrievalStateDto, SearchHit, StorageStatsDto,
+        EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse, IndexMode,
+        IndexingPhaseTimings, NodeDetailsDto, NodeId, ProjectSummary, RetrievalModeDto,
+        RetrievalStateDto, SearchHit, StorageStatsDto, TrailContextDto,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -379,6 +501,57 @@ mod tests {
             resolved_imports_global_unique: Some(53),
             resolved_imports_fuzzy: Some(54),
             resolved_imports_semantic: Some(55),
+        }
+    }
+
+    fn sample_node_details(id: &str, display_name: &str) -> NodeDetailsDto {
+        NodeDetailsDto {
+            id: NodeId(id.to_string()),
+            kind: codestory_contracts::api::NodeKind::FUNCTION,
+            display_name: display_name.to_string(),
+            serialized_name: display_name.to_string(),
+            qualified_name: None,
+            canonical_id: None,
+            file_path: None,
+            start_line: None,
+            start_col: None,
+            end_line: None,
+            end_col: None,
+            member_access: None,
+        }
+    }
+
+    fn sample_graph_node(id: &str, label: &str) -> GraphNodeDto {
+        GraphNodeDto {
+            id: NodeId(id.to_string()),
+            label: label.to_string(),
+            kind: codestory_contracts::api::NodeKind::FUNCTION,
+            depth: 0,
+            label_policy: None,
+            badge_visible_members: None,
+            badge_total_members: None,
+            merged_symbol_examples: Vec::new(),
+            file_path: None,
+            qualified_name: None,
+            member_access: None,
+        }
+    }
+
+    fn sample_graph_edge(
+        id: &str,
+        source: &str,
+        target: &str,
+        certainty: Option<&str>,
+    ) -> GraphEdgeDto {
+        GraphEdgeDto {
+            id: EdgeId(id.to_string()),
+            source: NodeId(source.to_string()),
+            target: NodeId(target.to_string()),
+            kind: EdgeKind::CALL,
+            confidence: None,
+            certainty: certainty.map(ToOwned::to_owned),
+            callsite_identity: None,
+            candidate_targets: Vec::new(),
         }
     }
 
@@ -491,6 +664,184 @@ mod tests {
             output.repo_text_hits[0].origin,
             codestory_contracts::api::SearchHitOrigin::TextMatch
         );
+    }
+
+    #[test]
+    fn build_search_output_adds_stable_node_ref_when_location_is_known() {
+        let root = Path::new("C:/repo");
+        let symbol_hits = vec![SearchHit {
+            node_id: NodeId("1".to_string()),
+            display_name: "ResolutionPass".to_string(),
+            kind: codestory_contracts::api::NodeKind::STRUCT,
+            file_path: Some("C:/repo/src/resolution/mod.rs".to_string()),
+            line: Some(42),
+            score: 0.9,
+            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+        }];
+
+        let output = build_search_output(
+            root,
+            "ResolutionPass",
+            &sample_retrieval(),
+            &symbol_hits,
+            &[],
+            5,
+            RepoTextOutputConfig {
+                mode: RepoTextMode::Auto,
+                enabled: false,
+            },
+        );
+
+        assert_eq!(
+            output.indexed_symbol_hits[0].node_ref.as_deref(),
+            Some("src/resolution/mod.rs:42:ResolutionPass")
+        );
+    }
+
+    #[test]
+    fn build_search_output_marks_repo_text_duplicates_of_indexed_symbols() {
+        let root = Path::new("C:/repo");
+        let symbol_hits = vec![SearchHit {
+            node_id: NodeId("symbol-1".to_string()),
+            display_name: "build_snapshot_digest".to_string(),
+            kind: codestory_contracts::api::NodeKind::FUNCTION,
+            file_path: Some("C:/repo/src/lib.rs".to_string()),
+            line: Some(7),
+            score: 0.9,
+            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+        }];
+        let repo_text_hits = vec![SearchHit {
+            node_id: NodeId("text-1".to_string()),
+            display_name: "src/lib.rs".to_string(),
+            kind: codestory_contracts::api::NodeKind::FILE,
+            file_path: Some("C:/repo/src/lib.rs".to_string()),
+            line: Some(7),
+            score: 500.0,
+            origin: codestory_contracts::api::SearchHitOrigin::TextMatch,
+            resolvable: false,
+        }];
+
+        let output = build_search_output(
+            root,
+            "snapshot digest",
+            &sample_retrieval(),
+            &symbol_hits,
+            &repo_text_hits,
+            5,
+            RepoTextOutputConfig {
+                mode: RepoTextMode::Auto,
+                enabled: true,
+            },
+        );
+
+        assert_eq!(
+            output.repo_text_hits[0].duplicate_of.as_deref(),
+            Some("symbol-1")
+        );
+    }
+
+    #[test]
+    fn all_existing_commands_accept_output_file() {
+        let commands = [
+            vec!["codestory-cli", "index", "--output-file", "out.md"],
+            vec!["codestory-cli", "ground", "--output-file", "out.md"],
+            vec![
+                "codestory-cli",
+                "search",
+                "--query",
+                "needle",
+                "--output-file",
+                "out.md",
+            ],
+            vec![
+                "codestory-cli",
+                "symbol",
+                "--query",
+                "Foo",
+                "--output-file",
+                "out.md",
+            ],
+            vec![
+                "codestory-cli",
+                "trail",
+                "--query",
+                "Foo",
+                "--hide-speculative",
+                "--format",
+                "dot",
+                "--output-file",
+                "out.md",
+            ],
+            vec![
+                "codestory-cli",
+                "snippet",
+                "--query",
+                "Foo",
+                "--output-file",
+                "out.md",
+            ],
+        ];
+
+        for command in commands {
+            Cli::try_parse_from(command).expect("command should parse --output-file");
+        }
+    }
+
+    #[test]
+    fn non_trail_commands_reject_dot_format_before_running() {
+        let error =
+            ensure_dot_only_for_trail(args::OutputFormat::Dot, "search").expect_err("reject dot");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--format dot is only supported by `trail`"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn hide_speculative_trail_edges_prunes_disconnected_nodes() {
+        let context = TrailContextDto {
+            focus: sample_node_details("a", "A"),
+            trail: GraphResponse {
+                center_id: NodeId("a".to_string()),
+                nodes: vec![
+                    sample_graph_node("a", "A"),
+                    sample_graph_node("b", "B"),
+                    sample_graph_node("c", "C"),
+                    sample_graph_node("d", "D"),
+                ],
+                edges: vec![
+                    sample_graph_edge("e1", "a", "b", Some("certain")),
+                    sample_graph_edge("e2", "b", "c", Some("uncertain")),
+                    sample_graph_edge("e3", "c", "d", Some("certain")),
+                ],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        };
+
+        let filtered = hide_speculative_trail_edges(context);
+        let node_ids = filtered
+            .trail
+            .nodes
+            .iter()
+            .map(|node| node.id.0.as_str())
+            .collect::<Vec<_>>();
+        let edge_ids = filtered
+            .trail
+            .edges
+            .iter()
+            .map(|edge| edge.id.0.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(node_ids, vec!["a", "b"]);
+        assert_eq!(edge_ids, vec!["e1"]);
+        assert_eq!(filtered.trail.omitted_edge_count, 2);
     }
 
     #[test]
