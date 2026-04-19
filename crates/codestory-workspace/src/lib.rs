@@ -71,6 +71,12 @@ pub struct WorkspaceManifest {
     settings: WorkspaceSettings,
     manifest_path: PathBuf,
     is_synthetic_default: Cell<bool>,
+    members: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceMembersManifest {
+    pub members: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,6 +128,7 @@ impl WorkspaceManifest {
             settings,
             manifest_path,
             is_synthetic_default: Cell::new(false),
+            members: Vec::new(),
         }
     }
 
@@ -132,6 +139,7 @@ impl WorkspaceManifest {
             settings,
             manifest_path: path,
             is_synthetic_default: Cell::new(false),
+            members: Vec::new(),
         })
     }
 
@@ -151,10 +159,16 @@ impl WorkspaceManifest {
             },
             manifest_path,
             is_synthetic_default: Cell::new(false),
+            members: Vec::new(),
         }
     }
 
     pub fn open(root_path: PathBuf) -> Result<Self> {
+        let workspace_file = root_path.join("codestory_workspace.json");
+        if workspace_file.exists() {
+            return Self::load_workspace_members(root_path, workspace_file);
+        }
+
         let project_file = root_path.join("codestory_project.json");
         if project_file.exists() {
             Self::load(project_file)
@@ -188,6 +202,42 @@ impl WorkspaceManifest {
         }
     }
 
+    fn load_workspace_members(root_path: PathBuf, manifest_path: PathBuf) -> Result<Self> {
+        let content = fs::read_to_string(&manifest_path)?;
+        let workspace: WorkspaceMembersManifest = serde_json::from_str(&content)?;
+        let mut manifest = Self::new(
+            root_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Workspace")
+                .to_string(),
+            manifest_path,
+        );
+        manifest.members = workspace.members.clone();
+        manifest.is_synthetic_default.set(true);
+        manifest.settings.source_groups = workspace
+            .members
+            .iter()
+            .map(|member| SourceGroupSettings {
+                id: Uuid::new_v4(),
+                language: Language::Rust,
+                standard: LanguageStandard::Default,
+                source_paths: vec![member.clone()],
+                exclude_patterns: vec![
+                    "**/node_modules/**".to_string(),
+                    "**/target/**".to_string(),
+                    "**/.git/**".to_string(),
+                    "**/dist/**".to_string(),
+                    "**/build/**".to_string(),
+                ],
+                include_paths: Vec::new(),
+                defines: HashMap::new(),
+                language_specific: LanguageSpecificSettings::Other,
+            })
+            .collect();
+        Ok(manifest)
+    }
+
     pub fn settings(&self) -> &WorkspaceSettings {
         &self.settings
     }
@@ -201,6 +251,10 @@ impl WorkspaceManifest {
             .parent()
             .unwrap_or(Path::new("."))
             .to_path_buf()
+    }
+
+    pub fn members(&self) -> &[PathBuf] {
+        &self.members
     }
 
     fn should_filter_source_group_language(&self) -> bool {
@@ -710,6 +764,43 @@ mod tests {
 
         assert!(files.contains(&root.join("app.ts")));
         assert!(files.contains(&root.join("src").join("main.py")));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_manifest_discovers_all_member_roots() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("backend").join("src"))?;
+        fs::create_dir_all(root.join("frontend"))?;
+        fs::create_dir_all(root.join("backend").join("target"))?;
+        fs::write(
+            root.join("codestory_workspace.json"),
+            r#"{"members":["backend","frontend"]}"#,
+        )?;
+        fs::write(
+            root.join("backend").join("src").join("lib.rs"),
+            "pub fn api() {}\n",
+        )?;
+        fs::write(
+            root.join("backend").join("target").join("generated.rs"),
+            "pub fn ignored() {}\n",
+        )?;
+        fs::write(
+            root.join("frontend").join("app.ts"),
+            "export const app = true;\n",
+        )?;
+
+        let manifest = WorkspaceManifest::open(root.clone())?;
+        let files = WorkspaceDiscovery.source_files(&manifest)?;
+
+        assert_eq!(
+            manifest.members(),
+            &[PathBuf::from("backend"), PathBuf::from("frontend")]
+        );
+        assert!(files.contains(&root.join("backend").join("src").join("lib.rs")));
+        assert!(files.contains(&root.join("frontend").join("app.ts")));
+        assert!(!files.contains(&root.join("backend").join("target").join("generated.rs")));
         Ok(())
     }
 

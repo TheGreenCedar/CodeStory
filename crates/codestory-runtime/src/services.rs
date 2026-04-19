@@ -1,9 +1,9 @@
 use codestory_contracts::api::{
     AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto, ApiError, GroundingBudgetDto,
-    GroundingSnapshotDto, IndexMode, IndexingPhaseTimings, NodeDetailsDto, NodeDetailsRequest,
-    NodeId, OpenProjectRequest, ProjectSummary, RetrievalStateDto, SearchHit, SearchRequest,
-    SearchResultsDto, SnippetContextDto, StartIndexingRequest, SymbolContextDto, TrailConfigDto,
-    TrailContextDto,
+    GroundingSnapshotDto, IndexDryRunDto, IndexMode, IndexingPhaseTimings, NodeDetailsDto,
+    NodeDetailsRequest, NodeId, OpenProjectRequest, ProjectSummary, RetrievalStateDto, SearchHit,
+    SearchRequest, SearchResultsDto, SnippetContextDto, StartIndexingRequest, SummaryGenerationDto,
+    SymbolContextDto, TrailConfigDto, TrailContextDto,
 };
 
 use crate::AppController;
@@ -55,6 +55,14 @@ impl ProjectService {
         self.controller
             .run_indexing_blocking_without_runtime_refresh(mode)
     }
+
+    pub fn dry_run_index(&self, mode: IndexMode) -> Result<IndexDryRunDto, ApiError> {
+        self.controller.dry_run_index(mode)
+    }
+
+    pub fn summarize_symbols_blocking(&self) -> Result<SummaryGenerationDto, ApiError> {
+        self.controller.summarize_symbols_blocking()
+    }
 }
 
 #[derive(Clone)]
@@ -81,6 +89,14 @@ impl IndexService {
     ) -> Result<IndexingPhaseTimings, ApiError> {
         self.controller
             .run_indexing_blocking_without_runtime_refresh(mode)
+    }
+
+    pub fn dry_run_index(&self, mode: IndexMode) -> Result<IndexDryRunDto, ApiError> {
+        self.controller.dry_run_index(mode)
+    }
+
+    pub fn summarize_symbols_blocking(&self) -> Result<SummaryGenerationDto, ApiError> {
+        self.controller.summarize_symbols_blocking()
     }
 }
 

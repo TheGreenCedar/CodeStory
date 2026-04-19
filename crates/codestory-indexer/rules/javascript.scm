@@ -121,16 +121,8 @@
   body: (statement_block
     (return_statement
       (jsx_self_closing_element
-        name: (_) @component)))) @def
+        name: (_) @component))))
 {
-  node @caller_name.node
-  attr (@caller_name.node) kind = "FUNCTION"
-  attr (@caller_name.node) name = (source-text @caller_name)
-  attr (@caller_name.node) start_row = (start-row @def)
-  attr (@caller_name.node) start_col = (start-column @def)
-  attr (@caller_name.node) end_row = (end-row @def)
-  attr (@caller_name.node) end_col = (end-column @def)
-
   node @component.node
   attr (@component.node) kind = "UNKNOWN"
   attr (@component.node) name = (source-text @component)
@@ -149,16 +141,8 @@
     (return_statement
       (jsx_self_closing_element
         (jsx_attribute
-          (property_identifier) @attribute))))) @def
+          (property_identifier) @attribute)))))
 {
-  node @caller_name.node
-  attr (@caller_name.node) kind = "FUNCTION"
-  attr (@caller_name.node) name = (source-text @caller_name)
-  attr (@caller_name.node) start_row = (start-row @def)
-  attr (@caller_name.node) start_col = (start-column @def)
-  attr (@caller_name.node) end_row = (end-row @def)
-  attr (@caller_name.node) end_col = (end-column @def)
-
   node @attribute.node
   attr (@attribute.node) kind = "FIELD"
   attr (@attribute.node) name = (source-text @attribute)

@@ -102,6 +102,15 @@ const TABLE_STATEMENTS: &[&str] = &[
         FOREIGN KEY(node_id) REFERENCES node(id),
         FOREIGN KEY(file_node_id) REFERENCES node(id)
     )",
+    "CREATE TABLE IF NOT EXISTS symbol_summary (
+        node_id INTEGER NOT NULL,
+        content_hash TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        model TEXT NOT NULL,
+        updated_at_epoch_ms INTEGER NOT NULL,
+        PRIMARY KEY(node_id, content_hash),
+        FOREIGN KEY(node_id) REFERENCES node(id)
+    )",
     "CREATE TABLE IF NOT EXISTS search_symbol_projection (
         node_id INTEGER PRIMARY KEY,
         display_name TEXT NOT NULL,
@@ -334,7 +343,12 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
         migrate_v11_llm_symbol_doc_reuse_metadata(&storage.conn)?;
         storage.set_schema_version(11)?;
     }
+    if stored_version < 12 {
+        migrate_v12_symbol_summary(&storage.conn)?;
+        storage.set_schema_version(12)?;
+    }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
+    create_symbol_summary_indexes(&storage.conn)?;
 
     if storage.deferred_secondary_indexes {
         create_load_indexes(&storage.conn)?;
@@ -403,6 +417,37 @@ fn create_llm_symbol_doc_reuse_index(conn: &Connection) -> Result<(), StorageErr
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_model_hash
          ON llm_symbol_doc(embedding_model, doc_version, doc_hash)",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(super) fn migrate_v12_symbol_summary(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS symbol_summary (
+            node_id INTEGER NOT NULL,
+            content_hash TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            model TEXT NOT NULL,
+            updated_at_epoch_ms INTEGER NOT NULL,
+            PRIMARY KEY(node_id, content_hash),
+            FOREIGN KEY(node_id) REFERENCES node(id)
+        )",
+        [],
+    )?;
+    create_symbol_summary_indexes(conn)?;
+    Ok(())
+}
+
+fn create_symbol_summary_indexes(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_symbol_summary_node
+         ON symbol_summary(node_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_symbol_summary_updated
+         ON symbol_summary(updated_at_epoch_ms)",
         [],
     )?;
     Ok(())

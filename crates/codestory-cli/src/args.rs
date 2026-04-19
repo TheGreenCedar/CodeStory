@@ -1,8 +1,8 @@
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
-    GroundingBudgetDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind, ProjectSummary,
-    RetrievalStateDto, SearchHitOrigin, SnippetContextDto, SymbolContextDto, TrailCallerScope,
-    TrailContextDto, TrailDirection, TrailMode,
+    GroundingBudgetDto, IndexDryRunDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind,
+    ProjectSummary, RetrievalStateDto, SearchHitOrigin, SnippetContextDto, SummaryGenerationDto,
+    SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -28,6 +28,10 @@ pub(crate) enum Command {
     Symbol(SymbolCommand),
     Trail(TrailCommand),
     Snippet(SnippetCommand),
+    Query(QueryCommand),
+    Explore(ExploreCommand),
+    Serve(ServeCommand),
+    GenerateCompletions(GenerateCompletionsCommand),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -96,6 +100,14 @@ pub(crate) enum CliLayout {
     Vertical,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    Powershell,
+}
+
 #[derive(Args, Debug)]
 pub(crate) struct IndexCommand {
     #[command(flatten)]
@@ -115,6 +127,20 @@ pub(crate) struct IndexCommand {
         help = "Write command output to this file instead of stdout. The parent directory must already exist."
     )]
     pub(crate) output_file: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Compute the refresh plan without parsing files or writing storage."
+    )]
+    pub(crate) dry_run: bool,
+    #[arg(long, help = "Generate cached symbol summaries after indexing.")]
+    pub(crate) summarize: bool,
+    #[arg(long, help = "Print indexing progress to stderr.")]
+    pub(crate) progress: bool,
+    #[arg(
+        long,
+        help = "Keep running and incrementally re-index after file changes."
+    )]
+    pub(crate) watch: bool,
 }
 
 #[derive(Args, Debug)]
@@ -225,6 +251,8 @@ pub(crate) struct SymbolCommand {
         help = "Write command output to this file instead of stdout. The parent directory must already exist."
     )]
     pub(crate) output_file: Option<PathBuf>,
+    #[arg(long, help = "Render a Mermaid graph instead of Markdown/JSON output.")]
+    pub(crate) mermaid: bool,
 }
 
 #[derive(Args, Debug)]
@@ -267,6 +295,8 @@ pub(crate) struct TrailCommand {
         help = "Write command output to this file instead of stdout. The parent directory must already exist."
     )]
     pub(crate) output_file: Option<PathBuf>,
+    #[arg(long, help = "Render a Mermaid graph instead of Markdown/JSON output.")]
+    pub(crate) mermaid: bool,
 }
 
 #[derive(Args, Debug)]
@@ -294,6 +324,87 @@ pub(crate) struct SnippetCommand {
     pub(crate) output_file: Option<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+pub(crate) struct QueryCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(value_name = "QUERY")]
+    pub(crate) query: String,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
+    pub(crate) refresh: RefreshMode,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ExploreCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[command(flatten)]
+    pub(crate) target: TargetArgs,
+    #[arg(long, default_value_t = 2)]
+    pub(crate) depth: u32,
+    #[arg(long, default_value_t = 18)]
+    pub(crate) max_nodes: u32,
+    #[arg(
+        long,
+        help = "Print plain Markdown instead of opening the terminal explorer when stdout is interactive."
+    )]
+    pub(crate) no_tui: bool,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
+    pub(crate) refresh: RefreshMode,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ServeCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(long, default_value = "127.0.0.1:3917")]
+    pub(crate) addr: String,
+    #[arg(
+        long,
+        help = "Serve a small MCP-style JSON-lines protocol over stdio instead of HTTP."
+    )]
+    pub(crate) stdio: bool,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
+    pub(crate) refresh: RefreshMode,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct GenerateCompletionsCommand {
+    #[arg(long, value_enum)]
+    pub(crate) shell: CompletionShell,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct IndexOutput<'a> {
     pub(crate) project: &'a str,
@@ -303,6 +414,13 @@ pub(crate) struct IndexOutput<'a> {
     pub(crate) retrieval: &'a RetrievalStateDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) phase_timings: Option<&'a IndexingPhaseTimings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) summary_generation: Option<&'a SummaryGenerationDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct IndexDryRunOutput<'a> {
+    pub(crate) dry_run: &'a IndexDryRunDto,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -339,6 +457,8 @@ pub(crate) struct SearchOutput {
     pub(crate) limit_per_source: u32,
     pub(crate) repo_text_mode: RepoTextMode,
     pub(crate) repo_text_enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) suggestions: Vec<SearchHitOutput>,
     pub(crate) indexed_symbol_hits: Vec<SearchHitOutput>,
     pub(crate) repo_text_hits: Vec<SearchHitOutput>,
 }
@@ -370,6 +490,37 @@ pub(crate) struct TrailJsonOutput<'a> {
 pub(crate) struct SnippetJsonOutput<'a> {
     pub(crate) resolution: QueryResolutionOutput,
     pub(crate) snippet: &'a SnippetContextDto,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct QueryItemOutput {
+    pub(crate) node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) node_ref: Option<String>,
+    pub(crate) display_name: String,
+    pub(crate) kind: NodeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) depth: Option<u32>,
+    pub(crate) source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct QueryOutput {
+    pub(crate) query: String,
+    pub(crate) ast: codestory_contracts::query::GraphQueryAst,
+    pub(crate) items: Vec<QueryItemOutput>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ExploreOutput<'a> {
+    pub(crate) resolution: QueryResolutionOutput,
+    pub(crate) symbol: &'a SymbolContextDto,
+    pub(crate) trail: &'a TrailContextDto,
+    pub(crate) snippet: Option<&'a SnippetContextDto>,
 }
 
 #[derive(Debug)]

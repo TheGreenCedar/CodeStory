@@ -2,6 +2,8 @@
 
 Resolves a symbol and returns its source code with surrounding context lines. Useful for reading the actual implementation without opening the full file.
 
+Markdown output uses ANSI syntax highlighting when stdout is an interactive terminal. Output files, pipes, and JSON output stay uncolored for automation.
+
 ## Usage
 
 ```

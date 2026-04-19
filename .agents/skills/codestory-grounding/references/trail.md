@@ -27,6 +27,7 @@ target/release/codestory-cli(.exe) trail [OPTIONS]
 | `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
 | `--format` | enum | `markdown` | Output format: `markdown`, `json`, or trail-only `dot` |
 | `--output-file` | path | *stdout* | Write command output to a file; the parent directory must already exist |
+| `--mermaid` | flag | `false` | Render a Mermaid flowchart instead of Markdown/JSON/DOT |
 
 ## Trail Modes
 
@@ -83,6 +84,9 @@ target/release/codestory-cli(.exe) trail --project . --query ResolutionPass --hi
 
 # Export a Graphviz DOT graph
 target/release/codestory-cli(.exe) trail --project . --query ResolutionPass --format dot --output-file trail.dot
+
+# Export a Mermaid flowchart
+target/release/codestory-cli(.exe) trail --project . --query ResolutionPass --mermaid --output-file trail.mmd
 ```
 
 ## Interpreting Trail Noise

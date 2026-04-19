@@ -23,6 +23,7 @@ target/release/codestory-cli(.exe) search [OPTIONS]
 
 - **Symbol-like queries** (e.g. `AppController`, `run_indexing`) search the indexed symbol table.
 - **Natural-language queries** (e.g. `"how does incremental indexing work"`) also perform a repo-wide text scan and merge results by score.
+- When hybrid retrieval finds strong semantic matches but no lexical match, Markdown and JSON output include `did_you_mean` suggestions.
 
 ## Output
 

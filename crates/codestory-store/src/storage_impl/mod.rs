@@ -25,7 +25,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 11;
+const SCHEMA_VERSION: u32 = 12;
 const GROUNDING_SNAPSHOT_VERSION: i64 = 1;
 const GROUNDING_SNAPSHOT_STATE_DIRTY: i64 = 0;
 const GROUNDING_SNAPSHOT_STATE_BUILDING: i64 = 1;
@@ -340,6 +340,15 @@ pub struct LlmSymbolDocStats {
     pub embedding_model: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SymbolSummaryRecord {
+    pub node_id: NodeId,
+    pub content_hash: String,
+    pub summary: String,
+    pub model: String,
+    pub updated_at_epoch_ms: i64,
+}
+
 impl Storage {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         Self::open_with_mode(path, StorageOpenMode::Live)
@@ -467,8 +476,39 @@ impl Storage {
              FROM source_snapshot.index_artifact_cache",
             [],
         );
-        let detach_result = self.conn.execute("DETACH DATABASE source_snapshot", []);
         let copied = copy_result?;
+        let has_symbol_summary: bool = self.conn.query_row(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM source_snapshot.sqlite_master
+                WHERE type = 'table' AND name = 'symbol_summary'
+             )",
+            [],
+            |row| row.get::<_, i64>(0).map(|value| value != 0),
+        )?;
+        if has_symbol_summary {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO symbol_summary (
+                    node_id,
+                    content_hash,
+                    summary,
+                    model,
+                    updated_at_epoch_ms
+                 )
+                 SELECT
+                    source_summary.node_id,
+                    source_summary.content_hash,
+                    source_summary.summary,
+                    source_summary.model,
+                    source_summary.updated_at_epoch_ms
+                 FROM source_snapshot.symbol_summary source_summary
+                 WHERE EXISTS (
+                    SELECT 1 FROM node WHERE node.id = source_summary.node_id
+                 )",
+                [],
+            )?;
+        }
+        let detach_result = self.conn.execute("DETACH DATABASE source_snapshot", []);
         detach_result?;
         Ok(copied)
     }
@@ -1050,6 +1090,7 @@ impl Storage {
         tx.execute("DELETE FROM occurrence", [])?;
         tx.execute("DELETE FROM edge", [])?;
         tx.execute("DELETE FROM llm_symbol_doc", [])?;
+        tx.execute("DELETE FROM symbol_summary", [])?;
         tx.execute("DELETE FROM search_symbol_projection", [])?;
         tx.execute("DELETE FROM component_access", [])?;
         tx.execute("DELETE FROM bookmark_node", [])?;
@@ -2135,6 +2176,110 @@ impl Storage {
             doc_count: doc_count.max(0).min(u32::MAX as i64) as u32,
             embedding_model,
         })
+    }
+
+    pub fn upsert_symbol_summaries_batch(
+        &mut self,
+        summaries: &[SymbolSummaryRecord],
+    ) -> Result<(), StorageError> {
+        if summaries.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO symbol_summary (
+                    node_id,
+                    content_hash,
+                    summary,
+                    model,
+                    updated_at_epoch_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(node_id, content_hash) DO UPDATE SET
+                    summary = excluded.summary,
+                    model = excluded.model,
+                    updated_at_epoch_ms = excluded.updated_at_epoch_ms",
+            )?;
+            for summary in summaries {
+                stmt.execute(params![
+                    summary.node_id.0,
+                    summary.content_hash,
+                    summary.summary,
+                    summary.model,
+                    summary.updated_at_epoch_ms,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_current_symbol_summaries_by_node_ids(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<HashMap<NodeId, SymbolSummaryRecord>, StorageError> {
+        if node_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = question_placeholders(node_ids.len());
+        let sql = format!(
+            "SELECT summary.node_id,
+                    summary.content_hash,
+                    summary.summary,
+                    summary.model,
+                    summary.updated_at_epoch_ms
+             FROM symbol_summary summary
+             INNER JOIN llm_symbol_doc doc
+                ON doc.node_id = summary.node_id
+               AND doc.doc_hash = summary.content_hash
+             WHERE summary.node_id IN ({placeholders})
+             ORDER BY summary.node_id ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(node_ids.iter().map(|id| id.0)))?;
+        let mut summaries = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let record = SymbolSummaryRecord {
+                node_id: NodeId(row.get(0)?),
+                content_hash: row.get(1)?,
+                summary: row.get(2)?,
+                model: row.get(3)?,
+                updated_at_epoch_ms: row.get(4)?,
+            };
+            summaries.insert(record.node_id, record);
+        }
+        Ok(summaries)
+    }
+
+    pub fn get_all_current_symbol_summaries(
+        &self,
+    ) -> Result<HashMap<NodeId, SymbolSummaryRecord>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT summary.node_id,
+                    summary.content_hash,
+                    summary.summary,
+                    summary.model,
+                    summary.updated_at_epoch_ms
+             FROM symbol_summary summary
+             INNER JOIN llm_symbol_doc doc
+                ON doc.node_id = summary.node_id
+               AND doc.doc_hash = summary.content_hash
+             ORDER BY summary.node_id ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut summaries = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let record = SymbolSummaryRecord {
+                node_id: NodeId(row.get(0)?),
+                content_hash: row.get(1)?,
+                summary: row.get(2)?,
+                model: row.get(3)?,
+                updated_at_epoch_ms: row.get(4)?,
+            };
+            summaries.insert(record.node_id, record);
+        }
+        Ok(summaries)
     }
 
     pub fn get_all_llm_symbol_docs(&self) -> Result<Vec<LlmSymbolDoc>, StorageError> {

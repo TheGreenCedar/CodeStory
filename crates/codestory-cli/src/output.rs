@@ -10,7 +10,10 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::args::{CliTrailMode, IndexOutput, OutputFormat, SearchOutput, TrailCommand};
+use crate::args::{
+    CliTrailMode, IndexDryRunOutput, IndexOutput, OutputFormat, QueryOutput, SearchOutput,
+    TrailCommand,
+};
 use crate::display::{
     clean_path_string, default_trail_direction, format_budget, format_direction, format_kind,
     format_trail_mode, relative_path,
@@ -109,6 +112,19 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
         output.summary.stats.file_count,
         output.summary.stats.error_count
     );
+    if !output.summary.members.is_empty() {
+        let _ = writeln!(markdown, "members:");
+        for member in &output.summary.members {
+            let _ = writeln!(
+                markdown,
+                "- `{}` files={} nodes={} edges={}",
+                clean_path_string(&member.path),
+                member.file_count.unwrap_or(member.indexed_files),
+                member.node_count.unwrap_or(0),
+                member.edge_count.unwrap_or(0)
+            );
+        }
+    }
     let _ = writeln!(
         markdown,
         "retrieval: {}",
@@ -256,6 +272,72 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
             ],
         );
     }
+    if let Some(summary) = output.summary_generation {
+        let _ = writeln!(
+            markdown,
+            "summaries: generated={} reused={} skipped={} endpoint={}",
+            summary.generated, summary.reused, summary.skipped, summary.endpoint
+        );
+    }
+    markdown
+}
+
+pub(crate) fn render_index_dry_run_markdown(output: &IndexDryRunOutput<'_>) -> String {
+    let dry_run = output.dry_run;
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Index Dry Run");
+    let _ = writeln!(markdown, "project: `{}`", clean_path_string(&dry_run.root));
+    let _ = writeln!(
+        markdown,
+        "storage: `{}`",
+        clean_path_string(&dry_run.storage_path)
+    );
+    let _ = writeln!(markdown, "refresh: `{:?}`", dry_run.refresh);
+    let _ = writeln!(
+        markdown,
+        "plan: would index {} files, remove {} files",
+        dry_run.files_to_index, dry_run.files_to_remove
+    );
+    if !dry_run.members.is_empty() {
+        let _ = writeln!(markdown, "members:");
+        for member in &dry_run.members {
+            let _ = write!(
+                markdown,
+                "- `{}` files_to_index={} indexed_files={}",
+                clean_path_string(&member.path),
+                member.files_to_index,
+                member.indexed_files
+            );
+            if member.file_count.is_some()
+                || member.node_count.is_some()
+                || member.edge_count.is_some()
+            {
+                let _ = write!(
+                    markdown,
+                    " files={} nodes={} edges={}",
+                    member.file_count.unwrap_or(member.indexed_files),
+                    member.node_count.unwrap_or(0),
+                    member.edge_count.unwrap_or(0)
+                );
+            }
+            let _ = writeln!(markdown);
+        }
+    }
+    if !dry_run.sample_files_to_index.is_empty() {
+        let _ = writeln!(markdown, "sample_files_to_index:");
+        for path in &dry_run.sample_files_to_index {
+            let _ = writeln!(markdown, "- `{}`", clean_path_string(path));
+        }
+    }
+    if !dry_run.sample_file_ids_to_remove.is_empty() {
+        let ids = dry_run
+            .sample_file_ids_to_remove
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(markdown, "sample_file_ids_to_remove: {ids}");
+    }
     markdown
 }
 
@@ -389,6 +471,12 @@ pub(crate) fn render_search_markdown(_project_root: &Path, output: &SearchOutput
             "disabled"
         }
     );
+    if !output.suggestions.is_empty() {
+        let _ = writeln!(markdown, "did_you_mean:");
+        for hit in &output.suggestions {
+            let _ = writeln!(markdown, "- {}", render_search_hit_output(hit));
+        }
+    }
     let _ = writeln!(
         markdown,
         "indexed_symbol_hits: {}",
@@ -420,6 +508,9 @@ pub(crate) fn render_symbol_markdown(
         "focus: {}",
         render_node(project_root, &context.node)
     );
+    if let Some(summary) = context.summary.as_deref() {
+        let _ = writeln!(markdown, "summary: {summary}");
+    }
     let _ = writeln!(markdown, "children: {}", context.children.len());
     for child in &context.children {
         let _ = writeln!(
@@ -444,6 +535,86 @@ pub(crate) fn render_symbol_markdown(
         }
     }
     markdown
+}
+
+pub(crate) fn render_query_markdown(output: &QueryOutput) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Query");
+    let _ = writeln!(markdown, "query: `{}`", output.query);
+    let _ = writeln!(markdown, "items: {}", output.items.len());
+    for item in &output.items {
+        let mut line = format!(
+            "- [{}] {} [{}]",
+            item.node_id,
+            item.display_name,
+            format_kind(item.kind)
+        );
+        if let Some(path) = item.file_path.as_deref() {
+            let _ = write!(line, " {path}");
+        }
+        if let Some(line_no) = item.line {
+            let _ = write!(line, ":{line_no}");
+        }
+        if let Some(depth) = item.depth {
+            let _ = write!(line, " depth={depth}");
+        }
+        if let Some(node_ref) = item.node_ref.as_deref() {
+            let _ = write!(line, " ref=`{node_ref}`");
+        }
+        let _ = write!(line, " source={}", item.source);
+        let _ = writeln!(markdown, "{line}");
+    }
+    markdown
+}
+
+pub(crate) fn render_symbol_mermaid(context: &SymbolContextDto) -> String {
+    let mut mermaid = String::new();
+    let _ = writeln!(mermaid, "flowchart LR");
+    let root = mermaid_node_id(&context.node.id.0);
+    let _ = writeln!(
+        mermaid,
+        "  {}[\"{}\\n[{}]\"]",
+        root,
+        escape_mermaid_label(&context.node.display_name),
+        format_kind(context.node.kind)
+    );
+    for child in &context.children {
+        let child_id = mermaid_node_id(&child.id.0);
+        let _ = writeln!(
+            mermaid,
+            "  {}[\"{}\\n[{}]\"]",
+            child_id,
+            escape_mermaid_label(&child.label),
+            format_kind(child.kind)
+        );
+        let _ = writeln!(mermaid, "  {} --> {}", root, child_id);
+    }
+    mermaid
+}
+
+pub(crate) fn render_trail_mermaid(context: &TrailContextDto) -> String {
+    let mut mermaid = String::new();
+    let _ = writeln!(mermaid, "flowchart LR");
+    for node in &context.trail.nodes {
+        let _ = writeln!(
+            mermaid,
+            "  {}[\"{}\\n[{}]\"]",
+            mermaid_node_id(&node.id.0),
+            escape_mermaid_label(&node.label),
+            format_kind(node.kind)
+        );
+    }
+    for edge in &context.trail.edges {
+        let label = format!("{:?}", edge.kind).to_lowercase();
+        let _ = writeln!(
+            mermaid,
+            "  {} -->|{}| {}",
+            mermaid_node_id(&edge.source.0),
+            escape_mermaid_label(&label),
+            mermaid_node_id(&edge.target.0)
+        );
+    }
+    mermaid
 }
 
 pub(crate) fn render_trail_markdown(
@@ -555,6 +726,7 @@ pub(crate) fn render_snippet_markdown(
     project_root: &Path,
     target: &ResolvedTarget,
     context: &SnippetContextDto,
+    colorize: bool,
 ) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Snippet");
@@ -572,7 +744,12 @@ pub(crate) fn render_snippet_markdown(
     );
     let fence = snippet_fence(&context.snippet);
     let _ = writeln!(markdown, "{fence}{}", snippet_language(&context.path));
-    let _ = writeln!(markdown, "{}", context.snippet);
+    let snippet = if colorize {
+        ansi_highlight_snippet(&context.path, &context.snippet)
+    } else {
+        context.snippet.clone()
+    };
+    let _ = writeln!(markdown, "{snippet}");
     let _ = writeln!(markdown, "{fence}");
     markdown
 }
@@ -740,6 +917,204 @@ fn escape_dot(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
+fn mermaid_node_id(value: &str) -> String {
+    let mut out = String::from("n");
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    out
+}
+
+fn escape_mermaid_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn ansi_highlight_snippet(path: &str, snippet: &str) -> String {
+    let language = snippet_language(path);
+    if language.is_empty() {
+        return snippet.to_string();
+    }
+    snippet
+        .lines()
+        .map(|line| ansi_highlight_line(language, line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn ansi_highlight_line(language: &str, line: &str) -> String {
+    let comment_marker = match language {
+        "python" | "ruby" | "toml" | "yaml" => Some("#"),
+        "rust" | "typescript" | "tsx" | "javascript" | "jsx" | "go" | "java" | "kotlin"
+        | "csharp" | "cpp" | "php" | "swift" => Some("//"),
+        _ => None,
+    };
+    let Some(marker) = comment_marker else {
+        return ansi_highlight_code(language, line);
+    };
+    if let Some(index) = line.find(marker) {
+        let (code, comment) = line.split_at(index);
+        return format!(
+            "{}\x1b[90m{}\x1b[0m",
+            ansi_highlight_code(language, code),
+            comment
+        );
+    }
+    ansi_highlight_code(language, line)
+}
+
+fn ansi_highlight_code(language: &str, code: &str) -> String {
+    let mut out = String::new();
+    let mut chars = code.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if matches!(ch, '"' | '\'' | '`') {
+            out.push_str("\x1b[32m");
+            out.push(ch);
+            let quote = ch;
+            let mut escaped = false;
+            for next in chars.by_ref() {
+                out.push(next);
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if next == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if next == quote {
+                    break;
+                }
+            }
+            out.push_str("\x1b[0m");
+            continue;
+        }
+
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            let mut word = String::new();
+            word.push(ch);
+            while let Some(next) = chars.peek().copied() {
+                if next.is_ascii_alphanumeric() || next == '_' {
+                    word.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if is_language_keyword(language, &word) {
+                let _ = write!(out, "\x1b[1;34m{word}\x1b[0m");
+            } else {
+                out.push_str(&word);
+            }
+            continue;
+        }
+
+        out.push(ch);
+    }
+    out
+}
+
+fn is_language_keyword(language: &str, word: &str) -> bool {
+    match language {
+        "rust" => matches!(
+            word,
+            "as" | "async"
+                | "await"
+                | "break"
+                | "const"
+                | "continue"
+                | "crate"
+                | "else"
+                | "enum"
+                | "fn"
+                | "for"
+                | "if"
+                | "impl"
+                | "in"
+                | "let"
+                | "match"
+                | "mod"
+                | "mut"
+                | "pub"
+                | "return"
+                | "self"
+                | "struct"
+                | "trait"
+                | "type"
+                | "use"
+                | "where"
+                | "while"
+        ),
+        "typescript" | "tsx" | "javascript" | "jsx" => matches!(
+            word,
+            "async"
+                | "await"
+                | "class"
+                | "const"
+                | "else"
+                | "export"
+                | "extends"
+                | "for"
+                | "from"
+                | "function"
+                | "if"
+                | "import"
+                | "interface"
+                | "let"
+                | "new"
+                | "return"
+                | "type"
+                | "var"
+                | "while"
+        ),
+        "python" => matches!(
+            word,
+            "async"
+                | "await"
+                | "class"
+                | "def"
+                | "elif"
+                | "else"
+                | "except"
+                | "for"
+                | "from"
+                | "if"
+                | "import"
+                | "in"
+                | "lambda"
+                | "return"
+                | "try"
+                | "while"
+                | "with"
+                | "yield"
+        ),
+        _ => matches!(
+            word,
+            "class"
+                | "const"
+                | "else"
+                | "enum"
+                | "for"
+                | "func"
+                | "function"
+                | "if"
+                | "import"
+                | "interface"
+                | "return"
+                | "struct"
+                | "type"
+                | "var"
+                | "while"
+        ),
+    }
+}
+
 fn snippet_language(path: &str) -> &'static str {
     match Path::new(path)
         .extension()
@@ -791,6 +1166,9 @@ fn render_ground_symbol(symbol: &codestory_contracts::api::GroundingSymbolDigest
     }
     if let Some(member_count) = symbol.member_count {
         let _ = write!(out, " members={member_count}");
+    }
+    if let Some(summary) = symbol.summary.as_deref() {
+        let _ = write!(out, " summary=\"{}\"", summary.replace('"', "\\\""));
     }
     if !symbol.edge_digest.is_empty() {
         let _ = write!(out, " edges={}", symbol.edge_digest.join("; "));

@@ -1,27 +1,47 @@
 use anyhow::{Context, Result, bail};
-use clap::Parser;
-use codestory_contracts::api::{SearchHit, SearchRepoTextMode, SearchRequest, TrailContextDto};
+use clap::{CommandFactory, Parser};
+use clap_complete::{Shell, generate};
+use codestory_contracts::api::{
+    AppEventPayload, IndexMode, LayoutDirection, SearchHit, SearchRepoTextMode, SearchRequest,
+    SnippetContextDto, SymbolContextDto, TrailCallerScope, TrailConfigDto, TrailContextDto,
+    TrailDirection, TrailMode,
+};
+use codestory_contracts::query::GraphQueryOperation;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
+    io::{BufRead, IsTerminal, Read, Write},
+    net::{TcpListener, TcpStream},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 mod args;
+mod config;
 mod display;
 mod output;
 mod query_resolution;
 mod runtime;
 
 use args::{
-    Cli, Command, GroundCommand, IndexCommand, IndexOutput, QueryResolutionOutput, RepoTextMode,
-    SearchCommand, SearchHitOutput, SearchOutput, SnippetCommand, SnippetJsonOutput, SymbolCommand,
-    SymbolJsonOutput, TrailCommand, TrailJsonOutput, build_trail_request,
+    Cli, Command, CompletionShell, ExploreCommand, ExploreOutput, GenerateCompletionsCommand,
+    GroundCommand, IndexCommand, IndexDryRunOutput, IndexOutput, QueryCommand, QueryItemOutput,
+    QueryOutput, QueryResolutionOutput, RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput,
+    ServeCommand, SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, TrailCommand,
+    TrailJsonOutput, build_trail_request,
 };
 use output::{
-    emit, emit_text, render_ground_markdown, render_index_markdown, render_search_markdown,
-    render_snippet_markdown, render_symbol_markdown, render_trail_dot, render_trail_markdown,
+    emit, emit_text, render_ground_markdown, render_index_dry_run_markdown, render_index_markdown,
+    render_query_markdown, render_search_markdown, render_snippet_markdown, render_symbol_markdown,
+    render_symbol_mermaid, render_trail_dot, render_trail_markdown, render_trail_mermaid,
 };
-use runtime::{RuntimeContext, ensure_index_ready, map_api_error, refresh_label, resolve_target};
+use runtime::{
+    RuntimeContext, ensure_index_ready, map_api_error, refresh_label, resolve_refresh_request,
+    resolve_target,
+};
 
 #[derive(Debug, Clone, Copy)]
 struct RepoTextOutputConfig {
@@ -55,13 +75,59 @@ fn main() -> Result<()> {
         Command::Symbol(cmd) => run_symbol(cmd),
         Command::Trail(cmd) => run_trail(cmd),
         Command::Snippet(cmd) => run_snippet(cmd),
+        Command::Query(cmd) => run_query(cmd),
+        Command::Explore(cmd) => run_explore(cmd),
+        Command::Serve(cmd) => run_serve(cmd),
+        Command::GenerateCompletions(cmd) => run_generate_completions(cmd),
     }
 }
 
 fn run_index(cmd: IndexCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "index")?;
+    if cmd.watch && cmd.output_file.is_some() {
+        eprintln!("watch mode rewrites the configured output file after each refresh");
+    }
+    run_index_once(&cmd)?;
+    if cmd.watch {
+        run_index_watch(cmd)?;
+    }
+    Ok(())
+}
+
+fn run_index_once(cmd: &IndexCommand) -> Result<()> {
     let runtime = RuntimeContext::new(&cmd.project)?;
+    if cmd.dry_run {
+        let summary = runtime.open_project_summary()?;
+        let refresh_mode =
+            resolve_refresh_request(cmd.refresh, &summary).unwrap_or(IndexMode::Incremental);
+        let dry_run = runtime
+            .index
+            .dry_run_index(refresh_mode)
+            .map_err(map_api_error)?;
+        let output = IndexDryRunOutput { dry_run: &dry_run };
+        let markdown = render_index_dry_run_markdown(&output);
+        return emit(cmd.format, &output, markdown, cmd.output_file.as_deref());
+    }
+
+    let progress = if cmd.progress {
+        Some(spawn_progress_printer(runtime.events.clone()))
+    } else {
+        None
+    };
     let opened = runtime.ensure_open(cmd.refresh)?;
+    if let Some(progress) = progress {
+        progress.finish();
+    }
+    let summary_generation = if cmd.summarize {
+        Some(
+            runtime
+                .index
+                .summarize_symbols_blocking()
+                .map_err(map_api_error)?,
+        )
+    } else {
+        None
+    };
     let retrieval = opened
         .summary
         .retrieval
@@ -76,10 +142,93 @@ fn run_index(cmd: IndexCommand) -> Result<()> {
         summary: &opened.summary,
         retrieval,
         phase_timings: opened.phase_timings.as_ref(),
+        summary_generation: summary_generation.as_ref(),
     };
 
     let markdown = render_index_markdown(&output);
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+struct ProgressPrinter {
+    done: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+impl ProgressPrinter {
+    fn finish(self) {
+        self.done.store(true, Ordering::SeqCst);
+        let _ = self.handle.join();
+    }
+}
+
+fn spawn_progress_printer(rx: crossbeam_channel::Receiver<AppEventPayload>) -> ProgressPrinter {
+    let done = Arc::new(AtomicBool::new(false));
+    let worker_done = Arc::clone(&done);
+    let handle = std::thread::spawn(move || {
+        while !worker_done.load(Ordering::SeqCst) {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(AppEventPayload::IndexingProgress { current, total }) => {
+                    eprintln!(
+                        "[{current}/{total}] {} indexing",
+                        format_progress_bar(current, total)
+                    );
+                }
+                Ok(AppEventPayload::IndexingStarted { file_count }) => {
+                    eprintln!(
+                        "[0/{file_count}] {} indexing started",
+                        format_progress_bar(0, file_count)
+                    );
+                }
+                Ok(_) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+    ProgressPrinter { done, handle }
+}
+
+fn format_progress_bar(current: u32, total: u32) -> String {
+    const WIDTH: u32 = 18;
+    let filled = if total == 0 {
+        0
+    } else {
+        current.saturating_mul(WIDTH) / total.max(1)
+    }
+    .min(WIDTH);
+    format!(
+        "[{}{}]",
+        "#".repeat(filled as usize),
+        "-".repeat(WIDTH.saturating_sub(filled) as usize)
+    )
+}
+
+fn run_index_watch(mut cmd: IndexCommand) -> Result<()> {
+    use notify::{RecursiveMode, Watcher};
+
+    cmd.dry_run = false;
+    cmd.refresh = args::RefreshMode::Incremental;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = tx.send(event);
+    })?;
+    watcher.watch(&cmd.project.project, RecursiveMode::Recursive)?;
+    eprintln!(
+        "watching {} for changes; press Ctrl+C to stop",
+        cmd.project.project.display()
+    );
+    loop {
+        match rx.recv() {
+            Ok(Ok(_event)) => {
+                std::thread::sleep(Duration::from_millis(250));
+                while rx.try_recv().is_ok() {}
+                eprintln!("change detected; running incremental index");
+                run_index_once(&cmd)?;
+            }
+            Ok(Err(error)) => eprintln!("watch error: {error}"),
+            Err(error) => anyhow::bail!("watch channel closed: {error}"),
+        }
+    }
 }
 
 fn run_ground(cmd: GroundCommand) -> Result<()> {
@@ -116,6 +265,7 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
         &search_results.retrieval,
         &search_results.indexed_symbol_hits,
         &search_results.repo_text_hits,
+        &search_results.suggestions,
         search_results.limit_per_source,
         RepoTextOutputConfig {
             mode: from_api_repo_text_mode(search_results.repo_text_mode),
@@ -138,6 +288,9 @@ fn run_symbol(cmd: SymbolCommand) -> Result<()> {
         .grounding
         .symbol_context(target.selected.node_id.clone())
         .map_err(map_api_error)?;
+    if cmd.mermaid {
+        return emit_text(render_symbol_mermaid(&context), cmd.output_file.as_deref());
+    }
     let markdown = render_symbol_markdown(&runtime.project_root, &target, &context);
     let output = SymbolJsonOutput {
         resolution: build_query_resolution_output(&runtime.project_root, &target),
@@ -160,6 +313,9 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
         .map_err(map_api_error)?;
     if cmd.hide_speculative {
         context = hide_speculative_trail_edges(context);
+    }
+    if cmd.mermaid {
+        return emit_text(render_trail_mermaid(&context), cmd.output_file.as_deref());
     }
     if cmd.format == args::OutputFormat::Dot {
         return emit_text(
@@ -187,12 +343,746 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
         .grounding
         .snippet_context(target.selected.node_id.clone(), cmd.context)
         .map_err(map_api_error)?;
-    let markdown = render_snippet_markdown(&runtime.project_root, &target, &context);
+    let colorize = cmd.format == args::OutputFormat::Markdown
+        && cmd.output_file.is_none()
+        && std::io::stdout().is_terminal();
+    let markdown = render_snippet_markdown(&runtime.project_root, &target, &context, colorize);
     let output = SnippetJsonOutput {
         resolution: build_query_resolution_output(&runtime.project_root, &target),
         snippet: &context,
     };
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn run_query(cmd: QueryCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "query")?;
+    let ast = codestory_runtime::parse_graph_query(&cmd.query)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    let opened = runtime.ensure_open(cmd.refresh)?;
+    ensure_index_ready(&opened, "query")?;
+    let mut items = Vec::<QueryItemOutput>::new();
+    for op in &ast.operations {
+        match op {
+            GraphQueryOperation::Trail(query) => {
+                let target = resolve_target(
+                    &runtime,
+                    args::TargetSelection::Query(query.symbol.clone()),
+                    None,
+                )?;
+                let mut request = TrailConfigDto {
+                    root_id: target.selected.node_id.clone(),
+                    mode: TrailMode::Neighborhood,
+                    target_id: None,
+                    depth: query.depth.unwrap_or(2),
+                    direction: query.direction.unwrap_or(TrailDirection::Both),
+                    caller_scope: TrailCallerScope::ProductionOnly,
+                    edge_filter: Vec::new(),
+                    show_utility_calls: false,
+                    node_filter: Vec::new(),
+                    max_nodes: 120,
+                    layout_direction: LayoutDirection::Horizontal,
+                };
+                if request.depth == 0 {
+                    request.max_nodes = 200;
+                }
+                let context = runtime
+                    .grounding
+                    .trail_context(request)
+                    .map_err(map_api_error)?;
+                items = context
+                    .trail
+                    .nodes
+                    .iter()
+                    .map(|node| graph_node_to_query_item(&runtime.project_root, node, "trail"))
+                    .collect();
+            }
+            GraphQueryOperation::Symbol(query) => {
+                let target = resolve_target(
+                    &runtime,
+                    args::TargetSelection::Query(query.query.clone()),
+                    None,
+                )?;
+                let context = runtime
+                    .grounding
+                    .symbol_context(target.selected.node_id.clone())
+                    .map_err(map_api_error)?;
+                items = std::iter::once(node_details_to_query_item(
+                    &runtime.project_root,
+                    &context.node,
+                    Some(0),
+                    "symbol",
+                ))
+                .chain(context.children.iter().map(|child| {
+                    QueryItemOutput {
+                        node_id: child.id.0.clone(),
+                        node_ref: None,
+                        display_name: child.label.clone(),
+                        kind: child.kind,
+                        file_path: child
+                            .file_path
+                            .as_deref()
+                            .map(|path| display::relative_path(&runtime.project_root, path)),
+                        line: None,
+                        depth: Some(1),
+                        source: "symbol_child".to_string(),
+                    }
+                }))
+                .collect();
+            }
+            GraphQueryOperation::Search(query) => {
+                let results = runtime
+                    .search
+                    .search_results(SearchRequest {
+                        query: query.query.clone(),
+                        repo_text: SearchRepoTextMode::Off,
+                        limit_per_source: 50,
+                    })
+                    .map_err(map_api_error)?;
+                items = results
+                    .indexed_symbol_hits
+                    .iter()
+                    .map(|hit| search_hit_to_query_item(&runtime.project_root, hit, "search"))
+                    .collect();
+            }
+            GraphQueryOperation::Filter(filter) => {
+                items.retain(|item| {
+                    filter.kind.is_none_or(|kind| item.kind == kind)
+                        && filter
+                            .depth
+                            .is_none_or(|depth| item.depth.unwrap_or(0) <= depth)
+                        && filter.file.as_deref().is_none_or(|needle| {
+                            item.file_path
+                                .as_deref()
+                                .is_some_and(|path| path.contains(needle))
+                        })
+                });
+            }
+            GraphQueryOperation::Limit(limit) => {
+                items.truncate(limit.count as usize);
+            }
+        }
+    }
+    let output = QueryOutput {
+        query: cmd.query,
+        ast,
+        items,
+    };
+    let markdown = render_query_markdown(&output);
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn run_explore(cmd: ExploreCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "explore")?;
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    let opened = runtime.ensure_open(cmd.refresh)?;
+    ensure_index_ready(&opened, "explore")?;
+    let file_filter = cmd.target.file_filter();
+    let target = resolve_target(&runtime, cmd.target.selection()?, file_filter.as_deref())?;
+    let symbol = runtime
+        .grounding
+        .symbol_context(target.selected.node_id.clone())
+        .map_err(map_api_error)?;
+    let trail = runtime
+        .grounding
+        .trail_context(TrailConfigDto {
+            root_id: target.selected.node_id.clone(),
+            mode: TrailMode::Neighborhood,
+            target_id: None,
+            depth: cmd.depth,
+            direction: TrailDirection::Both,
+            caller_scope: TrailCallerScope::ProductionOnly,
+            edge_filter: Vec::new(),
+            show_utility_calls: false,
+            node_filter: Vec::new(),
+            max_nodes: cmd.max_nodes.clamp(1, 120),
+            layout_direction: LayoutDirection::Horizontal,
+        })
+        .map_err(map_api_error)?;
+    let snippet = runtime
+        .grounding
+        .snippet_context(target.selected.node_id.clone(), 4)
+        .ok();
+    let output = ExploreOutput {
+        resolution: build_query_resolution_output(&runtime.project_root, &target),
+        symbol: &symbol,
+        trail: &trail,
+        snippet: snippet.as_ref(),
+    };
+    let markdown = render_explore_markdown(
+        &runtime.project_root,
+        &target,
+        &symbol,
+        &trail,
+        snippet.as_ref(),
+    );
+    if cmd.format == args::OutputFormat::Markdown
+        && cmd.output_file.is_none()
+        && !cmd.no_tui
+        && std::io::stdout().is_terminal()
+    {
+        return run_explore_tui(
+            &runtime.project_root,
+            &target,
+            &symbol,
+            &trail,
+            snippet.as_ref(),
+        );
+    }
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn run_serve(cmd: ServeCommand) -> Result<()> {
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    let opened = runtime.ensure_open(cmd.refresh)?;
+    ensure_index_ready(&opened, "serve")?;
+    if cmd.stdio {
+        return run_stdio_server(runtime);
+    }
+    let listener = TcpListener::bind(&cmd.addr)
+        .with_context(|| format!("Failed to bind server to {}", cmd.addr))?;
+    eprintln!("codestory serve listening on http://{}", cmd.addr);
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                if let Err(error) = handle_http_request(&runtime, stream) {
+                    eprintln!("serve request failed: {error:#}");
+                }
+            }
+            Err(error) => eprintln!("serve accept failed: {error}"),
+        }
+    }
+    Ok(())
+}
+
+fn run_generate_completions(cmd: GenerateCompletionsCommand) -> Result<()> {
+    let shell = match cmd.shell {
+        CompletionShell::Bash => Shell::Bash,
+        CompletionShell::Zsh => Shell::Zsh,
+        CompletionShell::Fish => Shell::Fish,
+        CompletionShell::Powershell => Shell::PowerShell,
+    };
+    let mut command = Cli::command();
+    generate(shell, &mut command, "codestory-cli", &mut std::io::stdout());
+    Ok(())
+}
+
+fn graph_node_to_query_item(
+    project_root: &std::path::Path,
+    node: &codestory_contracts::api::GraphNodeDto,
+    source: &str,
+) -> QueryItemOutput {
+    let file_path = node
+        .file_path
+        .as_deref()
+        .map(|path| display::relative_path(project_root, path));
+    QueryItemOutput {
+        node_id: node.id.0.clone(),
+        node_ref: None,
+        display_name: node.label.clone(),
+        kind: node.kind,
+        file_path,
+        line: None,
+        depth: Some(node.depth),
+        source: source.to_string(),
+    }
+}
+
+fn search_hit_to_query_item(
+    project_root: &std::path::Path,
+    hit: &SearchHit,
+    source: &str,
+) -> QueryItemOutput {
+    QueryItemOutput {
+        node_id: hit.node_id.0.clone(),
+        node_ref: output::node_ref(
+            project_root,
+            hit.file_path.as_deref(),
+            hit.line,
+            &hit.display_name,
+        ),
+        display_name: hit.display_name.clone(),
+        kind: hit.kind,
+        file_path: hit
+            .file_path
+            .as_deref()
+            .map(|path| display::relative_path(project_root, path)),
+        line: hit.line,
+        depth: None,
+        source: source.to_string(),
+    }
+}
+
+fn node_details_to_query_item(
+    project_root: &std::path::Path,
+    node: &codestory_contracts::api::NodeDetailsDto,
+    depth: Option<u32>,
+    source: &str,
+) -> QueryItemOutput {
+    QueryItemOutput {
+        node_id: node.id.0.clone(),
+        node_ref: output::node_ref(
+            project_root,
+            node.file_path.as_deref(),
+            node.start_line,
+            &node.display_name,
+        ),
+        display_name: node.display_name.clone(),
+        kind: node.kind,
+        file_path: node
+            .file_path
+            .as_deref()
+            .map(|path| display::relative_path(project_root, path)),
+        line: node.start_line,
+        depth,
+        source: source.to_string(),
+    }
+}
+
+fn render_explore_markdown(
+    project_root: &std::path::Path,
+    target: &runtime::ResolvedTarget,
+    symbol: &SymbolContextDto,
+    trail: &TrailContextDto,
+    snippet: Option<&SnippetContextDto>,
+) -> String {
+    let mut markdown = String::new();
+    markdown.push_str("# Explore\n");
+    markdown.push_str("resolution:\n");
+    markdown.push_str(&format!(
+        "- {}\n",
+        output::node_ref(
+            project_root,
+            target.selected.file_path.as_deref(),
+            target.selected.line,
+            &target.selected.display_name
+        )
+        .unwrap_or_else(|| target.selected.display_name.clone())
+    ));
+    markdown.push_str("symbol:\n");
+    markdown.push_str(&render_symbol_markdown(project_root, target, symbol));
+    markdown.push_str("\ntrail:\n");
+    let cmd = TrailCommand {
+        project: args::ProjectArgs {
+            project: project_root.to_path_buf(),
+            cache_dir: None,
+        },
+        target: args::TargetArgs {
+            id: Some(target.selected.node_id.0.clone()),
+            query: None,
+            file: None,
+        },
+        mode: args::CliTrailMode::Neighborhood,
+        depth: Some(2),
+        direction: Some(args::CliDirection::Both),
+        max_nodes: trail.trail.nodes.len().min(u32::MAX as usize) as u32,
+        include_tests: false,
+        show_utility_calls: false,
+        hide_speculative: false,
+        layout: args::CliLayout::Horizontal,
+        refresh: args::RefreshMode::None,
+        format: args::OutputFormat::Markdown,
+        output_file: None,
+        mermaid: false,
+    };
+    markdown.push_str(&render_trail_markdown(project_root, target, trail, &cmd));
+    if let Some(snippet) = snippet {
+        markdown.push_str("\nsnippet:\n");
+        markdown.push_str(&render_snippet_markdown(
+            project_root,
+            target,
+            snippet,
+            false,
+        ));
+    }
+    markdown
+}
+
+struct TerminalCleanup;
+
+impl Drop for TerminalCleanup {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    }
+}
+
+fn run_explore_tui(
+    project_root: &std::path::Path,
+    target: &runtime::ResolvedTarget,
+    symbol: &SymbolContextDto,
+    trail: &TrailContextDto,
+    snippet: Option<&SnippetContextDto>,
+) -> Result<()> {
+    use crossterm::{
+        event::{self, Event, KeyCode, KeyModifiers},
+        terminal::{EnterAlternateScreen, enable_raw_mode},
+    };
+    use ratatui::{
+        Terminal,
+        backend::CrosstermBackend,
+        layout::{Constraint, Direction, Layout},
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    };
+
+    let panes = [
+        (
+            "Symbol",
+            render_symbol_markdown(project_root, target, symbol),
+        ),
+        ("Trail", {
+            let cmd = TrailCommand {
+                project: args::ProjectArgs {
+                    project: project_root.to_path_buf(),
+                    cache_dir: None,
+                },
+                target: args::TargetArgs {
+                    id: Some(target.selected.node_id.0.clone()),
+                    query: None,
+                    file: None,
+                },
+                mode: args::CliTrailMode::Neighborhood,
+                depth: Some(2),
+                direction: Some(args::CliDirection::Both),
+                max_nodes: trail.trail.nodes.len().min(u32::MAX as usize) as u32,
+                include_tests: false,
+                show_utility_calls: false,
+                hide_speculative: false,
+                layout: args::CliLayout::Horizontal,
+                refresh: args::RefreshMode::None,
+                format: args::OutputFormat::Markdown,
+                output_file: None,
+                mermaid: false,
+            };
+            render_trail_markdown(project_root, target, trail, &cmd)
+        }),
+        (
+            "Snippet",
+            snippet
+                .map(|context| render_snippet_markdown(project_root, target, context, false))
+                .unwrap_or_else(|| "No snippet available for this symbol.".to_string()),
+        ),
+    ];
+
+    enable_raw_mode()?;
+    crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+    let _cleanup = TerminalCleanup;
+    let backend = CrosstermBackend::new(std::io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    let mut selected = 0usize;
+    let mut scroll = [0u16; 3];
+
+    loop {
+        terminal.draw(|frame| {
+            let area = frame.area();
+            let shell = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                ])
+                .split(area);
+            let body = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(24), Constraint::Min(30)])
+                .split(shell[1]);
+
+            let title = output::node_ref(
+                project_root,
+                target.selected.file_path.as_deref(),
+                target.selected.line,
+                &target.selected.display_name,
+            )
+            .unwrap_or_else(|| target.selected.display_name.clone());
+            frame.render_widget(
+                Paragraph::new(title).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("CodeStory Explore"),
+                ),
+                shell[0],
+            );
+
+            let nav_items = panes
+                .iter()
+                .enumerate()
+                .map(|(idx, (label, _))| {
+                    let style = if idx == selected {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    ListItem::new(Line::from(Span::styled(*label, style)))
+                })
+                .collect::<Vec<_>>();
+            frame.render_widget(
+                List::new(nav_items).block(Block::default().borders(Borders::ALL).title("Panes")),
+                body[0],
+            );
+
+            frame.render_widget(
+                Paragraph::new(panes[selected].1.as_str())
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(panes[selected].0),
+                    )
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll[selected], 0)),
+                body[1],
+            );
+            frame.render_widget(
+                Paragraph::new("Tab switch pane  Up/Down scroll  q quit"),
+                shell[2],
+            );
+        })?;
+
+        if event::poll(Duration::from_millis(250))?
+            && let Event::Key(key) = event::read()?
+        {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => break,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                KeyCode::Tab => selected = (selected + 1) % panes.len(),
+                KeyCode::BackTab => selected = (selected + panes.len() - 1) % panes.len(),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    scroll[selected] = scroll[selected].saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    scroll[selected] = scroll[selected].saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    scroll[selected] = scroll[selected].saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    scroll[selected] = scroll[selected].saturating_add(10);
+                }
+                KeyCode::Home => scroll[selected] = 0,
+                _ => {}
+            }
+        }
+    }
+    terminal.show_cursor()?;
+    Ok(())
+}
+
+fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Result<()> {
+    let mut buffer = [0u8; 8192];
+    let read = stream.read(&mut buffer)?;
+    let request = String::from_utf8_lossy(&buffer[..read]);
+    let line = request.lines().next().unwrap_or_default();
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or("/");
+    if method != "GET" {
+        return write_http_json(
+            &mut stream,
+            405,
+            &serde_json::json!({"error": "method not allowed"}),
+        );
+    }
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let params = parse_query_string(query);
+    match path {
+        "/health" => write_http_json(&mut stream, 200, &serde_json::json!({"ok": true})),
+        "/search" => {
+            let query = params.get("q").cloned().unwrap_or_default();
+            let results = runtime
+                .search
+                .search_results(SearchRequest {
+                    query,
+                    repo_text: SearchRepoTextMode::Auto,
+                    limit_per_source: 10,
+                })
+                .map_err(map_api_error)?;
+            write_http_json(&mut stream, 200, &results)
+        }
+        "/symbol" => {
+            let query = params.get("q").cloned().unwrap_or_default();
+            let target = resolve_target(runtime, args::TargetSelection::Query(query), None)?;
+            let context = runtime
+                .grounding
+                .symbol_context(target.selected.node_id)
+                .map_err(map_api_error)?;
+            write_http_json(&mut stream, 200, &context)
+        }
+        "/trail" => {
+            let query = params.get("q").cloned().unwrap_or_default();
+            let target = resolve_target(runtime, args::TargetSelection::Query(query), None)?;
+            let depth = params
+                .get("depth")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(2);
+            let context = runtime
+                .grounding
+                .trail_context(TrailConfigDto {
+                    root_id: target.selected.node_id,
+                    mode: TrailMode::Neighborhood,
+                    target_id: None,
+                    depth,
+                    direction: TrailDirection::Both,
+                    caller_scope: TrailCallerScope::ProductionOnly,
+                    edge_filter: Vec::new(),
+                    show_utility_calls: false,
+                    node_filter: Vec::new(),
+                    max_nodes: 80,
+                    layout_direction: LayoutDirection::Horizontal,
+                })
+                .map_err(map_api_error)?;
+            write_http_json(&mut stream, 200, &context)
+        }
+        _ => write_http_json(&mut stream, 404, &serde_json::json!({"error": "not found"})),
+    }
+}
+
+fn write_http_json<T: serde::Serialize>(
+    stream: &mut TcpStream,
+    status: u16,
+    value: &T,
+) -> Result<()> {
+    let body = serde_json::to_string_pretty(value)?;
+    let status_text = match status {
+        200 => "OK",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        _ => "OK",
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )?;
+    Ok(())
+}
+
+fn parse_query_string(query: &str) -> HashMap<String, String> {
+    query
+        .split('&')
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            Some((url_decode(key)?, url_decode(value)?))
+        })
+        .collect()
+}
+
+fn url_decode(value: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'+' => out.push(b' '),
+            b'%' if idx + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[idx + 1..idx + 3]).ok()?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                idx += 2;
+            }
+            byte => out.push(byte),
+        }
+        idx += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
+fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let response = handle_stdio_message(&runtime, &line);
+        writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
+fn handle_stdio_message(runtime: &RuntimeContext, line: &str) -> serde_json::Value {
+    let request: serde_json::Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(error) => return serde_json::json!({"error": error.to_string()}),
+    };
+    let method = request
+        .get("method")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    match method {
+        "initialize" => serde_json::json!({"result": {"name": "codestory", "version": "0.1.0"}}),
+        "tools/list" => serde_json::json!({
+            "result": {
+                "tools": [
+                    {"name": "search"},
+                    {"name": "symbol"},
+                    {"name": "trail"}
+                ]
+            }
+        }),
+        "tools/call" => {
+            let name = request
+                .pointer("/params/name")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let query = request
+                .pointer("/params/arguments/query")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            match name {
+                "search" => runtime
+                    .search
+                    .search_results(SearchRequest {
+                        query,
+                        repo_text: SearchRepoTextMode::Auto,
+                        limit_per_source: 10,
+                    })
+                    .map(|result| serde_json::json!({"result": result}))
+                    .unwrap_or_else(
+                        |error| serde_json::json!({"error": map_api_error(error).to_string()}),
+                    ),
+                "symbol" => resolve_target(runtime, args::TargetSelection::Query(query), None)
+                    .and_then(|target| {
+                        runtime
+                            .grounding
+                            .symbol_context(target.selected.node_id)
+                            .map_err(map_api_error)
+                    })
+                    .map(|result| serde_json::json!({"result": result}))
+                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
+                "trail" => resolve_target(runtime, args::TargetSelection::Query(query), None)
+                    .and_then(|target| {
+                        runtime
+                            .grounding
+                            .trail_context(TrailConfigDto {
+                                root_id: target.selected.node_id,
+                                mode: TrailMode::Neighborhood,
+                                target_id: None,
+                                depth: 2,
+                                direction: TrailDirection::Both,
+                                caller_scope: TrailCallerScope::ProductionOnly,
+                                edge_filter: Vec::new(),
+                                show_utility_calls: false,
+                                node_filter: Vec::new(),
+                                max_nodes: 80,
+                                layout_direction: LayoutDirection::Horizontal,
+                            })
+                            .map_err(map_api_error)
+                    })
+                    .map(|result| serde_json::json!({"result": result}))
+                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
+                _ => serde_json::json!({"error": "unknown tool"}),
+            }
+        }
+        _ => serde_json::json!({"error": "unknown method"}),
+    }
 }
 
 fn ensure_dot_only_for_trail(format: args::OutputFormat, command: &str) -> Result<()> {
@@ -208,6 +1098,7 @@ fn build_search_output(
     retrieval: &codestory_contracts::api::RetrievalStateDto,
     symbol_hits: &[SearchHit],
     repo_text_hits: &[SearchHit],
+    suggestions: &[SearchHit],
     limit_per_source: u32,
     repo_text: RepoTextOutputConfig,
 ) -> SearchOutput {
@@ -240,6 +1131,10 @@ fn build_search_output(
         limit_per_source,
         repo_text_mode: repo_text.mode,
         repo_text_enabled: repo_text.enabled,
+        suggestions: suggestions
+            .iter()
+            .map(|hit| build_search_hit_output(project_root, hit))
+            .collect(),
         indexed_symbol_hits,
         repo_text_hits,
     }
@@ -432,6 +1327,7 @@ mod tests {
                 file_count,
                 error_count: 0,
             },
+            members: Vec::new(),
             retrieval: None,
         }
     }
@@ -588,6 +1484,7 @@ mod tests {
             summary: &summary,
             retrieval: &retrieval,
             phase_timings: Some(&timings),
+            summary_generation: None,
         };
 
         let markdown = render_index_markdown(&output);
@@ -647,6 +1544,7 @@ mod tests {
             &sample_retrieval(),
             &symbol_hits,
             &repo_text_hits,
+            &[],
             5,
             RepoTextOutputConfig {
                 mode: RepoTextMode::Auto,
@@ -685,6 +1583,7 @@ mod tests {
             "ResolutionPass",
             &sample_retrieval(),
             &symbol_hits,
+            &[],
             &[],
             5,
             RepoTextOutputConfig {
@@ -729,6 +1628,7 @@ mod tests {
             &sample_retrieval(),
             &symbol_hits,
             &repo_text_hits,
+            &[],
             5,
             RepoTextOutputConfig {
                 mode: RepoTextMode::Auto,
@@ -779,6 +1679,22 @@ mod tests {
                 "snippet",
                 "--query",
                 "Foo",
+                "--output-file",
+                "out.md",
+            ],
+            vec![
+                "codestory-cli",
+                "query",
+                "search(query: 'Foo') | limit(1)",
+                "--output-file",
+                "out.md",
+            ],
+            vec![
+                "codestory-cli",
+                "explore",
+                "--query",
+                "Foo",
+                "--no-tui",
                 "--output-file",
                 "out.md",
             ],
