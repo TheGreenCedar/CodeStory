@@ -74,6 +74,26 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
         );
         append_optional_timings_line(
             &mut markdown,
+            "semantic_ms",
+            &[
+                ("doc_build", timings.semantic_doc_build_ms),
+                ("embedding", timings.semantic_embedding_ms),
+                ("db_upsert", timings.semantic_db_upsert_ms),
+                ("reload", timings.semantic_reload_ms),
+            ],
+        );
+        append_optional_timings_line(
+            &mut markdown,
+            "semantic_docs",
+            &[
+                ("reused", timings.semantic_docs_reused),
+                ("embedded", timings.semantic_docs_embedded),
+                ("pending", timings.semantic_docs_pending),
+                ("stale", timings.semantic_docs_stale),
+            ],
+        );
+        append_optional_timings_line(
+            &mut markdown,
             "staged_publish_ms",
             &[
                 ("deferred_indexes", timings.deferred_indexes_ms),

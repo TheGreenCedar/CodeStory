@@ -3,6 +3,10 @@ name = "codestory-runtime"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+onnx-cuda = ["ort/cuda"]
+onnx-directml = ["ort/directml"]
+
 [dependencies]
 anyhow = { workspace = true }
 codestory-contracts = { workspace = true }

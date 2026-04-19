@@ -247,6 +247,8 @@ fn test_llm_symbol_doc_round_trip() -> Result<(), StorageError> {
         file_path: Some("src/lib.rs".to_string()),
         start_line: Some(12),
         doc_text: "function pkg::do_work in src/lib.rs line 12".to_string(),
+        doc_version: 2,
+        doc_hash: "semantic-hash-501".to_string(),
         embedding_model: "local-hash-384".to_string(),
         embedding_dim: 384,
         embedding: vec![0.25_f32; 384],
@@ -256,8 +258,64 @@ fn test_llm_symbol_doc_round_trip() -> Result<(), StorageError> {
     let docs = storage.get_llm_symbol_docs_by_node_ids(&[NodeId(501)])?;
     assert_eq!(docs.len(), 1);
     assert_eq!(docs[0].node_id, NodeId(501));
+    assert_eq!(docs[0].doc_version, 2);
+    assert_eq!(docs[0].doc_hash, "semantic-hash-501");
     assert_eq!(docs[0].embedding_dim, 384);
     assert_eq!(docs[0].embedding.len(), 384);
+    Ok(())
+}
+
+#[test]
+fn test_llm_symbol_doc_copy_forward_preserves_reuse_metadata() -> Result<(), StorageError> {
+    let live_path = unique_temp_db_path("llm-copy-source");
+    let _ = cleanup_sqlite_sidecars(&live_path);
+
+    {
+        let mut live = Storage::open(&live_path)?;
+        live.insert_nodes_batch(&[Node {
+            id: NodeId(501),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "do_work".to_string(),
+            ..Default::default()
+        }])?;
+        live.upsert_llm_symbol_docs_batch(&[LlmSymbolDoc {
+            node_id: NodeId(501),
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: "pkg::do_work".to_string(),
+            qualified_name: Some("pkg::do_work".to_string()),
+            file_path: Some("src/lib.rs".to_string()),
+            start_line: Some(12),
+            doc_text: "function pkg::do_work in src/lib.rs line 12".to_string(),
+            doc_version: 2,
+            doc_hash: "semantic-hash-501".to_string(),
+            embedding_model: "local-hash-384".to_string(),
+            embedding_dim: 384,
+            embedding: vec![0.25_f32; 384],
+            updated_at_epoch_ms: 123,
+        }])?;
+    }
+
+    let mut staged = Storage::new_in_memory()?;
+    staged.insert_nodes_batch(&[Node {
+        id: NodeId(501),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "do_work".to_string(),
+        ..Default::default()
+    }])?;
+
+    assert_eq!(staged.copy_llm_symbol_docs_from(&live_path)?, 1);
+    let metadata = staged.get_llm_symbol_doc_reuse_metadata()?;
+    assert_eq!(metadata.len(), 1);
+    assert_eq!(metadata[0].node_id, NodeId(501));
+    assert_eq!(metadata[0].doc_version, 2);
+    assert_eq!(metadata[0].doc_hash, "semantic-hash-501");
+
+    assert_eq!(staged.prune_llm_symbol_docs_to_node_ids(&[NodeId(501)])?, 0);
+    assert_eq!(staged.prune_llm_symbol_docs_to_node_ids(&[])?, 1);
+    assert!(staged.get_all_llm_symbol_docs()?.is_empty());
+
+    cleanup_sqlite_sidecars(&live_path)?;
     Ok(())
 }
 
@@ -1074,6 +1132,8 @@ fn test_delete_file_projection() -> Result<(), StorageError> {
         file_path: Some("src/main.rs".to_string()),
         start_line: Some(1),
         doc_text: "foo symbol".to_string(),
+        doc_version: 2,
+        doc_hash: "semantic-hash-foo".to_string(),
         embedding_model: "local-hash-384".to_string(),
         embedding_dim: 384,
         embedding: vec![0.1_f32; 384],

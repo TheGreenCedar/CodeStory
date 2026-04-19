@@ -93,6 +93,8 @@ const TABLE_STATEMENTS: &[&str] = &[
         file_path TEXT,
         start_line INTEGER,
         doc_text TEXT NOT NULL,
+        doc_version INTEGER NOT NULL DEFAULT 0,
+        doc_hash TEXT NOT NULL DEFAULT '',
         embedding_model TEXT NOT NULL,
         embedding_dim INTEGER NOT NULL,
         embedding_blob BLOB NOT NULL,
@@ -328,6 +330,12 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
         storage.set_schema_version(10)?;
     }
 
+    if stored_version < 11 {
+        migrate_v11_llm_symbol_doc_reuse_metadata(&storage.conn)?;
+        storage.set_schema_version(11)?;
+    }
+    create_llm_symbol_doc_reuse_index(&storage.conn)?;
+
     if storage.deferred_secondary_indexes {
         create_load_indexes(&storage.conn)?;
     } else {
@@ -358,6 +366,8 @@ pub(super) fn migrate_v3_llm_symbol_projection(conn: &Connection) -> Result<(), 
             file_path TEXT,
             start_line INTEGER,
             doc_text TEXT NOT NULL,
+            doc_version INTEGER NOT NULL DEFAULT 0,
+            doc_hash TEXT NOT NULL DEFAULT '',
             embedding_model TEXT NOT NULL,
             embedding_dim INTEGER NOT NULL,
             embedding_blob BLOB NOT NULL,
@@ -373,6 +383,28 @@ pub(super) fn migrate_v3_llm_symbol_projection(conn: &Connection) -> Result<(), 
 pub(super) fn migrate_v4_reset_projection_state(storage: &Storage) -> Result<(), StorageError> {
     storage.clear()?;
     storage.conn.execute("DELETE FROM bookmark_category", [])?;
+    Ok(())
+}
+
+pub(super) fn migrate_v11_llm_symbol_doc_reuse_metadata(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    try_add_column(
+        conn,
+        "llm_symbol_doc",
+        "doc_version INTEGER NOT NULL DEFAULT 0",
+    )?;
+    try_add_column(conn, "llm_symbol_doc", "doc_hash TEXT NOT NULL DEFAULT ''")?;
+    create_llm_symbol_doc_reuse_index(conn)?;
+    Ok(())
+}
+
+fn create_llm_symbol_doc_reuse_index(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_model_hash
+         ON llm_symbol_doc(embedding_model, doc_version, doc_hash)",
+        [],
+    )?;
     Ok(())
 }
 

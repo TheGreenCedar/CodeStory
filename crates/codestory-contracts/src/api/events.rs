@@ -10,6 +10,22 @@ pub struct IndexingPhaseTimings {
     pub cleanup_ms: u32,
     pub cache_refresh_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_doc_build_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_embedding_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_db_upsert_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_reload_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_docs_reused: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_docs_embedded: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_docs_pending: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_docs_stale: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred_indexes_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_snapshot_ms: Option<u32>,
@@ -148,6 +164,14 @@ mod tests {
             error_flush_ms: 4,
             cleanup_ms: 5,
             cache_refresh_ms: None,
+            semantic_doc_build_ms: None,
+            semantic_embedding_ms: None,
+            semantic_db_upsert_ms: None,
+            semantic_reload_ms: None,
+            semantic_docs_reused: None,
+            semantic_docs_embedded: None,
+            semantic_docs_pending: None,
+            semantic_docs_stale: None,
             deferred_indexes_ms: None,
             summary_snapshot_ms: None,
             detail_snapshot_ms: None,
@@ -204,6 +228,14 @@ mod tests {
         assert!(value.get("resolution_calls_ms").is_none());
         assert!(value.get("resolution_imports_ms").is_none());
         assert!(value.get("resolution_cleanup_ms").is_none());
+        assert!(value.get("semantic_doc_build_ms").is_none());
+        assert!(value.get("semantic_embedding_ms").is_none());
+        assert!(value.get("semantic_db_upsert_ms").is_none());
+        assert!(value.get("semantic_reload_ms").is_none());
+        assert!(value.get("semantic_docs_reused").is_none());
+        assert!(value.get("semantic_docs_embedded").is_none());
+        assert!(value.get("semantic_docs_pending").is_none());
+        assert!(value.get("semantic_docs_stale").is_none());
         assert!(value.get("resolution_call_candidate_index_ms").is_none());
         assert!(value.get("resolution_import_candidate_index_ms").is_none());
         assert!(value.get("resolution_call_semantic_index_ms").is_none());

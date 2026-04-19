@@ -15,6 +15,12 @@ struct RepoE2eStats {
     embed_batch_size: u32,
     search_dir_unchanged: bool,
     index_seconds: f64,
+    graph_phase_seconds: f64,
+    semantic_phase_seconds: f64,
+    semantic_docs_reused: u64,
+    semantic_docs_embedded: u64,
+    semantic_docs_pending: u64,
+    semantic_docs_stale: u64,
     ground_seconds: f64,
     search_seconds: f64,
     symbol_seconds: f64,
@@ -169,6 +175,29 @@ fn u64_field(value: &Value, path: &[&str]) -> u64 {
         .unwrap_or_else(|| panic!("expected u64 at path {:?}", path))
 }
 
+fn optional_u64_field(value: &Value, path: &[&str]) -> u64 {
+    let mut current = value;
+    for key in path {
+        current = match current {
+            Value::Object(fields) => match fields.get(*key) {
+                Some(value) => value,
+                None => return 0,
+            },
+            Value::Array(items) => {
+                let Ok(index) = key.parse::<usize>() else {
+                    return 0;
+                };
+                match items.get(index) {
+                    Some(value) => value,
+                    None => return 0,
+                }
+            }
+            _ => return 0,
+        };
+    }
+    current.as_u64().unwrap_or(0)
+}
+
 fn bool_field(value: &Value, path: &[&str]) -> bool {
     let current = json_path(value, path);
     current
@@ -302,14 +331,43 @@ fn codestory_repo_release_e2e_emits_stats() {
         .expect("search dir modified time after reads");
     let search_dir_unchanged = search_dir_before == search_dir_after;
 
+    let graph_phase_ms = optional_u64_field(&index_json, &["phase_timings", "parse_index_ms"])
+        + optional_u64_field(&index_json, &["phase_timings", "projection_flush_ms"])
+        + optional_u64_field(&index_json, &["phase_timings", "edge_resolution_ms"])
+        + optional_u64_field(&index_json, &["phase_timings", "error_flush_ms"])
+        + optional_u64_field(&index_json, &["phase_timings", "cleanup_ms"]);
+    let semantic_phase_ms =
+        optional_u64_field(&index_json, &["phase_timings", "semantic_doc_build_ms"])
+            + optional_u64_field(&index_json, &["phase_timings", "semantic_embedding_ms"])
+            + optional_u64_field(&index_json, &["phase_timings", "semantic_db_upsert_ms"])
+            + optional_u64_field(&index_json, &["phase_timings", "semantic_reload_ms"]);
+
     let stats = RepoE2eStats {
         project_root: project_root.display().to_string(),
         cache_dir: cache_dir.path().display().to_string(),
         storage_path: storage_path.display().to_string(),
         search_dir: search_dir.display().to_string(),
-        embed_batch_size: 16,
+        embed_batch_size: 64,
         search_dir_unchanged,
         index_seconds,
+        graph_phase_seconds: graph_phase_ms as f64 / 1000.0,
+        semantic_phase_seconds: semantic_phase_ms as f64 / 1000.0,
+        semantic_docs_reused: optional_u64_field(
+            &index_json,
+            &["phase_timings", "semantic_docs_reused"],
+        ),
+        semantic_docs_embedded: optional_u64_field(
+            &index_json,
+            &["phase_timings", "semantic_docs_embedded"],
+        ),
+        semantic_docs_pending: optional_u64_field(
+            &index_json,
+            &["phase_timings", "semantic_docs_pending"],
+        ),
+        semantic_docs_stale: optional_u64_field(
+            &index_json,
+            &["phase_timings", "semantic_docs_stale"],
+        ),
         ground_seconds,
         search_seconds,
         symbol_seconds,
@@ -372,6 +430,10 @@ fn codestory_repo_release_e2e_emits_stats() {
     assert!(
         stats.index.semantic_doc_count > 0,
         "full repo index should populate semantic docs"
+    );
+    assert!(
+        stats.semantic_docs_embedded > 0,
+        "full repo index should report embedded semantic docs"
     );
     assert_eq!(
         stats.search.top_symbol_name, "AppController",

@@ -31,7 +31,7 @@ use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 mod agent;
 mod agent_commands;
@@ -436,19 +436,50 @@ enum SemanticProjectionMode {
     SkipPersistence,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SemanticProjectionStats {
+    reported: bool,
+    doc_build_ms: u32,
+    embedding_ms: u32,
+    db_upsert_ms: u32,
+    reload_ms: u32,
+    docs_reused: u32,
+    docs_embedded: u32,
+    docs_pending: u32,
+    docs_stale: u32,
+}
+
+struct SearchStateBuildResult {
+    node_names: HashMap<codestory_contracts::graph::NodeId, String>,
+    engine: SearchEngine,
+    semantic_stats: SemanticProjectionStats,
+}
+
+fn apply_semantic_projection_stats(
+    timings: &mut IndexingPhaseTimings,
+    stats: SemanticProjectionStats,
+) {
+    if !stats.reported {
+        return;
+    }
+    timings.semantic_doc_build_ms = Some(stats.doc_build_ms);
+    timings.semantic_embedding_ms = Some(stats.embedding_ms);
+    timings.semantic_db_upsert_ms = Some(stats.db_upsert_ms);
+    timings.semantic_reload_ms = Some(stats.reload_ms);
+    timings.semantic_docs_reused = Some(stats.docs_reused);
+    timings.semantic_docs_embedded = Some(stats.docs_embedded);
+    timings.semantic_docs_pending = Some(stats.docs_pending);
+    timings.semantic_docs_stale = Some(stats.docs_stale);
+}
+
 fn build_search_state(
     storage: &mut Storage,
     search_storage_path: Option<&Path>,
     nodes: Vec<codestory_contracts::graph::Node>,
     llm_refresh_file_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
     semantic_projection_mode: SemanticProjectionMode,
-) -> Result<
-    (
-        HashMap<codestory_contracts::graph::NodeId, String>,
-        SearchEngine,
-    ),
-    ApiError,
-> {
+    hydrate_semantic_docs: bool,
+) -> Result<SearchStateBuildResult, ApiError> {
     storage
         .rebuild_search_symbol_projection_from_node_table()
         .map_err(|e| {
@@ -474,21 +505,30 @@ fn build_search_state(
             .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
     }
     if semantic_projection_mode == SemanticProjectionMode::PersistBackedDocs {
-        sync_llm_symbol_projection(
+        let semantic_stats = sync_llm_symbol_projection(
             storage,
             &nodes,
             &node_names,
             &mut engine,
             llm_refresh_file_scope,
+            hydrate_semantic_docs,
         )?;
+        Ok(SearchStateBuildResult {
+            node_names,
+            engine,
+            semantic_stats,
+        })
     } else {
         tracing::debug!(
             "Skipping semantic doc persistence for transient build_search_state invocation"
         );
         engine.index_llm_symbol_docs(Vec::new());
+        Ok(SearchStateBuildResult {
+            node_names,
+            engine,
+            semantic_stats: SemanticProjectionStats::default(),
+        })
     }
-
-    Ok((node_names, engine))
 }
 
 fn current_epoch_ms() -> i64 {
@@ -503,7 +543,8 @@ const LLM_SYMBOL_DOC_VERSION_PREFIX: &str = "semantic_doc_version:";
 const SEARCH_NODE_BATCH_SIZE: usize = 8_192;
 const SEARCH_SYMBOL_PROJECTION_BATCH_SIZE: usize = 4_096;
 const LLM_DOC_RELOAD_BATCH_SIZE: usize = 256;
-const LLM_DOC_EMBED_BATCH_SIZE: usize = 16;
+const LLM_DOC_EMBED_BATCH_SIZE: usize = 64;
+const LLM_DOC_EMBED_BATCH_SIZE_ENV: &str = "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE";
 
 fn search_index_storage_path(storage_path: &Path) -> PathBuf {
     let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
@@ -650,7 +691,11 @@ fn reload_llm_docs_from_storage(
 }
 
 fn llm_doc_embed_batch_size() -> usize {
-    LLM_DOC_EMBED_BATCH_SIZE
+    std::env::var(LLM_DOC_EMBED_BATCH_SIZE_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map(|value| value.clamp(1, 512))
+        .unwrap_or(LLM_DOC_EMBED_BATCH_SIZE)
 }
 
 fn retrieval_state_from_parts(
@@ -978,6 +1023,23 @@ struct PendingLlmSymbolDoc {
     file_path: Option<String>,
     start_line: Option<u32>,
     doc_text: String,
+    doc_hash: String,
+}
+
+fn llm_symbol_doc_hash(doc_text: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET;
+    for byte in LLM_SYMBOL_DOC_SCHEMA_VERSION
+        .to_le_bytes()
+        .into_iter()
+        .chain(doc_text.as_bytes().iter().copied())
+    {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
 }
 
 fn flush_pending_llm_symbol_docs(
@@ -986,6 +1048,7 @@ fn flush_pending_llm_symbol_docs(
     pending: &mut Vec<PendingLlmSymbolDoc>,
     model_id: &str,
     updated_at_epoch_ms: i64,
+    stats: &mut SemanticProjectionStats,
 ) -> Result<(), ApiError> {
     if pending.is_empty() {
         return Ok(());
@@ -997,9 +1060,13 @@ fn flush_pending_llm_symbol_docs(
         .iter()
         .map(|doc| doc.doc_text.clone())
         .collect::<Vec<_>>();
+    let embedding_started = Instant::now();
     let embeddings = engine
         .embed_texts(&payloads)
         .map_err(|e| ApiError::internal(format!("Failed to embed symbol docs: {e}")))?;
+    stats.embedding_ms = stats
+        .embedding_ms
+        .saturating_add(clamp_u128_to_u32(embedding_started.elapsed().as_millis()));
 
     let docs = batch
         .into_iter()
@@ -1013,6 +1080,8 @@ fn flush_pending_llm_symbol_docs(
             file_path: doc.file_path,
             start_line: doc.start_line,
             doc_text: doc.doc_text,
+            doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
+            doc_hash: doc.doc_hash,
             embedding_model: model_id.clone(),
             embedding_dim: embedding.len() as u32,
             embedding,
@@ -1020,9 +1089,16 @@ fn flush_pending_llm_symbol_docs(
         })
         .collect::<Vec<_>>();
 
+    let upsert_started = Instant::now();
     storage
         .upsert_llm_symbol_docs_batch(&docs)
         .map_err(|e| ApiError::internal(format!("Failed to upsert LLM symbol docs: {e}")))?;
+    stats.db_upsert_ms = stats
+        .db_upsert_ms
+        .saturating_add(clamp_u128_to_u32(upsert_started.elapsed().as_millis()));
+    stats.docs_embedded = stats
+        .docs_embedded
+        .saturating_add(clamp_usize_to_u32(docs.len()));
 
     Ok(())
 }
@@ -1033,18 +1109,30 @@ fn sync_llm_symbol_projection(
     node_names: &HashMap<codestory_contracts::graph::NodeId, String>,
     engine: &mut SearchEngine,
     llm_refresh_file_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
-) -> Result<(), ApiError> {
+    hydrate_semantic_docs: bool,
+) -> Result<SemanticProjectionStats, ApiError> {
+    let mut stats = SemanticProjectionStats {
+        reported: true,
+        ..Default::default()
+    };
+
     if !hybrid_retrieval_enabled() {
-        engine.index_llm_symbol_docs(Vec::new());
-        return Ok(());
+        if hydrate_semantic_docs {
+            engine.index_llm_symbol_docs(Vec::new());
+        }
+        return Ok(stats);
     }
 
     if let Err(error) = engine.set_embedding_runtime_from_env() {
         tracing::warn!(
             "{EMBEDDING_MODEL_ENV} not configured or invalid ({error}); semantic ask retrieval will be unavailable until a local model artifact is configured. Use a bundled model at {DEFAULT_BUNDLED_EMBED_MODEL_PATH}, set {EMBEDDING_RUNTIME_MODE_ENV}=hash for local-dev embeddings, or set {HYBRID_RETRIEVAL_ENABLED_ENV}=false for lexical-only retrieval."
         );
-        reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
-        return Ok(());
+        if hydrate_semantic_docs {
+            let reload_started = Instant::now();
+            reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
+            stats.reload_ms = clamp_u128_to_u32(reload_started.elapsed().as_millis());
+        }
+        return Ok(stats);
     }
 
     let model_id = engine
@@ -1053,27 +1141,28 @@ fn sync_llm_symbol_projection(
         .to_string();
     let updated_at_epoch_ms = current_epoch_ms();
 
-    if llm_refresh_file_scope.is_none() {
-        storage
-            .clear_llm_symbol_docs()
-            .map_err(|e| ApiError::internal(format!("Failed to clear stale LLM docs: {e}")))?;
-    } else if let Some(scope) = llm_refresh_file_scope {
-        if scope.is_empty() {
-            reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
-            return Ok(());
-        }
+    let existing_docs = storage
+        .get_llm_symbol_doc_reuse_metadata()
+        .map_err(|e| ApiError::internal(format!("Failed to load semantic doc metadata: {e}")))?
+        .into_iter()
+        .map(|doc| (doc.node_id, doc))
+        .collect::<HashMap<_, _>>();
 
-        for file_node_id in scope {
-            storage
-                .delete_llm_symbol_docs_for_file(*file_node_id)
-                .map_err(|e| ApiError::internal(format!("Failed to clear stale LLM docs: {e}")))?;
+    if let Some(scope) = llm_refresh_file_scope {
+        if scope.is_empty() {
+            if hydrate_semantic_docs {
+                let reload_started = Instant::now();
+                reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
+                stats.reload_ms = clamp_u128_to_u32(reload_started.elapsed().as_millis());
+            }
+            return Ok(stats);
         }
     }
 
     let embed_batch_size = llm_doc_embed_batch_size();
     tracing::debug!(embed_batch_size, "Using semantic doc embedding batch size");
     let mut pending_docs = Vec::<PendingLlmSymbolDoc>::with_capacity(embed_batch_size);
-    let mut has_indexable_docs = false;
+    let mut seen_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
     let mut file_text_cache = HashMap::<String, Option<String>>::new();
 
     for node in nodes {
@@ -1093,6 +1182,7 @@ fn sync_llm_symbol_projection(
             .cloned()
             .unwrap_or_else(|| node_display_name(node));
         let file_path = AppController::file_path_for_node(storage, node)?;
+        let doc_build_started = Instant::now();
         let doc_text = build_llm_symbol_doc_text(
             storage,
             node,
@@ -1100,7 +1190,21 @@ fn sync_llm_symbol_projection(
             file_path.as_deref(),
             &mut file_text_cache,
         );
-        has_indexable_docs = true;
+        stats.doc_build_ms = stats
+            .doc_build_ms
+            .saturating_add(clamp_u128_to_u32(doc_build_started.elapsed().as_millis()));
+        let doc_hash = llm_symbol_doc_hash(&doc_text);
+        seen_node_ids.push(node.id);
+        if let Some(existing_doc) = existing_docs.get(&node.id)
+            && existing_doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
+            && existing_doc.doc_hash == doc_hash
+            && existing_doc.embedding_model == model_id
+            && existing_doc.embedding_dim > 0
+        {
+            stats.docs_reused = stats.docs_reused.saturating_add(1);
+            continue;
+        }
+        stats.docs_pending = stats.docs_pending.saturating_add(1);
         pending_docs.push(PendingLlmSymbolDoc {
             node_id: node.id,
             file_node_id: node.file_node_id,
@@ -1110,6 +1214,7 @@ fn sync_llm_symbol_projection(
             file_path,
             start_line: node.start_line,
             doc_text,
+            doc_hash,
         });
         if pending_docs.len() >= embed_batch_size {
             flush_pending_llm_symbol_docs(
@@ -1118,13 +1223,9 @@ fn sync_llm_symbol_projection(
                 &mut pending_docs,
                 &model_id,
                 updated_at_epoch_ms,
+                &mut stats,
             )?;
         }
-    }
-
-    if !has_indexable_docs {
-        reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
-        return Ok(());
     }
 
     flush_pending_llm_symbol_docs(
@@ -1133,10 +1234,28 @@ fn sync_llm_symbol_projection(
         &mut pending_docs,
         &model_id,
         updated_at_epoch_ms,
+        &mut stats,
     )?;
-    reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
 
-    Ok(())
+    let stale_docs = if let Some(scope) = llm_refresh_file_scope {
+        let file_node_ids = scope.iter().copied().collect::<Vec<_>>();
+        storage
+            .delete_llm_symbol_docs_for_files_except_node_ids(&file_node_ids, &seen_node_ids)
+            .map_err(|e| ApiError::internal(format!("Failed to prune stale LLM docs: {e}")))?
+    } else {
+        storage
+            .prune_llm_symbol_docs_to_node_ids(&seen_node_ids)
+            .map_err(|e| ApiError::internal(format!("Failed to prune stale LLM docs: {e}")))?
+    };
+    stats.docs_stale = clamp_usize_to_u32(stale_docs);
+
+    if hydrate_semantic_docs {
+        let reload_started = Instant::now();
+        reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
+        stats.reload_ms = clamp_u128_to_u32(reload_started.elapsed().as_millis());
+    }
+
+    Ok(stats)
 }
 
 #[derive(Debug, Clone)]
@@ -1844,8 +1963,9 @@ impl AppController {
         };
 
         match result {
-            Ok(summary) => {
-                if refresh_runtime_caches {
+            Ok(mut summary) => {
+                let cache_refresh_started = Instant::now();
+                let semantic_stats = if refresh_runtime_caches {
                     let mut storage = Storage::open(&storage_path).map_err(|e| {
                         ApiError::internal(format!("Failed to reopen storage: {e}"))
                     })?;
@@ -1854,7 +1974,7 @@ impl AppController {
                         &mut storage,
                         &storage_path,
                         summary.llm_refresh_scope.as_ref(),
-                    )?;
+                    )?
                 } else {
                     self.finalize_indexing_without_runtime_refresh_with(
                         &storage_path,
@@ -1864,11 +1984,16 @@ impl AppController {
                                 storage,
                                 &storage_path,
                                 llm_refresh_scope,
+                                false,
                             )
-                            .map(|_| ())
+                            .map(|result| result.semantic_stats)
                         },
-                    )?;
-                }
+                    )?
+                };
+                summary.phase_timings.cache_refresh_ms = Some(clamp_u128_to_u32(
+                    cache_refresh_started.elapsed().as_millis(),
+                ));
+                apply_semantic_projection_stats(&mut summary.phase_timings, semantic_stats);
                 Ok(summary.phase_timings)
             }
             Err(error) => {
@@ -1904,12 +2029,12 @@ impl AppController {
         storage_path: &Path,
         llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
         rebuild: F,
-    ) -> Result<(), ApiError>
+    ) -> Result<SemanticProjectionStats, ApiError>
     where
         F: FnOnce(
             &mut Storage,
             Option<&HashSet<codestory_contracts::graph::NodeId>>,
-        ) -> Result<(), ApiError>,
+        ) -> Result<SemanticProjectionStats, ApiError>,
     {
         let result = (|| {
             let mut storage = Storage::open(storage_path)
@@ -2623,6 +2748,7 @@ fn index_full(
 
     let mut staged = SnapshotStore::open_staged(storage_path)
         .map_err(|e| ApiError::internal(format!("Failed to open staged storage: {e}")))?;
+    let can_copy_forward = storage_path.exists();
 
     let bus = EventBus::new();
     let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
@@ -2639,6 +2765,14 @@ fn index_full(
             return Err(ApiError::internal(format!("Indexing failed: {err}")));
         }
     };
+    if can_copy_forward {
+        match staged.store_mut().copy_llm_symbol_docs_from(storage_path) {
+            Ok(copied) => tracing::debug!(copied, "Copied semantic docs into staged storage"),
+            Err(error) => {
+                tracing::warn!("Failed to copy semantic docs into staged storage: {error}")
+            }
+        }
+    }
     let staged_finalize_stats = match staged.snapshots().finalize_staged() {
         Ok(stats) => stats,
         Err(err) => {
@@ -2669,6 +2803,14 @@ fn index_full(
             error_flush_ms: clamp_u64_to_u32(index_stats.error_flush_ms),
             cleanup_ms: clamp_u64_to_u32(index_stats.cleanup_ms),
             cache_refresh_ms: None,
+            semantic_doc_build_ms: None,
+            semantic_embedding_ms: None,
+            semantic_db_upsert_ms: None,
+            semantic_reload_ms: None,
+            semantic_docs_reused: None,
+            semantic_docs_embedded: None,
+            semantic_docs_pending: None,
+            semantic_docs_stale: None,
             deferred_indexes_ms: Some(deferred_indexes_ms),
             summary_snapshot_ms: Some(summary_snapshot_ms),
             detail_snapshot_ms: None,
@@ -2834,6 +2976,14 @@ where
             error_flush_ms: clamp_u64_to_u32(index_stats.error_flush_ms),
             cleanup_ms: clamp_u64_to_u32(index_stats.cleanup_ms),
             cache_refresh_ms: None,
+            semantic_doc_build_ms: None,
+            semantic_embedding_ms: None,
+            semantic_db_upsert_ms: None,
+            semantic_reload_ms: None,
+            semantic_docs_reused: None,
+            semantic_docs_embedded: None,
+            semantic_docs_pending: None,
+            semantic_docs_stale: None,
             deferred_indexes_ms: None,
             summary_snapshot_ms: Some(summary_snapshot_ms),
             detail_snapshot_ms: Some(detail_snapshot_ms),
@@ -2938,13 +3088,8 @@ fn rebuild_search_state_from_storage(
     storage: &mut Storage,
     storage_path: &Path,
     llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
-) -> Result<
-    (
-        HashMap<codestory_contracts::graph::NodeId, String>,
-        SearchEngine,
-    ),
-    ApiError,
-> {
+    hydrate_semantic_docs: bool,
+) -> Result<SearchStateBuildResult, ApiError> {
     match storage.get_nodes() {
         Ok(nodes) => build_search_state(
             storage,
@@ -2952,6 +3097,7 @@ fn rebuild_search_state_from_storage(
             nodes,
             llm_refresh_scope,
             SemanticProjectionMode::PersistBackedDocs,
+            hydrate_semantic_docs,
         )
         .map_err(|e| ApiError::internal(format!("Failed to rebuild search state: {}", e.message))),
         Err(e) => Err(ApiError::internal(format!(
@@ -2965,16 +3111,18 @@ fn refresh_caches(
     storage: &mut Storage,
     storage_path: &Path,
     llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
-) -> Result<(), ApiError> {
-    let refreshed = rebuild_search_state_from_storage(storage, storage_path, llm_refresh_scope);
+) -> Result<SemanticProjectionStats, ApiError> {
+    let refreshed =
+        rebuild_search_state_from_storage(storage, storage_path, llm_refresh_scope, true);
 
     let mut s = controller.state.lock();
     match refreshed {
-        Ok((node_names, engine)) => {
-            s.node_names = node_names;
-            s.search_engine = Some(engine);
+        Ok(result) => {
+            let semantic_stats = result.semantic_stats;
+            s.node_names = result.node_names;
+            s.search_engine = Some(result.engine);
             s.is_indexing = false;
-            Ok(())
+            Ok(semantic_stats)
         }
         Err(error) => {
             tracing::warn!(
@@ -3047,7 +3195,7 @@ mod tests {
 
     #[test]
     fn llm_doc_embed_batch_size_uses_throughput_default() {
-        assert_eq!(llm_doc_embed_batch_size(), 16);
+        assert_eq!(llm_doc_embed_batch_size(), 64);
     }
 
     fn copy_tictactoe_workspace() -> tempfile::TempDir {
@@ -3345,7 +3493,7 @@ pub fn exact_symbol_anchor() {{}}
 
         for (query, expected_kind) in [
             ("check_winner", codestory_contracts::api::NodeKind::FUNCTION),
-            ("min_max", codestory_contracts::api::NodeKind::METHOD),
+            ("min_max", codestory_contracts::api::NodeKind::FUNCTION),
         ] {
             let hits = controller
                 .search(SearchRequest {
@@ -3420,14 +3568,17 @@ pub fn exact_symbol_anchor() {{}}
             ..Default::default()
         }];
 
-        let (node_names, mut engine) = build_search_state(
+        let result = build_search_state(
             &mut storage,
             None,
             nodes,
             None,
             SemanticProjectionMode::SkipPersistence,
+            true,
         )
         .expect("build search state");
+        let node_names = result.node_names;
+        let mut engine = result.engine;
         assert_eq!(
             node_names.get(&CoreNodeId(1)).map(String::as_str),
             Some("pkg.mod.short_name")
@@ -3508,6 +3659,119 @@ pub fn exact_symbol_anchor() {{}}
         assert!(
             stats.doc_count > 0,
             "expected full indexing to persist semantic docs without requiring a follow-up open"
+        );
+    }
+
+    #[test]
+    fn full_refresh_reuses_unchanged_semantic_docs_from_previous_live_index() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        let first_timings = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("first full index");
+        assert!(
+            first_timings.semantic_docs_embedded.unwrap_or(0) > 0,
+            "initial full refresh should embed semantic docs"
+        );
+        assert_eq!(first_timings.semantic_docs_reused.unwrap_or(0), 0);
+
+        let first_docs = Storage::open(&storage_path)
+            .expect("open first storage")
+            .get_all_llm_symbol_docs()
+            .expect("first semantic docs");
+        assert!(
+            first_docs
+                .iter()
+                .all(|doc| doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
+                    && !doc.doc_hash.is_empty()),
+            "semantic docs should carry reuse metadata"
+        );
+
+        let second_timings = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("second full index");
+        assert!(
+            second_timings.cache_refresh_ms.unwrap_or(0) > 0,
+            "cache refresh timing should include persisted search plus semantic sync"
+        );
+        assert!(
+            second_timings.semantic_doc_build_ms.is_some(),
+            "semantic doc build timing should be reported separately"
+        );
+        assert_eq!(
+            second_timings.semantic_docs_embedded.unwrap_or(u32::MAX),
+            0,
+            "unchanged full refresh should not re-embed semantic docs"
+        );
+        assert!(
+            second_timings.semantic_docs_reused.unwrap_or(0) > 0,
+            "unchanged full refresh should reuse semantic docs copied into the staged DB"
+        );
+    }
+
+    #[test]
+    fn incremental_refresh_rebuilds_touched_file_semantic_docs_only() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("full index");
+        let before_docs = Storage::open(&storage_path)
+            .expect("reopen storage before incremental")
+            .get_all_llm_symbol_docs()
+            .expect("semantic docs before incremental");
+
+        let rust_fixture = workspace.path().join("rust_tictactoe.rs");
+        let mut source = fs::read_to_string(&rust_fixture).expect("read rust fixture");
+        source.push_str("\nfn codestory_added_move_hint() -> i32 { 42 }\n");
+        fs::write(&rust_fixture, source).expect("write changed rust fixture");
+
+        let incremental_timings = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental index");
+        assert!(
+            incremental_timings.semantic_docs_embedded.unwrap_or(0) > 0,
+            "new semantic docs from the touched file should be embedded"
+        );
+        assert!(
+            incremental_timings
+                .semantic_docs_embedded
+                .unwrap_or(u32::MAX)
+                < clamp_usize_to_u32(before_docs.len()),
+            "incremental semantic sync should not re-embed untouched files"
+        );
+        assert_eq!(
+            incremental_timings.semantic_docs_stale.unwrap_or(0),
+            0,
+            "adding a symbol should not make existing semantic docs stale"
+        );
+
+        let docs = Storage::open(&storage_path)
+            .expect("reopen storage")
+            .get_all_llm_symbol_docs()
+            .expect("semantic docs after incremental");
+        assert!(
+            docs.iter()
+                .any(|doc| doc.display_name.contains("codestory_added_move_hint")),
+            "incremental semantic docs should include the new symbol"
         );
     }
 
@@ -3714,7 +3978,7 @@ pub fn exact_symbol_anchor() {{}}
 
         let mut env = hybrid_test_env();
         env.push(EnvGuard::set(EMBEDDING_MODEL_ID_ENV, "model-a"));
-        rebuild_search_state_from_storage(&mut storage, temp.path(), None)
+        rebuild_search_state_from_storage(&mut storage, temp.path(), None, true)
             .expect("initial rebuild");
         assert_eq!(
             storage
@@ -3745,7 +4009,7 @@ pub fn exact_symbol_anchor() {{}}
         );
 
         env.push(EnvGuard::set(EMBEDDING_MODEL_ID_ENV, "model-b"));
-        rebuild_search_state_from_storage(&mut storage, temp.path(), None)
+        rebuild_search_state_from_storage(&mut storage, temp.path(), None, true)
             .expect("mixed corpus should force rebuild");
 
         let docs = storage

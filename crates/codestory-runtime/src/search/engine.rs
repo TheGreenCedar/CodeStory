@@ -3,7 +3,10 @@ use codestory_contracts::graph::NodeId;
 use ndarray::{Array2, ArrayView2, ArrayView3, Axis};
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32String};
-use ort::session::Session;
+use ort::session::{
+    Session,
+    builder::{GraphOptimizationLevel, SessionBuilder},
+};
 use ort::value::TensorRef;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -25,6 +28,10 @@ pub const EMBEDDING_TOKENIZER_ENV: &str = "CODESTORY_EMBED_TOKENIZER_PATH";
 pub const EMBEDDING_MAX_TOKENS_ENV: &str = "CODESTORY_EMBED_MAX_TOKENS";
 pub const EMBEDDING_RUNTIME_MODE_ENV: &str = "CODESTORY_EMBED_RUNTIME_MODE";
 pub const DEFAULT_BUNDLED_EMBED_MODEL_PATH: &str = "models/all-minilm-l6-v2/model.onnx";
+const EMBEDDING_INTRA_THREADS_ENV: &str = "CODESTORY_EMBED_INTRA_THREADS";
+const EMBEDDING_INTER_THREADS_ENV: &str = "CODESTORY_EMBED_INTER_THREADS";
+const EMBEDDING_PARALLEL_EXECUTION_ENV: &str = "CODESTORY_EMBED_PARALLEL_EXECUTION";
+const EMBEDDING_EXECUTION_PROVIDER_ENV: &str = "CODESTORY_EMBED_EXECUTION_PROVIDER";
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingRuntimeAvailability {
@@ -68,6 +75,74 @@ fn resolve_bundled_embed_model_path() -> Option<PathBuf> {
     }
 
     None
+}
+
+fn env_usize(key: &str, min: usize, max: usize) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map(|value| value.clamp(min, max))
+}
+
+fn env_bool(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "onnx-cuda")]
+fn configure_cuda_embedding_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
+    builder
+        .with_execution_providers([ort::ep::CUDAExecutionProvider::default().build()])
+        .context("failed to configure CUDA ONNX execution provider")
+}
+
+#[cfg(not(feature = "onnx-cuda"))]
+fn configure_cuda_embedding_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
+    tracing::warn!(
+        "{EMBEDDING_EXECUTION_PROVIDER_ENV}=cuda requested, but this binary was built without the onnx-cuda feature; using CPU execution provider"
+    );
+    Ok(builder)
+}
+
+#[cfg(feature = "onnx-directml")]
+fn configure_directml_embedding_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
+    builder
+        .with_execution_providers([ort::ep::DirectMLExecutionProvider::default().build()])
+        .context("failed to configure DirectML ONNX execution provider")
+}
+
+#[cfg(not(feature = "onnx-directml"))]
+fn configure_directml_embedding_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
+    tracing::warn!(
+        "{EMBEDDING_EXECUTION_PROVIDER_ENV}=directml requested, but this binary was built without the onnx-directml feature; using CPU execution provider"
+    );
+    Ok(builder)
+}
+
+fn configure_embedding_execution_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
+    let provider = std::env::var(EMBEDDING_EXECUTION_PROVIDER_ENV)
+        .unwrap_or_else(|_| "cpu".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    match provider.as_str() {
+        "" | "cpu" => Ok(builder),
+        "cuda" => configure_cuda_embedding_provider(builder),
+        "directml" | "dml" => configure_directml_embedding_provider(builder),
+        other => {
+            tracing::warn!(
+                execution_provider = other,
+                "Unknown semantic embedding execution provider; using CPU execution provider"
+            );
+            Ok(builder)
+        }
+    }
 }
 
 pub fn embedding_runtime_availability_from_env() -> EmbeddingRuntimeAvailability {
@@ -197,6 +272,7 @@ struct OnnxEmbeddingRuntime {
     session: Mutex<Session>,
     tokenizer: Mutex<Tokenizer>,
     max_tokens: usize,
+    accepts_token_type_ids: bool,
 }
 
 impl EmbeddingRuntime {
@@ -270,10 +346,34 @@ impl EmbeddingRuntime {
             .map_err(|error| anyhow!("failed to configure tokenizer truncation: {error}"))?;
         tokenizer.with_padding(Some(PaddingParams::default()));
 
-        let session = Session::builder()
+        let mut builder = Session::builder()
             .context("failed to create ONNX session builder")?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .context("failed to configure ONNX graph optimization")?;
+        if let Some(threads) = env_usize(EMBEDDING_INTRA_THREADS_ENV, 1, 128) {
+            builder = builder
+                .with_intra_threads(threads)
+                .context("failed to configure ONNX intra-op threads")?;
+        }
+        if let Some(threads) = env_usize(EMBEDDING_INTER_THREADS_ENV, 1, 128) {
+            builder = builder
+                .with_inter_threads(threads)
+                .context("failed to configure ONNX inter-op threads")?;
+        }
+        if env_bool(EMBEDDING_PARALLEL_EXECUTION_ENV) {
+            builder = builder
+                .with_parallel_execution(true)
+                .context("failed to configure ONNX parallel execution")?;
+        }
+        builder = configure_embedding_execution_provider(builder)?;
+
+        let session = builder
             .commit_from_file(&model_path)
             .with_context(|| format!("failed to load ONNX model {}", model_path.display()))?;
+        let accepts_token_type_ids = session
+            .inputs()
+            .iter()
+            .any(|input| input.name() == "token_type_ids");
 
         Ok(Self {
             model_path,
@@ -282,6 +382,7 @@ impl EmbeddingRuntime {
                 session: Mutex::new(session),
                 tokenizer: Mutex::new(tokenizer),
                 max_tokens,
+                accepts_token_type_ids,
             })),
         })
     }
@@ -426,7 +527,6 @@ impl OnnxEmbeddingRuntime {
             }
         }
 
-        let token_type_ids = Array2::<i64>::zeros((batch, seq_len));
         let mut initial_error_text = None;
         let mut embeddings = {
             let mut session = self
@@ -437,13 +537,22 @@ impl OnnxEmbeddingRuntime {
                 .context("failed to build ONNX input_ids tensor")?;
             let attention_mask_ref = TensorRef::from_array_view(&attention_mask)
                 .context("failed to build ONNX attention_mask tensor")?;
-            let token_type_ids_ref = TensorRef::from_array_view(&token_type_ids)
-                .context("failed to build ONNX token_type_ids tensor")?;
-            match session.run(ort::inputs![
-                "input_ids" => input_ids_ref,
-                "attention_mask" => attention_mask_ref,
-                "token_type_ids" => token_type_ids_ref
-            ]) {
+            let run_result = if self.accepts_token_type_ids {
+                let token_type_ids = Array2::<i64>::zeros((batch, seq_len));
+                let token_type_ids_ref = TensorRef::from_array_view(&token_type_ids)
+                    .context("failed to build ONNX token_type_ids tensor")?;
+                session.run(ort::inputs![
+                    "input_ids" => input_ids_ref,
+                    "attention_mask" => attention_mask_ref,
+                    "token_type_ids" => token_type_ids_ref
+                ])
+            } else {
+                session.run(ort::inputs![
+                    "input_ids" => input_ids_ref,
+                    "attention_mask" => attention_mask_ref
+                ])
+            };
+            match run_result {
                 Ok(outputs) => extract_onnx_embeddings(outputs, attention_mask.view())?,
                 Err(error) => {
                     initial_error_text = Some(error.to_string());
@@ -453,7 +562,8 @@ impl OnnxEmbeddingRuntime {
         };
 
         if let Some(error_text) = initial_error_text {
-            let needs_two_input_fallback = error_text.contains("token_type_ids")
+            let needs_two_input_fallback = self.accepts_token_type_ids
+                && error_text.contains("token_type_ids")
                 && (error_text.contains("Invalid input name")
                     || error_text.contains("Invalid Feed Input Name")
                     || error_text.contains("Unknown input"));

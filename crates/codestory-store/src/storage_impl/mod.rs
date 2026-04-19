@@ -25,7 +25,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 10;
+const SCHEMA_VERSION: u32 = 11;
 const GROUNDING_SNAPSHOT_VERSION: i64 = 1;
 const GROUNDING_SNAPSHOT_STATE_DIRTY: i64 = 0;
 const GROUNDING_SNAPSHOT_STATE_BUILDING: i64 = 1;
@@ -317,10 +317,21 @@ pub struct LlmSymbolDoc {
     pub file_path: Option<String>,
     pub start_line: Option<u32>,
     pub doc_text: String,
+    pub doc_version: u32,
+    pub doc_hash: String,
     pub embedding_model: String,
     pub embedding_dim: u32,
     pub embedding: Vec<f32>,
     pub updated_at_epoch_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmSymbolDocReuseMetadata {
+    pub node_id: NodeId,
+    pub doc_version: u32,
+    pub doc_hash: String,
+    pub embedding_model: String,
+    pub embedding_dim: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -429,6 +440,37 @@ impl Storage {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn copy_index_artifact_cache_from(
+        &mut self,
+        source_path: &Path,
+    ) -> Result<usize, StorageError> {
+        if !source_path.exists() {
+            return Ok(0);
+        }
+        let source = source_path.to_string_lossy().to_string();
+        self.conn
+            .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
+        let copy_result = self.conn.execute(
+            "INSERT OR REPLACE INTO index_artifact_cache (
+                file_path,
+                cache_key,
+                artifact_blob,
+                updated_at_epoch_ms
+             )
+             SELECT
+                file_path,
+                cache_key,
+                artifact_blob,
+                updated_at_epoch_ms
+             FROM source_snapshot.index_artifact_cache",
+            [],
+        );
+        let detach_result = self.conn.execute("DETACH DATABASE source_snapshot", []);
+        let copied = copy_result?;
+        detach_result?;
+        Ok(copied)
     }
 
     pub fn has_ready_resolution_support_snapshot(
@@ -1965,12 +2007,14 @@ impl Storage {
                     file_path,
                     start_line,
                     doc_text,
+                    doc_version,
+                    doc_hash,
                     embedding_model,
                     embedding_dim,
                     embedding_blob,
                     updated_at_epoch_ms
                  ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
                  )
                  ON CONFLICT(node_id) DO UPDATE SET
                     file_node_id = excluded.file_node_id,
@@ -1980,6 +2024,8 @@ impl Storage {
                     file_path = excluded.file_path,
                     start_line = excluded.start_line,
                     doc_text = excluded.doc_text,
+                    doc_version = excluded.doc_version,
+                    doc_hash = excluded.doc_hash,
                     embedding_model = excluded.embedding_model,
                     embedding_dim = excluded.embedding_dim,
                     embedding_blob = excluded.embedding_blob,
@@ -1996,6 +2042,8 @@ impl Storage {
                     doc.file_path,
                     doc.start_line,
                     doc.doc_text,
+                    doc.doc_version as i64,
+                    doc.doc_hash,
                     doc.embedding_model,
                     doc.embedding_dim as i64,
                     encode_embedding_blob(&doc.embedding),
@@ -2025,6 +2073,8 @@ impl Storage {
                 file_path,
                 start_line,
                 doc_text,
+                doc_version,
+                doc_hash,
                 embedding_model,
                 embedding_dim,
                 embedding_blob,
@@ -2040,8 +2090,9 @@ impl Storage {
 
         while let Some(row) = rows.next()? {
             let kind: i32 = row.get(2)?;
-            let embedding_dim: i64 = row.get(9)?;
-            let embedding_blob: Vec<u8> = row.get(10)?;
+            let doc_version: i64 = row.get(8)?;
+            let embedding_dim: i64 = row.get(11)?;
+            let embedding_blob: Vec<u8> = row.get(12)?;
             docs.push(LlmSymbolDoc {
                 node_id: NodeId(row.get(0)?),
                 file_node_id: row.get::<_, Option<i64>>(1)?.map(NodeId),
@@ -2051,10 +2102,12 @@ impl Storage {
                 file_path: row.get(5)?,
                 start_line: row.get(6)?,
                 doc_text: row.get(7)?,
-                embedding_model: row.get(8)?,
+                doc_version: doc_version.max(0).min(u32::MAX as i64) as u32,
+                doc_hash: row.get(9)?,
+                embedding_model: row.get(10)?,
                 embedding_dim: embedding_dim.max(0) as u32,
                 embedding: decode_embedding_blob(&embedding_blob)?,
-                updated_at_epoch_ms: row.get(11)?,
+                updated_at_epoch_ms: row.get(13)?,
             });
         }
 
@@ -2088,6 +2141,35 @@ impl Storage {
         self.get_llm_symbol_docs_batch_after(None, usize::MAX)
     }
 
+    pub fn get_llm_symbol_doc_reuse_metadata(
+        &self,
+    ) -> Result<Vec<LlmSymbolDocReuseMetadata>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                node_id,
+                doc_version,
+                doc_hash,
+                embedding_model,
+                embedding_dim
+             FROM llm_symbol_doc
+             ORDER BY node_id ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut docs = Vec::new();
+        while let Some(row) = rows.next()? {
+            let doc_version: i64 = row.get(1)?;
+            let embedding_dim: i64 = row.get(4)?;
+            docs.push(LlmSymbolDocReuseMetadata {
+                node_id: NodeId(row.get(0)?),
+                doc_version: doc_version.max(0).min(u32::MAX as i64) as u32,
+                doc_hash: row.get(2)?,
+                embedding_model: row.get(3)?,
+                embedding_dim: embedding_dim.max(0).min(u32::MAX as i64) as u32,
+            });
+        }
+        Ok(docs)
+    }
+
     pub fn get_llm_symbol_docs_batch_after(
         &self,
         after_node_id: Option<NodeId>,
@@ -2103,6 +2185,8 @@ impl Storage {
                 file_path,
                 start_line,
                 doc_text,
+                doc_version,
+                doc_hash,
                 embedding_model,
                 embedding_dim,
                 embedding_blob,
@@ -2118,8 +2202,9 @@ impl Storage {
         let mut docs = Vec::new();
         while let Some(row) = rows.next()? {
             let kind: i32 = row.get(2)?;
-            let embedding_dim: i64 = row.get(9)?;
-            let embedding_blob: Vec<u8> = row.get(10)?;
+            let doc_version: i64 = row.get(8)?;
+            let embedding_dim: i64 = row.get(11)?;
+            let embedding_blob: Vec<u8> = row.get(12)?;
             docs.push(LlmSymbolDoc {
                 node_id: NodeId(row.get(0)?),
                 file_node_id: row.get::<_, Option<i64>>(1)?.map(NodeId),
@@ -2129,10 +2214,12 @@ impl Storage {
                 file_path: row.get(5)?,
                 start_line: row.get(6)?,
                 doc_text: row.get(7)?,
-                embedding_model: row.get(8)?,
+                doc_version: doc_version.max(0).min(u32::MAX as i64) as u32,
+                doc_hash: row.get(9)?,
+                embedding_model: row.get(10)?,
                 embedding_dim: embedding_dim.max(0) as u32,
                 embedding: decode_embedding_blob(&embedding_blob)?,
-                updated_at_epoch_ms: row.get(11)?,
+                updated_at_epoch_ms: row.get(13)?,
             });
         }
         Ok(docs)
@@ -2140,6 +2227,157 @@ impl Storage {
 
     pub fn clear_llm_symbol_docs(&mut self) -> Result<usize, StorageError> {
         let removed = self.conn.execute("DELETE FROM llm_symbol_doc", [])?;
+        Ok(removed)
+    }
+
+    pub fn copy_llm_symbol_docs_from(&mut self, source_path: &Path) -> Result<usize, StorageError> {
+        if !source_path.exists() {
+            return Ok(0);
+        }
+        let source = source_path.to_string_lossy().to_string();
+        self.conn
+            .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
+        let copy_result = self.conn.execute(
+            "INSERT OR REPLACE INTO llm_symbol_doc (
+                node_id,
+                file_node_id,
+                kind,
+                display_name,
+                qualified_name,
+                file_path,
+                start_line,
+                doc_text,
+                doc_version,
+                doc_hash,
+                embedding_model,
+                embedding_dim,
+                embedding_blob,
+                updated_at_epoch_ms
+             )
+             SELECT
+                source_doc.node_id,
+                source_doc.file_node_id,
+                source_doc.kind,
+                source_doc.display_name,
+                source_doc.qualified_name,
+                source_doc.file_path,
+                source_doc.start_line,
+                source_doc.doc_text,
+                source_doc.doc_version,
+                source_doc.doc_hash,
+                source_doc.embedding_model,
+                source_doc.embedding_dim,
+                source_doc.embedding_blob,
+                source_doc.updated_at_epoch_ms
+             FROM source_snapshot.llm_symbol_doc source_doc
+             WHERE EXISTS (
+                SELECT 1 FROM node WHERE node.id = source_doc.node_id
+             )
+             AND (
+                source_doc.file_node_id IS NULL
+                OR EXISTS (
+                    SELECT 1 FROM node WHERE node.id = source_doc.file_node_id
+                )
+             )",
+            [],
+        );
+        let detach_result = self.conn.execute("DETACH DATABASE source_snapshot", []);
+        let copied = copy_result?;
+        detach_result?;
+        Ok(copied)
+    }
+
+    pub fn prune_llm_symbol_docs_to_node_ids(
+        &mut self,
+        keep_node_ids: &[NodeId],
+    ) -> Result<usize, StorageError> {
+        if keep_node_ids.is_empty() {
+            return self.clear_llm_symbol_docs();
+        }
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS llm_symbol_doc_keep (
+                node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute("DELETE FROM temp.llm_symbol_doc_keep", [])?;
+        {
+            let mut stmt =
+                tx.prepare("INSERT OR IGNORE INTO temp.llm_symbol_doc_keep (node_id) VALUES (?1)")?;
+            for node_id in keep_node_ids {
+                stmt.execute(params![node_id.0])?;
+            }
+        }
+        let removed = tx.execute(
+            "DELETE FROM llm_symbol_doc
+             WHERE NOT EXISTS (
+                SELECT 1
+                FROM temp.llm_symbol_doc_keep keep
+                WHERE keep.node_id = llm_symbol_doc.node_id
+             )",
+            [],
+        )?;
+        tx.execute("DROP TABLE temp.llm_symbol_doc_keep", [])?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    pub fn delete_llm_symbol_docs_for_files_except_node_ids(
+        &mut self,
+        file_node_ids: &[NodeId],
+        keep_node_ids: &[NodeId],
+    ) -> Result<usize, StorageError> {
+        if file_node_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS llm_symbol_doc_scope (
+                file_node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS llm_symbol_doc_keep (
+                node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute("DELETE FROM temp.llm_symbol_doc_scope", [])?;
+        tx.execute("DELETE FROM temp.llm_symbol_doc_keep", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO temp.llm_symbol_doc_scope (file_node_id) VALUES (?1)",
+            )?;
+            for file_node_id in file_node_ids {
+                stmt.execute(params![file_node_id.0])?;
+            }
+        }
+        {
+            let mut stmt =
+                tx.prepare("INSERT OR IGNORE INTO temp.llm_symbol_doc_keep (node_id) VALUES (?1)")?;
+            for node_id in keep_node_ids {
+                stmt.execute(params![node_id.0])?;
+            }
+        }
+        let removed = tx.execute(
+            "DELETE FROM llm_symbol_doc
+             WHERE file_node_id IN (
+                SELECT file_node_id FROM temp.llm_symbol_doc_scope
+             )
+             AND NOT EXISTS (
+                SELECT 1
+                FROM temp.llm_symbol_doc_keep keep
+                WHERE keep.node_id = llm_symbol_doc.node_id
+             )",
+            [],
+        )?;
+        tx.execute("DROP TABLE temp.llm_symbol_doc_scope", [])?;
+        tx.execute("DROP TABLE temp.llm_symbol_doc_keep", [])?;
+        tx.commit()?;
         Ok(removed)
     }
 

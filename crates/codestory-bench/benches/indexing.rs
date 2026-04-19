@@ -3,12 +3,16 @@ use codestory_contracts::events::EventBus;
 use codestory_indexer::{IncrementalIndexingStats, WorkspaceIndexer};
 use codestory_runtime::AppController;
 use codestory_store::Store as Storage;
-use codestory_workspace::{BuildMode, RefreshExecutionPlan, WorkspaceManifest};
+use codestory_workspace::{
+    BuildMode, Language, LanguageSpecificSettings, LanguageStandard, RefreshExecutionPlan,
+    SourceGroupSettings, WorkspaceManifest, WorkspaceSettings,
+};
 use criterion::measurement::WallTime;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::path::PathBuf;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 use codestory_bench::util;
 
@@ -210,6 +214,30 @@ fn run_app_full_refresh_bench(root: PathBuf) -> IndexingPhaseTimings {
         .expect("run app full refresh benchmark")
 }
 
+fn cxx_benchmark_manifest(root: PathBuf) -> WorkspaceManifest {
+    WorkspaceManifest::from_parts(
+        WorkspaceSettings {
+            name: "benchmark".to_string(),
+            version: 1,
+            source_groups: vec![SourceGroupSettings {
+                id: Uuid::new_v4(),
+                language: Language::Cxx,
+                standard: LanguageStandard::Default,
+                source_paths: vec![root.clone()],
+                exclude_patterns: Vec::new(),
+                include_paths: Vec::new(),
+                defines: Default::default(),
+                language_specific: LanguageSpecificSettings::Cxx {
+                    cdb_path: Some(root.join("compile_commands.json")),
+                    header_paths: Vec::new(),
+                    precompiled_header: None,
+                },
+            }],
+        },
+        root.join("codestory_project.json"),
+    )
+}
+
 fn build_persistent_index_fixture(
     label: &'static str,
     file_count: usize,
@@ -258,7 +286,7 @@ fn run_incremental_touched_subset(
     fixture.touch_cursor = (fixture.touch_cursor + touched.len()) % fixture.files.len().max(1);
 
     let mut storage = Storage::open(&fixture.storage_path).expect("open benchmark storage");
-    let project = WorkspaceManifest::open(fixture.root.clone()).expect("open benchmark project");
+    let project = cxx_benchmark_manifest(fixture.root.clone());
     let plan = project
         .build_execution_plan(&refresh_inputs_from_storage(&storage))
         .expect("build incremental plan");
@@ -278,8 +306,7 @@ fn run_incremental_touched_subset(
 
 fn validate_incremental_fixture(fixture: &mut PersistentIndexFixture, touched_files: usize) {
     let storage = Storage::open(&fixture.storage_path).expect("open seeded benchmark storage");
-    let project =
-        WorkspaceManifest::open(fixture.root.clone()).expect("open seeded benchmark project");
+    let project = cxx_benchmark_manifest(fixture.root.clone());
     let idle_plan = project
         .build_execution_plan(&refresh_inputs_from_storage(&storage))
         .expect("build idle incremental plan");

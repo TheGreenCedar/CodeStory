@@ -14,6 +14,7 @@ criterion = { workspace = true }
 tempfile = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true }
 
 [[bench]]
 name = "indexing"
@@ -38,4 +39,3 @@ harness = false
 [[bench]]
 name = "incremental_cleanup"
 harness = false
-
