@@ -347,7 +347,7 @@ fn codestory_repo_release_e2e_emits_stats() {
         cache_dir: cache_dir.path().display().to_string(),
         storage_path: storage_path.display().to_string(),
         search_dir: search_dir.display().to_string(),
-        embed_batch_size: 64,
+        embed_batch_size: 128,
         search_dir_unchanged,
         index_seconds,
         graph_phase_seconds: graph_phase_ms as f64 / 1000.0,

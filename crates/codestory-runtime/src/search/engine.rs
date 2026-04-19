@@ -42,7 +42,7 @@ pub const EMBEDDING_TRUNCATE_DIM_ENV: &str = "CODESTORY_EMBED_TRUNCATE_DIM";
 pub const EMBEDDING_EXPECTED_DIM_ENV: &str = "CODESTORY_EMBED_EXPECTED_DIM";
 pub const LLAMACPP_EMBEDDINGS_URL_ENV: &str = "CODESTORY_EMBED_LLAMACPP_URL";
 pub const LLAMACPP_REQUEST_COUNT_ENV: &str = "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT";
-pub const DEFAULT_BUNDLED_EMBED_MODEL_PATH: &str = "models/bge-small-en-v1.5/onnx/model.onnx";
+pub const DEFAULT_BUNDLED_EMBED_MODEL_PATH: &str = "models/bge-base-en-v1.5/onnx/model.onnx";
 const EMBEDDING_INTRA_THREADS_ENV: &str = "CODESTORY_EMBED_INTRA_THREADS";
 const EMBEDDING_INTER_THREADS_ENV: &str = "CODESTORY_EMBED_INTER_THREADS";
 const EMBEDDING_PARALLEL_EXECUTION_ENV: &str = "CODESTORY_EMBED_PARALLEL_EXECUTION";
@@ -278,7 +278,7 @@ struct EmbeddingProfile {
 impl EmbeddingProfile {
     fn from_env() -> Result<Self> {
         let name = std::env::var(EMBEDDING_PROFILE_ENV)
-            .unwrap_or_else(|_| "bge-small-en-v1.5".to_string())
+            .unwrap_or_else(|_| "bge-base-en-v1.5".to_string())
             .trim()
             .to_ascii_lowercase();
 
@@ -1882,6 +1882,25 @@ mod tests {
             .unwrap_or(1);
 
         assert_eq!(embedding_session_count_from_env(), expected);
+    }
+
+    #[test]
+    fn embedding_profile_defaults_to_bge_base() -> Result<()> {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = EnvGuard::remove(EMBEDDING_PROFILE_ENV);
+
+        let profile = EmbeddingProfile::from_env()?;
+
+        assert_eq!(profile.name, "bge-base-en-v1.5");
+        assert_eq!(profile.model_id, "BAAI/bge-base-en-v1.5-local");
+        assert_eq!(profile.expected_dim, Some(768));
+        assert_eq!(
+            DEFAULT_BUNDLED_EMBED_MODEL_PATH,
+            "models/bge-base-en-v1.5/onnx/model.onnx"
+        );
+        Ok(())
     }
 
     #[test]

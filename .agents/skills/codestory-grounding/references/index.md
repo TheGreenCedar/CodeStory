@@ -36,12 +36,12 @@ Runtime environment variables control semantic retrieval and tuning:
 |----------|----------|
 | `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false` | Disable hybrid retrieval and use symbolic ranking. |
 | `CODESTORY_SEMANTIC_DOC_SCOPE=all` | Include the broader all-symbol semantic doc set. The default is durable symbols only. |
-| `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` | Override semantic doc embedding batch size. Default is `64`; use this only while profiling. |
+| `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` | Override semantic doc embedding batch size. Default is `128`; use this only while profiling. |
 | `CODESTORY_EMBED_RUNTIME_MODE=hash` | Use lightweight deterministic hash embeddings for local-dev semantic checks. |
 | `CODESTORY_EMBED_MODEL_PATH` | Path to the ONNX embedding model artifact. |
 | `CODESTORY_EMBED_TOKENIZER_PATH` | Path to `tokenizer.json`; defaults to a sibling of the model artifact. |
 | `CODESTORY_EMBED_SESSION_COUNT` | Number of ONNX embedding sessions, clamped from `1` to `16`; default is bounded by available parallelism and capped at two. |
-| `CODESTORY_EMBED_INTRA_THREADS`, `CODESTORY_EMBED_INTER_THREADS`, `CODESTORY_EMBED_PARALLEL_EXECUTION` | ONNX CPU execution tuning. |
+| `CODESTORY_EMBED_INTRA_THREADS`, `CODESTORY_EMBED_INTER_THREADS`, `CODESTORY_EMBED_PARALLEL_EXECUTION` | ONNX CPU-provider tuning; do not use CPU-provider rows for benchmark decisions. |
 | `CODESTORY_EMBED_EXECUTION_PROVIDER` | `cpu`, `cuda`, or `directml`; CUDA and DirectML require the matching Cargo feature. |
 
 ## Output

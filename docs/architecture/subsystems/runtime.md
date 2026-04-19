@@ -41,12 +41,12 @@ Important tuning surfaces:
 
 - `CODESTORY_SEMANTIC_DOC_SCOPE`: default durable symbols; use `all` for the older broad symbol set
 - `CODESTORY_EMBED_BACKEND`: `onnx`, `llamacpp`, or `hash`
-- `CODESTORY_EMBED_PROFILE`: built-in profile; defaults to `bge-small-en-v1.5`; explicit profiles include `minilm`, `bge-small-en-v1.5`, `qwen3-embedding-0.6b`, `embeddinggemma-300m`, `nomic-embed-text-v1.5`, or `nomic-embed-text-v2-moe`
+- `CODESTORY_EMBED_PROFILE`: built-in profile; defaults to `bge-base-en-v1.5`; explicit profiles include `minilm`, `bge-small-en-v1.5`, `bge-base-en-v1.5`, `qwen3-embedding-0.6b`, `embeddinggemma-300m`, `nomic-embed-text-v1.5`, or `nomic-embed-text-v2-moe`
 - `CODESTORY_EMBED_LLAMACPP_URL`: OpenAI-compatible llama.cpp embedding endpoint, default `http://127.0.0.1:8080/v1/embeddings`
 - `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT`: number of concurrent llama.cpp embedding requests, clamped from `1` to `16`
-- `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE`: semantic doc embedding batch size, default `64`
+- `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE`: semantic doc embedding batch size, default `128`
 - `CODESTORY_EMBED_SESSION_COUNT`: ONNX embedding worker count, clamped from `1` to `16`
-- `CODESTORY_EMBED_INTRA_THREADS`, `CODESTORY_EMBED_INTER_THREADS`, `CODESTORY_EMBED_PARALLEL_EXECUTION`: ONNX CPU execution tuning
+- `CODESTORY_EMBED_INTRA_THREADS`, `CODESTORY_EMBED_INTER_THREADS`, `CODESTORY_EMBED_PARALLEL_EXECUTION`: ONNX CPU-provider diagnostics; benchmark decisions should use GPU-provider runs
 - `CODESTORY_EMBED_EXECUTION_PROVIDER`: `cpu`, `cuda`, or `directml`; CUDA and DirectML require the matching Cargo feature
 
 ONNX is an in-process backend, not a hard dependency for semantic retrieval. The

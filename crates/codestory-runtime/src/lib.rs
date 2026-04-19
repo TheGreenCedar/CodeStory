@@ -42,6 +42,7 @@ mod mermaid;
 mod path_resolution;
 mod search;
 mod search_runtime;
+mod semantic_doc_text;
 mod services;
 mod support;
 mod symbol_query;
@@ -54,6 +55,10 @@ pub use codestory_contracts as contracts;
 pub(crate) use mermaid::{fallback_mermaid, mermaid_flowchart, mermaid_gantt, mermaid_sequence};
 pub(crate) use search_runtime::SearchEngine;
 pub use search_runtime::*;
+use semantic_doc_text::{
+    semantic_doc_language_from_path, semantic_path_aliases, semantic_symbol_aliases,
+    semantic_symbol_role_aliases,
+};
 pub use services::{
     AgentService, GroundingService, IndexService, ProjectService, SearchService, TrailService,
 };
@@ -538,12 +543,12 @@ fn current_epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
-const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 2;
+const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 3;
 const LLM_SYMBOL_DOC_VERSION_PREFIX: &str = "semantic_doc_version:";
 const SEARCH_NODE_BATCH_SIZE: usize = 8_192;
 const SEARCH_SYMBOL_PROJECTION_BATCH_SIZE: usize = 4_096;
 const LLM_DOC_RELOAD_BATCH_SIZE: usize = 256;
-const LLM_DOC_EMBED_BATCH_SIZE: usize = 64;
+const LLM_DOC_EMBED_BATCH_SIZE: usize = 128;
 const LLM_DOC_EMBED_BATCH_SIZE_ENV: &str = "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE";
 const SEMANTIC_DOC_SCOPE_ENV: &str = "CODESTORY_SEMANTIC_DOC_SCOPE";
 
@@ -1014,6 +1019,29 @@ fn build_llm_symbol_doc_text(
     if let Some(qualified_name) = node.qualified_name.as_deref() {
         let _ = writeln!(out, "qualified_name: {qualified_name}");
     }
+    if let Some(language) = semantic_doc_language_from_path(file_path) {
+        let _ = writeln!(out, "language: {language}");
+    }
+
+    let aliases = semantic_symbol_aliases(display_name, node.qualified_name.as_deref());
+    if !aliases.name_aliases.is_empty() {
+        let _ = writeln!(out, "name_aliases: {}", aliases.name_aliases.join(", "));
+    }
+    if let Some(terminal_alias) = aliases.terminal_alias {
+        let _ = writeln!(out, "terminal_alias: {terminal_alias}");
+    }
+    if !aliases.owner_aliases.is_empty() {
+        let _ = writeln!(out, "owner_aliases: {}", aliases.owner_aliases.join(", "));
+    }
+    let path_aliases = semantic_path_aliases(file_path, 8);
+    if !path_aliases.is_empty() {
+        let _ = writeln!(out, "path_aliases: {}", path_aliases.join(", "));
+    }
+    let _ = writeln!(
+        out,
+        "symbol_role: {}",
+        semantic_symbol_role_aliases(node.kind)
+    );
 
     let (signature, comments, body) = symbol_excerpt(node, file_path, file_text_cache);
     if !signature.is_empty() {
@@ -1188,7 +1216,7 @@ fn sync_llm_symbol_projection(
 
     let model_id = engine
         .embedding_model_id()
-        .unwrap_or("BAAI/bge-small-en-v1.5-local")
+        .unwrap_or("BAAI/bge-base-en-v1.5-local")
         .to_string();
     let updated_at_epoch_ms = current_epoch_ms();
 
@@ -3267,7 +3295,7 @@ mod tests {
 
     #[test]
     fn llm_doc_embed_batch_size_uses_throughput_default() {
-        assert_eq!(llm_doc_embed_batch_size(), 64);
+        assert_eq!(llm_doc_embed_batch_size(), 128);
     }
 
     #[test]
@@ -3366,6 +3394,145 @@ mod tests {
         assert!(
             padded_char_cost(&docs, 2) < (original_cost * 3 / 5),
             "length bucketing should avoid padding tiny docs to long-doc batches"
+        );
+    }
+
+    fn semantic_doc_text_for_test(
+        display_name: &str,
+        qualified_name: Option<&str>,
+        file_path: &str,
+        kind: NodeKind,
+    ) -> String {
+        let storage = Storage::new_in_memory().expect("storage");
+        let node = Node {
+            id: CoreNodeId(10),
+            kind,
+            serialized_name: display_name.to_string(),
+            qualified_name: qualified_name.map(str::to_string),
+            file_node_id: Some(CoreNodeId(1)),
+            start_line: Some(12),
+            ..Default::default()
+        };
+        let mut file_text_cache = HashMap::new();
+        build_llm_symbol_doc_text(
+            &storage,
+            &node,
+            display_name,
+            Some(file_path),
+            &mut file_text_cache,
+        )
+    }
+
+    #[test]
+    fn semantic_doc_text_adds_symbol_aliases_for_supported_language_naming_styles() {
+        let cases = [
+            (
+                "rust",
+                "src/game_state.rs",
+                "crate::game_state::check_winner",
+                Some("crate::game_state::check_winner"),
+                "check winner",
+                "crate game state check winner",
+            ),
+            (
+                "python",
+                "pkg/engine.py",
+                "pkg.engine.build_snapshot_digest",
+                Some("pkg.engine.build_snapshot_digest"),
+                "build snapshot digest",
+                "pkg engine build snapshot digest",
+            ),
+            (
+                "javascript",
+                "src/GameController.js",
+                "GameController.checkWinner",
+                Some("GameController.checkWinner"),
+                "check winner",
+                "game controller check winner",
+            ),
+            (
+                "typescript",
+                "src/useWinningMove.ts",
+                "useWinningMove",
+                None,
+                "use winning move",
+                "use winning move",
+            ),
+            (
+                "java",
+                "src/main/java/GameController.java",
+                "com.example.GameController.checkWinner",
+                Some("com.example.GameController.checkWinner"),
+                "check winner",
+                "com example game controller check winner",
+            ),
+            (
+                "c",
+                "src/field_ops.c",
+                "field_clear_move",
+                None,
+                "field clear move",
+                "field clear move",
+            ),
+            (
+                "cpp",
+                "src/field_ops.cpp",
+                "Game::Field::clearMove",
+                Some("Game::Field::clearMove"),
+                "clear move",
+                "game field clear move",
+            ),
+        ];
+
+        for (language, file_path, display_name, qualified_name, terminal_alias, full_alias) in cases
+        {
+            let doc = semantic_doc_text_for_test(
+                display_name,
+                qualified_name,
+                file_path,
+                NodeKind::FUNCTION,
+            );
+            assert!(
+                doc.contains(&format!("language: {language}")),
+                "doc should include language for {file_path}:\n{doc}"
+            );
+            assert!(
+                doc.contains(&format!("terminal_alias: {terminal_alias}")),
+                "doc should include terminal alias for {display_name}:\n{doc}"
+            );
+            assert!(
+                doc.contains(&format!("name_aliases: {full_alias}")),
+                "doc should include normalized full alias for {display_name}:\n{doc}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_doc_text_adds_kind_role_owner_and_path_alias_context() {
+        let doc = semantic_doc_text_for_test(
+            "AppController::openProjectWithStoragePath",
+            Some("codestory_runtime::AppController::openProjectWithStoragePath"),
+            "crates/codestory-runtime/src/lib.rs",
+            NodeKind::METHOD,
+        );
+
+        assert!(
+            doc.contains(
+                "symbol_role: method member function object behavior callable routine operation"
+            ),
+            "method docs should include callable role aliases:\n{doc}"
+        );
+        assert!(
+            doc.contains("owner_aliases: AppController, app controller"),
+            "method docs should expose owner/container aliases:\n{doc}"
+        );
+        assert!(
+            doc.contains("terminal_alias: open project with storage path"),
+            "method docs should expose normalized terminal names:\n{doc}"
+        );
+        assert!(
+            doc.contains("path_aliases: crates, codestory-runtime, codestory runtime, src, lib"),
+            "method docs should expose file path aliases:\n{doc}"
         );
     }
 
@@ -3651,6 +3818,10 @@ pub fn exact_symbol_anchor() {{}}
 
     #[test]
     fn search_prefers_real_tictactoe_definitions_for_check_winner_and_min_max() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "false");
         let workspace = copy_tictactoe_workspace();
         let controller = AppController::new();
         controller
