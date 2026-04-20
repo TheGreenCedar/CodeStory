@@ -34,13 +34,9 @@ fn run_cli(workspace: &Path, args: &[&str]) -> std::process::Output {
     command.output().expect("run codestory-cli")
 }
 
-#[test]
-#[ignore = "builds indexed runtime fixtures; run explicitly when touching CLI/runtime read-command flows"]
-fn read_commands_support_explicit_auto_refresh_after_indexing() {
-    let workspace = copy_tictactoe_workspace();
-
+fn index_workspace(workspace: &Path) {
     let index = run_cli(
-        workspace.path(),
+        workspace,
         &["index", "--refresh", "full", "--format", "json"],
     );
     assert!(
@@ -48,6 +44,13 @@ fn read_commands_support_explicit_auto_refresh_after_indexing() {
         "index command failed: {}",
         String::from_utf8_lossy(&index.stderr)
     );
+}
+
+#[test]
+#[ignore = "builds indexed runtime fixtures; run explicitly when touching CLI/runtime read-command flows"]
+fn read_commands_support_explicit_auto_refresh_after_indexing() {
+    let workspace = copy_tictactoe_workspace();
+    index_workspace(workspace.path());
 
     let search = run_cli(
         workspace.path(),
@@ -80,16 +83,7 @@ fn read_commands_support_explicit_auto_refresh_after_indexing() {
 #[ignore = "builds indexed runtime fixtures; run explicitly when touching CLI/runtime read-command flows"]
 fn symbol_query_file_filter_resolves_expected_fixture() {
     let workspace = copy_tictactoe_workspace();
-
-    let index = run_cli(
-        workspace.path(),
-        &["index", "--refresh", "full", "--format", "json"],
-    );
-    assert!(
-        index.status.success(),
-        "index command failed: {}",
-        String::from_utf8_lossy(&index.stderr)
-    );
+    index_workspace(workspace.path());
 
     let symbol = run_cli(
         workspace.path(),
@@ -123,16 +117,7 @@ fn symbol_query_file_filter_resolves_expected_fixture() {
 #[ignore = "builds indexed runtime fixtures; run explicitly when touching CLI/runtime read-command flows"]
 fn query_command_runs_search_filter_limit_pipeline() {
     let workspace = copy_tictactoe_workspace();
-
-    let index = run_cli(
-        workspace.path(),
-        &["index", "--refresh", "full", "--format", "json"],
-    );
-    assert!(
-        index.status.success(),
-        "index command failed: {}",
-        String::from_utf8_lossy(&index.stderr)
-    );
+    index_workspace(workspace.path());
 
     let query = run_cli(
         workspace.path(),

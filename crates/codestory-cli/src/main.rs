@@ -1473,159 +1473,212 @@ fn handle_stdio_message(runtime: &RuntimeContext, line: &str) -> serde_json::Val
                 .unwrap_or_default();
             read_stdio_resource(runtime, uri)
         }
-        "tools/call" => {
-            let name = request
-                .pointer("/params/name")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            let query = request
-                .pointer("/params/arguments/query")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            match name {
-                "search" => runtime
-                    .search
-                    .search_results(SearchRequest {
-                        query,
-                        repo_text: SearchRepoTextMode::Auto,
-                        limit_per_source: 10,
-                        hybrid_weights: None,
-                    })
-                    .map(|result| serde_json::json!({"result": result}))
-                    .unwrap_or_else(
-                        |error| serde_json::json!({"error": map_api_error(error).to_string()}),
-                    ),
-                "symbol" => resolve_target(runtime, args::TargetSelection::Query(query), None)
-                    .and_then(|target| {
-                        runtime
-                            .grounding
-                            .symbol_context(target.selected.node_id)
-                            .map_err(map_api_error)
-                    })
-                    .map(|result| serde_json::json!({"result": result}))
-                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
-                "trail" => resolve_target(runtime, args::TargetSelection::Query(query), None)
-                    .and_then(|target| {
-                        runtime
-                            .grounding
-                            .trail_context(TrailConfigDto {
-                                root_id: target.selected.node_id,
-                                mode: TrailMode::Neighborhood,
-                                target_id: None,
-                                depth: 2,
-                                direction: TrailDirection::Both,
-                                caller_scope: TrailCallerScope::ProductionOnly,
-                                edge_filter: Vec::new(),
-                                show_utility_calls: false,
-                                node_filter: Vec::new(),
-                                max_nodes: 80,
-                                layout_direction: LayoutDirection::Horizontal,
-                            })
-                            .map_err(map_api_error)
-                    })
-                    .map(|result| serde_json::json!({"result": result}))
-                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
-                "definition" => resolve_target(runtime, stdio_target_selection(&request), None)
-                    .and_then(|target| {
-                        runtime
-                            .grounding
-                            .symbol_context(target.selected.node_id.clone())
-                            .map_err(map_api_error)
-                            .map(|symbol| {
-                                serde_json::json!({
-                                    "resolution": build_query_resolution_output(&runtime.project_root, &target),
-                                    "definition": build_search_hit_output(&runtime.project_root, &target.selected, false),
-                                    "symbol": symbol,
-                                })
-                            })
-                    })
-                    .map(|result| serde_json::json!({"result": result}))
-                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
-                "references" => resolve_target(runtime, stdio_target_selection(&request), None)
-                    .and_then(|target| {
-                        runtime
-                            .grounding
-                            .trail_context(TrailConfigDto {
-                                root_id: target.selected.node_id.clone(),
-                                mode: TrailMode::AllReferencing,
-                                target_id: None,
-                                depth: 0,
-                                direction: TrailDirection::Incoming,
-                                caller_scope: TrailCallerScope::IncludeTestsAndBenches,
-                                edge_filter: Vec::new(),
-                                show_utility_calls: false,
-                                node_filter: Vec::new(),
-                                max_nodes: 120,
-                                layout_direction: LayoutDirection::Horizontal,
-                            })
-                            .map_err(map_api_error)
-                    })
-                    .map(|result| serde_json::json!({"result": result}))
-                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
-                "symbols" => {
-                    let limit = request
-                        .pointer("/params/arguments/limit")
-                        .and_then(|value| value.as_u64())
-                        .map(|value| value.min(2_000) as u32);
-                    let parent_id = request
-                        .pointer("/params/arguments/parent_id")
-                        .and_then(|value| value.as_str())
-                        .filter(|value| !value.is_empty());
-                    let result = if let Some(parent_id) = parent_id {
-                        runtime
-                            .grounding
-                            .list_children_symbols(ListChildrenSymbolsRequest {
-                                parent_id: NodeId(parent_id.to_string()),
-                            })
-                            .map(|symbols| serde_json::to_value(symbols).unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})))
-                    } else {
-                        runtime
-                            .grounding
-                            .list_root_symbols(ListRootSymbolsRequest { limit })
-                            .map(|symbols| serde_json::to_value(symbols).unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})))
-                    };
-                    result
-                        .map(|value| serde_json::json!({"result": value}))
-                        .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))
-                }
-                "snippet" => resolve_target(runtime, stdio_target_selection(&request), None)
-                    .and_then(|target| {
-                        runtime
-                            .grounding
-                            .snippet_context(target.selected.node_id, 4)
-                            .map_err(map_api_error)
-                    })
-                    .map(|result| serde_json::json!({"result": result}))
-                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
-                "ask" => {
-                    let prompt = request
-                        .pointer("/params/arguments/prompt")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or(query.as_str())
-                        .to_string();
-                    runtime
-                        .agent
-                        .ask(AgentAskRequest {
-                            prompt,
-                            retrieval_profile: codestory_contracts::api::AgentRetrievalProfileSelectionDto::Auto,
-                            focus_node_id: None,
-                            max_results: Some(8),
-                            response_mode: AgentResponseModeDto::Structured,
-                            latency_budget_ms: None,
-                            include_evidence: true,
-                            hybrid_weights: None,
-                            connection: AgentConnectionSettingsDto::default(),
-                            run_local_agent: false,
-                        })
-                        .map(|result| serde_json::json!({"result": result}))
-                        .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))
-                }
-                _ => serde_json::json!({"error": "unknown tool"}),
-            }
-        }
+        "tools/call" => handle_stdio_tool_call(runtime, &request),
         _ => serde_json::json!({"error": "unknown method"}),
     }
+}
+
+fn handle_stdio_tool_call(
+    runtime: &RuntimeContext,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    let name = request
+        .pointer("/params/name")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let query = request
+        .pointer("/params/arguments/query")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    match name {
+        "search" => handle_stdio_search(runtime, query),
+        "symbol" => handle_stdio_symbol(runtime, query),
+        "trail" => handle_stdio_trail(runtime, query),
+        "definition" => handle_stdio_definition(runtime, request),
+        "references" => handle_stdio_references(runtime, request),
+        "symbols" => handle_stdio_symbols(runtime, request),
+        "snippet" => handle_stdio_snippet(runtime, request),
+        "ask" => handle_stdio_ask(runtime, request, &query),
+        _ => serde_json::json!({"error": "unknown tool"}),
+    }
+}
+
+fn handle_stdio_search(runtime: &RuntimeContext, query: String) -> serde_json::Value {
+    runtime
+        .search
+        .search_results(SearchRequest {
+            query,
+            repo_text: SearchRepoTextMode::Auto,
+            limit_per_source: 10,
+            hybrid_weights: None,
+        })
+        .map(|result| serde_json::json!({"result": result}))
+        .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))
+}
+
+fn handle_stdio_symbol(runtime: &RuntimeContext, query: String) -> serde_json::Value {
+    resolve_target(runtime, args::TargetSelection::Query(query), None)
+        .and_then(|target| {
+            runtime
+                .grounding
+                .symbol_context(target.selected.node_id)
+                .map_err(map_api_error)
+        })
+        .map(|result| serde_json::json!({"result": result}))
+        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+}
+
+fn handle_stdio_trail(runtime: &RuntimeContext, query: String) -> serde_json::Value {
+    resolve_target(runtime, args::TargetSelection::Query(query), None)
+        .and_then(|target| {
+            runtime
+                .grounding
+                .trail_context(TrailConfigDto {
+                    root_id: target.selected.node_id,
+                    mode: TrailMode::Neighborhood,
+                    target_id: None,
+                    depth: 2,
+                    direction: TrailDirection::Both,
+                    caller_scope: TrailCallerScope::ProductionOnly,
+                    edge_filter: Vec::new(),
+                    show_utility_calls: false,
+                    node_filter: Vec::new(),
+                    max_nodes: 80,
+                    layout_direction: LayoutDirection::Horizontal,
+                })
+                .map_err(map_api_error)
+        })
+        .map(|result| serde_json::json!({"result": result}))
+        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+}
+
+fn handle_stdio_definition(
+    runtime: &RuntimeContext,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    resolve_target(runtime, stdio_target_selection(request), None)
+        .and_then(|target| {
+            runtime
+                .grounding
+                .symbol_context(target.selected.node_id.clone())
+                .map_err(map_api_error)
+                .map(|symbol| {
+                    serde_json::json!({
+                        "resolution": build_query_resolution_output(&runtime.project_root, &target),
+                        "definition": build_search_hit_output(&runtime.project_root, &target.selected, false),
+                        "symbol": symbol,
+                    })
+                })
+        })
+        .map(|result| serde_json::json!({"result": result}))
+        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+}
+
+fn handle_stdio_references(
+    runtime: &RuntimeContext,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    resolve_target(runtime, stdio_target_selection(request), None)
+        .and_then(|target| {
+            runtime
+                .grounding
+                .trail_context(TrailConfigDto {
+                    root_id: target.selected.node_id.clone(),
+                    mode: TrailMode::AllReferencing,
+                    target_id: None,
+                    depth: 0,
+                    direction: TrailDirection::Incoming,
+                    caller_scope: TrailCallerScope::IncludeTestsAndBenches,
+                    edge_filter: Vec::new(),
+                    show_utility_calls: false,
+                    node_filter: Vec::new(),
+                    max_nodes: 120,
+                    layout_direction: LayoutDirection::Horizontal,
+                })
+                .map_err(map_api_error)
+        })
+        .map(|result| serde_json::json!({"result": result}))
+        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+}
+
+fn handle_stdio_symbols(
+    runtime: &RuntimeContext,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    let limit = request
+        .pointer("/params/arguments/limit")
+        .and_then(|value| value.as_u64())
+        .map(|value| value.min(2_000) as u32);
+    let parent_id = request
+        .pointer("/params/arguments/parent_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    let result = if let Some(parent_id) = parent_id {
+        runtime
+            .grounding
+            .list_children_symbols(ListChildrenSymbolsRequest {
+                parent_id: NodeId(parent_id.to_string()),
+            })
+            .map(|symbols| {
+                serde_json::to_value(symbols)
+                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+            })
+    } else {
+        runtime
+            .grounding
+            .list_root_symbols(ListRootSymbolsRequest { limit })
+            .map(|symbols| {
+                serde_json::to_value(symbols)
+                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+            })
+    };
+    result
+        .map(|value| serde_json::json!({"result": value}))
+        .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))
+}
+
+fn handle_stdio_snippet(
+    runtime: &RuntimeContext,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    resolve_target(runtime, stdio_target_selection(request), None)
+        .and_then(|target| {
+            runtime
+                .grounding
+                .snippet_context(target.selected.node_id, 4)
+                .map_err(map_api_error)
+        })
+        .map(|result| serde_json::json!({"result": result}))
+        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+}
+
+fn handle_stdio_ask(
+    runtime: &RuntimeContext,
+    request: &serde_json::Value,
+    default_prompt: &str,
+) -> serde_json::Value {
+    let prompt = request
+        .pointer("/params/arguments/prompt")
+        .and_then(|value| value.as_str())
+        .unwrap_or(default_prompt)
+        .to_string();
+    runtime
+        .agent
+        .ask(AgentAskRequest {
+            prompt,
+            retrieval_profile: codestory_contracts::api::AgentRetrievalProfileSelectionDto::Auto,
+            focus_node_id: None,
+            max_results: Some(8),
+            response_mode: AgentResponseModeDto::Structured,
+            latency_budget_ms: None,
+            include_evidence: true,
+            hybrid_weights: None,
+            connection: AgentConnectionSettingsDto::default(),
+            run_local_agent: false,
+        })
+        .map(|result| serde_json::json!({"result": result}))
+        .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))
 }
 
 fn stdio_target_selection(request: &serde_json::Value) -> args::TargetSelection {

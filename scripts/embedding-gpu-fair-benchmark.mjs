@@ -1802,6 +1802,83 @@ function writeManifest(cases) {
   );
 }
 
+function writeCsvFile(fileName, header, rows) {
+  fs.writeFileSync(
+    path.join(outDir, fileName),
+    [header.join(","), ...rows.map((row) => row.map(csvEscape).join(","))].join("\n"),
+  );
+}
+
+function buildReportMarkdown(ranked, aliasRows, repeatRows, failed, cases) {
+  return [
+    "# CodeStory Embedding Research",
+    "",
+    `Artifact root: \`${outDir}\``,
+    `Stages: \`${[...requestedStages].join(",")}\``,
+    `Cases selected: \`${cases.length}\``,
+    `Queries: \`${queries.length}\``,
+    "",
+    "All decision-grade rows are GPU-only and must set `provider_verified=true`. ONNX rows require DirectML/CUDA fail-hard validation; llama.cpp rows require Vulkan0 and full model-layer offload.",
+    "Source-led lanes are recorded in `manifest.json` and `sources.md`; skipped rows mean an artifact or implementation prerequisite is still missing.",
+    "",
+    "## Ranking",
+    "",
+    "| Rank | Case | Stage | Doc mode | Backend | Quality gate | MRR@10 | Hit@10 | Persistent Hit@10 | Docs/sec | Footprint MB | Score |",
+    "| ---: | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ...ranked.map(
+      (result, index) =>
+        `| ${index + 1} | \`${result.case_id}\` | ${result.stage} | ${result.docMode} | ${result.kind} | ${
+          result.decision_quality_gate ? "pass" : "fail"
+        } | ${fmt(
+          result.score.mrr_at_10,
+        )} | ${fmt(result.score.hit_at_10)} | ${fmt(
+          result.score.persistent_hit_at_10,
+        )} | ${fmt(result.docs_per_second)} | ${fmt(result.model_size_mb)} | ${fmt(
+          result.combined_score,
+        )} |`,
+    ),
+    "",
+    "## Alias Comparison",
+    "",
+    "| Case | Mode | Delta MRR@10 vs no_alias | Delta Hit@10 | Per-query regressions |",
+    "| --- | --- | ---: | ---: | ---: |",
+    ...aliasRows.map(
+      (row) =>
+        `| \`${row.base_id}\` | ${row.doc_mode} | ${fmt(row.delta_mrr)} | ${fmt(
+          row.delta_hit10,
+        )} | ${row.regressions} |`,
+    ),
+    "",
+    ...(repeatRows.length
+      ? [
+          "## Repeat Summary",
+          "",
+          "| Case | Runs | MRR@10 | Hit@10 | Docs/sec | Index seconds |",
+          "| --- | ---: | ---: | ---: | ---: | ---: |",
+          ...repeatRows.map(
+            (row) =>
+              `| \`${row.case_id}\` | ${row.runs} | ${fmt(row.mrr_at_10)} | ${fmt(
+                row.hit_at_10,
+              )} | ${fmt(row.docs_per_second)} | ${fmt(row.index_seconds)} |`,
+          ),
+          "",
+        ]
+      : []),
+    "",
+    "## Blocked Candidates",
+    "",
+    ...blockedCandidates.map((candidate) => `- \`${candidate.id}\`: ${candidate.reason}`),
+    "",
+    "## Skipped Or Failed Rows",
+    "",
+    ...(failed.length
+      ? failed.map((result) => `- \`${result.case_id}\`: ${result.error}`)
+      : ["- none"]),
+    "",
+    "Combined score: quality gate first, then `0.50 * quality + 0.25 * speed + 0.15 * footprint + 0.10 * reliability` within this run.",
+  ].join("\n");
+}
+
 function writeReports(results, cases) {
   const ranked = normalizedCombined(results);
   const rankById = new Map(ranked.map((result, index) => [result.case_id, index + 1]));
@@ -1897,10 +1974,7 @@ function writeReports(results, cases) {
     result.skipped ? "true" : "",
     result.error ?? "",
   ]);
-  fs.writeFileSync(
-    path.join(outDir, "results.csv"),
-    [header.join(","), ...rows.map((row) => row.map(csvEscape).join(","))].join("\n"),
-  );
+  writeCsvFile("results.csv", header, rows);
 
   const queryHeader = [
     "case_id",
@@ -1926,30 +2000,21 @@ function writeReports(results, cases) {
       query.top.join(";"),
     ]),
   );
-  fs.writeFileSync(
-    path.join(outDir, "query-ranks.csv"),
-    [queryHeader.join(","), ...queryRows.map((row) => row.map(csvEscape).join(","))].join("\n"),
-  );
+  writeCsvFile("query-ranks.csv", queryHeader, queryRows);
 
   const aliasRows = aliasComparisons(results);
   const aliasHeader = ["case_id", "base_id", "doc_mode", "delta_mrr", "delta_hit10", "regressions"];
-  fs.writeFileSync(
-    path.join(outDir, "alias-comparisons.csv"),
-    [
-      aliasHeader.join(","),
-      ...aliasRows.map((row) =>
-        [
-          row.case_id,
-          row.base_id,
-          row.doc_mode,
-          fmt(row.delta_mrr),
-          fmt(row.delta_hit10),
-          row.regressions,
-        ]
-          .map(csvEscape)
-          .join(","),
-      ),
-    ].join("\n"),
+  writeCsvFile(
+    "alias-comparisons.csv",
+    aliasHeader,
+    aliasRows.map((row) => [
+      row.case_id,
+      row.base_id,
+      row.doc_mode,
+      fmt(row.delta_mrr),
+      fmt(row.delta_hit10),
+      row.regressions,
+    ]),
   );
 
   const repeatRows = repeatSummaries(results);
@@ -1979,41 +2044,35 @@ function writeReports(results, cases) {
     "avg_mean_rank_when_found",
     "misses",
   ];
-  fs.writeFileSync(
-    path.join(outDir, "repeat-summary.csv"),
-    [
-      repeatHeader.join(","),
-      ...repeatRows.map((row) =>
-        [
-          row.case_id,
-          row.runs,
-          row.docMode,
-          row.kind,
-          row.profile,
-          row.semanticScope,
-          row.quantization,
-          row.vectorEncoding,
-          row.truncateDim,
-          row.batch,
-          row.sessions,
-          row.requests,
-          row.parallel,
-          row.ctx,
-          row.pooling,
-          fmt(row.index_seconds),
-          fmt(row.semantic_seconds),
-          fmt(row.docs_per_second),
-          fmt(row.hit_at_1),
-          fmt(row.hit_at_10),
-          fmt(row.persistent_hit_at_10),
-          fmt(row.mrr_at_10),
-          fmt(row.mean_rank_when_found),
-          row.misses,
-        ]
-          .map(csvEscape)
-          .join(","),
-      ),
-    ].join("\n"),
+  writeCsvFile(
+    "repeat-summary.csv",
+    repeatHeader,
+    repeatRows.map((row) => [
+      row.case_id,
+      row.runs,
+      row.docMode,
+      row.kind,
+      row.profile,
+      row.semanticScope,
+      row.quantization,
+      row.vectorEncoding,
+      row.truncateDim,
+      row.batch,
+      row.sessions,
+      row.requests,
+      row.parallel,
+      row.ctx,
+      row.pooling,
+      fmt(row.index_seconds),
+      fmt(row.semantic_seconds),
+      fmt(row.docs_per_second),
+      fmt(row.hit_at_1),
+      fmt(row.hit_at_10),
+      fmt(row.persistent_hit_at_10),
+      fmt(row.mrr_at_10),
+      fmt(row.mean_rank_when_found),
+      row.misses,
+    ]),
   );
 
   fs.writeFileSync(path.join(outDir, "results.json"), JSON.stringify(results, null, 2));
@@ -2021,96 +2080,40 @@ function writeReports(results, cases) {
   fs.writeFileSync(path.join(outDir, "queries.json"), JSON.stringify(queries, null, 2));
 
   const failed = results.filter((result) => result.error);
-  const md = [
-    "# CodeStory Embedding Research",
-    "",
-    `Artifact root: \`${outDir}\``,
-    `Stages: \`${[...requestedStages].join(",")}\``,
-    `Cases selected: \`${cases.length}\``,
-    `Queries: \`${queries.length}\``,
-    "",
-    "All decision-grade rows are GPU-only and must set `provider_verified=true`. ONNX rows require DirectML/CUDA fail-hard validation; llama.cpp rows require Vulkan0 and full model-layer offload.",
-    "Source-led lanes are recorded in `manifest.json` and `sources.md`; skipped rows mean an artifact or implementation prerequisite is still missing.",
-    "",
-    "## Ranking",
-    "",
-    "| Rank | Case | Stage | Doc mode | Backend | Quality gate | MRR@10 | Hit@10 | Persistent Hit@10 | Docs/sec | Footprint MB | Score |",
-    "| ---: | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ...ranked.map(
-      (result, index) =>
-        `| ${index + 1} | \`${result.case_id}\` | ${result.stage} | ${result.docMode} | ${result.kind} | ${
-          result.decision_quality_gate ? "pass" : "fail"
-        } | ${fmt(
-          result.score.mrr_at_10,
-        )} | ${fmt(result.score.hit_at_10)} | ${fmt(
-          result.score.persistent_hit_at_10,
-        )} | ${fmt(result.docs_per_second)} | ${fmt(result.model_size_mb)} | ${fmt(
-          result.combined_score,
-        )} |`,
-    ),
-    "",
-    "## Alias Comparison",
-    "",
-    "| Case | Mode | Delta MRR@10 vs no_alias | Delta Hit@10 | Per-query regressions |",
-    "| --- | --- | ---: | ---: | ---: |",
-    ...aliasRows.map(
-      (row) =>
-        `| \`${row.base_id}\` | ${row.doc_mode} | ${fmt(row.delta_mrr)} | ${fmt(
-          row.delta_hit10,
-        )} | ${row.regressions} |`,
-    ),
-    "",
-    ...(repeatRows.length
-      ? [
-          "## Repeat Summary",
-          "",
-          "| Case | Runs | MRR@10 | Hit@10 | Docs/sec | Index seconds |",
-          "| --- | ---: | ---: | ---: | ---: | ---: |",
-          ...repeatRows.map(
-            (row) =>
-              `| \`${row.case_id}\` | ${row.runs} | ${fmt(row.mrr_at_10)} | ${fmt(
-                row.hit_at_10,
-              )} | ${fmt(row.docs_per_second)} | ${fmt(row.index_seconds)} |`,
-          ),
-          "",
-        ]
-      : []),
-    "",
-    "## Blocked Candidates",
-    "",
-    ...blockedCandidates.map((candidate) => `- \`${candidate.id}\`: ${candidate.reason}`),
-    "",
-    "## Skipped Or Failed Rows",
-    "",
-    ...(failed.length
-      ? failed.map((result) => `- \`${result.case_id}\`: ${result.error}`)
-      : ["- none"]),
-    "",
-    "Combined score: quality gate first, then `0.50 * quality + 0.25 * speed + 0.15 * footprint + 0.10 * reliability` within this run.",
-  ].join("\n");
-  fs.writeFileSync(path.join(outDir, "report.md"), md);
+  fs.writeFileSync(
+    path.join(outDir, "report.md"),
+    buildReportMarkdown(ranked, aliasRows, repeatRows, failed, cases),
+  );
 }
 
-const cases = selectedCases();
-const results = [];
-fs.mkdirSync(outDir, { recursive: true });
-writeManifest(cases);
-if (process.env.CODESTORY_EMBED_RESEARCH_LIST === "1") {
+function listSelectedCases(cases) {
   for (const config of cases) {
     console.log(config.case_id);
   }
-  process.exit(0);
 }
-for (const config of cases) {
-  try {
-    results.push(await runCase(config));
-  } catch (error) {
-    console.error(`${config.case_id} failed: ${error.message}`);
-    results.push({
-      ...config,
-      error: error.message,
-    });
+
+async function main() {
+  const cases = selectedCases();
+  const results = [];
+  fs.mkdirSync(outDir, { recursive: true });
+  writeManifest(cases);
+  if (process.env.CODESTORY_EMBED_RESEARCH_LIST === "1") {
+    listSelectedCases(cases);
+    return;
   }
+  for (const config of cases) {
+    try {
+      results.push(await runCase(config));
+    } catch (error) {
+      console.error(`${config.case_id} failed: ${error.message}`);
+      results.push({
+        ...config,
+        error: error.message,
+      });
+    }
+  }
+  writeReports(results, cases);
+  console.log(`wrote ${path.join(outDir, "results.csv")}`);
 }
-writeReports(results, cases);
-console.log(`wrote ${path.join(outDir, "results.csv")}`);
+
+await main();
