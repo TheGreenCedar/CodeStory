@@ -27,13 +27,15 @@ Use `scripts/embedding-gpu-fair-benchmark.mjs`. Every run writes:
 
 - `manifest.json`: source ledger, selected cases, artifact paths, model sizes, vector bytes per doc, and exact stage/case metadata.
 - `sources.md`: source scan and blocked candidates.
-- `results.csv` / `results.json`: row-level metrics, skipped rows, quality gate, component scores, and combined score.
+- `results.csv` / `results.json`: row-level metrics, skipped rows, provider validation, quality gate, component scores, and combined score.
 - `query-ranks.csv`: per-query ranks so persistent misses remain inspectable.
 - `repeat-summary.csv`: repeat averages for stages with repeated cases.
 - per-case logs under each case directory.
 
-Decision-grade rows still require GPU evidence: DirectML for ONNX rows and
-Vulkan0 plus full layer offload for llama.cpp rows.
+Decision-grade rows still require `provider_verified=true`: DirectML/CUDA
+fail-hard validation for ONNX rows and Vulkan0 plus full layer offload for
+llama.cpp rows. A row without provider validation is provenance only, even when
+it has metric columns.
 
 ## Stages
 
@@ -45,6 +47,7 @@ Vulkan0 plus full layer offload for llama.cpp rows.
 | `vector-quant` | Stored-vector quantization lane. Manifest-only until CodeStory has quantized-vector storage/search support. | `$env:CODESTORY_EMBED_RESEARCH_STAGE='vector-quant'; node scripts/embedding-gpu-fair-benchmark.mjs` |
 | `dimension` | Nomic Matryoshka dimensions and BGE-small negative controls. | `$env:CODESTORY_EMBED_RESEARCH_STAGE='dimension'; node scripts/embedding-gpu-fair-benchmark.mjs` |
 | `retrieval` | Hybrid weight, semantic scope, and alias-mode sweeps. | `$env:CODESTORY_EMBED_RESEARCH_STAGE='retrieval'; node scripts/embedding-gpu-fair-benchmark.mjs` |
+| `bge-small-candidate` | Three-repeat current default versus crossed BGE-small `scope=all`, `no_alias`, b256. | `$env:CODESTORY_EMBED_RESEARCH_STAGE='bge-small-candidate'; node scripts/embedding-gpu-fair-benchmark.mjs` |
 | `finalists2` | Three-repeat comparison of selected candidates after earlier stages identify them. | `$env:CODESTORY_EMBED_RESEARCH_STAGE='finalists2'; node scripts/embedding-gpu-fair-benchmark.mjs` |
 
 Use `CODESTORY_EMBED_RESEARCH_LIST=1` to list case IDs before running a stage.
@@ -60,7 +63,8 @@ The runner now uses a gated score instead of the old MRR/speed-only score:
 - footprint uses model size when the artifact exists and records vector bytes per doc for dimension/vector experiments
 
 Do not change a default from one run. A candidate must pass the quality gate,
-avoid material persistent-miss regressions, and hold up across finalist repeats.
+avoid material persistent-miss regressions, have provider-verified artifacts,
+and hold up across finalist repeats.
 
 ## Stop Rules
 
@@ -71,4 +75,3 @@ avoid material persistent-miss regressions, and hold up across finalist repeats.
 - Treat vector quantization as blocked until the store/search layer can preserve
   quantized corpus vectors and rescore against original vectors.
 - Rerun `controls` after any harness ranking change before comparing new lanes.
-

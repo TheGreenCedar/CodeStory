@@ -17,7 +17,7 @@ you need per-query ranks or logs.
 | Best prior quality candidate | BGE-base ONNX DirectML, `alias_variant`, batch `128`, sessions `2` |
 | Best llama.cpp throughput profile | BGE-base GGUF, `--pooling cls`, CodeStory request count `4`, server `-np 4` |
 | Fast prior finalist profile | ONNX BGE-small with `no_alias`, batch `256` |
-| Best Run 2 controls lead | ONNX BGE-small with `scope=all`, `no_alias`, batch `256`; needs retrieval sweep before promotion |
+| Best Run 2 controls lead | ONNX BGE-small with `scope=all`, `no_alias`, batch `256`; run `bge-small-candidate` before promotion |
 | Best Run 2 retrieval signal | `scope=all` improved BGE-small MRR most, while `no_alias` was the best durable-scope row; original retrieval speed rows are invalid because the GPU was locked |
 | Quality experiment, not default | Qwen3 0.6B GGUF with `alias_variant`, context `2048`, `r1/np1` |
 | Blocked candidate | `nomic-embed-text-v2-moe` until semantic docs have a hard token budget |
@@ -42,7 +42,7 @@ only a baseline, a blocked candidate, or a planned quantization row.
 | Model/profile | Local artifacts and backends | Evidence so far | Current status |
 | --- | --- | --- | --- |
 | `minilm` / all-MiniLM-L6-v2 | ONNX and GGUF Q8 | Legacy full GPU run only. ONNX: MRR@10 0.2668, Hit@10 0.5556, 773 docs/sec. llama.cpp: MRR@10 0.2372, Hit@10 0.6111, 610 docs/sec. | Speed/sanity baseline only; not competitive on quality. Keep in smoke/full runs, not finalists. |
-| `bge-small-en-v1.5` | ONNX default, GGUF Q8, planned GGUF Q6/Q5/Q4, planned ONNX int8/int4 | Shipped default profile. Stage 1 showed `no_alias` beat aliases for BGE-small. Stage 4 no-alias finalist was fast but lower quality. Run 2 controls made `scope=all`, `no_alias`, b256 the best composite controls row. Run 2 retrieval isolated knobs: `scope=all` had best MRR, and `no_alias` was the best durable-scope row. | Keep default unchanged. Run a crossed, repeatable row for `scope=all` + `no_alias` + b256 with fail-hard DirectML provider selection. |
+| `bge-small-en-v1.5` | ONNX default, GGUF Q8, planned GGUF Q6/Q5/Q4, planned ONNX int8/int4 | Shipped default profile. Stage 1 showed `no_alias` beat aliases for BGE-small. Stage 4 no-alias finalist was fast but lower quality. Run 2 controls made `scope=all`, `no_alias`, b256 the best composite controls row. Run 2 retrieval isolated knobs: `scope=all` had best MRR, and `no_alias` was the best durable-scope row. | Keep default unchanged. Run the focused `bge-small-candidate` stage, which repeats current default against `scope=all` + `no_alias` + b256 with provider validation stamped into artifacts. |
 | `bge-base-en-v1.5` | ONNX, GGUF Q8, planned GGUF Q6/Q5/Q4, planned ONNX int8/int4 | Best prior quality family. Stage 4 ONNX s2 had MRR@10 0.5006. Run 2 controls improved all-scope MRR@10 to 0.6379 for ONNX and 0.6362 for llama.cpp, both Hit@10 0.9143. | Best quality reference and best llama.cpp throughput reference, but model/vector footprint is larger than BGE-small. Use as quality bar, not automatic default. |
 | `nomic-embed-text-v1.5` | GGUF Q8, planned GGUF Q6/Q5/Q4 | Legacy full GPU run: MRR@10 0.4602, Hit@10 0.7222, 302 docs/sec. Stage 1 found `current_alias` was its best alias mode at MRR@10 0.4739. Prompt no-prefix row failed with a Windows search-index permission error, not a quality result. | Still interesting because it documents Matryoshka dimensions. Run `dimension` before making any speed/footprint claim. |
 | `nomic-embed-text-v2-moe` | GGUF Q8 | Legacy full run failed; prior alias docs exceeded the model context cap. Run 2 records it as blocked until semantic docs have a token budget. | Blocked, not rejected. Needs token-aware semantic-doc budgeting before quality comparison. |
@@ -131,8 +131,10 @@ Query-level deltas against the current runtime-shape baseline:
   hard token budget before the model can be judged fairly.
 
 The retrieval stage did not run the exact controls lead as a crossed candidate:
-`scope=all` + `no_alias` + b256. That crossed row is the next decision-grade
-default candidate to run with fail-hard DirectML provider selection.
+`scope=all` + `no_alias` + b256. The harness now exposes that row through the
+focused `bge-small-candidate` stage, paired with a current-default baseline and
+three repeats. Treat it as the next decision-grade default candidate only when
+its rows have `provider_verified=true` and current GPU timing.
 
 ## Per-Model Notes
 
@@ -280,7 +282,9 @@ Each current run writes `results.csv`, `results.json`, `query-ranks.csv`,
 `alias-comparisons.csv`, `cases.json`, `queries.json`, raw per-case logs, and a
 Markdown report. New finalist/repeat runs also write `repeat-summary.csv`.
 Run 2 additionally writes `manifest.json` and `sources.md`; see
-[embedding-research-run-2.md](embedding-research-run-2.md).
+[embedding-research-run-2.md](embedding-research-run-2.md). Current result rows
+include `provider_requested`, `provider_verified`, and `provider_evidence`;
+unverified rows are not decision-grade even if they contain metric columns.
 
 ## Recovered Evidence
 
@@ -313,6 +317,7 @@ Decision-grade rows must follow this contract:
   or explicitly mark mixed rows as tuning/provenance.
 - For ONNX rows, use DirectML or CUDA and reject CPU-provider fallback.
 - For llama.cpp rows, require a GPU device log plus full model-layer offload.
+- Treat only rows with `provider_verified=true` as ranked decision evidence.
 - Store raw logs and per-query ranks. Do not collapse the result to only the
   final score.
 - Record obvious host-load anomalies, GPU availability problems, and timing
@@ -341,6 +346,9 @@ $env:CODESTORY_EMBED_RESEARCH_STAGE = 'retrieval'
 $env:CODESTORY_EMBED_RESEARCH_LIST = '1'
 node scripts/embedding-gpu-fair-benchmark.mjs
 
+$env:CODESTORY_EMBED_RESEARCH_STAGE = 'bge-small-candidate'
+node scripts/embedding-gpu-fair-benchmark.mjs
+
 $env:CODESTORY_EMBED_RESEARCH_STAGE = 'alias'
 node scripts/embedding-gpu-fair-benchmark.mjs
 
@@ -360,10 +368,10 @@ This is the planned follow-up work, in priority order:
 
 | Priority | Work | Why |
 | ---: | --- | --- |
-| 1 | Run a verified-GPU crossed BGE-small retrieval/finalist row for `scope=all`, `no_alias`, b256. | Controls made this exact combination the best lead, but retrieval isolated scope and alias mode separately. |
+| 1 | Run `bge-small-candidate` and compare its repeat summary against the current default baseline. | Controls made `scope=all`, `no_alias`, b256 the best lead; the harness now gives that crossed row a focused repeatable stage with provider evidence. |
 | 2 | Rerun any retrieval row whose speed/cost matters under fail-hard DirectML provider selection. | The original retrieval run has usable quality deltas but invalid speed data because the GPU was locked. |
 | 3 | Add a token-aware semantic-doc budget and retest `nomic-embed-text-v2-moe`. | It cannot be fairly judged while alias docs can overflow its context; Run 2 records it as skipped until then. |
 | 4 | Implement quantized-vector storage/search with full-precision rescoring, then run `vector-quant`. | Source scan says vector quantization is separate from model quantization, but CodeStory cannot benchmark it honestly until the store/search path exists. |
 | 5 | Generate missing GGUF/ONNX quantized artifacts and run `weight-quant`. | The harness now records missing artifacts as skipped rows instead of false failures. |
 | 6 | Run `dimension` for Nomic v1.5 and compare against BGE-small negative controls. | Nomic documents Matryoshka dimensions; BGE truncation should stay a negative control. |
-| 7 | Promote only repeat-stable rows into `finalists2`. | Defaults should not change from a single mixed tuning pass. |
+| 7 | Promote only repeat-stable, provider-verified rows into `finalists2`. | Defaults should not change from a single mixed tuning pass or from artifacts that lack provider provenance. |
