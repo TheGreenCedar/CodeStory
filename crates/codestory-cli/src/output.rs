@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::{
-    GroundingSnapshotDto, NodeDetailsDto, RetrievalFallbackReasonDto, RetrievalModeDto,
-    RetrievalStateDto, SearchHit, SnippetContextDto, SymbolContextDto, TrailContextDto,
+    AgentAnswerDto, AgentResponseBlockDto, GraphArtifactDto, GroundingSnapshotDto, NodeDetailsDto,
+    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, SearchHit, SnippetContextDto,
+    SymbolContextDto, TrailContextDto,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -11,8 +12,8 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use crate::args::{
-    CliTrailMode, IndexDryRunOutput, IndexOutput, OutputFormat, QueryOutput, SearchOutput,
-    TrailCommand,
+    CliTrailMode, DoctorOutput, IndexDryRunOutput, IndexOutput, OutputFormat, QueryOutput,
+    SearchOutput, TrailCommand,
 };
 use crate::display::{
     clean_path_string, default_trail_direction, format_budget, format_direction, format_kind,
@@ -279,6 +280,12 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
             summary.generated, summary.reused, summary.skipped, summary.endpoint
         );
     }
+    if !output.next_commands.is_empty() {
+        let _ = writeln!(markdown, "next_commands:");
+        for command in &output.next_commands {
+            let _ = writeln!(markdown, "- `{command}`");
+        }
+    }
     markdown
 }
 
@@ -359,6 +366,7 @@ fn append_optional_timings_line(
 pub(crate) fn render_ground_markdown(
     project_root: &Path,
     snapshot: &GroundingSnapshotDto,
+    explain: bool,
 ) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Grounding Snapshot");
@@ -395,6 +403,31 @@ pub(crate) fn render_ground_markdown(
         let _ = writeln!(markdown, "notes:");
         for note in &snapshot.notes {
             let _ = writeln!(markdown, "- {note}");
+        }
+    }
+    if explain {
+        let _ = writeln!(markdown, "why:");
+        if let Some(retrieval) = snapshot.retrieval.as_ref() {
+            let _ = writeln!(
+                markdown,
+                "- retrieval_mode: {}",
+                render_retrieval_state(retrieval)
+            );
+        }
+        let _ = writeln!(
+            markdown,
+            "- coverage: represented {} of {} files and {} of {} symbols",
+            snapshot.coverage.represented_files,
+            snapshot.coverage.total_files,
+            snapshot.coverage.represented_symbols,
+            snapshot.coverage.total_symbols
+        );
+        if !snapshot.recommended_queries.is_empty() {
+            let _ = writeln!(
+                markdown,
+                "- query_hints: {}",
+                snapshot.recommended_queries.join(", ")
+            );
         }
     }
     let _ = writeln!(markdown, "root_symbols:");
@@ -477,6 +510,12 @@ pub(crate) fn render_search_markdown(_project_root: &Path, output: &SearchOutput
             let _ = writeln!(markdown, "- {}", render_search_hit_output(hit));
         }
     }
+    if output.explain && !output.query_hints.is_empty() {
+        let _ = writeln!(markdown, "query_hints:");
+        for hint in &output.query_hints {
+            let _ = writeln!(markdown, "- {hint}");
+        }
+    }
     let _ = writeln!(
         markdown,
         "indexed_symbol_hits: {}",
@@ -484,12 +523,145 @@ pub(crate) fn render_search_markdown(_project_root: &Path, output: &SearchOutput
     );
     for hit in &output.indexed_symbol_hits {
         let _ = writeln!(markdown, "- {}", render_search_hit_output(hit));
+        append_search_hit_why(&mut markdown, hit);
     }
     let _ = writeln!(markdown, "repo_text_hits: {}", output.repo_text_hits.len());
     for hit in &output.repo_text_hits {
         let _ = writeln!(markdown, "- {}", render_search_hit_output(hit));
+        append_search_hit_why(&mut markdown, hit);
         if let Some(excerpt) = hit.excerpt.as_deref() {
             let _ = writeln!(markdown, "  excerpt: {}", excerpt);
+        }
+    }
+    markdown
+}
+
+fn append_search_hit_why(markdown: &mut String, hit: &crate::args::SearchHitOutput) {
+    if hit.why.is_empty() {
+        return;
+    }
+    for why in &hit.why {
+        let _ = writeln!(markdown, "  why: {why}");
+    }
+}
+
+pub(crate) fn render_agent_answer_markdown(project_root: &Path, answer: &AgentAnswerDto) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Ask");
+    let _ = writeln!(markdown, "prompt: `{}`", answer.prompt.replace('\n', " "));
+    let _ = writeln!(markdown, "summary: {}", answer.summary);
+    let _ = writeln!(
+        markdown,
+        "retrieval_version: `{}`",
+        answer.retrieval_version
+    );
+    let _ = writeln!(
+        markdown,
+        "trace: profile={:?} policy={:?} latency_ms={} steps={}",
+        answer.retrieval_trace.resolved_profile,
+        answer.retrieval_trace.policy_mode,
+        answer.retrieval_trace.total_latency_ms,
+        answer.retrieval_trace.steps.len()
+    );
+    for section in &answer.sections {
+        let _ = writeln!(markdown, "\n## {}", section.title);
+        for block in &section.blocks {
+            match block {
+                AgentResponseBlockDto::Markdown { markdown: block } => {
+                    markdown.push_str(block);
+                    if !block.ends_with('\n') {
+                        markdown.push('\n');
+                    }
+                }
+                AgentResponseBlockDto::Mermaid { graph_id } => {
+                    if let Some(GraphArtifactDto::Mermaid { mermaid_syntax, .. }) =
+                        answer.graphs.iter().find(|graph| match graph {
+                            GraphArtifactDto::Mermaid { id, .. } => id == graph_id,
+                            GraphArtifactDto::Uml { .. } => false,
+                        })
+                    {
+                        let _ = writeln!(markdown, "```mermaid");
+                        markdown.push_str(mermaid_syntax);
+                        if !mermaid_syntax.ends_with('\n') {
+                            markdown.push('\n');
+                        }
+                        let _ = writeln!(markdown, "```");
+                    }
+                }
+            }
+        }
+    }
+    if !answer.citations.is_empty() {
+        let _ = writeln!(markdown, "\n## Citations");
+        for citation in &answer.citations {
+            let file = citation
+                .file_path
+                .as_deref()
+                .map(|path| relative_path(project_root, path))
+                .unwrap_or_else(|| "-".to_string());
+            let line = citation
+                .line
+                .map(|line| format!(":{line}"))
+                .unwrap_or_default();
+            let _ = write!(
+                markdown,
+                "- [{}] {} [{}] {}{} score={:.3}",
+                citation.node_id.0,
+                citation.display_name,
+                format_kind(citation.kind),
+                file,
+                line,
+                citation.score
+            );
+            if let Some(breakdown) = citation.retrieval_score_breakdown.as_ref() {
+                let _ = write!(
+                    markdown,
+                    " why lexical={:.3} semantic={:.3} graph={:.3} total={:.3}",
+                    breakdown.lexical, breakdown.semantic, breakdown.graph, breakdown.total
+                );
+            }
+            let _ = writeln!(markdown);
+        }
+    }
+    markdown
+}
+
+pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Doctor");
+    let _ = writeln!(markdown, "project: `{}`", output.project);
+    let _ = writeln!(markdown, "storage: `{}`", output.storage_path);
+    let _ = writeln!(
+        markdown,
+        "stats: nodes={} edges={} files={} errors={}",
+        output.stats.node_count,
+        output.stats.edge_count,
+        output.stats.file_count,
+        output.stats.error_count
+    );
+    if let Some(retrieval) = output.retrieval.as_ref() {
+        let _ = writeln!(markdown, "retrieval: {}", render_retrieval_state(retrieval));
+    }
+    let _ = writeln!(markdown, "checks:");
+    for check in &output.checks {
+        let _ = writeln!(
+            markdown,
+            "- {} [{}]: {}",
+            check.name, check.status, check.message
+        );
+    }
+    let _ = writeln!(markdown, "environment:");
+    for item in &output.environment {
+        let _ = writeln!(
+            markdown,
+            "- {} [{}]: {}",
+            item.name, item.status, item.message
+        );
+    }
+    if !output.next_commands.is_empty() {
+        let _ = writeln!(markdown, "next_commands:");
+        for command in &output.next_commands {
+            let _ = writeln!(markdown, "- `{command}`");
         }
     }
     markdown

@@ -1,9 +1,11 @@
 use codestory_contracts::api::{
     AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto, ApiError, GroundingBudgetDto,
-    GroundingSnapshotDto, IndexDryRunDto, IndexMode, IndexingPhaseTimings, NodeDetailsDto,
-    NodeDetailsRequest, NodeId, OpenProjectRequest, ProjectSummary, RetrievalStateDto, SearchHit,
-    SearchRequest, SearchResultsDto, SnippetContextDto, StartIndexingRequest, SummaryGenerationDto,
-    SymbolContextDto, TrailConfigDto, TrailContextDto,
+    GroundingSnapshotDto, IndexDryRunDto, IndexMode, IndexingPhaseTimings,
+    ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId,
+    OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, RetrievalStateDto, SearchHit,
+    SearchRequest, SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
+    SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
+    TrailContextDto,
 };
 
 use crate::AppController;
@@ -169,6 +171,34 @@ impl GroundingService {
 
     pub fn node_details(&self, req: NodeDetailsRequest) -> Result<NodeDetailsDto, ApiError> {
         self.controller.node_details(req)
+    }
+
+    pub fn node_occurrences(
+        &self,
+        req: codestory_contracts::api::NodeOccurrencesRequest,
+    ) -> Result<Vec<SourceOccurrenceDto>, ApiError> {
+        self.controller.node_occurrences(req)
+    }
+
+    pub fn list_root_symbols(
+        &self,
+        req: ListRootSymbolsRequest,
+    ) -> Result<Vec<SymbolSummaryDto>, ApiError> {
+        self.controller.list_root_symbols(req)
+    }
+
+    pub fn list_children_symbols(
+        &self,
+        req: ListChildrenSymbolsRequest,
+    ) -> Result<Vec<SymbolSummaryDto>, ApiError> {
+        self.controller.list_children_symbols(req)
+    }
+
+    pub fn open_definition(
+        &self,
+        req: OpenDefinitionRequest,
+    ) -> Result<SystemActionResponse, ApiError> {
+        self.controller.open_definition(req)
     }
 }
 

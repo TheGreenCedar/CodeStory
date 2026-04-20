@@ -8,11 +8,11 @@ use codestory_contracts::api::{
     ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess, NodeDetailsDto,
     NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest, OpenContainingFolderRequest,
     OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
-    ReadFileTextResponse, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto,
-    SearchHit, SearchRepoTextMode, SearchRequest, SearchResultsDto, SnippetContextDto,
-    SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto, SummaryGenerationDto,
-    SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto,
-    TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
+    ReadFileTextResponse, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto,
+    RetrievalStateDto, SearchHit, SearchRepoTextMode, SearchRequest, SearchResultsDto,
+    SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto,
+    SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
+    TrailContextDto, TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
     WorkspaceMemberIndexDto, WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
@@ -1983,6 +1983,7 @@ impl AppController {
             score,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             resolvable: true,
+            score_breakdown: None,
         })
     }
 
@@ -2053,6 +2054,7 @@ impl AppController {
                 score,
                 origin: codestory_contracts::api::SearchHitOrigin::TextMatch,
                 resolvable: false,
+                score_breakdown: None,
             });
         }
 
@@ -2766,9 +2768,15 @@ impl AppController {
 
         let mut out = Vec::with_capacity(hybrid.len());
         for scored in hybrid {
-            if let Some(hit) =
+            if let Some(mut hit) =
                 Self::build_search_hit(&storage, &node_names, scored.node_id, scored.total_score)
             {
+                hit.score_breakdown = Some(RetrievalScoreBreakdownDto {
+                    lexical: scored.lexical_score,
+                    semantic: scored.semantic_score,
+                    graph: scored.graph_score,
+                    total: scored.total_score,
+                });
                 out.push(HybridSearchScoredHit {
                     hit,
                     lexical_score: scored.lexical_score,
@@ -4290,6 +4298,7 @@ pub fn exact_symbol_anchor() {{}}
             score: 184.0,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             resolvable: true,
+            score_breakdown: None,
         };
         let method = SearchHit {
             node_id: NodeId("method".to_string()),
@@ -4300,6 +4309,7 @@ pub fn exact_symbol_anchor() {{}}
             score: 184.0,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             resolvable: true,
+            score_breakdown: None,
         };
 
         let mut hits = [method, function.clone()];
@@ -4872,6 +4882,7 @@ pub fn exact_symbol_anchor() {{}}
                 score: 0.25,
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 resolvable: true,
+                score_breakdown: None,
             },
             SearchHit {
                 node_id: NodeId("secondary".to_string()),
@@ -4882,6 +4893,7 @@ pub fn exact_symbol_anchor() {{}}
                 score: 0.75,
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 resolvable: true,
+                score_breakdown: None,
             },
         ];
 
@@ -4896,6 +4908,7 @@ pub fn exact_symbol_anchor() {{}}
                 score: 250.0,
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 resolvable: true,
+                score_breakdown: None,
             }],
         );
 

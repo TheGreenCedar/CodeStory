@@ -33,13 +33,15 @@ Use this path if you want to run the tool against a repository.
 4. Run the grounding workflows against the existing cache.
    ```text
    .\target\release\codestory-cli.exe ground --project <path>
-   .\target\release\codestory-cli.exe search --project <path> --query <query>
+   .\target\release\codestory-cli.exe search --project <path> --query <query> --why
+   .\target\release\codestory-cli.exe ask --project <path> "How does this repo fit together?"
    .\target\release\codestory-cli.exe symbol --project <path> (--id <node-id> | --query <query>)
    .\target\release\codestory-cli.exe trail --project <path> (--id <node-id> | --query <query>)
    .\target\release\codestory-cli.exe snippet --project <path> (--id <node-id> | --query <query>)
    .\target\release\codestory-cli.exe query --project <path> "trail(symbol: 'Foo') | filter(kind: function)"
    .\target\release\codestory-cli.exe explore --project <path> --query <query>
    .\target\release\codestory-cli.exe serve --project <path>
+   .\target\release\codestory-cli.exe doctor --project <path>
    ```
 
 Read commands default to `--refresh none`. They query the current cache unless you explicitly ask them to refresh.
@@ -104,7 +106,7 @@ Start here when you are contributing:
 
 ## Grounding Workflows
 
-The product surface starts with six core workflows and adds higher-level graph, explorer, serving, and shell-integration commands:
+The product surface starts with core grounding workflows and adds higher-level ask, graph, explorer, serving, health, and shell-integration commands:
 
 ```mermaid
 flowchart LR
@@ -112,26 +114,30 @@ flowchart LR
     Index["index"] --> LocalState["SQLite graph + snapshots"]
     LocalState --> Ground["ground"]
     LocalState --> Search["search"]
+    LocalState --> Ask["ask"]
     LocalState --> Symbol["symbol"]
     LocalState --> Trail["trail"]
     LocalState --> Snippet["snippet"]
     LocalState --> Query["query"]
     LocalState --> Explore["explore"]
     LocalState --> Serve["serve"]
+    LocalState --> Doctor["doctor"]
 ```
 
 - `index`: discover files, parse supported languages, resolve graph edges, persist search projections, and complete semantic docs before returning
-- `ground`: build grounded context from indexed symbols, snippets, graph traversal, and search results
-- `search`: find symbols, files, and query matches; semantic-only near misses appear under `did_you_mean`
+- `ground`: build grounded context from indexed symbols, snippets, graph traversal, and search results; `--why` explains retrieval mode, coverage, and query hints
+- `search`: find symbols, files, and query matches; semantic-only near misses appear under `did_you_mean`, and `--why` includes lexical/semantic/graph score breakdowns when available
+- `ask`: run DB-first agentic retrieval across search, graph, snippets, traces, and citations; by default it does not launch an external agent, while `--with-local-agent` opts into local Codex/Claude synthesis
 - `symbol`: inspect one symbol and its indexed relationships
 - `trail`: walk caller/callee and usage neighborhoods through the graph; `--mermaid` emits a Mermaid flowchart and `--format dot` emits Graphviz DOT
 - `snippet`: fetch focused source context for a symbol or file location; Markdown snippets use ANSI syntax highlighting when stdout is an interactive terminal
 - `query`: run a small graph query pipeline such as `trail(symbol: 'Foo', depth: 2) | filter(kind: function) | limit(10)`
-- `explore`: open an interactive terminal explorer when stdout is a terminal, or emit Markdown/JSON when piped or passed `--no-tui`
-- `serve`: expose local `/health`, `/search`, `/symbol`, and `/trail` JSON endpoints, or use `--stdio` for a small MCP-style JSON-lines tool protocol
+- `explore`: open an interactive terminal explorer when stdout is a terminal, or emit Markdown/JSON with definition and reference navigation metadata when piped or passed `--no-tui`
+- `serve`: expose local `/health`, `/search`, `/symbol`, `/definition`, `/references`, `/symbols`, and `/trail` JSON endpoints, or use `--stdio` for MCP-style tools, resources, resource templates, and prompts
+- `doctor`: report project/cache/index/retrieval health, relevant environment settings, and the next useful commands for the workspace
 - `generate-completions`: emit bash, zsh, fish, or PowerShell completions generated from the clap command model
 
-Hybrid retrieval is the intended default when local embedding assets are available. `index`, `ground`, and `search` now report retrieval mode, semantic doc counts, and explicit fallback reasons when the runtime drops back to symbolic ranking.
+Hybrid retrieval is the intended default when local embedding assets are available. `index`, `ground`, `search`, `ask`, and `doctor` now report retrieval mode, semantic doc counts, and explicit fallback reasons when the runtime drops back to symbolic ranking.
 
 ## Workspace And Config Files
 
@@ -149,7 +155,7 @@ Team or user defaults can live in `.codestory.toml` at the project root or in th
 
 ## Retrieval Defaults
 
-`index`, `ground`, and `search` now report the active retrieval mode. Hybrid retrieval is the default when local embedding assets are available; otherwise CodeStory falls back to symbolic or lexical ranking and reports why.
+`index`, `ground`, `search`, `ask`, and `doctor` report the active retrieval mode when they have retrieval state available. Hybrid retrieval is the default when local embedding assets are available; otherwise CodeStory falls back to symbolic or lexical ranking and reports why.
 
 The default `index` path is a full semantic sync, not a deferred background task. When embedding assets are available, the command returns after graph state, snapshots, lexical search state, and durable semantic docs are all ready. The index summary reports semantic timing and reuse counts so cold-start and repeated-refresh costs stay visible.
 
@@ -161,18 +167,19 @@ Hybrid retrieval setup:
 - llama.cpp GGUF server: run `llama-server --embedding` and set `CODESTORY_EMBED_LLAMACPP_URL` if it is not listening at `http://127.0.0.1:8080/v1/embeddings`; tune concurrent embedding requests with `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT`
 - durable semantic docs are the default; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` to include lower-signal local/member/module symbols for investigation
 - embedding batch size defaults to `128`; override with `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` only while profiling
-- search research can override hybrid ranking weights with `search --hybrid-lexical <WEIGHT> --hybrid-semantic <WEIGHT> --hybrid-graph <WEIGHT>`; omit these flags for the runtime defaults
+- search and ask research can override hybrid ranking weights with `--hybrid-lexical <WEIGHT> --hybrid-semantic <WEIGHT> --hybrid-graph <WEIGHT>`; omit these flags for the runtime defaults
+- handoff bundles: `ask --bundle <DIR>` writes `answer.md`, `answer.json`, and generated Mermaid artifacts for sharing or review
 - ONNX CPU tuning: `CODESTORY_EMBED_SESSION_COUNT`, `CODESTORY_EMBED_INTRA_THREADS`, `CODESTORY_EMBED_INTER_THREADS`, and `CODESTORY_EMBED_PARALLEL_EXECUTION`
 - optional ONNX providers: build `codestory-runtime` with `onnx-cuda` or `onnx-directml` and set `CODESTORY_EMBED_EXECUTION_PROVIDER=cuda` or `directml`
 - lexical-only mode: set `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false`
-- verification: `index`, `ground`, and `search` will report the retrieval mode plus any fallback reason
+- verification: `index`, `ground`, `search`, `ask`, and `doctor` will report the retrieval mode plus any fallback reason when relevant
 
 Measured backend tradeoffs and current model recommendations are recorded in [embedding-backend-benchmarks.md](docs/testing/embedding-backend-benchmarks.md).
 
 Refresh behavior:
 
 - `index --refresh auto`: full on an empty cache, incremental once indexed files already exist
-- `ground`, `search`, `symbol`, `trail`, `snippet`: default to `--refresh none`
+- `ground`, `search`, `ask`, `symbol`, `trail`, `snippet`, `query`, `explore`, and `serve`: default to `--refresh none`
 - use `--refresh incremental` when you want a read command to refresh an existing cache first
 - use `--refresh full` after a cache reset, schema change, or suspected stale-state incident
 
@@ -211,7 +218,7 @@ The workspace is organized into seven durable crates:
 - `codestory-store`: SQLite persistence, snapshots, trails, bookmarks, and search docs
 - `codestory-indexer`: parsing, extraction, resolution, batching, and indexing tests
 - `codestory-runtime`: orchestration, grounding, search, trail, and agent flows
-- `codestory-cli`: thin adapter and renderer for the six workflows
+- `codestory-cli`: thin adapter and renderer for grounding, ask, navigation, health, and serving workflows
 - `codestory-bench`: criterion benches for indexing, grounding, resolution, and cleanup work
 
 ## Build And Verification

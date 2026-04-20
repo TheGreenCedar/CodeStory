@@ -103,6 +103,7 @@ fn search_json_emits_search_results_dto_after_repo_text_merge() {
             "1",
             "--refresh",
             "none",
+            "--why",
             "--format",
             "json",
         ],
@@ -132,6 +133,15 @@ fn search_json_emits_search_results_dto_after_repo_text_merge() {
         json["indexed_symbol_hits"].as_array().map(Vec::len),
         Some(1),
         "search json should preserve the indexed symbol bucket"
+    );
+    assert_eq!(json["explain"], Value::Bool(true));
+    assert!(
+        json["indexed_symbol_hits"][0]["score_breakdown"].is_object(),
+        "search json should expose hybrid score breakdowns for indexed hits"
+    );
+    assert!(
+        json["indexed_symbol_hits"][0]["why"].is_array(),
+        "search --why json should carry compact explanation strings"
     );
     assert!(
         json["repo_text_hits"].is_array(),

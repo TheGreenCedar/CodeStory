@@ -115,28 +115,37 @@ pub(crate) fn agent_ask(
     );
     bundle.graphs.extend(mermaid_graphs);
 
-    let local_agent_prompt = build_local_agent_prompt(
-        &prompt,
-        &bundle.hits,
-        bundle.focused_node.as_ref(),
-        source_context.as_ref(),
-    );
-
     let local_agent_step = trace.start_step(
         AgentRetrievalStepKindDto::LocalAgent,
         vec![field("backend", format!("{:?}", req.connection.backend))],
     );
-    let local_agent_result = controller.run_local_agent(&req.connection, &local_agent_prompt);
-    match &local_agent_result {
-        Ok(response) => trace.finish_ok(
+    let local_agent_result = if req.run_local_agent {
+        let local_agent_prompt = build_local_agent_prompt(
+            &prompt,
+            &bundle.hits,
+            bundle.focused_node.as_ref(),
+            source_context.as_ref(),
+        );
+        let result = controller.run_local_agent(&req.connection, &local_agent_prompt);
+        match &result {
+            Ok(response) => trace.finish_ok(
+                local_agent_step,
+                vec![
+                    field("backend_label", response.backend_label),
+                    field("response_chars", response.markdown.len().to_string()),
+                ],
+            ),
+            Err(error) => trace.finish_err(local_agent_step, error.message.clone()),
+        }
+        Some(result)
+    } else {
+        trace.finish_skipped(
             local_agent_step,
-            vec![
-                field("backend_label", response.backend_label),
-                field("response_chars", response.markdown.len().to_string()),
-            ],
-        ),
-        Err(error) => trace.finish_err(local_agent_step, error.message.clone()),
-    }
+            "Local agent execution disabled for this ask request.",
+            Vec::new(),
+        );
+        None
+    };
 
     let synth_step = trace.start_step(
         AgentRetrievalStepKindDto::AnswerSynthesis,
@@ -149,7 +158,7 @@ pub(crate) fn agent_ask(
         &bundle,
         source_context.as_ref(),
         &req,
-        &local_agent_result,
+        local_agent_result.as_ref(),
     );
 
     trace.finish_ok(
@@ -836,18 +845,18 @@ fn build_sections(
     bundle: &RetrievalBundle,
     source_context: Option<&FocusedSourceContext>,
     req: &AgentAskRequest,
-    local_agent_result: &Result<LocalAgentResponse, ApiError>,
+    local_agent_result: Option<&Result<LocalAgentResponse, ApiError>>,
 ) -> Vec<AgentResponseSectionDto> {
     let mut sections = Vec::new();
 
     let mut analysis_blocks = Vec::new();
     match local_agent_result {
-        Ok(agent) => {
+        Some(Ok(agent)) => {
             analysis_blocks.push(AgentResponseBlockDto::Markdown {
                 markdown: format!("{}\n\n_Executed via `{}`._", agent.markdown, agent.command),
             });
         }
-        Err(error) => {
+        Some(Err(error)) => {
             let backend_label = agent_backend_label(req.connection.backend);
             let command = configured_agent_command(&req.connection);
             analysis_blocks.push(AgentResponseBlockDto::Markdown {
@@ -857,6 +866,11 @@ fn build_sections(
 \nContinuing with indexed DB-first retrieval evidence.",
                     backend_label, command, error.message
                 ),
+            });
+        }
+        None => {
+            analysis_blocks.push(AgentResponseBlockDto::Markdown {
+                markdown: "Local agent execution was skipped; this answer is assembled from indexed DB-first retrieval evidence.".to_string(),
             });
         }
     }
@@ -980,18 +994,25 @@ fn first_mermaid_graph_id(graphs: &[GraphArtifactDto]) -> Option<String> {
 fn summarize_response(
     resolved_profile: &ResolvedProfile,
     bundle: &RetrievalBundle,
-    local_agent_result: Result<&LocalAgentResponse, &ApiError>,
+    local_agent_result: Option<&Result<LocalAgentResponse, ApiError>>,
 ) -> String {
     match local_agent_result {
-        Ok(agent) => format!(
+        Some(Ok(agent)) => format!(
             "{} analyzed {} indexed match(es) in {:?} mode and generated {} graph artifact(s).",
             agent.backend_label,
             bundle.hits.len(),
             resolved_profile.policy_mode,
             bundle.graphs.len()
         ),
-        Err(_) => format!(
+        Some(Err(_)) => format!(
             "DB-first retrieval ({:?}/{:?}) returned {} indexed match(es) and {} graph artifact(s).",
+            resolved_profile.preset,
+            resolved_profile.policy_mode,
+            bundle.hits.len(),
+            bundle.graphs.len()
+        ),
+        None => format!(
+            "DB-first retrieval ({:?}/{:?}) returned {} indexed match(es) and {} graph artifact(s) without launching a local agent.",
             resolved_profile.preset,
             resolved_profile.policy_mode,
             bundle.hits.len(),
@@ -1255,6 +1276,7 @@ mod tests {
                 include_evidence: true,
                 hybrid_weights: None,
                 connection: codestory_contracts::api::AgentConnectionSettingsDto::default(),
+                run_local_agent: true,
             },
             "inspect this",
             Instant::now(),
@@ -1323,6 +1345,7 @@ mod tests {
             score: 10.0,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             resolvable: true,
+            score_breakdown: None,
         }];
 
         merge_search_hits(
@@ -1337,6 +1360,7 @@ mod tests {
                     score: 42.0,
                     origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                     resolvable: true,
+                    score_breakdown: None,
                 },
                 SearchHit {
                     node_id: codestory_contracts::api::NodeId("2".to_string()),
@@ -1347,6 +1371,7 @@ mod tests {
                     score: 18.0,
                     origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                     resolvable: true,
+                    score_breakdown: None,
                 },
             ],
             10,

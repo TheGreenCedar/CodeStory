@@ -1,6 +1,6 @@
 # CLI Subsystem
 
-`codestory-cli` is the thin adapter for indexing, grounding reads, graph-query helpers, local exploration, and lightweight serving.
+`codestory-cli` is the thin adapter for indexing, grounding reads, DB-first ask packets, graph-query helpers, local exploration, health checks, and lightweight serving.
 
 ## Ownership
 
@@ -62,17 +62,28 @@ Read commands default to `--refresh none` so they query the current cache unless
 
 `query` is intentionally small. It parses source operations (`search`, `symbol`, `trail`) followed by stream refinements (`filter`, `limit`) and rejects malformed or unknown named arguments rather than silently ignoring typos.
 
-## `search` Command Research Options
+`ask` is the first higher-level retrieval packet. It delegates to `codestory-runtime` agent orchestration, includes citations and retrieval traces, and defaults to DB-first synthesis without launching an external agent. `--with-local-agent` opts into the configured Codex or Claude command, and `--bundle <DIR>` writes Markdown, JSON, and Mermaid artifacts for handoff.
 
-`codestory-cli search` keeps production behavior on the runtime defaults unless a caller explicitly passes hybrid research weights:
+`doctor` is a read-only health report for project path resolution, cache presence, index counts, retrieval state, relevant embedding environment variables, and next commands. It should stay diagnostic; it should not mutate caches or fetch model assets.
+
+## `search` And `ask` Research Options
+
+`codestory-cli search` and `codestory-cli ask` keep production behavior on the runtime defaults unless a caller explicitly passes hybrid research weights:
 
 | Option | Default | Runtime effect |
 | --- | --- | --- |
 | `--hybrid-lexical <WEIGHT>` | runtime default | Overrides the lexical component weight for this search request. |
 | `--hybrid-semantic <WEIGHT>` | runtime default | Overrides the semantic embedding component weight for this search request. |
 | `--hybrid-graph <WEIGHT>` | runtime default | Overrides the graph-neighborhood component weight for this search request. |
+| `--why` | off | Search-only Markdown explanations for fallback state, origin, and lexical/semantic/graph score contributions when present. JSON includes the structured score breakdown when runtime has scored hybrid hits. |
 
 The runtime clamps and normalizes supplied weights before ranking. These flags exist so benchmark runs can sweep retrieval settings without changing global environment variables or production defaults.
+
+## Serving And Integration Surface
+
+HTTP serving keeps the current small GET/query-string shape. The stable routes are `/health`, `/search`, `/symbol`, `/definition`, `/references`, `/symbols`, and `/trail`. Definition and references accept either `q` or `id`, so agents can resolve from a query first and then reuse exact node ids.
+
+`serve --stdio` is MCP-style JSON lines. It exposes tools for search, symbol, trail, definition, references, symbols, snippet, and ask; resources for project, grounding, and root symbols; resource templates for node-specific symbol/reference/snippet/trail reads; and prompts for explain-symbol, callflow tracing, and impact analysis.
 
 ## Failure Signatures
 

@@ -3,7 +3,9 @@ use codestory_contracts::api::{
     ApiError, AppEventPayload, IndexMode, IndexingPhaseTimings, NodeDetailsDto, NodeDetailsRequest,
     ProjectSummary, SearchHit, SearchRepoTextMode, SearchRequest,
 };
-use codestory_runtime::{GroundingService, IndexService, ProjectService, Runtime, SearchService};
+use codestory_runtime::{
+    AgentService, GroundingService, IndexService, ProjectService, Runtime, SearchService,
+};
 use directories::ProjectDirs;
 use std::path::{Path, PathBuf};
 
@@ -26,6 +28,7 @@ pub(crate) struct RuntimeContext {
     pub(crate) index: IndexService,
     pub(crate) search: SearchService,
     pub(crate) grounding: GroundingService,
+    pub(crate) agent: AgentService,
     pub(crate) events: crossbeam_channel::Receiver<AppEventPayload>,
     pub(crate) project_root: PathBuf,
     pub(crate) storage_path: PathBuf,
@@ -56,6 +59,7 @@ impl RuntimeContext {
             index: runtime.index_service(),
             search: runtime.search_service(),
             grounding: runtime.grounding_service(),
+            agent: runtime.agent_service(),
             events,
             project_root,
             storage_path,
@@ -289,6 +293,7 @@ pub(crate) fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
         score: 0.0,
         origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
         resolvable: true,
+        score_breakdown: None,
     }
 }
 

@@ -1,7 +1,8 @@
 # Runtime Execution Path
 
-This page describes the current command path for the six supported CLI workflows:
-`index`, `ground`, `search`, `symbol`, `trail`, and `snippet`.
+This page describes the current command path for the core CLI workflows:
+`index`, `ground`, `search`, `ask`, `symbol`, `trail`, `snippet`, `explore`,
+`serve`, and `doctor`.
 
 ## Index Command
 
@@ -59,6 +60,36 @@ sequenceDiagram
 4. When semantic retrieval is unavailable, runtime falls back to symbolic ranking and records the fallback reason in the DTO surface.
 5. Runtime maps retrieval state plus matches into contract DTOs and CLI renders them.
 
+When `search --why` is requested, the CLI renders compact explanations from the
+same DTO surface: origin, fallback state, and lexical/semantic/graph score
+breakdowns when runtime produced hybrid scored hits.
+
+## Ask Command
+
+```mermaid
+sequenceDiagram
+    participant CLI as codestory-cli
+    participant Runtime as codestory-runtime
+    participant Search as runtime search
+    participant Graph as runtime graph builders
+    participant Agent as optional local agent
+
+    CLI->>Runtime: AgentAskRequest
+    Runtime->>Search: scored hybrid retrieval
+    Runtime->>Graph: neighborhood, trail, snippets, citations
+    Runtime-->>CLI: AgentAnswerDto with trace and evidence
+    opt --with-local-agent
+        Runtime->>Agent: constrained local prompt
+        Agent-->>Runtime: markdown synthesis
+    end
+    CLI->>CLI: render markdown/json and optional bundle
+```
+
+`ask` is DB-first by default. It runs runtime-owned retrieval planning and answer
+packet assembly without invoking an external process. `--with-local-agent`
+opts into a local Codex or Claude command after the indexed evidence packet has
+been built.
+
 ## Ground, Symbol, Trail, and Snippet Commands
 
 ```mermaid
@@ -72,6 +103,12 @@ flowchart LR
 2. Runtime reads graph rows, occurrences, trail data, search docs, or snapshot digests from the store.
 3. Runtime adds ranking, deduplication, and grounding-specific assembly on top of store-owned state.
 4. CLI formats the resulting DTOs without reimplementing orchestration.
+
+`explore` composes the same symbol, trail, and snippet DTOs into one bundled
+view and now adds definition plus incoming/outgoing reference metadata. `serve`
+reuses the same runtime calls for `/definition`, `/references`, `/symbols`, and
+stdio MCP-style resources/prompts/tools. `doctor` opens the project summary and
+reports cache/index/retrieval health without mutating state.
 
 ## Ownership Notes
 

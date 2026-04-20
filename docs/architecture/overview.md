@@ -53,7 +53,7 @@ Important rules:
 
 ## Operating Constraints
 
-- Keep the public command surface small and centered on the six CLI workflows.
+- Keep the public command surface small and centered on grounding, ask, navigation, health, and serving workflows.
 - Add shared graph, DTO, grounding, and event types to `codestory-contracts`, not to adapter crates.
 - Put source-of-truth persistence and snapshot lifecycle in `codestory-store`.
 - Keep rendering and argument parsing in `codestory-cli`; orchestration belongs in `codestory-runtime`.

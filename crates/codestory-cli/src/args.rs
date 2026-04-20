@@ -1,8 +1,10 @@
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
-    GroundingBudgetDto, IndexDryRunDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind,
-    ProjectSummary, RetrievalStateDto, SearchHitOrigin, SnippetContextDto, SummaryGenerationDto,
-    SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
+    AgentBackend, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, GroundingBudgetDto,
+    IndexDryRunDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind, ProjectSummary,
+    RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin, SnippetContextDto,
+    SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection,
+    TrailMode,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -24,6 +26,8 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     Index(IndexCommand),
     Ground(GroundCommand),
+    Ask(AskCommand),
+    Doctor(DoctorCommand),
     Search(SearchCommand),
     Symbol(SymbolCommand),
     Trail(TrailCommand),
@@ -108,6 +112,22 @@ pub(crate) enum CompletionShell {
     Powershell,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CliAskProfile {
+    Auto,
+    Architecture,
+    Callflow,
+    Inheritance,
+    Impact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CliAgentBackend {
+    Codex,
+    ClaudeCode,
+}
+
 #[derive(Args, Debug)]
 pub(crate) struct IndexCommand {
     #[command(flatten)]
@@ -164,6 +184,98 @@ pub(crate) struct GroundCommand {
         help = "Write command output to this file instead of stdout. The parent directory must already exist."
     )]
     pub(crate) output_file: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Explain retrieval mode, coverage, and query hints in the Markdown output."
+    )]
+    pub(crate) why: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct AskCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(value_name = "PROMPT", help = "Question or investigation prompt.")]
+    pub(crate) prompt: String,
+    #[arg(long, value_enum, default_value_t = CliAskProfile::Auto)]
+    pub(crate) profile: CliAskProfile,
+    #[arg(long, default_value_t = 8)]
+    pub(crate) max_results: u32,
+    #[arg(
+        long,
+        help = "Seed retrieval around an exact node id from search/symbol output."
+    )]
+    pub(crate) focus_id: Option<String>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
+    pub(crate) refresh: RefreshMode,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Write a handoff bundle with answer markdown, answer JSON, and generated graph artifacts."
+    )]
+    pub(crate) bundle: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Omit citation edge ids and score breakdowns from the structured answer."
+    )]
+    pub(crate) no_evidence: bool,
+    #[arg(
+        long,
+        help = "Launch the configured local agent after indexed retrieval. Disabled by default."
+    )]
+    pub(crate) with_local_agent: bool,
+    #[arg(long, value_enum, default_value_t = CliAgentBackend::Codex)]
+    pub(crate) backend: CliAgentBackend,
+    #[arg(
+        long,
+        help = "Override the local agent command used with --with-local-agent."
+    )]
+    pub(crate) agent_command: Option<String>,
+    #[arg(
+        long = "hybrid-lexical",
+        value_name = "WEIGHT",
+        help = "Override the lexical component weight for hybrid ask research runs."
+    )]
+    pub(crate) hybrid_lexical: Option<f32>,
+    #[arg(
+        long = "hybrid-semantic",
+        value_name = "WEIGHT",
+        help = "Override the semantic component weight for hybrid ask research runs."
+    )]
+    pub(crate) hybrid_semantic: Option<f32>,
+    #[arg(
+        long = "hybrid-graph",
+        value_name = "WEIGHT",
+        help = "Override the graph component weight for hybrid ask research runs."
+    )]
+    pub(crate) hybrid_graph: Option<f32>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct DoctorCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -200,6 +312,11 @@ pub(crate) struct SearchCommand {
         help = "Write command output to this file instead of stdout. The parent directory must already exist."
     )]
     pub(crate) output_file: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Show compact ranking and fallback explanations for each result."
+    )]
+    pub(crate) why: bool,
     #[arg(
         long = "hybrid-lexical",
         value_name = "WEIGHT",
@@ -434,6 +551,8 @@ pub(crate) struct IndexOutput<'a> {
     pub(crate) phase_timings: Option<&'a IndexingPhaseTimings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) summary_generation: Option<&'a SummaryGenerationDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) next_commands: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -463,9 +582,13 @@ pub(crate) struct SearchHitOutput {
     pub(crate) origin: SearchHitOrigin,
     pub(crate) resolvable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) score_breakdown: Option<RetrievalScoreBreakdownDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) duplicate_of: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) excerpt: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) why: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -475,6 +598,9 @@ pub(crate) struct SearchOutput {
     pub(crate) limit_per_source: u32,
     pub(crate) repo_text_mode: RepoTextMode,
     pub(crate) repo_text_enabled: bool,
+    pub(crate) explain: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) query_hints: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) suggestions: Vec<SearchHitOutput>,
     pub(crate) indexed_symbol_hits: Vec<SearchHitOutput>,
@@ -536,9 +662,37 @@ pub(crate) struct QueryOutput {
 #[derive(Debug, Serialize)]
 pub(crate) struct ExploreOutput<'a> {
     pub(crate) resolution: QueryResolutionOutput,
+    pub(crate) navigation: NavigationOutput,
     pub(crate) symbol: &'a SymbolContextDto,
     pub(crate) trail: &'a TrailContextDto,
     pub(crate) snippet: Option<&'a SnippetContextDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct NavigationOutput {
+    pub(crate) definition: SearchHitOutput,
+    pub(crate) incoming_references: Vec<QueryItemOutput>,
+    pub(crate) outgoing_references: Vec<QueryItemOutput>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DoctorCheckOutput {
+    pub(crate) name: String,
+    pub(crate) status: String,
+    pub(crate) message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DoctorOutput {
+    pub(crate) project: String,
+    pub(crate) storage_path: String,
+    pub(crate) indexed: bool,
+    pub(crate) stats: codestory_contracts::api::StorageStatsDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retrieval: Option<RetrievalStateDto>,
+    pub(crate) checks: Vec<DoctorCheckOutput>,
+    pub(crate) next_commands: Vec<String>,
+    pub(crate) environment: Vec<DoctorCheckOutput>,
 }
 
 #[derive(Debug)]
@@ -575,6 +729,35 @@ impl From<CliGroundingBudget> for GroundingBudgetDto {
             CliGroundingBudget::Strict => Self::Strict,
             CliGroundingBudget::Balanced => Self::Balanced,
             CliGroundingBudget::Max => Self::Max,
+        }
+    }
+}
+
+impl From<CliAskProfile> for AgentRetrievalProfileSelectionDto {
+    fn from(value: CliAskProfile) -> Self {
+        match value {
+            CliAskProfile::Auto => Self::Auto,
+            CliAskProfile::Architecture => Self::Preset {
+                preset: AgentRetrievalPresetDto::Architecture,
+            },
+            CliAskProfile::Callflow => Self::Preset {
+                preset: AgentRetrievalPresetDto::Callflow,
+            },
+            CliAskProfile::Inheritance => Self::Preset {
+                preset: AgentRetrievalPresetDto::Inheritance,
+            },
+            CliAskProfile::Impact => Self::Preset {
+                preset: AgentRetrievalPresetDto::Impact,
+            },
+        }
+    }
+}
+
+impl From<CliAgentBackend> for AgentBackend {
+    fn from(value: CliAgentBackend) -> Self {
+        match value {
+            CliAgentBackend::Codex => Self::Codex,
+            CliAgentBackend::ClaudeCode => Self::ClaudeCode,
         }
     }
 }
@@ -670,7 +853,9 @@ mod tests {
 
     #[test]
     fn read_commands_explain_refresh_none_default() {
-        for name in ["ground", "search", "symbol", "trail", "snippet"] {
+        for name in [
+            "ground", "ask", "search", "symbol", "trail", "snippet", "query", "explore", "serve",
+        ] {
             let help = render_subcommand_help(name);
             assert!(
                 help.contains("Read commands default to `none`"),
@@ -683,8 +868,24 @@ mod tests {
     fn search_help_explains_repo_text_modes() {
         let help = render_subcommand_help("search");
         assert!(help.contains("--repo-text <REPO_TEXT>"));
+        assert!(help.contains("--why"));
         assert!(help.contains("auto"));
         assert!(help.contains("on"));
         assert!(help.contains("off"));
+    }
+
+    #[test]
+    fn ask_help_exposes_db_first_controls() {
+        let help = render_subcommand_help("ask");
+        assert!(help.contains("--with-local-agent"));
+        assert!(help.contains("--bundle <DIR>"));
+        assert!(help.contains("--profile <PROFILE>"));
+    }
+
+    #[test]
+    fn doctor_help_is_read_only_health_surface() {
+        let help = render_subcommand_help("doctor");
+        assert!(help.contains("--format <FORMAT>"));
+        assert!(help.contains("--output-file <PATH>"));
     }
 }

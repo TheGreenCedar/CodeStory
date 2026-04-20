@@ -123,6 +123,8 @@ pub struct SearchHit {
     pub score: f32,
     pub origin: SearchHitOrigin,
     pub resolvable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_breakdown: Option<RetrievalScoreBreakdownDto>,
 }
 
 impl SearchHit {
@@ -674,9 +676,15 @@ pub struct AgentAskRequest {
     pub hybrid_weights: Option<AgentHybridWeightsDto>,
     #[serde(default)]
     pub connection: AgentConnectionSettingsDto,
+    #[serde(default = "default_run_local_agent")]
+    pub run_local_agent: bool,
 }
 
 const fn default_include_evidence() -> bool {
+    true
+}
+
+const fn default_run_local_agent() -> bool {
     true
 }
 

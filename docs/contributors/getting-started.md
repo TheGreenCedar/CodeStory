@@ -22,7 +22,9 @@ After the basic cargo checks, verify the shipped CLI flow with the built binary 
 ```powershell
 cargo build --release -p codestory-cli
 .\target\release\codestory-cli.exe index --project . --refresh auto
-.\target\release\codestory-cli.exe search --project . --query WorkspaceIndexer
+.\target\release\codestory-cli.exe search --project . --query WorkspaceIndexer --why
+.\target\release\codestory-cli.exe ask --project . "How does indexing flow through the runtime?"
+.\target\release\codestory-cli.exe doctor --project .
 ```
 
 Read commands default to `--refresh none`. If a read command says the cache is empty, either run `index --refresh full` first or rerun the read command with an explicit refresh mode.
@@ -39,7 +41,7 @@ Use one of these modes before debugging ranking quality:
 - optional hardware providers: build with `onnx-cuda` or `onnx-directml`, then set `CODESTORY_EMBED_EXECUTION_PROVIDER=cuda` or `directml`
 - lexical-only mode: `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false`
 
-`index`, `ground`, and `search` report the active retrieval mode plus any fallback reason, so confirm that output before assuming the ranking logic regressed. Default `index` synchronizes semantic docs before returning when embedding assets are available.
+`index`, `ground`, `search`, `ask`, and `doctor` report the active retrieval mode plus any fallback reason when retrieval state is available, so confirm that output before assuming the ranking logic regressed. Default `index` synchronizes semantic docs before returning when embedding assets are available.
 
 ## Recommended Reading Order
 
@@ -99,5 +101,5 @@ Read these pages first:
 - default cache layout: user cache root + hashed project path
 - explicit `--cache-dir`: use the exact directory you passed
 - `index --refresh auto`: chooses full on an empty cache and incremental after that
-- `ground`, `search`, `symbol`, `trail`, `snippet`: default to `--refresh none`
+- `ground`, `search`, `ask`, `symbol`, `trail`, `snippet`, `query`, `explore`, `serve`: default to `--refresh none`
 - use `--refresh full` after deleting the cache directory, after schema-affecting changes, or when stale state is suspected
