@@ -18,6 +18,7 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-04-19 | 4046f34 | pass, embedding research run 2 harness | 107.77 | 0.06 | 1.85 | 0.13 | 0.06 | 0.10 | 27,460 | 23,326 | 124 | 0 | 3,832 | true |
 | 2026-04-19 | 33cb581 | pass, hash semantic check for delight QoL lane | 7.64 | 0.04 | 0.25 | 0.07 | 0.04 | 0.03 | 29,692 | 25,215 | 127 | 0 | 4,039 | true |
 | 2026-04-20 | e1dc489 | pass, hash semantic check for embedding research lane | 8.31 | 0.04 | 0.24 | 0.08 | 0.04 | 0.03 | 29,840 | 25,331 | 127 | 0 | 4,055 | true |
+| 2026-04-20 | b5c6337 | pass, delight roadmap implementation | 111.52 | 0.05 | 0.94 | 0.09 | 0.04 | 0.03 | 30,414 | 25,829 | 127 | 0 | 4,114 | true |
 
 ## Phase Metrics
 
@@ -31,3 +32,4 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-04-19 | 4046f34 | embedding research run 2 harness cold E2E | 107.77 | 2.90 | 100.80 | 0 | 3,832 | 0 |
 | 2026-04-19 | 33cb581 | hash semantic check for delight QoL lane cold E2E | 7.64 | 3.21 | 0.89 | 0 | 4,039 | 0 |
 | 2026-04-20 | e1dc489 | hash semantic check for embedding research lane cold E2E | 8.31 | 3.27 | 0.92 | 0 | 4,055 | 0 |
+| 2026-04-20 | b5c6337 | delight roadmap implementation cold E2E | 111.52 | 3.07 | 103.66 | 0 | 4,114 | 0 |
