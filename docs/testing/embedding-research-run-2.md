@@ -52,6 +52,11 @@ it has metric columns.
 
 Use `CODESTORY_EMBED_RESEARCH_LIST=1` to list case IDs before running a stage.
 Use `CODESTORY_EMBED_RESEARCH_CASES=<case-id,...>` for bounded reruns.
+For short exploratory loops, set `CODESTORY_EMBED_RESEARCH_QUERY_LIMIT=<n>`,
+`CODESTORY_EMBED_RESEARCH_QUERY_IDS=<id,...>`, or
+`CODESTORY_EMBED_RESEARCH_QUERY_BUCKETS=<bucket,...>`. Query-sliced runs are
+useful for two-minute autoresearch probes, but the full query suite is still
+required before promoting a model, backend, or semantic-doc default.
 
 ## Scoring
 

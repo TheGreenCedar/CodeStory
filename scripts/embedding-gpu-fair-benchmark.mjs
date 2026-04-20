@@ -28,6 +28,19 @@ const selectedCaseIds = new Set(
     .map((id) => id.trim())
     .filter(Boolean),
 );
+const selectedQueryIds = new Set(
+  (process.env.CODESTORY_EMBED_RESEARCH_QUERY_IDS ?? "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean),
+);
+const selectedQueryBuckets = new Set(
+  (process.env.CODESTORY_EMBED_RESEARCH_QUERY_BUCKETS ?? "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean),
+);
+const queryLimit = parsePositiveIntEnv("CODESTORY_EMBED_RESEARCH_QUERY_LIMIT");
 const portBase = Number(process.env.CODESTORY_EMBED_RESEARCH_PORT_BASE ?? 8170);
 
 const blockedCandidates = [
@@ -521,6 +534,8 @@ const queries = [
   },
 ];
 
+const benchmarkQueries = selectQueries(queries);
+
 const modelPaths = {
   minilmOnnx: path.join(root, "models/all-minilm-l6-v2/model.onnx"),
   bgeSmallOnnx: path.join(root, "models/bge-small-en-v1.5/onnx/model.onnx"),
@@ -619,6 +634,35 @@ const baseProfiles = {
 
 function cloneCase(base, overrides = {}) {
   return { ...base, ...overrides };
+}
+
+function parsePositiveIntEnv(name) {
+  const value = process.env[name];
+  if (value === undefined || value === "") {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return parsed;
+}
+
+function selectQueries(allQueries) {
+  let out = allQueries;
+  if (selectedQueryIds.size > 0) {
+    out = out.filter((query) => selectedQueryIds.has(query.id));
+  }
+  if (selectedQueryBuckets.size > 0) {
+    out = out.filter((query) => selectedQueryBuckets.has(query.bucket));
+  }
+  if (queryLimit !== null) {
+    out = out.slice(0, queryLimit);
+  }
+  if (out.length === 0) {
+    throw new Error("query selection produced no benchmark queries");
+  }
+  return out;
 }
 
 function caseId(config) {
@@ -1501,7 +1545,7 @@ async function runCase(config) {
     const semanticSeconds = (indexJson.phase_timings?.semantic_embedding_ms ?? 0) / 1000;
     const searchResults = [];
     let searchElapsedMs = 0;
-    for (const q of queries) {
+    for (const q of benchmarkQueries) {
       const search = runCli(
         [
           "search",
@@ -1733,7 +1777,13 @@ function writeManifest(cases) {
     artifact_root: outDir,
     requested_stages: [...requestedStages],
     case_count: cases.length,
-    query_count: queries.length,
+    query_count: benchmarkQueries.length,
+    full_query_count: queries.length,
+    query_filter: {
+      ids: [...selectedQueryIds],
+      buckets: [...selectedQueryBuckets],
+      limit: queryLimit,
+    },
     scoring:
       "Decision ranking applies a quality gate, then 50% quality, 25% speed, 15% footprint, and 10% reliability.",
     source_references: researchSources,
@@ -1816,7 +1866,7 @@ function buildReportMarkdown(ranked, aliasRows, repeatRows, failed, cases) {
     `Artifact root: \`${outDir}\``,
     `Stages: \`${[...requestedStages].join(",")}\``,
     `Cases selected: \`${cases.length}\``,
-    `Queries: \`${queries.length}\``,
+    `Queries: \`${benchmarkQueries.length}\` of \`${queries.length}\``,
     "",
     "All decision-grade rows are GPU-only and must set `provider_verified=true`. ONNX rows require DirectML/CUDA fail-hard validation; llama.cpp rows require Vulkan0 and full model-layer offload.",
     "Source-led lanes are recorded in `manifest.json` and `sources.md`; skipped rows mean an artifact or implementation prerequisite is still missing.",
@@ -2077,7 +2127,7 @@ function writeReports(results, cases) {
 
   fs.writeFileSync(path.join(outDir, "results.json"), JSON.stringify(results, null, 2));
   fs.writeFileSync(path.join(outDir, "cases.json"), JSON.stringify(cases, null, 2));
-  fs.writeFileSync(path.join(outDir, "queries.json"), JSON.stringify(queries, null, 2));
+  fs.writeFileSync(path.join(outDir, "queries.json"), JSON.stringify(benchmarkQueries, null, 2));
 
   const failed = results.filter((result) => result.error);
   fs.writeFileSync(

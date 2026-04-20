@@ -361,6 +361,10 @@ For bounded tuning, set `CODESTORY_EMBED_RESEARCH_CASES` to a comma-separated
 case-id list from the list command. The runner scopes selected case IDs to the
 requested stage before execution, which avoids mixing alias-stage and
 tuning-stage rows with identical settings.
+For quick autoresearch probes, also set `CODESTORY_EMBED_RESEARCH_QUERY_LIMIT`,
+`CODESTORY_EMBED_RESEARCH_QUERY_IDS`, or `CODESTORY_EMBED_RESEARCH_QUERY_BUCKETS`
+to keep a run inside a small wall-clock cap. Treat those rows as exploratory;
+promotion decisions still require the full query suite.
 
 ## Remaining Research Backlog
 
