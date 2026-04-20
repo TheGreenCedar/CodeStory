@@ -33,6 +33,8 @@ pub struct StorageStatsDto {
 pub struct ProjectSummary {
     pub root: String,
     pub stats: StorageStatsDto,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<WorkspaceMemberIndexDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval: Option<RetrievalStateDto>,
 }
@@ -137,6 +139,8 @@ pub struct SearchResultsDto {
     pub repo_text_mode: SearchRepoTextMode,
     pub repo_text_enabled: bool,
     #[serde(default)]
+    pub suggestions: Vec<SearchHit>,
+    #[serde(default)]
     pub indexed_symbol_hits: Vec<SearchHit>,
     #[serde(default)]
     pub repo_text_hits: Vec<SearchHit>,
@@ -165,12 +169,16 @@ pub struct SymbolSummaryDto {
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct GroundingSymbolDigestDto {
     pub id: NodeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_ref: Option<String>,
     pub label: String,
     pub kind: NodeKind,
     #[serde(default)]
     pub line: Option<u32>,
     #[serde(default)]
     pub member_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     #[serde(default)]
     pub edge_digest: Vec<String>,
 }
@@ -458,6 +466,8 @@ pub struct NodeDetailsDto {
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SymbolContextDto {
     pub node: NodeDetailsDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     #[serde(default)]
     pub children: Vec<SymbolSummaryDto>,
     #[serde(default)]
@@ -483,6 +493,42 @@ pub struct SnippetContextDto {
     pub path: String,
     pub line: u32,
     pub snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct IndexDryRunDto {
+    pub root: String,
+    pub storage_path: String,
+    pub refresh: IndexMode,
+    pub files_to_index: u32,
+    pub files_to_remove: u32,
+    #[serde(default)]
+    pub sample_files_to_index: Vec<String>,
+    #[serde(default)]
+    pub sample_file_ids_to_remove: Vec<i64>,
+    #[serde(default)]
+    pub members: Vec<WorkspaceMemberIndexDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct WorkspaceMemberIndexDto {
+    pub path: String,
+    pub files_to_index: u32,
+    pub indexed_files: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SummaryGenerationDto {
+    pub generated: u32,
+    pub reused: u32,
+    pub skipped: u32,
+    pub endpoint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

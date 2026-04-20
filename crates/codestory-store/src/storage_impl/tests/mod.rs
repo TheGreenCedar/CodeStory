@@ -266,6 +266,63 @@ fn test_llm_symbol_doc_round_trip() -> Result<(), StorageError> {
 }
 
 #[test]
+fn test_symbol_summary_uses_current_content_hash() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[Node {
+        id: NodeId(501),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "do_work".to_string(),
+        ..Default::default()
+    }])?;
+    let doc = LlmSymbolDoc {
+        node_id: NodeId(501),
+        file_node_id: None,
+        kind: NodeKind::FUNCTION,
+        display_name: "pkg::do_work".to_string(),
+        qualified_name: Some("pkg::do_work".to_string()),
+        file_path: Some("src/lib.rs".to_string()),
+        start_line: Some(12),
+        doc_text: "function pkg::do_work in src/lib.rs line 12".to_string(),
+        doc_version: 2,
+        doc_hash: "semantic-hash-501".to_string(),
+        embedding_model: "local-hash-384".to_string(),
+        embedding_dim: 384,
+        embedding: vec![0.25_f32; 384],
+        updated_at_epoch_ms: 123,
+    };
+
+    storage.upsert_llm_symbol_docs_batch(std::slice::from_ref(&doc))?;
+    storage.upsert_symbol_summaries_batch(&[SymbolSummaryRecord {
+        node_id: NodeId(501),
+        content_hash: "semantic-hash-501".to_string(),
+        summary: "do_work coordinates the package work.".to_string(),
+        model: "test-model".to_string(),
+        updated_at_epoch_ms: 456,
+    }])?;
+
+    let summaries = storage.get_current_symbol_summaries_by_node_ids(&[NodeId(501)])?;
+    assert_eq!(
+        summaries
+            .get(&NodeId(501))
+            .map(|record| record.summary.as_str()),
+        Some("do_work coordinates the package work.")
+    );
+
+    let changed_doc = LlmSymbolDoc {
+        doc_hash: "semantic-hash-501-changed".to_string(),
+        ..doc
+    };
+    storage.upsert_llm_symbol_docs_batch(&[changed_doc])?;
+    assert!(
+        storage
+            .get_current_symbol_summaries_by_node_ids(&[NodeId(501)])?
+            .is_empty(),
+        "summary should not be returned once the symbol doc hash changes"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_llm_symbol_doc_copy_forward_preserves_reuse_metadata() -> Result<(), StorageError> {
     let live_path = unique_temp_db_path("llm-copy-source");
     let _ = cleanup_sqlite_sidecars(&live_path);
@@ -446,6 +503,7 @@ fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
         "occurrence",
         "edge",
         "llm_symbol_doc",
+        "symbol_summary",
         "callable_projection_state",
         "component_access",
         "bookmark_node",

@@ -18,6 +18,7 @@ pub use storage_impl::{
     GroundingFileSummary, GroundingNodeRecord, GroundingSnapshotMetadata, GroundingSnapshotState,
     LlmSymbolDoc, LlmSymbolDocReuseMetadata, LlmSymbolDocStats, ProjectionFlushBreakdown,
     SearchSymbolProjection, Storage as Store, StorageError, StorageOpenMode, StorageStats,
+    SymbolSummaryRecord,
 };
 pub use trail_store::TrailStore;
 

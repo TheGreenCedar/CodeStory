@@ -4,22 +4,23 @@ use codestory_contracts::api::{
     CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest,
     GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto,
     GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingSnapshotDto,
-    GroundingSymbolDigestDto, IndexMode, IndexingPhaseTimings, ListChildrenSymbolsRequest,
-    ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
-    NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
-    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, RetrievalFallbackReasonDto,
-    RetrievalModeDto, RetrievalStateDto, SearchHit, SearchRepoTextMode, SearchRequest,
-    SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
-    StorageStatsDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
-    TrailContextDto, TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
-    WriteFileResponse, WriteFileTextRequest,
+    GroundingSymbolDigestDto, IndexDryRunDto, IndexMode, IndexingPhaseTimings,
+    ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess, NodeDetailsDto,
+    NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest, OpenContainingFolderRequest,
+    OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
+    ReadFileTextResponse, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto,
+    SearchHit, SearchRepoTextMode, SearchRequest, SearchResultsDto, SnippetContextDto,
+    SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto, SummaryGenerationDto,
+    SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto,
+    TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
+    WorkspaceMemberIndexDto, WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
 use codestory_indexer::IncrementalIndexingStats;
 use codestory_indexer::WorkspaceIndexer as V2WorkspaceIndexer;
 use codestory_store::{
     FileInfo, GroundingEdgeKindCount, GroundingNodeRecord, LlmSymbolDoc, LlmSymbolDocStats,
-    SearchSymbolProjection, SnapshotStore, Store,
+    SearchSymbolProjection, SnapshotStore, Store, SymbolSummaryRecord,
 };
 use codestory_workspace::{
     IndexedFileRecord, RefreshExecutionPlan, RefreshInputs, Workspace, WorkspaceInventory,
@@ -40,6 +41,7 @@ mod graph_canonical;
 mod grounding;
 mod mermaid;
 mod path_resolution;
+mod query_language;
 mod search;
 mod search_runtime;
 mod semantic_doc_text;
@@ -53,6 +55,7 @@ pub(crate) use agent_commands::{
 };
 pub use codestory_contracts as contracts;
 pub(crate) use mermaid::{fallback_mermaid, mermaid_flowchart, mermaid_gantt, mermaid_sequence};
+pub use query_language::{GraphQueryParseError, parse_graph_query};
 pub(crate) use search_runtime::SearchEngine;
 pub use search_runtime::*;
 use semantic_doc_text::{
@@ -111,6 +114,10 @@ impl Runtime {
 
     pub fn agent_service(&self) -> AgentService {
         AgentService::new(self.controller.clone())
+    }
+
+    pub fn events(&self) -> Receiver<AppEventPayload> {
+        self.controller.events()
     }
 }
 
@@ -541,6 +548,217 @@ fn current_epoch_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
+}
+
+fn runtime_relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn workspace_member_index_summaries(
+    root: &Path,
+    workspace: &Workspace,
+    refresh_inputs: &RefreshInputs,
+    execution_plan: &RefreshExecutionPlan,
+) -> Vec<WorkspaceMemberIndexDto> {
+    workspace
+        .members()
+        .iter()
+        .map(|member| {
+            let absolute = if member.is_absolute() {
+                member.clone()
+            } else {
+                root.join(member)
+            };
+            let files_to_index = execution_plan
+                .files_to_index
+                .iter()
+                .filter(|path| path.starts_with(&absolute))
+                .count()
+                .min(u32::MAX as usize) as u32;
+            let indexed_files = refresh_inputs
+                .stored_files
+                .iter()
+                .filter(|file| file.path.starts_with(&absolute))
+                .count()
+                .min(u32::MAX as usize) as u32;
+            WorkspaceMemberIndexDto {
+                path: runtime_relative_path(root, &absolute),
+                files_to_index,
+                indexed_files,
+                file_count: None,
+                node_count: None,
+                edge_count: None,
+            }
+        })
+        .collect()
+}
+
+fn workspace_member_storage_summaries(
+    root: &Path,
+    workspace: &Workspace,
+    storage: &Storage,
+) -> Result<Vec<WorkspaceMemberIndexDto>, ApiError> {
+    if workspace.members().is_empty() {
+        return Ok(Vec::new());
+    }
+    let files = storage
+        .get_files()
+        .map_err(|e| ApiError::internal(format!("Failed to query member files: {e}")))?;
+    let nodes = storage
+        .get_nodes()
+        .map_err(|e| ApiError::internal(format!("Failed to query member nodes: {e}")))?;
+    let edges = storage
+        .get_edges()
+        .map_err(|e| ApiError::internal(format!("Failed to query member edges: {e}")))?;
+
+    let node_file_ids = nodes
+        .iter()
+        .map(|node| (node.id, node.file_node_id))
+        .collect::<HashMap<_, _>>();
+
+    Ok(workspace
+        .members()
+        .iter()
+        .map(|member| {
+            let absolute = if member.is_absolute() {
+                member.clone()
+            } else {
+                root.join(member)
+            };
+            let file_ids = files
+                .iter()
+                .filter(|file| file.path.starts_with(&absolute))
+                .map(|file| codestory_contracts::graph::NodeId(file.id))
+                .collect::<HashSet<_>>();
+            let file_count = file_ids.len().min(u32::MAX as usize) as u32;
+            let node_count = nodes
+                .iter()
+                .filter(|node| {
+                    file_ids.contains(&node.id)
+                        || node
+                            .file_node_id
+                            .is_some_and(|file_id| file_ids.contains(&file_id))
+                })
+                .count()
+                .min(u32::MAX as usize) as u32;
+            let edge_count = edges
+                .iter()
+                .filter(|edge| {
+                    edge.file_node_id
+                        .is_some_and(|file_id| file_ids.contains(&file_id))
+                        || node_file_ids
+                            .get(&edge.effective_source())
+                            .and_then(|file_id| *file_id)
+                            .is_some_and(|file_id| file_ids.contains(&file_id))
+                })
+                .count()
+                .min(u32::MAX as usize) as u32;
+            WorkspaceMemberIndexDto {
+                path: runtime_relative_path(root, &absolute),
+                files_to_index: 0,
+                indexed_files: file_count,
+                file_count: Some(file_count),
+                node_count: Some(node_count),
+                edge_count: Some(edge_count),
+            }
+        })
+        .collect())
+}
+
+fn summarize_symbol_doc(
+    endpoint: &str,
+    model: &str,
+    doc: &LlmSymbolDoc,
+) -> Result<String, ApiError> {
+    if endpoint.eq_ignore_ascii_case("local") || endpoint.eq_ignore_ascii_case("mock") {
+        return Ok(local_symbol_summary(doc));
+    }
+
+    let mut request = serde_json::json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Write one concise sentence explaining what this code symbol does. Do not mention that you are summarizing metadata."
+            },
+            {
+                "role": "user",
+                "content": doc.doc_text
+            }
+        ],
+        "temperature": 0
+    });
+    if let Some(object) = request.as_object_mut()
+        && let Ok(max_tokens) = std::env::var("CODESTORY_SUMMARY_MAX_TOKENS")
+            .unwrap_or_default()
+            .parse::<u32>()
+    {
+        object.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
+    }
+
+    let body = serde_json::to_string(&request)
+        .map_err(|e| ApiError::internal(format!("Failed to build summary request: {e}")))?;
+    let mut command = std::process::Command::new("curl");
+    command
+        .arg("-sS")
+        .arg("-X")
+        .arg("POST")
+        .arg(endpoint)
+        .arg("-H")
+        .arg("Content-Type: application/json");
+    if let Ok(api_key) = std::env::var("CODESTORY_SUMMARY_API_KEY")
+        && !api_key.trim().is_empty()
+    {
+        command
+            .arg("-H")
+            .arg(format!("Authorization: Bearer {}", api_key.trim()));
+    }
+    let output = command.arg("-d").arg(body).output().map_err(|e| {
+        ApiError::internal(format!(
+            "Failed to invoke curl for CODESTORY_SUMMARY_ENDPOINT: {e}"
+        ))
+    })?;
+    if !output.status.success() {
+        return Err(ApiError::internal(format!(
+            "Summary endpoint failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| ApiError::internal(format!("Summary endpoint returned invalid JSON: {e}")))?;
+    let summary = response
+        .pointer("/choices/0/message/content")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            response
+                .pointer("/choices/0/text")
+                .and_then(|value| value.as_str())
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::internal(
+                "Summary endpoint response did not include choices[0].message.content.",
+            )
+        })?;
+    Ok(summary.lines().next().unwrap_or(summary).trim().to_string())
+}
+
+fn local_symbol_summary(doc: &LlmSymbolDoc) -> String {
+    let kind = format!("{:?}", doc.kind).to_ascii_lowercase();
+    let location = doc
+        .file_path
+        .as_deref()
+        .map(|path| format!(" in {path}"))
+        .unwrap_or_default();
+    format!(
+        "{} is a {kind}{location} that participates in the indexed code graph.",
+        doc.display_name
+    )
 }
 
 const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 3;
@@ -1434,6 +1652,26 @@ fn merge_search_hits_by_node_id(hits: &mut Vec<SearchHit>, additional: Vec<Searc
     }
 }
 
+fn did_you_mean_suggestions(scored_hits: &[HybridSearchScoredHit]) -> Vec<SearchHit> {
+    const MIN_SEMANTIC_SCORE: f32 = 0.18;
+    const MAX_SUGGESTIONS: usize = 5;
+
+    if scored_hits.is_empty()
+        || scored_hits
+            .iter()
+            .any(|hit| hit.lexical_score > 0.01 || hit.graph_score > 0.25)
+    {
+        return Vec::new();
+    }
+
+    scored_hits
+        .iter()
+        .filter(|hit| hit.semantic_score >= MIN_SEMANTIC_SCORE)
+        .take(MAX_SUGGESTIONS)
+        .map(|hit| hit.hit.clone())
+        .collect()
+}
+
 struct AppState {
     project_root: Option<PathBuf>,
     storage_path: Option<PathBuf>,
@@ -1871,10 +2109,14 @@ impl AppController {
             file_count: clamp_i64_to_u32(derived_file_count),
             error_count: clamp_i64_to_u32(stats.error_count),
         };
+        let workspace = Workspace::open(root.to_path_buf())
+            .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
+        let members = workspace_member_storage_summaries(root, &workspace, storage)?;
 
         Ok(ProjectSummary {
             root: root.to_string_lossy().to_string(),
             stats: dto_stats,
+            members,
             retrieval: Some(retrieval_state_from_storage(storage)?),
         })
     }
@@ -2140,6 +2382,125 @@ impl AppController {
         self.run_indexing_blocking_inner(mode, false)
     }
 
+    pub fn dry_run_index(&self, mode: IndexMode) -> Result<IndexDryRunDto, ApiError> {
+        let root = self.require_project_root()?;
+        let storage_path = self.require_storage_path()?;
+        let workspace = Workspace::open(root.clone())
+            .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
+        let refresh_inputs = if storage_path.exists() {
+            let store = Store::open(&storage_path)
+                .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
+            workspace_refresh_inputs(&store)?
+        } else {
+            RefreshInputs::default()
+        };
+        let execution_plan = match mode {
+            IndexMode::Full => workspace.full_refresh_execution_plan().map_err(|e| {
+                ApiError::internal(format!("Failed to generate full refresh plan: {e}"))
+            })?,
+            IndexMode::Incremental => {
+                workspace
+                    .build_execution_plan(&refresh_inputs)
+                    .map_err(|e| {
+                        ApiError::internal(format!(
+                            "Failed to generate incremental refresh plan: {e}"
+                        ))
+                    })?
+            }
+        };
+        let members =
+            workspace_member_index_summaries(&root, &workspace, &refresh_inputs, &execution_plan);
+        Ok(IndexDryRunDto {
+            root: root.to_string_lossy().to_string(),
+            storage_path: storage_path.to_string_lossy().to_string(),
+            refresh: mode,
+            files_to_index: execution_plan.files_to_index.len().min(u32::MAX as usize) as u32,
+            files_to_remove: execution_plan.files_to_remove.len().min(u32::MAX as usize) as u32,
+            sample_files_to_index: execution_plan
+                .files_to_index
+                .iter()
+                .take(12)
+                .map(|path| runtime_relative_path(&root, path))
+                .collect(),
+            sample_file_ids_to_remove: execution_plan
+                .files_to_remove
+                .iter()
+                .take(12)
+                .copied()
+                .collect(),
+            members,
+        })
+    }
+
+    pub fn summarize_symbols_blocking(&self) -> Result<SummaryGenerationDto, ApiError> {
+        let endpoint = std::env::var("CODESTORY_SUMMARY_ENDPOINT")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ApiError::invalid_argument(
+                    "--summarize requires CODESTORY_SUMMARY_ENDPOINT to be configured.",
+                )
+            })?;
+        let model = std::env::var("CODESTORY_SUMMARY_MODEL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "codestory-symbol-summary".to_string());
+        let storage_path = self.require_storage_path()?;
+        let mut storage = Store::open(&storage_path)
+            .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
+        let docs = storage
+            .get_all_llm_symbol_docs()
+            .map_err(|e| ApiError::internal(format!("Failed to load symbol docs: {e}")))?;
+        let current_summaries = storage
+            .get_all_current_symbol_summaries()
+            .map_err(|e| ApiError::internal(format!("Failed to load symbol summaries: {e}")))?;
+
+        let mut generated = 0u32;
+        let mut reused = 0u32;
+        let mut skipped = 0u32;
+        let mut pending = Vec::new();
+        for doc in docs {
+            if current_summaries.contains_key(&doc.node_id) {
+                reused = reused.saturating_add(1);
+                continue;
+            }
+            if doc.doc_text.trim().is_empty() {
+                skipped = skipped.saturating_add(1);
+                continue;
+            }
+            let summary = summarize_symbol_doc(&endpoint, &model, &doc)?;
+            pending.push(SymbolSummaryRecord {
+                node_id: doc.node_id,
+                content_hash: doc.doc_hash,
+                summary,
+                model: model.clone(),
+                updated_at_epoch_ms: current_epoch_ms(),
+            });
+            generated = generated.saturating_add(1);
+
+            if pending.len() >= 32 {
+                storage
+                    .upsert_symbol_summaries_batch(&pending)
+                    .map_err(|e| {
+                        ApiError::internal(format!("Failed to store symbol summaries: {e}"))
+                    })?;
+                pending.clear();
+            }
+        }
+        storage
+            .upsert_symbol_summaries_batch(&pending)
+            .map_err(|e| ApiError::internal(format!("Failed to store symbol summaries: {e}")))?;
+
+        Ok(SummaryGenerationDto {
+            generated,
+            reused,
+            skipped,
+            endpoint,
+        })
+    }
+
     fn finalize_indexing_without_runtime_refresh_with<F>(
         &self,
         storage_path: &Path,
@@ -2173,7 +2534,7 @@ impl AppController {
         let query = req.query.clone();
         let limit_per_source = req.limit_per_source.clamp(1, 50) as usize;
         let repo_text_mode = req.repo_text;
-        let (mut indexed_symbol_hits, retrieval) = self.search_hybrid_results(
+        let (mut scored_symbol_hits, retrieval) = self.search_hybrid_scored_inner(
             SearchRequest {
                 query: query.clone(),
                 repo_text: SearchRepoTextMode::Off,
@@ -2184,6 +2545,11 @@ impl AppController {
             limit_per_source,
             req.hybrid_weights.clone(),
         )?;
+        let suggestions = did_you_mean_suggestions(&scored_symbol_hits);
+        let mut indexed_symbol_hits = scored_symbol_hits
+            .drain(..)
+            .map(|scored| scored.hit)
+            .collect::<Vec<_>>();
         let storage = self.open_storage()?;
 
         if should_expand_symbol_query(&query, indexed_symbol_hits.len()) {
@@ -2257,6 +2623,7 @@ impl AppController {
             limit_per_source: limit_per_source as u32,
             repo_text_mode,
             repo_text_enabled,
+            suggestions,
             indexed_symbol_hits,
             repo_text_hits,
             hits,

@@ -16,6 +16,11 @@ target/release/codestory-cli(.exe) index [OPTIONS]
 | `--cache-dir` | path | *auto* | Cache directory to use exactly as passed. If omitted, `codestory-cli` uses the system cache root with a per-project hashed subdirectory. The SQLite DB and sibling persisted search directory live under this cache root. |
 | `--refresh` | enum | `auto` | Refresh strategy: `auto`, `full`, `incremental`, or `none`. This decides whether graph/snapshot/semantic indexing runs before the summary is returned. |
 | `--format` | enum | `markdown` | Output format: `markdown` or `json`. JSON exposes the same project stats, retrieval state, phase timings, semantic counters, and resolution counters for automation. |
+| `--output-file` | path | *stdout* | Write output to an existing parent directory instead of stdout. |
+| `--dry-run` | bool | off | Resolve workspace discovery and the refresh plan, then report files that would be indexed or removed without parsing files or writing storage. |
+| `--summarize` | bool | off | Generate cached one-sentence symbol summaries after the index pass. Requires `CODESTORY_SUMMARY_ENDPOINT`, unless the endpoint is `local` or `mock`. |
+| `--progress` | bool | off | Print an incremental text progress bar to stderr. Stdout stays reserved for Markdown or JSON output. |
+| `--watch` | bool | off | Run once, then keep watching the project root and perform incremental refreshes on file changes. |
 
 ## Refresh Modes
 
@@ -44,6 +49,15 @@ Runtime environment variables control semantic retrieval and tuning:
 | `CODESTORY_EMBED_SESSION_COUNT` | Number of ONNX embedding sessions, clamped from `1` to `16`; default is bounded by available parallelism and capped at two. |
 | `CODESTORY_EMBED_INTRA_THREADS`, `CODESTORY_EMBED_INTER_THREADS`, `CODESTORY_EMBED_PARALLEL_EXECUTION` | ONNX CPU-provider tuning; do not use CPU-provider rows for benchmark decisions. |
 | `CODESTORY_EMBED_EXECUTION_PROVIDER` | `cpu`, `cuda`, or `directml`; CUDA and DirectML require the matching Cargo feature. |
+
+Symbol summarization uses these additional settings:
+
+| Variable | Behavior |
+|----------|----------|
+| `CODESTORY_SUMMARY_ENDPOINT` | OpenAI chat-completions-compatible endpoint for `index --summarize`; use `local` or `mock` for deterministic local summaries. |
+| `CODESTORY_SUMMARY_API_KEY` | Optional bearer token for the summary endpoint. |
+| `CODESTORY_SUMMARY_MODEL` | Model name sent to the summary endpoint; defaults to `codestory-symbol-summary`. |
+| `CODESTORY_SUMMARY_MAX_TOKENS` | Optional `max_tokens` override for summary calls. |
 
 ## Output
 
@@ -91,6 +105,15 @@ target/release/codestory-cli(.exe) index --project . --refresh full
 
 # Index a different project, JSON output
 target/release/codestory-cli(.exe) index --project ../other-repo --format json
+
+# Inspect a refresh plan without touching storage
+target/release/codestory-cli(.exe) index --project . --dry-run
+
+# Keep the index warm during active development
+target/release/codestory-cli(.exe) index --project . --watch --progress
+
+# Generate deterministic local symbol summaries for a smoke run
+CODESTORY_SUMMARY_ENDPOINT=local target/release/codestory-cli(.exe) index --project . --summarize
 ```
 
 ## Refresh Troubleshooting
@@ -104,3 +127,7 @@ target/release/codestory-cli(.exe) index --project ../other-repo --format json
 | Reusing a known-good index immediately after a successful fresh build + index run | `--refresh none` |
 
 Prefer `--refresh full` when you need confidence that historical errors are gone. Incremental runs can leave stale error rows behind if the previously failing files are not reprocessed.
+
+## OpenAPI Endpoint Awareness
+
+When discovered files include OpenAPI JSON/YAML schemas, CodeStory indexes each method/path as an endpoint symbol such as `GET /api/users`. Client literals in supported source files, for example `fetch("/api/users")` and `axios.post("/api/users")`, produce speculative call edges to matching endpoint refs so monorepo trails can cross frontend/backend contract boundaries.

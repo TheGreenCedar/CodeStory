@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind,
-    Occurrence, SourceLocation,
+    Occurrence, OccurrenceKind, ResolutionCertainty, SourceLocation,
 };
 use codestory_store::Store as Storage;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1185,6 +1185,11 @@ impl WorkspaceIndexer {
         let Some(language_config) =
             get_language_config_for_path(&full_path, compilation_info.as_ref())
         else {
+            match self.prepare_openapi_schema_work(&full_path) {
+                Ok(Some(local_storage)) => return Ok(PreparedIndexWork::Immediate(local_storage)),
+                Ok(None) => {}
+                Err(err_storage) => return Err(err_storage),
+            }
             return Ok(PreparedIndexWork::Immediate(IntermediateStorage::default()));
         };
 
@@ -1285,6 +1290,43 @@ impl WorkspaceIndexer {
                 }))
             }
         }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn prepare_openapi_schema_work(
+        &self,
+        full_path: &Path,
+    ) -> std::result::Result<Option<IntermediateStorage>, IntermediateStorage> {
+        if !is_openapi_candidate_path(full_path) {
+            return Ok(None);
+        }
+        let source = match std::fs::read_to_string(full_path) {
+            Ok(source) => source,
+            Err(error) => {
+                let mut local_storage = IntermediateStorage::default();
+                local_storage.add_error(codestory_contracts::graph::ErrorInfo {
+                    message: format!("Failed to read {:?}: {}", full_path, error),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: true,
+                    index_step: codestory_contracts::graph::IndexStep::Collection,
+                });
+                return Err(local_storage);
+            }
+        };
+        index_openapi_schema_file(full_path, &source).map_err(|error| {
+            let mut local_storage = IntermediateStorage::default();
+            local_storage.add_error(codestory_contracts::graph::ErrorInfo {
+                message: format!("Failed to index OpenAPI schema {:?}: {}", full_path, error),
+                file_id: None,
+                line: None,
+                column: None,
+                is_fatal: false,
+                index_step: codestory_contracts::graph::IndexStep::Indexing,
+            });
+            local_storage
+        })
     }
 
     fn execute_prepared_index(
@@ -3416,12 +3458,19 @@ fn canonicalize_nodes(
             .unwrap_or_else(|| node.serialized_name.clone());
         node.qualified_name = Some(qualified_name.clone());
 
-        let canonical_id = if is_type_like_kind(node.kind) {
-            format!("{}:{}", file_name, qualified_name)
-        } else {
-            let start_line = node.start_line.unwrap_or(1);
-            format!("{}:{}:{}", file_name, qualified_name, start_line)
-        };
+        let canonical_id = node
+            .canonical_id
+            .as_deref()
+            .filter(|value| value.starts_with("openapi:endpoint:"))
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if is_type_like_kind(node.kind) {
+                    format!("{}:{}", file_name, qualified_name)
+                } else {
+                    let start_line = node.start_line.unwrap_or(1);
+                    format!("{}:{}:{}", file_name, qualified_name, start_line)
+                }
+            });
         grouped_nodes.entry(canonical_id).or_default().push(node);
     }
 
@@ -4131,6 +4180,477 @@ fn reconcile_local_impl_anchor_nodes(
     impl_anchor_node_ids.dedup();
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenApiEndpoint {
+    method: String,
+    path: String,
+    line: u32,
+}
+
+fn is_openapi_candidate_path(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(extension.as_str(), "json" | "yaml" | "yml")
+}
+
+fn index_openapi_schema_file(path: &Path, source: &str) -> Result<Option<IntermediateStorage>> {
+    if !looks_like_openapi_schema(source) {
+        return Ok(None);
+    }
+    let endpoints = parse_openapi_endpoints(source)?;
+    if endpoints.is_empty() {
+        return Ok(None);
+    }
+
+    let mut local_storage = IntermediateStorage::default();
+    let (file_node, _file_name, file_id) = file_node_from_source(path, source);
+    local_storage.files.push(codestory_store::FileInfo {
+        id: file_id.0,
+        path: path.to_path_buf(),
+        language: "openapi".to_string(),
+        modification_time: file_modification_time(path),
+        indexed: true,
+        complete: true,
+        line_count: source.lines().count() as u32,
+    });
+    local_storage.nodes.push(file_node);
+
+    let mut seen = HashSet::new();
+    for endpoint in endpoints {
+        if !seen.insert((endpoint.method.clone(), endpoint.path.clone())) {
+            continue;
+        }
+        let node_id = schema_endpoint_node_id(&endpoint.method, &endpoint.path);
+        let label = schema_endpoint_label(&endpoint.method, &endpoint.path);
+        local_storage.nodes.push(Node {
+            id: node_id,
+            kind: NodeKind::FUNCTION,
+            serialized_name: label.clone(),
+            qualified_name: Some(format!("openapi::{label}")),
+            canonical_id: Some(format!("openapi:endpoint:{label}")),
+            file_node_id: Some(file_id),
+            start_line: Some(endpoint.line),
+            start_col: Some(1),
+            end_line: Some(endpoint.line),
+            end_col: Some(label.len().max(1) as u32),
+        });
+        local_storage
+            .component_access
+            .push((node_id, AccessKind::Public));
+        local_storage.edges.push(Edge {
+            id: EdgeId(generate_edge_id(file_id.0, node_id.0, EdgeKind::MEMBER)),
+            source: file_id,
+            target: node_id,
+            kind: EdgeKind::MEMBER,
+            file_node_id: Some(file_id),
+            line: Some(endpoint.line),
+            certainty: Some(ResolutionCertainty::Certain),
+            ..Default::default()
+        });
+        local_storage.occurrences.push(Occurrence {
+            element_id: node_id.0,
+            kind: OccurrenceKind::DEFINITION,
+            location: SourceLocation {
+                file_node_id: file_id,
+                start_line: endpoint.line,
+                start_col: 1,
+                end_line: endpoint.line,
+                end_col: label.len().max(1) as u32,
+            },
+        });
+    }
+
+    Ok(Some(local_storage))
+}
+
+fn looks_like_openapi_schema(source: &str) -> bool {
+    let lower = source.to_ascii_lowercase();
+    (lower.contains("\"openapi\"") || lower.contains("openapi:") || lower.contains("\"swagger\""))
+        && (lower.contains("\"paths\"") || lower.contains("paths:"))
+}
+
+fn parse_openapi_endpoints(source: &str) -> Result<Vec<OpenApiEndpoint>> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(source) {
+        return Ok(parse_openapi_json_endpoints(source, &value));
+    }
+    Ok(parse_openapi_yaml_endpoints(source))
+}
+
+fn parse_openapi_json_endpoints(source: &str, value: &serde_json::Value) -> Vec<OpenApiEndpoint> {
+    let Some(paths) = value.get("paths").and_then(|value| value.as_object()) else {
+        return Vec::new();
+    };
+    let mut endpoints = Vec::new();
+    for (path, methods) in paths {
+        let Some(methods) = methods.as_object() else {
+            continue;
+        };
+        for method in methods.keys() {
+            if is_http_method(method) {
+                endpoints.push(OpenApiEndpoint {
+                    method: method.to_ascii_uppercase(),
+                    path: path.clone(),
+                    line: find_endpoint_line(source, path, method),
+                });
+            }
+        }
+    }
+    endpoints
+}
+
+fn parse_openapi_yaml_endpoints(source: &str) -> Vec<OpenApiEndpoint> {
+    let mut endpoints = Vec::new();
+    let mut inside_paths = false;
+    let mut current_path: Option<String> = None;
+    let mut current_path_indent = 0usize;
+
+    for (index, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        let indent = line.len().saturating_sub(line.trim_start().len());
+        if trimmed == "paths:" {
+            inside_paths = true;
+            current_path = None;
+            current_path_indent = indent;
+            continue;
+        }
+        if inside_paths && indent <= current_path_indent && !trimmed.starts_with('/') {
+            break;
+        }
+        if !inside_paths {
+            continue;
+        }
+        if let Some(path) = trimmed
+            .strip_suffix(':')
+            .filter(|value| value.starts_with('/'))
+        {
+            current_path = Some(path.trim_matches('"').trim_matches('\'').to_string());
+            current_path_indent = indent;
+            continue;
+        }
+        let Some(path) = current_path.as_ref() else {
+            continue;
+        };
+        let method = trimmed.trim_end_matches(':');
+        if indent > current_path_indent && is_http_method(method) {
+            endpoints.push(OpenApiEndpoint {
+                method: method.to_ascii_uppercase(),
+                path: path.clone(),
+                line: index as u32 + 1,
+            });
+        }
+    }
+    endpoints
+}
+
+fn find_endpoint_line(source: &str, path: &str, method: &str) -> u32 {
+    let method = method.to_ascii_lowercase();
+    let mut path_seen = false;
+    for (index, line) in source.lines().enumerate() {
+        if line.contains(path) {
+            path_seen = true;
+        }
+        if path_seen && line.to_ascii_lowercase().contains(&format!("\"{method}\"")) {
+            return index as u32 + 1;
+        }
+    }
+    source
+        .lines()
+        .position(|line| line.contains(path))
+        .map(|index| index as u32 + 1)
+        .unwrap_or(1)
+}
+
+fn is_http_method(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "get" | "post" | "put" | "patch" | "delete" | "head" | "options" | "trace"
+    )
+}
+
+fn schema_endpoint_label(method: &str, path: &str) -> String {
+    format!(
+        "{} {}",
+        method.to_ascii_uppercase(),
+        normalize_api_path(path)
+    )
+}
+
+fn schema_endpoint_node_id(method: &str, path: &str) -> NodeId {
+    NodeId(generate_id(&format!(
+        "openapi:endpoint:{}",
+        schema_endpoint_label(method, path)
+    )))
+}
+
+fn normalize_api_path(path: &str) -> String {
+    let trimmed = path.trim().trim_matches('"').trim_matches('\'');
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn append_schema_endpoint_call_edges(
+    language_name: &str,
+    source: &str,
+    unique_nodes: &mut HashMap<NodeId, Node>,
+    file_id: NodeId,
+    result_edges: &mut Vec<Edge>,
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+    callsite_ordinals: &mut HashMap<(NodeId, Option<u32>), u32>,
+) {
+    if !matches!(
+        language_name,
+        "javascript" | "typescript" | "python" | "rust" | "java" | "go"
+    ) {
+        return;
+    }
+
+    for call in collect_api_endpoint_calls(source) {
+        let target = schema_endpoint_node_id(&call.method, &call.path);
+        let source_id = enclosing_callable_node_id(unique_nodes, call.line).unwrap_or(file_id);
+        unique_nodes.entry(target).or_insert_with(|| Node {
+            id: target,
+            kind: NodeKind::FUNCTION,
+            serialized_name: schema_endpoint_label(&call.method, &call.path),
+            qualified_name: Some(format!(
+                "schema_reference::{}",
+                schema_endpoint_label(&call.method, &call.path)
+            )),
+            canonical_id: Some(format!(
+                "openapi:endpoint:{}",
+                schema_endpoint_label(&call.method, &call.path)
+            )),
+            file_node_id: Some(file_id),
+            start_line: Some(call.line),
+            start_col: Some(call.col),
+            end_line: Some(call.line),
+            end_col: Some(call.col.saturating_add(call.path.len() as u32)),
+        });
+
+        if source_id == target {
+            continue;
+        }
+        let mut edge = Edge {
+            id: EdgeId(0),
+            source: source_id,
+            target,
+            kind: EdgeKind::CALL,
+            file_node_id: Some(file_id),
+            line: Some(call.line),
+            certainty: Some(ResolutionCertainty::Uncertain),
+            confidence: Some(0.45),
+            ..Default::default()
+        };
+        let next = callsite_ordinals.entry((target, edge.line)).or_insert(0);
+        *next = next.saturating_add(1);
+        ensure_callsite_identity(&mut edge, Some(call.col.saturating_add(*next)));
+        if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
+            continue;
+        }
+        edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
+        result_edges.push(edge);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ApiEndpointCall {
+    method: String,
+    path: String,
+    line: u32,
+    col: u32,
+}
+
+fn collect_api_endpoint_calls(source: &str) -> Vec<ApiEndpointCall> {
+    let mut calls = Vec::new();
+    for (line_index, line) in source.lines().enumerate() {
+        for (literal, col) in quoted_string_literals(line) {
+            if !is_api_path_literal(&literal) || !is_api_endpoint_call_context(line, col) {
+                continue;
+            }
+            calls.push(ApiEndpointCall {
+                method: infer_http_method(line),
+                path: normalize_api_path(&literal),
+                line: line_index as u32 + 1,
+                col,
+            });
+        }
+    }
+    calls
+}
+
+fn quoted_string_literals(line: &str) -> Vec<(String, u32)> {
+    let mut out = Vec::new();
+    let mut chars = line.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if !matches!(ch, '"' | '\'' | '`') {
+            continue;
+        }
+        let quote = ch;
+        let mut value = String::new();
+        let mut escaped = false;
+        for (_, next) in chars.by_ref() {
+            if escaped {
+                value.push(next);
+                escaped = false;
+                continue;
+            }
+            if next == '\\' {
+                escaped = true;
+                continue;
+            }
+            if next == quote {
+                break;
+            }
+            value.push(next);
+        }
+        out.push((value, index as u32 + 1));
+    }
+    out
+}
+
+fn is_api_path_literal(value: &str) -> bool {
+    let path = value.trim();
+    path.starts_with('/')
+        && path.len() > 1
+        && !path.starts_with("//")
+        && !path.chars().any(char::is_whitespace)
+        && path.chars().any(|ch| ch.is_ascii_alphabetic())
+}
+
+fn is_api_endpoint_call_context(line: &str, literal_col: u32) -> bool {
+    let literal_start = literal_col.saturating_sub(1) as usize;
+    let Some(before_literal) = line.get(..literal_start) else {
+        return false;
+    };
+    let trimmed_before = before_literal.trim_start();
+    if trimmed_before.starts_with("//") || trimmed_before.starts_with('#') {
+        return false;
+    }
+    if has_line_comment_before_literal(before_literal) {
+        return false;
+    }
+
+    let compact_before = compact_lowercase(before_literal);
+    if compact_before.contains("fetch(") || compact_before.contains("axios(") {
+        return true;
+    }
+
+    let methods = ["delete", "patch", "post", "put", "head", "options", "get"];
+    let client_receivers = [
+        "axios",
+        "requests",
+        "reqwest",
+        "http",
+        "$http",
+        "ky",
+        "got",
+        "httpclient",
+    ];
+    client_receivers.iter().any(|receiver| {
+        methods.iter().any(|method| {
+            compact_before.contains(&format!("{receiver}.{method}("))
+                || compact_before.contains(&format!("{receiver}::{method}("))
+        })
+    })
+}
+
+fn has_line_comment_before_literal(value: &str) -> bool {
+    let mut chars = value.char_indices().peekable();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    while let Some((idx, ch)) = chars.next() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '/' if chars.peek().is_some_and(|(_, next)| *next == '/') => return true,
+            '#' => {
+                let starts_comment = value[..idx].trim().is_empty()
+                    || value[..idx]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace);
+                if starts_comment {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
+fn compact_lowercase(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn infer_http_method(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    for method in ["delete", "patch", "post", "put", "head", "options", "get"] {
+        if lower.contains(&format!(".{method}("))
+            || lower.contains(&format!("method: \"{method}\""))
+            || lower.contains(&format!("method: '{method}'"))
+            || lower.contains(&format!("method = \"{method}\""))
+            || lower.contains(&format!("method = '{method}'"))
+            || lower.contains(&format!("\"{method}\""))
+            || lower.contains(&format!("'{method}'"))
+        {
+            return method.to_ascii_uppercase();
+        }
+    }
+    "GET".to_string()
+}
+
+fn enclosing_callable_node_id(nodes: &HashMap<NodeId, Node>, line: u32) -> Option<NodeId> {
+    nodes
+        .values()
+        .filter(|node| {
+            matches!(
+                node.kind,
+                NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+            ) && !node
+                .canonical_id
+                .as_deref()
+                .is_some_and(|value| value.starts_with("openapi:endpoint:"))
+                && node.start_line.unwrap_or(u32::MAX) <= line
+                && node.end_line.unwrap_or(0) >= line
+        })
+        .min_by_key(|node| {
+            node.end_line
+                .unwrap_or(line)
+                .saturating_sub(node.start_line.unwrap_or(line))
+        })
+        .map(|node| node.id)
+}
+
 /// Index a file and return the results.
 pub fn index_file(
     path: &Path,
@@ -4433,10 +4953,6 @@ pub fn index_file(
         symbol_table.as_ref(),
     );
 
-    if !unique_nodes.is_empty() {
-        result_nodes.extend(unique_nodes.values().cloned());
-    }
-
     // 2. Second pass: Create edges using tree-sitter-graph output
     let mut edge_keys: HashSet<EdgeDedupKey> = HashSet::new();
     let mut callsite_ordinals: HashMap<(NodeId, Option<u32>), u32> = HashMap::new();
@@ -4561,7 +5077,20 @@ pub fn index_file(
         &mut edge_keys,
         flags,
     );
+    append_schema_endpoint_call_edges(
+        language_config.language_name,
+        source,
+        &mut unique_nodes,
+        file_id,
+        &mut result_edges,
+        &mut edge_keys,
+        flags,
+        &mut callsite_ordinals,
+    );
 
+    if !unique_nodes.is_empty() {
+        result_nodes.extend(unique_nodes.values().cloned());
+    }
     result_occurrences.extend(definition_occurrences(&unique_nodes, file_id));
 
     // 3. Resolve qualified names, canonicalize IDs, and remap projections.
@@ -6815,6 +7344,131 @@ function render() {
                         .is_some_and(|node| node.serialized_name == "label")
             }),
             "expected JSX prop usage recovery to link render() to label"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_openapi_schema_indexes_endpoint_symbols() -> Result<()> {
+        let schema = r#"{
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/users": {
+      "get": {
+        "operationId": "listUsers"
+      }
+    }
+  }
+}"#;
+        let storage = index_openapi_schema_file(Path::new("openapi.json"), schema)?
+            .expect("schema should be indexed");
+        let endpoint_id = schema_endpoint_node_id("GET", "/api/users");
+        assert!(storage.nodes.iter().any(|node| {
+            node.id == endpoint_id
+                && node.kind == NodeKind::FUNCTION
+                && node.serialized_name == "GET /api/users"
+        }));
+        assert!(storage.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::MEMBER
+                && edge.target == endpoint_id
+                && edge.certainty == Some(ResolutionCertainty::Certain)
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_typescript_api_literal_creates_schema_endpoint_call_edge() -> Result<()> {
+        let code = r#"
+export async function loadUsers() {
+    return fetch("/api/users");
+}
+
+export async function createUser() {
+    return axios.post("/api/users", {});
+}
+"#;
+        let language_config = get_language_for_ext("ts").expect("typescript config");
+        let result = index_file(Path::new("client.ts"), code, &language_config, None, None)?;
+        let get_endpoint = schema_endpoint_node_id("GET", "/api/users");
+        let post_endpoint = schema_endpoint_node_id("POST", "/api/users");
+        let node_by_id = result
+            .nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<HashMap<_, _>>();
+
+        assert!(
+            node_by_id
+                .get(&get_endpoint)
+                .is_some_and(|node| node.serialized_name == "GET /api/users")
+        );
+        assert!(
+            node_by_id
+                .get(&post_endpoint)
+                .is_some_and(|node| node.serialized_name == "POST /api/users")
+        );
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.target == get_endpoint
+                && edge.certainty == Some(ResolutionCertainty::Uncertain)
+        }));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.target == post_endpoint
+                && edge.certainty == Some(ResolutionCertainty::Uncertain)
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_typescript_api_path_literals_without_client_calls_do_not_create_edges() -> Result<()> {
+        let code = r#"
+const docsPath = "/api/users";
+export const routeMap = {
+    users: "/api/users",
+};
+app.get("/api/users", handler);
+export function handler() {}
+"#;
+        let language_config = get_language_for_ext("ts").expect("typescript config");
+        let result = index_file(Path::new("routes.ts"), code, &language_config, None, None)?;
+        let endpoint = schema_endpoint_node_id("GET", "/api/users");
+
+        assert!(
+            result.nodes.iter().all(|node| node.id != endpoint),
+            "plain path literals and route declarations should not create endpoint nodes"
+        );
+        assert!(
+            result
+                .edges
+                .iter()
+                .all(|edge| edge.kind != EdgeKind::CALL || edge.target != endpoint),
+            "plain path literals and route declarations should not create endpoint call edges"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_typescript_api_path_literals_in_trailing_comments_do_not_create_edges() -> Result<()> {
+        let code = r#"
+export function handler() {
+    const ready = true; // fetch("/api/users")
+}
+"#;
+        let language_config = get_language_for_ext("ts").expect("typescript config");
+        let result = index_file(Path::new("client.ts"), code, &language_config, None, None)?;
+        let endpoint = schema_endpoint_node_id("GET", "/api/users");
+
+        assert!(
+            result.nodes.iter().all(|node| node.id != endpoint),
+            "trailing comments should not create endpoint nodes"
+        );
+        assert!(
+            result
+                .edges
+                .iter()
+                .all(|edge| edge.kind != EdgeKind::CALL || edge.target != endpoint),
+            "trailing comments should not create endpoint call edges"
         );
         Ok(())
     }

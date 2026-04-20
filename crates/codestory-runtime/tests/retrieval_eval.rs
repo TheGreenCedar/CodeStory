@@ -5,11 +5,25 @@ use codestory_contracts::api::{
 use codestory_runtime::AppController;
 use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 use tempfile::{TempDir, tempdir};
+
+static HYBRID_EVAL_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvGuard {
     key: &'static str,
     previous: Option<String>,
+}
+
+struct HybridEvalEnv {
+    guards: Option<Vec<EnvGuard>>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl Drop for HybridEvalEnv {
+    fn drop(&mut self) {
+        let _ = self.guards.take();
+    }
 }
 
 impl EnvGuard {
@@ -42,13 +56,20 @@ impl Drop for EnvGuard {
     }
 }
 
-fn hybrid_eval_env() -> Vec<EnvGuard> {
-    vec![
+fn hybrid_eval_env() -> HybridEvalEnv {
+    let lock = HYBRID_EVAL_ENV_LOCK
+        .lock()
+        .expect("hybrid eval env lock poisoned");
+    let guards = vec![
         EnvGuard::set("CODESTORY_HYBRID_RETRIEVAL_ENABLED", "true"),
         EnvGuard::set("CODESTORY_EMBED_RUNTIME_MODE", "hash"),
         EnvGuard::remove("CODESTORY_EMBED_MODEL_PATH"),
         EnvGuard::remove("CODESTORY_EMBED_TOKENIZER_PATH"),
-    ]
+    ];
+    HybridEvalEnv {
+        guards: Some(guards),
+        _lock: lock,
+    }
 }
 
 fn write_retrieval_fixture(root: &Path) {

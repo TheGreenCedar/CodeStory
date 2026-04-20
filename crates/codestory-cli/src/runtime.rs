@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use codestory_contracts::api::{
-    ApiError, IndexMode, IndexingPhaseTimings, NodeDetailsDto, NodeDetailsRequest, ProjectSummary,
-    SearchHit, SearchRepoTextMode, SearchRequest,
+    ApiError, AppEventPayload, IndexMode, IndexingPhaseTimings, NodeDetailsDto, NodeDetailsRequest,
+    ProjectSummary, SearchHit, SearchRepoTextMode, SearchRequest,
 };
 use codestory_runtime::{GroundingService, IndexService, ProjectService, Runtime, SearchService};
 use directories::ProjectDirs;
@@ -26,6 +26,7 @@ pub(crate) struct RuntimeContext {
     pub(crate) index: IndexService,
     pub(crate) search: SearchService,
     pub(crate) grounding: GroundingService,
+    pub(crate) events: crossbeam_channel::Receiver<AppEventPayload>,
     pub(crate) project_root: PathBuf,
     pub(crate) storage_path: PathBuf,
 }
@@ -42,14 +43,20 @@ pub(crate) struct ResolvedTarget {
 impl RuntimeContext {
     pub(crate) fn new(args: &ProjectArgs) -> Result<Self> {
         let project_root = canonicalize_project_root(&args.project)?;
-        let cache_root = cache_root_for_project(&project_root, args.cache_dir.as_deref())?;
+        let config = crate::config::load_config(&project_root)?;
+        let cache_root = cache_root_for_project(
+            &project_root,
+            args.cache_dir.as_deref().or(config.cache_dir.as_deref()),
+        )?;
         let storage_path = cache_root.join("codestory.db");
         let runtime = Runtime::new();
+        let events = runtime.events();
         Ok(Self {
             project: runtime.project_service(),
             index: runtime.index_service(),
             search: runtime.search_service(),
             grounding: runtime.grounding_service(),
+            events,
             project_root,
             storage_path,
         })

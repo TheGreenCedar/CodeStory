@@ -208,6 +208,7 @@ fn symbol_digest(
     member_counts: &HashMap<codestory_contracts::graph::NodeId, u32>,
     fallback_lines: &HashMap<codestory_contracts::graph::NodeId, u32>,
     edge_digests: &HashMap<codestory_contracts::graph::NodeId, Vec<String>>,
+    summaries: &HashMap<codestory_contracts::graph::NodeId, SymbolSummaryRecord>,
 ) -> GroundingSymbolDigestDto {
     let member_count = if is_structural_kind(node.kind) {
         Some(*member_counts.get(&node.id).unwrap_or(&0))
@@ -227,10 +228,14 @@ fn symbol_digest(
 
     GroundingSymbolDigestDto {
         id: NodeId::from(node.id),
+        node_ref: relative_file_path
+            .zip(line)
+            .map(|(path, line)| format!("{path}:{line}:{display_name}")),
         label,
         kind: NodeKind::from(node.kind),
         line,
         member_count,
+        summary: summaries.get(&node.id).map(|record| record.summary.clone()),
         edge_digest: edge_digests.get(&node.id).cloned().unwrap_or_default(),
     }
 }
@@ -454,6 +459,9 @@ impl AppController {
                 })?,
             4,
         );
+        let summaries = storage
+            .get_current_symbol_summaries_by_node_ids(&displayed_node_ids)
+            .map_err(|e| ApiError::internal(format!("Failed to load symbol summaries: {e}")))?;
 
         for coverage in selected_coverages {
             let mut symbols = Vec::with_capacity(coverage.represented_symbol_count as usize);
@@ -470,6 +478,7 @@ impl AppController {
                         &member_counts,
                         &fallback_lines,
                         &edge_digests,
+                        &summaries,
                     ));
                 }
             }
@@ -507,6 +516,7 @@ impl AppController {
                 &member_counts,
                 &fallback_lines,
                 &edge_digests,
+                &summaries,
             ));
         }
 
@@ -622,9 +632,15 @@ impl AppController {
             .filter(|hit| hit.node_id != node_id)
             .take(6)
             .collect();
+        let summary = storage
+            .get_current_symbol_summaries_by_node_ids(&[core_id])
+            .map_err(|e| ApiError::internal(format!("Failed to load symbol summary: {e}")))?
+            .remove(&core_id)
+            .map(|record| record.summary);
 
         Ok(SymbolContextDto {
             node,
+            summary,
             children,
             related_hits,
             edge_digest: edge_digest_for_node(&storage, core_id, 6),

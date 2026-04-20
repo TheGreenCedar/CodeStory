@@ -15,10 +15,11 @@ target/release/codestory-cli(.exe) search [OPTIONS]
 | `--project` | path | `.` | Project root directory (alias: `--path`) |
 | `--cache-dir` | path | *auto* | Override the cache directory |
 | `--query` | string | **required** | Search term — symbol name or natural-language text |
-| `--limit` | integer | `10` | Maximum number of results (capped at 50) |
-| `--repo-text` | enum | `auto` | Text-match mode: `auto`, `on`, or `off` |
+| `--limit` | integer | `10` | Maximum results per provenance group, capped at 50 |
+| `--repo-text` | enum | `auto` | Repo text scanning: `auto`, `on`, or `off` |
 | `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
 | `--format` | enum | `markdown` | Output format: `markdown` or `json` |
+| `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
 | `--hybrid-lexical` | float | runtime default | Override lexical weight for hybrid-search research |
 | `--hybrid-semantic` | float | runtime default | Override semantic weight for hybrid-search research |
 | `--hybrid-graph` | float | runtime default | Override graph-neighborhood weight for hybrid-search research |
@@ -27,6 +28,7 @@ target/release/codestory-cli(.exe) search [OPTIONS]
 
 - **Symbol-like queries** (e.g. `AppController`, `run_indexing`) search the indexed symbol table.
 - **Natural-language queries** (e.g. `"how does incremental indexing work"`) also perform a repo-wide text scan and merge results by score.
+- When hybrid retrieval finds strong semantic matches but no lexical match, Markdown and JSON output include `did_you_mean` suggestions.
 - **Hybrid weight overrides** are intended for benchmarking and tuning. Omit all three `--hybrid-*` flags for production-like runtime defaults.
 
 ## Output
@@ -52,6 +54,9 @@ target/release/codestory-cli(.exe) search --project . --query AppController
 
 # Natural-language search, more results
 target/release/codestory-cli(.exe) search --project . --query "how does the grounding snapshot work" --limit 20
+
+# Force repo text scanning for a symbol-like query
+target/release/codestory-cli(.exe) search --project . --query AppController --repo-text on
 
 # JSON output
 target/release/codestory-cli(.exe) search --project . --query TrailResult --format json

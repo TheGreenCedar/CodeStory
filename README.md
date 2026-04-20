@@ -1,6 +1,6 @@
 # CodeStory
 
-CodeStory is a local codebase grounding engine. It indexes a repository into a SQLite-backed graph, keeps grounding-oriented read models up to date, and exposes six workflows through `codestory-cli`.
+CodeStory is a local codebase grounding engine. It indexes a repository into a SQLite-backed graph, keeps grounding-oriented read models up to date, and exposes grounding, graph-query, visualization, and local-serving workflows through `codestory-cli`.
 
 ## System Map
 
@@ -37,6 +37,9 @@ Use this path if you want to run the tool against a repository.
    .\target\release\codestory-cli.exe symbol --project <path> (--id <node-id> | --query <query>)
    .\target\release\codestory-cli.exe trail --project <path> (--id <node-id> | --query <query>)
    .\target\release\codestory-cli.exe snippet --project <path> (--id <node-id> | --query <query>)
+   .\target\release\codestory-cli.exe query --project <path> "trail(symbol: 'Foo') | filter(kind: function)"
+   .\target\release\codestory-cli.exe explore --project <path> --query <query>
+   .\target\release\codestory-cli.exe serve --project <path>
    ```
 
 Read commands default to `--refresh none`. They query the current cache unless you explicitly ask them to refresh.
@@ -51,6 +54,10 @@ Read commands default to `--refresh none`. They query the current cache unless y
 | `--cache-dir <CACHE_DIR>` | user cache root plus a per-project hash | Uses the exact directory passed for the SQLite database and sibling search directory. Use this for temp-cache benchmarks or isolated repros. |
 | `--refresh <auto\|full\|incremental\|none>` | `auto` | Controls whether indexing work runs before the summary is returned. See the refresh table below. |
 | `--format <markdown\|json>` | `markdown` | Markdown is for humans. JSON exposes the same summary, retrieval state, and phase timings for tests and automation. |
+| `--dry-run` | off | Computes the refresh plan and reports files that would be indexed or removed without parsing, resolving, or writing storage. |
+| `--summarize` | off | After indexing, generates cached one-sentence symbol summaries. Requires `CODESTORY_SUMMARY_ENDPOINT`, unless set to `local` or `mock` for deterministic local summaries. |
+| `--progress` | off | Prints an incremental text progress bar to stderr so stdout stays parseable. |
+| `--watch` | off | Keeps running after the first index and triggers incremental refreshes when files change. |
 
 Refresh modes:
 
@@ -97,7 +104,7 @@ Start here when you are contributing:
 
 ## Grounding Workflows
 
-The product surface remains organized around six workflows:
+The product surface starts with six core workflows and adds higher-level graph, explorer, serving, and shell-integration commands:
 
 ```mermaid
 flowchart LR
@@ -108,16 +115,37 @@ flowchart LR
     LocalState --> Symbol["symbol"]
     LocalState --> Trail["trail"]
     LocalState --> Snippet["snippet"]
+    LocalState --> Query["query"]
+    LocalState --> Explore["explore"]
+    LocalState --> Serve["serve"]
 ```
 
 - `index`: discover files, parse supported languages, resolve graph edges, persist search projections, and complete semantic docs before returning
 - `ground`: build grounded context from indexed symbols, snippets, graph traversal, and search results
-- `search`: find symbols, files, and query matches
+- `search`: find symbols, files, and query matches; semantic-only near misses appear under `did_you_mean`
 - `symbol`: inspect one symbol and its indexed relationships
-- `trail`: walk caller/callee and usage neighborhoods through the graph
-- `snippet`: fetch focused source context for a symbol or file location
+- `trail`: walk caller/callee and usage neighborhoods through the graph; `--mermaid` emits a Mermaid flowchart and `--format dot` emits Graphviz DOT
+- `snippet`: fetch focused source context for a symbol or file location; Markdown snippets use ANSI syntax highlighting when stdout is an interactive terminal
+- `query`: run a small graph query pipeline such as `trail(symbol: 'Foo', depth: 2) | filter(kind: function) | limit(10)`
+- `explore`: open an interactive terminal explorer when stdout is a terminal, or emit Markdown/JSON when piped or passed `--no-tui`
+- `serve`: expose local `/health`, `/search`, `/symbol`, and `/trail` JSON endpoints, or use `--stdio` for a small MCP-style JSON-lines tool protocol
+- `generate-completions`: emit bash, zsh, fish, or PowerShell completions generated from the clap command model
 
 Hybrid retrieval is the intended default when local embedding assets are available. `index`, `ground`, and `search` now report retrieval mode, semantic doc counts, and explicit fallback reasons when the runtime drops back to symbolic ranking.
+
+## Workspace And Config Files
+
+CodeStory supports an optional `codestory_workspace.json` file at the repo root for monorepo-style sessions:
+
+```json
+{
+  "members": ["backend/", "frontend/", "shared/"]
+}
+```
+
+When the manifest is present, `index --project .` discovers all listed member roots and reports per-member refresh counts in index output. Repos without the manifest keep the single-root behavior. OpenAPI JSON/YAML schemas are treated as lightweight endpoint sources, and literal client calls such as `fetch("/api/users")` or `axios.post("/api/users")` create speculative graph edges to matching endpoint refs.
+
+Team or user defaults can live in `.codestory.toml` at the project root or in the user home directory. Project settings override home settings, and explicit environment variables still win. Supported keys include `cache_dir`, `embedding_model`, `hybrid_retrieval_enabled`, `semantic_doc_scope`, `semantic_doc_alias_mode`, `summary_endpoint`, and `summary_model`.
 
 ## Retrieval Defaults
 

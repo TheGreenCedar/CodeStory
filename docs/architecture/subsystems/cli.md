@@ -1,6 +1,6 @@
 # CLI Subsystem
 
-`codestory-cli` is the thin adapter for the six grounding workflows.
+`codestory-cli` is the thin adapter for indexing, grounding reads, graph-query helpers, local exploration, and lightweight serving.
 
 ## Ownership
 
@@ -32,6 +32,11 @@
 | `--cache-dir <CACHE_DIR>` | system cache root plus project hash | Overrides the cache root exactly. The SQLite store and persisted search directory live under this directory, which makes it useful for isolated repros and cold-start benchmarks. |
 | `--refresh <auto\|full\|incremental\|none>` | `auto` | Selects the refresh strategy. `auto` resolves to `full` for an empty cache and `incremental` once indexed files already exist. |
 | `--format <markdown\|json>` | `markdown` | Chooses human-readable output or machine-readable output. JSON includes the same retrieval metadata and phase timings. |
+| `--output-file <PATH>` | stdout | Writes Markdown or JSON to a file whose parent directory already exists. |
+| `--dry-run` | off | Computes discovery and refresh-plan counts without parsing files or writing storage. |
+| `--summarize` | off | Generates cached one-sentence symbol summaries after indexing. |
+| `--progress` | off | Prints progress updates to stderr while preserving stdout for structured output. |
+| `--watch` | off | Runs once, then watches the project root and triggers incremental refreshes. `--output-file` is rejected when it points inside the watched project tree. |
 
 Refresh behavior belongs to runtime, not the CLI adapter:
 
@@ -51,10 +56,15 @@ Index output should expose:
 - semantic timings and doc counts when semantic sync was considered
 - resolution diagnostics when the indexer reports them
 
+## Read And Query Output
+
+Read commands default to `--refresh none` so they query the current cache unless the caller asks for a refresh. `ground`, `search`, `symbol`, `trail`, `snippet`, `query`, and `explore` all support `--format markdown|json` and `--output-file <PATH>`; `trail` additionally supports Graphviz DOT via `--format dot`, while `symbol` and `trail` support Mermaid via `--mermaid`.
+
+`query` is intentionally small. It parses source operations (`search`, `symbol`, `trail`) followed by stream refinements (`filter`, `limit`) and rejects malformed or unknown named arguments rather than silently ignoring typos.
+
 ## `search` Command Research Options
 
-`codestory-cli search` keeps production behavior on the runtime defaults unless
-a caller explicitly passes hybrid research weights:
+`codestory-cli search` keeps production behavior on the runtime defaults unless a caller explicitly passes hybrid research weights:
 
 | Option | Default | Runtime effect |
 | --- | --- | --- |
@@ -62,9 +72,7 @@ a caller explicitly passes hybrid research weights:
 | `--hybrid-semantic <WEIGHT>` | runtime default | Overrides the semantic embedding component weight for this search request. |
 | `--hybrid-graph <WEIGHT>` | runtime default | Overrides the graph-neighborhood component weight for this search request. |
 
-The runtime clamps and normalizes supplied weights before ranking. These flags
-exist so benchmark runs can sweep retrieval settings without changing global
-environment variables or production defaults.
+The runtime clamps and normalizes supplied weights before ranking. These flags exist so benchmark runs can sweep retrieval settings without changing global environment variables or production defaults.
 
 ## Failure Signatures
 

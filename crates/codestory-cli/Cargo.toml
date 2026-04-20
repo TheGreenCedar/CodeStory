@@ -7,11 +7,16 @@ edition = "2024"
 codestory-contracts = { workspace = true }
 codestory-runtime = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 directories = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
+notify = { workspace = true }
+crossbeam-channel = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-toml = { workspace = true }

@@ -2,6 +2,8 @@
 
 Resolves a symbol and returns its source code with surrounding context lines. Useful for reading the actual implementation without opening the full file.
 
+Markdown output uses ANSI syntax highlighting when stdout is an interactive terminal. Output files, pipes, and JSON output stay uncolored for automation.
+
 ## Usage
 
 ```
@@ -16,9 +18,11 @@ target/release/codestory-cli(.exe) snippet [OPTIONS]
 | `--cache-dir` | path | *auto* | Override the cache directory |
 | `--id` | string | — | Node ID of the symbol (conflicts with `--query`) |
 | `--query` | string | — | Symbol name to resolve (conflicts with `--id`) |
+| `--file` | string | — | Limit `--query` resolution to paths containing this fragment |
 | `--context` | integer | `4` | Number of surrounding context lines above and below the symbol |
 | `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
 | `--format` | enum | `markdown` | Output format: `markdown` or `json` |
+| `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
 
 ## Output
 
@@ -50,6 +54,9 @@ target/release/codestory-cli(.exe) snippet --project . --query "AppController::n
 
 # More context
 target/release/codestory-cli(.exe) snippet --project . --query run_indexing --context 10
+
+# Disambiguate by file and write stable Markdown
+target/release/codestory-cli(.exe) snippet --project . --query TicTacToe --file rust_tictactoe.rs --output-file tictactoe.md
 
 # By node ID, JSON output
 target/release/codestory-cli(.exe) snippet --project . --id abc123def456 --format json
