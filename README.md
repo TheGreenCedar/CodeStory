@@ -253,4 +253,4 @@ CodeStory writes user-cache SQLite indexes keyed by the target project path. Bui
 
 ## License
 
-MIT. See `LICENSE`.
+Apache-2.0. See `LICENSE`.
