@@ -158,7 +158,9 @@ fn embedding_parallel_chunk_size(text_count: usize, worker_count: usize) -> usiz
 #[cfg(feature = "onnx-cuda")]
 fn configure_cuda_embedding_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
     builder
-        .with_execution_providers([ort::ep::CUDAExecutionProvider::default().build()])
+        .with_execution_providers([ort::ep::CUDAExecutionProvider::default()
+            .build()
+            .error_on_failure()])
         .context("failed to configure CUDA ONNX execution provider")
 }
 
@@ -173,7 +175,9 @@ fn configure_cuda_embedding_provider(builder: SessionBuilder) -> Result<SessionB
 #[cfg(feature = "onnx-directml")]
 fn configure_directml_embedding_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
     builder
-        .with_execution_providers([ort::ep::DirectMLExecutionProvider::default().build()])
+        .with_execution_providers([ort::ep::DirectMLExecutionProvider::default()
+            .build()
+            .error_on_failure()])
         .context("failed to configure DirectML ONNX execution provider")
 }
 
