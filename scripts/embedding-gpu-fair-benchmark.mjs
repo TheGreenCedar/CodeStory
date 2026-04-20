@@ -859,6 +859,30 @@ function stageRetrieval() {
   return [...weightSweeps, ...docSweeps];
 }
 
+function stageBgeSmallCandidate() {
+  return withRepeats(
+    [
+      cloneCase(baseProfiles.onnxBgeSmall, {
+        stage: "bge-small-candidate",
+        variant: "baseline-current-default",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+        batch: 128,
+        sessions: 2,
+      }),
+      cloneCase(baseProfiles.onnxBgeSmall, {
+        stage: "bge-small-candidate",
+        variant: "crossed-scope-all-no-alias-b256",
+        docMode: "no_alias",
+        semanticScope: "all",
+        batch: 256,
+        sessions: 2,
+      }),
+    ],
+    "bge-small-candidate",
+  );
+}
+
 function stageTuning() {
   const cases = [];
   for (const batch of [64, 128, 256]) {
@@ -1047,6 +1071,7 @@ function allCases() {
     ...stageVectorQuant(),
     ...stageDimension(),
     ...stageRetrieval(),
+    ...stageBgeSmallCandidate(),
     ...stageTuning(),
     ...stagePrompt(),
     ...stageFinalists(),
@@ -1127,7 +1152,7 @@ function baseEnv(config) {
   delete env.CODESTORY_EMBED_TOKENIZER_PATH;
 
   if (config.kind === "onnx") {
-    env.CODESTORY_EMBED_EXECUTION_PROVIDER = "directml";
+    env.CODESTORY_EMBED_EXECUTION_PROVIDER = config.executionProvider ?? "directml";
     env.CODESTORY_EMBED_MODEL_PATH = config.modelPath;
     env.CODESTORY_EMBED_SESSION_COUNT = String(config.sessions ?? 2);
     delete env.CODESTORY_EMBED_LLAMACPP_URL;
@@ -1291,6 +1316,40 @@ function validateLlamaGpu(caseDir) {
   return {
     gpu_device: "Vulkan0",
     offloaded_layers: `${last[1]}/${last[2]}`,
+    provider_requested: "Vulkan0",
+    provider_verified: true,
+    provider_evidence: `llama.cpp stderr logged Vulkan0 and offloaded ${last[1]}/${last[2]} layers to GPU`,
+  };
+}
+
+function onnxProviderFallbackMessage(stderr) {
+  const patterns = [
+    /using CPU execution provider/i,
+    /built without the onnx-directml/i,
+    /built without the onnx-cuda/i,
+    /Unknown semantic embedding execution provider/i,
+  ];
+  return patterns.find((pattern) => pattern.test(stderr))?.source ?? null;
+}
+
+function validateOnnxProvider(config, index, indexJson) {
+  const requested = config.executionProvider ?? "directml";
+  const fallback = onnxProviderFallbackMessage(index.stderr ?? "");
+  if (fallback) {
+    throw new Error(
+      `${config.case_id} did not validate ${requested}; refusing CPU/fallback ONNX benchmark (${fallback})`,
+    );
+  }
+  const embeddingModel =
+    indexJson.retrieval?.embedding_model ?? indexJson.summary?.retrieval?.embedding_model ?? "";
+  if (!String(embeddingModel).trim()) {
+    throw new Error(`${config.case_id} did not report an embedding model; refusing ambiguous row`);
+  }
+  return {
+    gpu_device: requested === "directml" ? "DirectML" : requested,
+    provider_requested: requested,
+    provider_verified: true,
+    provider_evidence: `${config.case_id} set CODESTORY_EMBED_EXECUTION_PROVIDER=${requested}; CPU/fallback markers absent; embedding_model=${embeddingModel}`,
   };
 }
 
@@ -1324,6 +1383,10 @@ function score(searchResults) {
     misses: searchResults.filter((result) => result.rank === null).map((result) => result.id),
     regressions: [],
   };
+}
+
+function isDecisionGradeResult(result) {
+  return !result.error && result.provider_verified === true;
 }
 
 function requiredFiles(config) {
@@ -1426,11 +1489,9 @@ async function runCase(config) {
       env,
       path.join(logsDir, "index.log"),
     );
-    if (config.kind === "onnx" && /using CPU execution provider|built without the onnx-directml/i.test(index.stderr)) {
-      throw new Error(`${config.case_id} did not use DirectML; refusing CPU ONNX benchmark`);
-    }
 
     const indexJson = parseJson(index.stdout);
+    const provider = config.kind === "onnx" ? validateOnnxProvider(config, index, indexJson) : {};
     const semanticDocsEmbedded = indexJson.phase_timings?.semantic_docs_embedded ?? null;
     const semanticDocCount =
       indexJson.retrieval?.semantic_doc_count ??
@@ -1477,6 +1538,7 @@ async function runCase(config) {
     }
     return {
       ...config,
+      ...provider,
       semantic_doc_count: semanticDocCount,
       semantic_docs_embedded: semanticDocsEmbedded,
       semantic_docs_reused: indexJson.phase_timings?.semantic_docs_reused ?? null,
@@ -1498,14 +1560,16 @@ async function runCase(config) {
       queries: searchResults,
     };
   });
-  const gpu = config.kind === "llama" ? validateLlamaGpu(caseDir) : { gpu_device: "DirectML" };
+  const gpu = config.kind === "llama" ? validateLlamaGpu(caseDir) : {};
   const withGpu = { ...result, ...gpu };
   fs.writeFileSync(path.join(caseDir, "result.json"), JSON.stringify(withGpu, null, 2));
   return withGpu;
 }
 
 function normalizedCombined(results) {
-  const ok = results.filter((result) => !result.error && result.docs_per_second !== null);
+  const ok = results.filter(
+    (result) => isDecisionGradeResult(result) && result.docs_per_second !== null,
+  );
   if (ok.length === 0) {
     return [];
   }
@@ -1550,7 +1614,7 @@ function normalizedCombined(results) {
 }
 
 function aliasComparisons(results) {
-  const ok = results.filter((result) => !result.error);
+  const ok = results.filter(isDecisionGradeResult);
   const groups = new Map();
   for (const result of ok) {
     const key = [
@@ -1622,7 +1686,7 @@ function repeatBaseId(caseIdValue) {
 
 function repeatSummaries(results) {
   const groups = new Map();
-  for (const result of results.filter((item) => !item.error)) {
+  for (const result of results.filter(isDecisionGradeResult)) {
     const key = repeatBaseId(result.case_id);
     const group = groups.get(key) ?? [];
     group.push(result);
@@ -1687,6 +1751,8 @@ function writeManifest(cases) {
         "Matryoshka/dimension-shortening rows, plus BGE-small negative controls.",
       retrieval:
         "Hybrid weight, semantic scope, and alias-mode sweeps using the CLI search weight flags.",
+      "bge-small-candidate":
+        "Three-repeat current-default versus crossed BGE-small scope=all + no_alias + b256 candidate.",
       finalists2:
         "Run only after earlier lanes produce candidates; three-repeat comparison of selected rows.",
     },
@@ -1696,6 +1762,8 @@ function writeManifest(cases) {
       id: config.id,
       kind: config.kind,
       hardware: config.hardware,
+      provider_requested:
+        config.kind === "onnx" ? (config.executionProvider ?? "directml") : "Vulkan0",
       profile: config.profile,
       semantic_scope: config.semanticScope,
       doc_mode: config.docMode,
@@ -1744,6 +1812,9 @@ function writeReports(results, cases) {
     "doc_mode",
     "kind",
     "hardware",
+    "provider_requested",
+    "provider_verified",
+    "provider_evidence",
     "profile",
     "semantic_scope",
     "quantization",
@@ -1786,6 +1857,9 @@ function writeReports(results, cases) {
     result.docMode,
     result.kind,
     result.hardware,
+    result.provider_requested ?? "",
+    result.provider_verified ?? "",
+    result.provider_evidence ?? "",
     result.profile,
     result.semanticScope ?? "",
     result.quantization ?? "",
@@ -1955,7 +2029,7 @@ function writeReports(results, cases) {
     `Cases selected: \`${cases.length}\``,
     `Queries: \`${queries.length}\``,
     "",
-    "All decision-grade rows are GPU-only. ONNX rows require DirectML; llama.cpp rows require Vulkan0 and full model-layer offload.",
+    "All decision-grade rows are GPU-only and must set `provider_verified=true`. ONNX rows require DirectML/CUDA fail-hard validation; llama.cpp rows require Vulkan0 and full model-layer offload.",
     "Source-led lanes are recorded in `manifest.json` and `sources.md`; skipped rows mean an artifact or implementation prerequisite is still missing.",
     "",
     "## Ranking",
