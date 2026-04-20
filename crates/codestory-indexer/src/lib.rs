@@ -4535,6 +4535,9 @@ fn is_api_endpoint_call_context(line: &str, literal_col: u32) -> bool {
     if trimmed_before.starts_with("//") || trimmed_before.starts_with('#') {
         return false;
     }
+    if has_line_comment_before_literal(before_literal) {
+        return false;
+    }
 
     let compact_before = compact_lowercase(before_literal);
     if compact_before.contains("fetch(") || compact_before.contains("axios(") {
@@ -4558,6 +4561,47 @@ fn is_api_endpoint_call_context(line: &str, literal_col: u32) -> bool {
                 || compact_before.contains(&format!("{receiver}::{method}("))
         })
     })
+}
+
+fn has_line_comment_before_literal(value: &str) -> bool {
+    let mut chars = value.char_indices().peekable();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    while let Some((idx, ch)) = chars.next() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '/' if chars.peek().is_some_and(|(_, next)| *next == '/') => return true,
+            '#' => {
+                let starts_comment = value[..idx].trim().is_empty()
+                    || value[..idx]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace);
+                if starts_comment {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    false
 }
 
 fn compact_lowercase(value: &str) -> String {
@@ -7400,6 +7444,31 @@ export function handler() {}
                 .iter()
                 .all(|edge| edge.kind != EdgeKind::CALL || edge.target != endpoint),
             "plain path literals and route declarations should not create endpoint call edges"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_typescript_api_path_literals_in_trailing_comments_do_not_create_edges() -> Result<()> {
+        let code = r#"
+export function handler() {
+    const ready = true; // fetch("/api/users")
+}
+"#;
+        let language_config = get_language_for_ext("ts").expect("typescript config");
+        let result = index_file(Path::new("client.ts"), code, &language_config, None, None)?;
+        let endpoint = schema_endpoint_node_id("GET", "/api/users");
+
+        assert!(
+            result.nodes.iter().all(|node| node.id != endpoint),
+            "trailing comments should not create endpoint nodes"
+        );
+        assert!(
+            result
+                .edges
+                .iter()
+                .all(|edge| edge.kind != EdgeKind::CALL || edge.target != endpoint),
+            "trailing comments should not create endpoint call edges"
         );
         Ok(())
     }

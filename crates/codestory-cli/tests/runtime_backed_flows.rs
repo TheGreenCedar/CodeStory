@@ -118,3 +118,46 @@ fn symbol_query_file_filter_resolves_expected_fixture() {
         "file filter should resolve to the requested fixture, got {resolved_path}"
     );
 }
+
+#[test]
+#[ignore = "builds indexed runtime fixtures; run explicitly when touching CLI/runtime read-command flows"]
+fn query_command_runs_search_filter_limit_pipeline() {
+    let workspace = copy_tictactoe_workspace();
+
+    let index = run_cli(
+        workspace.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    assert!(
+        index.status.success(),
+        "index command failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    let query = run_cli(
+        workspace.path(),
+        &[
+            "query",
+            "search(query: 'check_winner') | filter(kind: function) | limit(2)",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        query.status.success(),
+        "query command failed: {}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+
+    let json: Value = serde_json::from_slice(&query.stdout).expect("parse query json");
+    let items = json["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 2, "limit should cap filtered items");
+    assert!(
+        items.iter().all(|item| item["kind"] == "FUNCTION"),
+        "filter(kind: function) should keep only function hits: {items:?}"
+    );
+    assert!(
+        items.iter().all(|item| item["source"] == "search"),
+        "query search operation should mark item provenance"
+    );
+}

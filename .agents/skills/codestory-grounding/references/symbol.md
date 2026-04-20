@@ -16,10 +16,13 @@ target/release/codestory-cli(.exe) symbol [OPTIONS]
 | `--cache-dir` | path | *auto* | Override the cache directory |
 | `--id` | string | — | Node ID to inspect (conflicts with `--query`) |
 | `--query` | string | — | Symbol name to resolve (conflicts with `--id`) |
+| `--file` | string | — | Limit `--query` resolution to paths containing this fragment |
 | `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
 | `--format` | enum | `markdown` | Output format: `markdown` or `json` |
+| `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
+| `--mermaid` | flag | `false` | Render a Mermaid symbol graph instead of Markdown/JSON |
 
-> One of `--id` or `--query` is required. If `--query` is ambiguous (multiple equally-ranked matches), the CLI will error and suggest a more qualified name.
+> One of `--id` or `--query` is required. `--file` requires `--query`. If `--query` is ambiguous (multiple equally-ranked matches), the CLI will error and suggest a more qualified name or file filter.
 
 ## Target Resolution
 
@@ -51,6 +54,9 @@ target/release/codestory-cli(.exe) symbol --project . --query AppController
 
 # Inspect by node ID
 target/release/codestory-cli(.exe) symbol --project . --id abc123def456
+
+# Disambiguate a repeated symbol name by file
+target/release/codestory-cli(.exe) symbol --project . --query TicTacToe --file rust_tictactoe.rs
 
 # JSON output
 target/release/codestory-cli(.exe) symbol --project . --query "WorkspaceIndexer" --format json

@@ -56,6 +56,6 @@ Detailed argument tables, output examples, and usage patterns for each command:
 - [symbol](references/symbol.md) — Inspect a symbol's details and relationships
 - [trail](references/trail.md) — Follow a symbol's call/reference graph
 - [snippet](references/snippet.md) — Fetch source code context around a symbol
-- `query` — Structured graph query pipelines: `trail`, `symbol`, `search`, `filter`, and `limit`
+- [query](references/query.md) — Structured graph query pipelines: `trail`, `symbol`, `search`, `filter`, and `limit`
 - `explore` — Interactive terminal exploration with Markdown/JSON fallback
 - `serve` — Local HTTP JSON API or stdio tool protocol

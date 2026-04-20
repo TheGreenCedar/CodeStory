@@ -15,9 +15,11 @@ target/release/codestory-cli(.exe) search [OPTIONS]
 | `--project` | path | `.` | Project root directory (alias: `--path`) |
 | `--cache-dir` | path | *auto* | Override the cache directory |
 | `--query` | string | **required** | Search term — symbol name or natural-language text |
-| `--limit` | integer | `10` | Maximum number of results (capped at 50) |
+| `--limit` | integer | `10` | Maximum results per provenance group, capped at 50 |
+| `--repo-text` | enum | `auto` | Repo text scanning: `auto`, `on`, or `off` |
 | `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
 | `--format` | enum | `markdown` | Output format: `markdown` or `json` |
+| `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
 
 ## Query Behavior
 
@@ -48,6 +50,9 @@ target/release/codestory-cli(.exe) search --project . --query AppController
 
 # Natural-language search, more results
 target/release/codestory-cli(.exe) search --project . --query "how does the grounding snapshot work" --limit 20
+
+# Force repo text scanning for a symbol-like query
+target/release/codestory-cli(.exe) search --project . --query AppController --repo-text on
 
 # JSON output
 target/release/codestory-cli(.exe) search --project . --query TrailResult --format json

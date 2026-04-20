@@ -138,6 +138,7 @@ fn parse_operation(
 
     match name.as_str() {
         "trail" => {
+            reject_unknown_args(source, &args, &["symbol", "depth", "direction"])?;
             let symbol = required_string_arg(source, &args, "symbol", 0, args_offset)?;
             Ok(GraphQueryOperation::Trail(TrailQuery {
                 symbol,
@@ -145,20 +146,32 @@ fn parse_operation(
                 direction: optional_direction_arg(source, &args, "direction")?,
             }))
         }
-        "symbol" => Ok(GraphQueryOperation::Symbol(SymbolQuery {
-            query: required_string_arg(source, &args, "query", 0, args_offset)?,
-        })),
-        "search" => Ok(GraphQueryOperation::Search(SearchQuery {
-            query: required_string_arg(source, &args, "query", 0, args_offset)?,
-        })),
-        "filter" => Ok(GraphQueryOperation::Filter(FilterQuery {
-            kind: optional_kind_arg(source, &args, "kind")?,
-            file: optional_string_arg(&args, "file"),
-            depth: optional_u32_arg(source, &args, "depth")?,
-        })),
-        "limit" => Ok(GraphQueryOperation::Limit(LimitQuery {
-            count: required_u32_arg(source, &args, "n", 0, args_offset)?,
-        })),
+        "symbol" => {
+            reject_unknown_args(source, &args, &["query"])?;
+            Ok(GraphQueryOperation::Symbol(SymbolQuery {
+                query: required_string_arg(source, &args, "query", 0, args_offset)?,
+            }))
+        }
+        "search" => {
+            reject_unknown_args(source, &args, &["query"])?;
+            Ok(GraphQueryOperation::Search(SearchQuery {
+                query: required_string_arg(source, &args, "query", 0, args_offset)?,
+            }))
+        }
+        "filter" => {
+            reject_unknown_args(source, &args, &["kind", "file", "depth"])?;
+            Ok(GraphQueryOperation::Filter(FilterQuery {
+                kind: optional_kind_arg(source, &args, "kind")?,
+                file: optional_string_arg(&args, "file"),
+                depth: optional_u32_arg(source, &args, "depth")?,
+            }))
+        }
+        "limit" => {
+            reject_unknown_args(source, &args, &["n"])?;
+            Ok(GraphQueryOperation::Limit(LimitQuery {
+                count: required_u32_arg(source, &args, "n", 0, args_offset)?,
+            }))
+        }
         _ => Err(parse_error(
             source,
             segment_offset,
@@ -442,6 +455,26 @@ fn arg_offset(args: &[ParsedArg], key: &str) -> Option<usize> {
         .map(|arg| arg.offset)
 }
 
+fn reject_unknown_args(
+    source: &str,
+    args: &[ParsedArg],
+    allowed: &[&str],
+) -> Result<(), GraphQueryParseError> {
+    for arg in args {
+        let Some(key) = arg.key.as_deref() else {
+            continue;
+        };
+        if !allowed.contains(&key) {
+            return Err(parse_error(
+                source,
+                arg.offset,
+                format!("Unknown `{key}` argument"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn leading_ws(value: &str) -> usize {
     value.len() - value.trim_start().len()
 }
@@ -477,5 +510,11 @@ mod tests {
         let err = parse_graph_query("trail(symbol: 'Foo'").expect_err("unclosed");
         assert!(err.message.contains("Unclosed"));
         assert_eq!(err.offset, "trail(symbol: 'Foo'".len());
+    }
+
+    #[test]
+    fn rejects_unknown_named_arguments() {
+        let err = parse_graph_query("trail(symbol: 'Foo', deth: 2)").expect_err("unknown arg");
+        assert!(err.message.contains("Unknown `deth` argument"));
     }
 }
