@@ -42,6 +42,7 @@ pub const EMBEDDING_TRUNCATE_DIM_ENV: &str = "CODESTORY_EMBED_TRUNCATE_DIM";
 pub const EMBEDDING_EXPECTED_DIM_ENV: &str = "CODESTORY_EMBED_EXPECTED_DIM";
 pub const LLAMACPP_EMBEDDINGS_URL_ENV: &str = "CODESTORY_EMBED_LLAMACPP_URL";
 pub const LLAMACPP_REQUEST_COUNT_ENV: &str = "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT";
+pub const STORED_VECTOR_ENCODING_ENV: &str = "CODESTORY_STORED_VECTOR_ENCODING";
 pub const DEFAULT_BUNDLED_EMBED_MODEL_PATH: &str = "models/bge-small-en-v1.5/onnx/model.onnx";
 const EMBEDDING_INTRA_THREADS_ENV: &str = "CODESTORY_EMBED_INTRA_THREADS";
 const EMBEDDING_INTER_THREADS_ENV: &str = "CODESTORY_EMBED_INTER_THREADS";
@@ -49,6 +50,7 @@ const EMBEDDING_PARALLEL_EXECUTION_ENV: &str = "CODESTORY_EMBED_PARALLEL_EXECUTI
 const EMBEDDING_EXECUTION_PROVIDER_ENV: &str = "CODESTORY_EMBED_EXECUTION_PROVIDER";
 const EMBEDDING_SESSION_COUNT_ENV: &str = "CODESTORY_EMBED_SESSION_COUNT";
 const DEFAULT_LLAMACPP_EMBEDDINGS_URL: &str = "http://127.0.0.1:8080/v1/embeddings";
+const SEMANTIC_QUANTIZED_RESCORE_MULTIPLIER: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingRuntimeAvailability {
@@ -570,6 +572,151 @@ pub struct HybridSearchConfig {
     pub graph_weight: f32,
     pub lexical_limit: usize,
     pub semantic_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredVectorEncoding {
+    Float32,
+    Int8,
+    Uint8,
+    Binary,
+    Ubinary,
+}
+
+impl StoredVectorEncoding {
+    fn from_env() -> Result<Self> {
+        let raw = std::env::var(STORED_VECTOR_ENCODING_ENV).unwrap_or_default();
+        let normalized = raw.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "" | "float32" | "none" => Ok(Self::Float32),
+            "int8" => Ok(Self::Int8),
+            "uint8" => Ok(Self::Uint8),
+            "binary" => Ok(Self::Binary),
+            "ubinary" => Ok(Self::Ubinary),
+            other => Err(anyhow!(
+                "unsupported stored vector encoding `{other}` (set {STORED_VECTOR_ENCODING_ENV}=float32, int8, uint8, binary, or ubinary)"
+            )),
+        }
+    }
+
+    fn quantize(self, values: &[f32]) -> Option<QuantizedEmbedding> {
+        match self {
+            Self::Float32 => None,
+            Self::Int8 => Some(QuantizedEmbedding::Int8(
+                values
+                    .iter()
+                    .map(|value| (value * 127.0).round().clamp(-127.0, 127.0) as i8)
+                    .collect(),
+            )),
+            Self::Uint8 => Some(QuantizedEmbedding::Uint8(
+                values
+                    .iter()
+                    .map(|value| ((value + 1.0) * 127.5).round().clamp(0.0, 255.0) as u8)
+                    .collect(),
+            )),
+            Self::Binary => Some(QuantizedEmbedding::Binary(pack_sign_bits(values))),
+            Self::Ubinary => Some(QuantizedEmbedding::Ubinary(pack_sign_bits(values))),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum QuantizedEmbedding {
+    Int8(Vec<i8>),
+    Uint8(Vec<u8>),
+    Binary(PackedSignBits),
+    Ubinary(PackedSignBits),
+}
+
+impl QuantizedEmbedding {
+    fn approximate_cosine(&self, query_embedding: &[f32]) -> f32 {
+        match self {
+            Self::Int8(values) => {
+                if values.len() != query_embedding.len() || values.is_empty() {
+                    return 0.0;
+                }
+                query_embedding
+                    .iter()
+                    .zip(values)
+                    .map(|(query, doc)| query * (*doc as f32 / 127.0))
+                    .sum()
+            }
+            Self::Uint8(values) => {
+                if values.len() != query_embedding.len() || values.is_empty() {
+                    return 0.0;
+                }
+                query_embedding
+                    .iter()
+                    .zip(values)
+                    .map(|(query, doc)| query * ((*doc as f32 / 127.5) - 1.0))
+                    .sum()
+            }
+            Self::Binary(bits) => signed_binary_cosine(query_embedding, bits),
+            Self::Ubinary(bits) => unsigned_binary_cosine(query_embedding, bits),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PackedSignBits {
+    bytes: Vec<u8>,
+    len: usize,
+    positives: usize,
+}
+
+fn pack_sign_bits(values: &[f32]) -> PackedSignBits {
+    let mut bytes = vec![0_u8; values.len().div_ceil(8)];
+    let mut positives = 0;
+    for (index, value) in values.iter().enumerate() {
+        if *value >= 0.0 {
+            bytes[index / 8] |= 1 << (index % 8);
+            positives += 1;
+        }
+    }
+    PackedSignBits {
+        bytes,
+        len: values.len(),
+        positives,
+    }
+}
+
+fn sign_bit(bits: &PackedSignBits, index: usize) -> bool {
+    let Some(byte) = bits.bytes.get(index / 8) else {
+        return false;
+    };
+    (byte & (1 << (index % 8))) != 0
+}
+
+fn signed_binary_cosine(query_embedding: &[f32], bits: &PackedSignBits) -> f32 {
+    if query_embedding.len() != bits.len || bits.len == 0 {
+        return 0.0;
+    }
+    let mut score = 0_i32;
+    for (index, query) in query_embedding.iter().enumerate() {
+        let same_sign = (*query >= 0.0) == sign_bit(bits, index);
+        score += if same_sign { 1 } else { -1 };
+    }
+    score as f32 / bits.len as f32
+}
+
+fn unsigned_binary_cosine(query_embedding: &[f32], bits: &PackedSignBits) -> f32 {
+    if query_embedding.len() != bits.len || bits.len == 0 {
+        return 0.0;
+    }
+    let mut query_positives = 0_usize;
+    let mut intersection = 0_usize;
+    for (index, query) in query_embedding.iter().enumerate() {
+        if *query >= 0.0 {
+            query_positives += 1;
+            if sign_bit(bits, index) {
+                intersection += 1;
+            }
+        }
+    }
+    if query_positives == 0 || bits.positives == 0 {
+        return 0.0;
+    }
+    intersection as f32 / ((query_positives * bits.positives) as f32).sqrt()
 }
 
 impl Default for HybridSearchConfig {
@@ -1378,7 +1525,9 @@ pub struct SearchEngine {
     index: Index,
     reader: IndexReader,
     llm_docs: HashMap<NodeId, LlmSearchDoc>,
+    quantized_llm_docs: HashMap<NodeId, QuantizedEmbedding>,
     embedding_runtime: Option<EmbeddingRuntime>,
+    stored_vector_encoding: StoredVectorEncoding,
 }
 
 impl SearchEngine {
@@ -1401,7 +1550,9 @@ impl SearchEngine {
             index,
             reader,
             llm_docs: HashMap::new(),
+            quantized_llm_docs: HashMap::new(),
             embedding_runtime: None,
+            stored_vector_encoding: StoredVectorEncoding::from_env()?,
         })
     }
 
@@ -1466,13 +1617,15 @@ impl SearchEngine {
 
     pub fn index_llm_symbol_docs(&mut self, docs: Vec<LlmSearchDoc>) {
         self.llm_docs.clear();
+        self.quantized_llm_docs.clear();
         for doc in docs {
-            self.llm_docs.insert(doc.node_id, doc);
+            self.insert_llm_symbol_doc(doc);
         }
     }
 
     pub fn clear_llm_symbol_docs(&mut self) {
         self.llm_docs.clear();
+        self.quantized_llm_docs.clear();
     }
 
     pub fn extend_llm_symbol_docs<I>(&mut self, docs: I)
@@ -1480,8 +1633,69 @@ impl SearchEngine {
         I: IntoIterator<Item = LlmSearchDoc>,
     {
         for doc in docs {
-            self.llm_docs.insert(doc.node_id, doc);
+            self.insert_llm_symbol_doc(doc);
         }
+    }
+
+    fn insert_llm_symbol_doc(&mut self, doc: LlmSearchDoc) {
+        let node_id = doc.node_id;
+        if let Some(quantized) = self.stored_vector_encoding.quantize(&doc.embedding) {
+            self.quantized_llm_docs.insert(node_id, quantized);
+        } else {
+            self.quantized_llm_docs.remove(&node_id);
+        }
+        self.llm_docs.insert(node_id, doc);
+    }
+
+    fn semantic_scores(
+        &self,
+        query_embedding: &[f32],
+        semantic_limit: usize,
+    ) -> Vec<(NodeId, f32)> {
+        if semantic_limit == 0 {
+            return Vec::new();
+        }
+
+        let mut scored = if self.stored_vector_encoding == StoredVectorEncoding::Float32 {
+            self.llm_docs
+                .values()
+                .map(|doc| {
+                    let cosine = cosine_similarity(query_embedding, &doc.embedding);
+                    (doc.node_id, semantic_score_from_cosine(cosine))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            let mut approximate = self
+                .llm_docs
+                .values()
+                .map(|doc| {
+                    let cosine = self
+                        .quantized_llm_docs
+                        .get(&doc.node_id)
+                        .map(|embedding| embedding.approximate_cosine(query_embedding))
+                        .unwrap_or_else(|| cosine_similarity(query_embedding, &doc.embedding));
+                    (doc.node_id, cosine)
+                })
+                .collect::<Vec<_>>();
+            let rescore_limit = semantic_limit
+                .saturating_mul(SEMANTIC_QUANTIZED_RESCORE_MULTIPLIER)
+                .max(semantic_limit)
+                .min(self.llm_docs.len());
+            truncate_node_scores(&mut approximate, rescore_limit);
+            approximate
+                .into_iter()
+                .take(rescore_limit)
+                .filter_map(|(node_id, _)| {
+                    self.llm_docs.get(&node_id).map(|doc| {
+                        let cosine = cosine_similarity(query_embedding, &doc.embedding);
+                        (node_id, semantic_score_from_cosine(cosine))
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        truncate_node_scores(&mut scored, semantic_limit);
+        scored
     }
 
     pub fn index_nodes(&mut self, nodes: Vec<(NodeId, String)>) -> Result<()> {
@@ -1591,19 +1805,11 @@ impl SearchEngine {
             .map(|(node_id, score)| (node_id, (score / lexical_max).clamp(0.0, 1.0)))
             .collect::<HashMap<_, _>>();
 
-        let mut semantic_scored = self
-            .llm_docs
-            .values()
-            .map(|doc| {
-                let cosine = cosine_similarity(&query_embedding, &doc.embedding);
-                (doc.node_id, ((cosine + 1.0) * 0.5).clamp(0.0, 1.0))
-            })
-            .collect::<Vec<_>>();
-        semantic_scored.sort_by(|left, right| right.1.total_cmp(&left.1));
-
+        let semantic_scored = self.semantic_scores(&query_embedding, config.semantic_limit);
         let semantic_map = semantic_scored
-            .into_iter()
+            .iter()
             .take(config.semantic_limit)
+            .copied()
             .collect::<HashMap<_, _>>();
 
         let mut candidate_ids = HashSet::new();
@@ -1663,6 +1869,8 @@ impl SearchEngine {
 
         self.symbols.retain(|(_, id)| !remove_ids.contains(&id.0));
         self.llm_docs.retain(|id, _| !remove_ids.contains(&id.0));
+        self.quantized_llm_docs
+            .retain(|id, _| !remove_ids.contains(&id.0));
 
         let mut index_writer: IndexWriter<TantivyDocument> =
             self.index.writer(SEARCH_WRITER_HEAP_BYTES)?;
@@ -1812,6 +2020,30 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         .zip(b.iter())
         .map(|(left, right)| left * right)
         .sum()
+}
+
+fn semantic_score_from_cosine(cosine: f32) -> f32 {
+    ((cosine + 1.0) * 0.5).clamp(0.0, 1.0)
+}
+
+fn compare_node_scores_desc(left: &(NodeId, f32), right: &(NodeId, f32)) -> std::cmp::Ordering {
+    right
+        .1
+        .total_cmp(&left.1)
+        .then_with(|| left.0.cmp(&right.0))
+}
+
+fn truncate_node_scores(scored: &mut Vec<(NodeId, f32)>, limit: usize) {
+    if limit == 0 {
+        scored.clear();
+        return;
+    }
+    if scored.len() > limit {
+        let pivot = limit - 1;
+        scored.select_nth_unstable_by(pivot, compare_node_scores_desc);
+        scored.truncate(limit);
+    }
+    scored.sort_by(compare_node_scores_desc);
 }
 
 #[cfg(test)]
@@ -2205,6 +2437,119 @@ mod tests {
 
         assert!(!hits.is_empty());
         assert_eq!(hits[0].node_id, NodeId(10));
+        Ok(())
+    }
+
+    #[test]
+    fn test_hybrid_search_quantized_prefilter_rescores_full_precision() -> Result<()> {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = EnvGuard::set(STORED_VECTOR_ENCODING_ENV, "int8");
+
+        let mut engine = SearchEngine::new(None)?;
+        assert_eq!(engine.stored_vector_encoding, StoredVectorEncoding::Int8);
+        engine.index_nodes(vec![
+            (NodeId(20), "auth_policy".to_string()),
+            (NodeId(21), "theme_tokens".to_string()),
+        ])?;
+        engine.set_embedding_runtime(EmbeddingRuntime::test_runtime());
+        engine.index_llm_symbol_docs(vec![
+            LlmSearchDoc {
+                node_id: NodeId(20),
+                doc_text: "authorization policy permission validation".to_string(),
+                embedding: embed_text_with_hash_projection(
+                    "authorization policy permission validation",
+                    EMBEDDING_DIM,
+                ),
+            },
+            LlmSearchDoc {
+                node_id: NodeId(21),
+                doc_text: "visual theme color token spacing".to_string(),
+                embedding: embed_text_with_hash_projection(
+                    "visual theme color token spacing",
+                    EMBEDDING_DIM,
+                ),
+            },
+        ]);
+
+        assert_eq!(engine.quantized_llm_docs.len(), 2);
+        let hits = engine.search_hybrid_with_scores(
+            "permission validation",
+            &HashMap::new(),
+            HybridSearchConfig {
+                max_results: 5,
+                lexical_weight: 0.0,
+                semantic_weight: 1.0,
+                graph_weight: 0.0,
+                lexical_limit: 1,
+                semantic_limit: 5,
+            },
+        )?;
+
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].node_id, NodeId(20));
+        Ok(())
+    }
+
+    #[test]
+    fn test_float32_semantic_scores_return_bounded_top_candidates() -> Result<()> {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = EnvGuard::set(STORED_VECTOR_ENCODING_ENV, "float32");
+
+        fn axis_embedding(axis: usize) -> Vec<f32> {
+            let mut embedding = vec![0.0; EMBEDDING_DIM];
+            embedding[axis] = 1.0;
+            embedding
+        }
+
+        let mut engine = SearchEngine::new(None)?;
+        let docs = (0..8)
+            .map(|axis| LlmSearchDoc {
+                node_id: NodeId(20 + axis as i64),
+                doc_text: format!("doc {axis}"),
+                embedding: axis_embedding(axis),
+            })
+            .collect();
+        engine.index_llm_symbol_docs(docs);
+
+        let scored = engine.semantic_scores(&axis_embedding(0), 1);
+
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].0, NodeId(20));
+        assert!(engine.semantic_scores(&axis_embedding(0), 0).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_quantized_semantic_scores_return_bounded_top_candidates() -> Result<()> {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = EnvGuard::set(STORED_VECTOR_ENCODING_ENV, "int8");
+
+        fn axis_embedding(axis: usize) -> Vec<f32> {
+            let mut embedding = vec![0.0; EMBEDDING_DIM];
+            embedding[axis] = 1.0;
+            embedding
+        }
+
+        let mut engine = SearchEngine::new(None)?;
+        let docs = (0..8)
+            .map(|axis| LlmSearchDoc {
+                node_id: NodeId(20 + axis as i64),
+                doc_text: format!("doc {axis}"),
+                embedding: axis_embedding(axis),
+            })
+            .collect();
+        engine.index_llm_symbol_docs(docs);
+
+        let scored = engine.semantic_scores(&axis_embedding(0), 1);
+
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].0, NodeId(20));
         Ok(())
     }
 }

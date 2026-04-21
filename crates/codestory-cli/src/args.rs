@@ -335,6 +335,18 @@ pub(crate) struct SearchCommand {
         help = "Override the graph component weight for hybrid search research runs."
     )]
     pub(crate) hybrid_graph: Option<f32>,
+    #[arg(
+        long = "hybrid-lexical-limit",
+        value_name = "N",
+        help = "Override the lexical candidate limit for hybrid search research runs."
+    )]
+    pub(crate) hybrid_lexical_limit: Option<u32>,
+    #[arg(
+        long = "hybrid-semantic-limit",
+        value_name = "N",
+        help = "Override the semantic candidate limit for hybrid search research runs."
+    )]
+    pub(crate) hybrid_semantic_limit: Option<u32>,
 }
 
 #[derive(Args, Debug, Clone)]

@@ -66,6 +66,8 @@ pub struct SearchRequest {
     pub limit_per_source: u32,
     #[serde(default)]
     pub hybrid_weights: Option<AgentHybridWeightsDto>,
+    #[serde(default)]
+    pub hybrid_limits: Option<SearchHybridLimitsDto>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -655,6 +657,14 @@ pub struct AgentHybridWeightsDto {
     pub semantic: Option<f32>,
     #[serde(default)]
     pub graph: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Default)]
+pub struct SearchHybridLimitsDto {
+    #[serde(default)]
+    pub lexical: Option<u32>,
+    #[serde(default)]
+    pub semantic: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

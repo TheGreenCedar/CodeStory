@@ -128,6 +128,7 @@ pub(crate) fn resolve_target(
                         repo_text: SearchRepoTextMode::Off,
                         limit_per_source: 50,
                         hybrid_weights: None,
+                        hybrid_limits: None,
                     },
                     None,
                     Some(50),

@@ -5,8 +5,8 @@ use codestory_contracts::api::{
     AgentAskRequest, AgentConnectionSettingsDto, AgentHybridWeightsDto, AgentResponseModeDto,
     AppEventPayload, GraphArtifactDto, GroundingBudgetDto, IndexMode, LayoutDirection,
     ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeId, RetrievalScoreBreakdownDto,
-    SearchHit, SearchRepoTextMode, SearchRequest, SnippetContextDto, SymbolContextDto,
-    TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection, TrailMode,
+    SearchHit, SearchHybridLimitsDto, SearchRepoTextMode, SearchRequest, SnippetContextDto,
+    SymbolContextDto, TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection, TrailMode,
 };
 use codestory_contracts::query::GraphQueryOperation;
 use std::{
@@ -79,6 +79,10 @@ fn hybrid_weights(
         semantic,
         graph,
     })
+}
+
+fn hybrid_limits(lexical: Option<u32>, semantic: Option<u32>) -> Option<SearchHybridLimitsDto> {
+    (lexical.is_some() || semantic.is_some()).then_some(SearchHybridLimitsDto { lexical, semantic })
 }
 
 fn main() -> Result<()> {
@@ -358,6 +362,7 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "search")?;
     let hybrid_weights = hybrid_weights(cmd.hybrid_lexical, cmd.hybrid_semantic, cmd.hybrid_graph);
+    let hybrid_limits = hybrid_limits(cmd.hybrid_lexical_limit, cmd.hybrid_semantic_limit);
 
     let search_results = runtime
         .search
@@ -366,6 +371,7 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
             repo_text: to_api_repo_text_mode(cmd.repo_text),
             limit_per_source: cmd.limit.clamp(1, 50),
             hybrid_weights,
+            hybrid_limits,
         })
         .map_err(map_api_error)?;
     let output = build_search_output(
@@ -548,6 +554,7 @@ fn run_query(cmd: QueryCommand) -> Result<()> {
                         repo_text: SearchRepoTextMode::Off,
                         limit_per_source: 50,
                         hybrid_weights: None,
+                        hybrid_limits: None,
                     })
                     .map_err(map_api_error)?;
                 items = results
@@ -747,8 +754,17 @@ fn build_doctor_output(
 
     let environment = [
         "CODESTORY_EMBED_PROFILE",
+        "CODESTORY_EMBED_BACKEND",
         "CODESTORY_EMBED_MODEL_PATH",
         "CODESTORY_EMBED_RUNTIME_MODE",
+        "CODESTORY_EMBED_EXECUTION_PROVIDER",
+        "CODESTORY_EMBED_SESSION_COUNT",
+        "CODESTORY_EMBED_INTRA_THREADS",
+        "CODESTORY_EMBED_INTER_THREADS",
+        "CODESTORY_EMBED_PARALLEL_EXECUTION",
+        "CODESTORY_EMBED_LLAMACPP_URL",
+        "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT",
+        "CODESTORY_STORED_VECTOR_ENCODING",
         "CODESTORY_HYBRID_RETRIEVAL_ENABLED",
         "CODESTORY_SEMANTIC_DOC_ALIAS_MODE",
     ]
@@ -1258,6 +1274,7 @@ fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Resul
                     repo_text: SearchRepoTextMode::Auto,
                     limit_per_source: 10,
                     hybrid_weights: None,
+                    hybrid_limits: None,
                 })
                 .map_err(map_api_error)?;
             write_http_json(&mut stream, 200, &results)
@@ -1512,6 +1529,7 @@ fn handle_stdio_search(runtime: &RuntimeContext, query: String) -> serde_json::V
             repo_text: SearchRepoTextMode::Auto,
             limit_per_source: 10,
             hybrid_weights: None,
+            hybrid_limits: None,
         })
         .map(|result| serde_json::json!({"result": result}))
         .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))

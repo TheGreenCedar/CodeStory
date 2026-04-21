@@ -67,9 +67,9 @@ pub use services::{
 };
 pub(crate) use support::{
     FocusedSourceContext, HYBRID_RETRIEVAL_ENABLED_ENV, LocalAgentResponse,
-    aggregate_symbol_matches, build_local_agent_prompt, clamp_i64_to_u32, clamp_u64_to_u32,
-    clamp_u128_to_u32, clamp_usize_to_u32, extract_symbol_search_terms, file_text_match_line,
-    hybrid_retrieval_enabled, looks_like_repo_text_query, node_display_name,
+    aggregate_symbol_matches, apply_hybrid_limits, build_local_agent_prompt, clamp_i64_to_u32,
+    clamp_u64_to_u32, clamp_u128_to_u32, clamp_usize_to_u32, extract_symbol_search_terms,
+    file_text_match_line, hybrid_retrieval_enabled, looks_like_repo_text_query, node_display_name,
     normalized_hybrid_weights, preferred_occurrence, read_searchable_file_contents,
     should_expand_symbol_query, truncate_for_diagnostic,
 };
@@ -770,6 +770,7 @@ const LLM_DOC_EMBED_BATCH_SIZE: usize = 128;
 const LLM_DOC_EMBED_BATCH_SIZE_ENV: &str = "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE";
 const SEMANTIC_DOC_SCOPE_ENV: &str = "CODESTORY_SEMANTIC_DOC_SCOPE";
 const SEMANTIC_DOC_ALIAS_MODE_ENV: &str = "CODESTORY_SEMANTIC_DOC_ALIAS_MODE";
+const SEMANTIC_DOC_MAX_TOKENS_ENV: &str = "CODESTORY_SEMANTIC_DOC_MAX_TOKENS";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SemanticDocScope {
@@ -1052,6 +1053,14 @@ fn semantic_doc_alias_mode_from_value(value: &str) -> SemanticDocAliasMode {
     }
 }
 
+fn semantic_doc_max_tokens_from_env() -> Option<usize> {
+    std::env::var(SEMANTIC_DOC_MAX_TOKENS_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.clamp(16, 8_192))
+}
+
 fn llm_indexable_kind_for_scope(
     kind: codestory_contracts::graph::NodeKind,
     scope: SemanticDocScope,
@@ -1169,6 +1178,50 @@ fn compact_doc_lines(lines: impl Iterator<Item = String>, limit: usize) -> Vec<S
         .filter(|line| !line.is_empty())
         .take(limit)
         .collect()
+}
+
+fn semantic_doc_budget_cost(token: &str) -> usize {
+    token.chars().count().div_ceil(3).max(1)
+}
+
+#[cfg(test)]
+fn semantic_doc_text_budget_cost(doc_text: &str) -> usize {
+    doc_text
+        .split_whitespace()
+        .map(semantic_doc_budget_cost)
+        .sum()
+}
+
+fn truncate_semantic_doc_text_to_token_budget(doc_text: &str, max_tokens: usize) -> String {
+    let mut remaining = max_tokens;
+    let mut out = String::new();
+
+    'lines: for line in doc_text.lines() {
+        if remaining == 0 {
+            break;
+        }
+        let mut selected = Vec::new();
+        for token in line.split_whitespace() {
+            let cost = semantic_doc_budget_cost(token);
+            if cost > remaining {
+                break 'lines;
+            }
+            selected.push(token);
+            remaining -= cost;
+        }
+        if selected.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&selected.join(" "));
+    }
+
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
 }
 
 fn comment_block_before(lines: &[&str], start_idx: usize, limit: usize) -> Vec<String> {
@@ -1330,6 +1383,10 @@ fn build_llm_symbol_doc_text(
             let _ = write!(out, " {digest};");
         }
         out.push('\n');
+    }
+
+    if let Some(max_tokens) = semantic_doc_max_tokens_from_env() {
+        out = truncate_semantic_doc_text_to_token_budget(&out, max_tokens);
     }
 
     out
@@ -2542,6 +2599,7 @@ impl AppController {
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: req.limit_per_source,
                 hybrid_weights: req.hybrid_weights.clone(),
+                hybrid_limits: req.hybrid_limits.clone(),
             },
             None,
             limit_per_source,
@@ -2739,6 +2797,7 @@ impl AppController {
                 config.lexical_weight = lexical_weight;
                 config.semantic_weight = semantic_weight;
                 config.graph_weight = graph_weight;
+                apply_hybrid_limits(req.hybrid_limits.clone(), &mut config);
 
                 match engine.search_hybrid_with_scores(&req.query, &graph_boosts, config) {
                     Ok(value) => value,
@@ -3709,6 +3768,7 @@ mod tests {
                 EnvGuard::remove(EMBEDDING_TRUNCATE_DIM_ENV),
                 EnvGuard::remove(EMBEDDING_EXPECTED_DIM_ENV),
                 EnvGuard::remove(SEMANTIC_DOC_ALIAS_MODE_ENV),
+                EnvGuard::remove(SEMANTIC_DOC_MAX_TOKENS_ENV),
             ],
             _lock: lock,
         }
@@ -4035,6 +4095,58 @@ mod tests {
         drop(current);
     }
 
+    #[test]
+    fn semantic_doc_text_token_budget_is_opt_in_for_research() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _alias = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
+        let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "48");
+        let doc = semantic_doc_text_for_test(
+            "AppController::openProjectWithStoragePath",
+            Some("codestory_runtime::AppController::openProjectWithStoragePath"),
+            "crates/codestory-runtime/src/lib.rs",
+            NodeKind::METHOD,
+        );
+
+        assert!(
+            semantic_doc_text_budget_cost(&doc) <= 48,
+            "budgeted semantic doc should stay within the configured token budget:\n{doc}"
+        );
+        assert!(
+            doc.starts_with("semantic_doc_version:"),
+            "budgeted semantic doc should preserve the leading version field:\n{doc}"
+        );
+        assert!(
+            doc.contains("symbol: AppController::openProjectWithStoragePath"),
+            "budgeted semantic doc should preserve the symbol identity:\n{doc}"
+        );
+    }
+
+    #[test]
+    fn semantic_doc_text_token_budget_charges_long_identifiers() {
+        let doc = concat!(
+            "semantic_doc_version: 1\n",
+            "symbol: AppController::openProjectWithStoragePath\n",
+            "path_aliases: crates codestory runtime src lib rs app controller open project ",
+            "storage path AppControllerOpenProjectWithStoragePathRepeatedRepeated\n",
+        );
+        let truncated = truncate_semantic_doc_text_to_token_budget(doc, 36);
+
+        assert!(
+            semantic_doc_text_budget_cost(&truncated) <= 36,
+            "budgeted semantic doc should stay under the conservative token proxy:\n{truncated}"
+        );
+        assert!(
+            truncated.split_whitespace().count() < doc.split_whitespace().count(),
+            "long identifier-heavy docs should be truncated earlier than whitespace counts alone"
+        );
+        assert!(
+            truncated.contains("symbol: AppController::openProjectWithStoragePath"),
+            "budgeted semantic doc should retain leading symbol identity:\n{truncated}"
+        );
+    }
+
     fn copy_tictactoe_workspace() -> tempfile::TempDir {
         let temp = tempdir().expect("create temp dir");
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -4274,6 +4386,7 @@ pub fn exact_symbol_anchor() {{}}
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 10,
                 hybrid_weights: None,
+                hybrid_limits: None,
             })
             .expect("search");
 
@@ -4345,6 +4458,7 @@ pub fn exact_symbol_anchor() {{}}
                     repo_text: SearchRepoTextMode::Off,
                     limit_per_source: 10,
                     hybrid_weights: None,
+                    hybrid_limits: None,
                 })
                 .expect("search fixtures");
             let first = hits.first().expect("at least one hit");
@@ -4394,6 +4508,7 @@ pub fn exact_symbol_anchor() {{}}
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 20,
                 hybrid_weights: None,
+                hybrid_limits: None,
             })
             .expect("search with natural language");
 
@@ -4754,6 +4869,7 @@ pub fn exact_symbol_anchor() {{}}
                 repo_text: SearchRepoTextMode::On,
                 limit_per_source: 5,
                 hybrid_weights: None,
+                hybrid_limits: None,
             })
             .expect("search results");
 
@@ -5025,6 +5141,7 @@ pub fn exact_symbol_anchor() {{}}
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 10,
                 hybrid_weights: None,
+                hybrid_limits: None,
             })
             .expect_err("search should be blocked while indexing");
 
@@ -5051,6 +5168,7 @@ pub fn exact_symbol_anchor() {{}}
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 10,
                 hybrid_weights: None,
+                hybrid_limits: None,
             })
             .expect("lazy search should succeed");
 
@@ -5128,6 +5246,21 @@ pub fn exact_symbol_anchor() {{}}
         assert!((lexical - fallback.lexical_weight).abs() < 1e-6);
         assert!((semantic - fallback.semantic_weight).abs() < 1e-6);
         assert!((graph - fallback.graph_weight).abs() < 1e-6);
+    }
+
+    #[test]
+    fn apply_hybrid_limits_overrides_and_caps_values() {
+        let mut config = HybridSearchConfig::default();
+        apply_hybrid_limits(
+            Some(codestory_contracts::api::SearchHybridLimitsDto {
+                lexical: Some(0),
+                semantic: Some(5_000),
+            }),
+            &mut config,
+        );
+
+        assert_eq!(config.lexical_limit, 0);
+        assert_eq!(config.semantic_limit, 1_000);
     }
 
     #[test]

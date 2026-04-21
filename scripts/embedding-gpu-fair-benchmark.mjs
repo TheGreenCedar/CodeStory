@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -15,6 +16,9 @@ const outDir =
   process.env.CODESTORY_EMBED_RESEARCH_OUT_DIR ??
   process.env.CODESTORY_FAIR_BENCH_OUT_DIR ??
   path.join(root, "target/embedding-research", stamp);
+const cacheReplayFrom = process.env.CODESTORY_EMBED_RESEARCH_CACHE_FROM
+  ? path.resolve(process.env.CODESTORY_EMBED_RESEARCH_CACHE_FROM)
+  : "";
 
 const requestedStages = new Set(
   (process.env.CODESTORY_EMBED_RESEARCH_STAGE ?? "smoke")
@@ -43,13 +47,7 @@ const selectedQueryBuckets = new Set(
 const queryLimit = parsePositiveIntEnv("CODESTORY_EMBED_RESEARCH_QUERY_LIMIT");
 const portBase = Number(process.env.CODESTORY_EMBED_RESEARCH_PORT_BASE ?? 8170);
 
-const blockedCandidates = [
-  {
-    id: "llama-nomic-v2",
-    reason:
-      "blocked until semantic docs have a token-aware budget; previous alias docs exceeded llama.cpp's 512-token cap",
-  },
-];
+const blockedCandidates = [];
 
 const researchSources = [
   {
@@ -92,13 +90,19 @@ const researchSources = [
     id: "nomic-v2-moe",
     url: "https://huggingface.co/nomic-ai/nomic-embed-text-v2-moe",
     claim:
-      "Nomic v2 MoE remains a candidate only after CodeStory can enforce a semantic-doc token budget compatible with its context limits.",
+      "Nomic v2 MoE documents required search_query/search_document prefixes, a 512-token maximum input length, and Matryoshka truncation such as 256-dimensional embeddings.",
   },
   {
     id: "qwen3-embedding-06b",
     url: "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B",
     claim:
-      "Qwen3 0.6B remains a quality experiment candidate; CodeStory should not assume Matryoshka support unless the model card or implementation proves it.",
+      "Qwen3 0.6B documents 32k context, 1024-dimensional embeddings, MRL support, and user-defined output dimensions from 32 to 1024.",
+  },
+  {
+    id: "embeddinggemma-300m-mrl",
+    url: "https://huggingface.co/google/embeddinggemma-300m",
+    claim:
+      "EmbeddingGemma documents 768-dimensional output with Matryoshka options at 512, 256, and 128 dimensions after truncation and renormalization.",
   },
 ];
 
@@ -557,6 +561,10 @@ const modelPaths = {
     root,
     "models/gguf/nomic-embed-text-v1.5/nomic-embed-text-v1.5.Q8_0.gguf",
   ),
+  nomicV2Gguf: path.join(
+    root,
+    "models/gguf/nomic-embed-text-v2-moe/nomic-embed-text-v2-moe.Q8_0.gguf",
+  ),
   nomicV15GgufQ6: path.join(
     root,
     "models/gguf/nomic-embed-text-v1.5/nomic-embed-text-v1.5.Q6_K.gguf",
@@ -623,6 +631,16 @@ const baseProfiles = {
     modelPaths.nomicV15Gguf,
     "mean",
   ),
+  llamaNomicV2: {
+    ...llamaBase(
+      "llama-nomic-v2",
+      "nomic-embed-text-v2-moe",
+      modelPaths.nomicV2Gguf,
+      "mean",
+      512,
+    ),
+    maxTokens: 512,
+  },
   llamaGemma: llamaBase("llama-gemma", "embeddinggemma-300m", modelPaths.gemmaGguf, "mean"),
   llamaQwen: {
     ...llamaBase("llama-qwen", "qwen3-embedding-0.6b", modelPaths.qwenGguf, "last", 8192),
@@ -692,9 +710,17 @@ function caseId(config) {
   if (config.truncateDim !== undefined) {
     parts.push(`dim${config.truncateDim}`);
   }
+  if (config.semanticDocMaxTokens !== undefined) {
+    parts.push(`doc-tok${config.semanticDocMaxTokens}`);
+  }
   if (config.hybridWeights) {
     parts.push(
       `w${config.hybridWeights.lexical}-${config.hybridWeights.semantic}-${config.hybridWeights.graph}`,
+    );
+  }
+  if (config.hybridLimits) {
+    parts.push(
+      `lim-l${config.hybridLimits.lexical ?? "d"}-s${config.hybridLimits.semantic ?? "d"}`,
     );
   }
   if (config.repeatIndex !== undefined) {
@@ -706,6 +732,15 @@ function caseId(config) {
     .replaceAll(/[^a-zA-Z0-9._-]+/g, "-")
     .replaceAll(/-+/g, "-")
     .toLowerCase();
+}
+
+function artifactCaseDirName(caseIdValue) {
+  if (caseIdValue.length <= 56) {
+    return caseIdValue;
+  }
+  const hash = crypto.createHash("sha1").update(caseIdValue).digest("hex").slice(0, 10);
+  const prefix = caseIdValue.slice(0, 44).replaceAll(/[-.]+$/g, "");
+  return `${prefix}-${hash}`;
 }
 
 function stageSmoke() {
@@ -775,10 +810,15 @@ function stageAlias() {
 }
 
 function stageWeightQuant() {
+  const bgeBaseLlamaLeader = cloneCase(baseProfiles.llamaBgeBase, {
+    requests: 4,
+    parallel: 4,
+  });
   const llamaRows = [
-    [baseProfiles.llamaBgeBase, modelPaths.bgeBaseGgufQ6, "q6_k"],
-    [baseProfiles.llamaBgeBase, modelPaths.bgeBaseGgufQ5, "q5_k_m"],
-    [baseProfiles.llamaBgeBase, modelPaths.bgeBaseGgufQ4, "q4_k_m"],
+    [bgeBaseLlamaLeader, modelPaths.bgeBaseGgufQ6, "q6_k"],
+    [bgeBaseLlamaLeader, modelPaths.bgeBaseGgufQ5, "q5_k_m"],
+    [bgeBaseLlamaLeader, modelPaths.bgeBaseGgufQ4, "q4_k_m"],
+    [baseProfiles.llamaBgeSmall, modelPaths.bgeSmallGguf, "q8_0"],
     [baseProfiles.llamaBgeSmall, modelPaths.bgeSmallGgufQ6, "q6_k"],
     [baseProfiles.llamaBgeSmall, modelPaths.bgeSmallGgufQ5, "q5_k_m"],
     [baseProfiles.llamaBgeSmall, modelPaths.bgeSmallGgufQ4, "q4_k_m"],
@@ -800,16 +840,29 @@ function stageWeightQuant() {
 
   const onnxRows = [
     [baseProfiles.onnxBgeSmall, modelPaths.bgeSmallOnnxInt8, "int8-dynamic"],
+    [
+      baseProfiles.onnxBgeSmall,
+      modelPaths.bgeSmallOnnxInt8,
+      "int8-dynamic",
+      {
+        variant: "fast-profile",
+        docMode: "no_alias",
+        semanticScope: "all",
+        batch: 256,
+        sessions: 2,
+      },
+    ],
     [baseProfiles.onnxBgeBase, modelPaths.bgeBaseOnnxInt8, "int8-dynamic"],
     [baseProfiles.onnxBgeSmall, modelPaths.bgeSmallOnnxInt4, "int4-weight-only"],
     [baseProfiles.onnxBgeBase, modelPaths.bgeBaseOnnxInt4, "int4-weight-only"],
-  ].map(([base, modelPath, quantization]) =>
+  ].map(([base, modelPath, quantization, overrides = {}]) =>
     cloneCase(base, {
       stage: "weight-quant",
       modelPath,
       quantization,
       variant: "onnx",
       allowMissingArtifact: true,
+      ...overrides,
     }),
   );
 
@@ -817,15 +870,25 @@ function stageWeightQuant() {
 }
 
 function stageVectorQuant() {
-  return ["float16", "int8", "uint8", "binary", "ubinary"].map((vectorEncoding) =>
-    cloneCase(baseProfiles.onnxBgeSmall, {
+  const winnerShape = {
+    docMode: "no_alias",
+    semanticScope: "all",
+    batch: 256,
+    sessions: 2,
+  };
+  return ["float32", "float16", "int8", "uint8", "binary", "ubinary"].map((vectorEncoding) => {
+    const config = cloneCase(baseProfiles.onnxBgeSmall, {
       stage: "vector-quant",
-      variant: `stored-${vectorEncoding}`,
+      variant: vectorEncoding === "float32" ? "winner-float32-control" : `winner-stored-${vectorEncoding}`,
       vectorEncoding,
-      skipReason:
-        "CodeStory does not yet have a quantized-vector storage/search implementation; this source-led lane is manifest-only until that lands.",
-    }),
-  );
+      ...winnerShape,
+    });
+    if (vectorEncoding === "float16") {
+      config.skipReason =
+        "CodeStory does not yet have a float16 stored-vector implementation; int8/uint8/binary/ubinary are benchmarkable through the quantized prefilter path.";
+    }
+    return config;
+  });
 }
 
 function stageDimension() {
@@ -840,6 +903,46 @@ function stageDimension() {
     }),
   );
 
+  const gemmaDims = [768, 512, 256, 128].map((dimension) =>
+    cloneCase(baseProfiles.llamaGemma, {
+      stage: "dimension",
+      variant: `gemma-dim-${dimension}`,
+      truncateDim: dimension,
+      expectedDim: dimension,
+      vectorEncoding: "float32",
+      docMode: "no_alias",
+    }),
+  );
+
+  const qwenDims = [1024, 512, 256, 128].map((dimension) =>
+    cloneCase(baseProfiles.llamaQwen, {
+      stage: "dimension",
+      variant: `qwen-dim-${dimension}`,
+      truncateDim: dimension,
+      expectedDim: dimension,
+      vectorEncoding: "float32",
+      docMode: "alias_variant",
+      ctx: 2048,
+      maxTokens: 2048,
+      requests: 1,
+      parallel: 1,
+    }),
+  );
+
+  const nomicV2Dims = [768, 256].map((dimension) =>
+    cloneCase(baseProfiles.llamaNomicV2, {
+      stage: "dimension",
+      variant: `nomic-v2-dim-${dimension}`,
+      truncateDim: dimension,
+      expectedDim: dimension,
+      vectorEncoding: "float32",
+      docMode: "current_alias",
+      semanticDocMaxTokens: 320,
+      requests: 1,
+      parallel: 1,
+    }),
+  );
+
   const negativeControls = [384, 256].map((dimension) =>
     cloneCase(baseProfiles.onnxBgeSmall, {
       stage: "dimension",
@@ -851,7 +954,7 @@ function stageDimension() {
     }),
   );
 
-  return [...nomicDims, ...negativeControls];
+  return [...nomicDims, ...gemmaDims, ...qwenDims, ...nomicV2Dims, ...negativeControls];
 }
 
 function stageRetrieval() {
@@ -892,8 +995,7 @@ function stageRetrieval() {
     cloneCase(baseProfiles.llamaNomicV15, {
       stage: "retrieval",
       variant: "nomic-v2-token-budget-needed",
-      id: "llama-nomic-v2",
-      profile: "nomic-embed-text-v2-moe",
+      ...baseProfiles.llamaNomicV2,
       docMode: "current_alias",
       skipReason:
         "Blocked until semantic docs expose a hard token budget; previous alias docs exceeded the model context limit.",
@@ -1082,10 +1184,504 @@ function stageFinalistsRun2() {
         docMode: "alias_variant",
         semanticScope: "all",
       }),
+      cloneCase(baseProfiles.onnxBgeBase, {
+        variant: "best-prior-quality-pure-semantic-lex0-slim9",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        hybridWeights: { lexical: 0, semantic: 1, graph: 0 },
+        hybridLimits: { lexical: 0, semantic: 9 },
+      }),
       cloneCase(baseProfiles.llamaBgeBase, {
         variant: "best-prior-throughput",
         docMode: "alias_variant",
         semanticScope: "all",
+        requests: 4,
+        parallel: 4,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-current-alias",
+        docMode: "current_alias",
+        semanticScope: "all",
+        requests: 4,
+        parallel: 4,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-no-alias",
+        docMode: "no_alias",
+        semanticScope: "all",
+        requests: 4,
+        parallel: 4,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b128-r5",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 128,
+        requests: 5,
+        parallel: 5,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b256-r5",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 256,
+        requests: 5,
+        parallel: 5,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b384-r4",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 384,
+        requests: 4,
+        parallel: 4,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-balanced-weights",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0.45, semantic: 0.45, graph: 0.1 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-semantic-heavy",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0.2, semantic: 0.7, graph: 0.1 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-semantic-65",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0.25, semantic: 0.65, graph: 0.1 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-semantic-65-slim80",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0.25, semantic: 0.65, graph: 0.1 },
+        hybridLimits: { semantic: 80 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-semantic-65-slim60",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0.25, semantic: 0.65, graph: 0.1 },
+        hybridLimits: { semantic: 60 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-semantic-65-slim40",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0.25, semantic: 0.65, graph: 0.1 },
+        hybridLimits: { semantic: 40 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-semantic-65-lex40",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0.25, semantic: 0.65, graph: 0.1 },
+        hybridLimits: { lexical: 40 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-semantic-65-lex20",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0.25, semantic: 0.65, graph: 0.1 },
+        hybridLimits: { lexical: 20 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-semantic-65-lex0",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0.25, semantic: 0.65, graph: 0.1 },
+        hybridLimits: { lexical: 0 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-semantic-only-87-lex0",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0, semantic: 0.867, graph: 0.133 },
+        hybridLimits: { lexical: 0 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-semantic-only-90-lex0",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0, semantic: 0.9, graph: 0.1 },
+        hybridLimits: { lexical: 0 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-pure-semantic-lex0",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0, semantic: 1, graph: 0 },
+        hybridLimits: { lexical: 0 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-pure-semantic-lex0-slim20",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0, semantic: 1, graph: 0 },
+        hybridLimits: { lexical: 0, semantic: 20 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-pure-semantic-lex0-slim10",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0, semantic: 1, graph: 0 },
+        hybridLimits: { lexical: 0, semantic: 10 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-pure-semantic-lex0-slim9",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0, semantic: 1, graph: 0 },
+        hybridLimits: { lexical: 0, semantic: 9 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-pure-semantic-lex0-slim8",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0, semantic: 1, graph: 0 },
+        hybridLimits: { lexical: 0, semantic: 8 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-semantic95-lex5-slim8",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0.05, semantic: 0.95, graph: 0 },
+        hybridLimits: { lexical: 20, semantic: 8 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-pure-semantic-lex0-slim6",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0, semantic: 1, graph: 0 },
+        hybridLimits: { lexical: 0, semantic: 6 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-pure-semantic-lex0-slim5",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0, semantic: 1, graph: 0 },
+        hybridLimits: { lexical: 0, semantic: 5 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-semantic-60",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0.3, semantic: 0.6, graph: 0.1 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-semantic-625",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0.275, semantic: 0.625, graph: 0.1 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-semantic-75",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0.15, semantic: 0.75, graph: 0.1 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-graph-heavy",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0.3, semantic: 0.5, graph: 0.2 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-q5-b512-r4",
+        modelPath: modelPaths.bgeBaseGgufQ5,
+        quantization: "q5_k_m",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        allowMissingArtifact: true,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-q5-b512-r4-pure-semantic-lex0-slim9",
+        modelPath: modelPaths.bgeBaseGgufQ5,
+        quantization: "q5_k_m",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0, semantic: 1, graph: 0 },
+        hybridLimits: { lexical: 0, semantic: 9 },
+        allowMissingArtifact: true,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-q5-b512-r4-ub1024-pure-semantic-lex0-slim9",
+        modelPath: modelPaths.bgeBaseGgufQ5,
+        quantization: "q5_k_m",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        serverUbatch: 1024,
+        hybridWeights: { lexical: 0, semantic: 1, graph: 0 },
+        hybridLimits: { lexical: 0, semantic: 9 },
+        allowMissingArtifact: true,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-q5-b512-r4-ub1024-pure-semantic-lex0-slim8",
+        modelPath: modelPaths.bgeBaseGgufQ5,
+        quantization: "q5_k_m",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        serverUbatch: 1024,
+        hybridWeights: { lexical: 0, semantic: 1, graph: 0 },
+        hybridLimits: { lexical: 0, semantic: 8 },
+        allowMissingArtifact: true,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-q5-b512-r4-ub1024-semantic90-lex5-graph5-slim8",
+        modelPath: modelPaths.bgeBaseGgufQ5,
+        quantization: "q5_k_m",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        serverUbatch: 1024,
+        hybridWeights: { lexical: 0.05, semantic: 0.9, graph: 0.05 },
+        hybridLimits: { lexical: 20, semantic: 8 },
+        allowMissingArtifact: true,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-q5-b512-r4-ub1024-semantic95-lex5-slim8",
+        modelPath: modelPaths.bgeBaseGgufQ5,
+        quantization: "q5_k_m",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        serverUbatch: 1024,
+        hybridWeights: { lexical: 0.05, semantic: 0.95, graph: 0 },
+        hybridLimits: { lexical: 20, semantic: 8 },
+        allowMissingArtifact: true,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-q5-b512-r4-ub1024-semantic99-lex1-slim8",
+        modelPath: modelPaths.bgeBaseGgufQ5,
+        quantization: "q5_k_m",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        serverUbatch: 1024,
+        hybridWeights: { lexical: 0.01, semantic: 0.99, graph: 0 },
+        hybridLimits: { lexical: 20, semantic: 8 },
+        allowMissingArtifact: true,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-q5-b512-r4-ub1024-semantic995-lex0p5-slim8",
+        modelPath: modelPaths.bgeBaseGgufQ5,
+        quantization: "q5_k_m",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        serverUbatch: 1024,
+        hybridWeights: { lexical: 0.005, semantic: 0.995, graph: 0 },
+        hybridLimits: { lexical: 20, semantic: 8 },
+        allowMissingArtifact: true,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-q5-b512-r4-ub1024-semantic999-lex0p1-slim8",
+        modelPath: modelPaths.bgeBaseGgufQ5,
+        quantization: "q5_k_m",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        serverUbatch: 1024,
+        hybridWeights: { lexical: 0.001, semantic: 0.999, graph: 0 },
+        hybridLimits: { lexical: 20, semantic: 8 },
+        allowMissingArtifact: true,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-q5-b512-r4-ub1024-semantic9999-lex0p01-slim8",
+        modelPath: modelPaths.bgeBaseGgufQ5,
+        quantization: "q5_k_m",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        serverUbatch: 1024,
+        hybridWeights: { lexical: 0.0001, semantic: 0.9999, graph: 0 },
+        hybridLimits: { lexical: 20, semantic: 8 },
+        allowMissingArtifact: true,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-q5-b512-r4-semantic99-lex1-slim8",
+        modelPath: modelPaths.bgeBaseGgufQ5,
+        quantization: "q5_k_m",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0.01, semantic: 0.99, graph: 0 },
+        hybridLimits: { lexical: 20, semantic: 8 },
+        allowMissingArtifact: true,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-q5-b512-r4-ub1024-semantic98-lex2-slim8",
+        modelPath: modelPaths.bgeBaseGgufQ5,
+        quantization: "q5_k_m",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        serverUbatch: 1024,
+        hybridWeights: { lexical: 0.02, semantic: 0.98, graph: 0 },
+        hybridLimits: { lexical: 20, semantic: 8 },
+        allowMissingArtifact: true,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-q5-b512-r4-ub1024-semantic95-graph5-slim8",
+        modelPath: modelPaths.bgeBaseGgufQ5,
+        quantization: "q5_k_m",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        serverUbatch: 1024,
+        hybridWeights: { lexical: 0, semantic: 0.95, graph: 0.05 },
+        hybridLimits: { lexical: 0, semantic: 8 },
+        allowMissingArtifact: true,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-q5-b512-r4-ub1024",
+        modelPath: modelPaths.bgeBaseGgufQ5,
+        quantization: "q5_k_m",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        serverUbatch: 1024,
+        allowMissingArtifact: true,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-q5-b512-r4-sb4096",
+        modelPath: modelPaths.bgeBaseGgufQ5,
+        quantization: "q5_k_m",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        serverBatch: 4096,
+        serverUbatch: 4096,
+        allowMissingArtifact: true,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b768-r4",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 768,
+        requests: 4,
+        parallel: 4,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b1024-r4",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 1024,
         requests: 4,
         parallel: 4,
       }),
@@ -1095,11 +1691,93 @@ function stageFinalistsRun2() {
         semanticScope: "all",
         batch: 256,
       }),
+      cloneCase(baseProfiles.onnxBgeSmall, {
+        variant: "fast-profile-pure-semantic-lex0",
+        docMode: "no_alias",
+        semanticScope: "all",
+        batch: 256,
+        hybridWeights: { lexical: 0, semantic: 1, graph: 0 },
+        hybridLimits: { lexical: 0 },
+      }),
+      cloneCase(baseProfiles.onnxBgeSmall, {
+        variant: "fast-profile-pure-semantic-lex0-slim9",
+        docMode: "no_alias",
+        semanticScope: "all",
+        batch: 256,
+        hybridWeights: { lexical: 0, semantic: 1, graph: 0 },
+        hybridLimits: { lexical: 0, semantic: 9 },
+      }),
+      cloneCase(baseProfiles.onnxBgeSmall, {
+        variant: "fast-profile-semantic95-lex5-slim8",
+        docMode: "no_alias",
+        semanticScope: "all",
+        batch: 256,
+        hybridWeights: { lexical: 0.05, semantic: 0.95, graph: 0 },
+        hybridLimits: { lexical: 20, semantic: 8 },
+      }),
+      cloneCase(baseProfiles.onnxBgeSmall, {
+        variant: "fast-profile-semantic99-lex1-slim8",
+        docMode: "no_alias",
+        semanticScope: "all",
+        batch: 256,
+        hybridWeights: { lexical: 0.01, semantic: 0.99, graph: 0 },
+        hybridLimits: { lexical: 20, semantic: 8 },
+      }),
+      cloneCase(baseProfiles.onnxBgeBase, {
+        variant: "onnx-semantic99-lex1-slim8",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 256,
+        sessions: 2,
+        hybridWeights: { lexical: 0.01, semantic: 0.99, graph: 0 },
+        hybridLimits: { lexical: 20, semantic: 8 },
+      }),
+      cloneCase(baseProfiles.onnxMiniLm, {
+        variant: "minilm-semantic95-lex5-slim8",
+        docMode: "no_alias",
+        semanticScope: "all",
+        batch: 256,
+        sessions: 2,
+        hybridWeights: { lexical: 0.05, semantic: 0.95, graph: 0 },
+        hybridLimits: { lexical: 20, semantic: 8 },
+      }),
+      cloneCase(baseProfiles.llamaGemma, {
+        variant: "gemma-semantic95-lex5-slim8",
+        docMode: "no_alias",
+        semanticScope: "all",
+        batch: 128,
+        requests: 2,
+        parallel: 2,
+        hybridWeights: { lexical: 0.05, semantic: 0.95, graph: 0 },
+        hybridLimits: { lexical: 20, semantic: 8 },
+      }),
+      cloneCase(baseProfiles.llamaQwen, {
+        variant: "qwen-dim-512-semantic95-lex5-slim8",
+        docMode: "alias_variant",
+        semanticScope: "all",
+        batch: 128,
+        requests: 1,
+        parallel: 1,
+        ctx: 2048,
+        maxTokens: 2048,
+        truncateDim: 512,
+        expectedDim: 512,
+        vectorEncoding: "float32",
+        hybridWeights: { lexical: 0.05, semantic: 0.95, graph: 0 },
+        hybridLimits: { lexical: 20, semantic: 8 },
+      }),
       cloneCase(baseProfiles.llamaNomicV15, {
         variant: "nomic-dim-256",
         docMode: "current_alias",
         truncateDim: 256,
         expectedDim: 256,
+      }),
+      cloneCase(baseProfiles.llamaNomicV15, {
+        variant: "nomic-semantic95-lex5-slim8",
+        docMode: "current_alias",
+        semanticScope: "all",
+        hybridWeights: { lexical: 0.05, semantic: 0.95, graph: 0 },
+        hybridLimits: { lexical: 20, semantic: 8 },
       }),
     ],
     "finalists2",
@@ -1189,6 +1867,12 @@ function baseEnv(config) {
   setOrDelete(env, "CODESTORY_EMBED_LAYER_NORM", config.layerNorm);
   setOrDelete(env, "CODESTORY_EMBED_TRUNCATE_DIM", config.truncateDim);
   setOrDelete(env, "CODESTORY_EMBED_EXPECTED_DIM", config.expectedDim);
+  setOrDelete(env, "CODESTORY_SEMANTIC_DOC_MAX_TOKENS", config.semanticDocMaxTokens);
+  setOrDelete(
+    env,
+    "CODESTORY_STORED_VECTOR_ENCODING",
+    config.vectorEncoding && config.vectorEncoding !== "float32" ? config.vectorEncoding : null,
+  );
   delete env.CODESTORY_EMBED_INTRA_THREADS;
   delete env.CODESTORY_EMBED_INTER_THREADS;
   delete env.CODESTORY_EMBED_PARALLEL_EXECUTION;
@@ -1242,6 +1926,10 @@ function parseJson(raw) {
     throw new Error("command output did not include JSON");
   }
   return JSON.parse(raw.slice(start));
+}
+
+function readJsonFile(filePath) {
+  return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
 function postEmbedding(port) {
@@ -1455,6 +2143,20 @@ function hybridWeightArgs(config) {
   ];
 }
 
+function hybridLimitArgs(config) {
+  if (!config.hybridLimits) {
+    return [];
+  }
+  const args = [];
+  if (config.hybridLimits.lexical !== undefined) {
+    args.push("--hybrid-lexical-limit", String(config.hybridLimits.lexical));
+  }
+  if (config.hybridLimits.semantic !== undefined) {
+    args.push("--hybrid-semantic-limit", String(config.hybridLimits.semantic));
+  }
+  return args;
+}
+
 function fileSizeMb(filePath) {
   if (!filePath || !fs.existsSync(filePath)) {
     return null;
@@ -1490,15 +2192,20 @@ function vectorBytesPerDoc(config) {
 }
 
 async function runCase(config) {
-  const caseDir = path.join(outDir, config.case_id);
+  const artifact_case_dir = artifactCaseDirName(config.case_id);
+  const caseDir = path.join(outDir, artifact_case_dir);
   const cacheDir = path.join(caseDir, "cache");
   const logsDir = path.join(caseDir, "logs");
+  const replayCaseDir = cacheReplayFrom;
+  const replayCacheDir = replayCaseDir ? path.join(replayCaseDir, "cache") : "";
+  const replayResultPath = replayCaseDir ? path.join(replayCaseDir, "result.json") : "";
   fs.rmSync(caseDir, { recursive: true, force: true });
   fs.mkdirSync(logsDir, { recursive: true });
 
   if (config.skipReason) {
     const skipped = {
       ...config,
+      artifact_case_dir,
       skipped: true,
       error: config.skipReason,
       model_size_mb: fileSizeMb(config.modelPath),
@@ -1513,6 +2220,7 @@ async function runCase(config) {
       if (config.allowMissingArtifact && required === config.modelPath) {
         const skipped = {
           ...config,
+          artifact_case_dir,
           skipped: true,
           error: `missing optional research artifact: ${required}`,
           model_size_mb: null,
@@ -1528,21 +2236,65 @@ async function runCase(config) {
   const env = baseEnv(config);
   console.log(`running ${config.case_id}`);
   const result = await withServer(config, caseDir, async () => {
-    const index = runCli(
-      ["index", "--project", root, "--cache-dir", cacheDir, "--refresh", "full", "--format", "json"],
-      env,
-      path.join(logsDir, "index.log"),
-    );
+    let provider = {};
+    let semanticDocsEmbedded = null;
+    let semanticDocsReused = null;
+    let semanticDocCount = null;
+    let semanticSeconds = 0;
+    let docsPerSecond = null;
+    let indexSeconds = 0;
+    let embeddingModel = "";
+    let retrievalMode = "";
 
-    const indexJson = parseJson(index.stdout);
-    const provider = config.kind === "onnx" ? validateOnnxProvider(config, index, indexJson) : {};
-    const semanticDocsEmbedded = indexJson.phase_timings?.semantic_docs_embedded ?? null;
-    const semanticDocCount =
-      indexJson.retrieval?.semantic_doc_count ??
-      indexJson.summary?.retrieval?.semantic_doc_count ??
-      semanticDocsEmbedded ??
-      null;
-    const semanticSeconds = (indexJson.phase_timings?.semantic_embedding_ms ?? 0) / 1000;
+    if (replayCaseDir) {
+      if (!fs.existsSync(replayCacheDir)) {
+        throw new Error(`cache replay source is missing cache dir: ${replayCacheDir}`);
+      }
+      if (!fs.existsSync(replayResultPath)) {
+        throw new Error(`cache replay source is missing result.json: ${replayResultPath}`);
+      }
+      const replayResult = readJsonFile(replayResultPath);
+      provider = {
+        provider_requested: replayResult.provider_requested ?? "",
+        provider_verified: replayResult.provider_verified ?? true,
+        provider_evidence: replayResult.provider_evidence ?? "cache replay",
+      };
+      semanticDocCount = replayResult.semantic_doc_count ?? null;
+      semanticDocsEmbedded = 0;
+      semanticDocsReused = semanticDocCount;
+      docsPerSecond = replayResult.docs_per_second ?? null;
+      embeddingModel = replayResult.embedding_model ?? "";
+      retrievalMode = replayResult.retrieval_mode ?? "";
+    } else {
+      const index = runCli(
+        ["index", "--project", root, "--cache-dir", cacheDir, "--refresh", "full", "--format", "json"],
+        env,
+        path.join(logsDir, "index.log"),
+      );
+
+      const indexJson = parseJson(index.stdout);
+      provider = config.kind === "onnx" ? validateOnnxProvider(config, index, indexJson) : {};
+      semanticDocsEmbedded = indexJson.phase_timings?.semantic_docs_embedded ?? null;
+      semanticDocCount =
+        indexJson.retrieval?.semantic_doc_count ??
+        indexJson.summary?.retrieval?.semantic_doc_count ??
+        semanticDocsEmbedded ??
+        null;
+      semanticDocsReused = indexJson.phase_timings?.semantic_docs_reused ?? null;
+      semanticSeconds = (indexJson.phase_timings?.semantic_embedding_ms ?? 0) / 1000;
+      docsPerSecond =
+        semanticSeconds > 0 && semanticDocsEmbedded
+          ? semanticDocsEmbedded / semanticSeconds
+          : semanticSeconds > 0 && semanticDocCount
+            ? semanticDocCount / semanticSeconds
+            : null;
+      indexSeconds = index.elapsedMs / 1000;
+      embeddingModel =
+        indexJson.retrieval?.embedding_model ?? indexJson.summary?.retrieval?.embedding_model ?? "";
+      retrievalMode = indexJson.retrieval?.mode ?? indexJson.summary?.retrieval?.mode ?? "";
+    }
+
+    const activeCacheDir = replayCaseDir ? replayCacheDir : cacheDir;
     const searchResults = [];
     let searchElapsedMs = 0;
     for (const q of benchmarkQueries) {
@@ -1552,7 +2304,7 @@ async function runCase(config) {
           "--project",
           root,
           "--cache-dir",
-          cacheDir,
+          activeCacheDir,
           "--query",
           q.query,
           "--limit",
@@ -1564,6 +2316,7 @@ async function runCase(config) {
           "--format",
           "json",
           ...hybridWeightArgs(config),
+          ...hybridLimitArgs(config),
         ],
         env,
         path.join(logsDir, `${q.id}.log`),
@@ -1576,28 +2329,36 @@ async function runCase(config) {
         bucket: q.bucket,
         query: q.query,
         expected: q.expect,
+        elapsed_ms: search.elapsedMs,
         rank: findRank(hits, q),
         top: hits.slice(0, 5).map((hit) => hit.display_name),
       });
     }
+    const searchQueryMs = searchResults.map((result) => result.elapsed_ms);
+    const slowestSearch = searchResults.reduce(
+      (slowest, result) =>
+        !slowest || result.elapsed_ms > slowest.elapsed_ms ? result : slowest,
+      null,
+    );
     return {
       ...config,
+      artifact_case_dir,
+      cache_replay_from: replayCaseDir,
       ...provider,
       semantic_doc_count: semanticDocCount,
       semantic_docs_embedded: semanticDocsEmbedded,
-      semantic_docs_reused: indexJson.phase_timings?.semantic_docs_reused ?? null,
-      index_seconds: index.elapsedMs / 1000,
+      semantic_docs_reused: semanticDocsReused,
+      index_seconds: indexSeconds,
       semantic_seconds: semanticSeconds,
-      docs_per_second:
-        semanticSeconds > 0 && semanticDocsEmbedded
-          ? semanticDocsEmbedded / semanticSeconds
-          : semanticSeconds > 0 && semanticDocCount
-            ? semanticDocCount / semanticSeconds
-            : null,
+      docs_per_second: docsPerSecond,
       search_seconds: searchElapsedMs / 1000,
-      embedding_model:
-        indexJson.retrieval?.embedding_model ?? indexJson.summary?.retrieval?.embedding_model ?? "",
-      retrieval_mode: indexJson.retrieval?.mode ?? indexJson.summary?.retrieval?.mode ?? "",
+      search_query_ms_mean: mean(searchQueryMs),
+      search_query_ms_p50: percentile(searchQueryMs, 0.5),
+      search_query_ms_p95: percentile(searchQueryMs, 0.95),
+      search_query_ms_max: percentile(searchQueryMs, 1),
+      search_slowest_query_id: slowestSearch?.id ?? "",
+      embedding_model: embeddingModel,
+      retrieval_mode: retrievalMode,
       model_size_mb: fileSizeMb(config.modelPath),
       vector_bytes_per_doc: vectorBytesPerDoc(config),
       score: score(searchResults),
@@ -1724,6 +2485,16 @@ function mean(values) {
   return numeric.reduce((total, value) => total + value, 0) / numeric.length;
 }
 
+function percentile(values, quantile) {
+  const numeric = values.filter((value) => Number.isFinite(value)).sort((a, b) => a - b);
+  if (numeric.length === 0) {
+    return null;
+  }
+  const clamped = Math.min(1, Math.max(0, quantile));
+  const index = Math.ceil(clamped * numeric.length) - 1;
+  return numeric[Math.max(0, index)];
+}
+
 function repeatBaseId(caseIdValue) {
   return caseIdValue.replace(/-run\d+$/, "");
 }
@@ -1756,6 +2527,7 @@ function repeatSummaries(results) {
       pooling: group[0].pooling ?? "",
       index_seconds: mean(group.map((result) => result.index_seconds)),
       semantic_seconds: mean(group.map((result) => result.semantic_seconds)),
+      search_seconds: mean(group.map((result) => result.search_seconds)),
       docs_per_second: mean(group.map((result) => result.docs_per_second)),
       hit_at_1: mean(group.map((result) => result.score?.hit_at_1)),
       hit_at_10: mean(group.map((result) => result.score?.hit_at_10)),
@@ -1798,7 +2570,7 @@ function writeManifest(cases) {
       "vector-quant":
         "Stored-vector quantization lane. Manifest-only until CodeStory has quantized-vector storage/search support.",
       dimension:
-        "Matryoshka/dimension-shortening rows, plus BGE-small negative controls.",
+        "Source-backed Matryoshka/dimension rows for Nomic v1.5, Nomic v2 MoE, Qwen3 0.6B, and EmbeddingGemma; BGE-small is a negative control.",
       retrieval:
         "Hybrid weight, semantic scope, and alias-mode sweeps using the CLI search weight flags.",
       "bge-small-candidate":
@@ -1808,6 +2580,7 @@ function writeManifest(cases) {
     },
     cases: cases.map((config) => ({
       case_id: config.case_id,
+      artifact_case_dir: artifactCaseDirName(config.case_id),
       stage: config.stage,
       id: config.id,
       kind: config.kind,
@@ -1816,6 +2589,7 @@ function writeManifest(cases) {
         config.kind === "onnx" ? (config.executionProvider ?? "directml") : "Vulkan0",
       profile: config.profile,
       semantic_scope: config.semanticScope,
+      semantic_doc_max_tokens: config.semanticDocMaxTokens,
       doc_mode: config.docMode,
       quantization: config.quantization,
       vector_encoding: config.vectorEncoding,
@@ -1831,6 +2605,7 @@ function writeManifest(cases) {
       ctx: config.ctx,
       pooling: config.pooling,
       hybrid_weights: config.hybridWeights,
+      hybrid_limits: config.hybridLimits,
       variant: config.variant,
       skip_reason: config.skipReason,
       allow_missing_artifact: config.allowMissingArtifact,
@@ -1935,6 +2710,8 @@ function writeReports(results, cases) {
   const header = [
     "rank",
     "case_id",
+    "artifact_case_dir",
+    "cache_replay_from",
     "stage",
     "doc_mode",
     "kind",
@@ -1944,6 +2721,7 @@ function writeReports(results, cases) {
     "provider_evidence",
     "profile",
     "semantic_scope",
+    "semantic_doc_max_tokens",
     "quantization",
     "vector_encoding",
     "truncate_dim",
@@ -1952,6 +2730,7 @@ function writeReports(results, cases) {
     "requests",
     "parallel",
     "hybrid_weights",
+    "hybrid_limits",
     "ctx",
     "pooling",
     "variant",
@@ -1959,6 +2738,12 @@ function writeReports(results, cases) {
     "vector_bytes_per_doc",
     "index_seconds",
     "semantic_seconds",
+    "search_seconds",
+    "search_query_ms_mean",
+    "search_query_ms_p50",
+    "search_query_ms_p95",
+    "search_query_ms_max",
+    "search_slowest_query_id",
     "semantic_doc_count",
     "semantic_docs_embedded",
     "docs_per_second",
@@ -1980,6 +2765,8 @@ function writeReports(results, cases) {
   const rows = results.map((result) => [
     rankById.get(result.case_id) ?? "",
     result.case_id,
+    result.artifact_case_dir ?? artifactCaseDirName(result.case_id),
+    result.cache_replay_from ?? "",
     result.stage,
     result.docMode,
     result.kind,
@@ -1989,6 +2776,7 @@ function writeReports(results, cases) {
     result.provider_evidence ?? "",
     result.profile,
     result.semanticScope ?? "",
+    result.semanticDocMaxTokens ?? "",
     result.quantization ?? "",
     result.vectorEncoding ?? "",
     result.truncateDim ?? "",
@@ -1999,6 +2787,9 @@ function writeReports(results, cases) {
     result.hybridWeights
       ? `${result.hybridWeights.lexical}/${result.hybridWeights.semantic}/${result.hybridWeights.graph}`
       : "",
+    result.hybridLimits
+      ? `${result.hybridLimits.lexical ?? ""}/${result.hybridLimits.semantic ?? ""}`
+      : "",
     result.ctx ?? "",
     result.pooling ?? "",
     result.variant ?? "",
@@ -2006,6 +2797,12 @@ function writeReports(results, cases) {
     fmt(result.vector_bytes_per_doc),
     fmt(result.index_seconds),
     fmt(result.semantic_seconds),
+    fmt(result.search_seconds),
+    fmt(result.search_query_ms_mean),
+    fmt(result.search_query_ms_p50),
+    fmt(result.search_query_ms_p95),
+    fmt(result.search_query_ms_max),
+    result.search_slowest_query_id ?? "",
     result.semantic_doc_count ?? "",
     result.semantic_docs_embedded ?? "",
     fmt(result.docs_per_second),
@@ -2034,6 +2831,7 @@ function writeReports(results, cases) {
     "query_id",
     "bucket",
     "rank",
+    "search_elapsed_ms",
     "expected",
     "top5",
   ];
@@ -2046,6 +2844,7 @@ function writeReports(results, cases) {
       query.id,
       query.bucket,
       query.rank ?? "",
+      fmt(query.elapsed_ms),
       query.expected.join(";"),
       query.top.join(";"),
     ]),
@@ -2086,6 +2885,7 @@ function writeReports(results, cases) {
     "pooling",
     "avg_index_seconds",
     "avg_semantic_seconds",
+    "avg_search_seconds",
     "avg_docs_per_second",
     "avg_hit_at_1",
     "avg_hit_at_10",
@@ -2115,6 +2915,7 @@ function writeReports(results, cases) {
       row.pooling,
       fmt(row.index_seconds),
       fmt(row.semantic_seconds),
+      fmt(row.search_seconds),
       fmt(row.docs_per_second),
       fmt(row.hit_at_1),
       fmt(row.hit_at_10),
@@ -2158,6 +2959,7 @@ async function main() {
       console.error(`${config.case_id} failed: ${error.message}`);
       results.push({
         ...config,
+        artifact_case_dir: artifactCaseDirName(config.case_id),
         error: error.message,
       });
     }

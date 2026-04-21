@@ -1,5 +1,7 @@
 use crate::search_runtime::HybridSearchConfig;
-use codestory_contracts::api::{AgentHybridWeightsDto, NodeDetailsDto, SearchHit};
+use codestory_contracts::api::{
+    AgentHybridWeightsDto, NodeDetailsDto, SearchHit, SearchHybridLimitsDto,
+};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -51,6 +53,22 @@ pub(crate) fn normalized_hybrid_weights(
     }
 
     (lexical / sum, semantic / sum, graph / sum)
+}
+
+pub(crate) fn apply_hybrid_limits(
+    request_limits: Option<SearchHybridLimitsDto>,
+    config: &mut HybridSearchConfig,
+) {
+    const MAX_CANDIDATE_LIMIT: u32 = 1_000;
+    let Some(limits) = request_limits else {
+        return;
+    };
+    if let Some(lexical) = limits.lexical {
+        config.lexical_limit = lexical.min(MAX_CANDIDATE_LIMIT) as usize;
+    }
+    if let Some(semantic) = limits.semantic {
+        config.semantic_limit = semantic.min(MAX_CANDIDATE_LIMIT) as usize;
+    }
 }
 
 pub(crate) fn node_display_name(node: &codestory_contracts::graph::Node) -> String {
