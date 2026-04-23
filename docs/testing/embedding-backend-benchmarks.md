@@ -15,12 +15,13 @@ you need per-query ranks or logs.
 | Default client batch size | `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE=128` |
 | Default ONNX sessions | Keep the runtime default cap of `2`; `4` was not repeat-stable enough to become default |
 | Best Run 2 quality score candidate | BGE-base GGUF via llama.cpp/Vulkan, `alias_variant`, `scope=all`, batch `512`, CodeStory request count `4`, server `-np 4`, `--pooling cls` |
+| Best 60/30/10 local pipeline profile | BGE-base GGUF via llama.cpp/Vulkan, `alias_variant`, `scope=durable`, batch `768`, CodeStory request count `4`, server `-np 4`, `-ub 1024`, `--pooling cls`, with `CODESTORY_STORED_VECTOR_ENCODING=int8` scaled-int8 persistence |
 | Compressed BGE-base candidate | Clean-source BGE-base Q5_K_M GGUF via llama.cpp/Vulkan, `alias_variant`, `scope=all`, batch `512`, request count `4`, server `-np 4`, `--pooling cls`; three full-query repeats matched Q8 quality with lower throughput |
 | Best ONNX quality fallback | BGE-base ONNX DirectML, `alias_variant`, `scope=all`, batch `128`, sessions `2` |
 | Best llama.cpp throughput profile | BGE-base GGUF, `alias_variant`, batch `128`, `--pooling cls`, CodeStory request count `4`, server `-np 4` |
 | Fast prior finalist profile | ONNX BGE-small with `no_alias`, batch `256` |
 | Best BGE-small promotion candidate | ONNX BGE-small with `scope=all`, `no_alias`, batch `256`; three full-query repeats passed with MRR@10 0.6089 and Hit@10 0.9000 |
-| Stored-vector quantization candidate | BGE-small winner shape with byte vectors (`int8` or `uint8`) plus full-precision rescoring; binary regressed MRR on the bounded slice |
+| Promoted compact-storage profile | Compact scaled-int8 persisted vectors under `CODESTORY_STORED_VECTOR_ENCODING=int8`; BGE-base b768/r4 with llama.cpp `-ub 1024` passed the local 150-query suite and external four-repo gate, with 777 persisted bytes per doc |
 | Best Run 2 retrieval signal | `scope=all` improved BGE-small MRR most, while `no_alias` was the best durable-scope row; original retrieval speed rows are invalid because the GPU was locked |
 | Quality experiment, not default | Qwen3 0.6B GGUF with `alias_variant`, context `2048`, `r1/np1` |
 | Measured negative candidate | `nomic-embed-text-v2-moe` now runs with `CODESTORY_SEMANTIC_DOC_MAX_TOKENS`, but 256/768-dimensional bounded rows stayed below gate |
@@ -30,6 +31,14 @@ self-contained baseline in code and docs. The crossed BGE-small candidate is now
 promotion-grade evidence, but it still does not silently flip defaults: changing
 the runtime shape requires an explicit default-change decision and the
 repo-scale gate.
+
+The 2026-04-23 60/30/10 pipeline segment promotes BGE-base b768/r4 plus
+scaled-int8 persisted vectors as the best measured opt-in family, not as a
+silent runtime default. Keep the default BGE-small/float32 path unchanged until
+the owner explicitly accepts a default flip; set the BGE-base profile and
+`CODESTORY_STORED_VECTOR_ENCODING=int8` when reproducing the promoted pipeline.
+The local speed leader additionally sets llama.cpp `-ub 1024`; cross-repo run
+`20260423024405` passed the four-repo gate for that knob.
 
 The alias feature stays, but the older full alias text does not become the
 default. The default is the compact alias variant: language, terminal name,
@@ -63,12 +72,17 @@ BGE-small GGUF Q5_K_M was close to the same-backend Q8_0 control, but both lost
 Persistent Hit@10 and trailed the ONNX BGE-small finalist on speed. Missing GGUF
 Q6/Q5/Q4 and ONNX int4 artifacts for other models should still produce skipped
 rows in `weight-quant`; they are not evidence that quantization hurts quality.
+
 Stored-vector quantization is a separate storage/search implementation lane.
-The first CodeStory implementation keeps full-precision vectors for rescoring
-and adds quantized corpus prefiltering. BGE-small winner-shape bounded rows show
-that byte vectors (`int8` and `uint8`) preserve ranking on the persistent/alias
-slice, while binary sign-bit storage loses MRR. These are storage-candidate
-rows, not default or full-query promotion evidence yet.
+The first BGE-small bounded rows used quantized corpus prefiltering plus
+full-precision rescoring; int8/uint8 preserved ranking on that slice while
+binary sign-bit storage lost MRR. The current CodeStory implementation also
+supports compact persisted storage: with `CODESTORY_STORED_VECTOR_ENCODING=int8`
+it writes versioned scaled-int8 embedding blobs and decodes them back to
+normalized float vectors for the existing search path. The BGE-base b768/r4
+scaled-int8 profile now has local full-query and external four-repo promotion
+evidence; the older BGE-small byte rows are historical storage evidence, not the
+current compact-storage promotion row.
 
 ## Run 2 Controls Snapshot
 
@@ -212,6 +226,20 @@ plus b384 both regressed MRR. Treat b512/r4 as the current measured score leader
 and b128/r4 as the fastest stable throughput leader, with ONNX BGE-base as the best
 non-llama quality fallback.
 
+The later 60/30/10 pipeline segment reweighted the decision around retrieval
+quality, indexing/search speed, and persisted memory footprint. Under that
+metric, BGE-base llama.cpp/Vulkan with `alias_variant`, `scope=durable`, b768,
+request count 4/server `-np 4`, cls pooling, and scaled int8 persisted vectors
+is the current promoted opt-in family. Run 92 adds llama.cpp `-ub 1024` and
+scores `pipeline_score` 882198.781327 over 150 CodeStory queries with MRR@10
+1.0, Hit@1 1.0, Hit@10 1.0, 360.15 docs/sec, and 777 persisted vector bytes per
+doc after compacting the scaled-int8 header. Cross-repo promotion run
+`20260423024405` passed for the `-ub 1024` compact-header b768 scaled-int8
+profile over freelancer, traderotate, the-green-cedar, and Sourcetrail with
+aggregate Hit@10 1.0, MRR@10 0.826936508, adversarial Hit@10 1.0, search p95
+89.576 ms, and no misses. Keep this as a named profile or explicit
+environment-driven path until the owner accepts a default change.
+
 The leader-shape doc-mode variants did not beat `alias_variant`. Under the same
 llama.cpp/Vulkan `scope=all`, b128, r4/np4, ctx4096, cls-pool shape,
 `current_alias` scored 743.7298 with MRR@10 0.6269, Hit@10 0.9143, Hit@1
@@ -349,6 +377,12 @@ measured candidates if the runtime can depend on the llama.cpp/Vulkan sidecar
 and can accept 768-dimensional vectors. BGE-small remains the default
 self-contained profile until that product/runtime decision is made.
 
+For the current 60/30/10 pipeline metric, the b768 scaled-int8 profile supersedes
+the older b512/r4 finalist as the promoted opt-in pipeline family because it
+adds real persisted-footprint savings while preserving local perfect retrieval
+on the 150-query suite and passing the external four-repo gate. The `-ub 1024`
+variant is the current gated leader inside that family.
+
 ## Alias Decision
 
 Stage 1 compared `no_alias`, `current_alias`, and `alias_variant` at batch 128.
@@ -375,6 +409,7 @@ and `current_alias` without hand-editing code.
 | ONNX BGE-base sessions | Stage 2 showed s4 can be faster, but Stage 4 repeats did not preserve a quality or speed advantage over s2. Keep s2/default session cap for now. |
 | ONNX BGE-base batch | Batch 128 remains the comparison and default value. Batch 256 did not improve quality and was not clearly faster in the clean tuning run. |
 | llama.cpp BGE-base batch/parallelism | `r4/np4` remains the stable parallel shape. b512/r4 is the new score leader at average 791.9135, while b128/r4 remains the fastest stable profile at about 435.88 docs/sec versus b512/r4 at 434.30. b768/r4 opened well but failed repeat stability; b1024/r4 and b384/r4 regressed MRR. r5 improved docs/sec to about 441 but regressed MRR below the r4 leader bands. The earlier `r1/np1` MRR bump did not repeat. |
+| 60/30/10 compact-storage profile | With compact scaled-int8 persisted vectors, b768/r4 supersedes b896 and b640 for the current pipeline metric: run 92 added llama.cpp `-ub 1024` and improved the local score to 882198.781327, then cross-repo run `20260423024405` passed the four-repo profile gate. Keep the family opt-in until a default flip is explicitly accepted. |
 | llama.cpp BGE-base doc mode | Leader-shape `current_alias` and `no_alias` both lost Persistent Hit@10 and trailed the `alias_variant` leader. Keep `alias_variant` for BGE-base llama.cpp. |
 | BGE-small | Shipped default profile remains BGE-small with compact aliases. The crossed `scope=all`, `no_alias`, b256 row is now a promotion candidate after three stable full-query repeats, but not yet the runtime default. |
 | Run 2 retrieval | `scope=all` was the largest BGE-small quality lever; durable `no_alias` beat durable aliases; hybrid-weight tweaks did not improve quality. Original speed rows are invalid because the GPU was locked; fail-hard DirectML speedchecks restored the default row to about 17-21s index time. |
@@ -415,6 +450,8 @@ and `current_alias` without hand-editing code.
 | Run 2 BGE-base llama.cpp r5 frontier checks | `target/embedding-research/ar-bgeb-b256-r5-20260421T145150Z`, `target/embedding-research/ar-bgeb-b128-r5-20260421T145501Z` | Single full-query checks for the adjacent r5/np5 edge. b256/r5 reached 440.98 docs/sec and b128/r5 reached 441.89 docs/sec, but both regressed MRR below the r4 leaders while keeping Hit@10 0.9286 and Persistent Hit@10 0.25. Treat r5 as measured-negative unless the runtime or llama.cpp version changes. |
 | Run 2 finalists2 BGE-base ONNX repeats | `target/embedding-research/autoresearch-finalists2-bge-base-quality-full-run1-short-20260421T115554Z`, `target/embedding-research/autoresearch-finalists2-bge-base-quality-full-run2-20260421T120049Z`, `target/embedding-research/autoresearch-finalists2-bge-base-quality-full-run3-20260421T120546Z` | Three full-query repeats for BGE-base ONNX `scope=all`, `alias_variant`, b128/s2. Quality was stable at MRR@10 0.6593, Hit@10 0.9286, Hit@1 0.5286, Persistent Hit@10 0.25, with average docs/sec about 303.75 and average index time about 53.25s. The first unshortened run hit a Windows staged SQLite path-length/open failure and is tracked as crash provenance, not a repeat row. |
 | Run 2 finalists2 BGE-base llama.cpp repeats | `target/embedding-research/autoresearch-finalists2-llama-bge-base-throughput-full-run1-20260421T121058Z`, `target/embedding-research/autoresearch-finalists2-llama-bge-base-throughput-full-run2-20260421T121358Z`, `target/embedding-research/autoresearch-finalists2-llama-bge-base-throughput-full-run3-20260421T121654Z` | Three full-query repeats for BGE-base llama.cpp/Vulkan `scope=all`, `alias_variant`, b128, r4/np4, ctx4096, cls pool. Quality was stable at MRR@10 0.6601, Hit@10 0.9286, Hit@1 0.5286, Persistent Hit@10 0.25, with average docs/sec about 435.88 and average index time about 40.50s. This is the current balanced quality/throughput leader. |
+| 60/30/10 compact-storage local promotion | `target/autoresearch/indexer-embedder/20260423T015924`, `target/autoresearch/indexer-embedder/20260423T020818`, `target/autoresearch/indexer-embedder/20260423T022445`, `target/autoresearch/indexer-embedder/20260423T024103` | Versioned scaled-int8 persisted embeddings recovered perfect local quality and kept the compact footprint. The latest b768 `-ub 1024` run scores `pipeline_score` 882198.781327 with MRR@10 1.0, Hit@1 1.0, Hit@10 1.0, speed_component 0.670088925, footprint_component 0.811721039, 360.15 docs/sec, and 777 vector bytes per doc after compacting the scaled header. b896, b640, Q5_K_M, and the 384-token doc-budget scout were lower. |
+| 60/30/10 compact-storage cross-repo gate | `target/autoresearch/cross-repo-promotion/20260423022731`, `target/autoresearch/cross-repo-promotion/20260423024405` | BGE-base b768/r4 with `CODESTORY_STORED_VECTOR_ENCODING=int8` passed freelancer, traderotate, the-green-cedar, and Sourcetrail with 225 total queries and 100 adversarial queries. The latest `-ub 1024` gate scored aggregate Hit@10 1.0, MRR@10 0.826936508, Hit@1 0.724444444, adversarial Hit@10 1.0, adversarial MRR@10 0.834511905, p95 89.576 ms, and no misses. Sourcetrail covered 150 queries over the large mixed C++/Java/Python repository. |
 | Superseded raw run | `target/embedding-research/tuning-stage2-20260419` | Kept as provenance only; it mixed selected IDs across stages before the harness selection bug was fixed. |
 
 Each current run writes `results.csv`, `results.json`, `query-ranks.csv`,
@@ -516,11 +553,11 @@ This is the planned follow-up work, in priority order:
 
 | Priority | Work | Why |
 | ---: | --- | --- |
-| 1 | Decide whether the runtime can promote or expose the BGE-base llama.cpp/Vulkan score or throughput profile, then run the repo-scale gate if accepted. | Finalists2 repeated BGE-base llama.cpp as the best measured quality/throughput family. b512/r4 is the score leader, b128/r4 is the fastest stable throughput profile, and both add a llama.cpp sidecar plus 768-dimensional vectors. |
+| 1 | Decide whether to flip the runtime default to the promoted BGE-base b768/r4 scaled-int8 profile or keep it as an explicit opt-in profile. | The 60/30/10 pipeline segment passed local and four-repo gates with perfect local retrieval, real persisted-footprint savings, and no external misses, but it still adds a llama.cpp sidecar and 768-dimensional vectors. |
 | 2 | Decide whether to change the BGE-small runtime default, then run the repo-scale gate if accepted. | Crossed `scope=all`, `no_alias`, b256 passed three full-query repeats, but changing defaults should be an explicit product/runtime decision rather than an autoresearch side effect. |
 | 3 | Decide whether the runtime should expose clean-source BGE-base Q5_K_M b512/r4 as a compressed-quality option, then run the repo-scale gate if accepted. | Clean F16-derived Q5_K_M repeated stably under the b512/r4 leader shape and matched Q8 ranking quality while reducing the artifact to 77.49 MiB by quantizer report, but throughput and score stayed lower than Q8. Q6_K and Q4_K_M lost Hit@10 or persistent-hit, so do not push below Q5 without a new imatrix or calibration recipe. |
 | 4 | Rerun any retrieval row whose speed/cost matters under fail-hard DirectML provider selection. | The original retrieval run has usable quality deltas but invalid speed data because the GPU was locked. |
-| 5 | Stabilize ONNX DirectML speed before full-query vector-quant promotion rows. | Same-shape BGE-small vector rows preserved byte-quantization quality but ran in the old GPU-locked/cold-slow timing band. Repeat fail-hard provider speedchecks before making speed or cost claims. |
+| 5 | Reopen BGE-small or ONNX vector-quant rows only after DirectML speed is stable. | The promoted compact-storage row is BGE-base llama.cpp/Vulkan scaled int8; the older same-shape BGE-small vector rows preserved byte-quantization quality but ran in the old GPU-locked/cold-slow timing band. |
 | 6 | Revisit Nomic v2 only if semantic-doc/query shape changes materially. | The token-budget blocker is resolved for research, but 256/768-dimensional bounded rows were provider-valid and below gate. |
 | 7 | Pause dimension-only probes unless semantic docs or query shape changes first. | Provider-valid 256/512/768/1024 bounded probes for Nomic v1.5, Qwen3, and EmbeddingGemma did not pass the Hit@10 gate; larger dimensions did not rescue Gemma or Nomic. |
 | 8 | Promote only repeat-stable, provider-verified rows into `finalists2`. | Defaults should not change from a single mixed tuning pass or from artifacts that lack provider provenance. |

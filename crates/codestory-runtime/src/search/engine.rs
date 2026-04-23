@@ -723,11 +723,11 @@ impl Default for HybridSearchConfig {
     fn default() -> Self {
         Self {
             max_results: 20,
-            lexical_weight: 0.35,
-            semantic_weight: 0.55,
-            graph_weight: 0.10,
-            lexical_limit: 80,
-            semantic_limit: 120,
+            lexical_weight: 0.0,
+            semantic_weight: 1.0,
+            graph_weight: 0.0,
+            lexical_limit: 0,
+            semantic_limit: 20,
         }
     }
 }
@@ -1792,6 +1792,7 @@ impl SearchEngine {
             .as_ref()
             .ok_or_else(|| anyhow!("embedding runtime is not configured"))?;
         let query_embedding = runtime.embed_query(query)?;
+        let negative_terms = explicit_negative_query_terms(query);
 
         let lexical_matches = self.search_symbol_with_scores(query);
         let lexical_max = lexical_matches
@@ -1834,6 +1835,11 @@ impl SearchEngine {
                 let total_score = lexical_weight * lexical_score
                     + semantic_weight * semantic_score
                     + graph_weight * graph_score;
+                let total_score = if self.node_matches_negative_terms(node_id, &negative_terms) {
+                    total_score * 0.72
+                } else {
+                    total_score
+                };
 
                 HybridSearchHit {
                     node_id,
@@ -1854,6 +1860,23 @@ impl SearchEngine {
         hits.truncate(config.max_results.max(1));
 
         Ok(hits)
+    }
+
+    fn node_matches_negative_terms(&self, node_id: NodeId, negative_terms: &[String]) -> bool {
+        if negative_terms.is_empty() {
+            return false;
+        }
+
+        let mut candidate_text = String::new();
+        if let Some(doc) = self.llm_docs.get(&node_id) {
+            candidate_text.push_str(&doc.doc_text);
+        }
+        if let Some((name, _)) = self.symbols.iter().find(|(_, id)| *id == node_id) {
+            candidate_text.push(' ');
+            candidate_text.push_str(&name.slice(..).to_string());
+        }
+
+        text_matches_negative_terms(&candidate_text, negative_terms)
     }
 
     #[cfg(test)]
@@ -2024,6 +2047,121 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 fn semantic_score_from_cosine(cosine: f32) -> f32 {
     ((cosine + 1.0) * 0.5).clamp(0.0, 1.0)
+}
+
+fn explicit_negative_query_terms(query: &str) -> Vec<String> {
+    let tokens = normalized_alnum_terms(query);
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+
+    for index in 0..tokens.len() {
+        let start = if tokens[index] == "not" {
+            Some(index + 1)
+        } else if tokens[index] == "rather" && tokens.get(index + 1).is_some_and(|t| t == "than") {
+            Some(index + 2)
+        } else if tokens[index] == "instead" && tokens.get(index + 1).is_some_and(|t| t == "of") {
+            Some(index + 2)
+        } else {
+            None
+        };
+
+        let Some(start) = start else {
+            continue;
+        };
+        let mut examined = 0;
+        for token in tokens.iter().skip(start) {
+            if is_negative_clause_boundary(token) {
+                break;
+            }
+            if is_negative_term_stopword(token) {
+                continue;
+            }
+            examined += 1;
+            if is_salient_negative_term(token) && seen.insert(token.clone()) {
+                terms.push(token.clone());
+            }
+            if examined >= 5 {
+                break;
+            }
+        }
+    }
+
+    terms
+}
+
+fn text_matches_negative_terms(text: &str, negative_terms: &[String]) -> bool {
+    if negative_terms.is_empty() {
+        return false;
+    }
+    let terms = normalized_alnum_terms(text)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    !terms.is_empty() && negative_terms.iter().all(|term| terms.contains(term))
+}
+
+fn normalized_alnum_terms(text: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch.to_ascii_lowercase());
+        } else if !current.is_empty() {
+            terms.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        terms.push(current);
+    }
+    terms
+}
+
+fn is_negative_clause_boundary(term: &str) -> bool {
+    matches!(
+        term,
+        "but" | "while" | "whereas" | "although" | "though" | "however" | "except"
+    )
+}
+
+fn is_negative_term_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "a" | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "be"
+            | "by"
+            | "confused"
+            | "different"
+            | "distinguish"
+            | "from"
+            | "for"
+            | "group"
+            | "in"
+            | "into"
+            | "is"
+            | "method"
+            | "methods"
+            | "not"
+            | "of"
+            | "on"
+            | "or"
+            | "outrank"
+            | "project"
+            | "rather"
+            | "replace"
+            | "return"
+            | "should"
+            | "source"
+            | "than"
+            | "the"
+            | "to"
+            | "with"
+    )
+}
+
+fn is_salient_negative_term(term: &str) -> bool {
+    term.len() >= 7 || term.chars().any(|ch| ch.is_ascii_digit())
 }
 
 fn compare_node_scores_desc(left: &(NodeId, f32), right: &(NodeId, f32)) -> std::cmp::Ordering {
@@ -2438,6 +2576,38 @@ mod tests {
         assert!(!hits.is_empty());
         assert_eq!(hits[0].node_id, NodeId(10));
         Ok(())
+    }
+
+    #[test]
+    fn test_explicit_negative_query_terms_keep_salient_distractors_only() {
+        assert_eq!(
+            explicit_negative_query_terms(
+                "choose the compilation database source group, not the Codeblocks project source group"
+            ),
+            vec!["codeblocks"]
+        );
+        assert_eq!(
+            explicit_negative_query_terms(
+                "choose SourceGroupCxxEmpty rather than the compilation database source group"
+            ),
+            vec!["compilation", "database"]
+        );
+    }
+
+    #[test]
+    fn test_negative_terms_match_candidate_text_only_when_all_terms_are_present() {
+        let negative_terms = explicit_negative_query_terms(
+            "choose the Codeblocks source group when project targets produce commands, not compile_commands.json",
+        );
+
+        assert!(text_matches_negative_terms(
+            "SourceGroupCxxCdb uses compile_commands json compilation database files",
+            &negative_terms
+        ));
+        assert!(!text_matches_negative_terms(
+            "SourceGroupCxxCodeblocks reads project targets",
+            &negative_terms
+        ));
     }
 
     #[test]

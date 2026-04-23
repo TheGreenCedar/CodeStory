@@ -247,6 +247,41 @@
   attr (@name.node) end_col = (end-column @def)
 }
 
+;; Exported object/array configs
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: [
+        (object)
+        (array)
+      ] @def))) @decl
+{
+  node @name.node
+  attr (@name.node) kind = "GLOBAL_VARIABLE"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @decl)
+  attr (@name.node) start_col = (start-column @decl)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
+;; Default-exported config factory calls
+(export_statement
+  value: (call_expression
+    function: (identifier) @name
+    arguments: (arguments
+      (object) @def))) @decl
+{
+  node @name.node
+  attr (@name.node) kind = "GLOBAL_VARIABLE"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @decl)
+  attr (@name.node) start_col = (start-column @decl)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
 ;; Inheritance (extends / implements / interface extends)
 (class_declaration
   name: (type_identifier) @class_name

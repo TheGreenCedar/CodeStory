@@ -59,8 +59,8 @@ pub use query_language::{GraphQueryParseError, parse_graph_query};
 pub(crate) use search_runtime::SearchEngine;
 pub use search_runtime::*;
 use semantic_doc_text::{
-    semantic_doc_language_from_path, semantic_path_aliases, semantic_symbol_aliases,
-    semantic_symbol_role_aliases,
+    runtime_concept_phrases, semantic_doc_language_from_path, semantic_path_aliases,
+    semantic_symbol_aliases, semantic_symbol_role_aliases,
 };
 pub use services::{
     AgentService, GroundingService, IndexService, ProjectService, SearchService, TrailService,
@@ -73,10 +73,12 @@ pub(crate) use support::{
     normalized_hybrid_weights, preferred_occurrence, read_searchable_file_contents,
     should_expand_symbol_query, truncate_for_diagnostic,
 };
-pub(crate) use symbol_query::compare_search_hits;
 pub use symbol_query::{
     SymbolNameMatchRank, compare_ranked_hits, leading_symbol_segment, normalize_symbol_query,
     symbol_name_match_rank, terminal_symbol_segment,
+};
+pub(crate) use symbol_query::{
+    compare_search_hits, is_non_primary_source_hit, query_mentions_non_primary_source,
 };
 
 type Storage = Store;
@@ -761,11 +763,11 @@ fn local_symbol_summary(doc: &LlmSymbolDoc) -> String {
     )
 }
 
-const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 3;
+const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 4;
 const LLM_SYMBOL_DOC_VERSION_PREFIX: &str = "semantic_doc_version:";
 const SEARCH_NODE_BATCH_SIZE: usize = 8_192;
 const SEARCH_SYMBOL_PROJECTION_BATCH_SIZE: usize = 4_096;
-const LLM_DOC_RELOAD_BATCH_SIZE: usize = 256;
+const LLM_DOC_RELOAD_BATCH_SIZE: usize = 512;
 const LLM_DOC_EMBED_BATCH_SIZE: usize = 128;
 const LLM_DOC_EMBED_BATCH_SIZE_ENV: &str = "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE";
 const SEMANTIC_DOC_SCOPE_ENV: &str = "CODESTORY_SEMANTIC_DOC_SCOPE";
@@ -1342,6 +1344,10 @@ fn build_llm_symbol_doc_text(
         if !aliases.owner_aliases.is_empty() {
             let _ = writeln!(out, "owner_aliases: {}", aliases.owner_aliases.join(", "));
         }
+        let domain_aliases = runtime_concept_phrases(display_name, node.qualified_name.as_deref());
+        if !domain_aliases.is_empty() {
+            let _ = writeln!(out, "domain_aliases: {}", domain_aliases.join(", "));
+        }
         if alias_mode == SemanticDocAliasMode::CurrentAlias {
             let path_aliases = semantic_path_aliases(file_path, 8);
             if !path_aliases.is_empty() {
@@ -1707,6 +1713,20 @@ fn merge_search_hits_by_node_id(hits: &mut Vec<SearchHit>, additional: Vec<Searc
         existing.insert(hit.node_id.clone(), hits.len());
         hits.push(hit);
     }
+}
+
+fn dedupe_inexact_search_hits_by_display_key(query: &str, hits: &mut Vec<SearchHit>) {
+    let mut seen = HashSet::<(String, NodeKind, Option<String>)>::new();
+    hits.retain(|hit| {
+        let rank = symbol_name_match_rank(query, &hit.display_name);
+        let is_exact_match =
+            rank.exact_display != 0 || rank.exact_terminal != 0 || rank.exact_leading != 0;
+        if is_exact_match {
+            return true;
+        }
+
+        seen.insert((hit.display_name.clone(), hit.kind, hit.file_path.clone()))
+    });
 }
 
 fn did_you_mean_suggestions(scored_hits: &[HybridSearchScoredHit]) -> Vec<SearchHit> {
@@ -2655,6 +2675,7 @@ impl AppController {
         }
 
         indexed_symbol_hits.sort_by(|left, right| compare_search_hits(&query, left, right));
+        dedupe_inexact_search_hits_by_display_key(&query, &mut indexed_symbol_hits);
         indexed_symbol_hits.truncate(limit_per_source);
 
         let repo_text_enabled = Self::repo_text_enabled_for_mode(repo_text_mode, &query);
@@ -2744,6 +2765,8 @@ impl AppController {
         let storage = self.open_storage()?;
         let storage_retrieval = retrieval_state_from_storage(&storage)?;
         let mut graph_boosts = HashMap::<codestory_contracts::graph::NodeId, f32>::new();
+        let requested_max_results = max_results.clamp(1, 50);
+        let prefer_primary_sources = !query_mentions_non_primary_source(&req.query);
 
         let focus_core_id = match focus_node_id {
             Some(value) => Some(value.to_core()?),
@@ -2789,7 +2812,7 @@ impl AppController {
 
             let hits = if retrieval.mode == RetrievalModeDto::Hybrid {
                 let mut config = HybridSearchConfig {
-                    max_results: max_results.clamp(1, 50),
+                    max_results: requested_max_results,
                     ..HybridSearchConfig::default()
                 };
                 let (lexical_weight, semantic_weight, graph_weight) =
@@ -2798,6 +2821,9 @@ impl AppController {
                 config.semantic_weight = semantic_weight;
                 config.graph_weight = graph_weight;
                 apply_hybrid_limits(req.hybrid_limits.clone(), &mut config);
+                if prefer_primary_sources {
+                    config.max_results = requested_max_results.saturating_mul(5).min(80);
+                }
 
                 match engine.search_hybrid_with_scores(&req.query, &graph_boosts, config) {
                     Ok(value) => value,
@@ -2845,8 +2871,25 @@ impl AppController {
                 });
             }
         }
+        if prefer_primary_sources && out.len() > requested_max_results {
+            let top_window_has_non_primary = out
+                .iter()
+                .take(requested_max_results)
+                .any(|scored| is_non_primary_source_hit(&scored.hit));
+            if top_window_has_non_primary {
+                let primary_count = out
+                    .iter()
+                    .filter(|scored| !is_non_primary_source_hit(&scored.hit))
+                    .count();
+                if primary_count >= requested_max_results {
+                    out.retain(|scored| !is_non_primary_source_hit(&scored.hit));
+                }
+            } else {
+                out.truncate(requested_max_results);
+            }
+        }
         out.sort_by(|left, right| compare_search_hits(&req.query, &left.hit, &right.hit));
-        out.truncate(max_results.clamp(1, 50));
+        out.truncate(requested_max_results);
 
         Ok((out, retrieval))
     }
@@ -4255,6 +4298,10 @@ pub fn exact_symbol_anchor() {{}}
             "how does the language parsing work in this repo",
             5
         ));
+        assert!(!should_expand_symbol_query(
+            "How does the language parsing work in this repo?",
+            5
+        ));
     }
 
     #[test]
@@ -5035,6 +5082,96 @@ pub fn exact_symbol_anchor() {{}}
     }
 
     #[test]
+    fn inexact_search_results_deduplicate_repeated_display_keys() {
+        let mut hits = vec![
+            SearchHit {
+                node_id: NodeId("directml-cfg-enabled".to_string()),
+                display_name: "configure_directml_embedding_provider".to_string(),
+                kind: codestory_contracts::api::NodeKind::FUNCTION,
+                file_path: Some("src/search/engine.rs".to_string()),
+                line: Some(178),
+                score: 0.90,
+                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
+                score_breakdown: None,
+            },
+            SearchHit {
+                node_id: NodeId("directml-cfg-disabled".to_string()),
+                display_name: "configure_directml_embedding_provider".to_string(),
+                kind: codestory_contracts::api::NodeKind::FUNCTION,
+                file_path: Some("src/search/engine.rs".to_string()),
+                line: Some(187),
+                score: 0.80,
+                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
+                score_breakdown: None,
+            },
+            SearchHit {
+                node_id: NodeId("provider-selector".to_string()),
+                display_name: "configure_embedding_execution_provider".to_string(),
+                kind: codestory_contracts::api::NodeKind::FUNCTION,
+                file_path: Some("src/search/engine.rs".to_string()),
+                line: Some(194),
+                score: 0.70,
+                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
+                score_breakdown: None,
+            },
+        ];
+
+        hits.sort_by(|left, right| {
+            compare_search_hits(
+                "DirectML ONNX execution provider environment variable configuration",
+                left,
+                right,
+            )
+        });
+        dedupe_inexact_search_hits_by_display_key(
+            "DirectML ONNX execution provider environment variable configuration",
+            &mut hits,
+        );
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].node_id, NodeId("provider-selector".to_string()));
+        assert_eq!(hits[1].node_id, NodeId("directml-cfg-enabled".to_string()));
+    }
+
+    #[test]
+    fn exact_search_results_keep_repeated_display_keys() {
+        let mut hits = vec![
+            SearchHit {
+                node_id: NodeId("directml-cfg-enabled".to_string()),
+                display_name: "configure_directml_embedding_provider".to_string(),
+                kind: codestory_contracts::api::NodeKind::FUNCTION,
+                file_path: Some("src/search/engine.rs".to_string()),
+                line: Some(178),
+                score: 0.90,
+                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
+                score_breakdown: None,
+            },
+            SearchHit {
+                node_id: NodeId("directml-cfg-disabled".to_string()),
+                display_name: "configure_directml_embedding_provider".to_string(),
+                kind: codestory_contracts::api::NodeKind::FUNCTION,
+                file_path: Some("src/search/engine.rs".to_string()),
+                line: Some(187),
+                score: 0.80,
+                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
+                score_breakdown: None,
+            },
+        ];
+
+        dedupe_inexact_search_hits_by_display_key(
+            "configure_directml_embedding_provider",
+            &mut hits,
+        );
+
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
     fn full_index_rebuilds_semantic_docs_when_source_text_changes() {
         let _env = hybrid_test_env();
         let workspace = tempdir().expect("workspace dir");
@@ -5246,6 +5383,18 @@ pub fn exact_symbol_anchor() {{}}
         assert!((lexical - fallback.lexical_weight).abs() < 1e-6);
         assert!((semantic - fallback.semantic_weight).abs() < 1e-6);
         assert!((graph - fallback.graph_weight).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hybrid_search_defaults_to_accuracy_first_semantic_profile() {
+        let config = HybridSearchConfig::default();
+
+        assert_eq!(config.max_results, 20);
+        assert_eq!(config.lexical_weight, 0.0);
+        assert_eq!(config.semantic_weight, 1.0);
+        assert_eq!(config.graph_weight, 0.0);
+        assert_eq!(config.lexical_limit, 0);
+        assert_eq!(config.semantic_limit, 20);
     }
 
     #[test]

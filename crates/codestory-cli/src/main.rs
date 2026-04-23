@@ -1267,12 +1267,21 @@ fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Resul
         "/health" => write_http_json(&mut stream, 200, &serde_json::json!({"ok": true})),
         "/search" => {
             let query = params.get("q").cloned().unwrap_or_default();
+            let repo_text = params
+                .get("repo_text")
+                .and_then(|value| search_repo_text_mode_param(value))
+                .unwrap_or(SearchRepoTextMode::Auto);
+            let limit_per_source = params
+                .get("limit")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(10)
+                .clamp(1, 100);
             let results = runtime
                 .search
                 .search_results(SearchRequest {
                     query,
-                    repo_text: SearchRepoTextMode::Auto,
-                    limit_per_source: 10,
+                    repo_text,
+                    limit_per_source,
                     hybrid_weights: None,
                     hybrid_limits: None,
                 })
@@ -1426,6 +1435,15 @@ fn parse_query_string(query: &str) -> HashMap<String, String> {
             Some((url_decode(key)?, url_decode(value)?))
         })
         .collect()
+}
+
+fn search_repo_text_mode_param(value: &str) -> Option<SearchRepoTextMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some(SearchRepoTextMode::Auto),
+        "on" | "true" | "1" => Some(SearchRepoTextMode::On),
+        "off" | "false" | "0" => Some(SearchRepoTextMode::Off),
+        _ => None,
+    }
 }
 
 fn url_decode(value: &str) -> Option<String> {
@@ -2454,6 +2472,27 @@ mod tests {
             output.repo_text_hits[0].origin,
             codestory_contracts::api::SearchHitOrigin::TextMatch
         );
+    }
+
+    #[test]
+    fn http_search_repo_text_param_accepts_cli_modes() {
+        assert_eq!(
+            search_repo_text_mode_param("auto"),
+            Some(SearchRepoTextMode::Auto)
+        );
+        assert_eq!(
+            search_repo_text_mode_param("off"),
+            Some(SearchRepoTextMode::Off)
+        );
+        assert_eq!(
+            search_repo_text_mode_param("0"),
+            Some(SearchRepoTextMode::Off)
+        );
+        assert_eq!(
+            search_repo_text_mode_param("on"),
+            Some(SearchRepoTextMode::On)
+        );
+        assert_eq!(search_repo_text_mode_param("bogus"), None);
     }
 
     #[test]

@@ -536,6 +536,535 @@ const queries = [
     expect: ["preferred_occurrence"],
     bucket: "search-output",
   },
+  {
+    id: "holdout-cli-refresh-gate",
+    query: "before a read-only CLI command runs decide if the repo index must be built or refreshed",
+    expect: ["ensure_index_ready"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-graph-query-parser",
+    query: "parse a piped graph mini-language expression into trail symbol search filter and limit steps",
+    expect: ["parse_graph_query", "split_pipeline"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-query-markdown-render",
+    query: "render the structured query pipeline results for a human terminal report",
+    expect: ["render_query_markdown"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-stdio-tool-router",
+    query: "dispatch JSON stdio tool calls to search symbol trail snippet and ask handlers",
+    expect: [
+      "handle_stdio_tool_call",
+      "handle_stdio_search",
+      "handle_stdio_symbol",
+      "handle_stdio_trail",
+      "handle_stdio_snippet",
+      "handle_stdio_ask",
+    ],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-stdio-resource-reader",
+    query: "serve project summary grounding snapshot and symbol inventory resources over the stdio protocol",
+    expect: [
+      "read_stdio_resource",
+      "open_project_summary",
+      "GroundingService::grounding_snapshot",
+      "list_root_symbols",
+    ],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-agent-profile-router",
+    query: "choose an automatic retrieval preset from the user's natural language agent prompt",
+    expect: ["route_auto_preset", "resolve_profile"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-agent-source-context-gate",
+    query: "decide whether an agent question needs source code context before composing the answer",
+    expect: ["needs_source_context", "maybe_read_source_context"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-agent-term-planner",
+    query: "ask a local agent to suggest extra search terms when retrieval needs a planner",
+    expect: ["build_term_planner_prompt", "should_use_agent_term_planner"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-agent-prompt-builder",
+    query: "build the constrained prompt sent to a local code assistant using indexed context only",
+    expect: ["build_local_agent_prompt"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-agent-citation-map",
+    query: "turn scored retrieval hits into answer citations with target paths and line numbers",
+    expect: ["to_citation"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-embedding-profile-env",
+    query: "load embedding model profile prefixes pooling dimensions and backend choices from environment",
+    expect: ["EmbeddingProfile::from_env", "EmbeddingBackendSelection::from_env"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-query-embedding-prefix",
+    query: "prepend the search-query instruction prefix before embedding a user's lookup text",
+    expect: ["EmbeddingRuntime::embed_query"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-semantic-score-loop",
+    query: "compute cosine similarity scores between the query vector and stored semantic documents",
+    expect: ["semantic_scores", "cosine_similarity", "semantic_score_from_cosine"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-embedding-postprocess",
+    query: "normalize truncate and postprocess embedding vectors after model inference",
+    expect: ["postprocess_embeddings"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-search-doc-delete",
+    query: "remove persisted semantic search documents for one changed source file",
+    expect: ["SearchDocStore::delete_for_file", "delete_for_file"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-snapshot-promote",
+    query: "prepare a staged grounding snapshot database then promote it over the live cache",
+    expect: ["prepare_staged_publish", "promote_staged_snapshot", "SnapshotStore::promote_staged"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-resolution-support-cache",
+    query: "reuse or rebuild the cached support tables used by semantic call and import resolution",
+    expect: ["ResolutionSupport::prepare", "get_resolution_support_snapshot"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-common-call-noise",
+    query: "avoid resolving noisy unqualified helper calls like clone into unrelated global symbols",
+    expect: [
+      "common_unqualified_call_names",
+      "should_keep_common_call_resolution",
+      "is_common_unqualified_call_name",
+    ],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-sql-placeholder-builder",
+    query: "build numbered and question mark placeholders for variable length SQLite queries",
+    expect: ["numbered_placeholders", "question_placeholders"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-workspace-language-filter",
+    query: "filter discovered workspace files by configured source language groups",
+    expect: ["matches_source_group_language", "should_filter_source_group_language"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-workspace-ignore-rules",
+    query: "skip ignored directories and excluded paths while discovering project source files",
+    expect: [
+      "WorkspaceDiscovery::source_files",
+      "WorkspaceManifest::source_files",
+      "should_include_discovered_path",
+      "is_excluded_path",
+      "compile_exclude_patterns",
+    ],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-target-display-format",
+    query: "format a search result target with path line column and stable symbol label",
+    expect: ["format_search_hit_target"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-explore-report",
+    query: "assemble an explore report that bundles symbol details trails snippets and nearby search hits",
+    expect: ["run_explore", "render_explore_markdown"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-config-env-defaults",
+    query: "apply project config defaults into missing process environment variables",
+    expect: ["apply_env_defaults", "set_env_if_absent"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-config-file-merge",
+    query: "merge a codestory config file into CLI runtime settings",
+    expect: ["merge_config_file", "load_config"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-output-file-write",
+    query: "write rendered command output to a requested file and reject missing parents",
+    expect: ["write_output_file", "emit_text"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-search-why-render",
+    query: "append explanation fields showing why a search hit matched",
+    expect: ["append_search_hit_why", "explain_search_hit"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-trail-dot-render",
+    query: "render a trail graph as Graphviz DOT notation",
+    expect: ["render_trail_dot", "escape_dot"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-snippet-language",
+    query: "choose syntax highlighting language and fence for a source snippet",
+    expect: ["snippet_language", "snippet_fence"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-index-watch-output-guard",
+    query: "reject index watch output files that would be written inside the indexed tree",
+    expect: ["validate_index_watch_output_file"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-progress-printer",
+    query: "format and print indexing progress events while files are processed",
+    expect: ["spawn_progress_printer", "format_progress_bar"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-doctor-next-commands",
+    query: "build doctor diagnostics and suggest next indexing commands",
+    expect: ["build_doctor_output", "index_next_commands", "doctor_check"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-ask-artifact-bundle",
+    query: "write agent ask bundle artifacts with a sanitized filename",
+    expect: ["write_ask_bundle", "sanitize_artifact_name"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-http-server-router",
+    query: "route small HTTP server requests to health search symbol trail and snippet responses",
+    expect: ["handle_http_request", "write_http_json"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-http-query-string",
+    query: "decode URL query strings into target selection parameters",
+    expect: ["parse_query_string", "url_decode", "target_selection_from_params"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-stdio-target-selection",
+    query: "extract a target symbol query from stdio tool request arguments",
+    expect: ["stdio_target_selection"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-stdio-tool-specs",
+    query: "produce JSON tool metadata for the stdio tools list response",
+    expect: ["stdio_tools_list_json", "stdio_tool_spec"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-stdio-template-resource",
+    query: "read parameterized stdio template resources for symbols trails snippets and references",
+    expect: ["read_stdio_template_resource"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-search-output-groups",
+    query: "build search output while preserving indexed symbol and repo text provenance groups",
+    expect: ["build_search_output"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-query-resolution-output",
+    query: "serialize query target resolution selector id and display metadata",
+    expect: ["serialize_candidate_targets", "build_query_resolution_output"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-search-location-key",
+    query: "deduplicate search hits using path line and column location keys",
+    expect: [
+      "dedupe_inexact_search_hits_by_display_key",
+      "merge_search_hits",
+      "search_hit_location_key",
+    ],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-hide-speculative-trail",
+    query: "hide speculative edges from trail context before displaying graph output",
+    expect: ["hide_speculative_trail_edges", "is_speculative_certainty"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-repo-text-excerpt",
+    query: "make compact excerpts for repository text matches in search results",
+    expect: ["repo_text_excerpt", "compact_excerpt"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-resolution-ambiguity",
+    query: "construct no-match and ambiguous-match errors for target resolution",
+    expect: ["no_query_match_error", "ambiguous_query_error"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-resolution-candidate-rank",
+    query: "rank candidate target matches by exactness kind and declaration anchors",
+    expect: ["resolution_candidate_rank", "compare_resolution_candidates"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-resolution-file-read",
+    query: "read file contents while resolving a target from a file filter",
+    expect: ["read_file_contents_for_resolution"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-trail-request-build",
+    query: "convert CLI trail mode depth direction and filters into a trail request",
+    expect: ["build_trail_request", "build_trail_request_impl"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-agent-command-config",
+    query: "choose configured local agent command and backend label",
+    expect: ["configured_agent_command", "agent_backend_label"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-local-agent-response",
+    query: "capture stdout stderr and exit status from a local agent command",
+    expect: ["build_agent_response", "run_local_agent"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-agent-retrieval-markdown",
+    query: "write markdown that explains retrieved context citations and source snippets for an agent answer",
+    expect: ["retrieval_markdown", "render_agent_answer_markdown"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-agent-prompt-terms",
+    query: "extract concise keyword search terms from a user's long natural language prompt",
+    expect: ["prompt_search_terms"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-mermaid-fallback",
+    query: "create fallback mermaid diagrams when graph retrieval has too little structure",
+    expect: ["fallback_mermaid", "mermaid_flowchart", "mermaid_sequence"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-canonical-layout-dedupe",
+    query: "deduplicate canonical graph nodes and merge certainty for repeated graph edges",
+    expect: ["dedupe_key_for_node", "merge_certainty"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-canonical-node-sizing",
+    query: "estimate graph node width and height from label text and member rows",
+    expect: ["estimated_node_width", "estimated_node_height"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-embedding-session-count",
+    query: "read embedding session count and parallel chunk size from environment settings",
+    expect: ["embedding_session_count_from_env", "embedding_parallel_chunk_size"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-embedding-binary-cosine",
+    query: "score packed binary embedding vectors using signed and unsigned cosine approximations",
+    expect: [
+      "QuantizedEmbedding::approximate_cosine",
+      "signed_binary_cosine",
+      "unsigned_binary_cosine",
+      "pack_sign_bits",
+    ],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-http-embedding-response",
+    query: "split chunked HTTP responses returned by llama cpp embeddings endpoint",
+    expect: ["split_http_response", "decode_chunked_http_body"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-openai-embedding-json",
+    query: "parse OpenAI compatible embeddings JSON into ordered vector rows",
+    expect: ["parse_openai_embeddings_response", "rows_to_vecs"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-onnx-session-build",
+    query: "build an ONNX Runtime embedding session with provider and optimization settings",
+    expect: ["build_onnx_embedding_session"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-pooling-last-hidden",
+    query: "pool last hidden states using mean or last token strategy for embedding output",
+    expect: ["pool_last_hidden", "mean_pool_last_hidden", "last_token_pool_last_hidden"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-hash-projection-embedding",
+    query: "fallback hash projection embeds text into deterministic vector dimensions",
+    expect: ["embed_text_with_hash_projection"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-vector-normalization",
+    query: "apply layer normalization and L2 normalization to embedding vectors",
+    expect: ["layer_normalize", "l2_normalize"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-semantic-score-sort",
+    query: "sort semantic node scores descending and truncate to the requested candidate limit",
+    expect: ["compare_node_scores_desc", "truncate_node_scores"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-storage-sidecars",
+    query: "compute sqlite sidecar file paths and clean them up after storage operations",
+    expect: ["sqlite_sidecar_paths", "cleanup_sqlite_sidecars"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-grounding-rank-sql",
+    query: "generate SQL expressions for grounding display names and node rank ordering",
+    expect: ["grounding_display_name_expr", "grounding_node_rank_sql"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-grounding-snapshot-states",
+    query: "mark grounding summary and detail snapshots dirty or ready in storage metadata",
+    expect: [
+      "write_grounding_snapshot_states",
+      "invalidate_grounding_snapshots",
+      "mark_grounding_snapshots_dirty",
+      "mark_grounding_detail_snapshots_dirty",
+      "has_ready_grounding_summary_snapshots",
+      "has_ready_grounding_detail_snapshots",
+      "has_ready_grounding_snapshots",
+    ],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-grounding-detail-hydrate",
+    query: "hydrate detailed grounding node summaries and edge digests after summary snapshots exist",
+    expect: ["hydrate_grounding_detail_snapshots"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-storage-schema-migrations",
+    query: "apply storage schema migrations and create deferred secondary indexes",
+    expect: ["apply_schema_migrations", "create_deferred_secondary_indexes"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-trail-node-filter",
+    query: "filter trail graph nodes by caller scope and hide tests or utility helpers",
+    expect: ["apply_trail_node_filter", "is_caller_scope_allowed", "should_ignore_call_resolution"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-resolution-transaction",
+    query: "run call import and override resolution inside immediate SQLite transactions",
+    expect: ["run_in_immediate_transaction", "resolve_edges_after_prepare"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-resolution-update-builder",
+    query: "build resolved edge updates and candidate JSON payloads during semantic resolution",
+    expect: ["build_resolved_edge_update", "candidate_json"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-resolution-semantic-key",
+    query: "derive semantic resolution request keys and target names from unresolved edges",
+    expect: ["semantic_request_key", "semantic_request_target_name"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-resolution-import-candidates",
+    query: "create import name candidates and module prefixes for language-aware resolution",
+    expect: ["import_name_candidates", "module_prefix"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-resolution-candidate-pool",
+    query: "collect candidate pools from exact same file same module global and fuzzy matches",
+    expect: [
+      "collect_candidate_pool",
+      "collect_candidate_pool_from_index",
+      "find_same_file",
+      "find_same_module",
+      "find_fuzzy",
+    ],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-semantic-language-family",
+    query: "group languages into compatible semantic families for import and call resolution",
+    expect: ["language_family_bucket", "compatible_language_families"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-semantic-import-normalize",
+    query: "normalize JavaScript TypeScript C and C++ import or include symbols for matching",
+    expect: ["normalize_import_symbol", "normalize_include_symbol", "strip_known_script_extension"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-workspace-inventory-map",
+    query: "build a workspace inventory map from stored file records for incremental refresh",
+    expect: ["WorkspaceInventory::from_records", "RefreshInputs::inventory_map"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-workspace-file-push",
+    query: "push discovered source files with normalized compare keys for stable ordering",
+    expect: ["push_discovered_file", "normalized_compare_key", "normalize_path_key"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-index-artifact-cache-key",
+    query: "mix compiler and language settings into an index artifact cache key",
+    expect: ["build_index_artifact_cache_key", "mix_compilation_info", "mix_optional_standard"],
+    bucket: "holdout-adversarial",
+  },
+  {
+    id: "holdout-bookmark-create",
+    query: "create bookmark categories and update bookmark comments in storage",
+    expect: [
+      "create_bookmark_category",
+      "Storage::update_bookmark_comment",
+      "update_bookmark_comment",
+    ],
+    bucket: "holdout-adversarial",
+  },
 ];
 
 const benchmarkQueries = selectQueries(queries);
@@ -1422,6 +1951,61 @@ function stageFinalistsRun2() {
         hybridLimits: { lexical: 0, semantic: 6 },
       }),
       cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-durable-pure-semantic-lex0-slim6",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        hybridWeights: { lexical: 0, semantic: 1, graph: 0 },
+        hybridLimits: { lexical: 0, semantic: 6 },
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-durable-runtime-default",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-durable-runtime-default-stored-int8",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        vectorEncoding: "int8",
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b768-r4-durable-runtime-default-stored-int8",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+        batch: 768,
+        requests: 4,
+        parallel: 4,
+        vectorEncoding: "int8",
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b768-r4-durable-runtime-default-stored-int8-ub1024",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+        batch: 768,
+        requests: 4,
+        parallel: 4,
+        serverUbatch: 1024,
+        vectorEncoding: "int8",
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b896-r4-durable-runtime-default-stored-int8",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+        batch: 896,
+        requests: 4,
+        parallel: 4,
+        vectorEncoding: "int8",
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
         variant: "frontier-b512-r4-pure-semantic-lex0-slim5",
         docMode: "alias_variant",
         semanticScope: "all",
@@ -2086,12 +2670,24 @@ function validateOnnxProvider(config, index, indexJson) {
 }
 
 function findRank(hits, query) {
-  const expected = query.expect.map((item) => item.toLowerCase());
   const rank = hits.findIndex((hit) => {
-    const display = String(hit.display_name ?? "").toLowerCase();
-    return expected.some((needle) => display.includes(needle));
+    return query.expect.some((needle) => expectedSymbolMatchesHit(needle, hit));
   });
   return rank < 0 ? null : rank + 1;
+}
+
+function expectedSymbolMatchesHit(expected, hit) {
+  const hitSegments = new Set(symbolSegments([hit.display_name, hit.node_ref, hit.file_path].filter(Boolean).join(" ")));
+  const expectedSegments = symbolSegments(expected);
+  if (!expectedSegments.length) return false;
+  return expectedSegments.every((segment) => hitSegments.has(segment));
+}
+
+function symbolSegments(value) {
+  return String(value ?? "")
+    .match(/[a-z0-9_]+/gi)
+    ?.map((segment) => segment.toLowerCase())
+    .filter(Boolean) ?? [];
 }
 
 function score(searchResults) {
@@ -2186,6 +2782,17 @@ function embeddingDimension(config) {
 }
 
 function vectorBytesPerDoc(config) {
+  // CODESTORY_STORED_VECTOR_ENCODING=int8 stores a compact versioned
+  // llm_symbol_doc.embedding_blob with a scale header. Other encodings still persist raw f32.
+  const dimension = embeddingDimension(config);
+  if ((config.vectorEncoding ?? "float32") === "int8") {
+    const versionedHeaderBytes = 9;
+    return versionedHeaderBytes + dimension * precisionBytes.int8;
+  }
+  return dimension * precisionBytes.float32;
+}
+
+function prefilterVectorBytesPerDoc(config) {
   const precision = config.vectorEncoding ?? "float32";
   const bytes = precisionBytes[precision] ?? precisionBytes.float32;
   return embeddingDimension(config) * bytes;
@@ -2210,6 +2817,7 @@ async function runCase(config) {
       error: config.skipReason,
       model_size_mb: fileSizeMb(config.modelPath),
       vector_bytes_per_doc: vectorBytesPerDoc(config),
+      prefilter_vector_bytes_per_doc: prefilterVectorBytesPerDoc(config),
     };
     fs.writeFileSync(path.join(caseDir, "result.json"), JSON.stringify(skipped, null, 2));
     return skipped;
@@ -2225,6 +2833,7 @@ async function runCase(config) {
           error: `missing optional research artifact: ${required}`,
           model_size_mb: null,
           vector_bytes_per_doc: vectorBytesPerDoc(config),
+          prefilter_vector_bytes_per_doc: prefilterVectorBytesPerDoc(config),
         };
         fs.writeFileSync(path.join(caseDir, "result.json"), JSON.stringify(skipped, null, 2));
         return skipped;
@@ -2361,6 +2970,7 @@ async function runCase(config) {
       retrieval_mode: retrievalMode,
       model_size_mb: fileSizeMb(config.modelPath),
       vector_bytes_per_doc: vectorBytesPerDoc(config),
+      prefilter_vector_bytes_per_doc: prefilterVectorBytesPerDoc(config),
       score: score(searchResults),
       queries: searchResults,
     };
@@ -2568,7 +3178,7 @@ function writeManifest(cases) {
       "weight-quant":
         "GGUF and ONNX model-weight quantization rows. Missing quantized artifacts are reported as skipped rows.",
       "vector-quant":
-        "Stored-vector quantization lane. Manifest-only until CodeStory has quantized-vector storage/search support.",
+        "Quantized semantic prefilter lane. Persisted SQLite vector bytes remain float32 until compact vector storage support lands.",
       dimension:
         "Source-backed Matryoshka/dimension rows for Nomic v1.5, Nomic v2 MoE, Qwen3 0.6B, and EmbeddingGemma; BGE-small is a negative control.",
       retrieval:
@@ -2598,6 +3208,7 @@ function writeManifest(cases) {
       model_path: config.modelPath,
       model_size_mb: fileSizeMb(config.modelPath),
       vector_bytes_per_doc: vectorBytesPerDoc(config),
+      prefilter_vector_bytes_per_doc: prefilterVectorBytesPerDoc(config),
       batch: config.batch,
       sessions: config.sessions,
       requests: config.requests,
@@ -2736,6 +3347,7 @@ function writeReports(results, cases) {
     "variant",
     "model_size_mb",
     "vector_bytes_per_doc",
+    "prefilter_vector_bytes_per_doc",
     "index_seconds",
     "semantic_seconds",
     "search_seconds",
@@ -2795,6 +3407,7 @@ function writeReports(results, cases) {
     result.variant ?? "",
     fmt(result.model_size_mb),
     fmt(result.vector_bytes_per_doc),
+    fmt(result.prefilter_vector_bytes_per_doc),
     fmt(result.index_seconds),
     fmt(result.semantic_seconds),
     fmt(result.search_seconds),

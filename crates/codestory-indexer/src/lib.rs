@@ -403,13 +403,7 @@ fn infer_header_language_config(
         .unwrap_or(false);
 
     if use_cpp {
-        make_language_config(
-            tree_sitter_cpp::LANGUAGE.into(),
-            "cpp",
-            CPP_GRAPH_QUERY,
-            None,
-            LanguageRuleset::Cpp,
-        )
+        cpp_language_config()
     } else {
         make_language_config(
             tree_sitter_c::LANGUAGE.into(),
@@ -418,6 +412,62 @@ fn infer_header_language_config(
             None,
             LanguageRuleset::C,
         )
+    }
+}
+
+fn cpp_language_config() -> LanguageConfig {
+    make_language_config(
+        tree_sitter_cpp::LANGUAGE.into(),
+        "cpp",
+        CPP_GRAPH_QUERY,
+        None,
+        LanguageRuleset::Cpp,
+    )
+}
+
+fn path_is_c_header(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| ext.trim().trim_start_matches('.').eq_ignore_ascii_case("h"))
+}
+
+fn header_source_has_cpp_signals(source: &str) -> bool {
+    source
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with("//")
+                && !line.starts_with("/*")
+                && !line.starts_with('*')
+        })
+        .any(|line| {
+            line.starts_with("class ")
+                || line.starts_with("namespace ")
+                || line.starts_with("template <")
+                || line.starts_with("template<")
+                || line == "public:"
+                || line == "private:"
+                || line == "protected:"
+                || line.contains(" virtual ")
+                || line.starts_with("virtual ")
+                || line.contains("std::")
+                || line.contains("::")
+        })
+}
+
+fn maybe_upgrade_header_language_from_source(
+    path: &Path,
+    source: &str,
+    language_config: &LanguageConfig,
+) -> Option<LanguageConfig> {
+    if language_config.language_name == "c"
+        && path_is_c_header(path)
+        && header_source_has_cpp_signals(source)
+    {
+        Some(cpp_language_config())
+    } else {
+        None
     }
 }
 
@@ -1182,7 +1232,7 @@ impl WorkspaceIndexer {
             .compilation_db
             .as_ref()
             .and_then(|db| db.get_parsed_info(&full_path));
-        let Some(language_config) =
+        let Some(mut language_config) =
             get_language_config_for_path(&full_path, compilation_info.as_ref())
         else {
             match self.prepare_openapi_schema_work(&full_path) {
@@ -1208,21 +1258,26 @@ impl WorkspaceIndexer {
                 return Err(local_storage);
             }
         };
+        // Decode before building the cache key so source-aware header detection can choose
+        // the same parser that will be used for indexing.
+        let source = match String::from_utf8(bytes) {
+            Ok(source) => source,
+            Err(error) => String::from_utf8_lossy(&error.into_bytes()).into_owned(),
+        };
+        if let Some(upgraded) =
+            maybe_upgrade_header_language_from_source(&full_path, &source, &language_config)
+        {
+            language_config = upgraded;
+        }
         let flags = index_feature_flags();
         let artifact_cache_key = build_index_artifact_cache_key(
             &full_path,
-            &bytes,
+            source.as_bytes(),
             &language_config,
             compilation_info.as_ref(),
             flags.legacy_edge_identity,
             flags.lazy_graph_execution,
         );
-        // Consume the raw bytes once the cache key is built so valid UTF-8 files do not
-        // hold both the byte buffer and a second owned String allocation at the same time.
-        let source = match String::from_utf8(bytes) {
-            Ok(source) => source,
-            Err(error) => String::from_utf8_lossy(&error.into_bytes()).into_owned(),
-        };
 
         match storage.get_index_artifact_cache(&full_path, &artifact_cache_key) {
             Ok(Some(blob)) => match serde_json::from_slice::<CachedIndexArtifact>(&blob) {
@@ -1846,6 +1901,26 @@ fn collect_cpp_declaration_span_overrides(
                 && let Some(name) = trimmed_node_text(name_node, source)
             {
                 insert_declaration_span_override(overrides, NodeKind::CLASS, name, name_node, node);
+            }
+        }
+        "enum_specifier" => {
+            if let Some(name_node) = node.child_by_field_name("name")
+                && let Some(name) = trimmed_node_text(name_node, source)
+            {
+                insert_declaration_span_override(overrides, NodeKind::ENUM, name, name_node, node);
+            }
+        }
+        "enumerator" => {
+            if let Some(name_node) = node.child_by_field_name("name")
+                && let Some(name) = trimmed_node_text(name_node, source)
+            {
+                insert_declaration_span_override(
+                    overrides,
+                    NodeKind::ENUM_CONSTANT,
+                    name,
+                    name_node,
+                    node,
+                );
             }
         }
         "function_definition" => {
@@ -3118,7 +3193,7 @@ fn append_manual_c_enum_member_edges(
     edge_keys: &mut HashSet<EdgeDedupKey>,
     flags: IndexFeatureFlags,
 ) {
-    if language_name != "c" {
+    if language_name != "c" && language_name != "cpp" {
         return;
     }
 
@@ -6190,6 +6265,14 @@ class MyClass {
     myMethod() {}
 }
 function globalFunc() {}
+export const Posts = {
+    slug: "posts",
+    fields: [],
+};
+export const contentBlocks = [];
+export default buildConfig({
+    collections: [Posts],
+});
 "#;
         let language_config = get_language_for_ext("ts").unwrap();
 
@@ -6208,6 +6291,25 @@ function globalFunc() {}
                 .nodes
                 .iter()
                 .any(|n| n.serialized_name == "globalFunc" && n.kind == NodeKind::FUNCTION)
+        );
+        assert!(
+            result
+                .nodes
+                .iter()
+                .any(|n| { n.serialized_name == "Posts" && n.kind == NodeKind::GLOBAL_VARIABLE }),
+            "exported object config should be indexed as a global variable"
+        );
+        assert!(
+            result.nodes.iter().any(|n| {
+                n.serialized_name == "contentBlocks" && n.kind == NodeKind::GLOBAL_VARIABLE
+            }),
+            "exported array config should be indexed as a global variable"
+        );
+        assert!(
+            result.nodes.iter().any(|n| {
+                n.serialized_name == "buildConfig" && n.kind == NodeKind::GLOBAL_VARIABLE
+            }),
+            "default-exported config factory calls should be indexed as global variables"
         );
 
         // Assert Edge Creation (MEMBER)
@@ -6232,6 +6334,39 @@ function globalFunc() {}
         let config = get_language_config_for_path(Path::new("widget.h"), Some(&cpp_info))
             .expect("path-based header config should resolve");
         assert_eq!(config.language_name, "cpp");
+    }
+
+    #[test]
+    fn test_header_source_signals_can_upgrade_c_header_to_cpp() {
+        let c_header = r#"
+#ifndef COUNT_H
+#define COUNT_H
+typedef struct Counter Counter;
+void counter_increment(Counter* counter);
+#endif
+"#;
+        assert!(!header_source_has_cpp_signals(c_header));
+
+        let cpp_header = r#"
+#ifndef STORAGE_ACCESS_H
+#define STORAGE_ACCESS_H
+class Graph;
+class StorageAccess {
+public:
+    virtual std::shared_ptr<Graph> getGraphForAll() const = 0;
+};
+#endif
+"#;
+        assert!(header_source_has_cpp_signals(cpp_header));
+
+        let base_config = get_language_for_ext("h").expect("header extension should resolve");
+        let upgraded = maybe_upgrade_header_language_from_source(
+            Path::new("StorageAccess.h"),
+            cpp_header,
+            &base_config,
+        )
+        .expect("C++ header signals should upgrade parser");
+        assert_eq!(upgraded.language_name, "cpp");
     }
 
     #[test]

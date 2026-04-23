@@ -34,6 +34,30 @@
   attr (@name.node) end_col = (end-column @name)
 }
 
+(enum_specifier
+  name: (_) @name)
+{
+  node @name.node
+  attr (@name.node) kind = "ENUM"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+}
+
+(enumerator
+  name: (_) @name)
+{
+  node @name.node
+  attr (@name.node) kind = "ENUM_CONSTANT"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+}
+
 (function_definition
   declarator: (function_declarator
     declarator: (_) @name)) @def
@@ -47,9 +71,37 @@
   attr (@name.node) end_col = (end-column @def)
 }
 
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (_) @name))) @def
+{
+  node @name.node
+  attr (@name.node) kind = "FUNCTION"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
 (field_declaration
   declarator: (function_declarator
     declarator: (_) @name)) @def
+{
+  node @name.node
+  attr (@name.node) kind = "METHOD"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
+(field_declaration
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (_) @name))) @def
 {
   node @name.node
   attr (@name.node) kind = "METHOD"
@@ -93,6 +145,15 @@
   attr (@ns_name.node -> @member_name.node) kind = "MEMBER"
 }
 
+(namespace_definition
+  name: (_) @ns_name
+  body: (declaration_list
+    (enum_specifier name: (_) @member_name)))
+{
+  edge @ns_name.node -> @member_name.node
+  attr (@ns_name.node -> @member_name.node) kind = "MEMBER"
+}
+
 ;; Class members (methods)
 (class_specifier
   name: (_) @class_name
@@ -116,6 +177,18 @@
   attr (@class_name.node -> @method_name.node) kind = "MEMBER"
 }
 
+(class_specifier
+  name: (_) @class_name
+  body: (field_declaration_list
+    (field_declaration
+      declarator: (pointer_declarator
+        declarator: (function_declarator
+          declarator: (_) @method_name)))))
+{
+  edge @class_name.node -> @method_name.node
+  attr (@class_name.node -> @method_name.node) kind = "MEMBER"
+}
+
 ;; Class members (fields)
 (class_specifier
   name: (_) @class_name
@@ -124,6 +197,16 @@
 {
   edge @class_name.node -> @field_name.node
   attr (@class_name.node -> @field_name.node) kind = "MEMBER"
+}
+
+(class_specifier
+  name: (_) @class_name
+  body: (field_declaration_list
+    (field_declaration
+      type: (enum_specifier name: (_) @enum_name))))
+{
+  edge @class_name.node -> @enum_name.node
+  attr (@class_name.node -> @enum_name.node) kind = "MEMBER"
 }
 
 (struct_specifier
@@ -140,10 +223,52 @@
 (struct_specifier
   name: (_) @class_name
   body: (field_declaration_list
+    (field_declaration
+      declarator: (function_declarator
+        declarator: (_) @method_name))))
+{
+  edge @class_name.node -> @method_name.node
+  attr (@class_name.node -> @method_name.node) kind = "MEMBER"
+}
+
+(struct_specifier
+  name: (_) @class_name
+  body: (field_declaration_list
+    (field_declaration
+      declarator: (pointer_declarator
+        declarator: (function_declarator
+          declarator: (_) @method_name)))))
+{
+  edge @class_name.node -> @method_name.node
+  attr (@class_name.node -> @method_name.node) kind = "MEMBER"
+}
+
+(struct_specifier
+  name: (_) @class_name
+  body: (field_declaration_list
     (field_declaration declarator: (field_identifier) @field_name)))
 {
   edge @class_name.node -> @field_name.node
   attr (@class_name.node -> @field_name.node) kind = "MEMBER"
+}
+
+(struct_specifier
+  name: (_) @class_name
+  body: (field_declaration_list
+    (field_declaration
+      type: (enum_specifier name: (_) @enum_name))))
+{
+  edge @class_name.node -> @enum_name.node
+  attr (@class_name.node -> @enum_name.node) kind = "MEMBER"
+}
+
+(enum_specifier
+  name: (_) @enum_name
+  body: (enumerator_list
+    (enumerator name: (_) @constant_name)))
+{
+  edge @enum_name.node -> @constant_name.node
+  attr (@enum_name.node -> @constant_name.node) kind = "MEMBER"
 }
 
 (template_declaration
