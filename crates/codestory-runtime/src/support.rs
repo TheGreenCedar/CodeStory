@@ -169,15 +169,16 @@ pub(crate) fn extract_symbol_search_terms(query: &str) -> Vec<String> {
 }
 
 pub(crate) fn should_expand_symbol_query(query: &str, direct_hit_count: usize) -> bool {
+    if direct_hit_count >= 3 {
+        return false;
+    }
+
     let word_count = query.split_whitespace().count();
     let has_text_punctuation = query
         .chars()
         .any(|ch| matches!(ch, '.' | ',' | ':' | ';' | '!' | '?' | '"' | '\''));
     if word_count > 1 && has_text_punctuation {
         return true;
-    }
-    if direct_hit_count >= 3 {
-        return false;
     }
 
     word_count > 2 || query.len() > 28

@@ -557,6 +557,223 @@ struct Child : Base {
 }
 
 #[test]
+fn test_cpp_abstract_header_members_keep_owner_qualification() -> anyhow::Result<()> {
+    let (nodes, edges) = index_project(&[(
+        "StorageAccess.h",
+        r#"
+#include <memory>
+#include <string>
+#include <vector>
+
+class Graph;
+class NameHierarchy;
+class NodeBookmark;
+
+class StorageAccess
+{
+public:
+    virtual ~StorageAccess() = default;
+
+    virtual std::map<int, std::pair<int, NameHierarchy>> getNodeIdToParentFileMap(
+        const std::vector<int>& nodeIds) const = 0;
+    virtual std::shared_ptr<Graph> getGraphForAll() const = 0;
+    virtual std::shared_ptr<Graph> getGraphForActiveTokenIds(
+        const std::vector<int>& tokenIds,
+        const std::vector<int>& expandedNodeIds,
+        bool* isActiveNamespace = nullptr) const = 0;
+    virtual int addNodeBookmark(const NodeBookmark& bookmark) = 0;
+};
+"#,
+    )])?;
+
+    assert!(
+        has_node_kind(&nodes, "StorageAccess", NodeKind::CLASS),
+        "expected abstract C++ header class to be indexed"
+    );
+    assert!(
+        has_node_kind(&nodes, "StorageAccess::getGraphForAll", NodeKind::METHOD),
+        "expected one-line pure virtual method to be owner-qualified"
+    );
+    assert!(
+        has_node_kind(
+            &nodes,
+            "StorageAccess::getGraphForActiveTokenIds",
+            NodeKind::METHOD
+        ),
+        "expected multiline pure virtual method to be owner-qualified"
+    );
+    assert!(
+        has_node_kind(&nodes, "StorageAccess::addNodeBookmark", NodeKind::METHOD),
+        "expected abstract bookmark method to be owner-qualified"
+    );
+    assert!(
+        edge_between(
+            &nodes,
+            &edges,
+            EdgeKind::MEMBER,
+            "StorageAccess",
+            "StorageAccess::getGraphForActiveTokenIds"
+        ),
+        "expected StorageAccess -> getGraphForActiveTokenIds member edge"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_cpp_pointer_returning_members_and_definitions_are_indexed() -> anyhow::Result<()> {
+    let (nodes, edges) = index_project(&[(
+        "Graph.cpp",
+        r#"
+class Node;
+class Edge;
+
+class Graph
+{
+public:
+    Node* createNode(int id);
+    Node* addNodeAsPlainCopy(Node* node);
+    Edge* addEdgeAsPlainCopy(Edge* edge);
+};
+
+class TiXmlDocument
+{
+public:
+    const char* Parse(const char* p, int flags);
+};
+
+Node* Graph::cloneDetached(Node* node)
+{
+    return node;
+}
+
+const char* TiXmlDocument::Parse(const char* p, int flags)
+{
+    return p;
+}
+"#,
+    )])?;
+
+    assert!(has_node_kind(&nodes, "Graph", NodeKind::CLASS));
+    assert!(
+        has_node_kind(&nodes, "Graph::createNode", NodeKind::METHOD),
+        "expected pointer-returning class method to be owner-qualified"
+    );
+    assert!(
+        has_node_kind(&nodes, "Graph::addNodeAsPlainCopy", NodeKind::METHOD),
+        "expected Graph plain-copy node method to be indexed"
+    );
+    assert!(
+        has_node_kind(&nodes, "Graph::addEdgeAsPlainCopy", NodeKind::METHOD),
+        "expected Graph plain-copy edge method to be indexed"
+    );
+    assert!(
+        has_node_kind(&nodes, "TiXmlDocument::Parse", NodeKind::METHOD),
+        "expected const char pointer-returning Parse declaration to be indexed"
+    );
+    assert!(
+        has_node_kind(&nodes, "Graph::cloneDetached", NodeKind::FUNCTION),
+        "expected pointer-returning qualified definition to be indexed"
+    );
+    assert!(
+        edge_between(
+            &nodes,
+            &edges,
+            EdgeKind::MEMBER,
+            "Graph",
+            "Graph::addNodeAsPlainCopy"
+        ),
+        "expected Graph -> addNodeAsPlainCopy member edge"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_cpp_nested_header_enums_keep_owner_qualification() -> anyhow::Result<()> {
+    let (nodes, edges) = index_project(&[(
+        "CodeScrollParams.h",
+        r#"
+struct CodeScrollParams
+{
+    enum class Type
+    {
+        NONE,
+        TO_REFERENCE,
+        TO_FILE
+    };
+
+    enum class Target
+    {
+        VISIBLE,
+        CENTER,
+        TOP
+    };
+};
+
+class MessageChangeFileView
+{
+public:
+    enum FileState
+    {
+        FILE_MINIMIZED,
+        FILE_SNIPPETS,
+        FILE_MAXIMIZED
+    };
+};
+"#,
+    )])?;
+
+    assert!(has_node_kind(
+        &nodes,
+        "CodeScrollParams::Type",
+        NodeKind::ENUM
+    ));
+    assert!(has_node_kind(
+        &nodes,
+        "CodeScrollParams::Target",
+        NodeKind::ENUM
+    ));
+    assert!(has_node_kind(
+        &nodes,
+        "MessageChangeFileView::FileState",
+        NodeKind::ENUM
+    ));
+    assert!(has_node_kind(
+        &nodes,
+        "CodeScrollParams::Type::NONE",
+        NodeKind::ENUM_CONSTANT
+    ));
+    assert!(has_node_kind(
+        &nodes,
+        "MessageChangeFileView::FileState::FILE_MAXIMIZED",
+        NodeKind::ENUM_CONSTANT
+    ));
+    assert!(
+        edge_between(
+            &nodes,
+            &edges,
+            EdgeKind::MEMBER,
+            "CodeScrollParams",
+            "CodeScrollParams::Type"
+        ),
+        "expected nested C++ enum to be owned by its struct"
+    );
+    assert!(
+        edge_between(
+            &nodes,
+            &edges,
+            EdgeKind::MEMBER,
+            "CodeScrollParams::Type",
+            "CodeScrollParams::Type::NONE"
+        ),
+        "expected scoped enum constants to be owned by their enum"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_rust_generic_calls_with_multiple_type_arguments_do_not_duplicate_nodes()
 -> anyhow::Result<()> {
     let (nodes, edges) = index_project(&[(
