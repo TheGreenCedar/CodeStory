@@ -370,17 +370,16 @@ pub(crate) fn runtime_concept_phrases(
                         .to_string(),
                 );
             }
-            "embedding execution provider env" | "configure embedding execution provider" => {
+            "llamacpp embeddings url env" | "parse llamacpp endpoint" => {
                 push_unique_alias(
                     &mut phrases,
                     &mut seen,
-                    "DirectML ONNX execution provider environment variable configuration"
-                        .to_string(),
+                    "llama.cpp OpenAI-compatible embeddings endpoint URL configuration".to_string(),
                 );
                 push_unique_alias(
                     &mut phrases,
                     &mut seen,
-                    "CODESTORY_EMBED_EXEC_PROVIDER selects ONNX execution provider directml cuda cpu"
+                    "CODESTORY_EMBED_LLAMACPP_URL selects local HTTP embedding endpoint"
                         .to_string(),
                 );
             }
@@ -1308,22 +1307,22 @@ mod tests {
         );
         assert_eq!(
             runtime_concept_phrases(
-                "EMBEDDING_EXECUTION_PROVIDER_ENV",
-                Some("codestory_runtime::search::engine::EMBEDDING_EXECUTION_PROVIDER_ENV")
+                "LLAMACPP_EMBEDDINGS_URL_ENV",
+                Some("codestory_runtime::search::engine::LLAMACPP_EMBEDDINGS_URL_ENV")
             ),
             vec![
-                "DirectML ONNX execution provider environment variable configuration",
-                "CODESTORY_EMBED_EXEC_PROVIDER selects ONNX execution provider directml cuda cpu"
+                "llama.cpp OpenAI-compatible embeddings endpoint URL configuration",
+                "CODESTORY_EMBED_LLAMACPP_URL selects local HTTP embedding endpoint"
             ]
         );
         assert_eq!(
             runtime_concept_phrases(
-                "configure_embedding_execution_provider",
-                Some("codestory_runtime::search::engine::configure_embedding_execution_provider")
+                "parse",
+                Some("codestory_runtime::search::engine::LlamaCppEndpoint::parse")
             ),
             vec![
-                "DirectML ONNX execution provider environment variable configuration",
-                "CODESTORY_EMBED_EXEC_PROVIDER selects ONNX execution provider directml cuda cpu"
+                "llama.cpp OpenAI-compatible embeddings endpoint URL configuration",
+                "CODESTORY_EMBED_LLAMACPP_URL selects local HTTP embedding endpoint"
             ]
         );
         assert_eq!(

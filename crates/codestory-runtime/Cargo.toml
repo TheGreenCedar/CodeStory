@@ -3,10 +3,6 @@ name = "codestory-runtime"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-onnx-cuda = ["ort/cuda"]
-onnx-directml = ["ort/directml"]
-
 [dependencies]
 anyhow = { workspace = true }
 codestory-contracts = { workspace = true }
@@ -15,15 +11,12 @@ codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 crossbeam-channel = { workspace = true }
 feature-probe = { workspace = true }
-ndarray = { workspace = true }
 nucleo-matcher = { workspace = true }
-ort = { workspace = true }
 parking_lot = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tantivy = { workspace = true }
-tokenizers = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

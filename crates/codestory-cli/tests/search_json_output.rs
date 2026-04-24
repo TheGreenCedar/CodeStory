@@ -17,14 +17,6 @@ impl EnvGuard {
         }
         Self { key, previous }
     }
-
-    fn remove(key: &'static str) -> Self {
-        let previous = std::env::var(key).ok();
-        unsafe {
-            std::env::remove_var(key);
-        }
-        Self { key, previous }
-    }
 }
 
 impl Drop for EnvGuard {
@@ -43,8 +35,6 @@ fn hybrid_cli_env() -> Vec<EnvGuard> {
     vec![
         EnvGuard::set("CODESTORY_HYBRID_RETRIEVAL_ENABLED", "true"),
         EnvGuard::set("CODESTORY_EMBED_RUNTIME_MODE", "hash"),
-        EnvGuard::remove("CODESTORY_EMBED_MODEL_PATH"),
-        EnvGuard::remove("CODESTORY_EMBED_TOKENIZER_PATH"),
     ]
 }
 
@@ -72,8 +62,6 @@ fn run_cli(workspace: &Path, args: &[&str]) -> std::process::Output {
     command.arg("--project").arg(workspace);
     command.env("CODESTORY_HYBRID_RETRIEVAL_ENABLED", "true");
     command.env("CODESTORY_EMBED_RUNTIME_MODE", "hash");
-    command.env_remove("CODESTORY_EMBED_MODEL_PATH");
-    command.env_remove("CODESTORY_EMBED_TOKENIZER_PATH");
     command.output().expect("run codestory-cli")
 }
 

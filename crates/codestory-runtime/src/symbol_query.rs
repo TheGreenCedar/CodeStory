@@ -188,10 +188,8 @@ fn query_entrypoint_intent_bucket(query: &str, display_name: &str, is_exact_matc
                 && terms_contain_phrase(&terms, &["compare", "resolution", "hits"]))
             || (terminal == "file_text_match_line"
                 && terms_contain_phrase(&terms, &["file", "text", "match", "line"]))
-            || (matches!(
-                terminal.as_str(),
-                "configure_embedding_execution_provider" | "embedding_execution_provider_env"
-            ) && terms_contain_phrase(&terms, &["execution", "provider"])),
+            || (matches!(terminal.as_str(), "parse" | "llamacpp_embeddings_url_env")
+                && terms_contain_phrase(&terms, &["endpoint"])),
     )
 }
 
@@ -472,24 +470,24 @@ mod tests {
     }
 
     #[test]
-    fn inexact_queries_prefer_execution_provider_selector_entrypoint() {
-        let provider_selector = hit(
-            "selector",
-            "configure_embedding_execution_provider",
+    fn inexact_queries_prefer_llamacpp_endpoint_parser_entrypoint() {
+        let endpoint_parser = hit(
+            "parser",
+            "LlamaCppEndpoint::parse",
             NodeKind::FUNCTION,
             0.40,
         );
-        let directml_helper = hit(
-            "directml",
-            "configure_directml_embedding_provider",
+        let url_constant = hit(
+            "url-env",
+            "LLAMACPP_EMBEDDINGS_URL_ENV",
             NodeKind::FUNCTION,
             0.95,
         );
 
-        let mut hits = [directml_helper, provider_selector.clone()];
+        let mut hits = [url_constant, endpoint_parser.clone()];
         hits.sort_by(|left, right| {
             compare_search_hits(
-                "DirectML ONNX execution provider environment variable",
+                "llama.cpp embeddings endpoint URL environment variable",
                 left,
                 right,
             )
@@ -497,7 +495,7 @@ mod tests {
 
         assert_eq!(
             hits.first().map(|hit| &hit.node_id),
-            Some(&provider_selector.node_id)
+            Some(&endpoint_parser.node_id)
         );
     }
 

@@ -5,32 +5,37 @@ semantic-doc aliasing, and benchmark follow-up work. It intentionally avoids the
 older diary format: use this file first, then open the raw artifacts only when
 you need per-query ranks or logs.
 
+For the shorter human front door, start with
+[CodeStory Research Handbook](../research.md). For raw artifact preservation and
+inventory commands, use [Research Data Catalog](research-data-catalog.md).
+
 ## Current Decision
+
+Status note: ONNX rows below are preserved as historical benchmark provenance
+only. Active runtime and benchmark support now uses llama.cpp for real local
+models and `hash` for deterministic local-dev checks.
 
 | Question | Decision |
 | --- | --- |
-| Default self-contained backend | `CODESTORY_EMBED_BACKEND=onnx` |
-| Default model/profile | `CODESTORY_EMBED_PROFILE=bge-small-en-v1.5` |
+| Active real-model backend | `CODESTORY_EMBED_BACKEND=llamacpp` |
+| Local-dev/CI backend | `CODESTORY_EMBED_RUNTIME_MODE=hash` |
+| Default model/profile | `CODESTORY_EMBED_PROFILE=bge-base-en-v1.5` |
 | Default semantic doc alias mode | `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=alias_variant` |
 | Default client batch size | `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE=128` |
-| Default ONNX sessions | Keep the runtime default cap of `2`; `4` was not repeat-stable enough to become default |
+| Default llama.cpp endpoint | `CODESTORY_EMBED_LLAMACPP_URL=http://127.0.0.1:8080/v1/embeddings` |
 | Best Run 2 quality score candidate | BGE-base GGUF via llama.cpp/Vulkan, `alias_variant`, `scope=all`, batch `512`, CodeStory request count `4`, server `-np 4`, `--pooling cls` |
 | Best 60/30/10 local pipeline profile | BGE-base GGUF via llama.cpp/Vulkan, `alias_variant`, `scope=durable`, batch `768`, CodeStory request count `4`, server `-np 4`, `-ub 1024`, `--pooling cls`, with `CODESTORY_STORED_VECTOR_ENCODING=int8` scaled-int8 persistence |
 | Compressed BGE-base candidate | Clean-source BGE-base Q5_K_M GGUF via llama.cpp/Vulkan, `alias_variant`, `scope=all`, batch `512`, request count `4`, server `-np 4`, `--pooling cls`; three full-query repeats matched Q8 quality with lower throughput |
-| Best ONNX quality fallback | BGE-base ONNX DirectML, `alias_variant`, `scope=all`, batch `128`, sessions `2` |
 | Best llama.cpp throughput profile | BGE-base GGUF, `alias_variant`, batch `128`, `--pooling cls`, CodeStory request count `4`, server `-np 4` |
-| Fast prior finalist profile | ONNX BGE-small with `no_alias`, batch `256` |
-| Best BGE-small promotion candidate | ONNX BGE-small with `scope=all`, `no_alias`, batch `256`; three full-query repeats passed with MRR@10 0.6089 and Hit@10 0.9000 |
 | Promoted compact-storage profile | Compact scaled-int8 persisted vectors under `CODESTORY_STORED_VECTOR_ENCODING=int8`; BGE-base b768/r4 with llama.cpp `-ub 1024` passed the local 150-query suite and external four-repo gate, with 777 persisted bytes per doc |
 | Best Run 2 retrieval signal | `scope=all` improved BGE-small MRR most, while `no_alias` was the best durable-scope row; original retrieval speed rows are invalid because the GPU was locked |
 | Quality experiment, not default | Qwen3 0.6B GGUF with `alias_variant`, context `2048`, `r1/np1` |
 | Measured negative candidate | `nomic-embed-text-v2-moe` now runs with `CODESTORY_SEMANTIC_DOC_MAX_TOKENS`, but 256/768-dimensional bounded rows stayed below gate |
 
-The shipped runtime default remains BGE-small because it is the current
-self-contained baseline in code and docs. The crossed BGE-small candidate is now
-promotion-grade evidence, but it still does not silently flip defaults: changing
-the runtime shape requires an explicit default-change decision and the
-repo-scale gate.
+The active runtime no longer carries an in-process ONNX backend. The old ONNX
+rows remain in this document so benchmark conclusions stay auditable, but new
+candidate rows should use llama.cpp/GGUF unless a separate backend is added
+deliberately.
 
 The 2026-04-23 60/30/10 pipeline segment promotes BGE-base b768/r4 plus
 scaled-int8 persisted vectors as the best measured opt-in family, not as a
@@ -491,7 +496,6 @@ Decision-grade rows must follow this contract:
 - Use isolated cache directories per row under `target/embedding-research/<run>/`.
 - Keep one comparison table to one semantic doc mode and one batch-size policy,
   or explicitly mark mixed rows as tuning/provenance.
-- For ONNX rows, use DirectML or CUDA and reject CPU-provider fallback.
 - For llama.cpp rows, require a GPU device log plus full model-layer offload.
 - Treat only rows with `provider_verified=true` as ranked decision evidence.
 - Keep future BGE-base GGUF `weight-quant` rows aligned with the finalists2
@@ -512,7 +516,7 @@ Decision-grade rows must follow this contract:
 Useful commands:
 
 ```powershell
-cargo build --release -p codestory-cli --features codestory-runtime/onnx-directml
+cargo build --release -p codestory-cli
 
 $env:CODESTORY_EMBED_RESEARCH_STAGE = 'smoke'
 node scripts/embedding-gpu-fair-benchmark.mjs
@@ -553,11 +557,10 @@ This is the planned follow-up work, in priority order:
 
 | Priority | Work | Why |
 | ---: | --- | --- |
-| 1 | Decide whether to flip the runtime default to the promoted BGE-base b768/r4 scaled-int8 profile or keep it as an explicit opt-in profile. | The 60/30/10 pipeline segment passed local and four-repo gates with perfect local retrieval, real persisted-footprint savings, and no external misses, but it still adds a llama.cpp sidecar and 768-dimensional vectors. |
-| 2 | Decide whether to change the BGE-small runtime default, then run the repo-scale gate if accepted. | Crossed `scope=all`, `no_alias`, b256 passed three full-query repeats, but changing defaults should be an explicit product/runtime decision rather than an autoresearch side effect. |
-| 3 | Decide whether the runtime should expose clean-source BGE-base Q5_K_M b512/r4 as a compressed-quality option, then run the repo-scale gate if accepted. | Clean F16-derived Q5_K_M repeated stably under the b512/r4 leader shape and matched Q8 ranking quality while reducing the artifact to 77.49 MiB by quantizer report, but throughput and score stayed lower than Q8. Q6_K and Q4_K_M lost Hit@10 or persistent-hit, so do not push below Q5 without a new imatrix or calibration recipe. |
-| 4 | Rerun any retrieval row whose speed/cost matters under fail-hard DirectML provider selection. | The original retrieval run has usable quality deltas but invalid speed data because the GPU was locked. |
-| 5 | Reopen BGE-small or ONNX vector-quant rows only after DirectML speed is stable. | The promoted compact-storage row is BGE-base llama.cpp/Vulkan scaled int8; the older same-shape BGE-small vector rows preserved byte-quantization quality but ran in the old GPU-locked/cold-slow timing band. |
+| 1 | Decide whether to make the promoted BGE-base b768/r4 scaled-int8 profile the normal llama.cpp recommendation or keep it as an explicit opt-in profile. | The 60/30/10 pipeline segment passed local and four-repo gates with perfect local retrieval, real persisted-footprint savings, and no external misses, but it still assumes a llama.cpp sidecar and 768-dimensional vectors. |
+| 2 | Decide whether the runtime should expose clean-source BGE-base Q5_K_M b512/r4 as a compressed-quality option, then run the repo-scale gate if accepted. | Clean F16-derived Q5_K_M repeated stably under the b512/r4 leader shape and matched Q8 ranking quality while reducing the artifact to 77.49 MiB by quantizer report, but throughput and score stayed lower than Q8. Q6_K and Q4_K_M lost Hit@10 or persistent-hit, so do not push below Q5 without a new imatrix or calibration recipe. |
+| 3 | Retire BGE-small promotion work unless a new GGUF hypothesis appears. | The strongest BGE-small promotion row was ONNX-based and ONNX is no longer supported; current GGUF BGE-small rows are historical evidence only. |
+| 4 | Reopen stored-vector quantization rows only on the active llama.cpp BGE-base profile. | The promoted compact-storage row is BGE-base llama.cpp/Vulkan scaled int8; older BGE-small vector rows are historical provenance from the retired backend path. |
 | 6 | Revisit Nomic v2 only if semantic-doc/query shape changes materially. | The token-budget blocker is resolved for research, but 256/768-dimensional bounded rows were provider-valid and below gate. |
 | 7 | Pause dimension-only probes unless semantic docs or query shape changes first. | Provider-valid 256/512/768/1024 bounded probes for Nomic v1.5, Qwen3, and EmbeddingGemma did not pass the Hit@10 gate; larger dimensions did not rescue Gemma or Nomic. |
 | 8 | Promote only repeat-stable, provider-verified rows into `finalists2`. | Defaults should not change from a single mixed tuning pass or from artifacts that lack provider provenance. |

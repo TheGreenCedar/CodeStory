@@ -210,12 +210,9 @@ The default semantic text alias policy is `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=ali
 
 Embedding throughput is optimized for the local embedding path:
 
-- pending semantic docs are sorted by generated text length before embedding, which keeps padded ONNX batches close to uniform length
+- pending semantic docs are sorted by generated text length before embedding, which keeps batches close to uniform length
 - the default semantic embedding batch size is `128`, with `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` available for profiling
-- ONNX sessions use graph optimization, shared prepacked weights, and a small session pool
-- `CODESTORY_EMBED_SESSION_COUNT` controls worker count; the default is bounded by available parallelism and capped at two workers
-- `CODESTORY_EMBED_INTRA_THREADS`, `CODESTORY_EMBED_INTER_THREADS`, and `CODESTORY_EMBED_PARALLEL_EXECUTION` expose ONNX CPU-provider tuning for diagnostics, but benchmark decisions should use GPU-provider runs
-- optional `onnx-cuda` and `onnx-directml` Cargo features enable CUDA or DirectML provider selection through `CODESTORY_EMBED_EXECUTION_PROVIDER`
+- llama.cpp embeddings use `CODESTORY_EMBED_LLAMACPP_URL` for the OpenAI-compatible endpoint and `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT` for client-side request concurrency
 
 The repo-scale cold baseline on 2026-04-18 was `38.43s` total index time with `2.92s` graph phase, `32.07s` semantic phase, and `3,690` semantic docs embedded. A repeat full refresh on the same cache was `7.56s` with `3,690` semantic docs reused and `0` embedded. Keep new measurements in [codestory-e2e-stats-log.md](../testing/codestory-e2e-stats-log.md).
 
@@ -249,7 +246,7 @@ Full refresh builds a staged database and publishes it only after staged finaliz
 
 Semantic docs are persisted in SQLite with generated-text metadata. Reuse is keyed by schema version, generated text hash, embedding model, and embedding dimension. On full refresh, runtime copies prior semantic docs forward into the staged database before semantic sync checks them. On incremental refresh, runtime passes a touched-file scope so only docs belonging to changed files are rebuilt or pruned.
 
-Cold start still has to embed any semantic doc that has no reusable row. The cold path is kept under control by using the durable-symbol default scope, length-bucketed batches, batch size `128`, and bounded ONNX session parallelism.
+Cold start still has to embed any semantic doc that has no reusable row. The cold path is kept under control by using the durable-symbol default scope, length-bucketed batches, batch size `128`, and bounded llama.cpp request concurrency.
 
 ### What timing output means
 

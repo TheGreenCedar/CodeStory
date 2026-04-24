@@ -57,18 +57,6 @@ const researchSources = [
       "Embedding quantization is separate from model-weight quantization and supports float32, int8, uint8, binary, and ubinary corpus encodings with optional rescoring.",
   },
   {
-    id: "onnx-runtime-quantization",
-    url: "https://onnxruntime.ai/docs/performance/model-optimizations/quantization.html",
-    claim:
-      "ONNX Runtime supports dynamic/static int8 quantization and selected int4 weight-only quantization, but accuracy and operator support must be verified per model.",
-  },
-  {
-    id: "onnx-directml-execution-provider",
-    url: "https://onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html",
-    claim:
-      "DirectML requires sequential execution per session, so CodeStory benchmarks use separate ONNX sessions rather than parallel Run calls on one session.",
-  },
-  {
     id: "llama-cpp-quantize",
     url: "https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md",
     claim:
@@ -177,12 +165,6 @@ const queries = [
     bucket: "baseline",
   },
   {
-    id: "onnx-normalized-embeddings",
-    query: "convert ONNX output tensors into normalized embedding vectors",
-    expect: ["extract_onnx_embeddings"],
-    bucket: "baseline",
-  },
-  {
     id: "llamacpp-endpoint",
     query: "send an embeddings request to the local llama cpp server endpoint",
     expect: ["post_json_to_http_endpoint"],
@@ -271,12 +253,6 @@ const queries = [
     query: "Storage open_build sqlite build database connection",
     expect: ["Storage::open_build", "open_build"],
     bucket: "owner-terms",
-  },
-  {
-    id: "onnx-directml-provider",
-    query: "DirectML ONNX execution provider environment variable configuration",
-    expect: ["configure_embedding_execution_provider", "EMBEDDING_EXECUTION_PROVIDER_ENV"],
-    bucket: "alias-sensitive",
   },
   {
     id: "language-rust-node-kind",
@@ -2397,12 +2373,15 @@ function selectedCases() {
   const stageScopedCases = requestedStages.has("all")
     ? cases
     : cases.filter((config) => requestedStages.has(config.stage));
+  // ONNX case definitions are kept only so old case IDs in historical reports remain readable.
+  // Active runs are restricted to the supported llama.cpp backend.
+  const supportedCases = stageScopedCases.filter((config) => config.kind === "llama");
   const selected =
     selectedCaseIds.size > 0
-      ? stageScopedCases.filter(
+      ? supportedCases.filter(
           (config) => selectedCaseIds.has(config.case_id) || selectedCaseIds.has(config.id),
         )
-      : stageScopedCases;
+      : supportedCases;
   const seen = new Set();
   const unique = [];
   for (const config of selected) {
@@ -2441,8 +2420,8 @@ function baseEnv(config) {
   env.CODESTORY_SEMANTIC_DOC_ALIAS_MODE = config.docMode ?? "alias_variant";
   env.CODESTORY_LLM_DOC_EMBED_BATCH_SIZE = String(config.batch ?? 128);
   env.CODESTORY_EMBED_PROFILE = config.profile;
-  env.CODESTORY_EMBED_BACKEND = config.kind === "onnx" ? "onnx" : "llamacpp";
-  env.CODESTORY_EMBED_RUNTIME_MODE = config.kind === "onnx" ? "onnx" : "llamacpp";
+  env.CODESTORY_EMBED_BACKEND = "llamacpp";
+  env.CODESTORY_EMBED_RUNTIME_MODE = "llamacpp";
 
   setOrDelete(env, "CODESTORY_EMBED_MAX_TOKENS", config.maxTokens);
   setOrDelete(env, "CODESTORY_EMBED_QUERY_PREFIX", config.queryPrefix);
@@ -2457,25 +2436,9 @@ function baseEnv(config) {
     "CODESTORY_STORED_VECTOR_ENCODING",
     config.vectorEncoding && config.vectorEncoding !== "float32" ? config.vectorEncoding : null,
   );
-  delete env.CODESTORY_EMBED_INTRA_THREADS;
-  delete env.CODESTORY_EMBED_INTER_THREADS;
-  delete env.CODESTORY_EMBED_PARALLEL_EXECUTION;
   delete env.CODESTORY_EMBED_MODEL_ID;
-  delete env.CODESTORY_EMBED_TOKENIZER_PATH;
-
-  if (config.kind === "onnx") {
-    env.CODESTORY_EMBED_EXECUTION_PROVIDER = config.executionProvider ?? "directml";
-    env.CODESTORY_EMBED_MODEL_PATH = config.modelPath;
-    env.CODESTORY_EMBED_SESSION_COUNT = String(config.sessions ?? 2);
-    delete env.CODESTORY_EMBED_LLAMACPP_URL;
-    delete env.CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT;
-  } else {
-    delete env.CODESTORY_EMBED_EXECUTION_PROVIDER;
-    delete env.CODESTORY_EMBED_MODEL_PATH;
-    delete env.CODESTORY_EMBED_SESSION_COUNT;
-    env.CODESTORY_EMBED_LLAMACPP_URL = `http://127.0.0.1:${config.port}/v1/embeddings`;
-    env.CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT = String(config.requests ?? 1);
-  }
+  env.CODESTORY_EMBED_LLAMACPP_URL = `http://127.0.0.1:${config.port}/v1/embeddings`;
+  env.CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT = String(config.requests ?? 1);
   return env;
 }
 
@@ -2635,37 +2598,6 @@ function validateLlamaGpu(caseDir) {
     provider_requested: "Vulkan0",
     provider_verified: true,
     provider_evidence: `llama.cpp stderr logged Vulkan0 and offloaded ${last[1]}/${last[2]} layers to GPU`,
-  };
-}
-
-function onnxProviderFallbackMessage(stderr) {
-  const patterns = [
-    /using CPU execution provider/i,
-    /built without the onnx-directml/i,
-    /built without the onnx-cuda/i,
-    /Unknown semantic embedding execution provider/i,
-  ];
-  return patterns.find((pattern) => pattern.test(stderr))?.source ?? null;
-}
-
-function validateOnnxProvider(config, index, indexJson) {
-  const requested = config.executionProvider ?? "directml";
-  const fallback = onnxProviderFallbackMessage(index.stderr ?? "");
-  if (fallback) {
-    throw new Error(
-      `${config.case_id} did not validate ${requested}; refusing CPU/fallback ONNX benchmark (${fallback})`,
-    );
-  }
-  const embeddingModel =
-    indexJson.retrieval?.embedding_model ?? indexJson.summary?.retrieval?.embedding_model ?? "";
-  if (!String(embeddingModel).trim()) {
-    throw new Error(`${config.case_id} did not report an embedding model; refusing ambiguous row`);
-  }
-  return {
-    gpu_device: requested === "directml" ? "DirectML" : requested,
-    provider_requested: requested,
-    provider_verified: true,
-    provider_evidence: `${config.case_id} set CODESTORY_EMBED_EXECUTION_PROVIDER=${requested}; CPU/fallback markers absent; embedding_model=${embeddingModel}`,
   };
 }
 
@@ -2882,7 +2814,7 @@ async function runCase(config) {
       );
 
       const indexJson = parseJson(index.stdout);
-      provider = config.kind === "onnx" ? validateOnnxProvider(config, index, indexJson) : {};
+      provider = {};
       semanticDocsEmbedded = indexJson.phase_timings?.semantic_docs_embedded ?? null;
       semanticDocCount =
         indexJson.retrieval?.semantic_doc_count ??
@@ -3176,7 +3108,7 @@ function writeManifest(cases) {
       controls:
         "Three-repeat baselines for current default, prior BGE-base candidates, and fast BGE-small.",
       "weight-quant":
-        "GGUF and ONNX model-weight quantization rows. Missing quantized artifacts are reported as skipped rows.",
+        "GGUF model-weight quantization rows. Missing quantized artifacts are reported as skipped rows.",
       "vector-quant":
         "Quantized semantic prefilter lane. Persisted SQLite vector bytes remain float32 until compact vector storage support lands.",
       dimension:
@@ -3196,7 +3128,7 @@ function writeManifest(cases) {
       kind: config.kind,
       hardware: config.hardware,
       provider_requested:
-        config.kind === "onnx" ? (config.executionProvider ?? "directml") : "Vulkan0",
+        "Vulkan0",
       profile: config.profile,
       semantic_scope: config.semanticScope,
       semantic_doc_max_tokens: config.semanticDocMaxTokens,
@@ -3254,7 +3186,7 @@ function buildReportMarkdown(ranked, aliasRows, repeatRows, failed, cases) {
     `Cases selected: \`${cases.length}\``,
     `Queries: \`${benchmarkQueries.length}\` of \`${queries.length}\``,
     "",
-    "All decision-grade rows are GPU-only and must set `provider_verified=true`. ONNX rows require DirectML/CUDA fail-hard validation; llama.cpp rows require Vulkan0 and full model-layer offload.",
+    "All decision-grade rows are GPU-only and must set `provider_verified=true`. llama.cpp rows require Vulkan0 and full model-layer offload.",
     "Source-led lanes are recorded in `manifest.json` and `sources.md`; skipped rows mean an artifact or implementation prerequisite is still missing.",
     "",
     "## Ranking",

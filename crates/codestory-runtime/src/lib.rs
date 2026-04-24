@@ -1529,7 +1529,7 @@ fn sync_llm_symbol_projection(
 
     if let Err(error) = engine.set_embedding_runtime_from_env() {
         tracing::warn!(
-            "{EMBEDDING_MODEL_ENV} not configured or invalid ({error}); semantic ask retrieval will be unavailable until a local model artifact is configured. Use a bundled model at {DEFAULT_BUNDLED_EMBED_MODEL_PATH}, set {EMBEDDING_RUNTIME_MODE_ENV}=hash for local-dev embeddings, or set {HYBRID_RETRIEVAL_ENABLED_ENV}=false for lexical-only retrieval."
+            "llama.cpp embedding endpoint unavailable ({error}); semantic ask retrieval will be unavailable until CODESTORY_EMBED_LLAMACPP_URL points at a running OpenAI-compatible embeddings endpoint. Set {EMBEDDING_RUNTIME_MODE_ENV}=hash for local-dev embeddings, or set {HYBRID_RETRIEVAL_ENABLED_ENV}=false for lexical-only retrieval."
         );
         if hydrate_semantic_docs {
             let reload_started = Instant::now();
@@ -3801,9 +3801,7 @@ mod tests {
                 EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "true"),
                 EnvGuard::set(EMBEDDING_RUNTIME_MODE_ENV, "hash"),
                 EnvGuard::set(EMBEDDING_PROFILE_ENV, "bge-small-en-v1.5"),
-                EnvGuard::remove(EMBEDDING_MODEL_ENV),
                 EnvGuard::remove(EMBEDDING_MODEL_ID_ENV),
-                EnvGuard::remove(EMBEDDING_TOKENIZER_ENV),
                 EnvGuard::remove(EMBEDDING_POOLING_ENV),
                 EnvGuard::remove(EMBEDDING_QUERY_PREFIX_ENV),
                 EnvGuard::remove(EMBEDDING_DOCUMENT_PREFIX_ENV),
@@ -5085,8 +5083,8 @@ pub fn exact_symbol_anchor() {{}}
     fn inexact_search_results_deduplicate_repeated_display_keys() {
         let mut hits = vec![
             SearchHit {
-                node_id: NodeId("directml-cfg-enabled".to_string()),
-                display_name: "configure_directml_embedding_provider".to_string(),
+                node_id: NodeId("llamacpp-url-env".to_string()),
+                display_name: "LLAMACPP_EMBEDDINGS_URL_ENV".to_string(),
                 kind: codestory_contracts::api::NodeKind::FUNCTION,
                 file_path: Some("src/search/engine.rs".to_string()),
                 line: Some(178),
@@ -5096,8 +5094,8 @@ pub fn exact_symbol_anchor() {{}}
                 score_breakdown: None,
             },
             SearchHit {
-                node_id: NodeId("directml-cfg-disabled".to_string()),
-                display_name: "configure_directml_embedding_provider".to_string(),
+                node_id: NodeId("llamacpp-url-env-copy".to_string()),
+                display_name: "LLAMACPP_EMBEDDINGS_URL_ENV".to_string(),
                 kind: codestory_contracts::api::NodeKind::FUNCTION,
                 file_path: Some("src/search/engine.rs".to_string()),
                 line: Some(187),
@@ -5107,8 +5105,8 @@ pub fn exact_symbol_anchor() {{}}
                 score_breakdown: None,
             },
             SearchHit {
-                node_id: NodeId("provider-selector".to_string()),
-                display_name: "configure_embedding_execution_provider".to_string(),
+                node_id: NodeId("endpoint-parser".to_string()),
+                display_name: "LlamaCppEndpoint::parse".to_string(),
                 kind: codestory_contracts::api::NodeKind::FUNCTION,
                 file_path: Some("src/search/engine.rs".to_string()),
                 line: Some(194),
@@ -5121,27 +5119,27 @@ pub fn exact_symbol_anchor() {{}}
 
         hits.sort_by(|left, right| {
             compare_search_hits(
-                "DirectML ONNX execution provider environment variable configuration",
+                "llama.cpp embeddings endpoint URL environment variable configuration",
                 left,
                 right,
             )
         });
         dedupe_inexact_search_hits_by_display_key(
-            "DirectML ONNX execution provider environment variable configuration",
+            "llama.cpp embeddings endpoint URL environment variable configuration",
             &mut hits,
         );
 
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].node_id, NodeId("provider-selector".to_string()));
-        assert_eq!(hits[1].node_id, NodeId("directml-cfg-enabled".to_string()));
+        assert_eq!(hits[0].node_id, NodeId("endpoint-parser".to_string()));
+        assert_eq!(hits[1].node_id, NodeId("llamacpp-url-env".to_string()));
     }
 
     #[test]
     fn exact_search_results_keep_repeated_display_keys() {
         let mut hits = vec![
             SearchHit {
-                node_id: NodeId("directml-cfg-enabled".to_string()),
-                display_name: "configure_directml_embedding_provider".to_string(),
+                node_id: NodeId("llamacpp-url-env".to_string()),
+                display_name: "LLAMACPP_EMBEDDINGS_URL_ENV".to_string(),
                 kind: codestory_contracts::api::NodeKind::FUNCTION,
                 file_path: Some("src/search/engine.rs".to_string()),
                 line: Some(178),
@@ -5151,8 +5149,8 @@ pub fn exact_symbol_anchor() {{}}
                 score_breakdown: None,
             },
             SearchHit {
-                node_id: NodeId("directml-cfg-disabled".to_string()),
-                display_name: "configure_directml_embedding_provider".to_string(),
+                node_id: NodeId("llamacpp-url-env-copy".to_string()),
+                display_name: "LLAMACPP_EMBEDDINGS_URL_ENV".to_string(),
                 kind: codestory_contracts::api::NodeKind::FUNCTION,
                 file_path: Some("src/search/engine.rs".to_string()),
                 line: Some(187),
@@ -5163,10 +5161,7 @@ pub fn exact_symbol_anchor() {{}}
             },
         ];
 
-        dedupe_inexact_search_hits_by_display_key(
-            "configure_directml_embedding_provider",
-            &mut hits,
-        );
+        dedupe_inexact_search_hits_by_display_key("LLAMACPP_EMBEDDINGS_URL_ENV", &mut hits);
 
         assert_eq!(hits.len(), 2);
     }

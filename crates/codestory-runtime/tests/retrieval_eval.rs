@@ -63,8 +63,6 @@ fn hybrid_eval_env() -> HybridEvalEnv {
     let guards = vec![
         EnvGuard::set("CODESTORY_HYBRID_RETRIEVAL_ENABLED", "true"),
         EnvGuard::set("CODESTORY_EMBED_RUNTIME_MODE", "hash"),
-        EnvGuard::remove("CODESTORY_EMBED_MODEL_PATH"),
-        EnvGuard::remove("CODESTORY_EMBED_TOKENIZER_PATH"),
     ];
     HybridEvalEnv {
         guards: Some(guards),

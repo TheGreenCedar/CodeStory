@@ -83,8 +83,8 @@ Check:
 - whether the symbol exists in store-backed search docs
 - whether runtime rebuilt its search state after indexing
 - what retrieval mode `index`, `ground`, or `search` reported for the current run
-- whether semantic retrieval is disabled, missing model assets, or missing semantic docs
-- whether `CODESTORY_HYBRID_RETRIEVAL_ENABLED`, `CODESTORY_SEMANTIC_DOC_SCOPE`, `CODESTORY_EMBED_RUNTIME_MODE`, `CODESTORY_EMBED_MODEL_PATH`, or `CODESTORY_EMBED_TOKENIZER_PATH` changed between runs
+- whether semantic retrieval is disabled, the llama.cpp endpoint is unreachable, or semantic docs are missing
+- whether `CODESTORY_HYBRID_RETRIEVAL_ENABLED`, `CODESTORY_SEMANTIC_DOC_SCOPE`, `CODESTORY_EMBED_RUNTIME_MODE`, or `CODESTORY_EMBED_LLAMACPP_URL` changed between runs
 - whether graph-based boosts are overwhelming lexical matches
 
 Recovery order:
@@ -92,7 +92,7 @@ Recovery order:
 1. Confirm whether the miss is in `indexed_symbol_hits`, `repo_text_hits`, or both.
 2. Confirm the reported retrieval mode and fallback reason before touching search ranking code.
 3. For lightweight local-dev semantic checks, set `CODESTORY_EMBED_RUNTIME_MODE=hash`.
-4. For real local model assets, set `CODESTORY_EMBED_MODEL_PATH` and let the tokenizer default to a sibling `tokenizer.json` or set `CODESTORY_EMBED_TOKENIZER_PATH` explicitly.
+4. For real local model assets, start `llama-server --embedding` and set `CODESTORY_EMBED_LLAMACPP_URL` if it is not on the default endpoint.
 5. If the current machine should stay lexical only, set `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false` and verify the fallback messaging instead of treating it as a runtime regression.
 6. Rebuild once with `index --refresh full`.
 7. If semantic retrieval is still the only failing part, inspect the reported fallback reason before touching lexical ranking or CLI rendering.
@@ -120,8 +120,6 @@ Check:
 - whether `CODESTORY_SEMANTIC_DOC_SCOPE=all` is forcing the broad all-symbol semantic set
 - whether `CODESTORY_SEMANTIC_DOC_ALIAS_MODE` was changed from the profiled default of `alias_variant`
 - whether `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` was changed from the profiled default of `128`
-- whether `CODESTORY_EMBED_SESSION_COUNT` or ONNX thread settings are oversubscribing the machine
-- whether `CODESTORY_EMBED_EXECUTION_PROVIDER` names a provider that was not compiled into this binary
 - whether `CODESTORY_EMBED_BACKEND=llamacpp` is pointing at a real `llama-server --embedding` endpoint before trusting GGUF speed claims
 - whether llama.cpp request concurrency is matched on both sides: `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT` in CodeStory and `-np` in the server
 
@@ -130,9 +128,8 @@ Recovery order:
 1. Run one measured cold E2E and append the headline numbers to `docs/testing/codestory-e2e-stats-log.md`.
 2. Compare semantic embedded/reused counts before changing graph code.
 3. For reuse regressions, inspect semantic doc version, generated text hash, embedding model, and embedding dimension.
-4. For cold-only regressions, inspect durable semantic scope, length-bucket ordering, embedding batch size, and ONNX session count.
+4. For cold-only regressions, inspect durable semantic scope, length-bucket ordering, embedding batch size, llama.cpp request count, and server-side parallelism.
 5. For backend experiments, first verify the runtime is using the backend under test, then rerun the speed and quality comparisons documented in `docs/testing/embedding-backend-benchmarks.md`.
-6. For ONNX hardware-provider experiments, check `cargo check -p codestory-runtime --features onnx-cuda` or `onnx-directml`.
 
 ## If Grounding Is Wrong
 

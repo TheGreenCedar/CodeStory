@@ -44,11 +44,9 @@ Runtime environment variables control semantic retrieval and tuning:
 | `CODESTORY_SEMANTIC_DOC_ALIAS_MODE` | Semantic document alias policy: `alias_variant` default, `current_alias` full legacy alias text, or `no_alias` baseline research mode. |
 | `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` | Override semantic doc embedding batch size. Default is `128`; use this only while profiling. |
 | `CODESTORY_EMBED_RUNTIME_MODE=hash` | Use lightweight deterministic hash embeddings for local-dev semantic checks. |
-| `CODESTORY_EMBED_MODEL_PATH` | Path to the ONNX embedding model artifact. |
-| `CODESTORY_EMBED_TOKENIZER_PATH` | Path to `tokenizer.json`; defaults to a sibling of the model artifact. |
-| `CODESTORY_EMBED_SESSION_COUNT` | Number of ONNX embedding sessions, clamped from `1` to `16`; default is bounded by available parallelism and capped at two. |
-| `CODESTORY_EMBED_INTRA_THREADS`, `CODESTORY_EMBED_INTER_THREADS`, `CODESTORY_EMBED_PARALLEL_EXECUTION` | ONNX CPU-provider tuning; do not use CPU-provider rows for benchmark decisions. |
-| `CODESTORY_EMBED_EXECUTION_PROVIDER` | `cpu`, `cuda`, or `directml`; CUDA and DirectML require the matching Cargo feature. |
+| `CODESTORY_EMBED_BACKEND=llamacpp` | Use the active real-model backend. |
+| `CODESTORY_EMBED_LLAMACPP_URL` | OpenAI-compatible llama.cpp embeddings endpoint. |
+| `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT` | Client-side concurrent embedding requests, clamped from `1` to `16`. |
 
 Symbol summarization uses these additional settings:
 

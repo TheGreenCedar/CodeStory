@@ -54,7 +54,6 @@ fn build_indexed_controller(file_count: usize) -> anyhow::Result<(TempDir, AppCo
     unsafe {
         // Benchmark uses deterministic local embeddings to avoid external model setup in CI/dev.
         std::env::set_var("CODESTORY_EMBED_RUNTIME_MODE", "hash");
-        std::env::remove_var("CODESTORY_EMBED_MODEL_PATH");
     }
 
     let controller = AppController::new();

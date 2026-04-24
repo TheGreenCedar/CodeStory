@@ -13,8 +13,6 @@ Primary sources used to define the lanes:
 | Source | Why it matters |
 | --- | --- |
 | [Sentence Transformers embedding quantization](https://www.sbert.net/docs/package_reference/util/quantization.html) | Separates embedding/vector quantization from model-weight quantization and documents float32, int8, uint8, binary, and ubinary encodings plus rescoring. |
-| [ONNX Runtime quantization](https://onnxruntime.ai/docs/performance/model-optimizations/quantization.html) | Documents dynamic/static int8 quantization and selected int4 weight-only quantization, including accuracy-debugging caveats. |
-| [ONNX Runtime DirectML provider](https://onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html) | DirectML cannot run parallel calls on one session, which explains the multi-session benchmark design. |
 | [llama.cpp quantize](https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md) | Defines GGUF weight-quantization workflow, common quant types, and imatrix calibration. |
 | [Qdrant quantization](https://qdrant.tech/documentation/manage-data/quantization/) | Confirms stored-vector quantization is its own search/storage lane. |
 | [Nomic v1.5 model card](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5) | Documents Matryoshka dimensionality tradeoffs at 768, 512, 256, 128, and 64 dimensions. |
@@ -33,10 +31,9 @@ Use `scripts/embedding-gpu-fair-benchmark.mjs`. Every run writes:
 - `repeat-summary.csv`: repeat averages for stages with repeated cases.
 - per-case logs under each case directory.
 
-Decision-grade rows still require `provider_verified=true`: DirectML/CUDA
-fail-hard validation for ONNX rows and Vulkan0 plus full layer offload for
-llama.cpp rows. A row without provider validation is provenance only, even when
-it has metric columns.
+Decision-grade active rows still require `provider_verified=true`: llama.cpp
+rows need Vulkan0 plus full layer offload. Historical ONNX rows in older
+artifacts are provenance only; new runs should not add ONNX cases.
 
 ## Stages
 
@@ -44,7 +41,7 @@ it has metric columns.
 | --- | --- | --- |
 | `source-scan` | Write manifest and source ledger without running model cases. | `$env:CODESTORY_EMBED_RESEARCH_STAGE='source-scan'; node scripts/embedding-gpu-fair-benchmark.mjs` |
 | `controls` | Three-repeat baselines for the shipped default, prior BGE-base candidates, and fast BGE-small. | `$env:CODESTORY_EMBED_RESEARCH_STAGE='controls'; node scripts/embedding-gpu-fair-benchmark.mjs` |
-| `weight-quant` | GGUF and ONNX quantized-weight candidates. Missing generated artifacts become skipped rows, not false failures. | `$env:CODESTORY_EMBED_RESEARCH_STAGE='weight-quant'; node scripts/embedding-gpu-fair-benchmark.mjs` |
+| `weight-quant` | GGUF quantized-weight candidates. Missing generated artifacts become skipped rows, not false failures. | `$env:CODESTORY_EMBED_RESEARCH_STAGE='weight-quant'; node scripts/embedding-gpu-fair-benchmark.mjs` |
 | `vector-quant` | Stored-vector quantization lane for the BGE-small winner shape. Runs float32 control plus int8/uint8/binary/ubinary corpus encodings through quantized prefiltering and full-precision rescoring. | `$env:CODESTORY_EMBED_RESEARCH_STAGE='vector-quant'; node scripts/embedding-gpu-fair-benchmark.mjs` |
 | `dimension` | Source-backed Matryoshka/dimension rows for Nomic v1.5, Nomic v2 MoE, Qwen3 0.6B, and EmbeddingGemma; BGE-small stays as a negative control. | `$env:CODESTORY_EMBED_RESEARCH_STAGE='dimension'; node scripts/embedding-gpu-fair-benchmark.mjs` |
 | `retrieval` | Hybrid weight, semantic scope, and alias-mode sweeps. | `$env:CODESTORY_EMBED_RESEARCH_STAGE='retrieval'; node scripts/embedding-gpu-fair-benchmark.mjs` |

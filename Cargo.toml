@@ -68,9 +68,6 @@ sysinfo = "0.38"
 feature-probe = "0.1.1"
 tempfile = "3.10"
 toml = "0.8"
-ort = { version = "2.0.0-rc.11", features = ["ndarray", "download-binaries", "tls-native"] }
-tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
-ndarray = "0.17"
 
 criterion = "0.8.2"
 proptest = "1.5"

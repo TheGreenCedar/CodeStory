@@ -117,6 +117,9 @@ When changing embedding backends, model profiles, pooling, prefixes, batching,
 or hardware-provider settings, also rerun the speed and retrieval-quality
 comparison described in
 [`embedding-backend-benchmarks.md`](../testing/embedding-backend-benchmarks.md).
+Start from the human summary in [`research.md`](../research.md), and keep raw
+artifact locations current in
+[`research-data-catalog.md`](../testing/research-data-catalog.md).
 For new research lanes, start with the source-led stage contract in
 [`embedding-research-run-2.md`](../testing/embedding-research-run-2.md) so
 model-weight quantization, vector quantization, dimensions, and retrieval-weight
