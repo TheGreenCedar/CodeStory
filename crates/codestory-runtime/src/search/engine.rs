@@ -34,6 +34,7 @@ pub const EMBEDDING_EXPECTED_DIM_ENV: &str = "CODESTORY_EMBED_EXPECTED_DIM";
 pub const LLAMACPP_EMBEDDINGS_URL_ENV: &str = "CODESTORY_EMBED_LLAMACPP_URL";
 pub const LLAMACPP_REQUEST_COUNT_ENV: &str = "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT";
 pub const STORED_VECTOR_ENCODING_ENV: &str = "CODESTORY_STORED_VECTOR_ENCODING";
+pub const SYMBOL_FULL_TEXT_INDEX_ENV: &str = "CODESTORY_SYMBOL_FULL_TEXT_INDEX";
 const DEFAULT_LLAMACPP_EMBEDDINGS_URL: &str = "http://127.0.0.1:8080/v1/embeddings";
 const SEMANTIC_QUANTIZED_RESCORE_MULTIPLIER: usize = 4;
 
@@ -60,6 +61,10 @@ fn env_bool_override(key: &str) -> Option<bool> {
             _ => None,
         }
     })
+}
+
+fn symbol_full_text_index_enabled_from_env() -> bool {
+    env_bool_override(SYMBOL_FULL_TEXT_INDEX_ENV).unwrap_or(true)
 }
 
 fn embedding_parallel_chunk_size(text_count: usize, worker_count: usize) -> usize {
@@ -867,6 +872,14 @@ impl EmbeddingRuntime {
         self.embed_prepared_texts(&prepared)
     }
 
+    pub fn embed_text_refs(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let prepared = texts
+            .iter()
+            .map(|text| format!("{}{}", self.profile.document_prefix, text))
+            .collect::<Vec<_>>();
+        self.embed_prepared_texts(&prepared)
+    }
+
     fn embed_prepared_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut embeddings = match &self.backend {
             EmbeddingBackend::HashProjection => {
@@ -923,6 +936,7 @@ pub struct SearchEngine {
     quantized_llm_docs: HashMap<NodeId, QuantizedEmbedding>,
     embedding_runtime: Option<EmbeddingRuntime>,
     stored_vector_encoding: StoredVectorEncoding,
+    full_text_index_enabled: bool,
 }
 
 impl SearchEngine {
@@ -948,6 +962,7 @@ impl SearchEngine {
             quantized_llm_docs: HashMap::new(),
             embedding_runtime: None,
             stored_vector_encoding: StoredVectorEncoding::from_env()?,
+            full_text_index_enabled: symbol_full_text_index_enabled_from_env(),
         })
     }
 
@@ -991,6 +1006,9 @@ impl SearchEngine {
     }
 
     pub fn full_text_doc_count(&self) -> usize {
+        if !self.full_text_index_enabled {
+            return self.symbols.len();
+        }
         self.reader.searcher().num_docs() as usize
     }
 
@@ -1002,12 +1020,12 @@ impl SearchEngine {
         self.llm_docs.len().min(u32::MAX as usize) as u32
     }
 
-    pub fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    pub fn embed_text_refs(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let runtime = self
             .embedding_runtime
             .as_ref()
             .ok_or_else(|| anyhow!("embedding runtime is not configured"))?;
-        runtime.embed_texts(texts)
+        runtime.embed_text_refs(texts)
     }
 
     pub fn index_llm_symbol_docs(&mut self, docs: Vec<LlmSearchDoc>) {
@@ -1094,6 +1112,15 @@ impl SearchEngine {
     }
 
     pub fn index_nodes(&mut self, nodes: Vec<(NodeId, String)>) -> Result<()> {
+        if !self.full_text_index_enabled {
+            self.symbols.extend(
+                nodes
+                    .into_iter()
+                    .map(|(id, name)| (Utf32String::from(name.as_str()), id)),
+            );
+            return Ok(());
+        }
+
         let mut index_writer: IndexWriter<TantivyDocument> =
             self.index.writer(SEARCH_WRITER_HEAP_BYTES)?;
         let schema = self.index.schema();
@@ -1290,6 +1317,10 @@ impl SearchEngine {
         self.quantized_llm_docs
             .retain(|id, _| !remove_ids.contains(&id.0));
 
+        if !self.full_text_index_enabled {
+            return Ok(());
+        }
+
         let mut index_writer: IndexWriter<TantivyDocument> =
             self.index.writer(SEARCH_WRITER_HEAP_BYTES)?;
         let schema = self.index.schema();
@@ -1304,6 +1335,9 @@ impl SearchEngine {
 
     pub fn search_full_text(&self, query_str: &str) -> Result<Vec<NodeId>> {
         if query_str.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !self.full_text_index_enabled {
             return Ok(Vec::new());
         }
 
@@ -1782,6 +1816,29 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], NodeId(3));
 
+        Ok(())
+    }
+
+    #[test]
+    fn symbol_full_text_index_can_be_disabled_for_projection_only_search() -> Result<()> {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = EnvGuard::set(SYMBOL_FULL_TEXT_INDEX_ENV, "false");
+        let mut engine = SearchEngine::new(None)?;
+
+        engine.index_nodes(vec![
+            (NodeId(1), "AlphaSymbol".to_string()),
+            (NodeId(2), "BetaSymbol".to_string()),
+        ])?;
+
+        assert_eq!(engine.full_text_doc_count(), 2);
+        assert_eq!(engine.search_symbol("Beta"), vec![NodeId(2)]);
+        assert!(engine.search_full_text("betasymbol")?.is_empty());
+
+        engine.remove_nodes(&[NodeId(2)])?;
+        assert_eq!(engine.full_text_doc_count(), 1);
+        assert!(engine.search_symbol("Beta").is_empty());
         Ok(())
     }
 

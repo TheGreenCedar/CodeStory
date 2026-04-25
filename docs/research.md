@@ -1,90 +1,54 @@
 # CodeStory Research Handbook
 
-This is the human front door for CodeStory research. Use it before opening the
-large benchmark sheets or raw artifact trees.
-
-The short version: active embedding support is now llama.cpp for real local
-models and `hash` for deterministic local-dev checks. ONNX benchmark evidence
-is preserved as historical provenance, but ONNX is no longer a runtime or
-research-harness backend. The strongest measured local pipeline remains BGE-base
-through llama.cpp/Vulkan with scaled int8 persisted vectors.
+This is the human front door for CodeStory research. It keeps only the durable
+decisions and points to the comparison matrix, not raw run ledgers.
 
 ## Current Decisions
 
 | Area | Decision | Why it matters |
 | --- | --- | --- |
-| Runtime backend | Use `CODESTORY_EMBED_BACKEND=llamacpp` for real local embeddings, or `CODESTORY_EMBED_RUNTIME_MODE=hash` for deterministic local-dev/CI checks. | ONNX had no remaining product benefit and added dependency, provider, artifact, and docs weight. |
-| Default profile | `CODESTORY_EMBED_PROFILE=bge-base-en-v1.5`, `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=alias_variant`, durable scope, batch `128`. | This keeps the runtime aligned with the promoted BGE-base evidence while still requiring an explicit llama.cpp endpoint for real embeddings. |
-| Best quality/speed/footprint profile | BGE-base GGUF through llama.cpp/Vulkan, `alias_variant`, durable scope, batch `768`, request count `4`, server `-np 4`, `-ub 1024`, cls pooling, with `CODESTORY_STORED_VECTOR_ENCODING=int8`. | The 60/30/10 pipeline loop found the best local score here and the cross-repo gate passed with no misses. |
-| BGE-small status | Keep BGE-small rows as historical evidence only. | The strongest BGE-small result was an ONNX row, and ONNX is retired; current GGUF BGE-small rows did not beat the BGE-base llama.cpp path. |
-| Best compressed BGE-base artifact | Clean-source Q5_K_M GGUF under the BGE-base b512/r4 leader shape. | It preserved ranking quality with a smaller model artifact, but throughput and score stayed below Q8. It is a compression option, not the leader. |
-| Negative lanes to pause | Broad hybrid-weight sweeps, dimension-only loops, retired ONNX lanes, BGE-small GGUF lower-bit rows, Nomic v2 under current doc shape. | These consumed enough evidence to stop repeating them until the semantic-doc, query, hardware, or model hypothesis changes. |
-| Evidence standard | Provider-verified rows plus per-query ranks and repeated finalists decide recommendations. | A single row, CPU fallback, or missing GPU/provider proof is provenance only. |
+| Real local embeddings | Use `CODESTORY_EMBED_BACKEND=llamacpp`. | This is the active real-model path. |
+| Deterministic local checks | Use `CODESTORY_EMBED_RUNTIME_MODE=hash`. | Keeps local-dev and CI checks reproducible without model services. |
+| Default model profile | `CODESTORY_EMBED_PROFILE=bge-base-en-v1.5`. | BGE-base remains the best quality/speed family for the active runtime. |
+| Default doc shape | `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=alias_variant`, durable semantic scope. | Compact aliases help retrieval without the noise of full alias text. |
+| Best current local pipeline packet | BGE-base GGUF through llama.cpp/Vulkan, batch `512`, request count `6`, server batch `1024`, server microbatch `1024`, stored vectors `int8`. | This is the strongest current CodeStory-local packet after quality-gated scoring. |
+| Prior cross-repo promoted profile | BGE-base GGUF, batch `768`, request count `4`, server microbatch `1024`, stored vectors `int8`. | This has external promotion evidence, but the newer local b512/r6 shape still needs its own cross-repo gate. |
+| Evidence standard | Quality gates and rank profiles come before speed. | A faster row is rejected when MRR, Hit@10, rank1/rank2-10, or misses regress. |
 
 ## Research Threads
 
-### Embedding and Retrieval Backend Research
+### Embedding And Pipeline Performance
 
-Read [embedding-backend-benchmarks.md](testing/embedding-backend-benchmarks.md)
-for the full decision sheet. It consolidates model/backend choices, alias-mode
-results, Run 2 controls/retrieval/finalists, quantization lanes, the 60/30/10
-pipeline loop, and the remaining backlog.
-
-Use [embedding-research-run-2.md](testing/embedding-research-run-2.md) when you
-need the harness contract: source scan, stage names, scoring, stop rules, and
-how to run bounded slices without confusing exploratory evidence with promotion
-evidence.
-
-Use [research-data-catalog.md](testing/research-data-catalog.md) when you need
-to find raw CSV/JSON/log artifacts or preserve the local evidence tree.
+Read [Embedding Pipeline Decision Matrix](testing/embedding-backend-benchmarks.md)
+for the full comparison. It records the current winner, superseded candidates,
+discarded lanes, and what still needs proof.
 
 ### Repo-Scale E2E Performance
 
 Read [codestory-e2e-stats-log.md](testing/codestory-e2e-stats-log.md) for the
 rolling index/search timing history. This is the release-style sanity check for
-semantic indexing behavior and cache reuse, not a replacement for the raw
-benchmark runs.
+semantic indexing behavior and cache reuse.
 
-### Product and UX Research
+### Product And UX Research
 
-Read [project-delight-roadmap.md](project-delight-roadmap.md) for the external
-research-backed product direction: `ask`, explainable retrieval, navigation UX,
-MCP serving, setup help, and the implemented snapshot of those ideas.
+Read [project-delight-roadmap.md](project-delight-roadmap.md) for the product
+direction around `ask`, explainable retrieval, navigation UX, MCP serving, setup
+help, and implemented roadmap work.
 
-### Architecture and Documentation Research
+### Architecture And Documentation Research
 
 Read [decision-log.md](decision-log.md), [architecture overview](architecture/overview.md),
 and [indexing pipeline](architecture/indexing-pipeline.md) for the current
-architecture state. The old ADR-style layer was intentionally collapsed into
-current architecture docs because thin historical records were less useful than
-clear explanations of the live pipeline.
-
-## Data Custody
-
-Tracked docs keep the human-readable synthesis. Raw data stays local because it
-includes large generated caches, logs, search indexes, and model artifacts.
-
-Important local evidence roots:
-
-| Root | What it contains |
-| --- | --- |
-| `target/embedding-research/` | GPU fair benchmark runs, Run 2 controls/retrieval/finalists, quantization probes, per-query ranks, manifests, and per-case logs. |
-| `target/autoresearch/indexer-embedder/` | The later autoresearch loop around the 60/30/10 pipeline score, compact stored vectors, cache/scoring experiments, and local promotion candidates. |
-| `target/autoresearch/cross-repo-promotion/` | External promotion gates over freelancer, traderotate, the-green-cedar, Sourcetrail, and focused follow-up probes. |
-| `models/` | Local GGUF model artifacts used by active benchmark rows, plus any historical artifacts that have not yet been cleaned. This directory is ignored by git. |
-
-Those roots are not committed. If this checkout is moved or cleaned, archive
-them first. The catalog records the shape and most important paths, but it is
-not a substitute for the raw files.
+architecture state. Historical ADR-style notes were collapsed into current
+architecture docs because clear live-system explanations are more useful here.
 
 ## How To Continue Research
 
-1. Start from the current decision table above and the benchmark backlog.
-2. Extend `scripts/embedding-gpu-fair-benchmark.mjs` or the existing
-   autoresearch scripts instead of creating a parallel harness.
-3. Write `manifest.json`, `sources.md`, `results.csv`, `results.json`,
-   `query-ranks.csv`, and logs for every run that might matter later.
-4. Treat query-sliced runs as exploratory. Promotion needs full-query repeats
-   and provider proof.
-5. Update the tracked synthesis and the data catalog in the same change that
-   introduces a new research lane or accepted decision.
+1. Start from the current decision table and the comparison matrix.
+2. Add candidates to the existing benchmark harness instead of creating a new
+   one-off script.
+3. Keep query-sliced runs exploratory. Promotion needs full-query repeats,
+   provider proof, and a clean rank profile.
+4. Update the comparison matrix in the same change that adds or rejects a
+   meaningful research lane.
+5. Do not commit raw run ledgers, dashboard exports, or local artifact catalogs.

@@ -773,6 +773,10 @@ const LLM_DOC_EMBED_BATCH_SIZE_ENV: &str = "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE";
 const SEMANTIC_DOC_SCOPE_ENV: &str = "CODESTORY_SEMANTIC_DOC_SCOPE";
 const SEMANTIC_DOC_ALIAS_MODE_ENV: &str = "CODESTORY_SEMANTIC_DOC_ALIAS_MODE";
 const SEMANTIC_DOC_MAX_TOKENS_ENV: &str = "CODESTORY_SEMANTIC_DOC_MAX_TOKENS";
+const SEMANTIC_STREAM_PENDING_DOCS_ENV: &str = "CODESTORY_SEMANTIC_STREAM_PENDING_DOCS";
+const SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV: &str =
+    "CODESTORY_SEMANTIC_STREAM_SORT_WINDOW_BATCHES";
+const SEMANTIC_STREAM_SORT_WINDOW_BATCHES: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SemanticDocScope {
@@ -1061,6 +1065,25 @@ fn semantic_doc_max_tokens_from_env() -> Option<usize> {
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .map(|value| value.clamp(16, 8_192))
+}
+
+fn stream_pending_llm_symbol_docs_from_env() -> bool {
+    !matches!(
+        std::env::var(SEMANTIC_STREAM_PENDING_DOCS_ENV)
+            .unwrap_or_else(|_| "true".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+fn semantic_stream_sort_window_batches_from_env() -> usize {
+    std::env::var(SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map(|value| value.clamp(1, 16))
+        .unwrap_or(SEMANTIC_STREAM_SORT_WINDOW_BATCHES)
 }
 
 fn llm_indexable_kind_for_scope(
@@ -1462,11 +1485,11 @@ fn flush_pending_llm_symbol_docs(
     let model_id = model_id.to_string();
     let payloads = batch
         .iter()
-        .map(|doc| doc.doc_text.clone())
+        .map(|doc| doc.doc_text.as_str())
         .collect::<Vec<_>>();
     let embedding_started = Instant::now();
     let embeddings = engine
-        .embed_texts(&payloads)
+        .embed_text_refs(&payloads)
         .map_err(|e| ApiError::internal(format!("Failed to embed symbol docs: {e}")))?;
     stats.embedding_ms = stats
         .embedding_ms
@@ -1504,6 +1527,32 @@ fn flush_pending_llm_symbol_docs(
         .docs_embedded
         .saturating_add(clamp_usize_to_u32(docs.len()));
 
+    Ok(())
+}
+
+fn flush_streaming_llm_symbol_doc_window(
+    storage: &mut Storage,
+    engine: &mut SearchEngine,
+    pending_docs: &mut Vec<PendingLlmSymbolDoc>,
+    embed_batch_size: usize,
+    model_id: &str,
+    updated_at_epoch_ms: i64,
+    stats: &mut SemanticProjectionStats,
+) -> Result<(), ApiError> {
+    if pending_docs.len() < embed_batch_size {
+        return Ok(());
+    }
+
+    sort_pending_llm_symbol_docs_for_embedding_batches(pending_docs);
+    flush_pending_llm_symbol_docs(
+        storage,
+        engine,
+        &pending_docs[..embed_batch_size],
+        model_id,
+        updated_at_epoch_ms,
+        stats,
+    )?;
+    pending_docs.drain(..embed_batch_size);
     Ok(())
 }
 
@@ -1564,6 +1613,9 @@ fn sync_llm_symbol_projection(
     }
 
     let embed_batch_size = llm_doc_embed_batch_size();
+    let stream_pending_docs = stream_pending_llm_symbol_docs_from_env();
+    let stream_sort_window_batches = semantic_stream_sort_window_batches_from_env();
+    let stream_sort_window_size = embed_batch_size.saturating_mul(stream_sort_window_batches);
     tracing::debug!(embed_batch_size, "Using semantic doc embedding batch size");
     let mut pending_docs = Vec::<PendingLlmSymbolDoc>::new();
     let mut seen_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
@@ -1620,9 +1672,22 @@ fn sync_llm_symbol_projection(
             doc_text,
             doc_hash,
         });
+        if stream_pending_docs && pending_docs.len() >= stream_sort_window_size {
+            flush_streaming_llm_symbol_doc_window(
+                storage,
+                engine,
+                &mut pending_docs,
+                embed_batch_size,
+                &model_id,
+                updated_at_epoch_ms,
+                &mut stats,
+            )?;
+        }
     }
 
-    sort_pending_llm_symbol_docs_for_embedding_batches(&mut pending_docs);
+    if !stream_pending_docs {
+        sort_pending_llm_symbol_docs_for_embedding_batches(&mut pending_docs);
+    }
     for batch in pending_docs.chunks(embed_batch_size) {
         flush_pending_llm_symbol_docs(
             storage,
@@ -3818,6 +3883,33 @@ mod tests {
     #[test]
     fn llm_doc_embed_batch_size_uses_throughput_default() {
         assert_eq!(llm_doc_embed_batch_size(), 128);
+    }
+
+    #[test]
+    fn stream_pending_llm_symbol_docs_defaults_to_enabled() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvGuard::remove(SEMANTIC_STREAM_PENDING_DOCS_ENV);
+        assert!(stream_pending_llm_symbol_docs_from_env());
+
+        let _env = EnvGuard::set(SEMANTIC_STREAM_PENDING_DOCS_ENV, "false");
+        assert!(!stream_pending_llm_symbol_docs_from_env());
+    }
+
+    #[test]
+    fn semantic_stream_sort_window_defaults_to_one_batch() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvGuard::remove(SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV);
+        assert_eq!(semantic_stream_sort_window_batches_from_env(), 1);
+
+        let _env = EnvGuard::set(SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV, "1");
+        assert_eq!(semantic_stream_sort_window_batches_from_env(), 1);
+
+        let _env = EnvGuard::set(SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV, "999");
+        assert_eq!(semantic_stream_sort_window_batches_from_env(), 16);
     }
 
     #[test]

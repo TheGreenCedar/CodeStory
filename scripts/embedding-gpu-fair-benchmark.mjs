@@ -892,15 +892,15 @@ const queries = [
     bucket: "holdout-adversarial",
   },
   {
-    id: "holdout-onnx-session-build",
-    query: "build an ONNX Runtime embedding session with provider and optimization settings",
-    expect: ["build_onnx_embedding_session"],
+    id: "holdout-llamacpp-runtime-build",
+    query: "build a llama cpp embedding runtime with endpoint and profile settings",
+    expect: ["EmbeddingRuntime::from_env", "LlamaCppEndpoint::from_env", "EmbeddingProfile::from_env"],
     bucket: "holdout-adversarial",
   },
   {
-    id: "holdout-pooling-last-hidden",
-    query: "pool last hidden states using mean or last token strategy for embedding output",
-    expect: ["pool_last_hidden", "mean_pool_last_hidden", "last_token_pool_last_hidden"],
+    id: "holdout-embedding-pooling-config",
+    query: "parse embedding pooling mode from environment and include it in the llama cpp model cache id",
+    expect: ["EmbeddingPooling::from_value", "EmbeddingProfile::cache_model_id", "postprocess_embeddings"],
     bucket: "holdout-adversarial",
   },
   {
@@ -1217,6 +1217,12 @@ function caseId(config) {
   }
   if (config.semanticDocMaxTokens !== undefined) {
     parts.push(`doc-tok${config.semanticDocMaxTokens}`);
+  }
+  if (config.streamPendingSemanticDocs) {
+    parts.push("stream-docs");
+  }
+  if (config.fullTextIndex === false) {
+    parts.push("no-fulltext");
   }
   if (config.hybridWeights) {
     parts.push(
@@ -1954,6 +1960,91 @@ function stageFinalistsRun2() {
         vectorEncoding: "int8",
       }),
       cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r5-durable-runtime-default-stored-int8",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+        batch: 512,
+        requests: 5,
+        parallel: 5,
+        vectorEncoding: "int8",
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r5-durable-runtime-default-stored-int8-ub1024",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+        batch: 512,
+        requests: 5,
+        parallel: 5,
+        serverUbatch: 1024,
+        vectorEncoding: "int8",
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r6-durable-runtime-default-stored-int8-ub1024",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+        batch: 512,
+        requests: 6,
+        parallel: 6,
+        serverUbatch: 1024,
+        vectorEncoding: "int8",
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r6-durable-runtime-default-stored-int8-sb1024-ub1024",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+        batch: 512,
+        requests: 6,
+        parallel: 6,
+        serverBatch: 1024,
+        serverUbatch: 1024,
+        vectorEncoding: "int8",
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r6-durable-runtime-default-stored-int8-sb1024-ub1024-no-fulltext",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+        batch: 512,
+        requests: 6,
+        parallel: 6,
+        serverBatch: 1024,
+        serverUbatch: 1024,
+        vectorEncoding: "int8",
+        fullTextIndex: false,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-durable-runtime-default-stored-int8-ub1024",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        serverUbatch: 1024,
+        vectorEncoding: "int8",
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-durable-runtime-default-stored-int8-ub1024-tok320",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        serverUbatch: 1024,
+        vectorEncoding: "int8",
+        semanticDocMaxTokens: 320,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-b512-r4-durable-runtime-default-stored-int8-ub1024-tok320-stream",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+        batch: 512,
+        requests: 4,
+        parallel: 4,
+        serverUbatch: 1024,
+        vectorEncoding: "int8",
+        semanticDocMaxTokens: 320,
+        streamPendingSemanticDocs: true,
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
         variant: "frontier-b768-r4-durable-runtime-default-stored-int8",
         docMode: "alias_variant",
         semanticScope: "durable",
@@ -2375,6 +2466,20 @@ function selectedCases() {
     : cases.filter((config) => requestedStages.has(config.stage));
   // ONNX case definitions are kept only so old case IDs in historical reports remain readable.
   // Active runs are restricted to the supported llama.cpp backend.
+  if (selectedCaseIds.size > 0) {
+    const unsupportedSelections = stageScopedCases
+      .filter((config) => config.kind !== "llama")
+      .filter((config) => selectedCaseIds.has(config.case_id) || selectedCaseIds.has(config.id))
+      .map((config) => config.case_id)
+      .sort();
+    if (unsupportedSelections.length > 0) {
+      throw new Error(
+        `Removed benchmark backend selected: ${unsupportedSelections.join(
+          ", ",
+        )}. Active benchmark runs support llama.cpp cases only.`,
+      );
+    }
+  }
   const supportedCases = stageScopedCases.filter((config) => config.kind === "llama");
   const selected =
     selectedCaseIds.size > 0
@@ -2433,8 +2538,18 @@ function baseEnv(config) {
   setOrDelete(env, "CODESTORY_SEMANTIC_DOC_MAX_TOKENS", config.semanticDocMaxTokens);
   setOrDelete(
     env,
+    "CODESTORY_SEMANTIC_STREAM_PENDING_DOCS",
+    config.streamPendingSemanticDocs ? "true" : null,
+  );
+  setOrDelete(
+    env,
     "CODESTORY_STORED_VECTOR_ENCODING",
     config.vectorEncoding && config.vectorEncoding !== "float32" ? config.vectorEncoding : null,
+  );
+  setOrDelete(
+    env,
+    "CODESTORY_SYMBOL_FULL_TEXT_INDEX",
+    config.fullTextIndex === false ? "false" : null,
   );
   delete env.CODESTORY_EMBED_MODEL_ID;
   env.CODESTORY_EMBED_LLAMACPP_URL = `http://127.0.0.1:${config.port}/v1/embeddings`;
@@ -2781,7 +2896,20 @@ async function runCase(config) {
     let semanticDocsEmbedded = null;
     let semanticDocsReused = null;
     let semanticDocCount = null;
-    let semanticSeconds = 0;
+    let semanticSeconds = null;
+    let semanticDocBuildSeconds = null;
+    let semanticDbUpsertSeconds = null;
+    let semanticReloadSeconds = null;
+    let graphPhaseSeconds = null;
+    let parseIndexSeconds = null;
+    let projectionFlushSeconds = null;
+    let edgeResolutionSeconds = null;
+    let errorFlushSeconds = null;
+    let cleanupSeconds = null;
+    let deferredIndexesSeconds = null;
+    let summarySnapshotSeconds = null;
+    let publishSeconds = null;
+    let cacheRefreshSeconds = null;
     let docsPerSecond = null;
     let indexSeconds = 0;
     let embeddingModel = "";
@@ -2804,6 +2932,20 @@ async function runCase(config) {
       semanticDocsEmbedded = 0;
       semanticDocsReused = semanticDocCount;
       docsPerSecond = replayResult.docs_per_second ?? null;
+      semanticSeconds = replayResult.semantic_seconds ?? null;
+      semanticDocBuildSeconds = replayResult.semantic_doc_build_seconds ?? null;
+      semanticDbUpsertSeconds = replayResult.semantic_db_upsert_seconds ?? null;
+      semanticReloadSeconds = replayResult.semantic_reload_seconds ?? null;
+      graphPhaseSeconds = replayResult.graph_phase_seconds ?? null;
+      parseIndexSeconds = replayResult.parse_index_seconds ?? null;
+      projectionFlushSeconds = replayResult.projection_flush_seconds ?? null;
+      edgeResolutionSeconds = replayResult.edge_resolution_seconds ?? null;
+      errorFlushSeconds = replayResult.error_flush_seconds ?? null;
+      cleanupSeconds = replayResult.cleanup_seconds ?? null;
+      deferredIndexesSeconds = replayResult.deferred_indexes_seconds ?? null;
+      summarySnapshotSeconds = replayResult.summary_snapshot_seconds ?? null;
+      publishSeconds = replayResult.publish_seconds ?? null;
+      cacheRefreshSeconds = replayResult.cache_refresh_seconds ?? null;
       embeddingModel = replayResult.embedding_model ?? "";
       retrievalMode = replayResult.retrieval_mode ?? "";
     } else {
@@ -2814,15 +2956,34 @@ async function runCase(config) {
       );
 
       const indexJson = parseJson(index.stdout);
+      const phaseTimings = indexJson.phase_timings ?? {};
       provider = {};
-      semanticDocsEmbedded = indexJson.phase_timings?.semantic_docs_embedded ?? null;
+      semanticDocsEmbedded = phaseTimings.semantic_docs_embedded ?? null;
       semanticDocCount =
         indexJson.retrieval?.semantic_doc_count ??
         indexJson.summary?.retrieval?.semantic_doc_count ??
         semanticDocsEmbedded ??
         null;
-      semanticDocsReused = indexJson.phase_timings?.semantic_docs_reused ?? null;
-      semanticSeconds = (indexJson.phase_timings?.semantic_embedding_ms ?? 0) / 1000;
+      semanticDocsReused = phaseTimings.semantic_docs_reused ?? null;
+      semanticSeconds = (phaseTimings.semantic_embedding_ms ?? 0) / 1000;
+      semanticDocBuildSeconds = (phaseTimings.semantic_doc_build_ms ?? 0) / 1000;
+      semanticDbUpsertSeconds = (phaseTimings.semantic_db_upsert_ms ?? 0) / 1000;
+      semanticReloadSeconds = (phaseTimings.semantic_reload_ms ?? 0) / 1000;
+      parseIndexSeconds = (phaseTimings.parse_index_ms ?? 0) / 1000;
+      projectionFlushSeconds = (phaseTimings.projection_flush_ms ?? 0) / 1000;
+      edgeResolutionSeconds = (phaseTimings.edge_resolution_ms ?? 0) / 1000;
+      errorFlushSeconds = (phaseTimings.error_flush_ms ?? 0) / 1000;
+      cleanupSeconds = (phaseTimings.cleanup_ms ?? 0) / 1000;
+      deferredIndexesSeconds = (phaseTimings.deferred_indexes_ms ?? 0) / 1000;
+      summarySnapshotSeconds = (phaseTimings.summary_snapshot_ms ?? 0) / 1000;
+      publishSeconds = (phaseTimings.publish_ms ?? 0) / 1000;
+      cacheRefreshSeconds = (phaseTimings.cache_refresh_ms ?? 0) / 1000;
+      graphPhaseSeconds =
+        parseIndexSeconds +
+        projectionFlushSeconds +
+        edgeResolutionSeconds +
+        errorFlushSeconds +
+        cleanupSeconds;
       docsPerSecond =
         semanticSeconds > 0 && semanticDocsEmbedded
           ? semanticDocsEmbedded / semanticSeconds
@@ -2891,6 +3052,19 @@ async function runCase(config) {
       semantic_docs_reused: semanticDocsReused,
       index_seconds: indexSeconds,
       semantic_seconds: semanticSeconds,
+      semantic_doc_build_seconds: semanticDocBuildSeconds,
+      semantic_db_upsert_seconds: semanticDbUpsertSeconds,
+      semantic_reload_seconds: semanticReloadSeconds,
+      graph_phase_seconds: graphPhaseSeconds,
+      parse_index_seconds: parseIndexSeconds,
+      projection_flush_seconds: projectionFlushSeconds,
+      edge_resolution_seconds: edgeResolutionSeconds,
+      error_flush_seconds: errorFlushSeconds,
+      cleanup_seconds: cleanupSeconds,
+      deferred_indexes_seconds: deferredIndexesSeconds,
+      summary_snapshot_seconds: summarySnapshotSeconds,
+      publish_seconds: publishSeconds,
+      cache_refresh_seconds: cacheRefreshSeconds,
       docs_per_second: docsPerSecond,
       search_seconds: searchElapsedMs / 1000,
       search_query_ms_mean: mean(searchQueryMs),

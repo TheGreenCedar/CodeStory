@@ -173,10 +173,8 @@ Hybrid retrieval setup:
 - verification: `index`, `ground`, `search`, `ask`, and `doctor` will report the retrieval mode plus any fallback reason when relevant
 
 Measured backend tradeoffs and current model recommendations are summarized in
-the [research handbook](docs/research.md), with detailed benchmark evidence in
-[embedding-backend-benchmarks.md](docs/testing/embedding-backend-benchmarks.md)
-and raw artifact locations in
-[research-data-catalog.md](docs/testing/research-data-catalog.md).
+the [research handbook](docs/research.md), with the decision matrix in
+[embedding-backend-benchmarks.md](docs/testing/embedding-backend-benchmarks.md).
 
 Refresh behavior:
 

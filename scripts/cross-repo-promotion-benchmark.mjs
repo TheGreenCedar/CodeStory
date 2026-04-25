@@ -17,7 +17,7 @@ const cli = process.env.CODESTORY_CROSS_REPO_BIN ?? process.env.CODESTORY_EMBED_
 const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
 const outDir =
   process.env.CODESTORY_CROSS_REPO_OUT_DIR ??
-  path.join(root, "target", "autoresearch", "cross-repo-promotion", stamp);
+  path.join(root, "target", "embedding-pipeline", "cross-repo-promotion", stamp);
 const listOnly = process.argv.includes("--list") || process.env.CODESTORY_CROSS_REPO_LIST === "1";
 const skipIndex = process.argv.includes("--skip-index") || process.env.CODESTORY_CROSS_REPO_SKIP_INDEX === "1";
 const allowFail = process.env.CODESTORY_CROSS_REPO_ALLOW_FAIL === "1";
