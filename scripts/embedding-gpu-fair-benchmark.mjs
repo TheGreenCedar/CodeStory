@@ -19,6 +19,14 @@ const outDir =
 const cacheReplayFrom = process.env.CODESTORY_EMBED_RESEARCH_CACHE_FROM
   ? path.resolve(process.env.CODESTORY_EMBED_RESEARCH_CACHE_FROM)
   : "";
+const allowCacheReplay = /^(1|true|yes|on)$/i.test(
+  process.env.CODESTORY_EMBED_RESEARCH_ALLOW_CACHE_REPLAY ?? "",
+);
+if (cacheReplayFrom && !allowCacheReplay) {
+  throw new Error(
+    "CODESTORY_EMBED_RESEARCH_CACHE_FROM requires CODESTORY_EMBED_RESEARCH_ALLOW_CACHE_REPLAY=1",
+  );
+}
 
 const requestedStages = new Set(
   (process.env.CODESTORY_EMBED_RESEARCH_STAGE ?? "smoke")
@@ -45,9 +53,38 @@ const selectedQueryBuckets = new Set(
     .filter(Boolean),
 );
 const queryLimit = parsePositiveIntEnv("CODESTORY_EMBED_RESEARCH_QUERY_LIMIT");
+const querySplit = normalizeQuerySplit(
+  process.env.CODESTORY_EMBED_RESEARCH_QUERY_SPLIT ?? "dev",
+);
+const includeTaintedQueries = /^(1|true|yes|on)$/i.test(
+  process.env.CODESTORY_EMBED_RESEARCH_INCLUDE_TAINTED_QUERIES ?? "",
+);
+const promotionEligible = querySplit === "holdout";
 const portBase = Number(process.env.CODESTORY_EMBED_RESEARCH_PORT_BASE ?? 8170);
 
 const blockedCandidates = [];
+
+const historicallyTaintedQueryIds = new Set([
+  "grounding-overview",
+  "trail-neighborhood",
+  "semantic-sync",
+  "hybrid-weights",
+  "index-file",
+  "llamacpp-endpoint",
+  "resolve-target",
+  "camelcase-open-storage",
+  "path-runtime-lib-sync",
+  "semantic-symbol-aliases",
+  "node-details",
+  "workspace-exclude-patterns",
+  "source-files-discovery",
+  "holdout-stdio-tool-router",
+  "holdout-agent-citation-map",
+  "holdout-embedding-profile-env",
+  "holdout-resolution-support-cache",
+  "holdout-resolution-candidate-rank",
+  "holdout-resolution-semantic-key",
+]);
 
 const researchSources = [
   {
@@ -1171,8 +1208,30 @@ function parsePositiveIntEnv(name) {
   return parsed;
 }
 
+function normalizeQuerySplit(value) {
+  const normalized = value.trim().toLowerCase();
+  if (["dev", "holdout", "all"].includes(normalized)) {
+    return normalized;
+  }
+  throw new Error(
+    `CODESTORY_EMBED_RESEARCH_QUERY_SPLIT must be dev, holdout, or all; got ${value}`,
+  );
+}
+
+function queryBelongsToSplit(query, split) {
+  if (!includeTaintedQueries && historicallyTaintedQueryIds.has(query.id)) {
+    return false;
+  }
+  if (split === "all") {
+    return true;
+  }
+  const isHoldout =
+    query.id.startsWith("holdout-") || String(query.bucket ?? "").startsWith("holdout-");
+  return split === "holdout" ? isHoldout : !isHoldout;
+}
+
 function selectQueries(allQueries) {
-  let out = allQueries;
+  let out = allQueries.filter((query) => queryBelongsToSplit(query, querySplit));
   if (selectedQueryIds.size > 0) {
     out = out.filter((query) => selectedQueryIds.has(query.id));
   }
@@ -2000,6 +2059,19 @@ function stageFinalistsRun2() {
         vectorEncoding: "int8",
       }),
       cloneCase(baseProfiles.llamaBgeBase, {
+        variant: "frontier-q5-b512-r6-durable-runtime-default-stored-int8-sb1024-ub1024",
+        modelPath: modelPaths.bgeBaseGgufQ5,
+        quantization: "q5_k_m",
+        docMode: "alias_variant",
+        semanticScope: "durable",
+        batch: 512,
+        requests: 6,
+        parallel: 6,
+        serverBatch: 1024,
+        serverUbatch: 1024,
+        vectorEncoding: "int8",
+      }),
+      cloneCase(baseProfiles.llamaBgeBase, {
         variant: "frontier-b512-r6-durable-runtime-default-stored-int8-sb1024-ub1024-no-fulltext",
         docMode: "alias_variant",
         semanticScope: "durable",
@@ -2807,6 +2879,27 @@ function fileSizeMb(filePath) {
   return fs.statSync(filePath).size / 1024 / 1024;
 }
 
+function directorySizeBytes(dirPath) {
+  if (!dirPath || !fs.existsSync(dirPath)) {
+    return null;
+  }
+  let total = 0;
+  for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+    const entryPath = path.join(dirPath, entry.name);
+    if (entry.isDirectory()) {
+      total += directorySizeBytes(entryPath) ?? 0;
+    } else if (entry.isFile()) {
+      total += fs.statSync(entryPath).size;
+    }
+  }
+  return total;
+}
+
+function directorySizeMb(dirPath) {
+  const bytes = directorySizeBytes(dirPath);
+  return bytes === null ? null : bytes / 1024 / 1024;
+}
+
 function embeddingDimension(config) {
   if (config.expectedDim) {
     return config.expectedDim;
@@ -3046,6 +3139,9 @@ async function runCase(config) {
       ...config,
       artifact_case_dir,
       cache_replay_from: replayCaseDir,
+      query_split: querySplit,
+      promotion_eligible: promotionEligible,
+      promotion_blocker: promotionEligible ? "" : "query_split_not_holdout",
       ...provider,
       semantic_doc_count: semanticDocCount,
       semantic_docs_embedded: semanticDocsEmbedded,
@@ -3072,6 +3168,7 @@ async function runCase(config) {
       search_query_ms_p95: percentile(searchQueryMs, 0.95),
       search_query_ms_max: percentile(searchQueryMs, 1),
       search_slowest_query_id: slowestSearch?.id ?? "",
+      cache_dir_size_mb: directorySizeMb(activeCacheDir),
       embedding_model: embeddingModel,
       retrieval_mode: retrievalMode,
       model_size_mb: fileSizeMb(config.modelPath),
@@ -3265,7 +3362,16 @@ function writeManifest(cases) {
     artifact_root: outDir,
     requested_stages: [...requestedStages],
     case_count: cases.length,
+    query_split: querySplit,
+    promotion_eligible: promotionEligible,
+    promotion_rule: "Only query_split=holdout rows are eligible for promotion.",
+    cache_replay_allowed: allowCacheReplay,
+    cache_replay_from: cacheReplayFrom,
+    include_tainted_queries: includeTaintedQueries,
+    tainted_query_count: historicallyTaintedQueryIds.size,
+    tainted_queries_excluded: includeTaintedQueries ? [] : [...historicallyTaintedQueryIds],
     query_count: benchmarkQueries.length,
+    query_ids: benchmarkQueries.map((query) => query.id),
     full_query_count: queries.length,
     query_filter: {
       ids: [...selectedQueryIds],
@@ -3359,6 +3465,8 @@ function buildReportMarkdown(ranked, aliasRows, repeatRows, failed, cases) {
     `Stages: \`${[...requestedStages].join(",")}\``,
     `Cases selected: \`${cases.length}\``,
     `Queries: \`${benchmarkQueries.length}\` of \`${queries.length}\``,
+    `Query split: \`${querySplit}\`${promotionEligible ? " (promotion eligible)" : " (not promotion eligible)"}`,
+    `Historically tainted queries: \`${includeTaintedQueries ? "included" : "excluded"}\``,
     "",
     "All decision-grade rows are GPU-only and must set `provider_verified=true`. llama.cpp rows require Vulkan0 and full model-layer offload.",
     "Source-led lanes are recorded in `manifest.json` and `sources.md`; skipped rows mean an artifact or implementation prerequisite is still missing.",
@@ -3462,6 +3570,7 @@ function writeReports(results, cases) {
     "search_query_ms_p95",
     "search_query_ms_max",
     "search_slowest_query_id",
+    "cache_dir_size_mb",
     "semantic_doc_count",
     "semantic_docs_embedded",
     "docs_per_second",
@@ -3522,6 +3631,7 @@ function writeReports(results, cases) {
     fmt(result.search_query_ms_p95),
     fmt(result.search_query_ms_max),
     result.search_slowest_query_id ?? "",
+    fmt(result.cache_dir_size_mb),
     result.semantic_doc_count ?? "",
     result.semantic_docs_embedded ?? "",
     fmt(result.docs_per_second),

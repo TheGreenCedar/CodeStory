@@ -1,9 +1,9 @@
 # Embedding Pipeline Decision Matrix
 
 This is the curated decision record for CodeStory embedding, indexing, and
-retrieval performance work. It replaces the old run diaries and raw packet
-ledgers with the evidence a reader needs to understand what was tried, what was
-kept, what was rejected, and what still needs proof.
+retrieval performance work. It replaces raw packet diaries with the evidence a
+reader needs to understand what was tried, what was rejected, and what still
+needs proof.
 
 ## Decision Summary
 
@@ -13,35 +13,44 @@ kept, what was rejected, and what still needs proof.
 | Deterministic local-dev backend | `CODESTORY_EMBED_RUNTIME_MODE=hash` |
 | Default profile | `CODESTORY_EMBED_PROFILE=bge-base-en-v1.5` |
 | Default doc shape | `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=alias_variant`, durable semantic scope |
-| Best current local packet | BGE-base GGUF through llama.cpp/Vulkan, batch `512`, request count `6`, server batch `1024`, server microbatch `1024`, stored vectors `int8` |
-| Best previous cross-repo profile | BGE-base GGUF through llama.cpp/Vulkan, batch `768`, request count `4`, server microbatch `1024`, stored vectors `int8` |
-| Primary metric shape | Quality-led pipeline score: quality is the largest term, speed is secondary, footprint is tertiary, and quality-gate penalties can reduce the final score |
-| Default-change rule | Do not promote a faster row when MRR, Hit@10, rank profile, or cross-repo behavior regresses |
+| Current broad-holdout incumbent candidate | BGE-base Q8 GGUF through llama.cpp/Vulkan, batch `512`, request count `6`, server batch `1024`, server microbatch `1024`, stored vectors `int8`, full-text enabled |
+| Cross-repo gate status | The same q8/r6 full-text profile passed the external gate across 4 projects and 225 queries |
+| Primary metric shape | `pipeline_score = 1000000 * (0.7 * quality + 0.2 * speed + 0.1 * memory) * quality_gate_penalty` |
+| Memory component shape | Model footprint, persisted vector footprint, and cache/index footprint; peak RAM is reported separately when sampled |
+| Default-change rule | Do not promote a faster row when MRR, Hit@10, rank profile, repeat behavior, or cross-repo behavior regresses |
+| Perfect-score rule | Treat perfect retrieval scores as suspicious until split isolation, leakage checks, tainted-query exclusion, cache replay blocking, adversarial buckets, and a fresh confirmation run all agree |
 
-The newest local optimization loop makes the current local choice obvious:
-`b512/r6/sb1024/ub1024` is the best measured CodeStory packet. The older
-`b768/r4/ub1024` compact-storage profile still has cross-repo promotion evidence,
-but it has not been rerun as the newest local winner shape. Treat it as
-historical promotion evidence, not a reason to override the latest local result.
+The corrected 2026-04-28 loop excludes historically tainted query text and
+requires `promotion_eligible=true`. After broadening to 74 clean holdout queries,
+the useful local scores are no longer perfect: Q8/r6 full-text holds
+`MRR@10=0.9824324324324325`, `Hit@10=1`, and
+`Hit@1=0.972972972972973`. Segment 2 restarted the experiment ledger with this
+profile as the fresh baseline: first measured baseline
+`pipeline_score=909369.1102743357`; repeat `909844.2157260955`. That repeat
+also showed peak-RAM sampling variance, so tiny memory deltas need repeat
+evidence before they matter. Treat earlier perfect-score r5 evidence and any
+single-pass q5 score as historical/suspect, not current default proof.
 
 ## Primary Comparison Matrix
 
-| Candidate or lane | Best relevant evidence | Quality signal | Speed signal | Decision |
+| Candidate or lane | Best relevant evidence | Quality signal | Speed and footprint signal | Decision |
 | --- | --- | --- | --- | --- |
-| BGE-base llama.cpp, b512/r6, server batch 1024, microbatch 1024, stored int8 | `pipeline_score=873163.999266` | MRR@10 `0.982545045`, Hit@10 `1.0` | `409.58` docs/sec, index `18.779s`, semantic `10.833s` | Keep as the current local winner. |
-| BGE-base llama.cpp, b512/r6, microbatch 1024 only | `pipeline_score=872606.758299` | MRR@10 `0.982545045`, Hit@10 `1.0` | `406.50` docs/sec, semantic `10.915s` | Kept but superseded by the server-batch shape. |
-| BGE-base llama.cpp, b512/r5, microbatch 1024 | `pipeline_score=870971.265321` | MRR@10 `0.982545045`, Hit@10 `1.0` | `397.47` docs/sec, semantic `11.163s` | Kept as the path that led to r6, now superseded. |
-| BGE-base llama.cpp, b512/r8, server batch 1024, microbatch 1024 | `pipeline_score=872037.623150` | MRR@10 `0.982545045`, Hit@10 `1.0` | `403.36` docs/sec, semantic `11.005s` | Discard. More concurrency did not beat r6. |
-| BGE-base llama.cpp, b512/r7 or b768/r6 | r7 `870663.075971`, b768/r6 `871191.174582` | Quality held, but no score win | Both slower than the r6 winner | Discard. Adjacent batch/concurrency expansion is not the bottleneck. |
-| Projection-only symbol index, full-text symbol index disabled | First packet `869621.479788`; repeat `865754.081701` | MRR@10 `0.983108108`, rank1 `144`, rank2-10 `4`, misses `0` | First packet `391.93` docs/sec, repeat `378.30` docs/sec | Keep as opt-in architecture evidence. It reduces nonsemantic overhead but is not the primary winner. |
-| Continuous quality and explicit quality gates | Gate packets stayed finite and penalized fragile rows instead of reporting fake wins | Exposed MRR/rank regressions such as rank1 `142` vs `144` | Measurement only | Keep. Quality is part of the primary metric, not a side note. |
-| Query-rank and denominator reporting | Rank profile exposed rank1/rank2-10/miss counts; semantic doc counts stopped denominator ambiguity | Measurement only | Measurement only | Keep. This is the evidence layer future changes need. |
-| BGE-base Q5 active pipeline scout | `pipeline_score=843988.193781` | Quality gate failed: MRR@10 `0.975788288`, rank1 `142`, rank2-10 `6` | `351.87` docs/sec, index `22.435s`; footprint improved | Discard for the active pipeline. Smaller artifact did not justify the quality loss. |
-| BGE-small GGUF scouts | `353357.245456` for all-scope, `516361.429775` for durable | Quality gate failed despite good speed/footprint | Durable scout reached `574.33` docs/sec | Discard for this pipeline. It is fast but not good enough. |
+| BGE-base llama.cpp, b512/Q8/r6, server batch 1024, microbatch 1024, stored int8, full-text enabled | Segment 2 baseline `909369.110274`; repeat `909844.215726`; earlier fixed-wrapper holdout `910504.353332`; cross-repo `851670.370370` | Local MRR@10 `0.982432`, Hit@10 `1.0`, Hit@1 `0.972973`; cross-repo Hit@10 `1.0`, adversarial Hit@10 `1.0`, MRR@10 `0.826831` across 225 queries | Segment 2 baseline `368.01` docs/sec, cache `74.40 MB`, sampled peak descendant working set `828.73 MB`; repeat `371.89` docs/sec, sampled peak `1019.79 MB`; cross-repo search p95 `84.7 ms` | Keep as the current externally validated incumbent candidate and segment-2 baseline. This is evidence, not a license to skip future holdout and cross-repo gates. |
+| BGE-base llama.cpp, b512/r5, microbatch 1024, stored int8 | Earlier local `pipeline_score=918957.022351`; confirmation `918697.617312`; corrected segment-2 scout `901789.644032` | Earlier perfect local scores triggered the overfit review; corrected segment-2 quality matched q8/r6, but did not improve it | Corrected segment-2 r5 slowed to `327.58` docs/sec and sampled peak rose to `1074.43 MB` | Historical/discarded. Do not treat r5 as the current promoted answer after the corrected broad-holdout pass. |
+| BGE-base llama.cpp, b768/r4 vs b512/Q8/r6 on the 74-query broad holdout | Packet 18 selected Q8/r6 with `pipeline_score=910173.164803` | r4 matched Q8/r6 quality | r4 was slower than Q8/r6 (`361.85` vs `389.22` docs/sec) | Do not promote. Useful comparison only. |
+| BGE-base Q5 against the broad holdout incumbent | Segment 2 first pass `910704.594864`; repeat `901823.678946` | First pass matched q8/r6 quality; repeat failed quality with MRR@10 `0.975676` and Hit@1 `0.959459` | Model footprint shrank to `78.21 MB`, but speed regressed and repeat stayed below baseline | Discard as a default/promotion candidate. Reopen only with a quality-preserving and speed-neutral compression recipe. |
+| Full-text symbol index disabled | Segment 2 first pass `909873.095714`; repeat `908555.984747` | Quality matched q8/r6 on both passes | Cache and sampled RAM improved, but the first-pass score advantage did not repeat and the repeat fell below baseline | Discard as a default/promotion candidate for now. Keep only as an architecture scout. |
+| Semantic-doc alias modes against q8/r6 | Segment 2 isolated `current_alias=890267.797771`; isolated `no_alias=843630.908137` | Both failed the quality gate; `current_alias` MRR@10 `0.973423`, `no_alias` MRR@10 `0.936937` and Hit@10 `0.986486` | `no_alias` was faster, but quality loss dominated; `current_alias` was slower and larger | Keep `alias_variant` as the default semantic-doc shape. Stop broad alias-mode toggles unless miss analysis identifies a specific doc feature. |
+| Continuous quality and explicit quality gates | Gate packets stayed finite and penalized fragile rows instead of reporting fake wins | Exposed MRR/rank regressions and removed fake-perfect conclusions | Measurement only | Keep. Quality is part of the primary metric, not a side note. |
+| Leakage guard, tainted-query quarantine, and cache replay block | `semantic-doc-leakage-check` passed before the current benchmark packets | Prevents production semantic docs from copying benchmark query text | Measurement guard only | Required before promotion evidence. |
+| Query-rank, denominator, cache footprint, and peak-RAM reporting | Rank profile, semantic doc counts, `best_cache_dir_size_mb`, and sampled peak working set are now reported | Measurement only | Measurement only | Keep. This is the evidence layer future changes need. |
+| Parallel semantic score computation for large semantic indexes | Run 26 `pipeline_score=898343.384426` | Quality held: MRR@10 `0.982432`, Hit@10 `1.0`, Hit@1 `0.972973` | Speed and RAM regressed: `362.61` docs/sec, peak descendant working set `1072.92 MB` | Discard. Broad Rayon parallelism hurt the user-weighted metric; future search-latency work needs a more targeted search-only hypothesis. |
+| Top-k semantic score collection | First pass `912943.380576`; repeat `897131.467693` | Repeat failed quality: MRR@10 `0.970608`, Hit@1 `0.959459`, quality gate failed | Repeat stayed below the incumbent and kept high sampled RAM (`1058.27 MB`) | Discard and revert. Do not revisit without an exact-equivalence regression test against the old full-score selection path. |
+| BGE-small GGUF scouts | Segment 2 q8 distant scout `790489.007403`; older `353357.245456` for all-scope, `516361.429775` for durable | Segment 2 MRR@10 `0.901351`, Hit@1 `0.824324`, quality gate failed despite Hit@10 `1.0` | Smaller model footprint did not overcome lower quality and end-to-end shape changes | Discard for this pipeline. It is fast-ish in spots but not good enough. |
 | Nomic and EmbeddingGemma model-family scouts | Nomic `587079.276176`; Gemma `706729.502599` | Both below the quality bar | Slower or lower-ranked than BGE-base | Pause unless the semantic-doc/query hypothesis changes. |
 | Token-budget narrowing and semantic-scope pruning | tok320 `863128.088009`; no-macros `838267.207245`; no-test-macros `862424.110651` | Lost quality or rank profile | Some rows reduced semantic time but not enough | Discard. Removing documents is not free. |
 | Direct hydration, file-path cache, and reload skipping | Direct hydration `843840.934147`; stable-order hydration `859167.697841`; file-path cache `862471.707786` | Quality or speed regressed | Did not remove enough cache/semantic time | Discard for now. |
-| Background semantic embedding | Buggy packet `949630.846470`; corrected packet `857789.768509` | Corrected packet had lower quality | Corrected speed did not beat the winner | Discard. The apparent win was a measurement bug. |
+| Background semantic embedding | Buggy packet `949630.846470`; corrected packet `857789.768509` | Corrected packet had lower quality | Corrected speed did not beat the incumbent candidate | Discard. The apparent win was a measurement bug. |
 | ONNX rows | Older ONNX rows are historical only | Some older rows were competitive | Active runtime no longer carries ONNX | Do not reopen unless a new backend decision deliberately reintroduces it. |
 
 ## What Was Tried
@@ -51,22 +60,38 @@ The measured work covered these families:
 - llama.cpp request geometry: batch size, request count, server batch, and server microbatch.
 - Stored-vector footprint: compact scaled int8 persisted vectors.
 - Quality metric repair: explicit gates, continuous penalties, denominator metrics, and query-rank reporting.
-- Semantic document shape: token budgets, macro/test-macro pruning, callable/type scopes, and durable/all scope variants.
+- Benchmark isolation: leakage guard, tainted-query quarantine, and cache replay blocking.
+- Semantic document shape: token budgets, macro/test-macro pruning, callable/type scopes, durable/all scope variants, and alias variants.
 - Streaming and overlap scouts: semantic-doc streaming batches, sort windows, background embedding, and search-index overlap.
-- Cache and reload reduction: direct hydration, stable ordering, file-path caching, semantic reload skipping, and cache refresh split reporting.
+- Cache and reload reduction: direct hydration, stable ordering, file-path caching, semantic reload skipping, cache refresh split reporting, and full-text disablement.
 - Model family scouts: BGE-base, BGE-small, Nomic, EmbeddingGemma, Qwen-derived dimension work, and GGUF weight quantization.
-- Cross-repo promotion: the previous compact BGE-base b768/r4 microbatch profile passed external repositories, but the newest b512/r6 local winner still needs its own cross-repo gate before becoming a broader recommendation.
+- Cross-repo promotion: the q8/r6 full-text profile passed the external gate across 4 projects and 225 queries with Hit@10 `1.0`, adversarial Hit@10 `1.0`, and search p95 `84.7 ms`.
+- Memory measurement: `scripts/measure-peak-memory.ps1` samples descendant process working sets and reports optional `peak_vram_mb` when an available telemetry tool returns it.
+- Search-latency implementation scout: parallel semantic score computation was tested and discarded because it slowed the measured holdout and increased sampled RAM.
+- Search-latency top-k scout: top-k semantic score collection was tested and discarded because the repeat failed the quality gate.
+- Segment 2 restart: q8/r6 full-text was rebaselined, q5/r6 and no-fulltext/r6 were repeated before promotion, q8/r5 and BGE-small were rejected, and isolated `current_alias`/`no_alias` semantic-doc probes confirmed `alias_variant`.
 
 ## What Was Not Proven
 
 - True producer-consumer streaming from parsed/indexed symbols into the embedder
   has not been proven. Several scouts reduced or rearranged semantic work, but
   none established a safe end-to-end streaming architecture that beats the
-  current b512/r6 winner.
-- The newest local winner has not yet been promoted through the external
-  cross-repo gate.
+  current q8/r6 full-text incumbent candidate.
+- The current external gate covers four useful repository families, but broader
+  defaults should still be checked on any new representative repo family before
+  treating the profile as universal.
 - Q5 remains a compression option only if a future quality-preserving recipe
-  exists. The active Q5 packet failed the quality gate.
+  exists. The current scout saved model footprint but did not beat the q8/r6
+  incumbent under the user-weighted metric.
+- Disabling full-text remains an architecture idea, not a default. Its corrected
+  repeat did not justify promotion.
+- Broad semantic-doc alias toggles are not a proven improvement. Segment 2
+  isolated both `current_alias` and `no_alias`; both failed the corrected quality
+  gate, so future doc-shape work needs miss-level evidence instead of another
+  whole-mode flip.
+- VRAM was not measured on this Windows/Vulkan host because `nvidia-smi` did not
+  return memory usage. Peak RAM is sampled working set evidence, not exact max
+  RSS.
 - ONNX is not an active path. Older ONNX evidence should not drive new choices
   after the backend was removed.
 
@@ -74,5 +99,5 @@ The measured work covered these families:
 
 Use this file as the first stop for embedding and pipeline decisions. If a new
 candidate is added, update the matrix with the candidate shape, the best
-decision-grade metric row, the quality/rank signal, the speed signal, and the
-decision. Do not add raw run ledgers or diary files to the repo.
+decision-grade metric row, the quality/rank signal, the speed and footprint
+signal, and the decision. Do not add raw run ledgers or diary files to the repo.

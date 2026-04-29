@@ -11,8 +11,8 @@ decisions and points to the comparison matrix, not raw run ledgers.
 | Deterministic local checks | Use `CODESTORY_EMBED_RUNTIME_MODE=hash`. | Keeps local-dev and CI checks reproducible without model services. |
 | Default model profile | `CODESTORY_EMBED_PROFILE=bge-base-en-v1.5`. | BGE-base remains the best quality/speed family for the active runtime. |
 | Default doc shape | `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=alias_variant`, durable semantic scope. | Compact aliases help retrieval without the noise of full alias text. |
-| Best current local pipeline packet | BGE-base GGUF through llama.cpp/Vulkan, batch `512`, request count `6`, server batch `1024`, server microbatch `1024`, stored vectors `int8`. | This is the strongest current CodeStory-local packet after quality-gated scoring. |
-| Prior cross-repo promoted profile | BGE-base GGUF, batch `768`, request count `4`, server microbatch `1024`, stored vectors `int8`. | This has external promotion evidence, but the newer local b512/r6 shape still needs its own cross-repo gate. |
+| Current incumbent pipeline candidate | BGE-base Q8 GGUF through llama.cpp/Vulkan, batch `512`, request count `6`, server batch `1024`, server microbatch `1024`, stored vectors `int8`, full-text enabled. | This is the segment-2 baseline after the benchmark repair; it beat repeated q5, no-fulltext, r5, BGE-small, `current_alias`, and `no_alias` scouts. |
+| Peak memory evidence | Segment-2 q8/r6 baseline measured peak descendant working set `828.726562 MB`; repeat sampled `1019.789062 MB`; `peak_vram_mb` was unavailable on this host. | Memory is now measured explicitly, but sampled peak RAM is noisy enough that tiny memory wins need repeats. |
 | Evidence standard | Quality gates and rank profiles come before speed. | A faster row is rejected when MRR, Hit@10, rank1/rank2-10, or misses regress. |
 
 ## Research Threads
@@ -20,8 +20,8 @@ decisions and points to the comparison matrix, not raw run ledgers.
 ### Embedding And Pipeline Performance
 
 Read [Embedding Pipeline Decision Matrix](testing/embedding-backend-benchmarks.md)
-for the full comparison. It records the current winner, superseded candidates,
-discarded lanes, and what still needs proof.
+for the full comparison. It records the current incumbent candidate, historical
+rows, discarded lanes, and what still needs proof.
 
 ### Repo-Scale E2E Performance
 
@@ -47,8 +47,10 @@ architecture docs because clear live-system explanations are more useful here.
 1. Start from the current decision table and the comparison matrix.
 2. Add candidates to the existing benchmark harness instead of creating a new
    one-off script.
-3. Keep query-sliced runs exploratory. Promotion needs full-query repeats,
-   provider proof, and a clean rank profile.
+3. Keep query-sliced runs exploratory. Promotion needs clean holdout evidence,
+   leakage checks, cache replay blocking, cross-repo proof when defaults might
+   change, and a clean rank profile.
 4. Update the comparison matrix in the same change that adds or rejects a
-   meaningful research lane.
+   meaningful research lane; do not let a single first-pass score outrank a
+   failed repeat.
 5. Do not commit raw run ledgers, dashboard exports, or local artifact catalogs.

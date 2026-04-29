@@ -188,8 +188,11 @@ fn query_entrypoint_intent_bucket(query: &str, display_name: &str, is_exact_matc
                 && terms_contain_phrase(&terms, &["compare", "resolution", "hits"]))
             || (terminal == "file_text_match_line"
                 && terms_contain_phrase(&terms, &["file", "text", "match", "line"]))
-            || (matches!(terminal.as_str(), "parse" | "llamacpp_embeddings_url_env")
-                && terms_contain_phrase(&terms, &["endpoint"])),
+            || (terminal == "parse"
+                && terms_contain_phrase(&terms, &["endpoint"])
+                && terms
+                    .iter()
+                    .any(|term| matches!(term.as_str(), "url" | "env" | "environment"))),
     )
 }
 

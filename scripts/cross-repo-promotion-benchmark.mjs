@@ -1105,8 +1105,10 @@ function configureProfile(name, env) {
   const url = `http://127.0.0.1:${port}/v1/embeddings`;
   const docEmbedBatchSize = process.env.CODESTORY_CROSS_REPO_LLM_DOC_EMBED_BATCH_SIZE ?? "512";
   const storedVectorEncoding = process.env.CODESTORY_CROSS_REPO_STORED_VECTOR_ENCODING ?? "";
+  const llamaRequestCount = process.env.CODESTORY_CROSS_REPO_LLAMACPP_REQUEST_COUNT ?? "4";
   const llamaServerBatch = process.env.CODESTORY_CROSS_REPO_LLAMACPP_SERVER_BATCH ?? "2048";
   const llamaServerUbatch = process.env.CODESTORY_CROSS_REPO_LLAMACPP_SERVER_UBATCH ?? "2048";
+  const llamaServerParallel = process.env.CODESTORY_CROSS_REPO_LLAMACPP_PARALLEL ?? llamaRequestCount;
 
   env.CODESTORY_HYBRID_RETRIEVAL_ENABLED = "true";
   env.CODESTORY_SEMANTIC_DOC_SCOPE = "durable";
@@ -1117,7 +1119,7 @@ function configureProfile(name, env) {
   env.CODESTORY_EMBED_RUNTIME_MODE = "llamacpp";
   env.CODESTORY_EMBED_POOLING = "cls";
   env.CODESTORY_EMBED_LLAMACPP_URL = url;
-  env.CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT = "4";
+  env.CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT = llamaRequestCount;
   env.CODESTORY_SEMANTIC_DOC_MAX_TOKENS =
     process.env.CODESTORY_CROSS_REPO_SEMANTIC_DOC_MAX_TOKENS ?? "384";
   delete env.CODESTORY_EMBED_MAX_TOKENS;
@@ -1143,9 +1145,10 @@ function configureProfile(name, env) {
       doc_embed_batch_size: Number(env.CODESTORY_LLM_DOC_EMBED_BATCH_SIZE),
       stored_vector_encoding: env.CODESTORY_STORED_VECTOR_ENCODING ?? "float32",
       semantic_doc_max_tokens: Number(env.CODESTORY_SEMANTIC_DOC_MAX_TOKENS),
-      request_count: 4,
+      request_count: Number(llamaRequestCount),
       llama_server_batch: Number(llamaServerBatch),
       llama_server_ubatch: Number(llamaServerUbatch),
+      llama_server_parallel: Number(llamaServerParallel),
       model_path: modelPath,
       llama_server_url: url,
     },
@@ -1176,7 +1179,7 @@ function configureProfile(name, env) {
         "-ub",
         llamaServerUbatch,
         "-np",
-        "4",
+        llamaServerParallel,
         "-fa",
         "auto",
       ],

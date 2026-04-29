@@ -122,19 +122,19 @@ pub(crate) fn runtime_concept_phrases(
                 push_unique_alias(
                     &mut phrases,
                     &mut seen,
-                    "synchronize persisted semantic documents after indexing".to_string(),
+                    "refresh stored symbol embedding records for the completed index run".to_string(),
                 );
                 push_unique_alias(
                     &mut phrases,
                     &mut seen,
-                    "crates codestory runtime src lib sync semantic docs".to_string(),
+                    "runtime library projection refresh entry point for stored symbol documents".to_string(),
                 );
             }
             "grounding snapshot" => {
                 push_unique_alias(
                     &mut phrases,
                     &mut seen,
-                    "make compact grounding overview with coverage buckets and notes".to_string(),
+                    "assemble a concise workspace grounding summary with evidence groups".to_string(),
                 );
                 push_unique_alias(
                     &mut phrases,
@@ -150,12 +150,12 @@ pub(crate) fn runtime_concept_phrases(
             "normalized hybrid weights" => push_unique_alias(
                 &mut phrases,
                 &mut seen,
-                "normalize lexical semantic and graph weights for retrieval".to_string(),
+                "calculate balanced hybrid retrieval coefficients across search signals".to_string(),
             ),
             "index file" => push_unique_alias(
                 &mut phrases,
                 &mut seen,
-                "index one source file with tree sitter symbols and semantic edges".to_string(),
+                "parse a workspace file into graph nodes references and resolver inputs".to_string(),
             ),
             "reload llm docs from storage" => push_unique_alias(
                 &mut phrases,
@@ -206,7 +206,7 @@ pub(crate) fn runtime_concept_phrases(
                 push_unique_alias(
                     &mut phrases,
                     &mut seen,
-                    "turn scored retrieval hits into answer citations with target paths and line numbers"
+                    "convert selected search results into grounded citation evidence records"
                         .to_string(),
                 );
                 push_unique_alias(
@@ -220,7 +220,7 @@ pub(crate) fn runtime_concept_phrases(
                 push_unique_alias(
                     &mut phrases,
                     &mut seen,
-                    "rank candidate target matches by exactness kind and declaration anchors"
+                    "order possible resolution targets using name fit node category and source anchors"
                         .to_string(),
                 );
                 push_unique_alias(
@@ -240,13 +240,13 @@ pub(crate) fn runtime_concept_phrases(
                 push_unique_alias(
                     &mut phrases,
                     &mut seen,
-                    "workspace source files apply language filters and excludes".to_string(),
+                    "discover indexable workspace files using language rules and ignore patterns".to_string(),
                 );
             }
             "compile exclude patterns" => push_unique_alias(
                 &mut phrases,
                 &mut seen,
-                "compile glob exclude patterns for workspace source discovery".to_string(),
+                "prepare ignore matchers used while walking project files".to_string(),
             ),
             "build llm symbol doc text" => push_unique_alias(
                 &mut phrases,
@@ -256,7 +256,7 @@ pub(crate) fn runtime_concept_phrases(
             "trail context" => push_unique_alias(
                 &mut phrases,
                 &mut seen,
-                "follow outgoing graph edges around a focus symbol".to_string(),
+                "collect nearby graph relationships from the selected symbol".to_string(),
             ),
             "build trail request" | "build trail request impl" => {
                 push_unique_alias(
@@ -287,7 +287,7 @@ pub(crate) fn runtime_concept_phrases(
                 push_unique_alias(
                     &mut phrases,
                     &mut seen,
-                    "dispatch JSON stdio tool calls to search symbol trail snippet and ask handlers"
+                    "route stdio protocol requests to the repository lookup handlers"
                         .to_string(),
                 );
             }
@@ -306,7 +306,7 @@ pub(crate) fn runtime_concept_phrases(
                 push_unique_alias(
                     &mut phrases,
                     &mut seen,
-                    "reuse or rebuild cached support tables used by semantic call and import resolution"
+                    "maintain resolver lookup caches for imports and call targets"
                         .to_string(),
                 );
             }
@@ -317,7 +317,7 @@ pub(crate) fn runtime_concept_phrases(
                 push_unique_alias(
                     &mut phrases,
                     &mut seen,
-                    "reuse or rebuild cached support tables used by semantic call and import resolution"
+                    "maintain resolver lookup caches for imports and call targets"
                         .to_string(),
                 );
             }
@@ -330,7 +330,7 @@ pub(crate) fn runtime_concept_phrases(
                 push_unique_alias(
                     &mut phrases,
                     &mut seen,
-                    "derive semantic resolution request keys and target names from unresolved edges"
+                    "create unresolved-edge lookup keys for semantic resolution candidates"
                         .to_string(),
                 );
             }
@@ -348,7 +348,7 @@ pub(crate) fn runtime_concept_phrases(
             "open project with storage path" => push_unique_alias(
                 &mut phrases,
                 &mut seen,
-                "camel case openProjectWithStoragePath method for opening sqlite storage"
+                "JS storage opener keeps external project API spelling"
                     .to_string(),
             ),
             "from env"
@@ -366,7 +366,7 @@ pub(crate) fn runtime_concept_phrases(
                 push_unique_alias(
                     &mut phrases,
                     &mut seen,
-                    "load embedding model profile prefixes pooling dimensions and backend choices from environment"
+                    "read embedding backend profile configuration and model dimensions from env vars"
                         .to_string(),
                 );
             }
@@ -387,7 +387,7 @@ pub(crate) fn runtime_concept_phrases(
                 push_unique_alias(
                     &mut phrases,
                     &mut seen,
-                    "resolve user query to symbol id used by trail and snippet".to_string(),
+                    "choose the SearchHit node target requested by trail and snippet commands".to_string(),
                 );
                 push_unique_alias(
                     &mut phrases,
@@ -405,7 +405,7 @@ pub(crate) fn runtime_concept_phrases(
                 push_unique_alias(
                     &mut phrases,
                     &mut seen,
-                    "node details source occurrence edge digest for a symbol".to_string(),
+                    "summarize symbol metadata source span and relationship digest".to_string(),
                 );
                 push_unique_alias(
                     &mut phrases,
@@ -417,7 +417,7 @@ pub(crate) fn runtime_concept_phrases(
             "semantic symbol aliases" => push_unique_alias(
                 &mut phrases,
                 &mut seen,
-                "semantic symbol aliases split namespaces camel snake acronyms".to_string(),
+                "produce searchable name variants from namespaces casing and acronyms".to_string(),
             ),
             "build config" => push_unique_alias(
                 &mut phrases,
@@ -1072,8 +1072,8 @@ mod tests {
                 Some("codestory_runtime::sync_llm_symbol_projection")
             ),
             vec![
-                "synchronize persisted semantic documents after indexing",
-                "crates codestory runtime src lib sync semantic docs"
+                "refresh stored symbol embedding records for the completed index run",
+                "runtime library projection refresh entry point for stored symbol documents"
             ]
         );
         assert_eq!(
@@ -1082,7 +1082,7 @@ mod tests {
                 Some("codestory_runtime::grounding::GroundingService::grounding_snapshot")
             ),
             vec![
-                "make compact grounding overview with coverage buckets and notes",
+                "assemble a concise workspace grounding summary with evidence groups",
                 "GroundingService grounding snapshot overview entrypoint returns compact notes and coverage buckets",
                 "grounding snapshot ranked file summaries coverage buckets"
             ]
@@ -1092,11 +1092,11 @@ mod tests {
                 "normalized_hybrid_weights",
                 Some("codestory_runtime::support::normalized_hybrid_weights")
             ),
-            vec!["normalize lexical semantic and graph weights for retrieval"]
+            vec!["calculate balanced hybrid retrieval coefficients across search signals"]
         );
         assert_eq!(
             runtime_concept_phrases("index_file", Some("codestory_indexer::index_file")),
-            vec!["index one source file with tree sitter symbols and semantic edges"]
+            vec!["parse a workspace file into graph nodes references and resolver inputs"]
         );
         assert_eq!(
             runtime_concept_phrases(
@@ -1160,7 +1160,7 @@ mod tests {
                 Some("codestory_runtime::agent::orchestrator::to_citation")
             ),
             vec![
-                "turn scored retrieval hits into answer citations with target paths and line numbers",
+                "convert selected search results into grounded citation evidence records",
                 "map hybrid search result score to AgentCitation node file path line evidence"
             ]
         );
@@ -1170,7 +1170,7 @@ mod tests {
                 Some("codestory_cli::runtime::resolution_candidate_rank")
             ),
             vec![
-                "rank candidate target matches by exactness kind and declaration anchors",
+                "order possible resolution targets using name fit node category and source anchors",
                 "compare resolved target candidates with file filter exact name kind declaration priority"
             ]
         );
@@ -1180,7 +1180,7 @@ mod tests {
                 Some("codestory_cli::runtime::compare_resolution_candidates")
             ),
             vec![
-                "rank candidate target matches by exactness kind and declaration anchors",
+                "order possible resolution targets using name fit node category and source anchors",
                 "compare resolved target candidates with file filter exact name kind declaration priority"
             ]
         );
@@ -1188,7 +1188,7 @@ mod tests {
             runtime_concept_phrases("source_files", Some("codestory_workspace::source_files")),
             vec![
                 "workspace source files discovery entrypoint lists indexed source files",
-                "workspace source files apply language filters and excludes"
+                "discover indexable workspace files using language rules and ignore patterns"
             ]
         );
         assert_eq!(
@@ -1196,7 +1196,7 @@ mod tests {
                 "compile_exclude_patterns",
                 Some("codestory_workspace::compile_exclude_patterns")
             ),
-            vec!["compile glob exclude patterns for workspace source discovery"]
+            vec!["prepare ignore matchers used while walking project files"]
         );
         assert_eq!(
             runtime_concept_phrases(
@@ -1210,7 +1210,7 @@ mod tests {
                 "open_project_with_storage_path",
                 Some("codestory_runtime::ProjectService::open_project_with_storage_path")
             ),
-            vec!["camel case openProjectWithStoragePath method for opening sqlite storage"]
+            vec!["JS storage opener keeps external project API spelling"]
         );
         assert_eq!(
             runtime_concept_phrases(
@@ -1219,7 +1219,7 @@ mod tests {
             ),
             vec![
                 "stdio tool router dispatches search symbol trail snippet and ask commands",
-                "dispatch JSON stdio tool calls to search symbol trail snippet and ask handlers"
+                "route stdio protocol requests to the repository lookup handlers"
             ]
         );
         assert_eq!(
@@ -1248,7 +1248,7 @@ mod tests {
             ),
             vec![
                 "call resolution semantic request key target name candidate lookup",
-                "derive semantic resolution request keys and target names from unresolved edges"
+                "create unresolved-edge lookup keys for semantic resolution candidates"
             ]
         );
         assert_eq!(
@@ -1258,7 +1258,7 @@ mod tests {
             ),
             vec![
                 "resolution support cache snapshot for import and call resolution",
-                "reuse or rebuild cached support tables used by semantic call and import resolution"
+                "maintain resolver lookup caches for imports and call targets"
             ]
         );
         assert_eq!(
@@ -1266,9 +1266,7 @@ mod tests {
                 "prepare",
                 Some("codestory_indexer::ResolutionSupport::prepare")
             ),
-            vec![
-                "reuse or rebuild cached support tables used by semantic call and import resolution"
-            ]
+            vec!["maintain resolver lookup caches for imports and call targets"]
         );
         assert_eq!(
             runtime_concept_phrases(
@@ -1291,7 +1289,7 @@ mod tests {
             ),
             vec![
                 "embedding profile environment variable backend selection from env",
-                "load embedding model profile prefixes pooling dimensions and backend choices from environment"
+                "read embedding backend profile configuration and model dimensions from env vars"
             ]
         );
         assert_eq!(
@@ -1300,7 +1298,7 @@ mod tests {
                 Some("codestory_cli::runtime::resolve_target")
             ),
             vec![
-                "resolve user query to symbol id used by trail and snippet",
+                "choose the SearchHit node target requested by trail and snippet commands",
                 "resolve a user query to the selected SearchHit NodeId target for trail and snippet commands",
                 "map TargetSelection query or id into ResolvedTarget selected alternatives"
             ]
@@ -1320,10 +1318,7 @@ mod tests {
                 "parse",
                 Some("codestory_runtime::search::engine::LlamaCppEndpoint::parse")
             ),
-            vec![
-                "llama.cpp OpenAI-compatible embeddings endpoint URL configuration",
-                "CODESTORY_EMBED_LLAMACPP_URL selects local HTTP embedding endpoint"
-            ]
+            Vec::<String>::new()
         );
         assert_eq!(
             runtime_concept_phrases(
@@ -1338,7 +1333,7 @@ mod tests {
                 Some("codestory_runtime::grounding::GroundingService::node_details")
             ),
             vec![
-                "node details source occurrence edge digest for a symbol",
+                "summarize symbol metadata source span and relationship digest",
                 "node details entrypoint returns symbol metadata source and edge digest"
             ]
         );
@@ -1347,7 +1342,7 @@ mod tests {
                 "semantic_symbol_aliases",
                 Some("codestory_runtime::semantic_symbol_aliases")
             ),
-            vec!["semantic symbol aliases split namespaces camel snake acronyms"]
+            vec!["produce searchable name variants from namespaces casing and acronyms"]
         );
         assert_eq!(
             runtime_concept_phrases("buildConfig", Some("buildConfig")),
