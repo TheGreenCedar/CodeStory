@@ -22,7 +22,9 @@ impl SafetyMetadata {
         match self.effect {
             ToolEffect::Read => json!({
                 "readOnly": true,
-                "sideEffects": false
+                "sideEffects": false,
+                "localOnly": true,
+                "openWorld": false
             }),
         }
     }
@@ -32,7 +34,8 @@ impl SafetyMetadata {
             ToolEffect::Read => json!({
                 "readOnlyHint": true,
                 "destructiveHint": false,
-                "idempotentHint": true
+                "idempotentHint": true,
+                "openWorldHint": false
             }),
         }
     }
@@ -471,6 +474,15 @@ const RESPONSE_MODES: &[&str] = &["structured", "markdown"];
 static GENERIC_OBJECT_SCHEMA: SchemaObject =
     SchemaObject::passthrough_object("Generic JSON object.");
 
+static RESOURCE_LINK_SCHEMA: SchemaObject = SchemaObject::object(
+    "Continuation resource link.",
+    &[
+        SchemaProperty::string("rel", "Link relation."),
+        SchemaProperty::string("uri", "CodeStory resource URI."),
+    ],
+    &["rel", "uri"],
+);
+
 static SEARCH_HIT_SCHEMA: SchemaObject = SchemaObject::object(
     "CodeStory search hit DTO.",
     &[
@@ -486,6 +498,11 @@ static SEARCH_HIT_SCHEMA: SchemaObject = SchemaObject::object(
             "Whether the hit can be used as a symbol target.",
         ),
         SchemaProperty::object("score_breakdown", "Optional retrieval score breakdown."),
+        SchemaProperty::array(
+            "links",
+            "Bounded continuation resource links for this hit.",
+            &RESOURCE_LINK_SCHEMA,
+        ),
     ],
     &[
         "node_id",
@@ -583,6 +600,11 @@ static DEFINITION_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::object("resolution", "Query resolution metadata."),
         SchemaProperty::object("definition", "Resolved definition search hit."),
         SchemaProperty::object("symbol", "Symbol context DTO."),
+        SchemaProperty::array(
+            "links",
+            "Continuation resource links for the resolved definition.",
+            &RESOURCE_LINK_SCHEMA,
+        ),
     ],
     &["resolution", "definition", "symbol"],
 );
@@ -765,6 +787,16 @@ static TOOLS: &[ToolSpec] = &[
 ];
 
 static RESOURCES: &[ResourceSpec] = &[
+    ResourceSpec {
+        uri: "codestory://status",
+        name: "Status",
+        mime_type: "application/json",
+    },
+    ResourceSpec {
+        uri: "codestory://agent-guide",
+        name: "Agent guide",
+        mime_type: "application/json",
+    },
     ResourceSpec {
         uri: "codestory://project",
         name: "Project summary",

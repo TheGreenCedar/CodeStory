@@ -1616,7 +1616,7 @@ fn handle_stdio_search(
             hybrid_weights: None,
             hybrid_limits: None,
         })
-        .map(|result| serde_json::json!({"result": result}))
+        .map(|result| serde_json::json!({"result": enrich_stdio_search_result(result)}))
         .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))
 }
 
@@ -1684,10 +1684,20 @@ fn handle_stdio_definition(
                 .definition_context(target.selected.node_id.clone())
                 .map_err(map_api_error)
                 .map(|symbol| {
+                    let node_id = target.selected.node_id.0.clone();
+                    let links = stdio_node_links(&node_id);
+                    let mut definition = serde_json::to_value(build_search_hit_output(
+                        &runtime.project_root,
+                        &target.selected,
+                        false,
+                    ))
+                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+                    add_stdio_links(&mut definition, links.clone());
                     serde_json::json!({
                         "resolution": build_query_resolution_output(&runtime.project_root, &target),
-                        "definition": build_search_hit_output(&runtime.project_root, &target.selected, false),
+                        "definition": definition,
                         "symbol": symbol,
+                        "links": links,
                     })
                 })
         })
@@ -1836,6 +1846,8 @@ fn stdio_target_selection(request: &serde_json::Value) -> args::TargetSelection 
 
 fn read_stdio_resource(runtime: &RuntimeContext, uri: &str) -> serde_json::Value {
     let result = match uri {
+        "codestory://status" => read_stdio_status_resource(runtime),
+        "codestory://agent-guide" => Ok(read_stdio_agent_guide_resource()),
         "codestory://project" => runtime
             .open_project_summary()
             .map(|summary| serde_json::json!(summary)),
@@ -1854,6 +1866,157 @@ fn read_stdio_resource(runtime: &RuntimeContext, uri: &str) -> serde_json::Value
     result
         .map(|value| serde_json::json!({"result": {"contents": [{"uri": uri, "mimeType": "application/json", "text": value.to_string()}]}}))
         .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+}
+
+fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Value> {
+    let summary = runtime.open_project_summary()?;
+    let retrieval = summary.retrieval.as_ref();
+    Ok(serde_json::json!({
+        "project_root": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+        "storage_path": crate::display::clean_path_string(&runtime.storage_path.to_string_lossy()),
+        "storage_exists": runtime.storage_path.exists(),
+        "retrieval_mode": retrieval.map(|state| state.mode),
+        "semantic_ready": retrieval.is_some_and(|state| state.semantic_ready),
+        "semantic_doc_count": retrieval.map(|state| state.semantic_doc_count).unwrap_or(0),
+        "fallback_reason": retrieval.and_then(|state| state.fallback_reason),
+        "fallback_message": retrieval.and_then(|state| state.fallback_message.as_deref()),
+        "recommended_next_calls": [
+            {
+                "method": "resources/read",
+                "uri": "codestory://agent-guide"
+            },
+            {
+                "method": "tools/call",
+                "tool": "search",
+                "arguments": {
+                    "query": "<symbol-or-concept>",
+                    "limit": 10
+                }
+            },
+            {
+                "method": "tools/call",
+                "tool": "definition",
+                "arguments": {
+                    "id": "<node_id-from-search>"
+                }
+            },
+            {
+                "method": "resources/read",
+                "uri": "codestory://trail/<node_id-from-search>"
+            }
+        ]
+    }))
+}
+
+fn read_stdio_agent_guide_resource() -> serde_json::Value {
+    serde_json::json!({
+        "purpose": "Default read-only CodeStory browser loop for local codebase grounding.",
+        "recommended_call_sequence": [
+            {
+                "method": "resources/read",
+                "uri": "codestory://status"
+            },
+            {
+                "method": "tools/call",
+                "tool": "search",
+                "arguments": {
+                    "query": "<symbol-or-task>",
+                    "limit": 10
+                }
+            },
+            {
+                "method": "tools/call",
+                "tool": "definition",
+                "arguments": {
+                    "id": "<best-node-id>"
+                }
+            },
+            {
+                "method": "resources/read",
+                "uri": "codestory://snippet/<best-node-id>"
+            },
+            {
+                "method": "resources/read",
+                "uri": "codestory://references/<best-node-id>"
+            },
+            {
+                "method": "resources/read",
+                "uri": "codestory://trail/<best-node-id>"
+            }
+        ],
+        "safety_notes": [
+            "All stdio tools are read-only, non-destructive, idempotent, local-only, and closed-world.",
+            "Use continuation links from search or definition results before broadening retrieval.",
+            "Keep search limits bounded; stdio search clamps limit to 1..50.",
+            "Treat repo-text hits as evidence until a resolvable symbol is selected."
+        ]
+    })
+}
+
+fn enrich_stdio_search_result(
+    result: codestory_contracts::api::SearchResultsDto,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(result)
+        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+    for field in [
+        "suggestions",
+        "indexed_symbol_hits",
+        "repo_text_hits",
+        "hits",
+    ] {
+        if let Some(hits) = value.get_mut(field).and_then(|field| field.as_array_mut()) {
+            for hit in hits {
+                enrich_stdio_search_hit(hit);
+            }
+        }
+    }
+    value
+}
+
+fn enrich_stdio_search_hit(hit: &mut serde_json::Value) {
+    if !hit
+        .get("resolvable")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let Some(node_id) = hit
+        .get("node_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    add_stdio_links(hit, stdio_node_links(&node_id));
+}
+
+fn add_stdio_links(hit: &mut serde_json::Value, links: serde_json::Value) {
+    if let Some(object) = hit.as_object_mut() {
+        object.insert("links".to_string(), links);
+    }
+}
+
+fn stdio_node_links(node_id: &str) -> serde_json::Value {
+    serde_json::json!([
+        {
+            "rel": "symbol",
+            "uri": format!("codestory://symbol/{node_id}")
+        },
+        {
+            "rel": "snippet",
+            "uri": format!("codestory://snippet/{node_id}")
+        },
+        {
+            "rel": "references",
+            "uri": format!("codestory://references/{node_id}")
+        },
+        {
+            "rel": "trail",
+            "uri": format!("codestory://trail/{node_id}")
+        }
+    ])
 }
 
 fn read_stdio_template_resource(runtime: &RuntimeContext, uri: &str) -> Result<serde_json::Value> {

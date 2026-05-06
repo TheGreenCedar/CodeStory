@@ -257,6 +257,87 @@ fn assert_schema_enum_values(schema: &Value, pointer: &str, expected: &[&str]) {
     }
 }
 
+fn contains_key_recursive(value: &Value, names: &[&str]) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.keys().any(|key| names.contains(&key.as_str()))
+                || map
+                    .values()
+                    .any(|child| contains_key_recursive(child, names))
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|child| contains_key_recursive(child, names)),
+        _ => false,
+    }
+}
+
+fn contains_bool_recursive(value: &Value, names: &[&str], expected: bool) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.iter().any(|(key, child)| {
+                names.contains(&key.as_str()) && child.as_bool() == Some(expected)
+            }) || map
+                .values()
+                .any(|child| contains_bool_recursive(child, names, expected))
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|child| contains_bool_recursive(child, names, expected)),
+        _ => false,
+    }
+}
+
+fn string_values_recursive<'a>(value: &'a Value, strings: &mut Vec<&'a str>) {
+    match value {
+        Value::String(text) => strings.push(text),
+        Value::Array(values) => {
+            for child in values {
+                string_values_recursive(child, strings);
+            }
+        }
+        Value::Object(map) => {
+            for child in map.values() {
+                string_values_recursive(child, strings);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn json_resource_content(result: &Value, uri: &str) -> Value {
+    let content = result["contents"]
+        .as_array()
+        .expect("resource contents")
+        .iter()
+        .find(|content| content["uri"] == uri)
+        .unwrap_or_else(|| panic!("resource read should include content for {uri}: {result}"));
+    assert_eq!(content["mimeType"], "application/json");
+    let text = content["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("resource {uri} content should include JSON text: {content}"));
+    serde_json::from_str(text)
+        .unwrap_or_else(|error| panic!("resource {uri} should be parseable JSON: {error}\n{text}"))
+}
+
+fn continuation_uris_for(node_id: &str) -> Vec<String> {
+    ["symbol", "snippet", "references", "trail"]
+        .iter()
+        .map(|kind| format!("codestory://{kind}/{node_id}"))
+        .collect()
+}
+
+fn assert_continuation_links(value: &Value, node_id: &str, context: &str) {
+    let mut strings = Vec::new();
+    string_values_recursive(value, &mut strings);
+    for expected in continuation_uris_for(node_id) {
+        assert!(
+            strings.iter().any(|candidate| *candidate == expected),
+            "{context} should expose continuation link {expected}: {value}"
+        );
+    }
+}
+
 fn has_safety_metadata(tool: &Value) -> bool {
     let Some(metadata) = tool.get("annotations").or_else(|| tool.get("metadata")) else {
         return false;
@@ -268,6 +349,38 @@ fn has_safety_metadata(tool: &Value) -> bool {
         || text.contains("danger")
         || text.contains("mutation")
         || text.contains("safety")
+}
+
+fn assert_read_only_tool_metadata(tool: &Value) {
+    let name = tool["name"].as_str().expect("tool name");
+    let annotations = tool
+        .get("annotations")
+        .unwrap_or_else(|| panic!("{name} should include MCP-style annotations: {tool}"));
+    let safety = tool
+        .get("safety")
+        .or_else(|| tool.get("metadata"))
+        .unwrap_or_else(|| panic!("{name} should include safety metadata: {tool}"));
+
+    assert!(
+        annotations.get("readOnlyHint").and_then(Value::as_bool) == Some(true)
+            || contains_bool_recursive(safety, &["readOnly", "read_only"], true),
+        "{name} should declare read-only behavior: {tool}"
+    );
+    assert!(
+        annotations.get("destructiveHint").and_then(Value::as_bool) == Some(false)
+            || contains_bool_recursive(safety, &["destructive", "destructiveHint"], false),
+        "{name} should declare non-destructive behavior: {tool}"
+    );
+    assert!(
+        annotations.get("idempotentHint").and_then(Value::as_bool) == Some(true)
+            || contains_bool_recursive(safety, &["idempotent", "idempotentHint"], true),
+        "{name} should declare idempotent behavior: {tool}"
+    );
+    assert!(
+        contains_bool_recursive(tool, &["localOnly", "local_only"], true)
+            || contains_bool_recursive(tool, &["openWorld", "open_world"], false),
+        "{name} should declare local-only or open-world=false behavior: {tool}"
+    );
 }
 
 #[test]
@@ -368,6 +481,8 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
     );
 
     for tool in tools["tools"].as_array().expect("tools array") {
+        assert_read_only_tool_metadata(tool);
+
         let name = tool["name"].as_str().expect("tool name");
         let looks_like_write_or_system_tool = [
             "write", "edit", "delete", "remove", "create", "update", "patch", "open_", "launch",
@@ -564,8 +679,10 @@ fn resource_template_and_prompt_catalog_names_are_snapshot_stable() {
     assert_eq!(
         sorted_field_values(&resources, "resources", "uri"),
         vec![
+            "codestory://agent-guide",
             "codestory://grounding",
             "codestory://project",
+            "codestory://status",
             "codestory://symbols/root",
         ],
         "resource catalog should stay compact and stable: {resources}"
@@ -656,6 +773,16 @@ fn transcript_lists_tools_resources_templates_and_prompts() {
             .any(|resource| resource["uri"] == "codestory://project"),
         "resources/list should include the project resource: {resources}"
     );
+    for expected in ["codestory://status", "codestory://agent-guide"] {
+        assert!(
+            resources["resources"]
+                .as_array()
+                .expect("resources array")
+                .iter()
+                .any(|resource| resource["uri"] == expected),
+            "resources/list should include {expected}: {resources}"
+        );
+    }
 
     let templates = assert_success_envelope(
         &send_json(
@@ -727,6 +854,113 @@ fn transcript_reads_project_resource() {
 }
 
 #[test]
+fn resources_read_status_reports_browser_readiness_and_next_calls() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-resource",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+
+    let result = assert_success_envelope(&response, json!("status-resource"));
+    let status = json_resource_content(result, "codestory://status");
+    assert!(
+        status
+            .get("project_root")
+            .or_else(|| status.get("root"))
+            .and_then(Value::as_str)
+            .is_some_and(|root| !root.is_empty()),
+        "status should include project root: {status}"
+    );
+    assert!(
+        contains_key_recursive(
+            &status,
+            &["cache_path", "cache_dir", "storage_path", "storage"]
+        ),
+        "status should include cache/storage path information: {status}"
+    );
+    assert!(
+        contains_key_recursive(&status, &["retrieval_mode", "retrieval"])
+            || contains_bool_recursive(&status, &["not_ready", "notReady"], true),
+        "status should include retrieval mode or an explicit not-ready state: {status}"
+    );
+    assert!(
+        contains_key_recursive(
+            &status,
+            &[
+                "semantic",
+                "semantic_readiness",
+                "semantic_ready",
+                "semantic_doc_count",
+                "doc_count",
+                "fallback",
+                "fallback_reason",
+            ],
+        ),
+        "status should include semantic readiness/doc count/fallback information: {status}"
+    );
+    assert!(
+        status
+            .get("recommended_next_calls")
+            .or_else(|| status.get("recommended_calls"))
+            .or_else(|| status.get("next_calls"))
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty()),
+        "status should include recommended next calls: {status}"
+    );
+}
+
+#[test]
+fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "agent-guide-resource",
+            "method": "resources/read",
+            "params": {"uri": "codestory://agent-guide"}
+        }),
+    );
+
+    let result = assert_success_envelope(&response, json!("agent-guide-resource"));
+    let guide = json_resource_content(result, "codestory://agent-guide");
+    assert!(
+        guide
+            .get("default_browser_loop")
+            .or_else(|| guide.get("recommended_call_sequence"))
+            .or_else(|| guide.get("recommended_next_calls"))
+            .and_then(Value::as_array)
+            .is_some_and(|calls| calls.len() >= 3),
+        "agent guide should include a concise default browser loop or call sequence: {guide}"
+    );
+    let mut strings = Vec::new();
+    string_values_recursive(&guide, &mut strings);
+    for expected in ["search", "definition", "snippet"] {
+        assert!(
+            strings.iter().any(|value| value.contains(expected)),
+            "agent guide should recommend {expected} in its call sequence: {guide}"
+        );
+    }
+    assert!(
+        contains_key_recursive(&guide, &["safety_notes", "safety"])
+            || strings.iter().any(|value| {
+                let value = value.to_ascii_lowercase();
+                value.contains("read-only") || value.contains("non-destructive")
+            }),
+        "agent guide should include safety notes: {guide}"
+    );
+}
+
+#[test]
 fn transcript_calls_search_tool() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
@@ -753,6 +987,118 @@ fn transcript_calls_search_tool() {
                 .any(|hit| hit["display_name"] == "AppController")),
         "search tool should return AppController hit: {result}"
     );
+}
+
+#[test]
+fn search_tool_exposes_continuation_links_and_clamps_tiny_payloads() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "search-continuations",
+            "method": "tools/call",
+            "params": {
+                "name": "search",
+                "arguments": {"query": "AppController", "limit": 500}
+            }
+        }),
+    );
+
+    let result = assert_success_envelope(&response, json!("search-continuations"));
+    assert!(
+        result["limit_per_source"]
+            .as_u64()
+            .is_some_and(|limit| limit <= 50),
+        "search limit should be clamped to the documented max: {result}"
+    );
+    let response_size = serde_json::to_vec(&response)
+        .expect("serialize response")
+        .len();
+    assert!(
+        response_size < 64 * 1024,
+        "tiny fixture search response should stay bounded, got {response_size} bytes: {result}"
+    );
+    let hits = result["indexed_symbol_hits"]
+        .as_array()
+        .expect("indexed symbol hits");
+    assert!(
+        hits.len() <= 50,
+        "search indexed hits should respect the documented page cap: {result}"
+    );
+    let hit = hits
+        .iter()
+        .find(|hit| hit["display_name"] == "AppController")
+        .unwrap_or_else(|| panic!("missing AppController hit: {result}"));
+    let node_id = hit["node_id"].as_str().expect("hit node id");
+    assert_continuation_links(hit, node_id, "search hit");
+}
+
+#[test]
+fn search_tool_does_not_offer_symbol_links_for_non_resolvable_repo_text_hits() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "repo-text-continuations",
+            "method": "tools/call",
+            "params": {
+                "name": "search",
+                "arguments": {
+                    "query": "workspace:{project_name}",
+                    "repo_text": "on",
+                    "limit": 10
+                }
+            }
+        }),
+    );
+
+    let result = assert_success_envelope(&response, json!("repo-text-continuations"));
+    let repo_text_hits = result["repo_text_hits"].as_array().expect("repo text hits");
+    let non_resolvable_hit = repo_text_hits
+        .iter()
+        .find(|hit| hit["resolvable"] == json!(false))
+        .unwrap_or_else(|| panic!("expected a non-resolvable repo-text hit: {result}"));
+    assert!(
+        non_resolvable_hit.get("links").is_none(),
+        "non-resolvable repo-text hits should not advertise symbol/snippet/trail continuations: {non_resolvable_hit}"
+    );
+}
+
+#[test]
+fn definition_tool_exposes_symbol_snippet_references_and_trail_links() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "definition-continuations",
+            "method": "tools/call",
+            "params": {
+                "name": "definition",
+                "arguments": {"query": "AppController"}
+            }
+        }),
+    );
+
+    let result = assert_success_envelope(&response, json!("definition-continuations"));
+    let node_id = result
+        .pointer("/definition/node_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            result
+                .pointer("/resolution/resolved/node_id")
+                .and_then(Value::as_str)
+        })
+        .expect("definition result node id");
+    assert_continuation_links(result, node_id, "definition result");
 }
 
 #[test]
