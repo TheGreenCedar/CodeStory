@@ -37,6 +37,8 @@ pub struct ProjectSummary {
     pub members: Vec<WorkspaceMemberIndexDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval: Option<RetrievalStateDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<IndexFreshnessDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -159,6 +161,43 @@ pub struct StoredSemanticDocsContractDto {
     pub doc_shape: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexFreshnessStatusDto {
+    Fresh,
+    Stale,
+    NotChecked,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexFreshnessChangeKindDto {
+    Changed,
+    New,
+    Removed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct IndexFreshnessSampleDto {
+    pub kind: IndexFreshnessChangeKindDto,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct IndexFreshnessDto {
+    pub status: IndexFreshnessStatusDto,
+    pub changed_file_count: u32,
+    pub new_file_count: u32,
+    pub removed_file_count: u32,
+    pub checked_file_count: u32,
+    pub indexed_file_count: u32,
+    pub duration_ms: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub samples: Vec<IndexFreshnessSampleDto>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchHit {
     pub node_id: NodeId,
@@ -183,6 +222,8 @@ impl SearchHit {
 pub struct SearchResultsDto {
     pub query: String,
     pub retrieval: RetrievalStateDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<IndexFreshnessDto>,
     pub limit_per_source: u32,
     pub repo_text_mode: SearchRepoTextMode,
     pub repo_text_enabled: bool,
@@ -874,6 +915,8 @@ pub struct AgentAnswerDto {
     pub answer_id: String,
     pub prompt: String,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<IndexFreshnessDto>,
     pub sections: Vec<AgentResponseSectionDto>,
     pub citations: Vec<AgentCitationDto>,
     pub subgraph_ids: Vec<String>,

@@ -4,6 +4,8 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 struct StdioFixture {
@@ -304,6 +306,70 @@ fn contains_bool_recursive(value: &Value, names: &[&str], expected: bool) -> boo
             .any(|child| contains_bool_recursive(child, names, expected)),
         _ => false,
     }
+}
+
+fn find_index_freshness(value: &Value) -> Option<&Value> {
+    match value {
+        Value::Object(map) => {
+            for key in ["index_freshness", "freshness"] {
+                if let Some(candidate) = map.get(key)
+                    && (freshness_count(
+                        candidate,
+                        &["changed_file_count", "changed_count", "changed"],
+                    )
+                    .is_some()
+                        || candidate.get("not_checked_reason").is_some()
+                        || candidate.get("not_checked").is_some())
+                {
+                    return Some(candidate);
+                }
+            }
+            map.values().find_map(find_index_freshness)
+        }
+        Value::Array(items) => items.iter().find_map(find_index_freshness),
+        _ => None,
+    }
+}
+
+fn freshness_count(value: &Value, aliases: &[&str]) -> Option<u64> {
+    aliases
+        .iter()
+        .find_map(|alias| value.get(*alias).and_then(Value::as_u64))
+}
+
+fn assert_stale_freshness_counts(value: &Value, context: &str) {
+    let freshness = find_index_freshness(value)
+        .unwrap_or_else(|| panic!("{context} should include an index freshness signal: {value:#}"));
+    assert_eq!(
+        freshness_count(
+            freshness,
+            &["changed_file_count", "changed_count", "changed"]
+        ),
+        Some(1),
+        "{context} freshness should report one changed file: {freshness:#}"
+    );
+    assert_eq!(
+        freshness_count(
+            freshness,
+            &["new_file_count", "new_count", "new", "added_count", "added"]
+        ),
+        Some(1),
+        "{context} freshness should report one new file: {freshness:#}"
+    );
+    assert_eq!(
+        freshness_count(
+            freshness,
+            &[
+                "removed_file_count",
+                "removed_count",
+                "removed",
+                "deleted_count",
+                "deleted"
+            ]
+        ),
+        Some(1),
+        "{context} freshness should report one removed file: {freshness:#}"
+    );
 }
 
 fn string_values_recursive<'a>(value: &'a Value, strings: &mut Vec<&'a str>) {
@@ -940,6 +1006,58 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
             .and_then(Value::as_array)
             .is_some_and(|calls| !calls.is_empty()),
         "status should include recommended next calls: {status}"
+    );
+}
+
+#[test]
+fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
+    let fixture = indexed_fixture();
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        fixture.workspace.path().join("src").join("runtime.rs"),
+        r#"pub fn normalize_project(project_name: &str) -> String {
+    format!("changed:{project_name}")
+}
+"#,
+    )
+    .expect("modify indexed file after indexing");
+    fs::write(
+        fixture
+            .workspace
+            .path()
+            .join("src")
+            .join("new_after_index.rs"),
+        "pub fn new_after_index() {}\n",
+    )
+    .expect("write new file after indexing");
+    fs::remove_file(fixture.workspace.path().join("src").join("alpha.rs"))
+        .expect("remove indexed file after indexing");
+
+    let mut server = spawn_stdio_server(&fixture);
+    let mut elapsed = Vec::new();
+    let mut last_status = Value::Null;
+    for index in 0..12 {
+        let started = Instant::now();
+        let response = send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": format!("status-freshness-{index}"),
+                "method": "resources/read",
+                "params": {"uri": "codestory://status"}
+            }),
+        );
+        elapsed.push(started.elapsed());
+        let result = assert_success_envelope(&response, json!(format!("status-freshness-{index}")));
+        last_status = json_resource_content(result, "codestory://status");
+    }
+
+    assert_stale_freshness_counts(&last_status, "codestory://status");
+    elapsed.sort_unstable();
+    let p95 = elapsed[(elapsed.len() * 95).div_ceil(100) - 1];
+    assert!(
+        p95 < Duration::from_millis(250),
+        "warm status freshness check p95 should stay under 250ms for a small repo, got {p95:?}"
     );
 }
 

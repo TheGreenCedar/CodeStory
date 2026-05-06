@@ -3,6 +3,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 use tempfile::tempdir;
 
 fn write_tiny_rust_workspace(root: &Path) {
@@ -283,6 +285,87 @@ fn search_dir_for_storage(storage_path: &Path) -> PathBuf {
     parent.join(format!("{stem}.search"))
 }
 
+fn find_index_freshness(value: &Value) -> Option<&Value> {
+    match value {
+        Value::Object(map) => {
+            for key in ["index_freshness", "freshness"] {
+                if let Some(candidate) = map.get(key)
+                    && (freshness_count(
+                        candidate,
+                        &["changed_file_count", "changed_count", "changed"],
+                    )
+                    .is_some()
+                        || candidate.get("not_checked_reason").is_some()
+                        || candidate.get("not_checked").is_some())
+                {
+                    return Some(candidate);
+                }
+            }
+            map.values().find_map(find_index_freshness)
+        }
+        Value::Array(items) => items.iter().find_map(find_index_freshness),
+        _ => None,
+    }
+}
+
+fn freshness_count(value: &Value, aliases: &[&str]) -> Option<u64> {
+    aliases
+        .iter()
+        .find_map(|alias| value.get(*alias).and_then(Value::as_u64))
+}
+
+fn assert_stale_freshness_counts(value: &Value, context: &str) {
+    let freshness = find_index_freshness(value)
+        .unwrap_or_else(|| panic!("{context} should include an index freshness signal: {value:#}"));
+    assert_eq!(
+        freshness_count(
+            freshness,
+            &["changed_file_count", "changed_count", "changed"]
+        ),
+        Some(1),
+        "{context} freshness should report one changed file: {freshness:#}"
+    );
+    assert_eq!(
+        freshness_count(
+            freshness,
+            &["new_file_count", "new_count", "new", "added_count", "added"]
+        ),
+        Some(1),
+        "{context} freshness should report one new file: {freshness:#}"
+    );
+    assert_eq!(
+        freshness_count(
+            freshness,
+            &[
+                "removed_file_count",
+                "removed_count",
+                "removed",
+                "deleted_count",
+                "deleted"
+            ]
+        ),
+        Some(1),
+        "{context} freshness should report one removed file: {freshness:#}"
+    );
+}
+
+fn write_openapi_workspace(root: &Path) {
+    fs::write(
+        root.join("openapi.json"),
+        r#"{
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/users": {
+      "get": {
+        "operationId": "listUsers"
+      }
+    }
+  }
+}"#,
+    )
+    .expect("write openapi fixture");
+}
+
 fn write_investigation_workspace(root: &Path) {
     fs::write(
         root.join("Cargo.toml"),
@@ -345,6 +428,77 @@ fn trace_has_step(value: &Value, kind: &str) -> bool {
         .expect("retrieval trace steps")
         .iter()
         .any(|step| step["kind"] == kind)
+}
+
+#[test]
+fn read_commands_report_changed_openapi_index_freshness() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_openapi_workspace(workspace.path());
+
+    run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        workspace.path().join("openapi.json"),
+        r#"{
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/users": {
+      "post": {
+        "operationId": "createUser"
+      }
+    }
+  }
+}"#,
+    )
+    .expect("modify indexed openapi fixture");
+
+    let doctor = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["doctor", "--format", "json"],
+    );
+    let freshness = find_index_freshness(&doctor)
+        .unwrap_or_else(|| panic!("doctor should include index freshness: {doctor:#}"));
+    assert_eq!(
+        freshness["status"], "stale",
+        "changed indexed OpenAPI schema should make freshness stale: {freshness:#}"
+    );
+    assert_eq!(
+        freshness_count(
+            freshness,
+            &["changed_file_count", "changed_count", "changed"]
+        ),
+        Some(1),
+        "changed indexed OpenAPI schema should be counted as changed: {freshness:#}"
+    );
+    assert_eq!(
+        freshness_count(
+            freshness,
+            &["new_file_count", "new_count", "new", "added_count", "added"]
+        ),
+        Some(0),
+        "modified OpenAPI schema should not be counted as new: {freshness:#}"
+    );
+    assert_eq!(
+        freshness_count(
+            freshness,
+            &[
+                "removed_file_count",
+                "removed_count",
+                "removed",
+                "deleted_count",
+                "deleted"
+            ]
+        ),
+        Some(0),
+        "modified OpenAPI schema should not be counted as removed: {freshness:#}"
+    );
 }
 
 #[test]
@@ -705,6 +859,90 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
     assert_eq!(
         search_dir_before, search_dir_after,
         "read commands should not recreate the persisted search directory"
+    );
+}
+
+#[test]
+fn read_commands_report_stale_index_freshness_without_refreshing_cache() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+    fs::write(
+        workspace.path().join("src").join("removed_after_index.rs"),
+        "pub fn removed_after_index() {}\n",
+    )
+    .expect("write pre-index file");
+
+    let index = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    let storage_path = PathBuf::from(string_field(&index, &["storage_path"]));
+    let search_dir = search_dir_for_storage(&storage_path);
+    let storage_before = fs::metadata(&storage_path)
+        .expect("storage metadata before read")
+        .modified()
+        .expect("storage modified before read");
+    let search_dir_before = fs::metadata(&search_dir)
+        .expect("search dir metadata before read")
+        .modified()
+        .expect("search dir modified before read");
+
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        workspace.path().join("src").join("runtime.rs"),
+        r#"pub fn normalize_project(project_name: &str) -> String {
+    format!("changed:{project_name}")
+}
+"#,
+    )
+    .expect("modify indexed file after indexing");
+    fs::write(
+        workspace.path().join("src").join("new_after_index.rs"),
+        "pub fn new_after_index() {}\n",
+    )
+    .expect("write new file after indexing");
+    fs::remove_file(workspace.path().join("src").join("removed_after_index.rs"))
+        .expect("remove indexed file after indexing");
+
+    let search = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "search",
+            "--query",
+            "AppController",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert_stale_freshness_counts(&search, "search --refresh none");
+
+    let doctor = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["doctor", "--format", "json"],
+    );
+    assert_stale_freshness_counts(&doctor, "doctor");
+
+    let storage_after = fs::metadata(&storage_path)
+        .expect("storage metadata after read")
+        .modified()
+        .expect("storage modified after read");
+    let search_dir_after = fs::metadata(&search_dir)
+        .expect("search dir metadata after read")
+        .modified()
+        .expect("search dir modified after read");
+    assert_eq!(
+        storage_before, storage_after,
+        "read freshness checks should not mutate the SQLite cache"
+    );
+    assert_eq!(
+        search_dir_before, search_dir_after,
+        "read freshness checks should not recreate the persisted search directory"
     );
 }
 

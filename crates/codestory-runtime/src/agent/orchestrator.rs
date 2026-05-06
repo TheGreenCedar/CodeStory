@@ -8,9 +8,10 @@ use crate::{
 use codestory_contracts::api::{
     AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentResponseBlockDto, AgentResponseModeDto,
     AgentResponseSectionDto, AgentRetrievalPolicyModeDto, AgentRetrievalStepKindDto, ApiError,
-    EdgeId, GraphArtifactDto, GraphRequest, GraphResponse, NodeDetailsDto, NodeDetailsRequest,
-    NodeOccurrencesRequest, ReadFileTextRequest, RetrievalScoreBreakdownDto, SearchHit,
-    SearchHitOrigin, SearchRepoTextMode, SearchRequest, TrailConfigDto, TrailFilterOptionsDto,
+    EdgeId, GraphArtifactDto, GraphRequest, GraphResponse, IndexFreshnessDto,
+    IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeOccurrencesRequest,
+    ReadFileTextRequest, RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin,
+    SearchRepoTextMode, SearchRequest, TrailConfigDto, TrailFilterOptionsDto,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -36,6 +37,28 @@ fn retrieval_version() -> &'static str {
     } else {
         RETRIEVAL_VERSION_LEXICAL_ROLLBACK
     }
+}
+
+fn stale_freshness_annotation(freshness: &IndexFreshnessDto) -> Option<String> {
+    if freshness.status != IndexFreshnessStatusDto::Stale {
+        return None;
+    }
+    let samples = freshness
+        .samples
+        .iter()
+        .map(|sample| format!("{:?}:{}", sample.kind, sample.path))
+        .collect::<Vec<_>>();
+    Some(format!(
+        "Index freshness stale: changed={} new={} removed={}{}.",
+        freshness.changed_file_count,
+        freshness.new_file_count,
+        freshness.removed_file_count,
+        if samples.is_empty() {
+            String::new()
+        } else {
+            format!(" samples={}", samples.join(", "))
+        }
+    ))
 }
 
 fn latency_budget_ms(req: &AgentAskRequest) -> u128 {
@@ -102,6 +125,18 @@ pub(crate) fn agent_ask(
         &resolved_profile,
         &mut trace,
     )?;
+    let freshness = match controller.index_freshness() {
+        Ok(freshness) => {
+            if let Some(annotation) = stale_freshness_annotation(&freshness) {
+                trace.annotate(annotation);
+            }
+            Some(freshness)
+        }
+        Err(error) => {
+            trace.annotate(format!("Index freshness not checked: {}", error.message));
+            None
+        }
+    };
 
     let source_context = maybe_read_source_context(
         controller,
@@ -214,6 +249,7 @@ pub(crate) fn agent_ask(
         answer_id: request_id,
         prompt,
         summary,
+        freshness,
         sections,
         citations: bundle.citations,
         subgraph_ids: bundle

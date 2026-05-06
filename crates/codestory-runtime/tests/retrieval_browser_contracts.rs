@@ -649,7 +649,6 @@ fn exact_file_literal_ask_cites_repo_text_hit() {
 }
 
 #[test]
-#[ignore = "current limitation: Task 4.2 adds read-only freshness/stale-index warnings to browser outputs"]
 fn stale_index_warning_reports_changed_files_without_refreshing() {
     let _env = browser_contract_env();
     let (controller, workspace, _storage) = indexed_controller();

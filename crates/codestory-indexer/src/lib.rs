@@ -4262,7 +4262,7 @@ struct OpenApiEndpoint {
     line: u32,
 }
 
-fn is_openapi_candidate_path(path: &Path) -> bool {
+pub fn is_openapi_candidate_path(path: &Path) -> bool {
     let extension = path
         .extension()
         .and_then(|value| value.to_str())

@@ -2112,6 +2112,7 @@ mod tests {
             answer_id: "answer-1".to_string(),
             prompt: "How does packet output work?".to_string(),
             summary: "Packet output is assembled from retrieved CLI evidence.".to_string(),
+            freshness: None,
             sections: vec![AgentResponseSectionDto {
                 id: "answer".to_string(),
                 title: "Answer".to_string(),
@@ -2176,6 +2177,7 @@ mod tests {
         let output = crate::args::SearchOutput {
             query: "packet output".to_string(),
             retrieval: sample_retrieval(),
+            freshness: None,
             limit_per_source: 1,
             repo_text_mode: crate::args::RepoTextMode::Auto,
             repo_text_enabled: true,
@@ -2262,6 +2264,7 @@ mod tests {
             answer_id: "answer-1".to_string(),
             prompt: "Where did retrieval fail?".to_string(),
             summary: "Retrieval was incomplete.".to_string(),
+            freshness: None,
             sections: vec![AgentResponseSectionDto {
                 id: "answer".to_string(),
                 title: "Answer".to_string(),
@@ -2350,6 +2353,7 @@ mod tests {
         let output = crate::args::SearchOutput {
             query: "packet output".to_string(),
             retrieval,
+            freshness: None,
             limit_per_source: 1,
             repo_text_mode: crate::args::RepoTextMode::Off,
             repo_text_enabled: false,

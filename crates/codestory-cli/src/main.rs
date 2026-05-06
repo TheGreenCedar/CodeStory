@@ -3,10 +3,11 @@ use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use codestory_contracts::api::{
     AgentAskRequest, AgentConnectionSettingsDto, AgentHybridWeightsDto, AgentResponseModeDto,
-    AppEventPayload, GraphArtifactDto, GroundingBudgetDto, IndexMode, LayoutDirection,
-    ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeId, RetrievalScoreBreakdownDto,
-    SearchHit, SearchHybridLimitsDto, SearchRepoTextMode, SearchRequest, SnippetContextDto,
-    SymbolContextDto, TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection, TrailMode,
+    AppEventPayload, GraphArtifactDto, GroundingBudgetDto, IndexFreshnessDto,
+    IndexFreshnessStatusDto, IndexMode, LayoutDirection, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, NodeId, RetrievalScoreBreakdownDto, SearchHit, SearchHybridLimitsDto,
+    SearchRepoTextMode, SearchRequest, SnippetContextDto, SymbolContextDto, TrailCallerScope,
+    TrailConfigDto, TrailContextDto, TrailDirection, TrailMode,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -408,6 +409,7 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
         &runtime.project_root,
         &search_results.query,
         &search_results.retrieval,
+        search_results.freshness.as_ref(),
         &search_results.indexed_symbol_hits,
         &search_results.repo_text_hits,
         &search_results.suggestions,
@@ -797,6 +799,9 @@ fn build_doctor_output(
             checks.push(semantic_contract_check(retrieval));
         }
     }
+    if let Some(freshness) = summary.freshness.as_ref() {
+        checks.push(index_freshness_check(freshness));
+    }
 
     let environment = [
         "CODESTORY_EMBED_PROFILE",
@@ -824,9 +829,43 @@ fn build_doctor_output(
         indexed,
         stats: summary.stats.clone(),
         retrieval,
+        freshness: summary.freshness.clone(),
         checks,
         next_commands: index_next_commands(&project, summary.retrieval.as_ref()),
         environment,
+    }
+}
+
+fn index_freshness_check(freshness: &IndexFreshnessDto) -> DoctorCheckOutput {
+    match freshness.status {
+        IndexFreshnessStatusDto::Fresh => doctor_check(
+            "index_freshness",
+            "ok",
+            format!(
+                "Indexed file inventory is fresh (checked={} duration_ms={}).",
+                freshness.checked_file_count, freshness.duration_ms
+            ),
+        ),
+        IndexFreshnessStatusDto::Stale => doctor_check(
+            "index_freshness",
+            "warn",
+            format!(
+                "Indexed file inventory is stale: changed={} new={} removed={} (checked={} duration_ms={}). Run `codestory-cli index --refresh incremental` to update the cache.",
+                freshness.changed_file_count,
+                freshness.new_file_count,
+                freshness.removed_file_count,
+                freshness.checked_file_count,
+                freshness.duration_ms
+            ),
+        ),
+        IndexFreshnessStatusDto::NotChecked => doctor_check(
+            "index_freshness",
+            "info",
+            format!(
+                "Index freshness was not checked: {}.",
+                freshness.reason.as_deref().unwrap_or("no reason reported")
+            ),
+        ),
     }
 }
 
@@ -2263,6 +2302,7 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
         "semantic_doc_count": retrieval.map(|state| state.semantic_doc_count).unwrap_or(0),
         "fallback_reason": retrieval.and_then(|state| state.fallback_reason),
         "fallback_message": retrieval.and_then(|state| state.fallback_message.as_deref()),
+        "index_freshness": summary.freshness,
         "recommended_next_calls": [
             {
                 "method": "resources/read",
@@ -2450,6 +2490,7 @@ fn build_search_output(
     project_root: &std::path::Path,
     query: &str,
     retrieval: &codestory_contracts::api::RetrievalStateDto,
+    freshness: Option<&IndexFreshnessDto>,
     symbol_hits: &[SearchHit],
     repo_text_hits: &[SearchHit],
     suggestions: &[SearchHit],
@@ -2484,6 +2525,7 @@ fn build_search_output(
     SearchOutput {
         query: query.to_string(),
         retrieval: retrieval.clone(),
+        freshness: freshness.cloned(),
         limit_per_source,
         repo_text_mode: repo_text.mode,
         repo_text_enabled: repo_text.enabled,
@@ -2789,6 +2831,7 @@ mod tests {
             },
             members: Vec::new(),
             retrieval: None,
+            freshness: None,
         }
     }
 
@@ -3005,6 +3048,7 @@ mod tests {
             root,
             "needle",
             &sample_retrieval(),
+            None,
             &symbol_hits,
             &repo_text_hits,
             &[],
@@ -3068,6 +3112,7 @@ mod tests {
             root,
             "ResolutionPass",
             &sample_retrieval(),
+            None,
             &symbol_hits,
             &[],
             &[],
@@ -3115,6 +3160,7 @@ mod tests {
             root,
             "snapshot digest",
             &sample_retrieval(),
+            None,
             &symbol_hits,
             &repo_text_hits,
             &[],
@@ -3227,6 +3273,7 @@ mod tests {
             root,
             "ranked",
             &sample_retrieval(),
+            None,
             &symbol_hits,
             &[],
             &[],

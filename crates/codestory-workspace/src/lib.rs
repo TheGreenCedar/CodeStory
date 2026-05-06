@@ -229,6 +229,10 @@ impl WorkspaceManifest {
         WorkspaceDiscovery.source_files(self)
     }
 
+    pub fn source_files_bounded(&self, max_files: usize) -> Result<Option<Vec<PathBuf>>> {
+        WorkspaceDiscovery.source_files_bounded(self, max_files)
+    }
+
     pub fn full_refresh_plan(&self) -> Result<RefreshPlan> {
         Ok(RefreshPlan {
             mode: RefreshMode::FullRefresh,
@@ -245,10 +249,35 @@ impl WorkspaceManifest {
     pub fn build_execution_plan(&self, inputs: &RefreshInputs) -> Result<RefreshPlan> {
         WorkspaceDiscovery.build_refresh_plan(self, inputs)
     }
+
+    pub fn build_execution_plan_bounded(
+        &self,
+        inputs: &RefreshInputs,
+        max_current_files: usize,
+    ) -> Result<Option<RefreshPlan>> {
+        WorkspaceDiscovery.build_refresh_plan_bounded(self, inputs, max_current_files)
+    }
 }
 
 impl WorkspaceDiscovery {
     pub fn source_files(&self, manifest: &WorkspaceManifest) -> Result<Vec<PathBuf>> {
+        self.source_files_inner(manifest, None)
+            .map(|files| files.unwrap_or_default())
+    }
+
+    pub fn source_files_bounded(
+        &self,
+        manifest: &WorkspaceManifest,
+        max_files: usize,
+    ) -> Result<Option<Vec<PathBuf>>> {
+        self.source_files_inner(manifest, Some(max_files))
+    }
+
+    fn source_files_inner(
+        &self,
+        manifest: &WorkspaceManifest,
+        max_files: Option<usize>,
+    ) -> Result<Option<Vec<PathBuf>>> {
         let workspace_root = workspace_root(manifest);
         let mut all_files = Vec::new();
         let mut seen = HashSet::new();
@@ -276,6 +305,9 @@ impl WorkspaceDiscovery {
                         &exclude_patterns,
                     ) {
                         push_discovered_file(&mut all_files, &mut seen, full_path, &workspace_root);
+                        if source_file_limit_exceeded(&all_files, max_files) {
+                            return Ok(None);
+                        }
                     }
                 } else if full_path.is_dir() {
                     let mut builder = ignore::WalkBuilder::new(&full_path);
@@ -305,6 +337,9 @@ impl WorkspaceDiscovery {
                                 entry.into_path(),
                                 &workspace_root,
                             );
+                            if source_file_limit_exceeded(&all_files, max_files) {
+                                return Ok(None);
+                            }
                         }
                     }
                 }
@@ -312,7 +347,7 @@ impl WorkspaceDiscovery {
         }
 
         all_files.sort();
-        Ok(all_files)
+        Ok(Some(all_files))
     }
 
     pub fn build_refresh_plan(
@@ -320,7 +355,28 @@ impl WorkspaceDiscovery {
         manifest: &WorkspaceManifest,
         inputs: &RefreshInputs,
     ) -> Result<RefreshPlan> {
-        let current_files = self.source_files(manifest)?;
+        self.build_refresh_plan_inner(manifest, inputs, None)
+            .map(|plan| plan.unwrap_or_else(empty_incremental_plan))
+    }
+
+    pub fn build_refresh_plan_bounded(
+        &self,
+        manifest: &WorkspaceManifest,
+        inputs: &RefreshInputs,
+        max_current_files: usize,
+    ) -> Result<Option<RefreshPlan>> {
+        self.build_refresh_plan_inner(manifest, inputs, Some(max_current_files))
+    }
+
+    fn build_refresh_plan_inner(
+        &self,
+        manifest: &WorkspaceManifest,
+        inputs: &RefreshInputs,
+        max_current_files: Option<usize>,
+    ) -> Result<Option<RefreshPlan>> {
+        let Some(current_files) = self.source_files_inner(manifest, max_current_files)? else {
+            return Ok(None);
+        };
         let workspace_root = manifest.root_dir();
         let stored_map = inputs.inventory_map();
         let normalized_stored_map = stored_map
@@ -360,12 +416,25 @@ impl WorkspaceDiscovery {
         files_to_remove.sort_unstable();
         files_to_remove.dedup();
 
-        Ok(RefreshPlan {
+        Ok(Some(RefreshPlan {
             mode: RefreshMode::Incremental,
             files_to_index,
             files_to_remove,
             existing_file_ids,
-        })
+        }))
+    }
+}
+
+fn source_file_limit_exceeded(files: &[PathBuf], max_files: Option<usize>) -> bool {
+    max_files.is_some_and(|max_files| files.len() > max_files)
+}
+
+fn empty_incremental_plan() -> RefreshPlan {
+    RefreshPlan {
+        mode: RefreshMode::Incremental,
+        files_to_index: Vec::new(),
+        files_to_remove: Vec::new(),
+        existing_file_ids: HashMap::new(),
     }
 }
 

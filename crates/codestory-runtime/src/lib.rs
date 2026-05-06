@@ -4,7 +4,8 @@ use codestory_contracts::api::{
     CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest,
     EmbeddingProfileContractDto, GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse,
     GroundingBudgetDto, GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingSnapshotDto,
-    GroundingSymbolDigestDto, IndexDryRunDto, IndexMode, IndexingPhaseTimings,
+    GroundingSymbolDigestDto, IndexDryRunDto, IndexFreshnessChangeKindDto, IndexFreshnessDto,
+    IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexMode, IndexingPhaseTimings,
     ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess, NodeDetailsDto,
     NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest, OpenContainingFolderRequest,
     OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
@@ -564,6 +565,188 @@ fn runtime_relative_path(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+const INDEX_FRESHNESS_INDEXED_FILE_CAP: usize = 25_000;
+const INDEX_FRESHNESS_CURRENT_FILE_CAP: usize = 25_000;
+const INDEX_FRESHNESS_SAMPLE_LIMIT: usize = 8;
+
+fn not_checked_index_freshness(
+    reason: impl Into<String>,
+    indexed_file_count: u32,
+    started_at: Instant,
+) -> IndexFreshnessDto {
+    IndexFreshnessDto {
+        status: IndexFreshnessStatusDto::NotChecked,
+        changed_file_count: 0,
+        new_file_count: 0,
+        removed_file_count: 0,
+        checked_file_count: 0,
+        indexed_file_count,
+        duration_ms: clamp_u128_to_u32(started_at.elapsed().as_millis()),
+        reason: Some(reason.into()),
+        samples: Vec::new(),
+    }
+}
+
+fn refresh_inputs_from_files(files: Vec<FileInfo>) -> RefreshInputs {
+    let inventory = files
+        .iter()
+        .map(|file| {
+            (
+                file.path.clone(),
+                IndexedFileRecord {
+                    file_id: file.id,
+                    modification_time: file.modification_time,
+                    indexed: file.indexed,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let stored_files = files
+        .into_iter()
+        .map(|file| codestory_workspace::StoredFileState {
+            id: file.id,
+            path: file.path,
+            modification_time: file.modification_time,
+            indexed: file.indexed,
+        });
+
+    RefreshInputs {
+        stored_files: stored_files.collect(),
+        inventory: WorkspaceInventory::from_records(inventory),
+    }
+}
+
+fn indexable_source_path(path: &Path) -> bool {
+    let tree_sitter_supported = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .and_then(codestory_indexer::get_language_for_ext)
+        .is_some();
+    tree_sitter_supported || codestory_indexer::is_openapi_candidate_path(path)
+}
+
+fn index_freshness_from_storage(
+    root: &Path,
+    workspace: &Workspace,
+    storage: &Storage,
+) -> IndexFreshnessDto {
+    let started_at = Instant::now();
+    let files = match storage.get_files() {
+        Ok(files) => files,
+        Err(error) => {
+            return not_checked_index_freshness(
+                format!("failed to read indexed file inventory: {error}"),
+                0,
+                started_at,
+            );
+        }
+    };
+    let indexed_file_count = clamp_usize_to_u32(files.len());
+    if files.is_empty() {
+        return not_checked_index_freshness(
+            "no indexed file inventory is available yet",
+            indexed_file_count,
+            started_at,
+        );
+    }
+    if files.len() > INDEX_FRESHNESS_INDEXED_FILE_CAP {
+        return not_checked_index_freshness(
+            format!(
+                "indexed file inventory exceeds bounded freshness cap ({} > {})",
+                files.len(),
+                INDEX_FRESHNESS_INDEXED_FILE_CAP
+            ),
+            indexed_file_count,
+            started_at,
+        );
+    }
+
+    let removed_paths = files
+        .iter()
+        .map(|file| (file.id, file.path.clone()))
+        .collect::<HashMap<_, _>>();
+    let refresh_inputs = refresh_inputs_from_files(files);
+    let plan = match workspace
+        .build_execution_plan_bounded(&refresh_inputs, INDEX_FRESHNESS_CURRENT_FILE_CAP)
+    {
+        Ok(Some(plan)) => plan,
+        Ok(None) => {
+            return not_checked_index_freshness(
+                format!(
+                    "current workspace inventory exceeds bounded freshness cap (>{})",
+                    INDEX_FRESHNESS_CURRENT_FILE_CAP
+                ),
+                indexed_file_count,
+                started_at,
+            );
+        }
+        Err(error) => {
+            return not_checked_index_freshness(
+                format!("failed to check workspace inventory: {error}"),
+                indexed_file_count,
+                started_at,
+            );
+        }
+    };
+
+    let mut changed_file_count = 0u32;
+    let mut new_file_count = 0u32;
+    let mut samples = Vec::new();
+    for path in &plan.files_to_index {
+        let existing_indexed_file = plan.existing_file_ids.contains_key(path);
+        if !existing_indexed_file && !indexable_source_path(path) {
+            continue;
+        }
+        let kind = if existing_indexed_file {
+            changed_file_count = changed_file_count.saturating_add(1);
+            IndexFreshnessChangeKindDto::Changed
+        } else {
+            new_file_count = new_file_count.saturating_add(1);
+            IndexFreshnessChangeKindDto::New
+        };
+        if samples.len() < INDEX_FRESHNESS_SAMPLE_LIMIT {
+            samples.push(IndexFreshnessSampleDto {
+                kind,
+                path: runtime_relative_path(root, path),
+            });
+        }
+    }
+
+    let removed_file_count = clamp_usize_to_u32(plan.files_to_remove.len());
+    for removed_id in &plan.files_to_remove {
+        if samples.len() >= INDEX_FRESHNESS_SAMPLE_LIMIT {
+            break;
+        }
+        if let Some(path) = removed_paths.get(removed_id) {
+            samples.push(IndexFreshnessSampleDto {
+                kind: IndexFreshnessChangeKindDto::Removed,
+                path: runtime_relative_path(root, path),
+            });
+        }
+    }
+
+    let status = if changed_file_count == 0 && new_file_count == 0 && removed_file_count == 0 {
+        IndexFreshnessStatusDto::Fresh
+    } else {
+        IndexFreshnessStatusDto::Stale
+    };
+    let checked_file_count = indexed_file_count
+        .saturating_sub(removed_file_count)
+        .saturating_add(new_file_count);
+
+    IndexFreshnessDto {
+        status,
+        changed_file_count,
+        new_file_count,
+        removed_file_count,
+        checked_file_count,
+        indexed_file_count,
+        duration_ms: clamp_u128_to_u32(started_at.elapsed().as_millis()),
+        reason: None,
+        samples,
+    }
 }
 
 fn workspace_member_index_summaries(
@@ -2365,12 +2548,14 @@ impl AppController {
         let workspace = Workspace::open(root.to_path_buf())
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let members = workspace_member_storage_summaries(root, &workspace, storage)?;
+        let freshness = index_freshness_from_storage(root, &workspace, storage);
 
         Ok(ProjectSummary {
             root: root.to_string_lossy().to_string(),
             stats: dto_stats,
             members,
             retrieval: Some(retrieval_state_from_storage(storage)?),
+            freshness: Some(freshness),
         })
     }
 
@@ -2871,10 +3056,12 @@ impl AppController {
         let mut hits = Vec::with_capacity(indexed_symbol_hits.len() + repo_text_hits.len());
         hits.extend(indexed_symbol_hits.iter().cloned());
         hits.extend(repo_text_hits.iter().cloned());
+        let freshness = self.index_freshness().ok();
 
         Ok(SearchResultsDto {
             query,
             retrieval,
+            freshness,
             limit_per_source: limit_per_source as u32,
             repo_text_mode,
             repo_text_enabled,
@@ -2883,6 +3070,14 @@ impl AppController {
             repo_text_hits,
             hits,
         })
+    }
+
+    pub(crate) fn index_freshness(&self) -> Result<IndexFreshnessDto, ApiError> {
+        let root = self.require_project_root()?;
+        let storage = self.open_storage()?;
+        let workspace = Workspace::open(root.clone())
+            .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
+        Ok(index_freshness_from_storage(&root, &workspace, &storage))
     }
 
     fn search_hybrid_results(
@@ -3828,32 +4023,7 @@ fn workspace_refresh_inputs(store: &Store) -> Result<RefreshInputs, ApiError> {
         .files()
         .get_files()
         .map_err(|e| ApiError::internal(format!("Failed to read workspace inventory: {e}")))?;
-    let inventory = files
-        .iter()
-        .map(|file| {
-            (
-                file.path.clone(),
-                IndexedFileRecord {
-                    file_id: file.id,
-                    modification_time: file.modification_time,
-                    indexed: file.indexed,
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    let stored_files = files
-        .into_iter()
-        .map(|file| codestory_workspace::StoredFileState {
-            id: file.id,
-            path: file.path,
-            modification_time: file.modification_time,
-            indexed: file.indexed,
-        });
-
-    Ok(RefreshInputs {
-        stored_files: stored_files.collect(),
-        inventory: WorkspaceInventory::from_records(inventory),
-    })
+    Ok(refresh_inputs_from_files(files))
 }
 
 fn rebuild_search_state_from_storage(

@@ -1,10 +1,10 @@
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
     AgentBackend, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, GroundingBudgetDto,
-    IndexDryRunDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind, ProjectSummary,
-    RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin, SnippetContextDto,
-    SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection,
-    TrailMode,
+    IndexDryRunDto, IndexFreshnessDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind,
+    ProjectSummary, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
+    SnippetContextDto, SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto,
+    TrailDirection, TrailMode,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -621,6 +621,8 @@ pub(crate) struct SearchHitOutput {
 pub(crate) struct SearchOutput {
     pub(crate) query: String,
     pub(crate) retrieval: RetrievalStateDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) freshness: Option<IndexFreshnessDto>,
     pub(crate) limit_per_source: u32,
     pub(crate) repo_text_mode: RepoTextMode,
     pub(crate) repo_text_enabled: bool,
@@ -716,6 +718,8 @@ pub(crate) struct DoctorOutput {
     pub(crate) stats: codestory_contracts::api::StorageStatsDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retrieval: Option<RetrievalStateDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) freshness: Option<IndexFreshnessDto>,
     pub(crate) checks: Vec<DoctorCheckOutput>,
     pub(crate) next_commands: Vec<String>,
     pub(crate) environment: Vec<DoctorCheckOutput>,
