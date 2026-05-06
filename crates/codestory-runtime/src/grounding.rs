@@ -668,13 +668,21 @@ impl AppController {
         let line = node
             .start_line
             .ok_or_else(|| ApiError::invalid_argument("Symbol has no source line."))?;
-        let file = self.read_file_text(ReadFileTextRequest { path: path.clone() })?;
+        let (path, bounded) = self.bounded_file_snippet(
+            &path,
+            line,
+            context_lines,
+            crate::DIRECT_SNIPPET_MAX_BYTES,
+            crate::DIRECT_SNIPPET_TRUNCATION_SUFFIX,
+        )?;
 
         Ok(SnippetContextDto {
             node,
-            path: file.path,
+            path,
             line,
-            snippet: markdown_snippet(&file.text, Some(line), context_lines),
+            snippet: bounded.markdown,
+            snippet_truncated: bounded.truncated,
+            max_snippet_bytes: Some(crate::DIRECT_SNIPPET_MAX_BYTES as u32),
         })
     }
 }

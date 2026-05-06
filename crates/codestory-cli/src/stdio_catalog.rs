@@ -535,6 +535,11 @@ static SEARCH_RESULTS_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string("repo_text_mode", "Repo text search mode.")
             .with_enum(SEARCH_REPO_TEXT_MODES),
         SchemaProperty::boolean("repo_text_enabled", "Whether repo text search was enabled."),
+        SchemaProperty::object(
+            "repo_text_stats",
+            "Repo text scan cap, byte, and truncation telemetry.",
+        )
+        .nullable(),
         SchemaProperty::array(
             "suggestions",
             "Alternative matching symbols.",
@@ -590,6 +595,8 @@ static SNIPPET_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string("path", "Project-relative file path."),
         SchemaProperty::integer("line", "One-based focused line."),
         SchemaProperty::string("snippet", "Source snippet text."),
+        SchemaProperty::boolean("snippet_truncated", "Whether the snippet hit a byte cap."),
+        SchemaProperty::integer("max_snippet_bytes", "Snippet byte cap.").nullable(),
     ],
     &["node", "path", "line", "snippet"],
 );

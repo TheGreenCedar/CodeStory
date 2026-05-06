@@ -2941,6 +2941,32 @@ impl Storage {
         Ok(files)
     }
 
+    pub fn get_files_ordered_limit(&self, limit: usize) -> Result<Vec<FileInfo>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, language, modification_time, indexed, complete, line_count
+             FROM file
+             ORDER BY path ASC, id ASC
+             LIMIT ?1",
+        )?;
+        let file_iter = stmt.query_map(params![limit as i64], |row| {
+            Ok(FileInfo {
+                id: row.get(0)?,
+                path: PathBuf::from(row.get::<_, String>(1)?),
+                language: row.get(2)?,
+                modification_time: row.get(3)?,
+                indexed: row.get::<_, i32>(4)? != 0,
+                complete: row.get::<_, i32>(5)? != 0,
+                line_count: row.get(6)?,
+            })
+        })?;
+
+        let mut files = Vec::new();
+        for file in file_iter {
+            files.push(file?);
+        }
+        Ok(files)
+    }
+
     pub fn get_files_by_paths(
         &self,
         paths: &[PathBuf],

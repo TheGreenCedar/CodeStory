@@ -9,11 +9,11 @@ use codestory_contracts::api::{
     ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess, NodeDetailsDto,
     NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest, OpenContainingFolderRequest,
     OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
-    ReadFileTextResponse, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto,
-    RetrievalStateDto, SearchHit, SearchRepoTextMode, SearchRequest, SearchResultsDto,
-    SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto,
-    StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto,
-    SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
+    ReadFileTextResponse, RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalModeDto,
+    RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHit, SearchRepoTextMode, SearchRequest,
+    SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
+    StorageStatsDto, StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto,
+    SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
     UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WorkspaceMemberIndexDto,
     WriteFileResponse, WriteFileTextRequest,
 };
@@ -31,7 +31,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::io;
+use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -86,6 +86,27 @@ pub(crate) use symbol_query::{
 };
 
 type Storage = Store;
+
+const REPO_TEXT_SCAN_FILE_CAP: usize = 2_000;
+const REPO_TEXT_SCAN_BYTE_CAP: usize = 32 * 1024 * 1024;
+const REPO_TEXT_SCAN_TIME_CAP_MS: u128 = 500;
+const REPO_TEXT_MAX_FILE_BYTES: u64 = 1_000_000;
+const DIRECT_SNIPPET_CONTEXT_LINE_CAP: usize = 50;
+pub(crate) const DIRECT_SNIPPET_MAX_BYTES: usize = 64 * 1024;
+const DIRECT_SNIPPET_TRUNCATION_SUFFIX: &str = "\n... snippet truncated by byte cap\n```";
+
+#[derive(Debug, Clone)]
+struct RepoTextScan {
+    hits: Vec<SearchHit>,
+    stats: RepoTextScanStatsDto,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BoundedSnippet {
+    pub(crate) markdown: String,
+    pub(crate) truncated: bool,
+}
+
 #[derive(Clone)]
 pub struct Runtime {
     controller: AppController,
@@ -421,6 +442,7 @@ fn graph_edge_dto(
     }
 }
 
+#[cfg(test)]
 fn markdown_snippet(text: &str, focus_line: Option<u32>, context: usize) -> String {
     let all_lines: Vec<&str> = text.lines().collect();
     if all_lines.is_empty() {
@@ -449,6 +471,152 @@ fn markdown_snippet(text: &str, focus_line: Option<u32>, context: usize) -> Stri
     }
     out.push_str("```");
     out
+}
+
+fn truncate_to_byte_cap(mut text: String, max_bytes: usize, suffix: &str) -> BoundedSnippet {
+    if text.len() <= max_bytes {
+        return BoundedSnippet {
+            markdown: text,
+            truncated: false,
+        };
+    }
+
+    let mut keep = max_bytes.saturating_sub(suffix.len());
+    while keep > 0 && !text.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    text.truncate(keep);
+    text.push_str(suffix);
+    if text.len() > max_bytes {
+        let mut hard_keep = max_bytes;
+        while hard_keep > 0 && !text.is_char_boundary(hard_keep) {
+            hard_keep -= 1;
+        }
+        text.truncate(hard_keep);
+    }
+
+    BoundedSnippet {
+        markdown: text,
+        truncated: true,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn bounded_direct_markdown_snippet(
+    text: &str,
+    focus_line: Option<u32>,
+    context: usize,
+) -> BoundedSnippet {
+    let markdown = markdown_snippet(
+        text,
+        focus_line,
+        context.min(DIRECT_SNIPPET_CONTEXT_LINE_CAP),
+    );
+    truncate_to_byte_cap(
+        markdown,
+        DIRECT_SNIPPET_MAX_BYTES,
+        DIRECT_SNIPPET_TRUNCATION_SUFFIX,
+    )
+}
+
+fn bounded_markdown_snippet_from_path(
+    path: &Path,
+    focus_line: u32,
+    context: usize,
+    max_bytes: usize,
+    truncation_suffix: &str,
+) -> io::Result<BoundedSnippet> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = io::BufReader::new(file);
+    let context = context.min(DIRECT_SNIPPET_CONTEXT_LINE_CAP);
+    let focus = focus_line.max(1) as usize;
+    let start = focus.saturating_sub(context).max(1);
+    let end = focus.saturating_add(context);
+    let mut line_no = 0usize;
+    let mut line = String::new();
+    let mut out = String::from("```text\n");
+    let mut truncated = false;
+
+    loop {
+        let (read, line_truncated) = read_line_capped(&mut reader, &mut line, max_bytes)?;
+        if read == 0 {
+            break;
+        }
+        line_no = line_no.saturating_add(1);
+        if line_no > end {
+            break;
+        }
+        if line_no >= start {
+            truncated |= line_truncated;
+            let marker = if line_no == focus { ">" } else { " " };
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            let _ = writeln!(out, "{marker}{line_no:>5} | {trimmed}");
+        }
+    }
+
+    if out == "```text\n" {
+        return Ok(BoundedSnippet {
+            markdown: String::new(),
+            truncated: false,
+        });
+    }
+    out.push_str("```");
+
+    if out.len() > max_bytes {
+        return Ok(truncate_to_byte_cap(out, max_bytes, truncation_suffix));
+    }
+    if truncated {
+        if out.ends_with("```") {
+            out.truncate(out.len().saturating_sub(3));
+        }
+        if out.len().saturating_add(truncation_suffix.len()) <= max_bytes {
+            out.push_str(truncation_suffix);
+            return Ok(BoundedSnippet {
+                markdown: out,
+                truncated: true,
+            });
+        }
+        return Ok(truncate_to_byte_cap(out, max_bytes, truncation_suffix));
+    }
+    Ok(BoundedSnippet {
+        markdown: out,
+        truncated: false,
+    })
+}
+
+fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    out: &mut String,
+    max_line_bytes: usize,
+) -> io::Result<(usize, bool)> {
+    out.clear();
+    let mut total = 0usize;
+    let mut truncated = false;
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok((total, truncated));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take_len = newline.map(|pos| pos + 1).unwrap_or(available.len());
+        let chunk = &available[..take_len];
+        total = total.saturating_add(chunk.len());
+
+        if out.len() < max_line_bytes {
+            let remaining = max_line_bytes - out.len();
+            let copy_len = chunk.len().min(remaining);
+            out.push_str(&String::from_utf8_lossy(&chunk[..copy_len]));
+            truncated |= copy_len < chunk.len();
+        } else if !chunk.is_empty() {
+            truncated = true;
+        }
+
+        reader.consume(take_len);
+        if newline.is_some() {
+            return Ok((total, truncated));
+        }
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2435,9 +2603,25 @@ impl AppController {
         query: &str,
         limit: usize,
         indexed_hit_ids: &HashSet<NodeId>,
-    ) -> Result<Vec<SearchHit>, ApiError> {
+    ) -> Result<RepoTextScan, ApiError> {
+        let started_at = Instant::now();
+        let mut stats = RepoTextScanStatsDto {
+            scanned_file_count: 0,
+            scanned_byte_count: 0,
+            skipped_large_file_count: 0,
+            file_cap: REPO_TEXT_SCAN_FILE_CAP as u32,
+            byte_cap: REPO_TEXT_SCAN_BYTE_CAP as u32,
+            time_cap_ms: REPO_TEXT_SCAN_TIME_CAP_MS as u32,
+            duration_ms: 0,
+            truncated: false,
+            reason: None,
+            action: None,
+        };
         if query.trim().is_empty() || limit == 0 {
-            return Ok(Vec::new());
+            return Ok(RepoTextScan {
+                hits: Vec::new(),
+                stats,
+            });
         }
 
         let mut hits = Vec::new();
@@ -2445,20 +2629,64 @@ impl AppController {
         let terms = extract_symbol_search_terms(query);
         let normalized_query = query.trim().to_ascii_lowercase();
         for file in storage
-            .get_files()
+            .get_files_ordered_limit(REPO_TEXT_SCAN_FILE_CAP.saturating_add(1))
             .map_err(|e| ApiError::internal(format!("Failed to load files for text search: {e}")))?
         {
             if hits.len() >= limit {
                 break;
             }
+            if (stats.scanned_file_count as usize) >= REPO_TEXT_SCAN_FILE_CAP {
+                Self::mark_repo_text_scan_truncated(
+                    &mut stats,
+                    format!(
+                        "repo-text scan stopped after scanning {} files",
+                        REPO_TEXT_SCAN_FILE_CAP
+                    ),
+                );
+                break;
+            }
+            if started_at.elapsed().as_millis() > REPO_TEXT_SCAN_TIME_CAP_MS {
+                Self::mark_repo_text_scan_truncated(
+                    &mut stats,
+                    format!(
+                        "repo-text scan stopped after {} ms",
+                        REPO_TEXT_SCAN_TIME_CAP_MS
+                    ),
+                );
+                break;
+            }
 
             let path_string = file.path.to_string_lossy().to_string();
+            stats.scanned_file_count = stats.scanned_file_count.saturating_add(1);
+            let Ok(metadata) = std::fs::metadata(&file.path) else {
+                continue;
+            };
+            if metadata.len() > REPO_TEXT_MAX_FILE_BYTES {
+                stats.skipped_large_file_count = stats.skipped_large_file_count.saturating_add(1);
+                continue;
+            }
+            let projected_bytes =
+                u64::from(stats.scanned_byte_count).saturating_add(metadata.len());
+            if projected_bytes > REPO_TEXT_SCAN_BYTE_CAP as u64 {
+                Self::mark_repo_text_scan_truncated(
+                    &mut stats,
+                    format!(
+                        "repo-text scan stopped before reading more than {} bytes",
+                        REPO_TEXT_SCAN_BYTE_CAP
+                    ),
+                );
+                break;
+            }
             let Some(contents) = read_searchable_file_contents(&path_string) else {
                 continue;
             };
-            if contents.len() > 1_000_000 {
+            if contents.len() as u64 > REPO_TEXT_MAX_FILE_BYTES {
+                stats.skipped_large_file_count = stats.skipped_large_file_count.saturating_add(1);
                 continue;
             }
+            stats.scanned_byte_count = stats
+                .scanned_byte_count
+                .saturating_add(clamp_usize_to_u32(contents.len()));
             let Some(line) = file_text_match_line(&contents, query, &terms) else {
                 continue;
             };
@@ -2494,7 +2722,17 @@ impl AppController {
 
         hits.sort_by(|left, right| compare_search_hits(query, left, right));
         hits.truncate(limit);
-        Ok(hits)
+        stats.duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
+        Ok(RepoTextScan { hits, stats })
+    }
+
+    fn mark_repo_text_scan_truncated(stats: &mut RepoTextScanStatsDto, reason: String) {
+        stats.truncated = true;
+        stats.reason = Some(reason);
+        stats.action = Some(
+            "Narrow the query or use indexed symbol search with repo_text=off for deterministic results."
+                .to_string(),
+        );
     }
 
     fn lexical_symbol_hits(
@@ -3042,16 +3280,17 @@ impl AppController {
             .iter()
             .map(|hit| hit.node_id.clone())
             .collect::<HashSet<_>>();
-        let repo_text_hits = if repo_text_enabled {
-            Self::collect_repo_text_hits(
+        let (repo_text_hits, repo_text_stats) = if repo_text_enabled {
+            let scan = Self::collect_repo_text_hits(
                 &storage,
                 self.require_project_root().ok().as_deref(),
                 &query,
                 limit_per_source,
                 &indexed_hit_ids,
-            )?
+            )?;
+            (scan.hits, Some(scan.stats))
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         let mut hits = Vec::with_capacity(indexed_symbol_hits.len() + repo_text_hits.len());
         hits.extend(indexed_symbol_hits.iter().cloned());
@@ -3065,6 +3304,7 @@ impl AppController {
             limit_per_source: limit_per_source as u32,
             repo_text_mode,
             repo_text_enabled,
+            repo_text_stats,
             suggestions,
             indexed_symbol_hits,
             repo_text_hits,
@@ -3674,6 +3914,29 @@ impl AppController {
             path: candidate.to_string_lossy().to_string(),
             text,
         })
+    }
+
+    pub(crate) fn bounded_file_snippet(
+        &self,
+        path: &str,
+        line: u32,
+        context_lines: usize,
+        max_bytes: usize,
+        truncation_suffix: &str,
+    ) -> Result<(String, BoundedSnippet), ApiError> {
+        let candidate = self.resolve_project_file_path(path, false)?;
+        let snippet = bounded_markdown_snippet_from_path(
+            &candidate,
+            line,
+            context_lines,
+            max_bytes,
+            truncation_suffix,
+        )
+        .map_err(|e| {
+            ApiError::internal(format!("Failed to read file {}: {e}", candidate.display()))
+        })?;
+
+        Ok((candidate.to_string_lossy().to_string(), snippet))
     }
 
     pub fn write_file_text(
@@ -5414,6 +5677,153 @@ pub fn exact_symbol_anchor() {{}}
     }
 
     #[test]
+    fn repo_text_scan_reports_file_cap_on_large_low_match_fixture() {
+        let temp = tempdir().expect("temp dir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(storage_path.parent().expect("db parent")).expect("create db dir");
+        let src = temp.path().join("src");
+        std::fs::create_dir_all(&src).expect("create src");
+
+        {
+            let storage = Storage::open(&storage_path).expect("open storage");
+            for idx in 0..(REPO_TEXT_SCAN_FILE_CAP + 3) {
+                let path = src.join(format!("file_{idx}.rs"));
+                std::fs::write(&path, format!("pub fn file_{idx}() {{}}\n"))
+                    .expect("write fixture file");
+                storage
+                    .insert_file(&FileInfo {
+                        id: idx as i64 + 1,
+                        path,
+                        language: "rust".to_string(),
+                        modification_time: 1,
+                        indexed: true,
+                        complete: true,
+                        line_count: 1,
+                    })
+                    .expect("insert file");
+            }
+        }
+
+        let storage = Storage::open(&storage_path).expect("reopen storage");
+        let scan = AppController::collect_repo_text_hits(
+            &storage,
+            Some(temp.path()),
+            "needle that is not present",
+            10,
+            &HashSet::new(),
+        )
+        .expect("repo text scan");
+
+        assert!(scan.hits.is_empty());
+        assert!(scan.stats.truncated, "{:?}", scan.stats);
+        assert_eq!(
+            scan.stats.scanned_file_count,
+            REPO_TEXT_SCAN_FILE_CAP as u32
+        );
+        assert!(
+            scan.stats
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("scanning"))
+        );
+        assert!(scan.stats.action.is_some());
+    }
+
+    #[test]
+    fn repo_text_scan_skips_large_files_before_reading_contents() {
+        let temp = tempdir().expect("temp dir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(storage_path.parent().expect("db parent")).expect("create db dir");
+        let source_path = temp.path().join("large.rs");
+        std::fs::write(
+            &source_path,
+            format!(
+                "needle\n{}",
+                "x".repeat(REPO_TEXT_MAX_FILE_BYTES as usize + 16)
+            ),
+        )
+        .expect("write large source");
+
+        {
+            let storage = Storage::open(&storage_path).expect("open storage");
+            storage
+                .insert_file(&FileInfo {
+                    id: 1,
+                    path: source_path,
+                    language: "rust".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                })
+                .expect("insert file");
+        }
+
+        let storage = Storage::open(&storage_path).expect("reopen storage");
+        let scan = AppController::collect_repo_text_hits(
+            &storage,
+            Some(temp.path()),
+            "needle",
+            10,
+            &HashSet::new(),
+        )
+        .expect("repo text scan");
+
+        assert!(scan.hits.is_empty());
+        assert_eq!(scan.stats.scanned_file_count, 1);
+        assert_eq!(scan.stats.scanned_byte_count, 0);
+        assert_eq!(scan.stats.skipped_large_file_count, 1);
+        assert!(!scan.stats.truncated);
+    }
+
+    #[test]
+    fn direct_markdown_snippet_is_byte_capped() {
+        let text = (0..10_000)
+            .map(|idx| format!("line {idx}: {}", "x".repeat(2_048)))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let snippet = bounded_direct_markdown_snippet(&text, Some(5_000), usize::MAX);
+
+        assert!(snippet.truncated);
+        assert!(snippet.markdown.len() <= DIRECT_SNIPPET_MAX_BYTES);
+        assert!(
+            snippet.markdown.contains("snippet truncated by byte cap"),
+            "{}",
+            snippet.markdown
+        );
+        assert!(
+            snippet.markdown.ends_with("```"),
+            "truncated snippet should keep a balanced closing fence:\n{}",
+            snippet.markdown
+        );
+    }
+
+    #[test]
+    fn file_backed_snippet_streams_and_caps_long_lines() {
+        let temp = tempdir().expect("temp dir");
+        let source_path = temp.path().join("long_line.rs");
+        std::fs::write(
+            &source_path,
+            format!("pub fn alpha() {{}}\n// {}\n", "x".repeat(256 * 1024)),
+        )
+        .expect("write long line source");
+
+        let snippet = bounded_markdown_snippet_from_path(
+            &source_path,
+            2,
+            1,
+            DIRECT_SNIPPET_MAX_BYTES,
+            DIRECT_SNIPPET_TRUNCATION_SUFFIX,
+        )
+        .expect("read bounded snippet");
+
+        assert!(snippet.truncated);
+        assert!(snippet.markdown.len() <= DIRECT_SNIPPET_MAX_BYTES);
+        assert!(snippet.markdown.ends_with("```"));
+    }
+
+    #[test]
     fn symbol_context_by_id_does_not_mutate_persisted_semantic_docs() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
@@ -6172,6 +6582,66 @@ pub fn exact_symbol_anchor() {{}}
             graph.canonical_layout.is_some(),
             "Expected canonical_layout on trail response"
         );
+    }
+
+    #[test]
+    fn high_fanout_graph_trail_reports_truncation_at_max_nodes() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("codestory.db");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            let mut nodes = vec![Node {
+                id: CoreNodeId(1),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "root".to_string(),
+                ..Default::default()
+            }];
+            let mut edges = Vec::new();
+            for idx in 2..80 {
+                nodes.push(Node {
+                    id: CoreNodeId(idx),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: format!("child_{idx}"),
+                    ..Default::default()
+                });
+                edges.push(Edge {
+                    id: EdgeId(idx + 100),
+                    source: CoreNodeId(1),
+                    target: CoreNodeId(idx),
+                    kind: EdgeKind::CALL,
+                    ..Default::default()
+                });
+            }
+            storage.insert_nodes_batch(&nodes).expect("insert nodes");
+            storage.insert_edges_batch(&edges).expect("insert edges");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: temp.path().to_string_lossy().to_string(),
+            })
+            .expect("open project");
+
+        let graph = controller
+            .graph_trail(TrailConfigDto {
+                root_id: codestory_contracts::api::NodeId("1".to_string()),
+                mode: codestory_contracts::api::TrailMode::Neighborhood,
+                target_id: None,
+                depth: 1,
+                direction: codestory_contracts::api::TrailDirection::Outgoing,
+                caller_scope: codestory_contracts::api::TrailCallerScope::ProductionOnly,
+                edge_filter: vec![],
+                show_utility_calls: true,
+                node_filter: vec![],
+                max_nodes: 10,
+                layout_direction: codestory_contracts::api::LayoutDirection::Horizontal,
+            })
+            .expect("load high fanout trail");
+
+        assert!(graph.truncated, "expected trail truncation: {graph:?}");
+        assert!(graph.nodes.len() <= 10);
     }
 
     #[test]

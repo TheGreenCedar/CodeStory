@@ -219,6 +219,22 @@ impl SearchHit {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct RepoTextScanStatsDto {
+    pub scanned_file_count: u32,
+    pub scanned_byte_count: u32,
+    pub skipped_large_file_count: u32,
+    pub file_cap: u32,
+    pub byte_cap: u32,
+    pub time_cap_ms: u32,
+    pub duration_ms: u32,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchResultsDto {
     pub query: String,
     pub retrieval: RetrievalStateDto,
@@ -227,6 +243,8 @@ pub struct SearchResultsDto {
     pub limit_per_source: u32,
     pub repo_text_mode: SearchRepoTextMode,
     pub repo_text_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_text_stats: Option<RepoTextScanStatsDto>,
     #[serde(default)]
     pub suggestions: Vec<SearchHit>,
     #[serde(default)]
@@ -582,6 +600,10 @@ pub struct SnippetContextDto {
     pub path: String,
     pub line: u32,
     pub snippet: String,
+    #[serde(default)]
+    pub snippet_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_snippet_bytes: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

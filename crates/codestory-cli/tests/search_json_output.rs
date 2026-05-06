@@ -140,5 +140,14 @@ fn search_json_emits_search_results_dto_after_repo_text_merge() {
         Some(1),
         "repo-text hits should respect the per-source limit"
     );
+    assert!(
+        json["repo_text_stats"].is_object(),
+        "search json should include repo-text scan cap telemetry"
+    );
+    assert_eq!(
+        json["repo_text_stats"]["file_cap"].as_u64(),
+        Some(2000),
+        "repo-text scan stats should surface the configured file cap"
+    );
     assert_eq!(json["limit_per_source"], Value::from(1));
 }

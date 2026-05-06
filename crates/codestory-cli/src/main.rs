@@ -5,9 +5,9 @@ use codestory_contracts::api::{
     AgentAskRequest, AgentConnectionSettingsDto, AgentHybridWeightsDto, AgentResponseModeDto,
     AppEventPayload, GraphArtifactDto, GroundingBudgetDto, IndexFreshnessDto,
     IndexFreshnessStatusDto, IndexMode, LayoutDirection, ListChildrenSymbolsRequest,
-    ListRootSymbolsRequest, NodeId, RetrievalScoreBreakdownDto, SearchHit, SearchHybridLimitsDto,
-    SearchRepoTextMode, SearchRequest, SnippetContextDto, SymbolContextDto, TrailCallerScope,
-    TrailConfigDto, TrailContextDto, TrailDirection, TrailMode,
+    ListRootSymbolsRequest, NodeId, RepoTextScanStatsDto, RetrievalScoreBreakdownDto, SearchHit,
+    SearchHybridLimitsDto, SearchRepoTextMode, SearchRequest, SnippetContextDto, SymbolContextDto,
+    TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection, TrailMode,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -59,6 +59,11 @@ struct RepoTextOutputConfig {
     mode: RepoTextMode,
     enabled: bool,
 }
+
+const ASK_BUNDLE_OUTPUT_BYTE_CAP: usize = 5 * 1024 * 1024;
+const ASK_BUNDLE_MARKDOWN_SOFT_CAP: usize = 2 * 1024 * 1024;
+const ASK_BUNDLE_TRUNCATION_SUFFIX: &str =
+    "\n\n... bundle content truncated by ask bundle byte cap\n";
 
 const BROWSER_TRAIL_DEFAULT_DEPTH: u32 = 2;
 const BROWSER_TRAIL_MAX_DEPTH: u32 = 10;
@@ -412,6 +417,7 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
         search_results.freshness.as_ref(),
         &search_results.indexed_symbol_hits,
         &search_results.repo_text_hits,
+        search_results.repo_text_stats.as_ref(),
         &search_results.suggestions,
         search_results.limit_per_source,
         RepoTextOutputConfig {
@@ -1029,32 +1035,182 @@ fn write_ask_bundle(
             display::clean_path_string(&bundle_dir.to_string_lossy())
         )
     })?;
-    fs::write(bundle_dir.join("answer.md"), markdown).with_context(|| {
+    remove_stale_mermaid_artifacts(bundle_dir)?;
+    let mut notes = Vec::new();
+    let mut omitted_mermaid_artifacts = 0usize;
+    let full_answer_json =
+        serde_json::to_string_pretty(answer).context("Failed to serialize ask answer JSON")?;
+    let mut answer_json = if markdown.len().saturating_add(full_answer_json.len())
+        > ASK_BUNDLE_OUTPUT_BYTE_CAP
+    {
+        notes.push(
+            "answer.json was reduced to a valid manifest summary because the full answer exceeded the bundle byte cap."
+                .to_string(),
+        );
+        ask_bundle_summary_json(answer, true)?
+    } else {
+        full_answer_json
+    };
+    if answer_json.len() > ASK_BUNDLE_OUTPUT_BYTE_CAP {
+        notes.push(
+            "answer.json retrieval trace was omitted because the summary still exceeded the bundle byte cap."
+                .to_string(),
+        );
+        answer_json = ask_bundle_summary_json(answer, false)?;
+    }
+
+    let mut markdown = if markdown.len() > ASK_BUNDLE_MARKDOWN_SOFT_CAP {
+        notes.push(format!(
+            "answer.md was truncated to {} bytes before writing.",
+            ASK_BUNDLE_MARKDOWN_SOFT_CAP
+        ));
+        truncate_utf8_with_suffix(
+            markdown,
+            ASK_BUNDLE_MARKDOWN_SOFT_CAP,
+            ASK_BUNDLE_TRUNCATION_SUFFIX,
+        )
+    } else {
+        markdown.to_string()
+    };
+    let remaining_markdown_bytes = ASK_BUNDLE_OUTPUT_BYTE_CAP.saturating_sub(answer_json.len());
+    if markdown.len() > remaining_markdown_bytes {
+        notes.push(format!(
+            "answer.md was truncated to fit the remaining {} bundle bytes.",
+            remaining_markdown_bytes
+        ));
+        markdown = truncate_utf8_with_suffix(
+            &markdown,
+            remaining_markdown_bytes,
+            ASK_BUNDLE_TRUNCATION_SUFFIX,
+        );
+    }
+    fs::write(bundle_dir.join("answer.md"), &markdown).with_context(|| {
         format!(
             "Failed to write {}",
             display::clean_path_string(&bundle_dir.join("answer.md").to_string_lossy())
         )
     })?;
-    fs::write(
-        bundle_dir.join("answer.json"),
-        serde_json::to_string_pretty(answer).context("Failed to serialize ask answer JSON")?,
-    )
-    .with_context(|| {
+    fs::write(bundle_dir.join("answer.json"), &answer_json).with_context(|| {
         format!(
             "Failed to write {}",
             display::clean_path_string(&bundle_dir.join("answer.json").to_string_lossy())
         )
     })?;
+    let mut written_bytes = markdown.len().saturating_add(answer_json.len());
     for graph in &answer.graphs {
         if let GraphArtifactDto::Mermaid {
             id, mermaid_syntax, ..
         } = graph
         {
             let file_name = format!("{}.mmd", sanitize_artifact_name(id));
-            fs::write(bundle_dir.join(file_name), mermaid_syntax)?;
+            let artifact_path = bundle_dir.join(&file_name);
+            if written_bytes.saturating_add(mermaid_syntax.len()) > ASK_BUNDLE_OUTPUT_BYTE_CAP {
+                omitted_mermaid_artifacts = omitted_mermaid_artifacts.saturating_add(1);
+                continue;
+            }
+            fs::write(&artifact_path, mermaid_syntax)?;
+            written_bytes = written_bytes.saturating_add(mermaid_syntax.len());
+        }
+    }
+    if omitted_mermaid_artifacts > 0 {
+        notes.push(format!(
+            "Omitted {omitted_mermaid_artifacts} Mermaid artifact(s) after reaching the bundle byte cap."
+        ));
+    }
+    let manifest = serde_json::json!({
+        "output_byte_cap": ASK_BUNDLE_OUTPUT_BYTE_CAP,
+        "written_bytes_excluding_manifest": written_bytes,
+        "truncated": !notes.is_empty(),
+        "omitted_mermaid_artifacts": omitted_mermaid_artifacts,
+        "notes": notes,
+    });
+    fs::write(
+        bundle_dir.join("bundle_manifest.json"),
+        serde_json::to_string_pretty(&manifest).context("Failed to serialize bundle manifest")?,
+    )
+    .with_context(|| {
+        format!(
+            "Failed to write {}",
+            display::clean_path_string(&bundle_dir.join("bundle_manifest.json").to_string_lossy())
+        )
+    })?;
+    Ok(())
+}
+
+fn remove_stale_mermaid_artifacts(bundle_dir: &std::path::Path) -> Result<()> {
+    for entry in fs::read_dir(bundle_dir).with_context(|| {
+        format!(
+            "Failed to inspect bundle directory {}",
+            display::clean_path_string(&bundle_dir.to_string_lossy())
+        )
+    })? {
+        let entry = entry.context("Failed to inspect bundle entry")?;
+        let path = entry.path();
+        if path.extension().is_some_and(|extension| extension == "mmd") {
+            fs::remove_file(&path).with_context(|| {
+                format!(
+                    "Failed to remove stale {}",
+                    display::clean_path_string(&path.to_string_lossy())
+                )
+            })?;
         }
     }
     Ok(())
+}
+
+fn ask_bundle_summary_json(
+    answer: &codestory_contracts::api::AgentAnswerDto,
+    include_trace: bool,
+) -> Result<String> {
+    if include_trace {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "truncated": true,
+            "reason": "ask bundle output hit its byte cap",
+            "action": "Narrow focus, reduce trail depth, or use JSON output without --bundle for the full in-memory response.",
+            "answer_id": &answer.answer_id,
+            "prompt": &answer.prompt,
+            "summary": &answer.summary,
+            "retrieval_version": &answer.retrieval_version,
+            "citation_count": answer.citations.len(),
+            "graph_count": answer.graphs.len(),
+            "retrieval_trace": &answer.retrieval_trace,
+        }))
+        .context("Failed to serialize ask bundle summary JSON")
+    } else {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "truncated": true,
+            "reason": "ask bundle output hit its byte cap",
+            "action": "Narrow focus, reduce trail depth, or use JSON output without --bundle for the full in-memory response.",
+            "answer_id": &answer.answer_id,
+            "prompt": truncate_utf8_with_suffix(&answer.prompt, 4096, ASK_BUNDLE_TRUNCATION_SUFFIX),
+            "summary": truncate_utf8_with_suffix(&answer.summary, 8192, ASK_BUNDLE_TRUNCATION_SUFFIX),
+            "retrieval_version": &answer.retrieval_version,
+            "citation_count": answer.citations.len(),
+            "graph_count": answer.graphs.len(),
+            "retrieval_trace_omitted": true,
+        }))
+        .context("Failed to serialize minimal ask bundle summary JSON")
+    }
+}
+
+fn truncate_utf8_with_suffix(value: &str, max_bytes: usize, suffix: &str) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut keep = max_bytes.saturating_sub(suffix.len());
+    while keep > 0 && !value.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let mut truncated = value[..keep].to_string();
+    truncated.push_str(suffix);
+    if truncated.len() > max_bytes {
+        let mut hard_keep = max_bytes;
+        while hard_keep > 0 && !truncated.is_char_boundary(hard_keep) {
+            hard_keep -= 1;
+        }
+        truncated.truncate(hard_keep);
+    }
+    truncated
 }
 
 fn sanitize_artifact_name(value: &str) -> String {
@@ -2493,6 +2649,7 @@ fn build_search_output(
     freshness: Option<&IndexFreshnessDto>,
     symbol_hits: &[SearchHit],
     repo_text_hits: &[SearchHit],
+    repo_text_stats: Option<&RepoTextScanStatsDto>,
     suggestions: &[SearchHit],
     limit_per_source: u32,
     repo_text: RepoTextOutputConfig,
@@ -2537,6 +2694,7 @@ fn build_search_output(
             .collect(),
         indexed_symbol_hits,
         repo_text_hits,
+        repo_text_stats: repo_text_stats.cloned(),
     }
 }
 
@@ -2798,8 +2956,9 @@ mod tests {
     use crate::query_resolution::compare_resolution_hits;
     use crate::runtime::{cache_root_for_project, fnv1a_hex, resolve_refresh_request};
     use codestory_contracts::api::{
-        EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse, IndexMode,
-        IndexingPhaseTimings, NodeDetailsDto, NodeId, ProjectSummary, RetrievalModeDto,
+        AgentAnswerDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
+        AgentRetrievalTraceDto, EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse,
+        IndexMode, IndexingPhaseTimings, NodeDetailsDto, NodeId, ProjectSummary, RetrievalModeDto,
         RetrievalStateDto, SearchHit, StorageStatsDto, TrailContextDto,
     };
     use std::fs;
@@ -2817,6 +2976,30 @@ mod tests {
             stored_embedding: None,
             fallback_reason: None,
             fallback_message: None,
+        }
+    }
+
+    fn sample_agent_answer_with_graph(graph: GraphArtifactDto) -> AgentAnswerDto {
+        AgentAnswerDto {
+            answer_id: "answer-test".to_string(),
+            prompt: "Explain the capped bundle".to_string(),
+            summary: "Bundle summary".to_string(),
+            freshness: None,
+            sections: Vec::new(),
+            citations: Vec::new(),
+            subgraph_ids: vec!["big-mermaid".to_string()],
+            retrieval_version: "test".to_string(),
+            graphs: vec![graph],
+            retrieval_trace: AgentRetrievalTraceDto {
+                request_id: "answer-test".to_string(),
+                resolved_profile: AgentRetrievalPresetDto::Architecture,
+                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+                total_latency_ms: 1,
+                sla_target_ms: None,
+                sla_missed: false,
+                annotations: Vec::new(),
+                steps: Vec::new(),
+            },
         }
     }
 
@@ -3051,6 +3234,7 @@ mod tests {
             None,
             &symbol_hits,
             &repo_text_hits,
+            None,
             &[],
             5,
             RepoTextOutputConfig {
@@ -3069,6 +3253,64 @@ mod tests {
         assert_eq!(
             output.repo_text_hits[0].origin,
             codestory_contracts::api::SearchHitOrigin::TextMatch
+        );
+    }
+
+    #[test]
+    fn write_ask_bundle_caps_disk_artifacts_and_writes_manifest() {
+        let temp = tempdir().expect("bundle dir");
+        fs::write(
+            temp.path().join("big-mermaid.mmd"),
+            "stale oversized artifact",
+        )
+        .expect("write stale artifact");
+        fs::write(
+            temp.path().join("previously-omitted.mmd"),
+            "stale upstream-omitted artifact",
+        )
+        .expect("write stale upstream-omitted artifact");
+        let answer = sample_agent_answer_with_graph(GraphArtifactDto::Mermaid {
+            id: "big-mermaid".to_string(),
+            title: "Big Mermaid".to_string(),
+            diagram: "graph TD".to_string(),
+            mermaid_syntax: format!(
+                "graph TD\nA[{}]\n",
+                "x".repeat(ASK_BUNDLE_OUTPUT_BYTE_CAP + 1024)
+            ),
+        });
+
+        write_ask_bundle(temp.path(), &answer, "short answer").expect("write capped bundle");
+
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(temp.path().join("bundle_manifest.json"))
+                .expect("read bundle manifest"),
+        )
+        .expect("parse bundle manifest");
+        let answer_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(temp.path().join("answer.json")).expect("read answer json"),
+        )
+        .expect("parse answer json");
+
+        assert_eq!(manifest["truncated"], serde_json::Value::Bool(true));
+        assert_eq!(
+            manifest["omitted_mermaid_artifacts"].as_u64(),
+            Some(1),
+            "{manifest}"
+        );
+        assert!(
+            manifest["written_bytes_excluding_manifest"]
+                .as_u64()
+                .is_some_and(|bytes| bytes <= ASK_BUNDLE_OUTPUT_BYTE_CAP as u64),
+            "{manifest}"
+        );
+        assert_eq!(answer_json["truncated"], serde_json::Value::Bool(true));
+        assert!(
+            !temp.path().join("big-mermaid.mmd").exists(),
+            "oversized Mermaid artifact should be omitted"
+        );
+        assert!(
+            !temp.path().join("previously-omitted.mmd").exists(),
+            "stale Mermaid artifacts from prior runs should be removed"
         );
     }
 
@@ -3115,6 +3357,7 @@ mod tests {
             None,
             &symbol_hits,
             &[],
+            None,
             &[],
             5,
             RepoTextOutputConfig {
@@ -3163,6 +3406,7 @@ mod tests {
             None,
             &symbol_hits,
             &repo_text_hits,
+            None,
             &[],
             5,
             RepoTextOutputConfig {
@@ -3276,6 +3520,7 @@ mod tests {
             None,
             &symbol_hits,
             &[],
+            None,
             &[],
             5,
             RepoTextOutputConfig {

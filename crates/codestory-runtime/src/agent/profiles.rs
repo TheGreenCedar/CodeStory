@@ -4,6 +4,8 @@ use codestory_contracts::api::{
     TrailMode,
 };
 
+const CUSTOM_ASK_TRAIL_MAX_NODES: u32 = 2_000;
+
 #[derive(Debug, Clone)]
 pub(crate) struct TrailPlan {
     pub mode: TrailMode,
@@ -111,7 +113,7 @@ fn from_custom(config: &AgentCustomRetrievalConfigDto) -> ResolvedProfile {
     } else {
         config.depth.max(1)
     };
-    let max_nodes = config.max_nodes.clamp(10, 100_000);
+    let max_nodes = config.max_nodes.clamp(10, CUSTOM_ASK_TRAIL_MAX_NODES);
 
     ResolvedProfile {
         preset: AgentRetrievalPresetDto::Architecture,
@@ -233,5 +235,20 @@ mod tests {
             profile.policy_mode,
             AgentRetrievalPolicyModeDto::CompletenessFirst
         );
+    }
+
+    #[test]
+    fn custom_profile_caps_trail_nodes() {
+        let profile = resolve_profile(
+            "Deep dive",
+            &AgentRetrievalProfileSelectionDto::Custom {
+                config: AgentCustomRetrievalConfigDto {
+                    max_nodes: 100_000,
+                    ..AgentCustomRetrievalConfigDto::default()
+                },
+            },
+        );
+
+        assert_eq!(profile.trail_plans[0].max_nodes, CUSTOM_ASK_TRAIL_MAX_NODES);
     }
 }

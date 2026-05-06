@@ -430,6 +430,14 @@ fn trace_has_step(value: &Value, kind: &str) -> bool {
         .any(|step| step["kind"] == kind)
 }
 
+fn trace_field_value<'a>(step: &'a Value, bucket: &str, key: &str) -> Option<&'a str> {
+    step[bucket].as_array()?.iter().find_map(|field| {
+        (field["key"] == key)
+            .then(|| field["value"].as_str())
+            .flatten()
+    })
+}
+
 #[test]
 fn read_commands_report_changed_openapi_index_freshness() {
     let workspace = tempdir().expect("workspace dir");
@@ -1028,6 +1036,49 @@ fn ask_investigate_json_reports_bounded_trace_without_changing_plain_ask() {
         trace_has_step(&investigated, "source_read"),
         "investigation should record bounded source/snippet reads"
     );
+    let trace_steps = investigated["retrieval_trace"]["steps"]
+        .as_array()
+        .expect("trace steps");
+    if let Some(trail_step) = trace_steps.iter().find(|step| step["kind"] == "trail") {
+        assert!(
+            trace_field_value(trail_step, "input", "max_nodes").is_some()
+                || trace_field_value(trail_step, "output", "max_nodes").is_some(),
+            "trail trace should expose the active max_nodes cap: {trail_step}"
+        );
+    }
+    let source_step = trace_steps
+        .iter()
+        .find(|step| step["kind"] == "source_read")
+        .expect("source_read step");
+    if source_step["status"] == "ok" {
+        let max_source_bytes = trace_field_value(source_step, "output", "max_source_bytes")
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("max_source_bytes output");
+        let snippet_bytes = trace_field_value(source_step, "output", "snippet_bytes")
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("snippet_bytes output");
+        assert!(
+            snippet_bytes <= max_source_bytes,
+            "source_read should report snippet bytes within cap: {source_step}"
+        );
+    }
+    if let Some(repo_text_step) = trace_steps
+        .iter()
+        .find(|step| step["kind"] == "repo_text_fallback")
+    {
+        assert!(
+            trace_field_value(repo_text_step, "output", "file_cap").is_some(),
+            "repo-text fallback trace should expose scan caps: {repo_text_step}"
+        );
+    }
+    let synthesis_step = trace_steps
+        .iter()
+        .find(|step| step["kind"] == "answer_synthesis")
+        .expect("answer synthesis step");
+    assert!(
+        trace_field_value(synthesis_step, "output", "graph_artifact_byte_cap").is_some(),
+        "answer synthesis should expose graph artifact bundle caps: {synthesis_step}"
+    );
     assert!(
         array_is_non_empty(&investigated, &["citations"]),
         "investigation should return cited evidence"
@@ -1046,9 +1097,7 @@ fn ask_investigate_json_reports_bounded_trace_without_changing_plain_ask() {
         "investigation JSON should expose the named mode or what-I-checked trace"
     );
 
-    let local_agent_step = investigated["retrieval_trace"]["steps"]
-        .as_array()
-        .expect("trace steps")
+    let local_agent_step = trace_steps
         .iter()
         .find(|step| step["kind"] == "local_agent")
         .expect("local agent trace step");

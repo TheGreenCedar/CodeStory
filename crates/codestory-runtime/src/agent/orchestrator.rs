@@ -3,15 +3,15 @@ use crate::agent::trace::{TraceRecorder, field};
 use crate::{
     AppController, FocusedSourceContext, HybridSearchScoredHit, LocalAgentResponse,
     agent_backend_label, build_local_agent_prompt, configured_agent_command, fallback_mermaid,
-    hybrid_retrieval_enabled, markdown_snippet, mermaid_flowchart, mermaid_gantt, mermaid_sequence,
+    hybrid_retrieval_enabled, mermaid_flowchart, mermaid_gantt, mermaid_sequence,
 };
 use codestory_contracts::api::{
     AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentResponseBlockDto, AgentResponseModeDto,
     AgentResponseSectionDto, AgentRetrievalPolicyModeDto, AgentRetrievalStepKindDto, ApiError,
     EdgeId, GraphArtifactDto, GraphRequest, GraphResponse, IndexFreshnessDto,
     IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeOccurrencesRequest,
-    ReadFileTextRequest, RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin,
-    SearchRepoTextMode, SearchRequest, TrailConfigDto, TrailFilterOptionsDto,
+    RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest,
+    TrailConfigDto, TrailFilterOptionsDto,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -28,6 +28,7 @@ const WEAK_INITIAL_MIN_LEXICAL_ANCHOR: f32 = 0.01;
 const WEAK_INITIAL_MIN_GRAPH_ANCHOR: f32 = 0.25;
 const SOURCE_SNIPPET_TRUNCATION_SUFFIX: &str =
     "\n// ... source snippet truncated by investigation byte cap\n```";
+const GRAPH_ARTIFACT_BUNDLE_BYTE_CAP: usize = 512 * 1024;
 const RETRIEVAL_VERSION_HYBRID: &str = "hybrid-v1";
 const RETRIEVAL_VERSION_LEXICAL_ROLLBACK: &str = "lexical-rollback-v1";
 
@@ -99,6 +100,13 @@ struct RetrievalBundle {
     repo_text_fallback_used: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct GraphArtifactCapStats {
+    retained_bytes: usize,
+    omitted_count: usize,
+    truncated: bool,
+}
+
 pub(crate) fn agent_ask(
     controller: &AppController,
     req: AgentAskRequest,
@@ -158,6 +166,13 @@ pub(crate) fn agent_ask(
         &mut trace,
     );
     bundle.graphs.extend(mermaid_graphs);
+    let graph_cap_stats = cap_graph_artifacts(&mut bundle.graphs, GRAPH_ARTIFACT_BUNDLE_BYTE_CAP);
+    if graph_cap_stats.truncated {
+        trace.annotate(format!(
+            "Graph artifact bundle truncated at {} bytes; narrow focus or reduce trail depth for complete graph exports.",
+            GRAPH_ARTIFACT_BUNDLE_BYTE_CAP
+        ));
+    }
 
     let local_agent_step = trace.start_step(
         AgentRetrievalStepKindDto::LocalAgent,
@@ -213,6 +228,22 @@ pub(crate) fn agent_ask(
         vec![
             field("section_count", sections.len().to_string()),
             field("graph_count", bundle.graphs.len().to_string()),
+            field(
+                "graph_artifact_bytes",
+                graph_cap_stats.retained_bytes.to_string(),
+            ),
+            field(
+                "graph_artifact_byte_cap",
+                GRAPH_ARTIFACT_BUNDLE_BYTE_CAP.to_string(),
+            ),
+            field(
+                "graph_artifacts_omitted",
+                graph_cap_stats.omitted_count.to_string(),
+            ),
+            field(
+                "graph_artifact_truncated",
+                graph_cap_stats.truncated.to_string(),
+            ),
         ],
     );
 
@@ -264,6 +295,34 @@ pub(crate) fn agent_ask(
         graphs: bundle.graphs,
         retrieval_trace: trace_payload,
     })
+}
+
+fn cap_graph_artifacts(
+    graphs: &mut Vec<GraphArtifactDto>,
+    byte_cap: usize,
+) -> GraphArtifactCapStats {
+    let mut retained = Vec::with_capacity(graphs.len());
+    let mut retained_bytes = 0usize;
+    let mut omitted_count = 0usize;
+
+    for graph in graphs.drain(..) {
+        let encoded_bytes = serde_json::to_vec(&graph)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        if retained_bytes.saturating_add(encoded_bytes) <= byte_cap {
+            retained_bytes = retained_bytes.saturating_add(encoded_bytes);
+            retained.push(graph);
+        } else {
+            omitted_count = omitted_count.saturating_add(1);
+        }
+    }
+
+    *graphs = retained;
+    GraphArtifactCapStats {
+        retained_bytes,
+        omitted_count,
+        truncated: omitted_count > 0,
+    }
 }
 
 fn execute_retrieval(
@@ -557,6 +616,7 @@ fn execute_retrieval(
                     field("mode", format!("{:?}", plan.mode)),
                     field("depth", plan.depth.to_string()),
                     field("direction", format!("{:?}", plan.direction)),
+                    field("max_nodes", plan.max_nodes.to_string()),
                 ],
             );
 
@@ -577,14 +637,30 @@ fn execute_retrieval(
 
             match controller.graph_trail(request) {
                 Ok(trail) => {
-                    trace.finish_ok(
-                        trail_step,
-                        vec![
-                            field("nodes", trail.nodes.len().to_string()),
-                            field("edges", trail.edges.len().to_string()),
-                            field("truncated", trail.truncated.to_string()),
-                        ],
-                    );
+                    let trail_output = vec![
+                        field("nodes", trail.nodes.len().to_string()),
+                        field("edges", trail.edges.len().to_string()),
+                        field("max_nodes", plan.max_nodes.to_string()),
+                        field("truncated", trail.truncated.to_string()),
+                        field("omitted_edges", trail.omitted_edge_count.to_string()),
+                    ];
+                    if trail.truncated {
+                        trace.finish_truncated(
+                            trail_step,
+                            format!(
+                                "Trail output hit max_nodes={}; narrow focus or lower depth.",
+                                plan.max_nodes
+                            ),
+                            trail_output,
+                        );
+                        trace.annotate(format!(
+                            "Trail {} was truncated at max_nodes={}.",
+                            idx + 1,
+                            plan.max_nodes
+                        ));
+                    } else {
+                        trace.finish_ok(trail_step, trail_output);
+                    }
                     bundle.graphs.push(GraphArtifactDto::Uml {
                         id: format!("uml-trail-{}", idx + 1),
                         title: format!("Trail {}", idx + 1),
@@ -967,19 +1043,47 @@ fn investigate_repo_text_fallback(
             return Err(error);
         }
     };
+    let stats = results.repo_text_stats.clone();
     let mut hits = results.repo_text_hits;
     hits.truncate(max_results);
-    trace.finish_ok(
-        fallback_step,
-        vec![
-            field("repo_text_hits", hits.len().to_string()),
-            field("origin", SearchHitOrigin::TextMatch.as_str()),
-        ],
-    );
+    let mut output = vec![
+        field("repo_text_hits", hits.len().to_string()),
+        field("origin", SearchHitOrigin::TextMatch.as_str()),
+    ];
+    if let Some(stats) = stats.as_ref() {
+        output.push(field("scanned_files", stats.scanned_file_count.to_string()));
+        output.push(field("scanned_bytes", stats.scanned_byte_count.to_string()));
+        output.push(field("file_cap", stats.file_cap.to_string()));
+        output.push(field("byte_cap", stats.byte_cap.to_string()));
+        output.push(field("time_cap_ms", stats.time_cap_ms.to_string()));
+        output.push(field("scan_truncated", stats.truncated.to_string()));
+        if let Some(reason) = stats.reason.as_deref() {
+            output.push(field("scan_reason", reason.to_string()));
+        }
+        if let Some(action) = stats.action.as_deref() {
+            output.push(field("scan_action", action.to_string()));
+        }
+    }
+    let scan_truncated = stats.as_ref().is_some_and(|stats| stats.truncated);
+    if scan_truncated {
+        trace.finish_truncated(
+            fallback_step,
+            "Repo-text fallback stopped at a configured scan cap.",
+            output,
+        );
+    } else {
+        trace.finish_ok(fallback_step, output);
+    }
     if !hits.is_empty() {
         trace.annotate(
             "Repo-text fallback returned file/line evidence only; unresolved text hits are not treated as symbols.",
         );
+    }
+    if let Some(stats) = stats.as_ref()
+        && stats.truncated
+        && let Some(action) = stats.action.as_deref()
+    {
+        trace.annotate(format!("Repo-text fallback truncated: {action}"));
     }
     Ok(hits)
 }
@@ -1109,16 +1213,16 @@ fn maybe_read_source_context(
         return None;
     };
 
-    match controller.read_file_text(ReadFileTextRequest { path: path.clone() }) {
-        Ok(file) => {
-            let bounded = bounded_markdown_snippet(
-                &file.text,
-                Some(line),
-                6,
-                resolved_profile.max_source_bytes,
-            );
+    match controller.bounded_file_snippet(
+        &path,
+        line,
+        6,
+        resolved_profile.max_source_bytes,
+        SOURCE_SNIPPET_TRUNCATION_SUFFIX,
+    ) {
+        Ok((resolved_path, bounded)) => {
             let context = FocusedSourceContext {
-                path,
+                path: resolved_path,
                 line,
                 snippet: bounded.markdown,
             };
@@ -1158,18 +1262,20 @@ fn needs_source_context(prompt: &str) -> bool {
     .any(|keyword| normalized.contains(keyword))
 }
 
+#[cfg(test)]
 struct BoundedMarkdownSnippet {
     markdown: String,
     truncated: bool,
 }
 
+#[cfg(test)]
 fn bounded_markdown_snippet(
     text: &str,
     focus_line: Option<u32>,
     context_lines: usize,
     max_bytes: usize,
 ) -> BoundedMarkdownSnippet {
-    let mut snippet = markdown_snippet(text, focus_line, context_lines);
+    let mut snippet = crate::markdown_snippet(text, focus_line, context_lines);
     if snippet.len() <= max_bytes {
         return BoundedMarkdownSnippet {
             markdown: snippet,
@@ -1199,7 +1305,6 @@ fn bounded_markdown_snippet(
         truncated: true,
     }
 }
-
 fn build_mermaid_artifacts(
     profile: &ResolvedProfile,
     req: &AgentAskRequest,

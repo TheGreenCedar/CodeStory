@@ -2,9 +2,9 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
     AgentBackend, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, GroundingBudgetDto,
     IndexDryRunDto, IndexFreshnessDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind,
-    ProjectSummary, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
-    SnippetContextDto, SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto,
-    TrailDirection, TrailMode,
+    ProjectSummary, RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
+    SearchHitOrigin, SnippetContextDto, SummaryGenerationDto, SymbolContextDto, TrailCallerScope,
+    TrailContextDto, TrailDirection, TrailMode,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -633,6 +633,8 @@ pub(crate) struct SearchOutput {
     pub(crate) suggestions: Vec<SearchHitOutput>,
     pub(crate) indexed_symbol_hits: Vec<SearchHitOutput>,
     pub(crate) repo_text_hits: Vec<SearchHitOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repo_text_stats: Option<RepoTextScanStatsDto>,
 }
 
 #[derive(Debug, Clone, Serialize)]

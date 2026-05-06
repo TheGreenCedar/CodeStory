@@ -3,8 +3,8 @@ use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentRetrievalPolicyModeDto,
     AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
     AgentRetrievalStepStatusDto, GraphArtifactDto, GroundingSnapshotDto, NodeDetailsDto,
-    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, SearchHit, SnippetContextDto,
-    SymbolContextDto, TrailContextDto,
+    RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto,
+    SearchHit, SnippetContextDto, SymbolContextDto, TrailContextDto,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -490,6 +490,9 @@ pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput)
             "disabled"
         }
     );
+    if let Some(stats) = output.repo_text_stats.as_ref() {
+        append_repo_text_scan_stats(&mut markdown, stats);
+    }
     if output.explain {
         append_search_evidence_packet(&mut markdown, project_root, output);
     }
@@ -536,6 +539,36 @@ fn append_search_hit_why(markdown: &mut String, hit: &SearchHitOutput) {
     for why in &hit.why {
         let _ = writeln!(markdown, "  why: {why}");
     }
+}
+
+fn append_repo_text_scan_stats(markdown: &mut String, stats: &RepoTextScanStatsDto) {
+    let _ = writeln!(
+        markdown,
+        "repo_text_scan: {}",
+        repo_text_scan_summary(stats)
+    );
+    if stats.truncated {
+        if let Some(reason) = stats.reason.as_deref() {
+            let _ = writeln!(markdown, "repo_text_scan_reason: {reason}");
+        }
+        if let Some(action) = stats.action.as_deref() {
+            let _ = writeln!(markdown, "repo_text_scan_action: {action}");
+        }
+    }
+}
+
+fn repo_text_scan_summary(stats: &RepoTextScanStatsDto) -> String {
+    format!(
+        "files={}/{} bytes={}/{} duration_ms={}/{} skipped_large={} truncated={}",
+        stats.scanned_file_count,
+        stats.file_cap,
+        stats.scanned_byte_count,
+        stats.byte_cap,
+        stats.duration_ms,
+        stats.time_cap_ms,
+        stats.skipped_large_file_count,
+        stats.truncated
+    )
 }
 
 fn append_ground_evidence_packet(
@@ -681,6 +714,13 @@ fn append_search_evidence_packet(
             "disabled"
         }
     );
+    if let Some(stats) = output.repo_text_stats.as_ref() {
+        let _ = writeln!(
+            markdown,
+            "- repo text scan caps: {}",
+            repo_text_scan_summary(stats)
+        );
+    }
     let _ = writeln!(
         markdown,
         "- retrieval state: {}",
@@ -938,6 +978,19 @@ fn search_gap_notes(output: &SearchOutput) -> Vec<String> {
     }
     if !output.repo_text_enabled {
         gaps.push("repo text fallback was disabled".to_string());
+    }
+    if let Some(stats) = output.repo_text_stats.as_ref()
+        && stats.truncated
+    {
+        gaps.push(
+            stats
+                .reason
+                .clone()
+                .unwrap_or_else(|| "repo-text scan hit a configured cap".to_string()),
+        );
+        if let Some(action) = stats.action.clone() {
+            gaps.push(action);
+        }
     }
     if !output.suggestions.is_empty() {
         gaps.push(format!(
@@ -1524,6 +1577,13 @@ pub(crate) fn render_snippet_markdown(
         relative_path(project_root, &context.path),
         context.line
     );
+    if context.snippet_truncated {
+        let _ = writeln!(
+            markdown,
+            "snippet_truncated: true (max_snippet_bytes={})",
+            context.max_snippet_bytes.unwrap_or_default()
+        );
+    }
     let fence = snippet_fence(&context.snippet);
     let _ = writeln!(markdown, "{fence}{}", snippet_language(&context.path));
     let snippet = if colorize {
@@ -2188,12 +2248,28 @@ mod tests {
             suggestions: Vec::new(),
             indexed_symbol_hits: vec![sample_search_hit()],
             repo_text_hits: Vec::new(),
+            repo_text_stats: Some(RepoTextScanStatsDto {
+                scanned_file_count: 12,
+                scanned_byte_count: 4096,
+                skipped_large_file_count: 1,
+                file_cap: 2000,
+                byte_cap: 33_554_432,
+                time_cap_ms: 500,
+                duration_ms: 7,
+                truncated: false,
+                reason: None,
+                action: None,
+            }),
         };
 
         let markdown = render_search_markdown(Path::new("C:/repo"), &output);
 
         assert_evidence_packet_shape(&markdown, &["short_finding:", "summary:"]);
         assert_order(&markdown, "short_finding:", "confidence:");
+        assert!(
+            markdown.contains("repo text scan caps: files=12/2000 bytes=4096/33554432"),
+            "{markdown}"
+        );
         assert!(
             !markdown.contains("query_hints:"),
             "search --why should not duplicate packet next_commands as legacy query_hints:\n{markdown}"
@@ -2362,6 +2438,7 @@ mod tests {
             suggestions: Vec::new(),
             indexed_symbol_hits: Vec::new(),
             repo_text_hits: Vec::new(),
+            repo_text_stats: None,
         };
 
         let markdown = render_search_markdown(Path::new("C:/repo"), &output);
