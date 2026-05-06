@@ -380,6 +380,13 @@ pub(crate) struct TargetArgs {
         help = "Limit query resolution to files whose path matches this fragment."
     )]
     pub(crate) file: Option<String>,
+    #[arg(
+        long,
+        requires = "query",
+        value_name = "N",
+        help = "Resolve a query by the 1-based alternative number shown in an ambiguity error."
+    )]
+    pub(crate) choose: Option<usize>,
 }
 
 #[derive(Args, Debug)]
@@ -586,6 +593,8 @@ pub(crate) enum QuerySelectorOutput {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SearchHitOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) number: Option<usize>,
     pub(crate) node_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) node_ref: Option<String>,
@@ -715,16 +724,20 @@ pub(crate) struct DoctorOutput {
 #[derive(Debug)]
 pub(crate) enum TargetSelection {
     Id(NodeId),
-    Query(String),
+    Query {
+        query: String,
+        choose: Option<usize>,
+    },
 }
 
 impl TargetArgs {
     pub(crate) fn selection(&self) -> anyhow::Result<TargetSelection> {
         match (&self.id, &self.query) {
             (Some(id), None) => Ok(TargetSelection::Id(NodeId(id.trim().to_string()))),
-            (None, Some(query)) if !query.trim().is_empty() => {
-                Ok(TargetSelection::Query(query.trim().to_string()))
-            }
+            (None, Some(query)) if !query.trim().is_empty() => Ok(TargetSelection::Query {
+                query: query.trim().to_string(),
+                choose: self.choose,
+            }),
             (Some(_), Some(_)) => anyhow::bail!("Pass only one of --id or --query."),
             (None, None) => anyhow::bail!("Pass either --id or --query."),
             (None, Some(_)) => anyhow::bail!("--query cannot be empty."),

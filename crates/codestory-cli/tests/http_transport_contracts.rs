@@ -66,7 +66,9 @@ path = "src/lib.rs"
     fs::create_dir_all(&src).expect("create src dir");
     fs::write(
         src.join("lib.rs"),
-        r#"pub mod runtime;
+        r#"pub mod alpha;
+pub mod beta;
+pub mod runtime;
 
 pub struct AppController {
     project_name: String,
@@ -107,6 +109,22 @@ pub fn step15() -> usize { 15 }
 "#,
     )
     .expect("write lib.rs");
+    fs::write(
+        src.join("alpha.rs"),
+        r#"pub fn configure() -> usize {
+    1
+}
+"#,
+    )
+    .expect("write alpha.rs");
+    fs::write(
+        src.join("beta.rs"),
+        r#"pub fn configure() -> usize {
+    2
+}
+"#,
+    )
+    .expect("write beta.rs");
     fs::write(
         src.join("runtime.rs"),
         r#"pub fn normalize_project(project_name: &str) -> String {
@@ -399,6 +417,63 @@ fn http_routes_and_stdio_tools_keep_aligned_default_contracts() {
         catalog.contains(".with_default(ValueLiteral::Integer(300))")
             && catalog.contains(".with_bounds(1, 2000)"),
         "stdio symbols catalog should document the shared 300 default and 1..2000 bounds"
+    );
+}
+
+#[test]
+fn http_target_ambiguity_returns_json_error_and_choose_resolves() {
+    let fixture = indexed_fixture();
+    let (_server, addr) = spawn_http_server(&fixture);
+
+    let ambiguous = http_get(&addr, "/definition?q=configure").expect("ambiguous definition");
+    assert_eq!(ambiguous.status, 400);
+    assert_eq!(
+        ambiguous
+            .body
+            .pointer("/error/code")
+            .and_then(Value::as_str),
+        Some("ambiguous_target"),
+        "ambiguous HTTP target should return structured alternatives: {}",
+        ambiguous.body
+    );
+    let alternatives = ambiguous
+        .body
+        .pointer("/error/alternatives")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("ambiguous alternatives: {}", ambiguous.body));
+    assert!(alternatives.len() >= 2);
+    let second_id = alternatives[1]
+        .get("node_id")
+        .and_then(Value::as_str)
+        .expect("second alternative node id")
+        .to_string();
+    assert_eq!(alternatives[0].get("number"), Some(&Value::from(1)));
+    assert!(
+        alternatives[0]
+            .get("node_ref")
+            .and_then(Value::as_str)
+            .is_some(),
+        "alternatives should include node refs: {}",
+        ambiguous.body
+    );
+
+    let chosen = get_json(&addr, "/definition?q=configure&choose=2");
+    assert_eq!(
+        chosen
+            .pointer("/resolution/resolved/node_id")
+            .and_then(Value::as_str),
+        Some(second_id.as_str()),
+        "HTTP choose should resolve the displayed alternative #2: {chosen}"
+    );
+
+    let invalid =
+        http_get(&addr, "/definition?q=AppController&choose=abc").expect("invalid choose response");
+    assert_eq!(invalid.status, 400);
+    assert_eq!(
+        invalid.body.pointer("/error/code").and_then(Value::as_str),
+        Some("invalid_target"),
+        "invalid choose should return structured bad-request JSON: {}",
+        invalid.body
     );
 }
 

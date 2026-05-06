@@ -43,8 +43,8 @@ use output::{
     render_trail_dot, render_trail_markdown, render_trail_mermaid, validate_output_file_parent,
 };
 use runtime::{
-    RuntimeContext, ensure_index_ready, map_api_error, refresh_label, resolve_refresh_request,
-    resolve_target,
+    AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
+    resolve_refresh_request, resolve_target,
 };
 use stdio_catalog::{
     is_tool_name as is_stdio_tool_name, prompt_get_json as stdio_prompt_get_json,
@@ -430,7 +430,13 @@ fn run_symbol(cmd: SymbolCommand) -> Result<()> {
     ensure_index_ready(&opened, "symbol")?;
 
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target(&runtime, cmd.target.selection()?, file_filter.as_deref())?;
+    let target = resolve_target_or_emit_ambiguity(
+        &runtime,
+        cmd.target.selection()?,
+        file_filter.as_deref(),
+        cmd.format,
+        cmd.output_file.as_deref(),
+    )?;
     let context = runtime
         .browser
         .symbol_context(target.selected.node_id.clone())
@@ -453,7 +459,13 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
     ensure_index_ready(&opened, "trail")?;
 
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target(&runtime, cmd.target.selection()?, file_filter.as_deref())?;
+    let target = resolve_target_or_emit_ambiguity(
+        &runtime,
+        cmd.target.selection()?,
+        file_filter.as_deref(),
+        cmd.format,
+        cmd.output_file.as_deref(),
+    )?;
     let request = build_trail_request(&target.selected.node_id, &cmd);
     let mut context = runtime
         .browser
@@ -487,7 +499,13 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
     ensure_index_ready(&opened, "snippet")?;
 
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target(&runtime, cmd.target.selection()?, file_filter.as_deref())?;
+    let target = resolve_target_or_emit_ambiguity(
+        &runtime,
+        cmd.target.selection()?,
+        file_filter.as_deref(),
+        cmd.format,
+        cmd.output_file.as_deref(),
+    )?;
     let context = runtime
         .browser
         .snippet_context(target.selected.node_id.clone(), cmd.context)
@@ -534,7 +552,13 @@ fn run_explore(cmd: ExploreCommand) -> Result<()> {
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "explore")?;
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target(&runtime, cmd.target.selection()?, file_filter.as_deref())?;
+    let target = resolve_target_or_emit_ambiguity(
+        &runtime,
+        cmd.target.selection()?,
+        file_filter.as_deref(),
+        cmd.format,
+        cmd.output_file.as_deref(),
+    )?;
     let symbol = runtime
         .browser
         .symbol_context(target.selected.node_id.clone())
@@ -622,6 +646,87 @@ fn run_generate_completions(cmd: GenerateCompletionsCommand) -> Result<()> {
     let mut command = Cli::command();
     generate(shell, &mut command, "codestory-cli", &mut std::io::stdout());
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct CliErrorOutput {
+    error: CliErrorBody,
+}
+
+#[derive(serde::Serialize)]
+struct CliErrorBody {
+    code: &'static str,
+    message: String,
+    query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_filter: Option<String>,
+    alternatives: Vec<SearchHitOutput>,
+    next_commands: Vec<String>,
+}
+
+fn resolve_target_or_emit_ambiguity(
+    runtime: &RuntimeContext,
+    target: args::TargetSelection,
+    file_filter: Option<&str>,
+    format: args::OutputFormat,
+    output_file: Option<&std::path::Path>,
+) -> Result<runtime::ResolvedTarget> {
+    match resolve_target(runtime, target, file_filter) {
+        Ok(target) => Ok(target),
+        Err(error) => {
+            if format == args::OutputFormat::Json
+                && let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>()
+            {
+                let output = build_ambiguous_target_error_output(&runtime.project_root, ambiguous);
+                emit(
+                    args::OutputFormat::Json,
+                    &output,
+                    ambiguous.message.clone(),
+                    output_file,
+                )?;
+            }
+            Err(error)
+        }
+    }
+}
+
+fn build_ambiguous_target_error_output(
+    project_root: &std::path::Path,
+    ambiguous: &AmbiguousTargetError,
+) -> CliErrorOutput {
+    let alternatives = ambiguous
+        .alternatives
+        .iter()
+        .enumerate()
+        .map(|(index, hit)| build_numbered_search_hit_output(project_root, hit, index + 1))
+        .collect::<Vec<_>>();
+    let quoted_query = ambiguous.query.replace('"', "\\\"");
+    let file_clause = ambiguous
+        .file_filter
+        .as_deref()
+        .map(|file_filter| format!(" --file \"{}\"", file_filter.replace('"', "\\\"")))
+        .unwrap_or_default();
+    let mut next_commands = vec![format!(
+        "codestory-cli symbol --query \"{}\"{} --choose 1",
+        quoted_query, file_clause
+    )];
+    if let Some(first) = ambiguous.alternatives.first() {
+        next_commands.push(format!("codestory-cli symbol --id {}", first.node_id.0));
+    }
+
+    CliErrorOutput {
+        error: CliErrorBody {
+            code: "ambiguous_target",
+            message: ambiguous.message.clone(),
+            query: ambiguous.query.clone(),
+            file_filter: ambiguous
+                .file_filter
+                .as_deref()
+                .map(crate::display::clean_path_string),
+            alternatives,
+            next_commands,
+        },
+    }
 }
 
 fn build_doctor_output(
@@ -952,6 +1057,7 @@ fn render_explore_markdown(
             id: Some(target.selected.node_id.0.clone()),
             query: None,
             file: None,
+            choose: None,
         },
         mode: args::CliTrailMode::Neighborhood,
         depth: Some(2),
@@ -1023,6 +1129,7 @@ fn run_explore_tui(
                     id: Some(target.selected.node_id.0.clone()),
                     query: None,
                     file: None,
+                    choose: None,
                 },
                 mode: args::CliTrailMode::Neighborhood,
                 depth: Some(2),
@@ -1229,8 +1336,12 @@ fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Resul
             write_http_json(&mut stream, 200, &results)
         }
         "/symbol" => {
-            let query = params.get("q").cloned().unwrap_or_default();
-            let target = resolve_target(runtime, args::TargetSelection::Query(query), None)?;
+            let Some(selection) = http_target_selection_or_error(&mut stream, &params)? else {
+                return Ok(());
+            };
+            let Some(target) = resolve_http_target(&mut stream, runtime, selection, None)? else {
+                return Ok(());
+            };
             let context = runtime
                 .browser
                 .symbol_context(target.selected.node_id)
@@ -1238,7 +1349,12 @@ fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Resul
             write_http_json(&mut stream, 200, &context)
         }
         "/definition" => {
-            let target = resolve_target(runtime, target_selection_from_params(&params)?, None)?;
+            let Some(selection) = http_target_selection_or_error(&mut stream, &params)? else {
+                return Ok(());
+            };
+            let Some(target) = resolve_http_target(&mut stream, runtime, selection, None)? else {
+                return Ok(());
+            };
             let context = runtime
                 .browser
                 .definition_context(target.selected.node_id.clone())
@@ -1254,7 +1370,12 @@ fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Resul
             )
         }
         "/references" => {
-            let target = resolve_target(runtime, target_selection_from_params(&params)?, None)?;
+            let Some(selection) = http_target_selection_or_error(&mut stream, &params)? else {
+                return Ok(());
+            };
+            let Some(target) = resolve_http_target(&mut stream, runtime, selection, None)? else {
+                return Ok(());
+            };
             let context = runtime
                 .browser
                 .references_context(browser_references_config(target.selected.node_id.clone()))
@@ -1287,7 +1408,12 @@ fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Resul
             }
         }
         "/trail" => {
-            let target = resolve_target(runtime, target_selection_from_params(&params)?, None)?;
+            let Some(selection) = http_target_selection_or_error(&mut stream, &params)? else {
+                return Ok(());
+            };
+            let Some(target) = resolve_http_target(&mut stream, runtime, selection, None)? else {
+                return Ok(());
+            };
             let depth = browser_trail_depth(params.get("depth").map(String::as_str));
             let direction = browser_trail_direction(params.get("direction").map(String::as_str));
             let context = runtime
@@ -1360,6 +1486,39 @@ fn browser_symbols_limit(value: Option<&str>) -> Option<u32> {
     )
 }
 
+fn http_target_selection_or_error(
+    stream: &mut TcpStream,
+    params: &HashMap<String, String>,
+) -> Result<Option<args::TargetSelection>> {
+    match target_selection_from_params(params) {
+        Ok(selection) => Ok(Some(selection)),
+        Err(error) => {
+            write_http_error_json(stream, 400, "invalid_target", error.to_string())?;
+            Ok(None)
+        }
+    }
+}
+
+fn resolve_http_target(
+    stream: &mut TcpStream,
+    runtime: &RuntimeContext,
+    target: args::TargetSelection,
+    file_filter: Option<&str>,
+) -> Result<Option<runtime::ResolvedTarget>> {
+    match resolve_target(runtime, target, file_filter) {
+        Ok(target) => Ok(Some(target)),
+        Err(error) => {
+            if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
+                let output = build_ambiguous_target_error_output(&runtime.project_root, ambiguous);
+                write_http_json(stream, 400, &output)?;
+            } else {
+                write_http_error_json(stream, 400, "target_resolution_failed", error.to_string())?;
+            }
+            Ok(None)
+        }
+    }
+}
+
 fn target_selection_from_params(params: &HashMap<String, String>) -> Result<args::TargetSelection> {
     if let Some(id) = params.get("id").filter(|value| !value.trim().is_empty()) {
         return Ok(args::TargetSelection::Id(NodeId(id.trim().to_string())));
@@ -1368,7 +1527,21 @@ fn target_selection_from_params(params: &HashMap<String, String>) -> Result<args
     if query.trim().is_empty() {
         bail!("Pass `q` or `id`.");
     }
-    Ok(args::TargetSelection::Query(query))
+    Ok(args::TargetSelection::Query {
+        query,
+        choose: query_choose_param(params)?,
+    })
+}
+
+fn query_choose_param(params: &HashMap<String, String>) -> Result<Option<usize>> {
+    params
+        .get("choose")
+        .map(|value| {
+            value.parse::<usize>().with_context(|| {
+                format!("Invalid `choose` value `{value}`; expected a positive integer.")
+            })
+        })
+        .transpose()
 }
 
 fn write_http_json<T: serde::Serialize>(
@@ -1593,13 +1766,26 @@ fn stdio_jsonrpc_from_legacy(
         let message = error
             .as_str()
             .map(str::to_string)
+            .or_else(|| {
+                error
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| error.to_string());
         let code = if message.contains("unknown resource") {
             -32602
         } else {
             -32000
         };
-        return stdio_jsonrpc_error(id, code, message);
+        let mut response = stdio_jsonrpc_error(id, code, message);
+        if error.is_object()
+            && let Some(error_object) = response.get_mut("error")
+            && let Some(error_object) = error_object.as_object_mut()
+        {
+            error_object.insert("data".to_string(), error.clone());
+        }
+        return response;
     }
     stdio_jsonrpc_success(id, response)
 }
@@ -1647,8 +1833,8 @@ fn handle_stdio_tool_call(
         .to_string();
     match name {
         "search" => handle_stdio_search(runtime, request, query),
-        "symbol" => handle_stdio_symbol(runtime, query),
-        "trail" => handle_stdio_trail(runtime, request, query),
+        "symbol" => handle_stdio_symbol(runtime, request),
+        "trail" => handle_stdio_trail(runtime, request),
         "definition" => handle_stdio_definition(runtime, request),
         "references" => handle_stdio_references(runtime, request),
         "symbols" => handle_stdio_symbols(runtime, request),
@@ -1689,8 +1875,8 @@ fn handle_stdio_search(
         .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))
 }
 
-fn handle_stdio_symbol(runtime: &RuntimeContext, query: String) -> serde_json::Value {
-    resolve_target(runtime, args::TargetSelection::Query(query), None)
+fn handle_stdio_symbol(runtime: &RuntimeContext, request: &serde_json::Value) -> serde_json::Value {
+    resolve_target(runtime, stdio_target_selection(request), None)
         .and_then(|target| {
             runtime
                 .browser
@@ -1698,14 +1884,12 @@ fn handle_stdio_symbol(runtime: &RuntimeContext, query: String) -> serde_json::V
                 .map_err(map_api_error)
         })
         .map(|result| serde_json::json!({"result": result}))
-        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+        .unwrap_or_else(
+            |error| serde_json::json!({"error": stdio_legacy_error_value(runtime, &error)}),
+        )
 }
 
-fn handle_stdio_trail(
-    runtime: &RuntimeContext,
-    request: &serde_json::Value,
-    query: String,
-) -> serde_json::Value {
+fn handle_stdio_trail(runtime: &RuntimeContext, request: &serde_json::Value) -> serde_json::Value {
     let direction = match request
         .pointer("/params/arguments/direction")
         .and_then(|value| value.as_str())
@@ -1719,7 +1903,7 @@ fn handle_stdio_trail(
         .and_then(|value| value.as_u64())
         .map(|value| value.min(BROWSER_TRAIL_MAX_DEPTH as u64) as u32)
         .unwrap_or(BROWSER_TRAIL_DEFAULT_DEPTH);
-    resolve_target(runtime, args::TargetSelection::Query(query), None)
+    resolve_target(runtime, stdio_target_selection(request), None)
         .and_then(|target| {
             runtime
                 .browser
@@ -1731,7 +1915,9 @@ fn handle_stdio_trail(
                 .map_err(map_api_error)
         })
         .map(|result| serde_json::json!({"result": result}))
-        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+        .unwrap_or_else(
+            |error| serde_json::json!({"error": stdio_legacy_error_value(runtime, &error)}),
+        )
 }
 
 fn handle_stdio_definition(
@@ -1763,7 +1949,9 @@ fn handle_stdio_definition(
                 })
         })
         .map(|result| serde_json::json!({"result": result}))
-        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+        .unwrap_or_else(
+            |error| serde_json::json!({"error": stdio_legacy_error_value(runtime, &error)}),
+        )
 }
 
 fn handle_stdio_references(
@@ -1778,7 +1966,9 @@ fn handle_stdio_references(
                 .map_err(map_api_error)
         })
         .map(|result| serde_json::json!({"result": result}))
-        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+        .unwrap_or_else(
+            |error| serde_json::json!({"error": stdio_legacy_error_value(runtime, &error)}),
+        )
 }
 
 fn handle_stdio_symbols(
@@ -1830,7 +2020,9 @@ fn handle_stdio_snippet(
                 .map_err(map_api_error)
         })
         .map(|result| serde_json::json!({"result": result}))
-        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+        .unwrap_or_else(
+            |error| serde_json::json!({"error": stdio_legacy_error_value(runtime, &error)}),
+        )
 }
 
 fn handle_stdio_ask(
@@ -1890,7 +2082,27 @@ fn stdio_target_selection(request: &serde_json::Value) -> args::TargetSelection 
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_string();
-    args::TargetSelection::Query(query)
+    args::TargetSelection::Query {
+        query,
+        choose: request
+            .pointer("/params/arguments/choose")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize),
+    }
+}
+
+fn stdio_legacy_error_value(runtime: &RuntimeContext, error: &anyhow::Error) -> serde_json::Value {
+    if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
+        return serde_json::to_value(build_ambiguous_target_error_output(
+            &runtime.project_root,
+            ambiguous,
+        ))
+        .ok()
+        .and_then(|value| value.get("error").cloned())
+        .unwrap_or_else(|| serde_json::json!(ambiguous.to_string()));
+    }
+
+    serde_json::json!(error.to_string())
 }
 
 fn read_stdio_resource(runtime: &RuntimeContext, uri: &str) -> serde_json::Value {
@@ -2203,6 +2415,7 @@ fn build_search_hit_output(
         Vec::new()
     };
     SearchHitOutput {
+        number: None,
         node_id: hit.node_id.0.clone(),
         node_ref: crate::output::node_ref(
             project_root,
@@ -2222,6 +2435,16 @@ fn build_search_hit_output(
         excerpt: repo_text_excerpt(project_root, hit),
         why,
     }
+}
+
+fn build_numbered_search_hit_output(
+    project_root: &std::path::Path,
+    hit: &SearchHit,
+    number: usize,
+) -> SearchHitOutput {
+    let mut output = build_search_hit_output(project_root, hit, false);
+    output.number = Some(number);
+    output
 }
 
 fn explain_search_hit(
@@ -2352,6 +2575,24 @@ fn is_speculative_certainty(certainty: Option<&str>) -> bool {
     matches!(
         certainty.map(|value| value.to_ascii_lowercase()).as_deref(),
         Some("uncertain" | "speculative")
+    )
+}
+
+fn write_http_error_json(
+    stream: &mut TcpStream,
+    status: u16,
+    code: &'static str,
+    message: impl Into<String>,
+) -> Result<()> {
+    write_http_json(
+        stream,
+        status,
+        &serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message.into()
+            }
+        }),
     )
 }
 

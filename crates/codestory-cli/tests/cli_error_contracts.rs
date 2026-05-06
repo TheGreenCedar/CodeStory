@@ -1,3 +1,4 @@
+use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -74,6 +75,40 @@ fn assert_fails_with(output: std::process::Output, expected: &[&str]) {
             "expected output to contain {needle:?}\ncombined output:\n{combined}"
         );
     }
+}
+
+fn assert_success(output: &std::process::Output, context: &str) {
+    assert!(
+        output.status.success(),
+        "{context}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn index_workspace(workspace: &Path, cache_dir: &Path) {
+    let index = run_cli(
+        workspace,
+        cache_dir,
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    assert_success(&index, "index command failed");
+}
+
+fn parse_stdout_json(output: &std::process::Output) -> Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "stdout should be JSON, got parse error: {error}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+fn ambiguous_error_alternatives(json: &Value) -> &Vec<Value> {
+    json.pointer("/error/alternatives")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("ambiguous JSON should expose /error/alternatives: {json:#}"))
 }
 
 #[test]
@@ -176,17 +211,7 @@ fn ambiguous_query_lists_ranked_alternatives_and_next_steps() {
     let cache_dir = tempdir().expect("cache dir");
     write_ambiguous_rust_workspace(workspace.path());
 
-    let index = run_cli(
-        workspace.path(),
-        cache_dir.path(),
-        &["index", "--refresh", "full", "--format", "json"],
-    );
-    assert!(
-        index.status.success(),
-        "index command failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&index.stdout),
-        String::from_utf8_lossy(&index.stderr)
-    );
+    index_workspace(workspace.path(), cache_dir.path());
 
     let output = run_cli(
         workspace.path(),
@@ -211,5 +236,165 @@ fn ambiguous_query_lists_ranked_alternatives_and_next_steps() {
             "beta.rs",
             "resolve the exact `--id` from `search` output",
         ],
+    );
+}
+
+#[test]
+fn ambiguous_symbol_json_includes_numbered_alternatives_with_stable_refs() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_ambiguous_rust_workspace(workspace.path());
+    index_workspace(workspace.path(), cache_dir.path());
+
+    let output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "symbol",
+            "--query",
+            "configure",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert!(
+        !output.status.success(),
+        "ambiguous query must not silently resolve a tied target\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_stdout_json(&output);
+    assert_eq!(
+        json.pointer("/error/code").and_then(Value::as_str),
+        Some("ambiguous_target"),
+        "ambiguous JSON should carry a machine-readable error code: {json:#}"
+    );
+    assert!(
+        json.pointer("/resolution/resolved").is_none(),
+        "ambiguous JSON should not include a hidden resolved target: {json:#}"
+    );
+
+    let alternatives = ambiguous_error_alternatives(&json);
+    assert!(
+        alternatives.len() >= 2,
+        "ambiguous JSON should expose at least the tied alternatives: {json:#}"
+    );
+    for (offset, alternative) in alternatives.iter().take(2).enumerate() {
+        assert_eq!(
+            alternative.get("number").and_then(Value::as_u64),
+            Some((offset + 1) as u64),
+            "alternatives should be numbered in displayed 1-based order: {json:#}"
+        );
+        assert!(
+            alternative.get("node_id").and_then(Value::as_str).is_some(),
+            "alternative should include stable node_id: {alternative:#}"
+        );
+        assert!(
+            alternative
+                .get("node_ref")
+                .and_then(Value::as_str)
+                .is_some(),
+            "alternative should include stable node_ref: {alternative:#}"
+        );
+    }
+
+    let filtered = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "symbol",
+            "--query",
+            "configure",
+            "--file",
+            "src",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    let filtered_json = parse_stdout_json(&filtered);
+    assert!(
+        filtered_json
+            .pointer("/error/next_commands")
+            .and_then(Value::as_array)
+            .is_some_and(|commands| commands.iter().any(|command| command
+                .as_str()
+                .is_some_and(|value| value.contains("--file \"src\"")))),
+        "filtered ambiguity next command should preserve the file filter: {filtered_json:#}"
+    );
+}
+
+#[test]
+fn choose_flag_resolves_by_displayed_alternative_number_when_available() {
+    let help = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+        .args(["symbol", "--help"])
+        .output()
+        .expect("run symbol help");
+    assert_success(&help, "symbol --help failed");
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    if !help_text.contains("--choose") {
+        return;
+    }
+
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_ambiguous_rust_workspace(workspace.path());
+    index_workspace(workspace.path(), cache_dir.path());
+
+    let ambiguous = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "symbol",
+            "--query",
+            "configure",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        !ambiguous.status.success(),
+        "baseline ambiguous query should fail before --choose is applied"
+    );
+    let ambiguous_json = parse_stdout_json(&ambiguous);
+    let second_alternative = ambiguous_error_alternatives(&ambiguous_json)
+        .iter()
+        .find(|alternative| alternative.get("number").and_then(Value::as_u64) == Some(2))
+        .expect("displayed alternative #2");
+    let expected_node_id = second_alternative
+        .get("node_id")
+        .and_then(Value::as_str)
+        .expect("alternative #2 node_id")
+        .to_string();
+
+    let chosen = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "symbol",
+            "--query",
+            "configure",
+            "--choose",
+            "2",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success(&chosen, "--choose 2 should resolve deterministically");
+    let chosen_json = parse_stdout_json(&chosen);
+    assert_eq!(
+        chosen_json
+            .pointer("/resolution/resolved/node_id")
+            .and_then(Value::as_str),
+        Some(expected_node_id.as_str()),
+        "--choose should resolve the node id displayed as alternative #2"
     );
 }

@@ -42,7 +42,9 @@ path = "src/lib.rs"
     fs::create_dir_all(&src).expect("create src dir");
     fs::write(
         src.join("lib.rs"),
-        r#"pub mod runtime;
+        r#"pub mod alpha;
+pub mod beta;
+pub mod runtime;
 
 pub struct AppController {
     project_name: String,
@@ -66,6 +68,22 @@ pub fn open_project(project_name: &str) -> String {
 "#,
     )
     .expect("write lib.rs");
+    fs::write(
+        src.join("alpha.rs"),
+        r#"pub fn configure() -> usize {
+    1
+}
+"#,
+    )
+    .expect("write alpha.rs");
+    fs::write(
+        src.join("beta.rs"),
+        r#"pub fn configure() -> usize {
+    2
+}
+"#,
+    )
+    .expect("write beta.rs");
     fs::write(
         src.join("runtime.rs"),
         r#"pub fn normalize_project(project_name: &str) -> String {
@@ -553,7 +571,7 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         "search.limit should document the bounded default search page: {search}"
     );
 
-    for name in ["definition", "references", "snippet"] {
+    for name in ["symbol", "definition", "references", "snippet"] {
         let schema = tool_input_schema(&tools, name);
         let required = required_fields(schema);
         assert!(
@@ -569,6 +587,10 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
             schema_property(schema, "id")["type"],
             "string",
             "{name}.id should be a string node id: {schema}"
+        );
+        assert!(
+            schema_property(schema, "choose").get("minimum").is_some(),
+            "{name}.choose should document the 1-based lower bound: {schema}"
         );
     }
 
@@ -596,8 +618,13 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
 
     let trail = tool_input_schema(&tools, "trail");
     assert!(
-        required_fields(trail).contains("query"),
-        "trail.query should be required: {trail}"
+        !required_fields(trail).contains("query") && !required_fields(trail).contains("id"),
+        "trail should allow either query or id without requiring both: {trail}"
+    );
+    assert_eq!(schema_property(trail, "id")["type"], "string");
+    assert!(
+        schema_property(trail, "choose").get("minimum").is_some(),
+        "trail.choose should document the 1-based lower bound: {trail}"
     );
     assert_schema_enum_values(
         trail,
@@ -1099,6 +1126,61 @@ fn definition_tool_exposes_symbol_snippet_references_and_trail_links() {
         })
         .expect("definition result node id");
     assert_continuation_links(result, node_id, "definition result");
+}
+
+#[test]
+fn symbol_tool_reports_ambiguous_targets_and_choose_resolves_displayed_number() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let ambiguous = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ambiguous-symbol",
+            "method": "tools/call",
+            "params": {
+                "name": "symbol",
+                "arguments": {"query": "configure"}
+            }
+        }),
+    );
+    let error = assert_error_envelope(&ambiguous, json!("ambiguous-symbol"));
+    assert_error_code(error, -32000);
+    assert_eq!(
+        error.pointer("/data/code").and_then(Value::as_str),
+        Some("ambiguous_target"),
+        "stdio symbol ambiguity should expose structured error data: {ambiguous}"
+    );
+    let alternatives = error
+        .pointer("/data/alternatives")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("ambiguous alternatives: {ambiguous}"));
+    assert!(alternatives.len() >= 2);
+    let second_id = alternatives[1]
+        .get("node_id")
+        .and_then(Value::as_str)
+        .expect("second alternative node id")
+        .to_string();
+
+    let chosen = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "chosen-symbol",
+            "method": "tools/call",
+            "params": {
+                "name": "symbol",
+                "arguments": {"query": "configure", "choose": 2}
+            }
+        }),
+    );
+    let result = assert_success_envelope(&chosen, json!("chosen-symbol"));
+    assert_eq!(
+        result.pointer("/node/id").and_then(Value::as_str),
+        Some(second_id.as_str()),
+        "stdio symbol choose should resolve displayed alternative #2: {chosen}"
+    );
 }
 
 #[test]

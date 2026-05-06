@@ -685,16 +685,16 @@ static SEARCH_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     &["query"],
 );
 
-static QUERY_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
-    "Resolve a symbol by query.",
-    &[SchemaProperty::string_required("query", "Symbol query.").with_min_length(1)],
-    &["query"],
-);
-
 static TRAIL_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
-    "Return a graph trail around a symbol.",
+    "Return a graph trail around a symbol id or query.",
     &[
-        SchemaProperty::string_required("query", "Symbol query.").with_min_length(1),
+        SchemaProperty::string("query", "Symbol query.").with_min_length(1),
+        SchemaProperty::string("id", "Stable node id.").with_min_length(1),
+        SchemaProperty::integer(
+            "choose",
+            "Resolve by the 1-based alternative number from an ambiguity error.",
+        )
+        .with_bounds(1, 50),
         SchemaProperty::string("direction", "Trail direction.")
             .with_enum(&["incoming", "outgoing", "both"])
             .with_default(ValueLiteral::String("both")),
@@ -702,14 +702,20 @@ static TRAIL_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
             .with_default(ValueLiteral::Integer(2))
             .with_bounds(0, 10),
     ],
-    &["query"],
-);
+    &[],
+)
+.with_any_of_required(&[&["query"], &["id"]]);
 
 static TARGET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Resolve a symbol by query or stable node id.",
     &[
         SchemaProperty::string("query", "Symbol query.").with_min_length(1),
         SchemaProperty::string("id", "Stable node id.").with_min_length(1),
+        SchemaProperty::integer(
+            "choose",
+            "Resolve by the 1-based alternative number from an ambiguity error.",
+        )
+        .with_bounds(1, 50),
     ],
     &[],
 )
@@ -753,8 +759,8 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "symbol",
-        description: "Resolve a symbol and return details.",
-        input_schema: QUERY_INPUT_SCHEMA,
+        description: "Resolve a symbol id or query and return details.",
+        input_schema: TARGET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(SYMBOL_CONTEXT_SCHEMA)),
         safety: SafetyMetadata::read_only(),
     },

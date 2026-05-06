@@ -10,7 +10,7 @@ use directories::ProjectDirs;
 use std::path::{Path, PathBuf};
 
 use crate::args::{ProjectArgs, QuerySelectorOutput, RefreshMode, TargetSelection};
-use crate::display::{clean_path_string, format_search_hit_target};
+use crate::display::{clean_path_string, format_search_hit_target, relative_path};
 use crate::query_resolution::{
     compare_resolution_hits, file_filter_match_bucket, resolution_rank,
     search_hit_matches_file_filter,
@@ -42,6 +42,22 @@ pub(crate) struct ResolvedTarget {
     pub(crate) selected: SearchHit,
     pub(crate) alternatives: Vec<SearchHit>,
 }
+
+#[derive(Debug, Clone)]
+pub(crate) struct AmbiguousTargetError {
+    pub(crate) query: String,
+    pub(crate) file_filter: Option<String>,
+    pub(crate) alternatives: Vec<SearchHit>,
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for AmbiguousTargetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AmbiguousTargetError {}
 
 impl RuntimeContext {
     pub(crate) fn new(args: &ProjectArgs) -> Result<Self> {
@@ -119,7 +135,7 @@ pub(crate) fn resolve_target(
                 alternatives: Vec::new(),
             })
         }
-        TargetSelection::Query(query) => {
+        TargetSelection::Query { query, choose } => {
             let mut alternatives = runtime
                 .browser
                 .search_hybrid(
@@ -158,30 +174,65 @@ pub(crate) fn resolve_target(
                 )
             });
 
-            if alternatives.len() > 1 {
-                let rank0 = resolution_candidate_rank(
+            let tied_alternatives =
+                tied_top_alternatives(&runtime.project_root, &query, file_filter, &alternatives);
+            if let Some(choice) = choose {
+                if choice == 0 || choice > tied_alternatives.len() {
+                    bail!(
+                        "`--choose {choice}` is outside the displayed alternative range 1..={}. Re-run without `--choose` to inspect the current alternatives.",
+                        tied_alternatives.len()
+                    );
+                }
+                let selected = tied_alternatives[choice - 1].clone();
+                let mut alternatives = alternatives;
+                if let Some(position) = alternatives
+                    .iter()
+                    .position(|hit| hit.node_id == selected.node_id)
+                {
+                    let chosen = alternatives.remove(position);
+                    alternatives.insert(0, chosen);
+                }
+                return Ok(ResolvedTarget {
+                    selector: QuerySelectorOutput::Query,
+                    requested: query,
+                    file_filter: file_filter.map(ToOwned::to_owned),
+                    selected,
+                    alternatives,
+                });
+            }
+
+            if tied_alternatives.len() > 1 {
+                let error = ambiguous_query_error(
                     &runtime.project_root,
                     &query,
                     file_filter,
-                    &alternatives[0],
+                    &tied_alternatives,
                 );
+                return Err(AmbiguousTargetError {
+                    query,
+                    file_filter: file_filter.map(ToOwned::to_owned),
+                    alternatives: tied_alternatives,
+                    message: error,
+                }
+                .into());
+            }
+
+            if alternatives.len() > 1 {
                 let rank1 = resolution_candidate_rank(
                     &runtime.project_root,
                     &query,
                     file_filter,
                     &alternatives[1],
                 );
-                if rank0 == rank1 {
-                    bail!(
-                        "{}",
-                        ambiguous_query_error(
-                            &runtime.project_root,
-                            &query,
-                            file_filter,
-                            &alternatives,
-                        )
-                    );
-                }
+                debug_assert_ne!(
+                    resolution_candidate_rank(
+                        &runtime.project_root,
+                        &query,
+                        file_filter,
+                        &alternatives[0],
+                    ),
+                    rank1
+                );
             }
 
             let selected = alternatives
@@ -198,6 +249,25 @@ pub(crate) fn resolve_target(
             })
         }
     }
+}
+
+fn tied_top_alternatives(
+    project_root: &Path,
+    query: &str,
+    file_filter: Option<&str>,
+    alternatives: &[SearchHit],
+) -> Vec<SearchHit> {
+    let Some(first) = alternatives.first() else {
+        return Vec::new();
+    };
+    let top_rank = resolution_candidate_rank(project_root, query, file_filter, first);
+    alternatives
+        .iter()
+        .take_while(|hit| {
+            resolution_candidate_rank(project_root, query, file_filter, hit) == top_rank
+        })
+        .cloned()
+        .collect()
 }
 
 pub(crate) fn canonicalize_project_root(project: &Path) -> Result<PathBuf> {
@@ -332,6 +402,7 @@ fn compare_resolution_candidates(
             left,
         ))
         .then_with(|| compare_resolution_hits(query, left, right))
+        .then_with(|| left.node_id.0.cmp(&right.node_id.0))
 }
 
 fn no_query_match_error(
@@ -363,9 +434,20 @@ fn ambiguous_query_error(
     message.push_str(&format!(
         "Query `{query}` is ambiguous{scope}. Top equally ranked matches:\n"
     ));
-    for hit in alternatives.iter().take(4) {
-        message.push_str("  - ");
+    for (index, hit) in alternatives.iter().enumerate() {
+        let number = index + 1;
+        message.push_str("  ");
+        message.push_str(&number.to_string());
+        message.push_str(". ");
         message.push_str(&format_search_hit_target(project_root, hit));
+        message.push_str(" id=`");
+        message.push_str(&hit.node_id.0);
+        message.push('`');
+        if let Some(node_ref) = node_ref(project_root, hit) {
+            message.push_str(" ref=`");
+            message.push_str(&node_ref);
+            message.push('`');
+        }
         message.push('\n');
     }
     if file_filter.is_some() {
@@ -378,4 +460,14 @@ fn ambiguous_query_error(
         );
     }
     message
+}
+
+fn node_ref(project_root: &Path, hit: &SearchHit) -> Option<String> {
+    let file_path = hit.file_path.as_deref()?;
+    let line = hit.line?;
+    Some(format!(
+        "{}:{line}:{}",
+        relative_path(project_root, file_path),
+        hit.display_name
+    ))
 }
