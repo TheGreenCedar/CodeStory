@@ -1364,44 +1364,203 @@ fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let response = handle_stdio_message(&runtime, &line);
-        writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
-        stdout.flush()?;
+        if let Some(response) = handle_stdio_message(&runtime, &line) {
+            writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
+            stdout.flush()?;
+        }
     }
     Ok(())
 }
 
-fn handle_stdio_message(runtime: &RuntimeContext, line: &str) -> serde_json::Value {
+fn handle_stdio_message(runtime: &RuntimeContext, line: &str) -> Option<serde_json::Value> {
     let request: serde_json::Value = match serde_json::from_str(line) {
         Ok(value) => value,
-        Err(error) => return serde_json::json!({"error": error.to_string()}),
+        Err(error) => {
+            return Some(stdio_jsonrpc_error(
+                serde_json::Value::Null,
+                -32700,
+                format!("Parse error: {error}"),
+            ));
+        }
     };
-    let method = request
-        .get("method")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    match method {
-        "initialize" => serde_json::json!({"result": {"name": "codestory", "version": "0.1.0"}}),
+    if !request.is_object() {
+        return Some(stdio_jsonrpc_error(
+            serde_json::Value::Null,
+            -32600,
+            "Invalid request: expected JSON-RPC object",
+        ));
+    }
+    let Some(id) = request.get("id").cloned() else {
+        return None;
+    };
+    let Some(method) = request.get("method").and_then(|value| value.as_str()) else {
+        return Some(stdio_jsonrpc_error(
+            id,
+            -32600,
+            "Invalid request: missing method",
+        ));
+    };
+    let legacy_response = match method {
+        "initialize" => {
+            return Some(stdio_jsonrpc_success(
+                id,
+                stdio_initialize_result_json(&request),
+            ));
+        }
         "tools/list" => stdio_tools_list_json(),
         "resources/list" => stdio_resources_list_json(),
         "resources/templates/list" => stdio_resource_templates_list_json(),
         "prompts/list" => stdio_prompts_list_json(),
-        "prompts/get" => stdio_prompt_get_json(
-            request
+        "prompts/get" => {
+            let Some(name) = request
                 .pointer("/params/name")
                 .and_then(|value| value.as_str())
-                .unwrap_or_default(),
-        ),
+            else {
+                return Some(stdio_jsonrpc_error(
+                    id,
+                    -32602,
+                    "Invalid params: missing prompt name",
+                ));
+            };
+            match stdio_prompt_get_json(name) {
+                Ok(response) => response,
+                Err(error) => {
+                    return Some(stdio_jsonrpc_error(id, -32602, error.to_string()));
+                }
+            }
+        }
         "resources/read" => {
-            let uri = request
+            let Some(uri) = request
                 .pointer("/params/uri")
                 .and_then(|value| value.as_str())
-                .unwrap_or_default();
+            else {
+                return Some(stdio_jsonrpc_error(
+                    id,
+                    -32602,
+                    "Invalid params: missing resource uri",
+                ));
+            };
             read_stdio_resource(runtime, uri)
         }
-        "tools/call" => handle_stdio_tool_call(runtime, &request),
-        _ => serde_json::json!({"error": "unknown method"}),
+        "tools/call" => {
+            let Some(name) = request
+                .pointer("/params/name")
+                .and_then(|value| value.as_str())
+            else {
+                return Some(stdio_jsonrpc_error(
+                    id,
+                    -32602,
+                    "Invalid params: missing tool name",
+                ));
+            };
+            if !is_stdio_tool_name(name) {
+                return Some(stdio_jsonrpc_error(
+                    id,
+                    -32602,
+                    format!("Unknown tool: {name}"),
+                ));
+            }
+            if request
+                .pointer("/params/arguments")
+                .is_some_and(|value| !value.is_object() && !value.is_null())
+            {
+                return Some(stdio_jsonrpc_error(
+                    id,
+                    -32602,
+                    "Invalid params: tool arguments must be an object",
+                ));
+            }
+            handle_stdio_tool_call(runtime, &request)
+        }
+        _ => {
+            return Some(stdio_jsonrpc_error(
+                id,
+                -32601,
+                format!("Method not found: {method}"),
+            ));
+        }
+    };
+    Some(stdio_jsonrpc_from_legacy(id, legacy_response))
+}
+
+fn stdio_jsonrpc_success(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    })
+}
+
+fn stdio_jsonrpc_error(
+    id: serde_json::Value,
+    code: i32,
+    message: impl Into<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message.into()
+        }
+    })
+}
+
+fn stdio_jsonrpc_from_legacy(
+    id: serde_json::Value,
+    response: serde_json::Value,
+) -> serde_json::Value {
+    if let Some(result) = response.get("result") {
+        return stdio_jsonrpc_success(id, result.clone());
     }
+    if let Some(error) = response.get("error") {
+        let message = error
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string());
+        let code = if message.contains("unknown resource") {
+            -32602
+        } else {
+            -32000
+        };
+        return stdio_jsonrpc_error(id, code, message);
+    }
+    stdio_jsonrpc_success(id, response)
+}
+
+fn stdio_initialize_result_json(request: &serde_json::Value) -> serde_json::Value {
+    let protocol_version = request
+        .pointer("/params/protocolVersion")
+        .and_then(|value| value.as_str())
+        .unwrap_or("2024-11-05");
+    serde_json::json!({
+        "protocolVersion": protocol_version,
+        "name": "codestory",
+        "version": "0.1.0",
+        "serverInfo": {
+            "name": "codestory",
+            "version": "0.1.0"
+        },
+        "capabilities": {
+            "tools": {
+                "listChanged": false
+            },
+            "resources": {
+                "subscribe": false,
+                "listChanged": false
+            },
+            "prompts": {
+                "listChanged": false
+            }
+        }
+    })
+}
+
+fn is_stdio_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "search" | "symbol" | "trail" | "definition" | "references" | "symbols" | "snippet" | "ask"
+    )
 }
 
 fn handle_stdio_tool_call(
@@ -1700,19 +1859,20 @@ fn stdio_prompts_list_json() -> serde_json::Value {
     })
 }
 
-fn stdio_prompt_get_json(name: &str) -> serde_json::Value {
+fn stdio_prompt_get_json(name: &str) -> Result<serde_json::Value> {
     let prompt = match name {
+        "explain_symbol" => {
+            "Explain `{symbol}` using CodeStory definition, references, and source snippet context. Keep claims tied to retrieved evidence."
+        }
         "trace_callflow" => {
             "Trace the call flow for `{symbol}`. Use CodeStory trail, definition, and snippet context. Return key calls, uncertain edges, and review notes."
         }
         "impact_analysis" => {
             "Analyze the impact of changing `{symbol}`. Use incoming references, related symbols, and snippets. Separate direct callers from broader risk."
         }
-        _ => {
-            "Explain `{symbol}` using CodeStory definition, references, and source snippet context. Keep claims tied to retrieved evidence."
-        }
+        _ => bail!("Unknown prompt: {name}"),
     };
-    serde_json::json!({
+    Ok(serde_json::json!({
         "result": {
             "description": name,
             "messages": [
@@ -1725,7 +1885,7 @@ fn stdio_prompt_get_json(name: &str) -> serde_json::Value {
                 }
             ]
         }
-    })
+    }))
 }
 
 fn read_stdio_resource(runtime: &RuntimeContext, uri: &str) -> serde_json::Value {
