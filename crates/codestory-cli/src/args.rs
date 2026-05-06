@@ -199,6 +199,11 @@ pub(crate) struct AskCommand {
     pub(crate) prompt: String,
     #[arg(long, value_enum, default_value_t = CliAskProfile::Auto)]
     pub(crate) profile: CliAskProfile,
+    #[arg(
+        long,
+        help = "Use bounded investigation retrieval: weak-hit fallback, limited graph/source reads, and explicit gap trace."
+    )]
+    pub(crate) investigate: bool,
     #[arg(long, default_value_t = 8)]
     pub(crate) max_results: u32,
     #[arg(
@@ -762,6 +767,16 @@ impl From<CliAskProfile> for AgentRetrievalProfileSelectionDto {
                 preset: AgentRetrievalPresetDto::Impact,
             },
         }
+    }
+}
+
+pub(crate) fn ask_retrieval_profile(cmd: &AskCommand) -> AgentRetrievalProfileSelectionDto {
+    if cmd.investigate {
+        AgentRetrievalProfileSelectionDto::Preset {
+            preset: AgentRetrievalPresetDto::Investigate,
+        }
+    } else {
+        cmd.profile.into()
     }
 }
 

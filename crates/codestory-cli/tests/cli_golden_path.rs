@@ -231,6 +231,70 @@ fn search_dir_for_storage(storage_path: &Path) -> PathBuf {
     parent.join(format!("{stem}.search"))
 }
 
+fn write_investigation_workspace(root: &Path) {
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "investigation-browser-fixture"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .expect("write Cargo.toml");
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).expect("create src dir");
+    fs::write(
+        src.join("lib.rs"),
+        r#"pub mod evidence;
+pub mod router;
+
+pub fn run_investigation(payload: &str) -> &'static str {
+    let event = evidence::parse_investigation_event(payload);
+    router::route_investigation_event(event)
+}
+"#,
+    )
+    .expect("write lib.rs");
+    fs::write(
+        src.join("evidence.rs"),
+        r#"pub const INVESTIGATION_LITERAL: &str = "CODESTORY_INVESTIGATION_LITERAL";
+
+pub fn parse_investigation_event(payload: &str) -> &'static str {
+    let _marker = INVESTIGATION_LITERAL;
+    if payload.is_empty() {
+        "empty"
+    } else {
+        "routed"
+    }
+}
+"#,
+    )
+    .expect("write evidence.rs");
+    fs::write(
+        src.join("router.rs"),
+        r#"pub fn route_investigation_event(event: &str) -> &'static str {
+    match event {
+        "routed" => "source-read-with-citation",
+        _ => "gap-recorded",
+    }
+}
+"#,
+    )
+    .expect("write router.rs");
+}
+
+fn trace_has_step(value: &Value, kind: &str) -> bool {
+    value["retrieval_trace"]["steps"]
+        .as_array()
+        .expect("retrieval trace steps")
+        .iter()
+        .any(|step| step["kind"] == kind)
+}
+
 #[test]
 fn tiny_workspace_browser_loop_works_from_existing_cache() {
     let workspace = tempdir().expect("workspace dir");
@@ -461,5 +525,122 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
     assert_eq!(
         search_dir_before, search_dir_after,
         "read commands should not recreate the persisted search directory"
+    );
+}
+
+#[test]
+fn ask_investigate_json_reports_bounded_trace_without_changing_plain_ask() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_investigation_workspace(workspace.path());
+
+    let index = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    assert!(
+        index["summary"]["stats"]["node_count"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "index should discover investigation fixture symbols"
+    );
+
+    let plain_ask = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "ask",
+            "Where is INVESTIGATION_LITERAL used?",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+            "--agent-command",
+            "definitely-not-codestory-local-agent",
+        ],
+    );
+    assert!(
+        trace_has_step(&plain_ask, "search"),
+        "plain ask should keep the existing DB-first trace"
+    );
+    assert!(
+        plain_ask["retrieval_trace"]["annotations"]
+            .as_array()
+            .is_none_or(|annotations| {
+                !annotations.iter().any(|annotation| {
+                    annotation
+                        .as_str()
+                        .is_some_and(|value| value.contains("investigate"))
+                })
+            }),
+        "plain ask should not silently opt into the new investigation mode"
+    );
+
+    let investigated = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "ask",
+            "--investigate",
+            "Where is INVESTIGATION_LITERAL used and what source was checked?",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+            "--agent-command",
+            "definitely-not-codestory-local-agent",
+        ],
+    );
+    assert!(
+        trace_has_step(&investigated, "search"),
+        "investigation starts with the current search ranking"
+    );
+    assert!(
+        trace_has_step(&investigated, "query_expansion")
+            || trace_has_step(&investigated, "repo_text_fallback"),
+        "weak first hits should trigger query expansion or exact-symbol/file fallback"
+    );
+    assert!(
+        trace_has_step(&investigated, "trail") || trace_has_step(&investigated, "neighborhood"),
+        "investigation should record bounded graph expansion"
+    );
+    assert!(
+        trace_has_step(&investigated, "source_read"),
+        "investigation should record bounded source/snippet reads"
+    );
+    assert!(
+        array_is_non_empty(&investigated, &["citations"]),
+        "investigation should return cited evidence"
+    );
+    assert!(
+        investigated["retrieval_trace"]["annotations"]
+            .as_array()
+            .expect("trace annotations")
+            .iter()
+            .any(|annotation| {
+                annotation.as_str().is_some_and(|value| {
+                    let value = value.to_ascii_lowercase();
+                    value.contains("what i checked") || value.contains("investigation")
+                })
+            }),
+        "investigation JSON should expose the named mode or what-I-checked trace"
+    );
+
+    let local_agent_step = investigated["retrieval_trace"]["steps"]
+        .as_array()
+        .expect("trace steps")
+        .iter()
+        .find(|step| step["kind"] == "local_agent")
+        .expect("local agent trace step");
+    assert_eq!(local_agent_step["status"], "skipped");
+    assert!(
+        local_agent_step["input"]
+            .as_array()
+            .expect("local agent input fields")
+            .iter()
+            .any(|field| field["key"] == "requested" && field["value"] == "false"),
+        "ask --investigate must not request local-agent execution by default"
     );
 }

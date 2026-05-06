@@ -1,9 +1,9 @@
 use codestory_contracts::api::{
     AgentAskRequest, AgentCitationDto, AgentCustomRetrievalConfigDto, AgentResponseBlockDto,
-    AgentResponseModeDto, AgentRetrievalPolicyModeDto, AgentRetrievalStepKindDto,
-    AgentRetrievalStepStatusDto, IndexMode, LayoutDirection, NodeDetailsRequest, NodeId, SearchHit,
-    SearchHitOrigin, SearchRepoTextMode, SearchRequest, TrailCallerScope, TrailConfigDto,
-    TrailDirection, TrailMode,
+    AgentResponseModeDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
+    AgentRetrievalProfileSelectionDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
+    IndexMode, LayoutDirection, NodeDetailsRequest, NodeId, SearchHit, SearchHitOrigin,
+    SearchRepoTextMode, SearchRequest, TrailCallerScope, TrailConfigDto, TrailDirection, TrailMode,
 };
 use codestory_runtime::AppController;
 use std::fs;
@@ -54,7 +54,7 @@ impl Drop for EnvGuard {
 fn browser_contract_env() -> BrowserContractEnv {
     let lock = BROWSER_CONTRACT_ENV_LOCK
         .lock()
-        .expect("browser contract env lock poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let guards = vec![
         EnvGuard::set("CODESTORY_HYBRID_RETRIEVAL_ENABLED", "true"),
         EnvGuard::set("CODESTORY_EMBED_RUNTIME_MODE", "hash"),
@@ -68,7 +68,7 @@ fn browser_contract_env() -> BrowserContractEnv {
 fn browser_contract_symbolic_env() -> BrowserContractEnv {
     let lock = BROWSER_CONTRACT_ENV_LOCK
         .lock()
-        .expect("browser contract env lock poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let guards = vec![
         EnvGuard::set("CODESTORY_HYBRID_RETRIEVAL_ENABLED", "false"),
         EnvGuard::set("CODESTORY_EMBED_RUNTIME_MODE", "hash"),
@@ -210,21 +210,49 @@ fn ask_browser(
     prompt: &str,
     focus_node_id: Option<NodeId>,
 ) -> codestory_contracts::api::AgentAnswerDto {
+    ask_browser_with_profile(
+        controller,
+        prompt,
+        focus_node_id,
+        AgentRetrievalProfileSelectionDto::Custom {
+            config: AgentCustomRetrievalConfigDto {
+                depth: 2,
+                direction: TrailDirection::Both,
+                max_nodes: 40,
+                include_edge_occurrences: true,
+                enable_source_reads: true,
+                ..AgentCustomRetrievalConfigDto::default()
+            },
+        },
+    )
+}
+
+fn ask_investigate_browser(
+    controller: &AppController,
+    prompt: &str,
+    focus_node_id: Option<NodeId>,
+) -> codestory_contracts::api::AgentAnswerDto {
+    ask_browser_with_profile(
+        controller,
+        prompt,
+        focus_node_id,
+        AgentRetrievalProfileSelectionDto::Preset {
+            preset: AgentRetrievalPresetDto::Investigate,
+        },
+    )
+}
+
+fn ask_browser_with_profile(
+    controller: &AppController,
+    prompt: &str,
+    focus_node_id: Option<NodeId>,
+    retrieval_profile: AgentRetrievalProfileSelectionDto,
+) -> codestory_contracts::api::AgentAnswerDto {
     controller
         .browser_service()
         .ask(AgentAskRequest {
             prompt: prompt.to_string(),
-            retrieval_profile:
-                codestory_contracts::api::AgentRetrievalProfileSelectionDto::Custom {
-                    config: AgentCustomRetrievalConfigDto {
-                        depth: 2,
-                        direction: TrailDirection::Both,
-                        max_nodes: 40,
-                        include_edge_occurrences: true,
-                        enable_source_reads: true,
-                        ..AgentCustomRetrievalConfigDto::default()
-                    },
-                },
+            retrieval_profile,
             focus_node_id,
             max_results: Some(8),
             response_mode: AgentResponseModeDto::Structured,
@@ -270,6 +298,29 @@ fn trace_step_status(
         .find(|step| step.kind == kind)
         .unwrap_or_else(|| panic!("missing trace step {kind:?}"))
         .status
+}
+
+fn trace_step<'a>(
+    answer: &'a codestory_contracts::api::AgentAnswerDto,
+    kind: AgentRetrievalStepKindDto,
+) -> &'a codestory_contracts::api::AgentRetrievalStepDto {
+    answer
+        .retrieval_trace
+        .steps
+        .iter()
+        .find(|step| step.kind == kind)
+        .unwrap_or_else(|| panic!("missing trace step {kind:?}"))
+}
+
+fn trace_has_step(
+    answer: &codestory_contracts::api::AgentAnswerDto,
+    kind: AgentRetrievalStepKindDto,
+) -> bool {
+    answer
+        .retrieval_trace
+        .steps
+        .iter()
+        .any(|step| step.kind == kind)
 }
 
 #[test]
@@ -429,6 +480,53 @@ fn natural_language_integration_question_keeps_citations_and_trace_steps() {
 }
 
 #[test]
+fn investigate_strong_symbol_query_uses_initial_hits_without_fallback() {
+    let _env = browser_contract_env();
+    let (controller, _workspace, _storage) = indexed_controller();
+
+    let answer = ask_investigate_browser(&controller, "exact_symbol_anchor", None);
+
+    citation_named(&answer.citations, "exact_symbol_anchor");
+    assert!(
+        !trace_has_step(&answer, AgentRetrievalStepKindDto::QueryExpansion),
+        "strong initial symbol hits should not pay the query-expansion cost"
+    );
+    assert!(
+        !trace_has_step(&answer, AgentRetrievalStepKindDto::RepoTextFallback),
+        "strong initial symbol hits should not pay the repo-text fallback cost"
+    );
+    let search_step = trace_step(&answer, AgentRetrievalStepKindDto::Search);
+    assert!(
+        search_step
+            .output
+            .iter()
+            .any(|field| field.key == "accepted_hits" && field.value != "0"),
+        "investigation trace should keep strong initial indexed hits accepted"
+    );
+}
+
+#[test]
+fn custom_completeness_profile_does_not_run_investigation_fallback() {
+    let _env = browser_contract_env();
+    let (controller, _workspace, _storage) = indexed_controller();
+
+    let answer = ask_browser(
+        &controller,
+        "Where is CODESTORY_BROWSER_LITERAL defined?",
+        None,
+    );
+
+    assert!(
+        !trace_has_step(&answer, AgentRetrievalStepKindDto::QueryExpansion),
+        "custom completeness profiles should not silently enter investigation mode"
+    );
+    assert!(
+        !trace_has_step(&answer, AgentRetrievalStepKindDto::RepoTextFallback),
+        "repo-text fallback should stay behind the explicit Investigate preset"
+    );
+}
+
+#[test]
 fn ambiguous_symbol_search_exposes_ranked_alternatives() {
     let _env = browser_contract_env();
     let (controller, _workspace, _storage) = indexed_controller();
@@ -520,12 +618,11 @@ fn graph_and_snippet_expansion_preserve_neighbor_and_source_evidence() {
 }
 
 #[test]
-#[ignore = "current limitation: ask does not use repo-text/file-literal retrieval for citations yet"]
 fn exact_file_literal_ask_cites_repo_text_hit() {
     let _env = browser_contract_env();
     let (controller, _workspace, _storage) = indexed_controller();
 
-    let answer = ask_browser(
+    let answer = ask_investigate_browser(
         &controller,
         "Where is CODESTORY_BROWSER_LITERAL defined?",
         None,
@@ -537,6 +634,17 @@ fn exact_file_literal_ask_cites_repo_text_hit() {
             .as_deref()
             .is_some_and(|path| path.ends_with("ingest.rs"))),
         "future ask file/literal retrieval should cite repo-text file evidence"
+    );
+    assert!(
+        answer.retrieval_trace.steps.iter().any(|step| {
+            step.kind == AgentRetrievalStepKindDto::Search
+                && step.output.iter().any(|field| {
+                    field.key.contains("repo_text")
+                        || field.value.contains("repo_text")
+                        || field.value.contains("literal")
+                })
+        }),
+        "investigation ask should trace exact file/literal fallback evidence"
     );
 }
 
@@ -569,12 +677,11 @@ fn stale_index_warning_reports_changed_files_without_refreshing() {
 }
 
 #[test]
-#[ignore = "current limitation: Task 3.2/3.4 should add explicit no-hit gaps and next-query suggestions to ask output"]
 fn no_hit_query_reports_suggestions_and_explicit_gaps() {
     let _env = browser_contract_env();
     let (controller, _workspace, _storage) = indexed_controller();
 
-    let answer = ask_browser(
+    let answer = ask_investigate_browser(
         &controller,
         "Where is the nonexistent OAuth billing conveyor implemented?",
         None,
@@ -590,5 +697,21 @@ fn no_hit_query_reports_suggestions_and_explicit_gaps() {
     assert!(
         markdown.contains("Try:") || markdown.contains("next useful"),
         "future ask output should include query suggestions or next calls"
+    );
+    let search_step = trace_step(&answer, AgentRetrievalStepKindDto::Search);
+    assert!(
+        search_step
+            .output
+            .iter()
+            .any(|field| field.key.contains("hit") && field.value == "0"),
+        "no-hit investigation trace should record the weak initial hit count"
+    );
+    assert!(
+        answer.retrieval_trace.annotations.iter().any(|annotation| {
+            annotation.contains("gap")
+                || annotation.contains("low confidence")
+                || annotation.contains("no relevant")
+        }),
+        "low-confidence investigation should annotate explicit gaps"
     );
 }

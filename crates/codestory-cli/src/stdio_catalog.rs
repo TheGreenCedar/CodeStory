@@ -618,6 +618,15 @@ static AGENT_CITATION_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string("file_path", "Project-relative file path.").nullable(),
         SchemaProperty::integer("line", "One-based line number.").nullable(),
         SchemaProperty::number("score", "Citation score."),
+        SchemaProperty::string(
+            "origin",
+            "Citation origin, such as indexed_symbol or text_match.",
+        )
+        .with_enum(TEXT_HIT_ORIGINS),
+        SchemaProperty::boolean(
+            "resolvable",
+            "Whether the citation can be resolved as a symbol.",
+        ),
         SchemaProperty::string("subgraph_id", "Related subgraph id.").nullable(),
         SchemaProperty::string_array("evidence_edge_ids", "Evidence edge ids."),
         SchemaProperty::object(
@@ -626,7 +635,14 @@ static AGENT_CITATION_SCHEMA: SchemaObject = SchemaObject::object(
         )
         .nullable(),
     ],
-    &["node_id", "display_name", "kind", "score"],
+    &[
+        "node_id",
+        "display_name",
+        "kind",
+        "score",
+        "origin",
+        "resolvable",
+    ],
 );
 
 static AGENT_ANSWER_SCHEMA: SchemaObject = SchemaObject::object(

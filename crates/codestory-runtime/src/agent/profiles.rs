@@ -22,6 +22,8 @@ pub(crate) struct ResolvedProfile {
     pub trail_plans: Vec<TrailPlan>,
     pub include_edge_occurrences: bool,
     pub enable_source_reads: bool,
+    pub max_search_results: u32,
+    pub max_source_bytes: usize,
 }
 
 pub(crate) fn resolve_profile(
@@ -90,6 +92,16 @@ fn from_preset(preset: AgentRetrievalPresetDto) -> ResolvedProfile {
             AgentRetrievalPresetDto::Callflow | AgentRetrievalPresetDto::Impact
         ),
         enable_source_reads: true,
+        max_search_results: if matches!(preset, AgentRetrievalPresetDto::Investigate) {
+            12
+        } else {
+            25
+        },
+        max_source_bytes: if matches!(preset, AgentRetrievalPresetDto::Investigate) {
+            16 * 1024
+        } else {
+            32 * 1024
+        },
     }
 }
 
@@ -115,6 +127,8 @@ fn from_custom(config: &AgentCustomRetrievalConfigDto) -> ResolvedProfile {
         }],
         include_edge_occurrences: config.include_edge_occurrences,
         enable_source_reads: config.enable_source_reads,
+        max_search_results: 25,
+        max_source_bytes: 32 * 1024,
     }
 }
 
@@ -161,6 +175,15 @@ fn preset_trail_plans(preset: AgentRetrievalPresetDto) -> Vec<TrailPlan> {
             ],
             node_filter: vec![],
             max_nodes: 1200,
+        }],
+        AgentRetrievalPresetDto::Investigate => vec![TrailPlan {
+            mode: TrailMode::Neighborhood,
+            depth: 2,
+            direction: TrailDirection::Both,
+            caller_scope: TrailCallerScope::ProductionOnly,
+            edge_filter: vec![],
+            node_filter: vec![],
+            max_nodes: 360,
         }],
     }
 }

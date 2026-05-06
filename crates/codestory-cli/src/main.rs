@@ -34,7 +34,7 @@ use args::{
     IndexDryRunOutput, IndexOutput, NavigationOutput, QueryCommand, QueryItemOutput, QueryOutput,
     QueryResolutionOutput, RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput,
     ServeCommand, SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, TrailCommand,
-    TrailJsonOutput, build_trail_request,
+    TrailJsonOutput, ask_retrieval_profile, build_trail_request,
 };
 use output::{
     emit, emit_text, render_agent_answer_markdown, render_doctor_markdown, render_ground_markdown,
@@ -346,7 +346,7 @@ fn run_ask(cmd: AskCommand) -> Result<()> {
 
     let request = AgentAskRequest {
         prompt: cmd.prompt.clone(),
-        retrieval_profile: cmd.profile.into(),
+        retrieval_profile: ask_retrieval_profile(&cmd),
         focus_node_id: cmd
             .focus_id
             .as_ref()

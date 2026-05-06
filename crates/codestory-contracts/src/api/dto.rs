@@ -570,6 +570,7 @@ pub enum AgentRetrievalPresetDto {
     Callflow,
     Inheritance,
     Impact,
+    Investigate,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -710,12 +711,24 @@ pub struct AgentCitationDto {
     pub file_path: Option<String>,
     pub line: Option<u32>,
     pub score: f32,
+    #[serde(default = "default_search_hit_origin")]
+    pub origin: SearchHitOrigin,
+    #[serde(default = "default_citation_resolvable")]
+    pub resolvable: bool,
     #[serde(default)]
     pub subgraph_id: Option<String>,
     #[serde(default)]
     pub evidence_edge_ids: Vec<EdgeId>,
     #[serde(default)]
     pub retrieval_score_breakdown: Option<RetrievalScoreBreakdownDto>,
+}
+
+const fn default_search_hit_origin() -> SearchHitOrigin {
+    SearchHitOrigin::IndexedSymbol
+}
+
+const fn default_citation_resolvable() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -761,6 +774,8 @@ pub enum AgentRetrievalStepKindDto {
     SemanticQueryEmbedding,
     SemanticCandidateRetrieval,
     HybridRerank,
+    QueryExpansion,
+    RepoTextFallback,
     TrailFilterOptions,
     Neighborhood,
     Trail,

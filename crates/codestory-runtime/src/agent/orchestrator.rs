@@ -10,7 +10,7 @@ use codestory_contracts::api::{
     AgentResponseSectionDto, AgentRetrievalPolicyModeDto, AgentRetrievalStepKindDto, ApiError,
     EdgeId, GraphArtifactDto, GraphRequest, GraphResponse, NodeDetailsDto, NodeDetailsRequest,
     NodeOccurrencesRequest, ReadFileTextRequest, RetrievalScoreBreakdownDto, SearchHit,
-    SearchRequest, TrailConfigDto, TrailFilterOptionsDto,
+    SearchHitOrigin, SearchRepoTextMode, SearchRequest, TrailConfigDto, TrailFilterOptionsDto,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -21,6 +21,12 @@ const DEFAULT_MAX_RESULTS: u32 = 8;
 const DEFAULT_MAX_EDGES: u32 = 260;
 const DEFAULT_SLA_TARGET_MS: u32 = 18_000;
 const MIN_PHASE_DEADLINE_MS: u128 = 750;
+const WEAK_INITIAL_HIT_COUNT: usize = 3;
+const WEAK_INITIAL_TOP_SCORE: f32 = 0.30;
+const WEAK_INITIAL_MIN_LEXICAL_ANCHOR: f32 = 0.01;
+const WEAK_INITIAL_MIN_GRAPH_ANCHOR: f32 = 0.25;
+const SOURCE_SNIPPET_TRUNCATION_SUFFIX: &str =
+    "\n// ... source snippet truncated by investigation byte cap\n```";
 const RETRIEVAL_VERSION_HYBRID: &str = "hybrid-v1";
 const RETRIEVAL_VERSION_LEXICAL_ROLLBACK: &str = "lexical-rollback-v1";
 
@@ -66,6 +72,8 @@ struct RetrievalBundle {
     focus_node_id: Option<codestory_contracts::api::NodeId>,
     focused_node: Option<NodeDetailsDto>,
     primary_graph: Option<GraphResponse>,
+    fallback_used: bool,
+    repo_text_fallback_used: bool,
 }
 
 pub(crate) fn agent_ask(
@@ -102,6 +110,7 @@ pub(crate) fn agent_ask(
         &resolved_profile,
         ask_started_at,
         bundle.focused_node.as_ref(),
+        bundle.fallback_used,
         &mut trace,
     );
 
@@ -249,11 +258,14 @@ fn execute_retrieval(
         vec![field("required", semantic_required.to_string())],
     );
 
-    let max_results = req.max_results.unwrap_or(DEFAULT_MAX_RESULTS).clamp(1, 25) as usize;
-    let scored_hits = match controller.search_hybrid_scored(
+    let max_results = req
+        .max_results
+        .unwrap_or(DEFAULT_MAX_RESULTS)
+        .clamp(1, resolved_profile.max_search_results) as usize;
+    let mut scored_hits = match controller.search_hybrid_scored(
         SearchRequest {
             query: prompt.to_string(),
-            repo_text: codestory_contracts::api::SearchRepoTextMode::Off,
+            repo_text: SearchRepoTextMode::Off,
             limit_per_source: max_results as u32,
             hybrid_weights: None,
             hybrid_limits: None,
@@ -280,7 +292,19 @@ fn execute_retrieval(
         search_step,
         vec![
             field("hits", hits.len().to_string()),
+            field(
+                "accepted_hits",
+                if should_investigate(resolved_profile)
+                    && weak_initial_hits(prompt, &hits)
+                    && !has_literal_fallback_signal(prompt)
+                {
+                    "0".to_string()
+                } else {
+                    hits.len().to_string()
+                },
+            ),
             field("max_results", max_results.to_string()),
+            field("repo_text", "off_initial"),
         ],
     );
     if semantic_required {
@@ -316,10 +340,98 @@ fn execute_retrieval(
         );
     }
 
-    let focus_node_id = req
-        .focus_node_id
-        .clone()
-        .or_else(|| hits.first().map(|hit| hit.node_id.clone()));
+    let initial_hit_count = hits.len();
+    let mut hits = hits;
+    let literal_fallback_signal = has_literal_fallback_signal(prompt);
+    let mut expansion_added_hits = false;
+    if should_investigate(resolved_profile) && weak_initial_hits(prompt, &hits) {
+        let expanded = match investigate_query_expansion(
+            controller,
+            req,
+            prompt,
+            max_results,
+            ask_started_at,
+            resolved_profile,
+            trace,
+        ) {
+            Ok(expanded) => expanded,
+            Err(error) => {
+                trace.annotate(format!(
+                    "Investigation query expansion failed; continuing with initial hits: {}",
+                    error.message
+                ));
+                Vec::new()
+            }
+        };
+        if !expanded.is_empty() {
+            merge_scored_hits(&mut scored_hits, expanded, max_results);
+            hits = scored_hits
+                .iter()
+                .map(|scored| scored.hit.clone())
+                .collect::<Vec<_>>();
+            bundle.fallback_used = true;
+            expansion_added_hits = true;
+        }
+
+        if initial_hit_count == 0 && expansion_added_hits && !literal_fallback_signal {
+            hits.clear();
+            scored_hits.clear();
+            trace.annotate(
+                "Investigation discarded expansion-only hits for an unanchored natural-language query.",
+            );
+        }
+
+        if weak_initial_hits(prompt, &hits) && literal_fallback_signal {
+            let text_hits = match investigate_repo_text_fallback(
+                controller,
+                req,
+                prompt,
+                max_results,
+                ask_started_at,
+                resolved_profile,
+                trace,
+            ) {
+                Ok(hits) => hits,
+                Err(error) => {
+                    trace.annotate(format!(
+                        "Investigation repo-text fallback failed; continuing without file fallback: {}",
+                        error.message
+                    ));
+                    Vec::new()
+                }
+            };
+            if !text_hits.is_empty() {
+                merge_search_hits(&mut hits, text_hits, max_results);
+                bundle.fallback_used = true;
+                bundle.repo_text_fallback_used = hits
+                    .iter()
+                    .any(|hit| hit.origin == SearchHitOrigin::TextMatch);
+            }
+        } else if weak_initial_hits(prompt, &hits) {
+            if !hits.is_empty() {
+                hits.clear();
+                scored_hits.clear();
+                trace.annotate(
+                    "Investigation discarded low-confidence unanchored hits for a natural-language query.",
+                );
+            }
+            trace.annotate(
+                "Repo-text fallback skipped because the weak query did not contain a literal file/source token.",
+            );
+        }
+
+        if weak_initial_hits(prompt, &hits) {
+            trace.annotate(
+                "Investigation low confidence gap after query expansion and repo-text fallback.",
+            );
+        }
+    }
+
+    let focus_node_id = req.focus_node_id.clone().or_else(|| {
+        hits.iter()
+            .find(|hit| hit.resolvable)
+            .map(|hit| hit.node_id.clone())
+    });
 
     let filter_step = trace.start_step(
         AgentRetrievalStepKindDto::TrailFilterOptions,
@@ -568,15 +680,28 @@ fn execute_retrieval(
     });
     let include_structured_evidence =
         req.include_evidence || matches!(req.response_mode, AgentResponseModeDto::Structured);
-    let citations = scored_hits
+    let scored_by_node = scored_hits
         .iter()
-        .map(|scored| {
-            to_citation(
-                scored,
-                primary_subgraph_id.as_deref(),
-                primary_graph.as_ref(),
-                include_structured_evidence,
-            )
+        .map(|scored| (scored.hit.node_id.clone(), scored))
+        .collect::<HashMap<_, _>>();
+    let citations = hits
+        .iter()
+        .map(|hit| {
+            if let Some(scored) = scored_by_node.get(&hit.node_id) {
+                to_citation(
+                    scored,
+                    primary_subgraph_id.as_deref(),
+                    primary_graph.as_ref(),
+                    include_structured_evidence,
+                )
+            } else {
+                to_citation_from_hit(
+                    hit,
+                    primary_subgraph_id.as_deref(),
+                    primary_graph.as_ref(),
+                    include_structured_evidence,
+                )
+            }
         })
         .collect::<Vec<_>>();
 
@@ -602,6 +727,8 @@ fn to_citation(
         file_path: scored.hit.file_path.clone(),
         line: scored.hit.line,
         score: scored.total_score,
+        origin: scored.hit.origin,
+        resolvable: scored.hit.resolvable,
         subgraph_id: subgraph_id.map(ToOwned::to_owned),
         evidence_edge_ids: if include_evidence {
             evidence_edge_ids_for_node(primary_graph, &scored.hit.node_id)
@@ -614,6 +741,237 @@ fn to_citation(
             graph: scored.graph_score,
             total: scored.total_score,
         }),
+    }
+}
+
+fn weak_initial_hits(prompt: &str, hits: &[SearchHit]) -> bool {
+    let Some(top_hit) = hits.first() else {
+        return true;
+    };
+    let prompt_terms = normalized_anchor_terms(prompt);
+    if top_hit.score >= WEAK_INITIAL_TOP_SCORE && hit_has_indexed_anchor(top_hit, &prompt_terms) {
+        return false;
+    }
+
+    hits.len() < WEAK_INITIAL_HIT_COUNT
+        || top_hit.score < WEAK_INITIAL_TOP_SCORE
+        || !hits
+            .iter()
+            .take(WEAK_INITIAL_HIT_COUNT)
+            .any(|hit| hit_has_indexed_anchor(hit, &prompt_terms))
+}
+
+fn hit_has_indexed_anchor(hit: &SearchHit, prompt_terms: &HashSet<String>) -> bool {
+    if hit.origin == SearchHitOrigin::TextMatch {
+        return true;
+    }
+    if prompt_mentions_display_name(prompt_terms, &hit.display_name) {
+        return true;
+    }
+
+    hit.score_breakdown
+        .as_ref()
+        .map(|breakdown| {
+            breakdown.lexical > WEAK_INITIAL_MIN_LEXICAL_ANCHOR
+                || breakdown.graph > WEAK_INITIAL_MIN_GRAPH_ANCHOR
+        })
+        .unwrap_or(hit.resolvable)
+}
+
+fn prompt_mentions_display_name(prompt_terms: &HashSet<String>, display_name: &str) -> bool {
+    let display_terms = normalized_anchor_terms(display_name);
+    !display_terms.is_empty() && display_terms.iter().all(|term| prompt_terms.contains(term))
+}
+
+fn normalized_anchor_terms(value: &str) -> HashSet<String> {
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter_map(|term| {
+            let term = term.trim().to_ascii_lowercase();
+            (term.len() >= 3).then_some(term)
+        })
+        .collect()
+}
+
+fn should_investigate(profile: &ResolvedProfile) -> bool {
+    profile.preset == codestory_contracts::api::AgentRetrievalPresetDto::Investigate
+}
+
+fn has_literal_fallback_signal(prompt: &str) -> bool {
+    prompt.contains('`')
+        || prompt.contains('/')
+        || prompt.contains('\\')
+        || prompt.contains("::")
+        || prompt.contains(".rs")
+        || prompt
+            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .any(|token| {
+                token.contains('_')
+                    || (token.len() >= 4
+                        && token
+                            .chars()
+                            .filter(|ch| ch.is_ascii_alphabetic())
+                            .all(|ch| ch.is_ascii_uppercase()))
+            })
+}
+
+fn investigate_query_expansion(
+    controller: &AppController,
+    req: &AgentAskRequest,
+    prompt: &str,
+    max_results: usize,
+    ask_started_at: Instant,
+    resolved_profile: &ResolvedProfile,
+    trace: &mut TraceRecorder,
+) -> Result<Vec<HybridSearchScoredHit>, ApiError> {
+    let terms = prompt_search_terms(prompt)
+        .into_iter()
+        .take(4)
+        .collect::<Vec<_>>();
+    let expansion_step = trace.start_step(
+        AgentRetrievalStepKindDto::QueryExpansion,
+        vec![
+            field("term_count", terms.len().to_string()),
+            field("max_results", max_results.to_string()),
+        ],
+    );
+
+    if terms.is_empty() {
+        trace.finish_skipped(
+            expansion_step,
+            "No deterministic expansion terms extracted.",
+            Vec::new(),
+        );
+        return Ok(Vec::new());
+    }
+
+    let expansion_deadline = phase_deadline_ms(req, 45, 100);
+    if should_truncate_phase(resolved_profile, ask_started_at, expansion_deadline) {
+        trace.finish_truncated(
+            expansion_step,
+            "Skipped query expansion because latency budget was exceeded.",
+            vec![field("phase_deadline_ms", expansion_deadline.to_string())],
+        );
+        trace.annotate("Latency-first cutoff skipped investigation query expansion.");
+        return Ok(Vec::new());
+    }
+
+    let mut expanded = Vec::new();
+    for term in &terms {
+        let hits = match controller.search_hybrid_scored(
+            SearchRequest {
+                query: term.clone(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: max_results as u32,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            },
+            req.focus_node_id.clone(),
+            max_results,
+            req.hybrid_weights.clone(),
+        ) {
+            Ok(hits) => hits,
+            Err(error) => {
+                trace.finish_err(expansion_step, error.message.clone());
+                return Err(error);
+            }
+        };
+        expanded.extend(hits);
+    }
+
+    let hit_count = expanded.len();
+    trace.finish_ok(
+        expansion_step,
+        vec![
+            field("terms", terms.join(",")),
+            field("hits", hit_count.to_string()),
+        ],
+    );
+    Ok(expanded)
+}
+
+fn investigate_repo_text_fallback(
+    controller: &AppController,
+    req: &AgentAskRequest,
+    prompt: &str,
+    max_results: usize,
+    ask_started_at: Instant,
+    resolved_profile: &ResolvedProfile,
+    trace: &mut TraceRecorder,
+) -> Result<Vec<SearchHit>, ApiError> {
+    let fallback_step = trace.start_step(
+        AgentRetrievalStepKindDto::RepoTextFallback,
+        vec![
+            field("query_chars", prompt.len().to_string()),
+            field("max_results", max_results.to_string()),
+        ],
+    );
+
+    let fallback_deadline = phase_deadline_ms(req, 55, 100);
+    if should_truncate_phase(resolved_profile, ask_started_at, fallback_deadline) {
+        trace.finish_truncated(
+            fallback_step,
+            "Skipped repo-text fallback because latency budget was exceeded.",
+            vec![field("phase_deadline_ms", fallback_deadline.to_string())],
+        );
+        trace.annotate("Latency-first cutoff skipped investigation repo-text fallback.");
+        return Ok(Vec::new());
+    }
+
+    let results = match controller.search_results(SearchRequest {
+        query: prompt.to_string(),
+        repo_text: SearchRepoTextMode::On,
+        limit_per_source: max_results as u32,
+        hybrid_weights: None,
+        hybrid_limits: None,
+    }) {
+        Ok(results) => results,
+        Err(error) => {
+            trace.finish_err(fallback_step, error.message.clone());
+            return Err(error);
+        }
+    };
+    let mut hits = results.repo_text_hits;
+    hits.truncate(max_results);
+    trace.finish_ok(
+        fallback_step,
+        vec![
+            field("repo_text_hits", hits.len().to_string()),
+            field("origin", SearchHitOrigin::TextMatch.as_str()),
+        ],
+    );
+    if !hits.is_empty() {
+        trace.annotate(
+            "Repo-text fallback returned file/line evidence only; unresolved text hits are not treated as symbols.",
+        );
+    }
+    Ok(hits)
+}
+
+fn to_citation_from_hit(
+    hit: &SearchHit,
+    subgraph_id: Option<&str>,
+    primary_graph: Option<&GraphResponse>,
+    include_evidence: bool,
+) -> AgentCitationDto {
+    AgentCitationDto {
+        node_id: hit.node_id.clone(),
+        display_name: hit.display_name.clone(),
+        kind: hit.kind,
+        file_path: hit.file_path.clone(),
+        line: hit.line,
+        score: hit.score,
+        origin: hit.origin,
+        resolvable: hit.resolvable,
+        subgraph_id: subgraph_id.map(ToOwned::to_owned),
+        evidence_edge_ids: if include_evidence && hit.resolvable {
+            evidence_edge_ids_for_node(primary_graph, &hit.node_id)
+        } else {
+            Vec::new()
+        },
+        retrieval_score_breakdown: include_evidence
+            .then(|| hit.score_breakdown.clone())
+            .flatten(),
     }
 }
 
@@ -661,6 +1019,7 @@ fn maybe_read_source_context(
     resolved_profile: &ResolvedProfile,
     ask_started_at: Instant,
     focused_node: Option<&NodeDetailsDto>,
+    fallback_focus: bool,
     trace: &mut TraceRecorder,
 ) -> Option<FocusedSourceContext> {
     let source_step = trace.start_step(
@@ -680,7 +1039,7 @@ fn maybe_read_source_context(
         return None;
     }
 
-    if !needs_source_context(prompt) {
+    if !needs_source_context(prompt) && !fallback_focus {
         trace.finish_skipped(
             source_step,
             "Prompt does not request source-level context.",
@@ -716,16 +1075,28 @@ fn maybe_read_source_context(
 
     match controller.read_file_text(ReadFileTextRequest { path: path.clone() }) {
         Ok(file) => {
+            let bounded = bounded_markdown_snippet(
+                &file.text,
+                Some(line),
+                6,
+                resolved_profile.max_source_bytes,
+            );
             let context = FocusedSourceContext {
                 path,
                 line,
-                snippet: markdown_snippet(&file.text, Some(line), 6),
+                snippet: bounded.markdown,
             };
             trace.finish_ok(
                 source_step,
                 vec![
                     field("path", context.path.clone()),
                     field("line", context.line.to_string()),
+                    field(
+                        "max_source_bytes",
+                        resolved_profile.max_source_bytes.to_string(),
+                    ),
+                    field("snippet_bytes", context.snippet.len().to_string()),
+                    field("truncated", bounded.truncated.to_string()),
                 ],
             );
             Some(context)
@@ -749,6 +1120,48 @@ fn needs_source_context(prompt: &str) -> bool {
     ]
     .iter()
     .any(|keyword| normalized.contains(keyword))
+}
+
+struct BoundedMarkdownSnippet {
+    markdown: String,
+    truncated: bool,
+}
+
+fn bounded_markdown_snippet(
+    text: &str,
+    focus_line: Option<u32>,
+    context_lines: usize,
+    max_bytes: usize,
+) -> BoundedMarkdownSnippet {
+    let mut snippet = markdown_snippet(text, focus_line, context_lines);
+    if snippet.len() <= max_bytes {
+        return BoundedMarkdownSnippet {
+            markdown: snippet,
+            truncated: false,
+        };
+    }
+
+    if max_bytes <= SOURCE_SNIPPET_TRUNCATION_SUFFIX.len() {
+        snippet = SOURCE_SNIPPET_TRUNCATION_SUFFIX.to_string();
+        while snippet.len() > max_bytes {
+            snippet.pop();
+        }
+        return BoundedMarkdownSnippet {
+            markdown: snippet,
+            truncated: true,
+        };
+    }
+
+    let content_budget = max_bytes - SOURCE_SNIPPET_TRUNCATION_SUFFIX.len();
+    while snippet.len() > content_budget {
+        snippet.pop();
+    }
+    snippet.push_str(SOURCE_SNIPPET_TRUNCATION_SUFFIX);
+    debug_assert!(snippet.len() <= max_bytes);
+    BoundedMarkdownSnippet {
+        markdown: snippet,
+        truncated: true,
+    }
 }
 
 fn build_mermaid_artifacts(
@@ -965,9 +1378,21 @@ fn retrieval_markdown(
         markdown.push('\n');
     }
 
+    markdown.push_str("\nWhat I checked:\n");
+    markdown.push_str("- Initial indexed-symbol search with current hybrid ranking.\n");
+    if bundle.fallback_used {
+        markdown.push_str("- Deterministic query expansion because initial hits were weak.\n");
+    }
+    if bundle.repo_text_fallback_used {
+        markdown.push_str("- Repo-text/file fallback for literal file-line evidence.\n");
+    }
+    if !bundle.fallback_used && should_investigate(profile) {
+        markdown.push_str("- No fallback was needed because initial hits cleared the investigation confidence gate.\n");
+    }
+
     if bundle.hits.is_empty() {
         markdown.push_str(
-            "\nNo indexed symbol matches found. Try symbol names, module paths, or re-run indexing.\n",
+            "\nNo indexed symbol matches found. Try: symbol names, module paths, or re-run indexing.\n",
         );
     } else {
         markdown.push_str("\nTop indexed matches:\n");
@@ -979,8 +1404,25 @@ fn retrieval_markdown(
             };
             let _ = writeln!(
                 markdown,
-                "- **{}** [{:?}] score `{:.3}`{}",
-                hit.display_name, hit.kind, hit.score, location
+                "- **{}** [{:?}] origin `{}` resolvable `{}` score `{:.3}`{}",
+                hit.display_name,
+                hit.kind,
+                hit.origin.as_str(),
+                hit.resolvable,
+                hit.score,
+                location
+            );
+        }
+    }
+
+    if should_investigate(profile) && weak_initial_hits(prompt, &bundle.hits) {
+        markdown.push_str("\nGaps:\n");
+        markdown.push_str(
+            "- Confidence is low: investigation mode could not find enough strong indexed-symbol evidence within its bounded search.\n",
+        );
+        if bundle.hits.iter().any(SearchHit::is_text_match) {
+            markdown.push_str(
+                "- Repo-text hits cite file/line locations only and were not treated as resolvable symbols.\n",
             );
         }
     }
@@ -1248,6 +1690,39 @@ fn merge_search_hits(into: &mut Vec<SearchHit>, additional: Vec<SearchHit>, max_
     *into = merged;
 }
 
+fn merge_scored_hits(
+    into: &mut Vec<HybridSearchScoredHit>,
+    additional: Vec<HybridSearchScoredHit>,
+    max_candidates: usize,
+) {
+    let mut by_id = HashMap::<codestory_contracts::api::NodeId, HybridSearchScoredHit>::new();
+
+    for hit in into.drain(..) {
+        by_id.insert(hit.hit.node_id.clone(), hit);
+    }
+
+    for hit in additional {
+        by_id
+            .entry(hit.hit.node_id.clone())
+            .and_modify(|existing| {
+                if hit.total_score > existing.total_score {
+                    *existing = hit.clone();
+                }
+            })
+            .or_insert(hit);
+    }
+
+    let mut merged = by_id.into_values().collect::<Vec<_>>();
+    merged.sort_by(|left, right| {
+        right
+            .total_score
+            .partial_cmp(&left.total_score)
+            .unwrap_or(Ordering::Equal)
+    });
+    merged.truncate(max_candidates);
+    *into = merged;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1260,7 +1735,101 @@ mod tests {
             trail_plans: Vec::new(),
             include_edge_occurrences: false,
             enable_source_reads: true,
+            max_search_results: 25,
+            max_source_bytes: 32 * 1024,
         }
+    }
+
+    fn test_search_hit(node_id: &str, score: f32) -> SearchHit {
+        SearchHit {
+            node_id: codestory_contracts::api::NodeId(node_id.to_string()),
+            display_name: node_id.to_string(),
+            kind: codestory_contracts::api::NodeKind::FUNCTION,
+            file_path: None,
+            line: None,
+            score,
+            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            score_breakdown: None,
+        }
+    }
+
+    fn test_semantic_only_hit(node_id: &str, score: f32) -> SearchHit {
+        let mut hit = test_search_hit(node_id, score);
+        hit.score_breakdown = Some(RetrievalScoreBreakdownDto {
+            lexical: 0.0,
+            semantic: score,
+            graph: 0.0,
+            total: score,
+        });
+        hit
+    }
+
+    #[test]
+    fn investigation_mode_is_explicit_preset_only() {
+        let mut profile = latency_profile();
+        profile.policy_mode = AgentRetrievalPolicyModeDto::CompletenessFirst;
+        assert!(!should_investigate(&profile));
+
+        profile.preset = codestory_contracts::api::AgentRetrievalPresetDto::Investigate;
+        assert!(should_investigate(&profile));
+    }
+
+    #[test]
+    fn weak_initial_hits_use_normalized_search_scores() {
+        assert!(!weak_initial_hits(
+            "strong",
+            &[
+                test_search_hit("strong", 0.31),
+                test_search_hit("second", 0.20),
+                test_search_hit("third", 0.10),
+            ]
+        ));
+        assert!(weak_initial_hits(
+            "weak",
+            &[
+                test_search_hit("weak", 0.29),
+                test_search_hit("second", 0.20),
+                test_search_hit("third", 0.10),
+            ]
+        ));
+        assert!(weak_initial_hits(
+            "too_few",
+            &[test_search_hit("too_few", 0.29)]
+        ));
+    }
+
+    #[test]
+    fn weak_initial_hits_treat_semantic_only_matches_as_low_confidence() {
+        assert!(weak_initial_hits(
+            "unrelated billing conveyor",
+            &[
+                test_semantic_only_hit("semantic_one", 0.90),
+                test_semantic_only_hit("semantic_two", 0.80),
+                test_semantic_only_hit("semantic_three", 0.70),
+            ]
+        ));
+    }
+
+    #[test]
+    fn weak_initial_hits_accept_prompt_anchored_symbol_names() {
+        assert!(!weak_initial_hits(
+            "Where is exact_symbol_anchor used?",
+            &[test_semantic_only_hit("exact_symbol_anchor", 0.90)]
+        ));
+    }
+
+    #[test]
+    fn bounded_markdown_snippet_keeps_suffix_inside_byte_cap() {
+        let source = (0..200)
+            .map(|line| format!("let value_{line} = \"large source context\";\n"))
+            .collect::<String>();
+
+        let snippet = bounded_markdown_snippet(&source, Some(90), 90, 96);
+
+        assert!(snippet.truncated);
+        assert!(snippet.markdown.len() <= 96);
+        assert!(snippet.markdown.contains("truncated"));
     }
 
     #[test]

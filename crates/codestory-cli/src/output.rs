@@ -609,12 +609,14 @@ pub(crate) fn render_agent_answer_markdown(project_root: &Path, answer: &AgentAn
                 .unwrap_or_default();
             let _ = write!(
                 markdown,
-                "- [{}] {} [{}] {}{} score={:.3}",
+                "- [{}] {} [{}] {}{} origin={} resolvable={} score={:.3}",
                 citation.node_id.0,
                 citation.display_name,
                 format_kind(citation.kind),
                 file,
                 line,
+                citation.origin.as_str(),
+                citation.resolvable,
                 citation.score
             );
             if let Some(breakdown) = citation.retrieval_score_breakdown.as_ref() {
