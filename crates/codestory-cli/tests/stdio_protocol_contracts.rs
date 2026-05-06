@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -186,6 +187,89 @@ fn assert_error_code(error: &Value, code: i64) {
     );
 }
 
+fn sorted_field_values<'a>(items: &'a Value, array_field: &str, field: &str) -> Vec<&'a str> {
+    let mut values: Vec<_> = items[array_field]
+        .as_array()
+        .unwrap_or_else(|| panic!("{array_field} should be an array: {items}"))
+        .iter()
+        .map(|item| {
+            item[field].as_str().unwrap_or_else(|| {
+                panic!("{array_field} item should include string {field}: {item}")
+            })
+        })
+        .collect();
+    values.sort_unstable();
+    values
+}
+
+fn tool_by_name<'a>(tools: &'a Value, name: &str) -> &'a Value {
+    tools["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|tool| tool["name"] == name)
+        .unwrap_or_else(|| panic!("missing tool {name}: {tools}"))
+}
+
+fn tool_input_schema<'a>(tools: &'a Value, name: &str) -> &'a Value {
+    tool_by_name(tools, name)
+        .get("inputSchema")
+        .unwrap_or_else(|| panic!("tool {name} should include inputSchema: {tools}"))
+}
+
+fn required_fields(schema: &Value) -> BTreeSet<&str> {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("schema should include required fields: {schema}"))
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .unwrap_or_else(|| panic!("required field should be a string: {schema}"))
+        })
+        .collect()
+}
+
+fn schema_property<'a>(schema: &'a Value, name: &str) -> &'a Value {
+    schema
+        .pointer(&format!("/properties/{name}"))
+        .unwrap_or_else(|| panic!("schema should include property {name}: {schema}"))
+}
+
+fn assert_schema_enum_values(schema: &Value, pointer: &str, expected: &[&str]) {
+    let values: BTreeSet<_> = schema
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("schema should include enum array at {pointer}: {schema}"))
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .unwrap_or_else(|| panic!("enum values should be strings at {pointer}: {schema}"))
+        })
+        .collect();
+    for expected_value in expected {
+        assert!(
+            values.contains(expected_value),
+            "schema enum {pointer} should include {expected_value}: {schema}"
+        );
+    }
+}
+
+fn has_safety_metadata(tool: &Value) -> bool {
+    let Some(metadata) = tool.get("annotations").or_else(|| tool.get("metadata")) else {
+        return false;
+    };
+    let text = metadata.to_string().to_ascii_lowercase();
+    text.contains("write")
+        || text.contains("system")
+        || text.contains("destructive")
+        || text.contains("danger")
+        || text.contains("mutation")
+        || text.contains("safety")
+}
+
 #[test]
 fn initialize_preserves_id_and_reports_server_info_and_capabilities() {
     let fixture = indexed_fixture();
@@ -251,6 +335,273 @@ fn notification_messages_do_not_produce_responses() {
             .as_array()
             .is_some_and(|tools| !tools.is_empty()),
         "the next request should receive the first response after a notification: {response}"
+    );
+}
+
+#[test]
+fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let tools = assert_success_envelope(
+        &send_json(
+            &mut server,
+            json!({"jsonrpc": "2.0", "id": "catalog-tools", "method": "tools/list"}),
+        ),
+        json!("catalog-tools"),
+    )
+    .clone();
+
+    assert_eq!(
+        sorted_field_values(&tools, "tools", "name"),
+        vec![
+            "ask",
+            "definition",
+            "references",
+            "search",
+            "snippet",
+            "symbol",
+            "symbols",
+            "trail",
+        ],
+        "stdio browser tool names should stay stable and read-only: {tools}"
+    );
+
+    for tool in tools["tools"].as_array().expect("tools array") {
+        let name = tool["name"].as_str().expect("tool name");
+        let looks_like_write_or_system_tool = [
+            "write", "edit", "delete", "remove", "create", "update", "patch", "open_", "launch",
+            "shell", "exec", "system", "fs.",
+        ]
+        .iter()
+        .any(|needle| name.contains(needle));
+        assert!(
+            !looks_like_write_or_system_tool || has_safety_metadata(tool),
+            "write/system-looking tool {name} must include explicit safety metadata before it can appear in the read-only catalog: {tool}"
+        );
+    }
+}
+
+#[test]
+fn tool_catalog_input_schemas_capture_stable_arguments() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let tools = assert_success_envelope(
+        &send_json(
+            &mut server,
+            json!({"jsonrpc": "2.0", "id": "catalog-inputs", "method": "tools/list"}),
+        ),
+        json!("catalog-inputs"),
+    )
+    .clone();
+
+    let search = tool_input_schema(&tools, "search");
+    assert_eq!(
+        search["type"], "object",
+        "search schema should be object: {search}"
+    );
+    assert!(
+        required_fields(search).contains("query"),
+        "search.query should be required: {search}"
+    );
+    assert_eq!(
+        schema_property(search, "query")["type"],
+        "string",
+        "search.query should be a string: {search}"
+    );
+    let repo_text = schema_property(search, "repo_text");
+    assert_schema_enum_values(search, "/properties/repo_text/enum", &["auto", "off", "on"]);
+    assert_eq!(
+        repo_text.get("default"),
+        Some(&json!("auto")),
+        "search.repo_text should default to auto: {search}"
+    );
+    let search_limit = schema_property(search, "limit");
+    assert!(
+        matches!(search_limit["type"].as_str(), Some("integer" | "number")),
+        "search.limit should be numeric: {search}"
+    );
+    assert_eq!(
+        search_limit.get("default"),
+        Some(&json!(10)),
+        "search.limit should document the stdio default: {search}"
+    );
+    assert_eq!(
+        search_limit.get("minimum"),
+        Some(&json!(1)),
+        "search.limit should document a lower bound: {search}"
+    );
+    assert_eq!(
+        search_limit.get("maximum"),
+        Some(&json!(50)),
+        "search.limit should document the bounded default search page: {search}"
+    );
+
+    for name in ["definition", "references", "snippet"] {
+        let schema = tool_input_schema(&tools, name);
+        let required = required_fields(schema);
+        assert!(
+            !required.contains("query") && !required.contains("id"),
+            "{name} should allow either query or id without requiring both: {schema}"
+        );
+        assert_eq!(
+            schema_property(schema, "query")["type"],
+            "string",
+            "{name}.query should be a string: {schema}"
+        );
+        assert_eq!(
+            schema_property(schema, "id")["type"],
+            "string",
+            "{name}.id should be a string node id: {schema}"
+        );
+    }
+
+    let symbols = tool_input_schema(&tools, "symbols");
+    let symbols_limit = schema_property(symbols, "limit");
+    assert!(
+        matches!(symbols_limit["type"].as_str(), Some("integer" | "number")),
+        "symbols.limit should be numeric: {symbols}"
+    );
+    assert_eq!(
+        symbols_limit.get("default"),
+        Some(&json!(300)),
+        "symbols.limit should document the root-symbol browse default: {symbols}"
+    );
+    assert_eq!(
+        symbols_limit.get("minimum"),
+        Some(&json!(1)),
+        "symbols.limit should document a lower bound: {symbols}"
+    );
+    assert_eq!(
+        symbols_limit.get("maximum"),
+        Some(&json!(2000)),
+        "symbols.limit should document the stdio hard cap: {symbols}"
+    );
+
+    let trail = tool_input_schema(&tools, "trail");
+    assert!(
+        required_fields(trail).contains("query"),
+        "trail.query should be required: {trail}"
+    );
+    assert_schema_enum_values(
+        trail,
+        "/properties/direction/enum",
+        &["both", "incoming", "outgoing"],
+    );
+    assert_eq!(
+        schema_property(trail, "direction").get("default"),
+        Some(&json!("both")),
+        "trail.direction should document the stdio default: {trail}"
+    );
+    assert_eq!(
+        schema_property(trail, "depth").get("default"),
+        Some(&json!(2)),
+        "trail.depth should document the stdio default: {trail}"
+    );
+
+    let ask = tool_input_schema(&tools, "ask");
+    assert!(
+        required_fields(ask).contains("prompt"),
+        "ask.prompt should be required: {ask}"
+    );
+    assert_eq!(
+        schema_property(ask, "prompt")["type"],
+        "string",
+        "ask.prompt should be a string: {ask}"
+    );
+}
+
+#[test]
+fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let tools = assert_success_envelope(
+        &send_json(
+            &mut server,
+            json!({"jsonrpc": "2.0", "id": "catalog-outputs", "method": "tools/list"}),
+        ),
+        json!("catalog-outputs"),
+    )
+    .clone();
+
+    for name in [
+        "ask",
+        "definition",
+        "references",
+        "search",
+        "snippet",
+        "symbol",
+        "symbols",
+        "trail",
+    ] {
+        let tool = tool_by_name(&tools, name);
+        let output_schema = tool
+            .get("outputSchema")
+            .unwrap_or_else(|| panic!("{name} should expose outputSchema: {tool}"));
+        let expected_type = if name == "symbols" { "array" } else { "object" };
+        assert_eq!(
+            output_schema["type"], expected_type,
+            "{name} outputSchema should describe the stdio result shape: {tool}"
+        );
+    }
+}
+
+#[test]
+fn resource_template_and_prompt_catalog_names_are_snapshot_stable() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let resources = assert_success_envelope(
+        &send_json(
+            &mut server,
+            json!({"jsonrpc": "2.0", "id": "catalog-resources", "method": "resources/list"}),
+        ),
+        json!("catalog-resources"),
+    )
+    .clone();
+    assert_eq!(
+        sorted_field_values(&resources, "resources", "uri"),
+        vec![
+            "codestory://grounding",
+            "codestory://project",
+            "codestory://symbols/root",
+        ],
+        "resource catalog should stay compact and stable: {resources}"
+    );
+
+    let templates = assert_success_envelope(
+        &send_json(
+            &mut server,
+            json!({"jsonrpc": "2.0", "id": "catalog-templates", "method": "resources/templates/list"}),
+        ),
+        json!("catalog-templates"),
+    )
+    .clone();
+    assert_eq!(
+        sorted_field_values(&templates, "resourceTemplates", "uriTemplate"),
+        vec![
+            "codestory://references/{node_id}",
+            "codestory://snippet/{node_id}",
+            "codestory://symbol/{node_id}",
+            "codestory://trail/{node_id}",
+        ],
+        "resource template catalog should stay compact and stable: {templates}"
+    );
+
+    let prompts = assert_success_envelope(
+        &send_json(
+            &mut server,
+            json!({"jsonrpc": "2.0", "id": "catalog-prompts", "method": "prompts/list"}),
+        ),
+        json!("catalog-prompts"),
+    )
+    .clone();
+    assert_eq!(
+        sorted_field_values(&prompts, "prompts", "name"),
+        vec!["explain_symbol", "impact_analysis", "trace_callflow"],
+        "prompt catalog should stay compact and stable: {prompts}"
     );
 }
 

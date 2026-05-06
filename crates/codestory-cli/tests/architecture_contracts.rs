@@ -67,6 +67,13 @@ fn source_tree_contains(dir: &str, needle: &str) -> bool {
     })
 }
 
+fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let start_index = source.find(start).expect("start marker exists");
+    let tail = &source[start_index..];
+    let end_index = tail.find(end).expect("end marker exists");
+    &tail[..end_index]
+}
+
 #[test]
 fn workspace_crate_stays_decoupled_from_store_and_runtime() {
     let dependencies = dependency_names("crates/codestory-workspace/Cargo.toml");
@@ -230,6 +237,69 @@ fn runtime_exposes_read_only_browser_service_boundary() {
             && cli_main.contains("runtime.agent.ask(request)"),
         "CLI read-only browser operations should route through RuntimeContext.browser"
     );
+}
+
+#[test]
+fn stdio_tool_catalog_stays_aligned_with_read_only_browser_service_operations() {
+    let browser = read("crates/codestory-runtime/src/browser.rs");
+    let cli_main = read("crates/codestory-cli/src/main.rs");
+    let stdio_catalog = read("crates/codestory-cli/src/stdio_catalog.rs");
+    let stdio_tool_catalog = source_between(&stdio_catalog, "static TOOLS", "static RESOURCES");
+
+    let expected_tools = [
+        ("search", ".search_results(", "pub fn search_results"),
+        ("symbol", ".symbol_context(", "pub fn symbol_context"),
+        (
+            "definition",
+            ".definition_context(",
+            "pub fn definition_context",
+        ),
+        (
+            "references",
+            ".references_context(",
+            "pub fn references_context",
+        ),
+        ("symbols", ".list_root_symbols(", "pub fn list_root_symbols"),
+        (
+            "symbols",
+            ".list_children_symbols(",
+            "pub fn list_children_symbols",
+        ),
+        ("trail", ".trail_context(", "pub fn trail_context"),
+        ("snippet", ".snippet_context(", "pub fn snippet_context"),
+        ("ask", ".ask(", "pub fn ask"),
+    ];
+
+    for (tool_name, cli_call, browser_method) in expected_tools {
+        assert!(
+            stdio_tool_catalog.contains(&format!("\"{tool_name}\"")),
+            "stdio catalog/router should include read-only browser tool {tool_name}"
+        );
+        assert!(
+            cli_main.contains(cli_call),
+            "stdio tool {tool_name} should route through RuntimeContext.browser operation {cli_call}"
+        );
+        assert!(
+            browser.contains(browser_method),
+            "ReadOnlyBrowserService should expose operation for stdio tool {tool_name}: {browser_method}"
+        );
+    }
+
+    for forbidden in [
+        "\"write",
+        "\"edit",
+        "\"delete",
+        "\"patch",
+        "\"shell",
+        "\"exec",
+        "\"launch",
+        "\"open_folder",
+    ] {
+        assert!(
+            !stdio_tool_catalog.contains(forbidden),
+            "stdio read-only tool catalog should not expose write/system tool prefix {forbidden}"
+        );
+    }
 }
 
 #[test]

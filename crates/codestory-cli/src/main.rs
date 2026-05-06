@@ -26,6 +26,7 @@ mod display;
 mod output;
 mod query_resolution;
 mod runtime;
+mod stdio_catalog;
 
 use args::{
     AskCommand, Cli, Command, CompletionShell, DoctorCheckOutput, DoctorCommand, DoctorOutput,
@@ -44,6 +45,12 @@ use output::{
 use runtime::{
     RuntimeContext, ensure_index_ready, map_api_error, refresh_label, resolve_refresh_request,
     resolve_target,
+};
+use stdio_catalog::{
+    is_tool_name as is_stdio_tool_name, prompt_get_json as stdio_prompt_get_json,
+    prompts_list_json as stdio_prompts_list_json,
+    resource_templates_list_json as stdio_resource_templates_list_json,
+    resources_list_json as stdio_resources_list_json, tools_list_json as stdio_tools_list_json,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -1556,13 +1563,6 @@ fn stdio_initialize_result_json(request: &serde_json::Value) -> serde_json::Valu
     })
 }
 
-fn is_stdio_tool_name(name: &str) -> bool {
-    matches!(
-        name,
-        "search" | "symbol" | "trail" | "definition" | "references" | "symbols" | "snippet" | "ask"
-    )
-}
-
 fn handle_stdio_tool_call(
     runtime: &RuntimeContext,
     request: &serde_json::Value,
@@ -1577,9 +1577,9 @@ fn handle_stdio_tool_call(
         .unwrap_or_default()
         .to_string();
     match name {
-        "search" => handle_stdio_search(runtime, query),
+        "search" => handle_stdio_search(runtime, request, query),
         "symbol" => handle_stdio_symbol(runtime, query),
-        "trail" => handle_stdio_trail(runtime, query),
+        "trail" => handle_stdio_trail(runtime, request, query),
         "definition" => handle_stdio_definition(runtime, request),
         "references" => handle_stdio_references(runtime, request),
         "symbols" => handle_stdio_symbols(runtime, request),
@@ -1589,13 +1589,30 @@ fn handle_stdio_tool_call(
     }
 }
 
-fn handle_stdio_search(runtime: &RuntimeContext, query: String) -> serde_json::Value {
+fn handle_stdio_search(
+    runtime: &RuntimeContext,
+    request: &serde_json::Value,
+    query: String,
+) -> serde_json::Value {
+    let repo_text = match request
+        .pointer("/params/arguments/repo_text")
+        .and_then(|value| value.as_str())
+    {
+        Some("on") => SearchRepoTextMode::On,
+        Some("off") => SearchRepoTextMode::Off,
+        _ => SearchRepoTextMode::Auto,
+    };
+    let limit_per_source = request
+        .pointer("/params/arguments/limit")
+        .and_then(|value| value.as_u64())
+        .map(|value| value.clamp(1, 50) as u32)
+        .unwrap_or(10);
     runtime
         .browser
         .search_results(SearchRequest {
             query,
-            repo_text: SearchRepoTextMode::Auto,
-            limit_per_source: 10,
+            repo_text,
+            limit_per_source,
             hybrid_weights: None,
             hybrid_limits: None,
         })
@@ -1615,7 +1632,24 @@ fn handle_stdio_symbol(runtime: &RuntimeContext, query: String) -> serde_json::V
         .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
 }
 
-fn handle_stdio_trail(runtime: &RuntimeContext, query: String) -> serde_json::Value {
+fn handle_stdio_trail(
+    runtime: &RuntimeContext,
+    request: &serde_json::Value,
+    query: String,
+) -> serde_json::Value {
+    let direction = match request
+        .pointer("/params/arguments/direction")
+        .and_then(|value| value.as_str())
+    {
+        Some("incoming") => TrailDirection::Incoming,
+        Some("outgoing") => TrailDirection::Outgoing,
+        _ => TrailDirection::Both,
+    };
+    let depth = request
+        .pointer("/params/arguments/depth")
+        .and_then(|value| value.as_u64())
+        .map(|value| value.min(10) as u32)
+        .unwrap_or(2);
     resolve_target(runtime, args::TargetSelection::Query(query), None)
         .and_then(|target| {
             runtime
@@ -1624,8 +1658,8 @@ fn handle_stdio_trail(runtime: &RuntimeContext, query: String) -> serde_json::Va
                     root_id: target.selected.node_id,
                     mode: TrailMode::Neighborhood,
                     target_id: None,
-                    depth: 2,
-                    direction: TrailDirection::Both,
+                    depth,
+                    direction,
                     caller_scope: TrailCallerScope::ProductionOnly,
                     edge_filter: Vec::new(),
                     show_utility_calls: false,
@@ -1695,7 +1729,8 @@ fn handle_stdio_symbols(
     let limit = request
         .pointer("/params/arguments/limit")
         .and_then(|value| value.as_u64())
-        .map(|value| value.min(2_000) as u32);
+        .map(|value| value.clamp(1, 2_000) as u32)
+        .or(Some(300));
     let parent_id = request
         .pointer("/params/arguments/parent_id")
         .and_then(|value| value.as_str())
@@ -1749,16 +1784,32 @@ fn handle_stdio_ask(
         .and_then(|value| value.as_str())
         .unwrap_or(default_prompt)
         .to_string();
+    let max_results = request
+        .pointer("/params/arguments/max_results")
+        .and_then(|value| value.as_u64())
+        .map(|value| value.clamp(1, 50) as u32)
+        .unwrap_or(8);
+    let include_evidence = request
+        .pointer("/params/arguments/include_evidence")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    let response_mode = match request
+        .pointer("/params/arguments/response_mode")
+        .and_then(|value| value.as_str())
+    {
+        Some("markdown") => AgentResponseModeDto::Markdown,
+        _ => AgentResponseModeDto::Structured,
+    };
     runtime
         .browser
         .ask(AgentAskRequest {
             prompt,
             retrieval_profile: codestory_contracts::api::AgentRetrievalProfileSelectionDto::Auto,
             focus_node_id: None,
-            max_results: Some(8),
-            response_mode: AgentResponseModeDto::Structured,
+            max_results: Some(max_results),
+            response_mode,
             latency_budget_ms: None,
-            include_evidence: true,
+            include_evidence,
             hybrid_weights: None,
             connection: AgentConnectionSettingsDto::default(),
             run_local_agent: false,
@@ -1781,111 +1832,6 @@ fn stdio_target_selection(request: &serde_json::Value) -> args::TargetSelection 
         .unwrap_or_default()
         .to_string();
     args::TargetSelection::Query(query)
-}
-
-fn stdio_tools_list_json() -> serde_json::Value {
-    serde_json::json!({
-        "result": {
-            "tools": [
-                stdio_tool_spec("search", "Search indexed symbols and repo text.", &["query"]),
-                stdio_tool_spec("symbol", "Resolve a symbol and return details.", &["query"]),
-                stdio_tool_spec("trail", "Return a graph trail around a symbol.", &["query"]),
-                stdio_tool_spec("definition", "Return definition metadata for a symbol id or query.", &["query", "id"]),
-                stdio_tool_spec("references", "Return incoming references for a symbol id or query.", &["query", "id"]),
-                stdio_tool_spec("symbols", "Browse root symbols or children for a parent id.", &["parent_id", "limit"]),
-                stdio_tool_spec("snippet", "Return a focused source snippet for a symbol id or query.", &["query", "id"]),
-                stdio_tool_spec("ask", "Run DB-first agentic retrieval and return an answer packet.", &["prompt"])
-            ]
-        }
-    })
-}
-
-fn stdio_tool_spec(name: &str, description: &str, properties: &[&str]) -> serde_json::Value {
-    let props = properties
-        .iter()
-        .map(|property| {
-            (
-                (*property).to_string(),
-                serde_json::json!({
-                    "type": if *property == "limit" { "number" } else { "string" }
-                }),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    serde_json::json!({
-        "name": name,
-        "description": description,
-        "inputSchema": {
-            "type": "object",
-            "properties": props
-        }
-    })
-}
-
-fn stdio_resources_list_json() -> serde_json::Value {
-    serde_json::json!({
-        "result": {
-            "resources": [
-                {"uri": "codestory://project", "name": "Project summary", "mimeType": "application/json"},
-                {"uri": "codestory://grounding", "name": "Grounding snapshot", "mimeType": "application/json"},
-                {"uri": "codestory://symbols/root", "name": "Root symbols", "mimeType": "application/json"}
-            ]
-        }
-    })
-}
-
-fn stdio_resource_templates_list_json() -> serde_json::Value {
-    serde_json::json!({
-        "result": {
-            "resourceTemplates": [
-                {"uriTemplate": "codestory://symbol/{node_id}", "name": "Symbol details", "mimeType": "application/json"},
-                {"uriTemplate": "codestory://references/{node_id}", "name": "Symbol references", "mimeType": "application/json"},
-                {"uriTemplate": "codestory://snippet/{node_id}", "name": "Symbol snippet", "mimeType": "application/json"},
-                {"uriTemplate": "codestory://trail/{node_id}", "name": "Symbol trail", "mimeType": "application/json"}
-            ]
-        }
-    })
-}
-
-fn stdio_prompts_list_json() -> serde_json::Value {
-    serde_json::json!({
-        "result": {
-            "prompts": [
-                {"name": "explain_symbol", "description": "Explain a symbol using definition, references, and snippet context."},
-                {"name": "trace_callflow", "description": "Trace the outgoing call flow for a symbol."},
-                {"name": "impact_analysis", "description": "Find incoming references and likely downstream impact."}
-            ]
-        }
-    })
-}
-
-fn stdio_prompt_get_json(name: &str) -> Result<serde_json::Value> {
-    let prompt = match name {
-        "explain_symbol" => {
-            "Explain `{symbol}` using CodeStory definition, references, and source snippet context. Keep claims tied to retrieved evidence."
-        }
-        "trace_callflow" => {
-            "Trace the call flow for `{symbol}`. Use CodeStory trail, definition, and snippet context. Return key calls, uncertain edges, and review notes."
-        }
-        "impact_analysis" => {
-            "Analyze the impact of changing `{symbol}`. Use incoming references, related symbols, and snippets. Separate direct callers from broader risk."
-        }
-        _ => bail!("Unknown prompt: {name}"),
-    };
-    Ok(serde_json::json!({
-        "result": {
-            "description": name,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": {
-                        "type": "text",
-                        "text": prompt
-                    }
-                }
-            ]
-        }
-    }))
 }
 
 fn read_stdio_resource(runtime: &RuntimeContext, uri: &str) -> serde_json::Value {
