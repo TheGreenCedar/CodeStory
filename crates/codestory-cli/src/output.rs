@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentResponseBlockDto, GraphArtifactDto, GroundingSnapshotDto, NodeDetailsDto,
+    AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentRetrievalPolicyModeDto,
+    AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
+    AgentRetrievalStepStatusDto, GraphArtifactDto, GroundingSnapshotDto, NodeDetailsDto,
     RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, SearchHit, SnippetContextDto,
     SymbolContextDto, TrailContextDto,
 };
@@ -13,13 +15,15 @@ use std::path::Path;
 
 use crate::args::{
     CliTrailMode, DoctorOutput, IndexDryRunOutput, IndexOutput, OutputFormat, QueryOutput,
-    SearchOutput, TrailCommand,
+    SearchHitOutput, SearchOutput, TrailCommand,
 };
 use crate::display::{
     clean_path_string, default_trail_direction, format_budget, format_direction, format_kind,
     format_trail_mode, relative_path,
 };
 use crate::runtime::ResolvedTarget;
+
+const EVIDENCE_PREVIEW_LIMIT: usize = 3;
 
 pub(crate) fn emit<T: Serialize>(
     format: OutputFormat,
@@ -396,7 +400,10 @@ pub(crate) fn render_ground_markdown(
     if let Some(retrieval) = snapshot.retrieval.as_ref() {
         let _ = writeln!(markdown, "retrieval: {}", render_retrieval_state(retrieval));
     }
-    if !snapshot.recommended_queries.is_empty() {
+    if explain {
+        append_ground_evidence_packet(&mut markdown, project_root, snapshot);
+    }
+    if !explain && !snapshot.recommended_queries.is_empty() {
         let _ = writeln!(
             markdown,
             "recommended_queries: {}",
@@ -407,31 +414,6 @@ pub(crate) fn render_ground_markdown(
         let _ = writeln!(markdown, "notes:");
         for note in &snapshot.notes {
             let _ = writeln!(markdown, "- {note}");
-        }
-    }
-    if explain {
-        let _ = writeln!(markdown, "why:");
-        if let Some(retrieval) = snapshot.retrieval.as_ref() {
-            let _ = writeln!(
-                markdown,
-                "- retrieval_mode: {}",
-                render_retrieval_state(retrieval)
-            );
-        }
-        let _ = writeln!(
-            markdown,
-            "- coverage: represented {} of {} files and {} of {} symbols",
-            snapshot.coverage.represented_files,
-            snapshot.coverage.total_files,
-            snapshot.coverage.represented_symbols,
-            snapshot.coverage.total_symbols
-        );
-        if !snapshot.recommended_queries.is_empty() {
-            let _ = writeln!(
-                markdown,
-                "- query_hints: {}",
-                snapshot.recommended_queries.join(", ")
-            );
         }
     }
     let _ = writeln!(markdown, "root_symbols:");
@@ -484,7 +466,7 @@ pub(crate) fn render_ground_markdown(
     markdown
 }
 
-pub(crate) fn render_search_markdown(_project_root: &Path, output: &SearchOutput) -> String {
+pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Search");
     let _ = writeln!(markdown, "query: `{}`", output.query);
@@ -508,13 +490,16 @@ pub(crate) fn render_search_markdown(_project_root: &Path, output: &SearchOutput
             "disabled"
         }
     );
+    if output.explain {
+        append_search_evidence_packet(&mut markdown, project_root, output);
+    }
     if !output.suggestions.is_empty() {
         let _ = writeln!(markdown, "did_you_mean:");
         for hit in &output.suggestions {
             let _ = writeln!(markdown, "- {}", render_search_hit_output(hit));
         }
     }
-    if output.explain && !output.query_hints.is_empty() {
+    if !output.explain && !output.query_hints.is_empty() {
         let _ = writeln!(markdown, "query_hints:");
         for hint in &output.query_hints {
             let _ = writeln!(markdown, "- {hint}");
@@ -527,12 +512,16 @@ pub(crate) fn render_search_markdown(_project_root: &Path, output: &SearchOutput
     );
     for hit in &output.indexed_symbol_hits {
         let _ = writeln!(markdown, "- {}", render_search_hit_output(hit));
-        append_search_hit_why(&mut markdown, hit);
+        if !output.explain {
+            append_search_hit_why(&mut markdown, hit);
+        }
     }
     let _ = writeln!(markdown, "repo_text_hits: {}", output.repo_text_hits.len());
     for hit in &output.repo_text_hits {
         let _ = writeln!(markdown, "- {}", render_search_hit_output(hit));
-        append_search_hit_why(&mut markdown, hit);
+        if !output.explain {
+            append_search_hit_why(&mut markdown, hit);
+        }
         if let Some(excerpt) = hit.excerpt.as_deref() {
             let _ = writeln!(markdown, "  excerpt: {}", excerpt);
         }
@@ -540,13 +529,659 @@ pub(crate) fn render_search_markdown(_project_root: &Path, output: &SearchOutput
     markdown
 }
 
-fn append_search_hit_why(markdown: &mut String, hit: &crate::args::SearchHitOutput) {
+fn append_search_hit_why(markdown: &mut String, hit: &SearchHitOutput) {
     if hit.why.is_empty() {
         return;
     }
     for why in &hit.why {
         let _ = writeln!(markdown, "  why: {why}");
     }
+}
+
+fn append_ground_evidence_packet(
+    markdown: &mut String,
+    project_root: &Path,
+    snapshot: &GroundingSnapshotDto,
+) {
+    let (confidence, reasons) = ground_confidence(snapshot);
+    let _ = writeln!(
+        markdown,
+        "short_finding: grounding snapshot represents {}/{} files and {}/{} symbols.",
+        snapshot.coverage.represented_files,
+        snapshot.coverage.total_files,
+        snapshot.coverage.represented_symbols,
+        snapshot.coverage.total_symbols
+    );
+    let _ = writeln!(
+        markdown,
+        "confidence: {confidence} - {}",
+        reasons.join("; ")
+    );
+
+    let _ = writeln!(markdown, "what_was_checked:");
+    let _ = writeln!(
+        markdown,
+        "- project `{}` with `{}` budget",
+        clean_path_string(&snapshot.root),
+        format_budget(snapshot.budget)
+    );
+    let _ = writeln!(
+        markdown,
+        "- graph stats nodes={} edges={} files={} errors={}",
+        snapshot.stats.node_count,
+        snapshot.stats.edge_count,
+        snapshot.stats.file_count,
+        snapshot.stats.error_count
+    );
+    if let Some(retrieval) = snapshot.retrieval.as_ref() {
+        let _ = writeln!(
+            markdown,
+            "- retrieval state: {}",
+            render_retrieval_state(retrieval)
+        );
+    } else {
+        let _ = writeln!(markdown, "- retrieval state: unavailable");
+    }
+
+    let mut gaps = ground_gap_notes(snapshot);
+    if gaps.is_empty() {
+        gaps.push("No coverage gaps or retrieval fallbacks were reported.".to_string());
+    }
+    let _ = writeln!(markdown, "gaps_uncertainty:");
+    for gap in gaps {
+        let _ = writeln!(markdown, "- {gap}");
+    }
+
+    let _ = writeln!(markdown, "citations:");
+    if snapshot.root_symbols.is_empty() {
+        for file in snapshot.files.iter().take(EVIDENCE_PREVIEW_LIMIT) {
+            let _ = writeln!(
+                markdown,
+                "- `{}` [{}] represented_symbols={}/{}",
+                relative_path(project_root, &file.file_path),
+                file.language.as_deref().unwrap_or("unknown"),
+                file.represented_symbol_count,
+                file.symbol_count
+            );
+        }
+        if snapshot.files.is_empty() {
+            let _ = writeln!(markdown, "- none from grounding snapshot");
+        }
+    } else {
+        for symbol in snapshot.root_symbols.iter().take(EVIDENCE_PREVIEW_LIMIT) {
+            let node_ref = symbol
+                .node_ref
+                .as_deref()
+                .map(|value| format!(" ref=`{value}`"))
+                .unwrap_or_default();
+            let _ = writeln!(
+                markdown,
+                "- [{}] {} [{}]{}",
+                symbol.id.0,
+                symbol.label,
+                format_kind(symbol.kind),
+                node_ref
+            );
+        }
+    }
+
+    let _ = writeln!(markdown, "next_commands:");
+    if snapshot.recommended_queries.is_empty() {
+        let _ = writeln!(
+            markdown,
+            "- `{}`",
+            format!(
+                "codestory-cli ground --project {} --why",
+                quoted_cli_arg(&clean_path_string(&project_root.to_string_lossy()))
+            )
+        );
+    } else {
+        for command in snapshot
+            .recommended_queries
+            .iter()
+            .take(EVIDENCE_PREVIEW_LIMIT)
+        {
+            let _ = writeln!(markdown, "- `{command}`");
+        }
+    }
+}
+
+fn append_search_evidence_packet(
+    markdown: &mut String,
+    project_root: &Path,
+    output: &SearchOutput,
+) {
+    let total_hits = output.indexed_symbol_hits.len() + output.repo_text_hits.len();
+    let _ = writeln!(
+        markdown,
+        "short_finding: found {total_hits} direct hits for `{}` (indexed_symbol_hits={} repo_text_hits={}).",
+        output.query,
+        output.indexed_symbol_hits.len(),
+        output.repo_text_hits.len()
+    );
+    let (confidence, reasons) = search_confidence(output);
+    let _ = writeln!(
+        markdown,
+        "confidence: {confidence} - {}",
+        reasons.join("; ")
+    );
+
+    let _ = writeln!(markdown, "what_was_checked:");
+    let _ = writeln!(
+        markdown,
+        "- indexed symbol search with limit_per_source={}",
+        output.limit_per_source
+    );
+    let _ = writeln!(
+        markdown,
+        "- repo text search {}",
+        if output.repo_text_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    let _ = writeln!(
+        markdown,
+        "- retrieval state: {}",
+        render_retrieval_state(&output.retrieval)
+    );
+
+    let mut gaps = search_gap_notes(output);
+    if gaps.is_empty() {
+        gaps.push("No search gaps were reported for this query.".to_string());
+    }
+    let _ = writeln!(markdown, "gaps_uncertainty:");
+    for gap in gaps {
+        let _ = writeln!(markdown, "- {gap}");
+    }
+
+    let _ = writeln!(markdown, "citations:");
+    let mut wrote_citation = false;
+    for hit in output
+        .indexed_symbol_hits
+        .iter()
+        .chain(output.repo_text_hits.iter())
+        .take(EVIDENCE_PREVIEW_LIMIT)
+    {
+        wrote_citation = true;
+        let _ = writeln!(markdown, "- {}", render_search_hit_output(hit));
+    }
+    if !wrote_citation {
+        let _ = writeln!(markdown, "- none");
+    }
+
+    let _ = writeln!(markdown, "next_commands:");
+    if output.query_hints.is_empty() {
+        if let Some(hit) = output
+            .indexed_symbol_hits
+            .iter()
+            .chain(output.repo_text_hits.iter())
+            .find(|hit| hit.resolvable)
+        {
+            let project = quoted_project_arg(project_root);
+            let _ = writeln!(
+                markdown,
+                "- `codestory-cli symbol --project {project} --id {}`",
+                hit.node_id
+            );
+            let _ = writeln!(
+                markdown,
+                "- `codestory-cli ask --project {project} --focus-id {} {}`",
+                hit.node_id,
+                quoted_cli_arg("Explain this symbol")
+            );
+        } else {
+            let _ = writeln!(
+                markdown,
+                "- `codestory-cli search --project {} --query {} --why`",
+                quoted_project_arg(project_root),
+                quoted_cli_arg(&output.query)
+            );
+        }
+    } else {
+        for hint in output.query_hints.iter().take(EVIDENCE_PREVIEW_LIMIT) {
+            let _ = writeln!(markdown, "- {hint}");
+        }
+    }
+}
+
+fn append_agent_evidence_packet(
+    markdown: &mut String,
+    project_root: &Path,
+    answer: &AgentAnswerDto,
+) {
+    let (confidence, reasons) = agent_confidence(answer);
+    let _ = writeln!(
+        markdown,
+        "confidence: {confidence} - {}",
+        reasons.join("; ")
+    );
+
+    let _ = writeln!(markdown, "what_was_checked:");
+    let _ = writeln!(
+        markdown,
+        "- retrieval plan: profile={} policy={} latency_ms={} steps={}",
+        format_agent_profile(answer.retrieval_trace.resolved_profile),
+        format_agent_policy(answer.retrieval_trace.policy_mode),
+        answer.retrieval_trace.total_latency_ms,
+        answer.retrieval_trace.steps.len()
+    );
+    let checked_stages = answer
+        .retrieval_trace
+        .steps
+        .iter()
+        .take(EVIDENCE_PREVIEW_LIMIT + 3)
+        .map(|step| {
+            format!(
+                "{}:{}",
+                format_agent_step_kind(step.kind),
+                format_agent_step_status(step.status)
+            )
+        })
+        .collect::<Vec<_>>();
+    if checked_stages.is_empty() {
+        let _ = writeln!(markdown, "- no retrieval steps were recorded");
+    } else {
+        let _ = writeln!(markdown, "- checked stages: {}", checked_stages.join(", "));
+    }
+    let remaining_steps = answer
+        .retrieval_trace
+        .steps
+        .len()
+        .saturating_sub(EVIDENCE_PREVIEW_LIMIT + 3);
+    if remaining_steps > 0 {
+        let _ = writeln!(
+            markdown,
+            "- plus {remaining_steps} more stages in the JSON/bundle trace"
+        );
+    }
+
+    let mut gaps = agent_gap_notes(answer);
+    if gaps.is_empty() {
+        gaps.push("No explicit gaps were recorded in the retrieval trace.".to_string());
+    }
+    let _ = writeln!(markdown, "gaps_uncertainty:");
+    for gap in gaps {
+        let _ = writeln!(markdown, "- {gap}");
+    }
+
+    let _ = writeln!(markdown, "citations:");
+    if answer.citations.is_empty() {
+        let _ = writeln!(markdown, "- none");
+    } else {
+        for citation in answer.citations.iter().take(EVIDENCE_PREVIEW_LIMIT) {
+            let _ = writeln!(
+                markdown,
+                "- {}",
+                render_agent_citation(project_root, citation, false)
+            );
+        }
+    }
+
+    let _ = writeln!(markdown, "next_commands:");
+    if let Some(citation) = answer.citations.iter().find(|citation| citation.resolvable) {
+        let project = quoted_project_arg(project_root);
+        let _ = writeln!(
+            markdown,
+            "- `codestory-cli symbol --project {project} --id {}`",
+            citation.node_id.0
+        );
+        let _ = writeln!(
+            markdown,
+            "- `codestory-cli trail --project {project} --id {}`",
+            citation.node_id.0
+        );
+    } else {
+        let _ = writeln!(
+            markdown,
+            "- `codestory-cli search --project {} --query {} --why`",
+            quoted_project_arg(project_root),
+            quoted_cli_arg(&answer.prompt.replace('\n', " "))
+        );
+    }
+}
+
+fn ground_confidence(snapshot: &GroundingSnapshotDto) -> (&'static str, Vec<String>) {
+    let mut limiting = ground_gap_notes(snapshot);
+    let has_no_content =
+        snapshot.coverage.total_files == 0 || snapshot.coverage.represented_files == 0;
+    let confidence = if snapshot.stats.error_count > 0 || has_no_content {
+        "low"
+    } else if limiting.is_empty() {
+        "high"
+    } else {
+        "medium"
+    };
+    if limiting.is_empty() {
+        limiting.push("complete represented coverage with no fallback signal".to_string());
+    }
+    (confidence, limiting)
+}
+
+fn ground_gap_notes(snapshot: &GroundingSnapshotDto) -> Vec<String> {
+    let mut gaps = Vec::new();
+    if snapshot.stats.error_count > 0 {
+        gaps.push(format!(
+            "index reported {} errors",
+            snapshot.stats.error_count
+        ));
+    }
+    if snapshot.coverage.total_files == 0 {
+        gaps.push("no files were indexed".to_string());
+    } else if snapshot.coverage.represented_files < snapshot.coverage.total_files {
+        gaps.push(format!(
+            "represented files are partial: {}/{}",
+            snapshot.coverage.represented_files, snapshot.coverage.total_files
+        ));
+    }
+    if snapshot.coverage.total_symbols == 0 {
+        gaps.push("no symbols were indexed".to_string());
+    } else if snapshot.coverage.represented_symbols < snapshot.coverage.total_symbols {
+        gaps.push(format!(
+            "represented symbols are partial: {}/{}",
+            snapshot.coverage.represented_symbols, snapshot.coverage.total_symbols
+        ));
+    }
+    if snapshot.coverage.compressed_files > 0 {
+        gaps.push(format!(
+            "{} files are compressed in the packet",
+            snapshot.coverage.compressed_files
+        ));
+    }
+    if let Some(retrieval) = snapshot.retrieval.as_ref() {
+        append_retrieval_gap_notes(&mut gaps, retrieval);
+    } else {
+        gaps.push("retrieval state is unavailable".to_string());
+    }
+    gaps
+}
+
+fn search_confidence(output: &SearchOutput) -> (&'static str, Vec<String>) {
+    let mut reasons = search_gap_notes(output);
+    let top_score = output
+        .indexed_symbol_hits
+        .iter()
+        .chain(output.repo_text_hits.iter())
+        .map(|hit| hit.score)
+        .fold(0.0_f32, |left, right| left.max(right));
+    let total_hits = output.indexed_symbol_hits.len() + output.repo_text_hits.len();
+    let confidence = if total_hits == 0 || top_score < 0.35 {
+        "low"
+    } else if !output.indexed_symbol_hits.is_empty()
+        && top_score >= 0.75
+        && output.retrieval.fallback_reason.is_none()
+        && output.retrieval.semantic_ready
+    {
+        "high"
+    } else {
+        "medium"
+    };
+    if reasons.is_empty() {
+        reasons.push(format!(
+            "top hit score {top_score:.2} with indexed evidence available"
+        ));
+    }
+    (confidence, reasons)
+}
+
+fn search_gap_notes(output: &SearchOutput) -> Vec<String> {
+    let mut gaps = Vec::new();
+    append_retrieval_gap_notes(&mut gaps, &output.retrieval);
+    if output.indexed_symbol_hits.is_empty() && output.repo_text_hits.is_empty() {
+        gaps.push("no indexed symbol or repo-text hits matched".to_string());
+    } else if output.indexed_symbol_hits.is_empty() {
+        gaps.push(
+            "only repo-text hits matched; resolve a concrete identifier before graph browsing"
+                .to_string(),
+        );
+    }
+    if !output.repo_text_enabled {
+        gaps.push("repo text fallback was disabled".to_string());
+    }
+    if !output.suggestions.is_empty() {
+        gaps.push(format!(
+            "{} query suggestions may indicate ambiguity or spelling drift",
+            output.suggestions.len()
+        ));
+    }
+    if let Some(top_score) = output
+        .indexed_symbol_hits
+        .iter()
+        .chain(output.repo_text_hits.iter())
+        .map(|hit| hit.score)
+        .max_by(|left, right| left.total_cmp(right))
+        && top_score < 0.5
+    {
+        gaps.push(format!("top hit score is weak: {top_score:.2}"));
+    }
+    gaps
+}
+
+fn agent_confidence(answer: &AgentAnswerDto) -> (&'static str, Vec<String>) {
+    let mut reasons = agent_gap_notes(answer);
+    let top_score = answer
+        .citations
+        .iter()
+        .map(|citation| citation.score)
+        .fold(0.0_f32, |left, right| left.max(right));
+    let has_problem_step = answer
+        .retrieval_trace
+        .steps
+        .iter()
+        .any(|step| step.status != AgentRetrievalStepStatusDto::Ok);
+    let confidence = if answer.citations.is_empty()
+        || has_problem_step
+        || answer.retrieval_trace.sla_missed
+        || top_score < 0.35
+    {
+        "low"
+    } else if top_score >= 0.75 && reasons.is_empty() {
+        "high"
+    } else {
+        "medium"
+    };
+    if reasons.is_empty() {
+        reasons.push(format!(
+            "{} citations with top retrieval score {top_score:.2}",
+            answer.citations.len()
+        ));
+    }
+    (confidence, reasons)
+}
+
+fn agent_gap_notes(answer: &AgentAnswerDto) -> Vec<String> {
+    let mut gaps = Vec::new();
+    if answer.citations.is_empty() {
+        gaps.push("no citations were returned".to_string());
+    }
+    if answer.retrieval_trace.sla_missed {
+        let target = answer
+            .retrieval_trace
+            .sla_target_ms
+            .map(|value| format!(" target_ms={value}"))
+            .unwrap_or_default();
+        gaps.push(format!(
+            "retrieval SLA missed: latency_ms={}{}",
+            answer.retrieval_trace.total_latency_ms, target
+        ));
+    }
+    for annotation in answer
+        .retrieval_trace
+        .annotations
+        .iter()
+        .filter(|annotation| is_gap_annotation(annotation))
+        .take(EVIDENCE_PREVIEW_LIMIT)
+    {
+        gaps.push(format!("trace annotation: {annotation}"));
+    }
+    for step in answer
+        .retrieval_trace
+        .steps
+        .iter()
+        .filter(|step| step.status != AgentRetrievalStepStatusDto::Ok)
+        .take(EVIDENCE_PREVIEW_LIMIT)
+    {
+        gaps.push(format!(
+            "retrieval step issue: {}",
+            render_agent_step_summary(step)
+        ));
+    }
+    if answer
+        .citations
+        .iter()
+        .all(|citation| citation.retrieval_score_breakdown.is_none())
+        && !answer.citations.is_empty()
+    {
+        gaps.push("detailed citation score breakdowns are unavailable; use JSON/bundle trace for full evidence".to_string());
+    }
+    gaps
+}
+
+fn append_retrieval_gap_notes(gaps: &mut Vec<String>, retrieval: &RetrievalStateDto) {
+    if let Some(reason) = retrieval.fallback_reason {
+        gaps.push(format!(
+            "retrieval fallback: {}",
+            format_retrieval_fallback_reason(reason)
+        ));
+    }
+    if let Some(message) = retrieval.fallback_message.as_deref() {
+        gaps.push(format!("retrieval note: {}", message.replace('\n', " ")));
+    }
+    if !retrieval.semantic_ready {
+        gaps.push("semantic retrieval is not ready".to_string());
+    }
+}
+
+fn render_agent_step_summary(step: &AgentRetrievalStepDto) -> String {
+    let message = step
+        .message
+        .as_deref()
+        .map(|value| format!(" message=\"{}\"", value.replace('"', "\\\"")))
+        .unwrap_or_default();
+    format!(
+        "{} status={} duration_ms={}{}",
+        format_agent_step_kind(step.kind),
+        format_agent_step_status(step.status),
+        step.duration_ms,
+        message
+    )
+}
+
+fn render_agent_citation(
+    project_root: &Path,
+    citation: &AgentCitationDto,
+    include_breakdown: bool,
+) -> String {
+    let file = citation
+        .file_path
+        .as_deref()
+        .map(|path| relative_path(project_root, path))
+        .unwrap_or_else(|| "-".to_string());
+    let line = citation
+        .line
+        .map(|line| format!(":{line}"))
+        .unwrap_or_default();
+    let mut out = format!(
+        "[{}] {} [{}] {}{} origin={} resolvable={} score={:.3}",
+        citation.node_id.0,
+        citation.display_name,
+        format_kind(citation.kind),
+        file,
+        line,
+        citation.origin.as_str(),
+        citation.resolvable,
+        citation.score
+    );
+    if include_breakdown && let Some(breakdown) = citation.retrieval_score_breakdown.as_ref() {
+        let _ = write!(
+            out,
+            " why lexical={:.3} semantic={:.3} graph={:.3} total={:.3}",
+            breakdown.lexical, breakdown.semantic, breakdown.graph, breakdown.total
+        );
+    }
+    out
+}
+
+fn is_gap_annotation(annotation: &str) -> bool {
+    let lower = annotation.to_ascii_lowercase();
+    [
+        "fallback",
+        "gap",
+        "low confidence",
+        "missing",
+        "no relevant",
+        "skipped",
+        "truncated",
+        "uncertain",
+        "unavailable",
+        "weak",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn format_retrieval_fallback_reason(reason: RetrievalFallbackReasonDto) -> &'static str {
+    match reason {
+        RetrievalFallbackReasonDto::DisabledByConfig => "disabled_by_config",
+        RetrievalFallbackReasonDto::MissingEmbeddingRuntime => "missing_embedding_runtime",
+        RetrievalFallbackReasonDto::MissingSemanticDocs => "missing_semantic_docs",
+    }
+}
+
+fn format_agent_step_kind(kind: AgentRetrievalStepKindDto) -> &'static str {
+    match kind {
+        AgentRetrievalStepKindDto::Search => "search",
+        AgentRetrievalStepKindDto::SemanticQueryEmbedding => "semantic_query_embedding",
+        AgentRetrievalStepKindDto::SemanticCandidateRetrieval => "semantic_candidate_retrieval",
+        AgentRetrievalStepKindDto::HybridRerank => "hybrid_rerank",
+        AgentRetrievalStepKindDto::QueryExpansion => "query_expansion",
+        AgentRetrievalStepKindDto::RepoTextFallback => "repo_text_fallback",
+        AgentRetrievalStepKindDto::TrailFilterOptions => "trail_filter_options",
+        AgentRetrievalStepKindDto::Neighborhood => "neighborhood",
+        AgentRetrievalStepKindDto::Trail => "trail",
+        AgentRetrievalStepKindDto::NodeDetails => "node_details",
+        AgentRetrievalStepKindDto::NodeOccurrences => "node_occurrences",
+        AgentRetrievalStepKindDto::EdgeOccurrences => "edge_occurrences",
+        AgentRetrievalStepKindDto::SourceRead => "source_read",
+        AgentRetrievalStepKindDto::MermaidSynthesis => "mermaid_synthesis",
+        AgentRetrievalStepKindDto::AnswerSynthesis => "answer_synthesis",
+        AgentRetrievalStepKindDto::LocalAgent => "local_agent",
+    }
+}
+
+fn format_agent_step_status(status: AgentRetrievalStepStatusDto) -> &'static str {
+    match status {
+        AgentRetrievalStepStatusDto::Ok => "ok",
+        AgentRetrievalStepStatusDto::Error => "error",
+        AgentRetrievalStepStatusDto::Skipped => "skipped",
+        AgentRetrievalStepStatusDto::Truncated => "truncated",
+    }
+}
+
+fn format_agent_profile(profile: AgentRetrievalPresetDto) -> &'static str {
+    match profile {
+        AgentRetrievalPresetDto::Architecture => "architecture",
+        AgentRetrievalPresetDto::Callflow => "callflow",
+        AgentRetrievalPresetDto::Inheritance => "inheritance",
+        AgentRetrievalPresetDto::Impact => "impact",
+        AgentRetrievalPresetDto::Investigate => "investigate",
+    }
+}
+
+fn format_agent_policy(policy: AgentRetrievalPolicyModeDto) -> &'static str {
+    match policy {
+        AgentRetrievalPolicyModeDto::LatencyFirst => "latency_first",
+        AgentRetrievalPolicyModeDto::CompletenessFirst => "completeness_first",
+    }
+}
+
+fn quoted_project_arg(project_root: &Path) -> String {
+    quoted_cli_arg(&clean_path_string(&project_root.to_string_lossy()))
+}
+
+fn quoted_cli_arg(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
 }
 
 pub(crate) fn render_agent_answer_markdown(project_root: &Path, answer: &AgentAnswerDto) -> String {
@@ -559,14 +1194,7 @@ pub(crate) fn render_agent_answer_markdown(project_root: &Path, answer: &AgentAn
         "retrieval_version: `{}`",
         answer.retrieval_version
     );
-    let _ = writeln!(
-        markdown,
-        "trace: profile={:?} policy={:?} latency_ms={} steps={}",
-        answer.retrieval_trace.resolved_profile,
-        answer.retrieval_trace.policy_mode,
-        answer.retrieval_trace.total_latency_ms,
-        answer.retrieval_trace.steps.len()
-    );
+    append_agent_evidence_packet(&mut markdown, project_root, answer);
     for section in &answer.sections {
         let _ = writeln!(markdown, "\n## {}", section.title);
         for block in &section.blocks {
@@ -598,35 +1226,11 @@ pub(crate) fn render_agent_answer_markdown(project_root: &Path, answer: &AgentAn
     if !answer.citations.is_empty() {
         let _ = writeln!(markdown, "\n## Citations");
         for citation in &answer.citations {
-            let file = citation
-                .file_path
-                .as_deref()
-                .map(|path| relative_path(project_root, path))
-                .unwrap_or_else(|| "-".to_string());
-            let line = citation
-                .line
-                .map(|line| format!(":{line}"))
-                .unwrap_or_default();
-            let _ = write!(
+            let _ = writeln!(
                 markdown,
-                "- [{}] {} [{}] {}{} origin={} resolvable={} score={:.3}",
-                citation.node_id.0,
-                citation.display_name,
-                format_kind(citation.kind),
-                file,
-                line,
-                citation.origin.as_str(),
-                citation.resolvable,
-                citation.score
+                "- {}",
+                render_agent_citation(project_root, citation, true)
             );
-            if let Some(breakdown) = citation.retrieval_score_breakdown.as_ref() {
-                let _ = write!(
-                    markdown,
-                    " why lexical={:.3} semantic={:.3} graph={:.3} total={:.3}",
-                    breakdown.lexical, breakdown.semantic, breakdown.graph, breakdown.total
-                );
-            }
-            let _ = writeln!(markdown);
         }
     }
     markdown
@@ -998,11 +1602,7 @@ fn render_retrieval_state(state: &RetrievalStateDto) -> String {
         let _ = write!(out, " model={model}");
     }
     if let Some(reason) = state.fallback_reason {
-        let reason = match reason {
-            RetrievalFallbackReasonDto::DisabledByConfig => "disabled_by_config",
-            RetrievalFallbackReasonDto::MissingEmbeddingRuntime => "missing_embedding_runtime",
-            RetrievalFallbackReasonDto::MissingSemanticDocs => "missing_semantic_docs",
-        };
+        let reason = format_retrieval_fallback_reason(reason);
         let _ = write!(out, " fallback={reason}");
     }
     if let Some(message) = state.fallback_message.as_deref() {
@@ -1037,7 +1637,7 @@ fn render_search_hit(project_root: &Path, hit: &SearchHit) -> String {
     out
 }
 
-fn render_search_hit_output(hit: &crate::args::SearchHitOutput) -> String {
+fn render_search_hit_output(hit: &SearchHitOutput) -> String {
     let mut out = format!(
         "[{}] {} [{}]",
         hit.node_id,
@@ -1358,17 +1958,82 @@ fn render_ground_symbol(symbol: &codestory_contracts::api::GroundingSymbolDigest
 mod tests {
     use super::*;
     use codestory_contracts::api::{
-        EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse, NodeDetailsDto, NodeId,
-        TrailContextDto,
+        AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentResponseSectionDto,
+        AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalStepDto,
+        AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, AgentRetrievalTraceDto, EdgeId,
+        EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse, GroundingBudgetDto,
+        GroundingCoverageDto, GroundingFileDigestDto, GroundingSnapshotDto,
+        GroundingSymbolDigestDto, NodeDetailsDto, NodeId, NodeKind, RetrievalFallbackReasonDto,
+        RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
+        StorageStatsDto, TrailContextDto,
     };
     use serde_json::json;
     use std::path::Path;
     use tempfile::tempdir;
 
+    fn assert_evidence_packet_shape(markdown: &str, intro_labels: &[&str]) {
+        let lower = markdown.to_ascii_lowercase();
+        let mut missing = Vec::new();
+
+        if !intro_labels.iter().any(|label| lower.contains(label)) {
+            missing.push(format!("one of {intro_labels:?}"));
+        }
+        for required in ["confidence:", "what_was_checked:", "gaps_uncertainty:"] {
+            if !lower.contains(required) {
+                missing.push(required.to_string());
+            }
+        }
+        if !lower.contains("citations:") && !lower.contains("## citations") {
+            missing.push("citations: or ## citations".to_string());
+        }
+        if !lower.contains("next_commands:") && !lower.contains("query_hints:") {
+            missing.push("next_commands: or query_hints:".to_string());
+        }
+
+        assert!(
+            missing.is_empty(),
+            "Markdown evidence packet is missing {missing:?}:\n{markdown}"
+        );
+    }
+
+    fn assert_order(markdown: &str, first: &str, second: &str) {
+        let first_index = markdown
+            .find(first)
+            .unwrap_or_else(|| panic!("missing `{first}` in:\n{markdown}"));
+        let second_index = markdown
+            .find(second)
+            .unwrap_or_else(|| panic!("missing `{second}` in:\n{markdown}"));
+        assert!(
+            first_index < second_index,
+            "expected `{first}` before `{second}` in:\n{markdown}"
+        );
+    }
+
+    fn sample_retrieval() -> RetrievalStateDto {
+        RetrievalStateDto {
+            mode: RetrievalModeDto::Hybrid,
+            hybrid_configured: true,
+            semantic_ready: true,
+            semantic_doc_count: 12,
+            embedding_model: Some("bge-small-en-v1.5".to_string()),
+            fallback_reason: None,
+            fallback_message: None,
+        }
+    }
+
+    fn sample_storage_stats() -> StorageStatsDto {
+        StorageStatsDto {
+            node_count: 3,
+            edge_count: 2,
+            file_count: 1,
+            error_count: 0,
+        }
+    }
+
     fn sample_node_details(id: &str, display_name: &str) -> NodeDetailsDto {
         NodeDetailsDto {
             id: NodeId(id.to_string()),
-            kind: codestory_contracts::api::NodeKind::FUNCTION,
+            kind: NodeKind::FUNCTION,
             display_name: display_name.to_string(),
             serialized_name: display_name.to_string(),
             qualified_name: None,
@@ -1386,7 +2051,7 @@ mod tests {
         GraphNodeDto {
             id: NodeId(id.to_string()),
             label: label.to_string(),
-            kind: codestory_contracts::api::NodeKind::FUNCTION,
+            kind: NodeKind::FUNCTION,
             depth: 0,
             label_policy: None,
             badge_visible_members: None,
@@ -1409,6 +2074,375 @@ mod tests {
             callsite_identity: None,
             candidate_targets: Vec::new(),
         }
+    }
+
+    fn sample_search_hit() -> crate::args::SearchHitOutput {
+        crate::args::SearchHitOutput {
+            number: Some(1),
+            node_id: "node-build-packet".to_string(),
+            node_ref: Some("src/lib.rs:7:build_packet".to_string()),
+            display_name: "build_packet".to_string(),
+            kind: NodeKind::FUNCTION,
+            file_path: Some("C:/repo/src/lib.rs".to_string()),
+            line: Some(7),
+            score: 0.91,
+            origin: SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            score_breakdown: Some(RetrievalScoreBreakdownDto {
+                lexical: 0.7,
+                semantic: 0.1,
+                graph: 0.11,
+                total: 0.91,
+            }),
+            duplicate_of: None,
+            excerpt: None,
+            why: vec![
+                "matched symbol name and semantic evidence".to_string(),
+                "can be passed to symbol, trail, snippet, explore, or ask as a focus id"
+                    .to_string(),
+            ],
+        }
+    }
+
+    #[test]
+    fn ask_markdown_contract_includes_evidence_packet_shape() {
+        let answer = AgentAnswerDto {
+            answer_id: "answer-1".to_string(),
+            prompt: "How does packet output work?".to_string(),
+            summary: "Packet output is assembled from retrieved CLI evidence.".to_string(),
+            sections: vec![AgentResponseSectionDto {
+                id: "answer".to_string(),
+                title: "Answer".to_string(),
+                blocks: vec![AgentResponseBlockDto::Markdown {
+                    markdown: "Use the output renderer and keep claims tied to citations."
+                        .to_string(),
+                }],
+            }],
+            citations: vec![AgentCitationDto {
+                node_id: NodeId("node-render".to_string()),
+                display_name: "render_agent_answer_markdown".to_string(),
+                kind: NodeKind::FUNCTION,
+                file_path: Some("C:/repo/src/output.rs".to_string()),
+                line: Some(552),
+                score: 0.87,
+                origin: SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
+                subgraph_id: None,
+                evidence_edge_ids: Vec::new(),
+                retrieval_score_breakdown: None,
+            }],
+            subgraph_ids: Vec::new(),
+            retrieval_version: "test".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: AgentRetrievalTraceDto {
+                request_id: "request-1".to_string(),
+                resolved_profile: AgentRetrievalPresetDto::Architecture,
+                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+                total_latency_ms: 15,
+                sla_target_ms: Some(500),
+                sla_missed: false,
+                annotations: vec!["semantic retrieval ready".to_string()],
+                steps: vec![AgentRetrievalStepDto {
+                    kind: AgentRetrievalStepKindDto::Search,
+                    status: AgentRetrievalStepStatusDto::Ok,
+                    duration_ms: 4,
+                    input: Vec::new(),
+                    output: Vec::new(),
+                    message: Some("checked indexed symbols".to_string()),
+                }],
+            },
+        };
+
+        let markdown = render_agent_answer_markdown(Path::new("C:/repo"), &answer);
+
+        assert_evidence_packet_shape(&markdown, &["summary:", "answer:"]);
+        assert_order(&markdown, "confidence:", "what_was_checked:");
+        assert_order(&markdown, "what_was_checked:", "gaps_uncertainty:");
+        assert_order(&markdown, "gaps_uncertainty:", "citations:");
+        assert!(
+            !markdown.contains("request_id="),
+            "ask markdown should keep raw request ids in JSON/bundles:\n{markdown}"
+        );
+        assert!(
+            !markdown.contains("checked indexed symbols"),
+            "ask markdown should summarize normal step messages instead of dumping trace detail:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn search_why_markdown_contract_includes_evidence_packet_shape() {
+        let output = crate::args::SearchOutput {
+            query: "packet output".to_string(),
+            retrieval: sample_retrieval(),
+            limit_per_source: 1,
+            repo_text_mode: crate::args::RepoTextMode::Auto,
+            repo_text_enabled: true,
+            explain: true,
+            query_hints: vec![
+                "codestory-cli ask --project C:/repo \"How does packet output work?\"".to_string(),
+            ],
+            suggestions: Vec::new(),
+            indexed_symbol_hits: vec![sample_search_hit()],
+            repo_text_hits: Vec::new(),
+        };
+
+        let markdown = render_search_markdown(Path::new("C:/repo"), &output);
+
+        assert_evidence_packet_shape(&markdown, &["short_finding:", "summary:"]);
+        assert_order(&markdown, "short_finding:", "confidence:");
+        assert!(
+            !markdown.contains("query_hints:"),
+            "search --why should not duplicate packet next_commands as legacy query_hints:\n{markdown}"
+        );
+        assert!(
+            !markdown.contains("why:"),
+            "search --why should not duplicate packet evidence as legacy per-hit why lines:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn ground_why_markdown_contract_includes_evidence_packet_shape() {
+        let snapshot = GroundingSnapshotDto {
+            root: "C:/repo".to_string(),
+            budget: GroundingBudgetDto::Balanced,
+            generated_at_epoch_ms: 0,
+            stats: sample_storage_stats(),
+            retrieval: Some(sample_retrieval()),
+            coverage: GroundingCoverageDto {
+                total_files: 1,
+                represented_files: 1,
+                total_symbols: 1,
+                represented_symbols: 1,
+                compressed_files: 0,
+            },
+            root_symbols: vec![GroundingSymbolDigestDto {
+                id: NodeId("node-build-packet".to_string()),
+                node_ref: Some("src/lib.rs:7:build_packet".to_string()),
+                label: "build_packet".to_string(),
+                kind: NodeKind::FUNCTION,
+                line: Some(7),
+                member_count: None,
+                summary: Some("Builds the evidence packet.".to_string()),
+                edge_digest: Vec::new(),
+            }],
+            files: vec![GroundingFileDigestDto {
+                file_path: "C:/repo/src/lib.rs".to_string(),
+                language: Some("rust".to_string()),
+                symbol_count: 1,
+                represented_symbol_count: 1,
+                compressed: false,
+                symbols: Vec::new(),
+            }],
+            coverage_buckets: Vec::new(),
+            notes: vec!["No fallback was needed.".to_string()],
+            recommended_queries: vec![
+                "codestory-cli search --project C:/repo --query packet --why".to_string(),
+            ],
+        };
+
+        let markdown = render_ground_markdown(Path::new("C:/repo"), &snapshot, true);
+
+        assert_evidence_packet_shape(&markdown, &["short_finding:", "summary:"]);
+        assert_order(&markdown, "short_finding:", "confidence:");
+        assert!(
+            !markdown.contains("why:"),
+            "ground --why should use the redesigned packet instead of the legacy why block:\n{markdown}"
+        );
+        assert!(
+            !markdown.contains("recommended_queries:"),
+            "ground --why should not duplicate packet next_commands as legacy recommended_queries:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn ask_markdown_surfaces_low_confidence_trace_gaps() {
+        let answer = AgentAnswerDto {
+            answer_id: "answer-1".to_string(),
+            prompt: "Where did retrieval fail?".to_string(),
+            summary: "Retrieval was incomplete.".to_string(),
+            sections: vec![AgentResponseSectionDto {
+                id: "answer".to_string(),
+                title: "Answer".to_string(),
+                blocks: vec![AgentResponseBlockDto::Markdown {
+                    markdown: "The answer is limited by skipped source reads.".to_string(),
+                }],
+            }],
+            citations: vec![AgentCitationDto {
+                node_id: NodeId("node-weak".to_string()),
+                display_name: "weak_hit".to_string(),
+                kind: NodeKind::FUNCTION,
+                file_path: Some("C:/repo/src/lib.rs".to_string()),
+                line: Some(9),
+                score: 0.21,
+                origin: SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
+                subgraph_id: None,
+                evidence_edge_ids: Vec::new(),
+                retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
+                    lexical: 0.1,
+                    semantic: 0.06,
+                    graph: 0.05,
+                    total: 0.21,
+                }),
+            }],
+            subgraph_ids: Vec::new(),
+            retrieval_version: "test".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: AgentRetrievalTraceDto {
+                request_id: "request-low".to_string(),
+                resolved_profile: AgentRetrievalPresetDto::Investigate,
+                policy_mode: AgentRetrievalPolicyModeDto::CompletenessFirst,
+                total_latency_ms: 650,
+                sla_target_ms: Some(500),
+                sla_missed: true,
+                annotations: vec!["weak hits after fallback".to_string()],
+                steps: vec![
+                    AgentRetrievalStepDto {
+                        kind: AgentRetrievalStepKindDto::Search,
+                        status: AgentRetrievalStepStatusDto::Ok,
+                        duration_ms: 4,
+                        input: Vec::new(),
+                        output: Vec::new(),
+                        message: Some("normal search detail".to_string()),
+                    },
+                    AgentRetrievalStepDto {
+                        kind: AgentRetrievalStepKindDto::SourceRead,
+                        status: AgentRetrievalStepStatusDto::Skipped,
+                        duration_ms: 1,
+                        input: Vec::new(),
+                        output: Vec::new(),
+                        message: Some("source reads skipped by budget".to_string()),
+                    },
+                ],
+            },
+        };
+
+        let markdown = render_agent_answer_markdown(Path::new("C:/repo"), &answer);
+
+        assert!(markdown.contains("confidence: low"), "{markdown}");
+        assert!(
+            markdown.contains("retrieval SLA missed: latency_ms=650 target_ms=500"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("trace annotation: weak hits after fallback"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("retrieval step issue: source_read status=skipped"),
+            "{markdown}"
+        );
+        assert!(
+            !markdown.contains("normal search detail"),
+            "normal step messages should stay in JSON/bundles:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn search_why_markdown_surfaces_fallback_and_zero_hits() {
+        let mut retrieval = sample_retrieval();
+        retrieval.semantic_ready = false;
+        retrieval.semantic_doc_count = 0;
+        retrieval.fallback_reason = Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime);
+        retrieval.fallback_message = Some("embedding runtime unavailable".to_string());
+        let output = crate::args::SearchOutput {
+            query: "packet output".to_string(),
+            retrieval,
+            limit_per_source: 1,
+            repo_text_mode: crate::args::RepoTextMode::Off,
+            repo_text_enabled: false,
+            explain: true,
+            query_hints: Vec::new(),
+            suggestions: Vec::new(),
+            indexed_symbol_hits: Vec::new(),
+            repo_text_hits: Vec::new(),
+        };
+
+        let markdown = render_search_markdown(Path::new("C:/repo"), &output);
+
+        assert!(markdown.contains("confidence: low"), "{markdown}");
+        assert!(
+            markdown.contains("retrieval fallback: missing_embedding_runtime"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("retrieval note: embedding runtime unavailable"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("semantic retrieval is not ready"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("no indexed symbol or repo-text hits matched"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("repo text fallback was disabled"),
+            "{markdown}"
+        );
+        assert!(markdown.contains("citations:\n- none"), "{markdown}");
+    }
+
+    #[test]
+    fn ground_why_markdown_surfaces_fallback_and_partial_coverage() {
+        let mut retrieval = sample_retrieval();
+        retrieval.semantic_ready = false;
+        retrieval.semantic_doc_count = 0;
+        retrieval.fallback_reason = Some(RetrievalFallbackReasonDto::MissingSemanticDocs);
+        let snapshot = GroundingSnapshotDto {
+            root: "C:/repo".to_string(),
+            budget: GroundingBudgetDto::Strict,
+            generated_at_epoch_ms: 0,
+            stats: StorageStatsDto {
+                node_count: 1,
+                edge_count: 0,
+                file_count: 4,
+                error_count: 2,
+            },
+            retrieval: Some(retrieval),
+            coverage: GroundingCoverageDto {
+                total_files: 4,
+                represented_files: 1,
+                total_symbols: 5,
+                represented_symbols: 2,
+                compressed_files: 1,
+            },
+            root_symbols: Vec::new(),
+            files: vec![GroundingFileDigestDto {
+                file_path: "C:/repo/src/lib.rs".to_string(),
+                language: Some("rust".to_string()),
+                symbol_count: 5,
+                represented_symbol_count: 2,
+                compressed: true,
+                symbols: Vec::new(),
+            }],
+            coverage_buckets: Vec::new(),
+            notes: Vec::new(),
+            recommended_queries: Vec::new(),
+        };
+
+        let markdown = render_ground_markdown(Path::new("C:/repo"), &snapshot, true);
+
+        assert!(markdown.contains("confidence: low"), "{markdown}");
+        assert!(markdown.contains("index reported 2 errors"), "{markdown}");
+        assert!(
+            markdown.contains("represented files are partial: 1/4"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("represented symbols are partial: 2/5"),
+            "{markdown}"
+        );
+        assert!(markdown.contains("1 files are compressed"), "{markdown}");
+        assert!(
+            markdown.contains("retrieval fallback: missing_semantic_docs"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("semantic retrieval is not ready"),
+            "{markdown}"
+        );
     }
 
     #[test]
