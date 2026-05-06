@@ -59,6 +59,14 @@ struct RepoTextOutputConfig {
     enabled: bool,
 }
 
+const BROWSER_TRAIL_DEFAULT_DEPTH: u32 = 2;
+const BROWSER_TRAIL_MAX_DEPTH: u32 = 10;
+const BROWSER_TRAIL_MAX_NODES: u32 = 80;
+const BROWSER_REFERENCES_DEPTH: u32 = 0;
+const BROWSER_REFERENCES_MAX_NODES: u32 = 120;
+const BROWSER_SYMBOLS_DEFAULT_LIMIT: u32 = 300;
+const BROWSER_SYMBOLS_MAX_LIMIT: u32 = 2_000;
+
 fn to_api_repo_text_mode(mode: RepoTextMode) -> SearchRepoTextMode {
     match mode {
         RepoTextMode::Auto => SearchRepoTextMode::Auto,
@@ -1145,9 +1153,43 @@ fn run_explore_tui(
 }
 
 fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Result<()> {
-    let mut buffer = [0u8; 8192];
-    let read = stream.read(&mut buffer)?;
-    let request = String::from_utf8_lossy(&buffer[..read]);
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let mut request_bytes = Vec::with_capacity(1024);
+    let mut buffer = [0u8; 1024];
+    let mut headers_complete = false;
+    loop {
+        let read = match stream.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if read == 0 {
+            break;
+        }
+        request_bytes.extend_from_slice(&buffer[..read]);
+        if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            headers_complete = true;
+            break;
+        }
+        if request_bytes.len() >= 8192 {
+            break;
+        }
+    }
+    if !headers_complete {
+        return write_http_json(
+            &mut stream,
+            400,
+            &serde_json::json!({"error": "bad request"}),
+        );
+    }
+    let request = String::from_utf8_lossy(&request_bytes);
     let line = request.lines().next().unwrap_or_default();
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or_default();
@@ -1213,25 +1255,9 @@ fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Resul
         }
         "/references" => {
             let target = resolve_target(runtime, target_selection_from_params(&params)?, None)?;
-            let depth = params
-                .get("depth")
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(0);
             let context = runtime
                 .browser
-                .references_context(TrailConfigDto {
-                    root_id: target.selected.node_id.clone(),
-                    mode: TrailMode::AllReferencing,
-                    target_id: None,
-                    depth,
-                    direction: TrailDirection::Incoming,
-                    caller_scope: TrailCallerScope::IncludeTestsAndBenches,
-                    edge_filter: Vec::new(),
-                    show_utility_calls: false,
-                    node_filter: Vec::new(),
-                    max_nodes: 120,
-                    layout_direction: LayoutDirection::Horizontal,
-                })
+                .references_context(browser_references_config(target.selected.node_id.clone()))
                 .map_err(map_api_error)?;
             write_http_json(
                 &mut stream,
@@ -1243,10 +1269,7 @@ fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Resul
             )
         }
         "/symbols" => {
-            let limit = params
-                .get("limit")
-                .and_then(|value| value.parse::<u32>().ok())
-                .map(|value| value.clamp(1, 2_000));
+            let limit = browser_symbols_limit(params.get("limit").map(String::as_str));
             if let Some(parent_id) = params.get("parent_id").filter(|value| !value.is_empty()) {
                 let symbols = runtime
                     .browser
@@ -1264,32 +1287,77 @@ fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Resul
             }
         }
         "/trail" => {
-            let query = params.get("q").cloned().unwrap_or_default();
-            let target = resolve_target(runtime, args::TargetSelection::Query(query), None)?;
-            let depth = params
-                .get("depth")
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(2);
+            let target = resolve_target(runtime, target_selection_from_params(&params)?, None)?;
+            let depth = browser_trail_depth(params.get("depth").map(String::as_str));
+            let direction = browser_trail_direction(params.get("direction").map(String::as_str));
             let context = runtime
                 .browser
-                .trail_context(TrailConfigDto {
-                    root_id: target.selected.node_id,
-                    mode: TrailMode::Neighborhood,
-                    target_id: None,
+                .trail_context(browser_trail_config(
+                    target.selected.node_id,
                     depth,
-                    direction: TrailDirection::Both,
-                    caller_scope: TrailCallerScope::ProductionOnly,
-                    edge_filter: Vec::new(),
-                    show_utility_calls: false,
-                    node_filter: Vec::new(),
-                    max_nodes: 80,
-                    layout_direction: LayoutDirection::Horizontal,
-                })
+                    direction,
+                ))
                 .map_err(map_api_error)?;
             write_http_json(&mut stream, 200, &context)
         }
         _ => write_http_json(&mut stream, 404, &serde_json::json!({"error": "not found"})),
     }
+}
+
+fn browser_references_config(root_id: NodeId) -> TrailConfigDto {
+    TrailConfigDto {
+        root_id,
+        mode: TrailMode::AllReferencing,
+        target_id: None,
+        depth: BROWSER_REFERENCES_DEPTH,
+        direction: TrailDirection::Incoming,
+        caller_scope: TrailCallerScope::IncludeTestsAndBenches,
+        edge_filter: Vec::new(),
+        show_utility_calls: false,
+        node_filter: Vec::new(),
+        max_nodes: BROWSER_REFERENCES_MAX_NODES,
+        layout_direction: LayoutDirection::Horizontal,
+    }
+}
+
+fn browser_trail_config(root_id: NodeId, depth: u32, direction: TrailDirection) -> TrailConfigDto {
+    TrailConfigDto {
+        root_id,
+        mode: TrailMode::Neighborhood,
+        target_id: None,
+        depth,
+        direction,
+        caller_scope: TrailCallerScope::ProductionOnly,
+        edge_filter: Vec::new(),
+        show_utility_calls: false,
+        node_filter: Vec::new(),
+        max_nodes: BROWSER_TRAIL_MAX_NODES,
+        layout_direction: LayoutDirection::Horizontal,
+    }
+}
+
+fn browser_trail_depth(value: Option<&str>) -> u32 {
+    value
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(|value| value.min(BROWSER_TRAIL_MAX_DEPTH))
+        .unwrap_or(BROWSER_TRAIL_DEFAULT_DEPTH)
+}
+
+fn browser_trail_direction(value: Option<&str>) -> TrailDirection {
+    match value {
+        Some("incoming") => TrailDirection::Incoming,
+        Some("outgoing") => TrailDirection::Outgoing,
+        _ => TrailDirection::Both,
+    }
+}
+
+fn browser_symbols_limit(value: Option<&str>) -> Option<u32> {
+    Some(
+        value
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(|value| value.clamp(1, BROWSER_SYMBOLS_MAX_LIMIT))
+            .unwrap_or(BROWSER_SYMBOLS_DEFAULT_LIMIT),
+    )
 }
 
 fn target_selection_from_params(params: &HashMap<String, String>) -> Result<args::TargetSelection> {
@@ -1311,6 +1379,7 @@ fn write_http_json<T: serde::Serialize>(
     let body = serde_json::to_string_pretty(value)?;
     let status_text = match status {
         200 => "OK",
+        400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
         _ => "OK",
@@ -1648,25 +1717,17 @@ fn handle_stdio_trail(
     let depth = request
         .pointer("/params/arguments/depth")
         .and_then(|value| value.as_u64())
-        .map(|value| value.min(10) as u32)
-        .unwrap_or(2);
+        .map(|value| value.min(BROWSER_TRAIL_MAX_DEPTH as u64) as u32)
+        .unwrap_or(BROWSER_TRAIL_DEFAULT_DEPTH);
     resolve_target(runtime, args::TargetSelection::Query(query), None)
         .and_then(|target| {
             runtime
                 .browser
-                .trail_context(TrailConfigDto {
-                    root_id: target.selected.node_id,
-                    mode: TrailMode::Neighborhood,
-                    target_id: None,
+                .trail_context(browser_trail_config(
+                    target.selected.node_id,
                     depth,
                     direction,
-                    caller_scope: TrailCallerScope::ProductionOnly,
-                    edge_filter: Vec::new(),
-                    show_utility_calls: false,
-                    node_filter: Vec::new(),
-                    max_nodes: 80,
-                    layout_direction: LayoutDirection::Horizontal,
-                })
+                ))
                 .map_err(map_api_error)
         })
         .map(|result| serde_json::json!({"result": result}))
@@ -1713,19 +1774,7 @@ fn handle_stdio_references(
         .and_then(|target| {
             runtime
                 .browser
-                .references_context(TrailConfigDto {
-                    root_id: target.selected.node_id.clone(),
-                    mode: TrailMode::AllReferencing,
-                    target_id: None,
-                    depth: 0,
-                    direction: TrailDirection::Incoming,
-                    caller_scope: TrailCallerScope::IncludeTestsAndBenches,
-                    edge_filter: Vec::new(),
-                    show_utility_calls: false,
-                    node_filter: Vec::new(),
-                    max_nodes: 120,
-                    layout_direction: LayoutDirection::Horizontal,
-                })
+                .references_context(browser_references_config(target.selected.node_id.clone()))
                 .map_err(map_api_error)
         })
         .map(|result| serde_json::json!({"result": result}))
@@ -1739,8 +1788,8 @@ fn handle_stdio_symbols(
     let limit = request
         .pointer("/params/arguments/limit")
         .and_then(|value| value.as_u64())
-        .map(|value| value.clamp(1, 2_000) as u32)
-        .or(Some(300));
+        .map(|value| value.clamp(1, BROWSER_SYMBOLS_MAX_LIMIT as u64) as u32)
+        .or(Some(BROWSER_SYMBOLS_DEFAULT_LIMIT));
     let parent_id = request
         .pointer("/params/arguments/parent_id")
         .and_then(|value| value.as_str())
@@ -1858,7 +1907,9 @@ fn read_stdio_resource(runtime: &RuntimeContext, uri: &str) -> serde_json::Value
             .map_err(map_api_error),
         "codestory://symbols/root" => runtime
             .browser
-            .list_root_symbols(ListRootSymbolsRequest { limit: Some(300) })
+            .list_root_symbols(ListRootSymbolsRequest {
+                limit: Some(BROWSER_SYMBOLS_DEFAULT_LIMIT),
+            })
             .map(|symbols| serde_json::json!(symbols))
             .map_err(map_api_error),
         _ => read_stdio_template_resource(runtime, uri),
@@ -2035,19 +2086,7 @@ fn read_stdio_template_resource(runtime: &RuntimeContext, uri: &str) -> Result<s
             .map_err(map_api_error),
         "references" => runtime
             .browser
-            .references_context(TrailConfigDto {
-                root_id: node_id,
-                mode: TrailMode::AllReferencing,
-                target_id: None,
-                depth: 0,
-                direction: TrailDirection::Incoming,
-                caller_scope: TrailCallerScope::IncludeTestsAndBenches,
-                edge_filter: Vec::new(),
-                show_utility_calls: false,
-                node_filter: Vec::new(),
-                max_nodes: 120,
-                layout_direction: LayoutDirection::Horizontal,
-            })
+            .references_context(browser_references_config(node_id))
             .map(|value| serde_json::json!(value))
             .map_err(map_api_error),
         "snippet" => runtime
@@ -2057,19 +2096,11 @@ fn read_stdio_template_resource(runtime: &RuntimeContext, uri: &str) -> Result<s
             .map_err(map_api_error),
         "trail" => runtime
             .browser
-            .trail_context(TrailConfigDto {
-                root_id: node_id,
-                mode: TrailMode::Neighborhood,
-                target_id: None,
-                depth: 2,
-                direction: TrailDirection::Both,
-                caller_scope: TrailCallerScope::ProductionOnly,
-                edge_filter: Vec::new(),
-                show_utility_calls: false,
-                node_filter: Vec::new(),
-                max_nodes: 120,
-                layout_direction: LayoutDirection::Horizontal,
-            })
+            .trail_context(browser_trail_config(
+                node_id,
+                BROWSER_TRAIL_DEFAULT_DEPTH,
+                TrailDirection::Both,
+            ))
             .map(|value| serde_json::json!(value))
             .map_err(map_api_error),
         _ => bail!("unknown resource"),
