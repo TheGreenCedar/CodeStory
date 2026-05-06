@@ -96,7 +96,10 @@ const TABLE_STATEMENTS: &[&str] = &[
         doc_version INTEGER NOT NULL DEFAULT 0,
         doc_hash TEXT NOT NULL DEFAULT '',
         embedding_model TEXT NOT NULL,
+        embedding_profile TEXT,
+        embedding_backend TEXT,
         embedding_dim INTEGER NOT NULL,
+        doc_shape TEXT,
         embedding_blob BLOB NOT NULL,
         updated_at_epoch_ms INTEGER NOT NULL,
         FOREIGN KEY(node_id) REFERENCES node(id),
@@ -347,6 +350,10 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
         migrate_v12_symbol_summary(&storage.conn)?;
         storage.set_schema_version(12)?;
     }
+    if stored_version < 13 {
+        migrate_v13_llm_symbol_doc_embedding_contract(&storage.conn)?;
+        storage.set_schema_version(13)?;
+    }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
 
@@ -383,7 +390,10 @@ pub(super) fn migrate_v3_llm_symbol_projection(conn: &Connection) -> Result<(), 
             doc_version INTEGER NOT NULL DEFAULT 0,
             doc_hash TEXT NOT NULL DEFAULT '',
             embedding_model TEXT NOT NULL,
+            embedding_profile TEXT,
+            embedding_backend TEXT,
             embedding_dim INTEGER NOT NULL,
+            doc_shape TEXT,
             embedding_blob BLOB NOT NULL,
             updated_at_epoch_ms INTEGER NOT NULL,
             FOREIGN KEY(node_id) REFERENCES node(id),
@@ -436,6 +446,15 @@ pub(super) fn migrate_v12_symbol_summary(conn: &Connection) -> Result<(), Storag
         [],
     )?;
     create_symbol_summary_indexes(conn)?;
+    Ok(())
+}
+
+pub(super) fn migrate_v13_llm_symbol_doc_embedding_contract(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    try_add_column(conn, "llm_symbol_doc", "embedding_profile TEXT")?;
+    try_add_column(conn, "llm_symbol_doc", "embedding_backend TEXT")?;
+    try_add_column(conn, "llm_symbol_doc", "doc_shape TEXT")?;
     Ok(())
 }
 

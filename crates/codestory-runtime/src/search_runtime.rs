@@ -3,9 +3,10 @@ pub use crate::search::engine::{
     EMBEDDING_BACKEND_ENV, EMBEDDING_DOCUMENT_PREFIX_ENV, EMBEDDING_EXPECTED_DIM_ENV,
     EMBEDDING_LAYER_NORM_ENV, EMBEDDING_MAX_TOKENS_ENV, EMBEDDING_MODEL_ID_ENV,
     EMBEDDING_POOLING_ENV, EMBEDDING_PROFILE_ENV, EMBEDDING_QUERY_PREFIX_ENV,
-    EMBEDDING_RUNTIME_MODE_ENV, EMBEDDING_TRUNCATE_DIM_ENV, EmbeddingRuntimeAvailability,
-    HybridSearchConfig, HybridSearchHit, LLAMACPP_EMBEDDINGS_URL_ENV, LLAMACPP_REQUEST_COUNT_ENV,
-    LlmSearchDoc, STORED_VECTOR_ENCODING_ENV, embedding_runtime_availability_from_env,
+    EMBEDDING_RUNTIME_MODE_ENV, EMBEDDING_TRUNCATE_DIM_ENV, EmbeddingProfileContract,
+    EmbeddingRuntimeAvailability, HybridSearchConfig, HybridSearchHit, LLAMACPP_EMBEDDINGS_URL_ENV,
+    LLAMACPP_REQUEST_COUNT_ENV, LlmSearchDoc, STORED_VECTOR_ENCODING_ENV,
+    embedding_profile_contract_from_env, embedding_runtime_availability_from_env,
 };
 
 pub mod embedding {

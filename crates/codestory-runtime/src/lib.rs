@@ -2,8 +2,8 @@ use codestory_contracts::api::{
     AgentAnswerDto, AgentAskRequest, AgentBackend, AgentConnectionSettingsDto,
     AgentHybridWeightsDto, ApiError, AppEventPayload, BookmarkCategoryDto, BookmarkDto,
     CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest,
-    GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto,
-    GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingSnapshotDto,
+    EmbeddingProfileContractDto, GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse,
+    GroundingBudgetDto, GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingSnapshotDto,
     GroundingSymbolDigestDto, IndexDryRunDto, IndexMode, IndexingPhaseTimings,
     ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess, NodeDetailsDto,
     NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest, OpenContainingFolderRequest,
@@ -11,9 +11,10 @@ use codestory_contracts::api::{
     ReadFileTextResponse, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto,
     RetrievalStateDto, SearchHit, SearchRepoTextMode, SearchRequest, SearchResultsDto,
     SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto,
-    SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
-    TrailContextDto, TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
-    WorkspaceMemberIndexDto, WriteFileResponse, WriteFileTextRequest,
+    StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto,
+    SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
+    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WorkspaceMemberIndexDto,
+    WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
 use codestory_indexer::IncrementalIndexingStats;
@@ -790,6 +791,15 @@ enum SemanticDocScope {
     AllSymbols,
 }
 
+impl SemanticDocScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DurableSymbols => "durable_symbols",
+            Self::AllSymbols => "all_symbols",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SemanticDocAliasMode {
     NoAlias,
@@ -805,6 +815,33 @@ impl SemanticDocAliasMode {
             Self::AliasVariant => "alias_variant",
         }
     }
+}
+
+fn semantic_doc_shape_contract() -> String {
+    let max_tokens = semantic_doc_max_tokens_from_env()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "default".to_string());
+    format!(
+        "semantic_doc_version={};scope={};alias_mode={};max_tokens={}",
+        LLM_SYMBOL_DOC_SCHEMA_VERSION,
+        semantic_doc_scope_from_env().as_str(),
+        semantic_doc_alias_mode_from_env().as_str(),
+        max_tokens
+    )
+}
+
+fn current_embedding_contract_from_env() -> Option<EmbeddingProfileContractDto> {
+    let doc_shape = semantic_doc_shape_contract();
+    embedding_profile_contract_from_env()
+        .ok()
+        .map(|contract| EmbeddingProfileContractDto {
+            profile: contract.profile,
+            backend: contract.backend,
+            model_id: contract.model_id,
+            cache_key: contract.cache_key,
+            dimension: contract.dimension,
+            doc_shape,
+        })
 }
 
 fn search_index_storage_path(storage_path: &Path) -> PathBuf {
@@ -964,6 +1001,8 @@ fn retrieval_state_from_parts(
     embedding_model: Option<String>,
     embedding_runtime_available: bool,
     fallback_message: Option<String>,
+    current_embedding: Option<EmbeddingProfileContractDto>,
+    stored_embedding: Option<StoredSemanticDocsContractDto>,
 ) -> RetrievalStateDto {
     let hybrid_configured = hybrid_retrieval_enabled();
     let fallback_reason = if !hybrid_configured {
@@ -998,6 +1037,8 @@ fn retrieval_state_from_parts(
         semantic_ready,
         semantic_doc_count,
         embedding_model,
+        current_embedding,
+        stored_embedding,
         fallback_reason,
         fallback_message,
     }
@@ -1005,11 +1046,17 @@ fn retrieval_state_from_parts(
 
 fn retrieval_state_from_engine(engine: &SearchEngine) -> RetrievalStateDto {
     let probe = embedding_runtime_availability_from_env();
+    let current_embedding = current_embedding_contract_from_env();
     retrieval_state_from_parts(
         engine.semantic_doc_count(),
         engine
             .embedding_model_id()
             .map(str::to_string)
+            .or_else(|| {
+                current_embedding
+                    .as_ref()
+                    .map(|contract| contract.cache_key.clone())
+            })
             .or(probe.model_id),
         engine.embedding_runtime_configured(),
         if engine.embedding_runtime_configured() {
@@ -1017,23 +1064,63 @@ fn retrieval_state_from_engine(engine: &SearchEngine) -> RetrievalStateDto {
         } else {
             probe.fallback_message
         },
+        current_embedding,
+        None,
     )
 }
 
+fn retrieval_state_from_engine_with_storage_contract(
+    engine: &SearchEngine,
+    storage_retrieval: &RetrievalStateDto,
+) -> RetrievalStateDto {
+    let mut retrieval = retrieval_state_from_engine(engine);
+    retrieval.stored_embedding = storage_retrieval.stored_embedding.clone();
+    retrieval
+}
+
 fn retrieval_state_from_storage(storage: &Storage) -> Result<RetrievalStateDto, ApiError> {
-    let LlmSymbolDocStats {
-        doc_count,
-        embedding_model,
-    } = storage
+    let stats = storage
         .get_llm_symbol_doc_stats()
         .map_err(|e| ApiError::internal(format!("Failed to query LLM symbol doc stats: {e}")))?;
     let probe = embedding_runtime_availability_from_env();
+    let current_embedding = current_embedding_contract_from_env();
+    let stored_embedding = stored_semantic_docs_contract_from_stats(&stats);
     Ok(retrieval_state_from_parts(
-        doc_count,
-        embedding_model.or(probe.model_id),
+        stats.doc_count,
+        stats
+            .embedding_model
+            .clone()
+            .or_else(|| {
+                current_embedding
+                    .as_ref()
+                    .map(|contract| contract.cache_key.clone())
+            })
+            .or(probe.model_id),
         probe.available,
         probe.fallback_message,
+        current_embedding,
+        Some(stored_embedding),
     ))
+}
+
+fn stored_semantic_docs_contract_from_stats(
+    stats: &LlmSymbolDocStats,
+) -> StoredSemanticDocsContractDto {
+    StoredSemanticDocsContractDto {
+        doc_count: stats.doc_count,
+        embedding_profile: stats.embedding_profile.clone(),
+        embedding_backend: stats.embedding_backend.clone(),
+        cache_key: stats.embedding_model.clone(),
+        dimension: stats.embedding_dim,
+        doc_version: stats.doc_version,
+        mixed_embedding_profiles: stats.mixed_embedding_profiles,
+        mixed_embedding_models: stats.mixed_embedding_models,
+        mixed_embedding_backends: stats.mixed_embedding_backends,
+        mixed_dimensions: stats.mixed_dimensions,
+        mixed_doc_versions: stats.mixed_doc_versions,
+        mixed_doc_shapes: stats.mixed_doc_shapes,
+        doc_shape: stats.doc_shape.clone(),
+    }
 }
 
 fn semantic_doc_scope_from_env() -> SemanticDocScope {
@@ -1480,7 +1567,7 @@ fn flush_pending_llm_symbol_docs(
     storage: &mut Storage,
     engine: &mut SearchEngine,
     batch: &[PendingLlmSymbolDoc],
-    model_id: &str,
+    embedding_contract: &EmbeddingProfileContractDto,
     updated_at_epoch_ms: i64,
     stats: &mut SemanticProjectionStats,
 ) -> Result<(), ApiError> {
@@ -1488,7 +1575,6 @@ fn flush_pending_llm_symbol_docs(
         return Ok(());
     }
 
-    let model_id = model_id.to_string();
     let payloads = batch
         .iter()
         .map(|doc| doc.doc_text.as_str())
@@ -1515,8 +1601,11 @@ fn flush_pending_llm_symbol_docs(
             doc_text: doc.doc_text.clone(),
             doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
             doc_hash: doc.doc_hash.clone(),
-            embedding_model: model_id.clone(),
+            embedding_profile: Some(embedding_contract.profile.clone()),
+            embedding_model: embedding_contract.cache_key.clone(),
+            embedding_backend: Some(embedding_contract.backend.clone()),
             embedding_dim: embedding.len() as u32,
+            doc_shape: Some(embedding_contract.doc_shape.clone()),
             embedding,
             updated_at_epoch_ms,
         })
@@ -1541,7 +1630,7 @@ fn flush_streaming_llm_symbol_doc_window(
     engine: &mut SearchEngine,
     pending_docs: &mut Vec<PendingLlmSymbolDoc>,
     embed_batch_size: usize,
-    model_id: &str,
+    embedding_contract: &EmbeddingProfileContractDto,
     updated_at_epoch_ms: i64,
     stats: &mut SemanticProjectionStats,
 ) -> Result<(), ApiError> {
@@ -1554,7 +1643,7 @@ fn flush_streaming_llm_symbol_doc_window(
         storage,
         engine,
         &pending_docs[..embed_batch_size],
-        model_id,
+        embedding_contract,
         updated_at_epoch_ms,
         stats,
     )?;
@@ -1594,10 +1683,12 @@ fn sync_llm_symbol_projection(
         return Ok(stats);
     }
 
-    let model_id = engine
-        .embedding_model_id()
-        .unwrap_or("BAAI/bge-base-en-v1.5-local")
-        .to_string();
+    let embedding_contract = current_embedding_contract_from_env().ok_or_else(|| {
+        ApiError::internal(
+            "Failed to resolve current embedding profile contract after configuring runtime",
+        )
+    })?;
+    let model_id = embedding_contract.cache_key.clone();
     let updated_at_epoch_ms = current_epoch_ms();
 
     let existing_docs = storage
@@ -1660,8 +1751,16 @@ fn sync_llm_symbol_projection(
         if let Some(existing_doc) = existing_docs.get(&node.id)
             && existing_doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
             && existing_doc.doc_hash == doc_hash
+            && existing_doc.embedding_profile.as_deref()
+                == Some(embedding_contract.profile.as_str())
             && existing_doc.embedding_model == model_id
-            && existing_doc.embedding_dim > 0
+            && existing_doc.embedding_backend.as_deref()
+                == Some(embedding_contract.backend.as_str())
+            && embedding_contract
+                .dimension
+                .map(|dimension| existing_doc.embedding_dim == dimension)
+                .unwrap_or(existing_doc.embedding_dim > 0)
+            && existing_doc.doc_shape.as_deref() == Some(embedding_contract.doc_shape.as_str())
         {
             stats.docs_reused = stats.docs_reused.saturating_add(1);
             continue;
@@ -1684,7 +1783,7 @@ fn sync_llm_symbol_projection(
                 engine,
                 &mut pending_docs,
                 embed_batch_size,
-                &model_id,
+                &embedding_contract,
                 updated_at_epoch_ms,
                 &mut stats,
             )?;
@@ -1699,7 +1798,7 @@ fn sync_llm_symbol_projection(
             storage,
             engine,
             batch,
-            &model_id,
+            &embedding_contract,
             updated_at_epoch_ms,
             &mut stats,
         )?;
@@ -2880,9 +2979,11 @@ impl AppController {
                 if engine.embedding_runtime_configured() && engine.semantic_doc_count() == 0 {
                     reload_llm_docs_from_storage(&storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
                 }
-                retrieval = retrieval_state_from_engine(engine);
+                retrieval =
+                    retrieval_state_from_engine_with_storage_contract(engine, &storage_retrieval);
             } else if engine.semantic_doc_count() > 0 || engine.embedding_runtime_configured() {
-                retrieval = retrieval_state_from_engine(engine);
+                retrieval =
+                    retrieval_state_from_engine_with_storage_contract(engine, &storage_retrieval);
             }
 
             let hits = if retrieval.mode == RetrievalModeDto::Hybrid {
@@ -2915,6 +3016,8 @@ impl AppController {
                             Some(format!(
                                 "Semantic query fallback engaged after runtime error: {error}"
                             )),
+                            current_embedding_contract_from_env(),
+                            storage_retrieval.stored_embedding.clone(),
                         );
                         lexical_hybrid_hits(engine, &req.query, &graph_boosts)
                     }
@@ -4823,6 +4926,113 @@ pub fn exact_symbol_anchor() {{}}
         assert!(
             second_timings.semantic_docs_reused.unwrap_or(0) > 0,
             "unchanged full refresh should reuse semantic docs copied into the staged DB"
+        );
+    }
+
+    #[test]
+    fn full_refresh_repairs_reused_semantic_docs_missing_contract_metadata() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("first full index");
+
+        let mut legacy_docs = Storage::open(&storage_path)
+            .expect("open storage before legacy rewrite")
+            .get_all_llm_symbol_docs()
+            .expect("semantic docs before legacy rewrite");
+        assert!(
+            !legacy_docs.is_empty(),
+            "initial full index should persist semantic docs"
+        );
+        for doc in &mut legacy_docs {
+            doc.embedding_profile = None;
+            doc.embedding_backend = None;
+            doc.doc_shape = None;
+        }
+        Storage::open(&storage_path)
+            .expect("reopen storage for legacy rewrite")
+            .upsert_llm_symbol_docs_batch(&legacy_docs)
+            .expect("rewrite legacy semantic docs");
+
+        let repair_timings = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("full refresh repairs legacy contract metadata");
+        assert!(
+            repair_timings.semantic_docs_embedded.unwrap_or(0) > 0,
+            "missing contract metadata should prevent stale semantic docs from being reused"
+        );
+
+        let repaired_docs = Storage::open(&storage_path)
+            .expect("open storage after repair")
+            .get_all_llm_symbol_docs()
+            .expect("semantic docs after repair");
+        assert!(
+            repaired_docs.iter().all(|doc| {
+                doc.embedding_profile.as_deref() == Some("bge-small-en-v1.5")
+                    && doc.embedding_backend.as_deref() == Some("hash")
+                    && doc.doc_shape.as_deref() == Some(semantic_doc_shape_contract().as_str())
+            }),
+            "full refresh should backfill reusable docs with the current semantic contract"
+        );
+    }
+
+    #[test]
+    fn full_refresh_rebuilds_semantic_docs_when_embedding_dimension_changes() {
+        let mut env = hybrid_test_env();
+        env.push(EnvGuard::set(EMBEDDING_EXPECTED_DIM_ENV, "128"));
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("first full index");
+
+        let first_docs = Storage::open(&storage_path)
+            .expect("open storage after first index")
+            .get_all_llm_symbol_docs()
+            .expect("semantic docs after first index");
+        assert!(
+            first_docs
+                .iter()
+                .all(|doc| doc.embedding_dim == 128 && doc.embedding.len() == 128),
+            "initial hash docs should use the configured dimension"
+        );
+
+        env.push(EnvGuard::set(EMBEDDING_EXPECTED_DIM_ENV, "384"));
+        let repair_timings = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("second full index after dimension change");
+        assert!(
+            repair_timings.semantic_docs_embedded.unwrap_or(0) > 0,
+            "dimension drift should rebuild semantic docs instead of reusing stale vectors"
+        );
+
+        let repaired_docs = Storage::open(&storage_path)
+            .expect("open storage after dimension repair")
+            .get_all_llm_symbol_docs()
+            .expect("semantic docs after dimension repair");
+        assert!(
+            repaired_docs
+                .iter()
+                .all(|doc| doc.embedding_dim == 384 && doc.embedding.len() == 384),
+            "full refresh should persist semantic docs with the new dimension"
         );
     }
 

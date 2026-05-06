@@ -2016,6 +2016,8 @@ mod tests {
             semantic_ready: true,
             semantic_doc_count: 12,
             embedding_model: Some("bge-small-en-v1.5".to_string()),
+            current_embedding: None,
+            stored_embedding: None,
             fallback_reason: None,
             fallback_message: None,
         }

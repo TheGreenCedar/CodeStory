@@ -249,8 +249,11 @@ fn test_llm_symbol_doc_round_trip() -> Result<(), StorageError> {
         doc_text: "function pkg::do_work in src/lib.rs line 12".to_string(),
         doc_version: 2,
         doc_hash: "semantic-hash-501".to_string(),
+        embedding_profile: None,
         embedding_model: "local-hash-384".to_string(),
+        embedding_backend: None,
         embedding_dim: 384,
+        doc_shape: None,
         embedding: vec![0.25_f32; 384],
         updated_at_epoch_ms: 123,
     }])?;
@@ -262,6 +265,123 @@ fn test_llm_symbol_doc_round_trip() -> Result<(), StorageError> {
     assert_eq!(docs[0].doc_hash, "semantic-hash-501");
     assert_eq!(docs[0].embedding_dim, 384);
     assert_eq!(docs[0].embedding.len(), 384);
+    Ok(())
+}
+
+#[test]
+fn test_llm_symbol_doc_stats_report_contract_metadata() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[Node {
+        id: NodeId(501),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "do_work".to_string(),
+        ..Default::default()
+    }])?;
+
+    storage.upsert_llm_symbol_docs_batch(&[LlmSymbolDoc {
+        node_id: NodeId(501),
+        file_node_id: None,
+        kind: NodeKind::FUNCTION,
+        display_name: "pkg::do_work".to_string(),
+        qualified_name: Some("pkg::do_work".to_string()),
+        file_path: Some("src/lib.rs".to_string()),
+        start_line: Some(12),
+        doc_text: "semantic_doc_version: 2\nsymbol_kind: FUNCTION\nname: pkg::do_work".to_string(),
+        doc_version: 2,
+        doc_hash: "semantic-hash-501".to_string(),
+        embedding_profile: Some("bge-base-en-v1.5".to_string()),
+        embedding_model:
+            "BAAI/bge-base-en-v1.5-local|backend=llamacpp|pool=Cls|expected_dim=Some(768)"
+                .to_string(),
+        embedding_backend: Some("llamacpp".to_string()),
+        embedding_dim: 768,
+        doc_shape: Some("semantic_doc_version=2;alias_mode=alias_variant".to_string()),
+        embedding: vec![0.25_f32; 4],
+        updated_at_epoch_ms: 123,
+    }])?;
+
+    let stats = storage.get_llm_symbol_doc_stats()?;
+    let stored_contract =
+        serde_json::to_value(&stats).expect("serialize stored semantic doc stats");
+    for field in ["doc_count", "cache_key", "dimension", "doc_shape"] {
+        assert!(
+            stored_contract.get(field).is_some(),
+            "stored semantic-doc stats should report `{field}` for reuse/debug diagnostics"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_llm_symbol_doc_stats_treats_legacy_null_contract_metadata_as_mixed()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(501),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "legacy_work".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(502),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "fresh_work".to_string(),
+            ..Default::default()
+        },
+    ])?;
+
+    storage.upsert_llm_symbol_docs_batch(&[
+        LlmSymbolDoc {
+            node_id: NodeId(501),
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: "legacy_work".to_string(),
+            qualified_name: None,
+            file_path: Some("src/lib.rs".to_string()),
+            start_line: Some(12),
+            doc_text: "legacy semantic doc".to_string(),
+            doc_version: 4,
+            doc_hash: "legacy-hash".to_string(),
+            embedding_profile: None,
+            embedding_model: "same-cache-key".to_string(),
+            embedding_backend: None,
+            embedding_dim: 384,
+            doc_shape: None,
+            embedding: vec![0.25_f32; 4],
+            updated_at_epoch_ms: 123,
+        },
+        LlmSymbolDoc {
+            node_id: NodeId(502),
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: "fresh_work".to_string(),
+            qualified_name: None,
+            file_path: Some("src/lib.rs".to_string()),
+            start_line: Some(24),
+            doc_text: "fresh semantic doc".to_string(),
+            doc_version: 4,
+            doc_hash: "fresh-hash".to_string(),
+            embedding_profile: Some("bge-small-en-v1.5".to_string()),
+            embedding_model: "same-cache-key".to_string(),
+            embedding_backend: Some("hash".to_string()),
+            embedding_dim: 384,
+            doc_shape: Some("semantic_doc_version=4;scope=durable_symbols".to_string()),
+            embedding: vec![0.5_f32; 4],
+            updated_at_epoch_ms: 456,
+        },
+    ])?;
+
+    let stats = storage.get_llm_symbol_doc_stats()?;
+
+    assert_eq!(stats.embedding_model.as_deref(), Some("same-cache-key"));
+    assert!(stats.mixed_embedding_profiles);
+    assert!(stats.mixed_embedding_backends);
+    assert!(stats.mixed_doc_shapes);
+    assert!(!stats.mixed_embedding_models);
+    assert!(!stats.mixed_dimensions);
+    assert!(!stats.mixed_doc_versions);
     Ok(())
 }
 
@@ -285,8 +405,11 @@ fn test_symbol_summary_uses_current_content_hash() -> Result<(), StorageError> {
         doc_text: "function pkg::do_work in src/lib.rs line 12".to_string(),
         doc_version: 2,
         doc_hash: "semantic-hash-501".to_string(),
+        embedding_profile: None,
         embedding_model: "local-hash-384".to_string(),
+        embedding_backend: None,
         embedding_dim: 384,
+        doc_shape: None,
         embedding: vec![0.25_f32; 384],
         updated_at_epoch_ms: 123,
     };
@@ -346,8 +469,11 @@ fn test_llm_symbol_doc_copy_forward_preserves_reuse_metadata() -> Result<(), Sto
             doc_text: "function pkg::do_work in src/lib.rs line 12".to_string(),
             doc_version: 2,
             doc_hash: "semantic-hash-501".to_string(),
+            embedding_profile: Some("bge-small-en-v1.5".to_string()),
             embedding_model: "local-hash-384".to_string(),
+            embedding_backend: Some("hash".to_string()),
             embedding_dim: 384,
+            doc_shape: Some("semantic_doc_version=2".to_string()),
             embedding: vec![0.25_f32; 384],
             updated_at_epoch_ms: 123,
         }])?;
@@ -367,6 +493,17 @@ fn test_llm_symbol_doc_copy_forward_preserves_reuse_metadata() -> Result<(), Sto
     assert_eq!(metadata[0].node_id, NodeId(501));
     assert_eq!(metadata[0].doc_version, 2);
     assert_eq!(metadata[0].doc_hash, "semantic-hash-501");
+    assert_eq!(
+        metadata[0].embedding_profile.as_deref(),
+        Some("bge-small-en-v1.5")
+    );
+    assert_eq!(metadata[0].embedding_model, "local-hash-384");
+    assert_eq!(metadata[0].embedding_backend.as_deref(), Some("hash"));
+    assert_eq!(metadata[0].embedding_dim, 384);
+    assert_eq!(
+        metadata[0].doc_shape.as_deref(),
+        Some("semantic_doc_version=2")
+    );
 
     assert_eq!(staged.prune_llm_symbol_docs_to_node_ids(&[NodeId(501)])?, 0);
     assert_eq!(staged.prune_llm_symbol_docs_to_node_ids(&[])?, 1);
@@ -1192,8 +1329,11 @@ fn test_delete_file_projection() -> Result<(), StorageError> {
         doc_text: "foo symbol".to_string(),
         doc_version: 2,
         doc_hash: "semantic-hash-foo".to_string(),
+        embedding_profile: None,
         embedding_model: "local-hash-384".to_string(),
+        embedding_backend: None,
         embedding_dim: 384,
+        doc_shape: None,
         embedding: vec![0.1_f32; 384],
         updated_at_epoch_ms: 1,
     }])?;

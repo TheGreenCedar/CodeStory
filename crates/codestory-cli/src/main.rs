@@ -793,6 +793,9 @@ fn build_doctor_output(
                 }),
             )
         });
+        if retrieval.stored_embedding.is_some() {
+            checks.push(semantic_contract_check(retrieval));
+        }
     }
 
     let environment = [
@@ -824,6 +827,123 @@ fn build_doctor_output(
         checks,
         next_commands: index_next_commands(&project, summary.retrieval.as_ref()),
         environment,
+    }
+}
+
+fn semantic_contract_check(
+    retrieval: &codestory_contracts::api::RetrievalStateDto,
+) -> DoctorCheckOutput {
+    let Some(stored) = retrieval.stored_embedding.as_ref() else {
+        return doctor_check(
+            "semantic_contract",
+            "info",
+            "Stored semantic doc metadata is unavailable.".to_string(),
+        );
+    };
+    if stored.doc_count == 0 {
+        return doctor_check(
+            "semantic_contract",
+            "info",
+            "No stored semantic docs are available to compare with the current embedding config."
+                .to_string(),
+        );
+    }
+
+    let mut gaps = Vec::new();
+    if stored.mixed_embedding_profiles {
+        gaps.push("stored docs use mixed embedding profiles".to_string());
+    }
+    if stored.mixed_embedding_models {
+        gaps.push("stored docs use mixed cache keys".to_string());
+    }
+    if stored.mixed_embedding_backends {
+        gaps.push("stored docs use mixed embedding backends".to_string());
+    }
+    if stored.mixed_dimensions {
+        gaps.push("stored docs use mixed embedding dimensions".to_string());
+    }
+    if stored.mixed_doc_versions {
+        gaps.push("stored docs use mixed semantic doc versions".to_string());
+    }
+    if stored.mixed_doc_shapes {
+        gaps.push("stored docs use mixed semantic doc shapes".to_string());
+    }
+
+    if let Some(current) = retrieval.current_embedding.as_ref() {
+        compare_contract_field(
+            &mut gaps,
+            "embedding profile",
+            stored.embedding_profile.as_deref(),
+            Some(current.profile.as_str()),
+        );
+        compare_contract_field(
+            &mut gaps,
+            "embedding backend",
+            stored.embedding_backend.as_deref(),
+            Some(current.backend.as_str()),
+        );
+        compare_contract_field(
+            &mut gaps,
+            "cache key",
+            stored.cache_key.as_deref(),
+            Some(current.cache_key.as_str()),
+        );
+        compare_contract_field(
+            &mut gaps,
+            "semantic doc shape",
+            stored.doc_shape.as_deref(),
+            Some(current.doc_shape.as_str()),
+        );
+        if let (Some(stored_dim), Some(current_dim)) = (stored.dimension, current.dimension)
+            && stored_dim != current_dim
+        {
+            gaps.push(format!(
+                "embedding dimension mismatch: stored={stored_dim} current={current_dim}"
+            ));
+        }
+    } else {
+        gaps.push("current embedding config could not be resolved".to_string());
+    }
+
+    if gaps.is_empty() {
+        doctor_check(
+            "semantic_contract",
+            "ok",
+            format!(
+                "Stored semantic docs match the current embedding contract (docs={}).",
+                stored.doc_count
+            ),
+        )
+    } else {
+        doctor_check(
+            "semantic_contract",
+            "warn",
+            format!(
+                "{}. Run `codestory-cli index --refresh full` if semantic search should use the current config.",
+                gaps.join("; ")
+            ),
+        )
+    }
+}
+
+fn compare_contract_field(
+    gaps: &mut Vec<String>,
+    label: &str,
+    stored: Option<&str>,
+    current: Option<&str>,
+) {
+    match (stored, current) {
+        (Some(stored), Some(current)) if stored != current => {
+            gaps.push(format!(
+                "{label} mismatch: stored={stored} current={current}"
+            ));
+        }
+        (None, Some(current)) => {
+            gaps.push(format!(
+                "{label} missing from stored docs; current={current}"
+            ));
+        }
+        _ => {}
     }
 }
 
@@ -2651,6 +2771,8 @@ mod tests {
             semantic_ready: true,
             semantic_doc_count: 42,
             embedding_model: Some("sentence-transformers/all-MiniLM-L6-v2-local".to_string()),
+            current_embedding: None,
+            stored_embedding: None,
             fallback_reason: None,
             fallback_message: None,
         }

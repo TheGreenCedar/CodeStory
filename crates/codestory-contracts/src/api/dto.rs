@@ -110,9 +110,53 @@ pub struct RetrievalStateDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_embedding: Option<EmbeddingProfileContractDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_embedding: Option<StoredSemanticDocsContractDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<RetrievalFallbackReasonDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingProfileContractDto {
+    pub profile: String,
+    pub backend: String,
+    pub model_id: String,
+    pub cache_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<u32>,
+    pub doc_shape: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct StoredSemanticDocsContractDto {
+    pub doc_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_version: Option<u32>,
+    #[serde(default)]
+    pub mixed_embedding_profiles: bool,
+    #[serde(default)]
+    pub mixed_embedding_models: bool,
+    #[serde(default)]
+    pub mixed_embedding_backends: bool,
+    #[serde(default)]
+    pub mixed_dimensions: bool,
+    #[serde(default)]
+    pub mixed_doc_versions: bool,
+    #[serde(default)]
+    pub mixed_doc_shapes: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_shape: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

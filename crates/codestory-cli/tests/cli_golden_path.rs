@@ -81,6 +81,32 @@ fn run_cli(workspace: &Path, cache_dir: &Path, args: &[&str]) -> std::process::O
     command.output().expect("run codestory-cli")
 }
 
+fn run_cli_with_embedding_env(
+    workspace: &Path,
+    cache_dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    command
+        .args(args)
+        .arg("--project")
+        .arg(workspace)
+        .arg("--cache-dir")
+        .arg(cache_dir)
+        .env_remove("CODESTORY_EMBED_RUNTIME_MODE")
+        .env_remove("CODESTORY_EMBED_BACKEND")
+        .env_remove("CODESTORY_EMBED_PROFILE")
+        .env_remove("CODESTORY_EMBED_MODEL_ID")
+        .env_remove("CODESTORY_EMBED_TRUNCATE_DIM")
+        .env_remove("CODESTORY_EMBED_EXPECTED_DIM")
+        .env_remove("CODESTORY_EMBED_LLAMACPP_URL");
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    command.output().expect("run codestory-cli")
+}
+
 fn run_cli_json(workspace: &Path, cache_dir: &Path, args: &[&str]) -> Value {
     let output = run_cli(workspace, cache_dir, args);
     assert!(
@@ -91,6 +117,32 @@ fn run_cli_json(workspace: &Path, cache_dir: &Path, args: &[&str]) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("parse json output")
+}
+
+fn run_cli_json_with_embedding_env(
+    workspace: &Path,
+    cache_dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Value {
+    let output = run_cli_with_embedding_env(workspace, cache_dir, args, envs);
+    assert!(
+        output.status.success(),
+        "command failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("parse json output")
+}
+
+fn check_with_name<'a>(doctor: &'a Value, name: &str) -> &'a Value {
+    doctor["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == name)
+        .unwrap_or_else(|| panic!("doctor check `{name}` missing: {doctor:#}"))
 }
 
 fn run_stdio_request(
@@ -296,6 +348,127 @@ fn trace_has_step(value: &Value, kind: &str) -> bool {
 }
 
 #[test]
+fn doctor_reports_current_and_stored_semantic_doc_embedding_contract() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    let index = run_cli_json_with_embedding_env(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+        &[
+            ("CODESTORY_EMBED_RUNTIME_MODE", "hash"),
+            ("CODESTORY_EMBED_PROFILE", "bge-small-en-v1.5"),
+        ],
+    );
+    assert!(
+        index["summary"]["retrieval"]["semantic_doc_count"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "hash-mode index should persist semantic docs for doctor to report"
+    );
+
+    let doctor = run_cli_json_with_embedding_env(
+        workspace.path(),
+        cache_dir.path(),
+        &["doctor", "--format", "json"],
+        &[
+            ("CODESTORY_EMBED_RUNTIME_MODE", "hash"),
+            ("CODESTORY_EMBED_PROFILE", "bge-small-en-v1.5"),
+        ],
+    );
+    let current = &doctor["retrieval"]["current_embedding"];
+    for field in ["profile", "model_id", "backend", "dimension", "doc_shape"] {
+        assert!(
+            current.get(field).is_some(),
+            "doctor should report current embedding `{field}` metadata: {doctor:#}"
+        );
+    }
+
+    let stored = &doctor["retrieval"]["stored_embedding"];
+    for field in ["doc_count", "cache_key", "dimension", "doc_shape"] {
+        assert!(
+            stored.get(field).is_some(),
+            "doctor should report stored semantic-doc `{field}` metadata: {doctor:#}"
+        );
+    }
+}
+
+#[test]
+fn doctor_warns_when_stored_semantic_doc_profile_differs_from_current_config() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    run_cli_json_with_embedding_env(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+        &[
+            ("CODESTORY_EMBED_RUNTIME_MODE", "hash"),
+            ("CODESTORY_EMBED_PROFILE", "bge-small-en-v1.5"),
+        ],
+    );
+
+    let doctor = run_cli_json_with_embedding_env(
+        workspace.path(),
+        cache_dir.path(),
+        &["doctor", "--format", "json"],
+        &[
+            ("CODESTORY_EMBED_RUNTIME_MODE", "hash"),
+            ("CODESTORY_EMBED_PROFILE", "bge-base-en-v1.5"),
+        ],
+    );
+    let semantic_contract = check_with_name(&doctor, "semantic_contract");
+    assert_eq!(
+        semantic_contract["status"], "warn",
+        "doctor should warn when stored semantic-doc metadata mismatches current embedding config: {doctor:#}"
+    );
+    let message = semantic_contract["message"]
+        .as_str()
+        .expect("semantic contract message");
+    assert!(
+        message.contains("bge-small-en-v1.5") && message.contains("bge-base-en-v1.5"),
+        "mismatch warning should name stored and current profiles: {message}"
+    );
+}
+
+#[test]
+fn doctor_keeps_missing_llamacpp_endpoint_explicit() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    let doctor = run_cli_json_with_embedding_env(
+        workspace.path(),
+        cache_dir.path(),
+        &["doctor", "--format", "json"],
+        &[
+            ("CODESTORY_EMBED_BACKEND", "llamacpp"),
+            (
+                "CODESTORY_EMBED_LLAMACPP_URL",
+                "http://127.0.0.1:9/v1/embeddings",
+            ),
+        ],
+    );
+
+    assert_eq!(
+        doctor["retrieval"]["fallback_reason"], "missing_embedding_runtime",
+        "missing llama.cpp endpoint should stay a typed retrieval fallback: {doctor:#}"
+    );
+    let fallback_message = doctor["retrieval"]["fallback_message"]
+        .as_str()
+        .expect("fallback message");
+    assert!(
+        fallback_message.contains("llama.cpp")
+            && fallback_message.contains("127.0.0.1:9/v1/embeddings"),
+        "missing endpoint should name llama.cpp and the configured URL: {fallback_message}"
+    );
+}
+
+#[test]
 fn tiny_workspace_browser_loop_works_from_existing_cache() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
@@ -370,6 +543,13 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
     assert!(
         array_is_non_empty(&search, &["indexed_symbol_hits"]),
         "search should find AppController in the existing cache"
+    );
+    assert!(
+        search["retrieval"]["stored_embedding"]["doc_count"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "search should preserve stored semantic-doc contract metadata"
     );
     let node_id = string_field(&search, &["indexed_symbol_hits", "0", "node_id"]);
 

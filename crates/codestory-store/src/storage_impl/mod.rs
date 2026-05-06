@@ -25,7 +25,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 13;
 const GROUNDING_SNAPSHOT_VERSION: i64 = 1;
 const GROUNDING_SNAPSHOT_STATE_DIRTY: i64 = 0;
 const GROUNDING_SNAPSHOT_STATE_BUILDING: i64 = 1;
@@ -46,6 +46,69 @@ fn clamp_i64_to_u32(value: i64) -> u32 {
     } else {
         value as u32
     }
+}
+
+fn uniform_optional_string(
+    min_value: Option<String>,
+    max_value: Option<String>,
+) -> (Option<String>, bool) {
+    match (min_value, max_value) {
+        (Some(min_value), Some(max_value)) if min_value == max_value => (Some(min_value), false),
+        (Some(_), Some(_)) => (None, true),
+        (Some(value), None) | (None, Some(value)) => (Some(value), false),
+        (None, None) => (None, false),
+    }
+}
+
+fn uniform_optional_string_with_count(
+    row_count: i64,
+    value_count: i64,
+    min_value: Option<String>,
+    max_value: Option<String>,
+) -> (Option<String>, bool) {
+    if row_count <= 0 {
+        return (None, false);
+    }
+    if value_count != row_count {
+        let value = if value_count == 0 || min_value != max_value {
+            None
+        } else {
+            min_value
+        };
+        return (value, true);
+    }
+    uniform_optional_string(min_value, max_value)
+}
+
+fn uniform_optional_u32(min_value: Option<i64>, max_value: Option<i64>) -> (Option<u32>, bool) {
+    match (min_value, max_value) {
+        (Some(min_value), Some(max_value)) if min_value == max_value => {
+            (Some(clamp_i64_to_u32(min_value)), false)
+        }
+        (Some(_), Some(_)) => (None, true),
+        (Some(value), None) | (None, Some(value)) => (Some(clamp_i64_to_u32(value)), false),
+        (None, None) => (None, false),
+    }
+}
+
+fn uniform_optional_u32_with_count(
+    row_count: i64,
+    value_count: i64,
+    min_value: Option<i64>,
+    max_value: Option<i64>,
+) -> (Option<u32>, bool) {
+    if row_count <= 0 {
+        return (None, false);
+    }
+    if value_count != row_count {
+        let value = if value_count == 0 || min_value != max_value {
+            None
+        } else {
+            min_value.map(clamp_i64_to_u32)
+        };
+        return (value, true);
+    }
+    uniform_optional_u32(min_value, max_value)
 }
 
 fn current_epoch_ms() -> i64 {
@@ -319,8 +382,14 @@ pub struct LlmSymbolDoc {
     pub doc_text: String,
     pub doc_version: u32,
     pub doc_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_profile: Option<String>,
     pub embedding_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_backend: Option<String>,
     pub embedding_dim: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_shape: Option<String>,
     pub embedding: Vec<f32>,
     pub updated_at_epoch_ms: i64,
 }
@@ -330,14 +399,30 @@ pub struct LlmSymbolDocReuseMetadata {
     pub node_id: NodeId,
     pub doc_version: u32,
     pub doc_hash: String,
+    pub embedding_profile: Option<String>,
     pub embedding_model: String,
+    pub embedding_backend: Option<String>,
     pub embedding_dim: u32,
+    pub doc_shape: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LlmSymbolDocStats {
     pub doc_count: u32,
+    pub embedding_profile: Option<String>,
+    #[serde(rename = "cache_key")]
     pub embedding_model: Option<String>,
+    pub embedding_backend: Option<String>,
+    #[serde(rename = "dimension")]
+    pub embedding_dim: Option<u32>,
+    pub doc_version: Option<u32>,
+    pub doc_shape: Option<String>,
+    pub mixed_embedding_profiles: bool,
+    pub mixed_embedding_models: bool,
+    pub mixed_embedding_backends: bool,
+    pub mixed_dimensions: bool,
+    pub mixed_doc_versions: bool,
+    pub mixed_doc_shapes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2050,12 +2135,15 @@ impl Storage {
                     doc_text,
                     doc_version,
                     doc_hash,
+                    embedding_profile,
                     embedding_model,
+                    embedding_backend,
                     embedding_dim,
+                    doc_shape,
                     embedding_blob,
                     updated_at_epoch_ms
                  ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
                  )
                  ON CONFLICT(node_id) DO UPDATE SET
                     file_node_id = excluded.file_node_id,
@@ -2067,8 +2155,11 @@ impl Storage {
                     doc_text = excluded.doc_text,
                     doc_version = excluded.doc_version,
                     doc_hash = excluded.doc_hash,
+                    embedding_profile = excluded.embedding_profile,
                     embedding_model = excluded.embedding_model,
+                    embedding_backend = excluded.embedding_backend,
                     embedding_dim = excluded.embedding_dim,
+                    doc_shape = excluded.doc_shape,
                     embedding_blob = excluded.embedding_blob,
                     updated_at_epoch_ms = excluded.updated_at_epoch_ms",
             )?;
@@ -2085,8 +2176,11 @@ impl Storage {
                     doc.doc_text,
                     doc.doc_version as i64,
                     doc.doc_hash,
+                    doc.embedding_profile,
                     doc.embedding_model,
+                    doc.embedding_backend,
                     doc.embedding_dim as i64,
+                    doc.doc_shape,
                     encode_embedding_blob(&doc.embedding),
                     doc.updated_at_epoch_ms,
                 ])?;
@@ -2116,8 +2210,11 @@ impl Storage {
                 doc_text,
                 doc_version,
                 doc_hash,
+                embedding_profile,
                 embedding_model,
+                embedding_backend,
                 embedding_dim,
+                doc_shape,
                 embedding_blob,
                 updated_at_epoch_ms
              FROM llm_symbol_doc
@@ -2132,8 +2229,8 @@ impl Storage {
         while let Some(row) = rows.next()? {
             let kind: i32 = row.get(2)?;
             let doc_version: i64 = row.get(8)?;
-            let embedding_dim: i64 = row.get(11)?;
-            let embedding_blob: Vec<u8> = row.get(12)?;
+            let embedding_dim: i64 = row.get(13)?;
+            let embedding_blob: Vec<u8> = row.get(15)?;
             docs.push(LlmSymbolDoc {
                 node_id: NodeId(row.get(0)?),
                 file_node_id: row.get::<_, Option<i64>>(1)?.map(NodeId),
@@ -2145,10 +2242,13 @@ impl Storage {
                 doc_text: row.get(7)?,
                 doc_version: doc_version.max(0).min(u32::MAX as i64) as u32,
                 doc_hash: row.get(9)?,
-                embedding_model: row.get(10)?,
+                embedding_profile: row.get(10)?,
+                embedding_model: row.get(11)?,
+                embedding_backend: row.get(12)?,
                 embedding_dim: embedding_dim.max(0) as u32,
+                doc_shape: row.get(14)?,
                 embedding: decode_embedding_blob(&embedding_blob)?,
-                updated_at_epoch_ms: row.get(13)?,
+                updated_at_epoch_ms: row.get(16)?,
             });
         }
 
@@ -2156,25 +2256,100 @@ impl Storage {
     }
 
     pub fn get_llm_symbol_doc_stats(&self) -> Result<LlmSymbolDocStats, StorageError> {
-        let (doc_count, min_model, max_model) = self.conn.query_row(
-            "SELECT COUNT(*), MIN(embedding_model), MAX(embedding_model) FROM llm_symbol_doc",
+        let (
+            doc_count,
+            min_profile,
+            max_profile,
+            profile_count,
+            min_model,
+            max_model,
+            model_count,
+            min_backend,
+            max_backend,
+            backend_count,
+            min_dim,
+            max_dim,
+            dim_count,
+            min_version,
+            max_version,
+            version_count,
+            min_shape,
+            max_shape,
+            shape_count,
+        ) = self.conn.query_row(
+            "SELECT
+                COUNT(*),
+                MIN(embedding_profile),
+                MAX(embedding_profile),
+                COUNT(embedding_profile),
+                MIN(embedding_model),
+                MAX(embedding_model),
+                COUNT(embedding_model),
+                MIN(embedding_backend),
+                MAX(embedding_backend),
+                COUNT(embedding_backend),
+                MIN(embedding_dim),
+                MAX(embedding_dim),
+                COUNT(embedding_dim),
+                MIN(doc_version),
+                MAX(doc_version),
+                COUNT(doc_version),
+                MIN(doc_shape),
+                MAX(doc_shape),
+                COUNT(doc_shape)
+             FROM llm_symbol_doc",
             [],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, Option<i64>>(13)?,
+                    row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
+                    row.get::<_, i64>(18)?,
                 ))
             },
         )?;
-        let embedding_model = match (min_model, max_model) {
-            (Some(min_model), Some(max_model)) if min_model == max_model => Some(min_model),
-            _ => None,
-        };
+        let (embedding_profile, mixed_embedding_profiles) =
+            uniform_optional_string_with_count(doc_count, profile_count, min_profile, max_profile);
+        let (embedding_model, mixed_embedding_models) =
+            uniform_optional_string_with_count(doc_count, model_count, min_model, max_model);
+        let (embedding_backend, mixed_embedding_backends) =
+            uniform_optional_string_with_count(doc_count, backend_count, min_backend, max_backend);
+        let (doc_shape, mixed_doc_shapes) =
+            uniform_optional_string_with_count(doc_count, shape_count, min_shape, max_shape);
+        let (embedding_dim, mixed_dimensions) =
+            uniform_optional_u32_with_count(doc_count, dim_count, min_dim, max_dim);
+        let (doc_version, mixed_doc_versions) =
+            uniform_optional_u32_with_count(doc_count, version_count, min_version, max_version);
 
         Ok(LlmSymbolDocStats {
             doc_count: doc_count.max(0).min(u32::MAX as i64) as u32,
+            embedding_profile,
             embedding_model,
+            embedding_backend,
+            embedding_dim,
+            doc_version,
+            doc_shape,
+            mixed_embedding_profiles,
+            mixed_embedding_models,
+            mixed_embedding_backends,
+            mixed_dimensions,
+            mixed_doc_versions,
+            mixed_doc_shapes,
         })
     }
 
@@ -2294,8 +2469,11 @@ impl Storage {
                 node_id,
                 doc_version,
                 doc_hash,
+                embedding_profile,
                 embedding_model,
-                embedding_dim
+                embedding_backend,
+                embedding_dim,
+                doc_shape
              FROM llm_symbol_doc
              ORDER BY node_id ASC",
         )?;
@@ -2303,13 +2481,16 @@ impl Storage {
         let mut docs = Vec::new();
         while let Some(row) = rows.next()? {
             let doc_version: i64 = row.get(1)?;
-            let embedding_dim: i64 = row.get(4)?;
+            let embedding_dim: i64 = row.get(6)?;
             docs.push(LlmSymbolDocReuseMetadata {
                 node_id: NodeId(row.get(0)?),
                 doc_version: doc_version.max(0).min(u32::MAX as i64) as u32,
                 doc_hash: row.get(2)?,
-                embedding_model: row.get(3)?,
+                embedding_profile: row.get(3)?,
+                embedding_model: row.get(4)?,
+                embedding_backend: row.get(5)?,
                 embedding_dim: embedding_dim.max(0).min(u32::MAX as i64) as u32,
+                doc_shape: row.get(7)?,
             });
         }
         Ok(docs)
@@ -2332,8 +2513,11 @@ impl Storage {
                 doc_text,
                 doc_version,
                 doc_hash,
+                embedding_profile,
                 embedding_model,
+                embedding_backend,
                 embedding_dim,
+                doc_shape,
                 embedding_blob,
                 updated_at_epoch_ms
              FROM llm_symbol_doc
@@ -2348,8 +2532,8 @@ impl Storage {
         while let Some(row) = rows.next()? {
             let kind: i32 = row.get(2)?;
             let doc_version: i64 = row.get(8)?;
-            let embedding_dim: i64 = row.get(11)?;
-            let embedding_blob: Vec<u8> = row.get(12)?;
+            let embedding_dim: i64 = row.get(13)?;
+            let embedding_blob: Vec<u8> = row.get(15)?;
             docs.push(LlmSymbolDoc {
                 node_id: NodeId(row.get(0)?),
                 file_node_id: row.get::<_, Option<i64>>(1)?.map(NodeId),
@@ -2361,10 +2545,13 @@ impl Storage {
                 doc_text: row.get(7)?,
                 doc_version: doc_version.max(0).min(u32::MAX as i64) as u32,
                 doc_hash: row.get(9)?,
-                embedding_model: row.get(10)?,
+                embedding_profile: row.get(10)?,
+                embedding_model: row.get(11)?,
+                embedding_backend: row.get(12)?,
                 embedding_dim: embedding_dim.max(0) as u32,
+                doc_shape: row.get(14)?,
                 embedding: decode_embedding_blob(&embedding_blob)?,
-                updated_at_epoch_ms: row.get(13)?,
+                updated_at_epoch_ms: row.get(16)?,
             });
         }
         Ok(docs)
@@ -2394,8 +2581,11 @@ impl Storage {
                 doc_text,
                 doc_version,
                 doc_hash,
+                embedding_profile,
                 embedding_model,
+                embedding_backend,
                 embedding_dim,
+                doc_shape,
                 embedding_blob,
                 updated_at_epoch_ms
              )
@@ -2410,8 +2600,11 @@ impl Storage {
                 source_doc.doc_text,
                 source_doc.doc_version,
                 source_doc.doc_hash,
+                source_doc.embedding_profile,
                 source_doc.embedding_model,
+                source_doc.embedding_backend,
                 source_doc.embedding_dim,
+                source_doc.doc_shape,
                 source_doc.embedding_blob,
                 source_doc.updated_at_epoch_ms
              FROM source_snapshot.llm_symbol_doc source_doc

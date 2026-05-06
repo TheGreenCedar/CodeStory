@@ -45,6 +45,15 @@ pub struct EmbeddingRuntimeAvailability {
     pub fallback_message: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingProfileContract {
+    pub profile: String,
+    pub backend: String,
+    pub model_id: String,
+    pub cache_key: String,
+    pub dimension: Option<u32>,
+}
+
 fn env_usize(key: &str, min: usize, max: usize) -> Option<usize> {
     std::env::var(key)
         .ok()
@@ -344,6 +353,21 @@ pub fn embedding_runtime_availability_from_env() -> EmbeddingRuntimeAvailability
         model_id: Some(model_id),
         fallback_message: None,
     }
+}
+
+pub fn embedding_profile_contract_from_env() -> Result<EmbeddingProfileContract> {
+    let profile = EmbeddingProfile::from_env()?;
+    let backend = EmbeddingBackendSelection::from_env()?;
+    let cache_key = profile.cache_model_id(backend);
+    Ok(EmbeddingProfileContract {
+        profile: profile.name.clone(),
+        backend: backend.as_str().to_string(),
+        model_id: profile.model_id.clone(),
+        cache_key,
+        dimension: profile
+            .expected_dim
+            .map(|value| value.min(u32::MAX as usize) as u32),
+    })
 }
 
 #[derive(Debug, Clone)]
