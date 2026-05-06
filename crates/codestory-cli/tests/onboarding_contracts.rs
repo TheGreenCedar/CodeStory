@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -116,6 +117,49 @@ fn markdown_links_resolve_to_existing_local_files() {
                 "broken markdown link in {} -> {}",
                 file.display(),
                 resolved.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn codestory_grounding_skill_command_refs_track_cli_commands() {
+    let root = repo_root();
+    let skill_root = root.join(".agents/skills/codestory-grounding");
+    let commands = [
+        "index", "ground", "doctor", "search", "symbol", "trail", "snippet", "query", "explore",
+        "ask", "serve",
+    ];
+
+    for command in commands {
+        let reference = skill_root.join("references").join(format!("{command}.md"));
+        assert!(
+            reference.exists(),
+            "codestory-grounding should document `{command}` at {}",
+            reference.display()
+        );
+
+        let help = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+            .arg(command)
+            .arg("--help")
+            .output()
+            .unwrap_or_else(|error| panic!("run `{command} --help`: {error}"));
+        assert!(
+            help.status.success(),
+            "`{command}` should remain a valid CLI subcommand\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&help.stdout),
+            String::from_utf8_lossy(&help.stderr)
+        );
+    }
+
+    for command in ["ask", "doctor", "explore", "serve"] {
+        let reference =
+            fs::read_to_string(skill_root.join("references").join(format!("{command}.md")))
+                .expect("read command reference");
+        for required in ["Normal path", "Failure path", "Integration edge"] {
+            assert!(
+                reference.contains(required),
+                "`{command}` reference should include a {required} row"
             );
         }
     }

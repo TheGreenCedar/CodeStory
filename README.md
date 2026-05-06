@@ -152,7 +152,20 @@ CodeStory supports an optional `codestory_workspace.json` file at the repo root 
 
 When the manifest is present, `index --project .` discovers all listed member roots and reports per-member refresh counts in index output. Repos without the manifest keep the single-root behavior. OpenAPI JSON/YAML schemas are treated as lightweight endpoint sources, and literal client calls such as `fetch("/api/users")` or `axios.post("/api/users")` create speculative graph edges to matching endpoint refs.
 
-Team or user defaults can live in `.codestory.toml` at the project root or in the user home directory. Project settings override home settings, and explicit environment variables still win. Supported keys include `cache_dir`, `embedding_model`, `hybrid_retrieval_enabled`, `semantic_doc_scope`, `semantic_doc_alias_mode`, `summary_endpoint`, and `summary_model`.
+Team or user defaults can live in `.codestory.toml` at the project root or in the user home directory. CodeStory loads the home file first, then the project file, so project settings override home settings. Explicit environment variables still win over config defaults.
+
+Supported keys include `cache_dir`, `embedding_profile`, `embedding_model_id`, `hybrid_retrieval_enabled`, `semantic_doc_scope`, `semantic_doc_alias_mode`, `summary_endpoint`, and `summary_model`. The legacy `embedding_model` key is still accepted as a deprecated alias for `embedding_model_id`.
+
+Example:
+
+```toml
+embedding_profile = "bge-base-en-v1.5"
+embedding_model_id = "BAAI/bge-base-en-v1.5-local"
+hybrid_retrieval_enabled = true
+semantic_doc_scope = "durable"
+```
+
+`embedding_profile` maps to `CODESTORY_EMBED_PROFILE`, and `embedding_model_id` maps to `CODESTORY_EMBED_MODEL_ID`. If those environment variables are already set before the CLI starts, the CLI leaves them unchanged.
 
 ## Retrieval Defaults
 

@@ -8,7 +8,6 @@ use codestory_contracts::api::{
     SearchHit, SearchHybridLimitsDto, SearchRepoTextMode, SearchRequest, SnippetContextDto,
     SymbolContextDto, TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection, TrailMode,
 };
-use codestory_contracts::query::GraphQueryOperation;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
@@ -40,7 +39,7 @@ use output::{
     emit, emit_text, render_agent_answer_markdown, render_doctor_markdown, render_ground_markdown,
     render_index_dry_run_markdown, render_index_markdown, render_query_markdown,
     render_search_markdown, render_snippet_markdown, render_symbol_markdown, render_symbol_mermaid,
-    render_trail_dot, render_trail_markdown, render_trail_mermaid,
+    render_trail_dot, render_trail_markdown, render_trail_mermaid, validate_output_file_parent,
 };
 use runtime::{
     RuntimeContext, ensure_index_ready, map_api_error, refresh_label, resolve_refresh_request,
@@ -106,10 +105,18 @@ fn main() -> Result<()> {
 
 fn run_index(cmd: IndexCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "index")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
     validate_index_watch_output_file(&cmd)?;
     run_index_once(&cmd)?;
     if cmd.watch {
         run_index_watch(cmd)?;
+    }
+    Ok(())
+}
+
+fn preflight_output_file(output_file: Option<&std::path::Path>) -> Result<()> {
+    if let Some(path) = output_file {
+        validate_output_file_parent(path)?;
     }
     Ok(())
 }
@@ -302,6 +309,7 @@ fn run_index_watch(mut cmd: IndexCommand) -> Result<()> {
 
 fn run_ground(cmd: GroundCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "ground")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_ground_open(cmd.refresh)?;
     ensure_index_ready(&opened, "ground")?;
@@ -316,6 +324,7 @@ fn run_ground(cmd: GroundCommand) -> Result<()> {
 
 fn run_ask(cmd: AskCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "ask")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "ask")?;
@@ -339,7 +348,11 @@ fn run_ask(cmd: AskCommand) -> Result<()> {
         run_local_agent: cmd.with_local_agent,
     };
 
-    let answer = runtime.agent.ask(request).map_err(map_api_error)?;
+    let answer = if cmd.with_local_agent {
+        runtime.agent.ask(request).map_err(map_api_error)?
+    } else {
+        runtime.browser.ask(request).map_err(map_api_error)?
+    };
     let markdown = render_agent_answer_markdown(&runtime.project_root, &answer);
     if let Some(bundle_dir) = cmd.bundle.as_deref() {
         write_ask_bundle(bundle_dir, &answer, &markdown)?;
@@ -349,6 +362,7 @@ fn run_ask(cmd: AskCommand) -> Result<()> {
 
 fn run_doctor(cmd: DoctorCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "doctor")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let summary = runtime.open_project_summary()?;
     let output = build_doctor_output(&runtime, &summary);
@@ -358,6 +372,7 @@ fn run_doctor(cmd: DoctorCommand) -> Result<()> {
 
 fn run_search(cmd: SearchCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "search")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "search")?;
@@ -365,7 +380,7 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
     let hybrid_limits = hybrid_limits(cmd.hybrid_lexical_limit, cmd.hybrid_semantic_limit);
 
     let search_results = runtime
-        .search
+        .browser
         .search_results(SearchRequest {
             query: cmd.query.clone(),
             repo_text: to_api_repo_text_mode(cmd.repo_text),
@@ -394,6 +409,7 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
 
 fn run_symbol(cmd: SymbolCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "symbol")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "symbol")?;
@@ -401,7 +417,7 @@ fn run_symbol(cmd: SymbolCommand) -> Result<()> {
     let file_filter = cmd.target.file_filter();
     let target = resolve_target(&runtime, cmd.target.selection()?, file_filter.as_deref())?;
     let context = runtime
-        .grounding
+        .browser
         .symbol_context(target.selected.node_id.clone())
         .map_err(map_api_error)?;
     if cmd.mermaid {
@@ -416,6 +432,7 @@ fn run_symbol(cmd: SymbolCommand) -> Result<()> {
 }
 
 fn run_trail(cmd: TrailCommand) -> Result<()> {
+    preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "trail")?;
@@ -424,7 +441,7 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
     let target = resolve_target(&runtime, cmd.target.selection()?, file_filter.as_deref())?;
     let request = build_trail_request(&target.selected.node_id, &cmd);
     let mut context = runtime
-        .grounding
+        .browser
         .trail_context(request)
         .map_err(map_api_error)?;
     if cmd.hide_speculative {
@@ -449,6 +466,7 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
 
 fn run_snippet(cmd: SnippetCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "snippet")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "snippet")?;
@@ -456,7 +474,7 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
     let file_filter = cmd.target.file_filter();
     let target = resolve_target(&runtime, cmd.target.selection()?, file_filter.as_deref())?;
     let context = runtime
-        .grounding
+        .browser
         .snippet_context(target.selected.node_id.clone(), cmd.context)
         .map_err(map_api_error)?;
     let colorize = cmd.format == args::OutputFormat::Markdown
@@ -472,115 +490,19 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
 
 fn run_query(cmd: QueryCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "query")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
     let ast = codestory_runtime::parse_graph_query(&cmd.query)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "query")?;
-    let mut items = Vec::<QueryItemOutput>::new();
-    for op in &ast.operations {
-        match op {
-            GraphQueryOperation::Trail(query) => {
-                let target = resolve_target(
-                    &runtime,
-                    args::TargetSelection::Query(query.symbol.clone()),
-                    None,
-                )?;
-                let mut request = TrailConfigDto {
-                    root_id: target.selected.node_id.clone(),
-                    mode: TrailMode::Neighborhood,
-                    target_id: None,
-                    depth: query.depth.unwrap_or(2),
-                    direction: query.direction.unwrap_or(TrailDirection::Both),
-                    caller_scope: TrailCallerScope::ProductionOnly,
-                    edge_filter: Vec::new(),
-                    show_utility_calls: false,
-                    node_filter: Vec::new(),
-                    max_nodes: 120,
-                    layout_direction: LayoutDirection::Horizontal,
-                };
-                if request.depth == 0 {
-                    request.max_nodes = 200;
-                }
-                let context = runtime
-                    .grounding
-                    .trail_context(request)
-                    .map_err(map_api_error)?;
-                items = context
-                    .trail
-                    .nodes
-                    .iter()
-                    .map(|node| graph_node_to_query_item(&runtime.project_root, node, "trail"))
-                    .collect();
-            }
-            GraphQueryOperation::Symbol(query) => {
-                let target = resolve_target(
-                    &runtime,
-                    args::TargetSelection::Query(query.query.clone()),
-                    None,
-                )?;
-                let context = runtime
-                    .grounding
-                    .symbol_context(target.selected.node_id.clone())
-                    .map_err(map_api_error)?;
-                items = std::iter::once(node_details_to_query_item(
-                    &runtime.project_root,
-                    &context.node,
-                    Some(0),
-                    "symbol",
-                ))
-                .chain(context.children.iter().map(|child| {
-                    QueryItemOutput {
-                        node_id: child.id.0.clone(),
-                        node_ref: None,
-                        display_name: child.label.clone(),
-                        kind: child.kind,
-                        file_path: child
-                            .file_path
-                            .as_deref()
-                            .map(|path| display::relative_path(&runtime.project_root, path)),
-                        line: None,
-                        depth: Some(1),
-                        source: "symbol_child".to_string(),
-                    }
-                }))
-                .collect();
-            }
-            GraphQueryOperation::Search(query) => {
-                let results = runtime
-                    .search
-                    .search_results(SearchRequest {
-                        query: query.query.clone(),
-                        repo_text: SearchRepoTextMode::Off,
-                        limit_per_source: 50,
-                        hybrid_weights: None,
-                        hybrid_limits: None,
-                    })
-                    .map_err(map_api_error)?;
-                items = results
-                    .indexed_symbol_hits
-                    .iter()
-                    .map(|hit| search_hit_to_query_item(&runtime.project_root, hit, "search"))
-                    .collect();
-            }
-            GraphQueryOperation::Filter(filter) => {
-                items.retain(|item| {
-                    filter.kind.is_none_or(|kind| item.kind == kind)
-                        && filter
-                            .depth
-                            .is_none_or(|depth| item.depth.unwrap_or(0) <= depth)
-                        && filter.file.as_deref().is_none_or(|needle| {
-                            item.file_path
-                                .as_deref()
-                                .is_some_and(|path| path.contains(needle))
-                        })
-                });
-            }
-            GraphQueryOperation::Limit(limit) => {
-                items.truncate(limit.count as usize);
-            }
-        }
-    }
+    let items = runtime
+        .browser
+        .query(&ast)
+        .map_err(map_api_error)?
+        .iter()
+        .map(|item| browser_query_item_to_output(&runtime.project_root, item))
+        .collect();
     let output = QueryOutput {
         query: cmd.query,
         ast,
@@ -592,17 +514,18 @@ fn run_query(cmd: QueryCommand) -> Result<()> {
 
 fn run_explore(cmd: ExploreCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "explore")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "explore")?;
     let file_filter = cmd.target.file_filter();
     let target = resolve_target(&runtime, cmd.target.selection()?, file_filter.as_deref())?;
     let symbol = runtime
-        .grounding
+        .browser
         .symbol_context(target.selected.node_id.clone())
         .map_err(map_api_error)?;
     let trail = runtime
-        .grounding
+        .browser
         .trail_context(TrailConfigDto {
             root_id: target.selected.node_id.clone(),
             mode: TrailMode::Neighborhood,
@@ -618,7 +541,7 @@ fn run_explore(cmd: ExploreCommand) -> Result<()> {
         })
         .map_err(map_api_error)?;
     let snippet = runtime
-        .grounding
+        .browser
         .snippet_context(target.selected.node_id.clone(), 4)
         .ok();
     let output = ExploreOutput {
@@ -754,6 +677,7 @@ fn build_doctor_output(
 
     let environment = [
         "CODESTORY_EMBED_PROFILE",
+        "CODESTORY_EMBED_MODEL_ID",
         "CODESTORY_EMBED_BACKEND",
         "CODESTORY_EMBED_RUNTIME_MODE",
         "CODESTORY_EMBED_LLAMACPP_URL",
@@ -892,28 +816,27 @@ fn graph_node_to_query_item(
     }
 }
 
-fn search_hit_to_query_item(
+fn browser_query_item_to_output(
     project_root: &std::path::Path,
-    hit: &SearchHit,
-    source: &str,
+    item: &codestory_runtime::BrowserQueryItem,
 ) -> QueryItemOutput {
     QueryItemOutput {
-        node_id: hit.node_id.0.clone(),
+        node_id: item.node_id.0.clone(),
         node_ref: output::node_ref(
             project_root,
-            hit.file_path.as_deref(),
-            hit.line,
-            &hit.display_name,
+            item.file_path.as_deref(),
+            item.line,
+            &item.display_name,
         ),
-        display_name: hit.display_name.clone(),
-        kind: hit.kind,
-        file_path: hit
+        display_name: item.display_name.clone(),
+        kind: item.kind,
+        file_path: item
             .file_path
             .as_deref()
             .map(|path| display::relative_path(project_root, path)),
-        line: hit.line,
-        depth: None,
-        source: source.to_string(),
+        line: item.line,
+        depth: item.depth,
+        source: item.source.clone(),
     }
 }
 
@@ -961,32 +884,6 @@ fn build_navigation_output(
         definition: build_search_hit_output(project_root, &target.selected, false),
         incoming_references,
         outgoing_references,
-    }
-}
-
-fn node_details_to_query_item(
-    project_root: &std::path::Path,
-    node: &codestory_contracts::api::NodeDetailsDto,
-    depth: Option<u32>,
-    source: &str,
-) -> QueryItemOutput {
-    QueryItemOutput {
-        node_id: node.id.0.clone(),
-        node_ref: output::node_ref(
-            project_root,
-            node.file_path.as_deref(),
-            node.start_line,
-            &node.display_name,
-        ),
-        display_name: node.display_name.clone(),
-        kind: node.kind,
-        file_path: node
-            .file_path
-            .as_deref()
-            .map(|path| display::relative_path(project_root, path)),
-        line: node.start_line,
-        depth,
-        source: source.to_string(),
     }
 }
 
@@ -1271,7 +1168,7 @@ fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Resul
                 .unwrap_or(10)
                 .clamp(1, 100);
             let results = runtime
-                .search
+                .browser
                 .search_results(SearchRequest {
                     query,
                     repo_text,
@@ -1286,7 +1183,7 @@ fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Resul
             let query = params.get("q").cloned().unwrap_or_default();
             let target = resolve_target(runtime, args::TargetSelection::Query(query), None)?;
             let context = runtime
-                .grounding
+                .browser
                 .symbol_context(target.selected.node_id)
                 .map_err(map_api_error)?;
             write_http_json(&mut stream, 200, &context)
@@ -1294,8 +1191,8 @@ fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Resul
         "/definition" => {
             let target = resolve_target(runtime, target_selection_from_params(&params)?, None)?;
             let context = runtime
-                .grounding
-                .symbol_context(target.selected.node_id.clone())
+                .browser
+                .definition_context(target.selected.node_id.clone())
                 .map_err(map_api_error)?;
             write_http_json(
                 &mut stream,
@@ -1314,8 +1211,8 @@ fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Resul
                 .and_then(|value| value.parse::<u32>().ok())
                 .unwrap_or(0);
             let context = runtime
-                .grounding
-                .trail_context(TrailConfigDto {
+                .browser
+                .references_context(TrailConfigDto {
                     root_id: target.selected.node_id.clone(),
                     mode: TrailMode::AllReferencing,
                     target_id: None,
@@ -1345,7 +1242,7 @@ fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Resul
                 .map(|value| value.clamp(1, 2_000));
             if let Some(parent_id) = params.get("parent_id").filter(|value| !value.is_empty()) {
                 let symbols = runtime
-                    .grounding
+                    .browser
                     .list_children_symbols(ListChildrenSymbolsRequest {
                         parent_id: NodeId(parent_id.clone()),
                     })
@@ -1353,7 +1250,7 @@ fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Resul
                 write_http_json(&mut stream, 200, &symbols)
             } else {
                 let symbols = runtime
-                    .grounding
+                    .browser
                     .list_root_symbols(ListRootSymbolsRequest { limit })
                     .map_err(map_api_error)?;
                 write_http_json(&mut stream, 200, &symbols)
@@ -1367,7 +1264,7 @@ fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Resul
                 .and_then(|value| value.parse::<u32>().ok())
                 .unwrap_or(2);
             let context = runtime
-                .grounding
+                .browser
                 .trail_context(TrailConfigDto {
                     root_id: target.selected.node_id,
                     mode: TrailMode::Neighborhood,
@@ -1535,7 +1432,7 @@ fn handle_stdio_tool_call(
 
 fn handle_stdio_search(runtime: &RuntimeContext, query: String) -> serde_json::Value {
     runtime
-        .search
+        .browser
         .search_results(SearchRequest {
             query,
             repo_text: SearchRepoTextMode::Auto,
@@ -1551,7 +1448,7 @@ fn handle_stdio_symbol(runtime: &RuntimeContext, query: String) -> serde_json::V
     resolve_target(runtime, args::TargetSelection::Query(query), None)
         .and_then(|target| {
             runtime
-                .grounding
+                .browser
                 .symbol_context(target.selected.node_id)
                 .map_err(map_api_error)
         })
@@ -1563,7 +1460,7 @@ fn handle_stdio_trail(runtime: &RuntimeContext, query: String) -> serde_json::Va
     resolve_target(runtime, args::TargetSelection::Query(query), None)
         .and_then(|target| {
             runtime
-                .grounding
+                .browser
                 .trail_context(TrailConfigDto {
                     root_id: target.selected.node_id,
                     mode: TrailMode::Neighborhood,
@@ -1590,8 +1487,8 @@ fn handle_stdio_definition(
     resolve_target(runtime, stdio_target_selection(request), None)
         .and_then(|target| {
             runtime
-                .grounding
-                .symbol_context(target.selected.node_id.clone())
+                .browser
+                .definition_context(target.selected.node_id.clone())
                 .map_err(map_api_error)
                 .map(|symbol| {
                     serde_json::json!({
@@ -1612,8 +1509,8 @@ fn handle_stdio_references(
     resolve_target(runtime, stdio_target_selection(request), None)
         .and_then(|target| {
             runtime
-                .grounding
-                .trail_context(TrailConfigDto {
+                .browser
+                .references_context(TrailConfigDto {
                     root_id: target.selected.node_id.clone(),
                     mode: TrailMode::AllReferencing,
                     target_id: None,
@@ -1646,7 +1543,7 @@ fn handle_stdio_symbols(
         .filter(|value| !value.is_empty());
     let result = if let Some(parent_id) = parent_id {
         runtime
-            .grounding
+            .browser
             .list_children_symbols(ListChildrenSymbolsRequest {
                 parent_id: NodeId(parent_id.to_string()),
             })
@@ -1656,7 +1553,7 @@ fn handle_stdio_symbols(
             })
     } else {
         runtime
-            .grounding
+            .browser
             .list_root_symbols(ListRootSymbolsRequest { limit })
             .map(|symbols| {
                 serde_json::to_value(symbols)
@@ -1675,7 +1572,7 @@ fn handle_stdio_snippet(
     resolve_target(runtime, stdio_target_selection(request), None)
         .and_then(|target| {
             runtime
-                .grounding
+                .browser
                 .snippet_context(target.selected.node_id, 4)
                 .map_err(map_api_error)
         })
@@ -1694,7 +1591,7 @@ fn handle_stdio_ask(
         .unwrap_or(default_prompt)
         .to_string();
     runtime
-        .agent
+        .browser
         .ask(AgentAskRequest {
             prompt,
             retrieval_profile: codestory_contracts::api::AgentRetrievalProfileSelectionDto::Auto,
@@ -1842,7 +1739,7 @@ fn read_stdio_resource(runtime: &RuntimeContext, uri: &str) -> serde_json::Value
             .map(|snapshot| serde_json::json!(snapshot))
             .map_err(map_api_error),
         "codestory://symbols/root" => runtime
-            .grounding
+            .browser
             .list_root_symbols(ListRootSymbolsRequest { limit: Some(300) })
             .map(|symbols| serde_json::json!(symbols))
             .map_err(map_api_error),
@@ -1863,13 +1760,13 @@ fn read_stdio_template_resource(runtime: &RuntimeContext, uri: &str) -> Result<s
     let node_id = NodeId(node_id.to_string());
     match kind {
         "symbol" => runtime
-            .grounding
+            .browser
             .symbol_context(node_id)
             .map(|value| serde_json::json!(value))
             .map_err(map_api_error),
         "references" => runtime
-            .grounding
-            .trail_context(TrailConfigDto {
+            .browser
+            .references_context(TrailConfigDto {
                 root_id: node_id,
                 mode: TrailMode::AllReferencing,
                 target_id: None,
@@ -1885,12 +1782,12 @@ fn read_stdio_template_resource(runtime: &RuntimeContext, uri: &str) -> Result<s
             .map(|value| serde_json::json!(value))
             .map_err(map_api_error),
         "snippet" => runtime
-            .grounding
+            .browser
             .snippet_context(node_id, 4)
             .map(|value| serde_json::json!(value))
             .map_err(map_api_error),
         "trail" => runtime
-            .grounding
+            .browser
             .trail_context(TrailConfigDto {
                 root_id: node_id,
                 mode: TrailMode::Neighborhood,

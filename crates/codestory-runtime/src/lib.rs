@@ -36,6 +36,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 mod agent;
 mod agent_commands;
+mod browser;
 mod graph_builders;
 mod graph_canonical;
 mod grounding;
@@ -53,6 +54,7 @@ mod system_actions;
 pub(crate) use agent_commands::{
     agent_backend_label, configured_agent_command, resolve_agent_command,
 };
+pub use browser::{BrowserQueryItem, ReadOnlyBrowserService};
 pub use codestory_contracts as contracts;
 pub(crate) use mermaid::{fallback_mermaid, mermaid_flowchart, mermaid_gantt, mermaid_sequence};
 pub use query_language::{GraphQueryParseError, parse_graph_query};
@@ -116,6 +118,10 @@ impl Runtime {
 
     pub fn agent_service(&self) -> AgentService {
         AgentService::new(self.controller.clone())
+    }
+
+    pub fn browser_service(&self) -> ReadOnlyBrowserService {
+        ReadOnlyBrowserService::new(self.controller.clone())
     }
 
     pub fn events(&self) -> Receiver<AppEventPayload> {
@@ -1879,6 +1885,10 @@ impl AppController {
 
     pub fn agent_service(&self) -> AgentService {
         AgentService::new(self.clone())
+    }
+
+    pub fn browser_service(&self) -> ReadOnlyBrowserService {
+        ReadOnlyBrowserService::new(self.clone())
     }
 
     /// Subscribe to backend events. Intended to be consumed by a single pump

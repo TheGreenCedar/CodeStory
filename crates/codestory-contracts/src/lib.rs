@@ -4,3 +4,4 @@ pub mod graph;
 pub mod grounding;
 pub mod query;
 pub mod trail;
+pub mod workspace;

@@ -4,7 +4,7 @@ use codestory_contracts::api::{
     ProjectSummary, SearchHit, SearchRepoTextMode, SearchRequest,
 };
 use codestory_runtime::{
-    AgentService, GroundingService, IndexService, ProjectService, Runtime, SearchService,
+    AgentService, GroundingService, IndexService, ProjectService, ReadOnlyBrowserService, Runtime,
 };
 use directories::ProjectDirs;
 use std::path::{Path, PathBuf};
@@ -26,9 +26,9 @@ pub(crate) struct OpenedProject {
 pub(crate) struct RuntimeContext {
     pub(crate) project: ProjectService,
     pub(crate) index: IndexService,
-    pub(crate) search: SearchService,
     pub(crate) grounding: GroundingService,
     pub(crate) agent: AgentService,
+    pub(crate) browser: ReadOnlyBrowserService,
     pub(crate) events: crossbeam_channel::Receiver<AppEventPayload>,
     pub(crate) project_root: PathBuf,
     pub(crate) storage_path: PathBuf,
@@ -57,9 +57,9 @@ impl RuntimeContext {
         Ok(Self {
             project: runtime.project_service(),
             index: runtime.index_service(),
-            search: runtime.search_service(),
             grounding: runtime.grounding_service(),
             agent: runtime.agent_service(),
+            browser: runtime.browser_service(),
             events,
             project_root,
             storage_path,
@@ -108,7 +108,7 @@ pub(crate) fn resolve_target(
     match target {
         TargetSelection::Id(id) => {
             let details = runtime
-                .grounding
+                .browser
                 .node_details(NodeDetailsRequest { id: id.clone() })
                 .map_err(map_api_error)?;
             Ok(ResolvedTarget {
@@ -121,7 +121,7 @@ pub(crate) fn resolve_target(
         }
         TargetSelection::Query(query) => {
             let mut alternatives = runtime
-                .search
+                .browser
                 .search_hybrid(
                     SearchRequest {
                         query: query.clone(),

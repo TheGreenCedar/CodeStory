@@ -47,6 +47,20 @@ Refresh behavior belongs to runtime, not the CLI adapter:
 
 Semantic indexing is not a separate CLI flag. The default `index` path syncs semantic docs when embedding assets are available. Runtime-level environment variables control retrieval behavior and tuning, including `CODESTORY_HYBRID_RETRIEVAL_ENABLED`, `CODESTORY_SEMANTIC_DOC_SCOPE`, `CODESTORY_SEMANTIC_DOC_ALIAS_MODE`, `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE`, and `CODESTORY_EMBED_*`.
 
+## Configuration Files
+
+The CLI loads optional `.codestory.toml` defaults from the user home directory and then from the selected project root. Project config overrides home config. Explicit environment variables override both config files because config values are only applied when the matching runtime env var is absent.
+
+Embedding config keys map to the runtime env names:
+
+| `.codestory.toml` key | Runtime env var | Notes |
+| --- | --- | --- |
+| `embedding_profile` | `CODESTORY_EMBED_PROFILE` | Selects a built-in profile such as `bge-base-en-v1.5`, `bge-small-en-v1.5`, or `custom`. |
+| `embedding_model_id` | `CODESTORY_EMBED_MODEL_ID` | Overrides the resolved model id for the selected profile. |
+| `embedding_model` | `CODESTORY_EMBED_MODEL_ID` | Deprecated alias for `embedding_model_id`; prefer the explicit key in new config. |
+
+The CLI should not set stale embedding env aliases that the runtime does not read.
+
 Index output should expose:
 
 - project and storage paths

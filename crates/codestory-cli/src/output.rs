@@ -67,7 +67,7 @@ fn render_output_content<T: Serialize>(
     Ok(content)
 }
 
-fn write_output_file(path: &Path, content: &str) -> Result<()> {
+pub(crate) fn validate_output_file_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -78,7 +78,11 @@ fn write_output_file(path: &Path, content: &str) -> Result<()> {
             clean_path_string(&parent.to_string_lossy())
         );
     }
+    Ok(())
+}
 
+fn write_output_file(path: &Path, content: &str) -> Result<()> {
+    validate_output_file_parent(path)?;
     let file = File::create(path).with_context(|| {
         format!(
             "Failed to create output file {}",

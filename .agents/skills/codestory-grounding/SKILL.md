@@ -15,9 +15,21 @@ Use this skill to collect repo evidence with `codestory-cli` before answering ar
 4. Run `target/release/codestory-cli(.exe) ground --project <workspace>` for a compact context snapshot, then use `search`, `symbol`, `trail`, `query`, or `snippet` to narrow focus.
 5. Treat command output as evidence, then open only the files needed for edits or verification.
 
+## LLM Default Browser Loop
+
+Use this short loop before making repo claims or edits:
+
+1. `doctor --project <workspace>` to check project/cache/index/retrieval health.
+2. `index --project <workspace> --refresh full` if doctor reports no cache/index, stale failures, or a schema/indexing change needs proof; otherwise keep read commands on `--refresh none`.
+3. `ground --project <workspace>` for the compact map.
+4. `search --project <workspace> --query "<symbol or question>" --why` to find candidate evidence and ranking reasons.
+5. Use `symbol`, `trail`, `snippet`, or `explore` on the best node/query to verify definitions, relationships, and code.
+6. Use `ask --project <workspace> "<question>"` only after evidence is indexed; keep citations/evidence enabled unless the user asks for a terse handoff.
+
 ## Freshness Rules
 
-- Binary freshness: rebuild `codestory-cli` after changing `crates/codestory-cli`, `crates/codestory-app`, `crates/codestory-index`, `crates/codestory-storage`, or shared CLI-facing types.
+- Workspace crates: `codestory-contracts`, `codestory-workspace`, `codestory-store`, `codestory-indexer`, `codestory-runtime`, `codestory-cli`, and `codestory-bench`.
+- Binary freshness: rebuild `codestory-cli` after changing `crates/codestory-cli`, `crates/codestory-runtime`, `crates/codestory-contracts`, `crates/codestory-workspace`, `crates/codestory-indexer`, `crates/codestory-store`, or shared CLI-facing types.
 - Index freshness: use `index --refresh full` when checking whether historical indexing failures are actually gone. Incremental runs can leave stale error rows if the affected files are not reprocessed.
 - Query freshness: use `search` or `trail` with `--refresh none` only after the index has just been rebuilt successfully in the same session.
 
@@ -52,10 +64,12 @@ Detailed argument tables, output examples, and usage patterns for each command:
 
 - [index](references/index.md) — Build or refresh the symbol index
 - [ground](references/ground.md) — Compact codebase context snapshot
+- [doctor](references/doctor.md) — Read-only project/cache/index/retrieval health check
 - [search](references/search.md) — Search indexed symbols and repo text
 - [symbol](references/symbol.md) — Inspect a symbol's details and relationships
 - [trail](references/trail.md) — Follow a symbol's call/reference graph
 - [snippet](references/snippet.md) — Fetch source code context around a symbol
 - [query](references/query.md) — Structured graph query pipelines: `trail`, `symbol`, `search`, `filter`, and `limit`
-- `explore` — Interactive terminal exploration with Markdown/JSON fallback
-- `serve` — Local HTTP JSON API or stdio tool protocol
+- [explore](references/explore.md) — Interactive terminal exploration with Markdown/JSON fallback
+- [ask](references/ask.md) — DB-first answer packet with citations and optional handoff bundle
+- [serve](references/serve.md) — Local HTTP JSON API or stdio tool protocol

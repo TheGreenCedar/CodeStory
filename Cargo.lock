@@ -445,7 +445,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "codestory-contracts",
- "codestory-workspace",
  "parking_lot",
  "rusqlite",
  "serde",
@@ -460,6 +459,7 @@ name = "codestory-workspace"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "codestory-contracts",
  "glob",
  "ignore",
  "serde",

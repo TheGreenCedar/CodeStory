@@ -119,6 +119,11 @@ fn runtime_crate_depends_on_v2_surfaces_only() {
 #[test]
 fn store_crate_owns_persistence_without_legacy_escape_hatches() {
     let dependencies = dependency_names("crates/codestory-store/Cargo.toml");
+    assert!(
+        !dependencies.contains("codestory-workspace"),
+        "store should not depend on workspace discovery or refresh planning"
+    );
+
     for legacy in [
         "codestory-storage",
         "codestory-core",
@@ -160,6 +165,71 @@ fn cli_stays_thin() {
             "CLI source tree should not reference {forbidden} directly"
         );
     }
+}
+
+#[test]
+fn runtime_exposes_read_only_browser_service_boundary() {
+    let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
+    let browser = read("crates/codestory-runtime/src/browser.rs");
+    let cli_runtime = read("crates/codestory-cli/src/runtime.rs");
+    let cli_main = read("crates/codestory-cli/src/main.rs");
+
+    assert!(
+        runtime_lib.contains("pub use browser::{BrowserQueryItem, ReadOnlyBrowserService}")
+            && runtime_lib.contains("pub fn browser_service(&self) -> ReadOnlyBrowserService"),
+        "runtime should export a read-only browser service accessor"
+    );
+    assert!(
+        browser.contains("pub struct ReadOnlyBrowserService")
+            && browser.contains("pub fn search_results")
+            && browser.contains("pub fn symbol_context")
+            && browser.contains("pub fn definition_context")
+            && browser.contains("pub fn trail_context")
+            && browser.contains("pub fn references_context")
+            && browser.contains("pub fn snippet_context")
+            && browser.contains("pub fn list_root_symbols")
+            && browser.contains("pub fn list_children_symbols")
+            && browser.contains("pub fn query")
+            && browser.contains("pub fn ask"),
+        "read-only browser service should own the browser-facing read methods"
+    );
+    assert!(
+        browser.contains("req.run_local_agent = false"),
+        "read-only browser ask should force DB-first execution"
+    );
+
+    for forbidden in [
+        "open_definition",
+        "write_file",
+        "WriteFile",
+        "OpenContainingFolder",
+        "SystemActionResponse",
+        "launch_definition",
+        "TcpListener",
+        "run_stdio_server",
+        "handle_http_request",
+    ] {
+        assert!(
+            !browser.contains(forbidden),
+            "read-only browser service should not mention forbidden write/system/transport API {forbidden}"
+        );
+    }
+
+    assert!(
+        cli_runtime.contains("pub(crate) browser: ReadOnlyBrowserService")
+            && cli_runtime.contains("browser: runtime.browser_service()"),
+        "CLI runtime context should carry the runtime-owned browser boundary"
+    );
+    assert!(
+        cli_main.contains(".search_results(SearchRequest")
+            && cli_main.contains(".symbol_context(")
+            && cli_main.contains(".trail_context(")
+            && cli_main.contains(".snippet_context(")
+            && cli_main.contains(".query(&ast)")
+            && cli_main.contains("runtime.browser.ask(request)")
+            && cli_main.contains("runtime.agent.ask(request)"),
+        "CLI read-only browser operations should route through RuntimeContext.browser"
+    );
 }
 
 #[test]

@@ -117,7 +117,10 @@ pub(crate) fn agent_ask(
 
     let local_agent_step = trace.start_step(
         AgentRetrievalStepKindDto::LocalAgent,
-        vec![field("backend", format!("{:?}", req.connection.backend))],
+        vec![
+            field("backend", format!("{:?}", req.connection.backend)),
+            field("requested", req.run_local_agent.to_string()),
+        ],
     );
     let local_agent_result = if req.run_local_agent {
         let local_agent_prompt = build_local_agent_prompt(
@@ -142,7 +145,7 @@ pub(crate) fn agent_ask(
         trace.finish_skipped(
             local_agent_step,
             "Local agent execution disabled for this ask request.",
-            Vec::new(),
+            vec![field("state", "disabled")],
         );
         None
     };
