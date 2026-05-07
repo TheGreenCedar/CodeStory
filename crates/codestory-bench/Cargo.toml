@@ -39,3 +39,7 @@ harness = false
 [[bench]]
 name = "incremental_cleanup"
 harness = false
+
+[[bench]]
+name = "browser_stress"
+harness = false

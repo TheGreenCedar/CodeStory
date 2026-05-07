@@ -137,3 +137,22 @@ For indexing performance work, run the full bench when practical:
 ```powershell
 cargo bench -p codestory-bench --bench indexing
 ```
+
+For browser-scale stress work, start with the smoke lane and only opt into
+larger synthetic repos when the machine and change justify it:
+
+```powershell
+cargo bench -p codestory-bench --bench browser_stress
+$env:CODESTORY_STRESS_SCALE = "large" # 1k + 10k
+$env:CODESTORY_ALLOW_HEAVY_STRESS = "1"
+cargo bench -p codestory-bench --bench browser_stress
+```
+
+The full `100k` synthetic lane is intentionally opt-in with
+`CODESTORY_STRESS_SCALE=full`, `CODESTORY_ALLOW_HEAVY_STRESS=1`, and
+`CODESTORY_ALLOW_100K_STRESS=1`. The Criterion concurrency lane is a
+browser-service proxy for stdio/HTTP-shaped work, not transport promotion
+proof. Synthetic stress results are promotion scouts only; promotion requires
+at least one real repository run recorded with the same commit and command
+shape. See
+[`codestory-stress-lanes.md`](../testing/codestory-stress-lanes.md).
