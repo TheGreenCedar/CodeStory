@@ -62,7 +62,6 @@ pub(crate) struct ProjectArgs {
 pub(crate) enum OutputFormat {
     Markdown,
     Json,
-    #[value(hide = true)]
     Dot,
 }
 
@@ -1203,6 +1202,15 @@ mod tests {
         assert!(help.contains("--max-results"));
         assert!(help.contains("--with-local-agent"));
         assert!(help.contains("How does this repo fit together?"));
+    }
+
+    #[test]
+    fn trail_help_keeps_dot_format_discoverable() {
+        let help = render_subcommand_help("trail");
+        assert!(
+            help.contains("dot"),
+            "trail help should expose its graphviz output format: {help}"
+        );
     }
 
     #[test]

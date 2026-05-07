@@ -8,7 +8,7 @@ Eliminate user and AI friction in CodeStory skill-first repo explanation across 
 - Secondary: none yet
 
 ## How to Run
-`node scripts/codestory-manual-friction-check.mjs --setup-embeddings` prints `METRIC name=value` lines.
+`powershell -NoProfile -ExecutionPolicy Bypass -File ./autoresearch.ps1` builds the release CLI, runs `node scripts/codestory-manual-friction-check.mjs --setup-embeddings`, and prints `METRIC name=value` lines.
 
 ## Files in Scope
 - crates/codestory-runtime
@@ -43,8 +43,8 @@ Eliminate user and AI friction in CodeStory skill-first repo explanation across 
 
 ## What's Been Tried
 - 2026-05-07: Implemented semantic doc token budgeting, doctor semantic health labels, repo-overview ask fallback, query/trail resolver consistency, snippet/mode output clarity, and skill guidance updates.
-- Two fresh manual full harness rounds emitted `METRIC quality_gap=0`.
-- Autoresearch packet `packet-1-089c8d5afed0` kept with `quality_gap=0`, `repos_checked=3`, and checks passing.
+- 2026-05-07 follow-up: fixed `trail` help discoverability for `dot`, corrected repo-explain local-agent mode labeling, replaced placeholder e2e commit labels, and made the harness rebuild the release CLI before measuring.
+- Autoresearch packet `packet-1-089c8d5afed0` kept with `quality_gap=0`, `repos_checked=3`, and checks passing. A fresh packet should be logged after the follow-up patch so the ledger points at the final implementation commit.
 
 ## Resume This Session
 
