@@ -62,4 +62,5 @@ node "C:\\Users\\alber\\source\\repos\\autoresearch\\plugins\\codex-autoresearch
 
 <!-- AUTORESEARCH_RUN_LEDGER:START -->
 - Run 1 keep: Close manual explanation friction checklist; metric=0; best=0; commit=acf962b; Git: committed acf962b..
+- Run 2 keep: Verify forensic follow-up fixes; metric=0; best=0; commit=d205509; Git: committed d205509..
 <!-- AUTORESEARCH_RUN_LEDGER:END -->
