@@ -19,6 +19,7 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-04-19 | 33cb581 | pass, hash semantic check for delight QoL lane | 7.64 | 0.04 | 0.25 | 0.07 | 0.04 | 0.03 | 29,692 | 25,215 | 127 | 0 | 4,039 | true |
 | 2026-04-20 | e1dc489 | pass, hash semantic check for embedding research lane | 8.31 | 0.04 | 0.24 | 0.08 | 0.04 | 0.03 | 29,840 | 25,331 | 127 | 0 | 4,055 | true |
 | 2026-04-20 | b5c6337 | pass, delight roadmap implementation | 111.52 | 0.05 | 0.94 | 0.09 | 0.04 | 0.03 | 30,414 | 25,829 | 127 | 0 | 4,114 | true |
+| 2026-05-07 | 0adcd43 | pass, hash semantic check for stdio MCP envelope fix | 11.01 | 0.20 | 0.45 | 0.19 | 0.14 | 0.14 | 39,087 | 33,167 | 141 | 0 | 5,410 | true |
 
 ## Phase Metrics
 
@@ -33,3 +34,4 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-04-19 | 33cb581 | hash semantic check for delight QoL lane cold E2E | 7.64 | 3.21 | 0.89 | 0 | 4,039 | 0 |
 | 2026-04-20 | e1dc489 | hash semantic check for embedding research lane cold E2E | 8.31 | 3.27 | 0.92 | 0 | 4,055 | 0 |
 | 2026-04-20 | b5c6337 | delight roadmap implementation cold E2E | 111.52 | 3.07 | 103.66 | 0 | 4,114 | 0 |
+| 2026-05-07 | 0adcd43 | hash semantic check for stdio MCP envelope fix cold E2E | 11.01 | 4.47 | 1.60 | 0 | 5,410 | 0 |
