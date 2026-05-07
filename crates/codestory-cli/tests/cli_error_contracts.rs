@@ -206,6 +206,52 @@ fn non_trail_dot_format_is_rejected_before_runtime_cache_creation() {
 }
 
 #[test]
+fn trail_story_output_conflicts_are_rejected_before_runtime_cache_creation() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    let mermaid = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "trail",
+            "--query",
+            "AppController",
+            "--story",
+            "--mermaid",
+            "--refresh",
+            "none",
+        ],
+    );
+    assert_fails_with(mermaid, &["--story cannot be combined with --mermaid"]);
+    assert!(
+        !cache_dir.path().join("codestory.db").exists(),
+        "story/mermaid validation should happen before runtime cache creation"
+    );
+
+    let dot = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "trail",
+            "--query",
+            "AppController",
+            "--story",
+            "--format",
+            "dot",
+            "--refresh",
+            "none",
+        ],
+    );
+    assert_fails_with(dot, &["--story cannot be combined with --format dot"]);
+    assert!(
+        !cache_dir.path().join("codestory.db").exists(),
+        "story/dot validation should happen before runtime cache creation"
+    );
+}
+
+#[test]
 fn ambiguous_query_lists_ranked_alternatives_and_next_steps() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");

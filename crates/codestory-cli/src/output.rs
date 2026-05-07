@@ -4,7 +4,7 @@ use codestory_contracts::api::{
     AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
     AgentRetrievalStepStatusDto, GraphArtifactDto, GroundingSnapshotDto, NodeDetailsDto,
     RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto,
-    SearchHit, SnippetContextDto, SymbolContextDto, TrailContextDto,
+    SearchHit, SnippetContextDto, SymbolContextDto, TrailContextDto, TrailStoryDto,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -1531,6 +1531,56 @@ pub(crate) fn render_trail_markdown(
     markdown
 }
 
+pub(crate) fn render_trail_story_markdown(
+    project_root: &Path,
+    target: &ResolvedTarget,
+    context: &TrailContextDto,
+    _cmd: &TrailCommand,
+    story: &TrailStoryDto,
+) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Trail Story");
+    append_resolution(&mut markdown, project_root, target);
+    let _ = writeln!(
+        markdown,
+        "focus: {}",
+        render_node(project_root, &context.focus)
+    );
+    let _ = writeln!(markdown, "summary: {}", story.summary);
+
+    append_story_list(&mut markdown, "## Entry Points", &story.entry_points);
+
+    let _ = writeln!(markdown, "\n## Core Flow");
+    if story.core_flow.is_empty() {
+        let _ = writeln!(markdown, "- no graph edges were returned for this focus");
+    } else {
+        for step in &story.core_flow {
+            let _ = writeln!(
+                markdown,
+                "- [{}] {} {} {} (certainty={}). {}",
+                step.edge_id, step.source, step.relation, step.target, step.certainty, step.note
+            );
+        }
+    }
+
+    append_story_list(&mut markdown, "## Side Effects", &story.side_effects);
+    append_story_list(&mut markdown, "## Uncertainty", &story.uncertainty);
+    append_story_list(&mut markdown, "## Tests", &story.test_scope);
+    append_story_list(&mut markdown, "## Gaps And Limits", &story.limits);
+    markdown
+}
+
+fn append_story_list(markdown: &mut String, title: &str, items: &[String]) {
+    let _ = writeln!(markdown, "\n{title}");
+    if items.is_empty() {
+        let _ = writeln!(markdown, "- none");
+    } else {
+        for item in items {
+            let _ = writeln!(markdown, "- {item}");
+        }
+    }
+}
+
 pub(crate) fn render_trail_dot(_project_root: &Path, context: &TrailContextDto) -> String {
     let mut dot = String::new();
     let _ = writeln!(dot, "digraph codestory_trail {{");
@@ -2025,7 +2075,7 @@ mod tests {
         GroundingCoverageDto, GroundingFileDigestDto, GroundingSnapshotDto,
         GroundingSymbolDigestDto, NodeDetailsDto, NodeId, NodeKind, RetrievalFallbackReasonDto,
         RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
-        StorageStatsDto, TrailContextDto,
+        StorageStatsDto, TrailContextDto, TrailStoryDto, TrailStoryStepDto,
     };
     use serde_json::json;
     use std::path::Path;
@@ -2125,6 +2175,27 @@ mod tests {
         }
     }
 
+    fn sample_graph_node_with_file(
+        id: &str,
+        label: &str,
+        file_path: &str,
+        depth: u32,
+    ) -> GraphNodeDto {
+        GraphNodeDto {
+            id: NodeId(id.to_string()),
+            label: label.to_string(),
+            kind: NodeKind::FUNCTION,
+            depth,
+            label_policy: None,
+            badge_visible_members: None,
+            badge_total_members: None,
+            merged_symbol_examples: Vec::new(),
+            file_path: Some(file_path.to_string()),
+            qualified_name: None,
+            member_access: None,
+        }
+    }
+
     fn sample_graph_edge(id: &str, source: &str, target: &str) -> GraphEdgeDto {
         GraphEdgeDto {
             id: EdgeId(id.to_string()),
@@ -2135,6 +2206,239 @@ mod tests {
             certainty: None,
             callsite_identity: None,
             candidate_targets: Vec::new(),
+        }
+    }
+
+    fn sample_graph_edge_with_certainty(
+        id: &str,
+        source: &str,
+        target: &str,
+        certainty: &str,
+        confidence: f32,
+    ) -> GraphEdgeDto {
+        GraphEdgeDto {
+            id: EdgeId(id.to_string()),
+            source: NodeId(source.to_string()),
+            target: NodeId(target.to_string()),
+            kind: EdgeKind::CALL,
+            confidence: Some(confidence),
+            certainty: Some(certainty.to_string()),
+            callsite_identity: None,
+            candidate_targets: Vec::new(),
+        }
+    }
+
+    fn sample_trail_command(include_tests: bool) -> TrailCommand {
+        TrailCommand {
+            project: crate::args::ProjectArgs {
+                project: Path::new("C:/repo").to_path_buf(),
+                cache_dir: None,
+            },
+            target: crate::args::TargetArgs {
+                id: None,
+                query: Some("handle_request".to_string()),
+                file: None,
+                choose: None,
+            },
+            mode: CliTrailMode::Neighborhood,
+            depth: Some(2),
+            direction: None,
+            max_nodes: 24,
+            include_tests,
+            show_utility_calls: false,
+            hide_speculative: false,
+            story: true,
+            layout: crate::args::CliLayout::Horizontal,
+            refresh: crate::args::RefreshMode::None,
+            format: OutputFormat::Markdown,
+            output_file: None,
+            mermaid: false,
+        }
+    }
+
+    fn sample_resolved_target() -> ResolvedTarget {
+        ResolvedTarget {
+            selector: crate::args::QuerySelectorOutput::Query,
+            requested: "handle_request".to_string(),
+            file_filter: None,
+            selected: SearchHit {
+                node_id: NodeId("handle".to_string()),
+                display_name: "handle_request".to_string(),
+                kind: NodeKind::FUNCTION,
+                file_path: Some("C:/repo/src/request.rs".to_string()),
+                line: Some(10),
+                score: 1.0,
+                origin: SearchHitOrigin::IndexedSymbol,
+                resolvable: true,
+                score_breakdown: None,
+            },
+            alternatives: Vec::new(),
+        }
+    }
+
+    fn sample_story_trail_context() -> TrailContextDto {
+        let mut focus = sample_node_details("handle", "handle_request");
+        focus.file_path = Some("C:/repo/src/request.rs".to_string());
+        focus.start_line = Some(10);
+        let mut uncertain =
+            sample_graph_edge_with_certainty("edge-hook", "handle", "hook", "uncertain", 0.32);
+        uncertain.candidate_targets = vec![NodeId("candidate-one".to_string())];
+
+        TrailContextDto {
+            focus,
+            trail: GraphResponse {
+                center_id: NodeId("handle".to_string()),
+                nodes: vec![
+                    sample_graph_node_with_file(
+                        "handle",
+                        "handle_request",
+                        "C:/repo/src/request.rs",
+                        0,
+                    ),
+                    sample_graph_node_with_file(
+                        "validate",
+                        "validate_request",
+                        "C:/repo/src/request.rs",
+                        1,
+                    ),
+                    sample_graph_node_with_file(
+                        "profile",
+                        "load_profile",
+                        "C:/repo/src/profile.rs",
+                        2,
+                    ),
+                    sample_graph_node_with_file(
+                        "audit",
+                        "write_audit_log",
+                        "C:/repo/src/audit.rs",
+                        1,
+                    ),
+                    sample_graph_node_with_file(
+                        "hook",
+                        "dynamic_plugin_hook",
+                        "C:/repo/src/plugin.rs",
+                        1,
+                    ),
+                    sample_graph_node_with_file(
+                        "test",
+                        "test_request_flow",
+                        "C:/repo/tests/request_flow.rs",
+                        1,
+                    ),
+                ],
+                edges: vec![
+                    sample_graph_edge_with_certainty(
+                        "edge-validate",
+                        "handle",
+                        "validate",
+                        "certain",
+                        0.99,
+                    ),
+                    sample_graph_edge_with_certainty(
+                        "edge-profile",
+                        "validate",
+                        "profile",
+                        "probable",
+                        0.72,
+                    ),
+                    sample_graph_edge_with_certainty(
+                        "edge-audit",
+                        "handle",
+                        "audit",
+                        "certain",
+                        0.94,
+                    ),
+                    uncertain,
+                    sample_graph_edge_with_certainty(
+                        "edge-test",
+                        "test",
+                        "handle",
+                        "certain",
+                        0.95,
+                    ),
+                ],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+            story: None,
+        }
+    }
+
+    fn sample_trail_story(include_tests: bool) -> TrailStoryDto {
+        TrailStoryDto {
+            summary: "Story trail around `handle_request` found 6 nodes and 5 edges; mode=neighborhood direction=both tests=included utility_calls=hidden truncated=false.".to_string(),
+            entry_points: vec![
+                "focus: handle_request [function] `src/request.rs`".to_string(),
+                "entry: test_request_flow [function] `tests/request_flow.rs`".to_string(),
+            ],
+            core_flow: vec![
+                TrailStoryStepDto {
+                    edge_id: "edge-validate".to_string(),
+                    source: "handle_request [function] `src/request.rs`".to_string(),
+                    relation: "calls".to_string(),
+                    target: "validate_request [function] `src/request.rs`".to_string(),
+                    certainty: "certain".to_string(),
+                    note: "certain call edge confidence=0.99".to_string(),
+                },
+                TrailStoryStepDto {
+                    edge_id: "edge-profile".to_string(),
+                    source: "validate_request [function] `src/request.rs`".to_string(),
+                    relation: "calls".to_string(),
+                    target: "load_profile [function] `src/profile.rs`".to_string(),
+                    certainty: "probable".to_string(),
+                    note: "probable call edge confidence=0.72".to_string(),
+                },
+                TrailStoryStepDto {
+                    edge_id: "edge-hook".to_string(),
+                    source: "handle_request [function] `src/request.rs`".to_string(),
+                    relation: "calls".to_string(),
+                    target: "dynamic_plugin_hook [function] `src/plugin.rs`".to_string(),
+                    certainty: "uncertain".to_string(),
+                    note: "uncertain call edge confidence=0.32 candidate_targets=1".to_string(),
+                },
+                TrailStoryStepDto {
+                    edge_id: "edge-speculative".to_string(),
+                    source: "handle_request [function] `src/request.rs`".to_string(),
+                    relation: "calls".to_string(),
+                    target: "experimental_hook [function] `src/plugin.rs`".to_string(),
+                    certainty: "speculative".to_string(),
+                    note: "speculative call edge confidence=0.21".to_string(),
+                },
+                TrailStoryStepDto {
+                    edge_id: "edge-missing".to_string(),
+                    source: "handle_request [function] `src/request.rs`".to_string(),
+                    relation: "calls".to_string(),
+                    target: "legacy_dispatch [function] `src/legacy.rs`".to_string(),
+                    certainty: "missing certainty metadata".to_string(),
+                    note: "missing certainty metadata call edge".to_string(),
+                },
+            ],
+            side_effects: vec![
+                "possible side-effect candidate [edge-audit] handle_request [function] `src/request.rs` calls write_audit_log [function] `src/audit.rs` (certainty=certain)".to_string(),
+            ],
+            uncertainty: vec![
+                "[edge-profile] validate_request [function] `src/request.rs` calls load_profile [function] `src/profile.rs` is probable. probable call edge confidence=0.72".to_string(),
+                "[edge-hook] handle_request [function] `src/request.rs` calls dynamic_plugin_hook [function] `src/plugin.rs` is uncertain. uncertain call edge confidence=0.32 candidate_targets=1".to_string(),
+                "[edge-speculative] handle_request [function] `src/request.rs` calls experimental_hook [function] `src/plugin.rs` is speculative. speculative call edge confidence=0.21".to_string(),
+                "[edge-missing] handle_request [function] `src/request.rs` calls legacy_dispatch [function] `src/legacy.rs` is missing certainty metadata. missing certainty metadata call edge".to_string(),
+            ],
+            test_scope: if include_tests {
+                vec![
+                    "tests and benches included by --include-tests".to_string(),
+                    "1 test-like node(s) present: test_request_flow [function] `tests/request_flow.rs`".to_string(),
+                    "utility/helper calls hidden by default; pass --show-utility-calls to include them".to_string(),
+                ]
+            } else {
+                vec![
+                    "tests and benches excluded by default production-only scope; pass --include-tests to include them".to_string(),
+                    "1 test-like node(s) present: test_request_flow [function] `tests/request_flow.rs`".to_string(),
+                    "utility/helper calls hidden by default; pass --show-utility-calls to include them".to_string(),
+                ]
+            },
+            limits: vec![
+                "trail not truncated; max_nodes=24 omitted_edge_count=0".to_string(),
+            ],
         }
     }
 
@@ -2597,6 +2901,161 @@ mod tests {
     }
 
     #[test]
+    fn trail_story_markdown_includes_required_sections_and_textual_uncertainty() {
+        let project_root = Path::new("C:/repo");
+        let context = sample_story_trail_context();
+        let cmd = sample_trail_command(true);
+        let story = sample_trail_story(true);
+        let markdown = render_trail_story_markdown(
+            project_root,
+            &sample_resolved_target(),
+            &context,
+            &cmd,
+            &story,
+        );
+
+        assert_order(&markdown, "# Trail Story", "## Entry Points");
+        assert_order(&markdown, "## Entry Points", "## Core Flow");
+        assert_order(&markdown, "## Core Flow", "## Side Effects");
+        assert_order(&markdown, "## Side Effects", "## Uncertainty");
+        assert_order(&markdown, "## Uncertainty", "## Tests");
+        assert!(markdown.contains("handle_request [function]"));
+        assert!(markdown.contains("validate_request"));
+        assert!(markdown.contains("write_audit_log"));
+        assert!(markdown.contains("certainty=certain"));
+        assert!(markdown.contains("certainty=probable"));
+        assert!(markdown.contains("certainty=uncertain"));
+        assert!(
+            markdown.contains("candidate_targets=1"),
+            "uncertainty should explain why a low-confidence edge remains textual:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn trail_story_markdown_matches_stable_snapshot() {
+        let project_root = Path::new("C:/repo");
+        let context = sample_story_trail_context();
+        let cmd = sample_trail_command(true);
+        let story = sample_trail_story(true);
+        let markdown = render_trail_story_markdown(
+            project_root,
+            &sample_resolved_target(),
+            &context,
+            &cmd,
+            &story,
+        );
+
+        let expected = r#"# Trail Story
+resolved_query: `handle_request` -> [handle] handle_request [function] src/request.rs:10 score=1.00 origin=indexed_symbol ref=`src/request.rs:10:handle_request`
+focus: [handle] handle_request [function] src/request.rs:10
+summary: Story trail around `handle_request` found 6 nodes and 5 edges; mode=neighborhood direction=both tests=included utility_calls=hidden truncated=false.
+
+## Entry Points
+- focus: handle_request [function] `src/request.rs`
+- entry: test_request_flow [function] `tests/request_flow.rs`
+
+## Core Flow
+- [edge-validate] handle_request [function] `src/request.rs` calls validate_request [function] `src/request.rs` (certainty=certain). certain call edge confidence=0.99
+- [edge-profile] validate_request [function] `src/request.rs` calls load_profile [function] `src/profile.rs` (certainty=probable). probable call edge confidence=0.72
+- [edge-hook] handle_request [function] `src/request.rs` calls dynamic_plugin_hook [function] `src/plugin.rs` (certainty=uncertain). uncertain call edge confidence=0.32 candidate_targets=1
+- [edge-speculative] handle_request [function] `src/request.rs` calls experimental_hook [function] `src/plugin.rs` (certainty=speculative). speculative call edge confidence=0.21
+- [edge-missing] handle_request [function] `src/request.rs` calls legacy_dispatch [function] `src/legacy.rs` (certainty=missing certainty metadata). missing certainty metadata call edge
+
+## Side Effects
+- possible side-effect candidate [edge-audit] handle_request [function] `src/request.rs` calls write_audit_log [function] `src/audit.rs` (certainty=certain)
+
+## Uncertainty
+- [edge-profile] validate_request [function] `src/request.rs` calls load_profile [function] `src/profile.rs` is probable. probable call edge confidence=0.72
+- [edge-hook] handle_request [function] `src/request.rs` calls dynamic_plugin_hook [function] `src/plugin.rs` is uncertain. uncertain call edge confidence=0.32 candidate_targets=1
+- [edge-speculative] handle_request [function] `src/request.rs` calls experimental_hook [function] `src/plugin.rs` is speculative. speculative call edge confidence=0.21
+- [edge-missing] handle_request [function] `src/request.rs` calls legacy_dispatch [function] `src/legacy.rs` is missing certainty metadata. missing certainty metadata call edge
+
+## Tests
+- tests and benches included by --include-tests
+- 1 test-like node(s) present: test_request_flow [function] `tests/request_flow.rs`
+- utility/helper calls hidden by default; pass --show-utility-calls to include them
+
+## Gaps And Limits
+- trail not truncated; max_nodes=24 omitted_edge_count=0
+"#;
+
+        assert_eq!(markdown, expected);
+    }
+
+    #[test]
+    fn trail_story_reports_side_effects_and_test_scope() {
+        let included = sample_trail_story(true);
+        assert!(
+            included
+                .side_effects
+                .iter()
+                .any(|item| item.contains("write_audit_log")),
+            "story should name likely side-effect calls: {included:#?}"
+        );
+        assert!(
+            included
+                .test_scope
+                .iter()
+                .any(|item| item.contains("tests and benches included")),
+            "include-tests story should say tests are included: {included:#?}"
+        );
+        assert!(
+            included
+                .test_scope
+                .iter()
+                .any(|item| item.contains("test_request_flow")),
+            "include-tests story should name rendered test-like nodes: {included:#?}"
+        );
+
+        let excluded = sample_trail_story(false);
+        assert!(
+            excluded
+                .test_scope
+                .iter()
+                .any(|item| item.contains("tests and benches excluded")),
+            "production-scope story should say tests are excluded: {excluded:#?}"
+        );
+    }
+
+    #[test]
+    fn trail_story_handles_single_node_without_edges() {
+        let story = TrailStoryDto {
+            summary: "Story trail around `A` found 1 node and 0 edges; mode=neighborhood direction=both tests=excluded utility_calls=hidden truncated=false.".to_string(),
+            entry_points: vec![
+                "focus: A [function]".to_string(),
+                "no graph entry edges were returned for this focus".to_string(),
+            ],
+            core_flow: Vec::new(),
+            side_effects: vec![
+                "none detected from conservative edge-kind and target-name heuristics; inspect snippets for runtime effects".to_string(),
+            ],
+            uncertainty: vec!["no rendered trail edges to evaluate for certainty".to_string()],
+            test_scope: vec![
+                "tests and benches excluded by default production-only scope; pass --include-tests to include them".to_string(),
+                "no test-like nodes are present in the rendered trail".to_string(),
+            ],
+            limits: vec![
+                "trail not truncated; max_nodes=24 omitted_edge_count=0".to_string(),
+                "no edges were returned, so core flow is limited to the focus node".to_string(),
+            ],
+        };
+
+        assert!(story.core_flow.is_empty());
+        assert!(
+            story
+                .entry_points
+                .iter()
+                .any(|item| item.contains("no graph entry edges"))
+        );
+        assert!(
+            story
+                .limits
+                .iter()
+                .any(|item| item.contains("no edges were returned"))
+        );
+    }
+
+    #[test]
     fn render_trail_dot_emits_graphviz_nodes_and_edges() {
         let context = TrailContextDto {
             focus: sample_node_details("a", "A"),
@@ -2608,6 +3067,7 @@ mod tests {
                 omitted_edge_count: 0,
                 canonical_layout: None,
             },
+            story: None,
         };
 
         let dot = render_trail_dot(Path::new("C:/repo"), &context);

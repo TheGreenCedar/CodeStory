@@ -542,6 +542,30 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
         max_node_depth(&default_trail, "/trail/nodes") <= 2,
         "/trail should support q and default omitted depth to the stdio depth: {default_trail}"
     );
+    assert!(
+        default_trail.get("story").is_none(),
+        "/trail should not include story unless requested: {default_trail}"
+    );
+
+    let story_trail = get_json(&addr, &format!("/trail?id={step0_id}&story=true"));
+    assert_eq!(story_trail["focus"]["display_name"], "step0");
+    assert!(
+        story_trail
+            .pointer("/story/summary")
+            .and_then(Value::as_str)
+            .is_some_and(|summary| summary.contains("Story trail")),
+        "/trail?story=true should include a readable story summary: {story_trail}"
+    );
+    assert_nonempty_array(&story_trail, "/story/uncertainty");
+    assert!(
+        story_trail
+            .pointer("/story/test_scope")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| item
+                .as_str()
+                .is_some_and(|text| text.contains("tests and benches excluded")))),
+        "/trail?story=true should make production test scope explicit: {story_trail}"
+    );
 
     let incoming_trail = get_json(
         &addr,

@@ -12,7 +12,7 @@ use codestory_contracts::api::{
     TrailContextDto, TrailDirection, TrailMode,
 };
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     fs,
     io::{BufRead, IsTerminal, Read, Write},
     net::{TcpListener, TcpStream},
@@ -47,7 +47,7 @@ use output::{
     render_index_dry_run_markdown, render_index_markdown, render_query_markdown,
     render_retrieval_state, render_search_markdown, render_snippet_markdown,
     render_symbol_markdown, render_symbol_mermaid, render_trail_dot, render_trail_markdown,
-    render_trail_mermaid, validate_output_file_parent,
+    render_trail_mermaid, render_trail_story_markdown, validate_output_file_parent,
 };
 use runtime::{
     AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
@@ -726,6 +726,12 @@ fn run_symbol(cmd: SymbolCommand) -> Result<()> {
 
 fn run_trail(cmd: TrailCommand) -> Result<()> {
     preflight_output_file(cmd.output_file.as_deref())?;
+    if cmd.story && cmd.mermaid {
+        bail!("--story cannot be combined with --mermaid; use markdown or json output");
+    }
+    if cmd.story && cmd.format == args::OutputFormat::Dot {
+        bail!("--story cannot be combined with --format dot; use markdown or json output");
+    }
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "trail")?;
@@ -739,13 +745,10 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
         cmd.output_file.as_deref(),
     )?;
     let request = build_trail_request(&target.selected.node_id, &cmd);
-    let mut context = runtime
+    let context = runtime
         .browser
         .trail_context(request)
         .map_err(map_api_error)?;
-    if cmd.hide_speculative {
-        context = hide_speculative_trail_edges(context);
-    }
     if cmd.mermaid {
         return emit_text(render_trail_mermaid(&context), cmd.output_file.as_deref());
     }
@@ -755,7 +758,11 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
             cmd.output_file.as_deref(),
         );
     }
-    let markdown = render_trail_markdown(&runtime.project_root, &target, &context, &cmd);
+    let markdown = if let Some(story) = context.story.as_ref() {
+        render_trail_story_markdown(&runtime.project_root, &target, &context, &cmd, story)
+    } else {
+        render_trail_markdown(&runtime.project_root, &target, &context, &cmd)
+    };
     let output = TrailJsonOutput {
         resolution: build_query_resolution_output(&runtime.project_root, &target),
         trail: &context,
@@ -846,6 +853,8 @@ fn run_explore(cmd: ExploreCommand) -> Result<()> {
             caller_scope: TrailCallerScope::ProductionOnly,
             edge_filter: Vec::new(),
             show_utility_calls: false,
+            hide_speculative: false,
+            story: false,
             node_filter: Vec::new(),
             max_nodes: cmd.max_nodes.clamp(1, 120),
             layout_direction: LayoutDirection::Horizontal,
@@ -1976,6 +1985,7 @@ fn render_explore_markdown(
         include_tests: false,
         show_utility_calls: false,
         hide_speculative: false,
+        story: false,
         layout: args::CliLayout::Horizontal,
         refresh: args::RefreshMode::None,
         format: args::OutputFormat::Markdown,
@@ -2050,6 +2060,7 @@ fn build_explore_panes(
                     include_tests: false,
                     show_utility_calls: false,
                     hide_speculative: false,
+                    story: false,
                     layout: args::CliLayout::Horizontal,
                     refresh: args::RefreshMode::None,
                     format: args::OutputFormat::Markdown,
@@ -2422,12 +2433,14 @@ fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Resul
             };
             let depth = browser_trail_depth(params.get("depth").map(String::as_str));
             let direction = browser_trail_direction(params.get("direction").map(String::as_str));
+            let story = browser_bool_param(params.get("story").map(String::as_str));
             let context = runtime
                 .browser
                 .trail_context(browser_trail_config(
                     target.selected.node_id,
                     depth,
                     direction,
+                    story,
                 ))
                 .map_err(map_api_error)?;
             write_http_json(&mut stream, 200, &context)
@@ -2446,13 +2459,20 @@ fn browser_references_config(root_id: NodeId) -> TrailConfigDto {
         caller_scope: TrailCallerScope::IncludeTestsAndBenches,
         edge_filter: Vec::new(),
         show_utility_calls: false,
+        hide_speculative: false,
+        story: false,
         node_filter: Vec::new(),
         max_nodes: BROWSER_REFERENCES_MAX_NODES,
         layout_direction: LayoutDirection::Horizontal,
     }
 }
 
-fn browser_trail_config(root_id: NodeId, depth: u32, direction: TrailDirection) -> TrailConfigDto {
+fn browser_trail_config(
+    root_id: NodeId,
+    depth: u32,
+    direction: TrailDirection,
+    story: bool,
+) -> TrailConfigDto {
     TrailConfigDto {
         root_id,
         mode: TrailMode::Neighborhood,
@@ -2462,6 +2482,8 @@ fn browser_trail_config(root_id: NodeId, depth: u32, direction: TrailDirection) 
         caller_scope: TrailCallerScope::ProductionOnly,
         edge_filter: Vec::new(),
         show_utility_calls: false,
+        hide_speculative: false,
+        story,
         node_filter: Vec::new(),
         max_nodes: BROWSER_TRAIL_MAX_NODES,
         layout_direction: LayoutDirection::Horizontal,
@@ -2481,6 +2503,13 @@ fn browser_trail_direction(value: Option<&str>) -> TrailDirection {
         Some("outgoing") => TrailDirection::Outgoing,
         _ => TrailDirection::Both,
     }
+}
+
+fn browser_bool_param(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|value| value.to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 fn browser_symbols_limit(value: Option<&str>) -> Option<u32> {
@@ -2909,6 +2938,10 @@ fn handle_stdio_trail(runtime: &RuntimeContext, request: &serde_json::Value) -> 
         .and_then(|value| value.as_u64())
         .map(|value| value.min(BROWSER_TRAIL_MAX_DEPTH as u64) as u32)
         .unwrap_or(BROWSER_TRAIL_DEFAULT_DEPTH);
+    let story = request
+        .pointer("/params/arguments/story")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     resolve_target(runtime, stdio_target_selection(request), None)
         .and_then(|target| {
             runtime
@@ -2917,6 +2950,7 @@ fn handle_stdio_trail(runtime: &RuntimeContext, request: &serde_json::Value) -> 
                     target.selected.node_id,
                     depth,
                     direction,
+                    story,
                 ))
                 .map_err(map_api_error)
         })
@@ -3319,6 +3353,7 @@ fn read_stdio_template_resource(runtime: &RuntimeContext, uri: &str) -> Result<s
                 node_id,
                 BROWSER_TRAIL_DEFAULT_DEPTH,
                 TrailDirection::Both,
+                false,
             ))
             .map(|value| serde_json::json!(value))
             .map_err(map_api_error),
@@ -3521,6 +3556,7 @@ fn search_hit_location_key(hit: &SearchHitOutput) -> Option<(String, u32)> {
     Some((hit.file_path.clone()?, hit.line?))
 }
 
+#[cfg(test)]
 fn hide_speculative_trail_edges(mut context: TrailContextDto) -> TrailContextDto {
     let original_edge_count = context.trail.edges.len();
     let retained_edges = context
@@ -3543,7 +3579,7 @@ fn hide_speculative_trail_edges(mut context: TrailContextDto) -> TrailContextDto
     }
 
     let mut reachable = HashSet::new();
-    let mut queue = VecDeque::new();
+    let mut queue = std::collections::VecDeque::new();
     reachable.insert(context.trail.center_id.clone());
     queue.push_back(context.trail.center_id.clone());
     while let Some(node_id) = queue.pop_front() {
@@ -3582,6 +3618,7 @@ fn hide_speculative_trail_edges(mut context: TrailContextDto) -> TrailContextDto
     context
 }
 
+#[cfg(test)]
 fn is_speculative_certainty(certainty: Option<&str>) -> bool {
     matches!(
         certainty.map(|value| value.to_ascii_lowercase()).as_deref(),
@@ -4408,6 +4445,7 @@ mod tests {
                 omitted_edge_count: 0,
                 canonical_layout: None,
             },
+            story: None,
         };
 
         let filtered = hide_speculative_trail_edges(context);

@@ -749,6 +749,38 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
         "trail should return at least the focus node"
     );
 
+    let trail_story = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "trail",
+            &format!("--id={node_id}"),
+            "--story",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        string_field(&trail_story, &["trail", "story", "summary"]).contains("Story trail"),
+        "trail --story JSON should include a readable story summary"
+    );
+    assert!(
+        trail_story["trail"]["story"]["entry_points"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "trail --story should describe entry points"
+    );
+    assert!(
+        trail_story["trail"]["story"]["test_scope"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item
+                .as_str()
+                .is_some_and(|text| text.contains("tests and benches excluded")))),
+        "trail --story should make test scope explicit"
+    );
+
     let snippet = run_cli_json(
         workspace.path(),
         cache_dir.path(),

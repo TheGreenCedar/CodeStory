@@ -707,6 +707,16 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         Some(&json!(2)),
         "trail.depth should document the stdio default: {trail}"
     );
+    assert_eq!(
+        schema_property(trail, "story")["type"],
+        "boolean",
+        "trail.story should be a boolean opt-in: {trail}"
+    );
+    assert_eq!(
+        schema_property(trail, "story").get("default"),
+        Some(&json!(false)),
+        "trail.story should document the stdio default: {trail}"
+    );
 
     let ask = tool_input_schema(&tools, "ask");
     assert!(

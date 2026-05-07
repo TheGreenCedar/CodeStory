@@ -25,9 +25,9 @@ pub use dto::{
     SearchHybridLimitsDto, SearchRepoTextMode, SearchRequest, SearchResultsDto, SetUiLayoutRequest,
     SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto,
     StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto,
-    SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
-    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WorkspaceMemberIndexDto,
-    WriteFileDataUrlRequest, WriteFileResponse, WriteFileTextRequest,
+    SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto, TrailStoryDto,
+    TrailStoryStepDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
+    WorkspaceMemberIndexDto, WriteFileDataUrlRequest, WriteFileResponse, WriteFileTextRequest,
 };
 pub use errors::ApiError;
 pub use events::{AppEventPayload, IndexingPhaseTimings};

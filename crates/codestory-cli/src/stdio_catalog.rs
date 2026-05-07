@@ -584,6 +584,7 @@ static TRAIL_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(
     &[
         SchemaProperty::object("focus", "Focused node details DTO."),
         SchemaProperty::object("trail", "Graph response DTO."),
+        SchemaProperty::object("story", "Optional readable trail story DTO.").nullable(),
     ],
     &["focus", "trail"],
 );
@@ -708,6 +709,8 @@ static TRAIL_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("depth", "Trail depth.")
             .with_default(ValueLiteral::Integer(2))
             .with_bounds(0, 10),
+        SchemaProperty::boolean("story", "Include a readable trail story DTO.")
+            .with_default(ValueLiteral::Boolean(false)),
     ],
     &[],
 )

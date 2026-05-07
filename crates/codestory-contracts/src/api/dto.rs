@@ -501,6 +501,10 @@ pub struct TrailConfigDto {
     #[serde(default = "default_show_utility_calls")]
     pub show_utility_calls: bool,
     #[serde(default)]
+    pub hide_speculative: bool,
+    #[serde(default)]
+    pub story: bool,
+    #[serde(default)]
     pub node_filter: Vec<NodeKind>,
     pub max_nodes: u32,
     #[serde(default = "default_layout_direction")]
@@ -525,6 +529,29 @@ pub struct TrailFilterOptionsDto {
 pub struct TrailContextDto {
     pub focus: NodeDetailsDto,
     pub trail: GraphResponse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story: Option<TrailStoryDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct TrailStoryDto {
+    pub summary: String,
+    pub entry_points: Vec<String>,
+    pub core_flow: Vec<TrailStoryStepDto>,
+    pub side_effects: Vec<String>,
+    pub uncertainty: Vec<String>,
+    pub test_scope: Vec<String>,
+    pub limits: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct TrailStoryStepDto {
+    pub edge_id: String,
+    pub source: String,
+    pub relation: String,
+    pub target: String,
+    pub certainty: String,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

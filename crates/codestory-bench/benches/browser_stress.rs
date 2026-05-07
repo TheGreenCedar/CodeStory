@@ -260,6 +260,8 @@ fn stress_trail_request(root_id: NodeId, depth: u32) -> TrailConfigDto {
         caller_scope: TrailCallerScope::ProductionOnly,
         edge_filter: Vec::new(),
         show_utility_calls: true,
+        hide_speculative: false,
+        story: false,
         node_filter: Vec::new(),
         max_nodes: 2_000,
         layout_direction: LayoutDirection::Horizontal,

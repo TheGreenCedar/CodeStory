@@ -450,6 +450,8 @@ pub(crate) struct TrailCommand {
         help = "Hide uncertain/speculative edges and remove nodes disconnected from the trail focus."
     )]
     pub(crate) hide_speculative: bool,
+    #[arg(long, help = "Render a readable narrative of the trail graph.")]
+    pub(crate) story: bool,
     #[arg(long, value_enum, default_value_t = CliLayout::Horizontal)]
     pub(crate) layout: CliLayout,
     #[arg(
@@ -993,6 +995,8 @@ fn build_trail_request_impl(
         },
         edge_filter: Vec::new(),
         show_utility_calls: cmd.show_utility_calls,
+        hide_speculative: cmd.hide_speculative,
+        story: cmd.story,
         node_filter: Vec::new(),
         max_nodes: cmd.max_nodes.clamp(1, 200),
         layout_direction: match cmd.layout {

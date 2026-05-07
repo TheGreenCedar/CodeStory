@@ -576,6 +576,8 @@ fn graph_and_snippet_expansion_preserve_neighbor_and_source_evidence() {
             caller_scope: TrailCallerScope::ProductionOnly,
             edge_filter: Vec::new(),
             show_utility_calls: true,
+            hide_speculative: false,
+            story: false,
             node_filter: Vec::new(),
             max_nodes: 20,
             layout_direction: LayoutDirection::Horizontal,

@@ -630,6 +630,8 @@ fn execute_retrieval(
                 caller_scope: plan.caller_scope,
                 edge_filter: plan.edge_filter.clone(),
                 show_utility_calls: true,
+                hide_speculative: false,
+                story: false,
                 node_filter: plan.node_filter.clone(),
                 max_nodes: plan.max_nodes,
                 layout_direction: codestory_contracts::api::LayoutDirection::Horizontal,

@@ -1,6 +1,6 @@
 use super::*;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy)]
@@ -651,8 +651,24 @@ impl AppController {
         let focus = self.node_details(NodeDetailsRequest {
             id: req.root_id.clone(),
         })?;
-        let trail = self.graph_trail(req)?;
-        Ok(TrailContextDto { focus, trail })
+        let story_requested = req.story;
+        let trail = self.graph_trail(req.clone())?;
+        let story = if story_requested {
+            let project_root = self.require_project_root().ok();
+            Some(build_trail_story(
+                project_root.as_deref(),
+                &focus,
+                &trail,
+                &req,
+            ))
+        } else {
+            None
+        };
+        Ok(TrailContextDto {
+            focus,
+            trail,
+            story,
+        })
     }
 
     pub fn snippet_context(
@@ -684,6 +700,673 @@ impl AppController {
             snippet_truncated: bounded.truncated,
             max_snippet_bytes: Some(crate::DIRECT_SNIPPET_MAX_BYTES as u32),
         })
+    }
+}
+
+const TRAIL_STORY_CORE_FLOW_LIMIT: usize = 16;
+const TRAIL_STORY_PREVIEW_LIMIT: usize = 5;
+
+fn build_trail_story(
+    project_root: Option<&Path>,
+    focus: &NodeDetailsDto,
+    trail: &GraphResponse,
+    req: &TrailConfigDto,
+) -> TrailStoryDto {
+    let nodes_by_id = trail
+        .nodes
+        .iter()
+        .map(|node| (node.id.clone(), node))
+        .collect::<HashMap<_, _>>();
+    let mut incoming_counts = HashMap::<_, u32>::new();
+    for edge in &trail.edges {
+        *incoming_counts.entry(edge.target.clone()).or_default() += 1;
+    }
+
+    let test_nodes = trail
+        .nodes
+        .iter()
+        .filter(|node| is_test_like_story_node(node))
+        .collect::<Vec<_>>();
+
+    let mut entry_points = Vec::new();
+    entry_points.push(format!("focus: {}", story_focus_ref(project_root, focus)));
+    for node in trail
+        .nodes
+        .iter()
+        .filter(|node| incoming_counts.get(&node.id).copied().unwrap_or_default() == 0)
+        .filter(|node| node.id != focus.id)
+        .take(TRAIL_STORY_PREVIEW_LIMIT)
+    {
+        entry_points.push(format!("entry: {}", story_node_ref(project_root, node)));
+    }
+    if entry_points.len() == 1 && trail.edges.is_empty() {
+        entry_points.push("no graph entry edges were returned for this focus".to_string());
+    }
+
+    let core_flow = trail
+        .edges
+        .iter()
+        .take(TRAIL_STORY_CORE_FLOW_LIMIT)
+        .map(|edge| story_step(project_root, edge, &nodes_by_id))
+        .collect::<Vec<_>>();
+    let side_effects = side_effects_for_story(project_root, trail, &nodes_by_id);
+    let uncertainty = uncertainty_for_story(project_root, trail, &nodes_by_id, req);
+    let test_scope = test_scope_for_story(project_root, req, &test_nodes);
+    let limits = limits_for_story(trail, req);
+    let summary = format!(
+        "Story trail around `{}` found {} nodes and {} edges; mode={} direction={} tests={} utility_calls={} truncated={}.",
+        focus.display_name,
+        trail.nodes.len(),
+        trail.edges.len(),
+        story_trail_mode(req.mode),
+        story_trail_direction(req.direction),
+        if req.caller_scope == TrailCallerScope::IncludeTestsAndBenches {
+            "included"
+        } else {
+            "excluded"
+        },
+        if req.show_utility_calls {
+            "included"
+        } else {
+            "hidden"
+        },
+        trail.truncated
+    );
+
+    TrailStoryDto {
+        summary,
+        entry_points,
+        core_flow,
+        side_effects,
+        uncertainty,
+        test_scope,
+        limits,
+    }
+}
+
+fn story_step(
+    project_root: Option<&Path>,
+    edge: &GraphEdgeDto,
+    nodes_by_id: &HashMap<NodeId, &GraphNodeDto>,
+) -> TrailStoryStepDto {
+    let source = nodes_by_id
+        .get(&edge.source)
+        .map(|node| story_node_ref(project_root, node))
+        .unwrap_or_else(|| edge.source.0.clone());
+    let target = nodes_by_id
+        .get(&edge.target)
+        .map(|node| story_node_ref(project_root, node))
+        .unwrap_or_else(|| edge.target.0.clone());
+    let relation = story_relation(edge.kind).to_string();
+    let certainty = story_certainty(edge);
+    let confidence = edge
+        .confidence
+        .map(|value| format!(" confidence={value:.2}"))
+        .unwrap_or_default();
+    let candidates = if edge.candidate_targets.is_empty() {
+        String::new()
+    } else {
+        format!(" candidate_targets={}", edge.candidate_targets.len())
+    };
+    let callsite = edge
+        .callsite_identity
+        .as_deref()
+        .map(|value| format!(" callsite={value}"))
+        .unwrap_or_default();
+    let note = format!(
+        "{} {} edge{}{}{}",
+        certainty,
+        format!("{:?}", edge.kind).to_lowercase(),
+        confidence,
+        candidates,
+        callsite
+    );
+
+    TrailStoryStepDto {
+        edge_id: edge.id.0.clone(),
+        source,
+        relation,
+        target,
+        certainty,
+        note,
+    }
+}
+
+fn story_node_ref(project_root: Option<&Path>, node: &GraphNodeDto) -> String {
+    let path = node
+        .file_path
+        .as_deref()
+        .map(|value| format!(" `{}`", story_path(project_root, value)))
+        .unwrap_or_default();
+    format!("{} [{}]{}", node.label, story_node_kind(node.kind), path)
+}
+
+fn story_focus_ref(project_root: Option<&Path>, node: &NodeDetailsDto) -> String {
+    let path = node
+        .file_path
+        .as_deref()
+        .map(|value| format!(" `{}`", story_path(project_root, value)))
+        .unwrap_or_default();
+    format!(
+        "{} [{}]{}",
+        node.display_name,
+        story_node_kind(node.kind),
+        path
+    )
+}
+
+fn story_path(project_root: Option<&Path>, value: &str) -> String {
+    let path = Path::new(value);
+    project_root
+        .and_then(|root| path.strip_prefix(root).ok())
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| value.replace('\\', "/"))
+}
+
+fn story_node_kind(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::MODULE => "module",
+        NodeKind::NAMESPACE => "namespace",
+        NodeKind::PACKAGE => "package",
+        NodeKind::FILE => "file",
+        NodeKind::STRUCT => "struct",
+        NodeKind::CLASS => "class",
+        NodeKind::INTERFACE => "interface",
+        NodeKind::ANNOTATION => "annotation",
+        NodeKind::UNION => "union",
+        NodeKind::ENUM => "enum",
+        NodeKind::TYPEDEF => "typedef",
+        NodeKind::TYPE_PARAMETER => "type_parameter",
+        NodeKind::BUILTIN_TYPE => "builtin_type",
+        NodeKind::FUNCTION => "function",
+        NodeKind::METHOD => "method",
+        NodeKind::MACRO => "macro",
+        NodeKind::GLOBAL_VARIABLE => "global_variable",
+        NodeKind::FIELD => "field",
+        NodeKind::VARIABLE => "variable",
+        NodeKind::CONSTANT => "constant",
+        NodeKind::ENUM_CONSTANT => "enum_constant",
+        NodeKind::UNKNOWN => "unknown",
+    }
+}
+
+fn story_relation(kind: EdgeKind) -> &'static str {
+    match kind {
+        EdgeKind::CALL => "calls",
+        EdgeKind::USAGE => "uses",
+        EdgeKind::TYPE_USAGE => "uses type",
+        EdgeKind::MEMBER => "contains",
+        EdgeKind::INHERITANCE => "inherits from",
+        EdgeKind::OVERRIDE => "overrides",
+        EdgeKind::TYPE_ARGUMENT => "passes type argument to",
+        EdgeKind::TEMPLATE_SPECIALIZATION => "specializes",
+        EdgeKind::INCLUDE => "includes",
+        EdgeKind::IMPORT => "imports",
+        EdgeKind::MACRO_USAGE => "uses macro",
+        EdgeKind::ANNOTATION_USAGE => "uses annotation",
+        EdgeKind::UNKNOWN => "relates to",
+    }
+}
+
+fn story_certainty(edge: &GraphEdgeDto) -> String {
+    edge.certainty
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "missing certainty metadata".to_string())
+}
+
+fn is_uncertain_story_certainty(certainty: &str) -> bool {
+    matches!(
+        certainty,
+        "probable" | "uncertain" | "speculative" | "missing certainty metadata"
+    )
+}
+
+fn side_effects_for_story(
+    project_root: Option<&Path>,
+    trail: &GraphResponse,
+    nodes_by_id: &HashMap<NodeId, &GraphNodeDto>,
+) -> Vec<String> {
+    let mut side_effects = Vec::new();
+    for edge in &trail.edges {
+        let target = nodes_by_id.get(&edge.target).copied();
+        if !edge_suggests_side_effect(edge, target) {
+            continue;
+        }
+        let step = story_step(project_root, edge, nodes_by_id);
+        side_effects.push(format!(
+            "possible side-effect candidate [{}] {} {} {} (certainty={})",
+            step.edge_id, step.source, step.relation, step.target, step.certainty
+        ));
+    }
+    if side_effects.is_empty() {
+        side_effects.push(
+            "none detected from conservative edge-kind and target-name heuristics; inspect snippets for runtime effects"
+                .to_string(),
+        );
+    }
+    side_effects
+}
+
+fn edge_suggests_side_effect(edge: &GraphEdgeDto, target: Option<&GraphNodeDto>) -> bool {
+    if edge.kind != EdgeKind::CALL {
+        return false;
+    }
+    let Some(target) = target else {
+        return false;
+    };
+    let tokens = story_identifier_tokens(&target.label);
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "write"
+                | "save"
+                | "persist"
+                | "update"
+                | "insert"
+                | "delete"
+                | "remove"
+                | "emit"
+                | "send"
+                | "flush"
+                | "commit"
+                | "publish"
+        )
+    })
+}
+
+fn story_identifier_tokens(value: &str) -> Vec<String> {
+    let mut normalized = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if ch.is_ascii_uppercase() {
+                normalized.push(' ');
+            }
+            normalized.push(ch.to_ascii_lowercase());
+        } else {
+            normalized.push(' ');
+        }
+    }
+    normalized
+        .split_whitespace()
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn uncertainty_for_story(
+    project_root: Option<&Path>,
+    trail: &GraphResponse,
+    nodes_by_id: &HashMap<NodeId, &GraphNodeDto>,
+    req: &TrailConfigDto,
+) -> Vec<String> {
+    let mut uncertainty = Vec::new();
+    if req.hide_speculative {
+        uncertainty.push(
+            "hide_speculative was applied before story rendering; uncertain/speculative edges may have been removed"
+                .to_string(),
+        );
+    }
+    if !req.edge_filter.is_empty() {
+        uncertainty.push("edge filters were applied before rendering".to_string());
+    }
+    for edge in &trail.edges {
+        let certainty = story_certainty(edge);
+        if !is_uncertain_story_certainty(&certainty) {
+            continue;
+        }
+        let step = story_step(project_root, edge, nodes_by_id);
+        uncertainty.push(format!(
+            "[{}] {} {} {} is {}. {}",
+            step.edge_id, step.source, step.relation, step.target, step.certainty, step.note
+        ));
+    }
+    if uncertainty.is_empty() {
+        if trail.edges.is_empty() {
+            uncertainty.push("no rendered trail edges to evaluate for certainty".to_string());
+        } else {
+            uncertainty.push("all rendered trail edges are explicitly marked certain".to_string());
+        }
+    }
+    uncertainty
+}
+
+fn test_scope_for_story(
+    project_root: Option<&Path>,
+    req: &TrailConfigDto,
+    test_nodes: &[&GraphNodeDto],
+) -> Vec<String> {
+    let mut scope = Vec::new();
+    if req.caller_scope == TrailCallerScope::IncludeTestsAndBenches {
+        scope.push("tests and benches included by request caller scope".to_string());
+    } else {
+        scope.push(
+            "tests and benches excluded by production-only caller scope; request IncludeTestsAndBenches to include them"
+                .to_string(),
+        );
+    }
+    if test_nodes.is_empty() {
+        scope.push("no test-like nodes are present in the rendered trail".to_string());
+    } else {
+        scope.push(format!(
+            "{} test-like node(s) present: {}",
+            test_nodes.len(),
+            test_nodes
+                .iter()
+                .take(TRAIL_STORY_PREVIEW_LIMIT)
+                .map(|node| story_node_ref(project_root, node))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    scope.push(if req.show_utility_calls {
+        "utility/helper calls included by request".to_string()
+    } else {
+        "utility/helper calls hidden by default; enable show_utility_calls to include them"
+            .to_string()
+    });
+    scope
+}
+
+fn limits_for_story(trail: &GraphResponse, req: &TrailConfigDto) -> Vec<String> {
+    let mut limits = Vec::new();
+    if trail.edges.len() > TRAIL_STORY_CORE_FLOW_LIMIT {
+        limits.push(format!(
+            "core_flow shows first {} of {} rendered edges",
+            TRAIL_STORY_CORE_FLOW_LIMIT,
+            trail.edges.len()
+        ));
+    }
+    if trail.truncated {
+        limits.push(format!(
+            "trail was truncated at max_nodes={} with omitted_edge_count={}",
+            req.max_nodes, trail.omitted_edge_count
+        ));
+    } else {
+        limits.push(format!(
+            "trail not truncated; max_nodes={} omitted_edge_count={}",
+            req.max_nodes, trail.omitted_edge_count
+        ));
+    }
+    if trail.edges.is_empty() {
+        limits
+            .push("no edges were returned, so core flow is limited to the focus node".to_string());
+    }
+    limits
+}
+
+fn is_test_like_story_node(node: &GraphNodeDto) -> bool {
+    let text = format!(
+        "{} {}",
+        node.label.to_ascii_lowercase(),
+        node.file_path
+            .as_deref()
+            .unwrap_or_default()
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+    );
+    text.contains("/test")
+        || text.contains("tests/")
+        || text.contains("_test")
+        || text.contains("test_")
+        || text.contains("/benches/")
+        || text.contains("bench_")
+}
+
+fn story_trail_mode(mode: TrailMode) -> &'static str {
+    match mode {
+        TrailMode::Neighborhood => "neighborhood",
+        TrailMode::AllReferenced => "referenced",
+        TrailMode::AllReferencing => "referencing",
+        TrailMode::ToTargetSymbol => "to_target_symbol",
+    }
+}
+
+fn story_trail_direction(direction: TrailDirection) -> &'static str {
+    match direction {
+        TrailDirection::Incoming => "incoming",
+        TrailDirection::Outgoing => "outgoing",
+        TrailDirection::Both => "both",
+    }
+}
+
+#[cfg(test)]
+mod trail_story_tests {
+    use super::*;
+    use codestory_contracts::api::{EdgeId, LayoutDirection};
+
+    fn node(id: &str, label: &str, file_path: &str) -> GraphNodeDto {
+        GraphNodeDto {
+            id: NodeId(id.to_string()),
+            label: label.to_string(),
+            kind: NodeKind::FUNCTION,
+            depth: 0,
+            label_policy: None,
+            badge_visible_members: None,
+            badge_total_members: None,
+            merged_symbol_examples: Vec::new(),
+            file_path: Some(file_path.to_string()),
+            qualified_name: None,
+            member_access: None,
+        }
+    }
+
+    fn edge(id: usize, source: &str, target: &str, certainty: Option<&str>) -> GraphEdgeDto {
+        GraphEdgeDto {
+            id: EdgeId(format!("edge-{id}")),
+            source: NodeId(source.to_string()),
+            target: NodeId(target.to_string()),
+            kind: EdgeKind::CALL,
+            confidence: Some(0.99),
+            certainty: certainty.map(ToOwned::to_owned),
+            callsite_identity: None,
+            candidate_targets: Vec::new(),
+        }
+    }
+
+    fn request(story: bool) -> TrailConfigDto {
+        TrailConfigDto {
+            root_id: NodeId("focus".to_string()),
+            mode: TrailMode::Neighborhood,
+            target_id: None,
+            depth: 2,
+            direction: TrailDirection::Both,
+            caller_scope: TrailCallerScope::ProductionOnly,
+            edge_filter: Vec::new(),
+            show_utility_calls: false,
+            hide_speculative: false,
+            story,
+            node_filter: Vec::new(),
+            max_nodes: 24,
+            layout_direction: LayoutDirection::Horizontal,
+        }
+    }
+
+    fn focus_details() -> NodeDetailsDto {
+        NodeDetailsDto {
+            id: NodeId("focus".to_string()),
+            kind: NodeKind::FUNCTION,
+            display_name: "handle_request".to_string(),
+            serialized_name: "handle_request".to_string(),
+            qualified_name: None,
+            canonical_id: None,
+            file_path: Some("C:/repo/src/request.rs".to_string()),
+            start_line: None,
+            start_col: None,
+            end_line: None,
+            end_col: None,
+            member_access: None,
+        }
+    }
+
+    #[test]
+    fn trail_story_preserves_missing_certainty_and_reports_story_truncation() {
+        let focus = focus_details();
+        let mut nodes = vec![node("focus", "handle_request", "C:/repo/src/request.rs")];
+        let mut edges = Vec::new();
+        for index in 0..18 {
+            let target = format!("target-{index}");
+            nodes.push(node(
+                &target,
+                &format!("target_{index}"),
+                "C:/repo/src/flow.rs",
+            ));
+            edges.push(edge(index, "focus", &target, None));
+        }
+        let trail = GraphResponse {
+            center_id: NodeId("focus".to_string()),
+            nodes,
+            edges,
+            truncated: false,
+            omitted_edge_count: 0,
+            canonical_layout: None,
+        };
+
+        let story = build_trail_story(None, &focus, &trail, &request(true));
+
+        assert_eq!(story.core_flow.len(), TRAIL_STORY_CORE_FLOW_LIMIT);
+        assert!(
+            story
+                .uncertainty
+                .iter()
+                .any(|item| item.contains("missing certainty metadata")),
+            "missing certainty should remain textual uncertainty: {story:#?}"
+        );
+        assert!(
+            story
+                .limits
+                .iter()
+                .any(|item| item.contains("core_flow shows first 16 of 18 rendered edges")),
+            "story-level truncation should be disclosed: {story:#?}"
+        );
+    }
+
+    #[test]
+    fn trail_story_reports_certainty_spectrum_textually() {
+        let focus = focus_details();
+        let trail = GraphResponse {
+            center_id: NodeId("focus".to_string()),
+            nodes: vec![
+                node("focus", "handle_request", "C:/repo/src/request.rs"),
+                node("certain", "validate_request", "C:/repo/src/request.rs"),
+                node("probable", "load_profile", "C:/repo/src/profile.rs"),
+                node(
+                    "speculative",
+                    "dynamic_plugin_hook",
+                    "C:/repo/src/plugin.rs",
+                ),
+                node("missing", "legacy_dispatch", "C:/repo/src/legacy.rs"),
+            ],
+            edges: vec![
+                edge(1, "focus", "certain", Some("certain")),
+                edge(2, "focus", "probable", Some("probable")),
+                edge(3, "focus", "speculative", Some("speculative")),
+                edge(4, "focus", "missing", None),
+            ],
+            truncated: false,
+            omitted_edge_count: 0,
+            canonical_layout: None,
+        };
+
+        let story = build_trail_story(None, &focus, &trail, &request(true));
+        let core_certainties = story
+            .core_flow
+            .iter()
+            .map(|step| step.certainty.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            core_certainties.contains(&"certain")
+                && core_certainties.contains(&"probable")
+                && core_certainties.contains(&"speculative")
+                && core_certainties.contains(&"missing certainty metadata"),
+            "core flow should keep every certainty label textual: {story:#?}"
+        );
+        assert!(
+            story
+                .uncertainty
+                .iter()
+                .any(|item| item.contains("speculative"))
+                && story
+                    .uncertainty
+                    .iter()
+                    .any(|item| item.contains("missing certainty metadata")),
+            "uncertainty section should call out speculative and missing certainty: {story:#?}"
+        );
+    }
+
+    #[test]
+    fn trail_story_empty_edges_do_not_claim_certainty() {
+        let focus = focus_details();
+        let trail = GraphResponse {
+            center_id: NodeId("focus".to_string()),
+            nodes: vec![node("focus", "handle_request", "C:/repo/src/request.rs")],
+            edges: Vec::new(),
+            truncated: false,
+            omitted_edge_count: 0,
+            canonical_layout: None,
+        };
+
+        let story = build_trail_story(None, &focus, &trail, &request(true));
+
+        assert!(
+            story
+                .uncertainty
+                .iter()
+                .any(|item| item.contains("no rendered trail edges to evaluate")),
+            "empty story should not claim all edges are certain: {story:#?}"
+        );
+    }
+
+    #[test]
+    fn trail_story_side_effects_are_conservative_candidates() {
+        let focus = NodeDetailsDto {
+            id: NodeId("focus".to_string()),
+            kind: NodeKind::FUNCTION,
+            display_name: "handle_request".to_string(),
+            serialized_name: "handle_request".to_string(),
+            qualified_name: None,
+            canonical_id: None,
+            file_path: None,
+            start_line: None,
+            start_col: None,
+            end_line: None,
+            end_col: None,
+            member_access: None,
+        };
+        let trail = GraphResponse {
+            center_id: NodeId("focus".to_string()),
+            nodes: vec![
+                node("focus", "handle_request", "C:/repo/src/request.rs"),
+                node("write", "write_audit_log", "C:/repo/src/audit.rs"),
+                node("catalog", "catalog_entries", "C:/repo/src/catalog.rs"),
+            ],
+            edges: vec![
+                edge(1, "focus", "write", Some("certain")),
+                edge(2, "focus", "catalog", Some("certain")),
+            ],
+            truncated: false,
+            omitted_edge_count: 0,
+            canonical_layout: None,
+        };
+
+        let story = build_trail_story(None, &focus, &trail, &request(true));
+
+        assert!(
+            story
+                .side_effects
+                .iter()
+                .any(|item| item.contains("possible side-effect candidate")
+                    && item.contains("write_audit_log")),
+            "write target should be flagged as a candidate: {story:#?}"
+        );
+        assert!(
+            story
+                .side_effects
+                .iter()
+                .all(|item| !item.contains("catalog_entries")),
+            "catalog substring should not be treated as a side effect: {story:#?}"
+        );
     }
 }
 

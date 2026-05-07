@@ -123,6 +123,8 @@ impl ReadOnlyBrowserService {
                         caller_scope: TrailCallerScope::ProductionOnly,
                         edge_filter: Vec::new(),
                         show_utility_calls: false,
+                        hide_speculative: false,
+                        story: false,
                         node_filter: Vec::new(),
                         max_nodes: 120,
                         layout_direction: LayoutDirection::Horizontal,
