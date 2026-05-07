@@ -34,6 +34,13 @@ pub(crate) struct RuntimeContext {
     pub(crate) events: crossbeam_channel::Receiver<AppEventPayload>,
     pub(crate) project_root: PathBuf,
     pub(crate) storage_path: PathBuf,
+    pub(crate) managed_embeddings_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagedEmbeddingStartup {
+    AutostartIfInstalled,
+    InspectOnly,
 }
 
 #[derive(Debug, Clone)]
@@ -63,12 +70,22 @@ impl std::error::Error for AmbiguousTargetError {}
 
 impl RuntimeContext {
     pub(crate) fn new(args: &ProjectArgs) -> Result<Self> {
+        Self::new_with_startup(args, ManagedEmbeddingStartup::AutostartIfInstalled)
+    }
+
+    pub(crate) fn new_inspect_only(args: &ProjectArgs) -> Result<Self> {
+        Self::new_with_startup(args, ManagedEmbeddingStartup::InspectOnly)
+    }
+
+    fn new_with_startup(args: &ProjectArgs, startup: ManagedEmbeddingStartup) -> Result<Self> {
         let project_root = canonicalize_project_root(&args.project)?;
         let config = crate::config::load_config(&project_root)?;
-        let cache_root = cache_root_for_project(
-            &project_root,
-            args.cache_dir.as_deref().or(config.cache_dir.as_deref()),
-        )?;
+        let cache_override = args.cache_dir.as_deref().or(config.cache_dir.as_deref());
+        let cache_root = cache_root_for_project(&project_root, cache_override)?;
+        let managed_embeddings_root = crate::managed_embeddings::managed_root(cache_override)?;
+        if startup == ManagedEmbeddingStartup::AutostartIfInstalled {
+            crate::managed_embeddings::prepare_runtime_if_installed(&managed_embeddings_root);
+        }
         let storage_path = cache_root.join("codestory.db");
         let runtime = Runtime::new();
         let events = runtime.events();
@@ -82,6 +99,7 @@ impl RuntimeContext {
             events,
             project_root,
             storage_path,
+            managed_embeddings_root,
         })
     }
 
@@ -299,9 +317,7 @@ pub(crate) fn cache_root_for_project(
         None => {
             let base = ProjectDirs::from("dev", "codestory", "codestory")
                 .map(|dirs| dirs.cache_dir().to_path_buf())
-                .ok_or_else(|| {
-                    anyhow!("Failed to determine a user cache directory for codestory-cli")
-                })?;
+                .unwrap_or_else(|| std::env::temp_dir().join("codestory").join("cache"));
             Ok(base.join(fnv1a_hex(project_root.to_string_lossy().as_bytes())))
         }
     }

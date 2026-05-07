@@ -147,6 +147,47 @@ fn check_with_name<'a>(doctor: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("doctor check `{name}` missing: {doctor:#}"))
 }
 
+fn clean_test_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn install_fake_managed_embeddings(cache_dir: &Path) {
+    let root = cache_dir.join("managed-embeddings");
+    let server_dir = root.join("llama").join("b9058").join("fake");
+    let model_path = root
+        .join("models")
+        .join("bge-base-en-v1.5-gguf")
+        .join("bge-base-en-v1.5-q8_0.gguf");
+    fs::create_dir_all(&server_dir).expect("create fake server dir");
+    fs::create_dir_all(model_path.parent().expect("model parent")).expect("create model dir");
+    let server_name = if cfg!(target_os = "windows") {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    };
+    fs::copy(
+        env!("CARGO_BIN_EXE_codestory-cli"),
+        server_dir.join(server_name),
+    )
+    .expect("copy fake server executable");
+    fs::write(&model_path, b"fake model").expect("write fake model");
+    fs::write(
+        root.join("manifest.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "llama_release": "b9058",
+            "llama_asset": "fake",
+            "llama_path": clean_test_path(&server_dir),
+            "llama_variant": "cpu",
+            "model_asset": "bge-base-en-v1.5-q8_0.gguf",
+            "model_path": clean_test_path(&model_path),
+            "model_quant": "q8_0",
+            "endpoint": "http://127.0.0.1:8080/v1/embeddings",
+        }))
+        .expect("manifest json"),
+    )
+    .expect("write fake managed manifest");
+}
+
 fn run_stdio_request(
     workspace: &Path,
     cache_dir: &Path,
@@ -510,6 +551,79 @@ fn read_commands_report_changed_openapi_index_freshness() {
 }
 
 #[test]
+fn non_openapi_json_does_not_keep_freshness_stale() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+
+    fs::write(
+        workspace.path().join("skills-lock.json"),
+        r#"{"skills":[]}"#,
+    )
+    .expect("write non-openapi json");
+
+    let doctor = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["doctor", "--format", "json"],
+    );
+    let freshness = find_index_freshness(&doctor)
+        .unwrap_or_else(|| panic!("doctor should include index freshness: {doctor:#}"));
+    assert_eq!(
+        freshness["status"], "fresh",
+        "non-OpenAPI JSON that indexes to no symbols should not keep freshness stale: {freshness:#}"
+    );
+}
+
+#[test]
+fn new_openapi_with_late_paths_marks_freshness_stale() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+
+    let filler = "x".repeat(70 * 1024);
+    fs::write(
+        workspace.path().join("late-openapi.yaml"),
+        format!(
+            "openapi: 3.1.0\ninfo:\n  title: Late Paths\n  version: 1.0.0\ncomponents:\n  schemas:\n    Filler:\n      description: \"{filler}\"\npaths:\n  /api/late:\n    get:\n      operationId: getLate\n"
+        ),
+    )
+    .expect("write late OpenAPI fixture");
+
+    let doctor = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["doctor", "--format", "json"],
+    );
+    let freshness = find_index_freshness(&doctor)
+        .unwrap_or_else(|| panic!("doctor should include index freshness: {doctor:#}"));
+    assert_eq!(
+        freshness["status"], "stale",
+        "new OpenAPI schema with late paths should make freshness stale: {freshness:#}"
+    );
+    assert_eq!(
+        freshness_count(
+            freshness,
+            &["new_file_count", "new_count", "new", "added_count", "added"]
+        ),
+        Some(1),
+        "new OpenAPI schema with late paths should be counted as new: {freshness:#}"
+    );
+}
+
+#[test]
 fn doctor_reports_current_and_stored_semantic_doc_embedding_contract() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
@@ -627,6 +741,131 @@ fn doctor_keeps_missing_llamacpp_endpoint_explicit() {
         fallback_message.contains("llama.cpp")
             && fallback_message.contains("127.0.0.1:9/v1/embeddings"),
         "missing endpoint should name llama.cpp and the configured URL: {fallback_message}"
+    );
+}
+
+#[test]
+fn setup_embeddings_dry_run_reports_pinned_managed_assets() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    let setup = run_cli_json_with_embedding_env(
+        workspace.path(),
+        cache_dir.path(),
+        &["setup", "embeddings", "--dry-run", "--format", "json"],
+        &[],
+    );
+
+    assert_eq!(
+        setup["dry_run"], true,
+        "setup should report dry-run mode: {setup:#}"
+    );
+    assert!(
+        setup["llama"]["url"]
+            .as_str()
+            .is_some_and(|value| value.contains("ggml-org/llama.cpp")),
+        "setup should pin a llama.cpp release asset: {setup:#}"
+    );
+    let expected_variant = if cfg!(target_os = "macos") {
+        "cpu"
+    } else {
+        "vulkan"
+    };
+    assert_eq!(
+        setup["llama_variant"], expected_variant,
+        "setup should default to Vulkan where a pinned asset exists and report CPU only as fallback: {setup:#}"
+    );
+    assert!(
+        setup["model"]["url"]
+            .as_str()
+            .is_some_and(|value| value.contains("CompendiumLabs/bge-base-en-v1.5-gguf")),
+        "setup should pin the managed BGE-base GGUF model: {setup:#}"
+    );
+    assert!(
+        !cache_dir
+            .path()
+            .join("managed-embeddings")
+            .join("downloads")
+            .exists(),
+        "dry-run setup must not create download artifacts"
+    );
+    let next_commands = setup["next_commands"]
+        .as_array()
+        .expect("setup next commands")
+        .iter()
+        .map(|value| value.as_str().expect("next command"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        next_commands,
+        vec![
+            format!(
+                "codestory-cli doctor --project \"{}\" --cache-dir \"{}\"",
+                clean_test_path(workspace.path()),
+                clean_test_path(cache_dir.path())
+            ),
+            format!(
+                "codestory-cli index --project \"{}\" --cache-dir \"{}\" --refresh full",
+                clean_test_path(workspace.path()),
+                clean_test_path(cache_dir.path())
+            ),
+        ],
+        "setup follow-up commands should preserve project and cache args: {setup:#}"
+    );
+}
+
+#[test]
+fn doctor_reports_missing_managed_assets_before_setup() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    let doctor = run_cli_json_with_embedding_env(
+        workspace.path(),
+        cache_dir.path(),
+        &["doctor", "--format", "json"],
+        &[],
+    );
+
+    let managed = check_with_name(&doctor, "managed_embeddings");
+    assert_eq!(
+        managed["status"], "info",
+        "missing managed assets should be informational before setup: {doctor:#}"
+    );
+    assert!(
+        managed["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("setup embeddings")),
+        "doctor should name the setup command when managed assets are missing: {doctor:#}"
+    );
+}
+
+#[test]
+fn doctor_does_not_autostart_installed_managed_embeddings() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+    install_fake_managed_embeddings(cache_dir.path());
+
+    let doctor = run_cli_json_with_embedding_env(
+        workspace.path(),
+        cache_dir.path(),
+        &["doctor", "--format", "json"],
+        &[],
+    );
+
+    let managed = check_with_name(&doctor, "managed_embeddings");
+    assert!(
+        ["ok", "warn"].contains(&managed["status"].as_str().unwrap_or_default()),
+        "installed managed assets should be inspected without being treated as missing: {doctor:#}"
+    );
+    assert!(
+        !cache_dir
+            .path()
+            .join("managed-embeddings")
+            .join("logs")
+            .exists(),
+        "doctor should not create managed llama-server logs or start the fake server: {doctor:#}"
     );
 }
 

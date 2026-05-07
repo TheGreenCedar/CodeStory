@@ -180,6 +180,16 @@ fn runtime_exposes_read_only_browser_service_boundary() {
     let browser = read("crates/codestory-runtime/src/browser.rs");
     let cli_runtime = read("crates/codestory-cli/src/runtime.rs");
     let cli_main = read("crates/codestory-cli/src/main.rs");
+    let http_transport = read("crates/codestory-cli/src/http_transport.rs");
+    let stdio_transport = read("crates/codestory-cli/src/stdio_transport.rs");
+    let explore = read("crates/codestory-cli/src/explore.rs");
+    let cli_browser_surfaces = [
+        cli_main.as_str(),
+        http_transport.as_str(),
+        stdio_transport.as_str(),
+        explore.as_str(),
+    ]
+    .join("\n");
 
     assert!(
         runtime_lib.contains("pub use browser::{BrowserQueryItem, ReadOnlyBrowserService}")
@@ -228,11 +238,15 @@ fn runtime_exposes_read_only_browser_service_boundary() {
         "CLI runtime context should carry the runtime-owned browser boundary"
     );
     assert!(
-        cli_main.contains(".search_results(SearchRequest")
-            && cli_main.contains(".symbol_context(")
-            && cli_main.contains(".trail_context(")
-            && cli_main.contains(".snippet_context(")
-            && cli_main.contains(".query(&ast)")
+        cli_browser_surfaces.contains(".search_results(SearchRequest")
+            && cli_browser_surfaces.contains(".symbol_context(")
+            && cli_browser_surfaces.contains(".definition_context(")
+            && cli_browser_surfaces.contains(".references_context(")
+            && cli_browser_surfaces.contains(".list_root_symbols(")
+            && cli_browser_surfaces.contains(".list_children_symbols(")
+            && cli_browser_surfaces.contains(".trail_context(")
+            && cli_browser_surfaces.contains(".snippet_context(")
+            && cli_browser_surfaces.contains(".query(&ast)")
             && cli_main.contains("runtime.browser.ask(request)")
             && cli_main.contains("runtime.agent.ask(request)"),
         "CLI read-only browser operations should route through RuntimeContext.browser"
@@ -242,7 +256,7 @@ fn runtime_exposes_read_only_browser_service_boundary() {
 #[test]
 fn stdio_tool_catalog_stays_aligned_with_read_only_browser_service_operations() {
     let browser = read("crates/codestory-runtime/src/browser.rs");
-    let cli_main = read("crates/codestory-cli/src/main.rs");
+    let stdio_transport = read("crates/codestory-cli/src/stdio_transport.rs");
     let stdio_catalog = read("crates/codestory-cli/src/stdio_catalog.rs");
     let stdio_tool_catalog = source_between(&stdio_catalog, "static TOOLS", "static RESOURCES");
 
@@ -276,7 +290,7 @@ fn stdio_tool_catalog_stays_aligned_with_read_only_browser_service_operations() 
             "stdio catalog/router should include read-only browser tool {tool_name}"
         );
         assert!(
-            cli_main.contains(cli_call),
+            stdio_transport.contains(cli_call),
             "stdio tool {tool_name} should route through RuntimeContext.browser operation {cli_call}"
         );
         assert!(
@@ -308,13 +322,17 @@ fn web_cockpit_stays_deferred_until_browser_surface_gate_opens() {
     let warm_stats = read("docs/testing/codestory-stdio-warm-loop-stats.md");
     let runtime_path = read("docs/architecture/runtime-execution-path.md");
     let cli_args = read("crates/codestory-cli/src/args.rs");
-    let cli_main = read("crates/codestory-cli/src/main.rs");
+    let http_transport = read("crates/codestory-cli/src/http_transport.rs");
     let command_enum = source_between(
         &cli_args,
         "pub(crate) enum Command",
         "#[derive(Args, Debug, Clone)]",
     );
-    let http_routes = source_between(&cli_main, "match path {", "fn browser_references_config");
+    let http_routes = source_between(
+        &http_transport,
+        "match path {",
+        "fn browser_references_config",
+    );
 
     for required in [
         "Status: deferred.",

@@ -88,7 +88,8 @@ The main limitations are sharper:
   - A config test covers profile, model id, legacy alias, and explicit env override behavior.
 - **Validation**:
   - `cargo test -p codestory-cli config`
-  - `codestory-cli doctor --project . --format json` in hash-mode and missing-llama modes.
+  - `codestory-cli setup embeddings --project . --dry-run --format json`
+  - `codestory-cli doctor --project . --format json` in hash-mode, missing-managed-assets, and missing-llama modes.
 
 ### Task 0.3: Repair Agent-Facing Skill Docs
 
@@ -337,7 +338,7 @@ The main limitations are sharper:
 - **Acceptance criteria**:
   - Stored semantic docs report profile/model/backend/dimension/doc-shape enough to explain reuse or rebuild.
   - `doctor` warns when stored docs and current env/config disagree.
-  - Missing llama.cpp endpoint remains a clear fallback, not a silent degradation.
+  - Missing managed assets, stopped managed server, and external llama.cpp endpoint failures remain clear fallbacks, not silent degradation.
 - **Validation**:
   - hash backend normal path
   - fake llama.cpp path

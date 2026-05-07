@@ -4381,7 +4381,7 @@ fn index_openapi_schema_file(path: &Path, source: &str) -> Result<Option<Interme
     Ok(Some(local_storage))
 }
 
-fn looks_like_openapi_schema(source: &str) -> bool {
+pub fn looks_like_openapi_schema(source: &str) -> bool {
     let lower = source.to_ascii_lowercase();
     contains_openapi_schema_marker(&lower) && contains_openapi_paths_marker(&lower)
 }

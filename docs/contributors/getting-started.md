@@ -21,6 +21,7 @@ After the basic cargo checks, verify the shipped CLI flow with the built binary 
 
 ```powershell
 cargo build --release -p codestory-cli
+.\target\release\codestory-cli.exe setup embeddings --project . --dry-run
 .\target\release\codestory-cli.exe index --project . --refresh auto
 .\target\release\codestory-cli.exe search --project . --query WorkspaceIndexer --why
 .\target\release\codestory-cli.exe ask --project . "How does indexing flow through the runtime?"
@@ -33,8 +34,9 @@ Read commands default to `--refresh none`. If a read command says the cache is e
 
 Use one of these modes before debugging ranking quality:
 
+- managed real-model setup: `codestory-cli setup embeddings --project .`; use `--dry-run` first to inspect the pinned Vulkan llama.cpp and BGE-base GGUF assets without downloading, and pass `--variant cpu` when Vulkan is not usable on the machine
 - fast local-dev semantic mode: `CODESTORY_EMBED_RUNTIME_MODE=hash`
-- local model serving: run `llama-server --embedding` and point `CODESTORY_EMBED_LLAMACPP_URL` at its OpenAI-compatible embeddings endpoint when it is not on the default `http://127.0.0.1:8080/v1/embeddings`
+- external model serving: run `llama-server --embedding` and point `CODESTORY_EMBED_LLAMACPP_URL` at its OpenAI-compatible embeddings endpoint when it is not on the default `http://127.0.0.1:8080/v1/embeddings`
 - default semantic scope: durable symbols only; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` when you intentionally need the broad all-symbol semantic doc set
 - default semantic alias mode: compact aliases; set `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=no_alias` or `current_alias` only when reproducing benchmark rows
 - embedding throughput tuning: `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` and `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT`

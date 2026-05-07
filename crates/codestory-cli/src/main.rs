@@ -6,11 +6,12 @@ use codestory_contracts::api::{
     AgentResponseModeDto, AppEventPayload, BookmarkCategoryDto, BookmarkDto,
     CreateBookmarkCategoryRequest, CreateBookmarkRequest, GraphArtifactDto, IndexFreshnessDto,
     IndexFreshnessStatusDto, IndexMode, NodeId, NodeKind, RepoTextScanStatsDto,
-    RetrievalScoreBreakdownDto, SearchHit, SearchHybridLimitsDto, SearchRepoTextMode,
-    SearchRequest,
+    RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto, SearchHit, SearchHybridLimitsDto,
+    SearchRepoTextMode, SearchRequest,
 };
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     fs,
     io::IsTerminal,
     net::TcpListener,
@@ -26,6 +27,7 @@ mod config;
 mod display;
 mod explore;
 mod http_transport;
+mod managed_embeddings;
 mod output;
 mod query_resolution;
 mod runtime;
@@ -38,8 +40,9 @@ use args::{
     BookmarkRemoveOutput, Cli, Command, CompletionShell, DoctorCheckOutput, DoctorCommand,
     DoctorOutput, GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput,
     IndexOutput, QueryCommand, QueryOutput, QueryResolutionOutput, RepoTextMode, SearchCommand,
-    SearchHitOutput, SearchOutput, ServeCommand, SnippetCommand, SnippetJsonOutput, SymbolCommand,
-    SymbolJsonOutput, TrailCommand, TrailJsonOutput, ask_retrieval_profile, build_trail_request,
+    SearchHitOutput, SearchOutput, ServeCommand, SetupAction, SetupCommand, SnippetCommand,
+    SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, TrailCommand, TrailJsonOutput,
+    ask_retrieval_profile, build_trail_request,
 };
 #[cfg(test)]
 use codestory_contracts::api::TrailContextDto;
@@ -117,6 +120,7 @@ fn main() -> Result<()> {
         Command::Ground(cmd) => run_ground(cmd),
         Command::Ask(cmd) => run_ask(cmd),
         Command::Doctor(cmd) => run_doctor(cmd),
+        Command::Setup(cmd) => run_setup(cmd),
         Command::Search(cmd) => run_search(cmd),
         Command::Symbol(cmd) => run_symbol(cmd),
         Command::Trail(cmd) => run_trail(cmd),
@@ -127,6 +131,58 @@ fn main() -> Result<()> {
         Command::Serve(cmd) => run_serve(cmd),
         Command::GenerateCompletions(cmd) => run_generate_completions(cmd),
     }
+}
+
+fn run_setup(cmd: SetupCommand) -> Result<()> {
+    match cmd.action {
+        SetupAction::Embeddings(cmd) => run_setup_embeddings(cmd),
+    }
+}
+
+fn run_setup_embeddings(cmd: args::SetupEmbeddingsCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "setup embeddings")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let next_commands =
+        setup_embeddings_next_commands(&cmd.project.project, cmd.project.cache_dir.as_deref());
+    let project_root = runtime::canonicalize_project_root(&cmd.project.project)?;
+    let config = config::load_config(&project_root)?;
+    let cache_override = cmd
+        .project
+        .cache_dir
+        .as_deref()
+        .or(config.cache_dir.as_deref());
+    let managed_root = managed_embeddings::managed_root(cache_override)?;
+    let mut output = managed_embeddings::setup_embeddings(
+        &managed_root,
+        cmd.quant,
+        cmd.variant,
+        cmd.dry_run,
+        !cmd.no_start,
+    )?;
+    output.next_commands = next_commands;
+    let markdown = managed_embeddings::render_setup_embeddings_markdown(&output);
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn setup_embeddings_next_commands(
+    project: &std::path::Path,
+    cache_dir: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut args = format!(" --project {}", quote_command_path(project));
+    if let Some(cache_dir) = cache_dir {
+        let _ = write!(args, " --cache-dir {}", quote_command_path(cache_dir));
+    }
+    vec![
+        format!("codestory-cli doctor{args}"),
+        format!("codestory-cli index{args} --refresh full"),
+    ]
+}
+
+fn quote_command_path(path: &std::path::Path) -> String {
+    format!(
+        "\"{}\"",
+        display::clean_path_string(&path.to_string_lossy()).replace('"', "\\\"")
+    )
 }
 
 fn run_index(cmd: IndexCommand) -> Result<()> {
@@ -652,7 +708,7 @@ fn render_bookmark_row(output: &BookmarkOutput) -> String {
 fn run_doctor(cmd: DoctorCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "doctor")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let runtime = RuntimeContext::new(&cmd.project)?;
+    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let summary = runtime.open_project_summary()?;
     let output = build_doctor_output(&runtime, &summary);
     let markdown = render_doctor_markdown(&output);
@@ -956,7 +1012,7 @@ fn build_ambiguous_target_error_output(
                     "query_resolution: `{}` matched multiple equally ranked symbols",
                     ambiguous.query
                 ),
-                "search: inspect alternatives or rerun with --choose, --id, or --file".to_string(),
+                "search: inspect alternatives with `codestory-cli search --query`, then rerun this command with --choose, --id, or --file".to_string(),
             ],
             next_commands,
         },
@@ -1031,6 +1087,12 @@ fn build_doctor_output(
             checks.push(semantic_contract_check(retrieval));
         }
     }
+    let managed_status = managed_embeddings::inspect_status(&runtime.managed_embeddings_root);
+    checks.push(doctor_check(
+        "managed_embeddings",
+        managed_doctor_status(&managed_status.state),
+        managed_status.message,
+    ));
     if let Some(freshness) = summary.freshness.as_ref() {
         checks.push(index_freshness_check(freshness));
     }
@@ -1185,6 +1247,17 @@ fn semantic_contract_check(
                 stored.doc_count
             ),
         )
+    } else if !retrieval.semantic_ready
+        && retrieval.fallback_reason == Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime)
+    {
+        doctor_check(
+            "semantic_contract",
+            "info",
+            format!(
+                "{}. Resolve the embedding runtime first with `codestory-cli setup embeddings`; then run `codestory-cli index --refresh full` if semantic search should use the current config.",
+                gaps.join("; ")
+            ),
+        )
     } else {
         doctor_check(
             "semantic_contract",
@@ -1194,6 +1267,15 @@ fn semantic_contract_check(
                 gaps.join("; ")
             ),
         )
+    }
+}
+
+fn managed_doctor_status(state: &str) -> &'static str {
+    match state {
+        "managed_server_running" | "external_llama_configured" | "disabled_by_config" => "ok",
+        "missing_managed_assets" => "info",
+        "managed_server_stopped" | "external_llama_unreachable" => "warn",
+        _ => "info",
     }
 }
 
@@ -1243,6 +1325,13 @@ fn index_next_commands(
         format!("codestory-cli ask --project \"{project}\" \"How does this repo fit together?\""),
     ];
     if retrieval.is_some_and(|state| !state.semantic_ready) {
+        if retrieval.is_some_and(|state| {
+            state.fallback_reason == Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime)
+        }) {
+            commands.push(format!(
+                "codestory-cli setup embeddings --project \"{project}\""
+            ));
+        }
         commands.push(format!(
             "codestory-cli doctor --project \"{project}\" --format markdown"
         ));

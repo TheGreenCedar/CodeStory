@@ -53,6 +53,14 @@ platform-specific. The `hash` backend remains for deterministic local-dev and
 CI checks. Current local benchmark findings and recommendations live in
 [embedding-backend-benchmarks.md](../../testing/embedding-backend-benchmarks.md).
 
+The CLI owns managed embedding setup. `codestory-cli setup embeddings` installs
+pinned llama.cpp binaries and the default BGE-base GGUF model under the user
+cache, then starts `llama-server` on the default endpoint. Managed setup defaults
+to the Vulkan llama.cpp asset where one is pinned; `--variant cpu` is the
+fallback for machines where Vulkan is unavailable. Runtime still only speaks to
+an OpenAI-compatible HTTP endpoint; it does not download model assets or make
+setup decisions itself.
+
 Timing fields for this path are in `IndexingPhaseTimings`: `semantic_doc_build_ms`, `semantic_embedding_ms`, `semantic_db_upsert_ms`, `semantic_reload_ms`, `semantic_docs_reused`, `semantic_docs_embedded`, `semantic_docs_pending`, and `semantic_docs_stale`.
 
 ## Failure Signatures

@@ -128,7 +128,7 @@ fn codestory_grounding_skill_command_refs_track_cli_commands() {
     let skill_root = root.join(".agents/skills/codestory-grounding");
     let commands = [
         "index", "ground", "doctor", "search", "symbol", "trail", "snippet", "query", "explore",
-        "bookmark", "ask", "serve",
+        "bookmark", "ask", "setup", "serve",
     ];
 
     for command in commands {

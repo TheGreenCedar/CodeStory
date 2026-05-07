@@ -48,6 +48,8 @@ Runtime environment variables control semantic retrieval and tuning:
 | `CODESTORY_EMBED_LLAMACPP_URL` | OpenAI-compatible llama.cpp embeddings endpoint. |
 | `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT` | Client-side concurrent embedding requests, clamped from `1` to `16`. |
 
+Run `target/release/codestory-cli(.exe) setup embeddings --project .` to install the managed llama.cpp/BGE-base assets before expecting the default llama.cpp backend to be ready on a fresh machine.
+
 Symbol summarization uses these additional settings:
 
 | Variable | Behavior |

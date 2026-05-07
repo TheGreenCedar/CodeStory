@@ -798,7 +798,17 @@ fn indexable_source_path(path: &Path) -> bool {
         .and_then(|value| value.to_str())
         .and_then(codestory_indexer::get_language_for_ext)
         .is_some();
-    tree_sitter_supported || codestory_indexer::is_openapi_candidate_path(path)
+    tree_sitter_supported || looks_like_openapi_source_path(path)
+}
+
+fn looks_like_openapi_source_path(path: &Path) -> bool {
+    if !codestory_indexer::is_openapi_candidate_path(path) {
+        return false;
+    }
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return true;
+    };
+    codestory_indexer::looks_like_openapi_schema(&source)
 }
 
 fn index_freshness_from_storage(

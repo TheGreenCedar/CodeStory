@@ -332,6 +332,14 @@ fn ambiguous_symbol_json_includes_numbered_alternatives_with_stable_refs() {
         "ambiguous JSON should preserve layer notes: {json:#}"
     );
     assert!(
+        json.pointer("/error/layer_notes")
+            .and_then(Value::as_array)
+            .is_some_and(|notes| notes
+                .iter()
+                .all(|note| !note.as_str().unwrap_or_default().contains("search --file"))),
+        "ambiguous JSON should not imply `search --file` exists: {json:#}"
+    );
+    assert!(
         json.pointer("/resolution/resolved").is_none(),
         "ambiguous JSON should not include a hidden resolved target: {json:#}"
     );

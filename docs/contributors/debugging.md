@@ -91,11 +91,12 @@ Recovery order:
 
 1. Confirm whether the miss is in `indexed_symbol_hits`, `repo_text_hits`, or both.
 2. Confirm the reported retrieval mode and fallback reason before touching search ranking code.
-3. For lightweight local-dev semantic checks, set `CODESTORY_EMBED_RUNTIME_MODE=hash`.
-4. For real local model assets, start `llama-server --embedding` and set `CODESTORY_EMBED_LLAMACPP_URL` if it is not on the default endpoint.
-5. If the current machine should stay lexical only, set `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false` and verify the fallback messaging instead of treating it as a runtime regression.
-6. Rebuild once with `index --refresh full`.
-7. If semantic retrieval is still the only failing part, inspect the reported fallback reason before touching lexical ranking or CLI rendering.
+3. If `doctor` reports `missing_managed_assets` or `managed_server_stopped`, run `codestory-cli setup embeddings --project .` before reindexing. Managed setup defaults to Vulkan; rerun with `--variant cpu` if the machine cannot start the Vulkan binary.
+4. For lightweight local-dev semantic checks, set `CODESTORY_EMBED_RUNTIME_MODE=hash`.
+5. For external real local model assets, start `llama-server --embedding` and set `CODESTORY_EMBED_LLAMACPP_URL` if it is not on the default endpoint.
+6. If the current machine should stay lexical only, set `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false` and verify the fallback messaging instead of treating it as a runtime regression.
+7. Rebuild once with `index --refresh full`.
+8. If semantic retrieval is still the only failing part, inspect the reported fallback reason before touching lexical ranking or CLI rendering.
 
 ## If Cold Indexing Is Slow
 
@@ -120,6 +121,7 @@ Check:
 - whether `CODESTORY_SEMANTIC_DOC_SCOPE=all` is forcing the broad all-symbol semantic set
 - whether `CODESTORY_SEMANTIC_DOC_ALIAS_MODE` was changed from the profiled default of `alias_variant`
 - whether `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` was changed from the profiled default of `128`
+- whether managed embeddings are installed and the managed endpoint is running according to `doctor`
 - whether `CODESTORY_EMBED_BACKEND=llamacpp` is pointing at a real `llama-server --embedding` endpoint before trusting GGUF speed claims
 - whether llama.cpp request concurrency is matched on both sides: `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT` in CodeStory and `-np` in the server
 

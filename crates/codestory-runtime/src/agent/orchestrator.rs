@@ -9,7 +9,7 @@ use codestory_contracts::api::{
     AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentResponseBlockDto, AgentResponseModeDto,
     AgentResponseSectionDto, AgentRetrievalPolicyModeDto, AgentRetrievalStepKindDto, ApiError,
     EdgeId, GraphArtifactDto, GraphRequest, GraphResponse, IndexFreshnessDto,
-    IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeOccurrencesRequest,
+    IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeOccurrencesRequest,
     RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest,
     TrailConfigDto, TrailFilterOptionsDto,
 };
@@ -438,8 +438,13 @@ fn execute_retrieval(
     let initial_hit_count = hits.len();
     let mut hits = hits;
     let literal_fallback_signal = has_literal_fallback_signal(prompt);
+    let promotable_focus_available =
+        req.focus_node_id.is_some() || investigation_focus_anchor(prompt, &hits).is_some();
     let mut expansion_added_hits = false;
-    if should_investigate(resolved_profile) && weak_initial_hits(prompt, &hits) {
+    if should_investigate(resolved_profile)
+        && weak_initial_hits(prompt, &hits)
+        && !promotable_focus_available
+    {
         let expanded = match investigate_query_expansion(
             controller,
             req,
@@ -520,13 +525,24 @@ fn execute_retrieval(
                 "Investigation low confidence gap after query expansion and repo-text fallback.",
             );
         }
+    } else if should_investigate(resolved_profile)
+        && weak_initial_hits(prompt, &hits)
+        && promotable_focus_available
+    {
+        trace.annotate(
+            "Investigation kept an explicit or prompt-anchored focus instead of broad repo-text fallback.",
+        );
     }
 
-    let focus_node_id = req.focus_node_id.clone().or_else(|| {
-        hits.iter()
-            .find(|hit| hit.resolvable)
-            .map(|hit| hit.node_id.clone())
-    });
+    let focus_node_id = req
+        .focus_node_id
+        .clone()
+        .or_else(|| investigation_focus_anchor(prompt, &hits))
+        .or_else(|| {
+            hits.iter()
+                .find(|hit| hit.resolvable)
+                .map(|hit| hit.node_id.clone())
+        });
 
     let filter_step = trace.start_step(
         AgentRetrievalStepKindDto::TrailFilterOptions,
@@ -895,6 +911,15 @@ fn hit_has_indexed_anchor(hit: &SearchHit, prompt_terms: &HashSet<String>) -> bo
 fn prompt_mentions_display_name(prompt_terms: &HashSet<String>, display_name: &str) -> bool {
     let display_terms = normalized_anchor_terms(display_name);
     !display_terms.is_empty() && display_terms.iter().all(|term| prompt_terms.contains(term))
+}
+
+fn investigation_focus_anchor(prompt: &str, hits: &[SearchHit]) -> Option<NodeId> {
+    let prompt_terms = normalized_anchor_terms(prompt);
+    hits.iter()
+        .find(|hit| {
+            hit.resolvable && prompt_mentions_display_name(&prompt_terms, &hit.display_name)
+        })
+        .map(|hit| hit.node_id.clone())
 }
 
 fn normalized_anchor_terms(value: &str) -> HashSet<String> {
@@ -1960,6 +1985,24 @@ mod tests {
             "Where is exact_symbol_anchor used?",
             &[test_semantic_only_hit("exact_symbol_anchor", 0.90)]
         ));
+    }
+
+    #[test]
+    fn investigation_focus_anchor_prefers_prompt_named_symbol() {
+        let hit = test_semantic_only_hit("exact_symbol_anchor", 0.05);
+        assert_eq!(
+            investigation_focus_anchor("Explain exact_symbol_anchor", &[hit])
+                .expect("prompt-named hit should become focus")
+                .0,
+            "exact_symbol_anchor"
+        );
+        assert!(
+            investigation_focus_anchor(
+                "Explain unrelated behavior",
+                &[test_semantic_only_hit("exact_symbol_anchor", 0.90)]
+            )
+            .is_none()
+        );
     }
 
     #[test]

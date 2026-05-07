@@ -7,7 +7,7 @@ use codestory_contracts::api::{
     SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection,
     TrailMode,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const INDEX_REFRESH_HELP: &str = "Index defaults to `auto`: it chooses `full` for an empty cache and `incremental` once the \
@@ -29,6 +29,7 @@ pub(crate) enum Command {
     Ground(GroundCommand),
     Ask(AskCommand),
     Doctor(DoctorCommand),
+    Setup(SetupCommand),
     Search(SearchCommand),
     Symbol(SymbolCommand),
     Trail(TrailCommand),
@@ -112,6 +113,22 @@ pub(crate) enum CompletionShell {
     Zsh,
     Fish,
     Powershell,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CliEmbeddingQuant {
+    #[value(name = "q8_0")]
+    Q8_0,
+    #[value(name = "q4_k_m")]
+    Q4KM,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CliLlamaVariant {
+    Cpu,
+    Vulkan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
@@ -215,6 +232,8 @@ pub(crate) struct AskCommand {
     pub(crate) max_results: u32,
     #[arg(
         long,
+        allow_hyphen_values = true,
+        value_name = "NODE_ID",
         help = "Seed retrieval around an exact node id from search/symbol output."
     )]
     pub(crate) focus_id: Option<String>,
@@ -286,6 +305,50 @@ pub(crate) struct AskCommand {
 pub(crate) struct DoctorCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SetupCommand {
+    #[command(subcommand)]
+    pub(crate) action: SetupAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum SetupAction {
+    Embeddings(SetupEmbeddingsCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SetupEmbeddingsCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(long, value_enum, default_value_t = CliEmbeddingQuant::Q8_0)]
+    pub(crate) quant: CliEmbeddingQuant,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = CliLlamaVariant::Vulkan,
+        help = "Choose the pinned llama.cpp binary variant. Defaults to Vulkan; use cpu as the fallback."
+    )]
+    pub(crate) variant: CliLlamaVariant,
+    #[arg(
+        long,
+        help = "Show the managed llama/model plan without downloading or starting anything."
+    )]
+    pub(crate) dry_run: bool,
+    #[arg(
+        long,
+        help = "Install and verify assets without starting llama-server."
+    )]
+    pub(crate) no_start: bool,
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
     pub(crate) format: OutputFormat,
     #[arg(
@@ -377,6 +440,8 @@ pub(crate) struct SearchCommand {
 pub(crate) struct TargetArgs {
     #[arg(
         long,
+        allow_hyphen_values = true,
+        value_name = "NODE_ID",
         group = "selector",
         help = "Resolve the target from an exact node id returned by `search`, `symbol`, or `trail`."
     )]
@@ -1017,7 +1082,7 @@ pub(crate) fn default_trail_direction(mode: CliTrailMode) -> TrailDirection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     fn render_subcommand_help(name: &str) -> String {
         let mut command = Cli::command();
@@ -1030,11 +1095,11 @@ mod tests {
     #[test]
     fn symbol_help_requires_exactly_one_selector() {
         let help = render_subcommand_help("symbol");
-        assert!(help.contains("--id <ID>"));
+        assert!(help.contains("--id <NODE_ID>"));
         assert!(help.contains("--query <QUERY>"));
         assert!(help.contains("--file <FILE>"));
         assert!(
-            help.contains("<--id <ID>|--query <QUERY>>"),
+            help.contains("<--id <NODE_ID>|--query <QUERY>>"),
             "selector help should surface the required selector group in the usage line: {help}"
         );
     }
@@ -1075,5 +1140,42 @@ mod tests {
         let help = render_subcommand_help("doctor");
         assert!(help.contains("--format <FORMAT>"));
         assert!(help.contains("--output-file <PATH>"));
+    }
+
+    #[test]
+    fn setup_embeddings_defaults_to_vulkan_variant() {
+        let cli = Cli::try_parse_from(["codestory-cli", "setup", "embeddings"])
+            .expect("setup embeddings should parse");
+        match cli.command {
+            Command::Setup(SetupCommand {
+                action: SetupAction::Embeddings(cmd),
+            }) => assert_eq!(cmd.variant, CliLlamaVariant::Vulkan),
+            _ => panic!("expected setup embeddings command"),
+        }
+    }
+
+    #[test]
+    fn negative_node_ids_parse_without_equals_workaround() {
+        let cli = Cli::try_parse_from(["codestory-cli", "symbol", "--id", "-3816661223164617416"])
+            .expect("negative symbol id should parse");
+        match cli.command {
+            Command::Symbol(cmd) => {
+                assert_eq!(cmd.target.id.as_deref(), Some("-3816661223164617416"))
+            }
+            _ => panic!("expected symbol command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "codestory-cli",
+            "ask",
+            "what is this?",
+            "--focus-id",
+            "-3816661223164617416",
+        ])
+        .expect("negative focus id should parse");
+        match cli.command {
+            Command::Ask(cmd) => assert_eq!(cmd.focus_id.as_deref(), Some("-3816661223164617416")),
+            _ => panic!("expected ask command"),
+        }
     }
 }

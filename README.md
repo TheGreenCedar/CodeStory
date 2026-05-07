@@ -136,6 +136,7 @@ flowchart LR
 - `explore`: open an interactive terminal explorer when stdout is a terminal, or emit Markdown/JSON with definition and reference navigation metadata when piped or passed `--no-tui`
 - `serve`: expose local `/health`, `/search`, `/symbol`, `/definition`, `/references`, `/symbols`, and `/trail` JSON endpoints, or use `--stdio` for MCP-style tools, resources, resource templates, and prompts
 - `doctor`: report project/cache/index/retrieval health, relevant environment settings, and the next useful commands for the workspace
+- `setup embeddings`: install pinned managed llama.cpp and BGE-base GGUF assets in the user cache and start the local embedding server; the managed binary defaults to Vulkan with `--variant cpu` as the fallback
 - `generate-completions`: emit bash, zsh, fish, or PowerShell completions generated from the clap command model
 
 Hybrid retrieval is the intended default when local embedding assets are available. `index`, `ground`, `search`, `ask`, and `doctor` now report retrieval mode, semantic doc counts, and explicit fallback reasons when the runtime drops back to symbolic ranking.
@@ -175,9 +176,10 @@ The default `index` path is a full semantic sync, not a deferred background task
 
 Hybrid retrieval setup:
 
+- managed real-model setup: run `codestory-cli setup embeddings --project .` to download pinned Vulkan llama.cpp binaries plus BGE-base GGUF into the user cache and start `llama-server` at the default endpoint; pass `--variant cpu` when Vulkan startup is unavailable on the machine
 - fast local-dev semantic mode: set `CODESTORY_EMBED_RUNTIME_MODE=hash`
 - backend and profile selection: set `CODESTORY_EMBED_BACKEND=llamacpp` or `hash`; default profile is `bge-base-en-v1.5`; explicit profiles include `minilm`, `bge-small-en-v1.5`, `bge-base-en-v1.5`, `qwen3-embedding-0.6b`, `embeddinggemma-300m`, `nomic-embed-text-v1.5`, `nomic-embed-text-v2-moe`, or `custom`
-- llama.cpp GGUF server: run `llama-server --embedding` and set `CODESTORY_EMBED_LLAMACPP_URL` if it is not listening at `http://127.0.0.1:8080/v1/embeddings`; tune concurrent embedding requests with `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT`
+- external llama.cpp GGUF server: run `llama-server --embedding` yourself and set `CODESTORY_EMBED_LLAMACPP_URL` if it is not listening at `http://127.0.0.1:8080/v1/embeddings`; tune concurrent embedding requests with `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT`
 - durable semantic docs are the default; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` to include lower-signal local/member/module symbols for investigation
 - embedding batch size defaults to `128`; override with `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` only while profiling
 - search and ask research can override hybrid ranking weights with `--hybrid-lexical <WEIGHT> --hybrid-semantic <WEIGHT> --hybrid-graph <WEIGHT>`; omit these flags for the runtime defaults
