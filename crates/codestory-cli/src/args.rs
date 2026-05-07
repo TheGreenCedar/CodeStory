@@ -1,10 +1,11 @@
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
-    AgentBackend, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, GroundingBudgetDto,
-    IndexDryRunDto, IndexFreshnessDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind,
-    ProjectSummary, RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
-    SearchHitOrigin, SnippetContextDto, SummaryGenerationDto, SymbolContextDto, TrailCallerScope,
-    TrailContextDto, TrailDirection, TrailMode,
+    AgentBackend, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, BookmarkCategoryDto,
+    BookmarkDto, GroundingBudgetDto, IndexDryRunDto, IndexFreshnessDto, IndexingPhaseTimings,
+    LayoutDirection, NodeId, NodeKind, ProjectSummary, RepoTextScanStatsDto,
+    RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin, SnippetContextDto,
+    SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection,
+    TrailMode,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -34,6 +35,7 @@ pub(crate) enum Command {
     Snippet(SnippetCommand),
     Query(QueryCommand),
     Explore(ExploreCommand),
+    Bookmark(BookmarkCommand),
     Serve(ServeCommand),
     GenerateCompletions(GenerateCompletionsCommand),
 }
@@ -192,6 +194,11 @@ pub(crate) struct GroundCommand {
 }
 
 #[derive(Args, Debug)]
+#[command(group(
+    ArgGroup::new("ask_focus")
+        .args(["focus_id", "bookmark"])
+        .multiple(false)
+))]
 pub(crate) struct AskCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
@@ -211,6 +218,12 @@ pub(crate) struct AskCommand {
         help = "Seed retrieval around an exact node id from search/symbol output."
     )]
     pub(crate) focus_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "BOOKMARK_ID",
+        help = "Seed retrieval from a saved bookmark. Cannot be combined with --focus-id."
+    )]
+    pub(crate) bookmark: Option<String>,
     #[arg(
         long,
         value_enum,
@@ -539,6 +552,78 @@ pub(crate) struct ExploreCommand {
 }
 
 #[derive(Args, Debug)]
+pub(crate) struct BookmarkCommand {
+    #[command(subcommand)]
+    pub(crate) action: BookmarkAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum BookmarkAction {
+    Add(BookmarkAddCommand),
+    List(BookmarkListCommand),
+    Remove(BookmarkRemoveCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct BookmarkAddCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[command(flatten)]
+    pub(crate) target: TargetArgs,
+    #[arg(long, default_value = "Investigation")]
+    pub(crate) category: String,
+    #[arg(long)]
+    pub(crate) comment: Option<String>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
+    pub(crate) refresh: RefreshMode,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct BookmarkListCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(long)]
+    pub(crate) category: Option<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct BookmarkRemoveCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(value_name = "BOOKMARK_ID")]
+    pub(crate) id: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct ServeCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
@@ -698,6 +783,29 @@ pub(crate) struct ExploreOutput<'a> {
     pub(crate) symbol: &'a SymbolContextDto,
     pub(crate) trail: &'a TrailContextDto,
     pub(crate) snippet: Option<&'a SnippetContextDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BookmarkOutput {
+    pub(crate) bookmark: BookmarkDto,
+    pub(crate) stale: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct BookmarkAddOutput {
+    pub(crate) category: BookmarkCategoryDto,
+    pub(crate) bookmark: BookmarkOutput,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct BookmarkListOutput {
+    pub(crate) categories: Vec<BookmarkCategoryDto>,
+    pub(crate) bookmarks: Vec<BookmarkOutput>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct BookmarkRemoveOutput {
+    pub(crate) removed_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

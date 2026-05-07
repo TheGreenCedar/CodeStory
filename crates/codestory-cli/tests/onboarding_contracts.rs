@@ -128,7 +128,7 @@ fn codestory_grounding_skill_command_refs_track_cli_commands() {
     let skill_root = root.join(".agents/skills/codestory-grounding");
     let commands = [
         "index", "ground", "doctor", "search", "symbol", "trail", "snippet", "query", "explore",
-        "ask", "serve",
+        "bookmark", "ask", "serve",
     ];
 
     for command in commands {
@@ -152,7 +152,7 @@ fn codestory_grounding_skill_command_refs_track_cli_commands() {
         );
     }
 
-    for command in ["ask", "doctor", "explore", "serve"] {
+    for command in ["ask", "bookmark", "doctor", "explore", "serve"] {
         let reference =
             fs::read_to_string(skill_root.join("references").join(format!("{command}.md")))
                 .expect("read command reference");

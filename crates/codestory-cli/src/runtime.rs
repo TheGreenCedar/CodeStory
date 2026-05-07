@@ -4,7 +4,8 @@ use codestory_contracts::api::{
     ProjectSummary, SearchHit, SearchRepoTextMode, SearchRequest,
 };
 use codestory_runtime::{
-    AgentService, GroundingService, IndexService, ProjectService, ReadOnlyBrowserService, Runtime,
+    AgentService, BookmarkService, GroundingService, IndexService, ProjectService,
+    ReadOnlyBrowserService, Runtime,
 };
 use directories::ProjectDirs;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,7 @@ pub(crate) struct RuntimeContext {
     pub(crate) index: IndexService,
     pub(crate) grounding: GroundingService,
     pub(crate) agent: AgentService,
+    pub(crate) bookmarks: BookmarkService,
     pub(crate) browser: ReadOnlyBrowserService,
     pub(crate) events: crossbeam_channel::Receiver<AppEventPayload>,
     pub(crate) project_root: PathBuf,
@@ -75,6 +77,7 @@ impl RuntimeContext {
             index: runtime.index_service(),
             grounding: runtime.grounding_service(),
             agent: runtime.agent_service(),
+            bookmarks: runtime.bookmark_service(),
             browser: runtime.browser_service(),
             events,
             project_root,

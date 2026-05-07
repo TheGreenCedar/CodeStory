@@ -67,7 +67,8 @@ use semantic_doc_text::{
     semantic_symbol_aliases, semantic_symbol_role_aliases,
 };
 pub use services::{
-    AgentService, GroundingService, IndexService, ProjectService, SearchService, TrailService,
+    AgentService, BookmarkService, GroundingService, IndexService, ProjectService, SearchService,
+    TrailService,
 };
 pub(crate) use support::{
     FocusedSourceContext, HYBRID_RETRIEVAL_ENABLED_ENV, LocalAgentResponse,
@@ -141,6 +142,10 @@ impl Runtime {
 
     pub fn agent_service(&self) -> AgentService {
         AgentService::new(self.controller.clone())
+    }
+
+    pub fn bookmark_service(&self) -> BookmarkService {
+        BookmarkService::new(self.controller.clone())
     }
 
     pub fn browser_service(&self) -> ReadOnlyBrowserService {
@@ -2335,6 +2340,10 @@ impl AppController {
 
     pub fn agent_service(&self) -> AgentService {
         AgentService::new(self.clone())
+    }
+
+    pub fn bookmark_service(&self) -> BookmarkService {
+        BookmarkService::new(self.clone())
     }
 
     pub fn browser_service(&self) -> ReadOnlyBrowserService {

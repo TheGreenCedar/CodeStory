@@ -54,6 +54,7 @@ Use the release binary directly. This skill requires a local Rust toolchain and 
 - `target/release/codestory-cli(.exe) snippet`: Fetch source code context around a symbol
 - `target/release/codestory-cli(.exe) query`: Run a piped graph query such as `trail(symbol: 'Foo') | filter(kind: function)`
 - `target/release/codestory-cli(.exe) explore`: Open a terminal explorer or emit a bundled symbol/trail/snippet report
+- `target/release/codestory-cli(.exe) bookmark`: Save, list, or remove investigation focus bookmarks
 - `target/release/codestory-cli(.exe) serve`: Expose local HTTP JSON or stdio tool access for agents and editor integrations
 
 Always pass `--project <workspace>` explicitly so queries target the intended checkout even when you invoke the binary from the repo root. If a subcommand is unavailable in the current checkout, report that plainly and fall back to direct repo inspection instead of inventing grounded results.
@@ -71,5 +72,6 @@ Detailed argument tables, output examples, and usage patterns for each command:
 - [snippet](references/snippet.md) — Fetch source code context around a symbol
 - [query](references/query.md) — Structured graph query pipelines: `trail`, `symbol`, `search`, `filter`, and `limit`
 - [explore](references/explore.md) — Interactive terminal exploration with Markdown/JSON fallback
+- [bookmark](references/bookmark.md) — Save reusable investigation focus nodes
 - [ask](references/ask.md) — DB-first answer packet with citations and optional handoff bundle
 - [serve](references/serve.md) — Local HTTP JSON API or stdio tool protocol

@@ -17,6 +17,7 @@ target/release/codestory-cli(.exe) ask [OPTIONS] <PROMPT>
 | `--profile <auto|architecture|callflow|inheritance|impact>` | `auto` | Tune retrieval shape for the question. |
 | `--max-results <n>` | `8` | Retrieval cap, clamped to 1-25. |
 | `--focus-id <node_id>` | none | Seed retrieval from a node returned by `search`, `symbol`, `trail`, or `explore`. |
+| `--bookmark <bookmark_id>` | none | Seed retrieval from a saved investigation bookmark. Mutually exclusive with `--focus-id`. |
 | `--refresh <auto|full|incremental|none>` | `none` | Read an existing cache unless you intentionally refresh. |
 | `--format <markdown|json>` | `markdown` | Human or structured output. |
 | `--bundle <dir>` | none | Write Markdown, JSON, and graph handoff artifacts. |
@@ -29,7 +30,7 @@ target/release/codestory-cli(.exe) ask [OPTIONS] <PROMPT>
 |------|---------|-----------------|
 | Normal path | `target/release/codestory-cli(.exe) ask --project . "How does search ranking work?"` | Markdown answer with cited indexed evidence. |
 | Failure path | If it reports the index is unavailable, run `doctor --project .`, then `index --project . --refresh full`, and retry with `--refresh none`. | Avoids treating an empty or stale cache as evidence. |
-| Integration edge | Use `search --why` or `explore` first, then pass the selected node via `--focus-id <node_id>`; use `--bundle out/ask-search-ranking` for reviewer handoff. | Keeps the final answer tied to prior browser evidence. |
+| Integration edge | Use `search --why`, `explore`, or `bookmark list` first, then pass the selected node via `--focus-id <node_id>` or `--bookmark <bookmark_id>`; use `--bundle out/ask-search-ranking` for reviewer handoff. | Keeps the final answer tied to prior browser evidence. |
 
 ## Notes
 

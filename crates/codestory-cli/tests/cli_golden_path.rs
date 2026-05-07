@@ -766,6 +766,86 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
         "snippet should include source for AppController"
     );
 
+    let bookmark = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "bookmark",
+            "add",
+            &format!("--id={node_id}"),
+            "--comment",
+            "entry point under review",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    let bookmark_id = string_field(&bookmark, &["bookmark", "bookmark", "id"]).to_string();
+    assert_eq!(
+        string_field(&bookmark, &["bookmark", "bookmark", "node_id"]),
+        node_id
+    );
+    assert_eq!(
+        string_field(&bookmark, &["category", "name"]),
+        "Investigation"
+    );
+
+    let bookmarks = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["bookmark", "list", "--format", "json"],
+    );
+    assert!(
+        bookmarks["bookmarks"]
+            .as_array()
+            .expect("bookmarks")
+            .iter()
+            .any(|bookmark| bookmark["bookmark"]["id"] == bookmark_id),
+        "bookmark list should include the saved focus"
+    );
+
+    let bookmarked_ask = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "ask",
+            "What does this bookmark focus on?",
+            "--bookmark",
+            &bookmark_id,
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+            "--agent-command",
+            "definitely-not-codestory-local-agent",
+        ],
+    );
+    assert!(
+        bookmarked_ask["retrieval_trace"]["steps"]
+            .as_array()
+            .expect("bookmark ask trace steps")
+            .iter()
+            .any(|step| step["input"].as_array().is_some_and(|fields| fields
+                .iter()
+                .any(|field| field["key"] == "has_focus" && field["value"] == "true"))),
+        "ask --bookmark should explicitly seed focused retrieval"
+    );
+    assert!(
+        bookmarked_ask["retrieval_trace"]["annotations"]
+            .as_array()
+            .expect("bookmark ask trace annotations")
+            .iter()
+            .any(|annotation| {
+                let Some(annotation) = annotation.as_str() else {
+                    return false;
+                };
+                annotation.contains(&format!("bookmark_focus id={bookmark_id}"))
+                    && annotation.contains("comment=`entry point under review`")
+            }),
+        "ask --bookmark should preserve bookmark identity in the retrieval trace"
+    );
+
     let explore = run_cli_json(
         workspace.path(),
         cache_dir.path(),
@@ -924,6 +1004,26 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
         "trace should make the disabled local-agent state explicit"
     );
 
+    let removed = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["bookmark", "remove", &bookmark_id, "--format", "json"],
+    );
+    assert_eq!(string_field(&removed, &["removed_id"]), bookmark_id);
+    let bookmarks_after_remove = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["bookmark", "list", "--format", "json"],
+    );
+    assert!(
+        bookmarks_after_remove["bookmarks"]
+            .as_array()
+            .expect("bookmarks after remove")
+            .iter()
+            .all(|bookmark| bookmark["bookmark"]["id"] != bookmark_id),
+        "bookmark remove should persistently delete the saved focus"
+    );
+
     let stdio_env = tempdir().expect("stdio env dir");
     let marker = stdio_env.path().join("fake-agent-spawned.txt");
     let stdio = run_stdio_request(
@@ -961,6 +1061,126 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
     assert_eq!(
         search_dir_before, search_dir_after,
         "read commands should not recreate the persisted search directory"
+    );
+}
+
+#[test]
+fn bookmarks_degrade_gracefully_after_reindex_removes_target() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+
+    let search = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "search",
+            "--query",
+            "normalize_project",
+            "--repo-text",
+            "off",
+            "--limit",
+            "10",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    let target = search["indexed_symbol_hits"]
+        .as_array()
+        .expect("indexed symbol hits")
+        .iter()
+        .find(|hit| {
+            hit["display_name"] == "normalize_project"
+                && hit["file_path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("src/runtime.rs"))
+        })
+        .unwrap_or_else(|| panic!("normalize_project hit should exist: {search:#}"));
+    let node_id = target["node_id"].as_str().expect("node id");
+
+    let bookmark = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "bookmark",
+            "add",
+            &format!("--id={node_id}"),
+            "--comment",
+            "target that will disappear",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    let bookmark_id = string_field(&bookmark, &["bookmark", "bookmark", "id"]).to_string();
+
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        workspace.path().join("src").join("runtime.rs"),
+        r#"pub fn replacement_runtime_entry(project_name: &str) -> String {
+    format!("replacement:{project_name}")
+}
+"#,
+    )
+    .expect("remove bookmarked symbol");
+
+    run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "incremental", "--format", "json"],
+    );
+
+    let bookmarks = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["bookmark", "list", "--format", "json"],
+    );
+    let listed = bookmarks["bookmarks"].as_array().expect("bookmarks");
+    assert!(
+        listed.is_empty()
+            || listed
+                .iter()
+                .all(|bookmark| bookmark["stale"].as_bool() == Some(true)),
+        "bookmark list should prune removed nodes or mark stale rows without crashing: {bookmarks:#}"
+    );
+
+    let ask = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "ask",
+            "What did this bookmark point to?",
+            "--bookmark",
+            &bookmark_id,
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+            "--agent-command",
+            "definitely-not-codestory-local-agent",
+        ],
+    );
+    assert!(
+        !ask.status.success(),
+        "ask --bookmark should not silently ignore a removed bookmark"
+    );
+    let failure = format!(
+        "{}{}",
+        String::from_utf8_lossy(&ask.stdout),
+        String::from_utf8_lossy(&ask.stderr)
+    );
+    assert!(
+        failure.contains("Bookmark not found") || failure.contains("is stale"),
+        "ask --bookmark should explain stale or missing bookmark focus, got: {failure}"
     );
 }
 
