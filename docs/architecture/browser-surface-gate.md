@@ -24,8 +24,9 @@ Before starting web cockpit work:
   service.
 - Warm stdio/browser-loop p50, p95, and p99 timings must be recorded and must
   meet the active Current Promotion Budget in
-  `docs/testing/codestory-stdio-warm-loop-stats.md`. If that section says no
-  hard warm p95 budget is approved, this gate remains closed.
+  `docs/testing/codestory-stdio-warm-loop-stats.md`: small-fixture smoke p95
+  stays under the smoke budget, and a current real-repo run meets the Web
+  Cockpit Promotion Budget.
 - Browser stress lanes must pass at the intended scale, and synthetic evidence
   must not be treated as real-repository promotion proof.
 - `explore` must demonstrate the cockpit workflow in JSON/Markdown and

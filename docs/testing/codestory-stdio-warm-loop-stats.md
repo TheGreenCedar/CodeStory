@@ -17,10 +17,39 @@ The harness prints metrics from the test process after the stdio server exits. T
 
 ## Current Promotion Budget
 
-No hard warm p95 promotion budget is approved yet. The 2026-05-06 baseline is a
-small-fixture release-binary smoke, not web-cockpit promotion evidence. The
-browser surface gate stays closed until this section names a per-tool or
-per-loop p95 budget, target machine class, and passing current run.
+The active budget has two tiers.
+
+### Smoke Budget
+
+The small-fixture release-binary warm loop must stay comfortably below these
+p95 limits:
+
+| Operation | p95 Budget |
+| --- | ---: |
+| search | 75 ms |
+| symbol | 50 ms |
+| trail | 75 ms |
+| snippet | 50 ms |
+| resources/read:status | 50 ms |
+| full `search -> symbol -> trail -> snippet` loop | 250 ms |
+
+The 2026-05-06 baseline passes this smoke budget, but it remains a
+small-fixture smoke, not web-cockpit promotion evidence.
+
+### Web Cockpit Promotion Budget
+
+Before starting or promoting a separate web cockpit, record a current warm run
+against CodeStory itself or another representative real repository on the target
+machine class. The run must meet:
+
+| Scope | p95 Budget |
+| --- | ---: |
+| each default read operation | 500 ms |
+| full `search -> symbol -> trail -> snippet` loop | 1.5 s |
+
+The browser surface gate stays closed until a current real-repo run in this log
+meets the Web Cockpit Promotion Budget, and the stress-lane gate for the target
+scale also passes.
 
 ## Baseline Payload Sizes
 

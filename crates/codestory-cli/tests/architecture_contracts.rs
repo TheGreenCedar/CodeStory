@@ -343,7 +343,16 @@ fn web_cockpit_stays_deferred_until_browser_surface_gate_opens() {
     );
     assert!(
         warm_stats.contains("## Current Promotion Budget")
-            && warm_stats.contains("No hard warm p95 promotion budget is approved yet")
+            && warm_stats.contains("### Smoke Budget")
+            && warm_stats.contains("| search | 75 ms |")
+            && warm_stats.contains("| symbol | 50 ms |")
+            && warm_stats.contains("| trail | 75 ms |")
+            && warm_stats.contains("| snippet | 50 ms |")
+            && warm_stats.contains("| resources/read:status | 50 ms |")
+            && warm_stats.contains("| full `search -> symbol -> trail -> snippet` loop | 250 ms |")
+            && warm_stats.contains("### Web Cockpit Promotion Budget")
+            && warm_stats.contains("| each default read operation | 500 ms |")
+            && warm_stats.contains("| full `search -> symbol -> trail -> snippet` loop | 1.5 s |")
             && warm_stats.contains("browser surface gate stays closed"),
         "warm-loop stats doc should own the active p95 budget state"
     );
