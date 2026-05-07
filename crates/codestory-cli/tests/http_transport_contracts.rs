@@ -321,25 +321,34 @@ fn symbol_id_by_label(symbols: &Value, label: &str) -> String {
 
 #[test]
 fn http_routes_and_stdio_tools_keep_aligned_default_contracts() {
-    let main = read_repo_file("crates/codestory-cli/src/main.rs");
+    let http = read_repo_file("crates/codestory-cli/src/http_transport.rs");
+    let stdio = read_repo_file("crates/codestory-cli/src/stdio_transport.rs");
     let catalog = read_repo_file("crates/codestory-cli/src/stdio_catalog.rs");
     let http_handler = source_between(
-        &main,
-        "fn handle_http_request",
-        "fn browser_references_config",
+        &http,
+        "pub(crate) fn handle_http_request",
+        "fn resolve_http_target_from_params",
     );
-    let shared_browser_defaults =
-        source_between(&main, "const BROWSER_TRAIL_DEFAULT_DEPTH", "fn run");
+    let shared_browser_defaults = source_between(
+        &http,
+        "const BROWSER_TRAIL_DEFAULT_DEPTH",
+        "fn handle_http_request",
+    );
     let http_trail = route_arm(http_handler, "/trail", "_ =>");
     let http_references = route_arm(http_handler, "/references", "\"/symbols\"");
     let http_symbols = route_arm(http_handler, "/symbols", "\"/trail\"");
-    let stdio_trail = source_between(&main, "fn handle_stdio_trail", "fn handle_stdio_definition");
+    let stdio_trail = source_between(
+        &stdio,
+        "fn handle_stdio_trail",
+        "fn handle_stdio_definition",
+    );
     let stdio_references = source_between(
-        &main,
+        &stdio,
         "fn handle_stdio_references",
         "fn handle_stdio_symbols",
     );
-    let stdio_symbols = source_between(&main, "fn handle_stdio_symbols", "fn handle_stdio_snippet");
+    let stdio_symbols =
+        source_between(&stdio, "fn handle_stdio_symbols", "fn handle_stdio_snippet");
 
     for route in [
         "/search",
@@ -387,7 +396,7 @@ fn http_routes_and_stdio_tools_keep_aligned_default_contracts() {
     );
     assert!(
         source_between(
-            &main,
+            &http,
             "fn browser_references_config",
             "fn browser_trail_config"
         )

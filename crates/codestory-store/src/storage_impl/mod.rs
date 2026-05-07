@@ -168,24 +168,62 @@ fn grounding_indexable_predicate(alias: &str) -> String {
     )
 }
 
-fn grounding_node_rank_sql(alias: &str) -> String {
+fn grounding_import_like_symbol_predicate(alias: &str) -> String {
     let display_name = grounding_trimmed_name_expr(alias);
     format!(
+        "{alias}.kind IN ({module_kind}, {namespace_kind}, {package_kind}) AND {}",
+        grounding_import_like_name_predicate(&display_name),
+        module_kind = NodeKind::MODULE as i32,
+        namespace_kind = NodeKind::NAMESPACE as i32,
+        package_kind = NodeKind::PACKAGE as i32,
+    )
+}
+
+fn grounding_import_like_name_predicate(display_name: &str) -> String {
+    let double_quoted_name = grounding_sql_same_delimiter_expr(display_name, "char(34)");
+    let single_quoted_name = grounding_sql_same_delimiter_expr(display_name, "char(39)");
+    let angle_wrapped_name = grounding_sql_surrounded_by_expr(display_name, "'<'", "'>'");
+    let relative_current_dir_name = format!("{display_name} LIKE './%'");
+    let relative_parent_dir_name = format!("{display_name} LIKE '../%'");
+    let slash_separated_name = format!("instr({display_name}, '/') > 0");
+    format!(
+        "(
+            {double_quoted_name}
+            OR {single_quoted_name}
+            OR {angle_wrapped_name}
+            OR {relative_current_dir_name}
+            OR {relative_parent_dir_name}
+            OR {slash_separated_name}
+        )"
+    )
+}
+
+fn grounding_sql_same_delimiter_expr(display_name: &str, delimiter: &str) -> String {
+    grounding_sql_surrounded_by_expr(display_name, delimiter, delimiter)
+}
+
+fn grounding_sql_surrounded_by_expr(
+    display_name: &str,
+    start_delimiter: &str,
+    end_delimiter: &str,
+) -> String {
+    format!(
+        "(substr({display_name}, 1, 1) = {start_delimiter} AND substr({display_name}, length({display_name}), 1) = {end_delimiter})"
+    )
+}
+
+fn grounding_node_rank_sql(alias: &str) -> String {
+    let import_like_symbol = grounding_import_like_symbol_predicate(alias);
+    format!(
         "CASE
-            WHEN {alias}.kind IN ({module_kind}, {namespace_kind}, {package_kind}) AND (
-                (substr({display_name}, 1, 1) = char(34) AND substr({display_name}, length({display_name}), 1) = char(34))
-                OR (substr({display_name}, 1, 1) = char(39) AND substr({display_name}, length({display_name}), 1) = char(39))
-                OR (substr({display_name}, 1, 1) = '<' AND substr({display_name}, length({display_name}), 1) = '>')
-                OR {display_name} LIKE './%'
-                OR {display_name} LIKE '../%'
-                OR instr({display_name}, '/') > 0
-            ) THEN 5
+            WHEN {import_like_symbol} THEN 5
             WHEN {alias}.kind IN ({class_kind}, {struct_kind}, {interface_kind}, {enum_kind}, {union_kind}, {annotation_kind}, {typedef_kind}) THEN 0
             WHEN {alias}.kind IN ({function_kind}, {method_kind}, {macro_kind}) THEN 1
             WHEN {alias}.kind IN ({module_kind}, {namespace_kind}, {package_kind}) THEN 2
             WHEN {alias}.kind IN ({field_kind}, {variable_kind}, {global_variable_kind}, {constant_kind}, {enum_constant_kind}, {type_parameter_kind}) THEN 3
             ELSE 4
         END",
+        import_like_symbol = import_like_symbol,
         module_kind = NodeKind::MODULE as i32,
         namespace_kind = NodeKind::NAMESPACE as i32,
         package_kind = NodeKind::PACKAGE as i32,
@@ -206,6 +244,19 @@ fn grounding_node_rank_sql(alias: &str) -> String {
         enum_constant_kind = NodeKind::ENUM_CONSTANT as i32,
         type_parameter_kind = NodeKind::TYPE_PARAMETER as i32,
     )
+}
+
+fn outside_related_file_edge_predicate(file_param: &str) -> String {
+    format!(
+        "source_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+         AND target_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+         AND {}",
+        outside_file_node_predicate(file_param)
+    )
+}
+
+fn outside_file_node_predicate(file_param: &str) -> String {
+    format!("(file_node_id IS NULL OR file_node_id != {file_param})")
 }
 
 #[derive(Error, Debug)]
@@ -3764,14 +3815,14 @@ impl Storage {
             }
         }
 
+        let outside_related_file_edges = outside_related_file_edge_predicate("?1");
+
         tx.execute(
             &format!(
                 "UPDATE edge
                  SET resolved_source_node_id = NULL
                  WHERE resolved_source_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
-                 AND source_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
-                 AND target_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
-                 AND (file_node_id IS NULL OR file_node_id != ?1)"
+                 AND {outside_related_file_edges}"
             ),
             params![file_node_id],
         )?;
@@ -3784,9 +3835,7 @@ impl Storage {
                      certainty = NULL,
                      candidate_target_node_ids = NULL
                  WHERE resolved_target_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
-                 AND source_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
-                 AND target_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
-                 AND (file_node_id IS NULL OR file_node_id != ?1)"
+                 AND {outside_related_file_edges}"
             ),
             params![file_node_id],
         )?;

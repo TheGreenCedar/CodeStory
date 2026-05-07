@@ -5,7 +5,10 @@ use codestory_contracts::api::{
     SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, SymbolContextDto, SymbolSummaryDto,
     TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection, TrailMode,
 };
-use codestory_contracts::query::{GraphQueryAst, GraphQueryOperation};
+use codestory_contracts::query::{
+    FilterQuery, GraphQueryAst, GraphQueryOperation, SearchQuery as BrowserSearchQuery,
+    SymbolQuery, TrailQuery,
+};
 
 use crate::AppController;
 
@@ -28,6 +31,18 @@ pub struct BrowserQueryItem {
 #[derive(Clone)]
 pub struct ReadOnlyBrowserService {
     controller: AppController,
+}
+
+fn query_item_matches_filter(item: &BrowserQueryItem, filter: &FilterQuery) -> bool {
+    filter.kind.is_none_or(|kind| item.kind == kind)
+        && filter
+            .depth
+            .is_none_or(|depth| item.depth.unwrap_or(0) <= depth)
+        && filter.file.as_deref().is_none_or(|needle| {
+            item.file_path
+                .as_deref()
+                .is_some_and(|path| path.contains(needle))
+        })
 }
 
 impl ReadOnlyBrowserService {
@@ -113,98 +128,16 @@ impl ReadOnlyBrowserService {
         for op in &ast.operations {
             match op {
                 GraphQueryOperation::Trail(query) => {
-                    let target = self.resolve_query(&query.symbol)?;
-                    let mut request = TrailConfigDto {
-                        root_id: target.node_id,
-                        mode: TrailMode::Neighborhood,
-                        target_id: None,
-                        depth: query.depth.unwrap_or(2),
-                        direction: query.direction.unwrap_or(TrailDirection::Both),
-                        caller_scope: TrailCallerScope::ProductionOnly,
-                        edge_filter: Vec::new(),
-                        show_utility_calls: false,
-                        hide_speculative: false,
-                        story: false,
-                        node_filter: Vec::new(),
-                        max_nodes: 120,
-                        layout_direction: LayoutDirection::Horizontal,
-                    };
-                    if request.depth == 0 {
-                        request.max_nodes = 200;
-                    }
-                    let context = self.controller.trail_context(request)?;
-                    items = context
-                        .trail
-                        .nodes
-                        .into_iter()
-                        .map(|node| BrowserQueryItem {
-                            node_id: node.id,
-                            display_name: node.label,
-                            kind: node.kind,
-                            file_path: node.file_path,
-                            line: None,
-                            depth: Some(node.depth),
-                            source: "trail".to_string(),
-                        })
-                        .collect();
+                    items = self.query_trail_items(query)?;
                 }
                 GraphQueryOperation::Symbol(query) => {
-                    let target = self.resolve_query(&query.query)?;
-                    let context = self.controller.symbol_context(target.node_id.clone())?;
-                    items = std::iter::once(BrowserQueryItem {
-                        node_id: context.node.id,
-                        display_name: context.node.display_name,
-                        kind: context.node.kind,
-                        file_path: context.node.file_path,
-                        line: context.node.start_line,
-                        depth: Some(0),
-                        source: "symbol".to_string(),
-                    })
-                    .chain(context.children.into_iter().map(|child| BrowserQueryItem {
-                        node_id: child.id,
-                        display_name: child.label,
-                        kind: child.kind,
-                        file_path: child.file_path,
-                        line: None,
-                        depth: Some(1),
-                        source: "symbol_child".to_string(),
-                    }))
-                    .collect();
+                    items = self.query_symbol_items(query)?;
                 }
                 GraphQueryOperation::Search(query) => {
-                    let results = self.controller.search_results(SearchRequest {
-                        query: query.query.clone(),
-                        repo_text: SearchRepoTextMode::Off,
-                        limit_per_source: 50,
-                        hybrid_weights: None,
-                        hybrid_limits: None,
-                    })?;
-                    items = results
-                        .indexed_symbol_hits
-                        .into_iter()
-                        .map(|hit| BrowserQueryItem {
-                            node_id: hit.node_id,
-                            display_name: hit.display_name,
-                            kind: hit.kind,
-                            file_path: hit.file_path,
-                            line: hit.line,
-                            depth: None,
-                            source: "search".to_string(),
-                        })
-                        .collect();
+                    items = self.query_search_items(query)?;
                 }
                 GraphQueryOperation::Filter(filter) => {
-                    items.retain(|item| {
-                        filter.kind.is_none_or(|kind| item.kind == kind)
-                            && filter
-                                .depth
-                                .is_none_or(|depth| item.depth.unwrap_or(0) <= depth)
-                            && filter.file.as_deref().is_none_or(|needle| {
-                                item.file_path
-                                    .as_deref()
-                                    .is_some_and(|path| path.contains(needle))
-                            })
-                    });
+                    items.retain(|item| query_item_matches_filter(item, filter));
                 }
                 GraphQueryOperation::Limit(limit) => {
                     items.truncate(limit.count as usize);
@@ -212,6 +145,93 @@ impl ReadOnlyBrowserService {
             }
         }
         Ok(items)
+    }
+
+    fn query_trail_items(&self, query: &TrailQuery) -> Result<Vec<BrowserQueryItem>, ApiError> {
+        let target = self.resolve_query(&query.symbol)?;
+        let mut request = TrailConfigDto {
+            root_id: target.node_id,
+            mode: TrailMode::Neighborhood,
+            target_id: None,
+            depth: query.depth.unwrap_or(2),
+            direction: query.direction.unwrap_or(TrailDirection::Both),
+            caller_scope: TrailCallerScope::ProductionOnly,
+            edge_filter: Vec::new(),
+            show_utility_calls: false,
+            hide_speculative: false,
+            story: false,
+            node_filter: Vec::new(),
+            max_nodes: 120,
+            layout_direction: LayoutDirection::Horizontal,
+        };
+        if request.depth == 0 {
+            request.max_nodes = 200;
+        }
+        let context = self.controller.trail_context(request)?;
+        Ok(context
+            .trail
+            .nodes
+            .into_iter()
+            .map(|node| BrowserQueryItem {
+                node_id: node.id,
+                display_name: node.label,
+                kind: node.kind,
+                file_path: node.file_path,
+                line: None,
+                depth: Some(node.depth),
+                source: "trail".to_string(),
+            })
+            .collect())
+    }
+
+    fn query_symbol_items(&self, query: &SymbolQuery) -> Result<Vec<BrowserQueryItem>, ApiError> {
+        let target = self.resolve_query(&query.query)?;
+        let context = self.controller.symbol_context(target.node_id.clone())?;
+        Ok(std::iter::once(BrowserQueryItem {
+            node_id: context.node.id,
+            display_name: context.node.display_name,
+            kind: context.node.kind,
+            file_path: context.node.file_path,
+            line: context.node.start_line,
+            depth: Some(0),
+            source: "symbol".to_string(),
+        })
+        .chain(context.children.into_iter().map(|child| BrowserQueryItem {
+            node_id: child.id,
+            display_name: child.label,
+            kind: child.kind,
+            file_path: child.file_path,
+            line: None,
+            depth: Some(1),
+            source: "symbol_child".to_string(),
+        }))
+        .collect())
+    }
+
+    fn query_search_items(
+        &self,
+        query: &BrowserSearchQuery,
+    ) -> Result<Vec<BrowserQueryItem>, ApiError> {
+        let results = self.controller.search_results(SearchRequest {
+            query: query.query.clone(),
+            repo_text: SearchRepoTextMode::Off,
+            limit_per_source: 50,
+            hybrid_weights: None,
+            hybrid_limits: None,
+        })?;
+        Ok(results
+            .indexed_symbol_hits
+            .into_iter()
+            .map(|hit| BrowserQueryItem {
+                node_id: hit.node_id,
+                display_name: hit.display_name,
+                kind: hit.kind,
+                file_path: hit.file_path,
+                line: hit.line,
+                depth: None,
+                source: "search".to_string(),
+            })
+            .collect())
     }
 
     fn resolve_query(&self, query: &str) -> Result<SearchHit, ApiError> {

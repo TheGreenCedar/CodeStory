@@ -1065,8 +1065,9 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
         &marker,
         r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ask","arguments":{"prompt":"What does AppController do?"}}}"#,
     );
+    let stdio_result = &stdio["result"]["structuredContent"];
     assert!(
-        stdio["result"]["retrieval_trace"]["steps"]
+        stdio_result["retrieval_trace"]["steps"]
             .as_array()
             .expect("stdio ask trace steps")
             .iter()

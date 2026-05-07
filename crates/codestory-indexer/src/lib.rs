@@ -2279,10 +2279,7 @@ fn normalize_graph_capture(
         );
     }
 
-    if input.language_name == "cpp"
-        && input.kind == NodeKind::UNKNOWN
-        && (input.name.contains("::") || input.name.contains('<') || input.has_token_surface_edge)
-    {
+    if cpp_unknown_capture_needs_terminal_identifier(input) {
         return extract_terminal_identifier_from_span(
             input.source,
             input.graph_span.start_line,
@@ -2293,6 +2290,19 @@ fn normalize_graph_capture(
     }
 
     None
+}
+
+fn cpp_unknown_capture_needs_terminal_identifier(
+    input: &GraphCaptureNormalizationInput<'_>,
+) -> bool {
+    let is_cpp_unknown_capture = input.language_name == "cpp" && input.kind == NodeKind::UNKNOWN;
+    let has_composite_surface =
+        cpp_name_is_scoped_or_template(input.name) || input.has_token_surface_edge;
+    is_cpp_unknown_capture && has_composite_surface
+}
+
+fn cpp_name_is_scoped_or_template(name: &str) -> bool {
+    name.contains("::") || name.contains('<')
 }
 
 fn split_top_level_type_arguments(raw: &str) -> Vec<String> {
@@ -3393,35 +3403,61 @@ fn apply_qualified_names(nodes: Vec<Node>, edges: &[Edge], language_name: &str) 
         let parent_is_type_like = node_map
             .get(&parent_id)
             .is_some_and(|parent_node| is_type_like_kind(parent_node.kind));
-        if let Some(children) = parent_map.get(&parent_id) {
-            for child_id in children {
-                if let Some(child_node) = node_map.get_mut(child_id) {
-                    let delimiter = match language_name {
-                        "rust" | "cpp" | "c" => "::",
-                        _ => ".",
-                    };
-                    let new_name = format!(
-                        "{}{}{}",
-                        parent_qualified_name, delimiter, child_node.serialized_name
-                    );
-                    // Keep members of type-like owners owner-qualified in both name fields so
-                    // downstream resolution can distinguish declared members from
-                    // placeholder/reference nodes that share the same terminal token,
-                    // without changing terminal names for module-owned type declarations.
-                    if parent_is_type_like {
-                        child_node.serialized_name = format!(
-                            "{}{}{}",
-                            parent_serialized_name, delimiter, child_node.serialized_name
-                        );
-                    }
-                    child_node.qualified_name = Some(new_name.clone());
-                    queue.push((*child_id, new_name));
-                }
-            }
-        }
+        queue_qualified_child_names(
+            parent_id,
+            &parent_qualified_name,
+            &parent_serialized_name,
+            parent_is_type_like,
+            language_name,
+            &parent_map,
+            &mut node_map,
+            &mut queue,
+        );
     }
 
     node_map.into_values().collect()
+}
+
+fn queue_qualified_child_names(
+    parent_id: NodeId,
+    parent_qualified_name: &str,
+    parent_serialized_name: &str,
+    parent_is_type_like: bool,
+    language_name: &str,
+    parent_map: &HashMap<NodeId, Vec<NodeId>>,
+    node_map: &mut HashMap<NodeId, Node>,
+    queue: &mut Vec<(NodeId, String)>,
+) {
+    let Some(children) = parent_map.get(&parent_id) else {
+        return;
+    };
+    for child_id in children {
+        let Some(child_node) = node_map.get_mut(child_id) else {
+            continue;
+        };
+        let delimiter = qualified_name_delimiter(language_name);
+        let new_name = format!(
+            "{}{}{}",
+            parent_qualified_name, delimiter, child_node.serialized_name
+        );
+        // Keep members of type-like owners owner-qualified in both name fields so
+        // downstream resolution can distinguish declared members from placeholder/reference nodes.
+        if parent_is_type_like {
+            child_node.serialized_name = format!(
+                "{}{}{}",
+                parent_serialized_name, delimiter, child_node.serialized_name
+            );
+        }
+        child_node.qualified_name = Some(new_name.clone());
+        queue.push((*child_id, new_name));
+    }
+}
+
+fn qualified_name_delimiter(language_name: &str) -> &'static str {
+    match language_name {
+        "rust" | "cpp" | "c" => "::",
+        _ => ".",
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4033,7 +4069,11 @@ fn choose_existing_impl_anchor_target(storage: &Storage, anchor: &Node) -> Resul
         "SELECT id, serialized_name, qualified_name, file_node_id
          FROM node
          WHERE (serialized_name = ?1 OR serialized_name LIKE ?2)
-            AND (canonical_id IS NULL OR canonical_id NOT LIKE 'impl_anchor:%')
+            ",
+    );
+    query.push_str(non_impl_anchor_canonical_predicate());
+    query.push_str(
+        "
             AND kind IN (",
     );
     let kind_values = rust_type_like_kind_values();
@@ -4343,8 +4383,17 @@ fn index_openapi_schema_file(path: &Path, source: &str) -> Result<Option<Interme
 
 fn looks_like_openapi_schema(source: &str) -> bool {
     let lower = source.to_ascii_lowercase();
-    (lower.contains("\"openapi\"") || lower.contains("openapi:") || lower.contains("\"swagger\""))
-        && (lower.contains("\"paths\"") || lower.contains("paths:"))
+    contains_openapi_schema_marker(&lower) && contains_openapi_paths_marker(&lower)
+}
+
+fn contains_openapi_schema_marker(lower_source: &str) -> bool {
+    lower_source.contains("\"openapi\"")
+        || lower_source.contains("openapi:")
+        || lower_source.contains("\"swagger\"")
+}
+
+fn contains_openapi_paths_marker(lower_source: &str) -> bool {
+    lower_source.contains("\"paths\"") || lower_source.contains("paths:")
 }
 
 fn parse_openapi_endpoints(source: &str) -> Result<Vec<OpenApiEndpoint>> {
@@ -4470,6 +4519,10 @@ fn normalize_api_path(path: &str) -> String {
     } else {
         format!("/{trimmed}")
     }
+}
+
+fn non_impl_anchor_canonical_predicate() -> &'static str {
+    "AND (canonical_id IS NULL OR canonical_id NOT LIKE 'impl_anchor:%')"
 }
 
 fn append_schema_endpoint_call_edges(
@@ -5421,8 +5474,7 @@ fn apply_line_range_call_attribution(
             {
                 edge.source = best.id;
             }
-            if placeholder_source
-                && (!callable_ids.contains(&edge.source) || edge.source == edge.target)
+            if placeholder_source && call_edge_still_has_unresolved_placeholder(edge, &callable_ids)
             {
                 continue;
             }
@@ -5439,6 +5491,10 @@ fn apply_line_range_call_attribution(
     }
 
     *edges = updated_edges;
+}
+
+fn call_edge_still_has_unresolved_placeholder(edge: &Edge, callable_ids: &HashSet<NodeId>) -> bool {
+    !callable_ids.contains(&edge.source) || edge.source == edge.target
 }
 
 fn build_callable_projection_states(
@@ -5492,56 +5548,13 @@ fn build_callable_projection_states(
             &start_col.to_string(),
         ]);
 
-        let mut body_parts = Vec::new();
-        if let Some(source_edges) = edges_by_source.get(&node.id) {
-            let mut edge_parts = source_edges
-                .iter()
-                .filter(|edge| {
-                    !matches!(
-                        edge.kind,
-                        EdgeKind::MEMBER
-                            | EdgeKind::INHERITANCE
-                            | EdgeKind::IMPORT
-                            | EdgeKind::OVERRIDE
-                    )
-                })
-                .map(|edge| {
-                    format!(
-                        "{}:{}:{}:{}",
-                        edge.kind as i32,
-                        edge.target.0,
-                        edge.line.unwrap_or(0),
-                        edge.callsite_identity.as_deref().unwrap_or_default()
-                    )
-                })
-                .collect::<Vec<_>>();
-            edge_parts.sort();
-            body_parts.extend(edge_parts);
-        }
-
-        if let Some(file_occurrences) = occurrences_by_file.get(&file_id) {
-            let mut occurrence_parts = file_occurrences
-                .iter()
-                .filter(|occurrence| {
-                    occurrence.location.start_line >= start_line
-                        && occurrence.location.end_line <= end_line
-                        && occurrence.element_id != node.id.0
-                })
-                .map(|occurrence| {
-                    format!(
-                        "{}:{}:{}:{}:{}:{}",
-                        occurrence.element_id,
-                        occurrence.kind as i32,
-                        occurrence.location.start_line,
-                        occurrence.location.start_col,
-                        occurrence.location.end_line,
-                        occurrence.location.end_col
-                    )
-                })
-                .collect::<Vec<_>>();
-            occurrence_parts.sort();
-            body_parts.extend(occurrence_parts);
-        }
+        let mut body_parts = callable_edge_projection_parts(edges_by_source.get(&node.id));
+        body_parts.extend(callable_occurrence_projection_parts(
+            occurrences_by_file.get(&file_id),
+            node,
+            start_line,
+            end_line,
+        ));
 
         states.push(CallableProjectionState {
             file_id: file_id.0,
@@ -5568,6 +5581,75 @@ fn build_callable_projection_states(
 
     states.sort_by(|lhs, rhs| lhs.symbol_key.cmp(&rhs.symbol_key));
     states
+}
+
+fn callable_edge_projection_parts(source_edges: Option<&Vec<&Edge>>) -> Vec<String> {
+    let Some(source_edges) = source_edges else {
+        return Vec::new();
+    };
+    let mut edge_parts = source_edges
+        .iter()
+        .filter(|edge| !is_structural_projection_edge(edge.kind))
+        .map(|edge| {
+            format!(
+                "{}:{}:{}:{}",
+                edge.kind as i32,
+                edge.target.0,
+                edge.line.unwrap_or(0),
+                edge.callsite_identity.as_deref().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>();
+    edge_parts.sort();
+    edge_parts
+}
+
+fn is_structural_projection_edge(kind: EdgeKind) -> bool {
+    matches!(
+        kind,
+        EdgeKind::MEMBER | EdgeKind::INHERITANCE | EdgeKind::IMPORT | EdgeKind::OVERRIDE
+    )
+}
+
+fn callable_occurrence_projection_parts(
+    file_occurrences: Option<&Vec<&Occurrence>>,
+    node: &Node,
+    start_line: u32,
+    end_line: u32,
+) -> Vec<String> {
+    let Some(file_occurrences) = file_occurrences else {
+        return Vec::new();
+    };
+    let mut occurrence_parts = file_occurrences
+        .iter()
+        .filter(|occurrence| {
+            occurrence_belongs_to_callable_body(occurrence, node, start_line, end_line)
+        })
+        .map(|occurrence| {
+            format!(
+                "{}:{}:{}:{}:{}:{}",
+                occurrence.element_id,
+                occurrence.kind as i32,
+                occurrence.location.start_line,
+                occurrence.location.start_col,
+                occurrence.location.end_line,
+                occurrence.location.end_col
+            )
+        })
+        .collect::<Vec<_>>();
+    occurrence_parts.sort();
+    occurrence_parts
+}
+
+fn occurrence_belongs_to_callable_body(
+    occurrence: &Occurrence,
+    node: &Node,
+    start_line: u32,
+    end_line: u32,
+) -> bool {
+    occurrence.location.start_line >= start_line
+        && occurrence.location.end_line <= end_line
+        && occurrence.element_id != node.id.0
 }
 
 fn structural_projection_hash(
@@ -6438,7 +6520,8 @@ public:
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut saw_started = false;
         let mut saw_complete = false;
-        while Instant::now() < deadline && (!saw_started || !saw_complete) {
+        while Instant::now() < deadline && progress_events_still_pending(saw_started, saw_complete)
+        {
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Event::IndexingStarted { .. }) => saw_started = true,
                 Ok(Event::IndexingComplete { .. }) => saw_complete = true,
@@ -6451,6 +6534,10 @@ public:
         assert!(saw_complete, "expected IndexingComplete event");
 
         Ok(())
+    }
+
+    fn progress_events_still_pending(saw_started: bool, saw_complete: bool) -> bool {
+        !saw_started || !saw_complete
     }
 
     #[test]
