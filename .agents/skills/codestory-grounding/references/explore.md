@@ -1,6 +1,8 @@
 # `explore` - Bundled Symbol Browser
 
-Resolves one target and returns a combined symbol, trail, navigation, and snippet view. In an interactive terminal it can open the TUI; use `--no-tui` or `--format json` for stable agent output.
+Resolves one target and returns a combined status, search, results, symbol,
+trail, navigation, and snippet view. In an interactive terminal it can open the
+TUI; use `--no-tui` or `--format json` for stable agent output.
 
 ## Usage
 
@@ -27,7 +29,7 @@ target/release/codestory-cli(.exe) explore [OPTIONS] <--id <ID>|--query <QUERY>>
 
 | Path | Command | Expected result |
 |------|---------|-----------------|
-| Normal path | `target/release/codestory-cli(.exe) explore --project . --query WorkspaceIndexer --no-tui` | Markdown bundle with resolution, navigation, symbol details, trail, and snippet context. |
+| Normal path | `target/release/codestory-cli(.exe) explore --project . --query WorkspaceIndexer --no-tui` | Markdown bundle with status/retrieval/freshness, query resolution, navigation results, symbol details, trail, and snippet context. |
 | Failure path | If the target is ambiguous or missing, run `search --project . --query WorkspaceIndexer --why`, then retry with `--id <node_id>` or `--file <fragment>`. | Avoids guessing which symbol the report describes. |
 | Integration edge | Use explore after `search --why`; feed the resolved node id into `ask --focus-id`, `trail --id`, or `snippet --id` when the next step needs sharper evidence. | Converts broad search into a focused browser handoff. |
 
@@ -35,4 +37,6 @@ target/release/codestory-cli(.exe) explore [OPTIONS] <--id <ID>|--query <QUERY>>
 
 - Use `--format json` for downstream tools.
 - Use `--no-tui` in non-interactive agent runs to keep output copy-paste stable.
+- The TUI panes are keyboard reachable with Tab/Shift-Tab and include Status,
+  Search, Results, Detail, Trail, and Snippet.
 - `explore` includes production-only neighborhood trails; run `trail --include-tests` separately when test callers matter.

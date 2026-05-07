@@ -1652,7 +1652,7 @@ fn render_node(project_root: &Path, node: &NodeDetailsDto) -> String {
     out
 }
 
-fn render_retrieval_state(state: &RetrievalStateDto) -> String {
+pub(crate) fn render_retrieval_state(state: &RetrievalStateDto) -> String {
     let mode = match state.mode {
         RetrievalModeDto::Hybrid => "hybrid",
         RetrievalModeDto::Symbolic => "symbolic",

@@ -412,11 +412,11 @@ fn no_query_match_error(
 ) -> anyhow::Error {
     match file_filter {
         Some(file_filter) => anyhow!(
-            "No symbol matched query `{query}` within files matching `{}`. Run `codestory-cli search --query \"{query}\" --limit 10` to inspect candidates, or relax `--file`.",
+            "query_resolution: No symbol matched query `{query}` within files matching `{}`. Run `codestory-cli search --query \"{query}\" --limit 10` to inspect candidates, or relax `--file`.",
             clean_path_string(file_filter)
         ),
         None => anyhow!(
-            "No symbol matched query `{query}`. Run `codestory-cli search --query \"{query}\" --limit 10` to inspect candidates."
+            "query_resolution: No symbol matched query `{query}`. Run `codestory-cli search --query \"{query}\" --limit 10` to inspect candidates."
         ),
     }
 }

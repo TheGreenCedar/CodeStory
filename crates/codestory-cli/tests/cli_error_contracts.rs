@@ -272,6 +272,19 @@ fn ambiguous_symbol_json_includes_numbered_alternatives_with_stable_refs() {
         Some("ambiguous_target"),
         "ambiguous JSON should carry a machine-readable error code: {json:#}"
     );
+    assert_eq!(
+        json.pointer("/error/failed_layer").and_then(Value::as_str),
+        Some("query_resolution"),
+        "ambiguous JSON should identify the failed layer: {json:#}"
+    );
+    assert!(
+        json.pointer("/error/layer_notes")
+            .and_then(Value::as_array)
+            .is_some_and(|notes| notes.iter().any(|note| note
+                .as_str()
+                .is_some_and(|note| note.starts_with("query_resolution:")))),
+        "ambiguous JSON should preserve layer notes: {json:#}"
+    );
     assert!(
         json.pointer("/resolution/resolved").is_none(),
         "ambiguous JSON should not include a hidden resolved target: {json:#}"
@@ -325,6 +338,33 @@ fn ambiguous_symbol_json_includes_numbered_alternatives_with_stable_refs() {
                 .as_str()
                 .is_some_and(|value| value.contains("--file \"src\"")))),
         "filtered ambiguity next command should preserve the file filter: {filtered_json:#}"
+    );
+
+    let explore = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "explore",
+            "--query",
+            "configure",
+            "--no-tui",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        !explore.status.success(),
+        "ambiguous explore query must fail without silently choosing a target"
+    );
+    let explore_json = parse_stdout_json(&explore);
+    assert_eq!(
+        explore_json
+            .pointer("/error/failed_layer")
+            .and_then(Value::as_str),
+        Some("query_resolution"),
+        "explore ambiguity should preserve the failed query-resolution layer: {explore_json:#}"
     );
 }
 

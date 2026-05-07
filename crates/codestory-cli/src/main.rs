@@ -31,17 +31,19 @@ mod stdio_catalog;
 
 use args::{
     AskCommand, Cli, Command, CompletionShell, DoctorCheckOutput, DoctorCommand, DoctorOutput,
-    ExploreCommand, ExploreOutput, GenerateCompletionsCommand, GroundCommand, IndexCommand,
-    IndexDryRunOutput, IndexOutput, NavigationOutput, QueryCommand, QueryItemOutput, QueryOutput,
-    QueryResolutionOutput, RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput,
-    ServeCommand, SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, TrailCommand,
-    TrailJsonOutput, ask_retrieval_profile, build_trail_request,
+    ExploreCommand, ExploreOutput, ExploreSearchOutput, ExploreStatusOutput,
+    GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput, IndexOutput,
+    NavigationOutput, QueryCommand, QueryItemOutput, QueryOutput, QueryResolutionOutput,
+    RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput, ServeCommand, SnippetCommand,
+    SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, TrailCommand, TrailJsonOutput,
+    ask_retrieval_profile, build_trail_request,
 };
 use output::{
     emit, emit_text, render_agent_answer_markdown, render_doctor_markdown, render_ground_markdown,
     render_index_dry_run_markdown, render_index_markdown, render_query_markdown,
-    render_search_markdown, render_snippet_markdown, render_symbol_markdown, render_symbol_mermaid,
-    render_trail_dot, render_trail_markdown, render_trail_mermaid, validate_output_file_parent,
+    render_retrieval_state, render_search_markdown, render_snippet_markdown,
+    render_symbol_markdown, render_symbol_mermaid, render_trail_dot, render_trail_markdown,
+    render_trail_mermaid, validate_output_file_parent,
 };
 use runtime::{
     AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
@@ -587,13 +589,34 @@ fn run_explore(cmd: ExploreCommand) -> Result<()> {
             layout_direction: LayoutDirection::Horizontal,
         })
         .map_err(map_api_error)?;
-    let snippet = runtime
+    let snippet_result = runtime
         .browser
-        .snippet_context(target.selected.node_id.clone(), 4)
-        .ok();
+        .snippet_context(target.selected.node_id.clone(), 4);
+    let (snippet, snippet_layer_note) = match snippet_result {
+        Ok(snippet) => (Some(snippet), "snippet_context: available".to_string()),
+        Err(error) => (
+            None,
+            format!(
+                "snippet_context: unavailable: {}: {}",
+                error.code, error.message
+            ),
+        ),
+    };
+    let status = build_explore_status_output(
+        &runtime,
+        &opened,
+        &target,
+        cmd.refresh,
+        cmd.output_file.as_deref(),
+        &snippet_layer_note,
+    );
+    let search = build_explore_search_output(&runtime.project_root, &target);
+    let navigation = build_navigation_output(&runtime.project_root, &target, &trail);
     let output = ExploreOutput {
+        status,
+        search,
         resolution: build_query_resolution_output(&runtime.project_root, &target),
-        navigation: build_navigation_output(&runtime.project_root, &target, &trail),
+        navigation,
         symbol: &symbol,
         trail: &trail,
         snippet: snippet.as_ref(),
@@ -601,9 +624,13 @@ fn run_explore(cmd: ExploreCommand) -> Result<()> {
     let markdown = render_explore_markdown(
         &runtime.project_root,
         &target,
+        &output.status,
+        &output.search,
+        &output.navigation,
         &symbol,
         &trail,
         snippet.as_ref(),
+        &snippet_layer_note,
     );
     if cmd.format == args::OutputFormat::Markdown
         && cmd.output_file.is_none()
@@ -613,9 +640,13 @@ fn run_explore(cmd: ExploreCommand) -> Result<()> {
         return run_explore_tui(
             &runtime.project_root,
             &target,
+            &output.status,
+            &output.search,
+            &output.navigation,
             &symbol,
             &trail,
             snippet.as_ref(),
+            &snippet_layer_note,
         );
     }
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
@@ -664,11 +695,13 @@ struct CliErrorOutput {
 #[derive(serde::Serialize)]
 struct CliErrorBody {
     code: &'static str,
+    failed_layer: &'static str,
     message: String,
     query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     file_filter: Option<String>,
     alternatives: Vec<SearchHitOutput>,
+    layer_notes: Vec<String>,
     next_commands: Vec<String>,
 }
 
@@ -725,6 +758,7 @@ fn build_ambiguous_target_error_output(
     CliErrorOutput {
         error: CliErrorBody {
             code: "ambiguous_target",
+            failed_layer: "query_resolution",
             message: ambiguous.message.clone(),
             query: ambiguous.query.clone(),
             file_filter: ambiguous
@@ -732,6 +766,13 @@ fn build_ambiguous_target_error_output(
                 .as_deref()
                 .map(crate::display::clean_path_string),
             alternatives,
+            layer_notes: vec![
+                format!(
+                    "query_resolution: `{}` matched multiple equally ranked symbols",
+                    ambiguous.query
+                ),
+                "search: inspect alternatives or rerun with --choose, --id, or --file".to_string(),
+            ],
             next_commands,
         },
     }
@@ -1322,15 +1363,308 @@ fn build_navigation_output(
     }
 }
 
+fn build_explore_search_output(
+    project_root: &std::path::Path,
+    target: &runtime::ResolvedTarget,
+) -> ExploreSearchOutput {
+    ExploreSearchOutput {
+        selector: target.selector,
+        requested: target.requested.clone(),
+        file_filter: target
+            .file_filter
+            .as_deref()
+            .map(crate::display::clean_path_string),
+        selected: build_search_hit_output(project_root, &target.selected, false),
+        alternatives: target
+            .alternatives
+            .iter()
+            .skip(1)
+            .map(|hit| build_search_hit_output(project_root, hit, false))
+            .collect(),
+    }
+}
+
+fn build_explore_status_output(
+    runtime: &RuntimeContext,
+    opened: &runtime::OpenedProject,
+    target: &runtime::ResolvedTarget,
+    requested_refresh: args::RefreshMode,
+    output_file: Option<&std::path::Path>,
+    snippet_layer_note: &str,
+) -> ExploreStatusOutput {
+    let project = display::clean_path_string(&runtime.project_root.to_string_lossy());
+    let storage_path = display::clean_path_string(&runtime.storage_path.to_string_lossy());
+    let output_target = output_file
+        .map(|path| display::clean_path_string(&path.to_string_lossy()))
+        .unwrap_or_else(|| "stdout".to_string());
+    let retrieval = opened.summary.retrieval.clone();
+    let freshness = opened.summary.freshness.clone();
+    let next_commands =
+        explore_next_commands(&project, target, retrieval.as_ref(), freshness.as_ref());
+    let layer_notes = explore_layer_notes(
+        &storage_path,
+        &output_target,
+        &opened.summary,
+        target,
+        retrieval.as_ref(),
+        freshness.as_ref(),
+        snippet_layer_note,
+    );
+
+    ExploreStatusOutput {
+        project,
+        storage_path,
+        refresh: refresh_label(requested_refresh, opened.refresh_mode),
+        output_target,
+        indexed_files: opened.summary.stats.file_count,
+        indexed_nodes: opened.summary.stats.node_count,
+        indexed_edges: opened.summary.stats.edge_count,
+        retrieval,
+        freshness,
+        next_commands,
+        layer_notes,
+    }
+}
+
+fn explore_next_commands(
+    project: &str,
+    target: &runtime::ResolvedTarget,
+    retrieval: Option<&codestory_contracts::api::RetrievalStateDto>,
+    freshness: Option<&IndexFreshnessDto>,
+) -> Vec<String> {
+    let node_id = &target.selected.node_id.0;
+    let mut commands = Vec::new();
+    if freshness.is_some_and(|state| state.status == IndexFreshnessStatusDto::Stale) {
+        commands.push(format!(
+            "codestory-cli index --project \"{project}\" --refresh incremental"
+        ));
+    }
+    commands.push(format!(
+        "codestory-cli ask --project \"{project}\" --focus-id {node_id} \"What should I inspect next?\""
+    ));
+    commands.push(format!(
+        "codestory-cli trail --project \"{project}\" --id {node_id} --depth 3"
+    ));
+    commands.push(format!(
+        "codestory-cli snippet --project \"{project}\" --id {node_id}"
+    ));
+    if retrieval.is_some_and(|state| !state.semantic_ready) {
+        commands.push(format!(
+            "codestory-cli doctor --project \"{project}\" --format markdown"
+        ));
+    }
+    commands
+}
+
+fn explore_layer_notes(
+    storage_path: &str,
+    output_target: &str,
+    summary: &codestory_contracts::api::ProjectSummary,
+    target: &runtime::ResolvedTarget,
+    retrieval: Option<&codestory_contracts::api::RetrievalStateDto>,
+    freshness: Option<&IndexFreshnessDto>,
+    snippet_layer_note: &str,
+) -> Vec<String> {
+    let mut notes = vec![
+        format!("cache: reading existing SQLite cache at `{storage_path}`"),
+        format!(
+            "index: ready with files={} nodes={} edges={}",
+            summary.stats.file_count, summary.stats.node_count, summary.stats.edge_count
+        ),
+        format!(
+            "query_resolution: `{}` resolved to `{}`",
+            target.requested, target.selected.display_name
+        ),
+        "local_agent: not used by explore; use ask --focus-id for agent synthesis".to_string(),
+        format!("output_write: target `{output_target}` passed preflight"),
+        snippet_layer_note.to_string(),
+    ];
+    notes.push(match retrieval {
+        Some(retrieval) if retrieval.semantic_ready => {
+            format!(
+                "semantic_runtime: ready with {} semantic docs",
+                retrieval.semantic_doc_count
+            )
+        }
+        Some(retrieval) => format!(
+            "semantic_runtime: {}",
+            retrieval
+                .fallback_message
+                .as_deref()
+                .unwrap_or("semantic retrieval fallback is active")
+        ),
+        None => "semantic_runtime: retrieval state unavailable".to_string(),
+    });
+    notes.push(match freshness {
+        Some(freshness) => format!("freshness: {}", render_explore_freshness(freshness)),
+        None => "freshness: not reported by this cache open".to_string(),
+    });
+    notes
+}
+
+fn render_explore_freshness(freshness: &IndexFreshnessDto) -> String {
+    match freshness.status {
+        IndexFreshnessStatusDto::Fresh => format!(
+            "fresh checked_files={} duration_ms={}",
+            freshness.checked_file_count, freshness.duration_ms
+        ),
+        IndexFreshnessStatusDto::Stale => format!(
+            "stale changed={} new={} removed={} checked_files={} duration_ms={}",
+            freshness.changed_file_count,
+            freshness.new_file_count,
+            freshness.removed_file_count,
+            freshness.checked_file_count,
+            freshness.duration_ms
+        ),
+        IndexFreshnessStatusDto::NotChecked => format!(
+            "not_checked reason={}",
+            freshness.reason.as_deref().unwrap_or("not reported")
+        ),
+    }
+}
+
+fn render_explore_status_markdown(status: &ExploreStatusOutput) -> String {
+    let mut markdown = String::new();
+    markdown.push_str(&format!("- project: `{}`\n", status.project));
+    markdown.push_str(&format!("- cache: `{}`\n", status.storage_path));
+    markdown.push_str(&format!("- refresh: `{}`\n", status.refresh));
+    markdown.push_str(&format!("- output: `{}`\n", status.output_target));
+    markdown.push_str(&format!(
+        "- indexed: files={} nodes={} edges={}\n",
+        status.indexed_files, status.indexed_nodes, status.indexed_edges
+    ));
+    if let Some(retrieval) = status.retrieval.as_ref() {
+        markdown.push_str(&format!(
+            "- retrieval: {}\n",
+            render_retrieval_state(retrieval)
+        ));
+    } else {
+        markdown.push_str("- retrieval: unavailable\n");
+    }
+    if let Some(freshness) = status.freshness.as_ref() {
+        markdown.push_str(&format!(
+            "- freshness: {}\n",
+            render_explore_freshness(freshness)
+        ));
+    } else {
+        markdown.push_str("- freshness: unavailable\n");
+    }
+    if let Some(command) = status.next_commands.first() {
+        markdown.push_str(&format!("- next: `{command}`\n"));
+    }
+    markdown.push_str("- layers:\n");
+    for note in &status.layer_notes {
+        markdown.push_str(&format!("  - {note}\n"));
+    }
+    markdown
+}
+
+fn format_query_selector(selector: args::QuerySelectorOutput) -> &'static str {
+    match selector {
+        args::QuerySelectorOutput::Id => "id",
+        args::QuerySelectorOutput::Query => "query",
+    }
+}
+
+fn render_search_hit_output_ref(hit: &SearchHitOutput) -> String {
+    if let Some(node_ref) = hit.node_ref.as_deref() {
+        return format!("`{node_ref}`");
+    }
+    if let Some(file_path) = hit.file_path.as_deref() {
+        if let Some(line) = hit.line {
+            return format!("{} `{file_path}:{line}`", hit.display_name);
+        }
+        return format!("{} `{file_path}`", hit.display_name);
+    }
+    hit.display_name.clone()
+}
+
+fn render_query_item_output_ref(item: &QueryItemOutput) -> String {
+    if let Some(node_ref) = item.node_ref.as_deref() {
+        return format!("`{node_ref}`");
+    }
+    if let Some(file_path) = item.file_path.as_deref() {
+        if let Some(line) = item.line {
+            return format!("{} `{file_path}:{line}`", item.display_name);
+        }
+        return format!("{} `{file_path}`", item.display_name);
+    }
+    item.display_name.clone()
+}
+
+fn render_explore_search_markdown(search: &ExploreSearchOutput) -> String {
+    let mut markdown = String::new();
+    markdown.push_str(&format!(
+        "- selector: `{}`\n",
+        format_query_selector(search.selector)
+    ));
+    markdown.push_str(&format!("- requested: `{}`\n", search.requested));
+    if let Some(file_filter) = search.file_filter.as_deref() {
+        markdown.push_str(&format!("- file_filter: `{file_filter}`\n"));
+    }
+    markdown.push_str(&format!(
+        "- selected: {}\n",
+        render_search_hit_output_ref(&search.selected)
+    ));
+    markdown.push_str(&format!("- alternatives: {}\n", search.alternatives.len()));
+    for (index, alternative) in search.alternatives.iter().take(8).enumerate() {
+        markdown.push_str(&format!(
+            "  - {}. {}\n",
+            index + 1,
+            render_search_hit_output_ref(alternative)
+        ));
+    }
+    markdown
+}
+
+fn render_explore_results_markdown(navigation: &NavigationOutput) -> String {
+    let mut markdown = String::new();
+    markdown.push_str(&format!(
+        "- definition: {}\n",
+        render_search_hit_output_ref(&navigation.definition)
+    ));
+    markdown.push_str(&format!(
+        "- incoming_references: {}\n",
+        navigation.incoming_references.len()
+    ));
+    markdown.push_str(&format!(
+        "- outgoing_references: {}\n",
+        navigation.outgoing_references.len()
+    ));
+    for incoming in navigation.incoming_references.iter().take(6) {
+        markdown.push_str(&format!(
+            "- incoming: {}\n",
+            render_query_item_output_ref(incoming)
+        ));
+    }
+    for outgoing in navigation.outgoing_references.iter().take(6) {
+        markdown.push_str(&format!(
+            "- outgoing: {}\n",
+            render_query_item_output_ref(outgoing)
+        ));
+    }
+    markdown
+}
+
 fn render_explore_markdown(
     project_root: &std::path::Path,
     target: &runtime::ResolvedTarget,
+    status: &ExploreStatusOutput,
+    search: &ExploreSearchOutput,
+    navigation: &NavigationOutput,
     symbol: &SymbolContextDto,
     trail: &TrailContextDto,
     snippet: Option<&SnippetContextDto>,
+    snippet_layer_note: &str,
 ) -> String {
     let mut markdown = String::new();
     markdown.push_str("# Explore\n");
+    markdown.push_str("status:\n");
+    markdown.push_str(&render_explore_status_markdown(status));
+    markdown.push_str("search:\n");
+    markdown.push_str(&render_explore_search_markdown(search));
+    markdown.push_str("results:\n");
+    markdown.push_str(&render_explore_results_markdown(navigation));
     markdown.push_str("resolution:\n");
     markdown.push_str(&format!(
         "- {}\n",
@@ -1342,7 +1676,6 @@ fn render_explore_markdown(
         )
         .unwrap_or_else(|| target.selected.display_name.clone())
     ));
-    let navigation = build_navigation_output(project_root, target, trail);
     markdown.push_str("navigation:\n");
     if let Some(node_ref) = navigation.definition.node_ref.as_deref() {
         markdown.push_str(&format!("- definition: `{node_ref}`\n"));
@@ -1388,8 +1721,9 @@ fn render_explore_markdown(
         mermaid: false,
     };
     markdown.push_str(&render_trail_markdown(project_root, target, trail, &cmd));
+    markdown.push_str("\nsnippet:\n");
+    markdown.push_str(&format!("- {snippet_layer_note}\n"));
     if let Some(snippet) = snippet {
-        markdown.push_str("\nsnippet:\n");
         markdown.push_str(&render_snippet_markdown(
             project_root,
             target,
@@ -1398,6 +1732,144 @@ fn render_explore_markdown(
         ));
     }
     markdown
+}
+
+struct ExplorePane {
+    label: &'static str,
+    body: String,
+}
+
+fn build_explore_panes(
+    project_root: &std::path::Path,
+    target: &runtime::ResolvedTarget,
+    status: &ExploreStatusOutput,
+    search: &ExploreSearchOutput,
+    navigation: &NavigationOutput,
+    symbol: &SymbolContextDto,
+    trail: &TrailContextDto,
+    snippet: Option<&SnippetContextDto>,
+    snippet_layer_note: &str,
+) -> Vec<ExplorePane> {
+    vec![
+        ExplorePane {
+            label: "Status",
+            body: render_explore_status_markdown(status),
+        },
+        ExplorePane {
+            label: "Search",
+            body: render_explore_search_markdown(search),
+        },
+        ExplorePane {
+            label: "Results",
+            body: render_explore_results_markdown(navigation),
+        },
+        ExplorePane {
+            label: "Detail",
+            body: render_symbol_markdown(project_root, target, symbol),
+        },
+        ExplorePane {
+            label: "Trail",
+            body: {
+                let cmd = TrailCommand {
+                    project: args::ProjectArgs {
+                        project: project_root.to_path_buf(),
+                        cache_dir: None,
+                    },
+                    target: args::TargetArgs {
+                        id: Some(target.selected.node_id.0.clone()),
+                        query: None,
+                        file: None,
+                        choose: None,
+                    },
+                    mode: args::CliTrailMode::Neighborhood,
+                    depth: Some(2),
+                    direction: Some(args::CliDirection::Both),
+                    max_nodes: trail.trail.nodes.len().min(u32::MAX as usize) as u32,
+                    include_tests: false,
+                    show_utility_calls: false,
+                    hide_speculative: false,
+                    layout: args::CliLayout::Horizontal,
+                    refresh: args::RefreshMode::None,
+                    format: args::OutputFormat::Markdown,
+                    output_file: None,
+                    mermaid: false,
+                };
+                render_trail_markdown(project_root, target, trail, &cmd)
+            },
+        },
+        ExplorePane {
+            label: "Snippet",
+            body: format!(
+                "{snippet_layer_note}\n{}",
+                snippet
+                    .map(|context| render_snippet_markdown(project_root, target, context, false))
+                    .unwrap_or_default()
+            ),
+        },
+    ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExploreTuiAction {
+    NextPane,
+    PreviousPane,
+    ScrollUp(u16),
+    ScrollDown(u16),
+    Home,
+    Quit,
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExploreTuiState {
+    selected: usize,
+    scroll: Vec<u16>,
+}
+
+impl ExploreTuiState {
+    fn new(pane_count: usize) -> Self {
+        Self {
+            selected: 0,
+            scroll: vec![0; pane_count.max(1)],
+        }
+    }
+
+    fn apply(&mut self, action: ExploreTuiAction) -> bool {
+        match action {
+            ExploreTuiAction::NextPane => self.selected = (self.selected + 1) % self.scroll.len(),
+            ExploreTuiAction::PreviousPane => {
+                self.selected = (self.selected + self.scroll.len() - 1) % self.scroll.len();
+            }
+            ExploreTuiAction::ScrollUp(lines) => {
+                self.scroll[self.selected] = self.scroll[self.selected].saturating_sub(lines);
+            }
+            ExploreTuiAction::ScrollDown(lines) => {
+                self.scroll[self.selected] = self.scroll[self.selected].saturating_add(lines);
+            }
+            ExploreTuiAction::Home => self.scroll[self.selected] = 0,
+            ExploreTuiAction::Quit => return true,
+            ExploreTuiAction::None => {}
+        }
+        false
+    }
+}
+
+fn explore_tui_action(key: crossterm::event::KeyEvent) -> ExploreTuiAction {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => ExploreTuiAction::Quit,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            ExploreTuiAction::Quit
+        }
+        KeyCode::Tab => ExploreTuiAction::NextPane,
+        KeyCode::BackTab => ExploreTuiAction::PreviousPane,
+        KeyCode::Up | KeyCode::Char('k') => ExploreTuiAction::ScrollUp(1),
+        KeyCode::Down | KeyCode::Char('j') => ExploreTuiAction::ScrollDown(1),
+        KeyCode::PageUp => ExploreTuiAction::ScrollUp(10),
+        KeyCode::PageDown => ExploreTuiAction::ScrollDown(10),
+        KeyCode::Home => ExploreTuiAction::Home,
+        _ => ExploreTuiAction::None,
+    }
 }
 
 struct TerminalCleanup;
@@ -1412,12 +1884,16 @@ impl Drop for TerminalCleanup {
 fn run_explore_tui(
     project_root: &std::path::Path,
     target: &runtime::ResolvedTarget,
+    status: &ExploreStatusOutput,
+    search: &ExploreSearchOutput,
+    navigation: &NavigationOutput,
     symbol: &SymbolContextDto,
     trail: &TrailContextDto,
     snippet: Option<&SnippetContextDto>,
+    snippet_layer_note: &str,
 ) -> Result<()> {
     use crossterm::{
-        event::{self, Event, KeyCode, KeyModifiers},
+        event::{self, Event},
         terminal::{EnterAlternateScreen, enable_raw_mode},
     };
     use ratatui::{
@@ -1429,53 +1905,24 @@ fn run_explore_tui(
         widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     };
 
-    let panes = [
-        (
-            "Symbol",
-            render_symbol_markdown(project_root, target, symbol),
-        ),
-        ("Trail", {
-            let cmd = TrailCommand {
-                project: args::ProjectArgs {
-                    project: project_root.to_path_buf(),
-                    cache_dir: None,
-                },
-                target: args::TargetArgs {
-                    id: Some(target.selected.node_id.0.clone()),
-                    query: None,
-                    file: None,
-                    choose: None,
-                },
-                mode: args::CliTrailMode::Neighborhood,
-                depth: Some(2),
-                direction: Some(args::CliDirection::Both),
-                max_nodes: trail.trail.nodes.len().min(u32::MAX as usize) as u32,
-                include_tests: false,
-                show_utility_calls: false,
-                hide_speculative: false,
-                layout: args::CliLayout::Horizontal,
-                refresh: args::RefreshMode::None,
-                format: args::OutputFormat::Markdown,
-                output_file: None,
-                mermaid: false,
-            };
-            render_trail_markdown(project_root, target, trail, &cmd)
-        }),
-        (
-            "Snippet",
-            snippet
-                .map(|context| render_snippet_markdown(project_root, target, context, false))
-                .unwrap_or_else(|| "No snippet available for this symbol.".to_string()),
-        ),
-    ];
+    let panes = build_explore_panes(
+        project_root,
+        target,
+        status,
+        search,
+        navigation,
+        symbol,
+        trail,
+        snippet,
+        snippet_layer_note,
+    );
 
     enable_raw_mode()?;
     crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
     let _cleanup = TerminalCleanup;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let mut selected = 0usize;
-    let mut scroll = [0u16; 3];
+    let mut state = ExploreTuiState::new(panes.len());
 
     loop {
         terminal.draw(|frame| {
@@ -1512,15 +1959,15 @@ fn run_explore_tui(
             let nav_items = panes
                 .iter()
                 .enumerate()
-                .map(|(idx, (label, _))| {
-                    let style = if idx == selected {
+                .map(|(idx, pane)| {
+                    let style = if idx == state.selected {
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
                     };
-                    ListItem::new(Line::from(Span::styled(*label, style)))
+                    ListItem::new(Line::from(Span::styled(pane.label, style)))
                 })
                 .collect::<Vec<_>>();
             frame.render_widget(
@@ -1529,45 +1976,27 @@ fn run_explore_tui(
             );
 
             frame.render_widget(
-                Paragraph::new(panes[selected].1.as_str())
+                Paragraph::new(panes[state.selected].body.as_str())
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title(panes[selected].0),
+                            .title(panes[state.selected].label),
                     )
                     .wrap(Wrap { trim: false })
-                    .scroll((scroll[selected], 0)),
+                    .scroll((state.scroll[state.selected], 0)),
                 body[1],
             );
             frame.render_widget(
-                Paragraph::new("Tab switch pane  Up/Down scroll  q quit"),
+                Paragraph::new("Tab/Shift-Tab pane  Up/Down scroll  Home top  q quit"),
                 shell[2],
             );
         })?;
 
         if event::poll(Duration::from_millis(250))?
             && let Event::Key(key) = event::read()?
+            && state.apply(explore_tui_action(key))
         {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => break,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                KeyCode::Tab => selected = (selected + 1) % panes.len(),
-                KeyCode::BackTab => selected = (selected + panes.len() - 1) % panes.len(),
-                KeyCode::Up | KeyCode::Char('k') => {
-                    scroll[selected] = scroll[selected].saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    scroll[selected] = scroll[selected].saturating_add(1);
-                }
-                KeyCode::PageUp => {
-                    scroll[selected] = scroll[selected].saturating_sub(10);
-                }
-                KeyCode::PageDown => {
-                    scroll[selected] = scroll[selected].saturating_add(10);
-                }
-                KeyCode::Home => scroll[selected] = 0,
-                _ => {}
-            }
+            break;
         }
     }
     terminal.show_cursor()?;
@@ -3491,6 +3920,57 @@ mod tests {
         for command in commands {
             Cli::try_parse_from(command).expect("command should parse --output-file");
         }
+    }
+
+    #[test]
+    fn explore_tui_keyboard_state_reaches_every_pane() {
+        let mut state = ExploreTuiState::new(6);
+        for expected in 1..6 {
+            assert!(!state.apply(ExploreTuiAction::NextPane));
+            assert_eq!(state.selected, expected);
+        }
+        assert!(!state.apply(ExploreTuiAction::NextPane));
+        assert_eq!(state.selected, 0);
+
+        assert!(!state.apply(ExploreTuiAction::PreviousPane));
+        assert_eq!(state.selected, 5);
+        assert!(!state.apply(ExploreTuiAction::ScrollDown(12)));
+        assert_eq!(state.scroll[5], 12);
+        assert!(!state.apply(ExploreTuiAction::ScrollUp(5)));
+        assert_eq!(state.scroll[5], 7);
+        assert!(!state.apply(ExploreTuiAction::Home));
+        assert_eq!(state.scroll[5], 0);
+        assert!(state.apply(ExploreTuiAction::Quit));
+    }
+
+    #[test]
+    fn explore_tui_key_mapping_covers_keyboard_only_controls() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        assert_eq!(
+            explore_tui_action(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            ExploreTuiAction::NextPane
+        );
+        assert_eq!(
+            explore_tui_action(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            ExploreTuiAction::PreviousPane
+        );
+        assert_eq!(
+            explore_tui_action(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            ExploreTuiAction::ScrollDown(1)
+        );
+        assert_eq!(
+            explore_tui_action(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            ExploreTuiAction::ScrollUp(10)
+        );
+        assert_eq!(
+            explore_tui_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            ExploreTuiAction::Quit
+        );
+        assert_eq!(
+            explore_tui_action(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            ExploreTuiAction::Quit
+        );
     }
 
     #[test]

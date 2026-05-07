@@ -691,11 +691,41 @@ pub(crate) struct QueryOutput {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ExploreOutput<'a> {
+    pub(crate) status: ExploreStatusOutput,
+    pub(crate) search: ExploreSearchOutput,
     pub(crate) resolution: QueryResolutionOutput,
     pub(crate) navigation: NavigationOutput,
     pub(crate) symbol: &'a SymbolContextDto,
     pub(crate) trail: &'a TrailContextDto,
     pub(crate) snippet: Option<&'a SnippetContextDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExploreStatusOutput {
+    pub(crate) project: String,
+    pub(crate) storage_path: String,
+    pub(crate) refresh: String,
+    pub(crate) output_target: String,
+    pub(crate) indexed_files: u32,
+    pub(crate) indexed_nodes: u32,
+    pub(crate) indexed_edges: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retrieval: Option<RetrievalStateDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) freshness: Option<IndexFreshnessDto>,
+    pub(crate) next_commands: Vec<String>,
+    pub(crate) layer_notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExploreSearchOutput {
+    pub(crate) selector: QuerySelectorOutput,
+    pub(crate) requested: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) file_filter: Option<String>,
+    pub(crate) selected: SearchHitOutput,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) alternatives: Vec<SearchHitOutput>,
 }
 
 #[derive(Debug, Clone, Serialize)]

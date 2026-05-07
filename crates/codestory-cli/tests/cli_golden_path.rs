@@ -766,6 +766,100 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
         "snippet should include source for AppController"
     );
 
+    let explore = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "explore",
+            &format!("--id={node_id}"),
+            "--no-tui",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        string_field(&explore, &["search", "selected", "display_name"]),
+        "AppController"
+    );
+    assert_eq!(
+        string_field(&explore, &["status", "refresh"]),
+        "none",
+        "explore should report the read-command refresh mode"
+    );
+    assert!(
+        array_is_non_empty(&explore, &["status", "next_commands"]),
+        "explore JSON should include target-aware next commands"
+    );
+    assert!(
+        explore["status"]["layer_notes"]
+            .as_array()
+            .expect("layer notes")
+            .iter()
+            .any(|note| note
+                .as_str()
+                .is_some_and(|note| note.starts_with("query_resolution:"))),
+        "explore status should preserve the query-resolution layer"
+    );
+    assert!(
+        explore["status"]["layer_notes"]
+            .as_array()
+            .expect("layer notes")
+            .iter()
+            .any(|note| note
+                .as_str()
+                .is_some_and(|note| note.starts_with("snippet_context:"))),
+        "explore status should preserve the snippet-context layer"
+    );
+    assert!(
+        array_is_non_empty(&explore, &["trail", "trail", "nodes"]),
+        "explore JSON should include trail detail"
+    );
+    assert!(
+        string_field(&explore, &["snippet", "snippet"]).contains("AppController"),
+        "explore JSON should include snippet detail"
+    );
+
+    let explore_markdown = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "explore",
+            &format!("--id={node_id}"),
+            "--no-tui",
+            "--refresh",
+            "none",
+            "--format",
+            "markdown",
+        ],
+    );
+    assert!(
+        explore_markdown.status.success(),
+        "explore markdown failed: {}",
+        String::from_utf8_lossy(&explore_markdown.stderr)
+    );
+    let explore_markdown = String::from_utf8_lossy(&explore_markdown.stdout);
+    for expected in [
+        "# Explore",
+        "status:",
+        "search:",
+        "results:",
+        "resolution:",
+        "navigation:",
+        "symbol:",
+        "trail:",
+        "snippet:",
+        "snippet_context:",
+        "semantic_runtime:",
+        "output_write:",
+    ] {
+        assert!(
+            explore_markdown.contains(expected),
+            "explore markdown should contain `{expected}`:\n{explore_markdown}"
+        );
+    }
+
     let query = run_cli_json(
         workspace.path(),
         cache_dir.path(),
