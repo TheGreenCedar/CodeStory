@@ -21,6 +21,7 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-04-20 | b5c6337 | pass, delight roadmap implementation | 111.52 | 0.05 | 0.94 | 0.09 | 0.04 | 0.03 | 30,414 | 25,829 | 127 | 0 | 4,114 | true |
 | 2026-05-07 | 0adcd43 | pass, hash semantic check for stdio MCP envelope fix | 11.01 | 0.20 | 0.45 | 0.19 | 0.14 | 0.14 | 39,087 | 33,167 | 141 | 0 | 5,410 | true |
 | 2026-05-07 | this commit | pass, managed Vulkan embedding setup cold E2E | 51.45 | 0.18 | 0.60 | 0.20 | 0.15 | 0.14 | 40,064 | 33,971 | 146 | 0 | 5,548 | true |
+| 2026-05-07 | faf0fa8 | pass, manual friction autoresearch loop | 121.13 | 0.20 | 0.56 | 0.21 | 0.17 | 0.15 | 40,631 | 34,379 | 147 | 0 | 5,615 | true |
 
 ## Phase Metrics
 
@@ -37,3 +38,4 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-04-20 | b5c6337 | delight roadmap implementation cold E2E | 111.52 | 3.07 | 103.66 | 0 | 4,114 | 0 |
 | 2026-05-07 | 0adcd43 | hash semantic check for stdio MCP envelope fix cold E2E | 11.01 | 4.47 | 1.60 | 0 | 5,410 | 0 |
 | 2026-05-07 | this commit | managed Vulkan embedding setup cold E2E | 51.45 | 4.48 | 40.19 | 0 | 5,548 | 0 |
+| 2026-05-07 | faf0fa8 | manual friction autoresearch loop cold E2E | 121.13 | 4.12 | 111.89 | 0 | 5,615 | 0 |
