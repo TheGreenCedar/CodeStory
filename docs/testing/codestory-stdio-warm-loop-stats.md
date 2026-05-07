@@ -15,6 +15,13 @@ The harness prints metrics from the test process after the stdio server exits. T
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- | ---: | --- | --- | --- | --- |
 | 2026-05-06 | pending | small fixture, release binary, hash embeddings | pass | 20 | 25.09 | 1.56 | 25.96 | 169.29 | 1070.03 | 53.50 | 0.32 | 20.84/25.96/25.96 | 15.01/17.67/17.67 | 10.25/13.92/13.92 | 6.50/8.36/8.36 | 6.79/13.17/13.17 | 0 | null | null | true | true |
 
+## Current Promotion Budget
+
+No hard warm p95 promotion budget is approved yet. The 2026-05-06 baseline is a
+small-fixture release-binary smoke, not web-cockpit promotion evidence. The
+browser surface gate stays closed until this section names a per-tool or
+per-loop p95 budget, target machine class, and passing current run.
+
 ## Baseline Payload Sizes
 
 From the 2026-05-06 baseline:

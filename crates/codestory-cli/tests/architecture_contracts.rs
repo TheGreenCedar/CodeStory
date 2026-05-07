@@ -303,6 +303,71 @@ fn stdio_tool_catalog_stays_aligned_with_read_only_browser_service_operations() 
 }
 
 #[test]
+fn web_cockpit_stays_deferred_until_browser_surface_gate_opens() {
+    let gate = read("docs/architecture/browser-surface-gate.md");
+    let warm_stats = read("docs/testing/codestory-stdio-warm-loop-stats.md");
+    let runtime_path = read("docs/architecture/runtime-execution-path.md");
+    let cli_args = read("crates/codestory-cli/src/args.rs");
+    let cli_main = read("crates/codestory-cli/src/main.rs");
+    let command_enum = source_between(
+        &cli_args,
+        "pub(crate) enum Command",
+        "#[derive(Args, Debug, Clone)]",
+    );
+    let http_routes = source_between(&cli_main, "match path {", "fn browser_references_config");
+
+    for required in [
+        "Status: deferred.",
+        "Do not add a new `browse` command, web cockpit route, or browser-specific web UI",
+        "Tool, resource, and prompt manifests",
+        "Warm stdio/browser-loop p50, p95, and p99",
+        "Current Promotion Budget",
+        "docs/testing/codestory-stdio-warm-loop-stats.md",
+        "Browser stress lanes",
+        "`explore` must demonstrate the cockpit workflow",
+        "Screenshot-visible review",
+    ] {
+        assert!(
+            gate.contains(required),
+            "browser surface gate should document required gate evidence: missing {required}"
+        );
+    }
+
+    assert!(
+        runtime_path.contains("browser surface gate")
+            && runtime_path.contains("Do not add a")
+            && runtime_path.contains(
+                "separate `browse` command, web cockpit route, or browser-specific web UI"
+            ),
+        "runtime execution path should point future UI work at the browser surface gate"
+    );
+    assert!(
+        warm_stats.contains("## Current Promotion Budget")
+            && warm_stats.contains("No hard warm p95 promotion budget is approved yet")
+            && warm_stats.contains("browser surface gate stays closed"),
+        "warm-loop stats doc should own the active p95 budget state"
+    );
+
+    assert!(
+        command_enum.contains("Explore(ExploreCommand)")
+            && command_enum.contains("Serve(ServeCommand)"),
+        "explore and serve should remain the current browser surfaces"
+    );
+    for forbidden in ["Browse(", "BrowseCommand", "WebCockpit", "CockpitCommand"] {
+        assert!(
+            !command_enum.contains(forbidden),
+            "web cockpit/browse surface is deferred; unexpected CLI command {forbidden}"
+        );
+    }
+    for forbidden_route in ["\"/browse\"", "\"/cockpit\"", "\"/ui\"", "\"/web\""] {
+        assert!(
+            !http_routes.contains(forbidden_route),
+            "web cockpit/browse route is deferred until the browser surface gate opens: {forbidden_route}"
+        );
+    }
+}
+
+#[test]
 fn runtime_snapshot_lifecycle_flows_through_store_snapshot_surface() {
     let runtime = read("crates/codestory-runtime/src/lib.rs");
     assert!(
