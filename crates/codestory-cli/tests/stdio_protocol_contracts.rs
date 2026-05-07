@@ -180,6 +180,44 @@ fn assert_success_envelope(response: &Value, id: Value) -> &Value {
     response.get("result").expect("success result")
 }
 
+fn assert_tool_success(response: &Value, id: Value) -> &Value {
+    let result = assert_success_envelope(response, id);
+    assert!(
+        result.get("isError").and_then(Value::as_bool) != Some(true),
+        "successful tools/call should not be marked as an error: {response}"
+    );
+    assert_tool_text_content(result, response);
+    result
+        .get("structuredContent")
+        .expect("tools/call success should include structuredContent")
+}
+
+fn assert_tool_error(response: &Value, id: Value) -> &Value {
+    let result = assert_success_envelope(response, id);
+    assert_eq!(
+        result.get("isError").and_then(Value::as_bool),
+        Some(true),
+        "tools/call execution errors should be returned as CallToolResult errors: {response}"
+    );
+    assert_tool_text_content(result, response);
+    result
+        .get("structuredContent")
+        .expect("tools/call error should include structuredContent")
+}
+
+fn assert_tool_text_content<'a>(result: &'a Value, response: &Value) -> &'a str {
+    result["content"]
+        .as_array()
+        .and_then(|content| content.first())
+        .and_then(|content| {
+            (content["type"] == "text")
+                .then(|| content["text"].as_str())
+                .flatten()
+        })
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| panic!("tools/call result should include text content: {response}"))
+}
+
 fn assert_error_envelope(response: &Value, id: Value) -> &Value {
     assert_eq!(response.get("jsonrpc"), Some(&json!("2.0")));
     assert_eq!(response.get("id"), Some(&id));
@@ -758,11 +796,17 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
         let output_schema = tool
             .get("outputSchema")
             .unwrap_or_else(|| panic!("{name} should expose outputSchema: {tool}"));
-        let expected_type = if name == "symbols" { "array" } else { "object" };
         assert_eq!(
-            output_schema["type"], expected_type,
+            output_schema["type"], "object",
             "{name} outputSchema should describe the stdio result shape: {tool}"
         );
+        if name == "symbols" {
+            assert_eq!(
+                schema_property(output_schema, "symbols")["type"],
+                "array",
+                "symbols outputSchema should wrap symbol arrays in an object: {tool}"
+            );
+        }
     }
 }
 
@@ -822,6 +866,25 @@ fn resource_template_and_prompt_catalog_names_are_snapshot_stable() {
         sorted_field_values(&prompts, "prompts", "name"),
         vec!["explain_symbol", "impact_analysis", "trace_callflow"],
         "prompt catalog should stay compact and stable: {prompts}"
+    );
+
+    let explain_symbol = assert_success_envelope(
+        &send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "prompt-explain-symbol",
+                "method": "prompts/get",
+                "params": {"name": "explain_symbol"}
+            }),
+        ),
+        json!("prompt-explain-symbol"),
+    )
+    .clone();
+    assert_eq!(
+        explain_symbol["description"],
+        "Explain a symbol using definition, references, and snippet context.",
+        "prompts/get should return the human prompt description: {explain_symbol}"
     );
 }
 
@@ -1133,7 +1196,7 @@ fn transcript_calls_search_tool() {
         }),
     );
 
-    let result = assert_success_envelope(&response, json!(10));
+    let result = assert_tool_success(&response, json!(10));
     assert!(
         result["indexed_symbol_hits"]
             .as_array()
@@ -1141,6 +1204,28 @@ fn transcript_calls_search_tool() {
                 .iter()
                 .any(|hit| hit["display_name"] == "AppController")),
         "search tool should return AppController hit: {result}"
+    );
+
+    let symbols_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "symbols-structured",
+            "method": "tools/call",
+            "params": {
+                "name": "symbols",
+                "arguments": {"limit": 2}
+            }
+        }),
+    );
+
+    let symbols_result = assert_tool_success(&symbols_response, json!("symbols-structured"));
+    let symbols = symbols_result["symbols"].as_array().unwrap_or_else(|| {
+        panic!("symbols tool should return an object with symbols: {symbols_result}")
+    });
+    assert!(
+        !symbols.is_empty() && symbols.len() <= 2,
+        "symbols tool should respect the requested cap: {symbols_result}"
     );
 }
 
@@ -1162,7 +1247,7 @@ fn search_tool_exposes_continuation_links_and_clamps_tiny_payloads() {
         }),
     );
 
-    let result = assert_success_envelope(&response, json!("search-continuations"));
+    let result = assert_tool_success(&response, json!("search-continuations"));
     assert!(
         result["limit_per_source"]
             .as_u64()
@@ -1213,7 +1298,7 @@ fn search_tool_does_not_offer_symbol_links_for_non_resolvable_repo_text_hits() {
         }),
     );
 
-    let result = assert_success_envelope(&response, json!("repo-text-continuations"));
+    let result = assert_tool_success(&response, json!("repo-text-continuations"));
     let repo_text_hits = result["repo_text_hits"].as_array().expect("repo text hits");
     let non_resolvable_hit = repo_text_hits
         .iter()
@@ -1243,7 +1328,7 @@ fn definition_tool_exposes_symbol_snippet_references_and_trail_links() {
         }),
     );
 
-    let result = assert_success_envelope(&response, json!("definition-continuations"));
+    let result = assert_tool_success(&response, json!("definition-continuations"));
     let node_id = result
         .pointer("/definition/node_id")
         .and_then(Value::as_str)
@@ -1273,15 +1358,14 @@ fn symbol_tool_reports_ambiguous_targets_and_choose_resolves_displayed_number() 
             }
         }),
     );
-    let error = assert_error_envelope(&ambiguous, json!("ambiguous-symbol"));
-    assert_error_code(error, -32000);
+    let error = assert_tool_error(&ambiguous, json!("ambiguous-symbol"));
     assert_eq!(
-        error.pointer("/data/code").and_then(Value::as_str),
+        error.pointer("/code").and_then(Value::as_str),
         Some("ambiguous_target"),
         "stdio symbol ambiguity should expose structured error data: {ambiguous}"
     );
     let alternatives = error
-        .pointer("/data/alternatives")
+        .pointer("/alternatives")
         .and_then(Value::as_array)
         .unwrap_or_else(|| panic!("ambiguous alternatives: {ambiguous}"));
     assert!(alternatives.len() >= 2);
@@ -1303,7 +1387,7 @@ fn symbol_tool_reports_ambiguous_targets_and_choose_resolves_displayed_number() 
             }
         }),
     );
-    let result = assert_success_envelope(&chosen, json!("chosen-symbol"));
+    let result = assert_tool_success(&chosen, json!("chosen-symbol"));
     assert_eq!(
         result.pointer("/node/id").and_then(Value::as_str),
         Some(second_id.as_str()),

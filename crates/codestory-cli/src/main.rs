@@ -2754,7 +2754,10 @@ fn handle_stdio_message(runtime: &RuntimeContext, line: &str) -> Option<serde_js
                     "Invalid params: tool arguments must be an object",
                 ));
             }
-            handle_stdio_tool_call(runtime, &request)
+            return Some(stdio_jsonrpc_tool_call_from_legacy(
+                id,
+                handle_stdio_tool_call(runtime, &request),
+            ));
         }
         _ => {
             return Some(stdio_jsonrpc_error(
@@ -2798,16 +2801,7 @@ fn stdio_jsonrpc_from_legacy(
         return stdio_jsonrpc_success(id, result.clone());
     }
     if let Some(error) = response.get("error") {
-        let message = error
-            .as_str()
-            .map(str::to_string)
-            .or_else(|| {
-                error
-                    .get("message")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| error.to_string());
+        let message = stdio_legacy_error_message(error);
         let code = if message.contains("unknown resource") {
             -32602
         } else {
@@ -2823,6 +2817,67 @@ fn stdio_jsonrpc_from_legacy(
         return response;
     }
     stdio_jsonrpc_success(id, response)
+}
+
+fn stdio_jsonrpc_tool_call_from_legacy(
+    id: serde_json::Value,
+    response: serde_json::Value,
+) -> serde_json::Value {
+    if let Some(result) = response.get("result") {
+        return stdio_jsonrpc_success(id, stdio_tool_call_success(result.clone()));
+    }
+    if let Some(error) = response.get("error") {
+        return stdio_jsonrpc_success(id, stdio_tool_call_error(error));
+    }
+    stdio_jsonrpc_success(id, stdio_tool_call_success(response))
+}
+
+fn stdio_tool_call_success(structured_content: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "content": [
+            {
+                "type": "text",
+                "text": stdio_json_text(&structured_content)
+            }
+        ],
+        "structuredContent": structured_content
+    })
+}
+
+fn stdio_tool_call_error(error: &serde_json::Value) -> serde_json::Value {
+    let message = stdio_legacy_error_message(error);
+    let structured_content = if error.is_object() {
+        error.clone()
+    } else {
+        serde_json::json!({ "message": message.clone() })
+    };
+    serde_json::json!({
+        "content": [
+            {
+                "type": "text",
+                "text": message
+            }
+        ],
+        "structuredContent": structured_content,
+        "isError": true
+    })
+}
+
+fn stdio_legacy_error_message(error: &serde_json::Value) -> String {
+    error
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            error
+                .get("message")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| error.to_string())
+}
+
+fn stdio_json_text(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
 fn stdio_initialize_result_json(request: &serde_json::Value) -> serde_json::Value {
@@ -3044,7 +3099,7 @@ fn handle_stdio_symbols(
             })
     };
     result
-        .map(|value| serde_json::json!({"result": value}))
+        .map(|value| serde_json::json!({"result": {"symbols": value}}))
         .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))
 }
 

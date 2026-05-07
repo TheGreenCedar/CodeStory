@@ -118,7 +118,7 @@ impl PromptSpec {
     fn get_json(self) -> Value {
         json!({
             "result": {
-                "description": self.name,
+                "description": self.description,
                 "messages": [
                     {
                         "role": "user",
@@ -159,17 +159,12 @@ impl SchemaType {
 #[derive(Debug, Clone, Copy)]
 enum SchemaSpec {
     Object(SchemaObject),
-    ArrayOf(&'static SchemaObject),
 }
 
 impl SchemaSpec {
     fn to_json(self) -> Value {
         match self {
             Self::Object(object) => object.to_json(),
-            Self::ArrayOf(items) => json!({
-                "type": "array",
-                "items": items.to_json()
-            }),
         }
     }
 }
@@ -579,6 +574,16 @@ static SYMBOL_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(
     &["node", "children", "related_hits", "edge_digest"],
 );
 
+static SYMBOLS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "CodeStory symbol list output.",
+    &[SchemaProperty::array(
+        "symbols",
+        "Root or child symbol summaries.",
+        &SYMBOL_SUMMARY_SCHEMA,
+    )],
+    &["symbols"],
+);
+
 static TRAIL_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(
     "CodeStory trail context DTO.",
     &[
@@ -799,7 +804,7 @@ static TOOLS: &[ToolSpec] = &[
         name: "symbols",
         description: "Browse root symbols or children for a parent id.",
         input_schema: SYMBOLS_INPUT_SCHEMA,
-        output_schema: Some(SchemaSpec::ArrayOf(&SYMBOL_SUMMARY_SCHEMA)),
+        output_schema: Some(SchemaSpec::Object(SYMBOLS_OUTPUT_SCHEMA)),
         safety: SafetyMetadata::read_only(),
     },
     ToolSpec {
