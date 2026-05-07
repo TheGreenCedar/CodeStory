@@ -10,7 +10,7 @@ use codestory_contracts::query::{
     SymbolQuery, TrailQuery,
 };
 
-use crate::AppController;
+use crate::{AppController, compare_ranked_hits, symbol_name_match_rank};
 
 #[derive(Debug, Clone)]
 pub struct BrowserQueryItem {
@@ -43,6 +43,39 @@ fn query_item_matches_filter(item: &BrowserQueryItem, filter: &FilterQuery) -> b
                 .as_deref()
                 .is_some_and(|path| path.contains(needle))
         })
+}
+
+fn browser_resolution_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8) {
+    let rank = symbol_name_match_rank(query, &hit.display_name);
+    (
+        rank.exact_display,
+        rank.exact_terminal,
+        browser_resolution_kind_bucket(hit.kind),
+        rank.exact_leading,
+    )
+}
+
+fn browser_resolution_kind_bucket(kind: NodeKind) -> u8 {
+    match kind {
+        NodeKind::MODULE
+        | NodeKind::NAMESPACE
+        | NodeKind::PACKAGE
+        | NodeKind::STRUCT
+        | NodeKind::CLASS
+        | NodeKind::INTERFACE
+        | NodeKind::ENUM
+        | NodeKind::UNION
+        | NodeKind::TYPEDEF => 2,
+        NodeKind::FUNCTION
+        | NodeKind::METHOD
+        | NodeKind::MACRO
+        | NodeKind::FIELD
+        | NodeKind::VARIABLE
+        | NodeKind::GLOBAL_VARIABLE
+        | NodeKind::CONSTANT
+        | NodeKind::ENUM_CONSTANT => 1,
+        _ => 0,
+    }
 }
 
 impl ReadOnlyBrowserService {
@@ -248,11 +281,13 @@ impl ReadOnlyBrowserService {
             None,
         )?;
         hits.sort_by(|left, right| {
-            right
-                .score
-                .total_cmp(&left.score)
-                .then_with(|| left.display_name.cmp(&right.display_name))
-                .then_with(|| left.node_id.0.cmp(&right.node_id.0))
+            compare_ranked_hits(
+                left,
+                right,
+                browser_resolution_rank(query, left),
+                browser_resolution_rank(query, right),
+            )
+            .then_with(|| left.node_id.0.cmp(&right.node_id.0))
         });
         hits.into_iter().next().ok_or_else(|| {
             ApiError::not_found(format!(

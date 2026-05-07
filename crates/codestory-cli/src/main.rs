@@ -450,6 +450,14 @@ fn run_ask(cmd: AskCommand) -> Result<()> {
     } else {
         runtime.browser.ask(request).map_err(map_api_error)?
     };
+    answer
+        .retrieval_trace
+        .annotations
+        .push(if cmd.with_local_agent {
+            "mode=local_agent".to_string()
+        } else {
+            "mode=db_first_no_local_agent".to_string()
+        });
     if let Some(bookmark) = bookmark_focus.as_ref() {
         annotate_answer_with_bookmark_focus(&mut answer, bookmark);
     }
@@ -1065,24 +1073,7 @@ fn build_doctor_output(
         )
     });
     if let Some(retrieval) = retrieval.as_ref() {
-        checks.push(if retrieval.semantic_ready {
-            doctor_check(
-                "semantic",
-                "ok",
-                format!(
-                    "Hybrid retrieval is ready with {} semantic docs.",
-                    retrieval.semantic_doc_count
-                ),
-            )
-        } else {
-            doctor_check(
-                "semantic",
-                "info",
-                retrieval.fallback_message.clone().unwrap_or_else(|| {
-                    "Semantic retrieval is not ready; symbolic fallback is active.".to_string()
-                }),
-            )
-        });
+        checks.push(semantic_health_check(retrieval, &summary.stats));
         if retrieval.stored_embedding.is_some() {
             checks.push(semantic_contract_check(retrieval));
         }
@@ -1128,6 +1119,44 @@ fn build_doctor_output(
         next_commands: index_next_commands(&project, summary.retrieval.as_ref()),
         environment,
     }
+}
+
+fn semantic_health_check(
+    retrieval: &codestory_contracts::api::RetrievalStateDto,
+    stats: &codestory_contracts::api::StorageStatsDto,
+) -> DoctorCheckOutput {
+    if retrieval.semantic_ready {
+        if stats.file_count > 0 && retrieval.semantic_doc_count < stats.file_count {
+            return doctor_check(
+                "semantic",
+                "warn",
+                format!(
+                    "semantic partial: {} semantic docs for {} indexed files. A previous rebuild may have stopped early; run `codestory-cli setup embeddings`, then `codestory-cli index --refresh full`.",
+                    retrieval.semantic_doc_count, stats.file_count
+                ),
+            );
+        }
+
+        return doctor_check(
+            "semantic",
+            "ok",
+            format!(
+                "semantic ok: hybrid retrieval is ready with {} semantic docs.",
+                retrieval.semantic_doc_count
+            ),
+        );
+    }
+
+    let message = retrieval.fallback_message.clone().unwrap_or_else(|| {
+        "Semantic retrieval is not ready; symbolic fallback is active.".to_string()
+    });
+    let status =
+        if retrieval.fallback_reason == Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime) {
+            "warn"
+        } else {
+            "info"
+        };
+    doctor_check("semantic", status, format!("semantic failed: {message}"))
 }
 
 fn index_freshness_check(freshness: &IndexFreshnessDto) -> DoctorCheckOutput {
@@ -1243,7 +1272,7 @@ fn semantic_contract_check(
             "semantic_contract",
             "ok",
             format!(
-                "Stored semantic docs match the current embedding contract (docs={}).",
+                "semantic ok: stored semantic docs match the current embedding contract (docs={}).",
                 stored.doc_count
             ),
         )
@@ -1254,7 +1283,7 @@ fn semantic_contract_check(
             "semantic_contract",
             "info",
             format!(
-                "{}. Resolve the embedding runtime first with `codestory-cli setup embeddings`; then run `codestory-cli index --refresh full` if semantic search should use the current config.",
+                "semantic stale: {}. Resolve the embedding runtime first with `codestory-cli setup embeddings`; then run `codestory-cli index --refresh full` if semantic search should use the current config.",
                 gaps.join("; ")
             ),
         )
@@ -1263,7 +1292,7 @@ fn semantic_contract_check(
             "semantic_contract",
             "warn",
             format!(
-                "{}. Run `codestory-cli index --refresh full` if semantic search should use the current config.",
+                "semantic stale: {}. Run `codestory-cli index --refresh full` if semantic search should use the current config.",
                 gaps.join("; ")
             ),
         )
@@ -1322,7 +1351,9 @@ fn index_next_commands(
         format!(
             "codestory-cli search --project \"{project}\" --query \"<symbol or question>\" --why"
         ),
-        format!("codestory-cli ask --project \"{project}\" \"How does this repo fit together?\""),
+        format!(
+            "codestory-cli ask --project \"{project}\" --investigate \"How does this repo fit together?\""
+        ),
     ];
     if retrieval.is_some_and(|state| !state.semantic_ready) {
         if retrieval.is_some_and(|state| {

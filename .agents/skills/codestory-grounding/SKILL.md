@@ -20,11 +20,13 @@ Use this skill to collect repo evidence with `codestory-cli` before answering ar
 Use this short loop before making repo claims or edits:
 
 1. `doctor --project <workspace>` to check project/cache/index/retrieval health.
-2. `index --project <workspace> --refresh full` if doctor reports no cache/index, stale failures, or a schema/indexing change needs proof; otherwise keep read commands on `--refresh none`.
-3. `ground --project <workspace>` for the compact map.
-4. `search --project <workspace> --query "<symbol or question>" --why` to find candidate evidence and ranking reasons.
-5. Use `symbol`, `trail`, `snippet`, or `explore` on the best node/query to verify definitions, relationships, and code.
-6. Use `ask --project <workspace> "<question>"` only after evidence is indexed; keep citations/evidence enabled unless the user asks for a terse handoff.
+2. For semantic/manual E2E tests, run `setup embeddings --project <workspace>` before the full index unless `doctor` already reports managed embeddings ready.
+3. `index --project <workspace> --refresh full` if doctor reports no cache/index, semantic partial, semantic stale, stale failures, or a schema/indexing change needs proof; otherwise keep read commands on `--refresh none`.
+4. Re-run `doctor --project <workspace>` and require `semantic ok` before broad repository explanation prompts. If `doctor` says `semantic partial`, `semantic stale`, or `semantic failed`, say so and use `search --repo-text on --why`, `ground`, `symbol`, `trail`, and `snippet` as the evidence path until semantics are rebuilt.
+5. `ground --project <workspace>` for the compact map.
+6. `search --project <workspace> --query "<symbol or question>" --why` to find candidate evidence and ranking reasons.
+7. Use `symbol`, `trail`, `query`, `snippet`, or `explore` on the best node/query to verify definitions, relationships, and code.
+8. Use `ask --project <workspace> --investigate "<question>"` for repo explanations only after evidence is indexed; keep citations/evidence enabled unless the user asks for a terse handoff.
 
 ## Freshness Rules
 
@@ -32,6 +34,7 @@ Use this short loop before making repo claims or edits:
 - Binary freshness: rebuild `codestory-cli` after changing `crates/codestory-cli`, `crates/codestory-runtime`, `crates/codestory-contracts`, `crates/codestory-workspace`, `crates/codestory-indexer`, `crates/codestory-store`, or shared CLI-facing types.
 - Index freshness: use `index --refresh full` when checking whether historical indexing failures are actually gone. Incremental runs can leave stale error rows if the affected files are not reprocessed.
 - Query freshness: use `search` or `trail` with `--refresh none` only after the index has just been rebuilt successfully in the same session.
+- Broad ask freshness: do not treat broad `ask` output as authoritative while `doctor` reports semantic partial/stale/failed. Use lexical search plus repo-text fallback and focused snippets/trails instead.
 
 ## Result Interpretation
 
@@ -40,6 +43,7 @@ Use this short loop before making repo claims or edits:
 - `trail` should be judged by whether unrelated resolved targets disappeared. Local helper names like `once`, `from`, or `copied` can still appear as `[unknown]` nodes without indicating bad semantic resolution.
 - OpenAPI schema files index endpoint symbols such as `GET /api/users`; client literal calls can create speculative edges to those endpoints, so check certainty before treating a frontend/backend trail as verified.
 - Markdown snippets can use ANSI syntax highlighting in interactive terminals. Prefer `--output-file` or JSON when you need machine-stable text.
+- Snippet output reports the requested context and byte cap; when `snippet_truncated` is true, increasing `--context` may not expand output unless the byte cap also changes in code.
 - If `index` still reports errors after a fix, rerun with `--refresh full` before concluding the fix failed.
 
 ## Prerequisite

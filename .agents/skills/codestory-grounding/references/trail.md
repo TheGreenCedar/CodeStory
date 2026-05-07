@@ -19,7 +19,7 @@ target/release/codestory-cli(.exe) trail [OPTIONS]
 | `--mode` | enum | `neighborhood` | Trail mode: `neighborhood`, `referenced`, `referencing` |
 | `--depth` | integer | *auto* | Max traversal depth (default: 2 for neighborhood, 0 for referenced/referencing) |
 | `--direction` | enum | *auto* | Edge direction filter: `incoming`, `outgoing`, `both` |
-| `--max-nodes` | integer | `24` | Maximum nodes in the trail (clamped 1–200) |
+| `--max-nodes` | integer | `120` | Maximum nodes in the trail (clamped 1-200) |
 | `--include-tests` | flag | `false` | Include test and bench callers |
 | `--show-utility-calls` | flag | `false` | Include utility/helper call edges |
 | `--hide-speculative` | flag | `false` | Hide uncertain/speculative edges and remove nodes disconnected from the trail focus |

@@ -146,3 +146,92 @@ fn query_command_runs_search_filter_limit_pipeline() {
         "query search operation should mark item provenance"
     );
 }
+
+#[test]
+#[ignore = "builds indexed runtime fixtures; run explicitly when touching CLI/runtime read-command flows"]
+fn query_symbol_prefers_same_exact_target_as_symbol_command() {
+    let workspace = copy_tictactoe_workspace();
+    index_workspace(workspace.path());
+
+    let symbol = run_cli(
+        workspace.path(),
+        &["symbol", "--query", "_select_player", "--format", "json"],
+    );
+    assert!(
+        symbol.status.success(),
+        "symbol command failed: {}",
+        String::from_utf8_lossy(&symbol.stderr)
+    );
+    let symbol_json: Value = serde_json::from_slice(&symbol.stdout).expect("parse symbol json");
+    let expected_id = symbol_json["resolution"]["resolved"]["node_id"]
+        .as_str()
+        .expect("resolved node id");
+
+    let query = run_cli(
+        workspace.path(),
+        &[
+            "query",
+            "symbol('_select_player') | limit(1)",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        query.status.success(),
+        "query command failed: {}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+    let query_json: Value = serde_json::from_slice(&query.stdout).expect("parse query json");
+    let actual_id = query_json["items"][0]["node_id"]
+        .as_str()
+        .expect("query item node id");
+
+    assert_eq!(
+        actual_id, expected_id,
+        "query symbol() should resolve the same exact target as symbol --query"
+    );
+}
+
+#[test]
+#[ignore = "builds indexed runtime fixtures; run explicitly when touching CLI/runtime read-command flows"]
+fn trail_command_default_width_matches_query_dsl_trail() {
+    let workspace = copy_tictactoe_workspace();
+    index_workspace(workspace.path());
+
+    let trail = run_cli(
+        workspace.path(),
+        &["trail", "--query", "_select_player", "--format", "json"],
+    );
+    assert!(
+        trail.status.success(),
+        "trail command failed: {}",
+        String::from_utf8_lossy(&trail.stderr)
+    );
+    let trail_json: Value = serde_json::from_slice(&trail.stdout).expect("parse trail json");
+    let trail_nodes = trail_json["trail"]["trail"]["nodes"]
+        .as_array()
+        .expect("trail nodes");
+
+    let query = run_cli(
+        workspace.path(),
+        &[
+            "query",
+            "trail(symbol: '_select_player') | limit(120)",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        query.status.success(),
+        "query command failed: {}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+    let query_json: Value = serde_json::from_slice(&query.stdout).expect("parse query json");
+    let query_items = query_json["items"].as_array().expect("query items");
+
+    assert_eq!(
+        trail_nodes.len(),
+        query_items.len(),
+        "trail --query and query trail(...) should expose the same default graph width"
+    );
+}

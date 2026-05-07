@@ -1247,6 +1247,17 @@ pub(crate) fn render_agent_answer_markdown(project_root: &Path, answer: &AgentAn
         "retrieval_version: `{}`",
         answer.retrieval_version
     );
+    let mode = if answer
+        .retrieval_trace
+        .annotations
+        .iter()
+        .any(|annotation| annotation == "mode=local_agent")
+    {
+        "retrieval packet plus local-agent synthesis"
+    } else {
+        "DB-first retrieval packet; no local coding agent was launched by `ask`"
+    };
+    let _ = writeln!(markdown, "mode: {mode}");
     append_agent_evidence_packet(&mut markdown, project_root, answer);
     for section in &answer.sections {
         let _ = writeln!(markdown, "\n## {}", section.title);
@@ -1304,6 +1315,21 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
     );
     if let Some(retrieval) = output.retrieval.as_ref() {
         let _ = writeln!(markdown, "retrieval: {}", render_retrieval_state(retrieval));
+    }
+    let attention = output
+        .checks
+        .iter()
+        .filter(|check| matches!(check.status.as_str(), "warn" | "error"))
+        .collect::<Vec<_>>();
+    if !attention.is_empty() {
+        let _ = writeln!(markdown, "attention:");
+        for check in attention {
+            let _ = writeln!(
+                markdown,
+                "- {} [{}]: {}",
+                check.name, check.status, check.message
+            );
+        }
     }
     let _ = writeln!(markdown, "checks:");
     for check in &output.checks {
@@ -1626,6 +1652,12 @@ pub(crate) fn render_snippet_markdown(
         "path: `{}`:{}",
         relative_path(project_root, &context.path),
         context.line
+    );
+    let _ = writeln!(
+        markdown,
+        "context: requested_lines={} max_snippet_bytes={}",
+        context.requested_context,
+        context.max_snippet_bytes.unwrap_or_default()
     );
     if context.snippet_truncated {
         let _ = writeln!(

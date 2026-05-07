@@ -707,6 +707,7 @@ impl AppController {
             path,
             line,
             snippet: bounded.markdown,
+            requested_context: context_lines as u32,
             snippet_truncated: bounded.truncated,
             max_snippet_bytes: Some(crate::DIRECT_SNIPPET_MAX_BYTES as u32),
         })

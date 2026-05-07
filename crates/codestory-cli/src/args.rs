@@ -61,6 +61,7 @@ pub(crate) struct ProjectArgs {
 pub(crate) enum OutputFormat {
     Markdown,
     Json,
+    #[value(hide = true)]
     Dot,
 }
 
@@ -504,7 +505,7 @@ pub(crate) struct TrailCommand {
     pub(crate) depth: Option<u32>,
     #[arg(long, value_enum)]
     pub(crate) direction: Option<CliDirection>,
-    #[arg(long, default_value_t = 24)]
+    #[arg(long, default_value_t = 120)]
     pub(crate) max_nodes: u32,
     #[arg(long)]
     pub(crate) include_tests: bool,

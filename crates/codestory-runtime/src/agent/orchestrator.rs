@@ -8,7 +8,7 @@ use crate::{
 use codestory_contracts::api::{
     AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentResponseBlockDto, AgentResponseModeDto,
     AgentResponseSectionDto, AgentRetrievalPolicyModeDto, AgentRetrievalStepKindDto, ApiError,
-    EdgeId, GraphArtifactDto, GraphRequest, GraphResponse, IndexFreshnessDto,
+    EdgeId, GraphArtifactDto, GraphRequest, GraphResponse, GroundingBudgetDto, IndexFreshnessDto,
     IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeOccurrencesRequest,
     RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest,
     TrailConfigDto, TrailFilterOptionsDto,
@@ -97,6 +97,7 @@ struct RetrievalBundle {
     focused_node: Option<NodeDetailsDto>,
     primary_graph: Option<GraphResponse>,
     fallback_used: bool,
+    repo_explanation_fallback_used: bool,
     repo_text_fallback_used: bool,
 }
 
@@ -507,7 +508,7 @@ fn execute_retrieval(
                     .iter()
                     .any(|hit| hit.origin == SearchHitOrigin::TextMatch);
             }
-        } else if weak_initial_hits(prompt, &hits) {
+        } else if weak_initial_hits(prompt, &hits) && !is_repo_explanation_prompt(prompt) {
             if !hits.is_empty() {
                 hits.clear();
                 scored_hits.clear();
@@ -518,9 +519,13 @@ fn execute_retrieval(
             trace.annotate(
                 "Repo-text fallback skipped because the weak query did not contain a literal file/source token.",
             );
+        } else if weak_initial_hits(prompt, &hits) {
+            trace.annotate(
+                "Investigation deferred a broad repo explanation prompt to grounding snapshot fallback.",
+            );
         }
 
-        if weak_initial_hits(prompt, &hits) {
+        if weak_initial_hits(prompt, &hits) && !is_repo_explanation_prompt(prompt) {
             trace.annotate(
                 "Investigation low confidence gap after query expansion and repo-text fallback.",
             );
@@ -532,6 +537,29 @@ fn execute_retrieval(
         trace.annotate(
             "Investigation kept an explicit or prompt-anchored focus instead of broad repo-text fallback.",
         );
+    }
+
+    if should_investigate(resolved_profile)
+        && weak_initial_hits(prompt, &hits)
+        && is_repo_explanation_prompt(prompt)
+    {
+        let overview_hits = repo_explanation_grounding_hits(
+            controller,
+            req,
+            max_results,
+            ask_started_at,
+            resolved_profile,
+            trace,
+        )?;
+        if !overview_hits.is_empty() {
+            hits = overview_hits;
+            scored_hits.clear();
+            bundle.fallback_used = true;
+            bundle.repo_explanation_fallback_used = true;
+            trace.annotate(
+                "Investigation used grounding snapshot fallback for a broad repo explanation prompt.",
+            );
+        }
     }
 
     let focus_node_id = req
@@ -952,6 +980,120 @@ fn has_literal_fallback_signal(prompt: &str) -> bool {
                             .filter(|ch| ch.is_ascii_alphabetic())
                             .all(|ch| ch.is_ascii_uppercase()))
             })
+}
+
+fn is_repo_explanation_prompt(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    let subject = lower.contains("repo") || lower.contains("project") || lower.contains("codebase");
+    let intent = lower.contains("fit together")
+        || lower.contains("how does")
+        || lower.contains("explain")
+        || lower.contains("overview")
+        || lower.contains("architecture");
+    subject && intent
+}
+
+fn repo_explanation_grounding_hits(
+    controller: &AppController,
+    req: &AgentAskRequest,
+    max_results: usize,
+    ask_started_at: Instant,
+    resolved_profile: &ResolvedProfile,
+    trace: &mut TraceRecorder,
+) -> Result<Vec<SearchHit>, ApiError> {
+    let step = trace.start_step(
+        AgentRetrievalStepKindDto::QueryExpansion,
+        vec![
+            field("strategy", "grounding_snapshot"),
+            field("max_results", max_results.to_string()),
+        ],
+    );
+    let deadline_ms = phase_deadline_ms(req, 55, 100);
+    if should_truncate_phase(resolved_profile, ask_started_at, deadline_ms) {
+        trace.finish_truncated(
+            step,
+            "Skipped grounding snapshot fallback because latency budget was exceeded.",
+            vec![field("phase_deadline_ms", deadline_ms.to_string())],
+        );
+        return Ok(Vec::new());
+    }
+
+    let snapshot = match controller.grounding_snapshot(GroundingBudgetDto::Strict) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            trace.finish_err(step, error.message.clone());
+            return Err(error);
+        }
+    };
+
+    let mut hits = Vec::new();
+    let mut seen = HashSet::new();
+    for symbol in snapshot
+        .root_symbols
+        .iter()
+        .chain(snapshot.files.iter().flat_map(|file| file.symbols.iter()))
+    {
+        if !seen.insert(symbol.id.clone()) {
+            continue;
+        }
+        hits.push(search_hit_from_grounding_symbol(symbol));
+        if hits.len() >= max_results {
+            break;
+        }
+    }
+
+    trace.finish_ok(
+        step,
+        vec![
+            field("grounding_symbols", hits.len().to_string()),
+            field("coverage_files", snapshot.coverage.total_files.to_string()),
+            field(
+                "coverage_symbols",
+                snapshot.coverage.total_symbols.to_string(),
+            ),
+        ],
+    );
+
+    Ok(hits)
+}
+
+fn search_hit_from_grounding_symbol(
+    symbol: &codestory_contracts::api::GroundingSymbolDigestDto,
+) -> SearchHit {
+    let (file_path, line) = symbol
+        .node_ref
+        .as_deref()
+        .and_then(split_node_ref_location)
+        .unwrap_or((None, symbol.line));
+    SearchHit {
+        node_id: symbol.id.clone(),
+        display_name: symbol
+            .label
+            .split(" @ ")
+            .next()
+            .unwrap_or(symbol.label.as_str())
+            .to_string(),
+        kind: symbol.kind,
+        file_path,
+        line: symbol.line.or(line),
+        score: 0.55,
+        origin: SearchHitOrigin::IndexedSymbol,
+        resolvable: true,
+        score_breakdown: Some(RetrievalScoreBreakdownDto {
+            lexical: 0.35,
+            semantic: 0.0,
+            graph: 0.20,
+            total: 0.55,
+        }),
+    }
+}
+
+fn split_node_ref_location(value: &str) -> Option<(Option<String>, Option<u32>)> {
+    let mut parts = value.rsplitn(3, ':');
+    let _name = parts.next()?;
+    let line = parts.next()?.parse::<u32>().ok();
+    let path = parts.next().map(ToOwned::to_owned);
+    Some((path, line))
 }
 
 fn investigate_query_expansion(
@@ -1554,6 +1696,9 @@ fn retrieval_markdown(
     if bundle.repo_text_fallback_used {
         markdown.push_str("- Repo-text/file fallback for literal file-line evidence.\n");
     }
+    if bundle.repo_explanation_fallback_used {
+        markdown.push_str("- Grounding snapshot fallback for broad repo overview evidence.\n");
+    }
     if !bundle.fallback_used && should_investigate(profile) {
         markdown.push_str("- No fallback was needed because initial hits cleared the investigation confidence gate.\n");
     }
@@ -2003,6 +2148,42 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn repo_explanation_prompt_detection_is_broad_but_not_symbolic() {
+        assert!(is_repo_explanation_prompt(
+            "How does this repo fit together?"
+        ));
+        assert!(is_repo_explanation_prompt(
+            "Explain the project architecture"
+        ));
+        assert!(!is_repo_explanation_prompt(
+            "Where is build_llm_symbol_doc_text used?"
+        ));
+    }
+
+    #[test]
+    fn grounding_symbol_fallback_hit_is_anchor_ranked() {
+        let hit =
+            search_hit_from_grounding_symbol(&codestory_contracts::api::GroundingSymbolDigestDto {
+                id: NodeId("abc".to_string()),
+                node_ref: Some("src/main.rs:42:AppController".to_string()),
+                label: "AppController @ src/main.rs".to_string(),
+                kind: codestory_contracts::api::NodeKind::STRUCT,
+                line: None,
+                member_count: None,
+                summary: None,
+                edge_digest: Vec::new(),
+            });
+
+        assert_eq!(hit.display_name, "AppController");
+        assert_eq!(hit.file_path.as_deref(), Some("src/main.rs"));
+        assert_eq!(hit.line, Some(42));
+        assert!(!weak_initial_hits(
+            "How does this repo fit together?",
+            &[hit]
+        ));
     }
 
     #[test]

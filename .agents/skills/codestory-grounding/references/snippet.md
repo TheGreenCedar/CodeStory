@@ -26,10 +26,13 @@ target/release/codestory-cli(.exe) snippet [OPTIONS]
 
 ## Output
 
+Markdown output includes `context: requested_lines=<n> max_snippet_bytes=<bytes>`. JSON includes the same `requested_context`, `snippet_truncated`, and `max_snippet_bytes` fields. If `snippet_truncated` is true, the byte cap stopped the output; raising `--context` alone may not reveal more code.
+
 ```
 # Snippet
 resolved: `AppController::new` -> [abc123] new [FUNCTION] `src/lib.rs`:100
 file: `src/lib.rs`  lines: 96–115
+context: requested_lines=4 max_snippet_bytes=20000
 
     96: // --- AppController ---
     97:

@@ -1147,6 +1147,7 @@ const LLM_DOC_EMBED_BATCH_SIZE_ENV: &str = "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE";
 const SEMANTIC_DOC_SCOPE_ENV: &str = "CODESTORY_SEMANTIC_DOC_SCOPE";
 const SEMANTIC_DOC_ALIAS_MODE_ENV: &str = "CODESTORY_SEMANTIC_DOC_ALIAS_MODE";
 const SEMANTIC_DOC_MAX_TOKENS_ENV: &str = "CODESTORY_SEMANTIC_DOC_MAX_TOKENS";
+const SEMANTIC_DOC_DEFAULT_MAX_TOKENS: usize = 384;
 const SEMANTIC_STREAM_PENDING_DOCS_ENV: &str = "CODESTORY_SEMANTIC_STREAM_PENDING_DOCS";
 const SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV: &str =
     "CODESTORY_SEMANTIC_STREAM_SORT_WINDOW_BATCHES";
@@ -1185,9 +1186,7 @@ impl SemanticDocAliasMode {
 }
 
 fn semantic_doc_shape_contract() -> String {
-    let max_tokens = semantic_doc_max_tokens_from_env()
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "default".to_string());
+    let max_tokens = semantic_doc_max_tokens_from_env();
     format!(
         "semantic_doc_version={};scope={};alias_mode={};max_tokens={}",
         LLM_SYMBOL_DOC_SCHEMA_VERSION,
@@ -1519,12 +1518,13 @@ fn semantic_doc_alias_mode_from_value(value: &str) -> SemanticDocAliasMode {
     }
 }
 
-fn semantic_doc_max_tokens_from_env() -> Option<usize> {
+fn semantic_doc_max_tokens_from_env() -> usize {
     std::env::var(SEMANTIC_DOC_MAX_TOKENS_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .map(|value| value.clamp(16, 8_192))
+        .unwrap_or(SEMANTIC_DOC_DEFAULT_MAX_TOKENS)
 }
 
 fn stream_pending_llm_symbol_docs_from_env() -> bool {
@@ -1874,9 +1874,7 @@ fn build_llm_symbol_doc_text(
         out.push('\n');
     }
 
-    if let Some(max_tokens) = semantic_doc_max_tokens_from_env() {
-        out = truncate_semantic_doc_text_to_token_budget(&out, max_tokens);
-    }
+    out = truncate_semantic_doc_text_to_token_budget(&out, semantic_doc_max_tokens_from_env());
 
     out
 }
@@ -4611,6 +4609,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn semantic_doc_token_budget_defaults_to_safe_llamacpp_window() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvGuard::remove(SEMANTIC_DOC_MAX_TOKENS_ENV);
+
+        assert_eq!(
+            semantic_doc_max_tokens_from_env(),
+            SEMANTIC_DOC_DEFAULT_MAX_TOKENS
+        );
+        assert!(semantic_doc_shape_contract().contains("max_tokens=384"));
+    }
+
     fn pending_semantic_doc_for_test(node_id: i64, doc_text: &str) -> PendingLlmSymbolDoc {
         PendingLlmSymbolDoc {
             node_id: CoreNodeId(node_id),
@@ -4854,7 +4866,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_doc_text_token_budget_is_opt_in_for_research() {
+    fn semantic_doc_text_token_budget_respects_configured_limit() {
         let _lock = ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());

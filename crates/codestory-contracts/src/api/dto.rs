@@ -628,6 +628,8 @@ pub struct SnippetContextDto {
     pub line: u32,
     pub snippet: String,
     #[serde(default)]
+    pub requested_context: u32,
+    #[serde(default)]
     pub snippet_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_snippet_bytes: Option<u32>,
