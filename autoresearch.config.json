@@ -1,0 +1,10 @@
+{
+  "maxIterations": 20,
+  "commitPaths": [
+    "crates/codestory-runtime",
+    "crates/codestory-cli",
+    "crates/codestory-contracts",
+    ".agents/skills/codestory-grounding",
+    "scripts/codestory-manual-friction-check.mjs"
+  ]
+}
