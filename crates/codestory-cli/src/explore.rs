@@ -766,8 +766,8 @@ fn run_explore_tui(
     );
 
     enable_raw_mode()?;
-    crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
     let _cleanup = TerminalCleanup;
+    crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut state = ExploreTuiState::new(panes.len());
