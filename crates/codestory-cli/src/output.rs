@@ -14,8 +14,8 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use crate::args::{
-    CliTrailMode, DoctorOutput, IndexDryRunOutput, IndexOutput, OutputFormat, QueryOutput,
-    SearchHitOutput, SearchOutput, TrailCommand,
+    CliTrailMode, DoctorOutput, ExplainOutput, IndexDryRunOutput, IndexOutput, OutputFormat,
+    QueryOutput, SearchHitOutput, SearchOutput, TrailCommand,
 };
 use crate::display::{
     clean_path_string, default_trail_direction, format_budget, format_direction, format_kind,
@@ -463,6 +463,44 @@ pub(crate) fn render_ground_markdown(
             );
         }
     }
+    markdown
+}
+
+pub(crate) fn render_explain_markdown(project_root: &Path, output: &ExplainOutput<'_>) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Repo Explanation");
+    let _ = writeln!(markdown, "root: `{}`", clean_path_string(output.project));
+    let _ = writeln!(markdown, "refresh: `{}`", output.refresh);
+    let _ = writeln!(markdown, "workflow: {}", output.workflow.join(" -> "));
+    if let Some(retrieval) = output.retrieval {
+        let _ = writeln!(markdown, "retrieval: {}", render_retrieval_state(retrieval));
+    }
+    let _ = writeln!(
+        markdown,
+        "coverage: files {}/{} symbols {}/{}",
+        output.grounding.coverage.represented_files,
+        output.grounding.coverage.total_files,
+        output.grounding.coverage.represented_symbols,
+        output.grounding.coverage.total_symbols
+    );
+    let _ = writeln!(markdown, "prompt: `{}`", output.prompt);
+
+    if !output.anchors.is_empty() {
+        let _ = writeln!(markdown, "anchors:");
+        for anchor in output.anchors.iter().take(EVIDENCE_PREVIEW_LIMIT * 2) {
+            let _ = writeln!(markdown, "- {}", render_search_hit_output(anchor));
+        }
+    }
+
+    if !output.next_commands.is_empty() {
+        let _ = writeln!(markdown, "next_commands:");
+        for command in &output.next_commands {
+            let _ = writeln!(markdown, "- `{command}`");
+        }
+    }
+
+    let _ = writeln!(markdown);
+    markdown.push_str(&render_agent_answer_markdown(project_root, output.answer));
     markdown
 }
 

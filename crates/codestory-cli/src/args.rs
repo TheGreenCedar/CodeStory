@@ -1,11 +1,11 @@
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
-    AgentBackend, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, BookmarkCategoryDto,
-    BookmarkDto, GroundingBudgetDto, IndexDryRunDto, IndexFreshnessDto, IndexingPhaseTimings,
-    LayoutDirection, NodeId, NodeKind, ProjectSummary, RepoTextScanStatsDto,
-    RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin, SnippetContextDto,
-    SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection,
-    TrailMode,
+    AgentAnswerDto, AgentBackend, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto,
+    BookmarkCategoryDto, BookmarkDto, GroundingBudgetDto, GroundingSnapshotDto, IndexDryRunDto,
+    IndexFreshnessDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind, ProjectSummary,
+    RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
+    SnippetContextDto, SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto,
+    TrailDirection, TrailMode,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -27,6 +27,7 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     Index(IndexCommand),
     Ground(GroundCommand),
+    Explain(ExplainCommand),
     Ask(AskCommand),
     Doctor(DoctorCommand),
     Setup(SetupCommand),
@@ -209,6 +210,47 @@ pub(crate) struct GroundCommand {
         help = "Explain retrieval mode, coverage, and query hints in the Markdown output."
     )]
     pub(crate) why: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ExplainCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        value_name = "PROMPT",
+        default_value = "How does this repo fit together?",
+        help = "Repository explanation prompt."
+    )]
+    pub(crate) prompt: String,
+    #[arg(long, default_value_t = 12)]
+    pub(crate) max_results: u32,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::Auto,
+        help = "Explain defaults to `auto`: it opens or refreshes the index before collecting grounding and asking."
+    )]
+    pub(crate) refresh: RefreshMode,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Launch the configured local agent after indexed retrieval. Disabled by default."
+    )]
+    pub(crate) with_local_agent: bool,
+    #[arg(long, value_enum, default_value_t = CliAgentBackend::Codex)]
+    pub(crate) backend: CliAgentBackend,
+    #[arg(
+        long,
+        help = "Override the local agent command used with --with-local-agent."
+    )]
+    pub(crate) agent_command: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -790,6 +832,22 @@ pub(crate) struct SearchOutput {
     pub(crate) repo_text_stats: Option<RepoTextScanStatsDto>,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct ExplainOutput<'a> {
+    pub(crate) project: &'a str,
+    pub(crate) storage_path: &'a str,
+    pub(crate) refresh: &'a str,
+    pub(crate) prompt: &'a str,
+    pub(crate) workflow: Vec<&'static str>,
+    pub(crate) summary: &'a ProjectSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retrieval: Option<&'a RetrievalStateDto>,
+    pub(crate) grounding: &'a GroundingSnapshotDto,
+    pub(crate) anchors: Vec<SearchHitOutput>,
+    pub(crate) answer: &'a AgentAnswerDto,
+    pub(crate) next_commands: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct QueryResolutionOutput {
     pub(crate) selector: QuerySelectorOutput,
@@ -811,6 +869,8 @@ pub(crate) struct SymbolJsonOutput<'a> {
 pub(crate) struct TrailJsonOutput<'a> {
     pub(crate) resolution: QueryResolutionOutput,
     pub(crate) trail: &'a TrailContextDto,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) notes: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1134,6 +1194,15 @@ mod tests {
         assert!(help.contains("--with-local-agent"));
         assert!(help.contains("--bundle <DIR>"));
         assert!(help.contains("--profile <PROFILE>"));
+    }
+
+    #[test]
+    fn explain_help_exposes_guided_repo_flow() {
+        let help = render_subcommand_help("explain");
+        assert!(help.contains("Repository explanation prompt"));
+        assert!(help.contains("--max-results"));
+        assert!(help.contains("--with-local-agent"));
+        assert!(help.contains("How does this repo fit together?"));
     }
 
     #[test]

@@ -22,6 +22,7 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-05-07 | 0adcd43 | pass, hash semantic check for stdio MCP envelope fix | 11.01 | 0.20 | 0.45 | 0.19 | 0.14 | 0.14 | 39,087 | 33,167 | 141 | 0 | 5,410 | true |
 | 2026-05-07 | this commit | pass, managed Vulkan embedding setup cold E2E | 51.45 | 0.18 | 0.60 | 0.20 | 0.15 | 0.14 | 40,064 | 33,971 | 146 | 0 | 5,548 | true |
 | 2026-05-07 | faf0fa8 | pass, manual friction autoresearch loop | 121.13 | 0.20 | 0.56 | 0.21 | 0.17 | 0.15 | 40,631 | 34,379 | 147 | 0 | 5,615 | true |
+| 2026-05-07 | this commit | pass, intent-level manual friction closure | 148.20 | 0.23 | 0.64 | 0.25 | 0.19 | 0.17 | 41,033 | 34,708 | 147 | 0 | 5,658 | true |
 
 ## Phase Metrics
 
@@ -39,3 +40,4 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-05-07 | 0adcd43 | hash semantic check for stdio MCP envelope fix cold E2E | 11.01 | 4.47 | 1.60 | 0 | 5,410 | 0 |
 | 2026-05-07 | this commit | managed Vulkan embedding setup cold E2E | 51.45 | 4.48 | 40.19 | 0 | 5,548 | 0 |
 | 2026-05-07 | faf0fa8 | manual friction autoresearch loop cold E2E | 121.13 | 4.12 | 111.89 | 0 | 5,615 | 0 |
+| 2026-05-07 | this commit | intent-level manual friction closure cold E2E | 148.20 | 5.28 | 137.35 | 0 | 5,658 | 0 |

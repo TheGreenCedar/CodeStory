@@ -6349,7 +6349,11 @@ class MyClass {
 function globalFunc() {}
 export const Posts = {
     slug: "posts",
+    access: {
+        read: () => true,
+    },
     fields: [],
+    hooks: {},
 };
 export const contentBlocks = [];
 export default buildConfig({
@@ -6380,6 +6384,41 @@ export default buildConfig({
                 .iter()
                 .any(|n| { n.serialized_name == "Posts" && n.kind == NodeKind::GLOBAL_VARIABLE }),
             "exported object config should be indexed as a global variable"
+        );
+        for field_name in ["Posts.slug", "Posts.access", "Posts.fields", "Posts.hooks"] {
+            assert!(
+                result.nodes.iter().any(|node| {
+                    node.qualified_name.as_deref() == Some(field_name)
+                        && node.kind == NodeKind::FIELD
+                }),
+                "exported object config should index top-level field {field_name}"
+            );
+        }
+        let posts_id = result
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name == "Posts" && node.kind == NodeKind::GLOBAL_VARIABLE)
+            .expect("posts node")
+            .id;
+        let field_ids = result
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.kind == NodeKind::FIELD
+                    && node
+                        .qualified_name
+                        .as_deref()
+                        .is_some_and(|name| name.starts_with("Posts."))
+            })
+            .map(|node| node.id)
+            .collect::<HashSet<_>>();
+        assert!(
+            result.edges.iter().any(|edge| {
+                edge.kind == EdgeKind::MEMBER
+                    && edge.source == posts_id
+                    && field_ids.contains(&edge.target)
+            }),
+            "exported object config fields should be connected to their owner"
         );
         assert!(
             result.nodes.iter().any(|n| {

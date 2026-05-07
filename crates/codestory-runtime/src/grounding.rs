@@ -1,8 +1,11 @@
 use super::*;
 use crate::trail_story::build_trail_story;
+use codestory_contracts::api::SearchHitOrigin;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+
+const RECOMMENDED_QUERY_LIMIT: usize = 5;
 
 #[derive(Debug, Clone, Copy)]
 struct GroundingBudgetConfig {
@@ -292,6 +295,281 @@ fn build_edge_digest_map(
         .collect()
 }
 
+#[derive(Debug)]
+struct RecommendationCandidate<'a> {
+    symbol: &'a GroundingSymbolDigestDto,
+    name: String,
+    path: Option<String>,
+    order: usize,
+}
+
+fn grounding_symbol_name(symbol: &GroundingSymbolDigestDto) -> String {
+    symbol
+        .label
+        .split(" @ ")
+        .next()
+        .unwrap_or(symbol.label.as_str())
+        .trim()
+        .trim_matches(['`', '"', '\''])
+        .to_string()
+}
+
+fn grounding_symbol_path(symbol: &GroundingSymbolDigestDto) -> Option<String> {
+    if let Some(node_ref) = symbol.node_ref.as_deref()
+        && let Some((path, _line)) = split_grounding_node_ref_location(node_ref)
+    {
+        return path;
+    }
+
+    symbol
+        .label
+        .split_once(" @ ")
+        .map(|(_, path)| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+}
+
+fn split_grounding_node_ref_location(value: &str) -> Option<(Option<String>, Option<u32>)> {
+    let mut parts = value.rsplitn(3, ':');
+    let _name = parts.next()?;
+    let line = parts.next()?.parse::<u32>().ok();
+    let path = parts.next().map(ToOwned::to_owned);
+    Some((path, line))
+}
+
+fn normalized_recommendation_key(name: &str) -> String {
+    name.rsplit([':', '.', '/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn low_value_recommendation_path(path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let path = format!("/{}", path.replace('\\', "/").to_ascii_lowercase());
+    [
+        "/tests/",
+        "/test/",
+        "/testing/",
+        "/fixtures/",
+        "/fixture/",
+        "/examples/",
+        "/example/",
+        "/benches/",
+        "/bench/",
+        "/target/",
+        "/dist/",
+        "/build/",
+        "/migrations/",
+        "/bin/app/user/projects/",
+        "/src/external/",
+        "/external/",
+        "/vendor/",
+        "/third_party/",
+        "/third-party/",
+    ]
+    .iter()
+    .any(|marker| path.contains(marker))
+        || path.contains("/scripts/")
+}
+
+fn low_value_recommendation_candidate(candidate: &RecommendationCandidate<'_>) -> bool {
+    low_value_recommendation_path(candidate.path.as_deref())
+        || low_value_recommendation_name(&candidate.name)
+}
+
+fn low_value_recommendation_name(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase();
+    normalized.starts_with("std::") || normalized.starts_with("std.")
+}
+
+fn architecture_path_rank(path: Option<&str>) -> u8 {
+    let Some(path) = path else {
+        return 3;
+    };
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    if path.ends_with("/src/lib.rs")
+        || path.ends_with("/src/main.rs")
+        || path.ends_with("/src/mod.rs")
+        || path == "src/lib.rs"
+        || path == "src/main.rs"
+        || path.ends_with("payload.config.ts")
+        || path.ends_with("next.config.ts")
+    {
+        return 0;
+    }
+    if path.contains("/src/app/")
+        || path.contains("/src/collections/")
+        || path.contains("/src/components/")
+        || path.contains("/src/runtime/")
+        || path.contains("/src/index")
+    {
+        return 1;
+    }
+    if path.contains("/src/") || path.starts_with("src/") {
+        return 2;
+    }
+    3
+}
+
+fn architecture_kind_rank(kind: NodeKind) -> u8 {
+    match kind {
+        NodeKind::STRUCT
+        | NodeKind::CLASS
+        | NodeKind::INTERFACE
+        | NodeKind::ENUM
+        | NodeKind::UNION
+        | NodeKind::GLOBAL_VARIABLE
+        | NodeKind::MODULE
+        | NodeKind::NAMESPACE
+        | NodeKind::PACKAGE => 0,
+        NodeKind::FUNCTION | NodeKind::METHOD => 1,
+        NodeKind::TYPEDEF => 2,
+        NodeKind::FIELD | NodeKind::VARIABLE | NodeKind::CONSTANT | NodeKind::ENUM_CONSTANT => 3,
+        _ => 4,
+    }
+}
+
+fn compare_recommendation_candidates(
+    left: &RecommendationCandidate<'_>,
+    right: &RecommendationCandidate<'_>,
+) -> Ordering {
+    low_value_recommendation_path(left.path.as_deref())
+        .cmp(&low_value_recommendation_path(right.path.as_deref()))
+        .then(
+            architecture_path_rank(left.path.as_deref())
+                .cmp(&architecture_path_rank(right.path.as_deref())),
+        )
+        .then(
+            architecture_kind_rank(left.symbol.kind)
+                .cmp(&architecture_kind_rank(right.symbol.kind)),
+        )
+        .then(
+            right
+                .symbol
+                .member_count
+                .unwrap_or(0)
+                .cmp(&left.symbol.member_count.unwrap_or(0)),
+        )
+        .then(left.name.len().cmp(&right.name.len()))
+        .then(left.order.cmp(&right.order))
+        .then(left.name.cmp(&right.name))
+}
+
+fn recommended_grounding_queries(
+    root_symbols: &[GroundingSymbolDigestDto],
+    files: &[GroundingFileDigestDto],
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut order = 0usize;
+    for symbol in files
+        .iter()
+        .flat_map(|file| file.symbols.iter())
+        .chain(root_symbols.iter())
+    {
+        let name = grounding_symbol_name(symbol);
+        if name.is_empty() || is_import_like_name(&name) {
+            continue;
+        }
+        candidates.push(RecommendationCandidate {
+            path: grounding_symbol_path(symbol),
+            symbol,
+            name,
+            order,
+        });
+        order = order.saturating_add(1);
+    }
+    candidates.sort_by(compare_recommendation_candidates);
+
+    let use_primary_candidates = candidates
+        .iter()
+        .any(|candidate| !low_value_recommendation_candidate(candidate));
+    let mut seen = HashSet::new();
+    let mut recommended = Vec::new();
+    for candidate in candidates {
+        if use_primary_candidates && low_value_recommendation_candidate(&candidate) {
+            continue;
+        }
+        let key = normalized_recommendation_key(&candidate.name);
+        if key.is_empty() || !seen.insert(key) {
+            continue;
+        }
+        recommended.push(candidate.name);
+        if recommended.len() >= RECOMMENDED_QUERY_LIMIT {
+            break;
+        }
+    }
+    recommended
+}
+
+pub(crate) fn grounding_explanation_search_hits(
+    snapshot: &GroundingSnapshotDto,
+    limit: usize,
+) -> Vec<SearchHit> {
+    let mut candidates = Vec::new();
+    let mut order = 0usize;
+    for symbol in snapshot
+        .files
+        .iter()
+        .flat_map(|file| file.symbols.iter())
+        .chain(snapshot.root_symbols.iter())
+    {
+        let name = grounding_symbol_name(symbol);
+        if name.is_empty() || is_import_like_name(&name) {
+            continue;
+        }
+        candidates.push(RecommendationCandidate {
+            path: grounding_symbol_path(symbol),
+            symbol,
+            name,
+            order,
+        });
+        order = order.saturating_add(1);
+    }
+    candidates.sort_by(compare_recommendation_candidates);
+
+    let use_primary_candidates = candidates
+        .iter()
+        .any(|candidate| !low_value_recommendation_candidate(candidate));
+    let mut seen = HashSet::new();
+    let mut hits = Vec::new();
+    for candidate in candidates {
+        if use_primary_candidates && low_value_recommendation_candidate(&candidate) {
+            continue;
+        }
+        let key = normalized_recommendation_key(&candidate.name);
+        if key.is_empty() || !seen.insert(key) {
+            continue;
+        }
+        hits.push(search_hit_from_grounding_recommendation(&candidate));
+        if hits.len() >= limit {
+            break;
+        }
+    }
+    hits
+}
+
+fn search_hit_from_grounding_recommendation(candidate: &RecommendationCandidate<'_>) -> SearchHit {
+    SearchHit {
+        node_id: candidate.symbol.id.clone(),
+        display_name: candidate.name.clone(),
+        kind: candidate.symbol.kind,
+        file_path: candidate.path.clone(),
+        line: candidate.symbol.line,
+        score: 1.0,
+        origin: SearchHitOrigin::IndexedSymbol,
+        resolvable: true,
+        score_breakdown: Some(RetrievalScoreBreakdownDto {
+            lexical: 0.45,
+            semantic: 0.0,
+            graph: 0.55,
+            total: 1.0,
+        }),
+    }
+}
+
 impl AppController {
     pub fn grounding_snapshot(
         &self,
@@ -530,18 +808,7 @@ impl AppController {
             ));
         }
 
-        let mut recommended_queries = Vec::new();
-        for node in root_symbols.iter().take(5) {
-            let trimmed = node
-                .label
-                .split('@')
-                .next()
-                .map(str::trim)
-                .unwrap_or(node.label.as_str());
-            if !trimmed.is_empty() {
-                recommended_queries.push(trimmed.to_string());
-            }
-        }
+        let recommended_queries = recommended_grounding_queries(&root_symbols, &file_digests);
 
         let mut notes = vec![
             "Use `search --query <term>` to locate a symbol quickly.".to_string(),
@@ -748,6 +1015,116 @@ mod tests {
             child,
         ])?;
         Ok(())
+    }
+
+    fn grounding_symbol(
+        id: &str,
+        label: &str,
+        kind: codestory_contracts::api::NodeKind,
+        member_count: Option<u32>,
+    ) -> GroundingSymbolDigestDto {
+        GroundingSymbolDigestDto {
+            id: codestory_contracts::api::NodeId(id.to_string()),
+            node_ref: label
+                .split_once(" @ ")
+                .map(|(_, path)| format!("{path}:1:{}", label.split(" @ ").next().unwrap())),
+            label: label.to_string(),
+            kind,
+            line: Some(1),
+            member_count,
+            summary: None,
+            edge_digest: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recommended_grounding_queries_prefer_architecture_anchors() {
+        let fixture_symbols = vec![
+            grounding_symbol(
+                "fixture-js",
+                "Notifier @ crates/codestory-indexer/tests/fixtures/javascript_workflow.js",
+                codestory_contracts::api::NodeKind::CLASS,
+                Some(1),
+            ),
+            grounding_symbol(
+                "fixture-rs",
+                "Notifier @ crates/codestory-indexer/tests/fixtures/rust_workflow.rs",
+                codestory_contracts::api::NodeKind::INTERFACE,
+                Some(1),
+            ),
+            grounding_symbol(
+                "javaparser",
+                "com.github.javaparser.ast.visitor.CloneVisitor @ bin/app/user/projects/javaparser/src/main/java/com/github/javaparser/ast/visitor/CloneVisitor.java",
+                codestory_contracts::api::NodeKind::CLASS,
+                Some(2),
+            ),
+            grounding_symbol(
+                "sqlite",
+                "sqlite3 @ src/external/sqlite/sqlite3.c",
+                codestory_contracts::api::NodeKind::CLASS,
+                Some(2),
+            ),
+            grounding_symbol(
+                "testing-fixture",
+                "Bar @ testing/project_setup/custom_command_python/data/src/bar.py",
+                codestory_contracts::api::NodeKind::CLASS,
+                Some(2),
+            ),
+        ];
+        let files = vec![
+            GroundingFileDigestDto {
+                file_path: "crates/codestory-runtime/src/lib.rs".to_string(),
+                language: Some("rust".to_string()),
+                symbol_count: 4,
+                represented_symbol_count: 4,
+                compressed: true,
+                symbols: vec![
+                    grounding_symbol(
+                        "storage",
+                        "Storage @ crates/codestory-runtime/src/lib.rs",
+                        codestory_contracts::api::NodeKind::TYPEDEF,
+                        None,
+                    ),
+                    grounding_symbol(
+                        "runtime",
+                        "Runtime @ crates/codestory-runtime/src/lib.rs",
+                        codestory_contracts::api::NodeKind::STRUCT,
+                        Some(12),
+                    ),
+                ],
+            },
+            GroundingFileDigestDto {
+                file_path: "crates/codestory-indexer/src/lib.rs".to_string(),
+                language: Some("rust".to_string()),
+                symbol_count: 2,
+                represented_symbol_count: 2,
+                compressed: true,
+                symbols: vec![
+                    grounding_symbol(
+                        "language-config",
+                        "LanguageConfig @ crates/codestory-indexer/src/lib.rs",
+                        codestory_contracts::api::NodeKind::STRUCT,
+                        Some(6),
+                    ),
+                    grounding_symbol(
+                        "std-string",
+                        "std::wstring @ crates/codestory-indexer/src/lib.rs",
+                        codestory_contracts::api::NodeKind::CLASS,
+                        Some(1),
+                    ),
+                ],
+            },
+        ];
+
+        let recommended = recommended_grounding_queries(&fixture_symbols, &files);
+
+        assert_eq!(recommended.first().map(String::as_str), Some("Runtime"));
+        assert!(recommended.iter().any(|query| query == "LanguageConfig"));
+        assert!(!recommended.iter().any(|query| query == "Notifier"));
+        assert!(!recommended.iter().any(|query| query.contains("javaparser")));
+        assert!(!recommended.iter().any(|query| query == "sqlite3"));
+        assert!(!recommended.iter().any(|query| query == "Bar"));
+        assert!(!recommended.iter().any(|query| query == "std::wstring"));
     }
 
     #[test]

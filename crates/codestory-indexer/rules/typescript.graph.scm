@@ -266,6 +266,31 @@
   attr (@name.node) end_col = (end-column @def)
 }
 
+;; Top-level properties on exported object configs
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @owner
+      value: (object
+        (pair
+          key: [
+            (property_identifier)
+            (identifier)
+            (string)
+          ] @field_name) @field_def))))
+{
+  node @field_name.node
+  attr (@field_name.node) kind = "FIELD"
+  attr (@field_name.node) name = (source-text @field_name)
+  attr (@field_name.node) start_row = (start-row @field_def)
+  attr (@field_name.node) start_col = (start-column @field_def)
+  attr (@field_name.node) end_row = (end-row @field_def)
+  attr (@field_name.node) end_col = (end-column @field_def)
+
+  edge @owner.node -> @field_name.node
+  attr (@owner.node -> @field_name.node) kind = "MEMBER"
+}
+
 ;; Default-exported config factory calls
 (export_statement
   value: (call_expression

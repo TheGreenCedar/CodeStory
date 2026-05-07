@@ -1026,21 +1026,7 @@ fn repo_explanation_grounding_hits(
         }
     };
 
-    let mut hits = Vec::new();
-    let mut seen = HashSet::new();
-    for symbol in snapshot
-        .root_symbols
-        .iter()
-        .chain(snapshot.files.iter().flat_map(|file| file.symbols.iter()))
-    {
-        if !seen.insert(symbol.id.clone()) {
-            continue;
-        }
-        hits.push(search_hit_from_grounding_symbol(symbol));
-        if hits.len() >= max_results {
-            break;
-        }
-    }
+    let hits = crate::grounding::grounding_explanation_search_hits(&snapshot, max_results);
 
     trace.finish_ok(
         step,
@@ -1057,6 +1043,7 @@ fn repo_explanation_grounding_hits(
     Ok(hits)
 }
 
+#[cfg(test)]
 fn search_hit_from_grounding_symbol(
     symbol: &codestory_contracts::api::GroundingSymbolDigestDto,
 ) -> SearchHit {
@@ -1088,6 +1075,7 @@ fn search_hit_from_grounding_symbol(
     }
 }
 
+#[cfg(test)]
 fn split_node_ref_location(value: &str) -> Option<(Option<String>, Option<u32>)> {
     let mut parts = value.rsplitn(3, ':');
     let _name = parts.next()?;

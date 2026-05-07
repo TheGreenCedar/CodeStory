@@ -3,8 +3,9 @@ use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use codestory_contracts::api::{
     AgentAnswerDto, AgentAskRequest, AgentConnectionSettingsDto, AgentHybridWeightsDto,
-    AgentResponseModeDto, AppEventPayload, BookmarkCategoryDto, BookmarkDto,
-    CreateBookmarkCategoryRequest, CreateBookmarkRequest, GraphArtifactDto, IndexFreshnessDto,
+    AgentResponseModeDto, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto,
+    AppEventPayload, BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest,
+    CreateBookmarkRequest, GraphArtifactDto, GroundingBudgetDto, IndexFreshnessDto,
     IndexFreshnessStatusDto, IndexMode, NodeId, NodeKind, RepoTextScanStatsDto,
     RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto, SearchHit, SearchHybridLimitsDto,
     SearchRepoTextMode, SearchRequest,
@@ -38,11 +39,11 @@ use args::{
     AskCommand, BookmarkAction, BookmarkAddCommand, BookmarkAddOutput, BookmarkCommand,
     BookmarkListCommand, BookmarkListOutput, BookmarkOutput, BookmarkRemoveCommand,
     BookmarkRemoveOutput, Cli, Command, CompletionShell, DoctorCheckOutput, DoctorCommand,
-    DoctorOutput, GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput,
-    IndexOutput, QueryCommand, QueryOutput, QueryResolutionOutput, RepoTextMode, SearchCommand,
-    SearchHitOutput, SearchOutput, ServeCommand, SetupAction, SetupCommand, SnippetCommand,
-    SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, TrailCommand, TrailJsonOutput,
-    ask_retrieval_profile, build_trail_request,
+    DoctorOutput, ExplainCommand, ExplainOutput, GenerateCompletionsCommand, GroundCommand,
+    IndexCommand, IndexDryRunOutput, IndexOutput, QueryCommand, QueryOutput, QueryResolutionOutput,
+    RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput, ServeCommand, SetupAction,
+    SetupCommand, SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, TrailCommand,
+    TrailJsonOutput, ask_retrieval_profile, build_trail_request,
 };
 #[cfg(test)]
 use codestory_contracts::api::TrailContextDto;
@@ -51,11 +52,11 @@ use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
 #[cfg(test)]
 use http_transport::search_repo_text_mode_param;
 use output::{
-    emit, emit_text, render_agent_answer_markdown, render_doctor_markdown, render_ground_markdown,
-    render_index_dry_run_markdown, render_index_markdown, render_query_markdown,
-    render_search_markdown, render_snippet_markdown, render_symbol_markdown, render_symbol_mermaid,
-    render_trail_dot, render_trail_markdown, render_trail_mermaid, render_trail_story_markdown,
-    validate_output_file_parent,
+    emit, emit_text, render_agent_answer_markdown, render_doctor_markdown, render_explain_markdown,
+    render_ground_markdown, render_index_dry_run_markdown, render_index_markdown,
+    render_query_markdown, render_search_markdown, render_snippet_markdown, render_symbol_markdown,
+    render_symbol_mermaid, render_trail_dot, render_trail_markdown, render_trail_mermaid,
+    render_trail_story_markdown, validate_output_file_parent,
 };
 use runtime::{
     AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
@@ -118,6 +119,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Index(cmd) => run_index(cmd),
         Command::Ground(cmd) => run_ground(cmd),
+        Command::Explain(cmd) => run_explain(cmd),
         Command::Ask(cmd) => run_ask(cmd),
         Command::Doctor(cmd) => run_doctor(cmd),
         Command::Setup(cmd) => run_setup(cmd),
@@ -408,6 +410,121 @@ fn run_ground(cmd: GroundCommand) -> Result<()> {
         .map_err(map_api_error)?;
     let markdown = render_ground_markdown(&runtime.project_root, &snapshot, cmd.why);
     emit(cmd.format, &snapshot, markdown, cmd.output_file.as_deref())
+}
+
+fn run_explain(cmd: ExplainCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "explain")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let prompt = cmd.prompt.trim().to_string();
+    if prompt.is_empty() {
+        bail!("Prompt cannot be empty.");
+    }
+
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    let opened = runtime.ensure_open(cmd.refresh)?;
+    ensure_index_ready(&opened, "explain")?;
+
+    let snapshot = runtime
+        .grounding
+        .grounding_snapshot(GroundingBudgetDto::Balanced)
+        .map_err(map_api_error)?;
+    let search_results = runtime
+        .browser
+        .search_results(SearchRequest {
+            query: prompt.clone(),
+            repo_text: SearchRepoTextMode::Auto,
+            limit_per_source: cmd.max_results.clamp(1, 25),
+            hybrid_weights: None,
+            hybrid_limits: None,
+        })
+        .map_err(map_api_error)?;
+    let search_output = search_output_from_results(&runtime.project_root, &search_results, true);
+    let anchors = search_output
+        .indexed_symbol_hits
+        .iter()
+        .chain(search_output.suggestions.iter())
+        .filter(|hit| hit.resolvable)
+        .take(cmd.max_results.clamp(1, 25) as usize)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let request = AgentAskRequest {
+        prompt: prompt.clone(),
+        retrieval_profile: AgentRetrievalProfileSelectionDto::Preset {
+            preset: AgentRetrievalPresetDto::Investigate,
+        },
+        focus_node_id: None,
+        max_results: Some(cmd.max_results.clamp(1, 25)),
+        response_mode: AgentResponseModeDto::Markdown,
+        latency_budget_ms: None,
+        include_evidence: true,
+        hybrid_weights: None,
+        connection: AgentConnectionSettingsDto {
+            backend: cmd.backend.into(),
+            command: cmd.agent_command.clone(),
+        },
+        run_local_agent: cmd.with_local_agent,
+    };
+
+    let mut answer = if cmd.with_local_agent {
+        runtime.agent.ask(request).map_err(map_api_error)?
+    } else {
+        runtime.browser.ask(request).map_err(map_api_error)?
+    };
+    answer
+        .retrieval_trace
+        .annotations
+        .push(if cmd.with_local_agent {
+            "mode=repo_explain_local_agent".to_string()
+        } else {
+            "mode=repo_explain_db_first_no_local_agent".to_string()
+        });
+    answer
+        .retrieval_trace
+        .annotations
+        .push("workflow=doctor_index_ground_anchor_search_focused_ask".to_string());
+
+    let refresh = refresh_label(cmd.refresh, opened.refresh_mode);
+    let storage_path = runtime.storage_path.to_string_lossy().to_string();
+    let retrieval = opened.summary.retrieval.as_ref();
+    let next_commands = explain_next_commands(&runtime.project_root, &anchors);
+    let output = ExplainOutput {
+        project: &opened.summary.root,
+        storage_path: &storage_path,
+        refresh: &refresh,
+        prompt: &prompt,
+        workflow: vec![
+            "open_or_refresh_index",
+            "ground",
+            "anchor_search",
+            "focused_ask",
+        ],
+        summary: &opened.summary,
+        retrieval,
+        grounding: &snapshot,
+        anchors,
+        answer: &answer,
+        next_commands,
+    };
+    let markdown = render_explain_markdown(&runtime.project_root, &output);
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn explain_next_commands(
+    project_root: &std::path::Path,
+    anchors: &[SearchHitOutput],
+) -> Vec<String> {
+    anchors
+        .iter()
+        .take(3)
+        .map(|anchor| {
+            format!(
+                "codestory-cli explore --project {} --id {} --no-tui",
+                quote_command_path(project_root),
+                anchor.node_id
+            )
+        })
+        .collect()
 }
 
 fn run_ask(cmd: AskCommand) -> Result<()> {
@@ -835,16 +952,37 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
             cmd.output_file.as_deref(),
         );
     }
-    let markdown = if let Some(story) = context.story.as_ref() {
+    let notes = trail_guidance_notes(&context);
+    let mut markdown = if let Some(story) = context.story.as_ref() {
         render_trail_story_markdown(&runtime.project_root, &target, &context, &cmd, story)
     } else {
         render_trail_markdown(&runtime.project_root, &target, &context, &cmd)
     };
+    if !notes.is_empty() {
+        let _ = writeln!(markdown, "notes:");
+        for note in &notes {
+            let _ = writeln!(markdown, "- {note}");
+        }
+    }
     let output = TrailJsonOutput {
         resolution: build_query_resolution_output(&runtime.project_root, &target),
         trail: &context,
+        notes,
     };
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn trail_guidance_notes(context: &codestory_contracts::api::TrailContextDto) -> Vec<String> {
+    if !context.trail.edges.is_empty() || context.trail.nodes.len() > 1 {
+        return Vec::new();
+    }
+    if context.focus.file_path.is_none() {
+        return Vec::new();
+    }
+    vec![format!(
+        "No graph edges were indexed for `{}`. For object/config exports, use `snippet --id {}` or `explore --id {}` to inspect fields, hooks, access rules, and imports.",
+        context.focus.display_name, context.focus.id.0, context.focus.id.0
+    )]
 }
 
 fn run_snippet(cmd: SnippetCommand) -> Result<()> {
@@ -2398,6 +2536,13 @@ mod tests {
                 "codestory-cli",
                 "ask",
                 "How does this work?",
+                "--output-file",
+                "out.md",
+            ],
+            vec![
+                "codestory-cli",
+                "explain",
+                "How does this repo fit together?",
                 "--output-file",
                 "out.md",
             ],

@@ -3314,7 +3314,7 @@ impl AppController {
             limit_per_source,
             req.hybrid_weights.clone(),
         )?;
-        let suggestions = did_you_mean_suggestions(&scored_symbol_hits);
+        let mut suggestions = did_you_mean_suggestions(&scored_symbol_hits);
         let mut indexed_symbol_hits = scored_symbol_hits
             .drain(..)
             .map(|scored| scored.hit)
@@ -3329,8 +3329,21 @@ impl AppController {
         indexed_symbol_hits.sort_by(|left, right| compare_search_hits(&query, left, right));
         dedupe_inexact_search_hits_by_display_key(&query, &mut indexed_symbol_hits);
         indexed_symbol_hits.truncate(limit_per_source);
+        let mut used_repo_explanation_overview = false;
+        if Self::is_repo_explanation_search_query(&query)
+            && let Ok(snapshot) = self.grounding_snapshot(GroundingBudgetDto::Balanced)
+        {
+            let overview_hits =
+                grounding::grounding_explanation_search_hits(&snapshot, limit_per_source);
+            if !overview_hits.is_empty() {
+                used_repo_explanation_overview = true;
+                suggestions = overview_hits.clone();
+                indexed_symbol_hits = overview_hits;
+            }
+        }
 
-        let repo_text_enabled = Self::repo_text_enabled_for_mode(repo_text_mode, &query);
+        let repo_text_enabled = Self::repo_text_enabled_for_mode(repo_text_mode, &query)
+            && !used_repo_explanation_overview;
         let indexed_hit_ids = indexed_symbol_hits
             .iter()
             .map(|hit| hit.node_id.clone())
@@ -3365,6 +3378,18 @@ impl AppController {
             repo_text_hits,
             hits,
         })
+    }
+
+    fn is_repo_explanation_search_query(query: &str) -> bool {
+        let lower = query.to_ascii_lowercase();
+        let subject =
+            lower.contains("repo") || lower.contains("repository") || lower.contains("codebase");
+        let intent = lower.contains("fit together")
+            || lower.contains("how does")
+            || lower.contains("explain")
+            || lower.contains("overview")
+            || lower.contains("architecture");
+        subject && intent
     }
 
     fn expanded_symbol_hits(
