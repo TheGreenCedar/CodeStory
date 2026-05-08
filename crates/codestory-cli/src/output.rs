@@ -700,11 +700,8 @@ fn append_ground_evidence_packet(
     if snapshot.recommended_queries.is_empty() {
         let _ = writeln!(
             markdown,
-            "- `{}`",
-            format!(
-                "codestory-cli ground --project {} --why",
-                quoted_cli_arg(&clean_path_string(&project_root.to_string_lossy()))
-            )
+            "- `codestory-cli ground --project {} --why`",
+            quoted_cli_arg(&clean_path_string(&project_root.to_string_lossy()))
         );
     } else {
         for command in snapshot

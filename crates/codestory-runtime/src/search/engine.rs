@@ -38,6 +38,9 @@ pub const SYMBOL_FULL_TEXT_INDEX_ENV: &str = "CODESTORY_SYMBOL_FULL_TEXT_INDEX";
 const DEFAULT_LLAMACPP_EMBEDDINGS_URL: &str = "http://127.0.0.1:8080/v1/embeddings";
 const SEMANTIC_QUANTIZED_RESCORE_MULTIPLIER: usize = 4;
 
+type HttpHeaders = Vec<(String, String)>;
+type RawHttpResponse = (u16, HttpHeaders, Vec<u8>);
+
 #[derive(Debug, Clone)]
 pub struct EmbeddingRuntimeAvailability {
     pub available: bool,
@@ -98,7 +101,7 @@ impl EmbeddingBackendSelection {
         }
 
         let backend = std::env::var(EMBEDDING_BACKEND_ENV)
-            .unwrap_or_else(|_| runtime_mode)
+            .unwrap_or(runtime_mode)
             .trim()
             .to_ascii_lowercase();
         match backend.as_str() {
@@ -713,7 +716,7 @@ fn post_json_to_http_endpoint(
     })
 }
 
-fn split_http_response(response: &[u8]) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
+fn split_http_response(response: &[u8]) -> Result<RawHttpResponse> {
     let header_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -845,18 +848,16 @@ impl EmbeddingRuntime {
         let model_id = profile.cache_model_id(backend);
 
         match backend {
-            EmbeddingBackendSelection::HashProjection => {
-                return Ok(Self {
-                    model_path: PathBuf::from("hash-projection"),
-                    model_id,
-                    profile,
-                    backend: EmbeddingBackend::HashProjection,
-                });
-            }
+            EmbeddingBackendSelection::HashProjection => Ok(Self {
+                model_path: PathBuf::from("hash-projection"),
+                model_id,
+                profile,
+                backend: EmbeddingBackend::HashProjection,
+            }),
             EmbeddingBackendSelection::LlamaCpp => {
                 let endpoint = LlamaCppEndpoint::from_env()?;
                 endpoint.ensure_reachable()?;
-                return Ok(Self {
+                Ok(Self {
                     model_path: PathBuf::from(endpoint.url()),
                     model_id,
                     profile,
@@ -864,7 +865,7 @@ impl EmbeddingRuntime {
                         endpoint,
                         request_count: env_usize(LLAMACPP_REQUEST_COUNT_ENV, 1, 16).unwrap_or(1),
                     })),
-                });
+                })
             }
         }
     }
@@ -1508,11 +1509,12 @@ fn explicit_negative_query_terms(query: &str) -> Vec<String> {
     let mut seen = HashSet::new();
 
     for index in 0..tokens.len() {
+        let starts_two_token_phrase = (tokens[index] == "rather"
+            && tokens.get(index + 1).is_some_and(|t| t == "than"))
+            || (tokens[index] == "instead" && tokens.get(index + 1).is_some_and(|t| t == "of"));
         let start = if tokens[index] == "not" {
             Some(index + 1)
-        } else if tokens[index] == "rather" && tokens.get(index + 1).is_some_and(|t| t == "than") {
-            Some(index + 2)
-        } else if tokens[index] == "instead" && tokens.get(index + 1).is_some_and(|t| t == "of") {
+        } else if starts_two_token_phrase {
             Some(index + 2)
         } else {
             None

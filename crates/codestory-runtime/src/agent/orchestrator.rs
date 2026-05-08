@@ -149,12 +149,14 @@ pub(crate) fn agent_ask(
 
     let source_context = maybe_read_source_context(
         controller,
-        &req,
-        &prompt,
-        &resolved_profile,
-        ask_started_at,
-        bundle.focused_node.as_ref(),
-        bundle.fallback_used,
+        SourceContextRequest {
+            req: &req,
+            prompt: &prompt,
+            resolved_profile: &resolved_profile,
+            ask_started_at,
+            focused_node: bundle.focused_node.as_ref(),
+            fallback_focus: bundle.fallback_used,
+        },
         &mut trace,
     );
 
@@ -1309,25 +1311,29 @@ fn sanitize_plan_filters(plan: &TrailPlan, options: &TrailFilterOptionsDto) -> T
     sanitized
 }
 
+struct SourceContextRequest<'a> {
+    req: &'a AgentAskRequest,
+    prompt: &'a str,
+    resolved_profile: &'a ResolvedProfile,
+    ask_started_at: Instant,
+    focused_node: Option<&'a NodeDetailsDto>,
+    fallback_focus: bool,
+}
+
 fn maybe_read_source_context(
     controller: &AppController,
-    req: &AgentAskRequest,
-    prompt: &str,
-    resolved_profile: &ResolvedProfile,
-    ask_started_at: Instant,
-    focused_node: Option<&NodeDetailsDto>,
-    fallback_focus: bool,
+    request: SourceContextRequest<'_>,
     trace: &mut TraceRecorder,
 ) -> Option<FocusedSourceContext> {
     let source_step = trace.start_step(
         AgentRetrievalStepKindDto::SourceRead,
         vec![field(
             "enabled",
-            resolved_profile.enable_source_reads.to_string(),
+            request.resolved_profile.enable_source_reads.to_string(),
         )],
     );
 
-    if !resolved_profile.enable_source_reads {
+    if !request.resolved_profile.enable_source_reads {
         trace.finish_skipped(
             source_step,
             "Source reads disabled by profile configuration.",
@@ -1336,7 +1342,7 @@ fn maybe_read_source_context(
         return None;
     }
 
-    if !needs_source_context(prompt) && !fallback_focus {
+    if !needs_source_context(request.prompt) && !request.fallback_focus {
         trace.finish_skipped(
             source_step,
             "Prompt does not request source-level context.",
@@ -1345,8 +1351,12 @@ fn maybe_read_source_context(
         return None;
     }
 
-    let source_deadline = phase_deadline_ms(req, 50, 100);
-    if should_truncate_phase(resolved_profile, ask_started_at, source_deadline) {
+    let source_deadline = phase_deadline_ms(request.req, 50, 100);
+    if should_truncate_phase(
+        request.resolved_profile,
+        request.ask_started_at,
+        source_deadline,
+    ) {
         trace.finish_truncated(
             source_step,
             "Skipped source read because latency-first phase budget was exceeded.",
@@ -1356,7 +1366,7 @@ fn maybe_read_source_context(
         return None;
     }
 
-    let Some(node) = focused_node else {
+    let Some(node) = request.focused_node else {
         trace.finish_skipped(source_step, "No focused node available.", Vec::new());
         return None;
     };
@@ -1374,7 +1384,7 @@ fn maybe_read_source_context(
         &path,
         line,
         6,
-        resolved_profile.max_source_bytes,
+        request.resolved_profile.max_source_bytes,
         SOURCE_SNIPPET_TRUNCATION_SUFFIX,
     ) {
         Ok((resolved_path, bounded)) => {
@@ -1390,7 +1400,7 @@ fn maybe_read_source_context(
                     field("line", context.line.to_string()),
                     field(
                         "max_source_bytes",
-                        resolved_profile.max_source_bytes.to_string(),
+                        request.resolved_profile.max_source_bytes.to_string(),
                     ),
                     field("snippet_bytes", context.snippet.len().to_string()),
                     field("truncated", bounded.truncated.to_string()),

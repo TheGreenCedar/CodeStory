@@ -92,33 +92,24 @@ pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
         trail: &trail,
         snippet: snippet.as_ref(),
     };
-    let markdown = render_explore_markdown(
-        &runtime.project_root,
-        &target,
-        &output.status,
-        &output.search,
-        &output.navigation,
-        &symbol,
-        &trail,
-        snippet.as_ref(),
-        &snippet_layer_note,
-    );
+    let render_context = ExploreRenderContext {
+        project_root: &runtime.project_root,
+        target: &target,
+        status: &output.status,
+        search: &output.search,
+        navigation: &output.navigation,
+        symbol: &symbol,
+        trail: &trail,
+        snippet: snippet.as_ref(),
+        snippet_layer_note: &snippet_layer_note,
+    };
+    let markdown = render_explore_markdown(&render_context);
     if cmd.format == args::OutputFormat::Markdown
         && cmd.output_file.is_none()
         && !cmd.no_tui
         && std::io::stdout().is_terminal()
     {
-        return run_explore_tui(
-            &runtime.project_root,
-            &target,
-            &output.status,
-            &output.search,
-            &output.navigation,
-            &symbol,
-            &trail,
-            snippet.as_ref(),
-            &snippet_layer_note,
-        );
+        return run_explore_tui(&render_context);
     }
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
@@ -540,64 +531,75 @@ fn explore_trail_command(
     }
 }
 
-fn render_explore_markdown(
-    project_root: &std::path::Path,
-    target: &runtime::ResolvedTarget,
-    status: &ExploreStatusOutput,
-    search: &ExploreSearchOutput,
-    navigation: &NavigationOutput,
-    symbol: &SymbolContextDto,
-    trail: &TrailContextDto,
-    snippet: Option<&SnippetContextDto>,
-    snippet_layer_note: &str,
-) -> String {
+struct ExploreRenderContext<'a> {
+    project_root: &'a std::path::Path,
+    target: &'a runtime::ResolvedTarget,
+    status: &'a ExploreStatusOutput,
+    search: &'a ExploreSearchOutput,
+    navigation: &'a NavigationOutput,
+    symbol: &'a SymbolContextDto,
+    trail: &'a TrailContextDto,
+    snippet: Option<&'a SnippetContextDto>,
+    snippet_layer_note: &'a str,
+}
+
+fn render_explore_markdown(context: &ExploreRenderContext<'_>) -> String {
     let mut markdown = String::new();
     markdown.push_str("# Explore\n");
     markdown.push_str("status:\n");
-    markdown.push_str(&render_explore_status_markdown(status));
+    markdown.push_str(&render_explore_status_markdown(context.status));
     markdown.push_str("search:\n");
-    markdown.push_str(&render_explore_search_markdown(search));
+    markdown.push_str(&render_explore_search_markdown(context.search));
     markdown.push_str("results:\n");
-    markdown.push_str(&render_explore_results_markdown(navigation));
+    markdown.push_str(&render_explore_results_markdown(context.navigation));
     markdown.push_str("resolution:\n");
     markdown.push_str(&format!(
         "- {}\n",
         output::node_ref(
-            project_root,
-            target.selected.file_path.as_deref(),
-            target.selected.line,
-            &target.selected.display_name
+            context.project_root,
+            context.target.selected.file_path.as_deref(),
+            context.target.selected.line,
+            &context.target.selected.display_name
         )
-        .unwrap_or_else(|| target.selected.display_name.clone())
+        .unwrap_or_else(|| context.target.selected.display_name.clone())
     ));
     markdown.push_str("navigation:\n");
-    if let Some(node_ref) = navigation.definition.node_ref.as_deref() {
+    if let Some(node_ref) = context.navigation.definition.node_ref.as_deref() {
         markdown.push_str(&format!("- definition: `{node_ref}`\n"));
     } else {
         markdown.push_str(&format!(
             "- definition: {}\n",
-            navigation.definition.display_name
+            context.navigation.definition.display_name
         ));
     }
     markdown.push_str(&format!(
         "- incoming_references: {}\n",
-        navigation.incoming_references.len()
+        context.navigation.incoming_references.len()
     ));
     markdown.push_str(&format!(
         "- outgoing_references: {}\n",
-        navigation.outgoing_references.len()
+        context.navigation.outgoing_references.len()
     ));
     markdown.push_str("symbol:\n");
-    markdown.push_str(&render_symbol_markdown(project_root, target, symbol));
+    markdown.push_str(&render_symbol_markdown(
+        context.project_root,
+        context.target,
+        context.symbol,
+    ));
     markdown.push_str("\ntrail:\n");
-    let cmd = explore_trail_command(project_root, target, trail);
-    markdown.push_str(&render_trail_markdown(project_root, target, trail, &cmd));
+    let cmd = explore_trail_command(context.project_root, context.target, context.trail);
+    markdown.push_str(&render_trail_markdown(
+        context.project_root,
+        context.target,
+        context.trail,
+        &cmd,
+    ));
     markdown.push_str("\nsnippet:\n");
-    markdown.push_str(&format!("- {snippet_layer_note}\n"));
-    if let Some(snippet) = snippet {
+    markdown.push_str(&format!("- {}\n", context.snippet_layer_note));
+    if let Some(snippet) = context.snippet {
         markdown.push_str(&render_snippet_markdown(
-            project_root,
-            target,
+            context.project_root,
+            context.target,
             snippet,
             false,
         ));
@@ -610,47 +612,47 @@ struct ExplorePane {
     body: String,
 }
 
-fn build_explore_panes(
-    project_root: &std::path::Path,
-    target: &runtime::ResolvedTarget,
-    status: &ExploreStatusOutput,
-    search: &ExploreSearchOutput,
-    navigation: &NavigationOutput,
-    symbol: &SymbolContextDto,
-    trail: &TrailContextDto,
-    snippet: Option<&SnippetContextDto>,
-    snippet_layer_note: &str,
-) -> Vec<ExplorePane> {
+fn build_explore_panes(context: &ExploreRenderContext<'_>) -> Vec<ExplorePane> {
     vec![
         ExplorePane {
             label: "Status",
-            body: render_explore_status_markdown(status),
+            body: render_explore_status_markdown(context.status),
         },
         ExplorePane {
             label: "Search",
-            body: render_explore_search_markdown(search),
+            body: render_explore_search_markdown(context.search),
         },
         ExplorePane {
             label: "Results",
-            body: render_explore_results_markdown(navigation),
+            body: render_explore_results_markdown(context.navigation),
         },
         ExplorePane {
             label: "Detail",
-            body: render_symbol_markdown(project_root, target, symbol),
+            body: render_symbol_markdown(context.project_root, context.target, context.symbol),
         },
         ExplorePane {
             label: "Trail",
             body: {
-                let cmd = explore_trail_command(project_root, target, trail);
-                render_trail_markdown(project_root, target, trail, &cmd)
+                let cmd =
+                    explore_trail_command(context.project_root, context.target, context.trail);
+                render_trail_markdown(context.project_root, context.target, context.trail, &cmd)
             },
         },
         ExplorePane {
             label: "Snippet",
             body: format!(
-                "{snippet_layer_note}\n{}",
-                snippet
-                    .map(|context| render_snippet_markdown(project_root, target, context, false))
+                "{}\n{}",
+                context.snippet_layer_note,
+                context
+                    .snippet
+                    .map(|snippet| {
+                        render_snippet_markdown(
+                            context.project_root,
+                            context.target,
+                            snippet,
+                            false,
+                        )
+                    })
                     .unwrap_or_default()
             ),
         },
@@ -729,17 +731,7 @@ impl Drop for TerminalCleanup {
     }
 }
 
-fn run_explore_tui(
-    project_root: &std::path::Path,
-    target: &runtime::ResolvedTarget,
-    status: &ExploreStatusOutput,
-    search: &ExploreSearchOutput,
-    navigation: &NavigationOutput,
-    symbol: &SymbolContextDto,
-    trail: &TrailContextDto,
-    snippet: Option<&SnippetContextDto>,
-    snippet_layer_note: &str,
-) -> Result<()> {
+fn run_explore_tui(context: &ExploreRenderContext<'_>) -> Result<()> {
     use crossterm::{
         event::{self, Event},
         terminal::{EnterAlternateScreen, enable_raw_mode},
@@ -753,17 +745,7 @@ fn run_explore_tui(
         widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     };
 
-    let panes = build_explore_panes(
-        project_root,
-        target,
-        status,
-        search,
-        navigation,
-        symbol,
-        trail,
-        snippet,
-        snippet_layer_note,
-    );
+    let panes = build_explore_panes(context);
 
     enable_raw_mode()?;
     let _cleanup = TerminalCleanup;
@@ -789,12 +771,12 @@ fn run_explore_tui(
                 .split(shell[1]);
 
             let title = output::node_ref(
-                project_root,
-                target.selected.file_path.as_deref(),
-                target.selected.line,
-                &target.selected.display_name,
+                context.project_root,
+                context.target.selected.file_path.as_deref(),
+                context.target.selected.line,
+                &context.target.selected.display_name,
             )
-            .unwrap_or_else(|| target.selected.display_name.clone());
+            .unwrap_or_else(|| context.target.selected.display_name.clone());
             frame.render_widget(
                 Paragraph::new(title).block(
                     Block::default()

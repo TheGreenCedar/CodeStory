@@ -56,9 +56,7 @@ fn handle_stdio_message(runtime: &RuntimeContext, line: &str) -> Option<serde_js
             "Invalid request: expected JSON-RPC object",
         ));
     }
-    let Some(id) = request.get("id").cloned() else {
-        return None;
-    };
+    let id = request.get("id").cloned()?;
     let Some(method) = request.get("method").and_then(|value| value.as_str()) else {
         return Some(stdio_jsonrpc_error(
             id,

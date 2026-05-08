@@ -300,10 +300,10 @@ fn trace_step_status(
         .status
 }
 
-fn trace_step<'a>(
-    answer: &'a codestory_contracts::api::AgentAnswerDto,
+fn trace_step(
+    answer: &codestory_contracts::api::AgentAnswerDto,
     kind: AgentRetrievalStepKindDto,
-) -> &'a codestory_contracts::api::AgentRetrievalStepDto {
+) -> &codestory_contracts::api::AgentRetrievalStepDto {
     answer
         .retrieval_trace
         .steps

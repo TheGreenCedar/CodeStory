@@ -870,22 +870,22 @@ fn search_output_from_results(
     search_results: &codestory_contracts::api::SearchResultsDto,
     include_score_details: bool,
 ) -> SearchOutput {
-    build_search_output(
+    build_search_output(SearchOutputParts {
         project_root,
-        &search_results.query,
-        &search_results.retrieval,
-        search_results.freshness.as_ref(),
-        &search_results.indexed_symbol_hits,
-        &search_results.repo_text_hits,
-        search_results.repo_text_stats.as_ref(),
-        &search_results.suggestions,
-        search_results.limit_per_source,
-        RepoTextOutputConfig {
+        query: &search_results.query,
+        retrieval: &search_results.retrieval,
+        freshness: search_results.freshness.as_ref(),
+        symbol_hits: &search_results.indexed_symbol_hits,
+        repo_text_hits: &search_results.repo_text_hits,
+        repo_text_stats: search_results.repo_text_stats.as_ref(),
+        suggestions: &search_results.suggestions,
+        limit_per_source: search_results.limit_per_source,
+        repo_text: RepoTextOutputConfig {
             mode: from_api_repo_text_mode(search_results.repo_text_mode),
             enabled: search_results.repo_text_enabled,
         },
-        include_score_details,
-    )
+        explain: include_score_details,
+    })
 }
 
 fn run_symbol(cmd: SymbolCommand) -> Result<()> {
@@ -1721,22 +1721,25 @@ fn ensure_dot_only_for_trail(format: args::OutputFormat, command: &str) -> Resul
     Ok(())
 }
 
-fn build_search_output(
-    project_root: &std::path::Path,
-    query: &str,
-    retrieval: &codestory_contracts::api::RetrievalStateDto,
-    freshness: Option<&IndexFreshnessDto>,
-    symbol_hits: &[SearchHit],
-    repo_text_hits: &[SearchHit],
-    repo_text_stats: Option<&RepoTextScanStatsDto>,
-    suggestions: &[SearchHit],
+struct SearchOutputParts<'a> {
+    project_root: &'a std::path::Path,
+    query: &'a str,
+    retrieval: &'a codestory_contracts::api::RetrievalStateDto,
+    freshness: Option<&'a IndexFreshnessDto>,
+    symbol_hits: &'a [SearchHit],
+    repo_text_hits: &'a [SearchHit],
+    repo_text_stats: Option<&'a RepoTextScanStatsDto>,
+    suggestions: &'a [SearchHit],
     limit_per_source: u32,
     repo_text: RepoTextOutputConfig,
     explain: bool,
-) -> SearchOutput {
-    let indexed_symbol_hits = symbol_hits
+}
+
+fn build_search_output(parts: SearchOutputParts<'_>) -> SearchOutput {
+    let indexed_symbol_hits = parts
+        .symbol_hits
         .iter()
-        .map(|hit| build_search_hit_output(project_root, hit, explain))
+        .map(|hit| build_search_hit_output(parts.project_root, hit, parts.explain))
         .collect::<Vec<_>>();
     let mut duplicate_index = HashMap::new();
     for hit in &indexed_symbol_hits {
@@ -1746,34 +1749,36 @@ fn build_search_output(
                 .or_insert_with(|| hit.node_id.clone());
         }
     }
-    let repo_text_hits = repo_text_hits
+    let repo_text_hits = parts
+        .repo_text_hits
         .iter()
         .map(|hit| {
-            let mut output = build_search_hit_output(project_root, hit, explain);
+            let mut output = build_search_hit_output(parts.project_root, hit, parts.explain);
             if let Some(key) = search_hit_location_key(&output) {
                 output.duplicate_of = duplicate_index.get(&key).cloned();
             }
             output
         })
         .collect::<Vec<_>>();
-    let query_hints = search_query_hints(query, &indexed_symbol_hits, &repo_text_hits);
+    let query_hints = search_query_hints(parts.query, &indexed_symbol_hits, &repo_text_hits);
 
     SearchOutput {
-        query: query.to_string(),
-        retrieval: retrieval.clone(),
-        freshness: freshness.cloned(),
-        limit_per_source,
-        repo_text_mode: repo_text.mode,
-        repo_text_enabled: repo_text.enabled,
-        explain,
+        query: parts.query.to_string(),
+        retrieval: parts.retrieval.clone(),
+        freshness: parts.freshness.cloned(),
+        limit_per_source: parts.limit_per_source,
+        repo_text_mode: parts.repo_text.mode,
+        repo_text_enabled: parts.repo_text.enabled,
+        explain: parts.explain,
         query_hints,
-        suggestions: suggestions
+        suggestions: parts
+            .suggestions
             .iter()
-            .map(|hit| build_search_hit_output(project_root, hit, explain))
+            .map(|hit| build_search_hit_output(parts.project_root, hit, parts.explain))
             .collect(),
         indexed_symbol_hits,
         repo_text_hits,
-        repo_text_stats: repo_text_stats.cloned(),
+        repo_text_stats: parts.repo_text_stats.cloned(),
     }
 }
 
@@ -2290,22 +2295,22 @@ mod tests {
             score_breakdown: None,
         }];
 
-        let output = build_search_output(
-            root,
-            "needle",
-            &sample_retrieval(),
-            None,
-            &symbol_hits,
-            &repo_text_hits,
-            None,
-            &[],
-            5,
-            RepoTextOutputConfig {
+        let output = build_search_output(SearchOutputParts {
+            project_root: root,
+            query: "needle",
+            retrieval: &sample_retrieval(),
+            freshness: None,
+            symbol_hits: &symbol_hits,
+            repo_text_hits: &repo_text_hits,
+            repo_text_stats: None,
+            suggestions: &[],
+            limit_per_source: 5,
+            repo_text: RepoTextOutputConfig {
                 mode: RepoTextMode::Auto,
                 enabled: true,
             },
-            false,
-        );
+            explain: false,
+        });
 
         assert_eq!(output.repo_text_mode, RepoTextMode::Auto);
         assert!(output.repo_text_enabled);
@@ -2413,22 +2418,22 @@ mod tests {
             score_breakdown: None,
         }];
 
-        let output = build_search_output(
-            root,
-            "ResolutionPass",
-            &sample_retrieval(),
-            None,
-            &symbol_hits,
-            &[],
-            None,
-            &[],
-            5,
-            RepoTextOutputConfig {
+        let output = build_search_output(SearchOutputParts {
+            project_root: root,
+            query: "ResolutionPass",
+            retrieval: &sample_retrieval(),
+            freshness: None,
+            symbol_hits: &symbol_hits,
+            repo_text_hits: &[],
+            repo_text_stats: None,
+            suggestions: &[],
+            limit_per_source: 5,
+            repo_text: RepoTextOutputConfig {
                 mode: RepoTextMode::Auto,
                 enabled: false,
             },
-            false,
-        );
+            explain: false,
+        });
 
         assert_eq!(
             output.indexed_symbol_hits[0].node_ref.as_deref(),
@@ -2462,22 +2467,22 @@ mod tests {
             score_breakdown: None,
         }];
 
-        let output = build_search_output(
-            root,
-            "snapshot digest",
-            &sample_retrieval(),
-            None,
-            &symbol_hits,
-            &repo_text_hits,
-            None,
-            &[],
-            5,
-            RepoTextOutputConfig {
+        let output = build_search_output(SearchOutputParts {
+            project_root: root,
+            query: "snapshot digest",
+            retrieval: &sample_retrieval(),
+            freshness: None,
+            symbol_hits: &symbol_hits,
+            repo_text_hits: &repo_text_hits,
+            repo_text_stats: None,
+            suggestions: &[],
+            limit_per_source: 5,
+            repo_text: RepoTextOutputConfig {
                 mode: RepoTextMode::Auto,
                 enabled: true,
             },
-            false,
-        );
+            explain: false,
+        });
 
         assert_eq!(
             output.repo_text_hits[0].duplicate_of.as_deref(),
@@ -2658,22 +2663,22 @@ mod tests {
             }),
         }];
 
-        let output = build_search_output(
-            root,
-            "ranked",
-            &sample_retrieval(),
-            None,
-            &symbol_hits,
-            &[],
-            None,
-            &[],
-            5,
-            RepoTextOutputConfig {
+        let output = build_search_output(SearchOutputParts {
+            project_root: root,
+            query: "ranked",
+            retrieval: &sample_retrieval(),
+            freshness: None,
+            symbol_hits: &symbol_hits,
+            repo_text_hits: &[],
+            repo_text_stats: None,
+            suggestions: &[],
+            limit_per_source: 5,
+            repo_text: RepoTextOutputConfig {
                 mode: RepoTextMode::Off,
                 enabled: false,
             },
-            true,
-        );
+            explain: true,
+        });
 
         assert!(output.explain);
         assert_eq!(

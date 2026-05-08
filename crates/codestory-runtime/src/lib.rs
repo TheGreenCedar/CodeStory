@@ -88,6 +88,10 @@ pub(crate) use symbol_query::{
 };
 
 type Storage = Store;
+type GraphNodeId = codestory_contracts::graph::NodeId;
+type WeightedGraphMatches = Vec<(GraphNodeId, f32)>;
+type GraphNodeNameMap = HashMap<GraphNodeId, String>;
+type ExpandedSymbolMatches = Option<(WeightedGraphMatches, GraphNodeNameMap)>;
 
 const REPO_TEXT_SCAN_FILE_CAP: usize = 2_000;
 const REPO_TEXT_SCAN_BYTE_CAP: usize = 32 * 1024 * 1024;
@@ -2063,15 +2067,15 @@ fn sync_llm_symbol_projection(
         .map(|doc| (doc.node_id, doc))
         .collect::<HashMap<_, _>>();
 
-    if let Some(scope) = llm_refresh_file_scope {
-        if scope.is_empty() {
-            if hydrate_semantic_docs {
-                let reload_started = Instant::now();
-                reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
-                stats.reload_ms = clamp_u128_to_u32(reload_started.elapsed().as_millis());
-            }
-            return Ok(stats);
+    if let Some(scope) = llm_refresh_file_scope
+        && scope.is_empty()
+    {
+        if hydrate_semantic_docs {
+            let reload_started = Instant::now();
+            reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
+            stats.reload_ms = clamp_u128_to_u32(reload_started.elapsed().as_millis());
         }
+        return Ok(stats);
     }
 
     let embed_batch_size = llm_doc_embed_batch_size();
@@ -2230,32 +2234,36 @@ fn lexical_hybrid_hits(
         .collect::<Vec<_>>()
 }
 
-fn hybrid_hits_for_retrieval_state(
-    engine: &mut SearchEngine,
-    req: &SearchRequest,
-    graph_boosts: &HashMap<codestory_contracts::graph::NodeId, f32>,
+struct HybridHitsContext<'a> {
+    req: &'a SearchRequest,
+    graph_boosts: &'a HashMap<codestory_contracts::graph::NodeId, f32>,
     requested_max_results: usize,
     request_weights: Option<AgentHybridWeightsDto>,
     prefer_primary_sources: bool,
-    storage_retrieval: &RetrievalStateDto,
+    storage_retrieval: &'a RetrievalStateDto,
+}
+
+fn hybrid_hits_for_retrieval_state(
+    engine: &mut SearchEngine,
+    context: HybridHitsContext<'_>,
     retrieval: &mut RetrievalStateDto,
 ) -> Vec<HybridSearchHit> {
     if retrieval.mode != RetrievalModeDto::Hybrid {
-        return lexical_hybrid_hits(engine, &req.query, graph_boosts);
+        return lexical_hybrid_hits(engine, &context.req.query, context.graph_boosts);
     }
 
     let config = hybrid_search_config_for_request(
-        req,
-        requested_max_results,
-        request_weights,
-        prefer_primary_sources,
+        context.req,
+        context.requested_max_results,
+        context.request_weights,
+        context.prefer_primary_sources,
     );
-    match engine.search_hybrid_with_scores(&req.query, graph_boosts, config) {
+    match engine.search_hybrid_with_scores(&context.req.query, context.graph_boosts, config) {
         Ok(value) => value,
         Err(error) => {
             tracing::warn!(
                 "Hybrid retrieval failed for query {:?}; falling back to symbolic ranking: {}",
-                req.query,
+                context.req.query,
                 error
             );
             *retrieval = retrieval_state_from_parts(
@@ -2266,9 +2274,9 @@ fn hybrid_hits_for_retrieval_state(
                     "Semantic query fallback engaged after runtime error: {error}"
                 )),
                 current_embedding_contract_from_env(),
-                storage_retrieval.stored_embedding.clone(),
+                context.storage_retrieval.stored_embedding.clone(),
             );
-            lexical_hybrid_hits(engine, &req.query, graph_boosts)
+            lexical_hybrid_hits(engine, &context.req.query, context.graph_boosts)
         }
     }
 }
@@ -3129,11 +3137,9 @@ impl AppController {
     }
 
     fn recover_failed_indexing(&self, storage_path: &Path, refresh_runtime_caches: bool) {
-        if refresh_runtime_caches {
-            if let Ok(mut storage) = Storage::open(storage_path) {
-                let _ = refresh_caches(self, &mut storage, storage_path, None);
-                return;
-            }
+        if refresh_runtime_caches && let Ok(mut storage) = Storage::open(storage_path) {
+            let _ = refresh_caches(self, &mut storage, storage_path, None);
+            return;
         }
         self.clear_search_state();
         self.state.lock().is_indexing = false;
@@ -3406,16 +3412,7 @@ impl AppController {
             .collect())
     }
 
-    fn expanded_symbol_matches(
-        &self,
-        query: &str,
-    ) -> Result<
-        Option<(
-            Vec<(codestory_contracts::graph::NodeId, f32)>,
-            HashMap<codestory_contracts::graph::NodeId, String>,
-        )>,
-        ApiError,
-    > {
+    fn expanded_symbol_matches(&self, query: &str) -> Result<ExpandedSymbolMatches, ApiError> {
         let mut s = self.state.lock();
         let engine = s.search_engine.as_mut().ok_or_else(|| {
             ApiError::invalid_argument("Search engine not initialized. Open a project first.")
@@ -3554,12 +3551,14 @@ impl AppController {
 
             let hits = hybrid_hits_for_retrieval_state(
                 engine,
-                &req,
-                &graph_boosts,
-                requested_max_results,
-                request_weights,
-                prefer_primary_sources,
-                &storage_retrieval,
+                HybridHitsContext {
+                    req: &req,
+                    graph_boosts: &graph_boosts,
+                    requested_max_results,
+                    request_weights,
+                    prefer_primary_sources,
+                    storage_retrieval: &storage_retrieval,
+                },
                 &mut retrieval,
             );
 

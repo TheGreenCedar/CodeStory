@@ -491,7 +491,7 @@ fn warm_stdio_agent_loop_emits_stats_without_protocol_pollution() {
 
     let (fixture, index) = indexed_fixture(&binary);
     let index_json = &index.value;
-    let storage_path = PathBuf::from(string_field(&index_json, &["storage_path"]));
+    let storage_path = PathBuf::from(string_field(index_json, &["storage_path"]));
     let search_dir = search_dir_for_storage(&storage_path);
     let cold_search = run_cli_json(
         &binary,

@@ -23,6 +23,9 @@ const DISABLE_AUTOSTART_ENV: &str = "CODESTORY_MANAGED_EMBEDDINGS_DISABLE_AUTOST
 const ENDPOINT_PROBE_TEXT: &str = "codestory managed embeddings health probe";
 const ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+type HttpHeaders = Vec<(String, String)>;
+type RawHttpResponse = (u16, HttpHeaders, Vec<u8>);
+
 #[derive(Debug, Clone, Copy)]
 struct LlamaAsset {
     os: &'static str,
@@ -902,7 +905,7 @@ fn parse_embedding_probe_response(
     Ok(dimension)
 }
 
-fn split_http_response(response: &[u8]) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
+fn split_http_response(response: &[u8]) -> Result<RawHttpResponse> {
     let header_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")

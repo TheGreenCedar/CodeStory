@@ -3403,14 +3403,19 @@ fn apply_qualified_names(nodes: Vec<Node>, edges: &[Edge], language_name: &str) 
         let parent_is_type_like = node_map
             .get(&parent_id)
             .is_some_and(|parent_node| is_type_like_kind(parent_node.kind));
-        queue_qualified_child_names(
-            parent_id,
-            &parent_qualified_name,
-            &parent_serialized_name,
-            parent_is_type_like,
+        let mut traversal = QualifiedNameTraversal {
             language_name,
-            &parent_map,
-            &mut node_map,
+            parent_map: &parent_map,
+            node_map: &mut node_map,
+        };
+        queue_qualified_child_names(
+            QualifiedNameParent {
+                id: parent_id,
+                qualified_name: &parent_qualified_name,
+                serialized_name: &parent_serialized_name,
+                is_type_like: parent_is_type_like,
+            },
+            &mut traversal,
             &mut queue,
         );
     }
@@ -3418,34 +3423,42 @@ fn apply_qualified_names(nodes: Vec<Node>, edges: &[Edge], language_name: &str) 
     node_map.into_values().collect()
 }
 
+struct QualifiedNameParent<'a> {
+    id: NodeId,
+    qualified_name: &'a str,
+    serialized_name: &'a str,
+    is_type_like: bool,
+}
+
+struct QualifiedNameTraversal<'a> {
+    language_name: &'a str,
+    parent_map: &'a HashMap<NodeId, Vec<NodeId>>,
+    node_map: &'a mut HashMap<NodeId, Node>,
+}
+
 fn queue_qualified_child_names(
-    parent_id: NodeId,
-    parent_qualified_name: &str,
-    parent_serialized_name: &str,
-    parent_is_type_like: bool,
-    language_name: &str,
-    parent_map: &HashMap<NodeId, Vec<NodeId>>,
-    node_map: &mut HashMap<NodeId, Node>,
+    parent: QualifiedNameParent<'_>,
+    traversal: &mut QualifiedNameTraversal<'_>,
     queue: &mut Vec<(NodeId, String)>,
 ) {
-    let Some(children) = parent_map.get(&parent_id) else {
+    let Some(children) = traversal.parent_map.get(&parent.id) else {
         return;
     };
     for child_id in children {
-        let Some(child_node) = node_map.get_mut(child_id) else {
+        let Some(child_node) = traversal.node_map.get_mut(child_id) else {
             continue;
         };
-        let delimiter = qualified_name_delimiter(language_name);
+        let delimiter = qualified_name_delimiter(traversal.language_name);
         let new_name = format!(
             "{}{}{}",
-            parent_qualified_name, delimiter, child_node.serialized_name
+            parent.qualified_name, delimiter, child_node.serialized_name
         );
         // Keep members of type-like owners owner-qualified in both name fields so
         // downstream resolution can distinguish declared members from placeholder/reference nodes.
-        if parent_is_type_like {
+        if parent.is_type_like {
             child_node.serialized_name = format!(
                 "{}{}{}",
-                parent_serialized_name, delimiter, child_node.serialized_name
+                parent.serialized_name, delimiter, child_node.serialized_name
             );
         }
         child_node.qualified_name = Some(new_name.clone());
@@ -4525,15 +4538,19 @@ fn non_impl_anchor_canonical_predicate() -> &'static str {
     "AND (canonical_id IS NULL OR canonical_id NOT LIKE 'impl_anchor:%')"
 }
 
+struct SchemaEndpointEdgeSinks<'a> {
+    unique_nodes: &'a mut HashMap<NodeId, Node>,
+    result_edges: &'a mut Vec<Edge>,
+    edge_keys: &'a mut HashSet<EdgeDedupKey>,
+    callsite_ordinals: &'a mut HashMap<(NodeId, Option<u32>), u32>,
+}
+
 fn append_schema_endpoint_call_edges(
     language_name: &str,
     source: &str,
-    unique_nodes: &mut HashMap<NodeId, Node>,
     file_id: NodeId,
-    result_edges: &mut Vec<Edge>,
-    edge_keys: &mut HashSet<EdgeDedupKey>,
     flags: IndexFeatureFlags,
-    callsite_ordinals: &mut HashMap<(NodeId, Option<u32>), u32>,
+    sinks: &mut SchemaEndpointEdgeSinks<'_>,
 ) {
     if !matches!(
         language_name,
@@ -4544,19 +4561,15 @@ fn append_schema_endpoint_call_edges(
 
     for call in collect_api_endpoint_calls(source) {
         let target = schema_endpoint_node_id(&call.method, &call.path);
-        let source_id = enclosing_callable_node_id(unique_nodes, call.line).unwrap_or(file_id);
-        unique_nodes.entry(target).or_insert_with(|| Node {
+        let target_label = schema_endpoint_label(&call.method, &call.path);
+        let source_id =
+            enclosing_callable_node_id(sinks.unique_nodes, call.line).unwrap_or(file_id);
+        sinks.unique_nodes.entry(target).or_insert_with(|| Node {
             id: target,
             kind: NodeKind::FUNCTION,
-            serialized_name: schema_endpoint_label(&call.method, &call.path),
-            qualified_name: Some(format!(
-                "schema_reference::{}",
-                schema_endpoint_label(&call.method, &call.path)
-            )),
-            canonical_id: Some(format!(
-                "openapi:endpoint:{}",
-                schema_endpoint_label(&call.method, &call.path)
-            )),
+            serialized_name: target_label.clone(),
+            qualified_name: Some(format!("schema_reference::{target_label}")),
+            canonical_id: Some(format!("openapi:endpoint:{target_label}")),
             file_node_id: Some(file_id),
             start_line: Some(call.line),
             start_col: Some(call.col),
@@ -4578,14 +4591,17 @@ fn append_schema_endpoint_call_edges(
             confidence: Some(0.45),
             ..Default::default()
         };
-        let next = callsite_ordinals.entry((target, edge.line)).or_insert(0);
+        let next = sinks
+            .callsite_ordinals
+            .entry((target, edge.line))
+            .or_insert(0);
         *next = next.saturating_add(1);
         ensure_callsite_identity(&mut edge, Some(call.col.saturating_add(*next)));
-        if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
+        if !sinks.edge_keys.insert(edge_dedup_key(&edge, flags)) {
             continue;
         }
         edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
-        result_edges.push(edge);
+        sinks.result_edges.push(edge);
     }
 }
 
@@ -5208,12 +5224,14 @@ pub fn index_file(
     append_schema_endpoint_call_edges(
         language_config.language_name,
         source,
-        &mut unique_nodes,
         file_id,
-        &mut result_edges,
-        &mut edge_keys,
         flags,
-        &mut callsite_ordinals,
+        &mut SchemaEndpointEdgeSinks {
+            unique_nodes: &mut unique_nodes,
+            result_edges: &mut result_edges,
+            edge_keys: &mut edge_keys,
+            callsite_ordinals: &mut callsite_ordinals,
+        },
     );
 
     if !unique_nodes.is_empty() {
