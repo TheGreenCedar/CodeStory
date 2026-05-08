@@ -226,6 +226,14 @@ pub(crate) struct ExplainCommand {
         help = "Repository explanation prompt."
     )]
     pub(crate) prompt: String,
+    #[arg(
+        long = "id",
+        visible_alias = "focus-id",
+        allow_hyphen_values = true,
+        value_name = "NODE_ID",
+        help = "Seed the repo explanation around an exact node id. Agent-friendly alias for focused ask/explain follow-ups."
+    )]
+    pub(crate) id: Option<String>,
     #[arg(long, default_value_t = 12)]
     pub(crate) max_results: u32,
     #[arg(
@@ -567,7 +575,12 @@ pub(crate) struct SnippetCommand {
     pub(crate) project: ProjectArgs,
     #[command(flatten)]
     pub(crate) target: TargetArgs,
-    #[arg(long, default_value_t = 4)]
+    #[arg(
+        long,
+        visible_alias = "lines",
+        default_value_t = 4,
+        help = "Number of surrounding context lines above and below the symbol. `--lines` is accepted as an agent-friendly alias."
+    )]
     pub(crate) context: usize,
     #[arg(
         long,
@@ -587,11 +600,28 @@ pub(crate) struct SnippetCommand {
 }
 
 #[derive(Args, Debug)]
+#[command(group(
+    ArgGroup::new("query_input")
+        .args(["query", "sql"])
+        .required(true)
+        .multiple(false)
+))]
 pub(crate) struct QueryCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
-    #[arg(value_name = "QUERY")]
-    pub(crate) query: String,
+    #[arg(
+        value_name = "QUERY",
+        group = "query_input",
+        help = "CodeStory graph-query DSL, for example `search(query: 'AppController') | limit(5)`."
+    )]
+    pub(crate) query: Option<String>,
+    #[arg(
+        long,
+        group = "query_input",
+        value_name = "SQL",
+        help = "SQL is not supported; this flag returns targeted guidance instead of a parser-shaped error."
+    )]
+    pub(crate) sql: Option<String>,
     #[arg(
         long,
         value_enum,
@@ -1172,10 +1202,31 @@ mod tests {
     fn explain_help_exposes_guided_repo_flow() {
         let help = render_subcommand_help("explain");
         assert!(help.contains("Repository explanation prompt"));
+        assert!(help.contains("--id <NODE_ID>"));
+        assert!(help.contains("[aliases: --focus-id]"));
         assert!(help.contains("--max-results"));
         assert!(help.contains("How does this repo fit together?"));
         assert!(!help.contains("--with-local-agent"));
         assert!(!help.contains("--agent-command"));
+    }
+
+    #[test]
+    fn snippet_help_exposes_lines_alias_for_agent_context_guess() {
+        let help = render_subcommand_help("snippet");
+        assert!(help.contains("--context <CONTEXT>"));
+        assert!(help.contains("[aliases: --lines]"));
+        assert!(
+            help.contains("Number of surrounding context lines"),
+            "snippet help should make context sizing obvious: {help}"
+        );
+    }
+
+    #[test]
+    fn query_help_explains_graph_dsl_and_sql_guardrail() {
+        let help = render_subcommand_help("query");
+        assert!(help.contains("CodeStory graph-query DSL"));
+        assert!(help.contains("--sql <SQL>"));
+        assert!(help.contains("SQL is not supported"));
     }
 
     #[test]

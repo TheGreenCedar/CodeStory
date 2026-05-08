@@ -61,7 +61,7 @@ fallback for machines where Vulkan is unavailable. Runtime still only speaks to
 an OpenAI-compatible HTTP endpoint; it does not download model assets or make
 setup decisions itself.
 
-Timing fields for this path are in `IndexingPhaseTimings`: `semantic_doc_build_ms`, `semantic_embedding_ms`, `semantic_db_upsert_ms`, `semantic_reload_ms`, `semantic_docs_reused`, `semantic_docs_embedded`, `semantic_docs_pending`, and `semantic_docs_stale`.
+Timing fields for this path are in `IndexingPhaseTimings`: `search_projection_rebuild_ms`, `search_symbol_index_ms`, `runtime_cache_publish_ms`, `semantic_doc_build_ms`, `semantic_embedding_ms`, `semantic_db_upsert_ms`, `semantic_reload_ms`, `semantic_prune_ms`, `semantic_docs_reused`, `semantic_docs_embedded`, `semantic_docs_pending`, and `semantic_docs_stale`.
 
 ## Failure Signatures
 

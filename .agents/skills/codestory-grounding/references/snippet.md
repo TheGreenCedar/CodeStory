@@ -19,7 +19,7 @@ target/release/codestory-cli(.exe) snippet [OPTIONS]
 | `--id` | string | — | Node ID of the symbol (conflicts with `--query`) |
 | `--query` | string | — | Symbol name to resolve (conflicts with `--id`) |
 | `--file` | string | — | Limit `--query` resolution to paths containing this fragment |
-| `--context` | integer | `4` | Number of surrounding context lines above and below the symbol |
+| `--context` | integer | `4` | Number of surrounding context lines above and below the symbol. Alias: `--lines` |
 | `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
 | `--format` | enum | `markdown` | Output format: `markdown` or `json` |
 | `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
@@ -57,6 +57,9 @@ target/release/codestory-cli(.exe) snippet --project . --query "AppController::n
 
 # More context
 target/release/codestory-cli(.exe) snippet --project . --query run_indexing --context 10
+
+# Agent-friendly alias for the same context setting
+target/release/codestory-cli(.exe) snippet --project . --query run_indexing --lines 40
 
 # Disambiguate by file and write stable Markdown
 target/release/codestory-cli(.exe) snippet --project . --query TicTacToe --file rust_tictactoe.rs --output-file tictactoe.md

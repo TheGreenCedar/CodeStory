@@ -17,6 +17,7 @@ use codestory_contracts::api::{
     WorkspaceMemberIndexDto, WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
+use codestory_contracts::graph::{Edge as GraphEdge, Node as GraphNode};
 use codestory_indexer::IncrementalIndexingStats;
 use codestory_indexer::WorkspaceIndexer as V2WorkspaceIndexer;
 use codestory_store::{
@@ -637,16 +638,31 @@ struct SemanticProjectionStats {
     embedding_ms: u32,
     db_upsert_ms: u32,
     reload_ms: u32,
+    prune_ms: u32,
     docs_reused: u32,
     docs_embedded: u32,
     docs_pending: u32,
     docs_stale: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SearchStateBuildStats {
+    search_projection_rebuild_ms: u32,
+    search_symbol_index_ms: u32,
+}
+
 struct SearchStateBuildResult {
     node_names: HashMap<codestory_contracts::graph::NodeId, String>,
     engine: SearchEngine,
+    search_stats: SearchStateBuildStats,
     semantic_stats: SemanticProjectionStats,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CacheRefreshStats {
+    search_stats: SearchStateBuildStats,
+    semantic_stats: SemanticProjectionStats,
+    runtime_cache_publish_ms: Option<u32>,
 }
 
 fn apply_semantic_projection_stats(
@@ -660,10 +676,18 @@ fn apply_semantic_projection_stats(
     timings.semantic_embedding_ms = Some(stats.embedding_ms);
     timings.semantic_db_upsert_ms = Some(stats.db_upsert_ms);
     timings.semantic_reload_ms = Some(stats.reload_ms);
+    timings.semantic_prune_ms = Some(stats.prune_ms);
     timings.semantic_docs_reused = Some(stats.docs_reused);
     timings.semantic_docs_embedded = Some(stats.docs_embedded);
     timings.semantic_docs_pending = Some(stats.docs_pending);
     timings.semantic_docs_stale = Some(stats.docs_stale);
+}
+
+fn apply_cache_refresh_stats(timings: &mut IndexingPhaseTimings, stats: CacheRefreshStats) {
+    timings.search_projection_rebuild_ms = Some(stats.search_stats.search_projection_rebuild_ms);
+    timings.search_symbol_index_ms = Some(stats.search_stats.search_symbol_index_ms);
+    timings.runtime_cache_publish_ms = stats.runtime_cache_publish_ms;
+    apply_semantic_projection_stats(timings, stats.semantic_stats);
 }
 
 fn build_search_state(
@@ -674,11 +698,15 @@ fn build_search_state(
     semantic_projection_mode: SemanticProjectionMode,
     hydrate_semantic_docs: bool,
 ) -> Result<SearchStateBuildResult, ApiError> {
+    let projection_started = Instant::now();
     storage
         .rebuild_search_symbol_projection_from_node_table()
         .map_err(|e| {
             ApiError::internal(format!("Failed to rebuild search symbol projection: {e}"))
         })?;
+    let search_projection_rebuild_ms = clamp_u128_to_u32(projection_started.elapsed().as_millis());
+
+    let search_index_started = Instant::now();
     let mut node_names = HashMap::new();
     let mut engine = SearchEngine::new(search_storage_path)
         .map_err(|e| ApiError::internal(format!("Failed to init search engine: {e}")))?;
@@ -698,6 +726,11 @@ fn build_search_state(
             .index_nodes(search_nodes)
             .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
     }
+    let search_symbol_index_ms = clamp_u128_to_u32(search_index_started.elapsed().as_millis());
+    let search_stats = SearchStateBuildStats {
+        search_projection_rebuild_ms,
+        search_symbol_index_ms,
+    };
     if semantic_projection_mode == SemanticProjectionMode::PersistBackedDocs {
         let semantic_stats = sync_llm_symbol_projection(
             storage,
@@ -710,6 +743,7 @@ fn build_search_state(
         Ok(SearchStateBuildResult {
             node_names,
             engine,
+            search_stats,
             semantic_stats,
         })
     } else {
@@ -720,6 +754,7 @@ fn build_search_state(
         Ok(SearchStateBuildResult {
             node_names,
             engine,
+            search_stats,
             semantic_stats: SemanticProjectionStats::default(),
         })
     }
@@ -1578,17 +1613,72 @@ fn llm_indexable_kind(kind: codestory_contracts::graph::NodeKind) -> bool {
     llm_indexable_kind_for_scope(kind, semantic_doc_scope_from_env())
 }
 
-fn edge_digest_for_node(
-    storage: &Storage,
-    node_id: codestory_contracts::graph::NodeId,
-    limit: usize,
-) -> Vec<String> {
-    let mut by_kind = HashMap::<String, usize>::new();
-    if let Ok(edges) = storage.get_edges_for_node_id(node_id) {
-        for edge in edges {
-            let key = format!("{:?}", edge.kind);
-            *by_kind.entry(key).or_insert(0) += 1;
+#[derive(Default)]
+struct SemanticDocGraphContext {
+    child_labels: HashMap<GraphNodeId, Vec<String>>,
+    referenced_labels: HashMap<GraphNodeId, Vec<String>>,
+    edge_digests: HashMap<GraphNodeId, Vec<String>>,
+    file_paths: HashMap<GraphNodeId, String>,
+}
+
+impl SemanticDocGraphContext {
+    fn build(
+        storage: &Storage,
+        semantic_nodes: &[&GraphNode],
+        all_nodes: &[GraphNode],
+    ) -> Result<Self, ApiError> {
+        let nodes_by_id = all_nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<HashMap<_, _>>();
+        let node_ids = semantic_nodes
+            .iter()
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        let edges_by_node = storage.get_edges_for_node_ids(&node_ids).map_err(|e| {
+            ApiError::internal(format!("Failed to load semantic doc graph context: {e}"))
+        })?;
+
+        let mut context = Self::default();
+        for node in semantic_nodes {
+            if let Some(file_id) = node.file_node_id
+                && let Some(file_node) = nodes_by_id.get(&file_id)
+            {
+                context
+                    .file_paths
+                    .insert(node.id, file_node.serialized_name.clone());
+            }
+
+            let edges = edges_by_node
+                .get(&node.id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            context.child_labels.insert(
+                node.id,
+                child_symbol_labels_from_edges(node, edges, &nodes_by_id, 6),
+            );
+            context.referenced_labels.insert(
+                node.id,
+                referenced_symbol_labels_from_edges(node, edges, &nodes_by_id, 6),
+            );
+            context
+                .edge_digests
+                .insert(node.id, edge_digest_for_edges(edges, 6));
         }
+
+        Ok(context)
+    }
+
+    fn file_path_for_node(&self, node: &GraphNode) -> Option<&str> {
+        self.file_paths.get(&node.id).map(String::as_str)
+    }
+}
+
+fn edge_digest_for_edges(edges: &[GraphEdge], limit: usize) -> Vec<String> {
+    let mut by_kind = HashMap::<String, usize>::new();
+    for edge in edges {
+        let key = format!("{:?}", edge.kind);
+        *by_kind.entry(key).or_insert(0) += 1;
     }
 
     let mut counts = by_kind.into_iter().collect::<Vec<_>>();
@@ -1600,15 +1690,22 @@ fn edge_digest_for_node(
         .collect()
 }
 
-fn referenced_symbol_labels(
-    storage: &Storage,
-    node: &codestory_contracts::graph::Node,
+fn edge_digest_for_node(storage: &Storage, node_id: GraphNodeId, limit: usize) -> Vec<String> {
+    storage
+        .get_edges_for_node_ids(&[node_id])
+        .ok()
+        .and_then(|edges_by_node| edges_by_node.get(&node_id).cloned())
+        .map(|edges| edge_digest_for_edges(&edges, limit))
+        .unwrap_or_default()
+}
+
+fn referenced_symbol_labels_from_edges(
+    node: &GraphNode,
+    edges: &[GraphEdge],
+    nodes_by_id: &HashMap<GraphNodeId, &GraphNode>,
     limit: usize,
 ) -> Vec<String> {
     let mut labels = Vec::new();
-    let Ok(edges) = storage.get_edges_for_node_id(node.id) else {
-        return labels;
-    };
 
     for edge in edges {
         let (source, target) = edge.effective_endpoints();
@@ -1619,7 +1716,7 @@ fn referenced_symbol_labels(
         } else {
             continue;
         };
-        let Ok(Some(other_node)) = storage.get_node(other) else {
+        let Some(other_node) = nodes_by_id.get(&other) else {
             continue;
         };
         if !llm_indexable_kind(other_node.kind) {
@@ -1638,18 +1735,19 @@ fn referenced_symbol_labels(
     labels
 }
 
-fn child_symbol_labels(
-    storage: &Storage,
-    node: &codestory_contracts::graph::Node,
+fn child_symbol_labels_from_edges(
+    node: &GraphNode,
+    edges: &[GraphEdge],
+    nodes_by_id: &HashMap<GraphNodeId, &GraphNode>,
     limit: usize,
 ) -> Vec<String> {
-    let Ok(children) = storage.get_children_symbols(node.id) else {
-        return Vec::new();
-    };
-    children
-        .into_iter()
+    edges
+        .iter()
+        .filter(|edge| edge.kind == codestory_contracts::graph::EdgeKind::MEMBER)
+        .filter(|edge| edge.source == node.id)
+        .filter_map(|edge| nodes_by_id.get(&edge.target).copied())
         .filter(|child| llm_indexable_kind(child.kind))
-        .map(|child| node_display_name(&child))
+        .map(node_display_name)
         .filter(|label| !label.is_empty())
         .take(limit)
         .collect()
@@ -1778,8 +1876,8 @@ fn symbol_excerpt(
 }
 
 fn build_llm_symbol_doc_text(
-    storage: &Storage,
-    node: &codestory_contracts::graph::Node,
+    graph_context: &SemanticDocGraphContext,
+    node: &GraphNode,
     display_name: &str,
     file_path: Option<&str>,
     file_text_cache: &mut HashMap<String, Option<String>>,
@@ -1853,17 +1951,29 @@ fn build_llm_symbol_doc_text(
         let _ = writeln!(out, "body_summary: {}", body.join(" "));
     }
 
-    let children = child_symbol_labels(storage, node, 6);
+    let children = graph_context
+        .child_labels
+        .get(&node.id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     if !children.is_empty() {
         let _ = writeln!(out, "members: {}", children.join(", "));
     }
 
-    let related = referenced_symbol_labels(storage, node, 6);
+    let related = graph_context
+        .referenced_labels
+        .get(&node.id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     if !related.is_empty() {
         let _ = writeln!(out, "related_symbols: {}", related.join(", "));
     }
 
-    let edge_digest = edge_digest_for_node(storage, node.id, 6);
+    let edge_digest = graph_context
+        .edge_digests
+        .get(&node.id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     if !edge_digest.is_empty() {
         out.push_str("edge_digest:");
         for digest in edge_digest {
@@ -2080,35 +2190,39 @@ fn sync_llm_symbol_projection(
     let mut pending_docs = Vec::<PendingLlmSymbolDoc>::new();
     let mut seen_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
     let mut file_text_cache = HashMap::<String, Option<String>>::new();
+    let mut doc_build_ns = 0_u128;
+    let semantic_nodes = nodes
+        .iter()
+        .filter(|node| llm_indexable_kind(node.kind))
+        .filter(|node| {
+            llm_refresh_file_scope
+                .map(|scope| {
+                    node.file_node_id
+                        .map(|file_node_id| scope.contains(&file_node_id))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    let graph_context = SemanticDocGraphContext::build(storage, &semantic_nodes, nodes)?;
 
-    for node in nodes {
-        if !llm_indexable_kind(node.kind) {
-            continue;
-        }
-        if let Some(scope) = llm_refresh_file_scope
-            && !node
-                .file_node_id
-                .map(|file_node_id| scope.contains(&file_node_id))
-                .unwrap_or(false)
-        {
-            continue;
-        }
+    for node in semantic_nodes {
         let display_name = node_names
             .get(&node.id)
             .cloned()
             .unwrap_or_else(|| node_display_name(node));
-        let file_path = AppController::file_path_for_node(storage, node)?;
+        let file_path = graph_context
+            .file_path_for_node(node)
+            .map(ToString::to_string);
         let doc_build_started = Instant::now();
         let doc_text = build_llm_symbol_doc_text(
-            storage,
+            &graph_context,
             node,
             &display_name,
             file_path.as_deref(),
             &mut file_text_cache,
         );
-        stats.doc_build_ms = stats
-            .doc_build_ms
-            .saturating_add(clamp_u128_to_u32(doc_build_started.elapsed().as_millis()));
+        doc_build_ns = doc_build_ns.saturating_add(doc_build_started.elapsed().as_nanos());
         let doc_hash = llm_symbol_doc_hash(&doc_text);
         seen_node_ids.push(node.id);
         if let Some(existing_doc) = existing_docs.get(&node.id)
@@ -2152,6 +2266,7 @@ fn sync_llm_symbol_projection(
             )?;
         }
     }
+    stats.doc_build_ms = clamp_u128_to_u32(doc_build_ns / 1_000_000);
 
     if !stream_pending_docs {
         sort_pending_llm_symbol_docs_for_embedding_batches(&mut pending_docs);
@@ -2167,6 +2282,7 @@ fn sync_llm_symbol_projection(
         )?;
     }
 
+    let prune_started = Instant::now();
     let stale_docs = if let Some(scope) = llm_refresh_file_scope {
         let file_node_ids = scope.iter().copied().collect::<Vec<_>>();
         storage
@@ -2177,6 +2293,7 @@ fn sync_llm_symbol_projection(
             .prune_llm_symbol_docs_to_node_ids(&seen_node_ids)
             .map_err(|e| ApiError::internal(format!("Failed to prune stale LLM docs: {e}")))?
     };
+    stats.prune_ms = clamp_u128_to_u32(prune_started.elapsed().as_millis());
     stats.docs_stale = clamp_usize_to_u32(stale_docs);
 
     if hydrate_semantic_docs {
@@ -3091,7 +3208,7 @@ impl AppController {
         refresh_runtime_caches: bool,
     ) -> Result<IndexingPhaseTimings, ApiError> {
         let cache_refresh_started = Instant::now();
-        let semantic_stats = if refresh_runtime_caches {
+        let cache_stats = if refresh_runtime_caches {
             let mut storage = Storage::open(storage_path)
                 .map_err(|e| ApiError::internal(format!("Failed to reopen storage: {e}")))?;
             refresh_caches(
@@ -3111,14 +3228,18 @@ impl AppController {
                         llm_refresh_scope,
                         false,
                     )
-                    .map(|result| result.semantic_stats)
+                    .map(|result| CacheRefreshStats {
+                        search_stats: result.search_stats,
+                        semantic_stats: result.semantic_stats,
+                        runtime_cache_publish_ms: None,
+                    })
                 },
             )?
         };
         summary.phase_timings.cache_refresh_ms = Some(clamp_u128_to_u32(
             cache_refresh_started.elapsed().as_millis(),
         ));
-        apply_semantic_projection_stats(&mut summary.phase_timings, semantic_stats);
+        apply_cache_refresh_stats(&mut summary.phase_timings, cache_stats);
         Ok(summary.phase_timings)
     }
 
@@ -3266,12 +3387,12 @@ impl AppController {
         storage_path: &Path,
         llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
         rebuild: F,
-    ) -> Result<SemanticProjectionStats, ApiError>
+    ) -> Result<CacheRefreshStats, ApiError>
     where
         F: FnOnce(
             &mut Storage,
             Option<&HashSet<codestory_contracts::graph::NodeId>>,
-        ) -> Result<SemanticProjectionStats, ApiError>,
+        ) -> Result<CacheRefreshStats, ApiError>,
     {
         let result = (|| {
             let mut storage = Storage::open(storage_path)
@@ -4126,10 +4247,14 @@ fn index_full(
             error_flush_ms: clamp_u64_to_u32(index_stats.error_flush_ms),
             cleanup_ms: clamp_u64_to_u32(index_stats.cleanup_ms),
             cache_refresh_ms: None,
+            search_projection_rebuild_ms: None,
+            search_symbol_index_ms: None,
+            runtime_cache_publish_ms: None,
             semantic_doc_build_ms: None,
             semantic_embedding_ms: None,
             semantic_db_upsert_ms: None,
             semantic_reload_ms: None,
+            semantic_prune_ms: None,
             semantic_docs_reused: None,
             semantic_docs_embedded: None,
             semantic_docs_pending: None,
@@ -4299,10 +4424,14 @@ where
             error_flush_ms: clamp_u64_to_u32(index_stats.error_flush_ms),
             cleanup_ms: clamp_u64_to_u32(index_stats.cleanup_ms),
             cache_refresh_ms: None,
+            search_projection_rebuild_ms: None,
+            search_symbol_index_ms: None,
+            runtime_cache_publish_ms: None,
             semantic_doc_build_ms: None,
             semantic_embedding_ms: None,
             semantic_db_upsert_ms: None,
             semantic_reload_ms: None,
+            semantic_prune_ms: None,
             semantic_docs_reused: None,
             semantic_docs_embedded: None,
             semantic_docs_pending: None,
@@ -4409,18 +4538,26 @@ fn refresh_caches(
     storage: &mut Storage,
     storage_path: &Path,
     llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
-) -> Result<SemanticProjectionStats, ApiError> {
+) -> Result<CacheRefreshStats, ApiError> {
     let refreshed =
         rebuild_search_state_from_storage(storage, storage_path, llm_refresh_scope, true);
 
     let mut s = controller.state.lock();
     match refreshed {
         Ok(result) => {
+            let publish_started = Instant::now();
             let semantic_stats = result.semantic_stats;
+            let search_stats = result.search_stats;
             s.node_names = result.node_names;
             s.search_engine = Some(result.engine);
             s.is_indexing = false;
-            Ok(semantic_stats)
+            Ok(CacheRefreshStats {
+                search_stats,
+                semantic_stats,
+                runtime_cache_publish_ms: Some(clamp_u128_to_u32(
+                    publish_started.elapsed().as_millis(),
+                )),
+            })
         }
         Err(error) => {
             tracing::warn!(
@@ -4694,7 +4831,6 @@ mod tests {
         file_path: &str,
         kind: NodeKind,
     ) -> String {
-        let storage = Storage::new_in_memory().expect("storage");
         let node = Node {
             id: CoreNodeId(10),
             kind,
@@ -4704,9 +4840,10 @@ mod tests {
             start_line: Some(12),
             ..Default::default()
         };
+        let graph_context = SemanticDocGraphContext::default();
         let mut file_text_cache = HashMap::new();
         build_llm_symbol_doc_text(
-            &storage,
+            &graph_context,
             &node,
             display_name,
             Some(file_path),

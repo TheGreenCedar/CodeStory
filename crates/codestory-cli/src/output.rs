@@ -149,6 +149,15 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
             timings.cleanup_ms,
             timings.cache_refresh_ms.unwrap_or(0)
         );
+        append_optional_timings_line(
+            &mut markdown,
+            "cache_ms",
+            &[
+                ("search_projection", timings.search_projection_rebuild_ms),
+                ("search_index", timings.search_symbol_index_ms),
+                ("runtime_publish", timings.runtime_cache_publish_ms),
+            ],
+        );
         let _ = writeln!(
             markdown,
             "resolution: calls {}->{}, imports {}->{}",
@@ -165,6 +174,7 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
                 ("embedding", timings.semantic_embedding_ms),
                 ("db_upsert", timings.semantic_db_upsert_ms),
                 ("reload", timings.semantic_reload_ms),
+                ("prune", timings.semantic_prune_ms),
             ],
         );
         append_optional_timings_line(
@@ -485,6 +495,8 @@ pub(crate) fn render_explain_markdown(project_root: &Path, output: &ExplainOutpu
     );
     let _ = writeln!(markdown, "prompt: `{}`", output.prompt);
 
+    append_explain_agent_handoff(&mut markdown, project_root, output);
+
     if !output.anchors.is_empty() {
         let _ = writeln!(markdown, "anchors:");
         for anchor in output.anchors.iter().take(EVIDENCE_PREVIEW_LIMIT * 2) {
@@ -502,6 +514,88 @@ pub(crate) fn render_explain_markdown(project_root: &Path, output: &ExplainOutpu
     let _ = writeln!(markdown);
     markdown.push_str(&render_agent_answer_markdown(project_root, output.answer));
     markdown
+}
+
+fn append_explain_agent_handoff(
+    markdown: &mut String,
+    project_root: &Path,
+    output: &ExplainOutput<'_>,
+) {
+    let (confidence, confidence_reasons) = agent_confidence(output.answer);
+    let anchor_count = output.anchors.len();
+    let _ = writeln!(markdown, "agent_handoff:");
+    let _ = writeln!(
+        markdown,
+        "- use_this_first: one-command repo explanation with grounding, anchor search, and focused ask already run"
+    );
+    let _ = writeln!(
+        markdown,
+        "- index_stats: files={} nodes={} edges={} errors={} semantic_docs={}",
+        output.summary.stats.file_count,
+        output.summary.stats.node_count,
+        output.summary.stats.edge_count,
+        output.summary.stats.error_count,
+        output
+            .retrieval
+            .map(|retrieval| retrieval.semantic_doc_count)
+            .unwrap_or(0)
+    );
+    let _ = writeln!(
+        markdown,
+        "- evidence_shape: anchors={} citations={} graph_artifacts={} grounding_files={}/{} compressed_files={}",
+        anchor_count,
+        output.answer.citations.len(),
+        output.answer.graphs.len(),
+        output.grounding.coverage.represented_files,
+        output.grounding.coverage.total_files,
+        output.grounding.coverage.compressed_files
+    );
+    let _ = writeln!(
+        markdown,
+        "- confidence: {confidence} - {}",
+        confidence_reasons.join("; ")
+    );
+    let _ = writeln!(
+        markdown,
+        "- focused_followup: use `explain --id <NODE_ID> {}` or `ask --focus-id <NODE_ID> {}`",
+        quoted_cli_arg("Explain this symbol and its role in the repo."),
+        quoted_cli_arg("Explain this symbol and its role in the repo.")
+    );
+    let _ = writeln!(
+        markdown,
+        "- source_followup: use `snippet --context 40`; `--lines` is accepted as an alias for agents that guess it"
+    );
+    let _ = writeln!(
+        markdown,
+        "- graph_followup: use `trail --story --hide-speculative` before broad raw trails"
+    );
+    let _ = writeln!(
+        markdown,
+        "- query_note: `query` uses CodeStory DSL like `search(query: 'Name') | limit(5)`, not SQL"
+    );
+
+    if let Some(anchor) = output.anchors.first() {
+        let project = quoted_project_arg(project_root);
+        let _ = writeln!(markdown, "agent_primary_anchor:");
+        let _ = writeln!(markdown, "- {}", render_search_hit_output(anchor));
+        let _ = writeln!(markdown, "agent_primary_commands:");
+        let _ = writeln!(
+            markdown,
+            "- `codestory-cli ask --project {project} --focus-id {} {}`",
+            anchor.node_id,
+            quoted_cli_arg("Explain this symbol and its role in the repo.")
+        );
+        let _ = writeln!(
+            markdown,
+            "- `codestory-cli trail --project {project} --id {} --story --hide-speculative`",
+            anchor.node_id
+        );
+        let _ = writeln!(
+            markdown,
+            "- `codestory-cli snippet --project {project} --id {} --context 40`",
+            anchor.node_id
+        );
+    }
 }
 
 pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput) -> String {
@@ -2142,9 +2236,10 @@ mod tests {
         AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, AgentRetrievalTraceDto, EdgeId,
         EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse, GroundingBudgetDto,
         GroundingCoverageDto, GroundingFileDigestDto, GroundingSnapshotDto,
-        GroundingSymbolDigestDto, NodeDetailsDto, NodeId, NodeKind, RetrievalFallbackReasonDto,
-        RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
-        StorageStatsDto, TrailContextDto, TrailStoryDto, TrailStoryStepDto,
+        GroundingSymbolDigestDto, NodeDetailsDto, NodeId, NodeKind, ProjectSummary,
+        RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto,
+        RetrievalStateDto, SearchHitOrigin, StorageStatsDto, TrailContextDto, TrailStoryDto,
+        TrailStoryStepDto,
     };
     use serde_json::json;
     use std::path::Path;
@@ -2579,6 +2674,82 @@ mod tests {
                 .contains("mode: DB-first repo explanation packet assembled from indexed evidence"),
             "{db_markdown}"
         );
+    }
+
+    #[test]
+    fn explain_markdown_adds_agent_handoff_and_focused_commands() {
+        let summary = ProjectSummary {
+            root: "C:/repo".to_string(),
+            stats: sample_storage_stats(),
+            members: Vec::new(),
+            retrieval: Some(sample_retrieval()),
+            freshness: None,
+        };
+        let grounding = GroundingSnapshotDto {
+            root: "C:/repo".to_string(),
+            budget: GroundingBudgetDto::Balanced,
+            generated_at_epoch_ms: 0,
+            stats: sample_storage_stats(),
+            retrieval: Some(sample_retrieval()),
+            coverage: GroundingCoverageDto {
+                total_files: 2,
+                represented_files: 2,
+                total_symbols: 3,
+                represented_symbols: 3,
+                compressed_files: 1,
+            },
+            root_symbols: Vec::new(),
+            files: Vec::new(),
+            coverage_buckets: Vec::new(),
+            notes: Vec::new(),
+            recommended_queries: Vec::new(),
+        };
+        let answer =
+            sample_agent_answer_with_annotations(vec!["mode=repo_explain_db_first".to_string()]);
+        let output = ExplainOutput {
+            project: "C:/repo",
+            storage_path: "C:/cache/codestory.db",
+            refresh: "none",
+            prompt: "How does this repo fit together?",
+            workflow: vec![
+                "open_or_refresh_index",
+                "ground",
+                "anchor_search",
+                "focused_ask",
+            ],
+            summary: &summary,
+            retrieval: summary.retrieval.as_ref(),
+            grounding: &grounding,
+            anchors: vec![sample_search_hit()],
+            answer: &answer,
+            next_commands: vec![
+                "codestory-cli ask --project \"C:/repo\" --focus-id node-build-packet \"Explain this symbol and its role in the repo.\"".to_string(),
+            ],
+        };
+
+        let markdown = render_explain_markdown(Path::new("C:/repo"), &output);
+
+        for expected in [
+            "agent_handoff:",
+            "use_this_first: one-command repo explanation",
+            "evidence_shape: anchors=1 citations=0 graph_artifacts=0",
+            "focused_followup: use `explain --id <NODE_ID>",
+            "source_followup: use `snippet --context 40`; `--lines` is accepted",
+            "graph_followup: use `trail --story --hide-speculative`",
+            "query_note: `query` uses CodeStory DSL",
+            "agent_primary_anchor:",
+            "agent_primary_commands:",
+            "codestory-cli trail --project \"C:/repo\" --id node-build-packet --story --hide-speculative",
+            "codestory-cli snippet --project \"C:/repo\" --id node-build-packet --context 40",
+        ] {
+            assert!(
+                markdown.contains(expected),
+                "explain markdown should contain {expected:?}:\n{markdown}"
+            );
+        }
+        assert_order(&markdown, "agent_handoff:", "anchors:");
+        assert_order(&markdown, "anchors:", "next_commands:");
+        assert_order(&markdown, "next_commands:", "# Ask");
     }
 
     #[test]

@@ -820,40 +820,21 @@ impl WorkspaceIndexer {
                 .saturating_add(duration_ms_u64(lookup_started.elapsed()));
 
             let parse_started = Instant::now();
-            let parse_results: Vec<PreparedIndexJobResult> =
-                if plan.mode == codestory_workspace::BuildMode::FullRefresh {
-                    parse_jobs
-                        .iter()
-                        .map(|prepared_input| {
-                            if let Some(token) = cancel_token
-                                && token.is_cancelled()
-                            {
-                                cancelled_clone.store(true, Ordering::Relaxed);
-                                return PreparedIndexJobResult {
-                                    local_storage: IntermediateStorage::default(),
-                                    cache_write: None,
-                                };
-                            }
-                            self.execute_prepared_index(prepared_input, &symbol_table)
-                        })
-                        .collect()
-                } else {
-                    parse_jobs
-                        .par_iter()
-                        .map(|prepared_input| {
-                            if let Some(token) = cancel_token
-                                && token.is_cancelled()
-                            {
-                                cancelled_clone.store(true, Ordering::Relaxed);
-                                return PreparedIndexJobResult {
-                                    local_storage: IntermediateStorage::default(),
-                                    cache_write: None,
-                                };
-                            }
-                            self.execute_prepared_index(prepared_input, &symbol_table)
-                        })
-                        .collect()
-                };
+            let parse_results: Vec<PreparedIndexJobResult> = parse_jobs
+                .par_iter()
+                .map(|prepared_input| {
+                    if let Some(token) = cancel_token
+                        && token.is_cancelled()
+                    {
+                        cancelled_clone.store(true, Ordering::Relaxed);
+                        return PreparedIndexJobResult {
+                            local_storage: IntermediateStorage::default(),
+                            cache_write: None,
+                        };
+                    }
+                    self.execute_prepared_index(prepared_input, &symbol_table)
+                })
+                .collect();
             stats.parse_index_ms = stats
                 .parse_index_ms
                 .saturating_add(duration_ms_u64(parse_started.elapsed()));

@@ -340,7 +340,8 @@ fn codestory_repo_release_e2e_emits_stats() {
         optional_u64_field(&index_json, &["phase_timings", "semantic_doc_build_ms"])
             + optional_u64_field(&index_json, &["phase_timings", "semantic_embedding_ms"])
             + optional_u64_field(&index_json, &["phase_timings", "semantic_db_upsert_ms"])
-            + optional_u64_field(&index_json, &["phase_timings", "semantic_reload_ms"]);
+            + optional_u64_field(&index_json, &["phase_timings", "semantic_reload_ms"])
+            + optional_u64_field(&index_json, &["phase_timings", "semantic_prune_ms"]);
 
     let stats = RepoE2eStats {
         project_root: project_root.display().to_string(),

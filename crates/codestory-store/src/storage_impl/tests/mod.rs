@@ -1208,6 +1208,86 @@ fn test_file_storage() -> Result<(), StorageError> {
 }
 
 #[test]
+fn batched_edges_for_node_ids_matches_single_node_lookup() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "caller".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "callee".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(3),
+            kind: NodeKind::METHOD,
+            serialized_name: "resolved".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(4),
+            kind: NodeKind::CLASS,
+            serialized_name: "Owner".to_string(),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[
+        Edge {
+            id: EdgeId(1),
+            source: NodeId(1),
+            target: NodeId(2),
+            kind: EdgeKind::CALL,
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(2),
+            source: NodeId(4),
+            target: NodeId(3),
+            kind: EdgeKind::MEMBER,
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(3),
+            source: NodeId(1),
+            target: NodeId(2),
+            kind: EdgeKind::CALL,
+            resolved_target: Some(NodeId(3)),
+            certainty: Some(ResolutionCertainty::Certain),
+            confidence: Some(1.0),
+            ..Default::default()
+        },
+    ])?;
+
+    let node_ids = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+    let batched = storage.get_edges_for_node_ids(&node_ids)?;
+    for node_id in node_ids {
+        let single_edge_ids = storage
+            .get_edges_for_node_id(node_id)?
+            .into_iter()
+            .map(|edge| edge.id)
+            .collect::<Vec<_>>();
+        let batched_edge_ids = batched
+            .get(&node_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|edge| edge.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            batched_edge_ids, single_edge_ids,
+            "batched lookup should match single-node lookup for {node_id:?}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_error_storage() -> Result<(), StorageError> {
     let storage = Storage::new_in_memory()?;
     let info = FileInfo {

@@ -206,6 +206,38 @@ fn non_trail_dot_format_is_rejected_before_runtime_cache_creation() {
 }
 
 #[test]
+fn query_sql_flag_reports_graph_dsl_guidance_before_runtime_cache_creation() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    let output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "query",
+            "--sql",
+            "select path, kind, name from symbols",
+            "--refresh",
+            "none",
+        ],
+    );
+
+    assert_fails_with(
+        output,
+        &[
+            "uses the graph-query DSL, not SQL",
+            "search(query: 'AppController') | limit(5)",
+            "For raw symbol discovery, use `search --query",
+        ],
+    );
+    assert!(
+        !cache_dir.path().join("codestory.db").exists(),
+        "SQL guardrail should fail before runtime cache creation"
+    );
+}
+
+#[test]
 fn trail_story_output_conflicts_are_rejected_before_runtime_cache_creation() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
@@ -248,6 +280,93 @@ fn trail_story_output_conflicts_are_rejected_before_runtime_cache_creation() {
     assert!(
         !cache_dir.path().join("codestory.db").exists(),
         "story/dot validation should happen before runtime cache creation"
+    );
+}
+
+#[test]
+fn snippet_lines_alias_sets_context_for_agent_guesses() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+    index_workspace(workspace.path(), cache_dir.path());
+
+    let output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "snippet",
+            "--query",
+            "AppController",
+            "--lines",
+            "12",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_success(&output, "snippet --lines alias should succeed");
+    let json = parse_stdout_json(&output);
+    assert_eq!(
+        json.pointer("/snippet/requested_context")
+            .and_then(Value::as_u64),
+        Some(12),
+        "--lines should feed the same context field as --context: {json:#}"
+    );
+}
+
+#[test]
+fn explain_id_alias_runs_focused_repo_explanation() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+    index_workspace(workspace.path(), cache_dir.path());
+
+    let search = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "search",
+            "--query",
+            "AppController",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success(&search, "search should find focus id");
+    let search_json = parse_stdout_json(&search);
+    let node_id = search_json
+        .pointer("/indexed_symbol_hits/0/node_id")
+        .and_then(Value::as_str)
+        .expect("search hit node_id");
+
+    let explain = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "explain",
+            "--id",
+            node_id,
+            "Explain this symbol and its role in the repo.",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_success(&explain, "explain --id should run focused explanation");
+    let json = parse_stdout_json(&explain);
+    assert!(
+        json.pointer("/answer/retrieval_trace/annotations")
+            .and_then(Value::as_array)
+            .is_some_and(|annotations| annotations
+                .iter()
+                .any(|annotation| annotation.as_str() == Some("mode=repo_explain_db_first"))),
+        "focused explain should preserve repo-explain annotations: {json:#}"
     );
 }
 

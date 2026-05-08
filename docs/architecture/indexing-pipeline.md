@@ -252,10 +252,15 @@ Cold start still has to embed any semantic doc that has no reusable row. The col
 
 The index summary reports graph and semantic work separately:
 
+- `timings_ms.cache_refresh`: wrapper time for search projection, search indexing, semantic sync, and runtime publication
+- `cache_ms.search_projection`: SQLite search-symbol projection rebuild from persisted nodes
+- `cache_ms.search_index`: runtime search index construction for symbol names
+- `cache_ms.runtime_publish`: publishing the rebuilt search state into the live runtime
 - `semantic_ms.doc_build`: generated semantic text and hashes
 - `semantic_ms.embedding`: embedding runtime work for pending docs
 - `semantic_ms.db_upsert`: SQLite writes for embedded docs
 - `semantic_ms.reload`: loading persisted semantic docs into the runtime search engine when needed
+- `semantic_ms.prune`: removing stale semantic docs after the refreshed symbol set is known
 - `semantic_docs.reused`: existing docs accepted without embedding
 - `semantic_docs.embedded`: docs newly embedded in this run
 - `semantic_docs.pending`: docs that needed embedding after reuse checks

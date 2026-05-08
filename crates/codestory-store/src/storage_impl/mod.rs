@@ -37,6 +37,7 @@ const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id,
                  FROM edge e
                  JOIN node t ON t.id = e.target_node_id
                  LEFT JOIN node f ON f.id = e.file_node_id";
+const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = 200;
 
 fn clamp_i64_to_u32(value: i64) -> u32 {
     if value <= 0 {
@@ -1658,6 +1659,86 @@ impl Storage {
             edges.push(Self::edge_from_row(row)?);
         }
         Ok(edges)
+    }
+
+    pub fn get_edges_for_node_ids(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<HashMap<NodeId, Vec<Edge>>, StorageError> {
+        if node_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut unique_node_ids = Vec::new();
+        let mut seen_node_ids = HashSet::new();
+        for node_id in node_ids {
+            if seen_node_ids.insert(*node_id) {
+                unique_node_ids.push(*node_id);
+            }
+        }
+
+        let mut edges_by_node = unique_node_ids
+            .iter()
+            .copied()
+            .map(|node_id| (node_id, Vec::new()))
+            .collect::<HashMap<_, _>>();
+
+        for chunk in unique_node_ids.chunks(EDGE_NODE_LOOKUP_BATCH_SIZE) {
+            let source_placeholders = numbered_placeholders(1, chunk.len());
+            let target_placeholders = numbered_placeholders(1 + chunk.len(), chunk.len());
+            let resolved_source_placeholders =
+                numbered_placeholders(1 + chunk.len() * 2, chunk.len());
+            let resolved_target_placeholders =
+                numbered_placeholders(1 + chunk.len() * 3, chunk.len());
+            let query = format!(
+                "{EDGE_SELECT_BASE}
+                 WHERE e.source_node_id IN ({source_placeholders})
+                    OR e.target_node_id IN ({target_placeholders})
+                    OR e.resolved_source_node_id IN ({resolved_source_placeholders})
+                    OR e.resolved_target_node_id IN ({resolved_target_placeholders})
+                 ORDER BY e.id"
+            );
+            let params = chunk
+                .iter()
+                .map(|id| Value::from(id.0))
+                .chain(chunk.iter().map(|id| Value::from(id.0)))
+                .chain(chunk.iter().map(|id| Value::from(id.0)))
+                .chain(chunk.iter().map(|id| Value::from(id.0)));
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(params))?;
+            let chunk_node_ids = chunk.iter().copied().collect::<HashSet<_>>();
+            while let Some(row) = rows.next()? {
+                let mut edge = Self::edge_from_row(row)?;
+                let target_symbol: String = row.get(12)?;
+                if edge.kind == EdgeKind::CALL
+                    && edge.resolved_target.is_some()
+                    && should_ignore_call_resolution(
+                        &target_symbol,
+                        edge.certainty,
+                        edge.confidence,
+                    )
+                {
+                    edge.resolved_target = None;
+                    edge.confidence = None;
+                    edge.certainty = None;
+                }
+
+                let (source, target) = edge.effective_endpoints();
+                if chunk_node_ids.contains(&source)
+                    && let Some(edges) = edges_by_node.get_mut(&source)
+                {
+                    edges.push(edge.clone());
+                }
+                if target != source
+                    && chunk_node_ids.contains(&target)
+                    && let Some(edges) = edges_by_node.get_mut(&target)
+                {
+                    edges.push(edge);
+                }
+            }
+        }
+
+        Ok(edges_by_node)
     }
 
     pub fn get_present_node_kinds(&self) -> Result<Vec<NodeKind>, StorageError> {

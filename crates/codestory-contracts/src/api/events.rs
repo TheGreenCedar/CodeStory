@@ -10,6 +10,12 @@ pub struct IndexingPhaseTimings {
     pub cleanup_ms: u32,
     pub cache_refresh_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_projection_rebuild_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_symbol_index_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_cache_publish_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_doc_build_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_embedding_ms: Option<u32>,
@@ -17,6 +23,8 @@ pub struct IndexingPhaseTimings {
     pub semantic_db_upsert_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_reload_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_prune_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_docs_reused: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,10 +172,14 @@ mod tests {
             error_flush_ms: 4,
             cleanup_ms: 5,
             cache_refresh_ms: None,
+            search_projection_rebuild_ms: None,
+            search_symbol_index_ms: None,
+            runtime_cache_publish_ms: None,
             semantic_doc_build_ms: None,
             semantic_embedding_ms: None,
             semantic_db_upsert_ms: None,
             semantic_reload_ms: None,
+            semantic_prune_ms: None,
             semantic_docs_reused: None,
             semantic_docs_embedded: None,
             semantic_docs_pending: None,
@@ -232,6 +244,10 @@ mod tests {
         assert!(value.get("semantic_embedding_ms").is_none());
         assert!(value.get("semantic_db_upsert_ms").is_none());
         assert!(value.get("semantic_reload_ms").is_none());
+        assert!(value.get("semantic_prune_ms").is_none());
+        assert!(value.get("search_projection_rebuild_ms").is_none());
+        assert!(value.get("search_symbol_index_ms").is_none());
+        assert!(value.get("runtime_cache_publish_ms").is_none());
         assert!(value.get("semantic_docs_reused").is_none());
         assert!(value.get("semantic_docs_embedded").is_none());
         assert!(value.get("semantic_docs_pending").is_none());

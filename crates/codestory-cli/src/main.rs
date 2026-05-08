@@ -179,6 +179,10 @@ fn quote_command_path(path: &std::path::Path) -> String {
     )
 }
 
+fn quote_command_value(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
+}
+
 fn run_index(cmd: IndexCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "index")?;
     preflight_output_file(cmd.output_file.as_deref())?;
@@ -415,6 +419,11 @@ fn run_explain(cmd: ExplainCommand) -> Result<()> {
     if prompt.is_empty() {
         bail!("Prompt cannot be empty.");
     }
+    let focus_node_id = cmd
+        .id
+        .as_ref()
+        .map(|id| NodeId(id.trim().to_string()))
+        .filter(|id| !id.0.is_empty());
 
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
@@ -449,7 +458,7 @@ fn run_explain(cmd: ExplainCommand) -> Result<()> {
         retrieval_profile: AgentRetrievalProfileSelectionDto::Preset {
             preset: AgentRetrievalPresetDto::Investigate,
         },
-        focus_node_id: None,
+        focus_node_id,
         max_results: Some(cmd.max_results.clamp(1, 25)),
         response_mode: AgentResponseModeDto::Markdown,
         latency_budget_ms: None,
@@ -497,17 +506,30 @@ fn explain_next_commands(
     project_root: &std::path::Path,
     anchors: &[SearchHitOutput],
 ) -> Vec<String> {
-    anchors
-        .iter()
-        .take(3)
-        .map(|anchor| {
-            format!(
-                "codestory-cli explore --project {} --id {} --no-tui",
-                quote_command_path(project_root),
-                anchor.node_id
-            )
-        })
-        .collect()
+    let project = quote_command_path(project_root);
+    let mut commands = Vec::new();
+    if let Some(anchor) = anchors.first() {
+        commands.push(format!(
+            "codestory-cli ask --project {project} --focus-id {} {}",
+            anchor.node_id,
+            quote_command_value("Explain this symbol and its role in the repo.")
+        ));
+        commands.push(format!(
+            "codestory-cli trail --project {project} --id {} --story --hide-speculative",
+            anchor.node_id
+        ));
+        commands.push(format!(
+            "codestory-cli snippet --project {project} --id {} --context 40",
+            anchor.node_id
+        ));
+    }
+    commands.extend(anchors.iter().take(3).map(|anchor| {
+        format!(
+            "codestory-cli explore --project {project} --id {} --no-tui",
+            anchor.node_id
+        )
+    }));
+    commands
 }
 
 fn run_ask(cmd: AskCommand) -> Result<()> {
@@ -988,8 +1010,25 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
 fn run_query(cmd: QueryCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "query")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let ast = codestory_runtime::parse_graph_query(&cmd.query)
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if let Some(sql) = cmd.sql.as_deref() {
+        bail!(
+            "CodeStory `query` uses the graph-query DSL, not SQL. \
+             Use syntax like `search(query: 'AppController') | limit(5)` or \
+             `trail(symbol: 'AppController') | filter(kind: function)`. \
+             For raw symbol discovery, use `search --query {}`. \
+             Unsupported SQL received: {}",
+            quote_command_value(sql),
+            sql
+        );
+    }
+    let query = cmd
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .context("Query cannot be empty.")?;
+    let ast =
+        codestory_runtime::parse_graph_query(query).map_err(|error| anyhow::anyhow!("{error}"))?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "query")?;
@@ -1001,7 +1040,7 @@ fn run_query(cmd: QueryCommand) -> Result<()> {
         .map(|item| explore::browser_query_item_to_output(&runtime.project_root, item))
         .collect();
     let output = QueryOutput {
-        query: cmd.query,
+        query: query.to_string(),
         ast,
         items,
     };
@@ -2113,10 +2152,14 @@ mod tests {
             error_flush_ms: 4,
             cleanup_ms: 5,
             cache_refresh_ms: Some(6),
+            search_projection_rebuild_ms: Some(61),
+            search_symbol_index_ms: Some(62),
+            runtime_cache_publish_ms: Some(63),
             semantic_doc_build_ms: Some(7),
             semantic_embedding_ms: Some(8),
             semantic_db_upsert_ms: Some(9),
             semantic_reload_ms: Some(10),
+            semantic_prune_ms: Some(64),
             semantic_docs_reused: Some(11),
             semantic_docs_embedded: Some(12),
             semantic_docs_pending: Some(13),
@@ -2263,7 +2306,13 @@ mod tests {
 
         let markdown = render_index_markdown(&output);
 
-        assert!(markdown.contains("semantic_ms: doc_build=7 embedding=8 db_upsert=9 reload=10"));
+        assert!(
+            markdown.contains("cache_ms: search_projection=61 search_index=62 runtime_publish=63")
+        );
+        assert!(
+            markdown
+                .contains("semantic_ms: doc_build=7 embedding=8 db_upsert=9 reload=10 prune=64")
+        );
         assert!(markdown.contains("semantic_docs: reused=11 embedded=12 pending=13 stale=14"));
         assert!(markdown.contains(
             "staged_publish_ms: deferred_indexes=7 summary_snapshot=8 detail_snapshot=9 publish=10"
