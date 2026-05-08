@@ -701,6 +701,56 @@ fn doctor_keeps_missing_llamacpp_endpoint_explicit() {
 }
 
 #[test]
+fn doctor_redacts_sensitive_llamacpp_url_output() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    let doctor = run_cli_json_with_embedding_env(
+        workspace.path(),
+        cache_dir.path(),
+        &["doctor", "--format", "json"],
+        &[
+            ("CODESTORY_EMBED_BACKEND", "llamacpp"),
+            (
+                "CODESTORY_EMBED_LLAMACPP_URL",
+                "https://user:secret@example.test/v1/embeddings?token=abc#frag",
+            ),
+        ],
+    );
+
+    let serialized = doctor.to_string();
+    assert!(
+        serialized.contains("https://example.test/v1/embeddings"),
+        "doctor should retain scheme/host/path for configured endpoints: {doctor:#}"
+    );
+    for secret_fragment in ["user:secret", "token=abc", "#frag"] {
+        assert!(
+            !serialized.contains(secret_fragment),
+            "doctor output should redact sensitive URL fragments `{secret_fragment}`: {doctor:#}"
+        );
+    }
+
+    let managed = check_with_name(&doctor, "managed_embeddings");
+    assert!(
+        managed["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("https://example.test/v1/embeddings")),
+        "managed embedding status should use redacted endpoint display: {managed:#}"
+    );
+    let env_row = doctor["environment"]
+        .as_array()
+        .expect("doctor environment")
+        .iter()
+        .find(|row| row["name"] == "CODESTORY_EMBED_LLAMACPP_URL")
+        .unwrap_or_else(|| panic!("missing URL env row: {doctor:#}"));
+    assert_eq!(
+        env_row["message"], "set to `https://example.test/v1/embeddings`",
+        "doctor URL env row should redact userinfo, query, and fragment: {env_row:#}"
+    );
+}
+
+#[test]
 fn setup_embeddings_dry_run_reports_pinned_managed_assets() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
@@ -822,6 +872,31 @@ fn doctor_does_not_autostart_installed_managed_embeddings() {
             .join("logs")
             .exists(),
         "doctor should not create managed llama-server logs or start the fake server: {doctor:#}"
+    );
+}
+
+#[test]
+fn index_dry_run_does_not_autostart_installed_managed_embeddings() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+    install_fake_managed_embeddings(cache_dir.path());
+
+    let dry_run = run_cli_json_with_embedding_env(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--dry-run", "--format", "json"],
+        &[],
+    );
+
+    assert_eq!(dry_run["dry_run"]["files_to_index"], 3);
+    assert!(
+        !cache_dir
+            .path()
+            .join("managed-embeddings")
+            .join("logs")
+            .exists(),
+        "index --dry-run should not create managed llama-server logs or start the fake server: {dry_run:#}"
     );
 }
 
@@ -1520,6 +1595,10 @@ fn ask_investigate_json_reports_bounded_trace_without_changing_plain_ask() {
             "json",
         ],
     );
+    assert_eq!(
+        investigated["retrieval_trace"]["resolved_profile"], "investigate",
+        "ask --investigate should expose the selected retrieval profile: {investigated:#}"
+    );
     assert!(
         trace_has_step(&investigated, "search"),
         "investigation starts with the current search ranking"
@@ -1585,16 +1664,17 @@ fn ask_investigate_json_reports_bounded_trace_without_changing_plain_ask() {
         "investigation should return cited evidence"
     );
     assert!(
-        investigated["retrieval_trace"]["annotations"]
-            .as_array()
-            .expect("trace annotations")
-            .iter()
-            .any(|annotation| {
-                annotation.as_str().is_some_and(|value| {
-                    let value = value.to_ascii_lowercase();
-                    value.contains("what i checked") || value.contains("investigation")
-                })
-            }),
+        investigated["retrieval_trace"]["resolved_profile"] == "investigate"
+            || investigated["retrieval_trace"]["annotations"]
+                .as_array()
+                .expect("trace annotations")
+                .iter()
+                .any(|annotation| {
+                    annotation.as_str().is_some_and(|value| {
+                        let value = value.to_ascii_lowercase();
+                        value.contains("what i checked") || value.contains("investigation")
+                    })
+                }),
         "investigation JSON should expose the named mode or what-I-checked trace"
     );
 

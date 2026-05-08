@@ -766,6 +766,21 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         "string",
         "ask.prompt should be a string: {ask}"
     );
+    assert_eq!(
+        schema_property(ask, "investigate")["type"],
+        "boolean",
+        "ask.investigate should be a boolean opt-in: {ask}"
+    );
+    assert_eq!(
+        schema_property(ask, "investigate").get("default"),
+        Some(&json!(false)),
+        "ask.investigate should document the stdio default: {ask}"
+    );
+    assert_eq!(
+        schema_property(ask, "focus_id")["type"],
+        json!(["string", "null"]),
+        "ask.focus_id should accept an optional node id: {ask}"
+    );
 }
 
 #[test]
@@ -1226,6 +1241,84 @@ fn transcript_calls_search_tool() {
     assert!(
         !symbols.is_empty() && symbols.len() <= 2,
         "symbols tool should respect the requested cap: {symbols_result}"
+    );
+}
+
+#[test]
+fn ask_tool_maps_investigate_and_focus_id_to_browser_request() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let search_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ask-focus-search",
+            "method": "tools/call",
+            "params": {
+                "name": "search",
+                "arguments": {"query": "AppController"}
+            }
+        }),
+    );
+    let search_result = assert_tool_success(&search_response, json!("ask-focus-search"));
+    let node_id = search_result["indexed_symbol_hits"]
+        .as_array()
+        .expect("indexed symbol hits")
+        .iter()
+        .find(|hit| hit["display_name"] == "AppController")
+        .and_then(|hit| hit["node_id"].as_str())
+        .unwrap_or_else(|| panic!("missing AppController node id: {search_result}"))
+        .to_string();
+
+    let ask_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ask-investigate-focus",
+            "method": "tools/call",
+            "params": {
+                "name": "ask",
+                "arguments": {
+                    "prompt": "Explain AppController for a focused investigation",
+                    "investigate": true,
+                    "focus_id": node_id,
+                    "max_results": 4
+                }
+            }
+        }),
+    );
+
+    let answer = assert_tool_success(&ask_response, json!("ask-investigate-focus"));
+    assert_eq!(
+        answer.pointer("/retrieval_trace/resolved_profile"),
+        Some(&json!("investigate")),
+        "stdio ask.investigate should use the investigation preset: {answer}"
+    );
+    assert!(
+        answer
+            .get("summary")
+            .and_then(Value::as_str)
+            .is_some_and(|summary| summary.contains("DB-first retrieval")),
+        "stdio ask should return the DB-first labeled answer after local-agent removal: {answer}"
+    );
+    assert!(
+        !answer.to_string().contains("local_agent"),
+        "stdio ask should not leak removed local-agent fields: {answer}"
+    );
+    let neighborhood_step = answer
+        .pointer("/retrieval_trace/steps")
+        .and_then(Value::as_array)
+        .and_then(|steps| steps.iter().find(|step| step["kind"] == "neighborhood"))
+        .unwrap_or_else(|| panic!("missing neighborhood step in answer trace: {answer}"));
+    assert!(
+        neighborhood_step
+            .get("input")
+            .and_then(Value::as_array)
+            .is_some_and(|fields| fields
+                .iter()
+                .any(|field| field["key"] == "center_id" && field["value"] == node_id)),
+        "stdio ask.focus_id should seed the browser focus node: {neighborhood_step}"
     );
 }
 

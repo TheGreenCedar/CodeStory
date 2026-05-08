@@ -71,7 +71,7 @@ pub(crate) use support::{
     apply_hybrid_limits, clamp_i64_to_u32, clamp_u64_to_u32, clamp_u128_to_u32, clamp_usize_to_u32,
     extract_symbol_search_terms, file_text_match_line, hybrid_retrieval_enabled,
     looks_like_repo_text_query, node_display_name, normalized_hybrid_weights, preferred_occurrence,
-    read_searchable_file_contents, should_expand_symbol_query,
+    query_has_symbol_or_literal_signal, read_searchable_file_contents, should_expand_symbol_query,
 };
 pub use symbol_query::{
     SymbolNameMatchRank, compare_ranked_hits, leading_symbol_segment, normalize_symbol_query,
@@ -3328,9 +3328,15 @@ impl AppController {
             let overview_hits =
                 grounding::grounding_explanation_search_hits(&snapshot, limit_per_source);
             if !overview_hits.is_empty() {
-                used_repo_explanation_overview = true;
-                suggestions = overview_hits.clone();
-                indexed_symbol_hits = overview_hits;
+                if query_has_symbol_or_literal_signal(&query) {
+                    merge_search_hits_by_node_id(&mut suggestions, overview_hits);
+                    suggestions.sort_by(|left, right| compare_search_hits(&query, left, right));
+                    suggestions.truncate(limit_per_source);
+                } else {
+                    used_repo_explanation_overview = true;
+                    suggestions = overview_hits.clone();
+                    indexed_symbol_hits = overview_hits;
+                }
             }
         }
 
@@ -5025,6 +5031,53 @@ pub fn exact_symbol_anchor() {{}}
     }
 
     #[test]
+    fn repo_explanation_overview_replacement_is_generic_only() {
+        assert!(AppController::is_repo_explanation_search_query(
+            "Explain how this repo fits together"
+        ));
+        assert!(!query_has_symbol_or_literal_signal(
+            "Explain how this repo fits together"
+        ));
+        assert!(query_has_symbol_or_literal_signal(
+            "Explain how AppController fits into this repo"
+        ));
+        assert!(query_has_symbol_or_literal_signal(
+            "Explain `CODESTORY_EMBED_RUNTIME_MODE` in this repo"
+        ));
+        assert!(query_has_symbol_or_literal_signal(
+            "Explain crates/codestory-runtime/src/lib.rs in this repo"
+        ));
+    }
+
+    #[test]
+    fn file_text_matching_prefers_high_signal_identifier_literals() {
+        let contents = r#"
+pub const CODESTORY_EMBED_RUNTIME_MODE: &str = "hash";
+
+fn build_llm_symbol_doc_text() -> String {
+    String::new()
+}
+"#;
+
+        assert_eq!(
+            file_text_match_line(
+                contents,
+                "Where is `build_llm_symbol_doc_text` defined?",
+                &extract_symbol_search_terms("Where is `build_llm_symbol_doc_text` defined?")
+            ),
+            Some(4)
+        );
+        assert_eq!(
+            file_text_match_line(
+                contents,
+                "What sets CODESTORY_EMBED_RUNTIME_MODE?",
+                &extract_symbol_search_terms("What sets CODESTORY_EMBED_RUNTIME_MODE?")
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn should_expand_symbol_query_for_sentence_prompts() {
         assert!(should_expand_symbol_query(
             "How does the language parsing work in this repo?",
@@ -5252,6 +5305,65 @@ pub fn exact_symbol_anchor() {{}}
             );
             assert_eq!(terminal_symbol_segment(&first.display_name), query);
         }
+    }
+
+    #[test]
+    fn repo_explanation_search_preserves_symbol_like_indexed_hits() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "false");
+        let workspace = copy_tictactoe_workspace();
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: workspace.path().to_string_lossy().to_string(),
+            })
+            .expect("open workspace");
+        controller
+            .run_indexing_blocking(IndexMode::Full)
+            .expect("index fixtures");
+
+        let generic_results = controller
+            .search_results(SearchRequest {
+                query: "Explain how this repo fits together".to_string(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 10,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            })
+            .expect("generic repo explanation search");
+        assert!(
+            !generic_results.indexed_symbol_hits.is_empty(),
+            "generic repo-explanation prompts should still use grounding overview hits"
+        );
+        assert_eq!(
+            generic_results.indexed_symbol_hits.len(),
+            generic_results.suggestions.len(),
+            "generic repo-explanation replacement should mirror overview suggestions"
+        );
+
+        let results = controller
+            .search_results(SearchRequest {
+                query: "Explain how check_winner fits in this repo".to_string(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 10,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            })
+            .expect("search fixtures");
+
+        assert!(
+            results
+                .indexed_symbol_hits
+                .iter()
+                .any(|hit| terminal_symbol_segment(&hit.display_name) == "check_winner"),
+            "symbol-like repo-explanation prompts should preserve indexed hits: {results:?}"
+        );
+        assert!(
+            !results.suggestions.is_empty(),
+            "symbol-like repo-explanation prompts should keep overview hits as suggestions: {results:?}"
+        );
     }
 
     #[test]

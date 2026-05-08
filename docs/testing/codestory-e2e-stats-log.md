@@ -23,6 +23,7 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-05-07 | a881f80 | pass, managed Vulkan embedding setup cold E2E | 51.45 | 0.18 | 0.60 | 0.20 | 0.15 | 0.14 | 40,064 | 33,971 | 146 | 0 | 5,548 | true |
 | 2026-05-07 | faf0fa8 | pass, manual friction autoresearch loop | 121.13 | 0.20 | 0.56 | 0.21 | 0.17 | 0.15 | 40,631 | 34,379 | 147 | 0 | 5,615 | true |
 | 2026-05-07 | c9a9552 | pass, intent-level manual friction closure | 148.20 | 0.23 | 0.64 | 0.25 | 0.19 | 0.17 | 41,033 | 34,708 | 147 | 0 | 5,658 | true |
+| 2026-05-08 | 345fef5 | pass, branch review fixes | 59.07 | 0.18 | 0.48 | 0.20 | 0.17 | 0.16 | 41,126 | 34,784 | 145 | 0 | 5,703 | true |
 
 ## Phase Metrics
 
@@ -41,3 +42,4 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-05-07 | a881f80 | managed Vulkan embedding setup cold E2E | 51.45 | 4.48 | 40.19 | 0 | 5,548 | 0 |
 | 2026-05-07 | faf0fa8 | manual friction autoresearch loop cold E2E | 121.13 | 4.12 | 111.89 | 0 | 5,615 | 0 |
 | 2026-05-07 | c9a9552 | intent-level manual friction closure cold E2E | 148.20 | 5.28 | 137.35 | 0 | 5,658 | 0 |
+| 2026-05-08 | 345fef5 | branch review fixes cold E2E | 59.07 | 4.95 | 47.39 | 0 | 5,703 | 0 |

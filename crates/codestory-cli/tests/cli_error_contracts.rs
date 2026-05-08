@@ -196,7 +196,7 @@ fn non_trail_dot_format_is_rejected_before_runtime_cache_creation() {
         output,
         &[
             "--format dot is only supported by `trail`",
-            "`search` supports markdown and json",
+            "use markdown or json",
         ],
     );
     assert!(

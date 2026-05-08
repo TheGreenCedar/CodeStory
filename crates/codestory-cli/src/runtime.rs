@@ -81,7 +81,8 @@ impl RuntimeContext {
         let config = crate::config::load_config(&project_root)?;
         let cache_override = args.cache_dir.as_deref().or(config.cache_dir.as_deref());
         let cache_root = cache_root_for_project(&project_root, cache_override)?;
-        let managed_embeddings_root = crate::managed_embeddings::managed_root(cache_override)?;
+        let managed_embeddings_root =
+            crate::managed_embeddings::managed_root(args.cache_dir.as_deref())?;
         if startup == ManagedEmbeddingStartup::AutostartIfInstalled {
             crate::managed_embeddings::prepare_runtime_if_installed(&managed_embeddings_root);
         }
@@ -328,6 +329,39 @@ pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn project_config_cache_dir_does_not_select_managed_executable_root() {
+        let temp = tempdir().expect("temp dir");
+        let project = temp.path().join("repo");
+        let config_cache = temp.path().join("repo-controlled-cache");
+        fs::create_dir_all(&project).expect("create project");
+        fs::write(
+            project.join(".codestory.toml"),
+            format!("cache_dir = {:?}\n", config_cache.to_string_lossy()),
+        )
+        .expect("write project config");
+
+        let context = RuntimeContext::new_inspect_only(&ProjectArgs {
+            project,
+            cache_dir: None,
+        })
+        .expect("runtime context");
+
+        assert_eq!(context.storage_path, config_cache.join("codestory.db"));
+        assert_ne!(
+            context.managed_embeddings_root,
+            config_cache.join("managed-embeddings"),
+            "repo-controlled config cache_dir must not choose executable managed asset root"
+        );
+    }
 }
 
 pub(crate) fn resolve_refresh_request(

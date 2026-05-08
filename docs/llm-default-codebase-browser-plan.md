@@ -41,7 +41,7 @@ The main limitations are sharper:
 - Local external-agent execution has been removed from `ask`; the remaining risk is keeping the DB-first browser contract from regressing.
 - `.codestory.toml` documents `embedding_model`, but the config maps it to an env var the runtime does not read for active embedding profile selection.
 - The repo-local `codestory-grounding` skill has stale crate names and lacks detailed refs for `ask`, `doctor`, `explore`, and `serve`.
-- CLI help advertises `--format dot` for commands that later reject it.
+- CLI help must keep `--format dot` trail-only so non-trail commands expose only `markdown|json`.
 - The best product-flow tests are ignored or heavy; there is no small always-on "index then browse" golden path.
 - HTTP/stdio tool schemas and prompts are handwritten in the CLI.
 - `ask` is still mostly a one-pass evidence packet, and exact integration questions can return weak or zero-hit answers.

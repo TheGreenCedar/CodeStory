@@ -131,7 +131,7 @@ flowchart LR
 - `ground`: build grounded context from indexed symbols, snippets, graph traversal, and search results; `--why` explains retrieval mode, coverage, and query hints
 - `explain`: run the guided repo-explanation path in one command: open or refresh the index, ground, anchor search, and DB-first ask
 - `search`: find symbols, files, and query matches; semantic-only near misses appear under `did_you_mean`, and `--why` includes lexical/semantic/graph score breakdowns when available
-- `ask`: run DB-first agentic retrieval across search, graph, snippets, traces, and citations; by default it does not launch an external agent, while `--with-local-agent` opts into local Codex/Claude synthesis
+- `ask`: run DB-first agentic retrieval across search, graph, snippets, traces, and citations without launching an external agent
 - `symbol`: inspect one symbol and its indexed relationships
 - `trail`: walk caller/callee and usage neighborhoods through the graph; `--mermaid` emits a Mermaid flowchart and `--format dot` emits Graphviz DOT
 - `snippet`: fetch focused source context for a symbol or file location; Markdown snippets use ANSI syntax highlighting when stdout is an interactive terminal

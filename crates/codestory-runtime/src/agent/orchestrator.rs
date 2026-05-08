@@ -2032,36 +2032,6 @@ mod tests {
     }
 
     #[test]
-    fn should_use_agent_term_planner_for_sentence_queries_with_few_hits() {
-        assert!(should_use_agent_term_planner(
-            "How does the language parsing work in this repo?",
-            0
-        ));
-        assert!(!should_use_agent_term_planner("parser", 0));
-        assert!(!should_use_agent_term_planner(
-            "How does the language parsing work in this repo?",
-            4
-        ));
-    }
-
-    #[test]
-    fn parse_agent_terms_handles_bullets_and_commas() {
-        let parsed = parse_agent_terms(
-            "- parser_pipeline\n- tree_sitter::Parser, language_parsing, ast_builder",
-            6,
-        );
-        assert_eq!(
-            parsed,
-            vec![
-                "parser_pipeline".to_string(),
-                "tree_sitter::Parser".to_string(),
-                "language_parsing".to_string(),
-                "ast_builder".to_string(),
-            ]
-        );
-    }
-
-    #[test]
     fn merge_search_hits_deduplicates_and_keeps_best_score() {
         let mut into = vec![SearchHit {
             node_id: codestory_contracts::api::NodeId("1".to_string()),

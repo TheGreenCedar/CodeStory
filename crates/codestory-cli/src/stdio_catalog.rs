@@ -760,6 +760,13 @@ static ASK_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
             .with_bounds(1, 50),
         SchemaProperty::boolean("include_evidence", "Include evidence in the answer.")
             .with_default(ValueLiteral::Boolean(true)),
+        SchemaProperty::boolean("investigate", "Use bounded investigation retrieval.")
+            .with_default(ValueLiteral::Boolean(false)),
+        SchemaProperty::string(
+            "focus_id",
+            "Optional exact node id to focus retrieval around.",
+        )
+        .nullable(),
     ],
     &["prompt"],
 );

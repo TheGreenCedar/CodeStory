@@ -266,20 +266,21 @@ pub(crate) fn inspect_status(root: &Path) -> ManagedEmbeddingsStatus {
         } else {
             "external_llama_unreachable"
         };
+        let display_url = redact_url_for_display(&url);
         let message = if state == "external_llama_configured" {
             format!(
-                "External llama.cpp endpoint is configured and accepted an embeddings probe at {url}."
+                "External llama.cpp endpoint is configured and accepted an embeddings probe at {display_url}."
             )
         } else {
             format!(
-                "External llama.cpp endpoint is configured but did not accept an embeddings probe at {url}."
+                "External llama.cpp endpoint is configured but did not accept an embeddings probe at {display_url}."
             )
         };
         return ManagedEmbeddingsStatus {
             state: state.to_string(),
             message,
             root: clean_path(root),
-            endpoint: url,
+            endpoint: display_url,
             llama_server: None,
             model: None,
         };
@@ -420,10 +421,14 @@ fn start_or_reuse_managed_server(root: &Path) -> ManagedEmbeddingsStatus {
 fn spawn_llama_server(root: &Path, server: &Path, model: &Path) -> Result<()> {
     fs::create_dir_all(logs_dir(root))
         .with_context(|| format!("Failed to create {}", logs_dir(root).display()))?;
-    let server = fs::canonicalize(server)
-        .with_context(|| format!("Failed to resolve {}", server.display()))?;
-    let model = fs::canonicalize(model)
-        .with_context(|| format!("Failed to resolve {}", model.display()))?;
+    let server = canonical_child_path(root, server).with_context(|| {
+        format!(
+            "Managed llama-server path is not trusted: {}",
+            server.display()
+        )
+    })?;
+    let model = canonical_child_path(root, model)
+        .with_context(|| format!("Managed model path is not trusted: {}", model.display()))?;
     let stdout = OpenOptions::new()
         .create(true)
         .append(true)
@@ -482,7 +487,8 @@ fn install_asset(url: &str, destination: &Path, expected_sha256: &str) -> Result
     };
     fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
     let partial = destination.with_extension("download");
-    let status = Command::new("curl")
+    let curl = trusted_tool_path("curl", &[parent])?;
+    let status = Command::new(&curl)
         .arg("--fail")
         .arg("--location")
         .arg("--retry")
@@ -491,7 +497,12 @@ fn install_asset(url: &str, destination: &Path, expected_sha256: &str) -> Result
         .arg(&partial)
         .arg(url)
         .status()
-        .with_context(|| format!("Failed to run curl while downloading {url}"))?;
+        .with_context(|| {
+            format!(
+                "Failed to run trusted curl at {} while downloading {url}",
+                curl.display()
+            )
+        })?;
     if !status.success() {
         bail!("curl failed while downloading {url}");
     }
@@ -558,13 +569,26 @@ fn extract_llama_archive(archive: &Path, destination: &Path) -> Result<()> {
     }
     fs::create_dir_all(&staging)
         .with_context(|| format!("Failed to create {}", staging.display()))?;
-    let status = Command::new("tar")
+    let tar = trusted_tool_path(
+        "tar",
+        &[
+            archive.parent().unwrap_or_else(|| Path::new(".")),
+            destination,
+        ],
+    )?;
+    let status = Command::new(&tar)
         .arg("-xf")
         .arg(archive)
         .arg("-C")
         .arg(&staging)
         .status()
-        .with_context(|| format!("Failed to run tar while extracting {}", archive.display()))?;
+        .with_context(|| {
+            format!(
+                "Failed to run trusted tar at {} while extracting {}",
+                tar.display(),
+                archive.display()
+            )
+        })?;
     if !status.success() {
         bail!("tar failed while extracting {}", archive.display());
     }
@@ -584,11 +608,18 @@ fn extract_llama_archive(archive: &Path, destination: &Path) -> Result<()> {
 }
 
 fn archive_entries(archive: &Path) -> Result<Vec<String>> {
-    let output = Command::new("tar")
+    let tar = trusted_tool_path("tar", &[archive.parent().unwrap_or_else(|| Path::new("."))])?;
+    let output = Command::new(&tar)
         .arg("-tf")
         .arg(archive)
         .output()
-        .with_context(|| format!("Failed to run tar while listing {}", archive.display()))?;
+        .with_context(|| {
+            format!(
+                "Failed to run trusted tar at {} while listing {}",
+                tar.display(),
+                archive.display()
+            )
+        })?;
     if !output.status.success() {
         bail!(
             "tar failed while listing {}\nstderr:\n{}",
@@ -628,6 +659,71 @@ pub(crate) fn archive_entry_is_safe(entry: &str) -> bool {
     let path = Path::new(trimmed);
     path.components()
         .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+}
+
+fn trusted_tool_path(tool: &str, disallowed_roots: &[&Path]) -> Result<PathBuf> {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        bail!("PATH is not set; cannot locate trusted `{tool}`");
+    };
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        for candidate_name in command_candidate_names(tool) {
+            let candidate = dir.join(&candidate_name);
+            if !candidate.is_file() {
+                continue;
+            }
+            let canonical = fs::canonicalize(&candidate)
+                .with_context(|| format!("Failed to resolve {}", candidate.display()))?;
+            if path_is_under_disallowed_root(&canonical, disallowed_roots) {
+                continue;
+            }
+            return Ok(canonical);
+        }
+    }
+    bail!("Could not find trusted `{tool}` on PATH outside the project/cache roots")
+}
+
+fn command_candidate_names(tool: &str) -> Vec<String> {
+    if Path::new(tool).extension().is_some() {
+        return vec![tool.to_string()];
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut names = vec![tool.to_string()];
+        let path_ext = std::env::var_os("PATHEXT")
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+        for extension in path_ext.split(';') {
+            if extension.trim().is_empty() {
+                continue;
+            }
+            names.push(format!("{tool}{extension}"));
+            names.push(format!("{tool}{}", extension.to_ascii_lowercase()));
+        }
+        names
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        vec![tool.to_string()]
+    }
+}
+
+fn path_is_under_disallowed_root(path: &Path, disallowed_roots: &[&Path]) -> bool {
+    let current_dir = std::env::current_dir()
+        .ok()
+        .and_then(|path| fs::canonicalize(path).ok());
+    if current_dir
+        .as_ref()
+        .is_some_and(|root| path.starts_with(root))
+    {
+        return true;
+    }
+    disallowed_roots
+        .iter()
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .any(|root| path.starts_with(root))
 }
 
 fn write_manifest(
@@ -711,30 +807,57 @@ fn llama_extract_dir(root: &Path, asset: LlamaAsset) -> PathBuf {
         .join(archive_label)
 }
 
+fn manifest_child_path(root: &Path, raw_path: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(raw_path);
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    canonical_child_path(root, &candidate).ok()
+}
+
+fn canonical_child_path(root: &Path, path: &Path) -> Result<PathBuf> {
+    let root = fs::canonicalize(root)
+        .with_context(|| format!("Failed to resolve managed root {}", root.display()))?;
+    let path = fs::canonicalize(path)
+        .with_context(|| format!("Failed to resolve managed path {}", path.display()))?;
+    if !path.starts_with(&root) {
+        bail!(
+            "Managed path {} is outside managed root {}",
+            path.display(),
+            root.display()
+        );
+    }
+    Ok(path)
+}
+
 fn default_model_path(root: &Path) -> Option<PathBuf> {
     if let Some(manifest) = read_manifest(root)
         && let Some(model_path) = manifest.model_path
+        && let Some(path) = manifest_child_path(root, &model_path)
     {
-        let path = PathBuf::from(model_path);
         if path.exists() {
             return Some(path);
         }
     }
     MODEL_ASSETS
         .iter()
-        .map(|asset| models_dir(root).join(asset.name))
+        .filter_map(|asset| canonical_child_path(root, &models_dir(root).join(asset.name)).ok())
         .find(|path| path.exists())
 }
 
 fn llama_server_path(root: &Path) -> Option<PathBuf> {
     if let Some(manifest) = read_manifest(root)
         && let Some(llama_path) = manifest.llama_path
-        && let Some(server) = llama_server_in_dir(&PathBuf::from(llama_path))
+        && let Some(dir) = manifest_child_path(root, &llama_path)
+        && let Some(server) =
+            llama_server_in_dir(&dir).and_then(|path| canonical_child_path(root, &path).ok())
     {
         return Some(server);
     }
     let llama_root = root.join("llama").join(LLAMA_RELEASE_TAG);
-    llama_server_in_dir(&llama_root)
+    llama_server_in_dir(&llama_root).and_then(|path| canonical_child_path(root, &path).ok())
 }
 
 fn read_manifest(root: &Path) -> Option<ManagedManifest> {
@@ -984,6 +1107,23 @@ fn clean_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+pub(crate) fn redact_url_for_display(value: &str) -> String {
+    let trimmed = value.trim();
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return "set".to_string();
+    };
+    let without_fragment = rest.split('#').next().unwrap_or(rest);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    let host_and_path = without_query
+        .rsplit_once('@')
+        .map(|(_, after_userinfo)| after_userinfo)
+        .unwrap_or(without_query);
+    format!("{scheme}://{host_and_path}")
+}
+
 fn managed_status_message(root: &Path, running: bool) -> String {
     let install = managed_install_label(root)
         .map(|label| format!(" using {label}"))
@@ -1173,7 +1313,10 @@ mod tests {
         .expect("write manifest");
 
         let selected = llama_server_path(root).expect("selected server");
-        assert_eq!(selected, vulkan_dir.join(executable));
+        assert_eq!(
+            selected,
+            fs::canonicalize(vulkan_dir.join(executable)).expect("canonical vulkan server")
+        );
     }
 
     #[test]
@@ -1251,5 +1394,60 @@ mod tests {
         let root = managed_root(Some(temp.path())).expect("managed root");
         assert!(root.starts_with(temp.path()));
         assert!(root.ends_with(MANAGED_DIR_NAME));
+    }
+
+    #[test]
+    fn manifest_paths_outside_managed_root_are_ignored() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path().join("managed");
+        let outside = temp.path().join("outside");
+        let executable = if cfg!(target_os = "windows") {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        };
+        fs::create_dir_all(&root).expect("create managed root");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        fs::write(outside.join(executable), b"not trusted").expect("write outside server");
+        fs::write(outside.join("model.gguf"), b"not trusted").expect("write outside model");
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "llama_path": clean_path(&outside),
+                "model_path": clean_path(&outside.join("model.gguf")),
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+
+        assert!(llama_server_path(&root).is_none());
+        assert!(default_model_path(&root).is_none());
+    }
+
+    #[test]
+    fn trusted_tool_lookup_rejects_disallowed_roots() {
+        let temp = tempdir().expect("temp dir");
+        let disallowed = temp.path().join("repo");
+        let other = temp.path().join("tools");
+        fs::create_dir_all(&disallowed).expect("create disallowed");
+        fs::create_dir_all(&other).expect("create tools");
+        let tool = if cfg!(target_os = "windows") {
+            "codestory-test-tool.exe"
+        } else {
+            "codestory-test-tool"
+        };
+        let disallowed_tool = disallowed.join(tool);
+        let trusted_tool = other.join(tool);
+        fs::write(&disallowed_tool, b"bad").expect("write disallowed tool");
+        fs::write(&trusted_tool, b"ok").expect("write trusted tool");
+
+        assert!(path_is_under_disallowed_root(
+            &fs::canonicalize(disallowed_tool).expect("canonical disallowed"),
+            &[&disallowed]
+        ));
+        assert!(!path_is_under_disallowed_root(
+            &fs::canonicalize(trusted_tool).expect("canonical trusted"),
+            &[&disallowed]
+        ));
     }
 }

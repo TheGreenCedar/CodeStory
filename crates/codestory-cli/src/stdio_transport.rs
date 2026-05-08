@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use codestory_contracts::api::{
-    AgentAskRequest, AgentResponseModeDto, GroundingBudgetDto, ListChildrenSymbolsRequest,
+    AgentAskRequest, AgentResponseModeDto, AgentRetrievalPresetDto,
+    AgentRetrievalProfileSelectionDto, GroundingBudgetDto, ListChildrenSymbolsRequest,
     ListRootSymbolsRequest, NodeId, SearchRepoTextMode, SearchRequest, TrailDirection,
 };
 use std::io::{BufRead, Write};
@@ -518,6 +519,16 @@ fn handle_stdio_ask(
         .pointer("/params/arguments/include_evidence")
         .and_then(|value| value.as_bool())
         .unwrap_or(true);
+    let investigate = request
+        .pointer("/params/arguments/investigate")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let focus_node_id = request
+        .pointer("/params/arguments/focus_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| NodeId(value.to_string()));
     let response_mode = match request
         .pointer("/params/arguments/response_mode")
         .and_then(|value| value.as_str())
@@ -525,12 +536,19 @@ fn handle_stdio_ask(
         Some("markdown") => AgentResponseModeDto::Markdown,
         _ => AgentResponseModeDto::Structured,
     };
+    let retrieval_profile = if investigate {
+        AgentRetrievalProfileSelectionDto::Preset {
+            preset: AgentRetrievalPresetDto::Investigate,
+        }
+    } else {
+        AgentRetrievalProfileSelectionDto::Auto
+    };
     runtime
         .browser
         .ask(AgentAskRequest {
             prompt,
-            retrieval_profile: codestory_contracts::api::AgentRetrievalProfileSelectionDto::Auto,
-            focus_node_id: None,
+            retrieval_profile,
+            focus_node_id,
             max_results: Some(max_results),
             response_mode,
             latency_budget_ms: None,

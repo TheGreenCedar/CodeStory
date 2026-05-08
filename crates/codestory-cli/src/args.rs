@@ -65,6 +65,17 @@ pub(crate) enum OutputFormat {
     Dot,
 }
 
+fn parse_read_output_format(value: &str) -> Result<OutputFormat, String> {
+    match value {
+        "markdown" => Ok(OutputFormat::Markdown),
+        "json" => Ok(OutputFormat::Json),
+        "dot" => Err("--format dot is only supported by `trail`; use markdown or json".to_string()),
+        other => Err(format!(
+            "invalid output format `{other}`; expected `markdown` or `json`"
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum RefreshMode {
     Auto,
@@ -153,7 +164,7 @@ pub(crate) struct IndexCommand {
         long_help = INDEX_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -190,7 +201,7 @@ pub(crate) struct GroundCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -224,7 +235,7 @@ pub(crate) struct ExplainCommand {
         help = "Explain defaults to `auto`: it opens or refreshes the index before collecting grounding and asking."
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -274,7 +285,7 @@ pub(crate) struct AskCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -317,7 +328,7 @@ pub(crate) struct AskCommand {
 pub(crate) struct DoctorCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -361,7 +372,7 @@ pub(crate) struct SetupEmbeddingsCommand {
         help = "Install and verify assets without starting llama-server."
     )]
     pub(crate) no_start: bool,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -397,7 +408,7 @@ pub(crate) struct SearchCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -492,7 +503,7 @@ pub(crate) struct SymbolCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -565,7 +576,7 @@ pub(crate) struct SnippetCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -588,7 +599,7 @@ pub(crate) struct QueryCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -620,7 +631,7 @@ pub(crate) struct ExploreCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -660,7 +671,7 @@ pub(crate) struct BookmarkAddCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -676,7 +687,7 @@ pub(crate) struct BookmarkListCommand {
     pub(crate) project: ProjectArgs,
     #[arg(long)]
     pub(crate) category: Option<String>,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -692,7 +703,7 @@ pub(crate) struct BookmarkRemoveCommand {
     pub(crate) project: ProjectArgs,
     #[arg(value_name = "BOOKMARK_ID")]
     pub(crate) id: String,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -1174,6 +1185,49 @@ mod tests {
             help.contains("dot"),
             "trail help should expose its graphviz output format: {help}"
         );
+    }
+
+    #[test]
+    fn non_trail_help_does_not_advertise_dot_format() {
+        for name in [
+            "index", "ground", "explain", "ask", "doctor", "search", "symbol", "snippet", "query",
+            "explore",
+        ] {
+            let help = render_subcommand_help(name);
+            assert!(
+                !help.contains("dot"),
+                "{name} help should not advertise trail-only dot output: {help}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_trail_format_parser_rejects_dot_before_runtime() {
+        let error = Cli::try_parse_from([
+            "codestory-cli",
+            "search",
+            "--query",
+            "AppController",
+            "--format",
+            "dot",
+        ])
+        .expect_err("search should reject trail-only dot output");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--format dot is only supported by `trail`"),
+            "search parse error should explain the trail-only dot format: {error}"
+        );
+        Cli::try_parse_from([
+            "codestory-cli",
+            "trail",
+            "--query",
+            "AppController",
+            "--format",
+            "dot",
+        ])
+        .expect("trail should keep accepting dot output");
     }
 
     #[test]

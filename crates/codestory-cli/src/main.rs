@@ -145,14 +145,7 @@ fn run_setup_embeddings(cmd: args::SetupEmbeddingsCommand) -> Result<()> {
     preflight_output_file(cmd.output_file.as_deref())?;
     let next_commands =
         setup_embeddings_next_commands(&cmd.project.project, cmd.project.cache_dir.as_deref());
-    let project_root = runtime::canonicalize_project_root(&cmd.project.project)?;
-    let config = config::load_config(&project_root)?;
-    let cache_override = cmd
-        .project
-        .cache_dir
-        .as_deref()
-        .or(config.cache_dir.as_deref());
-    let managed_root = managed_embeddings::managed_root(cache_override)?;
+    let managed_root = managed_embeddings::managed_root(cmd.project.cache_dir.as_deref())?;
     let mut output = managed_embeddings::setup_embeddings(
         &managed_root,
         cmd.quant,
@@ -253,7 +246,11 @@ fn validate_index_watch_output_file(cmd: &IndexCommand) -> Result<()> {
 }
 
 fn run_index_once(cmd: &IndexCommand) -> Result<()> {
-    let runtime = RuntimeContext::new(&cmd.project)?;
+    let runtime = if cmd.dry_run {
+        RuntimeContext::new_inspect_only(&cmd.project)?
+    } else {
+        RuntimeContext::new(&cmd.project)?
+    };
     if cmd.dry_run {
         let summary = runtime.open_project_summary()?;
         let refresh_mode =
@@ -1143,7 +1140,12 @@ fn build_doctor_output(
     summary: &codestory_contracts::api::ProjectSummary,
 ) -> DoctorOutput {
     let indexed = summary.stats.node_count > 0;
-    let retrieval = summary.retrieval.clone();
+    let mut retrieval = summary.retrieval.clone();
+    if let Some(retrieval) = retrieval.as_mut()
+        && let Some(message) = retrieval.fallback_message.as_mut()
+    {
+        *message = redact_urls_in_text(message);
+    }
     let project = display::clean_path_string(&summary.root);
     let storage_path = display::clean_path_string(&runtime.storage_path.to_string_lossy());
     let storage_exists = runtime.storage_path.exists();
@@ -1213,7 +1215,7 @@ fn build_doctor_output(
     .into_iter()
     .map(|name| match std::env::var(name) {
         Ok(value) if !value.trim().is_empty() => {
-            doctor_check(name, "ok", format!("set to `{}`", value.trim()))
+            doctor_check(name, "ok", doctor_env_check_message(name, &value))
         }
         _ => doctor_check(name, "info", "not set; using runtime defaults".to_string()),
     })
@@ -1230,6 +1232,50 @@ fn build_doctor_output(
         next_commands: index_next_commands(&project, summary.retrieval.as_ref()),
         environment,
     }
+}
+
+fn doctor_env_check_message(name: &str, value: &str) -> String {
+    let trimmed = value.trim();
+    if name.ends_with("_URL") || trimmed.contains("://") {
+        return format!(
+            "set to `{}`",
+            managed_embeddings::redact_url_for_display(trimmed)
+        );
+    }
+    format!("set to `{trimmed}`")
+}
+
+fn redact_urls_in_text(text: &str) -> String {
+    text.split_whitespace()
+        .map(redact_url_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_url_token(token: &str) -> String {
+    let prefix_len = token
+        .find("://")
+        .and_then(|scheme_end| {
+            token[..scheme_end]
+                .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.')))
+                .map(|index| index + 1)
+                .or(Some(0))
+        })
+        .unwrap_or(token.len());
+    if prefix_len == token.len() {
+        return token.to_string();
+    }
+
+    let prefix = &token[..prefix_len];
+    let url_and_suffix = &token[prefix_len..];
+    let suffix_start = url_and_suffix
+        .find(|ch: char| matches!(ch, ')' | ']' | '}' | ',' | ';' | '`'))
+        .unwrap_or(url_and_suffix.len());
+    let (url, suffix) = url_and_suffix.split_at(suffix_start);
+    format!(
+        "{prefix}{}{suffix}",
+        managed_embeddings::redact_url_for_display(url)
+    )
 }
 
 fn semantic_health_check(
