@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 codestory-contracts = { workspace = true }
-codestory-workspace = { workspace = true }
 anyhow = { workspace = true }
 parking_lot = { workspace = true }
 rusqlite = { workspace = true }
@@ -16,4 +15,3 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-

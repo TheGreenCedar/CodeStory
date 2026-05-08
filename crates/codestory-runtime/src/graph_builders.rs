@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::VecDeque;
 
 pub(super) fn graph_neighborhood(
     controller: &AppController,
@@ -126,6 +127,7 @@ pub(super) fn graph_trail(
 ) -> Result<GraphResponse, ApiError> {
     let root_id = req.root_id.to_core()?;
     let graph_flags = app_graph_flags();
+    let hide_speculative = req.hide_speculative;
     let target_id = match req.target_id {
         Some(id) => Some(id.to_core()?),
         None => None,
@@ -229,12 +231,77 @@ pub(super) fn graph_trail(
     let canonical_layout =
         graph_canonical::build_canonical_layout(&center_id, &node_dtos, &edge_dtos);
 
-    Ok(GraphResponse {
+    let mut response = GraphResponse {
         center_id,
         nodes: node_dtos,
         edges: edge_dtos,
         truncated,
         omitted_edge_count,
         canonical_layout: Some(canonical_layout),
-    })
+    };
+    if hide_speculative {
+        response = hide_speculative_trail_edges(response);
+    }
+    Ok(response)
+}
+
+fn hide_speculative_trail_edges(mut response: GraphResponse) -> GraphResponse {
+    let original_edge_count = response.edges.len();
+    let retained_edges = response
+        .edges
+        .into_iter()
+        .filter(|edge| !is_speculative_certainty(edge.certainty.as_deref()))
+        .collect::<Vec<_>>();
+
+    let mut adjacency = HashMap::new();
+    for edge in &retained_edges {
+        adjacency
+            .entry(edge.source.clone())
+            .or_insert_with(Vec::new)
+            .push(edge.target.clone());
+        adjacency
+            .entry(edge.target.clone())
+            .or_insert_with(Vec::new)
+            .push(edge.source.clone());
+    }
+
+    let mut reachable = HashSet::new();
+    let mut queue = VecDeque::new();
+    reachable.insert(response.center_id.clone());
+    queue.push_back(response.center_id.clone());
+    while let Some(node_id) = queue.pop_front() {
+        if let Some(next_nodes) = adjacency.get(&node_id) {
+            for next in next_nodes {
+                if reachable.insert(next.clone()) {
+                    queue.push_back(next.clone());
+                }
+            }
+        }
+    }
+
+    response.nodes.retain(|node| reachable.contains(&node.id));
+    response.edges = retained_edges
+        .into_iter()
+        .filter(|edge| reachable.contains(&edge.source) && reachable.contains(&edge.target))
+        .collect();
+    let omitted_edges = original_edge_count.saturating_sub(response.edges.len()) as u32;
+    response.omitted_edge_count = response.omitted_edge_count.saturating_add(omitted_edges);
+
+    if let Some(layout) = response.canonical_layout.as_mut() {
+        layout.nodes.retain(|node| reachable.contains(&node.id));
+        layout.edges.retain(|edge| {
+            !is_speculative_certainty(edge.certainty.as_deref())
+                && reachable.contains(&edge.source)
+                && reachable.contains(&edge.target)
+        });
+    }
+
+    response
+}
+
+fn is_speculative_certainty(certainty: Option<&str>) -> bool {
+    matches!(
+        certainty.map(|value| value.to_ascii_lowercase()).as_deref(),
+        Some("uncertain" | "speculative")
+    )
 }

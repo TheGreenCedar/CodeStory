@@ -47,6 +47,20 @@ Refresh behavior belongs to runtime, not the CLI adapter:
 
 Semantic indexing is not a separate CLI flag. The default `index` path syncs semantic docs when embedding assets are available. Runtime-level environment variables control retrieval behavior and tuning, including `CODESTORY_HYBRID_RETRIEVAL_ENABLED`, `CODESTORY_SEMANTIC_DOC_SCOPE`, `CODESTORY_SEMANTIC_DOC_ALIAS_MODE`, `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE`, and `CODESTORY_EMBED_*`.
 
+## Configuration Files
+
+The CLI loads optional `.codestory.toml` defaults from the user home directory and then from the selected project root. Project config overrides home config. Explicit environment variables override both config files because config values are only applied when the matching runtime env var is absent.
+
+Embedding config keys map to the runtime env names:
+
+| `.codestory.toml` key | Runtime env var | Notes |
+| --- | --- | --- |
+| `embedding_profile` | `CODESTORY_EMBED_PROFILE` | Selects a built-in profile such as `bge-base-en-v1.5`, `bge-small-en-v1.5`, or `custom`. |
+| `embedding_model_id` | `CODESTORY_EMBED_MODEL_ID` | Overrides the resolved model id for the selected profile. |
+| `embedding_model` | `CODESTORY_EMBED_MODEL_ID` | Deprecated alias for `embedding_model_id`; prefer the explicit key in new config. |
+
+The CLI should not set stale embedding env aliases that the runtime does not read.
+
 Index output should expose:
 
 - project and storage paths
@@ -62,9 +76,9 @@ Read commands default to `--refresh none` so they query the current cache unless
 
 `query` is intentionally small. It parses source operations (`search`, `symbol`, `trail`) followed by stream refinements (`filter`, `limit`) and rejects malformed or unknown named arguments rather than silently ignoring typos.
 
-`ask` is the first higher-level retrieval packet. It delegates to `codestory-runtime` agent orchestration, includes citations and retrieval traces, and defaults to DB-first synthesis without launching an external agent. `--with-local-agent` opts into the configured Codex or Claude command, and `--bundle <DIR>` writes Markdown, JSON, and Mermaid artifacts for handoff.
+`ask` is the first higher-level retrieval packet. It delegates to `codestory-runtime` retrieval orchestration, includes citations and retrieval traces, and always uses DB-first synthesis. `--bundle <DIR>` writes Markdown, JSON, and Mermaid artifacts for handoff.
 
-`doctor` is a read-only health report for project path resolution, cache presence, index counts, retrieval state, relevant embedding environment variables, and next commands. It should stay diagnostic; it should not mutate caches or fetch model assets.
+`doctor` is a read-only health report for project path resolution, cache presence, index counts, retrieval state, managed embedding setup, relevant embedding environment variables, and next commands. It should stay diagnostic; it should not mutate caches or fetch model assets. `setup embeddings` is the explicit mutating path for installing pinned llama.cpp and BGE-base GGUF assets in the user cache. The managed binary default is Vulkan, with `--variant cpu` as the explicit fallback.
 
 ## `search` And `ask` Research Options
 

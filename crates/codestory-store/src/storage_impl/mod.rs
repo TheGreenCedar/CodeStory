@@ -25,7 +25,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 13;
 const GROUNDING_SNAPSHOT_VERSION: i64 = 1;
 const GROUNDING_SNAPSHOT_STATE_DIRTY: i64 = 0;
 const GROUNDING_SNAPSHOT_STATE_BUILDING: i64 = 1;
@@ -37,6 +37,7 @@ const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id,
                  FROM edge e
                  JOIN node t ON t.id = e.target_node_id
                  LEFT JOIN node f ON f.id = e.file_node_id";
+const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = 200;
 
 fn clamp_i64_to_u32(value: i64) -> u32 {
     if value <= 0 {
@@ -46,6 +47,69 @@ fn clamp_i64_to_u32(value: i64) -> u32 {
     } else {
         value as u32
     }
+}
+
+fn uniform_optional_string(
+    min_value: Option<String>,
+    max_value: Option<String>,
+) -> (Option<String>, bool) {
+    match (min_value, max_value) {
+        (Some(min_value), Some(max_value)) if min_value == max_value => (Some(min_value), false),
+        (Some(_), Some(_)) => (None, true),
+        (Some(value), None) | (None, Some(value)) => (Some(value), false),
+        (None, None) => (None, false),
+    }
+}
+
+fn uniform_optional_string_with_count(
+    row_count: i64,
+    value_count: i64,
+    min_value: Option<String>,
+    max_value: Option<String>,
+) -> (Option<String>, bool) {
+    if row_count <= 0 {
+        return (None, false);
+    }
+    if value_count != row_count {
+        let value = if value_count == 0 || min_value != max_value {
+            None
+        } else {
+            min_value
+        };
+        return (value, true);
+    }
+    uniform_optional_string(min_value, max_value)
+}
+
+fn uniform_optional_u32(min_value: Option<i64>, max_value: Option<i64>) -> (Option<u32>, bool) {
+    match (min_value, max_value) {
+        (Some(min_value), Some(max_value)) if min_value == max_value => {
+            (Some(clamp_i64_to_u32(min_value)), false)
+        }
+        (Some(_), Some(_)) => (None, true),
+        (Some(value), None) | (None, Some(value)) => (Some(clamp_i64_to_u32(value)), false),
+        (None, None) => (None, false),
+    }
+}
+
+fn uniform_optional_u32_with_count(
+    row_count: i64,
+    value_count: i64,
+    min_value: Option<i64>,
+    max_value: Option<i64>,
+) -> (Option<u32>, bool) {
+    if row_count <= 0 {
+        return (None, false);
+    }
+    if value_count != row_count {
+        let value = if value_count == 0 || min_value != max_value {
+            None
+        } else {
+            min_value.map(clamp_i64_to_u32)
+        };
+        return (value, true);
+    }
+    uniform_optional_u32(min_value, max_value)
 }
 
 fn current_epoch_ms() -> i64 {
@@ -105,24 +169,62 @@ fn grounding_indexable_predicate(alias: &str) -> String {
     )
 }
 
-fn grounding_node_rank_sql(alias: &str) -> String {
+fn grounding_import_like_symbol_predicate(alias: &str) -> String {
     let display_name = grounding_trimmed_name_expr(alias);
     format!(
+        "{alias}.kind IN ({module_kind}, {namespace_kind}, {package_kind}) AND {}",
+        grounding_import_like_name_predicate(&display_name),
+        module_kind = NodeKind::MODULE as i32,
+        namespace_kind = NodeKind::NAMESPACE as i32,
+        package_kind = NodeKind::PACKAGE as i32,
+    )
+}
+
+fn grounding_import_like_name_predicate(display_name: &str) -> String {
+    let double_quoted_name = grounding_sql_same_delimiter_expr(display_name, "char(34)");
+    let single_quoted_name = grounding_sql_same_delimiter_expr(display_name, "char(39)");
+    let angle_wrapped_name = grounding_sql_surrounded_by_expr(display_name, "'<'", "'>'");
+    let relative_current_dir_name = format!("{display_name} LIKE './%'");
+    let relative_parent_dir_name = format!("{display_name} LIKE '../%'");
+    let slash_separated_name = format!("instr({display_name}, '/') > 0");
+    format!(
+        "(
+            {double_quoted_name}
+            OR {single_quoted_name}
+            OR {angle_wrapped_name}
+            OR {relative_current_dir_name}
+            OR {relative_parent_dir_name}
+            OR {slash_separated_name}
+        )"
+    )
+}
+
+fn grounding_sql_same_delimiter_expr(display_name: &str, delimiter: &str) -> String {
+    grounding_sql_surrounded_by_expr(display_name, delimiter, delimiter)
+}
+
+fn grounding_sql_surrounded_by_expr(
+    display_name: &str,
+    start_delimiter: &str,
+    end_delimiter: &str,
+) -> String {
+    format!(
+        "(substr({display_name}, 1, 1) = {start_delimiter} AND substr({display_name}, length({display_name}), 1) = {end_delimiter})"
+    )
+}
+
+fn grounding_node_rank_sql(alias: &str) -> String {
+    let import_like_symbol = grounding_import_like_symbol_predicate(alias);
+    format!(
         "CASE
-            WHEN {alias}.kind IN ({module_kind}, {namespace_kind}, {package_kind}) AND (
-                (substr({display_name}, 1, 1) = char(34) AND substr({display_name}, length({display_name}), 1) = char(34))
-                OR (substr({display_name}, 1, 1) = char(39) AND substr({display_name}, length({display_name}), 1) = char(39))
-                OR (substr({display_name}, 1, 1) = '<' AND substr({display_name}, length({display_name}), 1) = '>')
-                OR {display_name} LIKE './%'
-                OR {display_name} LIKE '../%'
-                OR instr({display_name}, '/') > 0
-            ) THEN 5
+            WHEN {import_like_symbol} THEN 5
             WHEN {alias}.kind IN ({class_kind}, {struct_kind}, {interface_kind}, {enum_kind}, {union_kind}, {annotation_kind}, {typedef_kind}) THEN 0
             WHEN {alias}.kind IN ({function_kind}, {method_kind}, {macro_kind}) THEN 1
             WHEN {alias}.kind IN ({module_kind}, {namespace_kind}, {package_kind}) THEN 2
             WHEN {alias}.kind IN ({field_kind}, {variable_kind}, {global_variable_kind}, {constant_kind}, {enum_constant_kind}, {type_parameter_kind}) THEN 3
             ELSE 4
         END",
+        import_like_symbol = import_like_symbol,
         module_kind = NodeKind::MODULE as i32,
         namespace_kind = NodeKind::NAMESPACE as i32,
         package_kind = NodeKind::PACKAGE as i32,
@@ -143,6 +245,19 @@ fn grounding_node_rank_sql(alias: &str) -> String {
         enum_constant_kind = NodeKind::ENUM_CONSTANT as i32,
         type_parameter_kind = NodeKind::TYPE_PARAMETER as i32,
     )
+}
+
+fn outside_related_file_edge_predicate(file_param: &str) -> String {
+    format!(
+        "source_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+         AND target_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+         AND {}",
+        outside_file_node_predicate(file_param)
+    )
+}
+
+fn outside_file_node_predicate(file_param: &str) -> String {
+    format!("(file_node_id IS NULL OR file_node_id != {file_param})")
 }
 
 #[derive(Error, Debug)]
@@ -319,8 +434,14 @@ pub struct LlmSymbolDoc {
     pub doc_text: String,
     pub doc_version: u32,
     pub doc_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_profile: Option<String>,
     pub embedding_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_backend: Option<String>,
     pub embedding_dim: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_shape: Option<String>,
     pub embedding: Vec<f32>,
     pub updated_at_epoch_ms: i64,
 }
@@ -330,14 +451,30 @@ pub struct LlmSymbolDocReuseMetadata {
     pub node_id: NodeId,
     pub doc_version: u32,
     pub doc_hash: String,
+    pub embedding_profile: Option<String>,
     pub embedding_model: String,
+    pub embedding_backend: Option<String>,
     pub embedding_dim: u32,
+    pub doc_shape: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LlmSymbolDocStats {
     pub doc_count: u32,
+    pub embedding_profile: Option<String>,
+    #[serde(rename = "cache_key")]
     pub embedding_model: Option<String>,
+    pub embedding_backend: Option<String>,
+    #[serde(rename = "dimension")]
+    pub embedding_dim: Option<u32>,
+    pub doc_version: Option<u32>,
+    pub doc_shape: Option<String>,
+    pub mixed_embedding_profiles: bool,
+    pub mixed_embedding_models: bool,
+    pub mixed_embedding_backends: bool,
+    pub mixed_dimensions: bool,
+    pub mixed_doc_versions: bool,
+    pub mixed_doc_shapes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1524,6 +1661,86 @@ impl Storage {
         Ok(edges)
     }
 
+    pub fn get_edges_for_node_ids(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<HashMap<NodeId, Vec<Edge>>, StorageError> {
+        if node_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut unique_node_ids = Vec::new();
+        let mut seen_node_ids = HashSet::new();
+        for node_id in node_ids {
+            if seen_node_ids.insert(*node_id) {
+                unique_node_ids.push(*node_id);
+            }
+        }
+
+        let mut edges_by_node = unique_node_ids
+            .iter()
+            .copied()
+            .map(|node_id| (node_id, Vec::new()))
+            .collect::<HashMap<_, _>>();
+
+        for chunk in unique_node_ids.chunks(EDGE_NODE_LOOKUP_BATCH_SIZE) {
+            let source_placeholders = numbered_placeholders(1, chunk.len());
+            let target_placeholders = numbered_placeholders(1 + chunk.len(), chunk.len());
+            let resolved_source_placeholders =
+                numbered_placeholders(1 + chunk.len() * 2, chunk.len());
+            let resolved_target_placeholders =
+                numbered_placeholders(1 + chunk.len() * 3, chunk.len());
+            let query = format!(
+                "{EDGE_SELECT_BASE}
+                 WHERE e.source_node_id IN ({source_placeholders})
+                    OR e.target_node_id IN ({target_placeholders})
+                    OR e.resolved_source_node_id IN ({resolved_source_placeholders})
+                    OR e.resolved_target_node_id IN ({resolved_target_placeholders})
+                 ORDER BY e.id"
+            );
+            let params = chunk
+                .iter()
+                .map(|id| Value::from(id.0))
+                .chain(chunk.iter().map(|id| Value::from(id.0)))
+                .chain(chunk.iter().map(|id| Value::from(id.0)))
+                .chain(chunk.iter().map(|id| Value::from(id.0)));
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(params))?;
+            let chunk_node_ids = chunk.iter().copied().collect::<HashSet<_>>();
+            while let Some(row) = rows.next()? {
+                let mut edge = Self::edge_from_row(row)?;
+                let target_symbol: String = row.get(12)?;
+                if edge.kind == EdgeKind::CALL
+                    && edge.resolved_target.is_some()
+                    && should_ignore_call_resolution(
+                        &target_symbol,
+                        edge.certainty,
+                        edge.confidence,
+                    )
+                {
+                    edge.resolved_target = None;
+                    edge.confidence = None;
+                    edge.certainty = None;
+                }
+
+                let (source, target) = edge.effective_endpoints();
+                if chunk_node_ids.contains(&source)
+                    && let Some(edges) = edges_by_node.get_mut(&source)
+                {
+                    edges.push(edge.clone());
+                }
+                if target != source
+                    && chunk_node_ids.contains(&target)
+                    && let Some(edges) = edges_by_node.get_mut(&target)
+                {
+                    edges.push(edge);
+                }
+            }
+        }
+
+        Ok(edges_by_node)
+    }
+
     pub fn get_present_node_kinds(&self) -> Result<Vec<NodeKind>, StorageError> {
         let mut stmt = self
             .conn
@@ -2050,12 +2267,15 @@ impl Storage {
                     doc_text,
                     doc_version,
                     doc_hash,
+                    embedding_profile,
                     embedding_model,
+                    embedding_backend,
                     embedding_dim,
+                    doc_shape,
                     embedding_blob,
                     updated_at_epoch_ms
                  ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
                  )
                  ON CONFLICT(node_id) DO UPDATE SET
                     file_node_id = excluded.file_node_id,
@@ -2067,8 +2287,11 @@ impl Storage {
                     doc_text = excluded.doc_text,
                     doc_version = excluded.doc_version,
                     doc_hash = excluded.doc_hash,
+                    embedding_profile = excluded.embedding_profile,
                     embedding_model = excluded.embedding_model,
+                    embedding_backend = excluded.embedding_backend,
                     embedding_dim = excluded.embedding_dim,
+                    doc_shape = excluded.doc_shape,
                     embedding_blob = excluded.embedding_blob,
                     updated_at_epoch_ms = excluded.updated_at_epoch_ms",
             )?;
@@ -2085,8 +2308,11 @@ impl Storage {
                     doc.doc_text,
                     doc.doc_version as i64,
                     doc.doc_hash,
+                    doc.embedding_profile,
                     doc.embedding_model,
+                    doc.embedding_backend,
                     doc.embedding_dim as i64,
+                    doc.doc_shape,
                     encode_embedding_blob(&doc.embedding),
                     doc.updated_at_epoch_ms,
                 ])?;
@@ -2116,8 +2342,11 @@ impl Storage {
                 doc_text,
                 doc_version,
                 doc_hash,
+                embedding_profile,
                 embedding_model,
+                embedding_backend,
                 embedding_dim,
+                doc_shape,
                 embedding_blob,
                 updated_at_epoch_ms
              FROM llm_symbol_doc
@@ -2132,8 +2361,8 @@ impl Storage {
         while let Some(row) = rows.next()? {
             let kind: i32 = row.get(2)?;
             let doc_version: i64 = row.get(8)?;
-            let embedding_dim: i64 = row.get(11)?;
-            let embedding_blob: Vec<u8> = row.get(12)?;
+            let embedding_dim: i64 = row.get(13)?;
+            let embedding_blob: Vec<u8> = row.get(15)?;
             docs.push(LlmSymbolDoc {
                 node_id: NodeId(row.get(0)?),
                 file_node_id: row.get::<_, Option<i64>>(1)?.map(NodeId),
@@ -2145,10 +2374,13 @@ impl Storage {
                 doc_text: row.get(7)?,
                 doc_version: doc_version.max(0).min(u32::MAX as i64) as u32,
                 doc_hash: row.get(9)?,
-                embedding_model: row.get(10)?,
+                embedding_profile: row.get(10)?,
+                embedding_model: row.get(11)?,
+                embedding_backend: row.get(12)?,
                 embedding_dim: embedding_dim.max(0) as u32,
+                doc_shape: row.get(14)?,
                 embedding: decode_embedding_blob(&embedding_blob)?,
-                updated_at_epoch_ms: row.get(13)?,
+                updated_at_epoch_ms: row.get(16)?,
             });
         }
 
@@ -2156,25 +2388,100 @@ impl Storage {
     }
 
     pub fn get_llm_symbol_doc_stats(&self) -> Result<LlmSymbolDocStats, StorageError> {
-        let (doc_count, min_model, max_model) = self.conn.query_row(
-            "SELECT COUNT(*), MIN(embedding_model), MAX(embedding_model) FROM llm_symbol_doc",
+        let (
+            doc_count,
+            min_profile,
+            max_profile,
+            profile_count,
+            min_model,
+            max_model,
+            model_count,
+            min_backend,
+            max_backend,
+            backend_count,
+            min_dim,
+            max_dim,
+            dim_count,
+            min_version,
+            max_version,
+            version_count,
+            min_shape,
+            max_shape,
+            shape_count,
+        ) = self.conn.query_row(
+            "SELECT
+                COUNT(*),
+                MIN(embedding_profile),
+                MAX(embedding_profile),
+                COUNT(embedding_profile),
+                MIN(embedding_model),
+                MAX(embedding_model),
+                COUNT(embedding_model),
+                MIN(embedding_backend),
+                MAX(embedding_backend),
+                COUNT(embedding_backend),
+                MIN(embedding_dim),
+                MAX(embedding_dim),
+                COUNT(embedding_dim),
+                MIN(doc_version),
+                MAX(doc_version),
+                COUNT(doc_version),
+                MIN(doc_shape),
+                MAX(doc_shape),
+                COUNT(doc_shape)
+             FROM llm_symbol_doc",
             [],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, Option<i64>>(13)?,
+                    row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
+                    row.get::<_, i64>(18)?,
                 ))
             },
         )?;
-        let embedding_model = match (min_model, max_model) {
-            (Some(min_model), Some(max_model)) if min_model == max_model => Some(min_model),
-            _ => None,
-        };
+        let (embedding_profile, mixed_embedding_profiles) =
+            uniform_optional_string_with_count(doc_count, profile_count, min_profile, max_profile);
+        let (embedding_model, mixed_embedding_models) =
+            uniform_optional_string_with_count(doc_count, model_count, min_model, max_model);
+        let (embedding_backend, mixed_embedding_backends) =
+            uniform_optional_string_with_count(doc_count, backend_count, min_backend, max_backend);
+        let (doc_shape, mixed_doc_shapes) =
+            uniform_optional_string_with_count(doc_count, shape_count, min_shape, max_shape);
+        let (embedding_dim, mixed_dimensions) =
+            uniform_optional_u32_with_count(doc_count, dim_count, min_dim, max_dim);
+        let (doc_version, mixed_doc_versions) =
+            uniform_optional_u32_with_count(doc_count, version_count, min_version, max_version);
 
         Ok(LlmSymbolDocStats {
             doc_count: doc_count.max(0).min(u32::MAX as i64) as u32,
+            embedding_profile,
             embedding_model,
+            embedding_backend,
+            embedding_dim,
+            doc_version,
+            doc_shape,
+            mixed_embedding_profiles,
+            mixed_embedding_models,
+            mixed_embedding_backends,
+            mixed_dimensions,
+            mixed_doc_versions,
+            mixed_doc_shapes,
         })
     }
 
@@ -2294,8 +2601,11 @@ impl Storage {
                 node_id,
                 doc_version,
                 doc_hash,
+                embedding_profile,
                 embedding_model,
-                embedding_dim
+                embedding_backend,
+                embedding_dim,
+                doc_shape
              FROM llm_symbol_doc
              ORDER BY node_id ASC",
         )?;
@@ -2303,13 +2613,16 @@ impl Storage {
         let mut docs = Vec::new();
         while let Some(row) = rows.next()? {
             let doc_version: i64 = row.get(1)?;
-            let embedding_dim: i64 = row.get(4)?;
+            let embedding_dim: i64 = row.get(6)?;
             docs.push(LlmSymbolDocReuseMetadata {
                 node_id: NodeId(row.get(0)?),
                 doc_version: doc_version.max(0).min(u32::MAX as i64) as u32,
                 doc_hash: row.get(2)?,
-                embedding_model: row.get(3)?,
+                embedding_profile: row.get(3)?,
+                embedding_model: row.get(4)?,
+                embedding_backend: row.get(5)?,
                 embedding_dim: embedding_dim.max(0).min(u32::MAX as i64) as u32,
+                doc_shape: row.get(7)?,
             });
         }
         Ok(docs)
@@ -2332,8 +2645,11 @@ impl Storage {
                 doc_text,
                 doc_version,
                 doc_hash,
+                embedding_profile,
                 embedding_model,
+                embedding_backend,
                 embedding_dim,
+                doc_shape,
                 embedding_blob,
                 updated_at_epoch_ms
              FROM llm_symbol_doc
@@ -2348,8 +2664,8 @@ impl Storage {
         while let Some(row) = rows.next()? {
             let kind: i32 = row.get(2)?;
             let doc_version: i64 = row.get(8)?;
-            let embedding_dim: i64 = row.get(11)?;
-            let embedding_blob: Vec<u8> = row.get(12)?;
+            let embedding_dim: i64 = row.get(13)?;
+            let embedding_blob: Vec<u8> = row.get(15)?;
             docs.push(LlmSymbolDoc {
                 node_id: NodeId(row.get(0)?),
                 file_node_id: row.get::<_, Option<i64>>(1)?.map(NodeId),
@@ -2361,10 +2677,13 @@ impl Storage {
                 doc_text: row.get(7)?,
                 doc_version: doc_version.max(0).min(u32::MAX as i64) as u32,
                 doc_hash: row.get(9)?,
-                embedding_model: row.get(10)?,
+                embedding_profile: row.get(10)?,
+                embedding_model: row.get(11)?,
+                embedding_backend: row.get(12)?,
                 embedding_dim: embedding_dim.max(0) as u32,
+                doc_shape: row.get(14)?,
                 embedding: decode_embedding_blob(&embedding_blob)?,
-                updated_at_epoch_ms: row.get(13)?,
+                updated_at_epoch_ms: row.get(16)?,
             });
         }
         Ok(docs)
@@ -2394,8 +2713,11 @@ impl Storage {
                 doc_text,
                 doc_version,
                 doc_hash,
+                embedding_profile,
                 embedding_model,
+                embedding_backend,
                 embedding_dim,
+                doc_shape,
                 embedding_blob,
                 updated_at_epoch_ms
              )
@@ -2410,8 +2732,11 @@ impl Storage {
                 source_doc.doc_text,
                 source_doc.doc_version,
                 source_doc.doc_hash,
+                source_doc.embedding_profile,
                 source_doc.embedding_model,
+                source_doc.embedding_backend,
                 source_doc.embedding_dim,
+                source_doc.doc_shape,
                 source_doc.embedding_blob,
                 source_doc.updated_at_epoch_ms
              FROM source_snapshot.llm_symbol_doc source_doc
@@ -2730,6 +3055,32 @@ impl Storage {
             "SELECT id, path, language, modification_time, indexed, complete, line_count FROM file",
         )?;
         let file_iter = stmt.query_map([], |row| {
+            Ok(FileInfo {
+                id: row.get(0)?,
+                path: PathBuf::from(row.get::<_, String>(1)?),
+                language: row.get(2)?,
+                modification_time: row.get(3)?,
+                indexed: row.get::<_, i32>(4)? != 0,
+                complete: row.get::<_, i32>(5)? != 0,
+                line_count: row.get(6)?,
+            })
+        })?;
+
+        let mut files = Vec::new();
+        for file in file_iter {
+            files.push(file?);
+        }
+        Ok(files)
+    }
+
+    pub fn get_files_ordered_limit(&self, limit: usize) -> Result<Vec<FileInfo>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, language, modification_time, indexed, complete, line_count
+             FROM file
+             ORDER BY path ASC, id ASC
+             LIMIT ?1",
+        )?;
+        let file_iter = stmt.query_map(params![limit as i64], |row| {
             Ok(FileInfo {
                 id: row.get(0)?,
                 path: PathBuf::from(row.get::<_, String>(1)?),
@@ -3545,14 +3896,14 @@ impl Storage {
             }
         }
 
+        let outside_related_file_edges = outside_related_file_edge_predicate("?1");
+
         tx.execute(
             &format!(
                 "UPDATE edge
                  SET resolved_source_node_id = NULL
                  WHERE resolved_source_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
-                 AND source_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
-                 AND target_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
-                 AND (file_node_id IS NULL OR file_node_id != ?1)"
+                 AND {outside_related_file_edges}"
             ),
             params![file_node_id],
         )?;
@@ -3565,9 +3916,7 @@ impl Storage {
                      certainty = NULL,
                      candidate_target_node_ids = NULL
                  WHERE resolved_target_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
-                 AND source_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
-                 AND target_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
-                 AND (file_node_id IS NULL OR file_node_id != ?1)"
+                 AND {outside_related_file_edges}"
             ),
             params![file_node_id],
         )?;

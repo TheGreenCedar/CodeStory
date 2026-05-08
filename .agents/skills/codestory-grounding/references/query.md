@@ -15,6 +15,7 @@ target/release/codestory-cli(.exe) query [OPTIONS] <QUERY>
 | `<QUERY>` | string | required | Pipeline expression such as `search(query: 'Foo') | filter(kind: function) | limit(5)` |
 | `--project` | path | `.` | Project root directory (alias: `--path`) |
 | `--cache-dir` | path | *auto* | Override the cache directory |
+| `--sql` | string | none | Guardrail for agent mistakes. SQL is not supported; this emits graph-query DSL guidance. |
 | `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
 | `--format` | enum | `markdown` | Output format: `markdown` or `json` |
 | `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
@@ -29,7 +30,7 @@ target/release/codestory-cli(.exe) query [OPTIONS] <QUERY>
 | `filter(...)` | Filters current items | optional `kind`, `file`, and `depth` |
 | `limit(5)` | Truncates current items | positional integer, or `n: 5` |
 
-Unknown operation names, unknown named arguments, invalid node kinds, and malformed strings are rejected with a caret pointing at the bad query segment.
+Unknown operation names, unknown named arguments, invalid node kinds, and malformed strings are rejected with a caret pointing at the bad query segment. `query` is not a SQL interface; use `search --query <term> --why` for raw discovery or the graph-query DSL examples below for pipelines.
 
 ## Examples
 

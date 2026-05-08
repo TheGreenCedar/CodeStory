@@ -1,5 +1,5 @@
 use crate::{FileInfo, StorageError, Store};
-use codestory_workspace::StoredFileRecord;
+use codestory_contracts::workspace::StoredFileRecord;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

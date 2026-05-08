@@ -37,6 +37,8 @@ pub struct ProjectSummary {
     pub members: Vec<WorkspaceMemberIndexDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval: Option<RetrievalStateDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<IndexFreshnessDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -110,9 +112,90 @@ pub struct RetrievalStateDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_embedding: Option<EmbeddingProfileContractDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_embedding: Option<StoredSemanticDocsContractDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<RetrievalFallbackReasonDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingProfileContractDto {
+    pub profile: String,
+    pub backend: String,
+    pub model_id: String,
+    pub cache_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<u32>,
+    pub doc_shape: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct StoredSemanticDocsContractDto {
+    pub doc_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_version: Option<u32>,
+    #[serde(default)]
+    pub mixed_embedding_profiles: bool,
+    #[serde(default)]
+    pub mixed_embedding_models: bool,
+    #[serde(default)]
+    pub mixed_embedding_backends: bool,
+    #[serde(default)]
+    pub mixed_dimensions: bool,
+    #[serde(default)]
+    pub mixed_doc_versions: bool,
+    #[serde(default)]
+    pub mixed_doc_shapes: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_shape: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexFreshnessStatusDto {
+    Fresh,
+    Stale,
+    NotChecked,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexFreshnessChangeKindDto {
+    Changed,
+    New,
+    Removed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct IndexFreshnessSampleDto {
+    pub kind: IndexFreshnessChangeKindDto,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct IndexFreshnessDto {
+    pub status: IndexFreshnessStatusDto,
+    pub changed_file_count: u32,
+    pub new_file_count: u32,
+    pub removed_file_count: u32,
+    pub checked_file_count: u32,
+    pub indexed_file_count: u32,
+    pub duration_ms: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub samples: Vec<IndexFreshnessSampleDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -136,12 +219,32 @@ impl SearchHit {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct RepoTextScanStatsDto {
+    pub scanned_file_count: u32,
+    pub scanned_byte_count: u32,
+    pub skipped_large_file_count: u32,
+    pub file_cap: u32,
+    pub byte_cap: u32,
+    pub time_cap_ms: u32,
+    pub duration_ms: u32,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchResultsDto {
     pub query: String,
     pub retrieval: RetrievalStateDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<IndexFreshnessDto>,
     pub limit_per_source: u32,
     pub repo_text_mode: SearchRepoTextMode,
     pub repo_text_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_text_stats: Option<RepoTextScanStatsDto>,
     #[serde(default)]
     pub suggestions: Vec<SearchHit>,
     #[serde(default)]
@@ -398,6 +501,10 @@ pub struct TrailConfigDto {
     #[serde(default = "default_show_utility_calls")]
     pub show_utility_calls: bool,
     #[serde(default)]
+    pub hide_speculative: bool,
+    #[serde(default)]
+    pub story: bool,
+    #[serde(default)]
     pub node_filter: Vec<NodeKind>,
     pub max_nodes: u32,
     #[serde(default = "default_layout_direction")]
@@ -422,6 +529,29 @@ pub struct TrailFilterOptionsDto {
 pub struct TrailContextDto {
     pub focus: NodeDetailsDto,
     pub trail: GraphResponse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story: Option<TrailStoryDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct TrailStoryDto {
+    pub summary: String,
+    pub entry_points: Vec<String>,
+    pub core_flow: Vec<TrailStoryStepDto>,
+    pub side_effects: Vec<String>,
+    pub uncertainty: Vec<String>,
+    pub test_scope: Vec<String>,
+    pub limits: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct TrailStoryStepDto {
+    pub edge_id: String,
+    pub source: String,
+    pub relation: String,
+    pub target: String,
+    pub certainty: String,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -497,6 +627,12 @@ pub struct SnippetContextDto {
     pub path: String,
     pub line: u32,
     pub snippet: String,
+    #[serde(default)]
+    pub requested_context: u32,
+    #[serde(default)]
+    pub snippet_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_snippet_bytes: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -546,22 +682,6 @@ pub struct SetUiLayoutRequest {
     pub json: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentBackend {
-    #[default]
-    Codex,
-    ClaudeCode,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type, Default)]
-pub struct AgentConnectionSettingsDto {
-    #[serde(default)]
-    pub backend: AgentBackend,
-    #[serde(default)]
-    pub command: Option<String>,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRetrievalPresetDto {
@@ -570,6 +690,7 @@ pub enum AgentRetrievalPresetDto {
     Callflow,
     Inheritance,
     Impact,
+    Investigate,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -684,17 +805,9 @@ pub struct AgentAskRequest {
     pub include_evidence: bool,
     #[serde(default)]
     pub hybrid_weights: Option<AgentHybridWeightsDto>,
-    #[serde(default)]
-    pub connection: AgentConnectionSettingsDto,
-    #[serde(default = "default_run_local_agent")]
-    pub run_local_agent: bool,
 }
 
 const fn default_include_evidence() -> bool {
-    true
-}
-
-const fn default_run_local_agent() -> bool {
     true
 }
 
@@ -714,12 +827,24 @@ pub struct AgentCitationDto {
     pub file_path: Option<String>,
     pub line: Option<u32>,
     pub score: f32,
+    #[serde(default = "default_search_hit_origin")]
+    pub origin: SearchHitOrigin,
+    #[serde(default = "default_citation_resolvable")]
+    pub resolvable: bool,
     #[serde(default)]
     pub subgraph_id: Option<String>,
     #[serde(default)]
     pub evidence_edge_ids: Vec<EdgeId>,
     #[serde(default)]
     pub retrieval_score_breakdown: Option<RetrievalScoreBreakdownDto>,
+}
+
+const fn default_search_hit_origin() -> SearchHitOrigin {
+    SearchHitOrigin::IndexedSymbol
+}
+
+const fn default_citation_resolvable() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -765,6 +890,8 @@ pub enum AgentRetrievalStepKindDto {
     SemanticQueryEmbedding,
     SemanticCandidateRetrieval,
     HybridRerank,
+    QueryExpansion,
+    RepoTextFallback,
     TrailFilterOptions,
     Neighborhood,
     Trail,
@@ -774,7 +901,6 @@ pub enum AgentRetrievalStepKindDto {
     SourceRead,
     MermaidSynthesis,
     AnswerSynthesis,
-    LocalAgent,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -819,6 +945,8 @@ pub struct AgentAnswerDto {
     pub answer_id: String,
     pub prompt: String,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<IndexFreshnessDto>,
     pub sections: Vec<AgentResponseSectionDto>,
     pub citations: Vec<AgentCitationDto>,
     pub subgraph_ids: Vec<String>,

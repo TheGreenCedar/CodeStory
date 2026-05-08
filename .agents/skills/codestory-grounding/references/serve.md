@@ -1,0 +1,45 @@
+# `serve` - Local Agent Integration Surface
+
+Serves the indexed project over either a small HTTP JSON API or an MCP-style JSON-lines stdio protocol. It is for local browser/editor integrations after the cache is ready.
+
+## Usage
+
+```
+target/release/codestory-cli(.exe) serve [OPTIONS]
+```
+
+## Options
+
+| Option | Default | Use |
+|--------|---------|-----|
+| `--project <path>` | `.` | Repository root to serve. Always pass it explicitly. |
+| `--cache-dir <path>` | auto | Serve a specific cache directory. |
+| `--addr <host:port>` | `127.0.0.1:3917` | HTTP bind address. |
+| `--stdio` | off | Use JSON-lines stdio instead of HTTP. |
+| `--refresh <auto|full|incremental|none>` | `none` | Read an existing cache unless you intentionally refresh. |
+
+## HTTP Routes
+
+| Route | Parameters | Use |
+|-------|------------|-----|
+| `/health` | none | Basic process health. |
+| `/search` | `q`, optional `repo_text`, `limit` | Search indexed symbols and repo text. |
+| `/symbol` | `q` | Resolve symbol details by query. |
+| `/definition` | `q` or `id` | Definition metadata plus symbol context. |
+| `/references` | `q` or `id`, optional `depth` | Incoming references. |
+| `/symbols` | optional `parent_id`, `limit` | Root symbols or children. |
+| `/trail` | `q`, optional `depth` | Neighborhood trail. |
+
+## Agent Paths
+
+| Path | Command | Expected result |
+|------|---------|-----------------|
+| Normal path | `target/release/codestory-cli(.exe) serve --project . --addr 127.0.0.1:3917` then `GET /health` | Local JSON service returns `{"ok": true}` and browser routes use the existing index. |
+| Failure path | If serve reports missing index, run `doctor --project .` and `index --project . --refresh full`; if bind fails, choose a free `--addr`. | Distinguishes cache readiness from port conflicts. |
+| Integration edge | Use `serve --stdio` for MCP-style clients; it exposes tools for `search`, `symbol`, `trail`, `definition`, `references`, `symbols`, `snippet`, and `ask`, plus project/grounding resources and prompts. | Gives agents the same read-only browser primitives without shelling each command. |
+
+## Notes
+
+- `serve` is local by default on `127.0.0.1`; do not bind wider unless the user explicitly needs remote access.
+- HTTP only accepts GET requests for the documented routes.
+- Start it after a successful index or with an intentional refresh mode.

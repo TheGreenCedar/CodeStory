@@ -68,6 +68,7 @@ sysinfo = "0.38"
 feature-probe = "0.1.1"
 tempfile = "3.10"
 toml = "0.8"
+sha2 = "0.10"
 
 criterion = "0.8.2"
 proptest = "1.5"

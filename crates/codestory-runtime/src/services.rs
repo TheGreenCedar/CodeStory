@@ -1,5 +1,6 @@
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto, ApiError, GroundingBudgetDto,
+    AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto, ApiError, BookmarkCategoryDto,
+    BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, GroundingBudgetDto,
     GroundingSnapshotDto, IndexDryRunDto, IndexMode, IndexingPhaseTimings,
     ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId,
     OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, RetrievalStateDto, SearchHit,
@@ -229,5 +230,39 @@ impl AgentService {
 
     pub fn ask(&self, req: AgentAskRequest) -> Result<AgentAnswerDto, ApiError> {
         self.controller.agent_ask(req)
+    }
+}
+
+#[derive(Clone)]
+pub struct BookmarkService {
+    controller: AppController,
+}
+
+impl BookmarkService {
+    pub(crate) fn new(controller: AppController) -> Self {
+        Self { controller }
+    }
+
+    pub fn list_categories(&self) -> Result<Vec<BookmarkCategoryDto>, ApiError> {
+        self.controller.list_bookmark_categories()
+    }
+
+    pub fn create_category(
+        &self,
+        req: CreateBookmarkCategoryRequest,
+    ) -> Result<BookmarkCategoryDto, ApiError> {
+        self.controller.create_bookmark_category(req)
+    }
+
+    pub fn list_bookmarks(&self, category_id: Option<i64>) -> Result<Vec<BookmarkDto>, ApiError> {
+        self.controller.list_bookmarks(category_id)
+    }
+
+    pub fn create_bookmark(&self, req: CreateBookmarkRequest) -> Result<BookmarkDto, ApiError> {
+        self.controller.create_bookmark(req)
+    }
+
+    pub fn delete_bookmark(&self, id: i64) -> Result<(), ApiError> {
+        self.controller.delete_bookmark(id)
     }
 }

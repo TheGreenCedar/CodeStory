@@ -42,11 +42,14 @@ Runtime environment variables control semantic retrieval and tuning:
 | `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false` | Disable hybrid retrieval and use symbolic ranking. |
 | `CODESTORY_SEMANTIC_DOC_SCOPE=all` | Include the broader all-symbol semantic doc set. The default is durable symbols only. |
 | `CODESTORY_SEMANTIC_DOC_ALIAS_MODE` | Semantic document alias policy: `alias_variant` default, `current_alias` full legacy alias text, or `no_alias` baseline research mode. |
+| `CODESTORY_SEMANTIC_DOC_MAX_TOKENS` | Override semantic document token budget. Default is `384`, which keeps llama.cpp inputs below the physical batch window; use overrides only for controlled research. |
 | `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` | Override semantic doc embedding batch size. Default is `128`; use this only while profiling. |
 | `CODESTORY_EMBED_RUNTIME_MODE=hash` | Use lightweight deterministic hash embeddings for local-dev semantic checks. |
 | `CODESTORY_EMBED_BACKEND=llamacpp` | Use the active real-model backend. |
 | `CODESTORY_EMBED_LLAMACPP_URL` | OpenAI-compatible llama.cpp embeddings endpoint. |
 | `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT` | Client-side concurrent embedding requests, clamped from `1` to `16`. |
+
+Run `target/release/codestory-cli(.exe) setup embeddings --project .` to install the managed llama.cpp/BGE-base assets before expecting the default llama.cpp backend to be ready on a fresh machine.
 
 Symbol summarization uses these additional settings:
 
@@ -69,7 +72,8 @@ refresh: `auto(incremental)`
 stats: nodes=4231 edges=8452 files=187 errors=3
 retrieval: hybrid semantic_docs=3690 model=sentence-transformers/all-MiniLM-L6-v2-local
 timings_ms: parse=1200 flush=300 resolve=450 cleanup=80 cache_refresh=0
-semantic_ms: doc_build=115 embedding=32634 db_upsert=420 reload=18
+cache_ms: search_projection=42 search_index=210 runtime_publish=1
+semantic_ms: doc_build=115 embedding=32634 db_upsert=420 reload=18 prune=3
 semantic_docs: reused=0 embedded=3690 pending=3690 stale=0
 resolution: calls 120->15, imports 42->3
 ```
@@ -82,11 +86,15 @@ Important timing fields:
 | `timings_ms.flush` | Projection persistence time for graph rows and derived projection rows. |
 | `timings_ms.resolve` | Post-flush edge resolution time. |
 | `timings_ms.cleanup` | Incremental cleanup for removed/stale files. |
-| `timings_ms.cache_refresh` | Runtime cache refresh and semantic sync wrapper time. |
+| `timings_ms.cache_refresh` | Runtime cache refresh wrapper time; use `cache_ms` and `semantic_ms` fields to split the work. |
+| `cache_ms.search_projection` | SQLite rebuild of the search-symbol projection from the node table. |
+| `cache_ms.search_index` | Runtime search index construction for symbol names. |
+| `cache_ms.runtime_publish` | Publishing rebuilt node names and search engine into the live runtime state. |
 | `semantic_ms.doc_build` | Generated semantic text and hash construction. |
 | `semantic_ms.embedding` | Embedding runtime work for pending semantic docs. |
 | `semantic_ms.db_upsert` | SQLite upsert time for embedded docs. |
 | `semantic_ms.reload` | Loading persisted semantic docs into the runtime search engine when needed. |
+| `semantic_ms.prune` | Removing semantic docs that no longer belong to refreshed symbols. |
 | `semantic_docs.reused` | Existing docs accepted without embedding. |
 | `semantic_docs.embedded` | Docs newly embedded in this run. |
 | `semantic_docs.pending` | Docs that required embedding after reuse checks. |

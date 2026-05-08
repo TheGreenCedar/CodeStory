@@ -32,9 +32,10 @@ Use this path if you want to run the tool against a repository.
    ```
 4. Run the grounding workflows against the existing cache.
    ```text
+   .\target\release\codestory-cli.exe explain --project <path>
    .\target\release\codestory-cli.exe ground --project <path>
    .\target\release\codestory-cli.exe search --project <path> --query <query> --why
-   .\target\release\codestory-cli.exe ask --project <path> "How does this repo fit together?"
+   .\target\release\codestory-cli.exe ask --project <path> --investigate "How does search ranking work?"
    .\target\release\codestory-cli.exe symbol --project <path> (--id <node-id> | --query <query>)
    .\target\release\codestory-cli.exe trail --project <path> (--id <node-id> | --query <query>)
    .\target\release\codestory-cli.exe snippet --project <path> (--id <node-id> | --query <query>)
@@ -114,6 +115,7 @@ flowchart LR
     Project["Repository"] --> Index["index"]
     Index["index"] --> LocalState["SQLite graph + snapshots"]
     LocalState --> Ground["ground"]
+    LocalState --> Explain["explain"]
     LocalState --> Search["search"]
     LocalState --> Ask["ask"]
     LocalState --> Symbol["symbol"]
@@ -127,8 +129,9 @@ flowchart LR
 
 - `index`: discover files, parse supported languages, resolve graph edges, persist search projections, and complete semantic docs before returning
 - `ground`: build grounded context from indexed symbols, snippets, graph traversal, and search results; `--why` explains retrieval mode, coverage, and query hints
+- `explain`: run the guided repo-explanation path in one command: open or refresh the index, ground, anchor search, and DB-first ask
 - `search`: find symbols, files, and query matches; semantic-only near misses appear under `did_you_mean`, and `--why` includes lexical/semantic/graph score breakdowns when available
-- `ask`: run DB-first agentic retrieval across search, graph, snippets, traces, and citations; by default it does not launch an external agent, while `--with-local-agent` opts into local Codex/Claude synthesis
+- `ask`: run DB-first agentic retrieval across search, graph, snippets, traces, and citations without launching an external agent
 - `symbol`: inspect one symbol and its indexed relationships
 - `trail`: walk caller/callee and usage neighborhoods through the graph; `--mermaid` emits a Mermaid flowchart and `--format dot` emits Graphviz DOT
 - `snippet`: fetch focused source context for a symbol or file location; Markdown snippets use ANSI syntax highlighting when stdout is an interactive terminal
@@ -136,6 +139,7 @@ flowchart LR
 - `explore`: open an interactive terminal explorer when stdout is a terminal, or emit Markdown/JSON with definition and reference navigation metadata when piped or passed `--no-tui`
 - `serve`: expose local `/health`, `/search`, `/symbol`, `/definition`, `/references`, `/symbols`, and `/trail` JSON endpoints, or use `--stdio` for MCP-style tools, resources, resource templates, and prompts
 - `doctor`: report project/cache/index/retrieval health, relevant environment settings, and the next useful commands for the workspace
+- `setup embeddings`: install pinned managed llama.cpp and BGE-base GGUF assets in the user cache and start the local embedding server; the managed binary defaults to Vulkan with `--variant cpu` as the fallback
 - `generate-completions`: emit bash, zsh, fish, or PowerShell completions generated from the clap command model
 
 Hybrid retrieval is the intended default when local embedding assets are available. `index`, `ground`, `search`, `ask`, and `doctor` now report retrieval mode, semantic doc counts, and explicit fallback reasons when the runtime drops back to symbolic ranking.
@@ -152,7 +156,20 @@ CodeStory supports an optional `codestory_workspace.json` file at the repo root 
 
 When the manifest is present, `index --project .` discovers all listed member roots and reports per-member refresh counts in index output. Repos without the manifest keep the single-root behavior. OpenAPI JSON/YAML schemas are treated as lightweight endpoint sources, and literal client calls such as `fetch("/api/users")` or `axios.post("/api/users")` create speculative graph edges to matching endpoint refs.
 
-Team or user defaults can live in `.codestory.toml` at the project root or in the user home directory. Project settings override home settings, and explicit environment variables still win. Supported keys include `cache_dir`, `embedding_model`, `hybrid_retrieval_enabled`, `semantic_doc_scope`, `semantic_doc_alias_mode`, `summary_endpoint`, and `summary_model`.
+Team or user defaults can live in `.codestory.toml` at the project root or in the user home directory. CodeStory loads the home file first, then the project file, so project settings override home settings. Explicit environment variables still win over config defaults.
+
+Supported keys include `cache_dir`, `embedding_profile`, `embedding_model_id`, `hybrid_retrieval_enabled`, `semantic_doc_scope`, `semantic_doc_alias_mode`, `summary_endpoint`, and `summary_model`. The legacy `embedding_model` key is still accepted as a deprecated alias for `embedding_model_id`.
+
+Example:
+
+```toml
+embedding_profile = "bge-base-en-v1.5"
+embedding_model_id = "BAAI/bge-base-en-v1.5-local"
+hybrid_retrieval_enabled = true
+semantic_doc_scope = "durable"
+```
+
+`embedding_profile` maps to `CODESTORY_EMBED_PROFILE`, and `embedding_model_id` maps to `CODESTORY_EMBED_MODEL_ID`. If those environment variables are already set before the CLI starts, the CLI leaves them unchanged.
 
 ## Retrieval Defaults
 
@@ -162,9 +179,10 @@ The default `index` path is a full semantic sync, not a deferred background task
 
 Hybrid retrieval setup:
 
+- managed real-model setup: run `codestory-cli setup embeddings --project .` to download pinned Vulkan llama.cpp binaries plus BGE-base GGUF into the user cache and start `llama-server` at the default endpoint; pass `--variant cpu` when Vulkan startup is unavailable on the machine
 - fast local-dev semantic mode: set `CODESTORY_EMBED_RUNTIME_MODE=hash`
 - backend and profile selection: set `CODESTORY_EMBED_BACKEND=llamacpp` or `hash`; default profile is `bge-base-en-v1.5`; explicit profiles include `minilm`, `bge-small-en-v1.5`, `bge-base-en-v1.5`, `qwen3-embedding-0.6b`, `embeddinggemma-300m`, `nomic-embed-text-v1.5`, `nomic-embed-text-v2-moe`, or `custom`
-- llama.cpp GGUF server: run `llama-server --embedding` and set `CODESTORY_EMBED_LLAMACPP_URL` if it is not listening at `http://127.0.0.1:8080/v1/embeddings`; tune concurrent embedding requests with `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT`
+- external llama.cpp GGUF server: run `llama-server --embedding` yourself and set `CODESTORY_EMBED_LLAMACPP_URL` if it is not listening at `http://127.0.0.1:8080/v1/embeddings`; tune concurrent embedding requests with `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT`
 - durable semantic docs are the default; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` to include lower-signal local/member/module symbols for investigation
 - embedding batch size defaults to `128`; override with `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` only while profiling
 - search and ask research can override hybrid ranking weights with `--hybrid-lexical <WEIGHT> --hybrid-semantic <WEIGHT> --hybrid-graph <WEIGHT>`; omit these flags for the runtime defaults
@@ -179,6 +197,7 @@ the [research handbook](docs/research.md), with the decision matrix in
 Refresh behavior:
 
 - `index --refresh auto`: full on an empty cache, incremental once indexed files already exist
+- `explain --refresh auto`: opens or refreshes the index before collecting the repo explanation packet
 - `ground`, `search`, `ask`, `symbol`, `trail`, `snippet`, `query`, `explore`, and `serve`: default to `--refresh none`
 - use `--refresh incremental` when you want a read command to refresh an existing cache first
 - use `--refresh full` after a cache reset, schema change, or suspected stale-state incident

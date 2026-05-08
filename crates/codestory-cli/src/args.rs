@@ -1,12 +1,13 @@
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
-    AgentBackend, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, GroundingBudgetDto,
-    IndexDryRunDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind, ProjectSummary,
-    RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin, SnippetContextDto,
-    SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection,
-    TrailMode,
+    AgentAnswerDto, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto,
+    BookmarkCategoryDto, BookmarkDto, GroundingBudgetDto, GroundingSnapshotDto, IndexDryRunDto,
+    IndexFreshnessDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind, ProjectSummary,
+    RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
+    SnippetContextDto, SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto,
+    TrailDirection, TrailMode,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const INDEX_REFRESH_HELP: &str = "Index defaults to `auto`: it chooses `full` for an empty cache and `incremental` once the \
@@ -26,14 +27,17 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     Index(IndexCommand),
     Ground(GroundCommand),
+    Explain(ExplainCommand),
     Ask(AskCommand),
     Doctor(DoctorCommand),
+    Setup(SetupCommand),
     Search(SearchCommand),
     Symbol(SymbolCommand),
     Trail(TrailCommand),
     Snippet(SnippetCommand),
     Query(QueryCommand),
     Explore(ExploreCommand),
+    Bookmark(BookmarkCommand),
     Serve(ServeCommand),
     GenerateCompletions(GenerateCompletionsCommand),
 }
@@ -59,6 +63,17 @@ pub(crate) enum OutputFormat {
     Markdown,
     Json,
     Dot,
+}
+
+fn parse_read_output_format(value: &str) -> Result<OutputFormat, String> {
+    match value {
+        "markdown" => Ok(OutputFormat::Markdown),
+        "json" => Ok(OutputFormat::Json),
+        "dot" => Err("--format dot is only supported by `trail`; use markdown or json".to_string()),
+        other => Err(format!(
+            "invalid output format `{other}`; expected `markdown` or `json`"
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -112,6 +127,22 @@ pub(crate) enum CompletionShell {
     Powershell,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CliEmbeddingQuant {
+    #[value(name = "q8_0")]
+    Q8_0,
+    #[value(name = "q4_k_m")]
+    Q4KM,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CliLlamaVariant {
+    Cpu,
+    Vulkan,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CliAskProfile {
@@ -120,12 +151,6 @@ pub(crate) enum CliAskProfile {
     Callflow,
     Inheritance,
     Impact,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum CliAgentBackend {
-    Codex,
-    ClaudeCode,
 }
 
 #[derive(Args, Debug)]
@@ -139,7 +164,7 @@ pub(crate) struct IndexCommand {
         long_help = INDEX_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -176,7 +201,7 @@ pub(crate) struct GroundCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -192,6 +217,48 @@ pub(crate) struct GroundCommand {
 }
 
 #[derive(Args, Debug)]
+pub(crate) struct ExplainCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        value_name = "PROMPT",
+        default_value = "How does this repo fit together?",
+        help = "Repository explanation prompt."
+    )]
+    pub(crate) prompt: String,
+    #[arg(
+        long = "id",
+        visible_alias = "focus-id",
+        allow_hyphen_values = true,
+        value_name = "NODE_ID",
+        help = "Seed the repo explanation around an exact node id. Agent-friendly alias for focused ask/explain follow-ups."
+    )]
+    pub(crate) id: Option<String>,
+    #[arg(long, default_value_t = 12)]
+    pub(crate) max_results: u32,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::Auto,
+        help = "Explain defaults to `auto`: it opens or refreshes the index before collecting grounding and asking."
+    )]
+    pub(crate) refresh: RefreshMode,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+#[command(group(
+    ArgGroup::new("ask_focus")
+        .args(["focus_id", "bookmark"])
+        .multiple(false)
+))]
 pub(crate) struct AskCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
@@ -199,13 +266,26 @@ pub(crate) struct AskCommand {
     pub(crate) prompt: String,
     #[arg(long, value_enum, default_value_t = CliAskProfile::Auto)]
     pub(crate) profile: CliAskProfile,
+    #[arg(
+        long,
+        help = "Use bounded investigation retrieval: weak-hit fallback, limited graph/source reads, and explicit gap trace."
+    )]
+    pub(crate) investigate: bool,
     #[arg(long, default_value_t = 8)]
     pub(crate) max_results: u32,
     #[arg(
         long,
+        allow_hyphen_values = true,
+        value_name = "NODE_ID",
         help = "Seed retrieval around an exact node id from search/symbol output."
     )]
     pub(crate) focus_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "BOOKMARK_ID",
+        help = "Seed retrieval from a saved bookmark. Cannot be combined with --focus-id."
+    )]
+    pub(crate) bookmark: Option<String>,
     #[arg(
         long,
         value_enum,
@@ -213,7 +293,7 @@ pub(crate) struct AskCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -232,18 +312,6 @@ pub(crate) struct AskCommand {
         help = "Omit citation edge ids and score breakdowns from the structured answer."
     )]
     pub(crate) no_evidence: bool,
-    #[arg(
-        long,
-        help = "Launch the configured local agent after indexed retrieval. Disabled by default."
-    )]
-    pub(crate) with_local_agent: bool,
-    #[arg(long, value_enum, default_value_t = CliAgentBackend::Codex)]
-    pub(crate) backend: CliAgentBackend,
-    #[arg(
-        long,
-        help = "Override the local agent command used with --with-local-agent."
-    )]
-    pub(crate) agent_command: Option<String>,
     #[arg(
         long = "hybrid-lexical",
         value_name = "WEIGHT",
@@ -268,7 +336,51 @@ pub(crate) struct AskCommand {
 pub(crate) struct DoctorCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SetupCommand {
+    #[command(subcommand)]
+    pub(crate) action: SetupAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum SetupAction {
+    Embeddings(SetupEmbeddingsCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SetupEmbeddingsCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(long, value_enum, default_value_t = CliEmbeddingQuant::Q8_0)]
+    pub(crate) quant: CliEmbeddingQuant,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = CliLlamaVariant::Vulkan,
+        help = "Choose the pinned llama.cpp binary variant. Defaults to Vulkan; use cpu as the fallback."
+    )]
+    pub(crate) variant: CliLlamaVariant,
+    #[arg(
+        long,
+        help = "Show the managed llama/model plan without downloading or starting anything."
+    )]
+    pub(crate) dry_run: bool,
+    #[arg(
+        long,
+        help = "Install and verify assets without starting llama-server."
+    )]
+    pub(crate) no_start: bool,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -304,7 +416,7 @@ pub(crate) struct SearchCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -359,6 +471,8 @@ pub(crate) struct SearchCommand {
 pub(crate) struct TargetArgs {
     #[arg(
         long,
+        allow_hyphen_values = true,
+        value_name = "NODE_ID",
         group = "selector",
         help = "Resolve the target from an exact node id returned by `search`, `symbol`, or `trail`."
     )]
@@ -375,6 +489,13 @@ pub(crate) struct TargetArgs {
         help = "Limit query resolution to files whose path matches this fragment."
     )]
     pub(crate) file: Option<String>,
+    #[arg(
+        long,
+        requires = "query",
+        value_name = "N",
+        help = "Resolve a query by the 1-based alternative number shown in an ambiguity error."
+    )]
+    pub(crate) choose: Option<usize>,
 }
 
 #[derive(Args, Debug)]
@@ -390,7 +511,7 @@ pub(crate) struct SymbolCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -414,7 +535,7 @@ pub(crate) struct TrailCommand {
     pub(crate) depth: Option<u32>,
     #[arg(long, value_enum)]
     pub(crate) direction: Option<CliDirection>,
-    #[arg(long, default_value_t = 24)]
+    #[arg(long, default_value_t = 120)]
     pub(crate) max_nodes: u32,
     #[arg(long)]
     pub(crate) include_tests: bool,
@@ -425,6 +546,8 @@ pub(crate) struct TrailCommand {
         help = "Hide uncertain/speculative edges and remove nodes disconnected from the trail focus."
     )]
     pub(crate) hide_speculative: bool,
+    #[arg(long, help = "Render a readable narrative of the trail graph.")]
+    pub(crate) story: bool,
     #[arg(long, value_enum, default_value_t = CliLayout::Horizontal)]
     pub(crate) layout: CliLayout,
     #[arg(
@@ -452,7 +575,12 @@ pub(crate) struct SnippetCommand {
     pub(crate) project: ProjectArgs,
     #[command(flatten)]
     pub(crate) target: TargetArgs,
-    #[arg(long, default_value_t = 4)]
+    #[arg(
+        long,
+        visible_alias = "lines",
+        default_value_t = 4,
+        help = "Number of surrounding context lines above and below the symbol. `--lines` is accepted as an agent-friendly alias."
+    )]
     pub(crate) context: usize,
     #[arg(
         long,
@@ -461,7 +589,7 @@ pub(crate) struct SnippetCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -472,11 +600,28 @@ pub(crate) struct SnippetCommand {
 }
 
 #[derive(Args, Debug)]
+#[command(group(
+    ArgGroup::new("query_input")
+        .args(["query", "sql"])
+        .required(true)
+        .multiple(false)
+))]
 pub(crate) struct QueryCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
-    #[arg(value_name = "QUERY")]
-    pub(crate) query: String,
+    #[arg(
+        value_name = "QUERY",
+        group = "query_input",
+        help = "CodeStory graph-query DSL, for example `search(query: 'AppController') | limit(5)`."
+    )]
+    pub(crate) query: Option<String>,
+    #[arg(
+        long,
+        group = "query_input",
+        value_name = "SQL",
+        help = "SQL is not supported; this flag returns targeted guidance instead of a parser-shaped error."
+    )]
+    pub(crate) sql: Option<String>,
     #[arg(
         long,
         value_enum,
@@ -484,7 +629,7 @@ pub(crate) struct QueryCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -516,7 +661,79 @@ pub(crate) struct ExploreCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct BookmarkCommand {
+    #[command(subcommand)]
+    pub(crate) action: BookmarkAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum BookmarkAction {
+    Add(BookmarkAddCommand),
+    List(BookmarkListCommand),
+    Remove(BookmarkRemoveCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct BookmarkAddCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[command(flatten)]
+    pub(crate) target: TargetArgs,
+    #[arg(long, default_value = "Investigation")]
+    pub(crate) category: String,
+    #[arg(long)]
+    pub(crate) comment: Option<String>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
+    pub(crate) refresh: RefreshMode,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct BookmarkListCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(long)]
+    pub(crate) category: Option<String>,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct BookmarkRemoveCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(value_name = "BOOKMARK_ID")]
+    pub(crate) id: String,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -581,6 +798,8 @@ pub(crate) enum QuerySelectorOutput {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SearchHitOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) number: Option<usize>,
     pub(crate) node_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) node_ref: Option<String>,
@@ -607,6 +826,8 @@ pub(crate) struct SearchHitOutput {
 pub(crate) struct SearchOutput {
     pub(crate) query: String,
     pub(crate) retrieval: RetrievalStateDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) freshness: Option<IndexFreshnessDto>,
     pub(crate) limit_per_source: u32,
     pub(crate) repo_text_mode: RepoTextMode,
     pub(crate) repo_text_enabled: bool,
@@ -617,6 +838,24 @@ pub(crate) struct SearchOutput {
     pub(crate) suggestions: Vec<SearchHitOutput>,
     pub(crate) indexed_symbol_hits: Vec<SearchHitOutput>,
     pub(crate) repo_text_hits: Vec<SearchHitOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repo_text_stats: Option<RepoTextScanStatsDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ExplainOutput<'a> {
+    pub(crate) project: &'a str,
+    pub(crate) storage_path: &'a str,
+    pub(crate) refresh: &'a str,
+    pub(crate) prompt: &'a str,
+    pub(crate) workflow: Vec<&'static str>,
+    pub(crate) summary: &'a ProjectSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retrieval: Option<&'a RetrievalStateDto>,
+    pub(crate) grounding: &'a GroundingSnapshotDto,
+    pub(crate) anchors: Vec<SearchHitOutput>,
+    pub(crate) answer: &'a AgentAnswerDto,
+    pub(crate) next_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -640,6 +879,8 @@ pub(crate) struct SymbolJsonOutput<'a> {
 pub(crate) struct TrailJsonOutput<'a> {
     pub(crate) resolution: QueryResolutionOutput,
     pub(crate) trail: &'a TrailContextDto,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) notes: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -673,11 +914,64 @@ pub(crate) struct QueryOutput {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ExploreOutput<'a> {
+    pub(crate) status: ExploreStatusOutput,
+    pub(crate) search: ExploreSearchOutput,
     pub(crate) resolution: QueryResolutionOutput,
     pub(crate) navigation: NavigationOutput,
     pub(crate) symbol: &'a SymbolContextDto,
     pub(crate) trail: &'a TrailContextDto,
     pub(crate) snippet: Option<&'a SnippetContextDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BookmarkOutput {
+    pub(crate) bookmark: BookmarkDto,
+    pub(crate) stale: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct BookmarkAddOutput {
+    pub(crate) category: BookmarkCategoryDto,
+    pub(crate) bookmark: BookmarkOutput,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct BookmarkListOutput {
+    pub(crate) categories: Vec<BookmarkCategoryDto>,
+    pub(crate) bookmarks: Vec<BookmarkOutput>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct BookmarkRemoveOutput {
+    pub(crate) removed_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExploreStatusOutput {
+    pub(crate) project: String,
+    pub(crate) storage_path: String,
+    pub(crate) refresh: String,
+    pub(crate) output_target: String,
+    pub(crate) indexed_files: u32,
+    pub(crate) indexed_nodes: u32,
+    pub(crate) indexed_edges: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retrieval: Option<RetrievalStateDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) freshness: Option<IndexFreshnessDto>,
+    pub(crate) next_commands: Vec<String>,
+    pub(crate) layer_notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExploreSearchOutput {
+    pub(crate) selector: QuerySelectorOutput,
+    pub(crate) requested: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) file_filter: Option<String>,
+    pub(crate) selected: SearchHitOutput,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) alternatives: Vec<SearchHitOutput>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -702,6 +996,8 @@ pub(crate) struct DoctorOutput {
     pub(crate) stats: codestory_contracts::api::StorageStatsDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retrieval: Option<RetrievalStateDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) freshness: Option<IndexFreshnessDto>,
     pub(crate) checks: Vec<DoctorCheckOutput>,
     pub(crate) next_commands: Vec<String>,
     pub(crate) environment: Vec<DoctorCheckOutput>,
@@ -710,16 +1006,20 @@ pub(crate) struct DoctorOutput {
 #[derive(Debug)]
 pub(crate) enum TargetSelection {
     Id(NodeId),
-    Query(String),
+    Query {
+        query: String,
+        choose: Option<usize>,
+    },
 }
 
 impl TargetArgs {
     pub(crate) fn selection(&self) -> anyhow::Result<TargetSelection> {
         match (&self.id, &self.query) {
             (Some(id), None) => Ok(TargetSelection::Id(NodeId(id.trim().to_string()))),
-            (None, Some(query)) if !query.trim().is_empty() => {
-                Ok(TargetSelection::Query(query.trim().to_string()))
-            }
+            (None, Some(query)) if !query.trim().is_empty() => Ok(TargetSelection::Query {
+                query: query.trim().to_string(),
+                choose: self.choose,
+            }),
             (Some(_), Some(_)) => anyhow::bail!("Pass only one of --id or --query."),
             (None, None) => anyhow::bail!("Pass either --id or --query."),
             (None, Some(_)) => anyhow::bail!("--query cannot be empty."),
@@ -765,12 +1065,13 @@ impl From<CliAskProfile> for AgentRetrievalProfileSelectionDto {
     }
 }
 
-impl From<CliAgentBackend> for AgentBackend {
-    fn from(value: CliAgentBackend) -> Self {
-        match value {
-            CliAgentBackend::Codex => Self::Codex,
-            CliAgentBackend::ClaudeCode => Self::ClaudeCode,
+pub(crate) fn ask_retrieval_profile(cmd: &AskCommand) -> AgentRetrievalProfileSelectionDto {
+    if cmd.investigate {
+        AgentRetrievalProfileSelectionDto::Preset {
+            preset: AgentRetrievalPresetDto::Investigate,
         }
+    } else {
+        cmd.profile.into()
     }
 }
 
@@ -821,6 +1122,8 @@ fn build_trail_request_impl(
         },
         edge_filter: Vec::new(),
         show_utility_calls: cmd.show_utility_calls,
+        hide_speculative: cmd.hide_speculative,
+        story: cmd.story,
         node_filter: Vec::new(),
         max_nodes: cmd.max_nodes.clamp(1, 200),
         layout_direction: match cmd.layout {
@@ -841,7 +1144,7 @@ pub(crate) fn default_trail_direction(mode: CliTrailMode) -> TrailDirection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     fn render_subcommand_help(name: &str) -> String {
         let mut command = Cli::command();
@@ -854,11 +1157,11 @@ mod tests {
     #[test]
     fn symbol_help_requires_exactly_one_selector() {
         let help = render_subcommand_help("symbol");
-        assert!(help.contains("--id <ID>"));
+        assert!(help.contains("--id <NODE_ID>"));
         assert!(help.contains("--query <QUERY>"));
         assert!(help.contains("--file <FILE>"));
         assert!(
-            help.contains("<--id <ID>|--query <QUERY>>"),
+            help.contains("<--id <NODE_ID>|--query <QUERY>>"),
             "selector help should surface the required selector group in the usage line: {help}"
         );
     }
@@ -889,9 +1192,93 @@ mod tests {
     #[test]
     fn ask_help_exposes_db_first_controls() {
         let help = render_subcommand_help("ask");
-        assert!(help.contains("--with-local-agent"));
         assert!(help.contains("--bundle <DIR>"));
         assert!(help.contains("--profile <PROFILE>"));
+        assert!(!help.contains("--with-local-agent"));
+        assert!(!help.contains("--agent-command"));
+    }
+
+    #[test]
+    fn explain_help_exposes_guided_repo_flow() {
+        let help = render_subcommand_help("explain");
+        assert!(help.contains("Repository explanation prompt"));
+        assert!(help.contains("--id <NODE_ID>"));
+        assert!(help.contains("[aliases: --focus-id]"));
+        assert!(help.contains("--max-results"));
+        assert!(help.contains("How does this repo fit together?"));
+        assert!(!help.contains("--with-local-agent"));
+        assert!(!help.contains("--agent-command"));
+    }
+
+    #[test]
+    fn snippet_help_exposes_lines_alias_for_agent_context_guess() {
+        let help = render_subcommand_help("snippet");
+        assert!(help.contains("--context <CONTEXT>"));
+        assert!(help.contains("[aliases: --lines]"));
+        assert!(
+            help.contains("Number of surrounding context lines"),
+            "snippet help should make context sizing obvious: {help}"
+        );
+    }
+
+    #[test]
+    fn query_help_explains_graph_dsl_and_sql_guardrail() {
+        let help = render_subcommand_help("query");
+        assert!(help.contains("CodeStory graph-query DSL"));
+        assert!(help.contains("--sql <SQL>"));
+        assert!(help.contains("SQL is not supported"));
+    }
+
+    #[test]
+    fn trail_help_keeps_dot_format_discoverable() {
+        let help = render_subcommand_help("trail");
+        assert!(
+            help.contains("dot"),
+            "trail help should expose its graphviz output format: {help}"
+        );
+    }
+
+    #[test]
+    fn non_trail_help_does_not_advertise_dot_format() {
+        for name in [
+            "index", "ground", "explain", "ask", "doctor", "search", "symbol", "snippet", "query",
+            "explore",
+        ] {
+            let help = render_subcommand_help(name);
+            assert!(
+                !help.contains("dot"),
+                "{name} help should not advertise trail-only dot output: {help}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_trail_format_parser_rejects_dot_before_runtime() {
+        let error = Cli::try_parse_from([
+            "codestory-cli",
+            "search",
+            "--query",
+            "AppController",
+            "--format",
+            "dot",
+        ])
+        .expect_err("search should reject trail-only dot output");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--format dot is only supported by `trail`"),
+            "search parse error should explain the trail-only dot format: {error}"
+        );
+        Cli::try_parse_from([
+            "codestory-cli",
+            "trail",
+            "--query",
+            "AppController",
+            "--format",
+            "dot",
+        ])
+        .expect("trail should keep accepting dot output");
     }
 
     #[test]
@@ -899,5 +1286,42 @@ mod tests {
         let help = render_subcommand_help("doctor");
         assert!(help.contains("--format <FORMAT>"));
         assert!(help.contains("--output-file <PATH>"));
+    }
+
+    #[test]
+    fn setup_embeddings_defaults_to_vulkan_variant() {
+        let cli = Cli::try_parse_from(["codestory-cli", "setup", "embeddings"])
+            .expect("setup embeddings should parse");
+        match cli.command {
+            Command::Setup(SetupCommand {
+                action: SetupAction::Embeddings(cmd),
+            }) => assert_eq!(cmd.variant, CliLlamaVariant::Vulkan),
+            _ => panic!("expected setup embeddings command"),
+        }
+    }
+
+    #[test]
+    fn negative_node_ids_parse_without_equals_workaround() {
+        let cli = Cli::try_parse_from(["codestory-cli", "symbol", "--id", "-3816661223164617416"])
+            .expect("negative symbol id should parse");
+        match cli.command {
+            Command::Symbol(cmd) => {
+                assert_eq!(cmd.target.id.as_deref(), Some("-3816661223164617416"))
+            }
+            _ => panic!("expected symbol command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "codestory-cli",
+            "ask",
+            "what is this?",
+            "--focus-id",
+            "-3816661223164617416",
+        ])
+        .expect("negative focus id should parse");
+        match cli.command {
+            Command::Ask(cmd) => assert_eq!(cmd.focus_id.as_deref(), Some("-3816661223164617416")),
+            _ => panic!("expected ask command"),
+        }
     }
 }

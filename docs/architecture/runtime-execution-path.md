@@ -72,23 +72,16 @@ sequenceDiagram
     participant Runtime as codestory-runtime
     participant Search as runtime search
     participant Graph as runtime graph builders
-    participant Agent as optional local agent
 
     CLI->>Runtime: AgentAskRequest
     Runtime->>Search: scored hybrid retrieval
     Runtime->>Graph: neighborhood, trail, snippets, citations
     Runtime-->>CLI: AgentAnswerDto with trace and evidence
-    opt --with-local-agent
-        Runtime->>Agent: constrained local prompt
-        Agent-->>Runtime: markdown synthesis
-    end
     CLI->>CLI: render markdown/json and optional bundle
 ```
 
-`ask` is DB-first by default. It runs runtime-owned retrieval planning and answer
-packet assembly without invoking an external process. `--with-local-agent`
-opts into a local Codex or Claude command after the indexed evidence packet has
-been built.
+`ask` is DB-first. It runs runtime-owned retrieval planning and answer packet
+assembly without invoking an external process.
 
 ## Ground, Symbol, Trail, and Snippet Commands
 
@@ -109,6 +102,12 @@ view and now adds definition plus incoming/outgoing reference metadata. `serve`
 reuses the same runtime calls for `/definition`, `/references`, `/symbols`, and
 stdio MCP-style resources/prompts/tools. `doctor` opens the project summary and
 reports cache/index/retrieval health without mutating state.
+
+`explore` remains the cockpit surface until the
+[browser surface gate](browser-surface-gate.md) is satisfied. Do not add a
+separate `browse` command, web cockpit route, or browser-specific web UI without
+current manifest, warm-loop, stress-lane, explore, and screenshot-review
+evidence.
 
 ## Ownership Notes
 

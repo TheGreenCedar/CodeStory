@@ -820,40 +820,21 @@ impl WorkspaceIndexer {
                 .saturating_add(duration_ms_u64(lookup_started.elapsed()));
 
             let parse_started = Instant::now();
-            let parse_results: Vec<PreparedIndexJobResult> =
-                if plan.mode == codestory_workspace::BuildMode::FullRefresh {
-                    parse_jobs
-                        .iter()
-                        .map(|prepared_input| {
-                            if let Some(token) = cancel_token
-                                && token.is_cancelled()
-                            {
-                                cancelled_clone.store(true, Ordering::Relaxed);
-                                return PreparedIndexJobResult {
-                                    local_storage: IntermediateStorage::default(),
-                                    cache_write: None,
-                                };
-                            }
-                            self.execute_prepared_index(prepared_input, &symbol_table)
-                        })
-                        .collect()
-                } else {
-                    parse_jobs
-                        .par_iter()
-                        .map(|prepared_input| {
-                            if let Some(token) = cancel_token
-                                && token.is_cancelled()
-                            {
-                                cancelled_clone.store(true, Ordering::Relaxed);
-                                return PreparedIndexJobResult {
-                                    local_storage: IntermediateStorage::default(),
-                                    cache_write: None,
-                                };
-                            }
-                            self.execute_prepared_index(prepared_input, &symbol_table)
-                        })
-                        .collect()
-                };
+            let parse_results: Vec<PreparedIndexJobResult> = parse_jobs
+                .par_iter()
+                .map(|prepared_input| {
+                    if let Some(token) = cancel_token
+                        && token.is_cancelled()
+                    {
+                        cancelled_clone.store(true, Ordering::Relaxed);
+                        return PreparedIndexJobResult {
+                            local_storage: IntermediateStorage::default(),
+                            cache_write: None,
+                        };
+                    }
+                    self.execute_prepared_index(prepared_input, &symbol_table)
+                })
+                .collect();
             stats.parse_index_ms = stats
                 .parse_index_ms
                 .saturating_add(duration_ms_u64(parse_started.elapsed()));
@@ -2279,10 +2260,7 @@ fn normalize_graph_capture(
         );
     }
 
-    if input.language_name == "cpp"
-        && input.kind == NodeKind::UNKNOWN
-        && (input.name.contains("::") || input.name.contains('<') || input.has_token_surface_edge)
-    {
+    if cpp_unknown_capture_needs_terminal_identifier(input) {
         return extract_terminal_identifier_from_span(
             input.source,
             input.graph_span.start_line,
@@ -2293,6 +2271,19 @@ fn normalize_graph_capture(
     }
 
     None
+}
+
+fn cpp_unknown_capture_needs_terminal_identifier(
+    input: &GraphCaptureNormalizationInput<'_>,
+) -> bool {
+    let is_cpp_unknown_capture = input.language_name == "cpp" && input.kind == NodeKind::UNKNOWN;
+    let has_composite_surface =
+        cpp_name_is_scoped_or_template(input.name) || input.has_token_surface_edge;
+    is_cpp_unknown_capture && has_composite_surface
+}
+
+fn cpp_name_is_scoped_or_template(name: &str) -> bool {
+    name.contains("::") || name.contains('<')
 }
 
 fn split_top_level_type_arguments(raw: &str) -> Vec<String> {
@@ -3393,35 +3384,74 @@ fn apply_qualified_names(nodes: Vec<Node>, edges: &[Edge], language_name: &str) 
         let parent_is_type_like = node_map
             .get(&parent_id)
             .is_some_and(|parent_node| is_type_like_kind(parent_node.kind));
-        if let Some(children) = parent_map.get(&parent_id) {
-            for child_id in children {
-                if let Some(child_node) = node_map.get_mut(child_id) {
-                    let delimiter = match language_name {
-                        "rust" | "cpp" | "c" => "::",
-                        _ => ".",
-                    };
-                    let new_name = format!(
-                        "{}{}{}",
-                        parent_qualified_name, delimiter, child_node.serialized_name
-                    );
-                    // Keep members of type-like owners owner-qualified in both name fields so
-                    // downstream resolution can distinguish declared members from
-                    // placeholder/reference nodes that share the same terminal token,
-                    // without changing terminal names for module-owned type declarations.
-                    if parent_is_type_like {
-                        child_node.serialized_name = format!(
-                            "{}{}{}",
-                            parent_serialized_name, delimiter, child_node.serialized_name
-                        );
-                    }
-                    child_node.qualified_name = Some(new_name.clone());
-                    queue.push((*child_id, new_name));
-                }
-            }
-        }
+        let mut traversal = QualifiedNameTraversal {
+            language_name,
+            parent_map: &parent_map,
+            node_map: &mut node_map,
+        };
+        queue_qualified_child_names(
+            QualifiedNameParent {
+                id: parent_id,
+                qualified_name: &parent_qualified_name,
+                serialized_name: &parent_serialized_name,
+                is_type_like: parent_is_type_like,
+            },
+            &mut traversal,
+            &mut queue,
+        );
     }
 
     node_map.into_values().collect()
+}
+
+struct QualifiedNameParent<'a> {
+    id: NodeId,
+    qualified_name: &'a str,
+    serialized_name: &'a str,
+    is_type_like: bool,
+}
+
+struct QualifiedNameTraversal<'a> {
+    language_name: &'a str,
+    parent_map: &'a HashMap<NodeId, Vec<NodeId>>,
+    node_map: &'a mut HashMap<NodeId, Node>,
+}
+
+fn queue_qualified_child_names(
+    parent: QualifiedNameParent<'_>,
+    traversal: &mut QualifiedNameTraversal<'_>,
+    queue: &mut Vec<(NodeId, String)>,
+) {
+    let Some(children) = traversal.parent_map.get(&parent.id) else {
+        return;
+    };
+    for child_id in children {
+        let Some(child_node) = traversal.node_map.get_mut(child_id) else {
+            continue;
+        };
+        let delimiter = qualified_name_delimiter(traversal.language_name);
+        let new_name = format!(
+            "{}{}{}",
+            parent.qualified_name, delimiter, child_node.serialized_name
+        );
+        // Keep members of type-like owners owner-qualified in both name fields so
+        // downstream resolution can distinguish declared members from placeholder/reference nodes.
+        if parent.is_type_like {
+            child_node.serialized_name = format!(
+                "{}{}{}",
+                parent.serialized_name, delimiter, child_node.serialized_name
+            );
+        }
+        child_node.qualified_name = Some(new_name.clone());
+        queue.push((*child_id, new_name));
+    }
+}
+
+fn qualified_name_delimiter(language_name: &str) -> &'static str {
+    match language_name {
+        "rust" | "cpp" | "c" => "::",
+        _ => ".",
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4033,7 +4063,11 @@ fn choose_existing_impl_anchor_target(storage: &Storage, anchor: &Node) -> Resul
         "SELECT id, serialized_name, qualified_name, file_node_id
          FROM node
          WHERE (serialized_name = ?1 OR serialized_name LIKE ?2)
-            AND (canonical_id IS NULL OR canonical_id NOT LIKE 'impl_anchor:%')
+            ",
+    );
+    query.push_str(non_impl_anchor_canonical_predicate());
+    query.push_str(
+        "
             AND kind IN (",
     );
     let kind_values = rust_type_like_kind_values();
@@ -4262,7 +4296,7 @@ struct OpenApiEndpoint {
     line: u32,
 }
 
-fn is_openapi_candidate_path(path: &Path) -> bool {
+pub fn is_openapi_candidate_path(path: &Path) -> bool {
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
@@ -4341,10 +4375,19 @@ fn index_openapi_schema_file(path: &Path, source: &str) -> Result<Option<Interme
     Ok(Some(local_storage))
 }
 
-fn looks_like_openapi_schema(source: &str) -> bool {
+pub fn looks_like_openapi_schema(source: &str) -> bool {
     let lower = source.to_ascii_lowercase();
-    (lower.contains("\"openapi\"") || lower.contains("openapi:") || lower.contains("\"swagger\""))
-        && (lower.contains("\"paths\"") || lower.contains("paths:"))
+    contains_openapi_schema_marker(&lower) && contains_openapi_paths_marker(&lower)
+}
+
+fn contains_openapi_schema_marker(lower_source: &str) -> bool {
+    lower_source.contains("\"openapi\"")
+        || lower_source.contains("openapi:")
+        || lower_source.contains("\"swagger\"")
+}
+
+fn contains_openapi_paths_marker(lower_source: &str) -> bool {
+    lower_source.contains("\"paths\"") || lower_source.contains("paths:")
 }
 
 fn parse_openapi_endpoints(source: &str) -> Result<Vec<OpenApiEndpoint>> {
@@ -4472,15 +4515,23 @@ fn normalize_api_path(path: &str) -> String {
     }
 }
 
+fn non_impl_anchor_canonical_predicate() -> &'static str {
+    "AND (canonical_id IS NULL OR canonical_id NOT LIKE 'impl_anchor:%')"
+}
+
+struct SchemaEndpointEdgeSinks<'a> {
+    unique_nodes: &'a mut HashMap<NodeId, Node>,
+    result_edges: &'a mut Vec<Edge>,
+    edge_keys: &'a mut HashSet<EdgeDedupKey>,
+    callsite_ordinals: &'a mut HashMap<(NodeId, Option<u32>), u32>,
+}
+
 fn append_schema_endpoint_call_edges(
     language_name: &str,
     source: &str,
-    unique_nodes: &mut HashMap<NodeId, Node>,
     file_id: NodeId,
-    result_edges: &mut Vec<Edge>,
-    edge_keys: &mut HashSet<EdgeDedupKey>,
     flags: IndexFeatureFlags,
-    callsite_ordinals: &mut HashMap<(NodeId, Option<u32>), u32>,
+    sinks: &mut SchemaEndpointEdgeSinks<'_>,
 ) {
     if !matches!(
         language_name,
@@ -4491,19 +4542,15 @@ fn append_schema_endpoint_call_edges(
 
     for call in collect_api_endpoint_calls(source) {
         let target = schema_endpoint_node_id(&call.method, &call.path);
-        let source_id = enclosing_callable_node_id(unique_nodes, call.line).unwrap_or(file_id);
-        unique_nodes.entry(target).or_insert_with(|| Node {
+        let target_label = schema_endpoint_label(&call.method, &call.path);
+        let source_id =
+            enclosing_callable_node_id(sinks.unique_nodes, call.line).unwrap_or(file_id);
+        sinks.unique_nodes.entry(target).or_insert_with(|| Node {
             id: target,
             kind: NodeKind::FUNCTION,
-            serialized_name: schema_endpoint_label(&call.method, &call.path),
-            qualified_name: Some(format!(
-                "schema_reference::{}",
-                schema_endpoint_label(&call.method, &call.path)
-            )),
-            canonical_id: Some(format!(
-                "openapi:endpoint:{}",
-                schema_endpoint_label(&call.method, &call.path)
-            )),
+            serialized_name: target_label.clone(),
+            qualified_name: Some(format!("schema_reference::{target_label}")),
+            canonical_id: Some(format!("openapi:endpoint:{target_label}")),
             file_node_id: Some(file_id),
             start_line: Some(call.line),
             start_col: Some(call.col),
@@ -4525,14 +4572,17 @@ fn append_schema_endpoint_call_edges(
             confidence: Some(0.45),
             ..Default::default()
         };
-        let next = callsite_ordinals.entry((target, edge.line)).or_insert(0);
+        let next = sinks
+            .callsite_ordinals
+            .entry((target, edge.line))
+            .or_insert(0);
         *next = next.saturating_add(1);
         ensure_callsite_identity(&mut edge, Some(call.col.saturating_add(*next)));
-        if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
+        if !sinks.edge_keys.insert(edge_dedup_key(&edge, flags)) {
             continue;
         }
         edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
-        result_edges.push(edge);
+        sinks.result_edges.push(edge);
     }
 }
 
@@ -5155,12 +5205,14 @@ pub fn index_file(
     append_schema_endpoint_call_edges(
         language_config.language_name,
         source,
-        &mut unique_nodes,
         file_id,
-        &mut result_edges,
-        &mut edge_keys,
         flags,
-        &mut callsite_ordinals,
+        &mut SchemaEndpointEdgeSinks {
+            unique_nodes: &mut unique_nodes,
+            result_edges: &mut result_edges,
+            edge_keys: &mut edge_keys,
+            callsite_ordinals: &mut callsite_ordinals,
+        },
     );
 
     if !unique_nodes.is_empty() {
@@ -5421,8 +5473,7 @@ fn apply_line_range_call_attribution(
             {
                 edge.source = best.id;
             }
-            if placeholder_source
-                && (!callable_ids.contains(&edge.source) || edge.source == edge.target)
+            if placeholder_source && call_edge_still_has_unresolved_placeholder(edge, &callable_ids)
             {
                 continue;
             }
@@ -5439,6 +5490,10 @@ fn apply_line_range_call_attribution(
     }
 
     *edges = updated_edges;
+}
+
+fn call_edge_still_has_unresolved_placeholder(edge: &Edge, callable_ids: &HashSet<NodeId>) -> bool {
+    !callable_ids.contains(&edge.source) || edge.source == edge.target
 }
 
 fn build_callable_projection_states(
@@ -5492,56 +5547,13 @@ fn build_callable_projection_states(
             &start_col.to_string(),
         ]);
 
-        let mut body_parts = Vec::new();
-        if let Some(source_edges) = edges_by_source.get(&node.id) {
-            let mut edge_parts = source_edges
-                .iter()
-                .filter(|edge| {
-                    !matches!(
-                        edge.kind,
-                        EdgeKind::MEMBER
-                            | EdgeKind::INHERITANCE
-                            | EdgeKind::IMPORT
-                            | EdgeKind::OVERRIDE
-                    )
-                })
-                .map(|edge| {
-                    format!(
-                        "{}:{}:{}:{}",
-                        edge.kind as i32,
-                        edge.target.0,
-                        edge.line.unwrap_or(0),
-                        edge.callsite_identity.as_deref().unwrap_or_default()
-                    )
-                })
-                .collect::<Vec<_>>();
-            edge_parts.sort();
-            body_parts.extend(edge_parts);
-        }
-
-        if let Some(file_occurrences) = occurrences_by_file.get(&file_id) {
-            let mut occurrence_parts = file_occurrences
-                .iter()
-                .filter(|occurrence| {
-                    occurrence.location.start_line >= start_line
-                        && occurrence.location.end_line <= end_line
-                        && occurrence.element_id != node.id.0
-                })
-                .map(|occurrence| {
-                    format!(
-                        "{}:{}:{}:{}:{}:{}",
-                        occurrence.element_id,
-                        occurrence.kind as i32,
-                        occurrence.location.start_line,
-                        occurrence.location.start_col,
-                        occurrence.location.end_line,
-                        occurrence.location.end_col
-                    )
-                })
-                .collect::<Vec<_>>();
-            occurrence_parts.sort();
-            body_parts.extend(occurrence_parts);
-        }
+        let mut body_parts = callable_edge_projection_parts(edges_by_source.get(&node.id));
+        body_parts.extend(callable_occurrence_projection_parts(
+            occurrences_by_file.get(&file_id),
+            node,
+            start_line,
+            end_line,
+        ));
 
         states.push(CallableProjectionState {
             file_id: file_id.0,
@@ -5568,6 +5580,75 @@ fn build_callable_projection_states(
 
     states.sort_by(|lhs, rhs| lhs.symbol_key.cmp(&rhs.symbol_key));
     states
+}
+
+fn callable_edge_projection_parts(source_edges: Option<&Vec<&Edge>>) -> Vec<String> {
+    let Some(source_edges) = source_edges else {
+        return Vec::new();
+    };
+    let mut edge_parts = source_edges
+        .iter()
+        .filter(|edge| !is_structural_projection_edge(edge.kind))
+        .map(|edge| {
+            format!(
+                "{}:{}:{}:{}",
+                edge.kind as i32,
+                edge.target.0,
+                edge.line.unwrap_or(0),
+                edge.callsite_identity.as_deref().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>();
+    edge_parts.sort();
+    edge_parts
+}
+
+fn is_structural_projection_edge(kind: EdgeKind) -> bool {
+    matches!(
+        kind,
+        EdgeKind::MEMBER | EdgeKind::INHERITANCE | EdgeKind::IMPORT | EdgeKind::OVERRIDE
+    )
+}
+
+fn callable_occurrence_projection_parts(
+    file_occurrences: Option<&Vec<&Occurrence>>,
+    node: &Node,
+    start_line: u32,
+    end_line: u32,
+) -> Vec<String> {
+    let Some(file_occurrences) = file_occurrences else {
+        return Vec::new();
+    };
+    let mut occurrence_parts = file_occurrences
+        .iter()
+        .filter(|occurrence| {
+            occurrence_belongs_to_callable_body(occurrence, node, start_line, end_line)
+        })
+        .map(|occurrence| {
+            format!(
+                "{}:{}:{}:{}:{}:{}",
+                occurrence.element_id,
+                occurrence.kind as i32,
+                occurrence.location.start_line,
+                occurrence.location.start_col,
+                occurrence.location.end_line,
+                occurrence.location.end_col
+            )
+        })
+        .collect::<Vec<_>>();
+    occurrence_parts.sort();
+    occurrence_parts
+}
+
+fn occurrence_belongs_to_callable_body(
+    occurrence: &Occurrence,
+    node: &Node,
+    start_line: u32,
+    end_line: u32,
+) -> bool {
+    occurrence.location.start_line >= start_line
+        && occurrence.location.end_line <= end_line
+        && occurrence.element_id != node.id.0
 }
 
 fn structural_projection_hash(
@@ -6267,7 +6348,11 @@ class MyClass {
 function globalFunc() {}
 export const Posts = {
     slug: "posts",
+    access: {
+        read: () => true,
+    },
     fields: [],
+    hooks: {},
 };
 export const contentBlocks = [];
 export default buildConfig({
@@ -6298,6 +6383,41 @@ export default buildConfig({
                 .iter()
                 .any(|n| { n.serialized_name == "Posts" && n.kind == NodeKind::GLOBAL_VARIABLE }),
             "exported object config should be indexed as a global variable"
+        );
+        for field_name in ["Posts.slug", "Posts.access", "Posts.fields", "Posts.hooks"] {
+            assert!(
+                result.nodes.iter().any(|node| {
+                    node.qualified_name.as_deref() == Some(field_name)
+                        && node.kind == NodeKind::FIELD
+                }),
+                "exported object config should index top-level field {field_name}"
+            );
+        }
+        let posts_id = result
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name == "Posts" && node.kind == NodeKind::GLOBAL_VARIABLE)
+            .expect("posts node")
+            .id;
+        let field_ids = result
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.kind == NodeKind::FIELD
+                    && node
+                        .qualified_name
+                        .as_deref()
+                        .is_some_and(|name| name.starts_with("Posts."))
+            })
+            .map(|node| node.id)
+            .collect::<HashSet<_>>();
+        assert!(
+            result.edges.iter().any(|edge| {
+                edge.kind == EdgeKind::MEMBER
+                    && edge.source == posts_id
+                    && field_ids.contains(&edge.target)
+            }),
+            "exported object config fields should be connected to their owner"
         );
         assert!(
             result.nodes.iter().any(|n| {
@@ -6438,7 +6558,8 @@ public:
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut saw_started = false;
         let mut saw_complete = false;
-        while Instant::now() < deadline && (!saw_started || !saw_complete) {
+        while Instant::now() < deadline && progress_events_still_pending(saw_started, saw_complete)
+        {
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Event::IndexingStarted { .. }) => saw_started = true,
                 Ok(Event::IndexingComplete { .. }) => saw_complete = true,
@@ -6451,6 +6572,10 @@ public:
         assert!(saw_complete, "expected IndexingComplete event");
 
         Ok(())
+    }
+
+    fn progress_events_still_pending(saw_started: bool, saw_complete: bool) -> bool {
+        !saw_started || !saw_complete
     }
 
     #[test]

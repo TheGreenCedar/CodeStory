@@ -85,6 +85,8 @@ fn test_cli_app_indexer_smoke() -> anyhow::Result<()> {
             caller_scope: TrailCallerScope::ProductionOnly,
             edge_filter: vec![],
             show_utility_calls: true,
+            hide_speculative: false,
+            story: false,
             node_filter: vec![],
             max_nodes: 10,
             layout_direction: LayoutDirection::Horizontal,

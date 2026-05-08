@@ -34,24 +34,19 @@ impl EnvGuard {
         }
         Self { key, previous }
     }
-
-    fn remove(key: &'static str) -> Self {
-        let previous = std::env::var(key).ok();
-        unsafe {
-            std::env::remove_var(key);
-        }
-        Self { key, previous }
-    }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        unsafe {
-            if let Some(value) = self.previous.as_deref() {
-                std::env::set_var(self.key, value);
-            } else {
-                std::env::remove_var(self.key);
-            }
+        restore_env_value(self.key, self.previous.as_deref());
+    }
+}
+
+fn restore_env_value(key: &'static str, previous: Option<&str>) {
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
         }
     }
 }
@@ -215,6 +210,8 @@ fn retrieval_eval_trail_context_keeps_grounded_neighbors() {
             caller_scope: TrailCallerScope::ProductionOnly,
             edge_filter: Vec::new(),
             show_utility_calls: true,
+            hide_speculative: false,
+            story: false,
             node_filter: Vec::new(),
             max_nodes: 12,
             layout_direction: LayoutDirection::Horizontal,

@@ -19,10 +19,11 @@ target/release/codestory-cli(.exe) trail [OPTIONS]
 | `--mode` | enum | `neighborhood` | Trail mode: `neighborhood`, `referenced`, `referencing` |
 | `--depth` | integer | *auto* | Max traversal depth (default: 2 for neighborhood, 0 for referenced/referencing) |
 | `--direction` | enum | *auto* | Edge direction filter: `incoming`, `outgoing`, `both` |
-| `--max-nodes` | integer | `24` | Maximum nodes in the trail (clamped 1–200) |
+| `--max-nodes` | integer | `120` | Maximum nodes in the trail (clamped 1-200) |
 | `--include-tests` | flag | `false` | Include test and bench callers |
 | `--show-utility-calls` | flag | `false` | Include utility/helper call edges |
 | `--hide-speculative` | flag | `false` | Hide uncertain/speculative edges and remove nodes disconnected from the trail focus |
+| `--story` | flag | `false` | Render a readable narrative with entry points, core flow, side effects, uncertainty, and test scope |
 | `--layout` | enum | `horizontal` | Layout direction: `horizontal` or `vertical` |
 | `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
 | `--format` | enum | `markdown` | Output format: `markdown`, `json`, or trail-only `dot` |
@@ -64,6 +65,25 @@ Markdown trail output renders edge certainty directly in the arrow shape:
 | `uncertain` / `speculative` | `?call?>` | Low-confidence edge; hide with `--hide-speculative` |
 | missing certainty | `-call-> [unresolved]` | Legacy or unresolved certainty metadata |
 
+## Story Mode
+
+`--story` turns the trail graph into a text-first narrative for handoff to an
+LLM or reviewer. Markdown output starts with `# Trail Story`; JSON output keeps
+the normal trail context and adds its optional `story` object inside that shared
+context. Story mode is explicit and does not apply to `--mermaid` or
+`--format dot`.
+
+Story sections:
+
+| Section | What it makes explicit |
+|---------|------------------------|
+| Entry Points | The focus symbol and any rendered source nodes with no incoming edge. |
+| Core Flow | A readable edge-by-edge path with textual certainty labels. |
+| Side Effects | Likely mutating/runtime-effect calls inferred from edge kinds and labels. |
+| Uncertainty | Probable, uncertain, speculative, or missing-certainty edges in words. |
+| Tests | Whether tests/benches were included or excluded, plus visible test-like nodes. |
+| Gaps And Limits | Truncation, omitted edges, empty trails, and applied filters. |
+
 ## Examples
 
 ```bash
@@ -81,6 +101,9 @@ target/release/codestory-cli(.exe) trail --project . --query EventBus --max-node
 
 # Hide low-confidence edges in Markdown or JSON output
 target/release/codestory-cli(.exe) trail --project . --query ResolutionPass --hide-speculative
+
+# Narrative handoff for a reviewer or LLM
+target/release/codestory-cli(.exe) trail --project . --query ResolutionPass --story
 
 # Export a Graphviz DOT graph
 target/release/codestory-cli(.exe) trail --project . --query ResolutionPass --format dot --output-file trail.dot

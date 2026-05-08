@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = { workspace = true }
+codestory-contracts = { workspace = true }
 glob = { workspace = true }
 ignore = { workspace = true }
 serde = { workspace = true }

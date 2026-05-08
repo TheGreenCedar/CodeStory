@@ -2,18 +2,19 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use codestory_contracts::api::{
-    AgentAskRequest, AgentConnectionSettingsDto, AgentHybridWeightsDto, AgentResponseModeDto,
-    AppEventPayload, GraphArtifactDto, GroundingBudgetDto, IndexMode, LayoutDirection,
-    ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeId, RetrievalScoreBreakdownDto,
-    SearchHit, SearchHybridLimitsDto, SearchRepoTextMode, SearchRequest, SnippetContextDto,
-    SymbolContextDto, TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection, TrailMode,
+    AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto, AgentResponseModeDto,
+    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AppEventPayload,
+    BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
+    GraphArtifactDto, GroundingBudgetDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode,
+    NodeId, NodeKind, RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto,
+    SearchHit, SearchHybridLimitsDto, SearchRepoTextMode, SearchRequest,
 };
-use codestory_contracts::query::GraphQueryOperation;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::HashMap,
+    fmt::Write as _,
     fs,
-    io::{BufRead, IsTerminal, Read, Write},
-    net::{TcpListener, TcpStream},
+    io::IsTerminal,
+    net::TcpListener,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -24,27 +25,48 @@ use std::{
 mod args;
 mod config;
 mod display;
+mod explore;
+mod http_transport;
+mod managed_embeddings;
 mod output;
 mod query_resolution;
 mod runtime;
+mod stdio_catalog;
+mod stdio_transport;
 
 use args::{
-    AskCommand, Cli, Command, CompletionShell, DoctorCheckOutput, DoctorCommand, DoctorOutput,
-    ExploreCommand, ExploreOutput, GenerateCompletionsCommand, GroundCommand, IndexCommand,
-    IndexDryRunOutput, IndexOutput, NavigationOutput, QueryCommand, QueryItemOutput, QueryOutput,
-    QueryResolutionOutput, RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput,
-    ServeCommand, SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, TrailCommand,
-    TrailJsonOutput, build_trail_request,
+    AskCommand, BookmarkAction, BookmarkAddCommand, BookmarkAddOutput, BookmarkCommand,
+    BookmarkListCommand, BookmarkListOutput, BookmarkOutput, BookmarkRemoveCommand,
+    BookmarkRemoveOutput, Cli, Command, CompletionShell, DoctorCheckOutput, DoctorCommand,
+    DoctorOutput, ExplainCommand, ExplainOutput, GenerateCompletionsCommand, GroundCommand,
+    IndexCommand, IndexDryRunOutput, IndexOutput, QueryCommand, QueryOutput, QueryResolutionOutput,
+    RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput, ServeCommand, SetupAction,
+    SetupCommand, SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, TrailCommand,
+    TrailJsonOutput, ask_retrieval_profile, build_trail_request,
 };
+#[cfg(test)]
+use codestory_contracts::api::TrailContextDto;
+#[cfg(test)]
+use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
+#[cfg(test)]
+use http_transport::search_repo_text_mode_param;
 use output::{
-    emit, emit_text, render_agent_answer_markdown, render_doctor_markdown, render_ground_markdown,
-    render_index_dry_run_markdown, render_index_markdown, render_query_markdown,
-    render_search_markdown, render_snippet_markdown, render_symbol_markdown, render_symbol_mermaid,
-    render_trail_dot, render_trail_markdown, render_trail_mermaid,
+    emit, emit_text, render_agent_answer_markdown, render_doctor_markdown, render_explain_markdown,
+    render_ground_markdown, render_index_dry_run_markdown, render_index_markdown,
+    render_query_markdown, render_search_markdown, render_snippet_markdown, render_symbol_markdown,
+    render_symbol_mermaid, render_trail_dot, render_trail_markdown, render_trail_mermaid,
+    render_trail_story_markdown, validate_output_file_parent,
 };
 use runtime::{
-    RuntimeContext, ensure_index_ready, map_api_error, refresh_label, resolve_refresh_request,
-    resolve_target,
+    AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
+    resolve_refresh_request, resolve_target,
+};
+#[cfg(test)]
+use std::collections::HashSet;
+#[cfg(test)]
+use stdio_catalog::{
+    prompts_list_json as stdio_prompts_list_json, resources_list_json as stdio_resources_list_json,
+    tools_list_json as stdio_tools_list_json,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -52,6 +74,11 @@ struct RepoTextOutputConfig {
     mode: RepoTextMode,
     enabled: bool,
 }
+
+const ASK_BUNDLE_OUTPUT_BYTE_CAP: usize = 5 * 1024 * 1024;
+const ASK_BUNDLE_MARKDOWN_SOFT_CAP: usize = 2 * 1024 * 1024;
+const ASK_BUNDLE_TRUNCATION_SUFFIX: &str =
+    "\n\n... bundle content truncated by ask bundle byte cap\n";
 
 fn to_api_repo_text_mode(mode: RepoTextMode) -> SearchRepoTextMode {
     match mode {
@@ -91,25 +118,85 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Index(cmd) => run_index(cmd),
         Command::Ground(cmd) => run_ground(cmd),
+        Command::Explain(cmd) => run_explain(cmd),
         Command::Ask(cmd) => run_ask(cmd),
         Command::Doctor(cmd) => run_doctor(cmd),
+        Command::Setup(cmd) => run_setup(cmd),
         Command::Search(cmd) => run_search(cmd),
         Command::Symbol(cmd) => run_symbol(cmd),
         Command::Trail(cmd) => run_trail(cmd),
         Command::Snippet(cmd) => run_snippet(cmd),
         Command::Query(cmd) => run_query(cmd),
-        Command::Explore(cmd) => run_explore(cmd),
+        Command::Explore(cmd) => explore::run_explore(cmd),
+        Command::Bookmark(cmd) => run_bookmark(cmd),
         Command::Serve(cmd) => run_serve(cmd),
         Command::GenerateCompletions(cmd) => run_generate_completions(cmd),
     }
 }
 
+fn run_setup(cmd: SetupCommand) -> Result<()> {
+    match cmd.action {
+        SetupAction::Embeddings(cmd) => run_setup_embeddings(cmd),
+    }
+}
+
+fn run_setup_embeddings(cmd: args::SetupEmbeddingsCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "setup embeddings")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let next_commands =
+        setup_embeddings_next_commands(&cmd.project.project, cmd.project.cache_dir.as_deref());
+    let managed_root = managed_embeddings::managed_root(cmd.project.cache_dir.as_deref())?;
+    let mut output = managed_embeddings::setup_embeddings(
+        &managed_root,
+        cmd.quant,
+        cmd.variant,
+        cmd.dry_run,
+        !cmd.no_start,
+    )?;
+    output.next_commands = next_commands;
+    let markdown = managed_embeddings::render_setup_embeddings_markdown(&output);
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn setup_embeddings_next_commands(
+    project: &std::path::Path,
+    cache_dir: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut args = format!(" --project {}", quote_command_path(project));
+    if let Some(cache_dir) = cache_dir {
+        let _ = write!(args, " --cache-dir {}", quote_command_path(cache_dir));
+    }
+    vec![
+        format!("codestory-cli doctor{args}"),
+        format!("codestory-cli index{args} --refresh full"),
+    ]
+}
+
+fn quote_command_path(path: &std::path::Path) -> String {
+    format!(
+        "\"{}\"",
+        display::clean_path_string(&path.to_string_lossy()).replace('"', "\\\"")
+    )
+}
+
+fn quote_command_value(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
+}
+
 fn run_index(cmd: IndexCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "index")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
     validate_index_watch_output_file(&cmd)?;
     run_index_once(&cmd)?;
     if cmd.watch {
         run_index_watch(cmd)?;
+    }
+    Ok(())
+}
+
+fn preflight_output_file(output_file: Option<&std::path::Path>) -> Result<()> {
+    if let Some(path) = output_file {
+        validate_output_file_parent(path)?;
     }
     Ok(())
 }
@@ -163,7 +250,11 @@ fn validate_index_watch_output_file(cmd: &IndexCommand) -> Result<()> {
 }
 
 fn run_index_once(cmd: &IndexCommand) -> Result<()> {
-    let runtime = RuntimeContext::new(&cmd.project)?;
+    let runtime = if cmd.dry_run {
+        RuntimeContext::new_inspect_only(&cmd.project)?
+    } else {
+        RuntimeContext::new(&cmd.project)?
+    };
     if cmd.dry_run {
         let summary = runtime.open_project_summary()?;
         let refresh_mode =
@@ -236,25 +327,31 @@ fn spawn_progress_printer(rx: crossbeam_channel::Receiver<AppEventPayload>) -> P
     let handle = std::thread::spawn(move || {
         while !worker_done.load(Ordering::SeqCst) {
             match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(AppEventPayload::IndexingProgress { current, total }) => {
-                    eprintln!(
-                        "[{current}/{total}] {} indexing",
-                        format_progress_bar(current, total)
-                    );
-                }
-                Ok(AppEventPayload::IndexingStarted { file_count }) => {
-                    eprintln!(
-                        "[0/{file_count}] {} indexing started",
-                        format_progress_bar(0, file_count)
-                    );
-                }
-                Ok(_) => {}
+                Ok(event) => print_progress_event(event),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         }
     });
     ProgressPrinter { done, handle }
+}
+
+fn print_progress_event(event: AppEventPayload) {
+    match event {
+        AppEventPayload::IndexingProgress { current, total } => {
+            eprintln!(
+                "[{current}/{total}] {} indexing",
+                format_progress_bar(current, total)
+            );
+        }
+        AppEventPayload::IndexingStarted { file_count } => {
+            eprintln!(
+                "[0/{file_count}] {} indexing started",
+                format_progress_bar(0, file_count)
+            );
+        }
+        _ => {}
+    }
 }
 
 fn format_progress_bar(current: u32, total: u32) -> String {
@@ -302,6 +399,7 @@ fn run_index_watch(mut cmd: IndexCommand) -> Result<()> {
 
 fn run_ground(cmd: GroundCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "ground")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_ground_open(cmd.refresh)?;
     ensure_index_ready(&opened, "ground")?;
@@ -314,32 +412,164 @@ fn run_ground(cmd: GroundCommand) -> Result<()> {
     emit(cmd.format, &snapshot, markdown, cmd.output_file.as_deref())
 }
 
+fn run_explain(cmd: ExplainCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "explain")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let prompt = cmd.prompt.trim().to_string();
+    if prompt.is_empty() {
+        bail!("Prompt cannot be empty.");
+    }
+    let focus_node_id = cmd
+        .id
+        .as_ref()
+        .map(|id| NodeId(id.trim().to_string()))
+        .filter(|id| !id.0.is_empty());
+
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    let opened = runtime.ensure_open(cmd.refresh)?;
+    ensure_index_ready(&opened, "explain")?;
+
+    let snapshot = runtime
+        .grounding
+        .grounding_snapshot(GroundingBudgetDto::Balanced)
+        .map_err(map_api_error)?;
+    let search_results = runtime
+        .browser
+        .search_results(SearchRequest {
+            query: prompt.clone(),
+            repo_text: SearchRepoTextMode::Auto,
+            limit_per_source: cmd.max_results.clamp(1, 25),
+            hybrid_weights: None,
+            hybrid_limits: None,
+        })
+        .map_err(map_api_error)?;
+    let search_output = search_output_from_results(&runtime.project_root, &search_results, true);
+    let anchors = search_output
+        .indexed_symbol_hits
+        .iter()
+        .chain(search_output.suggestions.iter())
+        .filter(|hit| hit.resolvable)
+        .take(cmd.max_results.clamp(1, 25) as usize)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let request = AgentAskRequest {
+        prompt: prompt.clone(),
+        retrieval_profile: AgentRetrievalProfileSelectionDto::Preset {
+            preset: AgentRetrievalPresetDto::Investigate,
+        },
+        focus_node_id,
+        max_results: Some(cmd.max_results.clamp(1, 25)),
+        response_mode: AgentResponseModeDto::Markdown,
+        latency_budget_ms: None,
+        include_evidence: true,
+        hybrid_weights: None,
+    };
+
+    let mut answer = runtime.browser.ask(request).map_err(map_api_error)?;
+    answer
+        .retrieval_trace
+        .annotations
+        .push("mode=repo_explain_db_first".to_string());
+    answer
+        .retrieval_trace
+        .annotations
+        .push("workflow=doctor_index_ground_anchor_search_focused_ask".to_string());
+
+    let refresh = refresh_label(cmd.refresh, opened.refresh_mode);
+    let storage_path = runtime.storage_path.to_string_lossy().to_string();
+    let retrieval = opened.summary.retrieval.as_ref();
+    let next_commands = explain_next_commands(&runtime.project_root, &anchors);
+    let output = ExplainOutput {
+        project: &opened.summary.root,
+        storage_path: &storage_path,
+        refresh: &refresh,
+        prompt: &prompt,
+        workflow: vec![
+            "open_or_refresh_index",
+            "ground",
+            "anchor_search",
+            "focused_ask",
+        ],
+        summary: &opened.summary,
+        retrieval,
+        grounding: &snapshot,
+        anchors,
+        answer: &answer,
+        next_commands,
+    };
+    let markdown = render_explain_markdown(&runtime.project_root, &output);
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn explain_next_commands(
+    project_root: &std::path::Path,
+    anchors: &[SearchHitOutput],
+) -> Vec<String> {
+    let project = quote_command_path(project_root);
+    let mut commands = Vec::new();
+    if let Some(anchor) = anchors.first() {
+        commands.push(format!(
+            "codestory-cli ask --project {project} --focus-id {} {}",
+            anchor.node_id,
+            quote_command_value("Explain this symbol and its role in the repo.")
+        ));
+        commands.push(format!(
+            "codestory-cli trail --project {project} --id {} --story --hide-speculative",
+            anchor.node_id
+        ));
+        commands.push(format!(
+            "codestory-cli snippet --project {project} --id {} --context 40",
+            anchor.node_id
+        ));
+    }
+    commands.extend(anchors.iter().take(3).map(|anchor| {
+        format!(
+            "codestory-cli explore --project {project} --id {} --no-tui",
+            anchor.node_id
+        )
+    }));
+    commands
+}
+
 fn run_ask(cmd: AskCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "ask")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "ask")?;
 
+    let bookmark_focus = cmd
+        .bookmark
+        .as_deref()
+        .map(|id| load_bookmark_focus_by_id(&runtime, id))
+        .transpose()?;
     let request = AgentAskRequest {
         prompt: cmd.prompt.clone(),
-        retrieval_profile: cmd.profile.into(),
-        focus_node_id: cmd
-            .focus_id
+        retrieval_profile: ask_retrieval_profile(&cmd),
+        focus_node_id: bookmark_focus
             .as_ref()
-            .map(|id| NodeId(id.trim().to_string())),
+            .map(|bookmark| bookmark.node_id.clone())
+            .or_else(|| {
+                cmd.focus_id
+                    .as_ref()
+                    .map(|id| NodeId(id.trim().to_string()))
+            }),
         max_results: Some(cmd.max_results.clamp(1, 25)),
         response_mode: AgentResponseModeDto::Markdown,
         latency_budget_ms: None,
         include_evidence: !cmd.no_evidence,
         hybrid_weights: hybrid_weights(cmd.hybrid_lexical, cmd.hybrid_semantic, cmd.hybrid_graph),
-        connection: AgentConnectionSettingsDto {
-            backend: cmd.backend.into(),
-            command: cmd.agent_command.clone(),
-        },
-        run_local_agent: cmd.with_local_agent,
     };
 
-    let answer = runtime.agent.ask(request).map_err(map_api_error)?;
+    let mut answer = runtime.browser.ask(request).map_err(map_api_error)?;
+    answer
+        .retrieval_trace
+        .annotations
+        .push("mode=db_first".to_string());
+    if let Some(bookmark) = bookmark_focus.as_ref() {
+        annotate_answer_with_bookmark_focus(&mut answer, bookmark);
+    }
     let markdown = render_agent_answer_markdown(&runtime.project_root, &answer);
     if let Some(bundle_dir) = cmd.bundle.as_deref() {
         write_ask_bundle(bundle_dir, &answer, &markdown)?;
@@ -347,9 +577,255 @@ fn run_ask(cmd: AskCommand) -> Result<()> {
     emit(cmd.format, &answer, markdown, cmd.output_file.as_deref())
 }
 
+fn annotate_answer_with_bookmark_focus(answer: &mut AgentAnswerDto, bookmark: &BookmarkDto) {
+    let mut annotation = format!(
+        "bookmark_focus id={} category_id={} node={} label=`{}` kind={:?}",
+        bookmark.id,
+        bookmark.category_id,
+        bookmark.node_id.0,
+        bookmark.node_label,
+        bookmark.node_kind
+    );
+    if let Some(file_path) = bookmark.file_path.as_deref() {
+        annotation.push_str(&format!(
+            " path=`{}`",
+            display::clean_path_string(file_path)
+        ));
+    }
+    if let Some(comment) = bookmark.comment.as_deref() {
+        annotation.push_str(&format!(" comment=`{}`", comment.replace('`', "'")));
+    }
+    answer.retrieval_trace.annotations.push(annotation);
+}
+
+fn run_bookmark(cmd: BookmarkCommand) -> Result<()> {
+    match cmd.action {
+        BookmarkAction::Add(cmd) => run_bookmark_add(cmd),
+        BookmarkAction::List(cmd) => run_bookmark_list(cmd),
+        BookmarkAction::Remove(cmd) => run_bookmark_remove(cmd),
+    }
+}
+
+fn run_bookmark_add(cmd: BookmarkAddCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "bookmark add")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    let opened = runtime.ensure_open(cmd.refresh)?;
+    ensure_index_ready(&opened, "bookmark add")?;
+    let file_filter = cmd.target.file_filter();
+    let target = resolve_target_or_emit_ambiguity(
+        &runtime,
+        cmd.target.selection()?,
+        file_filter.as_deref(),
+        cmd.format,
+        cmd.output_file.as_deref(),
+    )?;
+    let category = ensure_bookmark_category(&runtime, &cmd.category)?;
+    let bookmark = runtime
+        .bookmarks
+        .create_bookmark(CreateBookmarkRequest {
+            category_id: category.id.clone(),
+            node_id: target.selected.node_id.clone(),
+            comment: cmd.comment.clone(),
+        })
+        .map_err(map_api_error)?;
+    let output = BookmarkAddOutput {
+        category,
+        bookmark: bookmark_output(bookmark),
+    };
+    emit(
+        cmd.format,
+        &output,
+        render_bookmark_add_markdown(&output),
+        cmd.output_file.as_deref(),
+    )
+}
+
+fn run_bookmark_list(cmd: BookmarkListCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "bookmark list")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    let _summary = runtime.open_project_summary()?;
+    let categories = runtime.bookmarks.list_categories().map_err(map_api_error)?;
+    let category_id = cmd
+        .category
+        .as_deref()
+        .map(|category| resolve_bookmark_category_id(&categories, category))
+        .transpose()?;
+    let bookmarks = runtime
+        .bookmarks
+        .list_bookmarks(category_id)
+        .map_err(map_api_error)?
+        .into_iter()
+        .map(bookmark_output)
+        .collect::<Vec<_>>();
+    let output = BookmarkListOutput {
+        categories,
+        bookmarks,
+    };
+    emit(
+        cmd.format,
+        &output,
+        render_bookmark_list_markdown(&output),
+        cmd.output_file.as_deref(),
+    )
+}
+
+fn run_bookmark_remove(cmd: BookmarkRemoveCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "bookmark remove")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    let _summary = runtime.open_project_summary()?;
+    let bookmark_id = parse_bookmark_db_id(&cmd.id, "bookmark_id")?;
+    find_bookmark_by_id(&runtime, &cmd.id)?;
+    runtime
+        .bookmarks
+        .delete_bookmark(bookmark_id)
+        .map_err(map_api_error)?;
+    let output = BookmarkRemoveOutput {
+        removed_id: bookmark_id.to_string(),
+    };
+    emit(
+        cmd.format,
+        &output,
+        render_bookmark_remove_markdown(&output),
+        cmd.output_file.as_deref(),
+    )
+}
+
+fn bookmark_output(bookmark: BookmarkDto) -> BookmarkOutput {
+    let stale = bookmark.node_kind == NodeKind::UNKNOWN;
+    BookmarkOutput { bookmark, stale }
+}
+
+fn parse_bookmark_db_id(raw: &str, field: &str) -> Result<i64> {
+    let trimmed = raw.trim();
+    trimmed
+        .parse::<i64>()
+        .with_context(|| format!("Invalid {field}: `{trimmed}`"))
+}
+
+fn resolve_bookmark_category_id(categories: &[BookmarkCategoryDto], raw: &str) -> Result<i64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("Bookmark category cannot be empty.");
+    }
+    if let Ok(id) = trimmed.parse::<i64>()
+        && categories
+            .iter()
+            .any(|category| category.id == id.to_string())
+    {
+        return Ok(id);
+    }
+    categories
+        .iter()
+        .find(|category| category.name.eq_ignore_ascii_case(trimmed))
+        .map(|category| parse_bookmark_db_id(&category.id, "category_id"))
+        .unwrap_or_else(|| bail!("Bookmark category not found: `{trimmed}`"))
+}
+
+fn ensure_bookmark_category(runtime: &RuntimeContext, raw: &str) -> Result<BookmarkCategoryDto> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("Bookmark category cannot be empty.");
+    }
+    let categories = runtime.bookmarks.list_categories().map_err(map_api_error)?;
+    if let Ok(id) = trimmed.parse::<i64>()
+        && let Some(category) = categories
+            .iter()
+            .find(|category| category.id == id.to_string())
+    {
+        return Ok(category.clone());
+    }
+    if let Some(category) = categories
+        .iter()
+        .find(|category| category.name.eq_ignore_ascii_case(trimmed))
+    {
+        return Ok(category.clone());
+    }
+    runtime
+        .bookmarks
+        .create_category(CreateBookmarkCategoryRequest {
+            name: trimmed.to_string(),
+        })
+        .map_err(map_api_error)
+}
+
+fn find_bookmark_by_id(runtime: &RuntimeContext, raw_id: &str) -> Result<BookmarkDto> {
+    let bookmark_id = parse_bookmark_db_id(raw_id, "bookmark_id")?;
+    runtime
+        .bookmarks
+        .list_bookmarks(None)
+        .map_err(map_api_error)?
+        .into_iter()
+        .find(|bookmark| bookmark.id == bookmark_id.to_string())
+        .with_context(|| format!("Bookmark not found: {bookmark_id}"))
+}
+
+fn load_bookmark_focus_by_id(runtime: &RuntimeContext, raw_id: &str) -> Result<BookmarkDto> {
+    let bookmark_id = parse_bookmark_db_id(raw_id, "bookmark_id")?;
+    let bookmark = find_bookmark_by_id(runtime, raw_id)?;
+    if bookmark.node_kind == NodeKind::UNKNOWN {
+        bail!(
+            "Bookmark {bookmark_id} is stale: node {} is no longer present after reindex.",
+            bookmark.node_id.0
+        );
+    }
+    Ok(bookmark)
+}
+
+fn render_bookmark_add_markdown(output: &BookmarkAddOutput) -> String {
+    let mut markdown = String::new();
+    markdown.push_str("# Bookmark Added\n");
+    markdown.push_str(&format!("- category: {}\n", output.category.name));
+    markdown.push_str(&render_bookmark_row(&output.bookmark));
+    markdown
+}
+
+fn render_bookmark_list_markdown(output: &BookmarkListOutput) -> String {
+    let mut markdown = String::new();
+    markdown.push_str("# Bookmarks\n");
+    markdown.push_str("categories:\n");
+    for category in &output.categories {
+        markdown.push_str(&format!("- {}: {}\n", category.id, category.name));
+    }
+    markdown.push_str("bookmarks:\n");
+    if output.bookmarks.is_empty() {
+        markdown.push_str("- none\n");
+    }
+    for bookmark in &output.bookmarks {
+        markdown.push_str(&render_bookmark_row(bookmark));
+    }
+    markdown
+}
+
+fn render_bookmark_remove_markdown(output: &BookmarkRemoveOutput) -> String {
+    format!("# Bookmark Removed\n- removed_id: {}\n", output.removed_id)
+}
+
+fn render_bookmark_row(output: &BookmarkOutput) -> String {
+    let bookmark = &output.bookmark;
+    let stale = if output.stale { " stale=true" } else { "" };
+    let file = bookmark
+        .file_path
+        .as_deref()
+        .map(|path| format!(" path=`{}`", display::clean_path_string(path)))
+        .unwrap_or_default();
+    let comment = bookmark
+        .comment
+        .as_deref()
+        .map(|comment| format!(" comment=`{}`", comment.replace('`', "'")))
+        .unwrap_or_default();
+    format!(
+        "- id={} node={} label=`{}` kind={:?}{file}{comment}{stale}\n",
+        bookmark.id, bookmark.node_id.0, bookmark.node_label, bookmark.node_kind
+    )
+}
+
 fn run_doctor(cmd: DoctorCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "doctor")?;
-    let runtime = RuntimeContext::new(&cmd.project)?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let summary = runtime.open_project_summary()?;
     let output = build_doctor_output(&runtime, &summary);
     let markdown = render_doctor_markdown(&output);
@@ -358,50 +834,69 @@ fn run_doctor(cmd: DoctorCommand) -> Result<()> {
 
 fn run_search(cmd: SearchCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "search")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "search")?;
-    let hybrid_weights = hybrid_weights(cmd.hybrid_lexical, cmd.hybrid_semantic, cmd.hybrid_graph);
-    let hybrid_limits = hybrid_limits(cmd.hybrid_lexical_limit, cmd.hybrid_semantic_limit);
-
     let search_results = runtime
-        .search
-        .search_results(SearchRequest {
-            query: cmd.query.clone(),
-            repo_text: to_api_repo_text_mode(cmd.repo_text),
-            limit_per_source: cmd.limit.clamp(1, 50),
-            hybrid_weights,
-            hybrid_limits,
-        })
+        .browser
+        .search_results(search_request_from_command(&cmd))
         .map_err(map_api_error)?;
-    let output = build_search_output(
-        &runtime.project_root,
-        &search_results.query,
-        &search_results.retrieval,
-        &search_results.indexed_symbol_hits,
-        &search_results.repo_text_hits,
-        &search_results.suggestions,
-        search_results.limit_per_source,
-        RepoTextOutputConfig {
-            mode: from_api_repo_text_mode(search_results.repo_text_mode),
-            enabled: search_results.repo_text_enabled,
-        },
-        cmd.why,
-    );
+    let output = search_output_from_results(&runtime.project_root, &search_results, cmd.why);
     let markdown = render_search_markdown(&runtime.project_root, &output);
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
+fn search_request_from_command(cmd: &SearchCommand) -> SearchRequest {
+    SearchRequest {
+        query: cmd.query.clone(),
+        repo_text: to_api_repo_text_mode(cmd.repo_text),
+        limit_per_source: cmd.limit.clamp(1, 50),
+        hybrid_weights: hybrid_weights(cmd.hybrid_lexical, cmd.hybrid_semantic, cmd.hybrid_graph),
+        hybrid_limits: hybrid_limits(cmd.hybrid_lexical_limit, cmd.hybrid_semantic_limit),
+    }
+}
+
+fn search_output_from_results(
+    project_root: &std::path::Path,
+    search_results: &codestory_contracts::api::SearchResultsDto,
+    include_score_details: bool,
+) -> SearchOutput {
+    build_search_output(SearchOutputParts {
+        project_root,
+        query: &search_results.query,
+        retrieval: &search_results.retrieval,
+        freshness: search_results.freshness.as_ref(),
+        symbol_hits: &search_results.indexed_symbol_hits,
+        repo_text_hits: &search_results.repo_text_hits,
+        repo_text_stats: search_results.repo_text_stats.as_ref(),
+        suggestions: &search_results.suggestions,
+        limit_per_source: search_results.limit_per_source,
+        repo_text: RepoTextOutputConfig {
+            mode: from_api_repo_text_mode(search_results.repo_text_mode),
+            enabled: search_results.repo_text_enabled,
+        },
+        explain: include_score_details,
+    })
+}
+
 fn run_symbol(cmd: SymbolCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "symbol")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "symbol")?;
 
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target(&runtime, cmd.target.selection()?, file_filter.as_deref())?;
+    let target = resolve_target_or_emit_ambiguity(
+        &runtime,
+        cmd.target.selection()?,
+        file_filter.as_deref(),
+        cmd.format,
+        cmd.output_file.as_deref(),
+    )?;
     let context = runtime
-        .grounding
+        .browser
         .symbol_context(target.selected.node_id.clone())
         .map_err(map_api_error)?;
     if cmd.mermaid {
@@ -416,20 +911,30 @@ fn run_symbol(cmd: SymbolCommand) -> Result<()> {
 }
 
 fn run_trail(cmd: TrailCommand) -> Result<()> {
+    preflight_output_file(cmd.output_file.as_deref())?;
+    if cmd.story && cmd.mermaid {
+        bail!("--story cannot be combined with --mermaid; use markdown or json output");
+    }
+    if cmd.story && cmd.format == args::OutputFormat::Dot {
+        bail!("--story cannot be combined with --format dot; use markdown or json output");
+    }
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "trail")?;
 
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target(&runtime, cmd.target.selection()?, file_filter.as_deref())?;
+    let target = resolve_target_or_emit_ambiguity(
+        &runtime,
+        cmd.target.selection()?,
+        file_filter.as_deref(),
+        cmd.format,
+        cmd.output_file.as_deref(),
+    )?;
     let request = build_trail_request(&target.selected.node_id, &cmd);
-    let mut context = runtime
-        .grounding
+    let context = runtime
+        .browser
         .trail_context(request)
         .map_err(map_api_error)?;
-    if cmd.hide_speculative {
-        context = hide_speculative_trail_edges(context);
-    }
     if cmd.mermaid {
         return emit_text(render_trail_mermaid(&context), cmd.output_file.as_deref());
     }
@@ -439,24 +944,56 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
             cmd.output_file.as_deref(),
         );
     }
-    let markdown = render_trail_markdown(&runtime.project_root, &target, &context, &cmd);
+    let notes = trail_guidance_notes(&context);
+    let mut markdown = if let Some(story) = context.story.as_ref() {
+        render_trail_story_markdown(&runtime.project_root, &target, &context, &cmd, story)
+    } else {
+        render_trail_markdown(&runtime.project_root, &target, &context, &cmd)
+    };
+    if !notes.is_empty() {
+        let _ = writeln!(markdown, "notes:");
+        for note in &notes {
+            let _ = writeln!(markdown, "- {note}");
+        }
+    }
     let output = TrailJsonOutput {
         resolution: build_query_resolution_output(&runtime.project_root, &target),
         trail: &context,
+        notes,
     };
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
+fn trail_guidance_notes(context: &codestory_contracts::api::TrailContextDto) -> Vec<String> {
+    if !context.trail.edges.is_empty() || context.trail.nodes.len() > 1 {
+        return Vec::new();
+    }
+    if context.focus.file_path.is_none() {
+        return Vec::new();
+    }
+    vec![format!(
+        "No graph edges were indexed for `{}`. For object/config exports, use `snippet --id {}` or `explore --id {}` to inspect fields, hooks, access rules, and imports.",
+        context.focus.display_name, context.focus.id.0, context.focus.id.0
+    )]
+}
+
 fn run_snippet(cmd: SnippetCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "snippet")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "snippet")?;
 
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target(&runtime, cmd.target.selection()?, file_filter.as_deref())?;
+    let target = resolve_target_or_emit_ambiguity(
+        &runtime,
+        cmd.target.selection()?,
+        file_filter.as_deref(),
+        cmd.format,
+        cmd.output_file.as_deref(),
+    )?;
     let context = runtime
-        .grounding
+        .browser
         .snippet_context(target.selected.node_id.clone(), cmd.context)
         .map_err(map_api_error)?;
     let colorize = cmd.format == args::OutputFormat::Markdown
@@ -472,182 +1009,42 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
 
 fn run_query(cmd: QueryCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "query")?;
-    let ast = codestory_runtime::parse_graph_query(&cmd.query)
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    if let Some(sql) = cmd.sql.as_deref() {
+        bail!(
+            "CodeStory `query` uses the graph-query DSL, not SQL. \
+             Use syntax like `search(query: 'AppController') | limit(5)` or \
+             `trail(symbol: 'AppController') | filter(kind: function)`. \
+             For raw symbol discovery, use `search --query {}`. \
+             Unsupported SQL received: {}",
+            quote_command_value(sql),
+            sql
+        );
+    }
+    let query = cmd
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .context("Query cannot be empty.")?;
+    let ast =
+        codestory_runtime::parse_graph_query(query).map_err(|error| anyhow::anyhow!("{error}"))?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "query")?;
-    let mut items = Vec::<QueryItemOutput>::new();
-    for op in &ast.operations {
-        match op {
-            GraphQueryOperation::Trail(query) => {
-                let target = resolve_target(
-                    &runtime,
-                    args::TargetSelection::Query(query.symbol.clone()),
-                    None,
-                )?;
-                let mut request = TrailConfigDto {
-                    root_id: target.selected.node_id.clone(),
-                    mode: TrailMode::Neighborhood,
-                    target_id: None,
-                    depth: query.depth.unwrap_or(2),
-                    direction: query.direction.unwrap_or(TrailDirection::Both),
-                    caller_scope: TrailCallerScope::ProductionOnly,
-                    edge_filter: Vec::new(),
-                    show_utility_calls: false,
-                    node_filter: Vec::new(),
-                    max_nodes: 120,
-                    layout_direction: LayoutDirection::Horizontal,
-                };
-                if request.depth == 0 {
-                    request.max_nodes = 200;
-                }
-                let context = runtime
-                    .grounding
-                    .trail_context(request)
-                    .map_err(map_api_error)?;
-                items = context
-                    .trail
-                    .nodes
-                    .iter()
-                    .map(|node| graph_node_to_query_item(&runtime.project_root, node, "trail"))
-                    .collect();
-            }
-            GraphQueryOperation::Symbol(query) => {
-                let target = resolve_target(
-                    &runtime,
-                    args::TargetSelection::Query(query.query.clone()),
-                    None,
-                )?;
-                let context = runtime
-                    .grounding
-                    .symbol_context(target.selected.node_id.clone())
-                    .map_err(map_api_error)?;
-                items = std::iter::once(node_details_to_query_item(
-                    &runtime.project_root,
-                    &context.node,
-                    Some(0),
-                    "symbol",
-                ))
-                .chain(context.children.iter().map(|child| {
-                    QueryItemOutput {
-                        node_id: child.id.0.clone(),
-                        node_ref: None,
-                        display_name: child.label.clone(),
-                        kind: child.kind,
-                        file_path: child
-                            .file_path
-                            .as_deref()
-                            .map(|path| display::relative_path(&runtime.project_root, path)),
-                        line: None,
-                        depth: Some(1),
-                        source: "symbol_child".to_string(),
-                    }
-                }))
-                .collect();
-            }
-            GraphQueryOperation::Search(query) => {
-                let results = runtime
-                    .search
-                    .search_results(SearchRequest {
-                        query: query.query.clone(),
-                        repo_text: SearchRepoTextMode::Off,
-                        limit_per_source: 50,
-                        hybrid_weights: None,
-                        hybrid_limits: None,
-                    })
-                    .map_err(map_api_error)?;
-                items = results
-                    .indexed_symbol_hits
-                    .iter()
-                    .map(|hit| search_hit_to_query_item(&runtime.project_root, hit, "search"))
-                    .collect();
-            }
-            GraphQueryOperation::Filter(filter) => {
-                items.retain(|item| {
-                    filter.kind.is_none_or(|kind| item.kind == kind)
-                        && filter
-                            .depth
-                            .is_none_or(|depth| item.depth.unwrap_or(0) <= depth)
-                        && filter.file.as_deref().is_none_or(|needle| {
-                            item.file_path
-                                .as_deref()
-                                .is_some_and(|path| path.contains(needle))
-                        })
-                });
-            }
-            GraphQueryOperation::Limit(limit) => {
-                items.truncate(limit.count as usize);
-            }
-        }
-    }
+    let items = runtime
+        .browser
+        .query(&ast)
+        .map_err(map_api_error)?
+        .iter()
+        .map(|item| explore::browser_query_item_to_output(&runtime.project_root, item))
+        .collect();
     let output = QueryOutput {
-        query: cmd.query,
+        query: query.to_string(),
         ast,
         items,
     };
     let markdown = render_query_markdown(&output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
-}
-
-fn run_explore(cmd: ExploreCommand) -> Result<()> {
-    ensure_dot_only_for_trail(cmd.format, "explore")?;
-    let runtime = RuntimeContext::new(&cmd.project)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, "explore")?;
-    let file_filter = cmd.target.file_filter();
-    let target = resolve_target(&runtime, cmd.target.selection()?, file_filter.as_deref())?;
-    let symbol = runtime
-        .grounding
-        .symbol_context(target.selected.node_id.clone())
-        .map_err(map_api_error)?;
-    let trail = runtime
-        .grounding
-        .trail_context(TrailConfigDto {
-            root_id: target.selected.node_id.clone(),
-            mode: TrailMode::Neighborhood,
-            target_id: None,
-            depth: cmd.depth,
-            direction: TrailDirection::Both,
-            caller_scope: TrailCallerScope::ProductionOnly,
-            edge_filter: Vec::new(),
-            show_utility_calls: false,
-            node_filter: Vec::new(),
-            max_nodes: cmd.max_nodes.clamp(1, 120),
-            layout_direction: LayoutDirection::Horizontal,
-        })
-        .map_err(map_api_error)?;
-    let snippet = runtime
-        .grounding
-        .snippet_context(target.selected.node_id.clone(), 4)
-        .ok();
-    let output = ExploreOutput {
-        resolution: build_query_resolution_output(&runtime.project_root, &target),
-        navigation: build_navigation_output(&runtime.project_root, &target, &trail),
-        symbol: &symbol,
-        trail: &trail,
-        snippet: snippet.as_ref(),
-    };
-    let markdown = render_explore_markdown(
-        &runtime.project_root,
-        &target,
-        &symbol,
-        &trail,
-        snippet.as_ref(),
-    );
-    if cmd.format == args::OutputFormat::Markdown
-        && cmd.output_file.is_none()
-        && !cmd.no_tui
-        && std::io::stdout().is_terminal()
-    {
-        return run_explore_tui(
-            &runtime.project_root,
-            &target,
-            &symbol,
-            &trail,
-            snippet.as_ref(),
-        );
-    }
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
@@ -656,7 +1053,7 @@ fn run_serve(cmd: ServeCommand) -> Result<()> {
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "serve")?;
     if cmd.stdio {
-        return run_stdio_server(runtime);
+        return stdio_transport::run_stdio_server(runtime);
     }
     let listener = TcpListener::bind(&cmd.addr)
         .with_context(|| format!("Failed to bind server to {}", cmd.addr))?;
@@ -664,7 +1061,7 @@ fn run_serve(cmd: ServeCommand) -> Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = handle_http_request(&runtime, stream) {
+                if let Err(error) = http_transport::handle_http_request(&runtime, stream) {
                     eprintln!("serve request failed: {error:#}");
                 }
             }
@@ -686,12 +1083,108 @@ fn run_generate_completions(cmd: GenerateCompletionsCommand) -> Result<()> {
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct CliErrorOutput {
+    error: CliErrorBody,
+}
+
+#[derive(serde::Serialize)]
+struct CliErrorBody {
+    code: &'static str,
+    failed_layer: &'static str,
+    message: String,
+    query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_filter: Option<String>,
+    alternatives: Vec<SearchHitOutput>,
+    layer_notes: Vec<String>,
+    next_commands: Vec<String>,
+}
+
+fn resolve_target_or_emit_ambiguity(
+    runtime: &RuntimeContext,
+    target: args::TargetSelection,
+    file_filter: Option<&str>,
+    format: args::OutputFormat,
+    output_file: Option<&std::path::Path>,
+) -> Result<runtime::ResolvedTarget> {
+    match resolve_target(runtime, target, file_filter) {
+        Ok(target) => Ok(target),
+        Err(error) => {
+            if format == args::OutputFormat::Json
+                && let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>()
+            {
+                let output = build_ambiguous_target_error_output(&runtime.project_root, ambiguous);
+                emit(
+                    args::OutputFormat::Json,
+                    &output,
+                    ambiguous.message.clone(),
+                    output_file,
+                )?;
+            }
+            Err(error)
+        }
+    }
+}
+
+fn build_ambiguous_target_error_output(
+    project_root: &std::path::Path,
+    ambiguous: &AmbiguousTargetError,
+) -> CliErrorOutput {
+    let alternatives = ambiguous
+        .alternatives
+        .iter()
+        .enumerate()
+        .map(|(index, hit)| build_numbered_search_hit_output(project_root, hit, index + 1))
+        .collect::<Vec<_>>();
+    let quoted_query = ambiguous.query.replace('"', "\\\"");
+    let file_clause = ambiguous
+        .file_filter
+        .as_deref()
+        .map(|file_filter| format!(" --file \"{}\"", file_filter.replace('"', "\\\"")))
+        .unwrap_or_default();
+    let mut next_commands = vec![format!(
+        "codestory-cli symbol --query \"{}\"{} --choose 1",
+        quoted_query, file_clause
+    )];
+    if let Some(first) = ambiguous.alternatives.first() {
+        next_commands.push(format!("codestory-cli symbol --id {}", first.node_id.0));
+    }
+
+    CliErrorOutput {
+        error: CliErrorBody {
+            code: "ambiguous_target",
+            failed_layer: "query_resolution",
+            message: ambiguous.message.clone(),
+            query: ambiguous.query.clone(),
+            file_filter: ambiguous
+                .file_filter
+                .as_deref()
+                .map(crate::display::clean_path_string),
+            alternatives,
+            layer_notes: vec![
+                format!(
+                    "query_resolution: `{}` matched multiple equally ranked symbols",
+                    ambiguous.query
+                ),
+                "search: inspect alternatives with `codestory-cli search --query`, then rerun this command with --choose, --id, or --file".to_string(),
+            ],
+            next_commands,
+        },
+    }
+}
+
 fn build_doctor_output(
     runtime: &RuntimeContext,
     summary: &codestory_contracts::api::ProjectSummary,
 ) -> DoctorOutput {
     let indexed = summary.stats.node_count > 0;
-    let retrieval = summary.retrieval.clone();
+    let mut retrieval = summary.retrieval.clone();
+    if let Some(retrieval) = retrieval.as_mut()
+        && let Some(message) = retrieval.fallback_message.as_mut()
+    {
+        *message = redact_urls_in_text(message);
+    }
     let project = display::clean_path_string(&summary.root);
     let storage_path = display::clean_path_string(&runtime.storage_path.to_string_lossy());
     let storage_exists = runtime.storage_path.exists();
@@ -732,28 +1225,24 @@ fn build_doctor_output(
         )
     });
     if let Some(retrieval) = retrieval.as_ref() {
-        checks.push(if retrieval.semantic_ready {
-            doctor_check(
-                "semantic",
-                "ok",
-                format!(
-                    "Hybrid retrieval is ready with {} semantic docs.",
-                    retrieval.semantic_doc_count
-                ),
-            )
-        } else {
-            doctor_check(
-                "semantic",
-                "info",
-                retrieval.fallback_message.clone().unwrap_or_else(|| {
-                    "Semantic retrieval is not ready; symbolic fallback is active.".to_string()
-                }),
-            )
-        });
+        checks.push(semantic_health_check(retrieval, &summary.stats));
+        if retrieval.stored_embedding.is_some() {
+            checks.push(semantic_contract_check(retrieval));
+        }
+    }
+    let managed_status = managed_embeddings::inspect_status(&runtime.managed_embeddings_root);
+    checks.push(doctor_check(
+        "managed_embeddings",
+        managed_doctor_status(&managed_status.state),
+        managed_status.message,
+    ));
+    if let Some(freshness) = summary.freshness.as_ref() {
+        checks.push(index_freshness_check(freshness));
     }
 
     let environment = [
         "CODESTORY_EMBED_PROFILE",
+        "CODESTORY_EMBED_MODEL_ID",
         "CODESTORY_EMBED_BACKEND",
         "CODESTORY_EMBED_RUNTIME_MODE",
         "CODESTORY_EMBED_LLAMACPP_URL",
@@ -765,7 +1254,7 @@ fn build_doctor_output(
     .into_iter()
     .map(|name| match std::env::var(name) {
         Ok(value) if !value.trim().is_empty() => {
-            doctor_check(name, "ok", format!("set to `{}`", value.trim()))
+            doctor_check(name, "ok", doctor_env_check_message(name, &value))
         }
         _ => doctor_check(name, "info", "not set; using runtime defaults".to_string()),
     })
@@ -777,9 +1266,262 @@ fn build_doctor_output(
         indexed,
         stats: summary.stats.clone(),
         retrieval,
+        freshness: summary.freshness.clone(),
         checks,
         next_commands: index_next_commands(&project, summary.retrieval.as_ref()),
         environment,
+    }
+}
+
+fn doctor_env_check_message(name: &str, value: &str) -> String {
+    let trimmed = value.trim();
+    if name.ends_with("_URL") || trimmed.contains("://") {
+        return format!(
+            "set to `{}`",
+            managed_embeddings::redact_url_for_display(trimmed)
+        );
+    }
+    format!("set to `{trimmed}`")
+}
+
+fn redact_urls_in_text(text: &str) -> String {
+    text.split_whitespace()
+        .map(redact_url_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_url_token(token: &str) -> String {
+    let prefix_len = token
+        .find("://")
+        .and_then(|scheme_end| {
+            token[..scheme_end]
+                .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.')))
+                .map(|index| index + 1)
+                .or(Some(0))
+        })
+        .unwrap_or(token.len());
+    if prefix_len == token.len() {
+        return token.to_string();
+    }
+
+    let prefix = &token[..prefix_len];
+    let url_and_suffix = &token[prefix_len..];
+    let suffix_start = url_and_suffix
+        .find(|ch: char| matches!(ch, ')' | ']' | '}' | ',' | ';' | '`'))
+        .unwrap_or(url_and_suffix.len());
+    let (url, suffix) = url_and_suffix.split_at(suffix_start);
+    format!(
+        "{prefix}{}{suffix}",
+        managed_embeddings::redact_url_for_display(url)
+    )
+}
+
+fn semantic_health_check(
+    retrieval: &codestory_contracts::api::RetrievalStateDto,
+    stats: &codestory_contracts::api::StorageStatsDto,
+) -> DoctorCheckOutput {
+    if retrieval.semantic_ready {
+        if stats.file_count > 0 && retrieval.semantic_doc_count < stats.file_count {
+            return doctor_check(
+                "semantic",
+                "warn",
+                format!(
+                    "semantic partial: {} semantic docs for {} indexed files. A previous rebuild may have stopped early; run `codestory-cli setup embeddings`, then `codestory-cli index --refresh full`.",
+                    retrieval.semantic_doc_count, stats.file_count
+                ),
+            );
+        }
+
+        return doctor_check(
+            "semantic",
+            "ok",
+            format!(
+                "semantic ok: hybrid retrieval is ready with {} semantic docs.",
+                retrieval.semantic_doc_count
+            ),
+        );
+    }
+
+    let message = retrieval.fallback_message.clone().unwrap_or_else(|| {
+        "Semantic retrieval is not ready; symbolic fallback is active.".to_string()
+    });
+    let status =
+        if retrieval.fallback_reason == Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime) {
+            "warn"
+        } else {
+            "info"
+        };
+    doctor_check("semantic", status, format!("semantic failed: {message}"))
+}
+
+fn index_freshness_check(freshness: &IndexFreshnessDto) -> DoctorCheckOutput {
+    match freshness.status {
+        IndexFreshnessStatusDto::Fresh => doctor_check(
+            "index_freshness",
+            "ok",
+            format!(
+                "Indexed file inventory is fresh (checked={} duration_ms={}).",
+                freshness.checked_file_count, freshness.duration_ms
+            ),
+        ),
+        IndexFreshnessStatusDto::Stale => doctor_check(
+            "index_freshness",
+            "warn",
+            format!(
+                "Indexed file inventory is stale: changed={} new={} removed={} (checked={} duration_ms={}). Run `codestory-cli index --refresh incremental` to update the cache.",
+                freshness.changed_file_count,
+                freshness.new_file_count,
+                freshness.removed_file_count,
+                freshness.checked_file_count,
+                freshness.duration_ms
+            ),
+        ),
+        IndexFreshnessStatusDto::NotChecked => doctor_check(
+            "index_freshness",
+            "info",
+            format!(
+                "Index freshness was not checked: {}.",
+                freshness.reason.as_deref().unwrap_or("no reason reported")
+            ),
+        ),
+    }
+}
+
+fn semantic_contract_check(
+    retrieval: &codestory_contracts::api::RetrievalStateDto,
+) -> DoctorCheckOutput {
+    let Some(stored) = retrieval.stored_embedding.as_ref() else {
+        return doctor_check(
+            "semantic_contract",
+            "info",
+            "Stored semantic doc metadata is unavailable.".to_string(),
+        );
+    };
+    if stored.doc_count == 0 {
+        return doctor_check(
+            "semantic_contract",
+            "info",
+            "No stored semantic docs are available to compare with the current embedding config."
+                .to_string(),
+        );
+    }
+
+    let mut gaps = Vec::new();
+    if stored.mixed_embedding_profiles {
+        gaps.push("stored docs use mixed embedding profiles".to_string());
+    }
+    if stored.mixed_embedding_models {
+        gaps.push("stored docs use mixed cache keys".to_string());
+    }
+    if stored.mixed_embedding_backends {
+        gaps.push("stored docs use mixed embedding backends".to_string());
+    }
+    if stored.mixed_dimensions {
+        gaps.push("stored docs use mixed embedding dimensions".to_string());
+    }
+    if stored.mixed_doc_versions {
+        gaps.push("stored docs use mixed semantic doc versions".to_string());
+    }
+    if stored.mixed_doc_shapes {
+        gaps.push("stored docs use mixed semantic doc shapes".to_string());
+    }
+
+    if let Some(current) = retrieval.current_embedding.as_ref() {
+        compare_contract_field(
+            &mut gaps,
+            "embedding profile",
+            stored.embedding_profile.as_deref(),
+            Some(current.profile.as_str()),
+        );
+        compare_contract_field(
+            &mut gaps,
+            "embedding backend",
+            stored.embedding_backend.as_deref(),
+            Some(current.backend.as_str()),
+        );
+        compare_contract_field(
+            &mut gaps,
+            "cache key",
+            stored.cache_key.as_deref(),
+            Some(current.cache_key.as_str()),
+        );
+        compare_contract_field(
+            &mut gaps,
+            "semantic doc shape",
+            stored.doc_shape.as_deref(),
+            Some(current.doc_shape.as_str()),
+        );
+        if let (Some(stored_dim), Some(current_dim)) = (stored.dimension, current.dimension)
+            && stored_dim != current_dim
+        {
+            gaps.push(format!(
+                "embedding dimension mismatch: stored={stored_dim} current={current_dim}"
+            ));
+        }
+    } else {
+        gaps.push("current embedding config could not be resolved".to_string());
+    }
+
+    if gaps.is_empty() {
+        doctor_check(
+            "semantic_contract",
+            "ok",
+            format!(
+                "semantic ok: stored semantic docs match the current embedding contract (docs={}).",
+                stored.doc_count
+            ),
+        )
+    } else if !retrieval.semantic_ready
+        && retrieval.fallback_reason == Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime)
+    {
+        doctor_check(
+            "semantic_contract",
+            "info",
+            format!(
+                "semantic stale: {}. Resolve the embedding runtime first with `codestory-cli setup embeddings`; then run `codestory-cli index --refresh full` if semantic search should use the current config.",
+                gaps.join("; ")
+            ),
+        )
+    } else {
+        doctor_check(
+            "semantic_contract",
+            "warn",
+            format!(
+                "semantic stale: {}. Run `codestory-cli index --refresh full` if semantic search should use the current config.",
+                gaps.join("; ")
+            ),
+        )
+    }
+}
+
+fn managed_doctor_status(state: &str) -> &'static str {
+    match state {
+        "managed_server_running" | "external_llama_configured" | "disabled_by_config" => "ok",
+        "missing_managed_assets" => "info",
+        "managed_server_stopped" | "external_llama_unreachable" => "warn",
+        _ => "info",
+    }
+}
+
+fn compare_contract_field(
+    gaps: &mut Vec<String>,
+    label: &str,
+    stored: Option<&str>,
+    current: Option<&str>,
+) {
+    match (stored, current) {
+        (Some(stored), Some(current)) if stored != current => {
+            gaps.push(format!(
+                "{label} mismatch: stored={stored} current={current}"
+            ));
+        }
+        (None, Some(current)) => {
+            gaps.push(format!(
+                "{label} missing from stored docs; current={current}"
+            ));
+        }
+        _ => {}
     }
 }
 
@@ -805,9 +1547,18 @@ fn index_next_commands(
         format!(
             "codestory-cli search --project \"{project}\" --query \"<symbol or question>\" --why"
         ),
-        format!("codestory-cli ask --project \"{project}\" \"How does this repo fit together?\""),
+        format!(
+            "codestory-cli ask --project \"{project}\" --investigate \"How does this repo fit together?\""
+        ),
     ];
     if retrieval.is_some_and(|state| !state.semantic_ready) {
+        if retrieval.is_some_and(|state| {
+            state.fallback_reason == Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime)
+        }) {
+            commands.push(format!(
+                "codestory-cli setup embeddings --project \"{project}\""
+            ));
+        }
         commands.push(format!(
             "codestory-cli doctor --project \"{project}\" --format markdown"
         ));
@@ -826,32 +1577,182 @@ fn write_ask_bundle(
             display::clean_path_string(&bundle_dir.to_string_lossy())
         )
     })?;
-    fs::write(bundle_dir.join("answer.md"), markdown).with_context(|| {
+    remove_stale_mermaid_artifacts(bundle_dir)?;
+    let mut notes = Vec::new();
+    let mut omitted_mermaid_artifacts = 0usize;
+    let full_answer_json =
+        serde_json::to_string_pretty(answer).context("Failed to serialize ask answer JSON")?;
+    let mut answer_json = if markdown.len().saturating_add(full_answer_json.len())
+        > ASK_BUNDLE_OUTPUT_BYTE_CAP
+    {
+        notes.push(
+            "answer.json was reduced to a valid manifest summary because the full answer exceeded the bundle byte cap."
+                .to_string(),
+        );
+        ask_bundle_summary_json(answer, true)?
+    } else {
+        full_answer_json
+    };
+    if answer_json.len() > ASK_BUNDLE_OUTPUT_BYTE_CAP {
+        notes.push(
+            "answer.json retrieval trace was omitted because the summary still exceeded the bundle byte cap."
+                .to_string(),
+        );
+        answer_json = ask_bundle_summary_json(answer, false)?;
+    }
+
+    let mut markdown = if markdown.len() > ASK_BUNDLE_MARKDOWN_SOFT_CAP {
+        notes.push(format!(
+            "answer.md was truncated to {} bytes before writing.",
+            ASK_BUNDLE_MARKDOWN_SOFT_CAP
+        ));
+        truncate_utf8_with_suffix(
+            markdown,
+            ASK_BUNDLE_MARKDOWN_SOFT_CAP,
+            ASK_BUNDLE_TRUNCATION_SUFFIX,
+        )
+    } else {
+        markdown.to_string()
+    };
+    let remaining_markdown_bytes = ASK_BUNDLE_OUTPUT_BYTE_CAP.saturating_sub(answer_json.len());
+    if markdown.len() > remaining_markdown_bytes {
+        notes.push(format!(
+            "answer.md was truncated to fit the remaining {} bundle bytes.",
+            remaining_markdown_bytes
+        ));
+        markdown = truncate_utf8_with_suffix(
+            &markdown,
+            remaining_markdown_bytes,
+            ASK_BUNDLE_TRUNCATION_SUFFIX,
+        );
+    }
+    fs::write(bundle_dir.join("answer.md"), &markdown).with_context(|| {
         format!(
             "Failed to write {}",
             display::clean_path_string(&bundle_dir.join("answer.md").to_string_lossy())
         )
     })?;
-    fs::write(
-        bundle_dir.join("answer.json"),
-        serde_json::to_string_pretty(answer).context("Failed to serialize ask answer JSON")?,
-    )
-    .with_context(|| {
+    fs::write(bundle_dir.join("answer.json"), &answer_json).with_context(|| {
         format!(
             "Failed to write {}",
             display::clean_path_string(&bundle_dir.join("answer.json").to_string_lossy())
         )
     })?;
+    let mut written_bytes = markdown.len().saturating_add(answer_json.len());
     for graph in &answer.graphs {
         if let GraphArtifactDto::Mermaid {
             id, mermaid_syntax, ..
         } = graph
         {
             let file_name = format!("{}.mmd", sanitize_artifact_name(id));
-            fs::write(bundle_dir.join(file_name), mermaid_syntax)?;
+            let artifact_path = bundle_dir.join(&file_name);
+            if written_bytes.saturating_add(mermaid_syntax.len()) > ASK_BUNDLE_OUTPUT_BYTE_CAP {
+                omitted_mermaid_artifacts = omitted_mermaid_artifacts.saturating_add(1);
+                continue;
+            }
+            fs::write(&artifact_path, mermaid_syntax)?;
+            written_bytes = written_bytes.saturating_add(mermaid_syntax.len());
+        }
+    }
+    if omitted_mermaid_artifacts > 0 {
+        notes.push(format!(
+            "Omitted {omitted_mermaid_artifacts} Mermaid artifact(s) after reaching the bundle byte cap."
+        ));
+    }
+    let manifest = serde_json::json!({
+        "output_byte_cap": ASK_BUNDLE_OUTPUT_BYTE_CAP,
+        "written_bytes_excluding_manifest": written_bytes,
+        "truncated": !notes.is_empty(),
+        "omitted_mermaid_artifacts": omitted_mermaid_artifacts,
+        "notes": notes,
+    });
+    fs::write(
+        bundle_dir.join("bundle_manifest.json"),
+        serde_json::to_string_pretty(&manifest).context("Failed to serialize bundle manifest")?,
+    )
+    .with_context(|| {
+        format!(
+            "Failed to write {}",
+            display::clean_path_string(&bundle_dir.join("bundle_manifest.json").to_string_lossy())
+        )
+    })?;
+    Ok(())
+}
+
+fn remove_stale_mermaid_artifacts(bundle_dir: &std::path::Path) -> Result<()> {
+    for entry in fs::read_dir(bundle_dir).with_context(|| {
+        format!(
+            "Failed to inspect bundle directory {}",
+            display::clean_path_string(&bundle_dir.to_string_lossy())
+        )
+    })? {
+        let entry = entry.context("Failed to inspect bundle entry")?;
+        let path = entry.path();
+        if path.extension().is_some_and(|extension| extension == "mmd") {
+            fs::remove_file(&path).with_context(|| {
+                format!(
+                    "Failed to remove stale {}",
+                    display::clean_path_string(&path.to_string_lossy())
+                )
+            })?;
         }
     }
     Ok(())
+}
+
+fn ask_bundle_summary_json(
+    answer: &codestory_contracts::api::AgentAnswerDto,
+    include_trace: bool,
+) -> Result<String> {
+    if include_trace {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "truncated": true,
+            "reason": "ask bundle output hit its byte cap",
+            "action": "Narrow focus, reduce trail depth, or use JSON output without --bundle for the full in-memory response.",
+            "answer_id": &answer.answer_id,
+            "prompt": &answer.prompt,
+            "summary": &answer.summary,
+            "retrieval_version": &answer.retrieval_version,
+            "citation_count": answer.citations.len(),
+            "graph_count": answer.graphs.len(),
+            "retrieval_trace": &answer.retrieval_trace,
+        }))
+        .context("Failed to serialize ask bundle summary JSON")
+    } else {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "truncated": true,
+            "reason": "ask bundle output hit its byte cap",
+            "action": "Narrow focus, reduce trail depth, or use JSON output without --bundle for the full in-memory response.",
+            "answer_id": &answer.answer_id,
+            "prompt": truncate_utf8_with_suffix(&answer.prompt, 4096, ASK_BUNDLE_TRUNCATION_SUFFIX),
+            "summary": truncate_utf8_with_suffix(&answer.summary, 8192, ASK_BUNDLE_TRUNCATION_SUFFIX),
+            "retrieval_version": &answer.retrieval_version,
+            "citation_count": answer.citations.len(),
+            "graph_count": answer.graphs.len(),
+            "retrieval_trace_omitted": true,
+        }))
+        .context("Failed to serialize minimal ask bundle summary JSON")
+    }
+}
+
+fn truncate_utf8_with_suffix(value: &str, max_bytes: usize, suffix: &str) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut keep = max_bytes.saturating_sub(suffix.len());
+    while keep > 0 && !value.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let mut truncated = value[..keep].to_string();
+    truncated.push_str(suffix);
+    if truncated.len() > max_bytes {
+        let mut hard_keep = max_bytes;
+        while hard_keep > 0 && !truncated.is_char_boundary(hard_keep) {
+            hard_keep -= 1;
+        }
+        truncated.truncate(hard_keep);
+    }
+    truncated
 }
 
 fn sanitize_artifact_name(value: &str) -> String {
@@ -871,1045 +1772,6 @@ fn sanitize_artifact_name(value: &str) -> String {
     out
 }
 
-fn graph_node_to_query_item(
-    project_root: &std::path::Path,
-    node: &codestory_contracts::api::GraphNodeDto,
-    source: &str,
-) -> QueryItemOutput {
-    let file_path = node
-        .file_path
-        .as_deref()
-        .map(|path| display::relative_path(project_root, path));
-    QueryItemOutput {
-        node_id: node.id.0.clone(),
-        node_ref: None,
-        display_name: node.label.clone(),
-        kind: node.kind,
-        file_path,
-        line: None,
-        depth: Some(node.depth),
-        source: source.to_string(),
-    }
-}
-
-fn search_hit_to_query_item(
-    project_root: &std::path::Path,
-    hit: &SearchHit,
-    source: &str,
-) -> QueryItemOutput {
-    QueryItemOutput {
-        node_id: hit.node_id.0.clone(),
-        node_ref: output::node_ref(
-            project_root,
-            hit.file_path.as_deref(),
-            hit.line,
-            &hit.display_name,
-        ),
-        display_name: hit.display_name.clone(),
-        kind: hit.kind,
-        file_path: hit
-            .file_path
-            .as_deref()
-            .map(|path| display::relative_path(project_root, path)),
-        line: hit.line,
-        depth: None,
-        source: source.to_string(),
-    }
-}
-
-fn build_navigation_output(
-    project_root: &std::path::Path,
-    target: &runtime::ResolvedTarget,
-    trail: &TrailContextDto,
-) -> NavigationOutput {
-    let center = &target.selected.node_id;
-    let nodes = trail
-        .trail
-        .nodes
-        .iter()
-        .map(|node| (node.id.clone(), node))
-        .collect::<HashMap<_, _>>();
-    let mut incoming_seen = HashSet::new();
-    let mut outgoing_seen = HashSet::new();
-    let mut incoming_references = Vec::new();
-    let mut outgoing_references = Vec::new();
-
-    for edge in &trail.trail.edges {
-        if &edge.target == center
-            && incoming_seen.insert(edge.source.clone())
-            && let Some(node) = nodes.get(&edge.source)
-        {
-            incoming_references.push(graph_node_to_query_item(
-                project_root,
-                node,
-                "incoming_reference",
-            ));
-        }
-        if &edge.source == center
-            && outgoing_seen.insert(edge.target.clone())
-            && let Some(node) = nodes.get(&edge.target)
-        {
-            outgoing_references.push(graph_node_to_query_item(
-                project_root,
-                node,
-                "outgoing_reference",
-            ));
-        }
-    }
-
-    NavigationOutput {
-        definition: build_search_hit_output(project_root, &target.selected, false),
-        incoming_references,
-        outgoing_references,
-    }
-}
-
-fn node_details_to_query_item(
-    project_root: &std::path::Path,
-    node: &codestory_contracts::api::NodeDetailsDto,
-    depth: Option<u32>,
-    source: &str,
-) -> QueryItemOutput {
-    QueryItemOutput {
-        node_id: node.id.0.clone(),
-        node_ref: output::node_ref(
-            project_root,
-            node.file_path.as_deref(),
-            node.start_line,
-            &node.display_name,
-        ),
-        display_name: node.display_name.clone(),
-        kind: node.kind,
-        file_path: node
-            .file_path
-            .as_deref()
-            .map(|path| display::relative_path(project_root, path)),
-        line: node.start_line,
-        depth,
-        source: source.to_string(),
-    }
-}
-
-fn render_explore_markdown(
-    project_root: &std::path::Path,
-    target: &runtime::ResolvedTarget,
-    symbol: &SymbolContextDto,
-    trail: &TrailContextDto,
-    snippet: Option<&SnippetContextDto>,
-) -> String {
-    let mut markdown = String::new();
-    markdown.push_str("# Explore\n");
-    markdown.push_str("resolution:\n");
-    markdown.push_str(&format!(
-        "- {}\n",
-        output::node_ref(
-            project_root,
-            target.selected.file_path.as_deref(),
-            target.selected.line,
-            &target.selected.display_name
-        )
-        .unwrap_or_else(|| target.selected.display_name.clone())
-    ));
-    let navigation = build_navigation_output(project_root, target, trail);
-    markdown.push_str("navigation:\n");
-    if let Some(node_ref) = navigation.definition.node_ref.as_deref() {
-        markdown.push_str(&format!("- definition: `{node_ref}`\n"));
-    } else {
-        markdown.push_str(&format!(
-            "- definition: {}\n",
-            navigation.definition.display_name
-        ));
-    }
-    markdown.push_str(&format!(
-        "- incoming_references: {}\n",
-        navigation.incoming_references.len()
-    ));
-    markdown.push_str(&format!(
-        "- outgoing_references: {}\n",
-        navigation.outgoing_references.len()
-    ));
-    markdown.push_str("symbol:\n");
-    markdown.push_str(&render_symbol_markdown(project_root, target, symbol));
-    markdown.push_str("\ntrail:\n");
-    let cmd = TrailCommand {
-        project: args::ProjectArgs {
-            project: project_root.to_path_buf(),
-            cache_dir: None,
-        },
-        target: args::TargetArgs {
-            id: Some(target.selected.node_id.0.clone()),
-            query: None,
-            file: None,
-        },
-        mode: args::CliTrailMode::Neighborhood,
-        depth: Some(2),
-        direction: Some(args::CliDirection::Both),
-        max_nodes: trail.trail.nodes.len().min(u32::MAX as usize) as u32,
-        include_tests: false,
-        show_utility_calls: false,
-        hide_speculative: false,
-        layout: args::CliLayout::Horizontal,
-        refresh: args::RefreshMode::None,
-        format: args::OutputFormat::Markdown,
-        output_file: None,
-        mermaid: false,
-    };
-    markdown.push_str(&render_trail_markdown(project_root, target, trail, &cmd));
-    if let Some(snippet) = snippet {
-        markdown.push_str("\nsnippet:\n");
-        markdown.push_str(&render_snippet_markdown(
-            project_root,
-            target,
-            snippet,
-            false,
-        ));
-    }
-    markdown
-}
-
-struct TerminalCleanup;
-
-impl Drop for TerminalCleanup {
-    fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
-    }
-}
-
-fn run_explore_tui(
-    project_root: &std::path::Path,
-    target: &runtime::ResolvedTarget,
-    symbol: &SymbolContextDto,
-    trail: &TrailContextDto,
-    snippet: Option<&SnippetContextDto>,
-) -> Result<()> {
-    use crossterm::{
-        event::{self, Event, KeyCode, KeyModifiers},
-        terminal::{EnterAlternateScreen, enable_raw_mode},
-    };
-    use ratatui::{
-        Terminal,
-        backend::CrosstermBackend,
-        layout::{Constraint, Direction, Layout},
-        style::{Color, Modifier, Style},
-        text::{Line, Span},
-        widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
-    };
-
-    let panes = [
-        (
-            "Symbol",
-            render_symbol_markdown(project_root, target, symbol),
-        ),
-        ("Trail", {
-            let cmd = TrailCommand {
-                project: args::ProjectArgs {
-                    project: project_root.to_path_buf(),
-                    cache_dir: None,
-                },
-                target: args::TargetArgs {
-                    id: Some(target.selected.node_id.0.clone()),
-                    query: None,
-                    file: None,
-                },
-                mode: args::CliTrailMode::Neighborhood,
-                depth: Some(2),
-                direction: Some(args::CliDirection::Both),
-                max_nodes: trail.trail.nodes.len().min(u32::MAX as usize) as u32,
-                include_tests: false,
-                show_utility_calls: false,
-                hide_speculative: false,
-                layout: args::CliLayout::Horizontal,
-                refresh: args::RefreshMode::None,
-                format: args::OutputFormat::Markdown,
-                output_file: None,
-                mermaid: false,
-            };
-            render_trail_markdown(project_root, target, trail, &cmd)
-        }),
-        (
-            "Snippet",
-            snippet
-                .map(|context| render_snippet_markdown(project_root, target, context, false))
-                .unwrap_or_else(|| "No snippet available for this symbol.".to_string()),
-        ),
-    ];
-
-    enable_raw_mode()?;
-    crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
-    let _cleanup = TerminalCleanup;
-    let backend = CrosstermBackend::new(std::io::stdout());
-    let mut terminal = Terminal::new(backend)?;
-    let mut selected = 0usize;
-    let mut scroll = [0u16; 3];
-
-    loop {
-        terminal.draw(|frame| {
-            let area = frame.area();
-            let shell = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(1),
-                    Constraint::Length(1),
-                ])
-                .split(area);
-            let body = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(24), Constraint::Min(30)])
-                .split(shell[1]);
-
-            let title = output::node_ref(
-                project_root,
-                target.selected.file_path.as_deref(),
-                target.selected.line,
-                &target.selected.display_name,
-            )
-            .unwrap_or_else(|| target.selected.display_name.clone());
-            frame.render_widget(
-                Paragraph::new(title).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("CodeStory Explore"),
-                ),
-                shell[0],
-            );
-
-            let nav_items = panes
-                .iter()
-                .enumerate()
-                .map(|(idx, (label, _))| {
-                    let style = if idx == selected {
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    };
-                    ListItem::new(Line::from(Span::styled(*label, style)))
-                })
-                .collect::<Vec<_>>();
-            frame.render_widget(
-                List::new(nav_items).block(Block::default().borders(Borders::ALL).title("Panes")),
-                body[0],
-            );
-
-            frame.render_widget(
-                Paragraph::new(panes[selected].1.as_str())
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(panes[selected].0),
-                    )
-                    .wrap(Wrap { trim: false })
-                    .scroll((scroll[selected], 0)),
-                body[1],
-            );
-            frame.render_widget(
-                Paragraph::new("Tab switch pane  Up/Down scroll  q quit"),
-                shell[2],
-            );
-        })?;
-
-        if event::poll(Duration::from_millis(250))?
-            && let Event::Key(key) = event::read()?
-        {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => break,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                KeyCode::Tab => selected = (selected + 1) % panes.len(),
-                KeyCode::BackTab => selected = (selected + panes.len() - 1) % panes.len(),
-                KeyCode::Up | KeyCode::Char('k') => {
-                    scroll[selected] = scroll[selected].saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    scroll[selected] = scroll[selected].saturating_add(1);
-                }
-                KeyCode::PageUp => {
-                    scroll[selected] = scroll[selected].saturating_sub(10);
-                }
-                KeyCode::PageDown => {
-                    scroll[selected] = scroll[selected].saturating_add(10);
-                }
-                KeyCode::Home => scroll[selected] = 0,
-                _ => {}
-            }
-        }
-    }
-    terminal.show_cursor()?;
-    Ok(())
-}
-
-fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Result<()> {
-    let mut buffer = [0u8; 8192];
-    let read = stream.read(&mut buffer)?;
-    let request = String::from_utf8_lossy(&buffer[..read]);
-    let line = request.lines().next().unwrap_or_default();
-    let mut parts = line.split_whitespace();
-    let method = parts.next().unwrap_or_default();
-    let target = parts.next().unwrap_or("/");
-    if method != "GET" {
-        return write_http_json(
-            &mut stream,
-            405,
-            &serde_json::json!({"error": "method not allowed"}),
-        );
-    }
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let params = parse_query_string(query);
-    match path {
-        "/health" => write_http_json(&mut stream, 200, &serde_json::json!({"ok": true})),
-        "/search" => {
-            let query = params.get("q").cloned().unwrap_or_default();
-            let repo_text = params
-                .get("repo_text")
-                .and_then(|value| search_repo_text_mode_param(value))
-                .unwrap_or(SearchRepoTextMode::Auto);
-            let limit_per_source = params
-                .get("limit")
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(10)
-                .clamp(1, 100);
-            let results = runtime
-                .search
-                .search_results(SearchRequest {
-                    query,
-                    repo_text,
-                    limit_per_source,
-                    hybrid_weights: None,
-                    hybrid_limits: None,
-                })
-                .map_err(map_api_error)?;
-            write_http_json(&mut stream, 200, &results)
-        }
-        "/symbol" => {
-            let query = params.get("q").cloned().unwrap_or_default();
-            let target = resolve_target(runtime, args::TargetSelection::Query(query), None)?;
-            let context = runtime
-                .grounding
-                .symbol_context(target.selected.node_id)
-                .map_err(map_api_error)?;
-            write_http_json(&mut stream, 200, &context)
-        }
-        "/definition" => {
-            let target = resolve_target(runtime, target_selection_from_params(&params)?, None)?;
-            let context = runtime
-                .grounding
-                .symbol_context(target.selected.node_id.clone())
-                .map_err(map_api_error)?;
-            write_http_json(
-                &mut stream,
-                200,
-                &serde_json::json!({
-                    "resolution": build_query_resolution_output(&runtime.project_root, &target),
-                    "definition": build_search_hit_output(&runtime.project_root, &target.selected, false),
-                    "symbol": context,
-                }),
-            )
-        }
-        "/references" => {
-            let target = resolve_target(runtime, target_selection_from_params(&params)?, None)?;
-            let depth = params
-                .get("depth")
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(0);
-            let context = runtime
-                .grounding
-                .trail_context(TrailConfigDto {
-                    root_id: target.selected.node_id.clone(),
-                    mode: TrailMode::AllReferencing,
-                    target_id: None,
-                    depth,
-                    direction: TrailDirection::Incoming,
-                    caller_scope: TrailCallerScope::IncludeTestsAndBenches,
-                    edge_filter: Vec::new(),
-                    show_utility_calls: false,
-                    node_filter: Vec::new(),
-                    max_nodes: 120,
-                    layout_direction: LayoutDirection::Horizontal,
-                })
-                .map_err(map_api_error)?;
-            write_http_json(
-                &mut stream,
-                200,
-                &serde_json::json!({
-                    "resolution": build_query_resolution_output(&runtime.project_root, &target),
-                    "references": context,
-                }),
-            )
-        }
-        "/symbols" => {
-            let limit = params
-                .get("limit")
-                .and_then(|value| value.parse::<u32>().ok())
-                .map(|value| value.clamp(1, 2_000));
-            if let Some(parent_id) = params.get("parent_id").filter(|value| !value.is_empty()) {
-                let symbols = runtime
-                    .grounding
-                    .list_children_symbols(ListChildrenSymbolsRequest {
-                        parent_id: NodeId(parent_id.clone()),
-                    })
-                    .map_err(map_api_error)?;
-                write_http_json(&mut stream, 200, &symbols)
-            } else {
-                let symbols = runtime
-                    .grounding
-                    .list_root_symbols(ListRootSymbolsRequest { limit })
-                    .map_err(map_api_error)?;
-                write_http_json(&mut stream, 200, &symbols)
-            }
-        }
-        "/trail" => {
-            let query = params.get("q").cloned().unwrap_or_default();
-            let target = resolve_target(runtime, args::TargetSelection::Query(query), None)?;
-            let depth = params
-                .get("depth")
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(2);
-            let context = runtime
-                .grounding
-                .trail_context(TrailConfigDto {
-                    root_id: target.selected.node_id,
-                    mode: TrailMode::Neighborhood,
-                    target_id: None,
-                    depth,
-                    direction: TrailDirection::Both,
-                    caller_scope: TrailCallerScope::ProductionOnly,
-                    edge_filter: Vec::new(),
-                    show_utility_calls: false,
-                    node_filter: Vec::new(),
-                    max_nodes: 80,
-                    layout_direction: LayoutDirection::Horizontal,
-                })
-                .map_err(map_api_error)?;
-            write_http_json(&mut stream, 200, &context)
-        }
-        _ => write_http_json(&mut stream, 404, &serde_json::json!({"error": "not found"})),
-    }
-}
-
-fn target_selection_from_params(params: &HashMap<String, String>) -> Result<args::TargetSelection> {
-    if let Some(id) = params.get("id").filter(|value| !value.trim().is_empty()) {
-        return Ok(args::TargetSelection::Id(NodeId(id.trim().to_string())));
-    }
-    let query = params.get("q").cloned().unwrap_or_default();
-    if query.trim().is_empty() {
-        bail!("Pass `q` or `id`.");
-    }
-    Ok(args::TargetSelection::Query(query))
-}
-
-fn write_http_json<T: serde::Serialize>(
-    stream: &mut TcpStream,
-    status: u16,
-    value: &T,
-) -> Result<()> {
-    let body = serde_json::to_string_pretty(value)?;
-    let status_text = match status {
-        200 => "OK",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        _ => "OK",
-    };
-    write!(
-        stream,
-        "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    )?;
-    Ok(())
-}
-
-fn parse_query_string(query: &str) -> HashMap<String, String> {
-    query
-        .split('&')
-        .filter(|part| !part.is_empty())
-        .filter_map(|part| {
-            let (key, value) = part.split_once('=').unwrap_or((part, ""));
-            Some((url_decode(key)?, url_decode(value)?))
-        })
-        .collect()
-}
-
-fn search_repo_text_mode_param(value: &str) -> Option<SearchRepoTextMode> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "auto" => Some(SearchRepoTextMode::Auto),
-        "on" | "true" | "1" => Some(SearchRepoTextMode::On),
-        "off" | "false" | "0" => Some(SearchRepoTextMode::Off),
-        _ => None,
-    }
-}
-
-fn url_decode(value: &str) -> Option<String> {
-    let mut out = Vec::with_capacity(value.len());
-    let bytes = value.as_bytes();
-    let mut idx = 0usize;
-    while idx < bytes.len() {
-        match bytes[idx] {
-            b'+' => out.push(b' '),
-            b'%' if idx + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[idx + 1..idx + 3]).ok()?;
-                out.push(u8::from_str_radix(hex, 16).ok()?);
-                idx += 2;
-            }
-            byte => out.push(byte),
-        }
-        idx += 1;
-    }
-    String::from_utf8(out).ok()
-}
-
-fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = handle_stdio_message(&runtime, &line);
-        writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
-        stdout.flush()?;
-    }
-    Ok(())
-}
-
-fn handle_stdio_message(runtime: &RuntimeContext, line: &str) -> serde_json::Value {
-    let request: serde_json::Value = match serde_json::from_str(line) {
-        Ok(value) => value,
-        Err(error) => return serde_json::json!({"error": error.to_string()}),
-    };
-    let method = request
-        .get("method")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    match method {
-        "initialize" => serde_json::json!({"result": {"name": "codestory", "version": "0.1.0"}}),
-        "tools/list" => stdio_tools_list_json(),
-        "resources/list" => stdio_resources_list_json(),
-        "resources/templates/list" => stdio_resource_templates_list_json(),
-        "prompts/list" => stdio_prompts_list_json(),
-        "prompts/get" => stdio_prompt_get_json(
-            request
-                .pointer("/params/name")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default(),
-        ),
-        "resources/read" => {
-            let uri = request
-                .pointer("/params/uri")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            read_stdio_resource(runtime, uri)
-        }
-        "tools/call" => handle_stdio_tool_call(runtime, &request),
-        _ => serde_json::json!({"error": "unknown method"}),
-    }
-}
-
-fn handle_stdio_tool_call(
-    runtime: &RuntimeContext,
-    request: &serde_json::Value,
-) -> serde_json::Value {
-    let name = request
-        .pointer("/params/name")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let query = request
-        .pointer("/params/arguments/query")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default()
-        .to_string();
-    match name {
-        "search" => handle_stdio_search(runtime, query),
-        "symbol" => handle_stdio_symbol(runtime, query),
-        "trail" => handle_stdio_trail(runtime, query),
-        "definition" => handle_stdio_definition(runtime, request),
-        "references" => handle_stdio_references(runtime, request),
-        "symbols" => handle_stdio_symbols(runtime, request),
-        "snippet" => handle_stdio_snippet(runtime, request),
-        "ask" => handle_stdio_ask(runtime, request, &query),
-        _ => serde_json::json!({"error": "unknown tool"}),
-    }
-}
-
-fn handle_stdio_search(runtime: &RuntimeContext, query: String) -> serde_json::Value {
-    runtime
-        .search
-        .search_results(SearchRequest {
-            query,
-            repo_text: SearchRepoTextMode::Auto,
-            limit_per_source: 10,
-            hybrid_weights: None,
-            hybrid_limits: None,
-        })
-        .map(|result| serde_json::json!({"result": result}))
-        .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))
-}
-
-fn handle_stdio_symbol(runtime: &RuntimeContext, query: String) -> serde_json::Value {
-    resolve_target(runtime, args::TargetSelection::Query(query), None)
-        .and_then(|target| {
-            runtime
-                .grounding
-                .symbol_context(target.selected.node_id)
-                .map_err(map_api_error)
-        })
-        .map(|result| serde_json::json!({"result": result}))
-        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
-}
-
-fn handle_stdio_trail(runtime: &RuntimeContext, query: String) -> serde_json::Value {
-    resolve_target(runtime, args::TargetSelection::Query(query), None)
-        .and_then(|target| {
-            runtime
-                .grounding
-                .trail_context(TrailConfigDto {
-                    root_id: target.selected.node_id,
-                    mode: TrailMode::Neighborhood,
-                    target_id: None,
-                    depth: 2,
-                    direction: TrailDirection::Both,
-                    caller_scope: TrailCallerScope::ProductionOnly,
-                    edge_filter: Vec::new(),
-                    show_utility_calls: false,
-                    node_filter: Vec::new(),
-                    max_nodes: 80,
-                    layout_direction: LayoutDirection::Horizontal,
-                })
-                .map_err(map_api_error)
-        })
-        .map(|result| serde_json::json!({"result": result}))
-        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
-}
-
-fn handle_stdio_definition(
-    runtime: &RuntimeContext,
-    request: &serde_json::Value,
-) -> serde_json::Value {
-    resolve_target(runtime, stdio_target_selection(request), None)
-        .and_then(|target| {
-            runtime
-                .grounding
-                .symbol_context(target.selected.node_id.clone())
-                .map_err(map_api_error)
-                .map(|symbol| {
-                    serde_json::json!({
-                        "resolution": build_query_resolution_output(&runtime.project_root, &target),
-                        "definition": build_search_hit_output(&runtime.project_root, &target.selected, false),
-                        "symbol": symbol,
-                    })
-                })
-        })
-        .map(|result| serde_json::json!({"result": result}))
-        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
-}
-
-fn handle_stdio_references(
-    runtime: &RuntimeContext,
-    request: &serde_json::Value,
-) -> serde_json::Value {
-    resolve_target(runtime, stdio_target_selection(request), None)
-        .and_then(|target| {
-            runtime
-                .grounding
-                .trail_context(TrailConfigDto {
-                    root_id: target.selected.node_id.clone(),
-                    mode: TrailMode::AllReferencing,
-                    target_id: None,
-                    depth: 0,
-                    direction: TrailDirection::Incoming,
-                    caller_scope: TrailCallerScope::IncludeTestsAndBenches,
-                    edge_filter: Vec::new(),
-                    show_utility_calls: false,
-                    node_filter: Vec::new(),
-                    max_nodes: 120,
-                    layout_direction: LayoutDirection::Horizontal,
-                })
-                .map_err(map_api_error)
-        })
-        .map(|result| serde_json::json!({"result": result}))
-        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
-}
-
-fn handle_stdio_symbols(
-    runtime: &RuntimeContext,
-    request: &serde_json::Value,
-) -> serde_json::Value {
-    let limit = request
-        .pointer("/params/arguments/limit")
-        .and_then(|value| value.as_u64())
-        .map(|value| value.min(2_000) as u32);
-    let parent_id = request
-        .pointer("/params/arguments/parent_id")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.is_empty());
-    let result = if let Some(parent_id) = parent_id {
-        runtime
-            .grounding
-            .list_children_symbols(ListChildrenSymbolsRequest {
-                parent_id: NodeId(parent_id.to_string()),
-            })
-            .map(|symbols| {
-                serde_json::to_value(symbols)
-                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
-            })
-    } else {
-        runtime
-            .grounding
-            .list_root_symbols(ListRootSymbolsRequest { limit })
-            .map(|symbols| {
-                serde_json::to_value(symbols)
-                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
-            })
-    };
-    result
-        .map(|value| serde_json::json!({"result": value}))
-        .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))
-}
-
-fn handle_stdio_snippet(
-    runtime: &RuntimeContext,
-    request: &serde_json::Value,
-) -> serde_json::Value {
-    resolve_target(runtime, stdio_target_selection(request), None)
-        .and_then(|target| {
-            runtime
-                .grounding
-                .snippet_context(target.selected.node_id, 4)
-                .map_err(map_api_error)
-        })
-        .map(|result| serde_json::json!({"result": result}))
-        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
-}
-
-fn handle_stdio_ask(
-    runtime: &RuntimeContext,
-    request: &serde_json::Value,
-    default_prompt: &str,
-) -> serde_json::Value {
-    let prompt = request
-        .pointer("/params/arguments/prompt")
-        .and_then(|value| value.as_str())
-        .unwrap_or(default_prompt)
-        .to_string();
-    runtime
-        .agent
-        .ask(AgentAskRequest {
-            prompt,
-            retrieval_profile: codestory_contracts::api::AgentRetrievalProfileSelectionDto::Auto,
-            focus_node_id: None,
-            max_results: Some(8),
-            response_mode: AgentResponseModeDto::Structured,
-            latency_budget_ms: None,
-            include_evidence: true,
-            hybrid_weights: None,
-            connection: AgentConnectionSettingsDto::default(),
-            run_local_agent: false,
-        })
-        .map(|result| serde_json::json!({"result": result}))
-        .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))
-}
-
-fn stdio_target_selection(request: &serde_json::Value) -> args::TargetSelection {
-    if let Some(id) = request
-        .pointer("/params/arguments/id")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-    {
-        return args::TargetSelection::Id(NodeId(id.trim().to_string()));
-    }
-    let query = request
-        .pointer("/params/arguments/query")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default()
-        .to_string();
-    args::TargetSelection::Query(query)
-}
-
-fn stdio_tools_list_json() -> serde_json::Value {
-    serde_json::json!({
-        "result": {
-            "tools": [
-                stdio_tool_spec("search", "Search indexed symbols and repo text.", &["query"]),
-                stdio_tool_spec("symbol", "Resolve a symbol and return details.", &["query"]),
-                stdio_tool_spec("trail", "Return a graph trail around a symbol.", &["query"]),
-                stdio_tool_spec("definition", "Return definition metadata for a symbol id or query.", &["query", "id"]),
-                stdio_tool_spec("references", "Return incoming references for a symbol id or query.", &["query", "id"]),
-                stdio_tool_spec("symbols", "Browse root symbols or children for a parent id.", &["parent_id", "limit"]),
-                stdio_tool_spec("snippet", "Return a focused source snippet for a symbol id or query.", &["query", "id"]),
-                stdio_tool_spec("ask", "Run DB-first agentic retrieval and return an answer packet.", &["prompt"])
-            ]
-        }
-    })
-}
-
-fn stdio_tool_spec(name: &str, description: &str, properties: &[&str]) -> serde_json::Value {
-    let props = properties
-        .iter()
-        .map(|property| {
-            (
-                (*property).to_string(),
-                serde_json::json!({
-                    "type": if *property == "limit" { "number" } else { "string" }
-                }),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    serde_json::json!({
-        "name": name,
-        "description": description,
-        "inputSchema": {
-            "type": "object",
-            "properties": props
-        }
-    })
-}
-
-fn stdio_resources_list_json() -> serde_json::Value {
-    serde_json::json!({
-        "result": {
-            "resources": [
-                {"uri": "codestory://project", "name": "Project summary", "mimeType": "application/json"},
-                {"uri": "codestory://grounding", "name": "Grounding snapshot", "mimeType": "application/json"},
-                {"uri": "codestory://symbols/root", "name": "Root symbols", "mimeType": "application/json"}
-            ]
-        }
-    })
-}
-
-fn stdio_resource_templates_list_json() -> serde_json::Value {
-    serde_json::json!({
-        "result": {
-            "resourceTemplates": [
-                {"uriTemplate": "codestory://symbol/{node_id}", "name": "Symbol details", "mimeType": "application/json"},
-                {"uriTemplate": "codestory://references/{node_id}", "name": "Symbol references", "mimeType": "application/json"},
-                {"uriTemplate": "codestory://snippet/{node_id}", "name": "Symbol snippet", "mimeType": "application/json"},
-                {"uriTemplate": "codestory://trail/{node_id}", "name": "Symbol trail", "mimeType": "application/json"}
-            ]
-        }
-    })
-}
-
-fn stdio_prompts_list_json() -> serde_json::Value {
-    serde_json::json!({
-        "result": {
-            "prompts": [
-                {"name": "explain_symbol", "description": "Explain a symbol using definition, references, and snippet context."},
-                {"name": "trace_callflow", "description": "Trace the outgoing call flow for a symbol."},
-                {"name": "impact_analysis", "description": "Find incoming references and likely downstream impact."}
-            ]
-        }
-    })
-}
-
-fn stdio_prompt_get_json(name: &str) -> serde_json::Value {
-    let prompt = match name {
-        "trace_callflow" => {
-            "Trace the call flow for `{symbol}`. Use CodeStory trail, definition, and snippet context. Return key calls, uncertain edges, and review notes."
-        }
-        "impact_analysis" => {
-            "Analyze the impact of changing `{symbol}`. Use incoming references, related symbols, and snippets. Separate direct callers from broader risk."
-        }
-        _ => {
-            "Explain `{symbol}` using CodeStory definition, references, and source snippet context. Keep claims tied to retrieved evidence."
-        }
-    };
-    serde_json::json!({
-        "result": {
-            "description": name,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": {
-                        "type": "text",
-                        "text": prompt
-                    }
-                }
-            ]
-        }
-    })
-}
-
-fn read_stdio_resource(runtime: &RuntimeContext, uri: &str) -> serde_json::Value {
-    let result = match uri {
-        "codestory://project" => runtime
-            .open_project_summary()
-            .map(|summary| serde_json::json!(summary)),
-        "codestory://grounding" => runtime
-            .grounding
-            .grounding_snapshot(GroundingBudgetDto::Balanced)
-            .map(|snapshot| serde_json::json!(snapshot))
-            .map_err(map_api_error),
-        "codestory://symbols/root" => runtime
-            .grounding
-            .list_root_symbols(ListRootSymbolsRequest { limit: Some(300) })
-            .map(|symbols| serde_json::json!(symbols))
-            .map_err(map_api_error),
-        _ => read_stdio_template_resource(runtime, uri),
-    };
-    result
-        .map(|value| serde_json::json!({"result": {"contents": [{"uri": uri, "mimeType": "application/json", "text": value.to_string()}]}}))
-        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
-}
-
-fn read_stdio_template_resource(runtime: &RuntimeContext, uri: &str) -> Result<serde_json::Value> {
-    let Some((kind, node_id)) = uri
-        .strip_prefix("codestory://")
-        .and_then(|tail| tail.split_once('/'))
-    else {
-        bail!("unknown resource");
-    };
-    let node_id = NodeId(node_id.to_string());
-    match kind {
-        "symbol" => runtime
-            .grounding
-            .symbol_context(node_id)
-            .map(|value| serde_json::json!(value))
-            .map_err(map_api_error),
-        "references" => runtime
-            .grounding
-            .trail_context(TrailConfigDto {
-                root_id: node_id,
-                mode: TrailMode::AllReferencing,
-                target_id: None,
-                depth: 0,
-                direction: TrailDirection::Incoming,
-                caller_scope: TrailCallerScope::IncludeTestsAndBenches,
-                edge_filter: Vec::new(),
-                show_utility_calls: false,
-                node_filter: Vec::new(),
-                max_nodes: 120,
-                layout_direction: LayoutDirection::Horizontal,
-            })
-            .map(|value| serde_json::json!(value))
-            .map_err(map_api_error),
-        "snippet" => runtime
-            .grounding
-            .snippet_context(node_id, 4)
-            .map(|value| serde_json::json!(value))
-            .map_err(map_api_error),
-        "trail" => runtime
-            .grounding
-            .trail_context(TrailConfigDto {
-                root_id: node_id,
-                mode: TrailMode::Neighborhood,
-                target_id: None,
-                depth: 2,
-                direction: TrailDirection::Both,
-                caller_scope: TrailCallerScope::ProductionOnly,
-                edge_filter: Vec::new(),
-                show_utility_calls: false,
-                node_filter: Vec::new(),
-                max_nodes: 120,
-                layout_direction: LayoutDirection::Horizontal,
-            })
-            .map(|value| serde_json::json!(value))
-            .map_err(map_api_error),
-        _ => bail!("unknown resource"),
-    }
-}
-
 fn ensure_dot_only_for_trail(format: args::OutputFormat, command: &str) -> Result<()> {
     if format == args::OutputFormat::Dot {
         bail!("--format dot is only supported by `trail`; `{command}` supports markdown and json");
@@ -1917,20 +1779,25 @@ fn ensure_dot_only_for_trail(format: args::OutputFormat, command: &str) -> Resul
     Ok(())
 }
 
-fn build_search_output(
-    project_root: &std::path::Path,
-    query: &str,
-    retrieval: &codestory_contracts::api::RetrievalStateDto,
-    symbol_hits: &[SearchHit],
-    repo_text_hits: &[SearchHit],
-    suggestions: &[SearchHit],
+struct SearchOutputParts<'a> {
+    project_root: &'a std::path::Path,
+    query: &'a str,
+    retrieval: &'a codestory_contracts::api::RetrievalStateDto,
+    freshness: Option<&'a IndexFreshnessDto>,
+    symbol_hits: &'a [SearchHit],
+    repo_text_hits: &'a [SearchHit],
+    repo_text_stats: Option<&'a RepoTextScanStatsDto>,
+    suggestions: &'a [SearchHit],
     limit_per_source: u32,
     repo_text: RepoTextOutputConfig,
     explain: bool,
-) -> SearchOutput {
-    let indexed_symbol_hits = symbol_hits
+}
+
+fn build_search_output(parts: SearchOutputParts<'_>) -> SearchOutput {
+    let indexed_symbol_hits = parts
+        .symbol_hits
         .iter()
-        .map(|hit| build_search_hit_output(project_root, hit, explain))
+        .map(|hit| build_search_hit_output(parts.project_root, hit, parts.explain))
         .collect::<Vec<_>>();
     let mut duplicate_index = HashMap::new();
     for hit in &indexed_symbol_hits {
@@ -1940,32 +1807,36 @@ fn build_search_output(
                 .or_insert_with(|| hit.node_id.clone());
         }
     }
-    let repo_text_hits = repo_text_hits
+    let repo_text_hits = parts
+        .repo_text_hits
         .iter()
         .map(|hit| {
-            let mut output = build_search_hit_output(project_root, hit, explain);
+            let mut output = build_search_hit_output(parts.project_root, hit, parts.explain);
             if let Some(key) = search_hit_location_key(&output) {
                 output.duplicate_of = duplicate_index.get(&key).cloned();
             }
             output
         })
         .collect::<Vec<_>>();
-    let query_hints = search_query_hints(query, &indexed_symbol_hits, &repo_text_hits);
+    let query_hints = search_query_hints(parts.query, &indexed_symbol_hits, &repo_text_hits);
 
     SearchOutput {
-        query: query.to_string(),
-        retrieval: retrieval.clone(),
-        limit_per_source,
-        repo_text_mode: repo_text.mode,
-        repo_text_enabled: repo_text.enabled,
-        explain,
+        query: parts.query.to_string(),
+        retrieval: parts.retrieval.clone(),
+        freshness: parts.freshness.cloned(),
+        limit_per_source: parts.limit_per_source,
+        repo_text_mode: parts.repo_text.mode,
+        repo_text_enabled: parts.repo_text.enabled,
+        explain: parts.explain,
         query_hints,
-        suggestions: suggestions
+        suggestions: parts
+            .suggestions
             .iter()
-            .map(|hit| build_search_hit_output(project_root, hit, explain))
+            .map(|hit| build_search_hit_output(parts.project_root, hit, parts.explain))
             .collect(),
         indexed_symbol_hits,
         repo_text_hits,
+        repo_text_stats: parts.repo_text_stats.cloned(),
     }
 }
 
@@ -2006,6 +1877,7 @@ fn build_search_hit_output(
         Vec::new()
     };
     SearchHitOutput {
+        number: None,
         node_id: hit.node_id.0.clone(),
         node_ref: crate::output::node_ref(
             project_root,
@@ -2025,6 +1897,16 @@ fn build_search_hit_output(
         excerpt: repo_text_excerpt(project_root, hit),
         why,
     }
+}
+
+fn build_numbered_search_hit_output(
+    project_root: &std::path::Path,
+    hit: &SearchHit,
+    number: usize,
+) -> SearchHitOutput {
+    let mut output = build_search_hit_output(project_root, hit, false);
+    output.number = Some(number);
+    output
 }
 
 fn explain_search_hit(
@@ -2090,6 +1972,7 @@ fn search_hit_location_key(hit: &SearchHitOutput) -> Option<(String, u32)> {
     Some((hit.file_path.clone()?, hit.line?))
 }
 
+#[cfg(test)]
 fn hide_speculative_trail_edges(mut context: TrailContextDto) -> TrailContextDto {
     let original_edge_count = context.trail.edges.len();
     let retained_edges = context
@@ -2112,7 +1995,7 @@ fn hide_speculative_trail_edges(mut context: TrailContextDto) -> TrailContextDto
     }
 
     let mut reachable = HashSet::new();
-    let mut queue = VecDeque::new();
+    let mut queue = std::collections::VecDeque::new();
     reachable.insert(context.trail.center_id.clone());
     queue.push_back(context.trail.center_id.clone());
     while let Some(node_id) = queue.pop_front() {
@@ -2151,6 +2034,7 @@ fn hide_speculative_trail_edges(mut context: TrailContextDto) -> TrailContextDto
     context
 }
 
+#[cfg(test)]
 fn is_speculative_certainty(certainty: Option<&str>) -> bool {
     matches!(
         certainty.map(|value| value.to_ascii_lowercase()).as_deref(),
@@ -2198,8 +2082,9 @@ mod tests {
     use crate::query_resolution::compare_resolution_hits;
     use crate::runtime::{cache_root_for_project, fnv1a_hex, resolve_refresh_request};
     use codestory_contracts::api::{
-        EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse, IndexMode,
-        IndexingPhaseTimings, NodeDetailsDto, NodeId, ProjectSummary, RetrievalModeDto,
+        AgentAnswerDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
+        AgentRetrievalTraceDto, EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse,
+        IndexMode, IndexingPhaseTimings, NodeDetailsDto, NodeId, ProjectSummary, RetrievalModeDto,
         RetrievalStateDto, SearchHit, StorageStatsDto, TrailContextDto,
     };
     use std::fs;
@@ -2213,8 +2098,34 @@ mod tests {
             semantic_ready: true,
             semantic_doc_count: 42,
             embedding_model: Some("sentence-transformers/all-MiniLM-L6-v2-local".to_string()),
+            current_embedding: None,
+            stored_embedding: None,
             fallback_reason: None,
             fallback_message: None,
+        }
+    }
+
+    fn sample_agent_answer_with_graph(graph: GraphArtifactDto) -> AgentAnswerDto {
+        AgentAnswerDto {
+            answer_id: "answer-test".to_string(),
+            prompt: "Explain the capped bundle".to_string(),
+            summary: "Bundle summary".to_string(),
+            freshness: None,
+            sections: Vec::new(),
+            citations: Vec::new(),
+            subgraph_ids: vec!["big-mermaid".to_string()],
+            retrieval_version: "test".to_string(),
+            graphs: vec![graph],
+            retrieval_trace: AgentRetrievalTraceDto {
+                request_id: "answer-test".to_string(),
+                resolved_profile: AgentRetrievalPresetDto::Architecture,
+                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+                total_latency_ms: 1,
+                sla_target_ms: None,
+                sla_missed: false,
+                annotations: Vec::new(),
+                steps: Vec::new(),
+            },
         }
     }
 
@@ -2229,6 +2140,7 @@ mod tests {
             },
             members: Vec::new(),
             retrieval: None,
+            freshness: None,
         }
     }
 
@@ -2240,10 +2152,14 @@ mod tests {
             error_flush_ms: 4,
             cleanup_ms: 5,
             cache_refresh_ms: Some(6),
+            search_projection_rebuild_ms: Some(61),
+            search_symbol_index_ms: Some(62),
+            runtime_cache_publish_ms: Some(63),
             semantic_doc_build_ms: Some(7),
             semantic_embedding_ms: Some(8),
             semantic_db_upsert_ms: Some(9),
             semantic_reload_ms: Some(10),
+            semantic_prune_ms: Some(64),
             semantic_docs_reused: Some(11),
             semantic_docs_embedded: Some(12),
             semantic_docs_pending: Some(13),
@@ -2390,7 +2306,13 @@ mod tests {
 
         let markdown = render_index_markdown(&output);
 
-        assert!(markdown.contains("semantic_ms: doc_build=7 embedding=8 db_upsert=9 reload=10"));
+        assert!(
+            markdown.contains("cache_ms: search_projection=61 search_index=62 runtime_publish=63")
+        );
+        assert!(
+            markdown
+                .contains("semantic_ms: doc_build=7 embedding=8 db_upsert=9 reload=10 prune=64")
+        );
         assert!(markdown.contains("semantic_docs: reused=11 embedded=12 pending=13 stale=14"));
         assert!(markdown.contains(
             "staged_publish_ms: deferred_indexes=7 summary_snapshot=8 detail_snapshot=9 publish=10"
@@ -2441,20 +2363,22 @@ mod tests {
             score_breakdown: None,
         }];
 
-        let output = build_search_output(
-            root,
-            "needle",
-            &sample_retrieval(),
-            &symbol_hits,
-            &repo_text_hits,
-            &[],
-            5,
-            RepoTextOutputConfig {
+        let output = build_search_output(SearchOutputParts {
+            project_root: root,
+            query: "needle",
+            retrieval: &sample_retrieval(),
+            freshness: None,
+            symbol_hits: &symbol_hits,
+            repo_text_hits: &repo_text_hits,
+            repo_text_stats: None,
+            suggestions: &[],
+            limit_per_source: 5,
+            repo_text: RepoTextOutputConfig {
                 mode: RepoTextMode::Auto,
                 enabled: true,
             },
-            false,
-        );
+            explain: false,
+        });
 
         assert_eq!(output.repo_text_mode, RepoTextMode::Auto);
         assert!(output.repo_text_enabled);
@@ -2465,6 +2389,64 @@ mod tests {
         assert_eq!(
             output.repo_text_hits[0].origin,
             codestory_contracts::api::SearchHitOrigin::TextMatch
+        );
+    }
+
+    #[test]
+    fn write_ask_bundle_caps_disk_artifacts_and_writes_manifest() {
+        let temp = tempdir().expect("bundle dir");
+        fs::write(
+            temp.path().join("big-mermaid.mmd"),
+            "stale oversized artifact",
+        )
+        .expect("write stale artifact");
+        fs::write(
+            temp.path().join("previously-omitted.mmd"),
+            "stale upstream-omitted artifact",
+        )
+        .expect("write stale upstream-omitted artifact");
+        let answer = sample_agent_answer_with_graph(GraphArtifactDto::Mermaid {
+            id: "big-mermaid".to_string(),
+            title: "Big Mermaid".to_string(),
+            diagram: "graph TD".to_string(),
+            mermaid_syntax: format!(
+                "graph TD\nA[{}]\n",
+                "x".repeat(ASK_BUNDLE_OUTPUT_BYTE_CAP + 1024)
+            ),
+        });
+
+        write_ask_bundle(temp.path(), &answer, "short answer").expect("write capped bundle");
+
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(temp.path().join("bundle_manifest.json"))
+                .expect("read bundle manifest"),
+        )
+        .expect("parse bundle manifest");
+        let answer_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(temp.path().join("answer.json")).expect("read answer json"),
+        )
+        .expect("parse answer json");
+
+        assert_eq!(manifest["truncated"], serde_json::Value::Bool(true));
+        assert_eq!(
+            manifest["omitted_mermaid_artifacts"].as_u64(),
+            Some(1),
+            "{manifest}"
+        );
+        assert!(
+            manifest["written_bytes_excluding_manifest"]
+                .as_u64()
+                .is_some_and(|bytes| bytes <= ASK_BUNDLE_OUTPUT_BYTE_CAP as u64),
+            "{manifest}"
+        );
+        assert_eq!(answer_json["truncated"], serde_json::Value::Bool(true));
+        assert!(
+            !temp.path().join("big-mermaid.mmd").exists(),
+            "oversized Mermaid artifact should be omitted"
+        );
+        assert!(
+            !temp.path().join("previously-omitted.mmd").exists(),
+            "stale Mermaid artifacts from prior runs should be removed"
         );
     }
 
@@ -2504,20 +2486,22 @@ mod tests {
             score_breakdown: None,
         }];
 
-        let output = build_search_output(
-            root,
-            "ResolutionPass",
-            &sample_retrieval(),
-            &symbol_hits,
-            &[],
-            &[],
-            5,
-            RepoTextOutputConfig {
+        let output = build_search_output(SearchOutputParts {
+            project_root: root,
+            query: "ResolutionPass",
+            retrieval: &sample_retrieval(),
+            freshness: None,
+            symbol_hits: &symbol_hits,
+            repo_text_hits: &[],
+            repo_text_stats: None,
+            suggestions: &[],
+            limit_per_source: 5,
+            repo_text: RepoTextOutputConfig {
                 mode: RepoTextMode::Auto,
                 enabled: false,
             },
-            false,
-        );
+            explain: false,
+        });
 
         assert_eq!(
             output.indexed_symbol_hits[0].node_ref.as_deref(),
@@ -2551,20 +2535,22 @@ mod tests {
             score_breakdown: None,
         }];
 
-        let output = build_search_output(
-            root,
-            "snapshot digest",
-            &sample_retrieval(),
-            &symbol_hits,
-            &repo_text_hits,
-            &[],
-            5,
-            RepoTextOutputConfig {
+        let output = build_search_output(SearchOutputParts {
+            project_root: root,
+            query: "snapshot digest",
+            retrieval: &sample_retrieval(),
+            freshness: None,
+            symbol_hits: &symbol_hits,
+            repo_text_hits: &repo_text_hits,
+            repo_text_stats: None,
+            suggestions: &[],
+            limit_per_source: 5,
+            repo_text: RepoTextOutputConfig {
                 mode: RepoTextMode::Auto,
                 enabled: true,
             },
-            false,
-        );
+            explain: false,
+        });
 
         assert_eq!(
             output.repo_text_hits[0].duplicate_of.as_deref(),
@@ -2626,6 +2612,13 @@ mod tests {
                 "--output-file",
                 "out.md",
             ],
+            vec![
+                "codestory-cli",
+                "explain",
+                "How does this repo fit together?",
+                "--output-file",
+                "out.md",
+            ],
             vec!["codestory-cli", "doctor", "--output-file", "out.md"],
             vec![
                 "codestory-cli",
@@ -2636,11 +2629,86 @@ mod tests {
                 "--output-file",
                 "out.md",
             ],
+            vec![
+                "codestory-cli",
+                "bookmark",
+                "add",
+                "--id",
+                "1",
+                "--output-file",
+                "out.md",
+            ],
+            vec![
+                "codestory-cli",
+                "bookmark",
+                "list",
+                "--output-file",
+                "out.md",
+            ],
+            vec![
+                "codestory-cli",
+                "bookmark",
+                "remove",
+                "1",
+                "--output-file",
+                "out.md",
+            ],
         ];
 
         for command in commands {
             Cli::try_parse_from(command).expect("command should parse --output-file");
         }
+    }
+
+    #[test]
+    fn explore_tui_keyboard_state_reaches_every_pane() {
+        let mut state = ExploreTuiState::new(6);
+        for expected in 1..6 {
+            assert!(!state.apply(ExploreTuiAction::NextPane));
+            assert_eq!(state.selected, expected);
+        }
+        assert!(!state.apply(ExploreTuiAction::NextPane));
+        assert_eq!(state.selected, 0);
+
+        assert!(!state.apply(ExploreTuiAction::PreviousPane));
+        assert_eq!(state.selected, 5);
+        assert!(!state.apply(ExploreTuiAction::ScrollDown(12)));
+        assert_eq!(state.scroll[5], 12);
+        assert!(!state.apply(ExploreTuiAction::ScrollUp(5)));
+        assert_eq!(state.scroll[5], 7);
+        assert!(!state.apply(ExploreTuiAction::Home));
+        assert_eq!(state.scroll[5], 0);
+        assert!(state.apply(ExploreTuiAction::Quit));
+    }
+
+    #[test]
+    fn explore_tui_key_mapping_covers_keyboard_only_controls() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        assert_eq!(
+            explore_tui_action(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            ExploreTuiAction::NextPane
+        );
+        assert_eq!(
+            explore_tui_action(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            ExploreTuiAction::PreviousPane
+        );
+        assert_eq!(
+            explore_tui_action(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            ExploreTuiAction::ScrollDown(1)
+        );
+        assert_eq!(
+            explore_tui_action(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            ExploreTuiAction::ScrollUp(10)
+        );
+        assert_eq!(
+            explore_tui_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            ExploreTuiAction::Quit
+        );
+        assert_eq!(
+            explore_tui_action(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            ExploreTuiAction::Quit
+        );
     }
 
     #[test]
@@ -2663,20 +2731,22 @@ mod tests {
             }),
         }];
 
-        let output = build_search_output(
-            root,
-            "ranked",
-            &sample_retrieval(),
-            &symbol_hits,
-            &[],
-            &[],
-            5,
-            RepoTextOutputConfig {
+        let output = build_search_output(SearchOutputParts {
+            project_root: root,
+            query: "ranked",
+            retrieval: &sample_retrieval(),
+            freshness: None,
+            symbol_hits: &symbol_hits,
+            repo_text_hits: &[],
+            repo_text_stats: None,
+            suggestions: &[],
+            limit_per_source: 5,
+            repo_text: RepoTextOutputConfig {
                 mode: RepoTextMode::Off,
                 enabled: false,
             },
-            true,
-        );
+            explain: true,
+        });
 
         assert!(output.explain);
         assert_eq!(
@@ -2790,6 +2860,7 @@ mod tests {
                 omitted_edge_count: 0,
                 canonical_layout: None,
             },
+            story: None,
         };
 
         let filtered = hide_speculative_trail_edges(context);

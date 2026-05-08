@@ -67,6 +67,13 @@ fn source_tree_contains(dir: &str, needle: &str) -> bool {
     })
 }
 
+fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let start_index = source.find(start).expect("start marker exists");
+    let tail = &source[start_index..];
+    let end_index = tail.find(end).expect("end marker exists");
+    &tail[..end_index]
+}
+
 #[test]
 fn workspace_crate_stays_decoupled_from_store_and_runtime() {
     let dependencies = dependency_names("crates/codestory-workspace/Cargo.toml");
@@ -119,6 +126,11 @@ fn runtime_crate_depends_on_v2_surfaces_only() {
 #[test]
 fn store_crate_owns_persistence_without_legacy_escape_hatches() {
     let dependencies = dependency_names("crates/codestory-store/Cargo.toml");
+    assert!(
+        !dependencies.contains("codestory-workspace"),
+        "store should not depend on workspace discovery or refresh planning"
+    );
+
     for legacy in [
         "codestory-storage",
         "codestory-core",
@@ -158,6 +170,226 @@ fn cli_stays_thin() {
         assert!(
             !source_tree_contains("crates/codestory-cli/src", forbidden),
             "CLI source tree should not reference {forbidden} directly"
+        );
+    }
+}
+
+#[test]
+fn runtime_exposes_read_only_browser_service_boundary() {
+    let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
+    let browser = read("crates/codestory-runtime/src/browser.rs");
+    let cli_runtime = read("crates/codestory-cli/src/runtime.rs");
+    let cli_main = read("crates/codestory-cli/src/main.rs");
+    let http_transport = read("crates/codestory-cli/src/http_transport.rs");
+    let stdio_transport = read("crates/codestory-cli/src/stdio_transport.rs");
+    let explore = read("crates/codestory-cli/src/explore.rs");
+    let cli_browser_surfaces = [
+        cli_main.as_str(),
+        http_transport.as_str(),
+        stdio_transport.as_str(),
+        explore.as_str(),
+    ]
+    .join("\n");
+
+    assert!(
+        runtime_lib.contains("pub use browser::{BrowserQueryItem, ReadOnlyBrowserService}")
+            && runtime_lib.contains("pub fn browser_service(&self) -> ReadOnlyBrowserService"),
+        "runtime should export a read-only browser service accessor"
+    );
+    assert!(
+        browser.contains("pub struct ReadOnlyBrowserService")
+            && browser.contains("pub fn search_results")
+            && browser.contains("pub fn symbol_context")
+            && browser.contains("pub fn definition_context")
+            && browser.contains("pub fn trail_context")
+            && browser.contains("pub fn references_context")
+            && browser.contains("pub fn snippet_context")
+            && browser.contains("pub fn list_root_symbols")
+            && browser.contains("pub fn list_children_symbols")
+            && browser.contains("pub fn query")
+            && browser.contains("pub fn ask"),
+        "read-only browser service should own the browser-facing read methods"
+    );
+    assert!(
+        !browser.contains("run_local_agent"),
+        "read-only browser ask should not carry local-agent execution controls"
+    );
+
+    for forbidden in [
+        "open_definition",
+        "write_file",
+        "WriteFile",
+        "OpenContainingFolder",
+        "SystemActionResponse",
+        "launch_definition",
+        "TcpListener",
+        "run_stdio_server",
+        "handle_http_request",
+    ] {
+        assert!(
+            !browser.contains(forbidden),
+            "read-only browser service should not mention forbidden write/system/transport API {forbidden}"
+        );
+    }
+
+    assert!(
+        cli_runtime.contains("pub(crate) browser: ReadOnlyBrowserService")
+            && cli_runtime.contains("browser: runtime.browser_service()"),
+        "CLI runtime context should carry the runtime-owned browser boundary"
+    );
+    assert!(
+        cli_browser_surfaces.contains(".search_results(SearchRequest")
+            && cli_browser_surfaces.contains(".symbol_context(")
+            && cli_browser_surfaces.contains(".definition_context(")
+            && cli_browser_surfaces.contains(".references_context(")
+            && cli_browser_surfaces.contains(".list_root_symbols(")
+            && cli_browser_surfaces.contains(".list_children_symbols(")
+            && cli_browser_surfaces.contains(".trail_context(")
+            && cli_browser_surfaces.contains(".snippet_context(")
+            && cli_browser_surfaces.contains(".query(&ast)")
+            && cli_main.contains("runtime.browser.ask(request)")
+            && !cli_main.contains("runtime.agent.ask(request)"),
+        "CLI read-only browser operations should route through RuntimeContext.browser"
+    );
+}
+
+#[test]
+fn stdio_tool_catalog_stays_aligned_with_read_only_browser_service_operations() {
+    let browser = read("crates/codestory-runtime/src/browser.rs");
+    let stdio_transport = read("crates/codestory-cli/src/stdio_transport.rs");
+    let stdio_catalog = read("crates/codestory-cli/src/stdio_catalog.rs");
+    let stdio_tool_catalog = source_between(&stdio_catalog, "static TOOLS", "static RESOURCES");
+
+    let expected_tools = [
+        ("search", ".search_results(", "pub fn search_results"),
+        ("symbol", ".symbol_context(", "pub fn symbol_context"),
+        (
+            "definition",
+            ".definition_context(",
+            "pub fn definition_context",
+        ),
+        (
+            "references",
+            ".references_context(",
+            "pub fn references_context",
+        ),
+        ("symbols", ".list_root_symbols(", "pub fn list_root_symbols"),
+        (
+            "symbols",
+            ".list_children_symbols(",
+            "pub fn list_children_symbols",
+        ),
+        ("trail", ".trail_context(", "pub fn trail_context"),
+        ("snippet", ".snippet_context(", "pub fn snippet_context"),
+        ("ask", ".ask(", "pub fn ask"),
+    ];
+
+    for (tool_name, cli_call, browser_method) in expected_tools {
+        assert!(
+            stdio_tool_catalog.contains(&format!("\"{tool_name}\"")),
+            "stdio catalog/router should include read-only browser tool {tool_name}"
+        );
+        assert!(
+            stdio_transport.contains(cli_call),
+            "stdio tool {tool_name} should route through RuntimeContext.browser operation {cli_call}"
+        );
+        assert!(
+            browser.contains(browser_method),
+            "ReadOnlyBrowserService should expose operation for stdio tool {tool_name}: {browser_method}"
+        );
+    }
+
+    for forbidden in [
+        "\"write",
+        "\"edit",
+        "\"delete",
+        "\"patch",
+        "\"shell",
+        "\"exec",
+        "\"launch",
+        "\"open_folder",
+    ] {
+        assert!(
+            !stdio_tool_catalog.contains(forbidden),
+            "stdio read-only tool catalog should not expose write/system tool prefix {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn web_cockpit_stays_deferred_until_browser_surface_gate_opens() {
+    let gate = read("docs/architecture/browser-surface-gate.md");
+    let warm_stats = read("docs/testing/codestory-stdio-warm-loop-stats.md");
+    let runtime_path = read("docs/architecture/runtime-execution-path.md");
+    let cli_args = read("crates/codestory-cli/src/args.rs");
+    let http_transport = read("crates/codestory-cli/src/http_transport.rs");
+    let command_enum = source_between(
+        &cli_args,
+        "pub(crate) enum Command",
+        "#[derive(Args, Debug, Clone)]",
+    );
+    let http_routes = source_between(
+        &http_transport,
+        "match path {",
+        "fn browser_references_config",
+    );
+
+    for required in [
+        "Status: deferred.",
+        "Do not add a new `browse` command, web cockpit route, or browser-specific web UI",
+        "Tool, resource, and prompt manifests",
+        "Warm stdio/browser-loop p50, p95, and p99",
+        "Current Promotion Budget",
+        "docs/testing/codestory-stdio-warm-loop-stats.md",
+        "Browser stress lanes",
+        "`explore` must demonstrate the cockpit workflow",
+        "Screenshot-visible review",
+    ] {
+        assert!(
+            gate.contains(required),
+            "browser surface gate should document required gate evidence: missing {required}"
+        );
+    }
+
+    assert!(
+        runtime_path.contains("browser surface gate")
+            && runtime_path.contains("Do not add a")
+            && runtime_path.contains(
+                "separate `browse` command, web cockpit route, or browser-specific web UI"
+            ),
+        "runtime execution path should point future UI work at the browser surface gate"
+    );
+    assert!(
+        warm_stats.contains("## Current Promotion Budget")
+            && warm_stats.contains("### Smoke Budget")
+            && warm_stats.contains("| search | 75 ms |")
+            && warm_stats.contains("| symbol | 50 ms |")
+            && warm_stats.contains("| trail | 75 ms |")
+            && warm_stats.contains("| snippet | 50 ms |")
+            && warm_stats.contains("| resources/read:status | 50 ms |")
+            && warm_stats.contains("| full `search -> symbol -> trail -> snippet` loop | 250 ms |")
+            && warm_stats.contains("### Web Cockpit Promotion Budget")
+            && warm_stats.contains("| each default read operation | 500 ms |")
+            && warm_stats.contains("| full `search -> symbol -> trail -> snippet` loop | 1.5 s |")
+            && warm_stats.contains("browser surface gate stays closed"),
+        "warm-loop stats doc should own the active p95 budget state"
+    );
+
+    assert!(
+        command_enum.contains("Explore(ExploreCommand)")
+            && command_enum.contains("Serve(ServeCommand)"),
+        "explore and serve should remain the current browser surfaces"
+    );
+    for forbidden in ["Browse(", "BrowseCommand", "WebCockpit", "CockpitCommand"] {
+        assert!(
+            !command_enum.contains(forbidden),
+            "web cockpit/browse surface is deferred; unexpected CLI command {forbidden}"
+        );
+    }
+    for forbidden_route in ["\"/browse\"", "\"/cockpit\"", "\"/ui\"", "\"/web\""] {
+        assert!(
+            !http_routes.contains(forbidden_route),
+            "web cockpit/browse route is deferred until the browser surface gate opens: {forbidden_route}"
         );
     }
 }
