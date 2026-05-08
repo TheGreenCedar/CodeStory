@@ -1,21 +1,20 @@
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentAskRequest, AgentBackend, AgentConnectionSettingsDto,
-    AgentHybridWeightsDto, ApiError, AppEventPayload, BookmarkCategoryDto, BookmarkDto,
-    CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest,
-    EmbeddingProfileContractDto, GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse,
-    GroundingBudgetDto, GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingSnapshotDto,
-    GroundingSymbolDigestDto, IndexDryRunDto, IndexFreshnessChangeKindDto, IndexFreshnessDto,
-    IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexMode, IndexingPhaseTimings,
-    ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess, NodeDetailsDto,
-    NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest, OpenContainingFolderRequest,
-    OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
-    ReadFileTextResponse, RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalModeDto,
-    RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHit, SearchRepoTextMode, SearchRequest,
-    SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
-    StorageStatsDto, StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto,
-    SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
-    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WorkspaceMemberIndexDto,
-    WriteFileResponse, WriteFileTextRequest,
+    AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto, ApiError, AppEventPayload,
+    BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId,
+    EdgeKind, EdgeOccurrencesRequest, EmbeddingProfileContractDto, GraphEdgeDto, GraphNodeDto,
+    GraphRequest, GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto,
+    GroundingFileDigestDto, GroundingSnapshotDto, GroundingSymbolDigestDto, IndexDryRunDto,
+    IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessSampleDto,
+    IndexFreshnessStatusDto, IndexMode, IndexingPhaseTimings, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
+    NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
+    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto,
+    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
+    SearchHit, SearchRepoTextMode, SearchRequest, SearchResultsDto, SnippetContextDto,
+    SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto, StoredSemanticDocsContractDto,
+    SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
+    TrailContextDto, TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
+    WorkspaceMemberIndexDto, WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
 use codestory_indexer::IncrementalIndexingStats;
@@ -37,7 +36,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 mod agent;
-mod agent_commands;
 mod browser;
 mod graph_builders;
 mod graph_canonical;
@@ -54,9 +52,6 @@ mod symbol_query;
 mod system_actions;
 mod trail_story;
 
-pub(crate) use agent_commands::{
-    agent_backend_label, configured_agent_command, resolve_agent_command,
-};
 pub use browser::{BrowserQueryItem, ReadOnlyBrowserService};
 pub use codestory_contracts as contracts;
 pub(crate) use mermaid::{fallback_mermaid, mermaid_flowchart, mermaid_gantt, mermaid_sequence};
@@ -72,12 +67,11 @@ pub use services::{
     TrailService,
 };
 pub(crate) use support::{
-    FocusedSourceContext, HYBRID_RETRIEVAL_ENABLED_ENV, LocalAgentResponse,
-    aggregate_symbol_matches, apply_hybrid_limits, build_local_agent_prompt, clamp_i64_to_u32,
-    clamp_u64_to_u32, clamp_u128_to_u32, clamp_usize_to_u32, extract_symbol_search_terms,
-    file_text_match_line, hybrid_retrieval_enabled, looks_like_repo_text_query, node_display_name,
-    normalized_hybrid_weights, preferred_occurrence, read_searchable_file_contents,
-    should_expand_symbol_query, truncate_for_diagnostic,
+    FocusedSourceContext, HYBRID_RETRIEVAL_ENABLED_ENV, aggregate_symbol_matches,
+    apply_hybrid_limits, clamp_i64_to_u32, clamp_u64_to_u32, clamp_u128_to_u32, clamp_usize_to_u32,
+    extract_symbol_search_terms, file_text_match_line, hybrid_retrieval_enabled,
+    looks_like_repo_text_query, node_display_name, normalized_hybrid_weights, preferred_occurrence,
+    read_searchable_file_contents, should_expand_symbol_query,
 };
 pub use symbol_query::{
     SymbolNameMatchRank, compare_ranked_hits, leading_symbol_segment, normalize_symbol_query,
@@ -2470,14 +2464,6 @@ impl AppController {
 
     fn open_folder_in_os(path: &Path) -> io::Result<()> {
         system_actions::open_folder_in_os(path)
-    }
-
-    fn run_local_agent(
-        &self,
-        connection: &AgentConnectionSettingsDto,
-        prompt: &str,
-    ) -> Result<LocalAgentResponse, ApiError> {
-        agent::local_runner::run_local_agent(self, connection, prompt)
     }
 
     fn launch_definition_in_ide(

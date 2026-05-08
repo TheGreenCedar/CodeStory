@@ -211,8 +211,8 @@ fn runtime_exposes_read_only_browser_service_boundary() {
         "read-only browser service should own the browser-facing read methods"
     );
     assert!(
-        browser.contains("req.run_local_agent = false"),
-        "read-only browser ask should force DB-first execution"
+        !browser.contains("run_local_agent"),
+        "read-only browser ask should not carry local-agent execution controls"
     );
 
     for forbidden in [
@@ -248,7 +248,7 @@ fn runtime_exposes_read_only_browser_service_boundary() {
             && cli_browser_surfaces.contains(".snippet_context(")
             && cli_browser_surfaces.contains(".query(&ast)")
             && cli_main.contains("runtime.browser.ask(request)")
-            && cli_main.contains("runtime.agent.ask(request)"),
+            && !cli_main.contains("runtime.agent.ask(request)"),
         "CLI read-only browser operations should route through RuntimeContext.browser"
     );
 }

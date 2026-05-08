@@ -38,7 +38,7 @@ CodeStory's durable promise is strong:
 
 The main limitations are sharper:
 
-- `AgentAskRequest` serde default still opts into local-agent execution even though CLI and stdio callsites opt out explicitly.
+- Local external-agent execution has been removed from `ask`; the remaining risk is keeping the DB-first browser contract from regressing.
 - `.codestory.toml` documents `embedding_model`, but the config maps it to an env var the runtime does not read for active embedding profile selection.
 - The repo-local `codestory-grounding` skill has stale crate names and lacks detailed refs for `ask`, `doctor`, `explore`, and `serve`.
 - CLI help advertises `--format dot` for commands that later reject it.
@@ -60,18 +60,16 @@ The main limitations are sharper:
 - `cargo test -p codestory-cli --test cli_golden_path`
 - `cargo test -p codestory-cli --test cli_error_contracts`
 
-### Task 0.1: Make Local Agent Execution Explicit Everywhere
+### Task 0.1: Keep Ask DB-First Everywhere
 
-- **Location**: `crates/codestory-contracts/src/api/dto.rs`, `crates/codestory-runtime/src/agent/local_runner.rs`, CLI ask tests.
-- **Description**: change `AgentAskRequest` serde default so omitted `run_local_agent` deserializes to `false`. Keep explicit `true` supported.
+- **Location**: `crates/codestory-contracts/src/api/dto.rs`, `crates/codestory-runtime/src/agent/orchestrator.rs`, CLI ask tests.
+- **Description**: keep `AgentAskRequest` as a retrieval-only contract with no external local-agent execution controls.
 - **Acceptance criteria**:
-  - Missing `run_local_agent` in JSON does not launch Codex/Claude.
-  - CLI `ask` remains DB-first unless `--with-local-agent` is passed.
-  - `serve --stdio` ask remains read-only by default.
-  - Retrieval trace records whether external local-agent execution was disabled, requested, or skipped.
+  - CLI `ask` and `explain` expose no local-agent flags.
+  - `serve --stdio` ask remains read-only and DB-first.
+  - Retrieval trace contains no local-agent execution step.
 - **Validation**:
-  - Add serde omission regression tests in `codestory-contracts`.
-  - Add CLI/stdin tests proving no local-agent command is spawned by omission.
+  - Add CLI/stdin tests proving ask output has only retrieval-owned trace steps.
 
 ### Task 0.2: Fix `.codestory.toml` Embedding Config Mapping
 
@@ -282,7 +280,7 @@ The main limitations are sharper:
 - **Hard limits**:
   - Respect latency budget before expensive trail/source phases.
   - Cap default trail nodes and source bytes.
-  - Never launch local agents unless explicitly requested.
+  - Keep investigation inside CodeStory's indexed retrieval layer.
 - **Acceptance criteria**:
   - Integration prompts that currently miss relevant symbols return cited hits.
   - Trace proves multiple retrieval steps only when needed.
@@ -422,7 +420,7 @@ The main limitations are sharper:
 - **Acceptance criteria**:
   - Project/status pane shows retrieval mode, fallback, freshness, and next useful command.
   - Search/results/detail/trail/snippet panes are keyboard reachable.
-  - Empty/error states preserve the failed layer: cache, index, semantic runtime, query resolution, local agent, output write.
+  - Empty/error states preserve the failed layer: cache, index, semantic runtime, query resolution, output write.
 - **Validation**:
   - Keyboard-only TUI pass.
   - JSON/Markdown fallback pass with `--no-tui`.

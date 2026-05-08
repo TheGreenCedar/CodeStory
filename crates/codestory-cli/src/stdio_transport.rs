@@ -1,8 +1,7 @@
 use anyhow::{Result, bail};
 use codestory_contracts::api::{
-    AgentAskRequest, AgentConnectionSettingsDto, AgentResponseModeDto, GroundingBudgetDto,
-    ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeId, SearchRepoTextMode, SearchRequest,
-    TrailDirection,
+    AgentAskRequest, AgentResponseModeDto, GroundingBudgetDto, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, NodeId, SearchRepoTextMode, SearchRequest, TrailDirection,
 };
 use std::io::{BufRead, Write};
 
@@ -537,8 +536,6 @@ fn handle_stdio_ask(
             latency_budget_ms: None,
             include_evidence,
             hybrid_weights: None,
-            connection: AgentConnectionSettingsDto::default(),
-            run_local_agent: false,
         })
         .map(|result| serde_json::json!({"result": result}))
         .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))

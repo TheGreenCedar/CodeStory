@@ -2,13 +2,12 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentAskRequest, AgentConnectionSettingsDto, AgentHybridWeightsDto,
-    AgentResponseModeDto, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto,
-    AppEventPayload, BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest,
-    CreateBookmarkRequest, GraphArtifactDto, GroundingBudgetDto, IndexFreshnessDto,
-    IndexFreshnessStatusDto, IndexMode, NodeId, NodeKind, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto, SearchHit, SearchHybridLimitsDto,
-    SearchRepoTextMode, SearchRequest,
+    AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto, AgentResponseModeDto,
+    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AppEventPayload,
+    BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
+    GraphArtifactDto, GroundingBudgetDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode,
+    NodeId, NodeKind, RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto,
+    SearchHit, SearchHybridLimitsDto, SearchRepoTextMode, SearchRequest,
 };
 use std::{
     collections::HashMap,
@@ -459,26 +458,13 @@ fn run_explain(cmd: ExplainCommand) -> Result<()> {
         latency_budget_ms: None,
         include_evidence: true,
         hybrid_weights: None,
-        connection: AgentConnectionSettingsDto {
-            backend: cmd.backend.into(),
-            command: cmd.agent_command.clone(),
-        },
-        run_local_agent: cmd.with_local_agent,
     };
 
-    let mut answer = if cmd.with_local_agent {
-        runtime.agent.ask(request).map_err(map_api_error)?
-    } else {
-        runtime.browser.ask(request).map_err(map_api_error)?
-    };
+    let mut answer = runtime.browser.ask(request).map_err(map_api_error)?;
     answer
         .retrieval_trace
         .annotations
-        .push(if cmd.with_local_agent {
-            "mode=repo_explain_local_agent".to_string()
-        } else {
-            "mode=repo_explain_db_first_no_local_agent".to_string()
-        });
+        .push("mode=repo_explain_db_first".to_string());
     answer
         .retrieval_trace
         .annotations
@@ -555,26 +541,13 @@ fn run_ask(cmd: AskCommand) -> Result<()> {
         latency_budget_ms: None,
         include_evidence: !cmd.no_evidence,
         hybrid_weights: hybrid_weights(cmd.hybrid_lexical, cmd.hybrid_semantic, cmd.hybrid_graph),
-        connection: AgentConnectionSettingsDto {
-            backend: cmd.backend.into(),
-            command: cmd.agent_command.clone(),
-        },
-        run_local_agent: cmd.with_local_agent,
     };
 
-    let mut answer = if cmd.with_local_agent {
-        runtime.agent.ask(request).map_err(map_api_error)?
-    } else {
-        runtime.browser.ask(request).map_err(map_api_error)?
-    };
+    let mut answer = runtime.browser.ask(request).map_err(map_api_error)?;
     answer
         .retrieval_trace
         .annotations
-        .push(if cmd.with_local_agent {
-            "mode=local_agent".to_string()
-        } else {
-            "mode=db_first_no_local_agent".to_string()
-        });
+        .push("mode=db_first".to_string());
     if let Some(bookmark) = bookmark_focus.as_ref() {
         annotate_answer_with_bookmark_focus(&mut answer, bookmark);
     }

@@ -259,10 +259,6 @@ fn ask_browser_with_profile(
             latency_budget_ms: Some(30_000),
             include_evidence: true,
             hybrid_weights: None,
-            connection: Default::default(),
-            // The read-only browser facade forces this back to false; keep it
-            // true here to guard that safety boundary while testing ask output.
-            run_local_agent: true,
         })
         .expect("ask browser")
 }

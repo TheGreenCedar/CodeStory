@@ -83,8 +83,7 @@ impl ReadOnlyBrowserService {
         Self { controller }
     }
 
-    pub fn ask(&self, mut req: AgentAskRequest) -> Result<AgentAnswerDto, ApiError> {
-        req.run_local_agent = false;
+    pub fn ask(&self, req: AgentAskRequest) -> Result<AgentAnswerDto, ApiError> {
         self.controller.agent_ask(req)
     }
 

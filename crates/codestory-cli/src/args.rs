@@ -1,6 +1,6 @@
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentBackend, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto,
+    AgentAnswerDto, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto,
     BookmarkCategoryDto, BookmarkDto, GroundingBudgetDto, GroundingSnapshotDto, IndexDryRunDto,
     IndexFreshnessDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind, ProjectSummary,
     RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
@@ -142,12 +142,6 @@ pub(crate) enum CliAskProfile {
     Impact,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum CliAgentBackend {
-    Codex,
-    ClaudeCode,
-}
-
 #[derive(Args, Debug)]
 pub(crate) struct IndexCommand {
     #[command(flatten)]
@@ -238,18 +232,6 @@ pub(crate) struct ExplainCommand {
         help = "Write command output to this file instead of stdout. The parent directory must already exist."
     )]
     pub(crate) output_file: Option<PathBuf>,
-    #[arg(
-        long,
-        help = "Launch the configured local agent after indexed retrieval. Disabled by default."
-    )]
-    pub(crate) with_local_agent: bool,
-    #[arg(long, value_enum, default_value_t = CliAgentBackend::Codex)]
-    pub(crate) backend: CliAgentBackend,
-    #[arg(
-        long,
-        help = "Override the local agent command used with --with-local-agent."
-    )]
-    pub(crate) agent_command: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -311,18 +293,6 @@ pub(crate) struct AskCommand {
         help = "Omit citation edge ids and score breakdowns from the structured answer."
     )]
     pub(crate) no_evidence: bool,
-    #[arg(
-        long,
-        help = "Launch the configured local agent after indexed retrieval. Disabled by default."
-    )]
-    pub(crate) with_local_agent: bool,
-    #[arg(long, value_enum, default_value_t = CliAgentBackend::Codex)]
-    pub(crate) backend: CliAgentBackend,
-    #[arg(
-        long,
-        help = "Override the local agent command used with --with-local-agent."
-    )]
-    pub(crate) agent_command: Option<String>,
     #[arg(
         long = "hybrid-lexical",
         value_name = "WEIGHT",
@@ -1064,15 +1034,6 @@ pub(crate) fn ask_retrieval_profile(cmd: &AskCommand) -> AgentRetrievalProfileSe
     }
 }
 
-impl From<CliAgentBackend> for AgentBackend {
-    fn from(value: CliAgentBackend) -> Self {
-        match value {
-            CliAgentBackend::Codex => Self::Codex,
-            CliAgentBackend::ClaudeCode => Self::ClaudeCode,
-        }
-    }
-}
-
 impl From<CliDirection> for TrailDirection {
     fn from(value: CliDirection) -> Self {
         match value {
@@ -1190,9 +1151,10 @@ mod tests {
     #[test]
     fn ask_help_exposes_db_first_controls() {
         let help = render_subcommand_help("ask");
-        assert!(help.contains("--with-local-agent"));
         assert!(help.contains("--bundle <DIR>"));
         assert!(help.contains("--profile <PROFILE>"));
+        assert!(!help.contains("--with-local-agent"));
+        assert!(!help.contains("--agent-command"));
     }
 
     #[test]
@@ -1200,8 +1162,9 @@ mod tests {
         let help = render_subcommand_help("explain");
         assert!(help.contains("Repository explanation prompt"));
         assert!(help.contains("--max-results"));
-        assert!(help.contains("--with-local-agent"));
         assert!(help.contains("How does this repo fit together?"));
+        assert!(!help.contains("--with-local-agent"));
+        assert!(!help.contains("--agent-command"));
     }
 
     #[test]

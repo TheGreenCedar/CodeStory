@@ -682,22 +682,6 @@ pub struct SetUiLayoutRequest {
     pub json: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentBackend {
-    #[default]
-    Codex,
-    ClaudeCode,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type, Default)]
-pub struct AgentConnectionSettingsDto {
-    #[serde(default)]
-    pub backend: AgentBackend,
-    #[serde(default)]
-    pub command: Option<String>,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRetrievalPresetDto {
@@ -821,10 +805,6 @@ pub struct AgentAskRequest {
     pub include_evidence: bool,
     #[serde(default)]
     pub hybrid_weights: Option<AgentHybridWeightsDto>,
-    #[serde(default)]
-    pub connection: AgentConnectionSettingsDto,
-    #[serde(default)]
-    pub run_local_agent: bool,
 }
 
 const fn default_include_evidence() -> bool {
@@ -921,7 +901,6 @@ pub enum AgentRetrievalStepKindDto {
     SourceRead,
     MermaidSynthesis,
     AnswerSynthesis,
-    LocalAgent,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -1046,29 +1025,4 @@ pub struct WriteFileDataUrlRequest {
 pub struct WriteFileResponse {
     // Use u32 so TS can safely represent this as `number` without BigInt.
     pub bytes_written: u32,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn agent_ask_request_omits_local_agent_by_default() {
-        let request: AgentAskRequest =
-            serde_json::from_value(serde_json::json!({ "prompt": "explain indexing" }))
-                .expect("agent ask request should deserialize with omitted run_local_agent");
-
-        assert!(!request.run_local_agent);
-    }
-
-    #[test]
-    fn agent_ask_request_preserves_explicit_local_agent_true() {
-        let request: AgentAskRequest = serde_json::from_value(serde_json::json!({
-            "prompt": "explain indexing",
-            "run_local_agent": true
-        }))
-        .expect("agent ask request should deserialize with explicit run_local_agent");
-
-        assert!(request.run_local_agent);
-    }
 }

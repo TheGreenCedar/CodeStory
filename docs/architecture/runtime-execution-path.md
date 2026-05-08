@@ -72,23 +72,16 @@ sequenceDiagram
     participant Runtime as codestory-runtime
     participant Search as runtime search
     participant Graph as runtime graph builders
-    participant Agent as optional local agent
 
     CLI->>Runtime: AgentAskRequest
     Runtime->>Search: scored hybrid retrieval
     Runtime->>Graph: neighborhood, trail, snippets, citations
     Runtime-->>CLI: AgentAnswerDto with trace and evidence
-    opt --with-local-agent
-        Runtime->>Agent: constrained local prompt
-        Agent-->>Runtime: markdown synthesis
-    end
     CLI->>CLI: render markdown/json and optional bundle
 ```
 
-`ask` is DB-first by default. It runs runtime-owned retrieval planning and answer
-packet assembly without invoking an external process. `--with-local-agent`
-opts into a local Codex or Claude command after the indexed evidence packet has
-been built.
+`ask` is DB-first. It runs runtime-owned retrieval planning and answer packet
+assembly without invoking an external process.
 
 ## Ground, Symbol, Trail, and Snippet Commands
 

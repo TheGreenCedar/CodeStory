@@ -41,7 +41,7 @@ CodeStory is building a local-first, language-aware code understanding substrate
 
 This roadmap is now represented in the CLI/runtime surface:
 
-- `ask` builds a DB-first answer packet with retrieval trace, citations, graphs, optional local-agent synthesis via `--with-local-agent`, and shareable `--bundle` artifacts.
+- `ask` builds a DB-first answer packet with retrieval trace, citations, graphs, and shareable `--bundle` artifacts.
 - `search --why` and `ground --why` add human-readable retrieval explanations; search JSON carries score breakdowns when runtime produces hybrid scored hits.
 - `explore` JSON/Markdown includes definition plus incoming/outgoing reference navigation metadata.
 - `serve` now exposes navigation HTTP routes (`/definition`, `/references`, `/symbols`) and `serve --stdio` publishes tools, resources, resource templates, and prompts.

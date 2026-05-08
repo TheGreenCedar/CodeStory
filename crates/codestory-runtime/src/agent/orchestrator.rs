@@ -1,8 +1,7 @@
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::trace::{TraceRecorder, field};
 use crate::{
-    AppController, FocusedSourceContext, HybridSearchScoredHit, LocalAgentResponse,
-    agent_backend_label, build_local_agent_prompt, configured_agent_command, fallback_mermaid,
+    AppController, FocusedSourceContext, HybridSearchScoredHit, fallback_mermaid,
     hybrid_retrieval_enabled, mermaid_flowchart, mermaid_gantt, mermaid_sequence,
 };
 use codestory_contracts::api::{
@@ -177,54 +176,12 @@ pub(crate) fn agent_ask(
         ));
     }
 
-    let local_agent_step = trace.start_step(
-        AgentRetrievalStepKindDto::LocalAgent,
-        vec![
-            field("backend", format!("{:?}", req.connection.backend)),
-            field("requested", req.run_local_agent.to_string()),
-        ],
-    );
-    let local_agent_result = if req.run_local_agent {
-        let local_agent_prompt = build_local_agent_prompt(
-            &prompt,
-            &bundle.hits,
-            bundle.focused_node.as_ref(),
-            source_context.as_ref(),
-        );
-        let result = controller.run_local_agent(&req.connection, &local_agent_prompt);
-        match &result {
-            Ok(response) => trace.finish_ok(
-                local_agent_step,
-                vec![
-                    field("backend_label", response.backend_label),
-                    field("response_chars", response.markdown.len().to_string()),
-                ],
-            ),
-            Err(error) => trace.finish_err(local_agent_step, error.message.clone()),
-        }
-        Some(result)
-    } else {
-        trace.finish_skipped(
-            local_agent_step,
-            "Local agent execution disabled for this ask request.",
-            vec![field("state", "disabled")],
-        );
-        None
-    };
-
     let synth_step = trace.start_step(
         AgentRetrievalStepKindDto::AnswerSynthesis,
         vec![field("citation_count", bundle.citations.len().to_string())],
     );
 
-    let sections = build_sections(
-        &prompt,
-        &resolved_profile,
-        &bundle,
-        source_context.as_ref(),
-        &req,
-        local_agent_result.as_ref(),
-    );
+    let sections = build_sections(&prompt, &resolved_profile, &bundle, source_context.as_ref());
 
     trace.finish_ok(
         synth_step,
@@ -277,7 +234,7 @@ pub(crate) fn agent_ask(
         "agent ask completed"
     );
 
-    let summary = summarize_response(&resolved_profile, &bundle, local_agent_result.as_ref());
+    let summary = summarize_response(&resolved_profile, &bundle);
 
     Ok(AgentAnswerDto {
         answer_id: request_id,
@@ -1569,36 +1526,12 @@ fn build_sections(
     resolved_profile: &ResolvedProfile,
     bundle: &RetrievalBundle,
     source_context: Option<&FocusedSourceContext>,
-    req: &AgentAskRequest,
-    local_agent_result: Option<&Result<LocalAgentResponse, ApiError>>,
 ) -> Vec<AgentResponseSectionDto> {
     let mut sections = Vec::new();
 
-    let mut analysis_blocks = Vec::new();
-    match local_agent_result {
-        Some(Ok(agent)) => {
-            analysis_blocks.push(AgentResponseBlockDto::Markdown {
-                markdown: format!("{}\n\n_Executed via `{}`._", agent.markdown, agent.command),
-            });
-        }
-        Some(Err(error)) => {
-            let backend_label = agent_backend_label(req.connection.backend);
-            let command = configured_agent_command(&req.connection);
-            analysis_blocks.push(AgentResponseBlockDto::Markdown {
-                markdown: format!(
-                    "Could not run local {} command `{}`.\\
-\nReason: {}\\
-\nContinuing with indexed DB-first retrieval evidence.",
-                    backend_label, command, error.message
-                ),
-            });
-        }
-        None => {
-            analysis_blocks.push(AgentResponseBlockDto::Markdown {
-                markdown: "Local agent execution was skipped; this answer is assembled from indexed DB-first retrieval evidence.".to_string(),
-            });
-        }
-    }
+    let mut analysis_blocks = vec![AgentResponseBlockDto::Markdown {
+        markdown: "Answer assembled from indexed DB-first retrieval evidence.".to_string(),
+    }];
 
     if let Some(primary_mermaid_id) = first_mermaid_graph_id(&bundle.graphs) {
         analysis_blocks.push(AgentResponseBlockDto::Mermaid {
@@ -1748,34 +1681,14 @@ fn first_mermaid_graph_id(graphs: &[GraphArtifactDto]) -> Option<String> {
     })
 }
 
-fn summarize_response(
-    resolved_profile: &ResolvedProfile,
-    bundle: &RetrievalBundle,
-    local_agent_result: Option<&Result<LocalAgentResponse, ApiError>>,
-) -> String {
-    match local_agent_result {
-        Some(Ok(agent)) => format!(
-            "{} analyzed {} indexed match(es) in {:?} mode and generated {} graph artifact(s).",
-            agent.backend_label,
-            bundle.hits.len(),
-            resolved_profile.policy_mode,
-            bundle.graphs.len()
-        ),
-        Some(Err(_)) => format!(
-            "DB-first retrieval ({:?}/{:?}) returned {} indexed match(es) and {} graph artifact(s).",
-            resolved_profile.preset,
-            resolved_profile.policy_mode,
-            bundle.hits.len(),
-            bundle.graphs.len()
-        ),
-        None => format!(
-            "DB-first retrieval ({:?}/{:?}) returned {} indexed match(es) and {} graph artifact(s) without launching a local agent.",
-            resolved_profile.preset,
-            resolved_profile.policy_mode,
-            bundle.hits.len(),
-            bundle.graphs.len()
-        ),
-    }
+fn summarize_response(resolved_profile: &ResolvedProfile, bundle: &RetrievalBundle) -> String {
+    format!(
+        "DB-first retrieval ({:?}/{:?}) returned {} indexed match(es) and {} graph artifact(s).",
+        resolved_profile.preset,
+        resolved_profile.policy_mode,
+        bundle.hits.len(),
+        bundle.graphs.len()
+    )
 }
 
 fn next_request_id() -> String {
@@ -1784,128 +1697,6 @@ fn next_request_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("ask-{}", nanos)
-}
-
-#[allow(dead_code)]
-fn should_use_agent_term_planner(prompt: &str, hit_count: usize) -> bool {
-    if hit_count >= 3 {
-        return false;
-    }
-    prompt.split_whitespace().count() >= 4
-}
-
-#[allow(dead_code)]
-fn build_term_planner_prompt(
-    prompt: &str,
-    existing_hits: &[SearchHit],
-    max_terms: usize,
-) -> String {
-    let seed = existing_hits
-        .iter()
-        .take(5)
-        .map(|hit| hit.display_name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    format!(
-        "You are selecting code-symbol search terms.\n\
-User question: {prompt}\n\
-Current symbol hits: {}\n\
-Return ONLY a comma-separated list of up to {max_terms} concise code search terms (identifiers, modules, or API names). \
-No explanation, no markdown, no numbering.",
-        if seed.is_empty() {
-            "(none)"
-        } else {
-            seed.as_str()
-        }
-    )
-}
-
-#[allow(dead_code)]
-fn parse_agent_terms(markdown: &str, max_terms: usize) -> Vec<String> {
-    let normalized = markdown.replace('\r', "\n").replace(['\n', ';'], ",");
-
-    let mut terms = Vec::new();
-    let mut seen = HashSet::<String>::new();
-
-    for raw in normalized.split(',') {
-        let trimmed = raw
-            .trim()
-            .trim_matches(['`', '"', '\'', '“', '”', '‘', '’'])
-            .trim_start_matches([
-                '-', '*', '•', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', ')',
-            ])
-            .trim();
-
-        if trimmed.len() < 3 || trimmed.len() > 80 {
-            continue;
-        }
-
-        let has_signal = trimmed
-            .chars()
-            .any(|ch| ch.is_ascii_alphabetic() || ch == '_' || ch == ':');
-        if !has_signal {
-            continue;
-        }
-
-        let key = trimmed.to_ascii_lowercase();
-        if seen.insert(key) {
-            terms.push(trimmed.to_string());
-        }
-
-        if terms.len() >= max_terms {
-            break;
-        }
-    }
-
-    terms
-}
-
-#[allow(dead_code)]
-fn request_agent_search_terms(
-    controller: &AppController,
-    req: &AgentAskRequest,
-    prompt: &str,
-    existing_hits: &[SearchHit],
-    trace: &mut TraceRecorder,
-    max_terms: usize,
-) -> Vec<String> {
-    let planner_step = trace.start_step(
-        AgentRetrievalStepKindDto::LocalAgent,
-        vec![
-            field("purpose", "term_planning"),
-            field("existing_hits", existing_hits.len().to_string()),
-            field("max_terms", max_terms.to_string()),
-        ],
-    );
-
-    let planner_prompt = build_term_planner_prompt(prompt, existing_hits, max_terms);
-    match controller.run_local_agent(&req.connection, &planner_prompt) {
-        Ok(response) => {
-            let terms = parse_agent_terms(&response.markdown, max_terms);
-            trace.finish_ok(
-                planner_step,
-                vec![
-                    field("backend_label", response.backend_label),
-                    field("terms_count", terms.len().to_string()),
-                ],
-            );
-            if terms.is_empty() {
-                trace.annotate("Agent term planner returned no usable terms.");
-            } else {
-                trace.annotate(format!(
-                    "Agent term planner proposed terms: {}",
-                    terms.join(", ")
-                ));
-            }
-            terms
-        }
-        Err(error) => {
-            trace.finish_err(planner_step, error.message.clone());
-            trace.annotate("Agent term planner failed; falling back to heuristic terms.");
-            Vec::new()
-        }
-    }
 }
 
 #[allow(dead_code)]
@@ -2213,8 +2004,6 @@ mod tests {
                 latency_budget_ms: None,
                 include_evidence: true,
                 hybrid_weights: None,
-                connection: codestory_contracts::api::AgentConnectionSettingsDto::default(),
-                run_local_agent: true,
             },
             "inspect this",
             Instant::now(),

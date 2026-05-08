@@ -318,7 +318,7 @@ fn explore_layer_notes(
             "query_resolution: `{}` resolved to `{}`",
             target.requested, target.selected.display_name
         ),
-        "local_agent: not used by explore; use ask --focus-id for agent synthesis".to_string(),
+        "ask: use ask --focus-id for a DB-first answer packet around this target".to_string(),
         format!("output_write: target `{output_target}` passed preflight"),
         snippet_layer_note.to_string(),
     ];

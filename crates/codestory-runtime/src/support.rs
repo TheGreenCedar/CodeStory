@@ -1,11 +1,8 @@
 use crate::search_runtime::HybridSearchConfig;
-use codestory_contracts::api::{
-    AgentHybridWeightsDto, NodeDetailsDto, SearchHit, SearchHybridLimitsDto,
-};
+use codestory_contracts::api::{AgentHybridWeightsDto, SearchHybridLimitsDto};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fmt::Write as _;
 
 pub(crate) const HYBRID_RETRIEVAL_ENABLED_ENV: &str = "CODESTORY_HYBRID_RETRIEVAL_ENABLED";
 
@@ -304,78 +301,4 @@ pub(crate) struct FocusedSourceContext {
     pub(crate) path: String,
     pub(crate) line: u32,
     pub(crate) snippet: String,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct LocalAgentResponse {
-    pub(crate) backend_label: &'static str,
-    pub(crate) command: String,
-    pub(crate) markdown: String,
-}
-
-pub(crate) fn truncate_for_diagnostic(raw: &str, max_chars: usize) -> String {
-    let mut compact = raw.trim().replace('\r', "");
-    if compact.len() > max_chars {
-        compact.truncate(max_chars);
-        compact.push_str("...");
-    }
-    compact
-}
-
-pub(crate) fn build_local_agent_prompt(
-    user_prompt: &str,
-    hits: &[SearchHit],
-    focused_node: Option<&NodeDetailsDto>,
-    focused_source: Option<&FocusedSourceContext>,
-) -> String {
-    let mut out = String::new();
-    out.push_str("You are a codebase assistant. Use only the provided indexed context.\n");
-    out.push_str("Do not run tools or execute commands. If context is insufficient, say so.\n\n");
-    let _ = writeln!(out, "User request:\n{}\n", user_prompt.trim());
-
-    out.push_str("Indexed symbol hits:\n");
-    if hits.is_empty() {
-        out.push_str("- none\n");
-    } else {
-        for hit in hits.iter().take(8) {
-            let location = match (&hit.file_path, hit.line) {
-                (Some(path), Some(line)) => format!(" ({path}:{line})"),
-                (Some(path), None) => format!(" ({path})"),
-                _ => String::new(),
-            };
-            let _ = writeln!(
-                out,
-                "- {} [{:?}] score {:.3}{}",
-                hit.display_name, hit.kind, hit.score, location
-            );
-        }
-    }
-
-    if let Some(node) = focused_node {
-        let _ = writeln!(
-            out,
-            "\nFocused symbol:\n- {} [{:?}]",
-            node.display_name, node.kind
-        );
-        if let Some(path) = node.file_path.as_deref() {
-            let _ = writeln!(out, "- file: {}", path);
-        }
-        if let Some(line) = node.start_line {
-            let _ = writeln!(out, "- start line: {}", line);
-        }
-    }
-
-    if let Some(source) = focused_source {
-        let _ = writeln!(
-            out,
-            "\nSource snippet from {}:{}:\n{}",
-            source.path, source.line, source.snippet
-        );
-    }
-
-    out.push_str(
-        "\nRespond in markdown with:\n1. Summary\n2. Key findings\n3. Recommended next steps\n",
-    );
-
-    out
 }

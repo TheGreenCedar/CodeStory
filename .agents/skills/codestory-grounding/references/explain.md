@@ -15,7 +15,6 @@ target/release/codestory-cli(.exe) explain [OPTIONS] [PROMPT]
 | `--refresh <mode>` | `auto` | Opens or refreshes the index before collecting evidence. |
 | `--max-results <n>` | `12` | Caps anchor and ask retrieval breadth. |
 | `--format <format>` | `markdown` | `markdown` or `json`. |
-| `--with-local-agent` | off | Run the configured local agent after indexed retrieval. |
 
 ## Usage
 
@@ -30,6 +29,5 @@ target/release/codestory-cli(.exe) explain [OPTIONS] [PROMPT]
 - Use `doctor` first in manual E2E tests when you need to prove semantic health.
 - If `doctor` reports semantic partial/stale/failed, rebuild or use the lexical
   fallback recipe before treating broad explanations as authoritative.
-- `explain` is still evidence-first: without `--with-local-agent`, it labels the
-  answer as DB-first/no-local-agent rather than pretending a synthesis model read
-  the whole repository.
+- `explain` is evidence-first: it labels the answer as a DB-first repo
+  explanation packet backed by indexed evidence.

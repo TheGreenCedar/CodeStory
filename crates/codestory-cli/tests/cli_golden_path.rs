@@ -188,46 +188,7 @@ fn install_fake_managed_embeddings(cache_dir: &Path) {
     .expect("write fake managed manifest");
 }
 
-fn run_stdio_request(
-    workspace: &Path,
-    cache_dir: &Path,
-    env_root: &Path,
-    marker: &Path,
-    request: &str,
-) -> Value {
-    let mut fake_agent_dir = env_root.join("bin");
-    if cfg!(target_os = "windows") {
-        fake_agent_dir = env_root.join("appdata").join("npm");
-        fs::create_dir_all(&fake_agent_dir).expect("create fake npm dir");
-        fs::write(
-            fake_agent_dir.join("codex.cmd"),
-            "@echo off\r\necho spawned > \"%CODESTORY_FAKE_AGENT_MARKER%\"\r\nexit /b 7\r\n",
-        )
-        .expect("write fake codex.cmd");
-    } else {
-        fs::create_dir_all(&fake_agent_dir).expect("create fake bin dir");
-        let fake_agent = fake_agent_dir.join("codex");
-        fs::write(
-            &fake_agent,
-            "#!/bin/sh\necho spawned > \"$CODESTORY_FAKE_AGENT_MARKER\"\nexit 7\n",
-        )
-        .expect("write fake codex");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = fs::metadata(&fake_agent)
-                .expect("fake codex metadata")
-                .permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&fake_agent, permissions).expect("chmod fake codex");
-        }
-    }
-
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let mut path_entries = vec![fake_agent_dir.clone()];
-    path_entries.extend(std::env::split_paths(&path));
-    let path = std::env::join_paths(path_entries).expect("join PATH");
-
+fn run_stdio_request(workspace: &Path, cache_dir: &Path, request: &str) -> Value {
     let mut child = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
         .arg("serve")
         .arg("--stdio")
@@ -238,11 +199,6 @@ fn run_stdio_request(
         .arg("--cache-dir")
         .arg(cache_dir)
         .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
-        .env("CODESTORY_FAKE_AGENT_MARKER", marker)
-        .env("APPDATA", env_root.join("appdata"))
-        .env("USERPROFILE", env_root.join("home"))
-        .env("LOCALAPPDATA", env_root.join("localappdata"))
-        .env("PATH", path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1088,8 +1044,6 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
             "none",
             "--format",
             "json",
-            "--agent-command",
-            "definitely-not-codestory-local-agent",
         ],
     );
     assert!(
@@ -1239,8 +1193,6 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
             "none",
             "--format",
             "json",
-            "--agent-command",
-            "definitely-not-codestory-local-agent",
         ],
     );
     assert!(
@@ -1251,28 +1203,13 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
         array_is_non_empty(&ask, &["retrieval_trace", "steps"]),
         "ask should include a retrieval trace"
     );
-    let local_agent_step = ask["retrieval_trace"]["steps"]
-        .as_array()
-        .expect("trace steps")
-        .iter()
-        .find(|step| step["kind"] == "local_agent")
-        .expect("local agent trace step should be present");
-    assert_eq!(local_agent_step["status"], "skipped");
     assert!(
-        local_agent_step["input"]
+        ask["retrieval_trace"]["steps"]
             .as_array()
-            .expect("local agent input fields")
+            .expect("trace steps")
             .iter()
-            .any(|field| field["key"] == "requested" && field["value"] == "false"),
-        "CLI ask should not request local-agent execution without --with-local-agent"
-    );
-    assert!(
-        local_agent_step["output"]
-            .as_array()
-            .expect("local agent output fields")
-            .iter()
-            .any(|field| field["key"] == "state" && field["value"] == "disabled"),
-        "trace should make the disabled local-agent state explicit"
+            .all(|step| step["kind"] != "local_agent"),
+        "CLI ask should not include removed local-agent trace steps"
     );
 
     let removed = run_cli_json(
@@ -1295,13 +1232,9 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
         "bookmark remove should persistently delete the saved focus"
     );
 
-    let stdio_env = tempdir().expect("stdio env dir");
-    let marker = stdio_env.path().join("fake-agent-spawned.txt");
     let stdio = run_stdio_request(
         workspace.path(),
         cache_dir.path(),
-        stdio_env.path(),
-        &marker,
         r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ask","arguments":{"prompt":"What does AppController do?"}}}"#,
     );
     let stdio_result = &stdio["result"]["structuredContent"];
@@ -1310,20 +1243,8 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
             .as_array()
             .expect("stdio ask trace steps")
             .iter()
-            .any(|step| {
-                step["kind"] == "local_agent"
-                    && step["status"] == "skipped"
-                    && step["input"]
-                        .as_array()
-                        .expect("local agent input")
-                        .iter()
-                        .any(|field| field["key"] == "requested" && field["value"] == "false")
-            }),
-        "stdio ask should leave local-agent execution disabled by omission"
-    );
-    assert!(
-        !marker.exists(),
-        "stdio ask without an explicit local-agent request should not spawn a default codex command"
+            .all(|step| step["kind"] != "local_agent"),
+        "stdio ask should not include removed local-agent trace steps"
     );
 
     let search_dir_after = fs::metadata(&search_dir)
@@ -1437,8 +1358,6 @@ fn bookmarks_degrade_gracefully_after_reindex_removes_target() {
             "none",
             "--format",
             "json",
-            "--agent-command",
-            "definitely-not-codestory-local-agent",
         ],
     );
     assert!(
@@ -1569,8 +1488,6 @@ fn ask_investigate_json_reports_bounded_trace_without_changing_plain_ask() {
             "none",
             "--format",
             "json",
-            "--agent-command",
-            "definitely-not-codestory-local-agent",
         ],
     );
     assert!(
@@ -1601,8 +1518,6 @@ fn ask_investigate_json_reports_bounded_trace_without_changing_plain_ask() {
             "none",
             "--format",
             "json",
-            "--agent-command",
-            "definitely-not-codestory-local-agent",
         ],
     );
     assert!(
@@ -1683,17 +1598,8 @@ fn ask_investigate_json_reports_bounded_trace_without_changing_plain_ask() {
         "investigation JSON should expose the named mode or what-I-checked trace"
     );
 
-    let local_agent_step = trace_steps
-        .iter()
-        .find(|step| step["kind"] == "local_agent")
-        .expect("local agent trace step");
-    assert_eq!(local_agent_step["status"], "skipped");
     assert!(
-        local_agent_step["input"]
-            .as_array()
-            .expect("local agent input fields")
-            .iter()
-            .any(|field| field["key"] == "requested" && field["value"] == "false"),
-        "ask --investigate must not request local-agent execution by default"
+        trace_steps.iter().all(|step| step["kind"] != "local_agent"),
+        "ask --investigate should not include removed local-agent trace steps"
     );
 }

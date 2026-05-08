@@ -1234,7 +1234,6 @@ fn format_agent_step_kind(kind: AgentRetrievalStepKindDto) -> &'static str {
         AgentRetrievalStepKindDto::SourceRead => "source_read",
         AgentRetrievalStepKindDto::MermaidSynthesis => "mermaid_synthesis",
         AgentRetrievalStepKindDto::AnswerSynthesis => "answer_synthesis",
-        AgentRetrievalStepKindDto::LocalAgent => "local_agent",
     }
 }
 
@@ -1330,20 +1329,11 @@ fn agent_answer_mode_label(answer: &AgentAnswerDto) -> &'static str {
     let repo_explain = annotations
         .iter()
         .any(|annotation| annotation.starts_with("mode=repo_explain_"));
-    let local_agent = annotations.iter().any(|annotation| {
-        matches!(
-            annotation.as_str(),
-            "mode=local_agent" | "mode=repo_explain_local_agent"
-        )
-    });
 
-    match (repo_explain, local_agent) {
-        (true, true) => "repo explanation packet plus local-agent synthesis",
-        (true, false) => {
-            "DB-first repo explanation packet; no local coding agent was launched by `explain`"
-        }
-        (false, true) => "retrieval packet plus local-agent synthesis",
-        (false, false) => "DB-first retrieval packet; no local coding agent was launched by `ask`",
+    if repo_explain {
+        "DB-first repo explanation packet assembled from indexed evidence"
+    } else {
+        "DB-first retrieval packet assembled from indexed evidence"
     }
 }
 
@@ -2581,23 +2571,13 @@ mod tests {
 
     #[test]
     fn ask_markdown_labels_repo_explain_modes() {
-        let db_first = sample_agent_answer_with_annotations(vec![
-            "mode=repo_explain_db_first_no_local_agent".to_string(),
-        ]);
+        let db_first =
+            sample_agent_answer_with_annotations(vec!["mode=repo_explain_db_first".to_string()]);
         let db_markdown = render_agent_answer_markdown(Path::new("C:/repo"), &db_first);
         assert!(
-            db_markdown.contains(
-                "mode: DB-first repo explanation packet; no local coding agent was launched by `explain`"
-            ),
+            db_markdown
+                .contains("mode: DB-first repo explanation packet assembled from indexed evidence"),
             "{db_markdown}"
-        );
-
-        let local_agent =
-            sample_agent_answer_with_annotations(vec!["mode=repo_explain_local_agent".to_string()]);
-        let local_markdown = render_agent_answer_markdown(Path::new("C:/repo"), &local_agent);
-        assert!(
-            local_markdown.contains("mode: repo explanation packet plus local-agent synthesis"),
-            "{local_markdown}"
         );
     }
 
