@@ -336,7 +336,7 @@ The main limitations are sharper:
 - **Acceptance criteria**:
   - Stored semantic docs report profile/model/backend/dimension/doc-shape enough to explain reuse or rebuild.
   - `doctor` warns when stored docs and current env/config disagree.
-  - Missing managed assets, stopped managed server, and external llama.cpp endpoint failures remain clear fallbacks, not silent degradation.
+  - Missing managed ONNX assets and external legacy llama.cpp endpoint failures remain clear fallbacks, not silent degradation.
 - **Validation**:
   - hash backend normal path
   - fake llama.cpp path

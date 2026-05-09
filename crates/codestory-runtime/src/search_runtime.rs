@@ -7,6 +7,7 @@ pub use crate::search::engine::{
     EmbeddingRuntimeAvailability, HybridSearchConfig, HybridSearchHit, LLAMACPP_EMBEDDINGS_URL_ENV,
     LLAMACPP_REQUEST_COUNT_ENV, LlmSearchDoc, STORED_VECTOR_ENCODING_ENV,
     embedding_profile_contract_from_env, embedding_runtime_availability_from_env,
+    probe_onnx_runtime_paths,
 };
 
 pub mod embedding {

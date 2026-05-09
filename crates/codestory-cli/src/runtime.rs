@@ -76,16 +76,14 @@ impl RuntimeContext {
         Self::new_with_startup(args, ManagedEmbeddingStartup::InspectOnly)
     }
 
-    fn new_with_startup(args: &ProjectArgs, startup: ManagedEmbeddingStartup) -> Result<Self> {
+    fn new_with_startup(args: &ProjectArgs, _startup: ManagedEmbeddingStartup) -> Result<Self> {
         let project_root = canonicalize_project_root(&args.project)?;
         let config = crate::config::load_config(&project_root)?;
         let cache_override = args.cache_dir.as_deref().or(config.cache_dir.as_deref());
         let cache_root = cache_root_for_project(&project_root, cache_override)?;
         let managed_embeddings_root =
             crate::managed_embeddings::managed_root(args.cache_dir.as_deref())?;
-        if startup == ManagedEmbeddingStartup::AutostartIfInstalled {
-            crate::managed_embeddings::prepare_runtime_if_installed(&managed_embeddings_root);
-        }
+        crate::managed_embeddings::prepare_runtime_if_installed(&managed_embeddings_root);
         let storage_path = cache_root.join("codestory.db");
         let runtime = Runtime::new();
         let events = runtime.events();
@@ -156,118 +154,170 @@ pub(crate) fn resolve_target(
             })
         }
         TargetSelection::Query { query, choose } => {
-            let mut alternatives = runtime
-                .browser
-                .search_hybrid(
-                    SearchRequest {
-                        query: query.clone(),
-                        repo_text: SearchRepoTextMode::Off,
-                        limit_per_source: 50,
-                        hybrid_weights: None,
-                        hybrid_limits: None,
-                    },
-                    None,
-                    Some(50),
-                    None,
-                )
-                .map_err(map_api_error)?;
-            if let Some(file_filter) = file_filter {
-                alternatives.retain(|hit| {
-                    search_hit_matches_file_filter(&runtime.project_root, hit, file_filter)
-                });
-            }
-            if alternatives.is_empty() {
-                return Err(no_query_match_error(
-                    &runtime.project_root,
-                    &query,
-                    file_filter,
-                ));
-            }
-
-            alternatives.sort_by(|left, right| {
-                compare_resolution_candidates(
-                    &runtime.project_root,
-                    &query,
-                    file_filter,
-                    left,
-                    right,
-                )
-            });
-
-            let tied_alternatives =
-                tied_top_alternatives(&runtime.project_root, &query, file_filter, &alternatives);
-            if let Some(choice) = choose {
-                if choice == 0 || choice > tied_alternatives.len() {
-                    bail!(
-                        "`--choose {choice}` is outside the displayed alternative range 1..={}. Re-run without `--choose` to inspect the current alternatives.",
-                        tied_alternatives.len()
-                    );
-                }
-                let selected = tied_alternatives[choice - 1].clone();
-                let mut alternatives = alternatives;
-                if let Some(position) = alternatives
-                    .iter()
-                    .position(|hit| hit.node_id == selected.node_id)
-                {
-                    let chosen = alternatives.remove(position);
-                    alternatives.insert(0, chosen);
-                }
-                return Ok(ResolvedTarget {
-                    selector: QuerySelectorOutput::Query,
-                    requested: query,
-                    file_filter: file_filter.map(ToOwned::to_owned),
-                    selected,
-                    alternatives,
-                });
-            }
-
-            if tied_alternatives.len() > 1 {
-                let error = ambiguous_query_error(
-                    &runtime.project_root,
-                    &query,
-                    file_filter,
-                    &tied_alternatives,
-                );
-                return Err(AmbiguousTargetError {
-                    query,
-                    file_filter: file_filter.map(ToOwned::to_owned),
-                    alternatives: tied_alternatives,
-                    message: error,
-                }
-                .into());
-            }
-
-            if alternatives.len() > 1 {
-                let rank1 = resolution_candidate_rank(
-                    &runtime.project_root,
-                    &query,
-                    file_filter,
-                    &alternatives[1],
-                );
-                debug_assert_ne!(
-                    resolution_candidate_rank(
-                        &runtime.project_root,
-                        &query,
-                        file_filter,
-                        &alternatives[0],
-                    ),
-                    rank1
-                );
-            }
-
-            let selected = alternatives
-                .first()
-                .cloned()
-                .ok_or_else(|| no_query_match_error(&runtime.project_root, &query, file_filter))?;
-
-            Ok(ResolvedTarget {
-                selector: QuerySelectorOutput::Query,
-                requested: query,
-                file_filter: file_filter.map(ToOwned::to_owned),
-                selected,
-                alternatives,
-            })
+            resolve_query_target(runtime, query, choose, file_filter)
         }
+    }
+}
+
+fn resolve_query_target(
+    runtime: &RuntimeContext,
+    query: String,
+    choose: Option<usize>,
+    file_filter: Option<&str>,
+) -> Result<ResolvedTarget> {
+    let alternatives = query_resolution_alternatives(runtime, &query, file_filter)?;
+    let tied_alternatives =
+        tied_top_alternatives(&runtime.project_root, &query, file_filter, &alternatives);
+
+    if let Some(choice) = choose {
+        return resolve_chosen_query_target(
+            query,
+            file_filter,
+            alternatives,
+            tied_alternatives,
+            choice,
+        );
+    }
+
+    reject_ambiguous_query_target(
+        &runtime.project_root,
+        &query,
+        file_filter,
+        tied_alternatives,
+    )?;
+    debug_assert_unique_top_candidate(&runtime.project_root, &query, file_filter, &alternatives);
+
+    let selected = alternatives
+        .first()
+        .cloned()
+        .ok_or_else(|| no_query_match_error(&runtime.project_root, &query, file_filter))?;
+    Ok(query_resolved_target(
+        query,
+        file_filter,
+        selected,
+        alternatives,
+    ))
+}
+
+fn query_resolution_alternatives(
+    runtime: &RuntimeContext,
+    query: &str,
+    file_filter: Option<&str>,
+) -> Result<Vec<SearchHit>> {
+    let mut alternatives = runtime
+        .browser
+        .search_hybrid(
+            SearchRequest {
+                query: query.to_owned(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 50,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            },
+            None,
+            Some(50),
+            None,
+        )
+        .map_err(map_api_error)?;
+    if let Some(file_filter) = file_filter {
+        alternatives
+            .retain(|hit| search_hit_matches_file_filter(&runtime.project_root, hit, file_filter));
+    }
+    if alternatives.is_empty() {
+        return Err(no_query_match_error(
+            &runtime.project_root,
+            query,
+            file_filter,
+        ));
+    }
+
+    alternatives.sort_by(|left, right| {
+        compare_resolution_candidates(&runtime.project_root, query, file_filter, left, right)
+    });
+    Ok(alternatives)
+}
+
+fn resolve_chosen_query_target(
+    query: String,
+    file_filter: Option<&str>,
+    mut alternatives: Vec<SearchHit>,
+    tied_alternatives: Vec<SearchHit>,
+    choice: usize,
+) -> Result<ResolvedTarget> {
+    if choice == 0 || choice > tied_alternatives.len() {
+        bail!(
+            "`--choose {choice}` is outside the displayed alternative range 1..={}. Re-run without `--choose` to inspect the current alternatives.",
+            tied_alternatives.len()
+        );
+    }
+
+    let selected = tied_alternatives[choice - 1].clone();
+    promote_selected_alternative(&mut alternatives, &selected);
+    Ok(query_resolved_target(
+        query,
+        file_filter,
+        selected,
+        alternatives,
+    ))
+}
+
+fn promote_selected_alternative(alternatives: &mut Vec<SearchHit>, selected: &SearchHit) {
+    if let Some(position) = alternatives
+        .iter()
+        .position(|hit| hit.node_id == selected.node_id)
+    {
+        let chosen = alternatives.remove(position);
+        alternatives.insert(0, chosen);
+    }
+}
+
+fn reject_ambiguous_query_target(
+    project_root: &Path,
+    query: &str,
+    file_filter: Option<&str>,
+    tied_alternatives: Vec<SearchHit>,
+) -> Result<()> {
+    if tied_alternatives.len() <= 1 {
+        return Ok(());
+    }
+
+    let message = ambiguous_query_error(project_root, query, file_filter, &tied_alternatives);
+    Err(AmbiguousTargetError {
+        query: query.to_owned(),
+        file_filter: file_filter.map(ToOwned::to_owned),
+        alternatives: tied_alternatives,
+        message,
+    }
+    .into())
+}
+
+fn debug_assert_unique_top_candidate(
+    project_root: &Path,
+    query: &str,
+    file_filter: Option<&str>,
+    alternatives: &[SearchHit],
+) {
+    if alternatives.len() > 1 {
+        let rank1 = resolution_candidate_rank(project_root, query, file_filter, &alternatives[1]);
+        debug_assert_ne!(
+            resolution_candidate_rank(project_root, query, file_filter, &alternatives[0]),
+            rank1
+        );
+    }
+}
+
+fn query_resolved_target(
+    query: String,
+    file_filter: Option<&str>,
+    selected: SearchHit,
+    alternatives: Vec<SearchHit>,
+) -> ResolvedTarget {
+    ResolvedTarget {
+        selector: QuerySelectorOutput::Query,
+        requested: query,
+        file_filter: file_filter.map(ToOwned::to_owned),
+        selected,
+        alternatives,
     }
 }
 

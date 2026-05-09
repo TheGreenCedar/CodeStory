@@ -4,42 +4,47 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
 
 use crate::args::{CliEmbeddingQuant, CliLlamaVariant};
 
-pub(crate) const MANAGED_LLAMACPP_URL: &str = "http://127.0.0.1:8080/v1/embeddings";
-const MANAGED_HOST: &str = "127.0.0.1";
-const MANAGED_PORT: u16 = 8080;
-const MANAGED_EMBEDDING_DIM: usize = 768;
-const LLAMA_RELEASE_TAG: &str = "b9058";
+const MANAGED_ONNX_BACKEND_LABEL: &str = "onnx";
+const MANAGED_ONNX_PROVIDER: &str = if cfg!(target_os = "windows") {
+    "directml"
+} else {
+    "cpu"
+};
+const MANAGED_DOC_EMBED_BATCH_SIZE: usize = 2048;
+const MANAGED_SEMANTIC_DOC_MAX_TOKENS: usize = 512;
+const MANAGED_ONNX_BATCH_TOKENS: usize = 32_768;
+const MANAGED_STORED_VECTOR_ENCODING: &str = "int8";
 const MANAGED_DIR_NAME: &str = "managed-embeddings";
-const DISABLE_AUTOSTART_ENV: &str = "CODESTORY_MANAGED_EMBEDDINGS_DISABLE_AUTOSTART";
+const MANAGED_POOLED_ONNX_MODEL_NAME: &str = "model_optimized_cls_pool.onnx";
+const ONNX_SOURCE_OUTPUT_NAME: &str = "last_hidden_state";
+const ONNX_POOLED_OUTPUT_NAME: &str = "sentence_embedding";
+const ONNX_CLS_INDEX_NAME: &str = "codestory_cls_index";
+const ONNX_CLS_POOL_NODE_NAME: &str = "codestory_cls_pool";
 const ENDPOINT_PROBE_TEXT: &str = "codestory managed embeddings health probe";
 const ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 type HttpHeaders = Vec<(String, String)>;
 type RawHttpResponse = (u16, HttpHeaders, Vec<u8>);
 
-#[derive(Debug, Clone, Copy)]
-struct LlamaAsset {
-    os: &'static str,
-    arch: &'static str,
-    variant: CliLlamaVariant,
-    name: &'static str,
-    url: &'static str,
-    sha256: &'static str,
-    size_bytes: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnnxAssetKind {
+    Model,
+    Tokenizer,
+    Auxiliary,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ModelAsset {
-    quant: CliEmbeddingQuant,
+struct OnnxAsset {
+    kind: OnnxAssetKind,
     name: &'static str,
     url: &'static str,
     sha256: &'static str,
@@ -53,77 +58,48 @@ struct HttpEndpoint {
     path: String,
 }
 
-const LLAMA_ASSETS: &[LlamaAsset] = &[
-    LlamaAsset {
-        os: "windows",
-        arch: "x86_64",
-        variant: CliLlamaVariant::Cpu,
-        name: "llama-b9058-bin-win-cpu-x64.zip",
-        url: "https://github.com/ggml-org/llama.cpp/releases/download/b9058/llama-b9058-bin-win-cpu-x64.zip",
-        sha256: "965ac174332a7edc60d9f9d1c6e5cc8243cb623c3c94d95e833a85172628ba06",
-        size_bytes: 16_045_952,
+const ONNX_ASSETS: &[OnnxAsset] = &[
+    OnnxAsset {
+        kind: OnnxAssetKind::Model,
+        name: "model_optimized.onnx",
+        url: "https://huggingface.co/Qdrant/bge-base-en-v1.5-onnx-Q/resolve/main/model_optimized.onnx",
+        sha256: "4e556722bc4f65716c544c8a931f1e90fb3f866e5741fd93a96f051d673339c7",
+        size_bytes: 217_824_172,
     },
-    LlamaAsset {
-        os: "windows",
-        arch: "x86_64",
-        variant: CliLlamaVariant::Vulkan,
-        name: "llama-b9058-bin-win-vulkan-x64.zip",
-        url: "https://github.com/ggml-org/llama.cpp/releases/download/b9058/llama-b9058-bin-win-vulkan-x64.zip",
-        sha256: "d0a52a50c021d80d49acfbdae38faafed2dd1e4923790bafb5e701f13548d893",
-        size_bytes: 33_677_020,
+    OnnxAsset {
+        kind: OnnxAssetKind::Tokenizer,
+        name: "tokenizer.json",
+        url: "https://huggingface.co/Qdrant/bge-base-en-v1.5-onnx-Q/resolve/main/tokenizer.json",
+        sha256: "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+        size_bytes: 711_396,
     },
-    LlamaAsset {
-        os: "linux",
-        arch: "x86_64",
-        variant: CliLlamaVariant::Cpu,
-        name: "llama-b9058-bin-ubuntu-x64.tar.gz",
-        url: "https://github.com/ggml-org/llama.cpp/releases/download/b9058/llama-b9058-bin-ubuntu-x64.tar.gz",
-        sha256: "2cf277637b18e4d30c95f5703dc82bb288245bbf3a16c0800738764ab219a76f",
-        size_bytes: 14_113_690,
+    OnnxAsset {
+        kind: OnnxAssetKind::Auxiliary,
+        name: "tokenizer_config.json",
+        url: "https://huggingface.co/Qdrant/bge-base-en-v1.5-onnx-Q/resolve/main/tokenizer_config.json",
+        sha256: "0b29c7bfc889e53b36d9dd3e686dd4300f6525110eaa98c76a5dafceb2029f53",
+        size_bytes: 1_242,
     },
-    LlamaAsset {
-        os: "linux",
-        arch: "x86_64",
-        variant: CliLlamaVariant::Vulkan,
-        name: "llama-b9058-bin-ubuntu-vulkan-x64.tar.gz",
-        url: "https://github.com/ggml-org/llama.cpp/releases/download/b9058/llama-b9058-bin-ubuntu-vulkan-x64.tar.gz",
-        sha256: "570d0a61897dc9c154d200dd5efd20bdd255f82f0342ca457f0188108c073fae",
-        size_bytes: 32_518_737,
+    OnnxAsset {
+        kind: OnnxAssetKind::Auxiliary,
+        name: "special_tokens_map.json",
+        url: "https://huggingface.co/Qdrant/bge-base-en-v1.5-onnx-Q/resolve/main/special_tokens_map.json",
+        sha256: "5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a",
+        size_bytes: 695,
     },
-    LlamaAsset {
-        os: "macos",
-        arch: "x86_64",
-        variant: CliLlamaVariant::Cpu,
-        name: "llama-b9058-bin-macos-x64.tar.gz",
-        url: "https://github.com/ggml-org/llama.cpp/releases/download/b9058/llama-b9058-bin-macos-x64.tar.gz",
-        sha256: "01b1aeec8a7262f11ff136b310172aa86efebbb44f8dc0d3ba93bf5e097b97aa",
-        size_bytes: 8_673_301,
+    OnnxAsset {
+        kind: OnnxAssetKind::Auxiliary,
+        name: "vocab.txt",
+        url: "https://huggingface.co/Qdrant/bge-base-en-v1.5-onnx-Q/resolve/main/vocab.txt",
+        sha256: "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3",
+        size_bytes: 231_508,
     },
-    LlamaAsset {
-        os: "macos",
-        arch: "aarch64",
-        variant: CliLlamaVariant::Cpu,
-        name: "llama-b9058-bin-macos-arm64.tar.gz",
-        url: "https://github.com/ggml-org/llama.cpp/releases/download/b9058/llama-b9058-bin-macos-arm64.tar.gz",
-        sha256: "3ad6db7e02af619afbb026afe0d05cc16f7a1d969c4c8483215a7c3bd92dd9a2",
-        size_bytes: 8_641_646,
-    },
-];
-
-const MODEL_ASSETS: &[ModelAsset] = &[
-    ModelAsset {
-        quant: CliEmbeddingQuant::Q8_0,
-        name: "bge-base-en-v1.5-q8_0.gguf",
-        url: "https://huggingface.co/CompendiumLabs/bge-base-en-v1.5-gguf/resolve/main/bge-base-en-v1.5-q8_0.gguf",
-        sha256: "ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c",
-        size_bytes: 117_974_304,
-    },
-    ModelAsset {
-        quant: CliEmbeddingQuant::Q4KM,
-        name: "bge-base-en-v1.5-q4_k_m.gguf",
-        url: "https://huggingface.co/CompendiumLabs/bge-base-en-v1.5-gguf/resolve/main/bge-base-en-v1.5-q4_k_m.gguf",
-        sha256: "74aebb552ea73b271d3b9c709923b4b7633b304fbc897a0498e52a180c3a9da9",
-        size_bytes: 68_348_448,
+    OnnxAsset {
+        kind: OnnxAssetKind::Auxiliary,
+        name: "config.json",
+        url: "https://huggingface.co/Qdrant/bge-base-en-v1.5-onnx-Q/resolve/main/config.json",
+        sha256: "86f84a5285de7f1ee673f712387219ef1e261ec27dcd870e793a80f9da1aaa3b",
+        size_bytes: 740,
     },
 ];
 
@@ -143,30 +119,26 @@ pub(crate) struct ManagedEmbeddingsStatus {
     pub(crate) message: String,
     pub(crate) root: String,
     pub(crate) endpoint: String,
-    pub(crate) llama_server: Option<String>,
     pub(crate) model: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct ManagedManifest {
-    llama_asset: Option<String>,
-    llama_path: Option<String>,
-    llama_variant: Option<CliLlamaVariant>,
-    model_asset: Option<String>,
-    model_path: Option<String>,
-    model_quant: Option<CliEmbeddingQuant>,
+    onnx_model_path: Option<String>,
+    onnx_source_model_path: Option<String>,
+    onnx_tokenizer_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ManagedEmbeddingsSetupOutput {
     pub(crate) dry_run: bool,
     pub(crate) root: String,
-    pub(crate) endpoint: String,
-    pub(crate) llama_release: String,
-    pub(crate) llama_variant: CliLlamaVariant,
-    pub(crate) model_quant: CliEmbeddingQuant,
-    pub(crate) llama: ManagedAssetOutput,
+    pub(crate) backend: String,
+    pub(crate) provider: String,
     pub(crate) model: ManagedAssetOutput,
+    pub(crate) runtime_model: ManagedAssetOutput,
+    pub(crate) tokenizer: ManagedAssetOutput,
+    pub(crate) auxiliary_assets: Vec<ManagedAssetOutput>,
     pub(crate) status: ManagedEmbeddingsStatus,
     pub(crate) next_commands: Vec<String>,
 }
@@ -186,60 +158,48 @@ pub(crate) fn managed_root(cache_override: Option<&Path>) -> Result<PathBuf> {
 
 pub(crate) fn setup_embeddings(
     root: &Path,
-    quant: CliEmbeddingQuant,
-    variant: CliLlamaVariant,
+    _quant: CliEmbeddingQuant,
+    _variant: CliLlamaVariant,
     dry_run: bool,
-    start_server: bool,
+    _start_server: bool,
 ) -> Result<ManagedEmbeddingsSetupOutput> {
-    let llama = select_llama_asset(variant)?;
-    let model = select_model_asset(quant);
-    let llama_archive = downloads_dir(root).join(llama.name);
-    let model_path = models_dir(root).join(model.name);
-    let llama_extract_dir = llama_extract_dir(root, llama);
+    let model = onnx_model_asset();
+    let tokenizer = onnx_tokenizer_asset();
+    let source_model_path = onnx_asset_path(root, model);
+    let runtime_model_path = pooled_onnx_model_path(root);
+    let tokenizer_path = onnx_asset_path(root, tokenizer);
 
     if !dry_run {
-        fs::create_dir_all(downloads_dir(root))
-            .with_context(|| format!("Failed to create {}", downloads_dir(root).display()))?;
-        fs::create_dir_all(models_dir(root))
-            .with_context(|| format!("Failed to create {}", models_dir(root).display()))?;
-        install_asset(llama.url, &llama_archive, llama.sha256)?;
-        extract_llama_archive(&llama_archive, &llama_extract_dir)?;
-        install_asset(model.url, &model_path, model.sha256)?;
-        write_manifest(root, llama, model, &llama_extract_dir, &model_path)?;
+        fs::create_dir_all(onnx_models_dir(root))
+            .with_context(|| format!("Failed to create {}", onnx_models_dir(root).display()))?;
+        for asset in ONNX_ASSETS {
+            install_asset(asset.url, &onnx_asset_path(root, asset), asset.sha256)?;
+        }
+        ensure_pooled_onnx_model(&source_model_path, &runtime_model_path)?;
+        write_onnx_manifest(
+            root,
+            model,
+            tokenizer,
+            &runtime_model_path,
+            &source_model_path,
+            &tokenizer_path,
+        )?;
     }
-
-    let status = if dry_run {
-        inspect_status(root)
-    } else if start_server {
-        start_or_reuse_managed_server(root)
-    } else {
-        inspect_status(root)
-    };
 
     Ok(ManagedEmbeddingsSetupOutput {
         dry_run,
         root: clean_path(root),
-        endpoint: MANAGED_LLAMACPP_URL.to_string(),
-        llama_release: LLAMA_RELEASE_TAG.to_string(),
-        llama_variant: llama.variant,
-        model_quant: model.quant,
-        llama: ManagedAssetOutput {
-            name: llama.name.to_string(),
-            url: llama.url.to_string(),
-            sha256: llama.sha256.to_string(),
-            size_bytes: llama.size_bytes,
-            path: clean_path(&llama_extract_dir),
-            installed: llama_server_path(root).is_some(),
-        },
-        model: ManagedAssetOutput {
-            name: model.name.to_string(),
-            url: model.url.to_string(),
-            sha256: model.sha256.to_string(),
-            size_bytes: model.size_bytes,
-            path: clean_path(&model_path),
-            installed: model_path.exists(),
-        },
-        status,
+        backend: MANAGED_ONNX_BACKEND_LABEL.to_string(),
+        provider: MANAGED_ONNX_PROVIDER.to_string(),
+        model: managed_onnx_asset_output(root, model),
+        runtime_model: managed_pooled_onnx_asset_output(root),
+        tokenizer: managed_onnx_asset_output(root, tokenizer),
+        auxiliary_assets: ONNX_ASSETS
+            .iter()
+            .filter(|asset| asset.kind == OnnxAssetKind::Auxiliary)
+            .map(|asset| managed_onnx_asset_output(root, asset))
+            .collect(),
+        status: inspect_status(root),
         next_commands: vec![
             "codestory-cli doctor --project .".to_string(),
             "codestory-cli index --project . --refresh full".to_string(),
@@ -248,19 +208,9 @@ pub(crate) fn setup_embeddings(
 }
 
 pub(crate) fn inspect_status(root: &Path) -> ManagedEmbeddingsStatus {
-    if disabled_by_embedding_env() {
-        return ManagedEmbeddingsStatus {
-            state: "disabled_by_config".to_string(),
-            message:
-                "Managed llama is skipped because embedding env config selects a non-llama backend."
-                    .to_string(),
-            root: clean_path(root),
-            endpoint: MANAGED_LLAMACPP_URL.to_string(),
-            llama_server: None,
-            model: None,
-        };
-    }
-    if let Some(url) = explicit_llama_url() {
+    if legacy_llamacpp_backend_selected()
+        && let Some(url) = explicit_llama_url()
+    {
         let state = if embedding_endpoint_ready(&url, None) {
             "external_llama_configured"
         } else {
@@ -281,61 +231,80 @@ pub(crate) fn inspect_status(root: &Path) -> ManagedEmbeddingsStatus {
             message,
             root: clean_path(root),
             endpoint: display_url,
-            llama_server: None,
             model: None,
         };
     }
 
-    let server = llama_server_path(root);
-    let model = default_model_path(root);
-    if server.is_none() || model.is_none() {
+    if legacy_llamacpp_backend_selected() {
         return ManagedEmbeddingsStatus {
-            state: "missing_managed_assets".to_string(),
+            state: "disabled_by_config".to_string(),
             message:
-                "Managed llama assets are not installed. Run `codestory-cli setup embeddings` (defaults to Vulkan; pass `--variant cpu` for the CPU fallback)."
+                "Managed ONNX is skipped because embedding env config selects legacy llama.cpp."
                     .to_string(),
             root: clean_path(root),
-            endpoint: MANAGED_LLAMACPP_URL.to_string(),
-            llama_server: server.as_ref().map(|path| clean_path(path)),
+            endpoint: MANAGED_ONNX_BACKEND_LABEL.to_string(),
+            model: None,
+        };
+    }
+
+    if disabled_by_embedding_env() {
+        return ManagedEmbeddingsStatus {
+            state: "disabled_by_config".to_string(),
+            message:
+                "Managed ONNX is skipped because embedding env config selects another backend."
+                    .to_string(),
+            root: clean_path(root),
+            endpoint: MANAGED_ONNX_BACKEND_LABEL.to_string(),
+            model: None,
+        };
+    }
+
+    let model = default_onnx_model_path(root);
+    let tokenizer = default_onnx_tokenizer_path(root);
+    if model.is_none() || tokenizer.is_none() {
+        return ManagedEmbeddingsStatus {
+            state: "missing_managed_assets".to_string(),
+            message: "Managed ONNX assets are not installed. Run `codestory-cli setup embeddings`."
+                .to_string(),
+            root: clean_path(root),
+            endpoint: MANAGED_ONNX_BACKEND_LABEL.to_string(),
             model: model.as_ref().map(|path| clean_path(path)),
         };
     }
 
-    let running = managed_endpoint_ready();
+    let model = model.expect("checked model path");
+    let tokenizer = tokenizer.expect("checked tokenizer path");
+    if let Err(error) = codestory_runtime::probe_onnx_runtime_paths(&model, &tokenizer) {
+        return ManagedEmbeddingsStatus {
+            state: "managed_onnx_unusable".to_string(),
+            message: format!(
+                "Managed ONNX assets are installed but failed runtime verification: {error}"
+            ),
+            root: clean_path(root),
+            endpoint: MANAGED_ONNX_BACKEND_LABEL.to_string(),
+            model: Some(clean_path(&model)),
+        };
+    }
+
     ManagedEmbeddingsStatus {
-        state: if running {
-            "managed_server_running"
-        } else {
-            "managed_server_stopped"
-        }
-        .to_string(),
-        message: managed_status_message(root, running),
+        state: "managed_onnx_ready".to_string(),
+        message: format!(
+            "Managed ONNX embeddings are installed with model `{}` and tokenizer `{}`.",
+            clean_path(&model),
+            clean_path(&tokenizer)
+        ),
         root: clean_path(root),
-        endpoint: MANAGED_LLAMACPP_URL.to_string(),
-        llama_server: server.as_ref().map(|path| clean_path(path)),
-        model: model.as_ref().map(|path| clean_path(path)),
+        endpoint: MANAGED_ONNX_BACKEND_LABEL.to_string(),
+        model: Some(clean_path(&model)),
     }
 }
 
 pub(crate) fn prepare_runtime_if_installed(root: &Path) {
-    if disabled_by_embedding_env()
-        || explicit_llama_url().is_some()
-        || std::env::var_os(DISABLE_AUTOSTART_ENV).is_some()
-    {
+    if disabled_by_embedding_env() || legacy_llamacpp_backend_selected() {
         return;
     }
-    if llama_server_path(root).is_none() || default_model_path(root).is_none() {
-        return;
-    }
-    if managed_endpoint_ready() {
-        set_managed_endpoint_env();
-        return;
-    }
-    let status = start_or_reuse_managed_server(root);
-    if status.state == "managed_server_running" {
-        set_managed_endpoint_env();
-    } else {
-        eprintln!("{}", status.message);
+    if default_onnx_model_path(root).is_some() && default_onnx_tokenizer_path(root).is_some() {
+        set_managed_endpoint_env(root);
     }
 }
 
@@ -343,21 +312,32 @@ pub(crate) fn render_setup_embeddings_markdown(output: &ManagedEmbeddingsSetupOu
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Managed Embeddings Setup");
     let _ = writeln!(markdown, "root: `{}`", output.root);
-    let _ = writeln!(markdown, "endpoint: `{}`", output.endpoint);
+    let _ = writeln!(markdown, "backend: `{}`", output.backend);
+    let _ = writeln!(markdown, "provider: `{}`", output.provider);
     let _ = writeln!(markdown, "dry_run: `{}`", output.dry_run);
     let _ = writeln!(markdown);
     let _ = writeln!(
         markdown,
-        "- llama: `{}` ({:?}, {} bytes)",
-        output.llama.name, output.llama_variant, output.llama.size_bytes
+        "- source_model: `{}` ({} bytes)",
+        output.model.name, output.model.size_bytes
     );
-    let _ = writeln!(markdown, "- llama_path: `{}`", output.llama.path);
+    let _ = writeln!(markdown, "- source_model_path: `{}`", output.model.path);
     let _ = writeln!(
         markdown,
-        "- model: `{}` ({:?}, {} bytes)",
-        output.model.name, output.model_quant, output.model.size_bytes
+        "- runtime_model: `{}` ({} bytes)",
+        output.runtime_model.name, output.runtime_model.size_bytes
     );
-    let _ = writeln!(markdown, "- model_path: `{}`", output.model.path);
+    let _ = writeln!(
+        markdown,
+        "- runtime_model_path: `{}`",
+        output.runtime_model.path
+    );
+    let _ = writeln!(
+        markdown,
+        "- tokenizer: `{}` ({} bytes)",
+        output.tokenizer.name, output.tokenizer.size_bytes
+    );
+    let _ = writeln!(markdown, "- tokenizer_path: `{}`", output.tokenizer.path);
     let _ = writeln!(markdown, "- status: `{}`", output.status.state);
     let _ = writeln!(markdown, "- message: {}", output.status.message);
     if !output.next_commands.is_empty() {
@@ -368,110 +348,6 @@ pub(crate) fn render_setup_embeddings_markdown(output: &ManagedEmbeddingsSetupOu
         }
     }
     markdown
-}
-
-fn start_or_reuse_managed_server(root: &Path) -> ManagedEmbeddingsStatus {
-    if managed_endpoint_ready() {
-        set_managed_endpoint_env();
-        return inspect_status(root);
-    }
-
-    let Some(server) = llama_server_path(root) else {
-        return inspect_status(root);
-    };
-    let Some(model) = default_model_path(root) else {
-        return inspect_status(root);
-    };
-    if let Err(error) = spawn_llama_server(root, &server, &model) {
-        return ManagedEmbeddingsStatus {
-            state: "managed_server_stopped".to_string(),
-            message: format!(
-                "Failed to start managed llama-server: {error:#}. Check logs in `{}`; if Vulkan startup fails on this machine, rerun setup with `--variant cpu`.",
-                clean_path(&logs_dir(root))
-            ),
-            root: clean_path(root),
-            endpoint: MANAGED_LLAMACPP_URL.to_string(),
-            llama_server: Some(clean_path(&server)),
-            model: Some(clean_path(&model)),
-        };
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        if managed_endpoint_ready() {
-            set_managed_endpoint_env();
-            return inspect_status(root);
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-
-    ManagedEmbeddingsStatus {
-        state: "managed_server_stopped".to_string(),
-        message: format!(
-            "Managed llama-server was started, but {MANAGED_LLAMACPP_URL} did not become reachable within 20 seconds. Check logs in `{}`; if Vulkan startup fails on this machine, rerun setup with `--variant cpu`.",
-            clean_path(&logs_dir(root))
-        ),
-        root: clean_path(root),
-        endpoint: MANAGED_LLAMACPP_URL.to_string(),
-        llama_server: Some(clean_path(&server)),
-        model: Some(clean_path(&model)),
-    }
-}
-
-fn spawn_llama_server(root: &Path, server: &Path, model: &Path) -> Result<()> {
-    fs::create_dir_all(logs_dir(root))
-        .with_context(|| format!("Failed to create {}", logs_dir(root).display()))?;
-    let server = canonical_child_path(root, server).with_context(|| {
-        format!(
-            "Managed llama-server path is not trusted: {}",
-            server.display()
-        )
-    })?;
-    let model = canonical_child_path(root, model)
-        .with_context(|| format!("Managed model path is not trusted: {}", model.display()))?;
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(logs_dir(root).join("llama-server.out.log"))
-        .context("Failed to open managed llama stdout log")?;
-    let stderr = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(logs_dir(root).join("llama-server.err.log"))
-        .context("Failed to open managed llama stderr log")?;
-    let mut command = Command::new(&server);
-    command
-        .args(llama_server_args(&model))
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
-    if let Some(parent) = server.parent() {
-        command.current_dir(parent);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    command
-        .spawn()
-        .with_context(|| format!("Failed to spawn {}", server.display()))?;
-    Ok(())
-}
-
-fn llama_server_args(model: &Path) -> Vec<String> {
-    vec![
-        "--embedding".to_string(),
-        "--model".to_string(),
-        model.to_string_lossy().to_string(),
-        "--pooling".to_string(),
-        "cls".to_string(),
-        "--host".to_string(),
-        MANAGED_HOST.to_string(),
-        "--port".to_string(),
-        MANAGED_PORT.to_string(),
-    ]
 }
 
 fn install_asset(url: &str, destination: &Path, expected_sha256: &str) -> Result<()> {
@@ -517,6 +393,274 @@ fn install_asset(url: &str, destination: &Path, expected_sha256: &str) -> Result
     Ok(())
 }
 
+fn ensure_pooled_onnx_model(source: &Path, destination: &Path) -> Result<()> {
+    if destination.exists()
+        && destination
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() > 0)
+    {
+        return Ok(());
+    }
+    let source_bytes =
+        fs::read(source).with_context(|| format!("Failed to read {}", source.display()))?;
+    let pooled_bytes = derive_cls_pooled_onnx_model(&source_bytes).with_context(|| {
+        format!(
+            "Failed to derive pooled ONNX model from {}",
+            source.display()
+        )
+    })?;
+    let Some(parent) = destination.parent() else {
+        bail!(
+            "Pooled ONNX destination has no parent: {}",
+            destination.display()
+        );
+    };
+    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
+    let partial = destination.with_extension("onnx.partial");
+    fs::write(&partial, pooled_bytes)
+        .with_context(|| format!("Failed to write {}", partial.display()))?;
+    fs::rename(&partial, destination).with_context(|| {
+        format!(
+            "Failed to move pooled ONNX model {} to {}",
+            partial.display(),
+            destination.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProtoField {
+    number: u32,
+    wire_type: u8,
+    start: usize,
+    value_start: usize,
+    value_end: usize,
+    end: usize,
+}
+
+fn derive_cls_pooled_onnx_model(source: &[u8]) -> Result<Vec<u8>> {
+    let fields = parse_proto_fields(source)?;
+    let mut out = Vec::with_capacity(source.len() + 512);
+    let mut rewrote_graph = false;
+    for field in fields {
+        if field.number == 7 && field.wire_type == 2 {
+            let graph = rewrite_graph_for_cls_pooling(&source[field.value_start..field.value_end])?;
+            write_len_field(&mut out, 7, &graph);
+            rewrote_graph = true;
+        } else {
+            out.extend_from_slice(&source[field.start..field.end]);
+        }
+    }
+    if !rewrote_graph {
+        bail!("ONNX ModelProto did not contain graph field 7");
+    }
+    Ok(out)
+}
+
+fn rewrite_graph_for_cls_pooling(graph: &[u8]) -> Result<Vec<u8>> {
+    let fields = parse_proto_fields(graph)?;
+    let mut source_output = None;
+    let mut already_pooled = false;
+    for field in &fields {
+        if field.number == 12
+            && field.wire_type == 2
+            && let Some(name) = value_info_name(&graph[field.value_start..field.value_end])?
+        {
+            if name == ONNX_POOLED_OUTPUT_NAME {
+                already_pooled = true;
+            }
+            if name == ONNX_SOURCE_OUTPUT_NAME {
+                source_output = Some(name);
+            } else if source_output.is_none() {
+                source_output = Some(name);
+            }
+        }
+    }
+    if already_pooled && source_output.as_deref() != Some(ONNX_SOURCE_OUTPUT_NAME) {
+        return Ok(graph.to_vec());
+    }
+    let source_output = source_output.ok_or_else(|| anyhow!("ONNX graph has no output"))?;
+
+    let mut out = Vec::with_capacity(graph.len() + 512);
+    for field in fields {
+        if field.number != 12 {
+            out.extend_from_slice(&graph[field.start..field.end]);
+        }
+    }
+    write_len_field(&mut out, 5, &cls_index_initializer());
+    write_len_field(&mut out, 1, &cls_pool_node(&source_output));
+    write_len_field(&mut out, 12, &sentence_embedding_value_info());
+    Ok(out)
+}
+
+fn value_info_name(value_info: &[u8]) -> Result<Option<String>> {
+    for field in parse_proto_fields(value_info)? {
+        if field.number == 1 && field.wire_type == 2 {
+            return String::from_utf8(value_info[field.value_start..field.value_end].to_vec())
+                .map(Some)
+                .context("ONNX ValueInfoProto name was not valid UTF-8");
+        }
+    }
+    Ok(None)
+}
+
+fn cls_pool_node(source_output: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_string_field(&mut out, 1, source_output);
+    write_string_field(&mut out, 1, ONNX_CLS_INDEX_NAME);
+    write_string_field(&mut out, 2, ONNX_POOLED_OUTPUT_NAME);
+    write_string_field(&mut out, 3, ONNX_CLS_POOL_NODE_NAME);
+    write_string_field(&mut out, 4, "Gather");
+    write_len_field(&mut out, 5, &axis_attribute());
+    out
+}
+
+fn axis_attribute() -> Vec<u8> {
+    let mut out = Vec::new();
+    write_string_field(&mut out, 1, "axis");
+    write_varint_field(&mut out, 3, 1);
+    write_varint_field(&mut out, 20, 2);
+    out
+}
+
+fn cls_index_initializer() -> Vec<u8> {
+    let mut out = Vec::new();
+    write_varint_field(&mut out, 2, 7);
+    write_string_field(&mut out, 8, ONNX_CLS_INDEX_NAME);
+    write_len_field(&mut out, 9, &0_i64.to_le_bytes());
+    out
+}
+
+fn sentence_embedding_value_info() -> Vec<u8> {
+    let mut out = Vec::new();
+    write_string_field(&mut out, 1, ONNX_POOLED_OUTPUT_NAME);
+    write_len_field(&mut out, 2, &float_tensor_type_proto());
+    out
+}
+
+fn float_tensor_type_proto() -> Vec<u8> {
+    let mut tensor = Vec::new();
+    write_varint_field(&mut tensor, 1, 1);
+    write_len_field(&mut tensor, 2, &sentence_embedding_shape_proto());
+
+    let mut out = Vec::new();
+    write_len_field(&mut out, 1, &tensor);
+    out
+}
+
+fn sentence_embedding_shape_proto() -> Vec<u8> {
+    let mut out = Vec::new();
+    write_len_field(&mut out, 1, &dim_param("batch_size"));
+    write_len_field(&mut out, 1, &dim_value(768));
+    out
+}
+
+fn dim_param(value: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_string_field(&mut out, 2, value);
+    out
+}
+
+fn dim_value(value: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_varint_field(&mut out, 1, value);
+    out
+}
+
+fn parse_proto_fields(bytes: &[u8]) -> Result<Vec<ProtoField>> {
+    let mut fields = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let start = offset;
+        let tag = read_varint(bytes, &mut offset)?;
+        let wire_type = (tag & 0x07) as u8;
+        let number = u32::try_from(tag >> 3).context("protobuf field number was too large")?;
+        let mut value_start = offset;
+        match wire_type {
+            0 => {
+                let _ = read_varint(bytes, &mut offset)?;
+            }
+            1 => {
+                offset = offset
+                    .checked_add(8)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or_else(|| anyhow!("truncated fixed64 protobuf field"))?;
+            }
+            2 => {
+                let len = usize::try_from(read_varint(bytes, &mut offset)?)
+                    .context("length-delimited protobuf field was too large")?;
+                value_start = offset;
+                offset = offset
+                    .checked_add(len)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or_else(|| anyhow!("truncated length-delimited protobuf field"))?;
+            }
+            5 => {
+                offset = offset
+                    .checked_add(4)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or_else(|| anyhow!("truncated fixed32 protobuf field"))?;
+            }
+            other => bail!("unsupported protobuf wire type {other}"),
+        }
+        fields.push(ProtoField {
+            number,
+            wire_type,
+            start,
+            value_start,
+            value_end: offset,
+            end: offset,
+        });
+    }
+    Ok(fields)
+}
+
+fn read_varint(bytes: &[u8], offset: &mut usize) -> Result<u64> {
+    let mut value = 0_u64;
+    let mut shift = 0_u32;
+    while *offset < bytes.len() {
+        let byte = bytes[*offset];
+        *offset += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+        if shift >= 64 {
+            bail!("protobuf varint was too long");
+        }
+    }
+    bail!("truncated protobuf varint")
+}
+
+fn write_string_field(out: &mut Vec<u8>, number: u32, value: &str) {
+    write_len_field(out, number, value.as_bytes());
+}
+
+fn write_varint_field(out: &mut Vec<u8>, number: u32, value: u64) {
+    write_tag(out, number, 0);
+    write_varint(out, value);
+}
+
+fn write_len_field(out: &mut Vec<u8>, number: u32, value: &[u8]) {
+    write_tag(out, number, 2);
+    write_varint(out, value.len() as u64);
+    out.extend_from_slice(value);
+}
+
+fn write_tag(out: &mut Vec<u8>, number: u32, wire_type: u8) {
+    write_varint(out, (u64::from(number) << 3) | u64::from(wire_type));
+}
+
+fn write_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
 fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
     let actual = sha256_file(path)?;
     if !actual.eq_ignore_ascii_case(expected) {
@@ -553,112 +697,6 @@ fn hex_lower(bytes: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
-}
-
-fn extract_llama_archive(archive: &Path, destination: &Path) -> Result<()> {
-    let marker = destination.join(".codestory-extracted");
-    if marker.exists() && llama_server_in_dir(destination).is_some() {
-        return Ok(());
-    }
-    let entries = archive_entries(archive)?;
-    validate_archive_entries(&entries)?;
-    let staging = destination.with_extension("staging");
-    if staging.exists() {
-        fs::remove_dir_all(&staging)
-            .with_context(|| format!("Failed to remove {}", staging.display()))?;
-    }
-    fs::create_dir_all(&staging)
-        .with_context(|| format!("Failed to create {}", staging.display()))?;
-    let tar = trusted_tool_path(
-        "tar",
-        &[
-            archive.parent().unwrap_or_else(|| Path::new(".")),
-            destination,
-        ],
-    )?;
-    let status = Command::new(&tar)
-        .arg("-xf")
-        .arg(archive)
-        .arg("-C")
-        .arg(&staging)
-        .status()
-        .with_context(|| {
-            format!(
-                "Failed to run trusted tar at {} while extracting {}",
-                tar.display(),
-                archive.display()
-            )
-        })?;
-    if !status.success() {
-        bail!("tar failed while extracting {}", archive.display());
-    }
-    if destination.exists() {
-        fs::remove_dir_all(destination)
-            .with_context(|| format!("Failed to remove {}", destination.display()))?;
-    }
-    fs::rename(&staging, destination).with_context(|| {
-        format!(
-            "Failed to move extracted llama archive {} to {}",
-            staging.display(),
-            destination.display()
-        )
-    })?;
-    fs::write(marker, b"ok").context("Failed to write managed extraction marker")?;
-    Ok(())
-}
-
-fn archive_entries(archive: &Path) -> Result<Vec<String>> {
-    let tar = trusted_tool_path("tar", &[archive.parent().unwrap_or_else(|| Path::new("."))])?;
-    let output = Command::new(&tar)
-        .arg("-tf")
-        .arg(archive)
-        .output()
-        .with_context(|| {
-            format!(
-                "Failed to run trusted tar at {} while listing {}",
-                tar.display(),
-                archive.display()
-            )
-        })?;
-    if !output.status.success() {
-        bail!(
-            "tar failed while listing {}\nstderr:\n{}",
-            archive.display(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
-}
-
-pub(crate) fn validate_archive_entries(entries: &[String]) -> Result<()> {
-    if entries.is_empty() {
-        bail!("Managed llama archive did not contain any entries");
-    }
-    for entry in entries {
-        if !archive_entry_is_safe(entry) {
-            bail!("Unsafe archive entry in managed llama asset: {entry}");
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn archive_entry_is_safe(entry: &str) -> bool {
-    let trimmed = entry.trim();
-    if trimmed.is_empty()
-        || trimmed.starts_with('/')
-        || trimmed.starts_with('\\')
-        || trimmed.contains(':')
-    {
-        return false;
-    }
-    let path = Path::new(trimmed);
-    path.components()
-        .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
 fn trusted_tool_path(tool: &str, disallowed_roots: &[&Path]) -> Result<PathBuf> {
@@ -726,25 +764,27 @@ fn path_is_under_disallowed_root(path: &Path, disallowed_roots: &[&Path]) -> boo
         .any(|root| path.starts_with(root))
 }
 
-fn write_manifest(
+fn write_onnx_manifest(
     root: &Path,
-    llama: LlamaAsset,
-    model: ModelAsset,
-    llama_extract_dir: &Path,
-    model_path: &Path,
+    model: &OnnxAsset,
+    tokenizer: &OnnxAsset,
+    runtime_model_path: &Path,
+    source_model_path: &Path,
+    tokenizer_path: &Path,
 ) -> Result<()> {
     fs::create_dir_all(root).with_context(|| format!("Failed to create {}", root.display()))?;
     let manifest = serde_json::json!({
-        "llama_release": LLAMA_RELEASE_TAG,
-        "llama_asset": llama.name,
-        "llama_sha256": llama.sha256,
-        "llama_path": clean_path(llama_extract_dir),
-        "llama_variant": llama.variant,
-        "model_asset": model.name,
-        "model_sha256": model.sha256,
-        "model_path": clean_path(model_path),
-        "model_quant": model.quant,
-        "endpoint": MANAGED_LLAMACPP_URL,
+        "backend": MANAGED_ONNX_BACKEND_LABEL,
+        "provider": MANAGED_ONNX_PROVIDER,
+        "onnx_model_asset": model.name,
+        "onnx_model_sha256": model.sha256,
+        "onnx_model_path": clean_path(runtime_model_path),
+        "onnx_source_model_path": clean_path(source_model_path),
+        "onnx_pooled_output": ONNX_POOLED_OUTPUT_NAME,
+        "onnx_tokenizer_asset": tokenizer.name,
+        "onnx_tokenizer_sha256": tokenizer.sha256,
+        "onnx_tokenizer_path": clean_path(tokenizer_path),
+        "onnx_assets": ONNX_ASSETS.iter().map(|asset| asset.name).collect::<Vec<_>>(),
     });
     fs::write(
         root.join("manifest.json"),
@@ -754,57 +794,65 @@ fn write_manifest(
     Ok(())
 }
 
-fn select_llama_asset(variant: CliLlamaVariant) -> Result<LlamaAsset> {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    if let Some(asset) = LLAMA_ASSETS
+fn onnx_model_asset() -> &'static OnnxAsset {
+    ONNX_ASSETS
         .iter()
-        .copied()
-        .find(|asset| asset.os == os && asset.arch == arch && asset.variant == variant)
-    {
-        return Ok(asset);
-    }
-    if variant == CliLlamaVariant::Vulkan
-        && let Some(asset) = LLAMA_ASSETS.iter().copied().find(|asset| {
-            asset.os == os && asset.arch == arch && asset.variant == CliLlamaVariant::Cpu
-        })
-    {
-        return Ok(asset);
-    }
-    Err(anyhow!(
-        "No pinned llama.cpp {variant:?} asset for {os}/{arch}. Use --variant cpu or an external llama.cpp endpoint via CODESTORY_EMBED_LLAMACPP_URL."
-    ))
+        .find(|asset| asset.kind == OnnxAssetKind::Model)
+        .expect("managed ONNX model asset is pinned")
 }
 
-fn select_model_asset(quant: CliEmbeddingQuant) -> ModelAsset {
-    MODEL_ASSETS
+fn onnx_tokenizer_asset() -> &'static OnnxAsset {
+    ONNX_ASSETS
         .iter()
-        .copied()
-        .find(|asset| asset.quant == quant)
-        .expect("all CLI model quant values have a pinned asset")
+        .find(|asset| asset.kind == OnnxAssetKind::Tokenizer)
+        .expect("managed ONNX tokenizer asset is pinned")
 }
 
-fn downloads_dir(root: &Path) -> PathBuf {
-    root.join("downloads")
+fn managed_onnx_asset_output(root: &Path, asset: &OnnxAsset) -> ManagedAssetOutput {
+    let path = onnx_asset_path(root, asset);
+    ManagedAssetOutput {
+        name: asset.name.to_string(),
+        url: asset.url.to_string(),
+        sha256: asset.sha256.to_string(),
+        size_bytes: asset.size_bytes,
+        path: clean_path(&path),
+        installed: path.exists(),
+    }
 }
 
-fn models_dir(root: &Path) -> PathBuf {
-    root.join("models").join("bge-base-en-v1.5-gguf")
+fn managed_pooled_onnx_asset_output(root: &Path) -> ManagedAssetOutput {
+    let path = pooled_onnx_model_path(root);
+    let size_bytes = fs::metadata(&path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let sha256 = if path.exists() {
+        sha256_file(&path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    ManagedAssetOutput {
+        name: MANAGED_POOLED_ONNX_MODEL_NAME.to_string(),
+        url: format!(
+            "derived:{}#{ONNX_CLS_POOL_NODE_NAME}",
+            onnx_model_asset().name
+        ),
+        sha256,
+        size_bytes,
+        path: clean_path(&path),
+        installed: path.exists(),
+    }
 }
 
-fn logs_dir(root: &Path) -> PathBuf {
-    root.join("logs")
+fn onnx_models_dir(root: &Path) -> PathBuf {
+    root.join("models").join("bge-base-en-v1.5-onnx-qdrant")
 }
 
-fn llama_extract_dir(root: &Path, asset: LlamaAsset) -> PathBuf {
-    let archive_label = asset
-        .name
-        .strip_suffix(".tar.gz")
-        .or_else(|| asset.name.strip_suffix(".zip"))
-        .unwrap_or(asset.name);
-    root.join("llama")
-        .join(LLAMA_RELEASE_TAG)
-        .join(archive_label)
+fn onnx_asset_path(root: &Path, asset: &OnnxAsset) -> PathBuf {
+    onnx_models_dir(root).join(asset.name)
+}
+
+fn pooled_onnx_model_path(root: &Path) -> PathBuf {
+    onnx_models_dir(root).join(MANAGED_POOLED_ONNX_MODEL_NAME)
 }
 
 fn manifest_child_path(root: &Path, raw_path: &str) -> Option<PathBuf> {
@@ -832,63 +880,52 @@ fn canonical_child_path(root: &Path, path: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn default_model_path(root: &Path) -> Option<PathBuf> {
+fn default_onnx_model_path(root: &Path) -> Option<PathBuf> {
     if let Some(manifest) = read_manifest(root)
-        && let Some(model_path) = manifest.model_path
+        && let Some(model_path) = manifest.onnx_model_path
         && let Some(path) = manifest_child_path(root, &model_path)
+        && path.exists()
     {
-        if path.exists() {
-            return Some(path);
-        }
+        return Some(path);
     }
-    MODEL_ASSETS
-        .iter()
-        .filter_map(|asset| canonical_child_path(root, &models_dir(root).join(asset.name)).ok())
-        .find(|path| path.exists())
+    let pooled_path = pooled_onnx_model_path(root);
+    if let Some(path) = canonical_child_path(root, &pooled_path)
+        .ok()
+        .filter(|path| path.exists())
+    {
+        return Some(path);
+    }
+    if let Some(manifest) = read_manifest(root)
+        && let Some(source_model_path) = manifest.onnx_source_model_path
+        && let Some(path) = manifest_child_path(root, &source_model_path)
+        && path.exists()
+    {
+        return Some(path);
+    }
+    let path = onnx_asset_path(root, onnx_model_asset());
+    canonical_child_path(root, &path)
+        .ok()
+        .filter(|path| path.exists())
 }
 
-fn llama_server_path(root: &Path) -> Option<PathBuf> {
+fn default_onnx_tokenizer_path(root: &Path) -> Option<PathBuf> {
     if let Some(manifest) = read_manifest(root)
-        && let Some(llama_path) = manifest.llama_path
-        && let Some(dir) = manifest_child_path(root, &llama_path)
-        && let Some(server) =
-            llama_server_in_dir(&dir).and_then(|path| canonical_child_path(root, &path).ok())
+        && let Some(tokenizer_path) = manifest.onnx_tokenizer_path
+        && let Some(path) = manifest_child_path(root, &tokenizer_path)
+        && path.exists()
     {
-        return Some(server);
+        return Some(path);
     }
-    let llama_root = root.join("llama").join(LLAMA_RELEASE_TAG);
-    llama_server_in_dir(&llama_root).and_then(|path| canonical_child_path(root, &path).ok())
+    let path = onnx_asset_path(root, onnx_tokenizer_asset());
+    canonical_child_path(root, &path)
+        .ok()
+        .filter(|path| path.exists())
 }
 
 fn read_manifest(root: &Path) -> Option<ManagedManifest> {
     let path = root.join("manifest.json");
     let bytes = fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
-}
-
-fn llama_server_in_dir(root: &Path) -> Option<PathBuf> {
-    let executable = if cfg!(target_os = "windows") {
-        "llama-server.exe"
-    } else {
-        "llama-server"
-    };
-    find_file_named(root, executable)
-}
-
-fn find_file_named(root: &Path, name: &str) -> Option<PathBuf> {
-    let entries = fs::read_dir(root).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.file_name().and_then(|value| value.to_str()) == Some(name) {
-            return Some(path);
-        }
-        if path.is_dir()
-            && let Some(found) = find_file_named(&path, name)
-        {
-            return Some(found);
-        }
-    }
-    None
 }
 
 fn disabled_by_embedding_env() -> bool {
@@ -902,6 +939,14 @@ fn disabled_by_embedding_env() -> bool {
         )
 }
 
+fn legacy_llamacpp_backend_selected() -> bool {
+    env_value_is_llamacpp("CODESTORY_EMBED_RUNTIME_MODE")
+        || env_value_is_llamacpp("CODESTORY_EMBED_BACKEND")
+        || (explicit_llama_url().is_some()
+            && env_value_is_unset("CODESTORY_EMBED_RUNTIME_MODE")
+            && env_value_is_unset("CODESTORY_EMBED_BACKEND"))
+}
+
 fn env_value_is_hash(name: &str) -> bool {
     matches!(
         std::env::var(name)
@@ -911,21 +956,77 @@ fn env_value_is_hash(name: &str) -> bool {
     )
 }
 
+fn env_value_is_llamacpp(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "llamacpp" | "llama.cpp" | "llama-cpp" | "gguf")
+    )
+}
+
+fn env_value_is_unset(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+}
+
 fn explicit_llama_url() -> Option<String> {
     std::env::var("CODESTORY_EMBED_LLAMACPP_URL")
         .ok()
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty() && value != MANAGED_LLAMACPP_URL)
+        .filter(|value| !value.is_empty())
 }
 
-fn set_managed_endpoint_env() {
+fn set_managed_endpoint_env(root: &Path) {
+    let Some(model_path) = default_onnx_model_path(root) else {
+        return;
+    };
+    let Some(tokenizer_path) = default_onnx_tokenizer_path(root) else {
+        return;
+    };
     unsafe {
-        std::env::set_var("CODESTORY_EMBED_LLAMACPP_URL", MANAGED_LLAMACPP_URL);
+        set_env_default_str("CODESTORY_EMBED_BACKEND", MANAGED_ONNX_BACKEND_LABEL);
+        set_env_default_str("CODESTORY_EMBED_ONNX_MODEL", &clean_path(&model_path));
+        set_env_default_str(
+            "CODESTORY_EMBED_ONNX_TOKENIZER",
+            &clean_path(&tokenizer_path),
+        );
+        set_env_default_str("CODESTORY_EMBED_ONNX_PROVIDER", MANAGED_ONNX_PROVIDER);
+        set_env_default(
+            "CODESTORY_EMBED_ONNX_BATCH_TOKENS",
+            MANAGED_ONNX_BATCH_TOKENS,
+        );
+        set_env_default(
+            "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE",
+            MANAGED_DOC_EMBED_BATCH_SIZE,
+        );
+        set_env_default(
+            "CODESTORY_SEMANTIC_DOC_MAX_TOKENS",
+            MANAGED_SEMANTIC_DOC_MAX_TOKENS,
+        );
+        set_env_default_str(
+            "CODESTORY_STORED_VECTOR_ENCODING",
+            MANAGED_STORED_VECTOR_ENCODING,
+        );
     }
 }
 
-fn managed_endpoint_ready() -> bool {
-    embedding_endpoint_ready(MANAGED_LLAMACPP_URL, Some(MANAGED_EMBEDDING_DIM))
+unsafe fn set_env_default(key: &str, value: usize) {
+    if std::env::var_os(key).is_none() {
+        unsafe {
+            std::env::set_var(key, value.to_string());
+        }
+    }
+}
+
+unsafe fn set_env_default_str(key: &str, value: &str) {
+    if std::env::var_os(key).is_none() {
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
 }
 
 pub(crate) fn embedding_endpoint_ready(url: &str, expected_dimension: Option<usize>) -> bool {
@@ -983,49 +1084,31 @@ fn post_json_to_endpoint(endpoint: &HttpEndpoint, request: &JsonValue) -> Result
     } else {
         body
     };
-    serde_json::from_slice(&body).with_context(|| {
-        format!(
-            "failed to parse JSON response from embedding endpoint {}",
-            endpoint.url()
-        )
-    })
+    serde_json::from_slice(&body)
+        .with_context(|| format!("failed to parse JSON response from {}", endpoint.url()))
 }
 
-fn parse_embedding_probe_response(
-    response: JsonValue,
-    expected_dimension: Option<usize>,
-) -> Result<usize> {
-    let data = response
-        .get("data")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| anyhow!("embedding probe response missing `data` array"))?;
-    if data.len() != 1 {
-        bail!(
-            "embedding probe response returned {} vectors for one input",
-            data.len()
-        );
+fn parse_http_endpoint(url: &str) -> Option<HttpEndpoint> {
+    let rest = url.trim().strip_prefix("http://")?;
+    let (authority, path) = rest
+        .split_once('/')
+        .map(|(authority, path)| (authority, format!("/{path}")))
+        .unwrap_or((rest, "/v1/embeddings".to_string()));
+    let (host, port) = if let Some((host, raw_port)) = authority.rsplit_once(':') {
+        (host.to_string(), raw_port.parse::<u16>().ok()?)
+    } else {
+        (authority.to_string(), 80)
+    };
+    if host.trim().is_empty() {
+        return None;
     }
-    let embedding = data[0]
-        .get("embedding")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| anyhow!("embedding probe response item missing `embedding`"))?;
-    if embedding.is_empty() {
-        bail!("embedding probe response returned an empty embedding");
+    Some(HttpEndpoint { host, port, path })
+}
+
+impl HttpEndpoint {
+    fn url(&self) -> String {
+        format!("http://{}:{}{}", self.host, self.port, self.path)
     }
-    if embedding.iter().any(|value| value.as_f64().is_none()) {
-        bail!("embedding probe response contained a non-numeric embedding value");
-    }
-    let dimension = embedding.len();
-    if let Some(expected_dimension) = expected_dimension
-        && dimension != expected_dimension
-    {
-        bail!(
-            "embedding probe response dimension mismatch: expected {}, got {}",
-            expected_dimension,
-            dimension
-        );
-    }
-    Ok(dimension)
 }
 
 fn split_http_response(response: &[u8]) -> Result<RawHttpResponse> {
@@ -1083,371 +1166,256 @@ fn decode_chunked_http_body(body: &[u8]) -> Result<Vec<u8>> {
     Ok(decoded)
 }
 
-fn parse_http_endpoint(url: &str) -> Option<HttpEndpoint> {
-    let rest = url.strip_prefix("http://")?;
-    let (authority, path) = rest
-        .split_once('/')
-        .map(|(authority, path)| (authority, format!("/{path}")))
-        .unwrap_or((rest, "/v1/embeddings".to_string()));
-    let (host, port) = if let Some((host, raw_port)) = authority.rsplit_once(':') {
-        (host.to_string(), raw_port.parse::<u16>().ok()?)
-    } else {
-        (authority.to_string(), 80)
-    };
-    (!host.trim().is_empty()).then_some(HttpEndpoint { host, port, path })
+fn parse_embedding_probe_response(
+    response: JsonValue,
+    expected_dimension: Option<usize>,
+) -> Result<usize> {
+    let data = response
+        .get("data")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| anyhow!("embedding probe response missing `data` array"))?;
+    let first = data
+        .first()
+        .ok_or_else(|| anyhow!("embedding probe response returned no vectors"))?;
+    let embedding = first
+        .get("embedding")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| anyhow!("embedding probe response item missing `embedding`"))?;
+    let dimension = embedding.len();
+    if let Some(expected_dimension) = expected_dimension
+        && dimension != expected_dimension
+    {
+        bail!("embedding probe returned dimension {dimension}, expected {expected_dimension}");
+    }
+    Ok(dimension)
 }
 
-impl HttpEndpoint {
-    fn url(&self) -> String {
-        format!("http://{}:{}{}", self.host, self.port, self.path)
+pub(crate) fn redact_url_for_display(value: &str) -> String {
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return value.to_string();
+    };
+    let rest = rest
+        .split_once('#')
+        .map(|(before, _)| before)
+        .unwrap_or(rest);
+    let rest = rest
+        .split_once('?')
+        .map(|(before, _)| before)
+        .unwrap_or(rest);
+    let (authority, suffix) = rest.split_once('/').unwrap_or((rest, ""));
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    if suffix.is_empty() {
+        format!("{scheme}://{host_port}")
+    } else {
+        format!("{scheme}://{host_port}/{suffix}")
     }
 }
 
 fn clean_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
-pub(crate) fn redact_url_for_display(value: &str) -> String {
-    let trimmed = value.trim();
-    let Some((scheme, rest)) = trimmed.split_once("://") else {
-        return "set".to_string();
-    };
-    let without_fragment = rest.split('#').next().unwrap_or(rest);
-    let without_query = without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(without_fragment);
-    let host_and_path = without_query
-        .rsplit_once('@')
-        .map(|(_, after_userinfo)| after_userinfo)
-        .unwrap_or(without_query);
-    format!("{scheme}://{host_and_path}")
-}
-
-fn managed_status_message(root: &Path, running: bool) -> String {
-    let install = managed_install_label(root)
-        .map(|label| format!(" using {label}"))
-        .unwrap_or_default();
-    if running {
-        format!(
-            "Managed llama.cpp endpoint accepted an embeddings probe at {MANAGED_LLAMACPP_URL}{install}."
-        )
-    } else {
-        format!(
-            "Managed llama assets are installed{install}, but llama-server is not reachable. Run `codestory-cli setup embeddings` to start it; if Vulkan startup fails on this machine, rerun setup with `--variant cpu`."
-        )
-    }
-}
-
-fn managed_install_label(root: &Path) -> Option<String> {
-    let manifest = read_manifest(root)?;
-    let llama = manifest
-        .llama_asset
-        .as_deref()
-        .or_else(|| manifest.llama_variant.map(llama_variant_label))?;
-    let model = manifest
-        .model_asset
-        .as_deref()
-        .or_else(|| manifest.model_quant.map(model_quant_label))?;
-    Some(format!("`{llama}` and `{model}`"))
-}
-
-fn llama_variant_label(variant: CliLlamaVariant) -> &'static str {
-    match variant {
-        CliLlamaVariant::Cpu => "cpu",
-        CliLlamaVariant::Vulkan => "vulkan",
-    }
-}
-
-fn model_quant_label(quant: CliEmbeddingQuant) -> &'static str {
-    match quant {
-        CliEmbeddingQuant::Q8_0 => "q8_0",
-        CliEmbeddingQuant::Q4KM => "q4_k_m",
-    }
+    crate::display::clean_path_string(&path.to_string_lossy())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
-    use tempfile::tempdir;
 
-    fn endpoint_serving_response(response: String) -> String {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind probe server");
-        let port = listener.local_addr().expect("probe server addr").port();
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept probe request");
-            let mut request = Vec::new();
-            let mut buffer = [0u8; 1024];
-            loop {
-                let read = stream.read(&mut buffer).expect("read probe request");
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..read]);
-                if request_is_complete(&request) {
-                    break;
-                }
-            }
-            stream
-                .write_all(response.as_bytes())
-                .expect("write probe response");
-        });
-        format!("http://127.0.0.1:{port}/v1/embeddings")
-    }
-
-    fn request_is_complete(request: &[u8]) -> bool {
-        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
-            return false;
-        };
-        let headers = String::from_utf8_lossy(&request[..header_end]);
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                let (key, value) = line.split_once(':')?;
-                key.trim()
-                    .eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap_or(0);
-        request.len() >= header_end + 4 + content_length
-    }
-
-    fn json_http_response(body: serde_json::Value) -> String {
-        let body = serde_json::to_string(&body).expect("json body");
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        )
+    fn clean_test_path(path: &Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
     }
 
     #[test]
-    fn archive_entry_safety_rejects_traversal_and_absolute_paths() {
-        assert!(archive_entry_is_safe("bin/llama-server.exe"));
-        assert!(archive_entry_is_safe("./bin/llama-server"));
-        assert!(!archive_entry_is_safe("../escape"));
-        assert!(!archive_entry_is_safe("/absolute"));
-        assert!(!archive_entry_is_safe("C:/absolute"));
-        assert!(!archive_entry_is_safe("dir/../../escape"));
-    }
-
-    #[test]
-    fn checksum_verification_detects_mismatch() {
-        let temp = tempdir().expect("temp dir");
-        let file = temp.path().join("asset.bin");
-        fs::write(&file, b"asset").expect("write asset");
-        let actual = sha256_file(&file).expect("sha256");
-        assert!(verify_sha256(&file, &actual).is_ok());
-        assert!(
-            verify_sha256(
-                &file,
-                "0000000000000000000000000000000000000000000000000000000000000000"
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn setup_dry_run_reports_pinned_assets_without_writing() {
-        let temp = tempdir().expect("temp dir");
+    fn setup_dry_run_reports_pinned_onnx_assets_without_writing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("managed");
         let output = setup_embeddings(
-            temp.path(),
+            &root,
             CliEmbeddingQuant::Q8_0,
             CliLlamaVariant::Cpu,
             true,
             false,
         )
-        .expect("dry-run setup");
-        assert!(output.dry_run);
-        assert!(output.llama.url.contains("ggml-org/llama.cpp"));
-        assert!(
-            output
-                .model
-                .url
-                .contains("CompendiumLabs/bge-base-en-v1.5-gguf")
-        );
-        assert!(!temp.path().join("downloads").exists());
-    }
+        .expect("dry run");
 
-    #[test]
-    fn vulkan_selection_falls_back_to_cpu_when_platform_has_no_vulkan_asset() {
-        let asset = select_llama_asset(CliLlamaVariant::Vulkan).expect("default asset");
-        if std::env::consts::OS == "macos" {
-            assert_eq!(asset.variant, CliLlamaVariant::Cpu);
-        } else if std::env::consts::ARCH == "x86_64" {
-            assert_eq!(asset.variant, CliLlamaVariant::Vulkan);
-        }
-    }
-
-    #[test]
-    fn manifest_selected_server_path_wins_when_multiple_variants_exist() {
-        let temp = tempdir().expect("temp dir");
-        let root = temp.path();
-        let executable = if cfg!(target_os = "windows") {
-            "llama-server.exe"
-        } else {
-            "llama-server"
-        };
-        let cpu_dir = root.join("llama").join(LLAMA_RELEASE_TAG).join("cpu");
-        let vulkan_dir = root.join("llama").join(LLAMA_RELEASE_TAG).join("vulkan");
-        fs::create_dir_all(&cpu_dir).expect("create cpu dir");
-        fs::create_dir_all(&vulkan_dir).expect("create vulkan dir");
-        fs::write(cpu_dir.join(executable), b"cpu").expect("write cpu server");
-        fs::write(vulkan_dir.join(executable), b"vulkan").expect("write vulkan server");
-
-        fs::write(
-            root.join("manifest.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "llama_asset": "llama-b9058-bin-win-vulkan-x64.zip",
-                "llama_path": clean_path(&vulkan_dir),
-                "llama_variant": "vulkan",
-                "model_asset": "bge-base-en-v1.5-q8_0.gguf",
-                "model_path": clean_path(&root.join("models/bge-base-en-v1.5-q8_0.gguf")),
-                "model_quant": "q8_0",
-            }))
-            .expect("manifest json"),
-        )
-        .expect("write manifest");
-
-        let selected = llama_server_path(root).expect("selected server");
+        assert_eq!(output.backend, "onnx");
+        assert!(output.model.url.contains("Qdrant/bge-base-en-v1.5-onnx-Q"));
+        assert_eq!(output.model.name, "model_optimized.onnx");
+        assert_eq!(output.runtime_model.name, MANAGED_POOLED_ONNX_MODEL_NAME);
         assert_eq!(
-            selected,
-            fs::canonicalize(vulkan_dir.join(executable)).expect("canonical vulkan server")
+            output.runtime_model.url,
+            "derived:model_optimized.onnx#codestory_cls_pool"
         );
-    }
-
-    #[test]
-    fn server_command_uses_embedding_endpoint_contract() {
-        let args = llama_server_args(Path::new("model.gguf"));
-        assert!(
-            args.windows(2)
-                .any(|pair| pair[0] == "--model" && pair[1] == "model.gguf")
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair[0] == "--pooling" && pair[1] == "cls")
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair[0] == "--host" && pair[1] == MANAGED_HOST)
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair[0] == "--port" && pair[1] == MANAGED_PORT.to_string())
-        );
-        assert!(args.iter().any(|arg| arg == "--embedding"));
-    }
-
-    #[test]
-    fn embedding_endpoint_probe_accepts_openai_embeddings_response() {
-        let url = endpoint_serving_response(json_http_response(serde_json::json!({
-            "data": [{
-                "index": 0,
-                "embedding": vec![0.125_f32; MANAGED_EMBEDDING_DIM],
-            }]
-        })));
-
-        probe_embedding_endpoint(&url, Some(MANAGED_EMBEDDING_DIM))
-            .expect("valid embedding endpoint should pass");
-    }
-
-    #[test]
-    fn embedding_endpoint_probe_rejects_plain_http_response() {
-        let url = endpoint_serving_response(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok"
-                .to_string(),
-        );
-
-        assert!(!embedding_endpoint_ready(&url, Some(MANAGED_EMBEDDING_DIM)));
-    }
-
-    #[test]
-    fn embedding_endpoint_probe_rejects_wrong_managed_dimension() {
-        let url = endpoint_serving_response(json_http_response(serde_json::json!({
-            "data": [{
-                "index": 0,
-                "embedding": [0.1, 0.2, 0.3],
-            }]
-        })));
-
-        assert!(!embedding_endpoint_ready(&url, Some(MANAGED_EMBEDDING_DIM)));
-    }
-
-    #[test]
-    fn external_embedding_endpoint_probe_does_not_require_managed_dimension() {
-        let url = endpoint_serving_response(json_http_response(serde_json::json!({
-            "data": [{
-                "index": 0,
-                "embedding": [0.1, 0.2, 0.3],
-            }]
-        })));
-
-        probe_embedding_endpoint(&url, None).expect("external endpoint should not require dim");
+        assert!(!output.runtime_model.installed);
+        assert_eq!(output.tokenizer.name, "tokenizer.json");
+        assert!(!root.exists(), "dry run should not write managed files");
     }
 
     #[test]
     fn manifest_paths_are_under_managed_root() {
-        let temp = tempdir().expect("temp dir");
+        let temp = tempfile::tempdir().expect("tempdir");
         let root = managed_root(Some(temp.path())).expect("managed root");
-        assert!(root.starts_with(temp.path()));
-        assert!(root.ends_with(MANAGED_DIR_NAME));
+        let model_dir = onnx_models_dir(&root);
+        fs::create_dir_all(&model_dir).expect("model dir");
+        let model = model_dir.join("model_optimized.onnx");
+        let tokenizer = model_dir.join("tokenizer.json");
+        fs::write(&model, b"model").expect("model");
+        fs::write(&tokenizer, b"tokenizer").expect("tokenizer");
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "onnx_model_path": clean_test_path(&model),
+                "onnx_tokenizer_path": clean_test_path(&tokenizer),
+            }))
+            .expect("manifest"),
+        )
+        .expect("manifest write");
+
+        assert_eq!(
+            default_onnx_model_path(&root).expect("model"),
+            fs::canonicalize(&model).expect("canonical model")
+        );
+        assert_eq!(
+            default_onnx_tokenizer_path(&root).expect("tokenizer"),
+            fs::canonicalize(&tokenizer).expect("canonical tokenizer")
+        );
     }
 
     #[test]
     fn manifest_paths_outside_managed_root_are_ignored() {
-        let temp = tempdir().expect("temp dir");
-        let root = temp.path().join("managed");
-        let outside = temp.path().join("outside");
-        let executable = if cfg!(target_os = "windows") {
-            "llama-server.exe"
-        } else {
-            "llama-server"
-        };
-        fs::create_dir_all(&root).expect("create managed root");
-        fs::create_dir_all(&outside).expect("create outside dir");
-        fs::write(outside.join(executable), b"not trusted").expect("write outside server");
-        fs::write(outside.join("model.gguf"), b"not trusted").expect("write outside model");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = managed_root(Some(temp.path())).expect("managed root");
+        let outside = temp.path().join("outside.onnx");
+        fs::create_dir_all(&root).expect("root");
+        fs::write(&outside, b"outside").expect("outside");
         fs::write(
             root.join("manifest.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "llama_path": clean_path(&outside),
-                "model_path": clean_path(&outside.join("model.gguf")),
+                "onnx_model_path": clean_test_path(&outside),
+                "onnx_tokenizer_path": clean_test_path(&outside),
             }))
-            .expect("manifest json"),
+            .expect("manifest"),
         )
-        .expect("write manifest");
+        .expect("manifest write");
 
-        assert!(llama_server_path(&root).is_none());
-        assert!(default_model_path(&root).is_none());
+        assert!(default_onnx_model_path(&root).is_none());
+        assert!(default_onnx_tokenizer_path(&root).is_none());
     }
 
     #[test]
-    fn trusted_tool_lookup_rejects_disallowed_roots() {
-        let temp = tempdir().expect("temp dir");
-        let disallowed = temp.path().join("repo");
-        let other = temp.path().join("tools");
-        fs::create_dir_all(&disallowed).expect("create disallowed");
-        fs::create_dir_all(&other).expect("create tools");
-        let tool = if cfg!(target_os = "windows") {
-            "codestory-test-tool.exe"
-        } else {
-            "codestory-test-tool"
-        };
-        let disallowed_tool = disallowed.join(tool);
-        let trusted_tool = other.join(tool);
-        fs::write(&disallowed_tool, b"bad").expect("write disallowed tool");
-        fs::write(&trusted_tool, b"ok").expect("write trusted tool");
+    fn endpoint_probe_rejects_wrong_dimension() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer).expect("read");
+            let body = r#"{"data":[{"embedding":[1.0,2.0]}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+        });
+        let url = format!("http://{addr}/v1/embeddings");
+        assert!(!embedding_endpoint_ready(&url, Some(768)));
+        handle.join().expect("server");
+    }
 
-        assert!(path_is_under_disallowed_root(
-            &fs::canonicalize(disallowed_tool).expect("canonical disallowed"),
-            &[&disallowed]
-        ));
-        assert!(!path_is_under_disallowed_root(
-            &fs::canonicalize(trusted_tool).expect("canonical trusted"),
-            &[&disallowed]
-        ));
+    #[test]
+    fn redacts_basic_auth_in_urls() {
+        assert_eq!(
+            redact_url_for_display("http://user:secret@127.0.0.1:8080/v1/embeddings"),
+            "http://127.0.0.1:8080/v1/embeddings"
+        );
+    }
+
+    #[test]
+    fn redacts_query_and_fragment_in_urls() {
+        assert_eq!(
+            redact_url_for_display("https://user:secret@example.test/v1/embeddings?token=abc#frag"),
+            "https://example.test/v1/embeddings"
+        );
+    }
+
+    #[test]
+    fn derives_cls_pooled_onnx_graph_output() {
+        let graph = minimal_last_hidden_state_graph();
+        let mut model = Vec::new();
+        write_len_field(&mut model, 7, &graph);
+
+        let derived = derive_cls_pooled_onnx_model(&model).expect("derive pooled model");
+        let model_fields = parse_proto_fields(&derived).expect("model fields");
+        let graph_field = model_fields
+            .iter()
+            .find(|field| field.number == 7)
+            .expect("graph field");
+        let graph_bytes = &derived[graph_field.value_start..graph_field.value_end];
+        let graph_fields = parse_proto_fields(graph_bytes).expect("graph fields");
+
+        let outputs = graph_fields
+            .iter()
+            .filter(|field| field.number == 12)
+            .map(|field| {
+                value_info_name(&graph_bytes[field.value_start..field.value_end])
+                    .expect("value info")
+                    .expect("name")
+            })
+            .collect::<Vec<_>>();
+        let node_names = graph_fields
+            .iter()
+            .filter(|field| field.number == 1)
+            .filter_map(|field| {
+                node_name(&graph_bytes[field.value_start..field.value_end]).expect("node")
+            })
+            .collect::<Vec<_>>();
+        let initializer_names = graph_fields
+            .iter()
+            .filter(|field| field.number == 5)
+            .filter_map(|field| {
+                tensor_name(&graph_bytes[field.value_start..field.value_end]).expect("tensor")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(outputs, vec![ONNX_POOLED_OUTPUT_NAME]);
+        assert!(node_names.contains(&ONNX_CLS_POOL_NODE_NAME.to_string()));
+        assert!(initializer_names.contains(&ONNX_CLS_INDEX_NAME.to_string()));
+    }
+
+    fn minimal_last_hidden_state_graph() -> Vec<u8> {
+        let mut graph = Vec::new();
+        write_string_field(&mut graph, 2, "test_graph");
+        write_len_field(&mut graph, 12, &last_hidden_state_value_info());
+        graph
+    }
+
+    fn last_hidden_state_value_info() -> Vec<u8> {
+        let mut value_info = Vec::new();
+        write_string_field(&mut value_info, 1, ONNX_SOURCE_OUTPUT_NAME);
+        value_info
+    }
+
+    fn node_name(bytes: &[u8]) -> Result<Option<String>> {
+        string_field(bytes, 3)
+    }
+
+    fn tensor_name(bytes: &[u8]) -> Result<Option<String>> {
+        string_field(bytes, 8)
+    }
+
+    fn string_field(bytes: &[u8], number: u32) -> Result<Option<String>> {
+        for field in parse_proto_fields(bytes)? {
+            if field.number == number && field.wire_type == 2 {
+                return String::from_utf8(bytes[field.value_start..field.value_end].to_vec())
+                    .map(Some)
+                    .context("protobuf string field was not valid UTF-8");
+            }
+        }
+        Ok(None)
     }
 }

@@ -7,11 +7,11 @@ decisions and points to the comparison matrix, not raw run ledgers.
 
 | Area | Decision | Why it matters |
 | --- | --- | --- |
-| Real local embeddings | Use `CODESTORY_EMBED_BACKEND=llamacpp`. | This is the active real-model path. |
+| Real local embeddings | Use `CODESTORY_EMBED_BACKEND=onnx`. | Managed setup now installs an in-process ONNX Runtime BGE-base path instead of launching llama.cpp. |
 | Deterministic local checks | Use `CODESTORY_EMBED_RUNTIME_MODE=hash`. | Keeps local-dev and CI checks reproducible without model services. |
 | Default model profile | `CODESTORY_EMBED_PROFILE=bge-base-en-v1.5`. | BGE-base remains the best quality/speed family for the active runtime. |
 | Default doc shape | `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=alias_variant`, durable semantic scope. | Compact aliases help retrieval without the noise of full alias text. |
-| Current incumbent pipeline candidate | BGE-base Q8 GGUF through llama.cpp/Vulkan, batch `512`, request count `6`, server batch `1024`, server microbatch `1024`, stored vectors `int8`, full-text enabled. | This is the segment-2 baseline after the benchmark repair; it beat repeated q5, no-fulltext, r5, BGE-small, `current_alias`, and `no_alias` scouts. |
+| Current benchmark baseline | Historical BGE-base Q8 GGUF through llama.cpp/Vulkan remains the last fully scored broad-holdout baseline; the active managed runtime is now BGE-base ONNX and needs a fresh benchmark row. | Do not compare new ONNX speed numbers against old llama.cpp rows without rerunning the quality and cross-repo gates. |
 | Peak memory evidence | Segment-2 q8/r6 baseline measured peak descendant working set `828.726562 MB`; repeat sampled `1019.789062 MB`; `peak_vram_mb` was unavailable on this host. | Memory is now measured explicitly, but sampled peak RAM is noisy enough that tiny memory wins need repeats. |
 | Evidence standard | Quality gates and rank profiles come before speed. | A faster row is rejected when MRR, Hit@10, rank1/rank2-10, or misses regress. |
 

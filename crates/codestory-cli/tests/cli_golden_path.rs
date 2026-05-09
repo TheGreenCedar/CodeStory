@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
 
 fn write_tiny_rust_workspace(root: &Path) {
@@ -153,35 +153,33 @@ fn clean_test_path(path: &Path) -> String {
 
 fn install_fake_managed_embeddings(cache_dir: &Path) {
     let root = cache_dir.join("managed-embeddings");
-    let server_dir = root.join("llama").join("b9058").join("fake");
     let model_path = root
         .join("models")
-        .join("bge-base-en-v1.5-gguf")
-        .join("bge-base-en-v1.5-q8_0.gguf");
-    fs::create_dir_all(&server_dir).expect("create fake server dir");
+        .join("bge-base-en-v1.5-onnx-qdrant")
+        .join("model_optimized.onnx");
+    let runtime_model_path = root
+        .join("models")
+        .join("bge-base-en-v1.5-onnx-qdrant")
+        .join("model_optimized_cls_pool.onnx");
+    let tokenizer_path = root
+        .join("models")
+        .join("bge-base-en-v1.5-onnx-qdrant")
+        .join("tokenizer.json");
     fs::create_dir_all(model_path.parent().expect("model parent")).expect("create model dir");
-    let server_name = if cfg!(target_os = "windows") {
-        "llama-server.exe"
-    } else {
-        "llama-server"
-    };
-    fs::copy(
-        env!("CARGO_BIN_EXE_codestory-cli"),
-        server_dir.join(server_name),
-    )
-    .expect("copy fake server executable");
     fs::write(&model_path, b"fake model").expect("write fake model");
+    fs::write(&runtime_model_path, b"fake pooled model").expect("write fake pooled model");
+    fs::write(&tokenizer_path, b"fake tokenizer").expect("write fake tokenizer");
     fs::write(
         root.join("manifest.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
-            "llama_release": "b9058",
-            "llama_asset": "fake",
-            "llama_path": clean_test_path(&server_dir),
-            "llama_variant": "cpu",
-            "model_asset": "bge-base-en-v1.5-q8_0.gguf",
-            "model_path": clean_test_path(&model_path),
-            "model_quant": "q8_0",
-            "endpoint": "http://127.0.0.1:8080/v1/embeddings",
+            "backend": "onnx",
+            "provider": "directml",
+            "onnx_model_asset": "model_optimized.onnx",
+            "onnx_model_path": clean_test_path(&runtime_model_path),
+            "onnx_source_model_path": clean_test_path(&model_path),
+            "onnx_pooled_output": "sentence_embedding",
+            "onnx_tokenizer_asset": "tokenizer.json",
+            "onnx_tokenizer_path": clean_test_path(&tokenizer_path),
         }))
         .expect("manifest json"),
     )
@@ -230,47 +228,40 @@ fn run_stdio_request(workspace: &Path, cache_dir: &Path, request: &str) -> Value
 }
 
 fn string_field<'a>(value: &'a Value, path: &[&str]) -> &'a str {
-    let mut current = value;
-    for key in path {
-        current = match current {
-            Value::Object(fields) => fields
-                .get(*key)
-                .unwrap_or_else(|| panic!("missing key {key:?} at path {path:?}")),
-            Value::Array(items) => {
-                let index = key
-                    .parse::<usize>()
-                    .unwrap_or_else(|_| panic!("expected array index at path {path:?}"));
-                items
-                    .get(index)
-                    .unwrap_or_else(|| panic!("missing index {index} at path {path:?}"))
-            }
-            _ => panic!("cannot descend into non-container at path {path:?}, key {key:?}"),
-        };
-    }
-    current
+    value_at_path(value, path)
         .as_str()
         .unwrap_or_else(|| panic!("expected string at path {path:?}"))
 }
 
 fn array_is_non_empty(value: &Value, path: &[&str]) -> bool {
+    value_at_path(value, path)
+        .as_array()
+        .is_some_and(|items| !items.is_empty())
+}
+
+fn value_at_path<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
     let mut current = value;
     for key in path {
-        current = match current {
-            Value::Object(fields) => fields
-                .get(*key)
-                .unwrap_or_else(|| panic!("missing key {key:?} at path {path:?}")),
-            Value::Array(items) => {
-                let index = key
-                    .parse::<usize>()
-                    .unwrap_or_else(|_| panic!("expected array index at path {path:?}"));
-                items
-                    .get(index)
-                    .unwrap_or_else(|| panic!("missing index {index} at path {path:?}"))
-            }
-            _ => panic!("cannot descend into non-container at path {path:?}, key {key:?}"),
-        };
+        current = value_at_path_key(current, key, path);
     }
-    current.as_array().is_some_and(|items| !items.is_empty())
+    current
+}
+
+fn value_at_path_key<'a>(value: &'a Value, key: &str, path: &[&str]) -> &'a Value {
+    match value {
+        Value::Object(fields) => fields
+            .get(key)
+            .unwrap_or_else(|| panic!("missing key {key:?} at path {path:?}")),
+        Value::Array(items) => {
+            let index = key
+                .parse::<usize>()
+                .unwrap_or_else(|_| panic!("expected array index at path {path:?}"));
+            items
+                .get(index)
+                .unwrap_or_else(|| panic!("missing index {index} at path {path:?}"))
+        }
+        _ => panic!("cannot descend into non-container at path {path:?}, key {key:?}"),
+    }
 }
 
 fn search_dir_for_storage(storage_path: &Path) -> PathBuf {
@@ -767,26 +758,29 @@ fn setup_embeddings_dry_run_reports_pinned_managed_assets() {
         setup["dry_run"], true,
         "setup should report dry-run mode: {setup:#}"
     );
-    assert!(
-        setup["llama"]["url"]
-            .as_str()
-            .is_some_and(|value| value.contains("ggml-org/llama.cpp")),
-        "setup should pin a llama.cpp release asset: {setup:#}"
-    );
-    let expected_variant = if cfg!(target_os = "macos") {
-        "cpu"
-    } else {
-        "vulkan"
-    };
     assert_eq!(
-        setup["llama_variant"], expected_variant,
-        "setup should default to Vulkan where a pinned asset exists and report CPU only as fallback: {setup:#}"
+        setup["backend"], "onnx",
+        "setup should select ONNX: {setup:#}"
     );
     assert!(
         setup["model"]["url"]
             .as_str()
-            .is_some_and(|value| value.contains("CompendiumLabs/bge-base-en-v1.5-gguf")),
-        "setup should pin the managed BGE-base GGUF model: {setup:#}"
+            .is_some_and(|value| value.contains("Qdrant/bge-base-en-v1.5-onnx-Q")),
+        "setup should pin the managed BGE-base ONNX model: {setup:#}"
+    );
+    assert_eq!(
+        setup["model"]["name"], "model_optimized.onnx",
+        "setup should report the pinned optimized ONNX graph: {setup:#}"
+    );
+    assert_eq!(
+        setup["runtime_model"]["name"], "model_optimized_cls_pool.onnx",
+        "setup should report the derived pooled ONNX runtime graph: {setup:#}"
+    );
+    assert!(
+        setup["tokenizer"]["url"]
+            .as_str()
+            .is_some_and(|value| value.contains("Qdrant/bge-base-en-v1.5-onnx-Q")),
+        "setup should pin the matching tokenizer: {setup:#}"
     );
     assert!(
         !cache_dir
@@ -861,9 +855,15 @@ fn doctor_does_not_autostart_installed_managed_embeddings() {
     );
 
     let managed = check_with_name(&doctor, "managed_embeddings");
+    assert_eq!(
+        managed["status"], "warn",
+        "installed but invalid managed assets should fail runtime verification: {doctor:#}"
+    );
     assert!(
-        ["ok", "warn"].contains(&managed["status"].as_str().unwrap_or_default()),
-        "installed managed assets should be inspected without being treated as missing: {doctor:#}"
+        managed["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("failed runtime verification")),
+        "managed status should explain that installed assets did not pass runtime verification: {doctor:#}"
     );
     assert!(
         !cache_dir
@@ -871,7 +871,7 @@ fn doctor_does_not_autostart_installed_managed_embeddings() {
             .join("managed-embeddings")
             .join("logs")
             .exists(),
-        "doctor should not create managed llama-server logs or start the fake server: {doctor:#}"
+        "doctor should not create managed embedding logs or start a server: {doctor:#}"
     );
 }
 
@@ -896,7 +896,7 @@ fn index_dry_run_does_not_autostart_installed_managed_embeddings() {
             .join("managed-embeddings")
             .join("logs")
             .exists(),
-        "index --dry-run should not create managed llama-server logs or start the fake server: {dry_run:#}"
+        "index --dry-run should not create managed embedding logs or start a server: {dry_run:#}"
     );
 }
 
@@ -906,9 +906,44 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
     let cache_dir = tempdir().expect("cache dir");
     write_tiny_rust_workspace(workspace.path());
 
+    let search_dir_snapshot =
+        index_tiny_workspace_for_browser_loop(workspace.path(), cache_dir.path());
+
+    assert_doctor_reports_existing_cache_health(workspace.path(), cache_dir.path());
+
+    assert_ground_reads_existing_cache(workspace.path(), cache_dir.path());
+
+    let node_id = search_app_controller_from_existing_cache(workspace.path(), cache_dir.path());
+
+    assert_symbol_reads_focus_node(workspace.path(), cache_dir.path(), &node_id);
+
+    assert_trail_reads_focus_node(workspace.path(), cache_dir.path(), &node_id);
+
+    assert_snippet_reads_focus_node(workspace.path(), cache_dir.path(), &node_id);
+
+    let bookmark_id = add_and_assert_bookmark_focus(workspace.path(), cache_dir.path(), &node_id);
+
+    assert_bookmark_focus_seeds_ask(workspace.path(), cache_dir.path(), &bookmark_id);
+
+    assert_explore_outputs_focus_context(workspace.path(), cache_dir.path(), &node_id);
+
+    assert_query_reads_existing_cache(workspace.path(), cache_dir.path());
+    assert_ask_uses_db_first_trace(workspace.path(), cache_dir.path(), &node_id);
+    remove_and_assert_bookmark_gone(workspace.path(), cache_dir.path(), &bookmark_id);
+    assert_stdio_ask_uses_db_first_trace(workspace.path(), cache_dir.path());
+
+    search_dir_snapshot.assert_unchanged();
+}
+
+struct SearchDirSnapshot {
+    path: PathBuf,
+    modified: SystemTime,
+}
+
+fn index_tiny_workspace_for_browser_loop(workspace: &Path, cache_dir: &Path) -> SearchDirSnapshot {
     let index = run_cli_json(
-        workspace.path(),
-        cache_dir.path(),
+        workspace,
+        cache_dir,
         &["index", "--refresh", "full", "--format", "json"],
     );
     assert!(
@@ -919,17 +954,11 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
         "index should discover symbols in the tiny workspace"
     );
     let storage_path = PathBuf::from(string_field(&index, &["storage_path"]));
-    let search_dir = search_dir_for_storage(&storage_path);
-    let search_dir_before = fs::metadata(&search_dir)
-        .expect("search dir metadata before read commands")
-        .modified()
-        .expect("search dir modified before read commands");
+    SearchDirSnapshot::capture(search_dir_for_storage(&storage_path))
+}
 
-    let doctor = run_cli_json(
-        workspace.path(),
-        cache_dir.path(),
-        &["doctor", "--format", "json"],
-    );
+fn assert_doctor_reports_existing_cache_health(workspace: &Path, cache_dir: &Path) {
+    let doctor = run_cli_json(workspace, cache_dir, &["doctor", "--format", "json"]);
     assert!(
         doctor["checks"]
             .as_array()
@@ -944,20 +973,24 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
             .any(|row| row["name"] == "CODESTORY_EMBED_MODEL_ID"),
         "doctor should expose the embedding model-id env var documented by .codestory.toml"
     );
+}
 
+fn assert_ground_reads_existing_cache(workspace: &Path, cache_dir: &Path) {
     let ground = run_cli_json(
-        workspace.path(),
-        cache_dir.path(),
+        workspace,
+        cache_dir,
         &["ground", "--refresh", "none", "--format", "json"],
     );
     assert!(
         array_is_non_empty(&ground, &["root_symbols"]) || array_is_non_empty(&ground, &["files"]),
         "ground should return project grounding data"
     );
+}
 
+fn search_app_controller_from_existing_cache(workspace: &Path, cache_dir: &Path) -> String {
     let search = run_cli_json(
-        workspace.path(),
-        cache_dir.path(),
+        workspace,
+        cache_dir,
         &[
             "search",
             "--query",
@@ -983,11 +1016,13 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
             > 0,
         "search should preserve stored semantic-doc contract metadata"
     );
-    let node_id = string_field(&search, &["indexed_symbol_hits", "0", "node_id"]);
+    string_field(&search, &["indexed_symbol_hits", "0", "node_id"]).to_string()
+}
 
+fn assert_symbol_reads_focus_node(workspace: &Path, cache_dir: &Path, node_id: &str) {
     let symbol = run_cli_json(
-        workspace.path(),
-        cache_dir.path(),
+        workspace,
+        cache_dir,
         &[
             "symbol",
             &format!("--id={node_id}"),
@@ -1001,10 +1036,12 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
         string_field(&symbol, &["symbol", "node", "display_name"]),
         "AppController"
     );
+}
 
+fn assert_trail_reads_focus_node(workspace: &Path, cache_dir: &Path, node_id: &str) {
     let trail = run_cli_json(
-        workspace.path(),
-        cache_dir.path(),
+        workspace,
+        cache_dir,
         &[
             "trail",
             &format!("--id={node_id}"),
@@ -1020,8 +1057,8 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
     );
 
     let trail_story = run_cli_json(
-        workspace.path(),
-        cache_dir.path(),
+        workspace,
+        cache_dir,
         &[
             "trail",
             &format!("--id={node_id}"),
@@ -1050,10 +1087,12 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
                 .is_some_and(|text| text.contains("tests and benches excluded")))),
         "trail --story should make test scope explicit"
     );
+}
 
+fn assert_snippet_reads_focus_node(workspace: &Path, cache_dir: &Path, node_id: &str) {
     let snippet = run_cli_json(
-        workspace.path(),
-        cache_dir.path(),
+        workspace,
+        cache_dir,
         &[
             "snippet",
             &format!("--id={node_id}"),
@@ -1067,10 +1106,12 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
         string_field(&snippet, &["snippet", "snippet"]).contains("AppController"),
         "snippet should include source for AppController"
     );
+}
 
+fn add_and_assert_bookmark_focus(workspace: &Path, cache_dir: &Path, node_id: &str) -> String {
     let bookmark = run_cli_json(
-        workspace.path(),
-        cache_dir.path(),
+        workspace,
+        cache_dir,
         &[
             "bookmark",
             "add",
@@ -1094,8 +1135,8 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
     );
 
     let bookmarks = run_cli_json(
-        workspace.path(),
-        cache_dir.path(),
+        workspace,
+        cache_dir,
         &["bookmark", "list", "--format", "json"],
     );
     assert!(
@@ -1106,15 +1147,18 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
             .any(|bookmark| bookmark["bookmark"]["id"] == bookmark_id),
         "bookmark list should include the saved focus"
     );
+    bookmark_id
+}
 
+fn assert_bookmark_focus_seeds_ask(workspace: &Path, cache_dir: &Path, bookmark_id: &str) {
     let bookmarked_ask = run_cli_json(
-        workspace.path(),
-        cache_dir.path(),
+        workspace,
+        cache_dir,
         &[
             "ask",
             "What does this bookmark focus on?",
             "--bookmark",
-            &bookmark_id,
+            bookmark_id,
             "--refresh",
             "none",
             "--format",
@@ -1145,10 +1189,12 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
             }),
         "ask --bookmark should preserve bookmark identity in the retrieval trace"
     );
+}
 
+fn assert_explore_outputs_focus_context(workspace: &Path, cache_dir: &Path, node_id: &str) {
     let explore = run_cli_json(
-        workspace.path(),
-        cache_dir.path(),
+        workspace,
+        cache_dir,
         &[
             "explore",
             &format!("--id={node_id}"),
@@ -1202,8 +1248,8 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
     );
 
     let explore_markdown = run_cli(
-        workspace.path(),
-        cache_dir.path(),
+        workspace,
+        cache_dir,
         &[
             "explore",
             &format!("--id={node_id}"),
@@ -1239,10 +1285,12 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
             "explore markdown should contain `{expected}`:\n{explore_markdown}"
         );
     }
+}
 
+fn assert_query_reads_existing_cache(workspace: &Path, cache_dir: &Path) {
     let query = run_cli_json(
-        workspace.path(),
-        cache_dir.path(),
+        workspace,
+        cache_dir,
         &[
             "query",
             "search(query: 'AppController') | limit(1)",
@@ -1256,10 +1304,12 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
         array_is_non_empty(&query, &["items"]),
         "query should read from the existing cache"
     );
+}
 
+fn assert_ask_uses_db_first_trace(workspace: &Path, cache_dir: &Path, node_id: &str) {
     let ask = run_cli_json(
-        workspace.path(),
-        cache_dir.path(),
+        workspace,
+        cache_dir,
         &[
             "ask",
             "What does AppController do?",
@@ -1286,16 +1336,18 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
             .all(|step| step["kind"] != "local_agent"),
         "CLI ask should not include removed local-agent trace steps"
     );
+}
 
+fn remove_and_assert_bookmark_gone(workspace: &Path, cache_dir: &Path, bookmark_id: &str) {
     let removed = run_cli_json(
-        workspace.path(),
-        cache_dir.path(),
-        &["bookmark", "remove", &bookmark_id, "--format", "json"],
+        workspace,
+        cache_dir,
+        &["bookmark", "remove", bookmark_id, "--format", "json"],
     );
     assert_eq!(string_field(&removed, &["removed_id"]), bookmark_id);
     let bookmarks_after_remove = run_cli_json(
-        workspace.path(),
-        cache_dir.path(),
+        workspace,
+        cache_dir,
         &["bookmark", "list", "--format", "json"],
     );
     assert!(
@@ -1306,10 +1358,12 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
             .all(|bookmark| bookmark["bookmark"]["id"] != bookmark_id),
         "bookmark remove should persistently delete the saved focus"
     );
+}
 
+fn assert_stdio_ask_uses_db_first_trace(workspace: &Path, cache_dir: &Path) {
     let stdio = run_stdio_request(
-        workspace.path(),
-        cache_dir.path(),
+        workspace,
+        cache_dir,
         r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ask","arguments":{"prompt":"What does AppController do?"}}}"#,
     );
     let stdio_result = &stdio["result"]["structuredContent"];
@@ -1321,15 +1375,27 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
             .all(|step| step["kind"] != "local_agent"),
         "stdio ask should not include removed local-agent trace steps"
     );
+}
 
-    let search_dir_after = fs::metadata(&search_dir)
-        .expect("search dir metadata after read commands")
-        .modified()
-        .expect("search dir modified after read commands");
-    assert_eq!(
-        search_dir_before, search_dir_after,
-        "read commands should not recreate the persisted search directory"
-    );
+impl SearchDirSnapshot {
+    fn capture(path: PathBuf) -> Self {
+        let modified = fs::metadata(&path)
+            .expect("search dir metadata before read commands")
+            .modified()
+            .expect("search dir modified before read commands");
+        Self { path, modified }
+    }
+
+    fn assert_unchanged(&self) {
+        let after = fs::metadata(&self.path)
+            .expect("search dir metadata after read commands")
+            .modified()
+            .expect("search dir modified after read commands");
+        assert_eq!(
+            self.modified, after,
+            "read commands should not recreate the persisted search directory"
+        );
+    }
 }
 
 #[test]

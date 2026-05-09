@@ -78,7 +78,7 @@ Read commands default to `--refresh none` so they query the current cache unless
 
 `ask` is the first higher-level retrieval packet. It delegates to `codestory-runtime` retrieval orchestration, includes citations and retrieval traces, and always uses DB-first synthesis. `--bundle <DIR>` writes Markdown, JSON, and Mermaid artifacts for handoff.
 
-`doctor` is a read-only health report for project path resolution, cache presence, index counts, retrieval state, managed embedding setup, relevant embedding environment variables, and next commands. It should stay diagnostic; it should not mutate caches or fetch model assets. `setup embeddings` is the explicit mutating path for installing pinned llama.cpp and BGE-base GGUF assets in the user cache. The managed binary default is Vulkan, with `--variant cpu` as the explicit fallback.
+`doctor` is a read-only health report for project path resolution, cache presence, index counts, retrieval state, managed embedding setup, relevant embedding environment variables, and next commands. It should stay diagnostic; it should not mutate caches or fetch model assets. `setup embeddings` is the explicit mutating path for installing pinned ONNX Runtime BGE-base assets in the user cache. Managed setup does not launch or retain an embedding server.
 
 ## `search` And `ask` Research Options
 

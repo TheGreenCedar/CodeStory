@@ -34,12 +34,12 @@ Read commands default to `--refresh none`. If a read command says the cache is e
 
 Use one of these modes before debugging ranking quality:
 
-- managed real-model setup: `codestory-cli setup embeddings --project .`; use `--dry-run` first to inspect the pinned Vulkan llama.cpp and BGE-base GGUF assets without downloading, and pass `--variant cpu` when Vulkan is not usable on the machine
+- managed real-model setup: `codestory-cli setup embeddings --project .`; use `--dry-run` first to inspect the pinned BGE-base ONNX assets without downloading
 - fast local-dev semantic mode: `CODESTORY_EMBED_RUNTIME_MODE=hash`
-- external model serving: run `llama-server --embedding` and point `CODESTORY_EMBED_LLAMACPP_URL` at its OpenAI-compatible embeddings endpoint when it is not on the default `http://127.0.0.1:8080/v1/embeddings`
+- external legacy model serving: set `CODESTORY_EMBED_BACKEND=llamacpp`, run `llama-server --embedding`, and point `CODESTORY_EMBED_LLAMACPP_URL` at its OpenAI-compatible embeddings endpoint when it is not on the default `http://127.0.0.1:8080/v1/embeddings`
 - default semantic scope: durable symbols only; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` when you intentionally need the broad all-symbol semantic doc set
 - default semantic alias mode: compact aliases; set `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=no_alias` or `current_alias` only when reproducing benchmark rows
-- embedding throughput tuning: `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` and `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT`
+- embedding throughput tuning: `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE`, `CODESTORY_EMBED_ONNX_BATCH_TOKENS`, `CODESTORY_EMBED_ONNX_PROVIDER`, and `CODESTORY_EMBED_ONNX_THREADS`
 - lexical-only mode: `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false`
 
 `index`, `ground`, `search`, `ask`, and `doctor` report the active retrieval mode plus any fallback reason when retrieval state is available, so confirm that output before assuming the ranking logic regressed. Default `index` synchronizes semantic docs before returning when embedding assets are available.

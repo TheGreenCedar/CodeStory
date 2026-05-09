@@ -139,7 +139,7 @@ flowchart LR
 - `explore`: open an interactive terminal explorer when stdout is a terminal, or emit Markdown/JSON with definition and reference navigation metadata when piped or passed `--no-tui`
 - `serve`: expose local `/health`, `/search`, `/symbol`, `/definition`, `/references`, `/symbols`, and `/trail` JSON endpoints, or use `--stdio` for MCP-style tools, resources, resource templates, and prompts
 - `doctor`: report project/cache/index/retrieval health, relevant environment settings, and the next useful commands for the workspace
-- `setup embeddings`: install pinned managed llama.cpp and BGE-base GGUF assets in the user cache and start the local embedding server; the managed binary defaults to Vulkan with `--variant cpu` as the fallback
+- `setup embeddings`: install pinned managed ONNX Runtime BGE-base assets in the user cache; no embedding server is started or kept alive
 - `generate-completions`: emit bash, zsh, fish, or PowerShell completions generated from the clap command model
 
 Hybrid retrieval is the intended default when local embedding assets are available. `index`, `ground`, `search`, `ask`, and `doctor` now report retrieval mode, semantic doc counts, and explicit fallback reasons when the runtime drops back to symbolic ranking.
@@ -179,12 +179,13 @@ The default `index` path is a full semantic sync, not a deferred background task
 
 Hybrid retrieval setup:
 
-- managed real-model setup: run `codestory-cli setup embeddings --project .` to download pinned Vulkan llama.cpp binaries plus BGE-base GGUF into the user cache and start `llama-server` at the default endpoint; pass `--variant cpu` when Vulkan startup is unavailable on the machine
+- managed real-model setup: run `codestory-cli setup embeddings --project .` to download the pinned Qdrant BGE-base ONNX graph plus tokenizer files into the user cache. Setup derives `model_optimized_cls_pool.onnx` from the downloaded graph so runtime receives `sentence_embedding` directly instead of the full token hidden state. The CLI seeds the managed local defaults of semantic doc window `512`, doc batch `2048`, ONNX provider `directml` on Windows or `cpu` elsewhere, ONNX per-call token budget `32768`, and in-memory stored vectors `int8` unless explicit environment variables override them.
 - fast local-dev semantic mode: set `CODESTORY_EMBED_RUNTIME_MODE=hash`
-- backend and profile selection: set `CODESTORY_EMBED_BACKEND=llamacpp` or `hash`; default profile is `bge-base-en-v1.5`; explicit profiles include `minilm`, `bge-small-en-v1.5`, `bge-base-en-v1.5`, `qwen3-embedding-0.6b`, `embeddinggemma-300m`, `nomic-embed-text-v1.5`, `nomic-embed-text-v2-moe`, or `custom`
-- external llama.cpp GGUF server: run `llama-server --embedding` yourself and set `CODESTORY_EMBED_LLAMACPP_URL` if it is not listening at `http://127.0.0.1:8080/v1/embeddings`; tune concurrent embedding requests with `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT`
+- backend and profile selection: set `CODESTORY_EMBED_BACKEND=onnx`, `llamacpp`, or `hash`; default profile is `bge-base-en-v1.5`; explicit profiles include `minilm`, `bge-small-en-v1.5`, `bge-base-en-v1.5`, `qwen3-embedding-0.6b`, `embeddinggemma-300m`, `nomic-embed-text-v1.5`, `nomic-embed-text-v2-moe`, or `custom`
+- managed ONNX paths: `setup embeddings` sets `CODESTORY_EMBED_ONNX_MODEL`, `CODESTORY_EMBED_ONNX_TOKENIZER`, `CODESTORY_EMBED_ONNX_PROVIDER`, and `CODESTORY_EMBED_ONNX_BATCH_TOKENS`; set them manually only for custom ONNX assets or profiling
+- external legacy llama.cpp GGUF server: run `llama-server --embedding` yourself, set `CODESTORY_EMBED_BACKEND=llamacpp`, and set `CODESTORY_EMBED_LLAMACPP_URL` if it is not listening at `http://127.0.0.1:8080/v1/embeddings`; tune concurrent embedding requests with `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT`
 - durable semantic docs are the default; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` to include lower-signal local/member/module symbols for investigation
-- embedding batch size defaults to `128`; override with `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` only while profiling
+- embedding batch size defaults to `128` for unmanaged runtimes and `2048` for the managed ONNX path; override with `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` only while profiling
 - search and ask research can override hybrid ranking weights with `--hybrid-lexical <WEIGHT> --hybrid-semantic <WEIGHT> --hybrid-graph <WEIGHT>`; omit these flags for the runtime defaults
 - handoff bundles: `ask --bundle <DIR>` writes `answer.md`, `answer.json`, and generated Mermaid artifacts for sharing or review
 - lexical-only mode: set `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false`

@@ -11,12 +11,15 @@ codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 crossbeam-channel = { workspace = true }
 feature-probe = { workspace = true }
+ndarray = { workspace = true }
 nucleo-matcher = { workspace = true }
+ort = { workspace = true }
 parking_lot = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tantivy = { workspace = true }
+tokenizers = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

@@ -1245,6 +1245,11 @@ fn build_doctor_output(
         "CODESTORY_EMBED_MODEL_ID",
         "CODESTORY_EMBED_BACKEND",
         "CODESTORY_EMBED_RUNTIME_MODE",
+        "CODESTORY_EMBED_ONNX_MODEL",
+        "CODESTORY_EMBED_ONNX_TOKENIZER",
+        "CODESTORY_EMBED_ONNX_PROVIDER",
+        "CODESTORY_EMBED_ONNX_BATCH_TOKENS",
+        "CODESTORY_EMBED_ONNX_THREADS",
         "CODESTORY_EMBED_LLAMACPP_URL",
         "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT",
         "CODESTORY_STORED_VECTOR_ENCODING",
@@ -1497,9 +1502,9 @@ fn semantic_contract_check(
 
 fn managed_doctor_status(state: &str) -> &'static str {
     match state {
-        "managed_server_running" | "external_llama_configured" | "disabled_by_config" => "ok",
+        "managed_onnx_ready" | "external_llama_configured" | "disabled_by_config" => "ok",
         "missing_managed_assets" => "info",
-        "managed_server_stopped" | "external_llama_unreachable" => "warn",
+        "external_llama_unreachable" | "managed_onnx_unusable" => "warn",
         _ => "info",
     }
 }

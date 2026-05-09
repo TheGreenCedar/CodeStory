@@ -361,23 +361,28 @@ pub(crate) enum SetupAction {
 pub(crate) struct SetupEmbeddingsCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
-    #[arg(long, value_enum, default_value_t = CliEmbeddingQuant::Q8_0)]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = CliEmbeddingQuant::Q8_0,
+        help = "Legacy GGUF quant selector retained for CLI compatibility; managed setup now installs the pinned ONNX model."
+    )]
     pub(crate) quant: CliEmbeddingQuant,
     #[arg(
         long,
         value_enum,
         default_value_t = CliLlamaVariant::Vulkan,
-        help = "Choose the pinned llama.cpp binary variant. Defaults to Vulkan; use cpu as the fallback."
+        help = "Legacy llama.cpp variant selector retained for CLI compatibility; managed setup now uses ONNX Runtime."
     )]
     pub(crate) variant: CliLlamaVariant,
     #[arg(
         long,
-        help = "Show the managed llama/model plan without downloading or starting anything."
+        help = "Show the managed ONNX asset plan without downloading anything."
     )]
     pub(crate) dry_run: bool,
     #[arg(
         long,
-        help = "Install and verify assets without starting llama-server."
+        help = "Compatibility flag; managed ONNX setup never starts a server."
     )]
     pub(crate) no_start: bool,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
@@ -1289,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_embeddings_defaults_to_vulkan_variant() {
+    fn setup_embeddings_keeps_legacy_variant_default_for_cli_compatibility() {
         let cli = Cli::try_parse_from(["codestory-cli", "setup", "embeddings"])
             .expect("setup embeddings should parse");
         match cli.command {

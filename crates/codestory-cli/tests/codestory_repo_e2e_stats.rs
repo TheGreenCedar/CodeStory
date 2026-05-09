@@ -124,6 +124,7 @@ fn run_cli_json(
         .arg(project_root)
         .arg("--cache-dir")
         .arg(cache_dir)
+        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
         .output()
         .expect("run codestory-cli");
     let seconds = started.elapsed().as_secs_f64();

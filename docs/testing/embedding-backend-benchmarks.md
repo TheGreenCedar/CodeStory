@@ -9,12 +9,12 @@ needs proof.
 
 | Question | Current answer |
 | --- | --- |
-| Real local embedding backend | `CODESTORY_EMBED_BACKEND=llamacpp` |
+| Real local embedding backend | `CODESTORY_EMBED_BACKEND=onnx` |
 | Deterministic local-dev backend | `CODESTORY_EMBED_RUNTIME_MODE=hash` |
 | Default profile | `CODESTORY_EMBED_PROFILE=bge-base-en-v1.5` |
 | Default doc shape | `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=alias_variant`, durable semantic scope |
-| Current broad-holdout incumbent candidate | BGE-base Q8 GGUF through llama.cpp/Vulkan, batch `512`, request count `6`, server batch `1024`, server microbatch `1024`, stored vectors `int8`, full-text enabled |
-| Cross-repo gate status | The same q8/r6 full-text profile passed the external gate across 4 projects and 225 queries |
+| Current broad-holdout incumbent candidate | Pending fresh ONNX quality row. Historical incumbent: BGE-base Q8 GGUF through llama.cpp/Vulkan, batch `512`, request count `6`, server batch `1024`, server microbatch `1024`, stored vectors `int8`, full-text enabled |
+| Cross-repo gate status | Historical q8/r6 full-text profile passed the external gate across 4 projects and 225 queries; ONNX needs the same fresh gate before benchmark promotion |
 | Primary metric shape | `pipeline_score = 1000000 * (0.7 * quality + 0.2 * speed + 0.1 * memory) * quality_gate_penalty` |
 | Memory component shape | Model footprint, persisted vector footprint, and cache/index footprint; peak RAM is reported separately when sampled |
 | Default-change rule | Do not promote a faster row when MRR, Hit@10, rank profile, repeat behavior, or cross-repo behavior regresses |
@@ -31,11 +31,16 @@ also showed peak-RAM sampling variance, so tiny memory deltas need repeat
 evidence before they matter. Treat earlier perfect-score r5 evidence and any
 single-pass q5 score as historical/suspect, not current default proof.
 
+As of the ONNX replacement, the llama.cpp rows below are historical baselines.
+Add a fresh ONNX row before calling the new managed backend promoted on quality
+and cross-repo evidence.
+
 ## Primary Comparison Matrix
 
 | Candidate or lane | Best relevant evidence | Quality signal | Speed and footprint signal | Decision |
 | --- | --- | --- | --- | --- |
-| BGE-base llama.cpp, b512/Q8/r6, server batch 1024, microbatch 1024, stored int8, full-text enabled | Segment 2 baseline `909369.110274`; repeat `909844.215726`; earlier fixed-wrapper holdout `910504.353332`; cross-repo `851670.370370` | Local MRR@10 `0.982432`, Hit@10 `1.0`, Hit@1 `0.972973`; cross-repo Hit@10 `1.0`, adversarial Hit@10 `1.0`, MRR@10 `0.826831` across 225 queries | Segment 2 baseline `368.01` docs/sec, cache `74.40 MB`, sampled peak descendant working set `828.73 MB`; repeat `371.89` docs/sec, sampled peak `1019.79 MB`; cross-repo search p95 `84.7 ms` | Keep as the current externally validated incumbent candidate and segment-2 baseline. This is evidence, not a license to skip future holdout and cross-repo gates. |
+| Managed BGE-base ONNX Runtime, CLS-pooled graph, DirectML, doc batch 2048, token budget 32768, stored int8 | Sourcetrail fresh-cache timing on 26,010 semantic docs after batch-fast tokenizer switch and pooled-output graph derivation | Quality gate not run yet; direct CPU ORT check showed pooled graph output exactly matched source `last_hidden_state[:, 0, :]` on sampled inputs; Sourcetrail `semantic_contract` and search smoke passed | `semantic_embedding_ms=128.438s`; previous 32k unpooled row was `135.762s`; pooled 65k was slower at `131.807s`; prior managed ONNX 65k first pass was `152.500s`, batch-fast 65k was `138.118s`, 16k was `137.776s`; unpooled 131k was aborted as slower and memory-heavy after sampled peak working set around `3.37 GB` | Active managed default for throughput shape. Still needs full quality and cross-repo gates before replacing the historical llama.cpp benchmark baseline as promoted evidence. |
+| BGE-base llama.cpp, b512/Q8/r6, server batch 1024, microbatch 1024, stored int8, full-text enabled | Segment 2 baseline `909369.110274`; repeat `909844.215726`; earlier fixed-wrapper holdout `910504.353332`; cross-repo `851670.370370` | Local MRR@10 `0.982432`, Hit@10 `1.0`, Hit@1 `0.972973`; cross-repo Hit@10 `1.0`, adversarial Hit@10 `1.0`, MRR@10 `0.826831` across 225 queries | Segment 2 baseline `368.01` docs/sec, cache `74.40 MB`, sampled peak descendant working set `828.73 MB`; repeat `371.89` docs/sec, sampled peak `1019.79 MB`; cross-repo search p95 `84.7 ms` | Historical externally validated baseline. Re-run the same gates for ONNX before treating the replacement as promoted on research evidence. |
 | BGE-base llama.cpp, b512/r5, microbatch 1024, stored int8 | Earlier local `pipeline_score=918957.022351`; confirmation `918697.617312`; corrected segment-2 scout `901789.644032` | Earlier perfect local scores triggered the overfit review; corrected segment-2 quality matched q8/r6, but did not improve it | Corrected segment-2 r5 slowed to `327.58` docs/sec and sampled peak rose to `1074.43 MB` | Historical/discarded. Do not treat r5 as the current promoted answer after the corrected broad-holdout pass. |
 | BGE-base llama.cpp, b768/r4 vs b512/Q8/r6 on the 74-query broad holdout | Packet 18 selected Q8/r6 with `pipeline_score=910173.164803` | r4 matched Q8/r6 quality | r4 was slower than Q8/r6 (`361.85` vs `389.22` docs/sec) | Do not promote. Useful comparison only. |
 | BGE-base Q5 against the broad holdout incumbent | Segment 2 first pass `910704.594864`; repeat `901823.678946` | First pass matched q8/r6 quality; repeat failed quality with MRR@10 `0.975676` and Hit@1 `0.959459` | Model footprint shrank to `78.21 MB`, but speed regressed and repeat stayed below baseline | Discard as a default/promotion candidate. Reopen only with a quality-preserving and speed-neutral compression recipe. |
@@ -51,13 +56,13 @@ single-pass q5 score as historical/suspect, not current default proof.
 | Token-budget narrowing and semantic-scope pruning | tok320 `863128.088009`; no-macros `838267.207245`; no-test-macros `862424.110651` | Lost quality or rank profile | Some rows reduced semantic time but not enough | Discard. Removing documents is not free. |
 | Direct hydration, file-path cache, and reload skipping | Direct hydration `843840.934147`; stable-order hydration `859167.697841`; file-path cache `862471.707786` | Quality or speed regressed | Did not remove enough cache/semantic time | Discard for now. |
 | Background semantic embedding | Buggy packet `949630.846470`; corrected packet `857789.768509` | Corrected packet had lower quality | Corrected speed did not beat the incumbent candidate | Discard. The apparent win was a measurement bug. |
-| ONNX rows | Older ONNX rows are historical only | Some older rows were competitive | Active runtime no longer carries ONNX | Do not reopen unless a new backend decision deliberately reintroduces it. |
+| Older ONNX rows | Historical only | Older ONNX rows predate the active replacement | Active runtime now carries ONNX directly | Do not use old ONNX evidence for new default decisions. Re-run speed, quality, and cross-repo gates on the active implementation before declaring a benchmark promotion. |
 
 ## What Was Tried
 
 The measured work covered these families:
 
-- llama.cpp request geometry: batch size, request count, server batch, and server microbatch.
+- ONNX Runtime provider and batch geometry, plus legacy llama.cpp request geometry for historical comparison.
 - Stored-vector footprint: compact scaled int8 persisted vectors.
 - Quality metric repair: explicit gates, continuous penalties, denominator metrics, and query-rank reporting.
 - Benchmark isolation: leakage guard, tainted-query quarantine, and cache replay blocking.
@@ -76,9 +81,9 @@ The measured work covered these families:
 - True producer-consumer streaming from parsed/indexed symbols into the embedder
   has not been proven. Several scouts reduced or rearranged semantic work, but
   none established a safe end-to-end streaming architecture that beats the
-  current q8/r6 full-text incumbent candidate.
-- The current external gate covers four useful repository families, but broader
-  defaults should still be checked on any new representative repo family before
+  historical q8/r6 full-text baseline or a fresh managed ONNX row.
+- The historical external gate covers four useful repository families, but ONNX
+  and any broader default should still be checked on representative repos before
   treating the profile as universal.
 - Q5 remains a compression option only if a future quality-preserving recipe
   exists. The current scout saved model footprint but did not beat the q8/r6
@@ -92,8 +97,9 @@ The measured work covered these families:
 - VRAM was not measured on this Windows/Vulkan host because `nvidia-smi` did not
   return memory usage. Peak RAM is sampled working set evidence, not exact max
   RSS.
-- ONNX is not an active path. Older ONNX evidence should not drive new choices
-  after the backend was removed.
+- ONNX is now the active managed path. Older ONNX evidence should not drive new
+  choices until the current implementation has fresh speed, quality, and
+  cross-repo rows.
 
 ## How To Use This Matrix
 

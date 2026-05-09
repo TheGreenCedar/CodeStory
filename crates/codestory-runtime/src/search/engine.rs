@@ -1,7 +1,14 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use codestory_contracts::graph::NodeId;
+use ndarray::Array2;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32String};
+use ort::{
+    ep, inputs,
+    session::{Session, builder::GraphOptimizationLevel},
+    value::TensorRef,
+};
+use parking_lot::Mutex;
 use rayon::prelude::*;
 use serde_json::{Value as JsonValue, json};
 use std::collections::{HashMap, HashSet};
@@ -31,11 +38,17 @@ pub const EMBEDDING_DOCUMENT_PREFIX_ENV: &str = "CODESTORY_EMBED_DOCUMENT_PREFIX
 pub const EMBEDDING_LAYER_NORM_ENV: &str = "CODESTORY_EMBED_LAYER_NORM";
 pub const EMBEDDING_TRUNCATE_DIM_ENV: &str = "CODESTORY_EMBED_TRUNCATE_DIM";
 pub const EMBEDDING_EXPECTED_DIM_ENV: &str = "CODESTORY_EMBED_EXPECTED_DIM";
+pub const ONNX_MODEL_PATH_ENV: &str = "CODESTORY_EMBED_ONNX_MODEL";
+pub const ONNX_TOKENIZER_PATH_ENV: &str = "CODESTORY_EMBED_ONNX_TOKENIZER";
+pub const ONNX_PROVIDER_ENV: &str = "CODESTORY_EMBED_ONNX_PROVIDER";
+pub const ONNX_THREADS_ENV: &str = "CODESTORY_EMBED_ONNX_THREADS";
+pub const ONNX_BATCH_TOKENS_ENV: &str = "CODESTORY_EMBED_ONNX_BATCH_TOKENS";
 pub const LLAMACPP_EMBEDDINGS_URL_ENV: &str = "CODESTORY_EMBED_LLAMACPP_URL";
 pub const LLAMACPP_REQUEST_COUNT_ENV: &str = "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT";
 pub const STORED_VECTOR_ENCODING_ENV: &str = "CODESTORY_STORED_VECTOR_ENCODING";
 pub const SYMBOL_FULL_TEXT_INDEX_ENV: &str = "CODESTORY_SYMBOL_FULL_TEXT_INDEX";
 const DEFAULT_LLAMACPP_EMBEDDINGS_URL: &str = "http://127.0.0.1:8080/v1/embeddings";
+const DEFAULT_ONNX_BATCH_TOKENS: usize = 32_768;
 const SEMANTIC_QUANTIZED_RESCORE_MULTIPLIER: usize = 4;
 
 type HttpHeaders = Vec<(String, String)>;
@@ -86,39 +99,73 @@ fn embedding_parallel_chunk_size(text_count: usize, worker_count: usize) -> usiz
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmbeddingBackendSelection {
+    Onnx,
     LlamaCpp,
     HashProjection,
 }
 
 impl EmbeddingBackendSelection {
     fn from_env() -> Result<Self> {
-        let runtime_mode = std::env::var(EMBEDDING_RUNTIME_MODE_ENV)
-            .unwrap_or_else(|_| "llamacpp".to_string())
+        let runtime_mode_raw = std::env::var(EMBEDDING_RUNTIME_MODE_ENV).ok();
+        let backend_raw = std::env::var(EMBEDDING_BACKEND_ENV).ok();
+        let runtime_mode = runtime_mode_raw
+            .as_deref()
+            .unwrap_or("onnx")
             .trim()
             .to_ascii_lowercase();
         if runtime_mode == "hash" || runtime_mode == "hash_projection" {
             return Ok(Self::HashProjection);
         }
 
-        let backend = std::env::var(EMBEDDING_BACKEND_ENV)
-            .unwrap_or(runtime_mode)
+        let backend = backend_raw
+            .as_deref()
+            .unwrap_or(&runtime_mode)
             .trim()
             .to_ascii_lowercase();
+        if backend_is_auto_or_default(&backend)
+            && runtime_mode_raw
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            && backend_raw
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            && std::env::var(LLAMACPP_EMBEDDINGS_URL_ENV)
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some()
+        {
+            return Ok(Self::LlamaCpp);
+        }
         match backend.as_str() {
-            "" | "auto" | "llamacpp" | "llama.cpp" | "llama-cpp" | "gguf" => Ok(Self::LlamaCpp),
+            "" | "auto" | "onnx" | "ort" | "onnxruntime" | "onnx-runtime" => Ok(Self::Onnx),
+            "llamacpp" | "llama.cpp" | "llama-cpp" | "gguf" => Ok(Self::LlamaCpp),
             "hash" | "hash_projection" => Ok(Self::HashProjection),
             other => Err(anyhow!(
-                "unsupported embedding backend `{other}` (set {EMBEDDING_BACKEND_ENV}=llamacpp or hash)"
+                "unsupported embedding backend `{other}` (set {EMBEDDING_BACKEND_ENV}=onnx, llamacpp, or hash)"
             )),
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::Onnx => "onnx",
             Self::LlamaCpp => "llamacpp",
             Self::HashProjection => "hash",
         }
     }
+}
+
+fn backend_is_auto_or_default(value: &str) -> bool {
+    matches!(
+        value,
+        "" | "auto" | "onnx" | "ort" | "onnxruntime" | "onnx-runtime"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,47 +361,54 @@ pub fn embedding_runtime_availability_from_env() -> EmbeddingRuntimeAvailability
     let profile = match EmbeddingProfile::from_env() {
         Ok(profile) => profile,
         Err(error) => {
-            return EmbeddingRuntimeAvailability {
-                available: false,
-                model_id: None,
-                fallback_message: Some(error.to_string()),
-            };
+            return unavailable_embedding_runtime(None, error);
         }
     };
     let backend = match EmbeddingBackendSelection::from_env() {
         Ok(backend) => backend,
         Err(error) => {
-            return EmbeddingRuntimeAvailability {
-                available: false,
-                model_id: Some(profile.model_id.clone()),
-                fallback_message: Some(error.to_string()),
-            };
+            return unavailable_embedding_runtime(Some(profile.model_id.clone()), error);
         }
     };
     let model_id = profile.cache_model_id(backend);
 
     if backend == EmbeddingBackendSelection::HashProjection {
-        return EmbeddingRuntimeAvailability {
-            available: true,
-            model_id: Some(model_id),
-            fallback_message: None,
-        };
+        return available_embedding_runtime(model_id);
     }
 
-    if let Err(error) =
-        LlamaCppEndpoint::from_env().and_then(|endpoint| endpoint.ensure_reachable())
-    {
-        return EmbeddingRuntimeAvailability {
-            available: false,
-            model_id: Some(model_id),
-            fallback_message: Some(error.to_string()),
-        };
+    if let Err(error) = ensure_embedding_backend_available(backend) {
+        return unavailable_embedding_runtime(Some(model_id), error);
     }
 
+    available_embedding_runtime(model_id)
+}
+
+fn available_embedding_runtime(model_id: String) -> EmbeddingRuntimeAvailability {
     EmbeddingRuntimeAvailability {
         available: true,
         model_id: Some(model_id),
         fallback_message: None,
+    }
+}
+
+fn unavailable_embedding_runtime(
+    model_id: Option<String>,
+    error: impl std::fmt::Display,
+) -> EmbeddingRuntimeAvailability {
+    EmbeddingRuntimeAvailability {
+        available: false,
+        model_id,
+        fallback_message: Some(error.to_string()),
+    }
+}
+
+fn ensure_embedding_backend_available(backend: EmbeddingBackendSelection) -> Result<()> {
+    match backend {
+        EmbeddingBackendSelection::Onnx => OnnxEmbeddingRuntime::probe_from_env().map(|_| ()),
+        EmbeddingBackendSelection::LlamaCpp => {
+            LlamaCppEndpoint::from_env().and_then(|endpoint| endpoint.ensure_reachable())
+        }
+        EmbeddingBackendSelection::HashProjection => Ok(()),
     }
 }
 
@@ -373,6 +427,14 @@ pub fn embedding_profile_contract_from_env() -> Result<EmbeddingProfileContract>
     })
 }
 
+pub fn probe_onnx_runtime_paths(model_path: &Path, tokenizer_path: &Path) -> Result<()> {
+    OnnxEmbeddingRuntime::from_paths(OnnxModelPaths {
+        model_path: model_path.to_path_buf(),
+        tokenizer_path: tokenizer_path.to_path_buf(),
+    })
+    .map(|_| ())
+}
+
 #[derive(Debug, Clone)]
 pub struct LlmSearchDoc {
     pub node_id: NodeId,
@@ -384,6 +446,464 @@ pub struct LlmSearchDoc {
 pub struct EmbeddingRuntimeProbe {
     pub model_path: PathBuf,
     pub model_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct OnnxModelPaths {
+    model_path: PathBuf,
+    tokenizer_path: PathBuf,
+}
+
+impl OnnxModelPaths {
+    fn from_env() -> Result<Self> {
+        let model_path = required_path_env(ONNX_MODEL_PATH_ENV)?;
+        let tokenizer_path = required_path_env(ONNX_TOKENIZER_PATH_ENV)?;
+        Ok(Self {
+            model_path,
+            tokenizer_path,
+        })
+    }
+}
+
+fn required_path_env(key: &str) -> Result<PathBuf> {
+    let raw = std::env::var(key).with_context(|| {
+        format!(
+            "{key} is not set; run `codestory-cli setup embeddings` or set {ONNX_MODEL_PATH_ENV} and {ONNX_TOKENIZER_PATH_ENV}"
+        )
+    })?;
+    let path = PathBuf::from(raw.trim());
+    if raw.trim().is_empty() {
+        bail!("{key} is empty");
+    }
+    if !path.exists() {
+        bail!("{key} points at a missing path: {}", path.display());
+    }
+    Ok(path)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnnxProvider {
+    Auto,
+    DirectMl,
+    Cpu,
+}
+
+impl OnnxProvider {
+    fn from_env() -> Result<Self> {
+        let raw = std::env::var(ONNX_PROVIDER_ENV)
+            .unwrap_or_else(|_| "auto".to_string())
+            .trim()
+            .to_ascii_lowercase();
+        match raw.as_str() {
+            "" | "auto" => Ok(Self::Auto),
+            "directml" | "dml" | "gpu" => Ok(Self::DirectMl),
+            "cpu" => Ok(Self::Cpu),
+            other => Err(anyhow!(
+                "unsupported {ONNX_PROVIDER_ENV} value `{other}` (expected auto, directml, or cpu)"
+            )),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OnnxEmbeddingRuntime {
+    tokenizer: tokenizers::Tokenizer,
+    session: Mutex<Session>,
+}
+
+struct OnnxEncodedRow {
+    ids: Vec<i64>,
+    attention: Vec<i64>,
+    token_types: Vec<i64>,
+}
+
+struct OnnxEncodedBatch {
+    input_ids: Array2<i64>,
+    attention_mask: Array2<i64>,
+    token_type_ids: Array2<i64>,
+    attention_values: Option<Vec<i64>>,
+    sequence_len: usize,
+}
+
+impl OnnxEmbeddingRuntime {
+    fn from_env() -> Result<(PathBuf, Self)> {
+        let paths = OnnxModelPaths::from_env()?;
+        Self::from_paths(paths)
+    }
+
+    fn probe_from_env() -> Result<PathBuf> {
+        Self::from_env().map(|(path, _runtime)| path)
+    }
+
+    fn from_paths(paths: OnnxModelPaths) -> Result<(PathBuf, Self)> {
+        let tokenizer =
+            tokenizers::Tokenizer::from_file(&paths.tokenizer_path).map_err(|error| {
+                anyhow!(
+                    "failed to load ONNX tokenizer {}: {error}",
+                    paths.tokenizer_path.display()
+                )
+            })?;
+        let session = build_onnx_session(&paths.model_path)?;
+        Ok((
+            paths.model_path,
+            Self {
+                tokenizer,
+                session: Mutex::new(session),
+            },
+        ))
+    }
+
+    fn embed_texts(&self, texts: &[String], profile: &EmbeddingProfile) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = self.encode_rows(texts, profile.max_tokens)?;
+        let max_batch_tokens =
+            env_usize(ONNX_BATCH_TOKENS_ENV, 1, 262_144).unwrap_or(DEFAULT_ONNX_BATCH_TOKENS);
+        let mut embeddings = Vec::with_capacity(texts.len());
+        let mut start = 0;
+        while start < rows.len() {
+            let end = onnx_batch_end_for_token_budget(&rows, start, max_batch_tokens);
+            let batch = shape_onnx_batch(&rows[start..end], profile.pooling)?;
+            embeddings.extend(self.run_encoded_batch(batch, profile)?);
+            start = end;
+        }
+        Ok(embeddings)
+    }
+
+    fn run_encoded_batch(
+        &self,
+        batch: OnnxEncodedBatch,
+        profile: &EmbeddingProfile,
+    ) -> Result<Vec<Vec<f32>>> {
+        let input_ids = TensorRef::from_array_view(batch.input_ids.view())
+            .context("failed to create ONNX input_ids tensor")?;
+        let attention_mask = TensorRef::from_array_view(batch.attention_mask.view())
+            .context("failed to create ONNX attention_mask tensor")?;
+        let token_type_ids = TensorRef::from_array_view(batch.token_type_ids.view())
+            .context("failed to create ONNX token_type_ids tensor")?;
+
+        let mut session = self.session.lock();
+        let outputs = session
+            .run(inputs![
+                "input_ids" => input_ids,
+                "attention_mask" => attention_mask,
+                "token_type_ids" => token_type_ids,
+            ])
+            .context("failed to run ONNX embedding model")?;
+        let output = outputs
+            .get("sentence_embedding")
+            .or_else(|| outputs.get("embeddings"))
+            .or_else(|| outputs.get("last_hidden_state"))
+            .unwrap_or_else(|| &outputs[0]);
+        let (shape, data) = output
+            .try_extract_tensor::<f32>()
+            .context("ONNX embedding output was not a float tensor")?;
+
+        let attention = batch.attention_values.as_deref();
+        extract_onnx_embeddings(
+            data,
+            shape,
+            attention,
+            batch.input_ids.nrows(),
+            batch.sequence_len,
+            profile.pooling,
+        )
+    }
+
+    fn encode_rows(&self, texts: &[String], max_tokens: usize) -> Result<Vec<OnnxEncodedRow>> {
+        let pad_id = self.tokenizer.token_to_id("[PAD]").unwrap_or(0) as i64;
+        let sep_id = self
+            .tokenizer
+            .token_to_id("[SEP]")
+            .map(|value| value as i64);
+        let encodings = self
+            .tokenizer
+            .encode_batch_fast(texts.iter().map(String::as_str).collect::<Vec<_>>(), true)
+            .map_err(|error| {
+                anyhow!("failed to tokenize input batch for ONNX embedding model: {error}")
+            })?;
+        let mut rows = Vec::with_capacity(texts.len());
+
+        for encoding in encodings {
+            let mut ids = encoding
+                .get_ids()
+                .iter()
+                .map(|value| *value as i64)
+                .collect::<Vec<_>>();
+            let mut attention = encoding
+                .get_attention_mask()
+                .iter()
+                .map(|value| *value as i64)
+                .collect::<Vec<_>>();
+            let mut token_types = encoding
+                .get_type_ids()
+                .iter()
+                .map(|value| *value as i64)
+                .collect::<Vec<_>>();
+
+            if ids.is_empty() {
+                ids.push(pad_id);
+                attention.push(0);
+                token_types.push(0);
+            }
+            if token_types.len() < ids.len() {
+                token_types.resize(ids.len(), 0);
+            }
+            if attention.len() < ids.len() {
+                attention.resize(ids.len(), 1);
+            }
+            if ids.len() > max_tokens {
+                ids.truncate(max_tokens);
+                attention.truncate(max_tokens);
+                token_types.truncate(max_tokens);
+                if let (Some(sep_id), Some(last)) = (sep_id, ids.last_mut()) {
+                    *last = sep_id;
+                }
+            }
+
+            rows.push(OnnxEncodedRow {
+                ids,
+                attention,
+                token_types,
+            });
+        }
+
+        Ok(rows)
+    }
+}
+
+fn onnx_batch_end_for_token_budget(
+    rows: &[OnnxEncodedRow],
+    start: usize,
+    max_batch_tokens: usize,
+) -> usize {
+    let mut end = start;
+    let mut sequence_len = 1_usize;
+    while end < rows.len() {
+        let next_sequence_len = sequence_len.max(rows[end].ids.len());
+        let next_row_count = end + 1 - start;
+        if end > start && next_sequence_len * next_row_count > max_batch_tokens {
+            break;
+        }
+        sequence_len = next_sequence_len;
+        end += 1;
+    }
+    end.max(start + 1)
+}
+
+fn shape_onnx_batch(
+    rows: &[OnnxEncodedRow],
+    pooling: EmbeddingPooling,
+) -> Result<OnnxEncodedBatch> {
+    let pad_id = 0_i64;
+    let row_count = rows.len();
+    let sequence_len = rows
+        .iter()
+        .map(|row| row.ids.len())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let mut input_values = vec![pad_id; row_count * sequence_len];
+    let mut attention_values = vec![0_i64; row_count * sequence_len];
+    let mut token_type_values = vec![0_i64; row_count * sequence_len];
+
+    for (row_index, row) in rows.iter().enumerate() {
+        let offset = row_index * sequence_len;
+        input_values[offset..offset + row.ids.len()].copy_from_slice(&row.ids);
+        attention_values[offset..offset + row.attention.len()].copy_from_slice(&row.attention);
+        token_type_values[offset..offset + row.token_types.len()].copy_from_slice(&row.token_types);
+    }
+
+    let needs_attention_values = !matches!(pooling, EmbeddingPooling::Cls);
+    let pooling_attention_values = needs_attention_values.then(|| attention_values.clone());
+
+    Ok(OnnxEncodedBatch {
+        input_ids: Array2::from_shape_vec((row_count, sequence_len), input_values)
+            .context("failed to shape ONNX input_ids")?,
+        attention_mask: Array2::from_shape_vec((row_count, sequence_len), attention_values)
+            .context("failed to shape ONNX attention_mask")?,
+        token_type_ids: Array2::from_shape_vec((row_count, sequence_len), token_type_values)
+            .context("failed to shape ONNX token_type_ids")?,
+        attention_values: pooling_attention_values,
+        sequence_len,
+    })
+}
+
+fn build_onnx_session(model_path: &Path) -> Result<Session> {
+    match OnnxProvider::from_env()? {
+        OnnxProvider::Auto => {
+            if cfg!(target_os = "windows")
+                && let Ok(session) =
+                    build_onnx_session_for_provider(model_path, OnnxProvider::DirectMl)
+            {
+                return Ok(session);
+            }
+            build_onnx_session_for_provider(model_path, OnnxProvider::Cpu)
+        }
+        OnnxProvider::DirectMl => {
+            build_onnx_session_for_provider(model_path, OnnxProvider::DirectMl)
+        }
+        OnnxProvider::Cpu => build_onnx_session_for_provider(model_path, OnnxProvider::Cpu),
+    }
+}
+
+fn build_onnx_session_for_provider(model_path: &Path, provider: OnnxProvider) -> Result<Session> {
+    let mut builder = Session::builder()
+        .context("failed to initialize ONNX Runtime session builder")?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(ort::Error::<()>::from)
+        .context("failed to configure ONNX graph optimizations")?;
+    if let Some(threads) = env_usize(ONNX_THREADS_ENV, 1, 64) {
+        builder = builder
+            .with_intra_threads(threads)
+            .map_err(ort::Error::<()>::from)
+            .context("failed to configure ONNX intra-op threads")?;
+    }
+    builder = match provider {
+        OnnxProvider::DirectMl => builder
+            .with_execution_providers([ep::DirectML::default().build().error_on_failure()])
+            .map_err(ort::Error::<()>::from)
+            .context("failed to configure ONNX DirectML execution provider")?,
+        OnnxProvider::Cpu => builder
+            .with_execution_providers([ep::CPU::default().build()])
+            .map_err(ort::Error::<()>::from)
+            .context("failed to configure ONNX CPU execution provider")?,
+        OnnxProvider::Auto => unreachable!("auto provider is resolved before session creation"),
+    };
+    builder.commit_from_file(model_path).with_context(|| {
+        format!(
+            "failed to load ONNX embedding model {}",
+            model_path.display()
+        )
+    })
+}
+
+fn extract_onnx_embeddings(
+    data: &[f32],
+    shape: &[i64],
+    attention: Option<&[i64]>,
+    expected_batch: usize,
+    expected_sequence_len: usize,
+    pooling: EmbeddingPooling,
+) -> Result<Vec<Vec<f32>>> {
+    match shape.len() {
+        2 => collect_onnx_pooled_embeddings(data, shape, expected_batch),
+        3 => pool_onnx_hidden_state(
+            data,
+            shape,
+            attention,
+            expected_batch,
+            expected_sequence_len,
+            pooling,
+        ),
+        _ => bail!("ONNX embedding output must be rank 2 or rank 3, got shape {shape:?}"),
+    }
+}
+
+fn collect_onnx_pooled_embeddings(
+    data: &[f32],
+    shape: &[i64],
+    expected_batch: usize,
+) -> Result<Vec<Vec<f32>>> {
+    let batch = usize::try_from(shape[0]).context("invalid ONNX output batch dimension")?;
+    let hidden_dim = usize::try_from(shape[1]).context("invalid ONNX output hidden dimension")?;
+    if batch != expected_batch {
+        bail!("ONNX embedding output batch mismatch: expected {expected_batch}, got {batch}");
+    }
+    if data.len() != batch * hidden_dim {
+        bail!(
+            "ONNX embedding output data length mismatch: shape={shape:?}, values={}",
+            data.len()
+        );
+    }
+    Ok(data
+        .chunks_exact(hidden_dim)
+        .map(<[f32]>::to_vec)
+        .collect::<Vec<_>>())
+}
+
+fn pool_onnx_hidden_state(
+    data: &[f32],
+    shape: &[i64],
+    attention: Option<&[i64]>,
+    expected_batch: usize,
+    expected_sequence_len: usize,
+    pooling: EmbeddingPooling,
+) -> Result<Vec<Vec<f32>>> {
+    if shape.len() != 3 {
+        bail!("ONNX embedding output must be rank 3, got shape {shape:?}");
+    }
+    let batch = usize::try_from(shape[0]).context("invalid ONNX output batch dimension")?;
+    let sequence_len =
+        usize::try_from(shape[1]).context("invalid ONNX output sequence dimension")?;
+    let hidden_dim = usize::try_from(shape[2]).context("invalid ONNX output hidden dimension")?;
+    if batch != expected_batch {
+        bail!("ONNX embedding output batch mismatch: expected {expected_batch}, got {batch}");
+    }
+    if sequence_len != expected_sequence_len {
+        bail!(
+            "ONNX embedding output sequence mismatch: expected {expected_sequence_len}, got {sequence_len}"
+        );
+    }
+    if data.len() != batch * sequence_len * hidden_dim {
+        bail!(
+            "ONNX embedding output data length mismatch: shape={shape:?}, values={}",
+            data.len()
+        );
+    }
+
+    let mut embeddings = Vec::with_capacity(batch);
+    for row in 0..batch {
+        let vector = match pooling {
+            EmbeddingPooling::Cls => {
+                let start = row * sequence_len * hidden_dim;
+                data[start..start + hidden_dim].to_vec()
+            }
+            EmbeddingPooling::LastToken => {
+                let attention =
+                    attention.ok_or_else(|| anyhow!("ONNX last-token pooling needs attention"))?;
+                let token_index = last_attention_index(attention, row, sequence_len).unwrap_or(0);
+                let start = ((row * sequence_len) + token_index) * hidden_dim;
+                data[start..start + hidden_dim].to_vec()
+            }
+            EmbeddingPooling::Mean => {
+                let attention =
+                    attention.ok_or_else(|| anyhow!("ONNX mean pooling needs attention"))?;
+                let mut vector = vec![0.0_f32; hidden_dim];
+                let mut count = 0.0_f32;
+                for token_index in 0..sequence_len {
+                    if attention[row * sequence_len + token_index] == 0 {
+                        continue;
+                    }
+                    let start = ((row * sequence_len) + token_index) * hidden_dim;
+                    for (target, value) in vector
+                        .iter_mut()
+                        .zip(data[start..start + hidden_dim].iter().copied())
+                    {
+                        *target += value;
+                    }
+                    count += 1.0;
+                }
+                if count > 0.0 {
+                    for value in &mut vector {
+                        *value /= count;
+                    }
+                }
+                vector
+            }
+        };
+        embeddings.push(vector);
+    }
+    Ok(embeddings)
+}
+
+fn last_attention_index(attention: &[i64], row: usize, sequence_len: usize) -> Option<usize> {
+    let offset = row * sequence_len;
+    (0..sequence_len)
+        .rev()
+        .find(|token_index| attention[offset + *token_index] != 0)
 }
 
 #[derive(Debug, Clone)]
@@ -573,6 +1093,7 @@ pub struct EmbeddingRuntime {
 
 #[derive(Debug, Clone)]
 enum EmbeddingBackend {
+    Onnx(Arc<OnnxEmbeddingRuntime>),
     LlamaCpp(Arc<LlamaCppEmbeddingRuntime>),
     HashProjection,
 }
@@ -830,6 +1351,14 @@ impl EmbeddingRuntime {
             });
         }
 
+        if backend == EmbeddingBackendSelection::Onnx {
+            let model_path = OnnxEmbeddingRuntime::probe_from_env()?;
+            return Ok(EmbeddingRuntimeProbe {
+                model_path,
+                model_id,
+            });
+        }
+
         if backend == EmbeddingBackendSelection::LlamaCpp {
             let endpoint = LlamaCppEndpoint::from_env()?;
             endpoint.ensure_reachable()?;
@@ -854,6 +1383,15 @@ impl EmbeddingRuntime {
                 profile,
                 backend: EmbeddingBackend::HashProjection,
             }),
+            EmbeddingBackendSelection::Onnx => {
+                let (model_path, runtime) = OnnxEmbeddingRuntime::from_env()?;
+                Ok(Self {
+                    model_path,
+                    model_id,
+                    profile,
+                    backend: EmbeddingBackend::Onnx(Arc::new(runtime)),
+                })
+            }
             EmbeddingBackendSelection::LlamaCpp => {
                 let endpoint = LlamaCppEndpoint::from_env()?;
                 endpoint.ensure_reachable()?;
@@ -924,6 +1462,7 @@ impl EmbeddingRuntime {
                 }
                 Ok(out)
             }
+            EmbeddingBackend::Onnx(runtime) => runtime.embed_texts(texts, &self.profile),
             EmbeddingBackend::LlamaCpp(runtime) => runtime.embed_texts(texts),
         }?;
         postprocess_embeddings(&mut embeddings, &self.profile)?;
@@ -1701,11 +2240,142 @@ mod tests {
     }
 
     #[test]
+    fn llamacpp_url_selects_legacy_backend_when_backend_is_unset() -> Result<()> {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _mode = EnvGuard::remove(EMBEDDING_RUNTIME_MODE_ENV);
+        let _backend = EnvGuard::remove(EMBEDDING_BACKEND_ENV);
+        let _url = EnvGuard::set(
+            LLAMACPP_EMBEDDINGS_URL_ENV,
+            "http://127.0.0.1:9/v1/embeddings",
+        );
+
+        assert_eq!(
+            EmbeddingBackendSelection::from_env()?,
+            EmbeddingBackendSelection::LlamaCpp
+        );
+
+        let _explicit_backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "onnx");
+        assert_eq!(
+            EmbeddingBackendSelection::from_env()?,
+            EmbeddingBackendSelection::Onnx
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn onnx_runtime_availability_rejects_corrupt_assets() -> Result<()> {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempdir()?;
+        let model_path = temp.path().join("model.onnx");
+        let tokenizer_path = temp.path().join("tokenizer.json");
+        std::fs::write(&model_path, b"not an onnx model")?;
+        std::fs::write(&tokenizer_path, b"not a tokenizer")?;
+
+        let _mode = EnvGuard::remove(EMBEDDING_RUNTIME_MODE_ENV);
+        let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "onnx");
+        let _model = EnvGuard::set(ONNX_MODEL_PATH_ENV, &model_path.to_string_lossy());
+        let _tokenizer = EnvGuard::set(ONNX_TOKENIZER_PATH_ENV, &tokenizer_path.to_string_lossy());
+        let _provider = EnvGuard::set(ONNX_PROVIDER_ENV, "cpu");
+
+        let availability = embedding_runtime_availability_from_env();
+
+        assert!(!availability.available);
+        assert!(
+            availability
+                .fallback_message
+                .as_deref()
+                .is_some_and(|message| message.contains("failed to load ONNX tokenizer")),
+            "availability should report a real ONNX asset load failure: {availability:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn embedding_parallel_chunk_size_spreads_batches_across_workers() {
         assert_eq!(embedding_parallel_chunk_size(64, 4), 16);
         assert_eq!(embedding_parallel_chunk_size(65, 4), 17);
         assert_eq!(embedding_parallel_chunk_size(7, 16), 1);
         assert_eq!(embedding_parallel_chunk_size(0, 4), 1);
+    }
+
+    #[test]
+    fn onnx_hidden_state_pooling_respects_attention_mask() -> Result<()> {
+        let data = vec![
+            1.0, 2.0, 3.0, 4.0, //
+            10.0, 20.0, 30.0, 40.0, //
+        ];
+        let attention = vec![1, 0, 1, 1];
+
+        let cls = pool_onnx_hidden_state(&data, &[2, 2, 2], None, 2, 2, EmbeddingPooling::Cls)?;
+        assert_eq!(cls, vec![vec![1.0, 2.0], vec![10.0, 20.0]]);
+
+        let mean = pool_onnx_hidden_state(
+            &data,
+            &[2, 2, 2],
+            Some(&attention),
+            2,
+            2,
+            EmbeddingPooling::Mean,
+        )?;
+        assert_eq!(mean, vec![vec![1.0, 2.0], vec![20.0, 30.0]]);
+
+        let last = pool_onnx_hidden_state(
+            &data,
+            &[2, 2, 2],
+            Some(&attention),
+            2,
+            2,
+            EmbeddingPooling::LastToken,
+        )?;
+        assert_eq!(last, vec![vec![1.0, 2.0], vec![30.0, 40.0]]);
+        Ok(())
+    }
+
+    #[test]
+    fn onnx_rank2_output_is_treated_as_pooled_embeddings() -> Result<()> {
+        let data = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+
+        let embeddings =
+            extract_onnx_embeddings(&data, &[2, 4], None, 2, 1, EmbeddingPooling::Cls)?;
+
+        assert_eq!(
+            embeddings,
+            vec![vec![1.0, 2.0, 3.0, 4.0], vec![10.0, 20.0, 30.0, 40.0]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn onnx_batch_token_budget_limits_padded_tensor_size() {
+        let rows = vec![
+            OnnxEncodedRow {
+                ids: vec![1; 4],
+                attention: vec![1; 4],
+                token_types: vec![0; 4],
+            },
+            OnnxEncodedRow {
+                ids: vec![1; 6],
+                attention: vec![1; 6],
+                token_types: vec![0; 6],
+            },
+            OnnxEncodedRow {
+                ids: vec![1; 6],
+                attention: vec![1; 6],
+                token_types: vec![0; 6],
+            },
+        ];
+
+        assert_eq!(onnx_batch_end_for_token_budget(&rows, 0, 12), 2);
+        assert_eq!(onnx_batch_end_for_token_budget(&rows, 2, 1), 3);
+
+        let cls_batch = shape_onnx_batch(&rows[..1], EmbeddingPooling::Cls).unwrap();
+        assert!(cls_batch.attention_values.is_none());
+        let mean_batch = shape_onnx_batch(&rows[..1], EmbeddingPooling::Mean).unwrap();
+        assert!(mean_batch.attention_values.is_some());
     }
 
     fn run_one_fake_embedding_server(

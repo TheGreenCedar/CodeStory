@@ -21,14 +21,15 @@ use codestory_contracts::graph::{Edge as GraphEdge, Node as GraphNode};
 use codestory_indexer::IncrementalIndexingStats;
 use codestory_indexer::WorkspaceIndexer as V2WorkspaceIndexer;
 use codestory_store::{
-    FileInfo, GroundingEdgeKindCount, GroundingNodeRecord, LlmSymbolDoc, LlmSymbolDocStats,
-    SearchSymbolProjection, SnapshotStore, Store, SymbolSummaryRecord,
+    FileInfo, GroundingEdgeKindCount, GroundingNodeRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata,
+    LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSummaryRecord,
 };
 use codestory_workspace::{
     IndexedFileRecord, RefreshExecutionPlan, RefreshInputs, Workspace, WorkspaceInventory,
 };
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{self, BufRead};
@@ -212,7 +213,15 @@ struct OptionalResolutionTelemetry {
 
 impl OptionalResolutionTelemetry {
     fn from_incremental_stats(index_stats: &IncrementalIndexingStats) -> Self {
-        let mut telemetry = Self {
+        let mut telemetry = Self::from_flush_stats(index_stats);
+        if index_stats.resolution_ran {
+            telemetry.apply_resolution_stats(index_stats);
+        }
+        telemetry
+    }
+
+    fn from_flush_stats(index_stats: &IncrementalIndexingStats) -> Self {
+        Self {
             setup_existing_projection_ids_ms: Some(clamp_u64_to_u32(
                 index_stats.setup_existing_projection_ids_ms,
             )),
@@ -229,116 +238,84 @@ impl OptionalResolutionTelemetry {
             flush_callable_projection_ms: Some(clamp_u64_to_u32(
                 index_stats.flush_callable_projection_ms,
             )),
-            resolution_override_count_ms: None,
-            resolution_unresolved_counts_ms: None,
-            resolution_calls_ms: None,
-            resolution_imports_ms: None,
-            resolution_cleanup_ms: None,
-            resolution_call_candidate_index_ms: None,
-            resolution_import_candidate_index_ms: None,
-            resolution_call_semantic_index_ms: None,
-            resolution_import_semantic_index_ms: None,
-            resolution_call_semantic_candidates_ms: None,
-            resolution_import_semantic_candidates_ms: None,
-            resolution_call_semantic_requests: None,
-            resolution_call_semantic_unique_requests: None,
-            resolution_call_semantic_skipped_requests: None,
-            resolution_import_semantic_requests: None,
-            resolution_import_semantic_unique_requests: None,
-            resolution_import_semantic_skipped_requests: None,
-            resolution_call_compute_ms: None,
-            resolution_import_compute_ms: None,
-            resolution_call_apply_ms: None,
-            resolution_import_apply_ms: None,
-            resolution_override_resolution_ms: None,
-            resolved_calls_same_file: None,
-            resolved_calls_same_module: None,
-            resolved_calls_global_unique: None,
-            resolved_calls_semantic: None,
-            resolved_imports_same_file: None,
-            resolved_imports_same_module: None,
-            resolved_imports_global_unique: None,
-            resolved_imports_fuzzy: None,
-            resolved_imports_semantic: None,
-        };
-        if !index_stats.resolution_ran {
-            return telemetry;
+            ..Self::default()
         }
-        telemetry.resolution_override_count_ms =
+    }
+
+    fn apply_resolution_stats(&mut self, index_stats: &IncrementalIndexingStats) {
+        self.resolution_override_count_ms =
             Some(clamp_u64_to_u32(index_stats.resolution_override_count_ms));
-        telemetry.resolution_unresolved_counts_ms = Some(clamp_u64_to_u32(
+        self.resolution_unresolved_counts_ms = Some(clamp_u64_to_u32(
             index_stats.resolution_unresolved_counts_ms,
         ));
-        telemetry.resolution_calls_ms = Some(clamp_u64_to_u32(index_stats.resolution_calls_ms));
-        telemetry.resolution_imports_ms = Some(clamp_u64_to_u32(index_stats.resolution_imports_ms));
-        telemetry.resolution_cleanup_ms = Some(clamp_u64_to_u32(index_stats.resolution_cleanup_ms));
-        telemetry.resolution_call_candidate_index_ms = Some(clamp_u64_to_u32(
+        self.resolution_calls_ms = Some(clamp_u64_to_u32(index_stats.resolution_calls_ms));
+        self.resolution_imports_ms = Some(clamp_u64_to_u32(index_stats.resolution_imports_ms));
+        self.resolution_cleanup_ms = Some(clamp_u64_to_u32(index_stats.resolution_cleanup_ms));
+        self.resolution_call_candidate_index_ms = Some(clamp_u64_to_u32(
             index_stats.resolution_call_candidate_index_ms,
         ));
-        telemetry.resolution_import_candidate_index_ms = Some(clamp_u64_to_u32(
+        self.resolution_import_candidate_index_ms = Some(clamp_u64_to_u32(
             index_stats.resolution_import_candidate_index_ms,
         ));
-        telemetry.resolution_call_semantic_index_ms = Some(clamp_u64_to_u32(
+        self.resolution_call_semantic_index_ms = Some(clamp_u64_to_u32(
             index_stats.resolution_call_semantic_index_ms,
         ));
-        telemetry.resolution_import_semantic_index_ms = Some(clamp_u64_to_u32(
+        self.resolution_import_semantic_index_ms = Some(clamp_u64_to_u32(
             index_stats.resolution_import_semantic_index_ms,
         ));
-        telemetry.resolution_call_semantic_candidates_ms = Some(clamp_u64_to_u32(
+        self.resolution_call_semantic_candidates_ms = Some(clamp_u64_to_u32(
             index_stats.resolution_call_semantic_candidates_ms,
         ));
-        telemetry.resolution_import_semantic_candidates_ms = Some(clamp_u64_to_u32(
+        self.resolution_import_semantic_candidates_ms = Some(clamp_u64_to_u32(
             index_stats.resolution_import_semantic_candidates_ms,
         ));
-        telemetry.resolution_call_semantic_requests = Some(clamp_usize_to_u32(
+        self.resolution_call_semantic_requests = Some(clamp_usize_to_u32(
             index_stats.resolution_call_semantic_requests,
         ));
-        telemetry.resolution_call_semantic_unique_requests = Some(clamp_usize_to_u32(
+        self.resolution_call_semantic_unique_requests = Some(clamp_usize_to_u32(
             index_stats.resolution_call_semantic_unique_requests,
         ));
-        telemetry.resolution_call_semantic_skipped_requests = Some(clamp_usize_to_u32(
+        self.resolution_call_semantic_skipped_requests = Some(clamp_usize_to_u32(
             index_stats.resolution_call_semantic_skipped_requests,
         ));
-        telemetry.resolution_import_semantic_requests = Some(clamp_usize_to_u32(
+        self.resolution_import_semantic_requests = Some(clamp_usize_to_u32(
             index_stats.resolution_import_semantic_requests,
         ));
-        telemetry.resolution_import_semantic_unique_requests = Some(clamp_usize_to_u32(
+        self.resolution_import_semantic_unique_requests = Some(clamp_usize_to_u32(
             index_stats.resolution_import_semantic_unique_requests,
         ));
-        telemetry.resolution_import_semantic_skipped_requests = Some(clamp_usize_to_u32(
+        self.resolution_import_semantic_skipped_requests = Some(clamp_usize_to_u32(
             index_stats.resolution_import_semantic_skipped_requests,
         ));
-        telemetry.resolution_call_compute_ms =
+        self.resolution_call_compute_ms =
             Some(clamp_u64_to_u32(index_stats.resolution_call_compute_ms));
-        telemetry.resolution_import_compute_ms =
+        self.resolution_import_compute_ms =
             Some(clamp_u64_to_u32(index_stats.resolution_import_compute_ms));
-        telemetry.resolution_call_apply_ms =
+        self.resolution_call_apply_ms =
             Some(clamp_u64_to_u32(index_stats.resolution_call_apply_ms));
-        telemetry.resolution_import_apply_ms =
+        self.resolution_import_apply_ms =
             Some(clamp_u64_to_u32(index_stats.resolution_import_apply_ms));
-        telemetry.resolution_override_resolution_ms = Some(clamp_u64_to_u32(
+        self.resolution_override_resolution_ms = Some(clamp_u64_to_u32(
             index_stats.resolution_override_resolution_ms,
         ));
-        telemetry.resolved_calls_same_file =
+        self.resolved_calls_same_file =
             Some(clamp_usize_to_u32(index_stats.resolved_calls_same_file));
-        telemetry.resolved_calls_same_module =
+        self.resolved_calls_same_module =
             Some(clamp_usize_to_u32(index_stats.resolved_calls_same_module));
-        telemetry.resolved_calls_global_unique =
+        self.resolved_calls_global_unique =
             Some(clamp_usize_to_u32(index_stats.resolved_calls_global_unique));
-        telemetry.resolved_calls_semantic =
+        self.resolved_calls_semantic =
             Some(clamp_usize_to_u32(index_stats.resolved_calls_semantic));
-        telemetry.resolved_imports_same_file =
+        self.resolved_imports_same_file =
             Some(clamp_usize_to_u32(index_stats.resolved_imports_same_file));
-        telemetry.resolved_imports_same_module =
+        self.resolved_imports_same_module =
             Some(clamp_usize_to_u32(index_stats.resolved_imports_same_module));
-        telemetry.resolved_imports_global_unique = Some(clamp_usize_to_u32(
+        self.resolved_imports_global_unique = Some(clamp_usize_to_u32(
             index_stats.resolved_imports_global_unique,
         ));
-        telemetry.resolved_imports_fuzzy =
-            Some(clamp_usize_to_u32(index_stats.resolved_imports_fuzzy));
-        telemetry.resolved_imports_semantic =
+        self.resolved_imports_fuzzy = Some(clamp_usize_to_u32(index_stats.resolved_imports_fuzzy));
+        self.resolved_imports_semantic =
             Some(clamp_usize_to_u32(index_stats.resolved_imports_semantic));
-        telemetry
     }
 }
 
@@ -559,16 +536,29 @@ fn bounded_markdown_snippet_from_path(
         }
     }
 
+    Ok(finish_bounded_file_snippet(
+        out,
+        truncated,
+        max_bytes,
+        truncation_suffix,
+    ))
+}
+
+fn finish_bounded_file_snippet(
+    mut out: String,
+    truncated: bool,
+    max_bytes: usize,
+    truncation_suffix: &str,
+) -> BoundedSnippet {
     if out == "```text\n" {
-        return Ok(BoundedSnippet {
+        return BoundedSnippet {
             markdown: String::new(),
             truncated: false,
-        });
+        };
     }
     out.push_str("```");
-
     if out.len() > max_bytes {
-        return Ok(truncate_to_byte_cap(out, max_bytes, truncation_suffix));
+        return truncate_to_byte_cap(out, max_bytes, truncation_suffix);
     }
     if truncated {
         if out.ends_with("```") {
@@ -576,17 +566,17 @@ fn bounded_markdown_snippet_from_path(
         }
         if out.len().saturating_add(truncation_suffix.len()) <= max_bytes {
             out.push_str(truncation_suffix);
-            return Ok(BoundedSnippet {
+            return BoundedSnippet {
                 markdown: out,
                 truncated: true,
-            });
+            };
         }
-        return Ok(truncate_to_byte_cap(out, max_bytes, truncation_suffix));
+        return truncate_to_byte_cap(out, max_bytes, truncation_suffix);
     }
-    Ok(BoundedSnippet {
+    BoundedSnippet {
         markdown: out,
         truncated: false,
-    })
+    }
 }
 
 fn read_line_capped<R: BufRead>(
@@ -1391,7 +1381,7 @@ fn llm_doc_embed_batch_size() -> usize {
     std::env::var(LLM_DOC_EMBED_BATCH_SIZE_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .map(|value| value.clamp(1, 512))
+        .map(|value| value.clamp(1, 2_048))
         .unwrap_or(LLM_DOC_EMBED_BATCH_SIZE)
 }
 
@@ -1674,6 +1664,27 @@ impl SemanticDocGraphContext {
     }
 }
 
+fn build_semantic_file_text_cache(
+    graph_context: &SemanticDocGraphContext,
+    semantic_nodes: &[&GraphNode],
+) -> HashMap<String, Option<String>> {
+    let mut file_paths = semantic_nodes
+        .iter()
+        .filter_map(|node| graph_context.file_path_for_node(node).map(str::to_string))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    file_paths.sort();
+
+    file_paths
+        .into_par_iter()
+        .map(|path| {
+            let contents = read_searchable_file_contents(&path);
+            (path, contents)
+        })
+        .collect()
+}
+
 fn edge_digest_for_edges(edges: &[GraphEdge], limit: usize) -> Vec<String> {
     let mut by_kind = HashMap::<String, usize>::new();
     for edge in edges {
@@ -1840,15 +1851,15 @@ fn comment_block_before(lines: &[&str], start_idx: usize, limit: usize) -> Vec<S
 fn symbol_excerpt(
     node: &codestory_contracts::graph::Node,
     file_path: Option<&str>,
-    file_text_cache: &mut HashMap<String, Option<String>>,
+    file_text_cache: &HashMap<String, Option<String>>,
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
     let Some(path) = file_path else {
         return (Vec::new(), Vec::new(), Vec::new());
     };
-    let contents = file_text_cache
-        .entry(path.to_string())
-        .or_insert_with(|| read_searchable_file_contents(path));
-    let Some(contents) = contents.as_deref() else {
+    let Some(contents) = file_text_cache
+        .get(path)
+        .and_then(|contents| contents.as_deref())
+    else {
         return (Vec::new(), Vec::new(), Vec::new());
     };
 
@@ -1880,7 +1891,7 @@ fn build_llm_symbol_doc_text(
     node: &GraphNode,
     display_name: &str,
     file_path: Option<&str>,
-    file_text_cache: &mut HashMap<String, Option<String>>,
+    file_text_cache: &HashMap<String, Option<String>>,
 ) -> String {
     let alias_mode = semantic_doc_alias_mode_from_env();
     let mut out = String::new();
@@ -2008,6 +2019,12 @@ struct PendingLlmSymbolDoc {
     doc_hash: String,
 }
 
+#[derive(Debug)]
+struct BuiltLlmSymbolDoc {
+    pending: PendingLlmSymbolDoc,
+    reusable: bool,
+}
+
 fn llm_symbol_doc_hash(doc_text: &str) -> String {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
@@ -2025,6 +2042,24 @@ fn llm_symbol_doc_hash(doc_text: &str) -> String {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     format!("{hash:016x}")
+}
+
+fn llm_symbol_doc_can_reuse(
+    existing_doc: &LlmSymbolDocReuseMetadata,
+    doc_hash: &str,
+    embedding_contract: &EmbeddingProfileContractDto,
+    model_id: &str,
+) -> bool {
+    existing_doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
+        && existing_doc.doc_hash == doc_hash
+        && existing_doc.embedding_profile.as_deref() == Some(embedding_contract.profile.as_str())
+        && existing_doc.embedding_model == model_id
+        && existing_doc.embedding_backend.as_deref() == Some(embedding_contract.backend.as_str())
+        && embedding_contract
+            .dimension
+            .map(|dimension| existing_doc.embedding_dim == dimension)
+            .unwrap_or(existing_doc.embedding_dim > 0)
+        && existing_doc.doc_shape.as_deref() == Some(embedding_contract.doc_shape.as_str())
 }
 
 fn sort_pending_llm_symbol_docs_for_embedding_batches(docs: &mut [PendingLlmSymbolDoc]) {
@@ -2055,7 +2090,7 @@ fn flush_pending_llm_symbol_docs(
     let embedding_started = Instant::now();
     let embeddings = engine
         .embed_text_refs(&payloads)
-        .map_err(|e| ApiError::internal(format!("Failed to embed symbol docs: {e}")))?;
+        .map_err(|e| ApiError::internal(format!("Failed to embed symbol docs: {e:#}")))?;
     stats.embedding_ms = stats
         .embedding_ms
         .saturating_add(clamp_u128_to_u32(embedding_started.elapsed().as_millis()));
@@ -2146,7 +2181,7 @@ fn sync_llm_symbol_projection(
 
     if let Err(error) = engine.set_embedding_runtime_from_env() {
         tracing::warn!(
-            "llama.cpp embedding endpoint unavailable ({error}); semantic ask retrieval will be unavailable until CODESTORY_EMBED_LLAMACPP_URL points at a running OpenAI-compatible embeddings endpoint. Set {EMBEDDING_RUNTIME_MODE_ENV}=hash for local-dev embeddings, or set {HYBRID_RETRIEVAL_ENABLED_ENV}=false for lexical-only retrieval."
+            "embedding runtime unavailable ({error}); semantic ask retrieval will be unavailable until managed ONNX assets are installed with `codestory-cli setup embeddings` or embedding env points at a reachable runtime. Set {EMBEDDING_RUNTIME_MODE_ENV}=hash for local-dev embeddings, or set {HYBRID_RETRIEVAL_ENABLED_ENV}=false for lexical-only retrieval."
         );
         if hydrate_semantic_docs {
             let reload_started = Instant::now();
@@ -2189,7 +2224,6 @@ fn sync_llm_symbol_projection(
     tracing::debug!(embed_batch_size, "Using semantic doc embedding batch size");
     let mut pending_docs = Vec::<PendingLlmSymbolDoc>::new();
     let mut seen_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
-    let mut file_text_cache = HashMap::<String, Option<String>>::new();
     let mut doc_build_ns = 0_u128;
     let semantic_nodes = nodes
         .iter()
@@ -2205,56 +2239,69 @@ fn sync_llm_symbol_projection(
         })
         .collect::<Vec<_>>();
     let graph_context = SemanticDocGraphContext::build(storage, &semantic_nodes, nodes)?;
+    let file_cache_started = Instant::now();
+    let file_text_cache = build_semantic_file_text_cache(&graph_context, &semantic_nodes);
+    doc_build_ns = doc_build_ns.saturating_add(file_cache_started.elapsed().as_nanos());
 
-    for node in semantic_nodes {
-        let display_name = node_names
-            .get(&node.id)
-            .cloned()
-            .unwrap_or_else(|| node_display_name(node));
-        let file_path = graph_context
-            .file_path_for_node(node)
-            .map(ToString::to_string);
+    for semantic_window in semantic_nodes.chunks(stream_sort_window_size.max(1)) {
         let doc_build_started = Instant::now();
-        let doc_text = build_llm_symbol_doc_text(
-            &graph_context,
-            node,
-            &display_name,
-            file_path.as_deref(),
-            &mut file_text_cache,
-        );
+        let built_docs = semantic_window
+            .par_iter()
+            .map(|node| {
+                let display_name = node_names
+                    .get(&node.id)
+                    .cloned()
+                    .unwrap_or_else(|| node_display_name(node));
+                let file_path = graph_context
+                    .file_path_for_node(node)
+                    .map(ToString::to_string);
+                let doc_text = build_llm_symbol_doc_text(
+                    &graph_context,
+                    node,
+                    &display_name,
+                    file_path.as_deref(),
+                    &file_text_cache,
+                );
+                let doc_hash = llm_symbol_doc_hash(&doc_text);
+                let reusable = existing_docs.get(&node.id).is_some_and(|existing_doc| {
+                    llm_symbol_doc_can_reuse(
+                        existing_doc,
+                        &doc_hash,
+                        &embedding_contract,
+                        &model_id,
+                    )
+                });
+
+                BuiltLlmSymbolDoc {
+                    pending: PendingLlmSymbolDoc {
+                        node_id: node.id,
+                        file_node_id: node.file_node_id,
+                        kind: node.kind,
+                        display_name,
+                        qualified_name: node.qualified_name.clone(),
+                        file_path,
+                        start_line: node.start_line,
+                        doc_text,
+                        doc_hash,
+                    },
+                    reusable,
+                }
+            })
+            .collect::<Vec<_>>();
         doc_build_ns = doc_build_ns.saturating_add(doc_build_started.elapsed().as_nanos());
-        let doc_hash = llm_symbol_doc_hash(&doc_text);
-        seen_node_ids.push(node.id);
-        if let Some(existing_doc) = existing_docs.get(&node.id)
-            && existing_doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
-            && existing_doc.doc_hash == doc_hash
-            && existing_doc.embedding_profile.as_deref()
-                == Some(embedding_contract.profile.as_str())
-            && existing_doc.embedding_model == model_id
-            && existing_doc.embedding_backend.as_deref()
-                == Some(embedding_contract.backend.as_str())
-            && embedding_contract
-                .dimension
-                .map(|dimension| existing_doc.embedding_dim == dimension)
-                .unwrap_or(existing_doc.embedding_dim > 0)
-            && existing_doc.doc_shape.as_deref() == Some(embedding_contract.doc_shape.as_str())
-        {
-            stats.docs_reused = stats.docs_reused.saturating_add(1);
-            continue;
+
+        for built_doc in built_docs {
+            seen_node_ids.push(built_doc.pending.node_id);
+            if built_doc.reusable {
+                stats.docs_reused = stats.docs_reused.saturating_add(1);
+                continue;
+            }
+
+            stats.docs_pending = stats.docs_pending.saturating_add(1);
+            pending_docs.push(built_doc.pending);
         }
-        stats.docs_pending = stats.docs_pending.saturating_add(1);
-        pending_docs.push(PendingLlmSymbolDoc {
-            node_id: node.id,
-            file_node_id: node.file_node_id,
-            kind: node.kind,
-            display_name,
-            qualified_name: node.qualified_name.clone(),
-            file_path,
-            start_line: node.start_line,
-            doc_text,
-            doc_hash,
-        });
-        if stream_pending_docs && pending_docs.len() >= stream_sort_window_size {
+
+        while stream_pending_docs && pending_docs.len() >= embed_batch_size {
             flush_streaming_llm_symbol_doc_window(
                 storage,
                 engine,
@@ -2826,27 +2873,7 @@ impl AppController {
             .get_files_ordered_limit(REPO_TEXT_SCAN_FILE_CAP.saturating_add(1))
             .map_err(|e| ApiError::internal(format!("Failed to load files for text search: {e}")))?
         {
-            if hits.len() >= limit {
-                break;
-            }
-            if (stats.scanned_file_count as usize) >= REPO_TEXT_SCAN_FILE_CAP {
-                Self::mark_repo_text_scan_truncated(
-                    &mut stats,
-                    format!(
-                        "repo-text scan stopped after scanning {} files",
-                        REPO_TEXT_SCAN_FILE_CAP
-                    ),
-                );
-                break;
-            }
-            if started_at.elapsed().as_millis() > REPO_TEXT_SCAN_TIME_CAP_MS {
-                Self::mark_repo_text_scan_truncated(
-                    &mut stats,
-                    format!(
-                        "repo-text scan stopped after {} ms",
-                        REPO_TEXT_SCAN_TIME_CAP_MS
-                    ),
-                );
+            if Self::repo_text_scan_should_stop(&mut stats, hits.len(), limit, &started_at) {
                 break;
             }
 
@@ -2889,35 +2916,97 @@ impl AppController {
                 continue;
             }
 
-            let display_name = project_root
-                .and_then(|root| file.path.strip_prefix(root).ok())
-                .map(|path| path.to_string_lossy().replace('\\', "/"))
-                .or_else(|| {
-                    file.path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().to_string())
-                })
-                .unwrap_or_else(|| path_string.clone());
-            let exact_match = !normalized_query.is_empty()
-                && contents.to_ascii_lowercase().contains(&normalized_query);
-            let score = if exact_match { 260.0 } else { 150.0 } - hits.len() as f32;
-            hits.push(SearchHit {
+            let display_name =
+                Self::repo_text_display_name(project_root, &file.path, path_string.as_str());
+            let score = Self::repo_text_score(&contents, &normalized_query, hits.len());
+            hits.push(Self::repo_text_search_hit(
                 node_id,
                 display_name,
-                kind: codestory_contracts::api::NodeKind::FILE,
-                file_path: Some(path_string),
-                line: Some(line),
+                path_string,
+                line,
                 score,
-                origin: codestory_contracts::api::SearchHitOrigin::TextMatch,
-                resolvable: false,
-                score_breakdown: None,
-            });
+            ));
         }
 
         hits.sort_by(|left, right| compare_search_hits(query, left, right));
         hits.truncate(limit);
         stats.duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
         Ok(RepoTextScan { hits, stats })
+    }
+
+    fn repo_text_scan_should_stop(
+        stats: &mut RepoTextScanStatsDto,
+        hits_len: usize,
+        limit: usize,
+        started_at: &Instant,
+    ) -> bool {
+        if hits_len >= limit {
+            return true;
+        }
+        if (stats.scanned_file_count as usize) >= REPO_TEXT_SCAN_FILE_CAP {
+            Self::mark_repo_text_scan_truncated(
+                stats,
+                format!(
+                    "repo-text scan stopped after scanning {} files",
+                    REPO_TEXT_SCAN_FILE_CAP
+                ),
+            );
+            return true;
+        }
+        if started_at.elapsed().as_millis() > REPO_TEXT_SCAN_TIME_CAP_MS {
+            Self::mark_repo_text_scan_truncated(
+                stats,
+                format!(
+                    "repo-text scan stopped after {} ms",
+                    REPO_TEXT_SCAN_TIME_CAP_MS
+                ),
+            );
+            return true;
+        }
+        false
+    }
+
+    fn repo_text_display_name(
+        project_root: Option<&Path>,
+        file_path: &Path,
+        fallback: &str,
+    ) -> String {
+        project_root
+            .and_then(|root| file_path.strip_prefix(root).ok())
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .or_else(|| {
+                file_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
+            .unwrap_or_else(|| fallback.to_string())
+    }
+
+    fn repo_text_score(contents: &str, normalized_query: &str, hit_index: usize) -> f32 {
+        let exact_match = !normalized_query.is_empty()
+            && contents.to_ascii_lowercase().contains(normalized_query);
+        let base_score = if exact_match { 260.0 } else { 150.0 };
+        base_score - hit_index as f32
+    }
+
+    fn repo_text_search_hit(
+        node_id: NodeId,
+        display_name: String,
+        path_string: String,
+        line: u32,
+        score: f32,
+    ) -> SearchHit {
+        SearchHit {
+            node_id,
+            display_name,
+            kind: codestory_contracts::api::NodeKind::FILE,
+            file_path: Some(path_string),
+            line: Some(line),
+            score,
+            origin: codestory_contracts::api::SearchHitOrigin::TextMatch,
+            resolvable: false,
+            score_breakdown: None,
+        }
     }
 
     fn mark_repo_text_scan_truncated(stats: &mut RepoTextScanStatsDto, reason: String) {
@@ -4662,6 +4751,16 @@ mod tests {
     }
 
     #[test]
+    fn llm_doc_embed_batch_size_allows_wider_managed_batches() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvGuard::set(LLM_DOC_EMBED_BATCH_SIZE_ENV, "1024");
+
+        assert_eq!(llm_doc_embed_batch_size(), 1024);
+    }
+
+    #[test]
     fn stream_pending_llm_symbol_docs_defaults_to_enabled() {
         let _lock = ENV_TEST_LOCK
             .lock()
@@ -4763,7 +4862,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_doc_token_budget_defaults_to_safe_llamacpp_window() {
+    fn semantic_doc_token_budget_defaults_to_safe_window() {
         let _lock = ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4841,13 +4940,13 @@ mod tests {
             ..Default::default()
         };
         let graph_context = SemanticDocGraphContext::default();
-        let mut file_text_cache = HashMap::new();
+        let file_text_cache = HashMap::new();
         build_llm_symbol_doc_text(
             &graph_context,
             &node,
             display_name,
             Some(file_path),
-            &mut file_text_cache,
+            &file_text_cache,
         )
     }
 
