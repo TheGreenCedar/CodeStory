@@ -200,7 +200,7 @@ fn build_navigation_output(
     }
 
     NavigationOutput {
-        definition: build_search_hit_output(project_root, &target.selected, false),
+        definition: build_search_hit_output(project_root, &target.selected, false, &[]),
         incoming_references,
         outgoing_references,
     }
@@ -217,12 +217,12 @@ fn build_explore_search_output(
             .file_filter
             .as_deref()
             .map(crate::display::clean_path_string),
-        selected: build_search_hit_output(project_root, &target.selected, false),
+        selected: build_search_hit_output(project_root, &target.selected, false, &[]),
         alternatives: target
             .alternatives
             .iter()
             .skip(1)
-            .map(|hit| build_search_hit_output(project_root, hit, false))
+            .map(|hit| build_search_hit_output(project_root, hit, false, &[]))
             .collect(),
     }
 }
@@ -585,6 +585,7 @@ fn render_explore_markdown(context: &ExploreRenderContext<'_>) -> String {
         context.project_root,
         context.target,
         context.symbol,
+        &[],
     ));
     markdown.push_str("\ntrail:\n");
     let cmd = explore_trail_command(context.project_root, context.target, context.trail);
@@ -602,6 +603,7 @@ fn render_explore_markdown(context: &ExploreRenderContext<'_>) -> String {
             context.target,
             snippet,
             false,
+            &[],
         ));
     }
     markdown
@@ -628,7 +630,7 @@ fn build_explore_panes(context: &ExploreRenderContext<'_>) -> Vec<ExplorePane> {
         },
         ExplorePane {
             label: "Detail",
-            body: render_symbol_markdown(context.project_root, context.target, context.symbol),
+            body: render_symbol_markdown(context.project_root, context.target, context.symbol, &[]),
         },
         ExplorePane {
             label: "Trail",
@@ -651,6 +653,7 @@ fn build_explore_panes(context: &ExploreRenderContext<'_>) -> Vec<ExplorePane> {
                             context.target,
                             snippet,
                             false,
+                            &[],
                         )
                     })
                     .unwrap_or_default()

@@ -413,6 +413,7 @@ fn handle_stdio_definition(
                         &runtime.project_root,
                         &target.selected,
                         false,
+                        &[],
                     ))
                     .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
                     add_stdio_links(&mut definition, links.clone());

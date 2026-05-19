@@ -1,5 +1,6 @@
 use codestory_contracts::api::{NodeKind, SearchHit, SearchHitOrigin};
 use std::cmp::Ordering;
+use std::fs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SymbolNameMatchRank {
@@ -287,10 +288,11 @@ pub(crate) fn is_non_primary_source_hit(hit: &SearchHit) -> bool {
         .unwrap_or(false)
 }
 
-fn search_match_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8, u8, u8, u8, u8, u8) {
+fn search_match_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8, u8, u8, u8, u8, u8, u8) {
     let rank = symbol_name_match_rank(query, &hit.display_name);
     let is_exact_match =
         rank.exact_display != 0 || rank.exact_terminal != 0 || rank.exact_leading != 0;
+    let definition_quality = exact_definition_quality_bucket(query, hit, is_exact_match);
     let source_bucket = u8::from(
         is_exact_match
             || query_mentions_non_primary_source(query)
@@ -311,6 +313,7 @@ fn search_match_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8, u8, u8, u
     };
 
     (
+        definition_quality,
         rank.exact_display,
         rank.exact_terminal,
         source_bucket,
@@ -321,6 +324,82 @@ fn search_match_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8, u8, u8, u
         kind_tiebreak,
         u8::from(hit.origin == SearchHitOrigin::IndexedSymbol),
     )
+}
+
+fn exact_definition_quality_bucket(query: &str, hit: &SearchHit, is_exact_match: bool) -> u8 {
+    if !is_exact_match || hit.origin == SearchHitOrigin::TextMatch || hit.kind == NodeKind::UNKNOWN
+    {
+        return 0;
+    }
+    if is_type_like_kind(hit.kind) {
+        return type_hit_line_quality(query, hit);
+    }
+    1
+}
+
+fn type_hit_line_quality(query: &str, hit: &SearchHit) -> u8 {
+    let Some(path) = hit.file_path.as_deref() else {
+        return 1;
+    };
+    let Some(line) = hit.line else {
+        return 1;
+    };
+    let Some(source_line) = read_source_line(path, line) else {
+        return 1;
+    };
+    let trimmed = source_line
+        .split("//")
+        .next()
+        .unwrap_or(source_line.as_str())
+        .trim();
+    let expected_name = terminal_symbol_segment(query);
+    if expected_name.is_empty() {
+        return 1;
+    }
+    let tokens = trimmed
+        .split(|ch: char| ch.is_whitespace() || ch == ':' || ch == ';' || ch == '{')
+        .map(|token| token.trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')))
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let Some(type_keyword_index) = tokens
+        .iter()
+        .position(|token| matches!(*token, "class" | "struct" | "interface" | "enum" | "union"))
+    else {
+        return 0;
+    };
+    let Some(type_name) = tokens.get(type_keyword_index + 1).copied() else {
+        return 0;
+    };
+    let direct_type_line = normalize_symbol_query(type_name) == expected_name;
+    if !direct_type_line {
+        return 0;
+    }
+    if trimmed.contains('{') || !trimmed.ends_with(';') {
+        2
+    } else {
+        0
+    }
+}
+
+fn read_source_line(path: &str, line: u32) -> Option<String> {
+    let contents = fs::read_to_string(path)
+        .or_else(|_| {
+            #[cfg(windows)]
+            {
+                path.strip_prefix(r"\\?\")
+                    .map(fs::read_to_string)
+                    .unwrap_or_else(|| fs::read_to_string(path))
+            }
+            #[cfg(not(windows))]
+            {
+                fs::read_to_string(path)
+            }
+        })
+        .ok()?;
+    contents
+        .lines()
+        .nth(line.saturating_sub(1) as usize)
+        .map(str::to_string)
 }
 
 pub(crate) fn compare_search_hits(query: &str, left: &SearchHit, right: &SearchHit) -> Ordering {
@@ -336,6 +415,7 @@ pub(crate) fn compare_search_hits(query: &str, left: &SearchHit, right: &SearchH
 mod tests {
     use super::*;
     use codestory_contracts::api::NodeId;
+    use tempfile::tempdir;
 
     fn hit(id: &str, display_name: &str, kind: NodeKind, score: f32) -> SearchHit {
         SearchHit {
@@ -697,5 +777,75 @@ mod tests {
             hits.first().map(|hit| &hit.node_id),
             Some(&external.node_id)
         );
+    }
+
+    #[test]
+    fn exact_type_queries_downrank_forward_declarations() {
+        let temp = tempdir().expect("create temp dir");
+        let forward_path = temp.path().join("ViewFactory.h");
+        let definition_path = temp.path().join("StorageAccess.h");
+        std::fs::write(&forward_path, "class StorageAccess;\n").expect("write forward decl");
+        std::fs::write(&definition_path, "class StorageAccess\n{\n};\n").expect("write definition");
+
+        let mut forward = hit_at_path(
+            "forward",
+            "StorageAccess",
+            NodeKind::CLASS,
+            0.95,
+            &forward_path.to_string_lossy(),
+        );
+        forward.line = Some(1);
+        let mut definition = hit_at_path(
+            "definition",
+            "StorageAccess",
+            NodeKind::CLASS,
+            0.80,
+            &definition_path.to_string_lossy(),
+        );
+        definition.line = Some(1);
+
+        let mut hits = [forward, definition.clone()];
+        hits.sort_by(|left, right| compare_search_hits("StorageAccess", left, right));
+
+        assert_eq!(
+            hits.first().map(|hit| &hit.node_id),
+            Some(&definition.node_id)
+        );
+    }
+
+    #[test]
+    fn exact_type_queries_downrank_inheritance_mentions_below_exact_members() {
+        let temp = tempdir().expect("create temp dir");
+        let inherited_path = temp.path().join("PersistentStorage.h");
+        let member_path = temp.path().join("StorageAccess.h");
+        std::fs::write(
+            &inherited_path,
+            "class PersistentStorage\n\t: public StorageAccess\n{\n};\n",
+        )
+        .expect("write inherited type");
+        std::fs::write(&member_path, "virtual ~StorageAccess() = default;\n")
+            .expect("write member");
+
+        let mut inherited = hit_at_path(
+            "inherited",
+            "StorageAccess",
+            NodeKind::CLASS,
+            0.95,
+            &inherited_path.to_string_lossy(),
+        );
+        inherited.line = Some(2);
+        let mut member = hit_at_path(
+            "member",
+            "StorageAccess::~StorageAccess",
+            NodeKind::FUNCTION,
+            0.80,
+            &member_path.to_string_lossy(),
+        );
+        member.line = Some(1);
+
+        let mut hits = [inherited, member.clone()];
+        hits.sort_by(|left, right| compare_search_hits("StorageAccess", left, right));
+
+        assert_eq!(hits.first().map(|hit| &hit.node_id), Some(&member.node_id));
     }
 }

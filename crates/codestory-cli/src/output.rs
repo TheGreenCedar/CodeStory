@@ -8,15 +8,15 @@ use codestory_contracts::api::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use crate::args::{
-    CliTrailMode, DoctorOutput, IndexDryRunOutput, IndexOutput, OutputFormat, QueryOutput,
-    SearchHitOutput, SearchOutput, TrailCommand,
+    CliTrailMode, DoctorOutput, DrillOutput, IndexDryRunOutput, IndexOutput, OutputFormat,
+    QueryOutput, SearchHitOutput, SearchOutput, TrailCommand, VerificationTargetOutput,
 };
 use crate::display::{
     clean_path_string, default_trail_direction, format_budget, format_direction, format_kind,
@@ -529,6 +529,12 @@ pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput)
         if !output.explain {
             append_search_hit_why(&mut markdown, hit);
         }
+        append_resolution_hints(&mut markdown, hit);
+        append_verification_targets(
+            &mut markdown,
+            "  verification_targets",
+            &hit.verification_targets,
+        );
     }
     let _ = writeln!(markdown, "repo_text_hits: {}", output.repo_text_hits.len());
     for hit in &output.repo_text_hits {
@@ -536,6 +542,7 @@ pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput)
         if !output.explain {
             append_search_hit_why(&mut markdown, hit);
         }
+        append_resolution_hints(&mut markdown, hit);
         if let Some(excerpt) = hit.excerpt.as_deref() {
             let _ = writeln!(markdown, "  excerpt: {}", excerpt);
         }
@@ -549,6 +556,35 @@ fn append_search_hit_why(markdown: &mut String, hit: &SearchHitOutput) {
     }
     for why in &hit.why {
         let _ = writeln!(markdown, "  why: {why}");
+    }
+}
+
+fn append_resolution_hints(markdown: &mut String, hit: &SearchHitOutput) {
+    for hint in &hit.resolution_hints {
+        let _ = writeln!(markdown, "  hint: {hint}");
+    }
+}
+
+fn append_verification_targets(
+    markdown: &mut String,
+    title: &str,
+    targets: &[VerificationTargetOutput],
+) {
+    if targets.is_empty() {
+        return;
+    }
+    let _ = writeln!(markdown, "{title}:");
+    for target in targets {
+        let node_ref = target
+            .node_ref
+            .as_deref()
+            .map(|value| format!(" ref=`{value}`"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            markdown,
+            "  - {} `{}`:{}{} - {}",
+            target.role, target.path, target.line, node_ref, target.reason
+        );
     }
 }
 
@@ -1413,10 +1449,99 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
     markdown
 }
 
+pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Drill");
+    let _ = writeln!(markdown, "project: `{}`", output.project);
+    if let Some(label) = output.label.as_deref() {
+        let _ = writeln!(markdown, "label: {label}");
+    }
+    let _ = writeln!(markdown, "output_dir: `{}`", output.output_dir);
+    let _ = writeln!(
+        markdown,
+        "index_before: files={} nodes={} edges={} errors={}",
+        output.mechanical.before_files,
+        output.mechanical.before_nodes,
+        output.mechanical.before_edges,
+        output.mechanical.before_errors
+    );
+    let _ = writeln!(
+        markdown,
+        "index_after: files={} nodes={} edges={} errors={} refresh={}",
+        output.mechanical.after_files,
+        output.mechanical.after_nodes,
+        output.mechanical.after_edges,
+        output.mechanical.after_errors,
+        output.mechanical.refresh
+    );
+    if let Some(retrieval) = output.mechanical.retrieval.as_ref() {
+        let _ = writeln!(markdown, "retrieval: {}", render_retrieval_state(retrieval));
+    }
+    if let Some(timings) = output.mechanical.phase_timings.as_ref() {
+        let _ = writeln!(
+            markdown,
+            "timings_ms: parse={} resolve={} cache_refresh={}",
+            timings.parse_index_ms,
+            timings.edge_resolution_ms,
+            timings.cache_refresh_ms.unwrap_or(0)
+        );
+    }
+
+    let _ = writeln!(markdown, "anchors:");
+    for anchor in &output.anchors {
+        let chosen = anchor
+            .chosen_anchor
+            .as_ref()
+            .map(render_search_hit_output)
+            .unwrap_or_else(|| "none".to_string());
+        let _ = writeln!(
+            markdown,
+            "- `{}` typed_hits={} chosen={}",
+            anchor.anchor, anchor.typed_hit_count, chosen
+        );
+        append_verification_targets(
+            &mut markdown,
+            "  verification_targets",
+            &anchor.verification_targets,
+        );
+        for status in &anchor.commands {
+            let artifact = status
+                .artifact
+                .as_deref()
+                .map(|path| format!(" artifact=`{path}`"))
+                .unwrap_or_default();
+            let error = status
+                .error
+                .as_deref()
+                .map(|error| format!(" error=\"{}\"", error.replace('"', "\\\"")))
+                .unwrap_or_default();
+            let _ = writeln!(
+                markdown,
+                "  - {} [{}]{}{}",
+                status.command, status.status, artifact, error
+            );
+        }
+    }
+
+    append_verification_targets(
+        &mut markdown,
+        "verification_targets",
+        &output.verification_targets,
+    );
+    if !output.next_commands.is_empty() {
+        let _ = writeln!(markdown, "next_commands:");
+        for command in &output.next_commands {
+            let _ = writeln!(markdown, "- `{command}`");
+        }
+    }
+    markdown
+}
+
 pub(crate) fn render_symbol_markdown(
     project_root: &Path,
     target: &ResolvedTarget,
     context: &SymbolContextDto,
+    verification_targets: &[VerificationTargetOutput],
 ) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Symbol");
@@ -1429,6 +1554,7 @@ pub(crate) fn render_symbol_markdown(
     if let Some(summary) = context.summary.as_deref() {
         let _ = writeln!(markdown, "summary: {summary}");
     }
+    append_verification_targets(&mut markdown, "verification_targets", verification_targets);
     let _ = writeln!(markdown, "children: {}", context.children.len());
     for child in &context.children {
         let _ = writeln!(
@@ -1630,6 +1756,7 @@ pub(crate) fn render_trail_story_markdown(
         render_node(project_root, &context.focus)
     );
     let _ = writeln!(markdown, "summary: {}", story.summary);
+    append_trail_edge_summary(&mut markdown, context);
 
     append_story_list(&mut markdown, "## Entry Points", &story.entry_points);
 
@@ -1637,11 +1764,22 @@ pub(crate) fn render_trail_story_markdown(
     if story.core_flow.is_empty() {
         let _ = writeln!(markdown, "- no graph edges were returned for this focus");
     } else {
-        for step in &story.core_flow {
+        for (step, duplicate_count) in compact_story_steps(&story.core_flow) {
+            let duplicate = if duplicate_count > 1 {
+                format!(" repeated={duplicate_count}")
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 markdown,
-                "- [{}] {} {} {} (certainty={}). {}",
-                step.edge_id, step.source, step.relation, step.target, step.certainty, step.note
+                "- [{}] {} {} {} (certainty={}{}). {}",
+                step.edge_id,
+                step.source,
+                step.relation,
+                step.target,
+                step.certainty,
+                duplicate,
+                step.note
             );
         }
     }
@@ -1651,6 +1789,71 @@ pub(crate) fn render_trail_story_markdown(
     append_story_list(&mut markdown, "## Tests", &story.test_scope);
     append_story_list(&mut markdown, "## Gaps And Limits", &story.limits);
     markdown
+}
+
+fn append_trail_edge_summary(markdown: &mut String, context: &TrailContextDto) {
+    let mut by_kind = BTreeMap::<String, u32>::new();
+    let mut by_certainty = BTreeMap::<String, u32>::new();
+    for edge in &context.trail.edges {
+        *by_kind
+            .entry(format!("{:?}", edge.kind).to_ascii_lowercase())
+            .or_default() += 1;
+        *by_certainty
+            .entry(
+                edge.certainty
+                    .as_deref()
+                    .unwrap_or("unresolved")
+                    .to_string(),
+            )
+            .or_default() += 1;
+    }
+    if by_kind.is_empty() && !context.trail.truncated && context.trail.omitted_edge_count == 0 {
+        return;
+    }
+    let _ = writeln!(markdown, "edge_summary:");
+    if !by_kind.is_empty() {
+        let kinds = by_kind
+            .into_iter()
+            .map(|(kind, count)| format!("{kind}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = writeln!(markdown, "- kinds: {kinds}");
+    }
+    if !by_certainty.is_empty() {
+        let certainties = by_certainty
+            .into_iter()
+            .map(|(certainty, count)| format!("{certainty}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = writeln!(markdown, "- certainty: {certainties}");
+    }
+    if context.trail.truncated || context.trail.omitted_edge_count > 0 {
+        let _ = writeln!(
+            markdown,
+            "- limits: truncated={} omitted_edges={}",
+            context.trail.truncated, context.trail.omitted_edge_count
+        );
+    }
+}
+
+fn compact_story_steps(
+    steps: &[codestory_contracts::api::TrailStoryStepDto],
+) -> Vec<(&codestory_contracts::api::TrailStoryStepDto, u32)> {
+    let mut compacted = Vec::<(&codestory_contracts::api::TrailStoryStepDto, u32)>::new();
+    for step in steps {
+        if let Some((last, count)) = compacted.last_mut()
+            && last.source == step.source
+            && last.relation == step.relation
+            && last.target == step.target
+            && last.certainty == step.certainty
+            && last.note == step.note
+        {
+            *count += 1;
+            continue;
+        }
+        compacted.push((step, 1));
+    }
+    compacted
 }
 
 fn append_story_list(markdown: &mut String, title: &str, items: &[String]) {
@@ -1695,6 +1898,7 @@ pub(crate) fn render_snippet_markdown(
     target: &ResolvedTarget,
     context: &SnippetContextDto,
     colorize: bool,
+    verification_targets: &[VerificationTargetOutput],
 ) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Snippet");
@@ -1723,6 +1927,7 @@ pub(crate) fn render_snippet_markdown(
             context.max_snippet_bytes.unwrap_or_default()
         );
     }
+    append_verification_targets(&mut markdown, "verification_targets", verification_targets);
     let fence = snippet_fence(&context.snippet);
     let _ = writeln!(markdown, "{fence}{}", snippet_language(&context.path));
     let snippet = if colorize {
@@ -1851,6 +2056,12 @@ fn render_search_hit_output(hit: &SearchHitOutput) -> String {
     }
     let _ = write!(out, " score={:.2}", hit.score);
     let _ = write!(out, " origin={}", hit.origin.as_str());
+    if let Some(role) = hit.symbol_role.as_deref() {
+        let _ = write!(out, " role={role}");
+    }
+    if let Some(kind) = hit.primary_occurrence_kind.as_deref() {
+        let _ = write!(out, " occurrence={kind}");
+    }
     if let Some(node_ref) = hit.node_ref.as_deref() {
         let _ = write!(out, " ref=`{node_ref}`");
     }
@@ -2551,6 +2762,11 @@ mod tests {
             }),
             duplicate_of: None,
             excerpt: None,
+            primary_occurrence_kind: None,
+            symbol_role: None,
+            paired_refs: Vec::new(),
+            verification_targets: Vec::new(),
+            resolution_hints: Vec::new(),
             why: vec![
                 "matched symbol name and semantic evidence".to_string(),
                 "can be passed to symbol, trail, snippet, explore, or context as a node id"
@@ -3038,6 +3254,9 @@ mod tests {
 resolved_query: `handle_request` -> [handle] handle_request [function] src/request.rs:10 score=1.00 origin=indexed_symbol ref=`src/request.rs:10:handle_request`
 focus: [handle] handle_request [function] src/request.rs:10
 summary: Story trail around `handle_request` found 6 nodes and 5 edges; mode=neighborhood direction=both tests=included utility_calls=hidden truncated=false.
+edge_summary:
+- kinds: call=5
+- certainty: certain=3 probable=1 uncertain=1
 
 ## Entry Points
 - focus: handle_request [function] `src/request.rs`
@@ -3069,6 +3288,41 @@ summary: Story trail around `handle_request` found 6 nodes and 5 edges; mode=nei
 "#;
 
         assert_eq!(markdown, expected);
+    }
+
+    #[test]
+    fn trail_story_compacts_repeated_core_flow_steps() {
+        let story = TrailStoryDto {
+            core_flow: vec![
+                TrailStoryStepDto {
+                    edge_id: "edge-1".to_string(),
+                    source: "A".to_string(),
+                    relation: "calls".to_string(),
+                    target: "B".to_string(),
+                    certainty: "certain".to_string(),
+                    note: "same call".to_string(),
+                },
+                TrailStoryStepDto {
+                    edge_id: "edge-2".to_string(),
+                    source: "A".to_string(),
+                    relation: "calls".to_string(),
+                    target: "B".to_string(),
+                    certainty: "certain".to_string(),
+                    note: "same call".to_string(),
+                },
+            ],
+            ..sample_trail_story(false)
+        };
+        let markdown = render_trail_story_markdown(
+            Path::new("C:/repo"),
+            &sample_resolved_target(),
+            &sample_story_trail_context(),
+            &sample_trail_command(false),
+            &story,
+        );
+
+        assert!(markdown.contains("repeated=2"));
+        assert!(!markdown.contains("[edge-2]"));
     }
 
     #[test]

@@ -384,9 +384,9 @@ pub(crate) fn preferred_occurrence(
 ) -> Option<&codestory_contracts::graph::Occurrence> {
     fn occurrence_rank(kind: codestory_contracts::graph::OccurrenceKind) -> u8 {
         match kind {
-            codestory_contracts::graph::OccurrenceKind::DECLARATION
-            | codestory_contracts::graph::OccurrenceKind::DEFINITION
-            | codestory_contracts::graph::OccurrenceKind::MACRO_DEFINITION => 3,
+            codestory_contracts::graph::OccurrenceKind::DEFINITION
+            | codestory_contracts::graph::OccurrenceKind::MACRO_DEFINITION => 4,
+            codestory_contracts::graph::OccurrenceKind::DECLARATION => 3,
             codestory_contracts::graph::OccurrenceKind::REFERENCE
             | codestory_contracts::graph::OccurrenceKind::MACRO_REFERENCE => 2,
             codestory_contracts::graph::OccurrenceKind::UNKNOWN => 1,
@@ -406,4 +406,40 @@ pub(crate) struct FocusedSourceContext {
     pub(crate) path: String,
     pub(crate) line: u32,
     pub(crate) snippet: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codestory_contracts::graph::{
+        NodeId as CoreNodeId, Occurrence, OccurrenceKind, SourceLocation,
+    };
+
+    fn occurrence(kind: OccurrenceKind, line: u32) -> Occurrence {
+        Occurrence {
+            element_id: 1,
+            kind,
+            location: SourceLocation {
+                file_node_id: CoreNodeId(10),
+                start_line: line,
+                start_col: 1,
+                end_line: line,
+                end_col: 10,
+            },
+        }
+    }
+
+    #[test]
+    fn preferred_occurrence_prefers_definition_over_declaration() {
+        let occurrences = vec![
+            occurrence(OccurrenceKind::DECLARATION, 1),
+            occurrence(OccurrenceKind::DEFINITION, 20),
+            occurrence(OccurrenceKind::REFERENCE, 5),
+        ];
+
+        let preferred = preferred_occurrence(&occurrences).expect("preferred occurrence");
+
+        assert_eq!(preferred.kind, OccurrenceKind::DEFINITION);
+        assert_eq!(preferred.location.start_line, 20);
+    }
 }

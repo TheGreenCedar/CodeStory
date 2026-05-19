@@ -6,11 +6,13 @@ use codestory_contracts::api::{
     AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AppEventPayload,
     BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
     GraphArtifactDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode, NodeId, NodeKind,
-    RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto, SearchHit,
-    SearchHybridLimitsDto, SearchRepoTextMode, SearchRequest,
+    NodeOccurrencesRequest, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
+    RetrievalScoreBreakdownDto, SearchHit, SearchHybridLimitsDto, SearchRepoTextMode,
+    SearchRequest, SourceOccurrenceDto, TrailCallerScope, TrailConfigDto, TrailDirection,
+    TrailMode,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Write as _,
     fs,
     io::IsTerminal,
@@ -38,11 +40,12 @@ use args::{
     BookmarkAction, BookmarkAddCommand, BookmarkAddOutput, BookmarkCommand, BookmarkListCommand,
     BookmarkListOutput, BookmarkOutput, BookmarkRemoveCommand, BookmarkRemoveOutput, Cli, Command,
     CompletionShell, ContextCommand, DoctorCheckOutput, DoctorCommand, DoctorOutput,
+    DrillAnchorOutput, DrillCommand, DrillCommandStatusOutput, DrillMechanicalOutput, DrillOutput,
     GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput, IndexOutput,
     QueryCommand, QueryOutput, QueryResolutionOutput, QuerySelectorOutput, RepoTextMode,
     SearchCommand, SearchHitOutput, SearchOutput, ServeCommand, SetupAction, SetupCommand,
     SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, TrailCommand,
-    TrailJsonOutput, build_trail_request,
+    TrailJsonOutput, VerificationTargetOutput, build_trail_request,
 };
 #[cfg(test)]
 use codestory_contracts::api::TrailContextDto;
@@ -52,17 +55,15 @@ use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
 use http_transport::search_repo_text_mode_param;
 use output::{
     context_packet_json, emit, emit_text, render_context_markdown, render_doctor_markdown,
-    render_ground_markdown, render_index_dry_run_markdown, render_index_markdown,
-    render_query_markdown, render_search_markdown, render_snippet_markdown, render_symbol_markdown,
-    render_symbol_mermaid, render_trail_dot, render_trail_markdown, render_trail_mermaid,
-    render_trail_story_markdown, validate_output_file_parent,
+    render_drill_markdown, render_ground_markdown, render_index_dry_run_markdown,
+    render_index_markdown, render_query_markdown, render_search_markdown, render_snippet_markdown,
+    render_symbol_markdown, render_symbol_mermaid, render_trail_dot, render_trail_markdown,
+    render_trail_mermaid, render_trail_story_markdown, validate_output_file_parent,
 };
 use runtime::{
     AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
     resolve_refresh_request, resolve_target,
 };
-#[cfg(test)]
-use std::collections::HashSet;
 #[cfg(test)]
 use stdio_catalog::{
     prompts_list_json as stdio_prompts_list_json, resources_list_json as stdio_resources_list_json,
@@ -122,6 +123,7 @@ fn main() -> Result<()> {
         Command::Doctor(cmd) => run_doctor(cmd),
         Command::Setup(cmd) => run_setup(cmd),
         Command::Search(cmd) => run_search(cmd),
+        Command::Drill(cmd) => run_drill(cmd),
         Command::Symbol(cmd) => run_symbol(cmd),
         Command::Trail(cmd) => run_trail(cmd),
         Command::Snippet(cmd) => run_snippet(cmd),
@@ -834,7 +836,7 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
         .browser
         .search_results(search_request_from_command(&cmd))
         .map_err(map_api_error)?;
-    let output = search_output_from_results(&runtime.project_root, &search_results, cmd.why);
+    let output = search_output_from_results(&runtime, &search_results, cmd.why);
     let markdown = render_search_markdown(&runtime.project_root, &output);
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
@@ -849,13 +851,429 @@ fn search_request_from_command(cmd: &SearchCommand) -> SearchRequest {
     }
 }
 
+fn run_drill(cmd: DrillCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "drill")?;
+    validate_drill_output_dir(&cmd.output_dir)?;
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    let before = runtime.open_project_summary()?;
+    let opened = runtime.ensure_open(cmd.refresh)?;
+    ensure_index_ready(&opened, "drill")?;
+    let refresh = refresh_label(cmd.refresh, opened.refresh_mode);
+    let report_ext = match cmd.format {
+        args::OutputFormat::Markdown => "md",
+        args::OutputFormat::Json => "json",
+        args::OutputFormat::Dot => unreachable!("dot was rejected above"),
+    };
+
+    let mut anchor_outputs = Vec::new();
+    let mut all_verification_targets = Vec::new();
+    for anchor in normalized_drill_anchors(&cmd.anchors) {
+        let anchor_output = run_drill_anchor(&runtime, &cmd.output_dir, cmd.format, &anchor)?;
+        all_verification_targets.extend(anchor_output.verification_targets.iter().cloned());
+        anchor_outputs.push(anchor_output);
+    }
+    dedupe_verification_targets(&mut all_verification_targets);
+
+    let output = DrillOutput {
+        project: display::clean_path_string(&opened.summary.root),
+        label: cmd.label.clone(),
+        output_dir: display::clean_path_string(&cmd.output_dir.to_string_lossy()),
+        mechanical: DrillMechanicalOutput {
+            before_files: before.stats.file_count,
+            before_nodes: before.stats.node_count,
+            before_edges: before.stats.edge_count,
+            before_errors: before.stats.error_count,
+            after_files: opened.summary.stats.file_count,
+            after_nodes: opened.summary.stats.node_count,
+            after_edges: opened.summary.stats.edge_count,
+            after_errors: opened.summary.stats.error_count,
+            refresh,
+            retrieval: opened.summary.retrieval.clone(),
+            phase_timings: opened.phase_timings.clone(),
+        },
+        anchors: anchor_outputs,
+        verification_targets: all_verification_targets,
+        next_commands: drill_next_commands(&runtime.project_root, &cmd.anchors),
+    };
+
+    let markdown = render_drill_markdown(&output);
+    let content = render_drill_content(cmd.format, &output, &markdown)?;
+    let report_path = cmd.output_dir.join(format!("drill-report.{report_ext}"));
+    fs::write(&report_path, &content).with_context(|| {
+        format!(
+            "Failed to write drill report {}",
+            display::clean_path_string(&report_path.to_string_lossy())
+        )
+    })?;
+    print!("{content}");
+    Ok(())
+}
+
+fn validate_drill_output_dir(output_dir: &std::path::Path) -> Result<()> {
+    fs::create_dir_all(output_dir).with_context(|| {
+        format!(
+            "Failed to create drill output directory {}",
+            display::clean_path_string(&output_dir.to_string_lossy())
+        )
+    })
+}
+
+fn render_drill_content(
+    format: args::OutputFormat,
+    output: &DrillOutput,
+    markdown: &str,
+) -> Result<String> {
+    let mut content = match format {
+        args::OutputFormat::Markdown => markdown.to_string(),
+        args::OutputFormat::Json => {
+            serde_json::to_string_pretty(output).context("Failed to serialize drill JSON")?
+        }
+        args::OutputFormat::Dot => bail!("--format dot is only supported by `trail`"),
+    };
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    Ok(content)
+}
+
+fn normalized_drill_anchors(anchors: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    anchors
+        .iter()
+        .flat_map(|anchor| anchor.split(','))
+        .map(str::trim)
+        .filter(|anchor| !anchor.is_empty())
+        .filter_map(|anchor| {
+            let owned = anchor.to_string();
+            seen.insert(owned.clone()).then_some(owned)
+        })
+        .collect()
+}
+
+fn run_drill_anchor(
+    runtime: &RuntimeContext,
+    output_dir: &std::path::Path,
+    format: args::OutputFormat,
+    anchor: &str,
+) -> Result<DrillAnchorOutput> {
+    let mut commands = Vec::new();
+    let safe_anchor = output_slug(anchor);
+    let search_results = runtime
+        .browser
+        .search_results(SearchRequest {
+            query: anchor.to_string(),
+            repo_text: SearchRepoTextMode::Auto,
+            limit_per_source: 10,
+            hybrid_weights: None,
+            hybrid_limits: None,
+        })
+        .map_err(map_api_error)?;
+    let search_output = search_output_from_results(runtime, &search_results, true);
+    let search_markdown = render_search_markdown(&runtime.project_root, &search_output);
+    commands.push(write_drill_artifact(
+        output_dir,
+        format,
+        &format!("{safe_anchor}-search"),
+        "search",
+        &search_output,
+        search_markdown,
+    ));
+
+    let chosen = choose_drill_anchor_hit(&search_results.indexed_symbol_hits).cloned();
+    let typed_hit_count = search_results
+        .indexed_symbol_hits
+        .iter()
+        .filter(|hit| hit.kind != NodeKind::UNKNOWN)
+        .count();
+    let Some(chosen) = chosen else {
+        return Ok(DrillAnchorOutput {
+            anchor: anchor.to_string(),
+            typed_hit_count,
+            chosen_anchor: None,
+            verification_targets: Vec::new(),
+            commands,
+        });
+    };
+
+    let target = runtime::ResolvedTarget {
+        selector: QuerySelectorOutput::Query,
+        requested: anchor.to_string(),
+        file_filter: None,
+        selected: chosen.clone(),
+        alternatives: search_results.indexed_symbol_hits.clone(),
+    };
+    let resolution = build_query_resolution_output_with_runtime(runtime, &target);
+    let verification_targets = resolution.resolved.verification_targets.clone();
+
+    match runtime.browser.symbol_context(chosen.node_id.clone()) {
+        Ok(symbol) => {
+            let markdown = render_symbol_markdown(
+                &runtime.project_root,
+                &target,
+                &symbol,
+                &verification_targets,
+            );
+            let output = SymbolJsonOutput {
+                resolution: resolution.clone(),
+                symbol: &symbol,
+                verification_targets: verification_targets.clone(),
+            };
+            commands.push(write_drill_artifact(
+                output_dir,
+                format,
+                &format!("{safe_anchor}-symbol"),
+                "symbol",
+                &output,
+                markdown,
+            ));
+        }
+        Err(error) => commands.push(drill_status_error("symbol", error)),
+    }
+
+    match runtime
+        .browser
+        .trail_context(drill_trail_request(&chosen.node_id))
+    {
+        Ok(trail) => {
+            let notes = trail_guidance_notes(&trail);
+            let mut markdown = if let Some(story) = trail.story.as_ref() {
+                let trail_cmd =
+                    drill_trail_command(&cmd_project_args(&runtime.project_root), &target);
+                render_trail_story_markdown(
+                    &runtime.project_root,
+                    &target,
+                    &trail,
+                    &trail_cmd,
+                    story,
+                )
+            } else {
+                let trail_cmd =
+                    drill_trail_command(&cmd_project_args(&runtime.project_root), &target);
+                render_trail_markdown(&runtime.project_root, &target, &trail, &trail_cmd)
+            };
+            if !notes.is_empty() {
+                let _ = writeln!(markdown, "notes:");
+                for note in &notes {
+                    let _ = writeln!(markdown, "- {note}");
+                }
+            }
+            let output = TrailJsonOutput {
+                resolution: resolution.clone(),
+                trail: &trail,
+                notes,
+            };
+            commands.push(write_drill_artifact(
+                output_dir,
+                format,
+                &format!("{safe_anchor}-trail"),
+                "trail",
+                &output,
+                markdown,
+            ));
+        }
+        Err(error) => commands.push(drill_status_error("trail", error)),
+    }
+
+    match runtime.browser.snippet_context(chosen.node_id.clone(), 40) {
+        Ok(snippet) => {
+            let markdown = render_snippet_markdown(
+                &runtime.project_root,
+                &target,
+                &snippet,
+                false,
+                &verification_targets,
+            );
+            let output = SnippetJsonOutput {
+                resolution: resolution.clone(),
+                snippet: &snippet,
+                verification_targets: verification_targets.clone(),
+            };
+            commands.push(write_drill_artifact(
+                output_dir,
+                format,
+                &format!("{safe_anchor}-snippet"),
+                "snippet",
+                &output,
+                markdown,
+            ));
+        }
+        Err(error) => commands.push(drill_status_error("snippet", error)),
+    }
+
+    Ok(DrillAnchorOutput {
+        anchor: anchor.to_string(),
+        typed_hit_count,
+        chosen_anchor: Some(resolution.resolved),
+        verification_targets,
+        commands,
+    })
+}
+
+fn write_drill_artifact<T: serde::Serialize>(
+    output_dir: &std::path::Path,
+    format: args::OutputFormat,
+    stem: &str,
+    command: &str,
+    output: &T,
+    markdown: String,
+) -> DrillCommandStatusOutput {
+    let ext = match format {
+        args::OutputFormat::Markdown => "md",
+        args::OutputFormat::Json => "json",
+        args::OutputFormat::Dot => "txt",
+    };
+    let path = output_dir.join(format!("{stem}.{ext}"));
+    let content = match format {
+        args::OutputFormat::Markdown => markdown,
+        args::OutputFormat::Json => match serde_json::to_string_pretty(output) {
+            Ok(value) => value,
+            Err(error) => return drill_status_error(command, error),
+        },
+        args::OutputFormat::Dot => unreachable!("dot was rejected by run_drill"),
+    };
+    match fs::write(&path, ensure_trailing_newline(content)) {
+        Ok(()) => DrillCommandStatusOutput {
+            command: command.to_string(),
+            status: "ok".to_string(),
+            artifact: Some(display::clean_path_string(&path.to_string_lossy())),
+            error: None,
+        },
+        Err(error) => drill_status_error(command, error),
+    }
+}
+
+fn drill_status_error(command: &str, error: impl std::fmt::Debug) -> DrillCommandStatusOutput {
+    DrillCommandStatusOutput {
+        command: command.to_string(),
+        status: "error".to_string(),
+        artifact: None,
+        error: Some(format!("{error:?}")),
+    }
+}
+
+fn ensure_trailing_newline(mut content: String) -> String {
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content
+}
+
+fn choose_drill_anchor_hit(hits: &[SearchHit]) -> Option<&SearchHit> {
+    hits.iter()
+        .find(|hit| hit.resolvable && hit.kind != NodeKind::UNKNOWN)
+        .or_else(|| hits.iter().find(|hit| hit.resolvable))
+}
+
+fn drill_trail_request(root_id: &NodeId) -> TrailConfigDto {
+    TrailConfigDto {
+        root_id: root_id.clone(),
+        mode: TrailMode::Neighborhood,
+        target_id: None,
+        depth: 2,
+        direction: TrailDirection::Both,
+        caller_scope: TrailCallerScope::ProductionOnly,
+        edge_filter: Vec::new(),
+        show_utility_calls: false,
+        hide_speculative: true,
+        story: true,
+        node_filter: Vec::new(),
+        max_nodes: 120,
+        layout_direction: codestory_contracts::api::LayoutDirection::Horizontal,
+    }
+}
+
+fn drill_trail_command(
+    project: &args::ProjectArgs,
+    target: &runtime::ResolvedTarget,
+) -> TrailCommand {
+    TrailCommand {
+        project: project.clone(),
+        target: args::TargetArgs {
+            id: Some(target.selected.node_id.0.clone()),
+            query: None,
+            file: None,
+            choose: None,
+        },
+        mode: args::CliTrailMode::Neighborhood,
+        depth: Some(2),
+        direction: Some(args::CliDirection::Both),
+        max_nodes: 120,
+        include_tests: false,
+        show_utility_calls: false,
+        hide_speculative: true,
+        story: true,
+        layout: args::CliLayout::Horizontal,
+        refresh: args::RefreshMode::None,
+        format: args::OutputFormat::Markdown,
+        output_file: None,
+        mermaid: false,
+    }
+}
+
+fn cmd_project_args(project_root: &std::path::Path) -> args::ProjectArgs {
+    args::ProjectArgs {
+        project: project_root.to_path_buf(),
+        cache_dir: None,
+    }
+}
+
+fn output_slug(value: &str) -> String {
+    let mut slug = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            slug.push(ch);
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "anchor".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+fn dedupe_verification_targets(targets: &mut Vec<VerificationTargetOutput>) {
+    let mut seen = HashSet::new();
+    targets.retain(|target| {
+        seen.insert((
+            target.role.clone(),
+            target.path.clone(),
+            target.line,
+            target.reason.clone(),
+        ))
+    });
+}
+
+fn drill_next_commands(project_root: &std::path::Path, anchors: &[String]) -> Vec<String> {
+    let project = quote_command_path(project_root);
+    normalized_drill_anchors(anchors)
+        .into_iter()
+        .take(5)
+        .map(|anchor| {
+            format!(
+                "codestory-cli search --project {project} --query {} --refresh none --repo-text auto --why",
+                quote_command_value(&anchor)
+            )
+        })
+        .collect()
+}
+
 fn search_output_from_results(
-    project_root: &std::path::Path,
+    runtime: &RuntimeContext,
     search_results: &codestory_contracts::api::SearchResultsDto,
     include_score_details: bool,
 ) -> SearchOutput {
+    let occurrences = collect_search_hit_occurrences(
+        runtime,
+        search_results
+            .indexed_symbol_hits
+            .iter()
+            .chain(search_results.suggestions.iter()),
+    );
     build_search_output(SearchOutputParts {
-        project_root,
+        project_root: &runtime.project_root,
         query: &search_results.query,
         retrieval: &search_results.retrieval,
         freshness: search_results.freshness.as_ref(),
@@ -863,6 +1281,7 @@ fn search_output_from_results(
         repo_text_hits: &search_results.repo_text_hits,
         repo_text_stats: search_results.repo_text_stats.as_ref(),
         suggestions: &search_results.suggestions,
+        occurrences_by_node: &occurrences,
         limit_per_source: search_results.limit_per_source,
         repo_text: RepoTextOutputConfig {
             mode: from_api_repo_text_mode(search_results.repo_text_mode),
@@ -894,10 +1313,18 @@ fn run_symbol(cmd: SymbolCommand) -> Result<()> {
     if cmd.mermaid {
         return emit_text(render_symbol_mermaid(&context), cmd.output_file.as_deref());
     }
-    let markdown = render_symbol_markdown(&runtime.project_root, &target, &context);
+    let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
+    let verification_targets = resolution.resolved.verification_targets.clone();
+    let markdown = render_symbol_markdown(
+        &runtime.project_root,
+        &target,
+        &context,
+        &verification_targets,
+    );
     let output = SymbolJsonOutput {
-        resolution: build_query_resolution_output(&runtime.project_root, &target),
+        resolution,
         symbol: &context,
+        verification_targets,
     };
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
@@ -937,6 +1364,7 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
         );
     }
     let notes = trail_guidance_notes(&context);
+    let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
     let mut markdown = if let Some(story) = context.story.as_ref() {
         render_trail_story_markdown(&runtime.project_root, &target, &context, &cmd, story)
     } else {
@@ -949,7 +1377,7 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
         }
     }
     let output = TrailJsonOutput {
-        resolution: build_query_resolution_output(&runtime.project_root, &target),
+        resolution,
         trail: &context,
         notes,
     };
@@ -991,10 +1419,19 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
     let colorize = cmd.format == args::OutputFormat::Markdown
         && cmd.output_file.is_none()
         && std::io::stdout().is_terminal();
-    let markdown = render_snippet_markdown(&runtime.project_root, &target, &context, colorize);
+    let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
+    let verification_targets = resolution.resolved.verification_targets.clone();
+    let markdown = render_snippet_markdown(
+        &runtime.project_root,
+        &target,
+        &context,
+        colorize,
+        &verification_targets,
+    );
     let output = SnippetJsonOutput {
-        resolution: build_query_resolution_output(&runtime.project_root, &target),
+        resolution,
         snippet: &context,
+        verification_targets,
     };
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
@@ -1130,17 +1567,28 @@ fn build_ambiguous_target_error_output(
         .map(|(index, hit)| build_numbered_search_hit_output(project_root, hit, index + 1))
         .collect::<Vec<_>>();
     let quoted_query = ambiguous.query.replace('"', "\\\"");
+    let project = quote_command_path(project_root);
     let file_clause = ambiguous
         .file_filter
         .as_deref()
         .map(|file_filter| format!(" --file \"{}\"", file_filter.replace('"', "\\\"")))
         .unwrap_or_default();
     let mut next_commands = vec![format!(
-        "codestory-cli symbol --query \"{}\"{} --choose 1",
+        "codestory-cli symbol --project {project} --query \"{}\"{} --choose 1",
         quoted_query, file_clause
     )];
     if let Some(first) = ambiguous.alternatives.first() {
-        next_commands.push(format!("codestory-cli symbol --id {}", first.node_id.0));
+        next_commands.push(format!(
+            "codestory-cli symbol --project {project} --id {}",
+            first.node_id.0
+        ));
+        if let Some(path) = first.file_path.as_deref() {
+            next_commands.push(format!(
+                "codestory-cli symbol --project {project} --query \"{}\" --file {}",
+                quoted_query,
+                quote_command_value(&crate::display::relative_path(project_root, path))
+            ));
+        }
     }
 
     CliErrorOutput {
@@ -1159,7 +1607,9 @@ fn build_ambiguous_target_error_output(
                     "query_resolution: `{}` matched multiple equally ranked symbols",
                     ambiguous.query
                 ),
-                "search: inspect alternatives with `codestory-cli search --query`, then rerun this command with --choose, --id, or --file".to_string(),
+                format!(
+                    "search: inspect alternatives with `codestory-cli search --project {project} --query`, then rerun this command with --choose, --id, or --file"
+                ),
             ],
             next_commands,
         },
@@ -1778,6 +2228,7 @@ struct SearchOutputParts<'a> {
     repo_text_hits: &'a [SearchHit],
     repo_text_stats: Option<&'a RepoTextScanStatsDto>,
     suggestions: &'a [SearchHit],
+    occurrences_by_node: &'a HashMap<NodeId, Vec<SourceOccurrenceDto>>,
     limit_per_source: u32,
     repo_text: RepoTextOutputConfig,
     explain: bool,
@@ -1787,7 +2238,14 @@ fn build_search_output(parts: SearchOutputParts<'_>) -> SearchOutput {
     let indexed_symbol_hits = parts
         .symbol_hits
         .iter()
-        .map(|hit| build_search_hit_output(parts.project_root, hit, parts.explain))
+        .map(|hit| {
+            build_search_hit_output(
+                parts.project_root,
+                hit,
+                parts.explain,
+                occurrences_for_hit(parts.occurrences_by_node, hit),
+            )
+        })
         .collect::<Vec<_>>();
     let mut duplicate_index = HashMap::new();
     for hit in &indexed_symbol_hits {
@@ -1801,7 +2259,7 @@ fn build_search_output(parts: SearchOutputParts<'_>) -> SearchOutput {
         .repo_text_hits
         .iter()
         .map(|hit| {
-            let mut output = build_search_hit_output(parts.project_root, hit, parts.explain);
+            let mut output = build_search_hit_output(parts.project_root, hit, parts.explain, &[]);
             if let Some(key) = search_hit_location_key(&output) {
                 output.duplicate_of = duplicate_index.get(&key).cloned();
             }
@@ -1822,7 +2280,14 @@ fn build_search_output(parts: SearchOutputParts<'_>) -> SearchOutput {
         suggestions: parts
             .suggestions
             .iter()
-            .map(|hit| build_search_hit_output(parts.project_root, hit, parts.explain))
+            .map(|hit| {
+                build_search_hit_output(
+                    parts.project_root,
+                    hit,
+                    parts.explain,
+                    occurrences_for_hit(parts.occurrences_by_node, hit),
+                )
+            })
             .collect(),
         indexed_symbol_hits,
         repo_text_hits,
@@ -1841,12 +2306,49 @@ fn build_query_resolution_output(
             .file_filter
             .as_deref()
             .map(crate::display::clean_path_string),
-        resolved: build_search_hit_output(project_root, &target.selected, false),
+        resolved: build_search_hit_output(project_root, &target.selected, false, &[]),
         alternatives: target
             .alternatives
             .iter()
             .skip(1)
-            .map(|hit| build_search_hit_output(project_root, hit, false))
+            .map(|hit| build_search_hit_output(project_root, hit, false, &[]))
+            .collect(),
+    }
+}
+
+fn build_query_resolution_output_with_runtime(
+    runtime: &RuntimeContext,
+    target: &runtime::ResolvedTarget,
+) -> QueryResolutionOutput {
+    let occurrences = collect_search_hit_occurrences(
+        runtime,
+        std::iter::once(&target.selected).chain(target.alternatives.iter()),
+    );
+    QueryResolutionOutput {
+        selector: target.selector,
+        requested: target.requested.clone(),
+        file_filter: target
+            .file_filter
+            .as_deref()
+            .map(crate::display::clean_path_string),
+        resolved: build_search_hit_output(
+            &runtime.project_root,
+            &target.selected,
+            false,
+            occurrences_for_hit(&occurrences, &target.selected),
+        ),
+        alternatives: target
+            .alternatives
+            .iter()
+            .skip(1)
+            .map(|hit| {
+                build_search_hit_output(
+                    &runtime.project_root,
+                    hit,
+                    false,
+                    occurrences_for_hit(&occurrences, hit),
+                )
+            })
             .collect(),
     }
 }
@@ -1855,6 +2357,7 @@ fn build_search_hit_output(
     project_root: &std::path::Path,
     hit: &SearchHit,
     explain: bool,
+    occurrences: &[SourceOccurrenceDto],
 ) -> SearchHitOutput {
     let file_path = hit
         .file_path
@@ -1866,6 +2369,21 @@ fn build_search_hit_output(
     } else {
         Vec::new()
     };
+    let verification_targets =
+        verification_targets_for_hit(project_root, &hit.display_name, occurrences);
+    let primary_occurrence_kind =
+        primary_occurrence(occurrences).map(|occurrence| occurrence.kind.clone());
+    let symbol_role = primary_occurrence_kind
+        .as_deref()
+        .map(symbol_role_for_occurrence_kind)
+        .map(str::to_string);
+    let paired_refs = paired_occurrence_targets(
+        project_root,
+        &hit.display_name,
+        primary_occurrence_kind.as_deref(),
+        occurrences,
+    );
+    let resolution_hints = resolution_hints_for_hit(hit, &verification_targets, &paired_refs);
     SearchHitOutput {
         number: None,
         node_id: hit.node_id.0.clone(),
@@ -1885,6 +2403,11 @@ fn build_search_hit_output(
         score_breakdown,
         duplicate_of: None,
         excerpt: repo_text_excerpt(project_root, hit),
+        primary_occurrence_kind,
+        symbol_role,
+        paired_refs,
+        verification_targets,
+        resolution_hints,
         why,
     }
 }
@@ -1894,9 +2417,211 @@ fn build_numbered_search_hit_output(
     hit: &SearchHit,
     number: usize,
 ) -> SearchHitOutput {
-    let mut output = build_search_hit_output(project_root, hit, false);
+    let mut output = build_search_hit_output(project_root, hit, false, &[]);
     output.number = Some(number);
     output
+}
+
+fn collect_search_hit_occurrences<'a>(
+    runtime: &RuntimeContext,
+    hits: impl Iterator<Item = &'a SearchHit>,
+) -> HashMap<NodeId, Vec<SourceOccurrenceDto>> {
+    let mut seen = HashSet::new();
+    let mut occurrences_by_node = HashMap::new();
+    for hit in hits {
+        if hit.is_text_match() || !hit.resolvable || !seen.insert(hit.node_id.clone()) {
+            continue;
+        }
+        if let Ok(occurrences) = runtime.browser.node_occurrences(NodeOccurrencesRequest {
+            id: hit.node_id.clone(),
+        }) {
+            occurrences_by_node.insert(hit.node_id.clone(), occurrences);
+        }
+    }
+    occurrences_by_node
+}
+
+fn occurrences_for_hit<'a>(
+    occurrences_by_node: &'a HashMap<NodeId, Vec<SourceOccurrenceDto>>,
+    hit: &SearchHit,
+) -> &'a [SourceOccurrenceDto] {
+    occurrences_by_node
+        .get(&hit.node_id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn primary_occurrence(occurrences: &[SourceOccurrenceDto]) -> Option<&SourceOccurrenceDto> {
+    occurrences.iter().max_by(|left, right| {
+        occurrence_kind_rank(&left.kind)
+            .cmp(&occurrence_kind_rank(&right.kind))
+            .then_with(|| right.start_line.cmp(&left.start_line))
+            .then_with(|| right.start_col.cmp(&left.start_col))
+    })
+}
+
+fn occurrence_kind_rank(kind: &str) -> u8 {
+    match kind {
+        "definition" | "macro_definition" => 5,
+        "declaration" => 4,
+        "reference" | "macro_reference" => 2,
+        _ => 1,
+    }
+}
+
+fn symbol_role_for_occurrence_kind(kind: &str) -> &'static str {
+    match kind {
+        "definition" | "macro_definition" => "definition",
+        "declaration" => "declaration",
+        "reference" | "macro_reference" => "reference",
+        _ => "unknown",
+    }
+}
+
+fn verification_targets_for_hit(
+    project_root: &std::path::Path,
+    display_name: &str,
+    occurrences: &[SourceOccurrenceDto],
+) -> Vec<VerificationTargetOutput> {
+    let Some(primary) = primary_occurrence(occurrences) else {
+        return Vec::new();
+    };
+    let mut ordered = occurrences.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        occurrence_kind_rank(&right.kind)
+            .cmp(&occurrence_kind_rank(&left.kind))
+            .then_with(|| left.file_path.cmp(&right.file_path))
+            .then_with(|| left.start_line.cmp(&right.start_line))
+            .then_with(|| left.start_col.cmp(&right.start_col))
+    });
+
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    for occurrence in ordered {
+        let role = symbol_role_for_occurrence_kind(&occurrence.kind);
+        let is_primary = same_source_occurrence(primary, occurrence);
+        if !is_primary && !matches!(role, "definition" | "declaration") {
+            continue;
+        }
+        let key = (
+            role.to_string(),
+            occurrence.file_path.clone(),
+            occurrence.start_line,
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        let reason = if is_primary {
+            "primary source occurrence selected for this symbol"
+        } else if role == "definition" {
+            "paired definition/body location for a declaration-style hit"
+        } else {
+            "paired declaration location for a definition-style hit"
+        };
+        targets.push(verification_target_from_occurrence(
+            project_root,
+            display_name,
+            occurrence,
+            role,
+            reason,
+        ));
+        if targets.len() >= 4 {
+            break;
+        }
+    }
+    targets
+}
+
+fn paired_occurrence_targets(
+    project_root: &std::path::Path,
+    display_name: &str,
+    primary_kind: Option<&str>,
+    occurrences: &[SourceOccurrenceDto],
+) -> Vec<VerificationTargetOutput> {
+    let primary_role = primary_kind.map(symbol_role_for_occurrence_kind);
+    let wanted_role = match primary_role {
+        Some("declaration") => Some("definition"),
+        Some("definition") => Some("declaration"),
+        _ => None,
+    };
+    let Some(wanted_role) = wanted_role else {
+        return Vec::new();
+    };
+
+    occurrences
+        .iter()
+        .filter(|occurrence| symbol_role_for_occurrence_kind(&occurrence.kind) == wanted_role)
+        .take(3)
+        .map(|occurrence| {
+            let reason = if wanted_role == "definition" {
+                "paired definition/body location"
+            } else {
+                "paired declaration location"
+            };
+            verification_target_from_occurrence(
+                project_root,
+                display_name,
+                occurrence,
+                wanted_role,
+                reason,
+            )
+        })
+        .collect()
+}
+
+fn verification_target_from_occurrence(
+    project_root: &std::path::Path,
+    display_name: &str,
+    occurrence: &SourceOccurrenceDto,
+    role: &str,
+    reason: &str,
+) -> VerificationTargetOutput {
+    let path = crate::display::relative_path(project_root, &occurrence.file_path);
+    VerificationTargetOutput {
+        role: role.to_string(),
+        path: path.clone(),
+        line: occurrence.start_line,
+        node_ref: Some(format!("{path}:{}:{display_name}", occurrence.start_line)),
+        reason: reason.to_string(),
+    }
+}
+
+fn same_source_occurrence(left: &SourceOccurrenceDto, right: &SourceOccurrenceDto) -> bool {
+    left.kind == right.kind
+        && left.file_path == right.file_path
+        && left.start_line == right.start_line
+        && left.start_col == right.start_col
+        && left.end_line == right.end_line
+        && left.end_col == right.end_col
+}
+
+fn resolution_hints_for_hit(
+    hit: &SearchHit,
+    verification_targets: &[VerificationTargetOutput],
+    paired_refs: &[VerificationTargetOutput],
+) -> Vec<String> {
+    let mut hints = Vec::new();
+    if hit.kind == NodeKind::UNKNOWN {
+        hints.push(
+            "node kind is unknown; prefer a typed alternative for symbol/trail/snippet follow-up"
+                .to_string(),
+        );
+    }
+    if hit.is_text_match() {
+        hints.push(
+            "repo-text hit is evidence only; choose an indexed symbol before graph browsing"
+                .to_string(),
+        );
+    }
+    if hit.resolvable && verification_targets.is_empty() {
+        hints.push(
+            "no source occurrence metadata was available for verification targeting".to_string(),
+        );
+    }
+    if !paired_refs.is_empty() {
+        hints.push("declaration/definition pair detected; open both files before trusting architecture claims".to_string());
+    }
+    hints
 }
 
 fn explain_search_hit(
@@ -2360,6 +3085,7 @@ mod tests {
             repo_text_hits: &repo_text_hits,
             repo_text_stats: None,
             suggestions: &[],
+            occurrences_by_node: &HashMap::new(),
             limit_per_source: 5,
             repo_text: RepoTextOutputConfig {
                 mode: RepoTextMode::Auto,
@@ -2488,6 +3214,7 @@ mod tests {
             repo_text_hits: &[],
             repo_text_stats: None,
             suggestions: &[],
+            occurrences_by_node: &HashMap::new(),
             limit_per_source: 5,
             repo_text: RepoTextOutputConfig {
                 mode: RepoTextMode::Auto,
@@ -2499,6 +3226,77 @@ mod tests {
         assert_eq!(
             output.indexed_symbol_hits[0].node_ref.as_deref(),
             Some("src/resolution/mod.rs:42:ResolutionPass")
+        );
+    }
+
+    #[test]
+    fn build_search_output_adds_occurrence_quality_and_verification_targets() {
+        let root = Path::new("C:/repo");
+        let symbol_hits = vec![SearchHit {
+            node_id: NodeId("1".to_string()),
+            display_name: "StorageAccess".to_string(),
+            kind: codestory_contracts::api::NodeKind::CLASS,
+            file_path: Some("C:/repo/src/lib/StorageAccess.h".to_string()),
+            line: Some(12),
+            score: 0.9,
+            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            score_breakdown: None,
+        }];
+        let mut occurrences = HashMap::new();
+        occurrences.insert(
+            NodeId("1".to_string()),
+            vec![
+                SourceOccurrenceDto {
+                    element_id: "1".to_string(),
+                    kind: "declaration".to_string(),
+                    file_path: "C:/repo/src/lib/StorageAccess.h".to_string(),
+                    start_line: 12,
+                    start_col: 1,
+                    end_line: 12,
+                    end_col: 20,
+                },
+                SourceOccurrenceDto {
+                    element_id: "1".to_string(),
+                    kind: "definition".to_string(),
+                    file_path: "C:/repo/src/lib/StorageAccess.cpp".to_string(),
+                    start_line: 44,
+                    start_col: 1,
+                    end_line: 60,
+                    end_col: 1,
+                },
+            ],
+        );
+
+        let output = build_search_output(SearchOutputParts {
+            project_root: root,
+            query: "StorageAccess",
+            retrieval: &sample_retrieval(),
+            freshness: None,
+            symbol_hits: &symbol_hits,
+            repo_text_hits: &[],
+            repo_text_stats: None,
+            suggestions: &[],
+            occurrences_by_node: &occurrences,
+            limit_per_source: 5,
+            repo_text: RepoTextOutputConfig {
+                mode: RepoTextMode::Auto,
+                enabled: false,
+            },
+            explain: false,
+        });
+
+        let hit = &output.indexed_symbol_hits[0];
+        assert_eq!(hit.primary_occurrence_kind.as_deref(), Some("definition"));
+        assert_eq!(hit.symbol_role.as_deref(), Some("definition"));
+        assert!(hit.verification_targets.iter().any(|target| target.path
+            == "src/lib/StorageAccess.cpp"
+            && target.role == "definition"));
+        assert!(
+            hit.paired_refs.iter().any(|target| {
+                target.path == "src/lib/StorageAccess.h" && target.role == "declaration"
+            }),
+            "definition hits should point back to the paired declaration"
         );
     }
 
@@ -2537,6 +3335,7 @@ mod tests {
             repo_text_hits: &repo_text_hits,
             repo_text_stats: None,
             suggestions: &[],
+            occurrences_by_node: &HashMap::new(),
             limit_per_source: 5,
             repo_text: RepoTextOutputConfig {
                 mode: RepoTextMode::Auto,
@@ -2719,6 +3518,7 @@ mod tests {
             repo_text_hits: &[],
             repo_text_stats: None,
             suggestions: &[],
+            occurrences_by_node: &HashMap::new(),
             limit_per_source: 5,
             repo_text: RepoTextOutputConfig {
                 mode: RepoTextMode::Off,
@@ -2740,6 +3540,22 @@ mod tests {
                 .why
                 .iter()
                 .any(|why| why.contains("lexical=0.700"))
+        );
+    }
+
+    #[test]
+    fn drill_anchor_helpers_normalize_and_sanitize_inputs() {
+        assert_eq!(
+            normalized_drill_anchors(&[
+                "WorkspaceIndexer, SearchService".to_string(),
+                "WorkspaceIndexer".to_string(),
+                " TrailResult ".to_string(),
+            ]),
+            vec!["WorkspaceIndexer", "SearchService", "TrailResult"]
+        );
+        assert_eq!(
+            output_slug("getElsewhereFeed() / posts"),
+            "getElsewhereFeed-posts"
         );
     }
 

@@ -551,13 +551,37 @@ fn ambiguous_query_error(
         }
         message.push('\n');
     }
+    message.push_str("\nNext commands:\n");
+    message.push_str(&format!(
+        "  codestory-cli symbol --project {} --query {}{} --choose 1\n",
+        quote_cli_path(project_root),
+        quote_cli_value(query),
+        file_filter
+            .map(|value| format!(" --file {}", quote_cli_value(&clean_path_string(value))))
+            .unwrap_or_default()
+    ));
+    if let Some(first) = alternatives.first() {
+        message.push_str(&format!(
+            "  codestory-cli symbol --project {} --id {}\n",
+            quote_cli_path(project_root),
+            first.node_id.0
+        ));
+        if let Some(path) = first.file_path.as_deref() {
+            message.push_str(&format!(
+                "  codestory-cli symbol --project {} --query {} --file {}\n",
+                quote_cli_path(project_root),
+                quote_cli_value(query),
+                quote_cli_value(&relative_path(project_root, path))
+            ));
+        }
+    }
     if file_filter.is_some() {
         message.push_str(
-            "\nPlease pass a more qualified symbol name or an exact `--id` from `search` output.",
+            "\nPass a more qualified symbol name, a stable `--id`, or a narrower `--file` fragment.",
         );
     } else {
         message.push_str(
-            "\nPlease pass a more qualified symbol name, add `--file <path-fragment>`, or resolve the exact `--id` from `search` output.",
+            "\nPass a more qualified symbol name, add `--file <path-fragment>`, or resolve the exact `--id` from `search` output.",
         );
     }
     message
@@ -571,4 +595,12 @@ fn node_ref(project_root: &Path, hit: &SearchHit) -> Option<String> {
         relative_path(project_root, file_path),
         hit.display_name
     ))
+}
+
+fn quote_cli_path(path: &Path) -> String {
+    quote_cli_value(&clean_path_string(&path.to_string_lossy()))
+}
+
+fn quote_cli_value(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
 }

@@ -30,6 +30,7 @@ pub(crate) enum Command {
     Doctor(DoctorCommand),
     Setup(SetupCommand),
     Search(SearchCommand),
+    Drill(DrillCommand),
     Symbol(SymbolCommand),
     Trail(TrailCommand),
     Snippet(SnippetCommand),
@@ -420,6 +421,40 @@ pub(crate) struct SearchCommand {
     pub(crate) hybrid_semantic_limit: Option<u32>,
 }
 
+#[derive(Args, Debug)]
+pub(crate) struct DrillCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        num_args = 1..,
+        required = true,
+        help = "Comma-separated concrete anchors to investigate deterministically."
+    )]
+    pub(crate) anchors: Vec<String>,
+    #[arg(
+        long,
+        help = "Human label for the drill question. Stored in the report only; it is not interpreted."
+    )]
+    pub(crate) label: Option<String>,
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory where the drill report and command artifacts are written."
+    )]
+    pub(crate) output_dir: PathBuf,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::Full,
+        long_help = READ_REFRESH_HELP
+    )]
+    pub(crate) refresh: RefreshMode,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+}
+
 #[derive(Args, Debug, Clone)]
 #[command(group(
     ArgGroup::new("selector")
@@ -777,8 +812,28 @@ pub(crate) struct SearchHitOutput {
     pub(crate) duplicate_of: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) excerpt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) primary_occurrence_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) symbol_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) paired_refs: Vec<VerificationTargetOutput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) verification_targets: Vec<VerificationTargetOutput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) resolution_hints: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) why: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct VerificationTargetOutput {
+    pub(crate) role: String,
+    pub(crate) path: String,
+    pub(crate) line: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) node_ref: Option<String>,
+    pub(crate) reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -816,6 +871,8 @@ pub(crate) struct QueryResolutionOutput {
 pub(crate) struct SymbolJsonOutput<'a> {
     pub(crate) resolution: QueryResolutionOutput,
     pub(crate) symbol: &'a SymbolContextDto,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) verification_targets: Vec<VerificationTargetOutput>,
 }
 
 #[derive(Debug, Serialize)]
@@ -830,6 +887,58 @@ pub(crate) struct TrailJsonOutput<'a> {
 pub(crate) struct SnippetJsonOutput<'a> {
     pub(crate) resolution: QueryResolutionOutput,
     pub(crate) snippet: &'a SnippetContextDto,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) verification_targets: Vec<VerificationTargetOutput>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DrillMechanicalOutput {
+    pub(crate) before_files: u32,
+    pub(crate) before_nodes: u32,
+    pub(crate) before_edges: u32,
+    pub(crate) before_errors: u32,
+    pub(crate) after_files: u32,
+    pub(crate) after_nodes: u32,
+    pub(crate) after_edges: u32,
+    pub(crate) after_errors: u32,
+    pub(crate) refresh: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retrieval: Option<RetrievalStateDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) phase_timings: Option<IndexingPhaseTimings>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DrillCommandStatusOutput {
+    pub(crate) command: String,
+    pub(crate) status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) artifact: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DrillAnchorOutput {
+    pub(crate) anchor: String,
+    pub(crate) typed_hit_count: usize,
+    pub(crate) chosen_anchor: Option<SearchHitOutput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) verification_targets: Vec<VerificationTargetOutput>,
+    pub(crate) commands: Vec<DrillCommandStatusOutput>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DrillOutput {
+    pub(crate) project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) label: Option<String>,
+    pub(crate) output_dir: String,
+    pub(crate) mechanical: DrillMechanicalOutput,
+    pub(crate) anchors: Vec<DrillAnchorOutput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) verification_targets: Vec<VerificationTargetOutput>,
+    pub(crate) next_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1101,6 +1210,15 @@ mod tests {
         assert!(help.contains("auto"));
         assert!(help.contains("on"));
         assert!(help.contains("off"));
+    }
+
+    #[test]
+    fn drill_help_exposes_deterministic_report_controls() {
+        let help = render_subcommand_help("drill");
+        assert!(help.contains("--anchors <ANCHORS>"));
+        assert!(help.contains("--output-dir <DIR>"));
+        assert!(help.contains("--label <LABEL>"));
+        assert!(help.contains("Stored in the report only; it is not interpreted"));
     }
 
     #[test]
