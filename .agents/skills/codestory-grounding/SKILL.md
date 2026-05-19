@@ -12,7 +12,7 @@ Use this skill to collect repo evidence with `codestory-cli` before answering ar
 1. Build the CLI first with `cargo build --release -p codestory-cli` when verification depends on local code changes.
 2. If `target/release/codestory-cli(.exe)` is missing, build it with `cargo build --release -p codestory-cli`. If it already exists and is fresh enough for the code you are verifying, use it directly.
 3. Run `target/release/codestory-cli(.exe) index --project <workspace> --refresh full` when validating fixes for prior indexing errors, schema/version changes, or graph/query-rule changes. Use `--refresh none` only after a successful fresh build and successful index run in the same verification session.
-4. For broad repo explanations, prefer `target/release/codestory-cli(.exe) explain --project <workspace>` after the index is healthy; it wraps grounding, anchor search, and focused ask into one handoff.
+4. For broad repo explanations after the index is healthy, run `target/release/codestory-cli(.exe) ground --project <workspace> --why`, then `search --project <workspace> --repo-text on --query "<question>" --why` for architecture/product/runtime anchors before using focused `ask`.
 5. Run `target/release/codestory-cli(.exe) ground --project <workspace>` for a compact context snapshot, then use `search`, `symbol`, `trail`, `query`, `explore`, or `snippet` to narrow focus.
 6. Treat command output as evidence, then open only the files needed for edits or verification.
 
@@ -24,7 +24,7 @@ Use this short loop before making repo claims or edits:
 2. For semantic/manual E2E tests, run `setup embeddings --project <workspace>` before the full index unless `doctor` already reports managed embeddings ready.
 3. `index --project <workspace> --refresh full` if doctor reports no cache/index, semantic partial, semantic stale, stale failures, or a schema/indexing change needs proof; otherwise keep read commands on `--refresh none`.
 4. Re-run `doctor --project <workspace>` and require `semantic ok` before broad repository explanation prompts. If `doctor` says `semantic partial`, `semantic stale`, or `semantic failed`, say so and use `search --repo-text on --why`, `ground`, `symbol`, `trail`, and `snippet` as the evidence path until semantics are rebuilt.
-5. `explain --project <workspace>` for broad "what is this repo / how does it fit together" questions.
+5. For broad "what is this repo / how does it fit together" questions, combine `ground --project <workspace> --why` with `search --project <workspace> --repo-text on --query "<question>" --why`, then use focused `ask --project <workspace> --focus-id <node_id> "<question>"` when you have an anchor.
 6. If you need to manually inspect the map, run `ground --project <workspace>` for the compact snapshot.
 7. `search --project <workspace> --query "<symbol or question>" --why` to find candidate evidence and ranking reasons.
 8. Use `symbol`, `trail`, `query`, `snippet`, or `explore` on the best node/query to verify definitions, relationships, and code.
@@ -56,7 +56,6 @@ Use the release binary directly. This skill requires a local Rust toolchain and 
 
 - `target/release/codestory-cli(.exe) index`: Index symbols, edges, and files via tree-sitter + semantic resolution
 - `target/release/codestory-cli(.exe) ground`: Produce a compact codebase context snapshot
-- `target/release/codestory-cli(.exe) explain`: Guided repo explanation flow: open/index as needed, ground, anchor search, and DB-first ask
 - `target/release/codestory-cli(.exe) search`: Search indexed symbols and repo text
 - `target/release/codestory-cli(.exe) symbol`: Inspect a single symbol's details, children, and relationships
 - `target/release/codestory-cli(.exe) trail`: Follow a symbol's call/reference graph as a directed trail
@@ -75,7 +74,6 @@ Detailed argument tables, output examples, and usage patterns for each command:
 
 - [index](references/index.md) — Build or refresh the symbol index
 - [ground](references/ground.md) — Compact codebase context snapshot
-- [explain](references/explain.md) — Guided repo explanation flow
 - [doctor](references/doctor.md) — Read-only project/cache/index/retrieval health check
 - [search](references/search.md) — Search indexed symbols and repo text
 - [symbol](references/symbol.md) — Inspect a symbol's details and relationships

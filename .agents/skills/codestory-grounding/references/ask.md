@@ -15,7 +15,7 @@ target/release/codestory-cli(.exe) ask [OPTIONS] <PROMPT>
 | `--project <path>` | `.` | Repository root to query. Always pass it explicitly. |
 | `--cache-dir <path>` | auto | Reuse or isolate a specific cache. |
 | `--profile <auto|architecture|callflow|inheritance|impact>` | `auto` | Tune retrieval shape for the question. |
-| `--investigate` | off | Use bounded investigation retrieval with weak-hit fallback, query expansion, and explicit gap trace. Prefer this for repo explanations. |
+| `--investigate` | off | Use bounded investigation retrieval with weak-hit fallback, query expansion, and explicit gap trace. Prefer this for focused repo explanation follow-ups after grounding/search anchors. |
 | `--max-results <n>` | `8` | Retrieval cap, clamped to 1-25. |
 | `--focus-id <node_id>` | none | Seed retrieval from a node returned by `search`, `symbol`, `trail`, or `explore`. |
 | `--bookmark <bookmark_id>` | none | Seed retrieval from a saved investigation bookmark. Mutually exclusive with `--focus-id`. |
@@ -35,5 +35,5 @@ target/release/codestory-cli(.exe) ask [OPTIONS] <PROMPT>
 ## Notes
 
 - Keep evidence on for user-facing claims; citations are the value of this command.
-- Do not use broad `ask` to explain a repo while `doctor` reports semantic partial/stale/failed. Run `search --repo-text on --why`, `ground`, and focused `symbol`/`trail`/`snippet` instead.
+- For broad repo explanations, start with `ground --why` and `search --repo-text on --why`; use focused `ask` after selecting anchors. If `doctor` reports semantic partial/stale/failed, stay on lexical/repo-text fallback with `symbol`/`trail`/`snippet` until the rebuild is clean.
 - Use `--format json` when another tool needs structured citations and score data.

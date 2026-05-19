@@ -317,60 +317,6 @@ fn snippet_lines_alias_sets_context_for_agent_guesses() {
 }
 
 #[test]
-fn explain_id_alias_runs_focused_repo_explanation() {
-    let workspace = tempdir().expect("workspace dir");
-    let cache_dir = tempdir().expect("cache dir");
-    write_tiny_rust_workspace(workspace.path());
-    index_workspace(workspace.path(), cache_dir.path());
-
-    let search = run_cli(
-        workspace.path(),
-        cache_dir.path(),
-        &[
-            "search",
-            "--query",
-            "AppController",
-            "--refresh",
-            "none",
-            "--format",
-            "json",
-        ],
-    );
-    assert_success(&search, "search should find focus id");
-    let search_json = parse_stdout_json(&search);
-    let node_id = search_json
-        .pointer("/indexed_symbol_hits/0/node_id")
-        .and_then(Value::as_str)
-        .expect("search hit node_id");
-
-    let explain = run_cli(
-        workspace.path(),
-        cache_dir.path(),
-        &[
-            "explain",
-            "--id",
-            node_id,
-            "Explain this symbol and its role in the repo.",
-            "--refresh",
-            "none",
-            "--format",
-            "json",
-        ],
-    );
-
-    assert_success(&explain, "explain --id should run focused explanation");
-    let json = parse_stdout_json(&explain);
-    assert!(
-        json.pointer("/answer/retrieval_trace/annotations")
-            .and_then(Value::as_array)
-            .is_some_and(|annotations| annotations
-                .iter()
-                .any(|annotation| annotation.as_str() == Some("mode=repo_explain_db_first"))),
-        "focused explain should preserve repo-explain annotations: {json:#}"
-    );
-}
-
-#[test]
 fn ambiguous_query_lists_ranked_alternatives_and_next_steps() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");

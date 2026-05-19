@@ -65,7 +65,7 @@ The main limitations are sharper:
 - **Location**: `crates/codestory-contracts/src/api/dto.rs`, `crates/codestory-runtime/src/agent/orchestrator.rs`, CLI ask tests.
 - **Description**: keep `AgentAskRequest` as a retrieval-only contract with no external local-agent execution controls.
 - **Acceptance criteria**:
-  - CLI `ask` and `explain` expose no local-agent flags.
+  - CLI `ask` exposes no local-agent flags.
   - `serve --stdio` ask remains read-only and DB-first.
   - Retrieval trace contains no local-agent execution step.
 - **Validation**:

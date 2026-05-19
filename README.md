@@ -32,7 +32,6 @@ Use this path if you want to run the tool against a repository.
    ```
 4. Run the grounding workflows against the existing cache.
    ```text
-   .\target\release\codestory-cli.exe explain --project <path>
    .\target\release\codestory-cli.exe ground --project <path>
    .\target\release\codestory-cli.exe search --project <path> --query <query> --why
    .\target\release\codestory-cli.exe ask --project <path> --investigate "How does search ranking work?"
@@ -115,7 +114,6 @@ flowchart LR
     Project["Repository"] --> Index["index"]
     Index["index"] --> LocalState["SQLite graph + snapshots"]
     LocalState --> Ground["ground"]
-    LocalState --> Explain["explain"]
     LocalState --> Search["search"]
     LocalState --> Ask["ask"]
     LocalState --> Symbol["symbol"]
@@ -129,9 +127,8 @@ flowchart LR
 
 - `index`: discover files, parse supported languages, resolve graph edges, persist search projections, and complete semantic docs before returning
 - `ground`: build grounded context from indexed symbols, snippets, graph traversal, and search results; `--why` explains retrieval mode, coverage, and query hints
-- `explain`: run the guided repo-explanation path in one command: open or refresh the index, ground, anchor search, and DB-first ask
 - `search`: find symbols, files, and query matches; semantic-only near misses appear under `did_you_mean`, and `--why` includes lexical/semantic/graph score breakdowns when available
-- `ask`: run DB-first agentic retrieval across search, graph, snippets, traces, and citations without launching an external agent
+- `ask`: run DB-first agentic retrieval across search, graph, snippets, traces, and citations without launching an external agent; start broad repo explanations with `ground --why` and `search --repo-text on --why`, then use focused `ask`
 - `symbol`: inspect one symbol and its indexed relationships
 - `trail`: walk caller/callee and usage neighborhoods through the graph; `--mermaid` emits a Mermaid flowchart and `--format dot` emits Graphviz DOT
 - `snippet`: fetch focused source context for a symbol or file location; Markdown snippets use ANSI syntax highlighting when stdout is an interactive terminal
@@ -198,7 +195,6 @@ the [research handbook](docs/research.md), with the decision matrix in
 Refresh behavior:
 
 - `index --refresh auto`: full on an empty cache, incremental once indexed files already exist
-- `explain --refresh auto`: opens or refreshes the index before collecting the repo explanation packet
 - `ground`, `search`, `ask`, `symbol`, `trail`, `snippet`, `query`, `explore`, and `serve`: default to `--refresh none`
 - use `--refresh incremental` when you want a read command to refresh an existing cache first
 - use `--refresh full` after a cache reset, schema change, or suspected stale-state incident
