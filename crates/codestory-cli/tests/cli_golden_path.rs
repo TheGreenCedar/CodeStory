@@ -923,14 +923,14 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
 
     let bookmark_id = add_and_assert_bookmark_focus(workspace.path(), cache_dir.path(), &node_id);
 
-    assert_bookmark_focus_seeds_ask(workspace.path(), cache_dir.path(), &bookmark_id);
+    assert_bookmark_focus_seeds_context(workspace.path(), cache_dir.path(), &bookmark_id);
 
     assert_explore_outputs_focus_context(workspace.path(), cache_dir.path(), &node_id);
 
     assert_query_reads_existing_cache(workspace.path(), cache_dir.path());
-    assert_ask_uses_db_first_trace(workspace.path(), cache_dir.path(), &node_id);
+    assert_context_uses_db_first_trace(workspace.path(), cache_dir.path(), &node_id);
     remove_and_assert_bookmark_gone(workspace.path(), cache_dir.path(), &bookmark_id);
-    assert_stdio_ask_uses_db_first_trace(workspace.path(), cache_dir.path());
+    assert_stdio_context_uses_db_first_trace(workspace.path(), cache_dir.path());
 
     search_dir_snapshot.assert_unchanged();
 }
@@ -1150,13 +1150,12 @@ fn add_and_assert_bookmark_focus(workspace: &Path, cache_dir: &Path, node_id: &s
     bookmark_id
 }
 
-fn assert_bookmark_focus_seeds_ask(workspace: &Path, cache_dir: &Path, bookmark_id: &str) {
-    let bookmarked_ask = run_cli_json(
+fn assert_bookmark_focus_seeds_context(workspace: &Path, cache_dir: &Path, bookmark_id: &str) {
+    let context = run_cli_json(
         workspace,
         cache_dir,
         &[
-            "ask",
-            "What does this bookmark focus on?",
+            "context",
             "--bookmark",
             bookmark_id,
             "--refresh",
@@ -1165,20 +1164,21 @@ fn assert_bookmark_focus_seeds_ask(workspace: &Path, cache_dir: &Path, bookmark_
             "json",
         ],
     );
+    let packet = &context["context"];
     assert!(
-        bookmarked_ask["retrieval_trace"]["steps"]
+        packet["retrieval_trace"]["steps"]
             .as_array()
-            .expect("bookmark ask trace steps")
+            .expect("bookmark context trace steps")
             .iter()
             .any(|step| step["input"].as_array().is_some_and(|fields| fields
                 .iter()
                 .any(|field| field["key"] == "has_focus" && field["value"] == "true"))),
-        "ask --bookmark should explicitly seed focused retrieval"
+        "context --bookmark should explicitly seed focused retrieval"
     );
     assert!(
-        bookmarked_ask["retrieval_trace"]["annotations"]
+        packet["retrieval_trace"]["annotations"]
             .as_array()
-            .expect("bookmark ask trace annotations")
+            .expect("bookmark context trace annotations")
             .iter()
             .any(|annotation| {
                 let Some(annotation) = annotation.as_str() else {
@@ -1187,7 +1187,7 @@ fn assert_bookmark_focus_seeds_ask(workspace: &Path, cache_dir: &Path, bookmark_
                 annotation.contains(&format!("bookmark_focus id={bookmark_id}"))
                     && annotation.contains("comment=`entry point under review`")
             }),
-        "ask --bookmark should preserve bookmark identity in the retrieval trace"
+        "context --bookmark should preserve bookmark identity in the retrieval trace"
     );
 }
 
@@ -1306,35 +1306,39 @@ fn assert_query_reads_existing_cache(workspace: &Path, cache_dir: &Path) {
     );
 }
 
-fn assert_ask_uses_db_first_trace(workspace: &Path, cache_dir: &Path, node_id: &str) {
-    let ask = run_cli_json(
+fn assert_context_uses_db_first_trace(workspace: &Path, cache_dir: &Path, node_id: &str) {
+    let context = run_cli_json(
         workspace,
         cache_dir,
         &[
-            "ask",
-            "What does AppController do?",
-            &format!("--focus-id={node_id}"),
+            "context",
+            &format!("--id={node_id}"),
             "--refresh",
             "none",
             "--format",
             "json",
         ],
     );
-    assert!(
-        array_is_non_empty(&ask, &["sections"]),
-        "ask should return a DB-first answer packet"
+    let packet = &context["context"];
+    assert_eq!(
+        string_field(&context, &["resolution", "resolved", "node_id"]),
+        node_id
     );
     assert!(
-        array_is_non_empty(&ask, &["retrieval_trace", "steps"]),
-        "ask should include a retrieval trace"
+        array_is_non_empty(packet, &["sections"]),
+        "context should return a DB-first evidence packet"
     );
     assert!(
-        ask["retrieval_trace"]["steps"]
+        array_is_non_empty(packet, &["retrieval_trace", "steps"]),
+        "context should include a retrieval trace"
+    );
+    assert!(
+        packet["retrieval_trace"]["steps"]
             .as_array()
             .expect("trace steps")
             .iter()
             .all(|step| step["kind"] != "local_agent"),
-        "CLI ask should not include removed local-agent trace steps"
+        "CLI context should not include removed local-agent trace steps"
     );
 }
 
@@ -1360,20 +1364,20 @@ fn remove_and_assert_bookmark_gone(workspace: &Path, cache_dir: &Path, bookmark_
     );
 }
 
-fn assert_stdio_ask_uses_db_first_trace(workspace: &Path, cache_dir: &Path) {
+fn assert_stdio_context_uses_db_first_trace(workspace: &Path, cache_dir: &Path) {
     let stdio = run_stdio_request(
         workspace,
         cache_dir,
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ask","arguments":{"prompt":"What does AppController do?"}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"context","arguments":{"query":"AppController"}}}"#,
     );
     let stdio_result = &stdio["result"]["structuredContent"];
     assert!(
         stdio_result["retrieval_trace"]["steps"]
             .as_array()
-            .expect("stdio ask trace steps")
+            .expect("stdio context trace steps")
             .iter()
             .all(|step| step["kind"] != "local_agent"),
-        "stdio ask should not include removed local-agent trace steps"
+        "stdio context should not include removed local-agent trace steps"
     );
 }
 
@@ -1487,12 +1491,11 @@ fn bookmarks_degrade_gracefully_after_reindex_removes_target() {
         "bookmark list should prune removed nodes or mark stale rows without crashing: {bookmarks:#}"
     );
 
-    let ask = run_cli(
+    let context = run_cli(
         workspace.path(),
         cache_dir.path(),
         &[
-            "ask",
-            "What did this bookmark point to?",
+            "context",
             "--bookmark",
             &bookmark_id,
             "--refresh",
@@ -1502,17 +1505,17 @@ fn bookmarks_degrade_gracefully_after_reindex_removes_target() {
         ],
     );
     assert!(
-        !ask.status.success(),
-        "ask --bookmark should not silently ignore a removed bookmark"
+        !context.status.success(),
+        "context --bookmark should not silently ignore a removed bookmark"
     );
     let failure = format!(
         "{}{}",
-        String::from_utf8_lossy(&ask.stdout),
-        String::from_utf8_lossy(&ask.stderr)
+        String::from_utf8_lossy(&context.stdout),
+        String::from_utf8_lossy(&context.stderr)
     );
     assert!(
         failure.contains("Bookmark not found") || failure.contains("is stale"),
-        "ask --bookmark should explain stale or missing bookmark focus, got: {failure}"
+        "context --bookmark should explain stale or missing bookmark focus, got: {failure}"
     );
 }
 
@@ -1601,7 +1604,7 @@ fn read_commands_report_stale_index_freshness_without_refreshing_cache() {
 }
 
 #[test]
-fn ask_investigate_json_reports_bounded_trace_without_changing_plain_ask() {
+fn context_json_reports_deep_trace_by_default() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
     write_investigation_workspace(workspace.path());
@@ -1619,68 +1622,53 @@ fn ask_investigate_json_reports_bounded_trace_without_changing_plain_ask() {
         "index should discover investigation fixture symbols"
     );
 
-    let plain_ask = run_cli_json(
+    let search = run_cli_json(
         workspace.path(),
         cache_dir.path(),
         &[
-            "ask",
-            "Where is INVESTIGATION_LITERAL used?",
+            "search",
+            "--query",
+            "parse_investigation_event",
             "--refresh",
             "none",
             "--format",
             "json",
         ],
     );
-    assert!(
-        trace_has_step(&plain_ask, "search"),
-        "plain ask should keep the existing DB-first trace"
-    );
-    assert!(
-        plain_ask["retrieval_trace"]["annotations"]
-            .as_array()
-            .is_none_or(|annotations| {
-                !annotations.iter().any(|annotation| {
-                    annotation
-                        .as_str()
-                        .is_some_and(|value| value.contains("investigate"))
-                })
-            }),
-        "plain ask should not silently opt into the new investigation mode"
-    );
+    let node_id = string_field(&search, &["indexed_symbol_hits", "0", "node_id"]).to_string();
 
-    let investigated = run_cli_json(
+    let context = run_cli_json(
         workspace.path(),
         cache_dir.path(),
         &[
-            "ask",
-            "--investigate",
-            "Where is INVESTIGATION_LITERAL used and what source was checked?",
+            "context",
+            &format!("--id={node_id}"),
             "--refresh",
             "none",
             "--format",
             "json",
         ],
     );
+    let investigated = &context["context"];
     assert_eq!(
         investigated["retrieval_trace"]["resolved_profile"], "investigate",
-        "ask --investigate should expose the selected retrieval profile: {investigated:#}"
+        "context should use the deep investigation profile by default: {investigated:#}"
+    );
+    assert_eq!(
+        string_field(&context, &["resolution", "resolved", "display_name"]),
+        "parse_investigation_event"
     );
     assert!(
         trace_has_step(&investigated, "search"),
-        "investigation starts with the current search ranking"
-    );
-    assert!(
-        trace_has_step(&investigated, "query_expansion")
-            || trace_has_step(&investigated, "repo_text_fallback"),
-        "weak first hits should trigger query expansion or exact-symbol/file fallback"
+        "context starts with the current search ranking"
     );
     assert!(
         trace_has_step(&investigated, "trail") || trace_has_step(&investigated, "neighborhood"),
-        "investigation should record bounded graph expansion"
+        "context should record bounded graph expansion"
     );
     assert!(
         trace_has_step(&investigated, "source_read"),
-        "investigation should record bounded source/snippet reads"
+        "context should record bounded source/snippet reads"
     );
     let trace_steps = investigated["retrieval_trace"]["steps"]
         .as_array()
@@ -1719,15 +1707,15 @@ fn ask_investigate_json_reports_bounded_trace_without_changing_plain_ask() {
     }
     let synthesis_step = trace_steps
         .iter()
-        .find(|step| step["kind"] == "answer_synthesis")
-        .expect("answer synthesis step");
+        .find(|step| step["kind"] == "context_synthesis")
+        .expect("context synthesis step");
     assert!(
         trace_field_value(synthesis_step, "output", "graph_artifact_byte_cap").is_some(),
-        "answer synthesis should expose graph artifact bundle caps: {synthesis_step}"
+        "context synthesis should expose graph artifact bundle caps: {synthesis_step}"
     );
     assert!(
         array_is_non_empty(&investigated, &["citations"]),
-        "investigation should return cited evidence"
+        "context should return cited evidence"
     );
     assert!(
         investigated["retrieval_trace"]["resolved_profile"] == "investigate"
@@ -1741,11 +1729,11 @@ fn ask_investigate_json_reports_bounded_trace_without_changing_plain_ask() {
                         value.contains("what i checked") || value.contains("investigation")
                     })
                 }),
-        "investigation JSON should expose the named mode or what-I-checked trace"
+        "context JSON should expose the named mode or what-I-checked trace"
     );
 
     assert!(
         trace_steps.iter().all(|step| step["kind"] != "local_agent"),
-        "ask --investigate should not include removed local-agent trace steps"
+        "context should not include removed local-agent trace steps"
     );
 }

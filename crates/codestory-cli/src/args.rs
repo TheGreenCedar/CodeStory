@@ -1,10 +1,10 @@
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
-    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, BookmarkCategoryDto, BookmarkDto,
-    GroundingBudgetDto, IndexDryRunDto, IndexFreshnessDto, IndexingPhaseTimings, LayoutDirection,
-    NodeId, NodeKind, ProjectSummary, RepoTextScanStatsDto, RetrievalScoreBreakdownDto,
-    RetrievalStateDto, SearchHitOrigin, SnippetContextDto, SummaryGenerationDto, SymbolContextDto,
-    TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
+    BookmarkCategoryDto, BookmarkDto, GroundingBudgetDto, IndexDryRunDto, IndexFreshnessDto,
+    IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind, ProjectSummary, RepoTextScanStatsDto,
+    RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin, SnippetContextDto,
+    SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection,
+    TrailMode,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     Index(IndexCommand),
     Ground(GroundCommand),
-    Ask(AskCommand),
+    Context(ContextCommand),
     Doctor(DoctorCommand),
     Setup(SetupCommand),
     Search(SearchCommand),
@@ -141,16 +141,6 @@ pub(crate) enum CliLlamaVariant {
     Vulkan,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CliAskProfile {
-    Auto,
-    Architecture,
-    Callflow,
-    Inheritance,
-    Impact,
-}
-
 #[derive(Args, Debug)]
 pub(crate) struct IndexCommand {
     #[command(flatten)]
@@ -216,37 +206,37 @@ pub(crate) struct GroundCommand {
 
 #[derive(Args, Debug)]
 #[command(group(
-    ArgGroup::new("ask_focus")
-        .args(["focus_id", "bookmark"])
+    ArgGroup::new("context_target")
+        .args(["id", "query", "bookmark"])
+        .required(true)
         .multiple(false)
 ))]
-pub(crate) struct AskCommand {
+pub(crate) struct ContextCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
-    #[arg(value_name = "PROMPT", help = "Question or investigation prompt.")]
-    pub(crate) prompt: String,
-    #[arg(long, value_enum, default_value_t = CliAskProfile::Auto)]
-    pub(crate) profile: CliAskProfile,
-    #[arg(
-        long,
-        help = "Use bounded investigation retrieval: weak-hit fallback, limited graph/source reads, and explicit gap trace."
-    )]
-    pub(crate) investigate: bool,
-    #[arg(long, default_value_t = 8)]
-    pub(crate) max_results: u32,
     #[arg(
         long,
         allow_hyphen_values = true,
         value_name = "NODE_ID",
-        help = "Seed retrieval around an exact node id from search/symbol output."
+        group = "context_target",
+        help = "Build context around an exact node id from search, symbol, trail, or explore output."
     )]
-    pub(crate) focus_id: Option<String>,
+    pub(crate) id: Option<String>,
+    #[arg(
+        long,
+        group = "context_target",
+        help = "Resolve a concrete symbol, file, literal, API path, module, or behavior term before building context."
+    )]
+    pub(crate) query: Option<String>,
     #[arg(
         long,
         value_name = "BOOKMARK_ID",
-        help = "Seed retrieval from a saved bookmark. Cannot be combined with --focus-id."
+        group = "context_target",
+        help = "Build context around a saved bookmark target."
     )]
     pub(crate) bookmark: Option<String>,
+    #[arg(long, default_value_t = 8)]
+    pub(crate) max_results: u32,
     #[arg(
         long,
         value_enum,
@@ -265,30 +255,33 @@ pub(crate) struct AskCommand {
     #[arg(
         long,
         value_name = "DIR",
-        help = "Write a handoff bundle with answer markdown, answer JSON, and generated graph artifacts."
+        help = "Write a context bundle with Markdown, JSON, and generated graph artifacts."
     )]
     pub(crate) bundle: Option<PathBuf>,
     #[arg(
         long,
-        help = "Omit citation edge ids and score breakdowns from the structured answer."
+        help = "Omit citation edge ids and score breakdowns from the structured context packet."
     )]
     pub(crate) no_evidence: bool,
     #[arg(
         long = "hybrid-lexical",
         value_name = "WEIGHT",
-        help = "Override the lexical component weight for hybrid ask research runs."
+        hide = true,
+        help = "Override the lexical component weight for hybrid context research runs."
     )]
     pub(crate) hybrid_lexical: Option<f32>,
     #[arg(
         long = "hybrid-semantic",
         value_name = "WEIGHT",
-        help = "Override the semantic component weight for hybrid ask research runs."
+        hide = true,
+        help = "Override the semantic component weight for hybrid context research runs."
     )]
     pub(crate) hybrid_semantic: Option<f32>,
     #[arg(
         long = "hybrid-graph",
         value_name = "WEIGHT",
-        help = "Override the graph component weight for hybrid ask research runs."
+        hide = true,
+        help = "Override the graph component weight for hybrid context research runs."
     )]
     pub(crate) hybrid_graph: Option<f32>,
 }
@@ -995,36 +988,6 @@ impl From<CliGroundingBudget> for GroundingBudgetDto {
     }
 }
 
-impl From<CliAskProfile> for AgentRetrievalProfileSelectionDto {
-    fn from(value: CliAskProfile) -> Self {
-        match value {
-            CliAskProfile::Auto => Self::Auto,
-            CliAskProfile::Architecture => Self::Preset {
-                preset: AgentRetrievalPresetDto::Architecture,
-            },
-            CliAskProfile::Callflow => Self::Preset {
-                preset: AgentRetrievalPresetDto::Callflow,
-            },
-            CliAskProfile::Inheritance => Self::Preset {
-                preset: AgentRetrievalPresetDto::Inheritance,
-            },
-            CliAskProfile::Impact => Self::Preset {
-                preset: AgentRetrievalPresetDto::Impact,
-            },
-        }
-    }
-}
-
-pub(crate) fn ask_retrieval_profile(cmd: &AskCommand) -> AgentRetrievalProfileSelectionDto {
-    if cmd.investigate {
-        AgentRetrievalProfileSelectionDto::Preset {
-            preset: AgentRetrievalPresetDto::Investigate,
-        }
-    } else {
-        cmd.profile.into()
-    }
-}
-
 impl From<CliDirection> for TrailDirection {
     fn from(value: CliDirection) -> Self {
         match value {
@@ -1119,7 +1082,8 @@ mod tests {
     #[test]
     fn read_commands_explain_refresh_none_default() {
         for name in [
-            "ground", "ask", "search", "symbol", "trail", "snippet", "query", "explore", "serve",
+            "ground", "context", "search", "symbol", "trail", "snippet", "query", "explore",
+            "serve",
         ] {
             let help = render_subcommand_help(name);
             assert!(
@@ -1140,10 +1104,17 @@ mod tests {
     }
 
     #[test]
-    fn ask_help_exposes_db_first_controls() {
-        let help = render_subcommand_help("ask");
+    fn context_help_exposes_targeted_bundle_controls() {
+        let help = render_subcommand_help("context");
+        assert!(help.contains("<--id <NODE_ID>|--query <QUERY>|--bookmark <BOOKMARK_ID>>"));
+        assert!(help.contains("--id <NODE_ID>"));
+        assert!(help.contains("--query <QUERY>"));
+        assert!(help.contains("--bookmark <BOOKMARK_ID>"));
         assert!(help.contains("--bundle <DIR>"));
-        assert!(help.contains("--profile <PROFILE>"));
+        assert!(!help.contains("PROMPT"));
+        assert!(!help.contains("--profile"));
+        assert!(!help.contains("--investigate"));
+        assert!(!help.contains("Question"));
         assert!(!help.contains("--with-local-agent"));
         assert!(!help.contains("--agent-command"));
     }
@@ -1179,7 +1150,8 @@ mod tests {
     #[test]
     fn non_trail_help_does_not_advertise_dot_format() {
         for name in [
-            "index", "ground", "ask", "doctor", "search", "symbol", "snippet", "query", "explore",
+            "index", "ground", "context", "doctor", "search", "symbol", "snippet", "query",
+            "explore",
         ] {
             let help = render_subcommand_help(name);
             assert!(
@@ -1248,17 +1220,11 @@ mod tests {
             _ => panic!("expected symbol command"),
         }
 
-        let cli = Cli::try_parse_from([
-            "codestory-cli",
-            "ask",
-            "what is this?",
-            "--focus-id",
-            "-3816661223164617416",
-        ])
-        .expect("negative focus id should parse");
+        let cli = Cli::try_parse_from(["codestory-cli", "context", "--id", "-3816661223164617416"])
+            .expect("negative context id should parse");
         match cli.command {
-            Command::Ask(cmd) => assert_eq!(cmd.focus_id.as_deref(), Some("-3816661223164617416")),
-            _ => panic!("expected ask command"),
+            Command::Context(cmd) => assert_eq!(cmd.id.as_deref(), Some("-3816661223164617416")),
+            _ => panic!("expected context command"),
         }
     }
 }

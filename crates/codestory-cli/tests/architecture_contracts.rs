@@ -212,7 +212,7 @@ fn runtime_exposes_read_only_browser_service_boundary() {
     );
     assert!(
         !browser.contains("run_local_agent"),
-        "read-only browser ask should not carry local-agent execution controls"
+        "read-only browser context retrieval should not carry local-agent execution controls"
     );
 
     for forbidden in [
@@ -281,7 +281,7 @@ fn stdio_tool_catalog_stays_aligned_with_read_only_browser_service_operations() 
         ),
         ("trail", ".trail_context(", "pub fn trail_context"),
         ("snippet", ".snippet_context(", "pub fn snippet_context"),
-        ("ask", ".ask(", "pub fn ask"),
+        ("context", ".ask(", "pub fn ask"),
     ];
 
     for (tool_name, cli_call, browser_method) in expected_tools {

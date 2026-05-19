@@ -590,7 +590,7 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
     assert_eq!(
         sorted_field_values(&tools, "tools", "name"),
         vec![
-            "ask",
+            "context",
             "definition",
             "references",
             "search",
@@ -756,30 +756,32 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         "trail.story should document the stdio default: {trail}"
     );
 
-    let ask = tool_input_schema(&tools, "ask");
+    let context = tool_input_schema(&tools, "context");
     assert!(
-        required_fields(ask).contains("prompt"),
-        "ask.prompt should be required: {ask}"
+        !required_fields(context).contains("query")
+            && !required_fields(context).contains("id")
+            && !required_fields(context).contains("bookmark"),
+        "context should require exactly one target through anyOf rather than a single prompt: {context}"
     );
     assert_eq!(
-        schema_property(ask, "prompt")["type"],
+        schema_property(context, "query")["type"],
         "string",
-        "ask.prompt should be a string: {ask}"
+        "context.query should be a string: {context}"
     );
     assert_eq!(
-        schema_property(ask, "investigate")["type"],
-        "boolean",
-        "ask.investigate should be a boolean opt-in: {ask}"
+        schema_property(context, "id")["type"],
+        "string",
+        "context.id should be a string node id: {context}"
     );
     assert_eq!(
-        schema_property(ask, "investigate").get("default"),
-        Some(&json!(false)),
-        "ask.investigate should document the stdio default: {ask}"
+        schema_property(context, "bookmark")["type"],
+        "string",
+        "context.bookmark should be a string bookmark id: {context}"
     );
     assert_eq!(
-        schema_property(ask, "focus_id")["type"],
-        json!(["string", "null"]),
-        "ask.focus_id should accept an optional node id: {ask}"
+        schema_property(context, "max_results").get("default"),
+        Some(&json!(8)),
+        "context.max_results should document the stdio default: {context}"
     );
 }
 
@@ -798,7 +800,7 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
     .clone();
 
     for name in [
-        "ask",
+        "context",
         "definition",
         "references",
         "search",
@@ -820,6 +822,23 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
                 schema_property(output_schema, "symbols")["type"],
                 "array",
                 "symbols outputSchema should wrap symbol arrays in an object: {tool}"
+            );
+        }
+        if name == "context" {
+            assert_eq!(
+                schema_property(output_schema, "packet_id")["type"],
+                "string",
+                "context outputSchema should expose context packet terminology: {tool}"
+            );
+            assert_eq!(
+                schema_property(output_schema, "target")["type"],
+                "string",
+                "context outputSchema should expose a resolved target label: {tool}"
+            );
+            assert!(
+                output_schema.pointer("/properties/answer_id").is_none()
+                    && output_schema.pointer("/properties/prompt").is_none(),
+                "context outputSchema should not expose answer/prompt DTO names: {tool}"
             );
         }
     }
@@ -930,7 +949,7 @@ fn transcript_lists_tools_resources_templates_and_prompts() {
         "references",
         "symbols",
         "snippet",
-        "ask",
+        "context",
     ] {
         assert!(
             tool_names.contains(&expected),
@@ -1245,7 +1264,7 @@ fn transcript_calls_search_tool() {
 }
 
 #[test]
-fn ask_tool_maps_investigate_and_focus_id_to_browser_request() {
+fn context_tool_maps_target_id_to_deep_browser_request() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
 
@@ -1253,7 +1272,7 @@ fn ask_tool_maps_investigate_and_focus_id_to_browser_request() {
         &mut server,
         json!({
             "jsonrpc": "2.0",
-            "id": "ask-focus-search",
+            "id": "context-focus-search",
             "method": "tools/call",
             "params": {
                 "name": "search",
@@ -1261,7 +1280,7 @@ fn ask_tool_maps_investigate_and_focus_id_to_browser_request() {
             }
         }),
     );
-    let search_result = assert_tool_success(&search_response, json!("ask-focus-search"));
+    let search_result = assert_tool_success(&search_response, json!("context-focus-search"));
     let node_id = search_result["indexed_symbol_hits"]
         .as_array()
         .expect("indexed symbol hits")
@@ -1271,46 +1290,44 @@ fn ask_tool_maps_investigate_and_focus_id_to_browser_request() {
         .unwrap_or_else(|| panic!("missing AppController node id: {search_result}"))
         .to_string();
 
-    let ask_response = send_json(
+    let context_response = send_json(
         &mut server,
         json!({
             "jsonrpc": "2.0",
-            "id": "ask-investigate-focus",
+            "id": "context-focus",
             "method": "tools/call",
             "params": {
-                "name": "ask",
+                "name": "context",
                 "arguments": {
-                    "prompt": "Explain AppController for a focused investigation",
-                    "investigate": true,
-                    "focus_id": node_id,
+                    "id": node_id,
                     "max_results": 4
                 }
             }
         }),
     );
 
-    let answer = assert_tool_success(&ask_response, json!("ask-investigate-focus"));
+    let packet = assert_tool_success(&context_response, json!("context-focus"));
     assert_eq!(
-        answer.pointer("/retrieval_trace/resolved_profile"),
+        packet.pointer("/retrieval_trace/resolved_profile"),
         Some(&json!("investigate")),
-        "stdio ask.investigate should use the investigation preset: {answer}"
+        "stdio context should use the investigation preset by default: {packet}"
     );
     assert!(
-        answer
+        packet
             .get("summary")
             .and_then(Value::as_str)
             .is_some_and(|summary| summary.contains("DB-first retrieval")),
-        "stdio ask should return the DB-first labeled answer after local-agent removal: {answer}"
+        "stdio context should return the DB-first labeled packet after local-agent removal: {packet}"
     );
     assert!(
-        !answer.to_string().contains("local_agent"),
-        "stdio ask should not leak removed local-agent fields: {answer}"
+        !packet.to_string().contains("local_agent"),
+        "stdio context should not leak removed local-agent fields: {packet}"
     );
-    let neighborhood_step = answer
+    let neighborhood_step = packet
         .pointer("/retrieval_trace/steps")
         .and_then(Value::as_array)
         .and_then(|steps| steps.iter().find(|step| step["kind"] == "neighborhood"))
-        .unwrap_or_else(|| panic!("missing neighborhood step in answer trace: {answer}"));
+        .unwrap_or_else(|| panic!("missing neighborhood step in context trace: {packet}"));
     assert!(
         neighborhood_step
             .get("input")
@@ -1318,7 +1335,7 @@ fn ask_tool_maps_investigate_and_focus_id_to_browser_request() {
             .is_some_and(|fields| fields
                 .iter()
                 .any(|field| field["key"] == "center_id" && field["value"] == node_id)),
-        "stdio ask.focus_id should seed the browser focus node: {neighborhood_step}"
+        "stdio context.id should seed the browser focus node: {neighborhood_step}"
     );
 }
 

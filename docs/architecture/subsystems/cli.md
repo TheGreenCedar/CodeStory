@@ -1,6 +1,6 @@
 # CLI Subsystem
 
-`codestory-cli` is the thin adapter for indexing, grounding reads, DB-first ask packets, graph-query helpers, local exploration, health checks, and lightweight serving.
+`codestory-cli` is the thin adapter for indexing, grounding reads, DB-first context packets, graph-query helpers, local exploration, health checks, and lightweight serving.
 
 ## Ownership
 
@@ -72,17 +72,17 @@ Index output should expose:
 
 ## Read And Query Output
 
-Read commands default to `--refresh none` so they query the current cache unless the caller asks for a refresh. `ground`, `search`, `symbol`, `trail`, `snippet`, `query`, and `explore` all support `--format markdown|json` and `--output-file <PATH>`; `trail` additionally supports Graphviz DOT via `--format dot`, while `symbol` and `trail` support Mermaid via `--mermaid`.
+Read commands default to `--refresh none` so they query the current cache unless the caller requests a refresh. `ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `query`, and `explore` all support `--format markdown|json` and `--output-file <PATH>`; `trail` additionally supports Graphviz DOT via `--format dot`, while `symbol` and `trail` support Mermaid via `--mermaid`.
 
 `query` is intentionally small. It parses source operations (`search`, `symbol`, `trail`) followed by stream refinements (`filter`, `limit`) and rejects malformed or unknown named arguments rather than silently ignoring typos.
 
-`ask` is the first higher-level retrieval packet. It delegates to `codestory-runtime` retrieval orchestration, includes citations and retrieval traces, and always uses DB-first synthesis. `--bundle <DIR>` writes Markdown, JSON, and Mermaid artifacts for handoff.
+`context` is the higher-level retrieval packet. It resolves one concrete target from `--id`, `--query`, or `--bookmark`, delegates to `codestory-runtime` retrieval orchestration, includes citations and retrieval traces, and always uses DB-first synthesis. It is not a natural-language question-answering surface. `--bundle <DIR>` writes Markdown, JSON, and Mermaid artifacts for handoff.
 
 `doctor` is a read-only health report for project path resolution, cache presence, index counts, retrieval state, managed embedding setup, relevant embedding environment variables, and next commands. It should stay diagnostic; it should not mutate caches or fetch model assets. `setup embeddings` is the explicit mutating path for installing pinned ONNX Runtime BGE-base assets in the user cache. Managed setup does not launch or retain an embedding server.
 
-## `search` And `ask` Research Options
+## `search` And `context` Research Options
 
-`codestory-cli search` and `codestory-cli ask` keep production behavior on the runtime defaults unless a caller explicitly passes hybrid research weights:
+`codestory-cli search` and `codestory-cli context` keep production behavior on the runtime defaults unless a caller explicitly passes hybrid research weights:
 
 | Option | Default | Runtime effect |
 | --- | --- | --- |
@@ -97,7 +97,7 @@ The runtime clamps and normalizes supplied weights before ranking. These flags e
 
 HTTP serving keeps the current small GET/query-string shape. The stable routes are `/health`, `/search`, `/symbol`, `/definition`, `/references`, `/symbols`, and `/trail`. Definition and references accept either `q` or `id`, so agents can resolve from a query first and then reuse exact node ids.
 
-`serve --stdio` is MCP-style JSON lines. It exposes tools for search, symbol, trail, definition, references, symbols, snippet, and ask; resources for project, grounding, and root symbols; resource templates for node-specific symbol/reference/snippet/trail reads; and prompts for explain-symbol, callflow tracing, and impact analysis.
+`serve --stdio` is MCP-style JSON lines. It exposes tools for search, context, symbol, trail, definition, references, symbols, and snippet; resources for project, grounding, and root symbols; resource templates for node-specific symbol/reference/snippet/trail reads; and prompts for explain-symbol, callflow tracing, and impact analysis.
 
 ## Failure Signatures
 

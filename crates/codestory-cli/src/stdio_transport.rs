@@ -1,8 +1,8 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use codestory_contracts::api::{
     AgentAskRequest, AgentResponseModeDto, AgentRetrievalPresetDto,
     AgentRetrievalProfileSelectionDto, GroundingBudgetDto, ListChildrenSymbolsRequest,
-    ListRootSymbolsRequest, NodeId, SearchRepoTextMode, SearchRequest, TrailDirection,
+    ListRootSymbolsRequest, NodeId, NodeKind, SearchRepoTextMode, SearchRequest, TrailDirection,
 };
 use std::io::{BufRead, Write};
 
@@ -11,6 +11,7 @@ use crate::http_transport::{
     BROWSER_SYMBOLS_DEFAULT_LIMIT, BROWSER_SYMBOLS_MAX_LIMIT, BROWSER_TRAIL_DEFAULT_DEPTH,
     BROWSER_TRAIL_MAX_DEPTH, browser_references_config, browser_trail_config,
 };
+use crate::output::context_packet_json;
 use crate::runtime::{AmbiguousTargetError, RuntimeContext, map_api_error, resolve_target};
 use crate::stdio_catalog::{
     is_tool_name as is_stdio_tool_name, prompt_get_json as stdio_prompt_get_json,
@@ -309,7 +310,7 @@ fn handle_stdio_tool_call(
         "references" => handle_stdio_references(runtime, request),
         "symbols" => handle_stdio_symbols(runtime, request),
         "snippet" => handle_stdio_snippet(runtime, request),
-        "ask" => handle_stdio_ask(runtime, request, &query),
+        "context" => handle_stdio_context(runtime, request),
         _ => serde_json::json!({"error": "unknown tool"}),
     }
 }
@@ -500,16 +501,16 @@ fn handle_stdio_snippet(
         )
 }
 
-fn handle_stdio_ask(
+fn handle_stdio_context(
     runtime: &RuntimeContext,
     request: &serde_json::Value,
-    default_prompt: &str,
 ) -> serde_json::Value {
-    let prompt = request
-        .pointer("/params/arguments/prompt")
-        .and_then(|value| value.as_str())
-        .unwrap_or(default_prompt)
-        .to_string();
+    let (target_label, focus_node_id) = match stdio_context_target(runtime, request) {
+        Ok(target) => target,
+        Err(error) => {
+            return serde_json::json!({"error": stdio_legacy_error_value(runtime, &error)});
+        }
+    };
     let max_results = request
         .pointer("/params/arguments/max_results")
         .and_then(|value| value.as_u64())
@@ -519,44 +520,75 @@ fn handle_stdio_ask(
         .pointer("/params/arguments/include_evidence")
         .and_then(|value| value.as_bool())
         .unwrap_or(true);
-    let investigate = request
-        .pointer("/params/arguments/investigate")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    let focus_node_id = request
-        .pointer("/params/arguments/focus_id")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| NodeId(value.to_string()));
-    let response_mode = match request
-        .pointer("/params/arguments/response_mode")
-        .and_then(|value| value.as_str())
-    {
-        Some("markdown") => AgentResponseModeDto::Markdown,
-        _ => AgentResponseModeDto::Structured,
-    };
-    let retrieval_profile = if investigate {
-        AgentRetrievalProfileSelectionDto::Preset {
-            preset: AgentRetrievalPresetDto::Investigate,
-        }
-    } else {
-        AgentRetrievalProfileSelectionDto::Auto
-    };
     runtime
         .browser
         .ask(AgentAskRequest {
-            prompt,
-            retrieval_profile,
-            focus_node_id,
+            prompt: target_label.clone(),
+            retrieval_profile: AgentRetrievalProfileSelectionDto::Preset {
+                preset: AgentRetrievalPresetDto::Investigate,
+            },
+            focus_node_id: Some(focus_node_id.clone()),
             max_results: Some(max_results),
-            response_mode,
+            response_mode: AgentResponseModeDto::Structured,
             latency_budget_ms: None,
             include_evidence,
             hybrid_weights: None,
         })
-        .map(|result| serde_json::json!({"result": result}))
+        .map(|mut result| {
+            result.retrieval_trace.annotations.push(format!(
+                "context_target node={} label=`{}`",
+                focus_node_id.0,
+                target_label.replace('`', "'")
+            ));
+            serde_json::json!({"result": context_packet_json(&result)})
+        })
         .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))
+}
+
+fn stdio_context_target(
+    runtime: &RuntimeContext,
+    request: &serde_json::Value,
+) -> Result<(String, NodeId)> {
+    let has_id = request
+        .pointer("/params/arguments/id")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_query = request
+        .pointer("/params/arguments/query")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty());
+    let bookmark = request
+        .pointer("/params/arguments/bookmark")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let selector_count =
+        usize::from(has_id) + usize::from(has_query) + usize::from(bookmark.is_some());
+    if selector_count != 1 {
+        bail!("Pass exactly one of id, query, or bookmark for context.");
+    }
+    if let Some(bookmark_id) = bookmark {
+        let bookmark = runtime
+            .bookmarks
+            .list_bookmarks(None)
+            .map_err(map_api_error)?
+            .into_iter()
+            .find(|bookmark| bookmark.id == bookmark_id)
+            .with_context(|| format!("Bookmark not found: {bookmark_id}"))?;
+        if bookmark.node_kind == NodeKind::UNKNOWN {
+            bail!(
+                "Bookmark {bookmark_id} is stale: node {} is no longer present after reindex.",
+                bookmark.node_id.0
+            );
+        }
+        return Ok((bookmark.node_label, bookmark.node_id));
+    }
+    resolve_target(runtime, stdio_target_selection(request), None).map(|target| {
+        (
+            target.selected.display_name.clone(),
+            target.selected.node_id.clone(),
+        )
+    })
 }
 
 fn stdio_target_selection(request: &serde_json::Value) -> args::TargetSelection {

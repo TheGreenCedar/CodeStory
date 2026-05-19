@@ -7,6 +7,7 @@ use codestory_contracts::api::{
     SearchHit, SnippetContextDto, SymbolContextDto, TrailContextDto, TrailStoryDto,
 };
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::File;
@@ -774,9 +775,8 @@ fn append_search_evidence_packet(
             );
             let _ = writeln!(
                 markdown,
-                "- `codestory-cli ask --project {project} --focus-id {} {}`",
-                hit.node_id,
-                quoted_cli_arg("Explain this symbol")
+                "- `codestory-cli context --project {project} --id {}`",
+                hit.node_id
             );
         } else {
             let _ = writeln!(
@@ -808,7 +808,7 @@ fn append_agent_evidence_packet(
     let _ = writeln!(markdown, "what_was_checked:");
     let _ = writeln!(
         markdown,
-        "- retrieval plan: profile={} policy={} latency_ms={} steps={}",
+        "- retrieval plan: preset={} policy={} latency_ms={} steps={}",
         format_agent_profile(answer.retrieval_trace.resolved_profile),
         format_agent_policy(answer.retrieval_trace.policy_mode),
         answer.retrieval_trace.total_latency_ms,
@@ -1205,7 +1205,7 @@ fn format_agent_step_kind(kind: AgentRetrievalStepKindDto) -> &'static str {
         AgentRetrievalStepKindDto::EdgeOccurrences => "edge_occurrences",
         AgentRetrievalStepKindDto::SourceRead => "source_read",
         AgentRetrievalStepKindDto::MermaidSynthesis => "mermaid_synthesis",
-        AgentRetrievalStepKindDto::AnswerSynthesis => "answer_synthesis",
+        AgentRetrievalStepKindDto::AnswerSynthesis => "context_synthesis",
     }
 }
 
@@ -1243,10 +1243,10 @@ fn quoted_cli_arg(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\\\""))
 }
 
-pub(crate) fn render_agent_answer_markdown(project_root: &Path, answer: &AgentAnswerDto) -> String {
+pub(crate) fn render_context_markdown(project_root: &Path, answer: &AgentAnswerDto) -> String {
     let mut markdown = String::new();
-    let _ = writeln!(markdown, "# Ask");
-    let _ = writeln!(markdown, "prompt: `{}`", answer.prompt.replace('\n', " "));
+    let _ = writeln!(markdown, "# Context");
+    let _ = writeln!(markdown, "target: `{}`", answer.prompt.replace('\n', " "));
     let _ = writeln!(markdown, "summary: {}", answer.summary);
     let _ = writeln!(
         markdown,
@@ -1256,7 +1256,12 @@ pub(crate) fn render_agent_answer_markdown(project_root: &Path, answer: &AgentAn
     let _ = writeln!(markdown, "mode: {}", agent_answer_mode_label(answer));
     append_agent_evidence_packet(&mut markdown, project_root, answer);
     for section in &answer.sections {
-        let _ = writeln!(markdown, "\n## {}", section.title);
+        let section_title = if section.title.eq_ignore_ascii_case("answer") {
+            "Context"
+        } else {
+            section.title.as_str()
+        };
+        let _ = writeln!(markdown, "\n## {}", section_title);
         for block in &section.blocks {
             match block {
                 AgentResponseBlockDto::Markdown { markdown: block } => {
@@ -1294,6 +1299,58 @@ pub(crate) fn render_agent_answer_markdown(project_root: &Path, answer: &AgentAn
         }
     }
     markdown
+}
+
+pub(crate) fn context_packet_json(answer: &AgentAnswerDto) -> Value {
+    let mut value = serde_json::to_value(answer).unwrap_or_else(|_| serde_json::json!({}));
+    normalize_context_packet_json(&mut value);
+    value
+}
+
+fn normalize_context_packet_json(value: &mut Value) {
+    let Some(packet) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(answer_id) = packet.remove("answer_id") {
+        packet.insert("packet_id".to_string(), answer_id);
+    }
+    if let Some(prompt) = packet.remove("prompt") {
+        packet.insert("target".to_string(), prompt);
+    }
+    if let Some(sections) = packet.get_mut("sections").and_then(Value::as_array_mut) {
+        for section in sections {
+            let Some(section) = section.as_object_mut() else {
+                continue;
+            };
+            if section.get("id").and_then(Value::as_str) == Some("answer") {
+                section.insert("id".to_string(), Value::String("context".to_string()));
+            }
+            if section
+                .get("title")
+                .and_then(Value::as_str)
+                .is_some_and(|title| title.eq_ignore_ascii_case("answer"))
+            {
+                section.insert("title".to_string(), Value::String("Context".to_string()));
+            }
+        }
+    }
+    if let Some(steps) = packet
+        .get_mut("retrieval_trace")
+        .and_then(|trace| trace.get_mut("steps"))
+        .and_then(Value::as_array_mut)
+    {
+        for step in steps {
+            let Some(step) = step.as_object_mut() else {
+                continue;
+            };
+            if step.get("kind").and_then(Value::as_str) == Some("answer_synthesis") {
+                step.insert(
+                    "kind".to_string(),
+                    Value::String("context_synthesis".to_string()),
+                );
+            }
+        }
+    }
 }
 
 fn agent_answer_mode_label(_answer: &AgentAnswerDto) -> &'static str {
@@ -2496,22 +2553,22 @@ mod tests {
             excerpt: None,
             why: vec![
                 "matched symbol name and semantic evidence".to_string(),
-                "can be passed to symbol, trail, snippet, explore, or ask as a focus id"
+                "can be passed to symbol, trail, snippet, explore, or context as a node id"
                     .to_string(),
             ],
         }
     }
 
     #[test]
-    fn ask_markdown_contract_includes_evidence_packet_shape() {
+    fn context_markdown_contract_includes_evidence_packet_shape() {
         let answer = AgentAnswerDto {
             answer_id: "answer-1".to_string(),
-            prompt: "How does packet output work?".to_string(),
+            prompt: "build_packet".to_string(),
             summary: "Packet output is assembled from retrieved CLI evidence.".to_string(),
             freshness: None,
             sections: vec![AgentResponseSectionDto {
-                id: "answer".to_string(),
-                title: "Answer".to_string(),
+                id: "context".to_string(),
+                title: "Context".to_string(),
                 blocks: vec![AgentResponseBlockDto::Markdown {
                     markdown: "Use the output renderer and keep claims tied to citations."
                         .to_string(),
@@ -2519,7 +2576,7 @@ mod tests {
             }],
             citations: vec![AgentCitationDto {
                 node_id: NodeId("node-render".to_string()),
-                display_name: "render_agent_answer_markdown".to_string(),
+                display_name: "render_context_markdown".to_string(),
                 kind: NodeKind::FUNCTION,
                 file_path: Some("C:/repo/src/output.rs".to_string()),
                 line: Some(552),
@@ -2552,19 +2609,19 @@ mod tests {
             },
         };
 
-        let markdown = render_agent_answer_markdown(Path::new("C:/repo"), &answer);
+        let markdown = render_context_markdown(Path::new("C:/repo"), &answer);
 
-        assert_evidence_packet_shape(&markdown, &["summary:", "answer:"]);
+        assert_evidence_packet_shape(&markdown, &["summary:", "target:"]);
         assert_order(&markdown, "confidence:", "what_was_checked:");
         assert_order(&markdown, "what_was_checked:", "gaps_uncertainty:");
         assert_order(&markdown, "gaps_uncertainty:", "citations:");
         assert!(
             !markdown.contains("request_id="),
-            "ask markdown should keep raw request ids in JSON/bundles:\n{markdown}"
+            "context markdown should keep raw request ids in JSON/bundles:\n{markdown}"
         );
         assert!(
             !markdown.contains("checked indexed symbols"),
-            "ask markdown should summarize normal step messages instead of dumping trace detail:\n{markdown}"
+            "context markdown should summarize normal step messages instead of dumping trace detail:\n{markdown}"
         );
     }
 
@@ -2579,7 +2636,7 @@ mod tests {
             repo_text_enabled: true,
             explain: true,
             query_hints: vec![
-                "codestory-cli ask --project C:/repo \"How does packet output work?\"".to_string(),
+                "codestory-cli context --project C:/repo --query build_packet".to_string(),
             ],
             suggestions: Vec::new(),
             indexed_symbol_hits: vec![sample_search_hit()],
@@ -2671,17 +2728,17 @@ mod tests {
     }
 
     #[test]
-    fn ask_markdown_surfaces_low_confidence_trace_gaps() {
+    fn context_markdown_surfaces_low_confidence_trace_gaps() {
         let answer = AgentAnswerDto {
             answer_id: "answer-1".to_string(),
-            prompt: "Where did retrieval fail?".to_string(),
+            prompt: "weak_hit".to_string(),
             summary: "Retrieval was incomplete.".to_string(),
             freshness: None,
             sections: vec![AgentResponseSectionDto {
-                id: "answer".to_string(),
-                title: "Answer".to_string(),
+                id: "context".to_string(),
+                title: "Context".to_string(),
                 blocks: vec![AgentResponseBlockDto::Markdown {
-                    markdown: "The answer is limited by skipped source reads.".to_string(),
+                    markdown: "The context is limited by skipped source reads.".to_string(),
                 }],
             }],
             citations: vec![AgentCitationDto {
@@ -2734,7 +2791,7 @@ mod tests {
             },
         };
 
-        let markdown = render_agent_answer_markdown(Path::new("C:/repo"), &answer);
+        let markdown = render_context_markdown(Path::new("C:/repo"), &answer);
 
         assert!(markdown.contains("confidence: low"), "{markdown}");
         assert!(

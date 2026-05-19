@@ -32,7 +32,7 @@ semantic indexing behavior and cache reuse.
 ### Product And UX Research
 
 Read [project-delight-roadmap.md](project-delight-roadmap.md) for the product
-direction around `ask`, explainable retrieval, navigation UX, MCP serving, setup
+direction around target context packets, explainable retrieval, navigation UX, MCP serving, setup
 help, and implemented roadmap work.
 
 ### Architecture And Documentation Research

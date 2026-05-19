@@ -2,7 +2,8 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto, AgentResponseModeDto, AppEventPayload,
+    AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto, AgentResponseModeDto,
+    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AppEventPayload,
     BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
     GraphArtifactDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode, NodeId, NodeKind,
     RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto, SearchHit,
@@ -34,14 +35,14 @@ mod stdio_catalog;
 mod stdio_transport;
 
 use args::{
-    AskCommand, BookmarkAction, BookmarkAddCommand, BookmarkAddOutput, BookmarkCommand,
-    BookmarkListCommand, BookmarkListOutput, BookmarkOutput, BookmarkRemoveCommand,
-    BookmarkRemoveOutput, Cli, Command, CompletionShell, DoctorCheckOutput, DoctorCommand,
-    DoctorOutput, GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput,
-    IndexOutput, QueryCommand, QueryOutput, QueryResolutionOutput, RepoTextMode, SearchCommand,
-    SearchHitOutput, SearchOutput, ServeCommand, SetupAction, SetupCommand, SnippetCommand,
-    SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, TrailCommand, TrailJsonOutput,
-    ask_retrieval_profile, build_trail_request,
+    BookmarkAction, BookmarkAddCommand, BookmarkAddOutput, BookmarkCommand, BookmarkListCommand,
+    BookmarkListOutput, BookmarkOutput, BookmarkRemoveCommand, BookmarkRemoveOutput, Cli, Command,
+    CompletionShell, ContextCommand, DoctorCheckOutput, DoctorCommand, DoctorOutput,
+    GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput, IndexOutput,
+    QueryCommand, QueryOutput, QueryResolutionOutput, QuerySelectorOutput, RepoTextMode,
+    SearchCommand, SearchHitOutput, SearchOutput, ServeCommand, SetupAction, SetupCommand,
+    SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, TrailCommand,
+    TrailJsonOutput, build_trail_request,
 };
 #[cfg(test)]
 use codestory_contracts::api::TrailContextDto;
@@ -50,11 +51,11 @@ use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
 #[cfg(test)]
 use http_transport::search_repo_text_mode_param;
 use output::{
-    emit, emit_text, render_agent_answer_markdown, render_doctor_markdown, render_ground_markdown,
-    render_index_dry_run_markdown, render_index_markdown, render_query_markdown,
-    render_search_markdown, render_snippet_markdown, render_symbol_markdown, render_symbol_mermaid,
-    render_trail_dot, render_trail_markdown, render_trail_mermaid, render_trail_story_markdown,
-    validate_output_file_parent,
+    context_packet_json, emit, emit_text, render_context_markdown, render_doctor_markdown,
+    render_ground_markdown, render_index_dry_run_markdown, render_index_markdown,
+    render_query_markdown, render_search_markdown, render_snippet_markdown, render_symbol_markdown,
+    render_symbol_mermaid, render_trail_dot, render_trail_markdown, render_trail_mermaid,
+    render_trail_story_markdown, validate_output_file_parent,
 };
 use runtime::{
     AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
@@ -74,10 +75,10 @@ struct RepoTextOutputConfig {
     enabled: bool,
 }
 
-const ASK_BUNDLE_OUTPUT_BYTE_CAP: usize = 5 * 1024 * 1024;
-const ASK_BUNDLE_MARKDOWN_SOFT_CAP: usize = 2 * 1024 * 1024;
-const ASK_BUNDLE_TRUNCATION_SUFFIX: &str =
-    "\n\n... bundle content truncated by ask bundle byte cap\n";
+const CONTEXT_BUNDLE_OUTPUT_BYTE_CAP: usize = 5 * 1024 * 1024;
+const CONTEXT_BUNDLE_MARKDOWN_SOFT_CAP: usize = 2 * 1024 * 1024;
+const CONTEXT_BUNDLE_TRUNCATION_SUFFIX: &str =
+    "\n\n... bundle content truncated by context bundle byte cap\n";
 
 fn to_api_repo_text_mode(mode: RepoTextMode) -> SearchRepoTextMode {
     match mode {
@@ -117,7 +118,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Index(cmd) => run_index(cmd),
         Command::Ground(cmd) => run_ground(cmd),
-        Command::Ask(cmd) => run_ask(cmd),
+        Command::Context(cmd) => run_context(cmd),
         Command::Doctor(cmd) => run_doctor(cmd),
         Command::Setup(cmd) => run_setup(cmd),
         Command::Search(cmd) => run_search(cmd),
@@ -410,29 +411,43 @@ fn run_ground(cmd: GroundCommand) -> Result<()> {
     emit(cmd.format, &snapshot, markdown, cmd.output_file.as_deref())
 }
 
-fn run_ask(cmd: AskCommand) -> Result<()> {
-    ensure_dot_only_for_trail(cmd.format, "ask")?;
+#[derive(serde::Serialize)]
+struct ContextTargetOutput {
+    selector: QuerySelectorOutput,
+    requested: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bookmark_id: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ContextJsonOutput {
+    target: ContextTargetOutput,
+    resolution: QueryResolutionOutput,
+    context: serde_json::Value,
+}
+
+struct ResolvedContextTarget {
+    target: runtime::ResolvedTarget,
+    requested: String,
+    selector: QuerySelectorOutput,
+    bookmark: Option<BookmarkDto>,
+}
+
+fn run_context(cmd: ContextCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "context")?;
     preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, "ask")?;
+    ensure_index_ready(&opened, "context")?;
 
-    let bookmark_focus = cmd
-        .bookmark
-        .as_deref()
-        .map(|id| load_bookmark_focus_by_id(&runtime, id))
-        .transpose()?;
+    let resolved = resolve_context_target(&runtime, &cmd, cmd.format, cmd.output_file.as_deref())?;
+    let target_prompt = context_target_prompt(&resolved);
     let request = AgentAskRequest {
-        prompt: cmd.prompt.clone(),
-        retrieval_profile: ask_retrieval_profile(&cmd),
-        focus_node_id: bookmark_focus
-            .as_ref()
-            .map(|bookmark| bookmark.node_id.clone())
-            .or_else(|| {
-                cmd.focus_id
-                    .as_ref()
-                    .map(|id| NodeId(id.trim().to_string()))
-            }),
+        prompt: target_prompt,
+        retrieval_profile: AgentRetrievalProfileSelectionDto::Preset {
+            preset: AgentRetrievalPresetDto::Investigate,
+        },
+        focus_node_id: Some(resolved.target.selected.node_id.clone()),
         max_results: Some(cmd.max_results.clamp(1, 25)),
         response_mode: AgentResponseModeDto::Markdown,
         latency_budget_ms: None,
@@ -445,17 +460,116 @@ fn run_ask(cmd: AskCommand) -> Result<()> {
         .retrieval_trace
         .annotations
         .push("mode=db_first".to_string());
-    if let Some(bookmark) = bookmark_focus.as_ref() {
-        annotate_answer_with_bookmark_focus(&mut answer, bookmark);
-    }
-    let markdown = render_agent_answer_markdown(&runtime.project_root, &answer);
+    annotate_answer_with_context_target(&mut answer, &resolved);
+    let markdown = render_context_markdown(&runtime.project_root, &answer);
+    let output = ContextJsonOutput {
+        target: ContextTargetOutput {
+            selector: resolved.selector,
+            requested: resolved.requested,
+            bookmark_id: resolved
+                .bookmark
+                .as_ref()
+                .map(|bookmark| bookmark.id.clone()),
+        },
+        resolution: build_query_resolution_output(&runtime.project_root, &resolved.target),
+        context: context_packet_json(&answer),
+    };
     if let Some(bundle_dir) = cmd.bundle.as_deref() {
-        write_ask_bundle(bundle_dir, &answer, &markdown)?;
+        write_context_bundle(bundle_dir, &output, &answer.graphs, &markdown)?;
     }
-    emit(cmd.format, &answer, markdown, cmd.output_file.as_deref())
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
-fn annotate_answer_with_bookmark_focus(answer: &mut AgentAnswerDto, bookmark: &BookmarkDto) {
+fn resolve_context_target(
+    runtime: &RuntimeContext,
+    cmd: &ContextCommand,
+    format: args::OutputFormat,
+    output_file: Option<&std::path::Path>,
+) -> Result<ResolvedContextTarget> {
+    let bookmark = cmd
+        .bookmark
+        .as_deref()
+        .map(|id| load_bookmark_focus_by_id(runtime, id))
+        .transpose()?;
+    let (selection, requested, selector) = if let Some(bookmark) = bookmark.as_ref() {
+        (
+            args::TargetSelection::Id(bookmark.node_id.clone()),
+            bookmark.node_label.clone(),
+            QuerySelectorOutput::Id,
+        )
+    } else if let Some(id) = cmd.id.as_deref() {
+        let trimmed = id.trim();
+        if trimmed.is_empty() {
+            bail!("--id cannot be empty.");
+        }
+        (
+            args::TargetSelection::Id(NodeId(trimmed.to_string())),
+            trimmed.to_string(),
+            QuerySelectorOutput::Id,
+        )
+    } else if let Some(query) = cmd.query.as_deref() {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            bail!("--query cannot be empty.");
+        }
+        (
+            args::TargetSelection::Query {
+                query: trimmed.to_string(),
+                choose: None,
+            },
+            trimmed.to_string(),
+            QuerySelectorOutput::Query,
+        )
+    } else {
+        bail!("Pass exactly one of --id, --query, or --bookmark.");
+    };
+    let target = resolve_target_or_emit_ambiguity(runtime, selection, None, format, output_file)?;
+    Ok(ResolvedContextTarget {
+        target,
+        requested,
+        selector,
+        bookmark,
+    })
+}
+
+fn context_target_prompt(resolved: &ResolvedContextTarget) -> String {
+    let selected = resolved.target.selected.display_name.trim();
+    if selected.is_empty() {
+        resolved.requested.clone()
+    } else {
+        selected.to_string()
+    }
+}
+
+fn annotate_answer_with_context_target(
+    answer: &mut AgentAnswerDto,
+    resolved: &ResolvedContextTarget,
+) {
+    let selected = &resolved.target.selected;
+    answer.retrieval_trace.annotations.push(format!(
+        "context_target selector={:?} requested=`{}` node={} label=`{}` kind={:?}",
+        resolved.selector,
+        resolved.requested.replace('`', "'"),
+        selected.node_id.0,
+        selected.display_name.replace('`', "'"),
+        selected.kind
+    ));
+    if let Some(file_path) = selected.file_path.as_deref() {
+        answer.retrieval_trace.annotations.push(format!(
+            "context_target_location path=`{}` line={}",
+            display::clean_path_string(file_path),
+            selected
+                .line
+                .map(|line| line.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+    }
+    if let Some(bookmark) = resolved.bookmark.as_ref() {
+        annotate_context_with_bookmark_focus(answer, bookmark);
+    }
+}
+
+fn annotate_context_with_bookmark_focus(answer: &mut AgentAnswerDto, bookmark: &BookmarkDto) {
     let mut annotation = format!(
         "bookmark_focus id={} category_id={} node={} label=`{}` kind={:?}",
         bookmark.id,
@@ -1428,11 +1542,9 @@ fn index_next_commands(
     let mut commands = vec![
         format!("codestory-cli ground --project \"{project}\""),
         format!(
-            "codestory-cli search --project \"{project}\" --query \"<symbol or question>\" --why"
+            "codestory-cli search --project \"{project}\" --query \"<symbol/file/literal/API path>\" --why"
         ),
-        format!(
-            "codestory-cli ask --project \"{project}\" --investigate \"How does this repo fit together?\""
-        ),
+        format!("codestory-cli context --project \"{project}\" --query \"<concrete target>\""),
     ];
     if retrieval.is_some_and(|state| !state.semantic_ready) {
         if retrieval.is_some_and(|state| {
@@ -1449,9 +1561,10 @@ fn index_next_commands(
     commands
 }
 
-fn write_ask_bundle(
+fn write_context_bundle<T: serde::Serialize>(
     bundle_dir: &std::path::Path,
-    answer: &codestory_contracts::api::AgentAnswerDto,
+    output: &T,
+    graphs: &[GraphArtifactDto],
     markdown: &str,
 ) -> Result<()> {
     fs::create_dir_all(bundle_dir).with_context(|| {
@@ -1463,73 +1576,79 @@ fn write_ask_bundle(
     remove_stale_mermaid_artifacts(bundle_dir)?;
     let mut notes = Vec::new();
     let mut omitted_mermaid_artifacts = 0usize;
-    let full_answer_json =
-        serde_json::to_string_pretty(answer).context("Failed to serialize ask answer JSON")?;
-    let mut answer_json = if markdown.len().saturating_add(full_answer_json.len())
-        > ASK_BUNDLE_OUTPUT_BYTE_CAP
+    let full_context_json =
+        serde_json::to_string_pretty(output).context("Failed to serialize context JSON")?;
+    let mut context_json = if markdown.len().saturating_add(full_context_json.len())
+        > CONTEXT_BUNDLE_OUTPUT_BYTE_CAP
     {
         notes.push(
-            "answer.json was reduced to a valid manifest summary because the full answer exceeded the bundle byte cap."
+            "context.json was reduced to a valid manifest summary because the full context exceeded the bundle byte cap."
                 .to_string(),
         );
-        ask_bundle_summary_json(answer, true)?
+        context_bundle_summary_json(output)?
     } else {
-        full_answer_json
+        full_context_json
     };
-    if answer_json.len() > ASK_BUNDLE_OUTPUT_BYTE_CAP {
+    if context_json.len() > CONTEXT_BUNDLE_OUTPUT_BYTE_CAP {
         notes.push(
-            "answer.json retrieval trace was omitted because the summary still exceeded the bundle byte cap."
+            "context.json details were omitted because the summary still exceeded the bundle byte cap."
                 .to_string(),
         );
-        answer_json = ask_bundle_summary_json(answer, false)?;
+        context_json = serde_json::to_string_pretty(&serde_json::json!({
+            "truncated": true,
+            "reason": "context bundle output hit its byte cap",
+            "action": "Narrow the target or use JSON output without --bundle for the full in-memory response.",
+        }))
+        .context("Failed to serialize minimal context bundle summary JSON")?;
     }
 
-    let mut markdown = if markdown.len() > ASK_BUNDLE_MARKDOWN_SOFT_CAP {
+    let mut markdown = if markdown.len() > CONTEXT_BUNDLE_MARKDOWN_SOFT_CAP {
         notes.push(format!(
-            "answer.md was truncated to {} bytes before writing.",
-            ASK_BUNDLE_MARKDOWN_SOFT_CAP
+            "context.md was truncated to {} bytes before writing.",
+            CONTEXT_BUNDLE_MARKDOWN_SOFT_CAP
         ));
         truncate_utf8_with_suffix(
             markdown,
-            ASK_BUNDLE_MARKDOWN_SOFT_CAP,
-            ASK_BUNDLE_TRUNCATION_SUFFIX,
+            CONTEXT_BUNDLE_MARKDOWN_SOFT_CAP,
+            CONTEXT_BUNDLE_TRUNCATION_SUFFIX,
         )
     } else {
         markdown.to_string()
     };
-    let remaining_markdown_bytes = ASK_BUNDLE_OUTPUT_BYTE_CAP.saturating_sub(answer_json.len());
+    let remaining_markdown_bytes =
+        CONTEXT_BUNDLE_OUTPUT_BYTE_CAP.saturating_sub(context_json.len());
     if markdown.len() > remaining_markdown_bytes {
         notes.push(format!(
-            "answer.md was truncated to fit the remaining {} bundle bytes.",
+            "context.md was truncated to fit the remaining {} bundle bytes.",
             remaining_markdown_bytes
         ));
         markdown = truncate_utf8_with_suffix(
             &markdown,
             remaining_markdown_bytes,
-            ASK_BUNDLE_TRUNCATION_SUFFIX,
+            CONTEXT_BUNDLE_TRUNCATION_SUFFIX,
         );
     }
-    fs::write(bundle_dir.join("answer.md"), &markdown).with_context(|| {
+    fs::write(bundle_dir.join("context.md"), &markdown).with_context(|| {
         format!(
             "Failed to write {}",
-            display::clean_path_string(&bundle_dir.join("answer.md").to_string_lossy())
+            display::clean_path_string(&bundle_dir.join("context.md").to_string_lossy())
         )
     })?;
-    fs::write(bundle_dir.join("answer.json"), &answer_json).with_context(|| {
+    fs::write(bundle_dir.join("context.json"), &context_json).with_context(|| {
         format!(
             "Failed to write {}",
-            display::clean_path_string(&bundle_dir.join("answer.json").to_string_lossy())
+            display::clean_path_string(&bundle_dir.join("context.json").to_string_lossy())
         )
     })?;
-    let mut written_bytes = markdown.len().saturating_add(answer_json.len());
-    for graph in &answer.graphs {
+    let mut written_bytes = markdown.len().saturating_add(context_json.len());
+    for graph in graphs {
         if let GraphArtifactDto::Mermaid {
             id, mermaid_syntax, ..
         } = graph
         {
             let file_name = format!("{}.mmd", sanitize_artifact_name(id));
             let artifact_path = bundle_dir.join(&file_name);
-            if written_bytes.saturating_add(mermaid_syntax.len()) > ASK_BUNDLE_OUTPUT_BYTE_CAP {
+            if written_bytes.saturating_add(mermaid_syntax.len()) > CONTEXT_BUNDLE_OUTPUT_BYTE_CAP {
                 omitted_mermaid_artifacts = omitted_mermaid_artifacts.saturating_add(1);
                 continue;
             }
@@ -1543,7 +1662,7 @@ fn write_ask_bundle(
         ));
     }
     let manifest = serde_json::json!({
-        "output_byte_cap": ASK_BUNDLE_OUTPUT_BYTE_CAP,
+        "output_byte_cap": CONTEXT_BUNDLE_OUTPUT_BYTE_CAP,
         "written_bytes_excluding_manifest": written_bytes,
         "truncated": !notes.is_empty(),
         "omitted_mermaid_artifacts": omitted_mermaid_artifacts,
@@ -1583,39 +1702,27 @@ fn remove_stale_mermaid_artifacts(bundle_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn ask_bundle_summary_json(
-    answer: &codestory_contracts::api::AgentAnswerDto,
-    include_trace: bool,
-) -> Result<String> {
-    if include_trace {
-        serde_json::to_string_pretty(&serde_json::json!({
-            "truncated": true,
-            "reason": "ask bundle output hit its byte cap",
-            "action": "Narrow focus, reduce trail depth, or use JSON output without --bundle for the full in-memory response.",
-            "answer_id": &answer.answer_id,
-            "prompt": &answer.prompt,
-            "summary": &answer.summary,
-            "retrieval_version": &answer.retrieval_version,
-            "citation_count": answer.citations.len(),
-            "graph_count": answer.graphs.len(),
-            "retrieval_trace": &answer.retrieval_trace,
-        }))
-        .context("Failed to serialize ask bundle summary JSON")
-    } else {
-        serde_json::to_string_pretty(&serde_json::json!({
-            "truncated": true,
-            "reason": "ask bundle output hit its byte cap",
-            "action": "Narrow focus, reduce trail depth, or use JSON output without --bundle for the full in-memory response.",
-            "answer_id": &answer.answer_id,
-            "prompt": truncate_utf8_with_suffix(&answer.prompt, 4096, ASK_BUNDLE_TRUNCATION_SUFFIX),
-            "summary": truncate_utf8_with_suffix(&answer.summary, 8192, ASK_BUNDLE_TRUNCATION_SUFFIX),
-            "retrieval_version": &answer.retrieval_version,
-            "citation_count": answer.citations.len(),
-            "graph_count": answer.graphs.len(),
-            "retrieval_trace_omitted": true,
-        }))
-        .context("Failed to serialize minimal ask bundle summary JSON")
-    }
+fn context_bundle_summary_json<T: serde::Serialize>(output: &T) -> Result<String> {
+    let value = serde_json::to_value(output).context("Failed to serialize context summary JSON")?;
+    serde_json::to_string_pretty(&serde_json::json!({
+        "truncated": true,
+        "reason": "context bundle output hit its byte cap",
+        "action": "Narrow the target or use JSON output without --bundle for the full in-memory response.",
+        "target": value.get("target"),
+        "resolution": value.get("resolution"),
+        "context_summary": value.pointer("/context/summary"),
+        "citation_count": value
+            .pointer("/context/citations")
+            .and_then(|citations| citations.as_array())
+            .map(|citations| citations.len())
+            .unwrap_or(0),
+        "graph_count": value
+            .pointer("/context/graphs")
+            .and_then(|graphs| graphs.as_array())
+            .map(|graphs| graphs.len())
+            .unwrap_or(0),
+    }))
+    .context("Failed to serialize context bundle summary JSON")
 }
 
 fn truncate_utf8_with_suffix(value: &str, max_bytes: usize, suffix: &str) -> String {
@@ -1988,8 +2095,8 @@ mod tests {
 
     fn sample_agent_answer_with_graph(graph: GraphArtifactDto) -> AgentAnswerDto {
         AgentAnswerDto {
-            answer_id: "answer-test".to_string(),
-            prompt: "Explain the capped bundle".to_string(),
+            answer_id: "context-test".to_string(),
+            prompt: "capped_bundle".to_string(),
             summary: "Bundle summary".to_string(),
             freshness: None,
             sections: Vec::new(),
@@ -1998,7 +2105,7 @@ mod tests {
             retrieval_version: "test".to_string(),
             graphs: vec![graph],
             retrieval_trace: AgentRetrievalTraceDto {
-                request_id: "answer-test".to_string(),
+                request_id: "context-test".to_string(),
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -2274,7 +2381,7 @@ mod tests {
     }
 
     #[test]
-    fn write_ask_bundle_caps_disk_artifacts_and_writes_manifest() {
+    fn write_context_bundle_caps_disk_artifacts_and_writes_manifest() {
         let temp = tempdir().expect("bundle dir");
         fs::write(
             temp.path().join("big-mermaid.mmd"),
@@ -2292,21 +2399,26 @@ mod tests {
             diagram: "graph TD".to_string(),
             mermaid_syntax: format!(
                 "graph TD\nA[{}]\n",
-                "x".repeat(ASK_BUNDLE_OUTPUT_BYTE_CAP + 1024)
+                "x".repeat(CONTEXT_BUNDLE_OUTPUT_BYTE_CAP + 1024)
             ),
         });
+        let output = serde_json::json!({
+            "target": {"selector": "id", "requested": "big-mermaid"},
+            "context": crate::output::context_packet_json(&answer),
+        });
 
-        write_ask_bundle(temp.path(), &answer, "short answer").expect("write capped bundle");
+        write_context_bundle(temp.path(), &output, &answer.graphs, "short context")
+            .expect("write capped bundle");
 
         let manifest: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(temp.path().join("bundle_manifest.json"))
                 .expect("read bundle manifest"),
         )
         .expect("parse bundle manifest");
-        let answer_json: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(temp.path().join("answer.json")).expect("read answer json"),
+        let context_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(temp.path().join("context.json")).expect("read context json"),
         )
-        .expect("parse answer json");
+        .expect("parse context json");
 
         assert_eq!(manifest["truncated"], serde_json::Value::Bool(true));
         assert_eq!(
@@ -2317,10 +2429,10 @@ mod tests {
         assert!(
             manifest["written_bytes_excluding_manifest"]
                 .as_u64()
-                .is_some_and(|bytes| bytes <= ASK_BUNDLE_OUTPUT_BYTE_CAP as u64),
+                .is_some_and(|bytes| bytes <= CONTEXT_BUNDLE_OUTPUT_BYTE_CAP as u64),
             "{manifest}"
         );
-        assert_eq!(answer_json["truncated"], serde_json::Value::Bool(true));
+        assert_eq!(context_json["truncated"], serde_json::Value::Bool(true));
         assert!(
             !temp.path().join("big-mermaid.mmd").exists(),
             "oversized Mermaid artifact should be omitted"

@@ -22,8 +22,8 @@ target/release/codestory-cli(.exe) doctor [OPTIONS]
 | Path | Command | Expected result |
 |------|---------|-----------------|
 | Normal path | `target/release/codestory-cli(.exe) doctor --project .` | Reports project root, cache path, indexed stats, retrieval state, managed embedding setup, environment hints, and next commands. |
-| Failure path | If cache or index checks warn, run `index --project . --refresh full`; if managed embeddings are missing or stopped, run `setup embeddings --project .`; if semantic reports `semantic partial`, `semantic stale`, or `semantic failed`, rebuild before broad `ask` or continue with `search --repo-text on --why` plus focused `symbol`/`trail`/`snippet`. | Separates missing index, missing model runtime, stale semantic docs, partial semantic docs, and lexical fallback. |
-| Integration edge | Use doctor before `ground`, `search --why`, `explore`, `ask`, or `serve`; its next commands are the safe follow-up loop. | Prevents read commands from silently querying the wrong or empty cache. |
+| Failure path | If cache or index checks warn, run `index --project . --refresh full`; if managed embeddings are missing or stopped, run `setup embeddings --project .`; if semantic reports `semantic partial`, `semantic stale`, or `semantic failed`, rebuild before `context` or continue with `search --repo-text on --why` plus focused `symbol`/`trail`/`snippet`. | Separates missing index, missing model runtime, stale semantic docs, partial semantic docs, and lexical fallback. |
+| Integration edge | Use doctor before `ground`, `search --why`, `explore`, `context`, or `serve`; its next commands are the safe follow-up loop. | Prevents read commands from silently querying the wrong or empty cache. |
 
 ## Notes
 

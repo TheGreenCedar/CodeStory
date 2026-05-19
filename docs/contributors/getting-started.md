@@ -24,7 +24,7 @@ cargo build --release -p codestory-cli
 .\target\release\codestory-cli.exe setup embeddings --project . --dry-run
 .\target\release\codestory-cli.exe index --project . --refresh auto
 .\target\release\codestory-cli.exe search --project . --query WorkspaceIndexer --why
-.\target\release\codestory-cli.exe ask --project . "How does indexing flow through the runtime?"
+.\target\release\codestory-cli.exe context --project . --query WorkspaceIndexer
 .\target\release\codestory-cli.exe doctor --project .
 ```
 
@@ -42,7 +42,7 @@ Use one of these modes before debugging ranking quality:
 - embedding throughput tuning: `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE`, `CODESTORY_EMBED_ONNX_BATCH_TOKENS`, `CODESTORY_EMBED_ONNX_PROVIDER`, and `CODESTORY_EMBED_ONNX_THREADS`
 - lexical-only mode: `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false`
 
-`index`, `ground`, `search`, `ask`, and `doctor` report the active retrieval mode plus any fallback reason when retrieval state is available, so confirm that output before assuming the ranking logic regressed. Default `index` synchronizes semantic docs before returning when embedding assets are available.
+`index`, `ground`, `search`, `context`, and `doctor` report the active retrieval mode plus any fallback reason when retrieval state is available, so confirm that output before assuming the ranking logic regressed. Default `index` synchronizes semantic docs before returning when embedding assets are available.
 
 ## Recommended Reading Order
 
@@ -102,5 +102,5 @@ Read these pages first:
 - default cache layout: user cache root + hashed project path
 - explicit `--cache-dir`: use the exact directory you passed
 - `index --refresh auto`: chooses full on an empty cache and incremental after that
-- `ground`, `search`, `ask`, `symbol`, `trail`, `snippet`, `query`, `explore`, `serve`: default to `--refresh none`
+- `ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `query`, `explore`, `serve`: default to `--refresh none`
 - use `--refresh full` after deleting the cache directory, after schema-affecting changes, or when stale state is suspected

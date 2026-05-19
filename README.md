@@ -34,7 +34,8 @@ Use this path if you want to run the tool against a repository.
    ```text
    .\target\release\codestory-cli.exe ground --project <path>
    .\target\release\codestory-cli.exe search --project <path> --query <query> --why
-   .\target\release\codestory-cli.exe ask --project <path> --investigate "How does search ranking work?"
+   .\target\release\codestory-cli.exe context --project <path> --query AppController
+   .\target\release\codestory-cli.exe context --project <path> --id <node-id>
    .\target\release\codestory-cli.exe symbol --project <path> (--id <node-id> | --query <query>)
    .\target\release\codestory-cli.exe trail --project <path> (--id <node-id> | --query <query>)
    .\target\release\codestory-cli.exe snippet --project <path> (--id <node-id> | --query <query>)
@@ -44,7 +45,7 @@ Use this path if you want to run the tool against a repository.
    .\target\release\codestory-cli.exe doctor --project <path>
    ```
 
-Read commands default to `--refresh none`. They query the current cache unless you explicitly ask them to refresh.
+Read commands default to `--refresh none`. They query the current cache unless you explicitly request a refresh.
 
 ### `index` Options
 
@@ -107,7 +108,7 @@ Start here when you are contributing:
 
 ## Grounding Workflows
 
-The product surface starts with core grounding workflows and adds higher-level ask, graph, explorer, serving, health, and shell-integration commands:
+The product surface starts with core grounding workflows and adds deeper context, graph, explorer, serving, health, and shell-integration commands:
 
 ```mermaid
 flowchart LR
@@ -115,7 +116,7 @@ flowchart LR
     Index["index"] --> LocalState["SQLite graph + snapshots"]
     LocalState --> Ground["ground"]
     LocalState --> Search["search"]
-    LocalState --> Ask["ask"]
+    LocalState --> Context["context"]
     LocalState --> Symbol["symbol"]
     LocalState --> Trail["trail"]
     LocalState --> Snippet["snippet"]
@@ -125,21 +126,76 @@ flowchart LR
     LocalState --> Doctor["doctor"]
 ```
 
-- `index`: discover files, parse supported languages, resolve graph edges, persist search projections, and complete semantic docs before returning
-- `ground`: build grounded context from indexed symbols, snippets, graph traversal, and search results; `--why` explains retrieval mode, coverage, and query hints
-- `search`: find symbols, files, and query matches; semantic-only near misses appear under `did_you_mean`, and `--why` includes lexical/semantic/graph score breakdowns when available
-- `ask`: run DB-first agentic retrieval across search, graph, snippets, traces, and citations without launching an external agent; start broad repo explanations with `ground --why` and `search --repo-text on --why`, then use focused `ask`
-- `symbol`: inspect one symbol and its indexed relationships
-- `trail`: walk caller/callee and usage neighborhoods through the graph; `--mermaid` emits a Mermaid flowchart and `--format dot` emits Graphviz DOT
-- `snippet`: fetch focused source context for a symbol or file location; Markdown snippets use ANSI syntax highlighting when stdout is an interactive terminal
-- `query`: run a small graph query pipeline such as `trail(symbol: 'Foo', depth: 2) | filter(kind: function) | limit(10)`
-- `explore`: open an interactive terminal explorer when stdout is a terminal, or emit Markdown/JSON with definition and reference navigation metadata when piped or passed `--no-tui`
-- `serve`: expose local `/health`, `/search`, `/symbol`, `/definition`, `/references`, `/symbols`, and `/trail` JSON endpoints, or use `--stdio` for MCP-style tools, resources, resource templates, and prompts
-- `doctor`: report project/cache/index/retrieval health, relevant environment settings, and the next useful commands for the workspace
-- `setup embeddings`: install pinned managed ONNX Runtime BGE-base assets in the user cache; no embedding server is started or kept alive
-- `generate-completions`: emit bash, zsh, fish, or PowerShell completions generated from the clap command model
+- `doctor`: read-only health check for project/cache/index/retrieval readiness.
+- `index`: build or refresh the SQLite graph/search/semantic cache.
+- `ground`: broad repo-level orientation snapshot; `--why` explains retrieval mode, coverage, gaps, and next commands.
+- `search`: lightweight candidate discovery for symbols, files, literals, API paths, modules, and specific behavior terms; use `--why` for ranking reasons.
+- `context`: deep evidence/context bundle for one concrete target selected by `--id`, `--query`, or `--bookmark`; it is not question answering, chatting, or prompt interpretation.
+- `symbol`: inspect one exact symbol and relationships.
+- `trail`: follow caller/callee/reference graph around a symbol; `--story --hide-speculative` gives a readable flow with uncertainty.
+- `snippet`: fetch source context around a symbol; Markdown snippets use ANSI syntax highlighting when stdout is an interactive terminal.
+- `query`: run structured graph-query pipelines such as `trail(symbol: 'Foo', depth: 2) | filter(kind: function) | limit(10)`.
+- `explore`: interactive or bundled navigation view around a target.
+- `bookmark`: save, list, or remove investigation focus nodes.
+- `setup embeddings`: install and validate managed embedding assets.
+- `serve`: expose HTTP/stdio read-only browser surfaces.
+- `generate-completions`: emit bash, zsh, fish, or PowerShell completions generated from the clap command model.
 
-Hybrid retrieval is the intended default when local embedding assets are available. `index`, `ground`, `search`, `ask`, and `doctor` now report retrieval mode, semantic doc counts, and explicit fallback reasons when the runtime drops back to symbolic ranking.
+Use `search` when you only need candidates. Use `context` when you already have one concrete target and want the deeper packet: target resolution metadata, symbol details, related hits, trail/story evidence, snippets/source context, retrieval/freshness health, citations/evidence ids, gaps/uncertainty, and optional bundle artifacts.
+
+Do not pass broad natural-language questions to `context`. For broad repo/product questions, use `ground --why`, run one or more concrete `search --repo-text on --why` queries, select anchors, then run `context --id <node-id>` for each anchor.
+
+Hybrid retrieval is the intended default when local embedding assets are available. `index`, `ground`, `search`, `context`, and `doctor` now report retrieval mode, semantic doc counts, and explicit fallback reasons when the runtime drops back to symbolic ranking.
+
+## Template Workflows
+
+Fresh repo orientation:
+
+```powershell
+codestory-cli doctor --project <workspace>
+codestory-cli index --project <workspace> --refresh full
+codestory-cli ground --project <workspace> --why
+codestory-cli search --project <workspace> --query "<architecture term>" --why
+```
+
+Candidate-to-context workflow:
+
+```powershell
+codestory-cli search --project <workspace> --query "<symbol/file/literal/API path>" --why
+# choose a concrete node_id
+codestory-cli context --project <workspace> --id <node-id>
+```
+
+Exact symbol investigation:
+
+```powershell
+codestory-cli symbol --project <workspace> --id <node-id>
+codestory-cli trail --project <workspace> --id <node-id> --story --hide-speculative
+codestory-cli snippet --project <workspace> --id <node-id> --context 40
+codestory-cli context --project <workspace> --id <node-id> --bundle out/context-<name>
+```
+
+Broad repo/product question workflow:
+
+```powershell
+# do not pass the question to context
+codestory-cli ground --project <workspace> --why
+codestory-cli search --project <workspace> --repo-text on --query "<concrete term>" --why
+codestory-cli search --project <workspace> --repo-text on --query "<another concrete term>" --why
+# select anchors
+codestory-cli context --project <workspace> --id <node-id>
+```
+
+Stale or unhealthy semantic retrieval:
+
+```powershell
+codestory-cli doctor --project <workspace>
+codestory-cli setup embeddings --project <workspace>
+codestory-cli index --project <workspace> --refresh full
+codestory-cli doctor --project <workspace>
+```
+
+If retrieval is still partial, stale, or failed, use `search --repo-text on --why`, `symbol`, `trail`, and `snippet`; treat `context` output as incomplete when it reports gaps.
 
 ## Workspace And Config Files
 
@@ -170,7 +226,7 @@ semantic_doc_scope = "durable"
 
 ## Retrieval Defaults
 
-`index`, `ground`, `search`, `ask`, and `doctor` report the active retrieval mode when they have retrieval state available. Hybrid retrieval is the default when local embedding assets are available; otherwise CodeStory falls back to symbolic or lexical ranking and reports why.
+`index`, `ground`, `search`, `context`, and `doctor` report the active retrieval mode when they have retrieval state available. Hybrid retrieval is the default when local embedding assets are available; otherwise CodeStory falls back to symbolic or lexical ranking and reports why.
 
 The default `index` path is a full semantic sync, not a deferred background task. When embedding assets are available, the command returns after graph state, snapshots, lexical search state, and durable semantic docs are all ready. The index summary reports semantic timing and reuse counts so cold-start and repeated-refresh costs stay visible.
 
@@ -183,10 +239,10 @@ Hybrid retrieval setup:
 - external legacy llama.cpp GGUF server: run `llama-server --embedding` yourself, set `CODESTORY_EMBED_BACKEND=llamacpp`, and set `CODESTORY_EMBED_LLAMACPP_URL` if it is not listening at `http://127.0.0.1:8080/v1/embeddings`; tune concurrent embedding requests with `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT`
 - durable semantic docs are the default; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` to include lower-signal local/member/module symbols for investigation
 - embedding batch size defaults to `128` for unmanaged runtimes and `2048` for the managed ONNX path; override with `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` only while profiling
-- search and ask research can override hybrid ranking weights with `--hybrid-lexical <WEIGHT> --hybrid-semantic <WEIGHT> --hybrid-graph <WEIGHT>`; omit these flags for the runtime defaults
-- handoff bundles: `ask --bundle <DIR>` writes `answer.md`, `answer.json`, and generated Mermaid artifacts for sharing or review
+- search and context research can override hybrid ranking weights with hidden `--hybrid-lexical <WEIGHT> --hybrid-semantic <WEIGHT> --hybrid-graph <WEIGHT>` tuning flags; omit these flags for the runtime defaults
+- context bundles: `context --bundle <DIR>` writes `context.md`, `context.json`, generated graph artifacts, and a bundle manifest for sharing or review
 - lexical-only mode: set `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false`
-- verification: `index`, `ground`, `search`, `ask`, and `doctor` will report the retrieval mode plus any fallback reason when relevant
+- verification: `index`, `ground`, `search`, `context`, and `doctor` will report the retrieval mode plus any fallback reason when relevant
 
 Measured backend tradeoffs and current model recommendations are summarized in
 the [research handbook](docs/research.md), with the decision matrix in
@@ -195,7 +251,7 @@ the [research handbook](docs/research.md), with the decision matrix in
 Refresh behavior:
 
 - `index --refresh auto`: full on an empty cache, incremental once indexed files already exist
-- `ground`, `search`, `ask`, `symbol`, `trail`, `snippet`, `query`, `explore`, and `serve`: default to `--refresh none`
+- `ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `query`, `explore`, and `serve`: default to `--refresh none`
 - use `--refresh incremental` when you want a read command to refresh an existing cache first
 - use `--refresh full` after a cache reset, schema change, or suspected stale-state incident
 
@@ -234,7 +290,7 @@ The workspace is organized into seven durable crates:
 - `codestory-store`: SQLite persistence, snapshots, trails, bookmarks, and search docs
 - `codestory-indexer`: parsing, extraction, resolution, batching, and indexing tests
 - `codestory-runtime`: orchestration, grounding, search, trail, and agent flows
-- `codestory-cli`: thin adapter and renderer for grounding, ask, navigation, health, and serving workflows
+- `codestory-cli`: thin adapter and renderer for grounding, context packets, navigation, health, and serving workflows
 - `codestory-bench`: criterion benches for indexing, grounding, resolution, and cleanup work
 
 ## Build And Verification

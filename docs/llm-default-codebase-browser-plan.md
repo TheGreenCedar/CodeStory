@@ -8,7 +8,7 @@
 
 CodeStory already has the core substrate for an agent-native codebase browser:
 local indexing, a SQLite-backed symbol/edge graph, semantic docs, grounding
-snapshots, search, symbol inspection, trails, snippets, DB-first `ask`, a TUI
+snapshots, search, symbol inspection, trails, snippets, DB-first `context`, a TUI
 `explore` path, HTTP routes, and MCP-style stdio serving.
 
 The next product leap is not another isolated command. It is making those
@@ -21,7 +21,7 @@ The reviewed direction is:
 2. Add fast always-on browser-path tests.
 3. Cleanly separate read-only browser services from CLI transports.
 4. Make stdio/MCP compatibility explicit and testable.
-5. Improve retrieval quality with a bounded iterative `ask` mode.
+5. Improve retrieval quality with a bounded target-context mode.
 6. Add freshness, setup, and performance trust signals.
 7. Improve the existing `explore` and evidence UX before creating a new UI surface.
 
@@ -31,20 +31,20 @@ CodeStory's durable promise is strong:
 
 - `codestory-cli index` builds graph state, snapshots, lexical search state, and semantic docs.
 - Read commands default to `--refresh none`, which is the right posture for agent loops over a known cache.
-- `ground`, `search --why`, `symbol`, `trail`, `snippet`, `query`, `explore`, `ask`, `doctor`, and `serve` already cover most browser primitives.
+- `ground`, `search --why`, `context`, `symbol`, `trail`, `snippet`, `query`, `explore`, `doctor`, and `serve` already cover most browser primitives.
 - `serve --stdio` exposes tools, resources, resource templates, and prompts.
 - The architecture docs and contract tests preserve the intended crate split.
 - The repo-scale e2e stats gate already measures index/search/symbol/trail/snippet behavior.
 
 The main limitations are sharper:
 
-- Local external-agent execution has been removed from `ask`; the remaining risk is keeping the DB-first browser contract from regressing.
+- Local external-agent execution has been removed from high-level retrieval; the remaining risk is keeping the DB-first browser contract from regressing.
 - `.codestory.toml` documents `embedding_model`, but the config maps it to an env var the runtime does not read for active embedding profile selection.
-- The repo-local `codestory-grounding` skill has stale crate names and lacks detailed refs for `ask`, `doctor`, `explore`, and `serve`.
+- The repo-local `codestory-grounding` skill has stale crate names and lacks detailed refs for `context`, `doctor`, `explore`, and `serve`.
 - CLI help must keep `--format dot` trail-only so non-trail commands expose only `markdown|json`.
 - The best product-flow tests are ignored or heavy; there is no small always-on "index then browse" golden path.
 - HTTP/stdio tool schemas and prompts are handwritten in the CLI.
-- `ask` is still mostly a one-pass evidence packet, and exact integration questions can return weak or zero-hit answers.
+- `context` is still mostly a one-pass evidence packet, and exact integration targets can return weak or zero-hit packets.
 - Freshness/profile mismatch signals are not first-class browser outputs.
 - Performance evidence is strong for this repo, but not yet for 10k-100k file agent loops.
 
@@ -60,16 +60,16 @@ The main limitations are sharper:
 - `cargo test -p codestory-cli --test cli_golden_path`
 - `cargo test -p codestory-cli --test cli_error_contracts`
 
-### Task 0.1: Keep Ask DB-First Everywhere
+### Task 0.1: Keep Context DB-First Everywhere
 
-- **Location**: `crates/codestory-contracts/src/api/dto.rs`, `crates/codestory-runtime/src/agent/orchestrator.rs`, CLI ask tests.
+- **Location**: `crates/codestory-contracts/src/api/dto.rs`, `crates/codestory-runtime/src/agent/orchestrator.rs`, CLI context tests.
 - **Description**: keep `AgentAskRequest` as a retrieval-only contract with no external local-agent execution controls.
 - **Acceptance criteria**:
-  - CLI `ask` exposes no local-agent flags.
-  - `serve --stdio` ask remains read-only and DB-first.
+  - CLI `context` exposes no local-agent flags.
+  - `serve --stdio` context remains read-only and DB-first.
   - Retrieval trace contains no local-agent execution step.
 - **Validation**:
-  - Add CLI/stdin tests proving ask output has only retrieval-owned trace steps.
+  - Add CLI/stdin tests proving context output has only retrieval-owned trace steps.
 
 ### Task 0.2: Fix `.codestory.toml` Embedding Config Mapping
 
@@ -95,9 +95,9 @@ The main limitations are sharper:
 - **Description**: make the repo-local skill the canonical operational guide for agents.
 - **Acceptance criteria**:
   - Remove stale crate names: `codestory-app`, `codestory-index`, `codestory-storage`.
-  - Add command refs for `ask.md`, `doctor.md`, `explore.md`, and `serve.md`.
+  - Add command refs for `context.md`, `doctor.md`, `explore.md`, and `serve.md`.
   - Add a short "LLM default browser loop":
-    `doctor` -> `index` when needed -> `ground` -> `search --why` -> `symbol/trail/snippet/explore` -> `ask` with citations.
+    `doctor` -> `index` when needed -> `ground` -> `search --why` -> `symbol/trail/snippet/explore` -> `context` with citations.
   - Each command ref includes one normal path, one failure path, and one integration edge.
 - **Validation**:
   - Skill metadata validation with `quick_validate.py`.
@@ -167,7 +167,7 @@ The main limitations are sharper:
   - `trail`
   - `snippet`
   - `query`
-  - DB-first `ask` packet
+  - DB-first `context` packet
 - **Non-goals**:
   - Do not include file writes, opening IDEs, opening folders, or OS actions.
   - Do not move socket/stdin transport loops into runtime.
@@ -238,24 +238,24 @@ The main limitations are sharper:
   - Handler descriptor tests.
   - One HTTP smoke against an indexed temp repo.
 
-## Sprint 3: Retrieval Quality And Iterative Ask
+## Sprint 3: Retrieval Quality And Target Context
 
-**Goal**: make `ask` answer integration and architecture questions by browsing, not by hoping a single search query hits.
+**Goal**: make `context` gather deep evidence around concrete integration and architecture anchors instead of hoping a single search query hits.
 
 **Demo/validation**
 
 - `cargo test -p codestory-runtime --test retrieval_eval`
 - new retrieval golden tests
-- CLI `ask` JSON/Markdown snapshot tests
+- CLI `context` JSON/Markdown snapshot tests
 
-### Task 3.1: Build Retrieval Golden Fixtures Before Changing Ask
+### Task 3.1: Build Retrieval Golden Fixtures Before Changing Context
 
 - **Location**: `crates/codestory-runtime/tests/retrieval_browser_contracts.rs`.
-- **Description**: create deterministic fixtures for the browser questions CodeStory must answer.
+- **Description**: create deterministic fixtures for the browser investigations CodeStory must ground.
 - **Cases**:
   - exact symbol query
   - exact file/literal query
-  - natural-language integration question
+  - broad integration question decomposed into concrete search anchors
   - ambiguous symbol requiring alternatives
   - graph/snippet expansion
   - stale index warning
@@ -266,10 +266,10 @@ The main limitations are sharper:
 - **Validation**:
   - `cargo test -p codestory-runtime --test retrieval_browser_contracts`.
 
-### Task 3.2: Add A Bounded `ask --investigate` Mode
+### Task 3.2: Make Bounded Context The Default
 
 - **Location**: `crates/codestory-cli/src/args.rs`, `crates/codestory-contracts/src/api/dto.rs`, `crates/codestory-runtime/src/agent/orchestrator.rs`, `crates/codestory-runtime/src/agent/profiles.rs`.
-- **Description**: add a named investigation mode before making it the default.
+- **Description**: make the deep retrieval path the default for `context`, with no public lightweight/deep split.
 - **Behavior**:
   - Initial search with current ranking.
   - Query expansion or exact-symbol/file fallback when first hits are weak.
@@ -282,12 +282,12 @@ The main limitations are sharper:
   - Cap default trail nodes and source bytes.
   - Keep investigation inside CodeStory's indexed retrieval layer.
 - **Acceptance criteria**:
-  - Integration prompts that currently miss relevant symbols return cited hits.
+  - Integration targets that currently miss relevant symbols return cited hits.
   - Trace proves multiple retrieval steps only when needed.
-  - Default `ask` behavior remains stable until investigation mode is measured.
+  - `context` stays target-first and does not accept broad question prompts.
 - **Validation**:
-  - Golden prompt tests.
-  - `ask --investigate --format json` trace assertions.
+  - Golden target tests.
+  - `context --format json` trace assertions.
   - Warm latency checks under the performance thresholds.
 
 ### Task 3.3: Improve Target Resolution UX
@@ -304,10 +304,10 @@ The main limitations are sharper:
 
 ### Task 3.4: Redesign Evidence Packet Output
 
-- **Location**: `crates/codestory-cli/src/output.rs`, ask renderers, search/ground explanations.
+- **Location**: `crates/codestory-cli/src/output.rs`, context renderers, search/ground explanations.
 - **Description**: make Markdown outputs easier for humans and LLMs to consume.
 - **Suggested structure**:
-  - answer or short finding
+  - context summary or short finding
   - confidence
   - what was checked
   - gaps/uncertainty
@@ -317,7 +317,7 @@ The main limitations are sharper:
   - Full trace remains in JSON/bundles.
   - Markdown never hides fallback reasons or low-confidence state.
 - **Validation**:
-  - Snapshot tests for `ask`, `search --why`, and `ground --why`.
+  - Snapshot tests for `context`, `search --why`, and `ground --why`.
 
 ## Sprint 4: Operational Trust And Performance Evidence
 
@@ -345,7 +345,7 @@ The main limitations are sharper:
 
 ### Task 4.2: Add Index Freshness Signal
 
-- **Location**: runtime project/search/ask DTOs, workspace inventory check, `doctor`, `serve --stdio` status resource.
+- **Location**: runtime project/search/context DTOs, workspace inventory check, `doctor`, `serve --stdio` status resource.
 - **Description**: make stale caches visible without mutating read commands.
 - **Acceptance criteria**:
   - Freshness check is bounded and read-only.
@@ -375,12 +375,12 @@ The main limitations are sharper:
 
 ### Task 4.4: Add Hard Caps Before Bigger Bundles
 
-- **Location**: repo-text search, ask investigation, future bundle/context tools.
+- **Location**: repo-text search, context retrieval, future bundle/context tools.
 - **Description**: reduce large-repo footguns before introducing higher-level bundle tools.
 - **Caps**:
   - repo-text scanned files/bytes/time
   - bundle output bytes
-  - default ask trail nodes
+  - default context trail nodes
   - source snippet bytes
 - **Acceptance criteria**:
   - Truncation is explicit and actionable.
@@ -431,7 +431,7 @@ The main limitations are sharper:
 - **Description**: expose saved focus sets for repeated investigations.
 - **Acceptance criteria**:
   - Add/list/remove bookmarks.
-  - `ask` or `trail` can use bookmark context if explicitly requested.
+  - `context` or `trail` can use bookmark context if explicitly requested.
   - Stale bookmarks after reindex degrade gracefully.
 - **Validation**:
   - CRUD tests.
@@ -461,7 +461,7 @@ The main limitations are sharper:
 
 ### PR 1: Trust Foundations
 
-- Fix `AgentAskRequest` default.
+- Fix the high-level retrieval request default.
 - Add serde omission tests.
 - Fix `.codestory.toml` embedding config mapping.
 - Add config precedence tests.
@@ -470,7 +470,7 @@ The main limitations are sharper:
 ### PR 2: Agent Docs And Fast Browser Tests
 
 - Repair `codestory-grounding` skill freshness rules.
-- Add `ask`, `doctor`, `explore`, `serve` refs.
+- Add `context`, `doctor`, `explore`, `serve` refs.
 - Add command-reference drift tests.
 - Add `cli_golden_path.rs`.
 - Add `cli_error_contracts.rs`.
@@ -487,7 +487,7 @@ The main limitations are sharper:
 
 - **Protocol overreach**: do not freeze a rich manifest until service boundaries are clean.
 - **UI duplication**: improve `explore` first; defer `browse` and web cockpit.
-- **Latency waterfall**: iterative `ask` must be budgeted before graph/source phases.
+- **Latency waterfall**: deep `context` must be budgeted before graph/source phases.
 - **Repo-text I/O**: add global caps before repo-text participates in high-level bundles.
 - **Config churn**: support legacy `embedding_model` while introducing precise `embedding_profile` and `embedding_model_id`.
 - **Telemetry sprawl**: retrieval state already reports several useful fields; add only counters that explain current blind spots.
@@ -499,7 +499,7 @@ CodeStory is credibly acting as an LLM's default codebase browser when:
 
 - an agent can discover and use the read-only browser loop from the repo-local skill or stdio resources;
 - missing cache, stale cache, semantic fallback, ambiguous symbols, and unsupported format cases produce actionable output;
-- `ask --investigate` can answer real integration questions with cited symbols, snippets, trails, and explicit gaps;
+- `context` can gather evidence for real integration anchors with cited symbols, snippets, trails, and explicit gaps;
 - MCP/stdio clients receive stable schemas, read-only annotations, JSON-RPC-shaped errors, and continuation resource links;
 - warm stdio/browser-loop p95 timings are measured and bounded;
 - repo-scale and stress-lane gates protect index/search/trail/snippet behavior before releases;

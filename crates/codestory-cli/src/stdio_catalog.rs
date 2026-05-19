@@ -464,7 +464,6 @@ impl SchemaObject {
 
 const TEXT_HIT_ORIGINS: &[&str] = &["indexed_symbol", "text_match"];
 const SEARCH_REPO_TEXT_MODES: &[&str] = &["auto", "on", "off"];
-const RESPONSE_MODES: &[&str] = &["structured", "markdown"];
 
 static GENERIC_OBJECT_SCHEMA: SchemaObject =
     SchemaObject::passthrough_object("Generic JSON object.");
@@ -658,13 +657,13 @@ static AGENT_CITATION_SCHEMA: SchemaObject = SchemaObject::object(
     ],
 );
 
-static AGENT_ANSWER_SCHEMA: SchemaObject = SchemaObject::object(
-    "CodeStory agent answer DTO.",
+static CONTEXT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
+    "CodeStory context packet DTO.",
     &[
-        SchemaProperty::string("answer_id", "Stable answer id."),
-        SchemaProperty::string("prompt", "Original prompt."),
-        SchemaProperty::string("summary", "Answer summary."),
-        SchemaProperty::array("sections", "Answer sections.", &GENERIC_OBJECT_SCHEMA),
+        SchemaProperty::string("packet_id", "Stable context packet id."),
+        SchemaProperty::string("target", "Resolved retrieval target label."),
+        SchemaProperty::string("summary", "Context packet summary."),
+        SchemaProperty::array("sections", "Context sections.", &GENERIC_OBJECT_SCHEMA),
         SchemaProperty::array("citations", "Evidence citations.", &AGENT_CITATION_SCHEMA),
         SchemaProperty::string_array("subgraph_ids", "Related graph ids."),
         SchemaProperty::string("retrieval_version", "Retrieval version."),
@@ -672,8 +671,8 @@ static AGENT_ANSWER_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::object("retrieval_trace", "Retrieval trace and summary."),
     ],
     &[
-        "answer_id",
-        "prompt",
+        "packet_id",
+        "target",
         "summary",
         "sections",
         "citations",
@@ -747,29 +746,29 @@ static SYMBOLS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     &[],
 );
 
-static ASK_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
-    "Run DB-first agentic retrieval and return an answer packet.",
+static CONTEXT_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Build a deep evidence packet for one concrete retrieval target.",
     &[
-        SchemaProperty::string_required("prompt", "Question or task for retrieval.")
+        SchemaProperty::string(
+            "query",
+            "Concrete symbol, file, literal, API path, module, or behavior term.",
+        )
+        .with_min_length(1),
+        SchemaProperty::string("id", "Stable node id to build context around.").with_min_length(1),
+        SchemaProperty::string("bookmark", "Saved bookmark id to build context around.")
             .with_min_length(1),
-        SchemaProperty::string("response_mode", "Answer response mode.")
-            .with_enum(RESPONSE_MODES)
-            .with_default(ValueLiteral::String("structured")),
         SchemaProperty::integer("max_results", "Maximum retrieval results.")
             .with_default(ValueLiteral::Integer(8))
             .with_bounds(1, 50),
-        SchemaProperty::boolean("include_evidence", "Include evidence in the answer.")
-            .with_default(ValueLiteral::Boolean(true)),
-        SchemaProperty::boolean("investigate", "Use bounded investigation retrieval.")
-            .with_default(ValueLiteral::Boolean(false)),
-        SchemaProperty::string(
-            "focus_id",
-            "Optional exact node id to focus retrieval around.",
+        SchemaProperty::boolean(
+            "include_evidence",
+            "Include citation edge ids and score details.",
         )
-        .nullable(),
+        .with_default(ValueLiteral::Boolean(true)),
     ],
-    &["prompt"],
-);
+    &[],
+)
+.with_any_of_required(&[&["query"], &["id"], &["bookmark"]]);
 
 static TOOLS: &[ToolSpec] = &[
     ToolSpec {
@@ -822,10 +821,10 @@ static TOOLS: &[ToolSpec] = &[
         safety: SafetyMetadata::read_only(),
     },
     ToolSpec {
-        name: "ask",
-        description: "Run DB-first agentic retrieval and return an answer packet.",
-        input_schema: ASK_INPUT_SCHEMA,
-        output_schema: Some(SchemaSpec::Object(AGENT_ANSWER_SCHEMA)),
+        name: "context",
+        description: "Build a deep evidence packet for one concrete retrieval target; not question answering.",
+        input_schema: CONTEXT_INPUT_SCHEMA,
+        output_schema: Some(SchemaSpec::Object(CONTEXT_PACKET_SCHEMA)),
         safety: SafetyMetadata::read_only(),
     },
 ];

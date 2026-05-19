@@ -1,7 +1,7 @@
 # Runtime Execution Path
 
 This page describes the current command path for the core CLI workflows:
-`index`, `ground`, `search`, `ask`, `symbol`, `trail`, `snippet`, `explore`,
+`index`, `ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `explore`,
 `serve`, and `doctor`.
 
 ## Index Command
@@ -64,7 +64,7 @@ When `search --why` is requested, the CLI renders compact explanations from the
 same DTO surface: origin, fallback state, and lexical/semantic/graph score
 breakdowns when runtime produced hybrid scored hits.
 
-## Ask Command
+## Context Command
 
 ```mermaid
 sequenceDiagram
@@ -73,15 +73,17 @@ sequenceDiagram
     participant Search as runtime search
     participant Graph as runtime graph builders
 
-    CLI->>Runtime: AgentAskRequest
+    CLI->>Runtime: concrete target request
     Runtime->>Search: scored hybrid retrieval
     Runtime->>Graph: neighborhood, trail, snippets, citations
-    Runtime-->>CLI: AgentAnswerDto with trace and evidence
+    Runtime-->>CLI: context packet with trace and evidence
     CLI->>CLI: render markdown/json and optional bundle
 ```
 
-`ask` is DB-first. It runs runtime-owned retrieval planning and answer packet
-assembly without invoking an external process.
+`context` is DB-first and target-first. The CLI resolves `--id`, `--query`, or
+`--bookmark` to one concrete target, then asks runtime-owned retrieval to build
+a deep evidence packet. It is not a question-answering command and does not
+interpret broad natural-language prompts.
 
 ## Ground, Symbol, Trail, and Snippet Commands
 

@@ -283,7 +283,7 @@ fn explore_next_commands(
         ));
     }
     commands.push(format!(
-        "codestory-cli ask --project \"{project}\" --focus-id {node_id} \"What should I inspect next?\""
+        "codestory-cli context --project \"{project}\" --id {node_id}"
     ));
     commands.push(format!(
         "codestory-cli trail --project \"{project}\" --id {node_id} --depth 3"
@@ -318,7 +318,7 @@ fn explore_layer_notes(
             "query_resolution: `{}` resolved to `{}`",
             target.requested, target.selected.display_name
         ),
-        "ask: use ask --focus-id for a DB-first answer packet around this target".to_string(),
+        "context: use context --id for a deep evidence packet around this target".to_string(),
         format!("output_write: target `{output_target}` passed preflight"),
         snippet_layer_note.to_string(),
     ];

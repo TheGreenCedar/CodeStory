@@ -4,9 +4,9 @@ CodeStory is building a local-first, language-aware code understanding substrate
 
 ## High-impact changes (delight-focused, not bug fixes)
 
-1. **Ship an “Agentic Ask” command that auto-plans retrieval before answering**
-   - Add a first-class command (for example `codestory-cli ask`) that performs iterative context gathering across `search`, `symbol`, `trail`, `snippet`, and optional web/MCP tools before producing a final answer packet.
-   - Why this is high impact: this removes manual query choreography for users and makes CodeStory feel like a collaborative investigator rather than a toolbox.
+1. **Ship a deep `context` command that auto-plans retrieval around one target**
+   - Add a first-class command (`codestory-cli context`) that performs iterative context gathering across `search`, `symbol`, `trail`, and `snippet` after a concrete target has been selected.
+   - Why this is high impact: this removes manual evidence choreography for users once they have an anchor, while keeping lightweight discovery in `search`.
    - Research signal: Sourcegraph documents that proactive, iterative context gathering improves response quality and reduces user burden in coding assistants.
 
 2. **Make retrieval explainable by default (`--why` mode + score breakdown)**
@@ -41,7 +41,7 @@ CodeStory is building a local-first, language-aware code understanding substrate
 
 This roadmap is now represented in the CLI/runtime surface:
 
-- `ask` builds a DB-first answer packet with retrieval trace, citations, graphs, and shareable `--bundle` artifacts.
+- `context` builds a DB-first evidence packet with retrieval trace, citations, graphs, and shareable `--bundle` artifacts around one concrete target.
 - `search --why` and `ground --why` add human-readable retrieval explanations; search JSON carries score breakdowns when runtime produces hybrid scored hits.
 - `explore` JSON/Markdown includes definition plus incoming/outgoing reference navigation metadata.
 - `serve` now exposes navigation HTTP routes (`/definition`, `/references`, `/symbols`) and `serve --stdio` publishes tools, resources, resource templates, and prompts.

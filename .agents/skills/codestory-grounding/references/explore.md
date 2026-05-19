@@ -31,7 +31,7 @@ target/release/codestory-cli(.exe) explore [OPTIONS] <--id <ID>|--query <QUERY>>
 |------|---------|-----------------|
 | Normal path | `target/release/codestory-cli(.exe) explore --project . --query WorkspaceIndexer --no-tui` | Markdown bundle with status/retrieval/freshness, query resolution, navigation results, symbol details, trail, and snippet context. |
 | Failure path | If the target is ambiguous or missing, run `search --project . --query WorkspaceIndexer --why`, then retry with `--id <node_id>` or `--file <fragment>`. | Avoids guessing which symbol the report describes. |
-| Integration edge | Use explore after `search --why`; feed the resolved node id into `ask --focus-id`, `trail --id`, or `snippet --id` when the next step needs sharper evidence. | Converts broad search into a focused browser handoff. |
+| Integration edge | Use explore after `search --why`; feed the resolved node id into `context --id`, `trail --id`, or `snippet --id` when the next step needs sharper evidence. | Converts broad search into a focused browser handoff. |
 
 ## Notes
 

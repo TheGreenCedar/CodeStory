@@ -28,11 +28,11 @@ target/release/codestory-cli(.exe) bookmark <add|list|remove> [OPTIONS]
 |------|---------|-----------------|
 | Normal path | `target/release/codestory-cli(.exe) bookmark add --project . --query WorkspaceIndexer --comment "indexing entry point"` | Creates or reuses the `Investigation` category and returns a bookmark id. |
 | Failure path | If a bookmark points at a node removed by reindexing, `bookmark list` reports it as stale or absent; rerun `search --why` and replace the bookmark. | Avoids silently using stale focus state. |
-| Integration edge | Use `ask --bookmark <bookmark_id>` when an answer should reuse a saved focus. | Makes bookmark context opt-in and visible in the retrieval trace. |
+| Integration edge | Use `context --bookmark <bookmark_id>` when a deep evidence packet should reuse a saved focus. | Makes bookmark context opt-in and visible in the retrieval trace. |
 
 ## Notes
 
 - `bookmark list --format json` is best for automation.
-- `ask --bookmark <bookmark_id>` is mutually exclusive with `--focus-id`.
+- `context --bookmark <bookmark_id>` is mutually exclusive with `--id` and `--query`.
 - Full refreshes and projection cleanup may remove bookmark rows for deleted
   nodes; orphaned rows degrade as stale instead of crashing.
