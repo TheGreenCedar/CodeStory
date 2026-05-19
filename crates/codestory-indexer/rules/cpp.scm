@@ -11,7 +11,8 @@
 }
 
 (class_specifier
-  name: (_) @name)
+  name: (_) @name
+  body: (field_declaration_list))
 {
   node @name.node
   attr (@name.node) kind = "CLASS"
@@ -23,7 +24,8 @@
 }
 
 (struct_specifier
-  name: (_) @name)
+  name: (_) @name
+  body: (field_declaration_list))
 {
   node @name.node
   attr (@name.node) kind = "CLASS"
@@ -32,6 +34,34 @@
   attr (@name.node) start_col = (start-column @name)
   attr (@name.node) end_row = (end-row @name)
   attr (@name.node) end_col = (end-column @name)
+}
+
+(class_specifier
+  name: (_) @name
+  !body)
+{
+  node @name.node
+  attr (@name.node) kind = "CLASS"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+  attr (@name.node) canonical_role = "declaration"
+}
+
+(struct_specifier
+  name: (_) @name
+  !body)
+{
+  node @name.node
+  attr (@name.node) kind = "CLASS"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+  attr (@name.node) canonical_role = "declaration"
 }
 
 (enum_specifier

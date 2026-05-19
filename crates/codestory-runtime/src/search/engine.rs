@@ -1743,16 +1743,16 @@ impl SearchEngine {
 
         for (name, id) in &self.symbols {
             if let Some(score) = pattern.score(name.slice(..), &mut self.matcher) {
-                matches.push((*id, score));
+                matches.push((*id, score, symbol_candidate_rank(query, name, score)));
             }
         }
 
-        matches.sort_by_key(|b| std::cmp::Reverse(b.1));
+        matches.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| right.1.cmp(&left.1)));
 
         let mut seen = HashSet::new();
         matches
             .into_iter()
-            .map(|(id, score)| (id, score as f32))
+            .map(|(id, score, _)| (id, score as f32))
             .filter(|(id, _)| seen.insert(*id))
             .take(200)
             .collect()
@@ -1931,6 +1931,29 @@ impl SearchEngine {
 
         Ok(results)
     }
+}
+
+fn symbol_candidate_rank(query: &str, name: &Utf32String, score: u32) -> (u8, u8, u8, u32) {
+    let query = query.trim().to_ascii_lowercase();
+    let display = name.to_string();
+    let display_lower = display.to_ascii_lowercase();
+    let terminal_lower = display
+        .rsplit([':', '.', '/', '\\'])
+        .next()
+        .unwrap_or(display.as_str())
+        .to_ascii_lowercase();
+    let leading_lower = display
+        .split("::")
+        .next()
+        .unwrap_or(display.as_str())
+        .to_ascii_lowercase();
+
+    (
+        u8::from(display_lower == query),
+        u8::from(terminal_lower == query),
+        u8::from(leading_lower == query),
+        score,
+    )
 }
 
 fn recreate_search_storage_dir(path: &Path) -> Result<()> {
@@ -2512,6 +2535,23 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], NodeId(3));
 
+        Ok(())
+    }
+
+    #[test]
+    fn exact_symbol_search_prioritizes_exact_display_name_candidates() -> Result<()> {
+        let mut engine = SearchEngine::new(None)?;
+
+        engine.index_nodes(vec![
+            (NodeId(1), "StorageAccess::~StorageAccess".to_string()),
+            (NodeId(2), "StorageAccess::getFileContent".to_string()),
+            (NodeId(3), "ComponentFactory::getStorageAccess".to_string()),
+            (NodeId(4), "StorageAccess".to_string()),
+        ])?;
+
+        let results = engine.search_symbol("StorageAccess");
+
+        assert_eq!(results.first(), Some(&NodeId(4)));
         Ok(())
     }
 

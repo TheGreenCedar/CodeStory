@@ -75,12 +75,15 @@ pub(crate) use support::{
     looks_like_repo_text_query, node_display_name, normalized_hybrid_weights, preferred_occurrence,
     query_has_symbol_or_literal_signal, read_searchable_file_contents, should_expand_symbol_query,
 };
+#[cfg(test)]
+use symbol_query::compare_search_hits;
 pub use symbol_query::{
     SymbolNameMatchRank, compare_ranked_hits, leading_symbol_segment, normalize_symbol_query,
     symbol_name_match_rank, terminal_symbol_segment,
 };
 pub(crate) use symbol_query::{
-    compare_search_hits, is_non_primary_source_hit, query_mentions_non_primary_source,
+    compare_search_hits_with_project_root, is_non_primary_source_hit,
+    query_mentions_non_primary_source,
 };
 
 type Storage = Store;
@@ -2449,16 +2452,47 @@ fn hybrid_search_config_for_request(
         max_results: requested_max_results,
         ..HybridSearchConfig::default()
     };
+    let has_request_weights = request_weights.is_some();
     let (lexical_weight, semantic_weight, graph_weight) =
         normalized_hybrid_weights(request_weights, &config);
     config.lexical_weight = lexical_weight;
     config.semantic_weight = semantic_weight;
     config.graph_weight = graph_weight;
+    let exact_symbol_query = looks_like_exact_symbol_query(&req.query);
+    if !has_request_weights && exact_symbol_query {
+        config.lexical_weight = 0.85;
+        config.semantic_weight = 0.15;
+        config.graph_weight = 0.0;
+        config.max_results = requested_max_results.saturating_mul(50).clamp(50, 1_000);
+        config.lexical_limit = config.lexical_limit.max(200);
+        config.semantic_limit = config.semantic_limit.max(20);
+    }
     apply_hybrid_limits(req.hybrid_limits.clone(), &mut config);
-    if prefer_primary_sources {
+    if prefer_primary_sources && !exact_symbol_query {
         config.max_results = requested_max_results.saturating_mul(5).min(80);
     }
     config
+}
+
+fn looks_like_exact_symbol_query(query: &str) -> bool {
+    let trimmed = query.trim();
+    !trimmed.is_empty()
+        && !trimmed.chars().any(char::is_whitespace)
+        && trimmed.chars().any(|ch| ch.is_ascii_alphabetic())
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '.' | '$'))
+}
+
+fn should_pretruncate_primary_source_window(
+    query: &str,
+    prefer_primary_sources: bool,
+    candidate_count: usize,
+    requested_max_results: usize,
+) -> bool {
+    prefer_primary_sources
+        && !looks_like_exact_symbol_query(query)
+        && candidate_count > requested_max_results
 }
 
 fn merge_search_hits_by_node_id(hits: &mut Vec<SearchHit>, additional: Vec<SearchHit>) {
@@ -2928,7 +2962,9 @@ impl AppController {
             ));
         }
 
-        hits.sort_by(|left, right| compare_search_hits(query, left, right));
+        hits.sort_by(|left, right| {
+            compare_search_hits_with_project_root(project_root, query, left, right)
+        });
         hits.truncate(limit);
         stats.duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
         Ok(RepoTextScan { hits, stats })
@@ -3040,7 +3076,10 @@ impl AppController {
             .into_iter()
             .filter_map(|(id, score)| Self::build_search_hit(&storage, &node_names, id, score))
             .collect::<Vec<_>>();
-        hits.sort_by(|left, right| compare_search_hits(query, left, right));
+        let project_root = self.require_project_root().ok();
+        hits.sort_by(|left, right| {
+            compare_search_hits_with_project_root(project_root.as_deref(), query, left, right)
+        });
         hits.truncate(max_results.clamp(1, 50));
         Ok(hits)
     }
@@ -3528,7 +3567,10 @@ impl AppController {
             merge_search_hits_by_node_id(&mut indexed_symbol_hits, expanded_hits);
         }
 
-        indexed_symbol_hits.sort_by(|left, right| compare_search_hits(&query, left, right));
+        let project_root = self.require_project_root().ok();
+        indexed_symbol_hits.sort_by(|left, right| {
+            compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
+        });
         dedupe_inexact_search_hits_by_display_key(&query, &mut indexed_symbol_hits);
         indexed_symbol_hits.truncate(limit_per_source);
         let mut used_repo_explanation_overview = false;
@@ -3540,7 +3582,14 @@ impl AppController {
             if !overview_hits.is_empty() {
                 if query_has_symbol_or_literal_signal(&query) {
                     merge_search_hits_by_node_id(&mut suggestions, overview_hits);
-                    suggestions.sort_by(|left, right| compare_search_hits(&query, left, right));
+                    suggestions.sort_by(|left, right| {
+                        compare_search_hits_with_project_root(
+                            project_root.as_deref(),
+                            &query,
+                            left,
+                            right,
+                        )
+                    });
                     suggestions.truncate(limit_per_source);
                 } else {
                     used_repo_explanation_overview = true;
@@ -3787,7 +3836,12 @@ impl AppController {
                 });
             }
         }
-        if prefer_primary_sources && out.len() > requested_max_results {
+        if should_pretruncate_primary_source_window(
+            &req.query,
+            prefer_primary_sources,
+            out.len(),
+            requested_max_results,
+        ) {
             let top_window_has_non_primary = out
                 .iter()
                 .take(requested_max_results)
@@ -3804,7 +3858,15 @@ impl AppController {
                 out.truncate(requested_max_results);
             }
         }
-        out.sort_by(|left, right| compare_search_hits(&req.query, &left.hit, &right.hit));
+        let project_root = self.require_project_root().ok();
+        out.sort_by(|left, right| {
+            compare_search_hits_with_project_root(
+                project_root.as_deref(),
+                &req.query,
+                &left.hit,
+                &right.hit,
+            )
+        });
         out.truncate(requested_max_results);
 
         Ok((out, retrieval))
@@ -6505,6 +6567,26 @@ fn build_llm_symbol_doc_text() -> String {
         dedupe_inexact_search_hits_by_display_key("LLAMACPP_EMBEDDINGS_URL_ENV", &mut hits);
 
         assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn exact_symbol_queries_skip_primary_source_pretruncate() {
+        assert!(
+            !should_pretruncate_primary_source_window("StorageAccess", true, 250, 10),
+            "exact symbol queries need final exact-symbol sorting before truncation"
+        );
+        assert!(should_pretruncate_primary_source_window(
+            "how search ranking works",
+            true,
+            250,
+            10
+        ));
+        assert!(!should_pretruncate_primary_source_window(
+            "how search ranking works",
+            false,
+            250,
+            10
+        ));
     }
 
     #[test]

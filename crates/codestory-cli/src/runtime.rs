@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use crate::args::{ProjectArgs, QuerySelectorOutput, RefreshMode, TargetSelection};
 use crate::display::{clean_path_string, format_search_hit_target, relative_path};
 use crate::query_resolution::{
-    compare_resolution_hits, file_filter_match_bucket, resolution_rank,
+    compare_resolution_hits, file_filter_match_bucket, resolution_rank_with_project_root,
     search_hit_matches_file_filter,
 };
 
@@ -474,8 +474,8 @@ fn resolution_candidate_rank(
     query: &str,
     file_filter: Option<&str>,
     hit: &SearchHit,
-) -> (u8, u8, u8, u8, u8, u8) {
-    let rank = resolution_rank(query, hit);
+) -> (u8, u8, u8, u8, u8, u8, u8) {
+    let rank = resolution_rank_with_project_root(Some(project_root), query, hit);
     (
         file_filter
             .map(|filter| file_filter_match_bucket(project_root, hit, filter))
@@ -485,6 +485,7 @@ fn resolution_candidate_rank(
         rank.2,
         rank.3,
         rank.4,
+        rank.5,
     )
 }
 

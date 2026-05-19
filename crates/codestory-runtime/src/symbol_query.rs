@@ -1,6 +1,7 @@
 use codestory_contracts::api::{NodeKind, SearchHit, SearchHitOrigin};
 use std::cmp::Ordering;
 use std::fs;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SymbolNameMatchRank {
@@ -288,11 +289,16 @@ pub(crate) fn is_non_primary_source_hit(hit: &SearchHit) -> bool {
         .unwrap_or(false)
 }
 
-fn search_match_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8, u8, u8, u8, u8, u8, u8) {
+fn search_match_rank(
+    project_root: Option<&Path>,
+    query: &str,
+    hit: &SearchHit,
+) -> (u8, u8, u8, u8, u8, u8, u8, u8, u8, u8) {
     let rank = symbol_name_match_rank(query, &hit.display_name);
     let is_exact_match =
         rank.exact_display != 0 || rank.exact_terminal != 0 || rank.exact_leading != 0;
-    let definition_quality = exact_definition_quality_bucket(query, hit, is_exact_match);
+    let definition_quality =
+        exact_definition_quality_bucket(project_root, query, hit, is_exact_match);
     let source_bucket = u8::from(
         is_exact_match
             || query_mentions_non_primary_source(query)
@@ -326,25 +332,30 @@ fn search_match_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8, u8, u8, u
     )
 }
 
-fn exact_definition_quality_bucket(query: &str, hit: &SearchHit, is_exact_match: bool) -> u8 {
+fn exact_definition_quality_bucket(
+    project_root: Option<&Path>,
+    query: &str,
+    hit: &SearchHit,
+    is_exact_match: bool,
+) -> u8 {
     if !is_exact_match || hit.origin == SearchHitOrigin::TextMatch || hit.kind == NodeKind::UNKNOWN
     {
         return 0;
     }
     if is_type_like_kind(hit.kind) {
-        return type_hit_line_quality(query, hit);
+        return type_hit_line_quality(project_root, query, hit);
     }
     1
 }
 
-fn type_hit_line_quality(query: &str, hit: &SearchHit) -> u8 {
+fn type_hit_line_quality(project_root: Option<&Path>, query: &str, hit: &SearchHit) -> u8 {
     let Some(path) = hit.file_path.as_deref() else {
         return 1;
     };
     let Some(line) = hit.line else {
         return 1;
     };
-    let Some(source_line) = read_source_line(path, line) else {
+    let Some(source_line) = read_source_line(project_root, path, line) else {
         return 1;
     };
     let trimmed = source_line
@@ -381,8 +392,19 @@ fn type_hit_line_quality(query: &str, hit: &SearchHit) -> u8 {
     }
 }
 
-fn read_source_line(path: &str, line: u32) -> Option<String> {
-    let contents = fs::read_to_string(path)
+fn read_source_line(project_root: Option<&Path>, path: &str, line: u32) -> Option<String> {
+    let raw_path = Path::new(path);
+    let joined_path;
+    let candidate = if raw_path.is_absolute() {
+        raw_path
+    } else if let Some(root) = project_root {
+        joined_path = root.join(raw_path);
+        joined_path.as_path()
+    } else {
+        raw_path
+    };
+
+    let contents = fs::read_to_string(candidate)
         .or_else(|_| {
             #[cfg(windows)]
             {
@@ -402,12 +424,22 @@ fn read_source_line(path: &str, line: u32) -> Option<String> {
         .map(str::to_string)
 }
 
+#[cfg(test)]
 pub(crate) fn compare_search_hits(query: &str, left: &SearchHit, right: &SearchHit) -> Ordering {
+    compare_search_hits_with_project_root(None, query, left, right)
+}
+
+pub(crate) fn compare_search_hits_with_project_root(
+    project_root: Option<&Path>,
+    query: &str,
+    left: &SearchHit,
+    right: &SearchHit,
+) -> Ordering {
     compare_ranked_hits(
         left,
         right,
-        search_match_rank(query, left),
-        search_match_rank(query, right),
+        search_match_rank(project_root, query, left),
+        search_match_rank(project_root, query, right),
     )
 }
 
@@ -806,6 +838,44 @@ mod tests {
 
         let mut hits = [forward, definition.clone()];
         hits.sort_by(|left, right| compare_search_hits("StorageAccess", left, right));
+
+        assert_eq!(
+            hits.first().map(|hit| &hit.node_id),
+            Some(&definition.node_id)
+        );
+    }
+
+    #[test]
+    fn exact_type_queries_use_project_root_for_relative_paths() {
+        let temp = tempdir().expect("create temp dir");
+        let src = temp.path().join("src");
+        std::fs::create_dir_all(&src).expect("create src dir");
+        std::fs::write(src.join("ViewFactory.h"), "class StorageAccess;\n")
+            .expect("write forward decl");
+        std::fs::write(src.join("StorageAccess.h"), "class StorageAccess\n{\n};\n")
+            .expect("write definition");
+
+        let mut forward = hit_at_path(
+            "forward",
+            "StorageAccess",
+            NodeKind::CLASS,
+            0.95,
+            "src/ViewFactory.h",
+        );
+        forward.line = Some(1);
+        let mut definition = hit_at_path(
+            "definition",
+            "StorageAccess",
+            NodeKind::CLASS,
+            0.80,
+            "src/StorageAccess.h",
+        );
+        definition.line = Some(1);
+
+        let mut hits = [forward, definition.clone()];
+        hits.sort_by(|left, right| {
+            compare_search_hits_with_project_root(Some(temp.path()), "StorageAccess", left, right)
+        });
 
         assert_eq!(
             hits.first().map(|hit| &hit.node_id),

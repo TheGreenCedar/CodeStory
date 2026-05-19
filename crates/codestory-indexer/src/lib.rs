@@ -3326,6 +3326,7 @@ fn infer_access_from_source(
 
 fn definition_occurrences(
     unique_nodes: &HashMap<NodeId, Node>,
+    canonical_roles: &HashMap<NodeId, CanonicalNodeRole>,
     file_id: NodeId,
 ) -> Vec<Occurrence> {
     let mut occurrences = Vec::new();
@@ -3333,9 +3334,14 @@ fn definition_occurrences(
         if let (Some(start_line), Some(start_col), Some(end_line), Some(end_col)) =
             (node.start_line, node.start_col, node.end_line, node.end_col)
         {
+            let kind = if canonical_roles.get(&node.id) == Some(&CanonicalNodeRole::Declaration) {
+                codestory_contracts::graph::OccurrenceKind::DECLARATION
+            } else {
+                codestory_contracts::graph::OccurrenceKind::DEFINITION
+            };
             occurrences.push(Occurrence {
                 element_id: node.id.0,
-                kind: codestory_contracts::graph::OccurrenceKind::DEFINITION,
+                kind,
                 location: SourceLocation {
                     file_node_id: file_id,
                     start_line,
@@ -5218,7 +5224,11 @@ pub fn index_file(
     if !unique_nodes.is_empty() {
         result_nodes.extend(unique_nodes.values().cloned());
     }
-    result_occurrences.extend(definition_occurrences(&unique_nodes, file_id));
+    result_occurrences.extend(definition_occurrences(
+        &unique_nodes,
+        &canonical_role_by_node_id,
+        file_id,
+    ));
 
     // 3. Resolve qualified names, canonicalize IDs, and remap projections.
     let (final_nodes, _new_file_id, id_remap) = post_process_index_results(

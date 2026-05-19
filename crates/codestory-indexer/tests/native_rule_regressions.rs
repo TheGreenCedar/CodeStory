@@ -1,11 +1,18 @@
 use codestory_contracts::events::EventBus;
-use codestory_contracts::graph::{Edge, EdgeKind, Node, NodeKind};
+use codestory_contracts::graph::{Edge, EdgeKind, Node, NodeKind, Occurrence, OccurrenceKind};
 use codestory_indexer::WorkspaceIndexer;
 use codestory_store::Store as Storage;
 use std::fs;
 use tempfile::tempdir;
 
 fn index_project(files: &[(&str, &str)]) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+    let (nodes, edges, _) = index_project_with_occurrences(files)?;
+    Ok((nodes, edges))
+}
+
+fn index_project_with_occurrences(
+    files: &[(&str, &str)],
+) -> anyhow::Result<(Vec<Node>, Vec<Edge>, Vec<Occurrence>)> {
     let dir = tempdir()?;
     let root = dir.path();
     let mut files_to_index = Vec::with_capacity(files.len());
@@ -31,7 +38,11 @@ fn index_project(files: &[(&str, &str)]) -> anyhow::Result<(Vec<Node>, Vec<Edge>
 
     let errors = storage.get_errors(None)?;
     anyhow::ensure!(errors.is_empty(), "indexing errors: {errors:?}");
-    Ok((storage.get_nodes()?, storage.get_edges()?))
+    Ok((
+        storage.get_nodes()?,
+        storage.get_edges()?,
+        storage.get_occurrences()?,
+    ))
 }
 
 fn matches_name(actual: &str, wanted: &str) -> bool {
@@ -616,6 +627,31 @@ public:
         ),
         "expected StorageAccess -> getGraphForActiveTokenIds member edge"
     );
+
+    Ok(())
+}
+
+#[test]
+fn test_cpp_forward_class_declaration_is_not_a_definition_occurrence() -> anyhow::Result<()> {
+    let (nodes, _edges, occurrences) = index_project_with_occurrences(&[(
+        "ViewFactory.h",
+        r#"
+class StorageAccess;
+
+class ViewFactory
+{
+};
+"#,
+    )])?;
+
+    let storage_access = find_node_by_name_and_kind(&nodes, "StorageAccess", NodeKind::CLASS)
+        .ok_or_else(|| anyhow::anyhow!("expected forward-declared class node"))?;
+    let occurrence = occurrences
+        .iter()
+        .find(|occurrence| occurrence.element_id == storage_access.id.0)
+        .ok_or_else(|| anyhow::anyhow!("expected StorageAccess occurrence"))?;
+
+    assert_eq!(occurrence.kind, OccurrenceKind::DECLARATION);
 
     Ok(())
 }
