@@ -236,110 +236,116 @@ struct ResolvedExploreProfile {
     output: ExploreProfileOutput,
 }
 
+struct ExploreProfileSpec {
+    requested_name: &'static str,
+    depth_floor: u32,
+    node_floor: u32,
+    caller_scope: TrailCallerScope,
+    notes: &'static [&'static str],
+}
+
 fn resolve_explore_profile(
     requested: Option<ExploreProfile>,
     depth: u32,
     max_nodes: u32,
 ) -> ResolvedExploreProfile {
-    let requested_name = requested
-        .map(|profile| match profile {
-            ExploreProfile::Architecture => "architecture",
-            ExploreProfile::Route => "route",
-            ExploreProfile::Bug => "bug",
-            ExploreProfile::Refactor => "refactor",
-            ExploreProfile::TestImpact => "test-impact",
-        })
-        .unwrap_or("default")
-        .to_string();
-    let (depth_floor, node_floor, caller_scope, notes) = match requested {
-        Some(ExploreProfile::Architecture) => (
-            3,
-            48,
-            TrailCallerScope::ProductionOnly,
-            vec![
-                "architecture profile widens production relationship evidence around subsystem anchors"
-                    .to_string(),
-                "source packets may include nearby implementation or related-hit source when graph evidence exposes it"
-                    .to_string(),
-            ],
-        ),
-        Some(ExploreProfile::Route) => (
-            3,
-            48,
-            TrailCallerScope::ProductionOnly,
-            vec![
-                "route profile widens neighborhood evidence for route, handler, and endpoint nodes"
-                    .to_string(),
-                "tests stay dampened unless they are already in the selected route neighborhood"
-                    .to_string(),
-            ],
-        ),
-        Some(ExploreProfile::Bug) => (
-            3,
-            60,
-            TrailCallerScope::IncludeTestsAndBenches,
-            vec![
-                "bug profile includes tests and benches so repro and assertion neighbors are visible"
-                    .to_string(),
-                "relationship evidence remains graph-bounded; run affected for changed-file impact"
-                    .to_string(),
-            ],
-        ),
-        Some(ExploreProfile::Refactor) => (
-            3,
-            72,
-            TrailCallerScope::IncludeTestsAndBenches,
-            vec![
-                "refactor profile expands dependents and nearby tests for blast-radius review"
-                    .to_string(),
-                "use trail or affected next when public API impact needs a deeper walk".to_string(),
-            ],
-        ),
-        Some(ExploreProfile::TestImpact) => (
-            4,
-            90,
-            TrailCallerScope::IncludeTestsAndBenches,
-            vec![
-                "test-impact profile favors test and bench neighbors for verification planning"
-                    .to_string(),
-                "test suggestions are focused hints, not proof of complete coverage".to_string(),
-            ],
-        ),
-        None => (
-            depth,
-            max_nodes,
-            TrailCallerScope::ProductionOnly,
-            vec![
-                "default profile preserves the normal explore depth, node budget, and production-only caller scope"
-                    .to_string(),
-            ],
-        ),
-    };
+    let spec = explore_profile_spec(requested, depth, max_nodes);
     let resolved_depth = if requested.is_some() {
-        depth.max(depth_floor)
+        depth.max(spec.depth_floor)
     } else {
         depth
     };
     let resolved_max_nodes = if requested.is_some() {
-        max_nodes.max(node_floor)
+        max_nodes.max(spec.node_floor)
     } else {
         max_nodes
     };
-    let caller_scope_label = match caller_scope {
-        TrailCallerScope::ProductionOnly => "production-only",
-        TrailCallerScope::IncludeTestsAndBenches => "include-tests-and-benches",
-    }
-    .to_string();
+    let caller_scope_label = explore_caller_scope_label(spec.caller_scope).to_string();
 
     ResolvedExploreProfile {
-        caller_scope,
+        caller_scope: spec.caller_scope,
         output: ExploreProfileOutput {
-            requested: requested_name,
+            requested: spec.requested_name.to_string(),
             depth: resolved_depth,
             max_nodes: resolved_max_nodes,
             caller_scope: caller_scope_label,
-            notes,
+            notes: spec.notes.iter().map(|note| (*note).to_string()).collect(),
         },
+    }
+}
+
+fn explore_profile_spec(
+    requested: Option<ExploreProfile>,
+    depth: u32,
+    max_nodes: u32,
+) -> ExploreProfileSpec {
+    match requested {
+        Some(ExploreProfile::Architecture) => ExploreProfileSpec {
+            requested_name: "architecture",
+            depth_floor: 3,
+            node_floor: 48,
+            caller_scope: TrailCallerScope::ProductionOnly,
+            notes: &[
+                "architecture profile widens production relationship evidence around subsystem anchors",
+                "source packets may include nearby implementation or related-hit source when graph evidence exposes it",
+            ],
+        },
+        Some(ExploreProfile::Route) => ExploreProfileSpec {
+            requested_name: "route",
+            depth_floor: 3,
+            node_floor: 48,
+            caller_scope: TrailCallerScope::ProductionOnly,
+            notes: &[
+                "route profile widens neighborhood evidence for route, handler, and endpoint nodes",
+                "tests stay dampened unless they are already in the selected route neighborhood",
+            ],
+        },
+        Some(ExploreProfile::Bug) => ExploreProfileSpec {
+            requested_name: "bug",
+            depth_floor: 3,
+            node_floor: 60,
+            caller_scope: TrailCallerScope::IncludeTestsAndBenches,
+            notes: &[
+                "bug profile includes tests and benches so repro and assertion neighbors are visible",
+                "relationship evidence remains graph-bounded; run affected for changed-file impact",
+            ],
+        },
+        Some(ExploreProfile::Refactor) => ExploreProfileSpec {
+            requested_name: "refactor",
+            depth_floor: 3,
+            node_floor: 72,
+            caller_scope: TrailCallerScope::IncludeTestsAndBenches,
+            notes: &[
+                "refactor profile expands dependents and nearby tests for blast-radius review",
+                "use trail or affected next when public API impact needs a deeper walk",
+            ],
+        },
+        Some(ExploreProfile::TestImpact) => ExploreProfileSpec {
+            requested_name: "test-impact",
+            depth_floor: 4,
+            node_floor: 90,
+            caller_scope: TrailCallerScope::IncludeTestsAndBenches,
+            notes: &[
+                "test-impact profile favors test and bench neighbors for verification planning",
+                "test suggestions are focused hints, not proof of complete coverage",
+            ],
+        },
+        None => ExploreProfileSpec {
+            requested_name: "default",
+            depth_floor: depth,
+            node_floor: max_nodes,
+            caller_scope: TrailCallerScope::ProductionOnly,
+            notes: &[
+                "default profile preserves the normal explore depth, node budget, and production-only caller scope",
+            ],
+        },
+    }
+}
+
+fn explore_caller_scope_label(caller_scope: TrailCallerScope) -> &'static str {
+    match caller_scope {
+        TrailCallerScope::ProductionOnly => "production-only",
+        TrailCallerScope::IncludeTestsAndBenches => "include-tests-and-benches",
     }
 }
 

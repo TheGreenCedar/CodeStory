@@ -1552,20 +1552,11 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
         );
     }
     if let Some(status) = output.question_search.as_ref() {
-        let artifact = status
-            .artifact
-            .as_deref()
-            .map(|path| format!(" artifact=`{path}`"))
-            .unwrap_or_default();
-        let error = status
-            .error
-            .as_deref()
-            .map(|error| format!(" error=\"{}\"", error.replace('"', "\\\"")))
-            .unwrap_or_default();
         let _ = writeln!(
             markdown,
-            "question_search: {} [{}]{}{}",
-            status.command, status.status, artifact, error
+            "question_search: {} {}",
+            status.command,
+            render_drill_command_status_suffix(status)
         );
     }
 
@@ -1587,20 +1578,11 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
             &anchor.verification_targets,
         );
         for status in &anchor.commands {
-            let artifact = status
-                .artifact
-                .as_deref()
-                .map(|path| format!(" artifact=`{path}`"))
-                .unwrap_or_default();
-            let error = status
-                .error
-                .as_deref()
-                .map(|error| format!(" error=\"{}\"", error.replace('"', "\\\"")))
-                .unwrap_or_default();
             let _ = writeln!(
                 markdown,
-                "  - {} [{}]{}{}",
-                status.command, status.status, artifact, error
+                "  - {} {}",
+                status.command,
+                render_drill_command_status_suffix(status)
             );
         }
     }
@@ -1609,29 +1591,15 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
         let _ = writeln!(markdown, "bridges:");
         for bridge in &output.bridges {
             let evidence = &bridge.evidence;
-            let artifact = bridge
-                .command
-                .artifact
-                .as_deref()
-                .map(|path| format!(" artifact=`{path}`"))
-                .unwrap_or_default();
-            let error = bridge
-                .command
-                .error
-                .as_deref()
-                .map(|error| format!(" error=\"{}\"", error.replace('"', "\\\"")))
-                .unwrap_or_default();
             let _ = writeln!(
                 markdown,
-                "- `{}` -> `{}` status={} strategy={} confidence={} [{}]{}{}",
+                "- `{}` -> `{}` status={} strategy={} confidence={} {}",
                 evidence.from_anchor,
                 evidence.to_anchor,
                 evidence.status,
                 evidence.strategy,
                 evidence.confidence,
-                bridge.command.status,
-                artifact,
-                error
+                render_drill_command_status_suffix(&bridge.command)
             );
             if let Some(path) = evidence.graph_path.as_ref() {
                 let _ = writeln!(
@@ -1744,6 +1712,20 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
         }
     }
     markdown
+}
+
+fn render_drill_command_status_suffix(status: &crate::args::DrillCommandStatusOutput) -> String {
+    let artifact = status
+        .artifact
+        .as_deref()
+        .map(|path| format!(" artifact=`{path}`"))
+        .unwrap_or_default();
+    let error = status
+        .error
+        .as_deref()
+        .map(|error| format!(" error=\"{}\"", error.replace('"', "\\\"")))
+        .unwrap_or_default();
+    format!("[{}]{}{}", status.status, artifact, error)
 }
 
 pub(crate) fn render_symbol_markdown(

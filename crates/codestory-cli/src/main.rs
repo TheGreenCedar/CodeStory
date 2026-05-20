@@ -917,36 +917,18 @@ fn run_drill(cmd: DrillCommand) -> Result<()> {
     };
 
     let markdown = render_drill_markdown(&output);
-    let json = serde_json::to_string_pretty(&output).context("Failed to serialize drill JSON")?;
-    let selected_content = render_drill_content(cmd.format, &output, &markdown)?;
+    let contents = render_drill_contents(cmd.format, &output, &markdown)?;
     let report_path = cmd.output_dir.join(format!("drill-report.{report_ext}"));
-    fs::write(&report_path, &selected_content).with_context(|| {
-        format!(
-            "Failed to write drill report {}",
-            display::clean_path_string(&report_path.to_string_lossy())
-        )
-    })?;
+    write_drill_report_file(&report_path, &contents.selected)?;
     let markdown_path = cmd.output_dir.join("drill-report.md");
     if report_path != markdown_path {
-        fs::write(&markdown_path, ensure_trailing_newline(markdown.clone())).with_context(
-            || {
-                format!(
-                    "Failed to write drill report {}",
-                    display::clean_path_string(&markdown_path.to_string_lossy())
-                )
-            },
-        )?;
+        write_drill_report_file(&markdown_path, &contents.markdown)?;
     }
     let json_path = cmd.output_dir.join("drill-report.json");
     if report_path != json_path {
-        fs::write(&json_path, ensure_trailing_newline(json)).with_context(|| {
-            format!(
-                "Failed to write drill report {}",
-                display::clean_path_string(&json_path.to_string_lossy())
-            )
-        })?;
+        write_drill_report_file(&json_path, &contents.json)?;
     }
-    print!("{selected_content}");
+    print!("{}", contents.selected);
     Ok(())
 }
 
@@ -959,22 +941,40 @@ fn validate_drill_output_dir(output_dir: &std::path::Path) -> Result<()> {
     })
 }
 
-fn render_drill_content(
+struct DrillReportContents {
+    selected: String,
+    markdown: String,
+    json: String,
+}
+
+fn render_drill_contents(
     format: args::OutputFormat,
     output: &DrillOutput,
     markdown: &str,
-) -> Result<String> {
-    let mut content = match format {
-        args::OutputFormat::Markdown => markdown.to_string(),
-        args::OutputFormat::Json => {
-            serde_json::to_string_pretty(output).context("Failed to serialize drill JSON")?
-        }
+) -> Result<DrillReportContents> {
+    let markdown = ensure_trailing_newline(markdown.to_string());
+    let json = ensure_trailing_newline(
+        serde_json::to_string_pretty(output).context("Failed to serialize drill JSON")?,
+    );
+    let selected = match format {
+        args::OutputFormat::Markdown => markdown.clone(),
+        args::OutputFormat::Json => json.clone(),
         args::OutputFormat::Dot => bail!("--format dot is only supported by `trail`"),
     };
-    if !content.ends_with('\n') {
-        content.push('\n');
-    }
-    Ok(content)
+    Ok(DrillReportContents {
+        selected,
+        markdown,
+        json,
+    })
+}
+
+fn write_drill_report_file(path: &std::path::Path, content: &str) -> Result<()> {
+    fs::write(path, content).with_context(|| {
+        format!(
+            "Failed to write drill report {}",
+            display::clean_path_string(&path.to_string_lossy())
+        )
+    })
 }
 
 fn normalized_drill_anchors(anchors: &[String]) -> Vec<String> {
@@ -1326,30 +1326,7 @@ fn build_drill_bridge_evidence(
 
     match forward {
         Ok(trail) if drill_bridge_has_graph_path(&trail, &from_id, &to_id) => {
-            DrillBridgeEvidenceOutput {
-                from_anchor: from.anchor.clone(),
-                to_anchor: to.anchor.clone(),
-                status: "graph_path".to_string(),
-                strategy: "to_target_symbol_forward".to_string(),
-                confidence: if trail.trail.truncated {
-                    "medium"
-                } else {
-                    "high"
-                }
-                .to_string(),
-                from_node: Some(from_node),
-                to_node: Some(to_node),
-                graph_path: Some(drill_bridge_graph_path_output(
-                    &runtime.project_root,
-                    "forward",
-                    &trail,
-                )),
-                shared_files: Vec::new(),
-                notes: vec![
-                    "bridge uses TrailMode::ToTargetSymbol from the earlier anchor to the later anchor"
-                        .to_string(),
-                ],
-            }
+            graph_path_drill_bridge(&runtime.project_root, from, to, from_node, to_node, &trail)
         }
         Ok(trail) => {
             let reverse = runtime
@@ -1358,87 +1335,151 @@ fn build_drill_bridge_evidence(
             if let Ok(reverse_trail) = reverse
                 && drill_bridge_has_graph_path(&reverse_trail, &to_id, &from_id)
             {
-                return DrillBridgeEvidenceOutput {
-                    from_anchor: from.anchor.clone(),
-                    to_anchor: to.anchor.clone(),
-                    status: "reverse_graph_path".to_string(),
-                    strategy: "to_target_symbol_reverse".to_string(),
-                    confidence: if reverse_trail.trail.truncated {
-                        "low"
-                    } else {
-                        "medium"
-                    }
-                    .to_string(),
-                    from_node: Some(from_node),
-                    to_node: Some(to_node),
-                    graph_path: Some(drill_bridge_graph_path_output(
-                        &runtime.project_root,
-                        "reverse",
-                        &reverse_trail,
-                    )),
-                    shared_files: Vec::new(),
-                    notes: vec![
-                        "no forward graph path was visible; a reverse graph path was found"
-                            .to_string(),
-                        "treat reverse paths as relationship evidence, not proof of the requested execution direction"
-                            .to_string(),
-                    ],
-                };
+                return reverse_graph_path_drill_bridge(
+                    &runtime.project_root,
+                    from,
+                    to,
+                    from_node,
+                    to_node,
+                    &reverse_trail,
+                );
             }
 
             let shared_files = drill_bridge_shared_files(runtime, &from_id, &to_id);
-            let status = if shared_files.is_empty() {
-                "no_bridge_found"
-            } else {
-                "shared_file_only"
-            };
-            let mut notes = vec![
-                "no forward TrailMode::ToTargetSymbol graph path was visible between these anchors"
-                    .to_string(),
-            ];
-            if shared_files.is_empty() {
-                notes.push(
-                    "fallback neighborhood comparison found no shared source files".to_string(),
-                );
-            } else {
-                notes.push(
-                    "fallback neighborhood comparison found shared source files but no graph path"
-                        .to_string(),
-                );
-            }
-            DrillBridgeEvidenceOutput {
-                from_anchor: from.anchor.clone(),
-                to_anchor: to.anchor.clone(),
-                status: status.to_string(),
-                strategy: "to_target_symbol_then_shared_files".to_string(),
-                confidence: "low".to_string(),
-                from_node: Some(from_node),
-                to_node: Some(to_node),
-                graph_path: Some(drill_bridge_graph_path_output(
-                    &runtime.project_root,
-                    "forward_no_path",
-                    &trail,
-                )),
+            fallback_drill_bridge(
+                &runtime.project_root,
+                from,
+                to,
+                from_node,
+                to_node,
+                &trail,
                 shared_files,
-                notes,
-            }
+            )
         }
-        Err(error) => DrillBridgeEvidenceOutput {
-            from_anchor: from.anchor.clone(),
-            to_anchor: to.anchor.clone(),
-            status: "error".to_string(),
-            strategy: "to_target_symbol_forward".to_string(),
-            confidence: "low".to_string(),
-            from_node: Some(from_node),
-            to_node: Some(to_node),
-            graph_path: None,
-            shared_files: Vec::new(),
-            notes: vec![format!(
-                "bridge graph query failed: {}: {}",
-                error.code, error.message
-            )],
-        },
+        Err(error) => drill_bridge_error(from, to, from_node, to_node, &error.code, &error.message),
     }
+}
+
+fn graph_path_drill_bridge(
+    project_root: &std::path::Path,
+    from: &DrillAnchorOutput,
+    to: &DrillAnchorOutput,
+    from_node: SearchHitOutput,
+    to_node: SearchHitOutput,
+    trail: &TrailContextDto,
+) -> DrillBridgeEvidenceOutput {
+    DrillBridgeEvidenceOutput {
+        from_anchor: from.anchor.clone(),
+        to_anchor: to.anchor.clone(),
+        status: "graph_path".to_string(),
+        strategy: "to_target_symbol_forward".to_string(),
+        confidence: drill_graph_path_confidence(trail.trail.truncated, "high", "medium"),
+        from_node: Some(from_node),
+        to_node: Some(to_node),
+        graph_path: Some(drill_bridge_graph_path_output(
+            project_root,
+            "forward",
+            trail,
+        )),
+        shared_files: Vec::new(),
+        notes: vec![
+            "bridge uses TrailMode::ToTargetSymbol from the earlier anchor to the later anchor"
+                .to_string(),
+        ],
+    }
+}
+
+fn reverse_graph_path_drill_bridge(
+    project_root: &std::path::Path,
+    from: &DrillAnchorOutput,
+    to: &DrillAnchorOutput,
+    from_node: SearchHitOutput,
+    to_node: SearchHitOutput,
+    trail: &TrailContextDto,
+) -> DrillBridgeEvidenceOutput {
+    DrillBridgeEvidenceOutput {
+        from_anchor: from.anchor.clone(),
+        to_anchor: to.anchor.clone(),
+        status: "reverse_graph_path".to_string(),
+        strategy: "to_target_symbol_reverse".to_string(),
+        confidence: drill_graph_path_confidence(trail.trail.truncated, "medium", "low"),
+        from_node: Some(from_node),
+        to_node: Some(to_node),
+        graph_path: Some(drill_bridge_graph_path_output(project_root, "reverse", trail)),
+        shared_files: Vec::new(),
+        notes: vec![
+            "no forward graph path was visible; a reverse graph path was found".to_string(),
+            "treat reverse paths as relationship evidence, not proof of the requested execution direction"
+                .to_string(),
+        ],
+    }
+}
+
+fn fallback_drill_bridge(
+    project_root: &std::path::Path,
+    from: &DrillAnchorOutput,
+    to: &DrillAnchorOutput,
+    from_node: SearchHitOutput,
+    to_node: SearchHitOutput,
+    trail: &TrailContextDto,
+    shared_files: Vec<String>,
+) -> DrillBridgeEvidenceOutput {
+    let mut notes = vec![
+        "no forward TrailMode::ToTargetSymbol graph path was visible between these anchors"
+            .to_string(),
+    ];
+    notes.push(if shared_files.is_empty() {
+        "fallback neighborhood comparison found no shared source files".to_string()
+    } else {
+        "fallback neighborhood comparison found shared source files but no graph path".to_string()
+    });
+    DrillBridgeEvidenceOutput {
+        from_anchor: from.anchor.clone(),
+        to_anchor: to.anchor.clone(),
+        status: if shared_files.is_empty() {
+            "no_bridge_found"
+        } else {
+            "shared_file_only"
+        }
+        .to_string(),
+        strategy: "to_target_symbol_then_shared_files".to_string(),
+        confidence: "low".to_string(),
+        from_node: Some(from_node),
+        to_node: Some(to_node),
+        graph_path: Some(drill_bridge_graph_path_output(
+            project_root,
+            "forward_no_path",
+            trail,
+        )),
+        shared_files,
+        notes,
+    }
+}
+
+fn drill_bridge_error(
+    from: &DrillAnchorOutput,
+    to: &DrillAnchorOutput,
+    from_node: SearchHitOutput,
+    to_node: SearchHitOutput,
+    code: &str,
+    message: &str,
+) -> DrillBridgeEvidenceOutput {
+    DrillBridgeEvidenceOutput {
+        from_anchor: from.anchor.clone(),
+        to_anchor: to.anchor.clone(),
+        status: "error".to_string(),
+        strategy: "to_target_symbol_forward".to_string(),
+        confidence: "low".to_string(),
+        from_node: Some(from_node),
+        to_node: Some(to_node),
+        graph_path: None,
+        shared_files: Vec::new(),
+        notes: vec![format!("bridge graph query failed: {code}: {message}")],
+    }
+}
+
+fn drill_graph_path_confidence(truncated: bool, complete: &str, truncated_value: &str) -> String {
+    if truncated { truncated_value } else { complete }.to_string()
 }
 
 fn unresolved_drill_bridge(
@@ -4206,6 +4247,128 @@ mod tests {
             callsite_identity: None,
             candidate_targets: Vec::new(),
         }
+    }
+
+    fn sample_search_hit_output(id: &str, name: &str) -> SearchHitOutput {
+        SearchHitOutput {
+            number: None,
+            node_id: id.to_string(),
+            node_ref: Some(format!("src/lib.rs:1:{name}")),
+            display_name: name.to_string(),
+            kind: NodeKind::FUNCTION,
+            file_path: Some("src/lib.rs".to_string()),
+            line: Some(1),
+            score: 1.0,
+            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            match_quality: SearchMatchQualityDto::Exact,
+            resolvable: true,
+            score_breakdown: None,
+            duplicate_of: None,
+            excerpt: None,
+            primary_occurrence_kind: None,
+            symbol_role: None,
+            paired_refs: Vec::new(),
+            verification_targets: Vec::new(),
+            resolution_hints: Vec::new(),
+            why: Vec::new(),
+        }
+    }
+
+    fn sample_drill_anchor(anchor: &str, node_id: &str) -> DrillAnchorOutput {
+        DrillAnchorOutput {
+            anchor: anchor.to_string(),
+            typed_hit_count: 1,
+            chosen_anchor: Some(sample_search_hit_output(node_id, anchor)),
+            verification_targets: Vec::new(),
+            commands: Vec::new(),
+        }
+    }
+
+    fn sample_bridge_trail(truncated: bool) -> TrailContextDto {
+        TrailContextDto {
+            focus: sample_node_details("a", "A"),
+            trail: GraphResponse {
+                center_id: NodeId("a".to_string()),
+                nodes: vec![sample_graph_node("a", "A"), sample_graph_node("b", "B")],
+                edges: vec![sample_graph_edge("e1", "a", "b", Some("certain"))],
+                truncated,
+                omitted_edge_count: if truncated { 1 } else { 0 },
+                canonical_layout: None,
+            },
+            story: None,
+        }
+    }
+
+    #[test]
+    fn drill_bridge_constructors_preserve_status_contract() {
+        let from = sample_drill_anchor("FromAnchor", "a");
+        let to = sample_drill_anchor("ToAnchor", "b");
+        let project_root = Path::new("C:/repo");
+        let complete_trail = sample_bridge_trail(false);
+        let truncated_trail = sample_bridge_trail(true);
+
+        let forward = graph_path_drill_bridge(
+            project_root,
+            &from,
+            &to,
+            from.chosen_anchor.clone().expect("from"),
+            to.chosen_anchor.clone().expect("to"),
+            &complete_trail,
+        );
+        assert_eq!(forward.status, "graph_path");
+        assert_eq!(forward.strategy, "to_target_symbol_forward");
+        assert_eq!(forward.confidence, "high");
+        assert_eq!(forward.graph_path.as_ref().expect("path").mode, "forward");
+
+        let reverse = reverse_graph_path_drill_bridge(
+            project_root,
+            &from,
+            &to,
+            from.chosen_anchor.clone().expect("from"),
+            to.chosen_anchor.clone().expect("to"),
+            &truncated_trail,
+        );
+        assert_eq!(reverse.status, "reverse_graph_path");
+        assert_eq!(reverse.strategy, "to_target_symbol_reverse");
+        assert_eq!(reverse.confidence, "low");
+        assert_eq!(reverse.graph_path.as_ref().expect("path").mode, "reverse");
+
+        let shared_file = fallback_drill_bridge(
+            project_root,
+            &from,
+            &to,
+            from.chosen_anchor.clone().expect("from"),
+            to.chosen_anchor.clone().expect("to"),
+            &complete_trail,
+            vec!["src/lib.rs".to_string()],
+        );
+        assert_eq!(shared_file.status, "shared_file_only");
+        assert_eq!(shared_file.strategy, "to_target_symbol_then_shared_files");
+        assert_eq!(shared_file.confidence, "low");
+
+        let missing = fallback_drill_bridge(
+            project_root,
+            &from,
+            &to,
+            from.chosen_anchor.clone().expect("from"),
+            to.chosen_anchor.clone().expect("to"),
+            &complete_trail,
+            Vec::new(),
+        );
+        assert_eq!(missing.status, "no_bridge_found");
+
+        let error = drill_bridge_error(
+            &from,
+            &to,
+            from.chosen_anchor.clone().expect("from"),
+            to.chosen_anchor.clone().expect("to"),
+            "internal",
+            "failed",
+        );
+        assert_eq!(error.status, "error");
+        assert_eq!(error.strategy, "to_target_symbol_forward");
+        assert!(error.notes[0].contains("internal: failed"));
+        assert!(error.graph_path.is_none());
     }
 
     #[test]
