@@ -200,7 +200,13 @@ fn build_navigation_output(
     }
 
     NavigationOutput {
-        definition: build_search_hit_output(project_root, &target.selected, false, &[]),
+        definition: build_search_hit_output(
+            project_root,
+            &target.selected,
+            Some(&target.requested),
+            false,
+            &[],
+        ),
         incoming_references,
         outgoing_references,
     }
@@ -217,12 +223,20 @@ fn build_explore_search_output(
             .file_filter
             .as_deref()
             .map(crate::display::clean_path_string),
-        selected: build_search_hit_output(project_root, &target.selected, false, &[]),
+        selected: build_search_hit_output(
+            project_root,
+            &target.selected,
+            Some(&target.requested),
+            false,
+            &[],
+        ),
         alternatives: target
             .alternatives
             .iter()
             .skip(1)
-            .map(|hit| build_search_hit_output(project_root, hit, false, &[]))
+            .map(|hit| {
+                build_search_hit_output(project_root, hit, Some(&target.requested), false, &[])
+            })
             .collect(),
     }
 }

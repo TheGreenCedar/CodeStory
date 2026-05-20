@@ -170,6 +170,15 @@ impl GroundingService {
         self.controller.snippet_context(node_id, context)
     }
 
+    pub fn snippet_function_body_context(
+        &self,
+        node_id: NodeId,
+        context: usize,
+    ) -> Result<SnippetContextDto, ApiError> {
+        self.controller
+            .snippet_function_body_context(node_id, context)
+    }
+
     pub fn node_details(&self, req: NodeDetailsRequest) -> Result<NodeDetailsDto, ApiError> {
         self.controller.node_details(req)
     }

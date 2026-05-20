@@ -10,11 +10,12 @@ use codestory_contracts::api::{
     NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
     ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto,
     RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
-    SearchHit, SearchRepoTextMode, SearchRequest, SearchResultsDto, SnippetContextDto,
-    SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto, StoredSemanticDocsContractDto,
-    SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
-    TrailContextDto, TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
-    WorkspaceMemberIndexDto, WriteFileResponse, WriteFileTextRequest,
+    SearchHit, SearchMatchQualityDto, SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest,
+    SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
+    StorageStatsDto, StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto,
+    SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
+    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WorkspaceMemberIndexDto,
+    WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
 use codestory_contracts::graph::{Edge as GraphEdge, Node as GraphNode};
@@ -110,6 +111,123 @@ struct RepoTextScan {
 pub(crate) struct BoundedSnippet {
     pub(crate) markdown: String,
     pub(crate) truncated: bool,
+}
+
+fn exact_symbol_hit_count(query: &str, hits: &[SearchHit]) -> u32 {
+    hits.iter()
+        .filter(|hit| {
+            let rank = symbol_name_match_rank(query, &hit.display_name);
+            rank.exact_display > 0 || rank.exact_terminal > 0 || rank.exact_leading > 0
+        })
+        .count()
+        .min(u32::MAX as usize) as u32
+}
+
+fn search_hit_match_quality(query: &str, hit: &SearchHit) -> SearchMatchQualityDto {
+    if hit.is_text_match() {
+        return SearchMatchQualityDto::RepoText;
+    }
+    let query = query.trim();
+    if query.is_empty() {
+        return SearchMatchQualityDto::SemanticSuggestion;
+    }
+    let query_normalized = normalize_symbol_query(query);
+    let display_normalized = normalize_symbol_query(&hit.display_name);
+    let terminal = terminal_symbol_segment(&hit.display_name);
+    let leading = leading_symbol_segment(&hit.display_name);
+    if hit.display_name == query {
+        return SearchMatchQualityDto::Exact;
+    }
+    if display_normalized == query_normalized
+        || terminal == query_normalized
+        || leading == query_normalized
+    {
+        return SearchMatchQualityDto::NormalizedExact;
+    }
+    if display_normalized.starts_with(&query_normalized)
+        || terminal.starts_with(&query_normalized)
+        || leading.starts_with(&query_normalized)
+    {
+        return SearchMatchQualityDto::Prefix;
+    }
+    if hit
+        .score_breakdown
+        .as_ref()
+        .is_some_and(|breakdown| breakdown.semantic > 0.0 && breakdown.lexical <= f32::EPSILON)
+    {
+        return SearchMatchQualityDto::SemanticSuggestion;
+    }
+    SearchMatchQualityDto::Fuzzy
+}
+
+fn annotate_search_hit_match_quality(query: &str, hits: &mut [SearchHit]) {
+    for hit in hits {
+        hit.match_quality = Some(search_hit_match_quality(query, hit));
+    }
+}
+
+fn weak_search_top_hit(hits: &[SearchHit]) -> bool {
+    hits.first().is_none_or(|hit| hit.score < 0.5)
+}
+
+fn repo_text_auto_fallback_reason(query: &str, indexed_hits: &[SearchHit]) -> Option<String> {
+    if query.trim().is_empty() {
+        return None;
+    }
+    if indexed_hits.is_empty() {
+        return Some("auto fallback: no indexed symbol hits matched the query".to_string());
+    }
+    if exact_symbol_hit_count(query, indexed_hits) == 0 {
+        if query_has_symbol_or_literal_signal(query) {
+            return Some(
+                "auto fallback: query looks like a concrete anchor but no exact indexed symbol matched"
+                    .to_string(),
+            );
+        }
+        if weak_search_top_hit(indexed_hits) {
+            return Some(
+                "auto fallback: top indexed symbol hit was weak and non-exact".to_string(),
+            );
+        }
+    }
+    None
+}
+
+fn search_query_assessment(
+    query: &str,
+    indexed_hits: &[SearchHit],
+    repo_text_hits: &[SearchHit],
+    repo_text_mode: SearchRepoTextMode,
+    repo_text_enabled: bool,
+    repo_text_fallback_reason: Option<String>,
+) -> SearchQueryAssessmentDto {
+    let exact_symbol_hit_count = exact_symbol_hit_count(query, indexed_hits);
+    let weak_top_hit = exact_symbol_hit_count == 0 && weak_search_top_hit(indexed_hits);
+    let stale_or_missing_anchor =
+        exact_symbol_hit_count == 0 && query_has_symbol_or_literal_signal(query);
+    let recommended_next_action = if exact_symbol_hit_count > 0 {
+        Some(
+            "Open the exact indexed hit with symbol, trail, and snippet before answering."
+                .to_string(),
+        )
+    } else if !repo_text_hits.is_empty() {
+        Some(
+            "Use repo-text hits to choose a concrete identifier, then rerun symbol/trail/snippet."
+                .to_string(),
+        )
+    } else if repo_text_mode == SearchRepoTextMode::Off || !repo_text_enabled {
+        Some("Rerun search with --repo-text on or a shorter concrete symbol.".to_string())
+    } else {
+        Some("Try a shorter symbol, file name, or literal from ground output.".to_string())
+    };
+
+    SearchQueryAssessmentDto {
+        exact_symbol_hit_count,
+        weak_top_hit,
+        stale_or_missing_anchor,
+        repo_text_fallback_reason,
+        recommended_next_action,
+    }
 }
 
 #[derive(Clone)]
@@ -518,6 +636,51 @@ fn bounded_markdown_snippet_from_path(
     let start = focus.saturating_sub(context).max(1);
     let end = focus.saturating_add(context);
     let mut line_no = 0usize;
+    let mut line = String::new();
+    let mut out = String::from("```text\n");
+    let mut truncated = false;
+
+    loop {
+        let (read, line_truncated) = read_line_capped(&mut reader, &mut line, max_bytes)?;
+        if read == 0 {
+            break;
+        }
+        line_no = line_no.saturating_add(1);
+        if line_no > end {
+            break;
+        }
+        if line_no >= start {
+            truncated |= line_truncated;
+            let marker = if line_no == focus { ">" } else { " " };
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            let _ = writeln!(out, "{marker}{line_no:>5} | {trimmed}");
+        }
+    }
+
+    Ok(finish_bounded_file_snippet(
+        out,
+        truncated,
+        max_bytes,
+        truncation_suffix,
+    ))
+}
+
+fn bounded_markdown_snippet_range_from_path(
+    path: &Path,
+    focus_line: u32,
+    start_line: u32,
+    end_line: u32,
+    context: usize,
+    max_bytes: usize,
+    truncation_suffix: &str,
+) -> io::Result<BoundedSnippet> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = io::BufReader::new(file);
+    let context = context.min(DIRECT_SNIPPET_CONTEXT_LINE_CAP) as u32;
+    let focus = focus_line.max(1);
+    let start = start_line.saturating_sub(context).max(1);
+    let end = end_line.max(start_line).saturating_add(context);
+    let mut line_no = 0u32;
     let mut line = String::new();
     let mut out = String::from("```text\n");
     let mut truncated = false;
@@ -2859,14 +3022,22 @@ impl AppController {
             line,
             score,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
             resolvable: true,
             score_breakdown: None,
         })
     }
 
-    fn repo_text_enabled_for_mode(mode: SearchRepoTextMode, query: &str) -> bool {
+    fn repo_text_enabled_for_mode(
+        mode: SearchRepoTextMode,
+        query: &str,
+        indexed_hits: &[SearchHit],
+    ) -> bool {
         match mode {
-            SearchRepoTextMode::Auto => looks_like_repo_text_query(query),
+            SearchRepoTextMode::Auto => {
+                looks_like_repo_text_query(query)
+                    || repo_text_auto_fallback_reason(query, indexed_hits).is_some()
+            }
             SearchRepoTextMode::On => true,
             SearchRepoTextMode::Off => false,
         }
@@ -2907,7 +3078,7 @@ impl AppController {
             .get_files_ordered_limit(REPO_TEXT_SCAN_FILE_CAP.saturating_add(1))
             .map_err(|e| ApiError::internal(format!("Failed to load files for text search: {e}")))?
         {
-            if Self::repo_text_scan_should_stop(&mut stats, hits.len(), limit, &started_at) {
+            if Self::repo_text_scan_should_stop(&mut stats, &started_at) {
                 break;
             }
 
@@ -2952,7 +3123,14 @@ impl AppController {
 
             let display_name =
                 Self::repo_text_display_name(project_root, &file.path, path_string.as_str());
-            let score = Self::repo_text_score(&contents, &normalized_query, hits.len());
+            let score = Self::repo_text_score(
+                &contents,
+                &path_string,
+                &normalized_query,
+                &terms,
+                line,
+                hits.len(),
+            );
             hits.push(Self::repo_text_search_hit(
                 node_id,
                 display_name,
@@ -2970,15 +3148,7 @@ impl AppController {
         Ok(RepoTextScan { hits, stats })
     }
 
-    fn repo_text_scan_should_stop(
-        stats: &mut RepoTextScanStatsDto,
-        hits_len: usize,
-        limit: usize,
-        started_at: &Instant,
-    ) -> bool {
-        if hits_len >= limit {
-            return true;
-        }
+    fn repo_text_scan_should_stop(stats: &mut RepoTextScanStatsDto, started_at: &Instant) -> bool {
         if (stats.scanned_file_count as usize) >= REPO_TEXT_SCAN_FILE_CAP {
             Self::mark_repo_text_scan_truncated(
                 stats,
@@ -3018,11 +3188,47 @@ impl AppController {
             .unwrap_or_else(|| fallback.to_string())
     }
 
-    fn repo_text_score(contents: &str, normalized_query: &str, hit_index: usize) -> f32 {
-        let exact_match = !normalized_query.is_empty()
-            && contents.to_ascii_lowercase().contains(normalized_query);
-        let base_score = if exact_match { 260.0 } else { 150.0 };
-        base_score - hit_index as f32
+    fn repo_text_score(
+        contents: &str,
+        path: &str,
+        normalized_query: &str,
+        terms: &[String],
+        line: u32,
+        hit_index: usize,
+    ) -> f32 {
+        let normalized_contents = contents.to_ascii_lowercase();
+        let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+        let line_text = contents
+            .lines()
+            .nth(line.saturating_sub(1) as usize)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let exact_line_match = !normalized_query.is_empty() && line_text.contains(normalized_query);
+        let exact_file_match =
+            !normalized_query.is_empty() && normalized_contents.contains(normalized_query);
+        let path_term_hits = terms
+            .iter()
+            .filter(|term| normalized_path.contains(term.as_str()))
+            .count() as f32;
+        let line_term_hits = terms
+            .iter()
+            .filter(|term| line_text.contains(term.as_str()))
+            .count() as f32;
+        let file_term_hits = terms
+            .iter()
+            .filter(|term| normalized_contents.contains(term.as_str()))
+            .count() as f32;
+
+        let mut score = 100.0;
+        if exact_line_match {
+            score += 220.0;
+        } else if exact_file_match {
+            score += 140.0;
+        }
+        score += path_term_hits * 35.0;
+        score += line_term_hits * 28.0;
+        score += file_term_hits * 6.0;
+        score - (hit_index as f32 * 0.01)
     }
 
     fn repo_text_search_hit(
@@ -3040,6 +3246,7 @@ impl AppController {
             line: Some(line),
             score,
             origin: codestory_contracts::api::SearchHitOrigin::TextMatch,
+            match_quality: Some(SearchMatchQualityDto::RepoText),
             resolvable: false,
             score_breakdown: None,
         }
@@ -3599,13 +3806,19 @@ impl AppController {
             }
         }
 
-        let repo_text_enabled = Self::repo_text_enabled_for_mode(repo_text_mode, &query)
-            && !used_repo_explanation_overview;
+        let repo_text_fallback_reason = if repo_text_mode == SearchRepoTextMode::Auto {
+            repo_text_auto_fallback_reason(&query, &indexed_symbol_hits)
+        } else {
+            None
+        };
+        let repo_text_enabled =
+            Self::repo_text_enabled_for_mode(repo_text_mode, &query, &indexed_symbol_hits)
+                && !used_repo_explanation_overview;
         let indexed_hit_ids = indexed_symbol_hits
             .iter()
             .map(|hit| hit.node_id.clone())
             .collect::<HashSet<_>>();
-        let (repo_text_hits, repo_text_stats) = if repo_text_enabled {
+        let (mut repo_text_hits, repo_text_stats) = if repo_text_enabled {
             let scan = Self::collect_repo_text_hits(
                 &storage,
                 self.require_project_root().ok().as_deref(),
@@ -3617,10 +3830,21 @@ impl AppController {
         } else {
             (Vec::new(), None)
         };
+        annotate_search_hit_match_quality(&query, &mut suggestions);
+        annotate_search_hit_match_quality(&query, &mut indexed_symbol_hits);
+        annotate_search_hit_match_quality(&query, &mut repo_text_hits);
         let mut hits = Vec::with_capacity(indexed_symbol_hits.len() + repo_text_hits.len());
         hits.extend(indexed_symbol_hits.iter().cloned());
         hits.extend(repo_text_hits.iter().cloned());
         let freshness = self.index_freshness().ok();
+        let query_assessment = search_query_assessment(
+            &query,
+            &indexed_symbol_hits,
+            &repo_text_hits,
+            repo_text_mode,
+            repo_text_enabled,
+            repo_text_fallback_reason,
+        );
 
         Ok(SearchResultsDto {
             query,
@@ -3629,6 +3853,7 @@ impl AppController {
             limit_per_source: limit_per_source as u32,
             repo_text_mode,
             repo_text_enabled,
+            query_assessment: Some(query_assessment),
             repo_text_stats,
             suggestions,
             indexed_symbol_hits,
@@ -4293,6 +4518,33 @@ impl AppController {
         let snippet = bounded_markdown_snippet_from_path(
             &candidate,
             line,
+            context_lines,
+            max_bytes,
+            truncation_suffix,
+        )
+        .map_err(|e| {
+            ApiError::internal(format!("Failed to read file {}: {e}", candidate.display()))
+        })?;
+
+        Ok((candidate.to_string_lossy().to_string(), snippet))
+    }
+
+    pub(crate) fn bounded_file_snippet_range(
+        &self,
+        path: &str,
+        focus_line: u32,
+        start_line: u32,
+        end_line: u32,
+        context_lines: usize,
+        max_bytes: usize,
+        truncation_suffix: &str,
+    ) -> Result<(String, BoundedSnippet), ApiError> {
+        let candidate = self.resolve_project_file_path(path, false)?;
+        let snippet = bounded_markdown_snippet_range_from_path(
+            &candidate,
+            focus_line,
+            start_line,
+            end_line,
             context_lines,
             max_bytes,
             truncation_suffix,
@@ -5545,6 +5797,7 @@ fn build_llm_symbol_doc_text() -> String {
             line: None,
             score: 184.0,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
             resolvable: true,
             score_breakdown: None,
         };
@@ -5556,6 +5809,7 @@ fn build_llm_symbol_doc_text() -> String {
             line: None,
             score: 184.0,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
             resolvable: true,
             score_breakdown: None,
         };
@@ -6188,6 +6442,151 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn repo_text_auto_fallback_runs_for_missing_concrete_anchor() {
+        let temp = tempdir().expect("temp dir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(storage_path.parent().expect("db parent")).expect("create db dir");
+        let source_path = temp.path().join("src").join("lib.rs");
+        let readme_path = temp.path().join("README.md");
+        std::fs::create_dir_all(source_path.parent().expect("src parent")).expect("create src");
+        std::fs::write(&source_path, "pub fn unrelated_anchor() {}\n").expect("write source");
+        std::fs::write(
+            &readme_path,
+            "GlobalResourceListView is a retired frontend surface mentioned in notes.\n",
+        )
+        .expect("write readme");
+
+        {
+            let mut storage = Storage::open(&storage_path).expect("open storage");
+            storage
+                .insert_file(&FileInfo {
+                    id: 11,
+                    path: source_path.clone(),
+                    language: "rust".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                })
+                .expect("insert source file");
+            storage
+                .insert_file(&FileInfo {
+                    id: 12,
+                    path: readme_path,
+                    language: "markdown".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                })
+                .expect("insert readme file");
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(11),
+                        kind: NodeKind::FILE,
+                        serialized_name: source_path.to_string_lossy().to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(101),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "unrelated_anchor".to_string(),
+                        file_node_id: Some(CoreNodeId(11)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert nodes");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
+            .expect("open project");
+
+        let results = controller
+            .search_results(SearchRequest {
+                query: "GlobalResourceListView".to_string(),
+                repo_text: SearchRepoTextMode::Auto,
+                limit_per_source: 5,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            })
+            .expect("search results");
+
+        assert!(results.repo_text_enabled);
+        assert!(!results.repo_text_hits.is_empty());
+        let assessment = results.query_assessment.expect("query assessment");
+        assert_eq!(assessment.exact_symbol_hit_count, 0);
+        assert!(assessment.stale_or_missing_anchor);
+        assert!(
+            assessment
+                .repo_text_fallback_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no indexed symbol")
+                    || reason.contains("no exact indexed symbol"))
+        );
+    }
+
+    #[test]
+    fn repo_text_ranking_uses_path_and_query_tokens_for_svelte_surfaces() {
+        let temp = tempdir().expect("temp dir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(storage_path.parent().expect("db parent")).expect("create db dir");
+        let rust_path = temp.path().join("src").join("commands.rs");
+        let svelte_path = temp.path().join("src").join("App.svelte");
+        std::fs::create_dir_all(rust_path.parent().expect("src parent")).expect("create src");
+        std::fs::write(
+            &rust_path,
+            "pub fn get_snapshot() {}\n// invoke runtime bridge\n",
+        )
+        .expect("write rust");
+        std::fs::write(
+            &svelte_path,
+            "const readSnapshot = () => invoke('get_snapshot');\n",
+        )
+        .expect("write svelte");
+
+        {
+            let storage = Storage::open(&storage_path).expect("open storage");
+            for (id, path, language) in
+                [(11, rust_path, "rust"), (12, svelte_path.clone(), "svelte")]
+            {
+                storage
+                    .insert_file(&FileInfo {
+                        id,
+                        path,
+                        language: language.to_string(),
+                        modification_time: 1,
+                        indexed: true,
+                        complete: true,
+                        line_count: 1,
+                    })
+                    .expect("insert file");
+            }
+        }
+
+        let storage = Storage::open(&storage_path).expect("reopen storage");
+        let scan = AppController::collect_repo_text_hits(
+            &storage,
+            Some(temp.path()),
+            "readSnapshot get_snapshot App.svelte invoke",
+            5,
+            &HashSet::new(),
+        )
+        .expect("repo text scan");
+
+        assert!(
+            scan.hits
+                .first()
+                .is_some_and(|hit| hit.display_name.ends_with("App.svelte")),
+            "Svelte command surface should rank first: {:#?}",
+            scan.hits
+        );
+    }
+
+    #[test]
     fn repo_text_scan_reports_file_cap_on_large_low_match_fixture() {
         let temp = tempdir().expect("temp dir");
         let storage_path = temp.path().join("cache").join("codestory.db");
@@ -6445,6 +6844,7 @@ fn build_llm_symbol_doc_text() -> String {
                 line: Some(10),
                 score: 0.25,
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
             },
@@ -6456,6 +6856,7 @@ fn build_llm_symbol_doc_text() -> String {
                 line: Some(20),
                 score: 0.75,
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
             },
@@ -6471,6 +6872,7 @@ fn build_llm_symbol_doc_text() -> String {
                 line: Some(10),
                 score: 250.0,
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
             }],
@@ -6493,6 +6895,7 @@ fn build_llm_symbol_doc_text() -> String {
                 line: Some(178),
                 score: 0.90,
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
             },
@@ -6504,6 +6907,7 @@ fn build_llm_symbol_doc_text() -> String {
                 line: Some(187),
                 score: 0.80,
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
             },
@@ -6515,6 +6919,7 @@ fn build_llm_symbol_doc_text() -> String {
                 line: Some(194),
                 score: 0.70,
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
             },
@@ -6548,6 +6953,7 @@ fn build_llm_symbol_doc_text() -> String {
                 line: Some(178),
                 score: 0.90,
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
             },
@@ -6559,6 +6965,7 @@ fn build_llm_symbol_doc_text() -> String {
                 line: Some(187),
                 score: 0.80,
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
             },

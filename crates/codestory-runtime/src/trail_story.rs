@@ -2,7 +2,7 @@ use codestory_contracts::api::{
     EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse, NodeDetailsDto, NodeId, NodeKind,
     TrailCallerScope, TrailConfigDto, TrailDirection, TrailMode, TrailStoryDto, TrailStoryStepDto,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 const TRAIL_STORY_CORE_FLOW_LIMIT: usize = 16;
@@ -45,11 +45,14 @@ pub(crate) fn build_trail_story(
         entry_points.push("no graph entry edges were returned for this focus".to_string());
     }
 
-    let core_flow = trail
-        .edges
+    let grouped = grouped_story_steps(project_root, trail, req, &nodes_by_id);
+    let core_flow = grouped
+        .runtime_flow
         .iter()
+        .chain(grouped.data_flow.iter())
+        .chain(grouped.type_structure.iter())
         .take(TRAIL_STORY_CORE_FLOW_LIMIT)
-        .map(|edge| story_step(project_root, edge, &nodes_by_id))
+        .cloned()
         .collect::<Vec<_>>();
     let side_effects = side_effects_for_story(project_root, trail, &nodes_by_id);
     let uncertainty = uncertainty_for_story(project_root, trail, &nodes_by_id, req);
@@ -79,11 +82,129 @@ pub(crate) fn build_trail_story(
         summary,
         entry_points,
         core_flow,
+        runtime_flow: grouped.runtime_flow,
+        data_flow: grouped.data_flow,
+        type_structure: grouped.type_structure,
+        utility_calls: grouped.utility_calls,
         side_effects,
         uncertainty,
         test_scope,
         limits,
     }
+}
+
+#[derive(Default)]
+struct GroupedStorySteps {
+    runtime_flow: Vec<TrailStoryStepDto>,
+    data_flow: Vec<TrailStoryStepDto>,
+    type_structure: Vec<TrailStoryStepDto>,
+    utility_calls: Vec<TrailStoryStepDto>,
+}
+
+fn grouped_story_steps(
+    project_root: Option<&Path>,
+    trail: &GraphResponse,
+    req: &TrailConfigDto,
+    nodes_by_id: &HashMap<NodeId, &GraphNodeDto>,
+) -> GroupedStorySteps {
+    let mut grouped = GroupedStorySteps::default();
+    let mut seen = HashSet::new();
+    for edge in &trail.edges {
+        let target = nodes_by_id.get(&edge.target).copied();
+        let step = story_step(project_root, edge, nodes_by_id);
+        let key = format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            step.source, step.relation, step.target, step.certainty
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        if edge_is_utility_call(edge, target) {
+            if req.show_utility_calls {
+                grouped.utility_calls.push(step);
+            }
+            continue;
+        }
+        match story_edge_group(edge.kind) {
+            StoryEdgeGroup::Runtime => grouped.runtime_flow.push(step),
+            StoryEdgeGroup::Data => grouped.data_flow.push(step),
+            StoryEdgeGroup::TypeStructure => grouped.type_structure.push(step),
+        }
+    }
+    grouped.runtime_flow.truncate(TRAIL_STORY_CORE_FLOW_LIMIT);
+    grouped.data_flow.truncate(TRAIL_STORY_CORE_FLOW_LIMIT);
+    grouped.type_structure.truncate(TRAIL_STORY_CORE_FLOW_LIMIT);
+    grouped.utility_calls.truncate(TRAIL_STORY_PREVIEW_LIMIT);
+    grouped
+}
+
+enum StoryEdgeGroup {
+    Runtime,
+    Data,
+    TypeStructure,
+}
+
+fn story_edge_group(kind: EdgeKind) -> StoryEdgeGroup {
+    match kind {
+        EdgeKind::CALL | EdgeKind::MACRO_USAGE => StoryEdgeGroup::Runtime,
+        EdgeKind::USAGE | EdgeKind::INCLUDE | EdgeKind::IMPORT | EdgeKind::ANNOTATION_USAGE => {
+            StoryEdgeGroup::Data
+        }
+        EdgeKind::TYPE_USAGE
+        | EdgeKind::MEMBER
+        | EdgeKind::INHERITANCE
+        | EdgeKind::OVERRIDE
+        | EdgeKind::TYPE_ARGUMENT
+        | EdgeKind::TEMPLATE_SPECIALIZATION
+        | EdgeKind::UNKNOWN => StoryEdgeGroup::TypeStructure,
+    }
+}
+
+fn edge_is_utility_call(edge: &GraphEdgeDto, target: Option<&GraphNodeDto>) -> bool {
+    if edge.kind != EdgeKind::CALL {
+        return false;
+    }
+    let Some(target) = target else {
+        return false;
+    };
+    let normalized_label = target.label.to_ascii_lowercase();
+    if normalized_label
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .any(|segment| {
+            matches!(
+                segment,
+                "map_err" | "unwrap_or" | "unwrap_or_else" | "to_string" | "as_ref" | "as_mut"
+            )
+        })
+    {
+        return true;
+    }
+    let tokens = story_identifier_tokens(&target.label);
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "ok" | "err"
+                | "some"
+                | "none"
+                | "clone"
+                | "cloned"
+                | "copy"
+                | "copied"
+                | "from"
+                | "into"
+                | "map"
+                | "map_err"
+                | "unwrap"
+                | "unwrap_or"
+                | "unwrap_or_else"
+                | "to_string"
+                | "as_ref"
+                | "as_mut"
+                | "lock"
+                | "borrow"
+                | "default"
+        )
+    })
 }
 
 fn story_step(
@@ -230,12 +351,20 @@ fn side_effects_for_story(
     nodes_by_id: &HashMap<NodeId, &GraphNodeDto>,
 ) -> Vec<String> {
     let mut side_effects = Vec::new();
+    let mut seen = HashSet::new();
     for edge in &trail.edges {
         let target = nodes_by_id.get(&edge.target).copied();
         if !edge_suggests_side_effect(edge, target) {
             continue;
         }
         let step = story_step(project_root, edge, nodes_by_id);
+        let key = format!(
+            "{}\u{1f}{}\u{1f}{}",
+            step.source, step.relation, step.target
+        );
+        if !seen.insert(key) {
+            continue;
+        }
         side_effects.push(format!(
             "possible side-effect candidate [{}] {} {} {} (certainty={})",
             step.edge_id, step.source, step.relation, step.target, step.certainty
@@ -668,6 +797,57 @@ mod trail_story_tests {
                 .iter()
                 .all(|item| !item.contains("catalog_entries")),
             "catalog substring should not be treated as a side effect: {story:#?}"
+        );
+    }
+
+    #[test]
+    fn trail_story_utility_calls_are_suppressed_from_machine_output_by_default() {
+        let focus = focus_details();
+        let trail = GraphResponse {
+            center_id: NodeId("focus".to_string()),
+            nodes: vec![
+                node("focus", "handle_request", "C:/repo/src/request.rs"),
+                node("utility", "to_string", "C:/repo/src/request.rs"),
+                node("business", "load_profile", "C:/repo/src/profile.rs"),
+            ],
+            edges: vec![
+                edge(1, "focus", "utility", Some("certain")),
+                edge(2, "focus", "business", Some("certain")),
+            ],
+            truncated: false,
+            omitted_edge_count: 0,
+            canonical_layout: None,
+        };
+
+        let hidden = build_trail_story(None, &focus, &trail, &request(true));
+        assert!(
+            hidden.utility_calls.is_empty(),
+            "default JSON story should not leak hidden utility calls: {hidden:#?}"
+        );
+        assert!(
+            hidden
+                .runtime_flow
+                .iter()
+                .all(|step| !step.target.contains("to_string")),
+            "default runtime flow should suppress utility calls: {hidden:#?}"
+        );
+
+        let mut visible_req = request(true);
+        visible_req.show_utility_calls = true;
+        let visible = build_trail_story(None, &focus, &trail, &visible_req);
+        assert!(
+            visible
+                .utility_calls
+                .iter()
+                .any(|step| step.target.contains("to_string")),
+            "explicit utility output should retain utility calls: {visible:#?}"
+        );
+        assert!(
+            visible
+                .runtime_flow
+                .iter()
+                .all(|step| !step.target.contains("to_string")),
+            "utility calls should stay in the utility group, not duplicate runtime flow: {visible:#?}"
         );
     }
 }

@@ -131,6 +131,19 @@ fn search_json_emits_search_results_dto_after_repo_text_merge() {
         "search json should expose hybrid score breakdowns for indexed hits"
     );
     assert!(
+        json["indexed_symbol_hits"][0]["match_quality"].is_string(),
+        "search json should classify hit match quality"
+    );
+    assert_eq!(
+        json["query_assessment"]["exact_symbol_hit_count"].as_u64(),
+        Some(0),
+        "natural-language query should not be overstated as an exact symbol hit"
+    );
+    assert!(
+        json["query_assessment"]["recommended_next_action"].is_string(),
+        "search json should include a deterministic next-action assessment"
+    );
+    assert!(
         json["indexed_symbol_hits"][0]["why"].is_array(),
         "search --why json should carry compact explanation strings"
     );

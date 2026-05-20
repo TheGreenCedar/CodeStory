@@ -488,6 +488,41 @@ fn ambiguous_symbol_json_includes_numbered_alternatives_with_stable_refs() {
 }
 
 #[test]
+fn ambiguous_query_writes_output_file_even_on_failure() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_ambiguous_rust_workspace(workspace.path());
+    index_workspace(workspace.path(), cache_dir.path());
+    let output_file = cache_dir.path().join("ambiguous-snippet.md");
+
+    let output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "snippet",
+            "--query",
+            "configure",
+            "--refresh",
+            "none",
+            "--output-file",
+            output_file.to_str().expect("utf-8 temp path"),
+        ],
+    );
+
+    assert!(
+        !output.status.success(),
+        "ambiguous snippet should still fail after writing diagnostics"
+    );
+    let diagnostic = fs::read_to_string(&output_file).expect("read ambiguity output file");
+    assert!(diagnostic.contains("# Command Error"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("code: ambiguous_target"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("alternatives:"), "{diagnostic}");
+}
+
+#[test]
 fn choose_flag_resolves_by_displayed_alternative_number_when_available() {
     let help = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
         .args(["symbol", "--help"])

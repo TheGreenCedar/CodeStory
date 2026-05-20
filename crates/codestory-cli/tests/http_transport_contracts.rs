@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -495,6 +495,19 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
     assert_eq!(search["query"], "AppController");
     assert_eq!(search["limit_per_source"], 10);
     assert_nonempty_array(&search, "/indexed_symbol_hits");
+    let app_controller_hit = search
+        .pointer("/indexed_symbol_hits")
+        .and_then(Value::as_array)
+        .and_then(|hits| {
+            hits.iter()
+                .find(|hit| hit["display_name"] == "AppController")
+        })
+        .unwrap_or_else(|| panic!("missing AppController hit in /search: {search}"));
+    assert_eq!(
+        app_controller_hit["match_quality"],
+        json!("exact"),
+        "HTTP /search should include match_quality on raw SearchResultsDto hits: {app_controller_hit}"
+    );
 
     let definition = get_json(&addr, "/definition?q=AppController");
     assert_eq!(

@@ -90,6 +90,17 @@ impl SearchHitOrigin {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum SearchMatchQualityDto {
+    Exact,
+    NormalizedExact,
+    Prefix,
+    Fuzzy,
+    SemanticSuggestion,
+    RepoText,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum RetrievalModeDto {
     Hybrid,
     Symbolic,
@@ -207,6 +218,8 @@ pub struct SearchHit {
     pub line: Option<u32>,
     pub score: f32,
     pub origin: SearchHitOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_quality: Option<SearchMatchQualityDto>,
     pub resolvable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score_breakdown: Option<RetrievalScoreBreakdownDto>,
@@ -235,6 +248,17 @@ pub struct RepoTextScanStatsDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SearchQueryAssessmentDto {
+    pub exact_symbol_hit_count: u32,
+    pub weak_top_hit: bool,
+    pub stale_or_missing_anchor: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_text_fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_next_action: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchResultsDto {
     pub query: String,
     pub retrieval: RetrievalStateDto,
@@ -243,6 +267,8 @@ pub struct SearchResultsDto {
     pub limit_per_source: u32,
     pub repo_text_mode: SearchRepoTextMode,
     pub repo_text_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_assessment: Option<SearchQueryAssessmentDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_text_stats: Option<RepoTextScanStatsDto>,
     #[serde(default)]
@@ -538,6 +564,14 @@ pub struct TrailStoryDto {
     pub summary: String,
     pub entry_points: Vec<String>,
     pub core_flow: Vec<TrailStoryStepDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_flow: Vec<TrailStoryStepDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_flow: Vec<TrailStoryStepDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_structure: Vec<TrailStoryStepDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub utility_calls: Vec<TrailStoryStepDto>,
     pub side_effects: Vec<String>,
     pub uncertainty: Vec<String>,
     pub test_scope: Vec<String>,
@@ -621,12 +655,22 @@ pub struct ReadFileTextResponse {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SnippetScopeDto {
+    #[default]
+    LineContext,
+    FunctionBody,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SnippetContextDto {
     pub node: NodeDetailsDto,
     pub path: String,
     pub line: u32,
     pub snippet: String,
+    #[serde(default)]
+    pub scope: SnippetScopeDto,
     #[serde(default)]
     pub requested_context: u32,
     #[serde(default)]

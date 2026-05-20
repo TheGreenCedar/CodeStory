@@ -16,7 +16,7 @@ target/release/codestory-cli(.exe) search [OPTIONS]
 | `--cache-dir` | path | *auto* | Override the cache directory |
 | `--query` | string | **required** | Search term — symbol name or natural-language text |
 | `--limit` | integer | `10` | Maximum results per provenance group, capped at 50 |
-| `--repo-text` | enum | `auto` | Repo text scanning: `auto`, `on`, or `off` |
+| `--repo-text` | enum | `auto` | Repo text scanning: `auto`, `on`, or `off`. `auto` also scans repo text when indexed hits are weak or no exact concrete anchor matched |
 | `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
 | `--format` | enum | `markdown` | Output format: `markdown` or `json` |
 | `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
@@ -28,6 +28,7 @@ target/release/codestory-cli(.exe) search [OPTIONS]
 
 - **Symbol-like queries** (e.g. `AppController`, `run_indexing`) search the indexed symbol table.
 - **Natural-language queries** (e.g. `"how does incremental indexing work"`) also perform a repo-wide text scan and merge results by score.
+- **Concrete anchors with weak indexed results** also trigger repo text in `auto` mode. This prevents stale names such as retired UI components from looking like valid direct symbol hits.
 - When hybrid retrieval finds strong semantic matches but no lexical match, Markdown and JSON output include `did_you_mean` suggestions.
 - **Hybrid weight overrides** are intended for benchmarking and tuning. Omit all three `--hybrid-*` flags for production-like runtime defaults.
 
@@ -42,9 +43,13 @@ hits: 3
 - [ghi789] app_controller [MODULE] `src/app/mod.rs`:1 score=0.60
 ```
 
-Each hit includes: node ID, display name, kind, file path, line number, and relevance score.
+Each hit includes: node ID, display name, kind, file path, line number, relevance score, provenance, and `match_quality` (`exact`, `normalized_exact`, `prefix`, `fuzzy`, `semantic_suggestion`, or `repo_text`).
+
+Search output also includes `query_assessment` with exact symbol hit count, weak-hit/stale-anchor flags, any repo-text fallback reason, and a recommended next action. Use it to avoid treating weak semantic suggestions as proof of an exact anchor.
 
 When a name appears more than once, prefer typed symbol hits such as `[function]`, `[struct]`, `[field]`, or `[file]` over `[unknown]` hits when you are verifying symbol surfacing. `[unknown]` results are often usage-like callsite or reference nodes, not the canonical definition.
+
+Repo-text hits from text-only surfaces such as `.svelte` files are evidence, not graph anchors. Use the excerpt to choose a symbol or open a snippet/source file for verification.
 
 ## Examples
 

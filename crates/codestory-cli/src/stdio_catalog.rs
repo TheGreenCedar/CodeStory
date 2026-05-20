@@ -487,6 +487,10 @@ static SEARCH_HIT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("line", "One-based line number.").nullable(),
         SchemaProperty::number("score", "Ranking score."),
         SchemaProperty::string("origin", "Hit source.").with_enum(TEXT_HIT_ORIGINS),
+        SchemaProperty::string(
+            "match_quality",
+            "How exactly the hit matched the query: exact, normalized_exact, prefix, fuzzy, semantic_suggestion, or repo_text.",
+        ),
         SchemaProperty::boolean(
             "resolvable",
             "Whether the hit can be used as a symbol target.",
@@ -504,6 +508,7 @@ static SEARCH_HIT_SCHEMA: SchemaObject = SchemaObject::object(
         "kind",
         "score",
         "origin",
+        "match_quality",
         "resolvable",
     ],
 );
@@ -529,6 +534,11 @@ static SEARCH_RESULTS_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string("repo_text_mode", "Repo text search mode.")
             .with_enum(SEARCH_REPO_TEXT_MODES),
         SchemaProperty::boolean("repo_text_enabled", "Whether repo text search was enabled."),
+        SchemaProperty::object(
+            "query_assessment",
+            "Exactness, weak-hit, repo-text fallback, and next-action assessment.",
+        )
+        .nullable(),
         SchemaProperty::object(
             "repo_text_stats",
             "Repo text scan cap, byte, and truncation telemetry.",

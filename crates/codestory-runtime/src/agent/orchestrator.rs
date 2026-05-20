@@ -1024,6 +1024,7 @@ fn search_hit_from_grounding_symbol(
         line: symbol.line.or(line),
         score: 0.55,
         origin: SearchHitOrigin::IndexedSymbol,
+        match_quality: None,
         resolvable: true,
         score_breakdown: Some(RetrievalScoreBreakdownDto {
             lexical: 0.35,
@@ -1851,6 +1852,7 @@ mod tests {
             line: None,
             score,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
             resolvable: true,
             score_breakdown: None,
         }
@@ -2041,6 +2043,7 @@ mod tests {
             line: None,
             score: 10.0,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
             resolvable: true,
             score_breakdown: None,
         }];
@@ -2056,6 +2059,7 @@ mod tests {
                     line: None,
                     score: 42.0,
                     origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                    match_quality: None,
                     resolvable: true,
                     score_breakdown: None,
                 },
@@ -2067,6 +2071,7 @@ mod tests {
                     line: None,
                     score: 18.0,
                     origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                    match_quality: None,
                     resolvable: true,
                     score_breakdown: None,
                 },

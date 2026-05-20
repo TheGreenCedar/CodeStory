@@ -412,6 +412,7 @@ fn handle_stdio_definition(
                     let mut definition = serde_json::to_value(build_search_hit_output(
                         &runtime.project_root,
                         &target.selected,
+                        Some(&target.requested),
                         false,
                         &[],
                     ))

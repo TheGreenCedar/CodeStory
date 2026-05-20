@@ -560,6 +560,7 @@ fn search_hit_from_grounding_recommendation(candidate: &RecommendationCandidate<
         line: candidate.symbol.line,
         score: 1.0,
         origin: SearchHitOrigin::IndexedSymbol,
+        match_quality: None,
         resolvable: true,
         score_breakdown: Some(RetrievalScoreBreakdownDto {
             lexical: 0.45,
@@ -974,6 +975,45 @@ impl AppController {
             path,
             line,
             snippet: bounded.markdown,
+            scope: codestory_contracts::api::SnippetScopeDto::LineContext,
+            requested_context: context_lines as u32,
+            snippet_truncated: bounded.truncated,
+            max_snippet_bytes: Some(crate::DIRECT_SNIPPET_MAX_BYTES as u32),
+        })
+    }
+
+    pub fn snippet_function_body_context(
+        &self,
+        node_id: NodeId,
+        context_lines: usize,
+    ) -> Result<SnippetContextDto, ApiError> {
+        let node = self.node_details(NodeDetailsRequest { id: node_id })?;
+        let path = node
+            .file_path
+            .clone()
+            .ok_or_else(|| ApiError::invalid_argument("Symbol has no source file."))?;
+        let line = node
+            .start_line
+            .ok_or_else(|| ApiError::invalid_argument("Symbol has no source line."))?;
+        let Some(end_line) = node.end_line.filter(|end| *end >= line) else {
+            return self.snippet_context(node.id.clone(), context_lines);
+        };
+        let (path, bounded) = self.bounded_file_snippet_range(
+            &path,
+            line,
+            line,
+            end_line,
+            context_lines,
+            crate::DIRECT_SNIPPET_MAX_BYTES,
+            crate::DIRECT_SNIPPET_TRUNCATION_SUFFIX,
+        )?;
+
+        Ok(SnippetContextDto {
+            node,
+            path,
+            line,
+            snippet: bounded.markdown,
+            scope: codestory_contracts::api::SnippetScopeDto::FunctionBody,
             requested_context: context_lines as u32,
             snippet_truncated: bounded.truncated,
             max_snippet_bytes: Some(crate::DIRECT_SNIPPET_MAX_BYTES as u32),

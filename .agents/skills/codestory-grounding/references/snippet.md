@@ -20,13 +20,16 @@ target/release/codestory-cli(.exe) snippet [OPTIONS]
 | `--query` | string | — | Symbol name to resolve (conflicts with `--id`) |
 | `--file` | string | — | Limit `--query` resolution to paths containing this fragment |
 | `--context` | integer | `4` | Number of surrounding context lines above and below the symbol. Alias: `--lines` |
+| `--function-body` | flag | `false` | Prefer the selected function/method implementation body when source ranges are available |
 | `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
 | `--format` | enum | `markdown` | Output format: `markdown` or `json` |
 | `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
 
 ## Output
 
-Markdown output includes `context: requested_lines=<n> max_snippet_bytes=<bytes>`. JSON includes the same `requested_context`, `snippet_truncated`, and `max_snippet_bytes` fields. If `snippet_truncated` is true, the byte cap stopped the output; raising `--context` alone may not reveal more code.
+Markdown output includes `context: scope=<line_context|function_body> requested_lines=<n> max_snippet_bytes=<bytes>`. JSON includes the same `scope`, `requested_context`, `snippet_truncated`, and `max_snippet_bytes` fields. If `snippet_truncated` is true, the byte cap stopped the output; raising `--context` alone may not reveal more code.
+
+When `--function-body` is set, snippet prefers an implementation/body-looking function or method hit over a declaration-looking hit when possible. If source ranges are unavailable, it falls back to normal line context.
 
 ```
 # Snippet
@@ -60,6 +63,9 @@ target/release/codestory-cli(.exe) snippet --project . --query run_indexing --co
 
 # Agent-friendly alias for the same context setting
 target/release/codestory-cli(.exe) snippet --project . --query run_indexing --lines 40
+
+# Prefer the full implementation body when available
+target/release/codestory-cli(.exe) snippet --project . --query run_indexing --function-body --lines 8
 
 # Disambiguate by file and write stable Markdown
 target/release/codestory-cli(.exe) snippet --project . --query TicTacToe --file rust_tictactoe.rs --output-file tictactoe.md

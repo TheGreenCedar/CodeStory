@@ -345,7 +345,23 @@ fn exact_definition_quality_bucket(
     if is_type_like_kind(hit.kind) {
         return type_hit_line_quality(project_root, query, hit);
     }
+    if is_callable_like_kind(hit.kind) {
+        return callable_hit_line_quality(project_root, query, hit);
+    }
+    if matches!(
+        hit.kind,
+        NodeKind::MODULE | NodeKind::NAMESPACE | NodeKind::PACKAGE
+    ) {
+        return module_hit_line_quality(project_root, query, hit);
+    }
     1
+}
+
+fn is_callable_like_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+    )
 }
 
 fn type_hit_line_quality(project_root: Option<&Path>, query: &str, hit: &SearchHit) -> u8 {
@@ -390,6 +406,100 @@ fn type_hit_line_quality(project_root: Option<&Path>, query: &str, hit: &SearchH
     } else {
         0
     }
+}
+
+fn callable_hit_line_quality(project_root: Option<&Path>, query: &str, hit: &SearchHit) -> u8 {
+    let Some(trimmed) = hit_source_line_without_comment(project_root, hit) else {
+        return 1;
+    };
+    let expected_name = terminal_symbol_segment(query);
+    if expected_name.is_empty() {
+        return 1;
+    }
+    if is_import_or_reexport_line(&trimmed) {
+        return 0;
+    }
+    if !line_contains_symbol_name(&trimmed, &expected_name) {
+        return 1;
+    }
+    if looks_like_callable_declaration(&trimmed) {
+        return 1;
+    }
+    if looks_like_callable_definition(&trimmed, &expected_name) {
+        return 2;
+    }
+    1
+}
+
+fn module_hit_line_quality(project_root: Option<&Path>, query: &str, hit: &SearchHit) -> u8 {
+    let Some(trimmed) = hit_source_line_without_comment(project_root, hit) else {
+        return 1;
+    };
+    let expected_name = terminal_symbol_segment(query);
+    if expected_name.is_empty() {
+        return 1;
+    }
+    if is_import_or_reexport_line(&trimmed) {
+        return 0;
+    }
+    if declares_named_module(&trimmed, &expected_name) {
+        return 1;
+    }
+    u8::from(line_contains_symbol_name(&trimmed, &expected_name))
+}
+
+fn hit_source_line_without_comment(project_root: Option<&Path>, hit: &SearchHit) -> Option<String> {
+    let path = hit.file_path.as_deref()?;
+    let line = hit.line?;
+    let source_line = read_source_line(project_root, path, line)?;
+    Some(
+        source_line
+            .split("//")
+            .next()
+            .unwrap_or(source_line.as_str())
+            .trim()
+            .to_string(),
+    )
+}
+
+fn is_import_or_reexport_line(trimmed: &str) -> bool {
+    let lower = trimmed.trim_start().to_ascii_lowercase();
+    lower.starts_with("use ")
+        || lower.starts_with("pub use ")
+        || lower.starts_with("import ")
+        || lower.starts_with("export {")
+        || lower.starts_with("export *")
+        || lower.starts_with("export from ")
+        || lower.starts_with("from ")
+        || lower.contains(" import ")
+        || lower.contains(" from ")
+}
+
+fn line_contains_symbol_name(trimmed: &str, expected_name: &str) -> bool {
+    trimmed
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .any(|token| normalize_symbol_query(token) == expected_name)
+}
+
+fn looks_like_callable_declaration(trimmed: &str) -> bool {
+    let without_attrs = trimmed.trim_start_matches(|ch: char| ch == '@' || ch.is_whitespace());
+    without_attrs.ends_with(';') || without_attrs.ends_with("= 0;")
+}
+
+fn looks_like_callable_definition(trimmed: &str, expected_name: &str) -> bool {
+    let normalized = normalize_symbol_query(trimmed);
+    normalized.contains(&format!("fn {expected_name}"))
+        || normalized.contains(&format!("function {expected_name}"))
+        || normalized.contains(&format!("def {expected_name}"))
+        || normalized.contains(&format!("{expected_name}("))
+        || normalized.contains(&format!("{expected_name} ("))
+}
+
+fn declares_named_module(trimmed: &str, expected_name: &str) -> bool {
+    let normalized = normalize_symbol_query(trimmed);
+    normalized.contains(&format!("mod {expected_name}"))
+        || normalized.contains(&format!("module {expected_name}"))
+        || normalized.contains(&format!("namespace {expected_name}"))
 }
 
 fn read_source_line(project_root: Option<&Path>, path: &str, line: u32) -> Option<String> {
@@ -458,6 +568,7 @@ mod tests {
             line: None,
             score,
             origin: SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
             resolvable: true,
             score_breakdown: None,
         }
@@ -842,6 +953,90 @@ mod tests {
         assert_eq!(
             hits.first().map(|hit| &hit.node_id),
             Some(&definition.node_id)
+        );
+    }
+
+    #[test]
+    fn exact_callable_queries_prefer_implementation_over_reexports() {
+        let temp = tempdir().expect("create temp dir");
+        let reexport_path = temp.path().join("lib.rs");
+        let implementation_path = temp.path().join("browser.rs");
+        std::fs::write(
+            &reexport_path,
+            "pub use browser::{exact_symbol_anchor, expand_browser_context};\n",
+        )
+        .expect("write reexport");
+        std::fs::write(
+            &implementation_path,
+            "pub fn exact_symbol_anchor() -> &'static str {\n    \"anchor\"\n}\n",
+        )
+        .expect("write implementation");
+
+        let mut reexport = hit_at_path(
+            "reexport",
+            "exact_symbol_anchor",
+            NodeKind::MODULE,
+            0.95,
+            &reexport_path.to_string_lossy(),
+        );
+        reexport.line = Some(1);
+        let mut implementation = hit_at_path(
+            "implementation",
+            "exact_symbol_anchor",
+            NodeKind::FUNCTION,
+            0.80,
+            &implementation_path.to_string_lossy(),
+        );
+        implementation.line = Some(1);
+
+        let mut hits = [reexport, implementation.clone()];
+        hits.sort_by(|left, right| compare_search_hits("exact_symbol_anchor", left, right));
+
+        assert_eq!(
+            hits.first().map(|hit| &hit.node_id),
+            Some(&implementation.node_id)
+        );
+    }
+
+    #[test]
+    fn exact_callable_queries_prefer_function_bodies_over_declarations() {
+        let temp = tempdir().expect("create temp dir");
+        let declaration_path = temp.path().join("SourceGroupCxxCdb.h");
+        let implementation_path = temp.path().join("SourceGroupCxxCdb.cpp");
+        std::fs::write(
+            &declaration_path,
+            "std::vector<IndexerCommand> getIndexerCommands() const override;\n",
+        )
+        .expect("write declaration");
+        std::fs::write(
+            &implementation_path,
+            "std::vector<IndexerCommand> SourceGroupCxxCdb::getIndexerCommands() const\n{\n    return {};\n}\n",
+        )
+        .expect("write implementation");
+
+        let mut declaration = hit_at_path(
+            "declaration",
+            "SourceGroupCxxCdb::getIndexerCommands",
+            NodeKind::METHOD,
+            0.95,
+            &declaration_path.to_string_lossy(),
+        );
+        declaration.line = Some(1);
+        let mut implementation = hit_at_path(
+            "implementation",
+            "SourceGroupCxxCdb::getIndexerCommands",
+            NodeKind::METHOD,
+            0.80,
+            &implementation_path.to_string_lossy(),
+        );
+        implementation.line = Some(1);
+
+        let mut hits = [declaration, implementation.clone()];
+        hits.sort_by(|left, right| compare_search_hits("getIndexerCommands", left, right));
+
+        assert_eq!(
+            hits.first().map(|hit| &hit.node_id),
+            Some(&implementation.node_id)
         );
     }
 

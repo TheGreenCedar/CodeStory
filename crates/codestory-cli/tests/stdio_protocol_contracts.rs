@@ -1239,6 +1239,17 @@ fn transcript_calls_search_tool() {
                 .any(|hit| hit["display_name"] == "AppController")),
         "search tool should return AppController hit: {result}"
     );
+    let app_controller_hit = result["indexed_symbol_hits"]
+        .as_array()
+        .expect("indexed symbol hits")
+        .iter()
+        .find(|hit| hit["display_name"] == "AppController")
+        .unwrap_or_else(|| panic!("missing AppController hit: {result}"));
+    assert_eq!(
+        app_controller_hit["match_quality"],
+        json!("exact"),
+        "stdio search hits should satisfy the advertised match_quality schema: {app_controller_hit}"
+    );
 
     let symbols_response = send_json(
         &mut server,

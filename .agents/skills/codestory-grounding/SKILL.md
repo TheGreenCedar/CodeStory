@@ -17,6 +17,7 @@ Use this skill to collect repo evidence with `codestory-cli` before making archi
 - `symbol`: inspect one exact symbol and relationships.
 - `trail`: follow caller, callee, and reference graph around a symbol; use `--story --hide-speculative` for readable flow evidence.
 - `snippet`: fetch source context around a symbol.
+- `drill`: run a deterministic agent-grounding packet for a natural-language question and concrete anchors, including search/symbol/trail/snippet artifacts and a source-verification checklist.
 - `query`: run structured graph-query pipelines.
 - `explore`: interactive or bundled navigation view around a target.
 - `bookmark`: save, list, or remove investigation focus nodes.
@@ -115,6 +116,7 @@ Detailed argument tables, output examples, and usage patterns for each command:
 - [symbol](references/symbol.md) - Inspect a symbol's details and relationships
 - [trail](references/trail.md) - Follow a symbol's call/reference graph
 - [snippet](references/snippet.md) - Fetch source code context around a symbol
+- [drill](references/drill.md) - Build a repeatable evidence packet for agent-grounding drills
 - [query](references/query.md) - Structured graph query pipelines
 - [explore](references/explore.md) - Interactive terminal exploration with Markdown/JSON fallback
 - [bookmark](references/bookmark.md) - Save reusable investigation focus nodes

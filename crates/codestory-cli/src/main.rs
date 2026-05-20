@@ -7,9 +7,9 @@ use codestory_contracts::api::{
     BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
     GraphArtifactDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode, NodeId, NodeKind,
     NodeOccurrencesRequest, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
-    RetrievalScoreBreakdownDto, SearchHit, SearchHybridLimitsDto, SearchRepoTextMode,
-    SearchRequest, SourceOccurrenceDto, TrailCallerScope, TrailConfigDto, TrailDirection,
-    TrailMode,
+    RetrievalScoreBreakdownDto, SearchHit, SearchHybridLimitsDto, SearchMatchQualityDto,
+    SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest, SourceOccurrenceDto,
+    TrailCallerScope, TrailConfigDto, TrailDirection, TrailMode,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -41,11 +41,11 @@ use args::{
     BookmarkListOutput, BookmarkOutput, BookmarkRemoveCommand, BookmarkRemoveOutput, Cli, Command,
     CompletionShell, ContextCommand, DoctorCheckOutput, DoctorCommand, DoctorOutput,
     DrillAnchorOutput, DrillCommand, DrillCommandStatusOutput, DrillMechanicalOutput, DrillOutput,
-    GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput, IndexOutput,
-    QueryCommand, QueryOutput, QueryResolutionOutput, QuerySelectorOutput, RepoTextMode,
-    SearchCommand, SearchHitOutput, SearchOutput, ServeCommand, SetupAction, SetupCommand,
-    SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, TrailCommand,
-    TrailJsonOutput, VerificationTargetOutput, build_trail_request,
+    DrillVerificationChecklistItemOutput, GenerateCompletionsCommand, GroundCommand, IndexCommand,
+    IndexDryRunOutput, IndexOutput, QueryCommand, QueryOutput, QueryResolutionOutput,
+    QuerySelectorOutput, RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput, ServeCommand,
+    SetupAction, SetupCommand, SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput,
+    TrailCommand, TrailJsonOutput, VerificationTargetOutput, build_trail_request,
 };
 #[cfg(test)]
 use codestory_contracts::api::TrailContextDto;
@@ -867,6 +867,11 @@ fn run_drill(cmd: DrillCommand) -> Result<()> {
 
     let mut anchor_outputs = Vec::new();
     let mut all_verification_targets = Vec::new();
+    let question_search = cmd
+        .question
+        .as_deref()
+        .map(|question| run_drill_question_search(&runtime, &cmd.output_dir, cmd.format, question))
+        .transpose()?;
     for anchor in normalized_drill_anchors(&cmd.anchors) {
         let anchor_output = run_drill_anchor(&runtime, &cmd.output_dir, cmd.format, &anchor)?;
         all_verification_targets.extend(anchor_output.verification_targets.iter().cloned());
@@ -877,6 +882,7 @@ fn run_drill(cmd: DrillCommand) -> Result<()> {
     let output = DrillOutput {
         project: display::clean_path_string(&opened.summary.root),
         label: cmd.label.clone(),
+        question: cmd.question.clone(),
         output_dir: display::clean_path_string(&cmd.output_dir.to_string_lossy()),
         mechanical: DrillMechanicalOutput {
             before_files: before.stats.file_count,
@@ -891,21 +897,44 @@ fn run_drill(cmd: DrillCommand) -> Result<()> {
             retrieval: opened.summary.retrieval.clone(),
             phase_timings: opened.phase_timings.clone(),
         },
+        question_search,
         anchors: anchor_outputs,
         verification_targets: all_verification_targets,
+        verification_checklist: drill_verification_checklist(),
         next_commands: drill_next_commands(&runtime.project_root, &cmd.anchors),
     };
 
     let markdown = render_drill_markdown(&output);
-    let content = render_drill_content(cmd.format, &output, &markdown)?;
+    let json = serde_json::to_string_pretty(&output).context("Failed to serialize drill JSON")?;
+    let selected_content = render_drill_content(cmd.format, &output, &markdown)?;
     let report_path = cmd.output_dir.join(format!("drill-report.{report_ext}"));
-    fs::write(&report_path, &content).with_context(|| {
+    fs::write(&report_path, &selected_content).with_context(|| {
         format!(
             "Failed to write drill report {}",
             display::clean_path_string(&report_path.to_string_lossy())
         )
     })?;
-    print!("{content}");
+    let markdown_path = cmd.output_dir.join("drill-report.md");
+    if report_path != markdown_path {
+        fs::write(&markdown_path, ensure_trailing_newline(markdown.clone())).with_context(
+            || {
+                format!(
+                    "Failed to write drill report {}",
+                    display::clean_path_string(&markdown_path.to_string_lossy())
+                )
+            },
+        )?;
+    }
+    let json_path = cmd.output_dir.join("drill-report.json");
+    if report_path != json_path {
+        fs::write(&json_path, ensure_trailing_newline(json)).with_context(|| {
+            format!(
+                "Failed to write drill report {}",
+                display::clean_path_string(&json_path.to_string_lossy())
+            )
+        })?;
+    }
+    print!("{selected_content}");
     Ok(())
 }
 
@@ -1109,6 +1138,53 @@ fn run_drill_anchor(
     })
 }
 
+fn run_drill_question_search(
+    runtime: &RuntimeContext,
+    output_dir: &std::path::Path,
+    format: args::OutputFormat,
+    question: &str,
+) -> Result<DrillCommandStatusOutput> {
+    let search_results = runtime
+        .browser
+        .search_results(SearchRequest {
+            query: question.to_string(),
+            repo_text: SearchRepoTextMode::On,
+            limit_per_source: 10,
+            hybrid_weights: None,
+            hybrid_limits: None,
+        })
+        .map_err(map_api_error)?;
+    let search_output = search_output_from_results(runtime, &search_results, true);
+    let search_markdown = render_search_markdown(&runtime.project_root, &search_output);
+    Ok(write_drill_artifact(
+        output_dir,
+        format,
+        "question-search",
+        "question_search",
+        &search_output,
+        search_markdown,
+    ))
+}
+
+fn drill_verification_checklist() -> Vec<DrillVerificationChecklistItemOutput> {
+    let allowed = ["correct", "partial", "misleading", "unsupported"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    [
+        "Record the CodeStory-only architecture answer before opening source files.",
+        "Open only files named or implied by CodeStory evidence for source-truth verification.",
+        "Classify each major claim as correct, partial, misleading, or unsupported.",
+        "Record what changed after source reads; revisions are product findings, not cleanup.",
+    ]
+    .into_iter()
+    .map(|item| DrillVerificationChecklistItemOutput {
+        item: item.to_string(),
+        allowed_classifications: allowed.clone(),
+    })
+    .collect()
+}
+
 fn write_drill_artifact<T: serde::Serialize>(
     output_dir: &std::path::Path,
     format: args::OutputFormat,
@@ -1280,6 +1356,7 @@ fn search_output_from_results(
         symbol_hits: &search_results.indexed_symbol_hits,
         repo_text_hits: &search_results.repo_text_hits,
         repo_text_stats: search_results.repo_text_stats.as_ref(),
+        query_assessment: search_results.query_assessment.as_ref(),
         suggestions: &search_results.suggestions,
         occurrences_by_node: &occurrences,
         limit_per_source: search_results.limit_per_source,
@@ -1397,6 +1474,58 @@ fn trail_guidance_notes(context: &codestory_contracts::api::TrailContextDto) -> 
     )]
 }
 
+fn prefer_function_body_target(
+    runtime: &RuntimeContext,
+    mut target: runtime::ResolvedTarget,
+) -> runtime::ResolvedTarget {
+    if hit_looks_like_function_body(&runtime.project_root, &target.selected) {
+        return target;
+    }
+    let Some((index, preferred)) = target
+        .alternatives
+        .iter()
+        .enumerate()
+        .find(|(_, hit)| hit_looks_like_function_body(&runtime.project_root, hit))
+        .map(|(index, hit)| (index, hit.clone()))
+    else {
+        return target;
+    };
+    target.selected = preferred;
+    let promoted = target.alternatives.remove(index);
+    target.alternatives.insert(0, promoted);
+    target
+}
+
+fn hit_looks_like_function_body(project_root: &std::path::Path, hit: &SearchHit) -> bool {
+    if !matches!(hit.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+        return false;
+    }
+    let Some(path) = hit.file_path.as_deref() else {
+        return false;
+    };
+    let Some(line) = hit.line else {
+        return false;
+    };
+    let path = std::path::Path::new(path);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_root.join(path)
+    };
+    let Ok(contents) = fs::read_to_string(&resolved) else {
+        return false;
+    };
+    let line_index = line.saturating_sub(1) as usize;
+    let window = contents
+        .lines()
+        .skip(line_index)
+        .take(8)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let before_body = window.split('{').next().unwrap_or(window.as_str());
+    window.contains('{') && !before_body.contains(';')
+}
+
 fn run_snippet(cmd: SnippetCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "snippet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
@@ -1412,10 +1541,21 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
         cmd.format,
         cmd.output_file.as_deref(),
     )?;
-    let context = runtime
-        .browser
-        .snippet_context(target.selected.node_id.clone(), cmd.context)
-        .map_err(map_api_error)?;
+    let target = if cmd.function_body {
+        prefer_function_body_target(&runtime, target)
+    } else {
+        target
+    };
+    let context = if cmd.function_body {
+        runtime
+            .browser
+            .snippet_function_body_context(target.selected.node_id.clone(), cmd.context)
+    } else {
+        runtime
+            .browser
+            .snippet_context(target.selected.node_id.clone(), cmd.context)
+    }
+    .map_err(map_api_error)?;
     let colorize = cmd.format == args::OutputFormat::Markdown
         && cmd.output_file.is_none()
         && std::io::stdout().is_terminal();
@@ -1540,20 +1680,79 @@ fn resolve_target_or_emit_ambiguity(
     match resolve_target(runtime, target, file_filter) {
         Ok(target) => Ok(target),
         Err(error) => {
-            if format == args::OutputFormat::Json
-                && let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>()
-            {
+            if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
                 let output = build_ambiguous_target_error_output(&runtime.project_root, ambiguous);
-                emit(
-                    args::OutputFormat::Json,
-                    &output,
-                    ambiguous.message.clone(),
-                    output_file,
-                )?;
+                if output_file.is_some() || format == args::OutputFormat::Json {
+                    emit(
+                        format,
+                        &output,
+                        render_cli_error_markdown(&output),
+                        output_file,
+                    )?;
+                }
             }
             Err(error)
         }
     }
+}
+
+fn render_cli_error_markdown(output: &CliErrorOutput) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Command Error");
+    let _ = writeln!(markdown, "code: {}", output.error.code);
+    let _ = writeln!(markdown, "failed_layer: {}", output.error.failed_layer);
+    let _ = writeln!(markdown, "message: {}", output.error.message);
+    let _ = writeln!(markdown, "query: `{}`", output.error.query);
+    if let Some(file_filter) = output.error.file_filter.as_deref() {
+        let _ = writeln!(markdown, "file_filter: `{file_filter}`");
+    }
+    let _ = writeln!(
+        markdown,
+        "alternatives: {}",
+        output.error.alternatives.len()
+    );
+    for alternative in &output.error.alternatives {
+        let location = alternative
+            .file_path
+            .as_deref()
+            .map(|path| {
+                alternative
+                    .line
+                    .map(|line| format!(" {path}:{line}"))
+                    .unwrap_or_else(|| format!(" {path}"))
+            })
+            .unwrap_or_default();
+        let _ = writeln!(
+            markdown,
+            "- [{}] {} [{}]{} score={:.2} match={}",
+            alternative.node_id,
+            alternative.display_name,
+            display::format_kind(alternative.kind),
+            location,
+            alternative.score,
+            match alternative.match_quality {
+                SearchMatchQualityDto::Exact => "exact",
+                SearchMatchQualityDto::NormalizedExact => "normalized_exact",
+                SearchMatchQualityDto::Prefix => "prefix",
+                SearchMatchQualityDto::Fuzzy => "fuzzy",
+                SearchMatchQualityDto::SemanticSuggestion => "semantic_suggestion",
+                SearchMatchQualityDto::RepoText => "repo_text",
+            }
+        );
+    }
+    if !output.error.layer_notes.is_empty() {
+        let _ = writeln!(markdown, "layer_notes:");
+        for note in &output.error.layer_notes {
+            let _ = writeln!(markdown, "- {note}");
+        }
+    }
+    if !output.error.next_commands.is_empty() {
+        let _ = writeln!(markdown, "next_commands:");
+        for command in &output.error.next_commands {
+            let _ = writeln!(markdown, "- `{command}`");
+        }
+    }
+    markdown
 }
 
 fn build_ambiguous_target_error_output(
@@ -1564,7 +1763,9 @@ fn build_ambiguous_target_error_output(
         .alternatives
         .iter()
         .enumerate()
-        .map(|(index, hit)| build_numbered_search_hit_output(project_root, hit, index + 1))
+        .map(|(index, hit)| {
+            build_numbered_search_hit_output(project_root, hit, Some(&ambiguous.query), index + 1)
+        })
         .collect::<Vec<_>>();
     let quoted_query = ambiguous.query.replace('"', "\\\"");
     let project = quote_command_path(project_root);
@@ -2227,6 +2428,7 @@ struct SearchOutputParts<'a> {
     symbol_hits: &'a [SearchHit],
     repo_text_hits: &'a [SearchHit],
     repo_text_stats: Option<&'a RepoTextScanStatsDto>,
+    query_assessment: Option<&'a SearchQueryAssessmentDto>,
     suggestions: &'a [SearchHit],
     occurrences_by_node: &'a HashMap<NodeId, Vec<SourceOccurrenceDto>>,
     limit_per_source: u32,
@@ -2242,6 +2444,7 @@ fn build_search_output(parts: SearchOutputParts<'_>) -> SearchOutput {
             build_search_hit_output(
                 parts.project_root,
                 hit,
+                Some(parts.query),
                 parts.explain,
                 occurrences_for_hit(parts.occurrences_by_node, hit),
             )
@@ -2259,7 +2462,13 @@ fn build_search_output(parts: SearchOutputParts<'_>) -> SearchOutput {
         .repo_text_hits
         .iter()
         .map(|hit| {
-            let mut output = build_search_hit_output(parts.project_root, hit, parts.explain, &[]);
+            let mut output = build_search_hit_output(
+                parts.project_root,
+                hit,
+                Some(parts.query),
+                parts.explain,
+                &[],
+            );
             if let Some(key) = search_hit_location_key(&output) {
                 output.duplicate_of = duplicate_index.get(&key).cloned();
             }
@@ -2275,6 +2484,7 @@ fn build_search_output(parts: SearchOutputParts<'_>) -> SearchOutput {
         limit_per_source: parts.limit_per_source,
         repo_text_mode: parts.repo_text.mode,
         repo_text_enabled: parts.repo_text.enabled,
+        query_assessment: parts.query_assessment.cloned(),
         explain: parts.explain,
         query_hints,
         suggestions: parts
@@ -2284,6 +2494,7 @@ fn build_search_output(parts: SearchOutputParts<'_>) -> SearchOutput {
                 build_search_hit_output(
                     parts.project_root,
                     hit,
+                    Some(parts.query),
                     parts.explain,
                     occurrences_for_hit(parts.occurrences_by_node, hit),
                 )
@@ -2306,12 +2517,20 @@ fn build_query_resolution_output(
             .file_filter
             .as_deref()
             .map(crate::display::clean_path_string),
-        resolved: build_search_hit_output(project_root, &target.selected, false, &[]),
+        resolved: build_search_hit_output(
+            project_root,
+            &target.selected,
+            Some(&target.requested),
+            false,
+            &[],
+        ),
         alternatives: target
             .alternatives
             .iter()
             .skip(1)
-            .map(|hit| build_search_hit_output(project_root, hit, false, &[]))
+            .map(|hit| {
+                build_search_hit_output(project_root, hit, Some(&target.requested), false, &[])
+            })
             .collect(),
     }
 }
@@ -2334,6 +2553,7 @@ fn build_query_resolution_output_with_runtime(
         resolved: build_search_hit_output(
             &runtime.project_root,
             &target.selected,
+            Some(&target.requested),
             false,
             occurrences_for_hit(&occurrences, &target.selected),
         ),
@@ -2345,6 +2565,7 @@ fn build_query_resolution_output_with_runtime(
                 build_search_hit_output(
                     &runtime.project_root,
                     hit,
+                    Some(&target.requested),
                     false,
                     occurrences_for_hit(&occurrences, hit),
                 )
@@ -2356,6 +2577,7 @@ fn build_query_resolution_output_with_runtime(
 fn build_search_hit_output(
     project_root: &std::path::Path,
     hit: &SearchHit,
+    query: Option<&str>,
     explain: bool,
     occurrences: &[SourceOccurrenceDto],
 ) -> SearchHitOutput {
@@ -2399,6 +2621,9 @@ fn build_search_hit_output(
         line: hit.line,
         score: hit.score,
         origin: hit.origin,
+        match_quality: hit
+            .match_quality
+            .unwrap_or_else(|| search_match_quality(query, hit)),
         resolvable: hit.resolvable,
         score_breakdown,
         duplicate_of: None,
@@ -2415,11 +2640,48 @@ fn build_search_hit_output(
 fn build_numbered_search_hit_output(
     project_root: &std::path::Path,
     hit: &SearchHit,
+    query: Option<&str>,
     number: usize,
 ) -> SearchHitOutput {
-    let mut output = build_search_hit_output(project_root, hit, false, &[]);
+    let mut output = build_search_hit_output(project_root, hit, query, false, &[]);
     output.number = Some(number);
     output
+}
+
+fn search_match_quality(query: Option<&str>, hit: &SearchHit) -> SearchMatchQualityDto {
+    if hit.is_text_match() {
+        return SearchMatchQualityDto::RepoText;
+    }
+    let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) else {
+        return SearchMatchQualityDto::SemanticSuggestion;
+    };
+    let query_normalized = codestory_runtime::normalize_symbol_query(query);
+    let display_normalized = codestory_runtime::normalize_symbol_query(&hit.display_name);
+    let terminal = codestory_runtime::terminal_symbol_segment(&hit.display_name);
+    let leading = codestory_runtime::leading_symbol_segment(&hit.display_name);
+    if hit.display_name == query {
+        return SearchMatchQualityDto::Exact;
+    }
+    if display_normalized == query_normalized
+        || terminal == query_normalized
+        || leading == query_normalized
+    {
+        return SearchMatchQualityDto::NormalizedExact;
+    }
+    if display_normalized.starts_with(&query_normalized)
+        || terminal.starts_with(&query_normalized)
+        || leading.starts_with(&query_normalized)
+    {
+        return SearchMatchQualityDto::Prefix;
+    }
+    if hit
+        .score_breakdown
+        .as_ref()
+        .is_some_and(|breakdown| breakdown.semantic > 0.0 && breakdown.lexical <= f32::EPSILON)
+    {
+        return SearchMatchQualityDto::SemanticSuggestion;
+    }
+    SearchMatchQualityDto::Fuzzy
 }
 
 fn collect_search_hit_occurrences<'a>(
@@ -2612,6 +2874,16 @@ fn resolution_hints_for_hit(
             "repo-text hit is evidence only; choose an indexed symbol before graph browsing"
                 .to_string(),
         );
+        if hit
+            .file_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with(".svelte"))
+        {
+            hints.push(
+                "Svelte files are currently surfaced through repo-text evidence; typed graph edges may be unavailable for this file"
+                    .to_string(),
+            );
+        }
     }
     if hit.resolvable && verification_targets.is_empty() {
         hints.push(
@@ -3061,6 +3333,7 @@ mod tests {
             line: Some(10),
             score: 0.9,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
             resolvable: true,
             score_breakdown: None,
         }];
@@ -3072,6 +3345,7 @@ mod tests {
             line: Some(3),
             score: 500.0,
             origin: codestory_contracts::api::SearchHitOrigin::TextMatch,
+            match_quality: Some(codestory_contracts::api::SearchMatchQualityDto::RepoText),
             resolvable: false,
             score_breakdown: None,
         }];
@@ -3084,6 +3358,7 @@ mod tests {
             symbol_hits: &symbol_hits,
             repo_text_hits: &repo_text_hits,
             repo_text_stats: None,
+            query_assessment: None,
             suggestions: &[],
             occurrences_by_node: &HashMap::new(),
             limit_per_source: 5,
@@ -3201,6 +3476,7 @@ mod tests {
             line: Some(42),
             score: 0.9,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
             resolvable: true,
             score_breakdown: None,
         }];
@@ -3213,6 +3489,7 @@ mod tests {
             symbol_hits: &symbol_hits,
             repo_text_hits: &[],
             repo_text_stats: None,
+            query_assessment: None,
             suggestions: &[],
             occurrences_by_node: &HashMap::new(),
             limit_per_source: 5,
@@ -3240,6 +3517,7 @@ mod tests {
             line: Some(12),
             score: 0.9,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
             resolvable: true,
             score_breakdown: None,
         }];
@@ -3276,6 +3554,7 @@ mod tests {
             symbol_hits: &symbol_hits,
             repo_text_hits: &[],
             repo_text_stats: None,
+            query_assessment: None,
             suggestions: &[],
             occurrences_by_node: &occurrences,
             limit_per_source: 5,
@@ -3311,6 +3590,7 @@ mod tests {
             line: Some(7),
             score: 0.9,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
             resolvable: true,
             score_breakdown: None,
         }];
@@ -3322,6 +3602,7 @@ mod tests {
             line: Some(7),
             score: 500.0,
             origin: codestory_contracts::api::SearchHitOrigin::TextMatch,
+            match_quality: Some(codestory_contracts::api::SearchMatchQualityDto::RepoText),
             resolvable: false,
             score_breakdown: None,
         }];
@@ -3334,6 +3615,7 @@ mod tests {
             symbol_hits: &symbol_hits,
             repo_text_hits: &repo_text_hits,
             repo_text_stats: None,
+            query_assessment: None,
             suggestions: &[],
             occurrences_by_node: &HashMap::new(),
             limit_per_source: 5,
@@ -3500,6 +3782,7 @@ mod tests {
             line: Some(10),
             score: 0.9,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
             resolvable: true,
             score_breakdown: Some(codestory_contracts::api::RetrievalScoreBreakdownDto {
                 lexical: 0.7,
@@ -3517,6 +3800,7 @@ mod tests {
             symbol_hits: &symbol_hits,
             repo_text_hits: &[],
             repo_text_stats: None,
+            query_assessment: None,
             suggestions: &[],
             occurrences_by_node: &HashMap::new(),
             limit_per_source: 5,
@@ -3709,6 +3993,7 @@ mod tests {
                 line: None,
                 score: 0.9,
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
             },
@@ -3720,6 +4005,7 @@ mod tests {
                 line: None,
                 score: 0.9,
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
             },
@@ -3749,6 +4035,7 @@ mod tests {
                 line: Some(2),
                 score: 1.0,
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
             },
@@ -3760,6 +4047,7 @@ mod tests {
                 line: Some(1),
                 score: 1.0,
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
             },
@@ -3782,6 +4070,7 @@ mod tests {
                 line: Some(20),
                 score: 0.9,
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
             },
@@ -3793,6 +4082,7 @@ mod tests {
                 line: Some(10),
                 score: 0.8,
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
             },

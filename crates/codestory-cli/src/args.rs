@@ -2,9 +2,9 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
     BookmarkCategoryDto, BookmarkDto, GroundingBudgetDto, IndexDryRunDto, IndexFreshnessDto,
     IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind, ProjectSummary, RepoTextScanStatsDto,
-    RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin, SnippetContextDto,
-    SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection,
-    TrailMode,
+    RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin, SearchMatchQualityDto,
+    SearchQueryAssessmentDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto,
+    TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -440,6 +440,11 @@ pub(crate) struct DrillCommand {
     pub(crate) label: Option<String>,
     #[arg(
         long,
+        help = "Natural-language architecture question to collect repo-text evidence for. Stored and searched; it is not answered by the CLI."
+    )]
+    pub(crate) question: Option<String>,
+    #[arg(
+        long,
         value_name = "DIR",
         help = "Directory where the drill report and command artifacts are written."
     )]
@@ -576,6 +581,11 @@ pub(crate) struct SnippetCommand {
         help = "Number of surrounding context lines above and below the symbol. `--lines` is accepted as an agent-friendly alias."
     )]
     pub(crate) context: usize,
+    #[arg(
+        long,
+        help = "Prefer the selected symbol's full function or method body, with context lines around it when source ranges are available."
+    )]
+    pub(crate) function_body: bool,
     #[arg(
         long,
         value_enum,
@@ -805,6 +815,7 @@ pub(crate) struct SearchHitOutput {
     pub(crate) line: Option<u32>,
     pub(crate) score: f32,
     pub(crate) origin: SearchHitOrigin,
+    pub(crate) match_quality: SearchMatchQualityDto,
     pub(crate) resolvable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) score_breakdown: Option<RetrievalScoreBreakdownDto>,
@@ -845,6 +856,8 @@ pub(crate) struct SearchOutput {
     pub(crate) limit_per_source: u32,
     pub(crate) repo_text_mode: RepoTextMode,
     pub(crate) repo_text_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) query_assessment: Option<SearchQueryAssessmentDto>,
     pub(crate) explain: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) query_hints: Vec<String>,
@@ -929,15 +942,27 @@ pub(crate) struct DrillAnchorOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct DrillVerificationChecklistItemOutput {
+    pub(crate) item: String,
+    pub(crate) allowed_classifications: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct DrillOutput {
     pub(crate) project: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) question: Option<String>,
     pub(crate) output_dir: String,
     pub(crate) mechanical: DrillMechanicalOutput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) question_search: Option<DrillCommandStatusOutput>,
     pub(crate) anchors: Vec<DrillAnchorOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) verification_targets: Vec<VerificationTargetOutput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) verification_checklist: Vec<DrillVerificationChecklistItemOutput>,
     pub(crate) next_commands: Vec<String>,
 }
 
@@ -1218,6 +1243,7 @@ mod tests {
         assert!(help.contains("--anchors <ANCHORS>"));
         assert!(help.contains("--output-dir <DIR>"));
         assert!(help.contains("--label <LABEL>"));
+        assert!(help.contains("--question <QUESTION>"));
         assert!(help.contains("Stored in the report only; it is not interpreted"));
     }
 
@@ -1242,6 +1268,7 @@ mod tests {
         let help = render_subcommand_help("snippet");
         assert!(help.contains("--context <CONTEXT>"));
         assert!(help.contains("[aliases: --lines]"));
+        assert!(help.contains("--function-body"));
         assert!(
             help.contains("Number of surrounding context lines"),
             "snippet help should make context sizing obvious: {help}"

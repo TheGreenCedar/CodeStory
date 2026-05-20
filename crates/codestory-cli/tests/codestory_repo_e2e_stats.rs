@@ -85,6 +85,13 @@ struct SnippetStats {
     snippet_lines: usize,
 }
 
+struct DrillRepoCase {
+    name: &'static str,
+    project_root: PathBuf,
+    question: &'static str,
+    anchors: &'static [&'static str],
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -212,6 +219,41 @@ fn array_len(value: &Value, path: &[&str]) -> usize {
         .as_array()
         .unwrap_or_else(|| panic!("expected array at path {:?}", path))
         .len()
+}
+
+fn drill_repo_cases() -> Vec<DrillRepoCase> {
+    let code_story = repo_root();
+    let source_repos = code_story
+        .parent()
+        .expect("codestory checkout has sibling repo parent")
+        .to_path_buf();
+
+    vec![
+        DrillRepoCase {
+            name: "sourcetrail",
+            project_root: source_repos.join("Sourcetrail"),
+            question: "Explain how Sourcetrail turns project/source-group configuration into indexing work, then how indexed data is accessed by the application.",
+            anchors: &["SourceGroupCxxCdb", "IndexerJava", "StorageAccess"],
+        },
+        DrillRepoCase {
+            name: "codestory",
+            project_root: code_story,
+            question: "Explain how CodeStory's full-index path flows through CLI/runtime/workspace/indexer/store and how that supports later search, trail, and snippet commands.",
+            anchors: &["WorkspaceIndexer", "SearchService", "TrailResult"],
+        },
+        DrillRepoCase {
+            name: "rootandruntime",
+            project_root: source_repos.join("rootandruntime"),
+            question: "Explain how public writing/social surfaces connect to Payload collections, comment auth, and the elsewhere feed.",
+            anchors: &["Posts", "getElsewhereFeed", "getCommentAuth"],
+        },
+        DrillRepoCase {
+            name: "batcave",
+            project_root: source_repos.join("BatCave"),
+            question: "Explain how BatCave frontend command surfaces connect to runtime snapshot data, including stale anchors and Svelte repo-text evidence.",
+            anchors: &["GlobalResourceListView", "App.svelte", "get_snapshot"],
+        },
+    ]
 }
 
 #[test]
@@ -471,5 +513,108 @@ fn codestory_repo_release_e2e_emits_stats() {
         stats.symbol_seconds < 10.0,
         "cold symbol lookup should stay under 10 seconds on the codestory repo, got {:.2}s",
         stats.symbol_seconds
+    );
+}
+
+#[test]
+#[ignore = "real-repo drill harness; run after cargo build --release -p codestory-cli on the Windows workstation with sibling repos present"]
+fn real_repo_agent_grounding_drill_emits_verification_packets() {
+    let binary = release_cli_binary();
+    assert!(
+        binary.is_file(),
+        "missing release binary at {}. Run `cargo build --release -p codestory-cli` first.",
+        binary.display()
+    );
+
+    let root_output = tempdir().expect("drill output dir");
+    let cache_dir = tempdir().expect("drill cache dir");
+    let mut exercised = 0usize;
+
+    for case in drill_repo_cases() {
+        if !case.project_root.is_dir() {
+            eprintln!(
+                "skipping {}: missing repo {}",
+                case.name,
+                case.project_root.display()
+            );
+            continue;
+        }
+        exercised += 1;
+        let output_dir = root_output.path().join(case.name);
+        fs::create_dir_all(&output_dir).expect("create per-repo drill output dir");
+
+        let mut args = vec![
+            "drill".to_string(),
+            "--refresh".to_string(),
+            "full".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+            "--question".to_string(),
+            case.question.to_string(),
+            "--output-dir".to_string(),
+            output_dir.display().to_string(),
+            "--anchors".to_string(),
+        ];
+        args.extend(case.anchors.iter().map(|anchor| (*anchor).to_string()));
+
+        let (_seconds, drill_json) = run_cli_json(
+            &binary,
+            case.project_root.as_path(),
+            cache_dir.path(),
+            &args,
+        );
+
+        assert_eq!(
+            string_field(&drill_json, &["question"]),
+            case.question,
+            "{} drill should preserve the natural-language question",
+            case.name
+        );
+        assert_eq!(
+            array_len(&drill_json, &["anchors"]),
+            case.anchors.len(),
+            "{} drill should emit one anchor packet per requested anchor",
+            case.name
+        );
+        assert!(
+            array_len(&drill_json, &["verification_checklist"]) >= 4,
+            "{} drill should force source-truth verification structure",
+            case.name
+        );
+        assert!(
+            output_dir.join("drill-report.md").is_file(),
+            "{} drill should write a markdown report",
+            case.name
+        );
+        assert!(
+            output_dir.join("drill-report.json").is_file(),
+            "{} drill should write a JSON report",
+            case.name
+        );
+        assert_eq!(
+            string_field(&drill_json, &["question_search", "status"]),
+            "ok",
+            "{} drill should collect natural-language repo-text evidence",
+            case.name
+        );
+        for anchor_index in 0..case.anchors.len() {
+            let index = anchor_index.to_string();
+            assert_eq!(
+                string_field(&drill_json, &["anchors", index.as_str(), "anchor"]),
+                case.anchors[anchor_index],
+                "{} drill should keep anchor order",
+                case.name
+            );
+            assert!(
+                array_len(&drill_json, &["anchors", index.as_str(), "commands"]) >= 1,
+                "{} drill anchor should record evidence command artifacts",
+                case.name
+            );
+        }
+    }
+
+    assert!(
+        exercised > 0,
+        "no real repos were present for the drill harness"
     );
 }

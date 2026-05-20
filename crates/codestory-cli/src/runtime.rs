@@ -464,6 +464,7 @@ pub(crate) fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
         line: node.start_line,
         score: 0.0,
         origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+        match_quality: None,
         resolvable: true,
         score_breakdown: None,
     }

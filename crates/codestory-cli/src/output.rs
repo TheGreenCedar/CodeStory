@@ -504,6 +504,9 @@ pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput)
     if let Some(stats) = output.repo_text_stats.as_ref() {
         append_repo_text_scan_stats(&mut markdown, stats);
     }
+    if let Some(assessment) = output.query_assessment.as_ref() {
+        append_query_assessment(&mut markdown, assessment);
+    }
     if output.explain {
         append_search_evidence_packet(&mut markdown, project_root, output);
     }
@@ -601,6 +604,25 @@ fn append_repo_text_scan_stats(markdown: &mut String, stats: &RepoTextScanStatsD
         if let Some(action) = stats.action.as_deref() {
             let _ = writeln!(markdown, "repo_text_scan_action: {action}");
         }
+    }
+}
+
+fn append_query_assessment(
+    markdown: &mut String,
+    assessment: &codestory_contracts::api::SearchQueryAssessmentDto,
+) {
+    let _ = writeln!(
+        markdown,
+        "query_assessment: exact_symbol_hits={} weak_top_hit={} stale_or_missing_anchor={}",
+        assessment.exact_symbol_hit_count,
+        assessment.weak_top_hit,
+        assessment.stale_or_missing_anchor
+    );
+    if let Some(reason) = assessment.repo_text_fallback_reason.as_deref() {
+        let _ = writeln!(markdown, "repo_text_fallback_reason: {reason}");
+    }
+    if let Some(action) = assessment.recommended_next_action.as_deref() {
+        let _ = writeln!(markdown, "recommended_next_action: {action}");
     }
 }
 
@@ -729,10 +751,27 @@ fn append_search_evidence_packet(
     output: &SearchOutput,
 ) {
     let total_hits = output.indexed_symbol_hits.len() + output.repo_text_hits.len();
+    let exact_symbol_hits = output
+        .query_assessment
+        .as_ref()
+        .map(|assessment| assessment.exact_symbol_hit_count)
+        .unwrap_or_default();
+    let finding = if total_hits == 0 {
+        format!("found no hits for `{}`", output.query)
+    } else if exact_symbol_hits == 0 {
+        format!(
+            "found {total_hits} candidate hits but no exact indexed symbol for `{}`",
+            output.query
+        )
+    } else {
+        format!(
+            "found {total_hits} direct hits for `{}` with {exact_symbol_hits} exact indexed symbol hit(s)",
+            output.query
+        )
+    };
     let _ = writeln!(
         markdown,
-        "short_finding: found {total_hits} direct hits for `{}` (indexed_symbol_hits={} repo_text_hits={}).",
-        output.query,
+        "short_finding: {finding} (indexed_symbol_hits={} repo_text_hits={}).",
         output.indexed_symbol_hits.len(),
         output.repo_text_hits.len()
     );
@@ -772,6 +811,16 @@ fn append_search_evidence_packet(
     );
 
     let mut gaps = search_gap_notes(output);
+    if let Some(assessment) = output.query_assessment.as_ref() {
+        if assessment.exact_symbol_hit_count == 0 && !output.indexed_symbol_hits.is_empty() {
+            gaps.push(
+                "indexed hits are candidates only; no exact symbol anchor matched".to_string(),
+            );
+        }
+        if let Some(reason) = assessment.repo_text_fallback_reason.clone() {
+            gaps.push(reason);
+        }
+    }
     if gaps.is_empty() {
         gaps.push("No search gaps were reported for this query.".to_string());
     }
@@ -1456,6 +1505,9 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
     if let Some(label) = output.label.as_deref() {
         let _ = writeln!(markdown, "label: {label}");
     }
+    if let Some(question) = output.question.as_deref() {
+        let _ = writeln!(markdown, "question: {question}");
+    }
     let _ = writeln!(markdown, "output_dir: `{}`", output.output_dir);
     let _ = writeln!(
         markdown,
@@ -1484,6 +1536,23 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
             timings.parse_index_ms,
             timings.edge_resolution_ms,
             timings.cache_refresh_ms.unwrap_or(0)
+        );
+    }
+    if let Some(status) = output.question_search.as_ref() {
+        let artifact = status
+            .artifact
+            .as_deref()
+            .map(|path| format!(" artifact=`{path}`"))
+            .unwrap_or_default();
+        let error = status
+            .error
+            .as_deref()
+            .map(|error| format!(" error=\"{}\"", error.replace('"', "\\\"")))
+            .unwrap_or_default();
+        let _ = writeln!(
+            markdown,
+            "question_search: {} [{}]{}{}",
+            status.command, status.status, artifact, error
         );
     }
 
@@ -1528,6 +1597,17 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
         "verification_targets",
         &output.verification_targets,
     );
+    if !output.verification_checklist.is_empty() {
+        let _ = writeln!(markdown, "verification_checklist:");
+        for item in &output.verification_checklist {
+            let _ = writeln!(
+                markdown,
+                "- {} classifications={}",
+                item.item,
+                item.allowed_classifications.join("|")
+            );
+        }
+    }
     if !output.next_commands.is_empty() {
         let _ = writeln!(markdown, "next_commands:");
         for command in &output.next_commands {
@@ -1760,28 +1840,26 @@ pub(crate) fn render_trail_story_markdown(
 
     append_story_list(&mut markdown, "## Entry Points", &story.entry_points);
 
-    let _ = writeln!(markdown, "\n## Core Flow");
-    if story.core_flow.is_empty() {
+    append_story_steps(&mut markdown, "## Runtime Flow", &story.runtime_flow);
+    append_story_steps(
+        &mut markdown,
+        "## Data And Interface Flow",
+        &story.data_flow,
+    );
+    append_story_steps(
+        &mut markdown,
+        "## Type And Member Structure",
+        &story.type_structure,
+    );
+    if _cmd.show_utility_calls {
+        append_story_steps(&mut markdown, "## Utility Calls", &story.utility_calls);
+    }
+    if story.runtime_flow.is_empty()
+        && story.data_flow.is_empty()
+        && story.type_structure.is_empty()
+    {
+        let _ = writeln!(markdown, "\n## Core Flow");
         let _ = writeln!(markdown, "- no graph edges were returned for this focus");
-    } else {
-        for (step, duplicate_count) in compact_story_steps(&story.core_flow) {
-            let duplicate = if duplicate_count > 1 {
-                format!(" repeated={duplicate_count}")
-            } else {
-                String::new()
-            };
-            let _ = writeln!(
-                markdown,
-                "- [{}] {} {} {} (certainty={}{}). {}",
-                step.edge_id,
-                step.source,
-                step.relation,
-                step.target,
-                step.certainty,
-                duplicate,
-                step.note
-            );
-        }
     }
 
     append_story_list(&mut markdown, "## Side Effects", &story.side_effects);
@@ -1789,6 +1867,35 @@ pub(crate) fn render_trail_story_markdown(
     append_story_list(&mut markdown, "## Tests", &story.test_scope);
     append_story_list(&mut markdown, "## Gaps And Limits", &story.limits);
     markdown
+}
+
+fn append_story_steps(
+    markdown: &mut String,
+    title: &str,
+    steps: &[codestory_contracts::api::TrailStoryStepDto],
+) {
+    if steps.is_empty() {
+        return;
+    }
+    let _ = writeln!(markdown, "\n{title}");
+    for (step, duplicate_count) in compact_story_steps(steps) {
+        let duplicate = if duplicate_count > 1 {
+            format!(" repeated={duplicate_count}")
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            markdown,
+            "- [{}] {} {} {} (certainty={}{}). {}",
+            step.edge_id,
+            step.source,
+            step.relation,
+            step.target,
+            step.certainty,
+            duplicate,
+            step.note
+        );
+    }
 }
 
 fn append_trail_edge_summary(markdown: &mut String, context: &TrailContextDto) {
@@ -1916,7 +2023,8 @@ pub(crate) fn render_snippet_markdown(
     );
     let _ = writeln!(
         markdown,
-        "context: requested_lines={} max_snippet_bytes={}",
+        "context: scope={} requested_lines={} max_snippet_bytes={}",
+        format_snippet_scope(context.scope),
         context.requested_context,
         context.max_snippet_bytes.unwrap_or_default()
     );
@@ -1938,6 +2046,13 @@ pub(crate) fn render_snippet_markdown(
     let _ = writeln!(markdown, "{snippet}");
     let _ = writeln!(markdown, "{fence}");
     markdown
+}
+
+fn format_snippet_scope(scope: codestory_contracts::api::SnippetScopeDto) -> &'static str {
+    match scope {
+        codestory_contracts::api::SnippetScopeDto::LineContext => "line_context",
+        codestory_contracts::api::SnippetScopeDto::FunctionBody => "function_body",
+    }
 }
 
 fn append_resolution(markdown: &mut String, project_root: &Path, target: &ResolvedTarget) {
@@ -2056,6 +2171,7 @@ fn render_search_hit_output(hit: &SearchHitOutput) -> String {
     }
     let _ = write!(out, " score={:.2}", hit.score);
     let _ = write!(out, " origin={}", hit.origin.as_str());
+    let _ = write!(out, " match={}", format_match_quality(hit.match_quality));
     if let Some(role) = hit.symbol_role.as_deref() {
         let _ = write!(out, " role={role}");
     }
@@ -2069,6 +2185,19 @@ fn render_search_hit_output(hit: &SearchHitOutput) -> String {
         let _ = write!(out, " (see above)");
     }
     out
+}
+
+fn format_match_quality(quality: codestory_contracts::api::SearchMatchQualityDto) -> &'static str {
+    match quality {
+        codestory_contracts::api::SearchMatchQualityDto::Exact => "exact",
+        codestory_contracts::api::SearchMatchQualityDto::NormalizedExact => "normalized_exact",
+        codestory_contracts::api::SearchMatchQualityDto::Prefix => "prefix",
+        codestory_contracts::api::SearchMatchQualityDto::Fuzzy => "fuzzy",
+        codestory_contracts::api::SearchMatchQualityDto::SemanticSuggestion => {
+            "semantic_suggestion"
+        }
+        codestory_contracts::api::SearchMatchQualityDto::RepoText => "repo_text",
+    }
 }
 
 pub(crate) fn node_ref(
@@ -2569,6 +2698,7 @@ mod tests {
                 line: Some(10),
                 score: 1.0,
                 origin: SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
             },
@@ -2666,54 +2796,59 @@ mod tests {
     }
 
     fn sample_trail_story(include_tests: bool) -> TrailStoryDto {
+        let core_flow = vec![
+            TrailStoryStepDto {
+                edge_id: "edge-validate".to_string(),
+                source: "handle_request [function] `src/request.rs`".to_string(),
+                relation: "calls".to_string(),
+                target: "validate_request [function] `src/request.rs`".to_string(),
+                certainty: "certain".to_string(),
+                note: "certain call edge confidence=0.99".to_string(),
+            },
+            TrailStoryStepDto {
+                edge_id: "edge-profile".to_string(),
+                source: "validate_request [function] `src/request.rs`".to_string(),
+                relation: "calls".to_string(),
+                target: "load_profile [function] `src/profile.rs`".to_string(),
+                certainty: "probable".to_string(),
+                note: "probable call edge confidence=0.72".to_string(),
+            },
+            TrailStoryStepDto {
+                edge_id: "edge-hook".to_string(),
+                source: "handle_request [function] `src/request.rs`".to_string(),
+                relation: "calls".to_string(),
+                target: "dynamic_plugin_hook [function] `src/plugin.rs`".to_string(),
+                certainty: "uncertain".to_string(),
+                note: "uncertain call edge confidence=0.32 candidate_targets=1".to_string(),
+            },
+            TrailStoryStepDto {
+                edge_id: "edge-speculative".to_string(),
+                source: "handle_request [function] `src/request.rs`".to_string(),
+                relation: "calls".to_string(),
+                target: "experimental_hook [function] `src/plugin.rs`".to_string(),
+                certainty: "speculative".to_string(),
+                note: "speculative call edge confidence=0.21".to_string(),
+            },
+            TrailStoryStepDto {
+                edge_id: "edge-missing".to_string(),
+                source: "handle_request [function] `src/request.rs`".to_string(),
+                relation: "calls".to_string(),
+                target: "legacy_dispatch [function] `src/legacy.rs`".to_string(),
+                certainty: "missing certainty metadata".to_string(),
+                note: "missing certainty metadata call edge".to_string(),
+            },
+        ];
         TrailStoryDto {
             summary: "Story trail around `handle_request` found 6 nodes and 5 edges; mode=neighborhood direction=both tests=included utility_calls=hidden truncated=false.".to_string(),
             entry_points: vec![
                 "focus: handle_request [function] `src/request.rs`".to_string(),
                 "entry: test_request_flow [function] `tests/request_flow.rs`".to_string(),
             ],
-            core_flow: vec![
-                TrailStoryStepDto {
-                    edge_id: "edge-validate".to_string(),
-                    source: "handle_request [function] `src/request.rs`".to_string(),
-                    relation: "calls".to_string(),
-                    target: "validate_request [function] `src/request.rs`".to_string(),
-                    certainty: "certain".to_string(),
-                    note: "certain call edge confidence=0.99".to_string(),
-                },
-                TrailStoryStepDto {
-                    edge_id: "edge-profile".to_string(),
-                    source: "validate_request [function] `src/request.rs`".to_string(),
-                    relation: "calls".to_string(),
-                    target: "load_profile [function] `src/profile.rs`".to_string(),
-                    certainty: "probable".to_string(),
-                    note: "probable call edge confidence=0.72".to_string(),
-                },
-                TrailStoryStepDto {
-                    edge_id: "edge-hook".to_string(),
-                    source: "handle_request [function] `src/request.rs`".to_string(),
-                    relation: "calls".to_string(),
-                    target: "dynamic_plugin_hook [function] `src/plugin.rs`".to_string(),
-                    certainty: "uncertain".to_string(),
-                    note: "uncertain call edge confidence=0.32 candidate_targets=1".to_string(),
-                },
-                TrailStoryStepDto {
-                    edge_id: "edge-speculative".to_string(),
-                    source: "handle_request [function] `src/request.rs`".to_string(),
-                    relation: "calls".to_string(),
-                    target: "experimental_hook [function] `src/plugin.rs`".to_string(),
-                    certainty: "speculative".to_string(),
-                    note: "speculative call edge confidence=0.21".to_string(),
-                },
-                TrailStoryStepDto {
-                    edge_id: "edge-missing".to_string(),
-                    source: "handle_request [function] `src/request.rs`".to_string(),
-                    relation: "calls".to_string(),
-                    target: "legacy_dispatch [function] `src/legacy.rs`".to_string(),
-                    certainty: "missing certainty metadata".to_string(),
-                    note: "missing certainty metadata call edge".to_string(),
-                },
-            ],
+            core_flow: core_flow.clone(),
+            runtime_flow: core_flow,
+            data_flow: Vec::new(),
+            type_structure: Vec::new(),
+            utility_calls: Vec::new(),
             side_effects: vec![
                 "possible side-effect candidate [edge-audit] handle_request [function] `src/request.rs` calls write_audit_log [function] `src/audit.rs` (certainty=certain)".to_string(),
             ],
@@ -2753,6 +2888,7 @@ mod tests {
             line: Some(7),
             score: 0.91,
             origin: SearchHitOrigin::IndexedSymbol,
+            match_quality: codestory_contracts::api::SearchMatchQualityDto::NormalizedExact,
             resolvable: true,
             score_breakdown: Some(RetrievalScoreBreakdownDto {
                 lexical: 0.7,
@@ -2850,6 +2986,16 @@ mod tests {
             limit_per_source: 1,
             repo_text_mode: crate::args::RepoTextMode::Auto,
             repo_text_enabled: true,
+            query_assessment: Some(codestory_contracts::api::SearchQueryAssessmentDto {
+                exact_symbol_hit_count: 1,
+                weak_top_hit: false,
+                stale_or_missing_anchor: false,
+                repo_text_fallback_reason: None,
+                recommended_next_action: Some(
+                    "Open the exact indexed hit with symbol, trail, and snippet before answering."
+                        .to_string(),
+                ),
+            }),
             explain: true,
             query_hints: vec![
                 "codestory-cli context --project C:/repo --query build_packet".to_string(),
@@ -3042,6 +3188,15 @@ mod tests {
             limit_per_source: 1,
             repo_text_mode: crate::args::RepoTextMode::Off,
             repo_text_enabled: false,
+            query_assessment: Some(codestory_contracts::api::SearchQueryAssessmentDto {
+                exact_symbol_hit_count: 0,
+                weak_top_hit: true,
+                stale_or_missing_anchor: false,
+                repo_text_fallback_reason: None,
+                recommended_next_action: Some(
+                    "Rerun search with --repo-text on or a shorter concrete symbol.".to_string(),
+                ),
+            }),
             explain: true,
             query_hints: Vec::new(),
             suggestions: Vec::new(),
@@ -3220,8 +3375,8 @@ mod tests {
         );
 
         assert_order(&markdown, "# Trail Story", "## Entry Points");
-        assert_order(&markdown, "## Entry Points", "## Core Flow");
-        assert_order(&markdown, "## Core Flow", "## Side Effects");
+        assert_order(&markdown, "## Entry Points", "## Runtime Flow");
+        assert_order(&markdown, "## Runtime Flow", "## Side Effects");
         assert_order(&markdown, "## Side Effects", "## Uncertainty");
         assert_order(&markdown, "## Uncertainty", "## Tests");
         assert!(markdown.contains("handle_request [function]"));
@@ -3262,7 +3417,7 @@ edge_summary:
 - focus: handle_request [function] `src/request.rs`
 - entry: test_request_flow [function] `tests/request_flow.rs`
 
-## Core Flow
+## Runtime Flow
 - [edge-validate] handle_request [function] `src/request.rs` calls validate_request [function] `src/request.rs` (certainty=certain). certain call edge confidence=0.99
 - [edge-profile] validate_request [function] `src/request.rs` calls load_profile [function] `src/profile.rs` (certainty=probable). probable call edge confidence=0.72
 - [edge-hook] handle_request [function] `src/request.rs` calls dynamic_plugin_hook [function] `src/plugin.rs` (certainty=uncertain). uncertain call edge confidence=0.32 candidate_targets=1
@@ -3294,6 +3449,24 @@ edge_summary:
     fn trail_story_compacts_repeated_core_flow_steps() {
         let story = TrailStoryDto {
             core_flow: vec![
+                TrailStoryStepDto {
+                    edge_id: "edge-1".to_string(),
+                    source: "A".to_string(),
+                    relation: "calls".to_string(),
+                    target: "B".to_string(),
+                    certainty: "certain".to_string(),
+                    note: "same call".to_string(),
+                },
+                TrailStoryStepDto {
+                    edge_id: "edge-2".to_string(),
+                    source: "A".to_string(),
+                    relation: "calls".to_string(),
+                    target: "B".to_string(),
+                    certainty: "certain".to_string(),
+                    note: "same call".to_string(),
+                },
+            ],
+            runtime_flow: vec![
                 TrailStoryStepDto {
                     edge_id: "edge-1".to_string(),
                     source: "A".to_string(),
@@ -3369,6 +3542,10 @@ edge_summary:
                 "no graph entry edges were returned for this focus".to_string(),
             ],
             core_flow: Vec::new(),
+            runtime_flow: Vec::new(),
+            data_flow: Vec::new(),
+            type_structure: Vec::new(),
+            utility_calls: Vec::new(),
             side_effects: vec![
                 "none detected from conservative edge-kind and target-name heuristics; inspect snippets for runtime effects".to_string(),
             ],

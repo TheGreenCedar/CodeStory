@@ -127,7 +127,7 @@ pub(crate) fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStrea
                 200,
                 &serde_json::json!({
                     "resolution": build_query_resolution_output(&runtime.project_root, &target),
-                    "definition": build_search_hit_output(&runtime.project_root, &target.selected, false, &[]),
+                    "definition": build_search_hit_output(&runtime.project_root, &target.selected, Some(&target.requested), false, &[]),
                     "symbol": context,
                 }),
             )

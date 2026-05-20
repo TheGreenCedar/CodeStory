@@ -1,0 +1,48 @@
+# `drill` - Build a Repeatable Agent-Grounding Evidence Packet
+
+Runs a deterministic evidence collection pass for a realistic codebase question. The command does not answer the question; it writes the artifacts an agent should use before drafting and verifying an answer.
+
+## Usage
+
+```
+target/release/codestory-cli(.exe) drill [OPTIONS]
+```
+
+## Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--project` | path | `.` | Project root directory (alias: `--path`) |
+| `--cache-dir` | path | *auto* | Override the cache directory |
+| `--anchors` | string list | **required** | Concrete anchors to investigate; comma-separated and repeatable |
+| `--question` | string | *none* | Natural-language architecture question to search with repo text; stored in the report |
+| `--label` | string | *none* | Human label for the run |
+| `--output-dir` | path | **required** | Directory for the drill report and artifacts; created if missing |
+| `--refresh` | enum | `full` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
+| `--format` | enum | `markdown` | Primary output format: `markdown` or `json` |
+
+## Output
+
+The command writes both `drill-report.md` and `drill-report.json` in `--output-dir`, plus per-anchor artifacts in the requested primary format.
+
+The report includes:
+
+- mechanical index status before and after refresh
+- optional question repo-text search artifact
+- per-anchor search, symbol, trail, and snippet artifacts
+- chosen anchor and verification targets
+- a verification checklist requiring `correct`, `partial`, `misleading`, or `unsupported` classifications
+
+## Examples
+
+```bash
+# CodeStory-first evidence packet for an architecture question
+target/release/codestory-cli(.exe) drill --project . --refresh full --question "how full indexing supports search trail and snippet commands" --anchors WorkspaceIndexer,SearchService,TrailResult --output-dir target/drill/codestory
+
+# JSON-first run for automation, while still writing Markdown too
+target/release/codestory-cli(.exe) drill --project . --refresh none --anchors Posts,getElsewhereFeed,getCommentAuth --output-dir target/drill/rootandruntime --format json
+```
+
+## Interpretation
+
+Use the drill report as the CodeStory-only phase. Draft the architecture answer from those artifacts first, then open only files named or implied by the artifacts and classify each claim against source truth. If the answer changes materially after source reads, record that as a CodeStory or agent-UX finding.

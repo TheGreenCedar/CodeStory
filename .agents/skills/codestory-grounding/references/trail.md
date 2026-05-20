@@ -23,7 +23,7 @@ target/release/codestory-cli(.exe) trail [OPTIONS]
 | `--include-tests` | flag | `false` | Include test and bench callers |
 | `--show-utility-calls` | flag | `false` | Include utility/helper call edges |
 | `--hide-speculative` | flag | `false` | Hide uncertain/speculative edges and remove nodes disconnected from the trail focus |
-| `--story` | flag | `false` | Render a readable narrative with entry points, core flow, side effects, uncertainty, and test scope |
+| `--story` | flag | `false` | Render a readable narrative with entry points, grouped runtime/data/type flow, side effects, uncertainty, and test scope |
 | `--layout` | enum | `horizontal` | Layout direction: `horizontal` or `vertical` |
 | `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
 | `--format` | enum | `markdown` | Output format: `markdown`, `json`, or trail-only `dot` |
@@ -78,7 +78,10 @@ Story sections:
 | Section | What it makes explicit |
 |---------|------------------------|
 | Entry Points | The focus symbol and any rendered source nodes with no incoming edge. |
-| Core Flow | A readable edge-by-edge path with textual certainty labels. |
+| Runtime Flow | Call/macro edges that look like runtime execution flow. |
+| Data And Interface Flow | Usage/import/include-style edges that show wiring and consumers. |
+| Type And Member Structure | Member, inheritance, type-usage, override, and generic/template structure. |
+| Utility Calls | Helper calls when `--show-utility-calls` is enabled; otherwise hidden from the main story. |
 | Side Effects | Likely mutating/runtime-effect calls inferred from edge kinds and labels. |
 | Uncertainty | Probable, uncertain, speculative, or missing-certainty edges in words. |
 | Tests | Whether tests/benches were included or excluded, plus visible test-like nodes. |
