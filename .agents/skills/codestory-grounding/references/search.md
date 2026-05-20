@@ -28,6 +28,7 @@ target/release/codestory-cli(.exe) search [OPTIONS]
 
 - **Symbol-like queries** (e.g. `AppController`, `run_indexing`) search the indexed symbol table.
 - **Natural-language queries** (e.g. `"how does incremental indexing work"`) also perform a repo-wide text scan and merge results by score.
+- **Field-qualified queries** filter indexed and repo-text results after candidate retrieval. Supported filters are `kind:<node-kind-or-alias>`, `path:<path-fragment>`, `name:<symbol-fragment>`, and `lang:<language-or-extension>`. Example: `kind:function name:listUsers` or `path:routes.ts /api/users`.
 - **Concrete anchors with weak indexed results** also trigger repo text in `auto` mode. This prevents stale names such as retired UI components from looking like valid direct symbol hits.
 - When hybrid retrieval finds strong semantic matches but no lexical match, Markdown and JSON output include `did_you_mean` suggestions.
 - Ranking boosts exact and terminal symbol names, CamelCase initials, compound terms, and path co-location. Test, fixture, vendor, and external hits are dampened unless the query asks for them.
@@ -83,6 +84,9 @@ target/release/codestory-cli(.exe) search --project . --query "how does the grou
 
 # Force repo text scanning for a symbol-like query
 target/release/codestory-cli(.exe) search --project . --query AppController --repo-text on
+
+# Narrow an ambiguous result set by kind and file path
+target/release/codestory-cli(.exe) search --project . --query "kind:function path:routes.ts /api/users" --repo-text off
 
 # JSON output
 target/release/codestory-cli(.exe) search --project . --query TrailResult --format json

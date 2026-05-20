@@ -17,7 +17,7 @@ Use this skill to collect repo evidence with `codestory-cli` before making archi
 - `symbol`: inspect one exact symbol and relationships.
 - `trail`: follow caller, callee, and reference graph around a symbol; use `--story --hide-speculative` for readable flow evidence.
 - `snippet`: fetch source context around a symbol.
-- `drill`: run a deterministic agent-grounding packet for a natural-language question and concrete anchors, including search/symbol/trail/snippet artifacts and a source-verification checklist.
+- `drill`: run a deterministic agent-grounding packet for a natural-language question and concrete anchors, including search/symbol/trail/explore/snippet artifacts, bridge evidence, a claim-ledger template, and a source-verification checklist.
 - `query`: run structured graph-query pipelines.
 - `explore`: interactive or bundled navigation view around a target, including grouped line-numbered source packets.
 - `files`: list indexed file inventory, language counts, inferred source/test/generated/vendor roles, and partial-index markers.

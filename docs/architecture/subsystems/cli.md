@@ -72,7 +72,7 @@ Index output should expose:
 
 ## Read And Query Output
 
-Read commands default to `--refresh none` so they query the current cache unless the caller requests a refresh. `drill` is the exception: it defaults to `--refresh full` so generated report bundles are mechanically fresh. `ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `query`, and `explore` all support `--format markdown|json` and `--output-file <PATH>`; `trail` additionally supports Graphviz DOT via `--format dot`, while `symbol` and `trail` support Mermaid via `--mermaid`.
+Read commands default to `--refresh none` so they query the current cache unless the caller requests a refresh. `drill` is the exception: it defaults to `--refresh full` so generated report bundles are mechanically fresh, records the CodeStory-only/source-truth answer-quality contract, writes per-anchor search/symbol/trail/explore/snippet artifacts, adds cross-anchor bridge evidence, and emits a claim-ledger template for source-truth classification. `ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `query`, and `explore` all support `--format markdown|json` and `--output-file <PATH>`; `trail` additionally supports Graphviz DOT via `--format dot`, while `symbol` and `trail` support Mermaid via `--mermaid`. `search --query` also accepts field-qualified filters such as `kind:function`, `path:routes.ts`, `name:listUsers`, and `lang:typescript` for narrowing candidate sets without hiding the original query text in output.
 
 `query` is intentionally small. It parses source operations (`search`, `symbol`, `trail`) followed by stream refinements (`filter`, `limit`) and rejects malformed or unknown named arguments rather than silently ignoring typos.
 

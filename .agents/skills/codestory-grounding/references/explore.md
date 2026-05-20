@@ -20,6 +20,7 @@ target/release/codestory-cli(.exe) explore [OPTIONS] <--id <ID>|--query <QUERY>>
 | `--id <node_id>` | none | Resolve an exact node id from prior output. |
 | `--query <text>` | none | Resolve by symbol query. Required when using `--file`. |
 | `--file <fragment>` | none | Disambiguate a query by path fragment. |
+| `--profile <architecture|route|bug|refactor|test-impact>` | default | Tune depth, caller scope, and source packet evidence for the investigation type. |
 | `--depth <n>` | `2` | Neighborhood trail depth. |
 | `--max-nodes <n>` | `18` | Trail node cap, clamped to 1-120. |
 | `--no-tui` | off | Print Markdown instead of opening the terminal explorer. |
@@ -38,6 +39,7 @@ target/release/codestory-cli(.exe) explore [OPTIONS] <--id <ID>|--query <QUERY>>
 
 - Use `--format json` for downstream tools.
 - Use `--no-tui` in non-interactive agent runs to keep output copy-paste stable.
+- Use `--profile architecture` for subsystem anchors where the agent needs wider production relationship evidence and related-hit source packets.
 - If query resolution is `ambiguous`, do not let `explore` pick for you. Run
   `search --project . --query <query> --why`, then retry with `--id <node_id>`
   or `--file <fragment>`.

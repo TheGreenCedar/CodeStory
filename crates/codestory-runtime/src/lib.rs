@@ -577,6 +577,20 @@ struct RepoTextScan {
 }
 
 #[derive(Debug, Clone)]
+struct SearchIntentQuery {
+    effective_query: String,
+    filters: Vec<SearchIntentFilter>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SearchIntentFilter {
+    Kind(String),
+    Path(String),
+    Name(String),
+    Language(String),
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct BoundedSnippet {
     pub(crate) markdown: String,
     pub(crate) truncated: bool,
@@ -590,6 +604,187 @@ pub(crate) struct BoundedSnippetRangeOptions<'a> {
     pub(crate) context_lines: usize,
     pub(crate) max_bytes: usize,
     pub(crate) truncation_suffix: &'a str,
+}
+
+fn parse_search_intent_query(query: &str) -> SearchIntentQuery {
+    let mut free_terms = Vec::new();
+    let mut name_terms = Vec::new();
+    let mut fallback_terms = Vec::new();
+    let mut filters = Vec::new();
+
+    for token in query.split_whitespace() {
+        let Some((field, raw_value)) = token.split_once(':') else {
+            free_terms.push(token.to_string());
+            continue;
+        };
+        let value = strip_query_value_quotes(raw_value);
+        if value.is_empty() {
+            free_terms.push(token.to_string());
+            continue;
+        }
+        match field.to_ascii_lowercase().as_str() {
+            "kind" => {
+                fallback_terms.push(value.clone());
+                filters.push(SearchIntentFilter::Kind(value));
+            }
+            "path" | "file" => {
+                fallback_terms.push(value.clone());
+                filters.push(SearchIntentFilter::Path(value));
+            }
+            "name" | "symbol" => {
+                name_terms.push(value.clone());
+                fallback_terms.push(value.clone());
+                filters.push(SearchIntentFilter::Name(value));
+            }
+            "lang" | "language" => {
+                fallback_terms.push(value.clone());
+                filters.push(SearchIntentFilter::Language(value));
+            }
+            _ => free_terms.push(token.to_string()),
+        }
+    }
+
+    let effective_query = if !free_terms.is_empty() {
+        free_terms.join(" ")
+    } else if !name_terms.is_empty() {
+        name_terms.join(" ")
+    } else if !fallback_terms.is_empty() {
+        fallback_terms.join(" ")
+    } else {
+        query.trim().to_string()
+    };
+
+    SearchIntentQuery {
+        effective_query,
+        filters,
+    }
+}
+
+fn strip_query_value_quotes(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if matches!(first, b'"' | b'\'' | b'`') && first == last {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value.to_string()
+}
+
+fn apply_search_intent_filters(hits: &mut Vec<SearchHit>, filters: &[SearchIntentFilter]) {
+    if filters.is_empty() {
+        return;
+    }
+    hits.retain(|hit| {
+        filters
+            .iter()
+            .all(|filter| search_hit_matches_intent_filter(hit, filter))
+    });
+}
+
+fn search_hit_matches_intent_filter(hit: &SearchHit, filter: &SearchIntentFilter) -> bool {
+    match filter {
+        SearchIntentFilter::Kind(kind) => search_hit_kind_matches(hit.kind, kind),
+        SearchIntentFilter::Path(fragment) => hit.file_path.as_deref().is_some_and(|path| {
+            path.to_ascii_lowercase()
+                .contains(&fragment.to_ascii_lowercase())
+        }),
+        SearchIntentFilter::Name(name) => search_hit_name_matches(&hit.display_name, name),
+        SearchIntentFilter::Language(language) => hit
+            .file_path
+            .as_deref()
+            .is_some_and(|path| language_filter_matches_path(language, path)),
+    }
+}
+
+fn search_hit_kind_matches(kind: NodeKind, requested: &str) -> bool {
+    let normalized = normalize_filter_token(requested);
+    let actual = normalize_filter_token(&format!("{kind:?}"));
+    if normalized == actual {
+        return true;
+    }
+    match normalized.as_str() {
+        "fn" | "func" | "function" => kind == NodeKind::FUNCTION,
+        "method" => kind == NodeKind::METHOD,
+        "callable" => matches!(
+            kind,
+            NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+        ),
+        "type" => matches!(
+            kind,
+            NodeKind::STRUCT
+                | NodeKind::CLASS
+                | NodeKind::INTERFACE
+                | NodeKind::UNION
+                | NodeKind::ENUM
+                | NodeKind::TYPEDEF
+        ),
+        "var" | "variable" => matches!(kind, NodeKind::VARIABLE | NodeKind::GLOBAL_VARIABLE),
+        "global" | "globalvar" | "globalvariable" => kind == NodeKind::GLOBAL_VARIABLE,
+        "const" | "constant" => kind == NodeKind::CONSTANT,
+        "field" | "member" => kind == NodeKind::FIELD,
+        "file" => kind == NodeKind::FILE,
+        _ => false,
+    }
+}
+
+fn search_hit_name_matches(display_name: &str, requested: &str) -> bool {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return true;
+    }
+    let display_lower = display_name.to_ascii_lowercase();
+    let requested_lower = requested.to_ascii_lowercase();
+    display_lower.contains(&requested_lower)
+        || normalize_symbol_query(display_name).contains(&normalize_symbol_query(requested))
+}
+
+fn language_filter_matches_path(requested: &str, path: &str) -> bool {
+    let requested_lower = requested.trim().to_ascii_lowercase();
+    let requested_normalized = normalize_filter_token(&requested_lower);
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match requested_normalized.as_str() {
+        "rs" | "rust" => extension == "rs",
+        "ts" | "typescript" => matches!(extension.as_str(), "ts" | "tsx"),
+        "tsx" => extension == "tsx",
+        "js" | "javascript" => matches!(extension.as_str(), "js" | "jsx" | "mjs" | "cjs"),
+        "jsx" => extension == "jsx",
+        "py" | "python" => extension == "py",
+        "java" => extension == "java",
+        "cpp" | "cxx" | "cc" | "hpp" | "hxx" | "cplusplus" if requested_lower != "c" => {
+            matches!(extension.as_str(), "cpp" | "cxx" | "cc" | "hpp" | "hxx")
+        }
+        _ if requested_lower == "c++" => {
+            matches!(extension.as_str(), "cpp" | "cxx" | "cc" | "hpp" | "hxx")
+        }
+        _ if requested_lower == "c#" => extension == "cs",
+        "c" => matches!(extension.as_str(), "c" | "h"),
+        "cs" | "csharp" => extension == "cs",
+        "go" => extension == "go",
+        "svelte" => extension == "svelte",
+        "json" => extension == "json",
+        "md" | "markdown" => matches!(extension.as_str(), "md" | "mdx"),
+        "rb" | "ruby" => extension == "rb",
+        "php" => extension == "php",
+        "kt" | "kotlin" => matches!(extension.as_str(), "kt" | "kts"),
+        "swift" => extension == "swift",
+        _ => requested_normalized == normalize_filter_token(&extension),
+    }
+}
+
+fn normalize_filter_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
 }
 
 fn exact_symbol_hit_count(query: &str, hits: &[SearchHit]) -> u32 {
@@ -4335,7 +4530,9 @@ impl AppController {
 
     pub fn search_results(&self, req: SearchRequest) -> Result<SearchResultsDto, ApiError> {
         self.ensure_consistent_read_state("Search")?;
-        let query = req.query.clone();
+        let original_query = req.query.clone();
+        let intent_query = parse_search_intent_query(&original_query);
+        let query = intent_query.effective_query.clone();
         let limit_per_source = req.limit_per_source.clamp(1, 50) as usize;
         let repo_text_mode = req.repo_text;
         let (mut scored_symbol_hits, retrieval) = self.search_hybrid_scored_inner(
@@ -4362,6 +4559,9 @@ impl AppController {
             merge_search_hits_by_node_id(&mut indexed_symbol_hits, expanded_hits);
         }
 
+        apply_search_intent_filters(&mut suggestions, &intent_query.filters);
+        apply_search_intent_filters(&mut indexed_symbol_hits, &intent_query.filters);
+
         let project_root = self.require_project_root().ok();
         indexed_symbol_hits.sort_by(|left, right| {
             compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
@@ -4372,8 +4572,9 @@ impl AppController {
         if Self::is_repo_explanation_search_query(&query)
             && let Ok(snapshot) = self.grounding_snapshot(GroundingBudgetDto::Balanced)
         {
-            let overview_hits =
+            let mut overview_hits =
                 grounding::grounding_explanation_search_hits(&snapshot, limit_per_source);
+            apply_search_intent_filters(&mut overview_hits, &intent_query.filters);
             if !overview_hits.is_empty() {
                 if query_has_symbol_or_literal_signal(&query) {
                     merge_search_hits_by_node_id(&mut suggestions, overview_hits);
@@ -4414,7 +4615,9 @@ impl AppController {
                 limit_per_source,
                 &indexed_hit_ids,
             )?;
-            (scan.hits, Some(scan.stats))
+            let mut hits = scan.hits;
+            apply_search_intent_filters(&mut hits, &intent_query.filters);
+            (hits, Some(scan.stats))
         } else {
             (Vec::new(), None)
         };
@@ -4435,7 +4638,7 @@ impl AppController {
         );
 
         Ok(SearchResultsDto {
-            query,
+            query: original_query,
             retrieval,
             freshness,
             limit_per_source: limit_per_source as u32,
@@ -6249,6 +6452,86 @@ mod tests {
             ],
             _lock: lock,
         }
+    }
+
+    #[test]
+    fn parse_search_intent_query_extracts_supported_filters() {
+        let parsed = parse_search_intent_query(
+            "kind:function name:`listUsers` path:src/routes.ts lang:typescript",
+        );
+
+        assert_eq!(parsed.effective_query, "listUsers");
+        assert_eq!(
+            parsed.filters,
+            vec![
+                SearchIntentFilter::Kind("function".to_string()),
+                SearchIntentFilter::Name("listUsers".to_string()),
+                SearchIntentFilter::Path("src/routes.ts".to_string()),
+                SearchIntentFilter::Language("typescript".to_string()),
+            ]
+        );
+
+        let unknown_prefix = parse_search_intent_query("owner:web /api/users");
+        assert_eq!(unknown_prefix.effective_query, "owner:web /api/users");
+        assert!(unknown_prefix.filters.is_empty());
+    }
+
+    #[test]
+    fn search_intent_filters_hits_by_kind_path_name_and_language() {
+        fn hit(
+            id: &str,
+            display_name: &str,
+            kind: codestory_contracts::api::NodeKind,
+            file_path: &str,
+        ) -> SearchHit {
+            SearchHit {
+                node_id: codestory_contracts::api::NodeId(id.to_string()),
+                display_name: display_name.to_string(),
+                kind,
+                file_path: Some(file_path.to_string()),
+                line: Some(1),
+                score: 1.0,
+                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
+                resolvable: true,
+                score_breakdown: None,
+            }
+        }
+
+        let mut hits = vec![
+            hit(
+                "a",
+                "listUsers",
+                codestory_contracts::api::NodeKind::FUNCTION,
+                "src/routes.ts",
+            ),
+            hit(
+                "b",
+                "Users",
+                codestory_contracts::api::NodeKind::STRUCT,
+                "src/routes.ts",
+            ),
+            hit(
+                "c",
+                "listUsers",
+                codestory_contracts::api::NodeKind::FUNCTION,
+                "src/routes.rs",
+            ),
+        ];
+
+        apply_search_intent_filters(
+            &mut hits,
+            &[
+                SearchIntentFilter::Kind("function".to_string()),
+                SearchIntentFilter::Path("routes.ts".to_string()),
+                SearchIntentFilter::Name("listUsers".to_string()),
+                SearchIntentFilter::Language("typescript".to_string()),
+            ],
+        );
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].display_name, "listUsers");
+        assert_eq!(hits[0].file_path.as_deref(), Some("src/routes.ts"));
     }
 
     #[test]
