@@ -221,6 +221,14 @@ fn array_len(value: &Value, path: &[&str]) -> usize {
         .len()
 }
 
+fn array_contains_command(value: &Value, path: &[&str], expected: &str) -> bool {
+    json_path(value, path)
+        .as_array()
+        .unwrap_or_else(|| panic!("expected array at path {:?}", path))
+        .iter()
+        .any(|item| item["command"].as_str() == Some(expected))
+}
+
 fn drill_repo_cases() -> Vec<DrillRepoCase> {
     let code_story = repo_root();
     let source_repos = code_story
@@ -250,8 +258,8 @@ fn drill_repo_cases() -> Vec<DrillRepoCase> {
         DrillRepoCase {
             name: "batcave",
             project_root: source_repos.join("BatCave"),
-            question: "Explain how BatCave frontend command surfaces connect to runtime snapshot data, including stale anchors and Svelte repo-text evidence.",
-            anchors: &["GlobalResourceListView", "App.svelte", "get_snapshot"],
+            question: "Explain how BatCave Tauri commands expose runtime snapshots and how telemetry collectors feed RuntimeStore.",
+            anchors: &["RuntimeStore", "TelemetryCollector", "get_snapshot"],
         },
     ]
 }
@@ -582,6 +590,40 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             case.name
         );
         assert!(
+            bool_field(
+                &drill_json,
+                &["answer_quality_contract", "code_story_only_draft_required"]
+            ),
+            "{} drill should require a CodeStory-only draft before source reads",
+            case.name
+        );
+        assert!(
+            bool_field(
+                &drill_json,
+                &[
+                    "answer_quality_contract",
+                    "source_truth_verification_required"
+                ]
+            ),
+            "{} drill should require source-truth verification after the draft",
+            case.name
+        );
+        assert!(
+            array_len(&drill_json, &["answer_quality_contract", "score_inputs"]) >= 5,
+            "{} drill should expose score inputs for answer-quality reporting",
+            case.name
+        );
+        assert!(
+            array_len(&drill_json, &["claim_ledger_template", "claims"]) >= case.anchors.len(),
+            "{} drill should emit a fillable claim ledger template",
+            case.name
+        );
+        assert!(
+            array_len(&drill_json, &["bridges"]) >= case.anchors.len().saturating_sub(1),
+            "{} drill should emit cross-anchor bridge evidence",
+            case.name
+        );
+        assert!(
             output_dir.join("drill-report.md").is_file(),
             "{} drill should write a markdown report",
             case.name
@@ -610,6 +652,17 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
                 "{} drill anchor should record evidence command artifacts",
                 case.name
             );
+            if !json_path(&drill_json, &["anchors", index.as_str(), "chosen_anchor"]).is_null() {
+                assert!(
+                    array_contains_command(
+                        &drill_json,
+                        &["anchors", index.as_str(), "commands"],
+                        "explore"
+                    ),
+                    "{} drill should include an explore source-packet artifact for resolved anchors",
+                    case.name
+                );
+            }
         }
     }
 

@@ -11,6 +11,8 @@ framework routes are discoverable after ranking or indexing changes.
 - Latency: maximum per-query wall-clock latency observed by the harness.
 - Anchor buckets: whether expected anchors appeared in `indexed_symbol_hits`,
   `repo_text_hits`, or both.
+- Field-qualified recall: `kind:`, `path:`, `name:`, and `lang:` queries must
+  keep the expected anchor while filtering unrelated hits.
 - Negative/noisy guard: a deliberately noisy query must not produce exact
   anchors.
 
@@ -42,7 +44,7 @@ search_quality_eval recall=1.000 mrr=0.833 max_latency_ms=42 anchor_buckets=inde
 - Low recall means an expected anchor was not indexed or not returned. Check the
   failing query class first: exact symbol, CamelCase, compound term,
   natural-language query, route/endpoint, handler, likely-test hint,
-  repo-text fallback, or negative/noisy query.
+  field-qualified filter, repo-text fallback, or negative/noisy query.
 - Low MRR means the right anchor exists but noisy hits outrank it. Use
   `search --why --format json` on the failing query and inspect scoring,
   fallback, and `query_assessment` before changing ranking.
@@ -56,6 +58,10 @@ search_quality_eval recall=1.000 mrr=0.833 max_latency_ms=42 anchor_buckets=inde
   failure, even if recall looks high.
 - A route query failure blocks route-support promotion until the route coverage
   playbook explains the gap or the fixture/search expectation is fixed.
+- Field-qualified misses usually mean the candidate was retrieved but filtered
+  out by kind/path/name/language normalization; rerun the same query with
+  `--why --format json` and compare `indexed_symbol_hits` before weakening the
+  filter.
 
 ## Promotion Rules
 

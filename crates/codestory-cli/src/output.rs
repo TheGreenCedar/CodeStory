@@ -1605,10 +1605,126 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
         }
     }
 
+    if !output.bridges.is_empty() {
+        let _ = writeln!(markdown, "bridges:");
+        for bridge in &output.bridges {
+            let evidence = &bridge.evidence;
+            let artifact = bridge
+                .command
+                .artifact
+                .as_deref()
+                .map(|path| format!(" artifact=`{path}`"))
+                .unwrap_or_default();
+            let error = bridge
+                .command
+                .error
+                .as_deref()
+                .map(|error| format!(" error=\"{}\"", error.replace('"', "\\\"")))
+                .unwrap_or_default();
+            let _ = writeln!(
+                markdown,
+                "- `{}` -> `{}` status={} strategy={} confidence={} [{}]{}{}",
+                evidence.from_anchor,
+                evidence.to_anchor,
+                evidence.status,
+                evidence.strategy,
+                evidence.confidence,
+                bridge.command.status,
+                artifact,
+                error
+            );
+            if let Some(path) = evidence.graph_path.as_ref() {
+                let _ = writeln!(
+                    markdown,
+                    "  graph_path: nodes={} edges={} truncated={} omitted_edges={}",
+                    path.node_count, path.edge_count, path.truncated, path.omitted_edge_count
+                );
+            }
+            if !evidence.shared_files.is_empty() {
+                let _ = writeln!(
+                    markdown,
+                    "  shared_files: {}",
+                    evidence.shared_files.join(", ")
+                );
+            }
+            for note in &evidence.notes {
+                let _ = writeln!(markdown, "  - {note}");
+            }
+        }
+    }
+
     append_verification_targets(
         &mut markdown,
         "verification_targets",
         &output.verification_targets,
+    );
+    let contract = &output.answer_quality_contract;
+    let _ = writeln!(
+        markdown,
+        "answer_quality_contract: code_story_only_draft_required={} source_truth_verification_required={}",
+        contract.code_story_only_draft_required, contract.source_truth_verification_required
+    );
+    let _ = writeln!(markdown, "- pass_condition: {}", contract.pass_condition);
+    if !contract.score_inputs.is_empty() {
+        let _ = writeln!(markdown, "- score_inputs:");
+        for input in &contract.score_inputs {
+            let _ = writeln!(markdown, "  - {input}");
+        }
+    }
+    if !contract.correction_buckets.is_empty() {
+        let _ = writeln!(
+            markdown,
+            "- correction_buckets: {}",
+            contract.correction_buckets.join("|")
+        );
+    }
+    let ledger = &output.claim_ledger_template;
+    let _ = writeln!(
+        markdown,
+        "claim_ledger_template: version={} claims={}",
+        ledger.template_version,
+        ledger.claims.len()
+    );
+    if !ledger.instructions.is_empty() {
+        let _ = writeln!(markdown, "- instructions:");
+        for instruction in &ledger.instructions {
+            let _ = writeln!(markdown, "  - {instruction}");
+        }
+    }
+    for claim in &ledger.claims {
+        let _ = writeln!(
+            markdown,
+            "- `{}` confidence={} classification=pending changed_after_source_read=pending",
+            claim.id, claim.pre_verification_confidence
+        );
+        let _ = writeln!(markdown, "  claim: {}", claim.claim);
+        if !claim.expected_evidence.is_empty() {
+            let _ = writeln!(markdown, "  evidence:");
+            for artifact in &claim.expected_evidence {
+                let _ = writeln!(markdown, "  - `{artifact}`");
+            }
+        }
+        if !claim.source_truth_files.is_empty() {
+            let _ = writeln!(
+                markdown,
+                "  source_truth_files: {}",
+                claim.source_truth_files.join(", ")
+            );
+        }
+    }
+    let _ = writeln!(
+        markdown,
+        "- scoring: correct={} partial={} misleading={} unsupported={} material_revision_count={}",
+        ledger.scoring.correct,
+        ledger.scoring.partial,
+        ledger.scoring.misleading,
+        ledger.scoring.unsupported,
+        ledger.scoring.material_revision_count
+    );
+    let _ = writeln!(
+        markdown,
+        "- score_formula: {}",
+        ledger.scoring.score_formula
     );
     if !output.verification_checklist.is_empty() {
         let _ = writeln!(markdown, "verification_checklist:");
@@ -2169,7 +2285,7 @@ fn render_search_hit(project_root: &Path, hit: &SearchHit) -> String {
     out
 }
 
-fn render_search_hit_output(hit: &SearchHitOutput) -> String {
+pub(crate) fn render_search_hit_output(hit: &SearchHitOutput) -> String {
     let mut out = format!(
         "[{}] {} [{}]",
         hit.node_id,

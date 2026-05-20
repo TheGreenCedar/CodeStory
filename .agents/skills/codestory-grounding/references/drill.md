@@ -23,14 +23,17 @@ target/release/codestory-cli(.exe) drill [OPTIONS]
 
 ## Output
 
-The command writes both `drill-report.md` and `drill-report.json` in `--output-dir`, plus per-anchor artifacts in the requested primary format.
+The command writes both `drill-report.md` and `drill-report.json` in `--output-dir`, plus per-anchor and bridge artifacts in the requested primary format.
 
 The report includes:
 
 - mechanical index status before and after refresh
 - optional question repo-text search artifact
-- per-anchor search, symbol, trail, and snippet artifacts
+- per-anchor search, symbol, trail, explore, and snippet artifacts
+- cross-anchor bridge artifacts using graph paths first and shared-file fallback diagnostics when no graph bridge is visible
 - chosen anchor and verification targets
+- an answer-quality contract requiring a CodeStory-only draft before source reads and source-truth verification afterward
+- a fillable claim-ledger template for source-truth classification, correction counts, and material-revision tracking
 - a verification checklist requiring `correct`, `partial`, `misleading`, or `unsupported` classifications
 
 ## Examples

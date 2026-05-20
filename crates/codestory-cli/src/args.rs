@@ -697,6 +697,7 @@ pub(crate) struct ExploreCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ExploreProfile {
+    Architecture,
     Route,
     Bug,
     Refactor,
@@ -1029,6 +1030,41 @@ pub(crate) struct DrillCommandStatusOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct DrillBridgeGraphPathOutput {
+    pub(crate) mode: String,
+    pub(crate) node_count: usize,
+    pub(crate) edge_count: usize,
+    pub(crate) truncated: bool,
+    pub(crate) omitted_edge_count: u32,
+    pub(crate) nodes: Vec<String>,
+    pub(crate) edges: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DrillBridgeEvidenceOutput {
+    pub(crate) from_anchor: String,
+    pub(crate) to_anchor: String,
+    pub(crate) status: String,
+    pub(crate) strategy: String,
+    pub(crate) confidence: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) from_node: Option<SearchHitOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) to_node: Option<SearchHitOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) graph_path: Option<DrillBridgeGraphPathOutput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) shared_files: Vec<String>,
+    pub(crate) notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DrillBridgeOutput {
+    pub(crate) evidence: DrillBridgeEvidenceOutput,
+    pub(crate) command: DrillCommandStatusOutput,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct DrillAnchorOutput {
     pub(crate) anchor: String,
     pub(crate) typed_hit_count: usize,
@@ -1045,6 +1081,48 @@ pub(crate) struct DrillVerificationChecklistItemOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct DrillAnswerQualityContractOutput {
+    pub(crate) code_story_only_draft_required: bool,
+    pub(crate) source_truth_verification_required: bool,
+    pub(crate) pass_condition: String,
+    pub(crate) score_inputs: Vec<String>,
+    pub(crate) correction_buckets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DrillClaimLedgerEntryOutput {
+    pub(crate) id: String,
+    pub(crate) claim: String,
+    pub(crate) expected_evidence: Vec<String>,
+    pub(crate) source_truth_files: Vec<String>,
+    pub(crate) pre_verification_confidence: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) classification: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) changed_after_source_read: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) correction_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DrillClaimLedgerScoringOutput {
+    pub(crate) correct: u32,
+    pub(crate) partial: u32,
+    pub(crate) misleading: u32,
+    pub(crate) unsupported: u32,
+    pub(crate) material_revision_count: u32,
+    pub(crate) score_formula: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DrillClaimLedgerOutput {
+    pub(crate) template_version: u32,
+    pub(crate) instructions: Vec<String>,
+    pub(crate) claims: Vec<DrillClaimLedgerEntryOutput>,
+    pub(crate) scoring: DrillClaimLedgerScoringOutput,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct DrillOutput {
     pub(crate) project: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1057,7 +1135,11 @@ pub(crate) struct DrillOutput {
     pub(crate) question_search: Option<DrillCommandStatusOutput>,
     pub(crate) anchors: Vec<DrillAnchorOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) bridges: Vec<DrillBridgeOutput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) verification_targets: Vec<VerificationTargetOutput>,
+    pub(crate) answer_quality_contract: DrillAnswerQualityContractOutput,
+    pub(crate) claim_ledger_template: DrillClaimLedgerOutput,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) verification_checklist: Vec<DrillVerificationChecklistItemOutput>,
     pub(crate) next_commands: Vec<String>,

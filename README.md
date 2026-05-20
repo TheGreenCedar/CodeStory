@@ -132,7 +132,7 @@ flowchart LR
 - `doctor`: read-only health check for project/cache/index/retrieval readiness.
 - `index`: build or refresh the SQLite graph/search/semantic cache.
 - `ground`: broad repo-level orientation snapshot; `--why` explains retrieval mode, coverage, gaps, and next commands.
-- `search`: lightweight candidate discovery for symbols, files, literals, API paths, modules, and specific behavior terms; use `--why` for ranking reasons.
+- `search`: lightweight candidate discovery for symbols, files, literals, API paths, modules, and specific behavior terms; use `--why` for ranking reasons and `kind:`, `path:`, `name:`, or `lang:` filters for ambiguous result sets.
 - `context`: deep evidence/context bundle for one concrete target selected by `--id`, `--query`, or `--bookmark`; it is not question answering, chatting, or prompt interpretation.
 - `symbol`: inspect one exact symbol and relationships.
 - `trail`: follow caller/callee/reference graph around a symbol; `--story --hide-speculative` gives a readable flow with uncertainty.
@@ -141,7 +141,7 @@ flowchart LR
 - `explore`: interactive or bundled navigation view around a target; use `--no-tui` or `--format json` for stable agent output.
 - `files`: inspect indexed file inventory, language counts, inferred roles, and framework route coverage notes.
 - `affected`: map changed files to impacted symbols, route evidence when present, likely tests, blind spots, and next commands.
-- `drill`: write a deterministic report bundle for selected anchors and an optional architecture question; defaults to `--refresh full`.
+- `drill`: write a deterministic report bundle for selected anchors and an optional architecture question, including search/symbol/trail/explore/snippet artifacts, cross-anchor bridge evidence, and the CodeStory-only/source-truth answer-quality contract plus claim-ledger template; defaults to `--refresh full`.
 - `bookmark`: save, list, or remove investigation focus nodes.
 - `setup embeddings`: install and validate managed embedding assets.
 - `generate-completions`: emit bash, zsh, fish, or PowerShell completions generated from the clap command model.
@@ -151,6 +151,8 @@ Use `ground --why` for broad orientation, `search --why` for candidate discovery
 Do not pass broad natural-language questions to `context`. For broad repo/product questions, use `ground --why`, run one or more concrete `search --repo-text on --why` queries, select anchors, then run `context --id <node-id>` for each anchor.
 
 Hybrid retrieval is the intended default when local embedding assets are available. `index`, `ground`, `search`, `context`, and `doctor` now report retrieval mode, semantic doc counts, and explicit fallback reasons when the runtime drops back to symbolic ranking.
+
+Search accepts field-qualified filters when you already know part of the target: `kind:function name:listUsers`, `path:routes.ts /api/users`, and `lang:typescript /api/users` keep the original query in output while using the unqualified terms for ranking.
 
 ## Template Workflows
 

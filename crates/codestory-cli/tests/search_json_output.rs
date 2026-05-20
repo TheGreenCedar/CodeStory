@@ -38,6 +38,38 @@ function listUsers() {
 "#,
     )
     .expect("write route fixture");
+    fs::write(
+        src.join("architecture.ts"),
+        r#"
+// Project source groups create indexing commands and storage access.
+export class SourceGroupCxxCdb {
+  getIndexerCommands() { return []; }
+}
+
+// Full indexing flows through workspace indexer, search service, trails, and snippets.
+export class WorkspaceIndexer {
+  run() { return "indexed"; }
+}
+export class SearchService {
+  search() { return []; }
+}
+export interface TrailResult {
+  nodes: string[];
+}
+
+// Public writing social surfaces connect posts, comment auth, and elsewhere feed.
+export const Posts = {
+  slug: "posts",
+};
+export function getElsewhereFeed() {
+  return [];
+}
+export function getCommentAuth() {
+  return null;
+}
+"#,
+    )
+    .expect("write architecture fixture");
 }
 
 fn write_openapi_route_fixture(root: &Path) {
@@ -353,6 +385,94 @@ fn symbol_json_exposes_typed_route_endpoint_metadata() {
 }
 
 #[test]
+fn field_qualified_search_filters_kind_path_name_and_language() {
+    let workspace = tempdir().expect("workspace dir");
+    write_search_quality_fixture(workspace.path());
+
+    let index = run_cli(
+        workspace.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    assert!(
+        index.status.success(),
+        "index command failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    let cases = [
+        (
+            "kind:function name:listUsers",
+            "listUsers",
+            Some("FUNCTION"),
+            Some("src/routes.ts"),
+        ),
+        (
+            "path:routes.ts /api/users",
+            "GET /api/users",
+            None,
+            Some("src/routes.ts"),
+        ),
+        ("lang:typescript /api/users", "GET /api/users", None, None),
+    ];
+
+    for (query, expected_name, expected_kind, expected_path) in cases {
+        let search = run_cli(
+            workspace.path(),
+            &[
+                "search",
+                "--query",
+                query,
+                "--limit",
+                "5",
+                "--repo-text",
+                "off",
+                "--refresh",
+                "none",
+                "--format",
+                "json",
+            ],
+        );
+        assert!(
+            search.status.success(),
+            "search command failed for {query}: {}",
+            String::from_utf8_lossy(&search.stderr)
+        );
+        let json: Value = serde_json::from_slice(&search.stdout).expect("parse search json");
+        assert_eq!(json["query"], Value::String(query.to_string()));
+        let hits = json["indexed_symbol_hits"]
+            .as_array()
+            .expect("indexed_symbol_hits");
+        assert!(
+            !hits.is_empty(),
+            "field-qualified search should keep matching indexed hits for {query}: {json:#}"
+        );
+        assert!(
+            hits.iter().any(|hit| {
+                hit["display_name"]
+                    .as_str()
+                    .is_some_and(|name| name.contains(expected_name))
+            }),
+            "expected {expected_name} in filtered hits for {query}: {json:#}"
+        );
+        if let Some(kind) = expected_kind {
+            assert!(
+                hits.iter()
+                    .all(|hit| hit["kind"].as_str().is_some_and(|value| value == kind)),
+                "kind filter should remove non-{kind} hits for {query}: {json:#}"
+            );
+        }
+        if let Some(path) = expected_path {
+            assert!(
+                hits.iter().all(|hit| hit["file_path"]
+                    .as_str()
+                    .is_some_and(|value| value.ends_with(path))),
+                "path/language filter should remove unrelated paths for {query}: {json:#}"
+            );
+        }
+    }
+}
+
+#[test]
 #[ignore = "search-quality eval harness; run explicitly after changing search ranking or route indexing"]
 fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
     let workspace = tempdir().expect("workspace dir");
@@ -371,10 +491,33 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
     let expectations = [
         ("exact_symbol_anchor", "exact_symbol_anchor", "off"),
         ("build snapshot digest", "build_snapshot_digest", "off"),
+        (
+            "kind:function build snapshot digest",
+            "build_snapshot_digest",
+            "off",
+        ),
         ("/api/users", "GET /api/users", "off"),
+        ("path:routes.ts /api/users", "GET /api/users", "off"),
+        ("lang:typescript /api/users", "GET /api/users", "off"),
+        ("kind:function name:listUsers", "listUsers", "off"),
         (
             "compressed grounding summary for oss users",
             "build_snapshot_digest",
+            "on",
+        ),
+        (
+            "how project source groups create indexing commands and storage access",
+            "SourceGroupCxxCdb",
+            "on",
+        ),
+        (
+            "how full indexing supports search trail and snippet commands",
+            "WorkspaceIndexer",
+            "on",
+        ),
+        (
+            "how posts comments auth and elsewhere feed connect to public pages",
+            "getElsewhereFeed",
             "on",
         ),
     ];
