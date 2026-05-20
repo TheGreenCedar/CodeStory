@@ -518,7 +518,10 @@ fn matches_source_group_language(path: &Path, language: &Language) -> bool {
             | (&Language::Python, Some("py" | "pyi"))
             | (&Language::Java, Some("java"))
             | (&Language::JavaScript, Some("js" | "jsx" | "mjs" | "cjs"))
-            | (&Language::TypeScript, Some("ts" | "tsx" | "mts" | "cts"))
+            | (
+                &Language::TypeScript,
+                Some("ts" | "tsx" | "mts" | "cts" | "svelte")
+            )
             | (
                 &Language::Cxx,
                 Some("c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx")
@@ -745,13 +748,53 @@ mod tests {
         let root = temp.path().join("repo");
         fs::create_dir_all(root.join("src"))?;
         fs::write(root.join("app.ts"), "export const app = true;\n")?;
+        fs::write(
+            root.join("App.svelte"),
+            "<script>export let app;</script>\n",
+        )?;
         fs::write(root.join("src").join("main.py"), "print('hello')\n")?;
 
         let manifest = WorkspaceManifest::open(root.clone())?;
         let files = WorkspaceDiscovery.source_files(&manifest)?;
 
         assert!(files.contains(&root.join("app.ts")));
+        assert!(files.contains(&root.join("App.svelte")));
         assert!(files.contains(&root.join("src").join("main.py")));
+        Ok(())
+    }
+
+    #[test]
+    fn source_files_keep_svelte_in_typescript_source_groups_as_text_evidence() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src").join("App.svelte"), "<script></script>\n")?;
+        fs::write(
+            root.join("src").join("App.ts"),
+            "export const app = true;\n",
+        )?;
+
+        let manifest = WorkspaceManifest::from_parts(
+            WorkspaceSettings {
+                name: "repo".to_string(),
+                version: 1,
+                source_groups: vec![SourceGroupSettings {
+                    id: Uuid::new_v4(),
+                    language: Language::TypeScript,
+                    standard: LanguageStandard::Default,
+                    source_paths: vec![root.join("src")],
+                    exclude_patterns: Vec::new(),
+                    include_paths: Vec::new(),
+                    defines: HashMap::new(),
+                    language_specific: LanguageSpecificSettings::Other,
+                }],
+            },
+            root.join("codestory_project.json"),
+        );
+
+        let files = WorkspaceDiscovery.source_files(&manifest)?;
+        assert!(files.contains(&root.join("src").join("App.ts")));
+        assert!(files.contains(&root.join("src").join("App.svelte")));
         Ok(())
     }
 

@@ -1221,6 +1221,26 @@ impl WorkspaceIndexer {
                 Ok(None) => {}
                 Err(err_storage) => return Err(err_storage),
             }
+            if is_text_only_candidate_path(&full_path) {
+                return match index_text_only_file(&full_path) {
+                    Ok(local_storage) => Ok(PreparedIndexWork::Immediate(local_storage)),
+                    Err(error) => {
+                        let mut local_storage = IntermediateStorage::default();
+                        local_storage.add_error(codestory_contracts::graph::ErrorInfo {
+                            message: format!(
+                                "Failed to index text-only file {:?}: {}",
+                                path, error
+                            ),
+                            file_id: None,
+                            line: None,
+                            column: None,
+                            is_fatal: false,
+                            index_step: codestory_contracts::graph::IndexStep::Indexing,
+                        });
+                        Err(local_storage)
+                    }
+                };
+            }
             return Ok(PreparedIndexWork::Immediate(IntermediateStorage::default()));
         };
 
@@ -4311,6 +4331,45 @@ pub fn is_openapi_candidate_path(path: &Path) -> bool {
     matches!(extension.as_str(), "json" | "yaml" | "yml")
 }
 
+pub fn is_text_only_candidate_path(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(extension.as_str(), "svelte")
+}
+
+fn text_only_language_name(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "svelte" => "svelte",
+        _ => "text",
+    }
+}
+
+fn index_text_only_file(path: &Path) -> Result<IntermediateStorage> {
+    let source = std::fs::read_to_string(path)?;
+    let mut local_storage = IntermediateStorage::default();
+    let (file_node, _file_name, file_id) = file_node_from_source(path, &source);
+    local_storage.files.push(codestory_store::FileInfo {
+        id: file_id.0,
+        path: path.to_path_buf(),
+        language: text_only_language_name(path).to_string(),
+        modification_time: file_modification_time(path),
+        indexed: true,
+        complete: true,
+        line_count: source.lines().count() as u32,
+    });
+    local_storage.nodes.push(file_node);
+    Ok(local_storage)
+}
+
 fn index_openapi_schema_file(path: &Path, source: &str) -> Result<Option<IntermediateStorage>> {
     if !looks_like_openapi_schema(source) {
         return Ok(None);
@@ -5858,6 +5917,7 @@ fn generate_edge_id_for_edge(edge: &Edge, flags: IndexFeatureFlags) -> i64 {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use tempfile::tempdir;
 
     #[derive(Debug)]
     struct RawGraphContract {
@@ -7643,6 +7703,25 @@ function render() {
                 && edge.target == endpoint_id
                 && edge.certainty == Some(ResolutionCertainty::Certain)
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_text_only_svelte_file_records_file_inventory() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("App.svelte");
+        std::fs::write(
+            &path,
+            "<script>\n  import { invoke } from '@tauri-apps/api/core';\n</script>\n",
+        )?;
+
+        let storage = index_text_only_file(&path)?;
+
+        assert_eq!(storage.files.len(), 1);
+        assert_eq!(storage.files[0].language, "svelte");
+        assert_eq!(storage.files[0].path, path);
+        assert!(storage.nodes.iter().any(|node| node.kind == NodeKind::FILE));
+        assert!(storage.edges.is_empty());
         Ok(())
     }
 

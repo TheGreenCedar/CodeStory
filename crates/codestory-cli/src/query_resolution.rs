@@ -17,7 +17,7 @@ pub(crate) fn compare_resolution_hits(
     )
 }
 
-pub(crate) fn resolution_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8, u8, u8) {
+pub(crate) fn resolution_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8, u8, u8, u8) {
     resolution_rank_with_project_root(None, query, hit)
 }
 
@@ -25,13 +25,14 @@ pub(crate) fn resolution_rank_with_project_root(
     project_root: Option<&Path>,
     query: &str,
     hit: &SearchHit,
-) -> (u8, u8, u8, u8, u8, u8) {
+) -> (u8, u8, u8, u8, u8, u8, u8) {
     let rank = symbol_name_match_rank(query, &hit.display_name);
 
     (
         rank.exact_display,
         rank.exact_terminal,
         type_definition_line_bucket(project_root, query, hit),
+        callable_definition_line_bucket(project_root, query, hit),
         declaration_anchor_bucket(hit),
         resolution_kind_bucket(hit.kind),
         rank.exact_leading,
@@ -190,6 +191,82 @@ fn type_definition_line_bucket(project_root: Option<&Path>, query: &str, hit: &S
     } else {
         0
     }
+}
+
+fn callable_definition_line_bucket(
+    project_root: Option<&Path>,
+    query: &str,
+    hit: &SearchHit,
+) -> u8 {
+    if !matches!(
+        hit.kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+    ) {
+        return 0;
+    }
+
+    let rank = symbol_name_match_rank(query, &hit.display_name);
+    if rank.exact_display == 0 && rank.exact_terminal == 0 && rank.exact_leading == 0 {
+        return 0;
+    }
+
+    let Some(file_path) = hit.file_path.as_deref() else {
+        return 0;
+    };
+    let Some(line) = hit.line else {
+        return 0;
+    };
+    let Ok(contents) = read_file_contents_for_resolution(project_root, file_path) else {
+        return 0;
+    };
+    let line_index = line.saturating_sub(1) as usize;
+    let Some(source_line) = contents.lines().nth(line_index) else {
+        return 0;
+    };
+    let trimmed = source_line.split("//").next().unwrap_or(source_line).trim();
+    let expected = codestory_runtime::terminal_symbol_segment(query);
+    if expected.is_empty() || !line_contains_symbol_name(trimmed, &expected) {
+        return 0;
+    }
+    let signature_window = contents
+        .lines()
+        .skip(line_index)
+        .take(12)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if looks_like_callable_declaration(&signature_window) {
+        return 0;
+    }
+    if !looks_like_callable_definition(&signature_window) {
+        return 0;
+    }
+
+    2
+}
+
+fn line_contains_symbol_name(line: &str, expected: &str) -> bool {
+    line.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .any(|token| token.eq_ignore_ascii_case(expected))
+}
+
+fn looks_like_callable_declaration(line: &str) -> bool {
+    let brace = line.find('{');
+    let semicolon = line.find(';');
+    let before_body = brace.map(|index| &line[..index]).unwrap_or(line);
+    matches!(
+        (brace, semicolon),
+        (Some(brace), Some(semicolon)) if semicolon < brace
+    ) || matches!((brace, semicolon), (None, Some(_)))
+        || before_body.contains("= 0;")
+}
+
+fn looks_like_callable_definition(line: &str) -> bool {
+    let brace = line.find('{');
+    let semicolon = line.find(';');
+    matches!(
+        (brace, semicolon),
+        (Some(brace), Some(semicolon)) if brace < semicolon
+    ) || matches!((brace, semicolon), (Some(_), None))
 }
 
 fn hit_is_impl_anchor(hit: &SearchHit) -> bool {

@@ -1038,9 +1038,21 @@ fn search_confidence(output: &SearchOutput) -> (&'static str, Vec<String>) {
         .map(|hit| hit.score)
         .fold(0.0_f32, |left, right| left.max(right));
     let total_hits = output.indexed_symbol_hits.len() + output.repo_text_hits.len();
+    let exact_symbol_hits = output
+        .query_assessment
+        .as_ref()
+        .map(|assessment| assessment.exact_symbol_hit_count)
+        .unwrap_or(0);
+    let weak_top_hit = output
+        .query_assessment
+        .as_ref()
+        .is_some_and(|assessment| assessment.weak_top_hit);
     let confidence = if total_hits == 0 || top_score < 0.35 {
         "low"
+    } else if weak_top_hit && output.repo_text_hits.is_empty() {
+        "low"
     } else if !output.indexed_symbol_hits.is_empty()
+        && exact_symbol_hits > 0
         && top_score >= 0.75
         && output.retrieval.fallback_reason.is_none()
         && output.retrieval.semantic_ready

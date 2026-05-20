@@ -4093,6 +4093,142 @@ mod tests {
     }
 
     #[test]
+    fn resolution_prefers_callable_implementation_over_declaration() {
+        let temp = tempdir().expect("create temp dir");
+        let declaration_path = temp.path().join("Project.h");
+        let implementation_path = temp.path().join("Project.cpp");
+        fs::write(&declaration_path, "void buildIndex() const;\n").expect("write declaration");
+        fs::write(
+            &implementation_path,
+            "void Project::buildIndex() const\n{\n    runIndexer();\n}\n",
+        )
+        .expect("write implementation");
+
+        let query = "Project::buildIndex";
+        let mut hits = [
+            SearchHit {
+                node_id: NodeId("declaration".to_string()),
+                display_name: "Project::buildIndex".to_string(),
+                kind: codestory_contracts::api::NodeKind::METHOD,
+                file_path: Some(declaration_path.to_string_lossy().to_string()),
+                line: Some(1),
+                score: 1.0,
+                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
+                resolvable: true,
+                score_breakdown: None,
+            },
+            SearchHit {
+                node_id: NodeId("implementation".to_string()),
+                display_name: "Project::buildIndex".to_string(),
+                kind: codestory_contracts::api::NodeKind::FUNCTION,
+                file_path: Some(implementation_path.to_string_lossy().to_string()),
+                line: Some(1),
+                score: 1.0,
+                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
+                resolvable: true,
+                score_breakdown: None,
+            },
+        ];
+
+        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
+        assert_eq!(hits[0].node_id.0, "implementation");
+    }
+
+    #[test]
+    fn resolution_prefers_multiline_callable_implementation_over_declaration() {
+        let temp = tempdir().expect("create temp dir");
+        let declaration_path = temp.path().join("IndexerJava.h");
+        let implementation_path = temp.path().join("IndexerJava.cpp");
+        fs::write(
+            &declaration_path,
+            "void doIndex(\n    Command command,\n    State state) override;\n",
+        )
+        .expect("write declaration");
+        fs::write(
+            &implementation_path,
+            "void IndexerJava::doIndex(\n    Command command,\n    State state)\n{\n    parse(command);\n}\n",
+        )
+        .expect("write implementation");
+
+        let query = "IndexerJava::doIndex";
+        let mut hits = [
+            SearchHit {
+                node_id: NodeId("declaration".to_string()),
+                display_name: "IndexerJava::doIndex".to_string(),
+                kind: codestory_contracts::api::NodeKind::METHOD,
+                file_path: Some(declaration_path.to_string_lossy().to_string()),
+                line: Some(1),
+                score: 1.0,
+                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
+                resolvable: true,
+                score_breakdown: None,
+            },
+            SearchHit {
+                node_id: NodeId("implementation".to_string()),
+                display_name: "IndexerJava::doIndex".to_string(),
+                kind: codestory_contracts::api::NodeKind::FUNCTION,
+                file_path: Some(implementation_path.to_string_lossy().to_string()),
+                line: Some(1),
+                score: 1.0,
+                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
+                resolvable: true,
+                score_breakdown: None,
+            },
+        ];
+
+        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
+        assert_eq!(hits[0].node_id.0, "implementation");
+    }
+
+    #[test]
+    fn resolution_keeps_callable_implementation_when_body_contains_assignment() {
+        let temp = tempdir().expect("create temp dir");
+        let declaration_path = temp.path().join("Foo.h");
+        let implementation_path = temp.path().join("Foo.cpp");
+        fs::write(&declaration_path, "void bar();\n").expect("write declaration");
+        fs::write(
+            &implementation_path,
+            "void Foo::bar()\n{\n    int status = 0;\n    use(status);\n}\n",
+        )
+        .expect("write implementation");
+
+        let query = "Foo::bar";
+        let mut hits = [
+            SearchHit {
+                node_id: NodeId("declaration".to_string()),
+                display_name: "Foo::bar".to_string(),
+                kind: codestory_contracts::api::NodeKind::METHOD,
+                file_path: Some(declaration_path.to_string_lossy().to_string()),
+                line: Some(1),
+                score: 1.0,
+                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
+                resolvable: true,
+                score_breakdown: None,
+            },
+            SearchHit {
+                node_id: NodeId("implementation".to_string()),
+                display_name: "Foo::bar".to_string(),
+                kind: codestory_contracts::api::NodeKind::FUNCTION,
+                file_path: Some(implementation_path.to_string_lossy().to_string()),
+                line: Some(1),
+                score: 1.0,
+                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+                match_quality: None,
+                resolvable: true,
+                score_breakdown: None,
+            },
+        ];
+
+        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
+        assert_eq!(hits[0].node_id.0, "implementation");
+    }
+
+    #[test]
     fn clean_path_unix_noop() {
         assert_eq!(clean_path_string("src/lib.rs"), "src/lib.rs");
     }

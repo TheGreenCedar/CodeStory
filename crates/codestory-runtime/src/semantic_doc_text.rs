@@ -15,6 +15,7 @@ pub(crate) fn semantic_doc_language_from_path(path: Option<&str>) -> Option<&'st
         "py" | "pyi" => Some("python"),
         "rs" => Some("rust"),
         "ts" | "tsx" | "mts" | "cts" => Some("typescript"),
+        "svelte" => Some("svelte"),
         _ => None,
     }
 }
@@ -1017,6 +1018,7 @@ mod tests {
             ("a.tsx", Some("typescript")),
             ("a.mts", Some("typescript")),
             ("a.cts", Some("typescript")),
+            ("App.svelte", Some("svelte")),
             ("README.md", None),
         ];
 

@@ -475,7 +475,7 @@ fn resolution_candidate_rank(
     query: &str,
     file_filter: Option<&str>,
     hit: &SearchHit,
-) -> (u8, u8, u8, u8, u8, u8, u8) {
+) -> (u8, u8, u8, u8, u8, u8, u8, u8) {
     let rank = resolution_rank_with_project_root(Some(project_root), query, hit);
     (
         file_filter
@@ -487,6 +487,7 @@ fn resolution_candidate_rank(
         rank.3,
         rank.4,
         rank.5,
+        rank.6,
     )
 }
 

@@ -166,8 +166,24 @@ fn annotate_search_hit_match_quality(query: &str, hits: &mut [SearchHit]) {
     }
 }
 
-fn weak_search_top_hit(hits: &[SearchHit]) -> bool {
-    hits.first().is_none_or(|hit| hit.score < 0.5)
+fn text_contains_query_term(text: &str, term: &str) -> bool {
+    if text.contains(term) {
+        return true;
+    }
+    let Some(singular) = term.strip_suffix('s') else {
+        return false;
+    };
+    singular.len() >= 3 && text.contains(singular)
+}
+
+fn weak_search_top_hit(query: &str, hits: &[SearchHit]) -> bool {
+    hits.first().is_none_or(|hit| {
+        hit.score < 0.5
+            || matches!(
+                search_hit_match_quality(query, hit),
+                SearchMatchQualityDto::Fuzzy | SearchMatchQualityDto::SemanticSuggestion
+            )
+    })
 }
 
 fn repo_text_auto_fallback_reason(query: &str, indexed_hits: &[SearchHit]) -> Option<String> {
@@ -184,7 +200,7 @@ fn repo_text_auto_fallback_reason(query: &str, indexed_hits: &[SearchHit]) -> Op
                     .to_string(),
             );
         }
-        if weak_search_top_hit(indexed_hits) {
+        if weak_search_top_hit(query, indexed_hits) {
             return Some(
                 "auto fallback: top indexed symbol hit was weak and non-exact".to_string(),
             );
@@ -202,7 +218,7 @@ fn search_query_assessment(
     repo_text_fallback_reason: Option<String>,
 ) -> SearchQueryAssessmentDto {
     let exact_symbol_hit_count = exact_symbol_hit_count(query, indexed_hits);
-    let weak_top_hit = exact_symbol_hit_count == 0 && weak_search_top_hit(indexed_hits);
+    let weak_top_hit = exact_symbol_hit_count == 0 && weak_search_top_hit(query, indexed_hits);
     let stale_or_missing_anchor =
         exact_symbol_hit_count == 0 && query_has_symbol_or_literal_signal(query);
     let recommended_next_action = if exact_symbol_hit_count > 0 {
@@ -987,7 +1003,9 @@ fn indexable_source_path(path: &Path) -> bool {
         .and_then(|value| value.to_str())
         .and_then(codestory_indexer::get_language_for_ext)
         .is_some();
-    tree_sitter_supported || looks_like_openapi_source_path(path)
+    tree_sitter_supported
+        || codestory_indexer::is_text_only_candidate_path(path)
+        || looks_like_openapi_source_path(path)
 }
 
 fn looks_like_openapi_source_path(path: &Path) -> bool {
@@ -3113,7 +3131,8 @@ impl AppController {
             stats.scanned_byte_count = stats
                 .scanned_byte_count
                 .saturating_add(clamp_usize_to_u32(contents.len()));
-            let Some(line) = file_text_match_line(&contents, query, &terms) else {
+            let Some(line) = Self::repo_text_match_line(&contents, &path_string, query, &terms)
+            else {
                 continue;
             };
             let node_id = NodeId::from(codestory_contracts::graph::NodeId(file.id));
@@ -3188,6 +3207,60 @@ impl AppController {
             .unwrap_or_else(|| fallback.to_string())
     }
 
+    fn repo_text_match_line(
+        contents: &str,
+        path: &str,
+        query: &str,
+        terms: &[String],
+    ) -> Option<u32> {
+        if let Some(line) = file_text_match_line(contents, query, terms) {
+            return Some(line);
+        }
+        if terms.is_empty() {
+            return None;
+        }
+
+        let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+        let mut distinct_hit_terms = HashSet::new();
+        for (term_index, term) in terms.iter().enumerate() {
+            if text_contains_query_term(&normalized_path, term) {
+                distinct_hit_terms.insert(term_index);
+            }
+        }
+        let path_has_term = !distinct_hit_terms.is_empty();
+
+        let mut best_line = None;
+        let mut best_score = 0usize;
+        for (index, line) in contents.lines().enumerate() {
+            let normalized_line = line.to_ascii_lowercase();
+            let mut line_score = 0usize;
+            for (term_index, term) in terms.iter().enumerate() {
+                if text_contains_query_term(&normalized_line, term) {
+                    distinct_hit_terms.insert(term_index);
+                    line_score += 1;
+                }
+            }
+            if line_score > best_score {
+                best_score = line_score;
+                best_line = Some((index + 1).min(u32::MAX as usize) as u32);
+            }
+        }
+
+        let required_hits = if path_has_term { 2 } else { 3.min(terms.len()) };
+        if distinct_hit_terms.len() < required_hits {
+            return None;
+        }
+
+        best_line.or(Some(1))
+    }
+
+    fn repo_text_term_hits(text: &str, terms: &[String]) -> f32 {
+        terms
+            .iter()
+            .filter(|term| text_contains_query_term(text, term))
+            .count() as f32
+    }
+
     fn repo_text_score(
         contents: &str,
         path: &str,
@@ -3206,18 +3279,9 @@ impl AppController {
         let exact_line_match = !normalized_query.is_empty() && line_text.contains(normalized_query);
         let exact_file_match =
             !normalized_query.is_empty() && normalized_contents.contains(normalized_query);
-        let path_term_hits = terms
-            .iter()
-            .filter(|term| normalized_path.contains(term.as_str()))
-            .count() as f32;
-        let line_term_hits = terms
-            .iter()
-            .filter(|term| line_text.contains(term.as_str()))
-            .count() as f32;
-        let file_term_hits = terms
-            .iter()
-            .filter(|term| normalized_contents.contains(term.as_str()))
-            .count() as f32;
+        let path_term_hits = Self::repo_text_term_hits(&normalized_path, terms);
+        let line_term_hits = Self::repo_text_term_hits(&line_text, terms);
+        let file_term_hits = Self::repo_text_term_hits(&normalized_contents, terms);
 
         let mut score = 100.0;
         if exact_line_match {
@@ -6587,6 +6651,111 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn repo_text_partial_matches_surface_public_page_wiring() {
+        let temp = tempdir().expect("temp dir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(storage_path.parent().expect("db parent")).expect("create db dir");
+        let page_path = temp
+            .path()
+            .join("src")
+            .join("app")
+            .join("(frontend)")
+            .join("posts")
+            .join("[slug]")
+            .join("page.tsx");
+        let social_path = temp.path().join("src").join("lib").join("social-feed.ts");
+        std::fs::create_dir_all(page_path.parent().expect("page parent")).expect("create page dir");
+        std::fs::create_dir_all(social_path.parent().expect("social parent"))
+            .expect("create social dir");
+        std::fs::write(
+            &page_path,
+            "import { PostComments } from './PostComments';\nexport default async function PostPage() { return <PostComments />; }\n",
+        )
+        .expect("write page");
+        std::fs::write(
+            &social_path,
+            "export async function getElsewhereFeed() { return []; }\n",
+        )
+        .expect("write social feed");
+
+        {
+            let storage = Storage::open(&storage_path).expect("open storage");
+            for (id, path, language) in [(11, page_path, "tsx"), (12, social_path, "typescript")] {
+                storage
+                    .insert_file(&FileInfo {
+                        id,
+                        path,
+                        language: language.to_string(),
+                        modification_time: 1,
+                        indexed: true,
+                        complete: true,
+                        line_count: 2,
+                    })
+                    .expect("insert file");
+            }
+        }
+
+        let storage = Storage::open(&storage_path).expect("reopen storage");
+        let scan = AppController::collect_repo_text_hits(
+            &storage,
+            Some(temp.path()),
+            "how posts comments auth and elsewhere feed connect to public pages",
+            10,
+            &HashSet::new(),
+        )
+        .expect("repo text scan");
+
+        assert!(
+            scan.hits.iter().any(|hit| hit
+                .display_name
+                .ends_with("src/app/(frontend)/posts/[slug]/page.tsx")),
+            "natural-language repo text should surface public page wiring, not only symbols: {:#?}",
+            scan.hits
+        );
+    }
+
+    #[test]
+    fn repo_text_partial_match_requires_distinct_query_terms() {
+        let temp = tempdir().expect("temp dir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(storage_path.parent().expect("db parent")).expect("create db dir");
+        let page_path = temp.path().join("src").join("posts").join("page.tsx");
+        std::fs::create_dir_all(page_path.parent().expect("page parent")).expect("create page dir");
+        std::fs::write(&page_path, "export const posts = [];\n").expect("write page");
+
+        {
+            let storage = Storage::open(&storage_path).expect("open storage");
+            storage
+                .insert_file(&FileInfo {
+                    id: 11,
+                    path: page_path,
+                    language: "tsx".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                })
+                .expect("insert file");
+        }
+
+        let storage = Storage::open(&storage_path).expect("reopen storage");
+        let scan = AppController::collect_repo_text_hits(
+            &storage,
+            Some(temp.path()),
+            "posts comments auth",
+            10,
+            &HashSet::new(),
+        )
+        .expect("repo text scan");
+
+        assert!(
+            scan.hits.is_empty(),
+            "one repeated term in path and file contents should not satisfy multi-concept repo-text matching: {:#?}",
+            scan.hits
+        );
+    }
+
+    #[test]
     fn repo_text_scan_reports_file_cap_on_large_low_match_fixture() {
         let temp = tempdir().expect("temp dir");
         let storage_path = temp.path().join("cache").join("codestory.db");
@@ -6626,17 +6795,44 @@ fn build_llm_symbol_doc_text() -> String {
 
         assert!(scan.hits.is_empty());
         assert!(scan.stats.truncated, "{:?}", scan.stats);
-        assert_eq!(
-            scan.stats.scanned_file_count,
-            REPO_TEXT_SCAN_FILE_CAP as u32
-        );
+        assert!(scan.stats.scanned_file_count <= REPO_TEXT_SCAN_FILE_CAP as u32);
         assert!(
             scan.stats
                 .reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("scanning"))
+                .is_some_and(|reason| reason.contains("scanning") || reason.contains("ms"))
         );
         assert!(scan.stats.action.is_some());
+    }
+
+    #[test]
+    fn repo_text_scan_file_cap_sets_truncated_reason() {
+        let mut stats = RepoTextScanStatsDto {
+            scanned_file_count: REPO_TEXT_SCAN_FILE_CAP as u32,
+            scanned_byte_count: 0,
+            skipped_large_file_count: 0,
+            file_cap: REPO_TEXT_SCAN_FILE_CAP as u32,
+            byte_cap: REPO_TEXT_SCAN_BYTE_CAP as u32,
+            time_cap_ms: REPO_TEXT_SCAN_TIME_CAP_MS as u32,
+            duration_ms: 0,
+            truncated: false,
+            reason: None,
+            action: None,
+        };
+
+        assert!(AppController::repo_text_scan_should_stop(
+            &mut stats,
+            &Instant::now()
+        ));
+        assert!(stats.truncated);
+        assert!(
+            stats
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("scanning 2000 files")),
+            "{stats:?}"
+        );
+        assert!(stats.action.is_some());
     }
 
     #[test]
