@@ -54,6 +54,14 @@ const SEMANTIC_QUANTIZED_RESCORE_MULTIPLIER: usize = 4;
 type HttpHeaders = Vec<(String, String)>;
 type RawHttpResponse = (u16, HttpHeaders, Vec<u8>);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SymbolCandidateRank {
+    exact_display: u8,
+    exact_terminal: u8,
+    exact_leading: u8,
+    fuzzy_score: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct EmbeddingRuntimeAvailability {
     pub available: bool,
@@ -1933,7 +1941,7 @@ impl SearchEngine {
     }
 }
 
-fn symbol_candidate_rank(query: &str, name: &Utf32String, score: u32) -> (u8, u8, u8, u32) {
+fn symbol_candidate_rank(query: &str, name: &Utf32String, score: u32) -> SymbolCandidateRank {
     let query = query.trim().to_ascii_lowercase();
     let display = name.to_string();
     let display_lower = display.to_ascii_lowercase();
@@ -1948,12 +1956,12 @@ fn symbol_candidate_rank(query: &str, name: &Utf32String, score: u32) -> (u8, u8
         .unwrap_or(display.as_str())
         .to_ascii_lowercase();
 
-    (
-        u8::from(display_lower == query),
-        u8::from(terminal_lower == query),
-        u8::from(leading_lower == query),
-        score,
-    )
+    SymbolCandidateRank {
+        exact_display: u8::from(display_lower == query),
+        exact_terminal: u8::from(terminal_lower == query),
+        exact_leading: u8::from(leading_lower == query),
+        fuzzy_score: score,
+    }
 }
 
 fn recreate_search_storage_dir(path: &Path) -> Result<()> {

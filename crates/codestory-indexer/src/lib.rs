@@ -37,6 +37,11 @@ struct IndexFeatureFlags {
     lazy_graph_execution: bool,
 }
 
+struct PostProcessedIndexResults {
+    nodes: Vec<Node>,
+    id_remap: HashMap<NodeId, NodeId>,
+}
+
 impl IndexFeatureFlags {
     fn from_env() -> Self {
         Self {
@@ -3925,7 +3930,7 @@ fn post_process_index_results(
     is_tsx_file: bool,
     runtime_import_specs: &[RuntimeImportSpec],
     flags: IndexFeatureFlags,
-) -> (Vec<Node>, NodeId, HashMap<NodeId, NodeId>) {
+) -> PostProcessedIndexResults {
     // Stage 1: qualify names before deduplication so canonical IDs are stable.
     let mut final_nodes = apply_qualified_names(result_nodes, result_edges, language_name);
     if language_name == "rust" {
@@ -3959,7 +3964,10 @@ fn post_process_index_results(
     // Stage 7: runtime module imports should not retain generic CALL placeholders.
     suppress_runtime_import_call_edges(&final_nodes, result_edges, runtime_import_specs);
 
-    (final_nodes, new_file_id, id_remap)
+    PostProcessedIndexResults {
+        nodes: final_nodes,
+        id_remap,
+    }
 }
 
 fn remap_pending_node_id(storage: &mut IntermediateStorage, from: NodeId, to: NodeId) {
@@ -5290,7 +5298,7 @@ pub fn index_file(
     ));
 
     // 3. Resolve qualified names, canonicalize IDs, and remap projections.
-    let (final_nodes, _new_file_id, id_remap) = post_process_index_results(
+    let post_processed = post_process_index_results(
         result_nodes,
         &mut result_edges,
         &mut result_occurrences,
@@ -5302,6 +5310,8 @@ pub fn index_file(
         &runtime_import_specs,
         flags,
     );
+    let final_nodes = post_processed.nodes;
+    let id_remap = post_processed.id_remap;
     let final_node_ids = final_nodes
         .iter()
         .map(|node| node.id)

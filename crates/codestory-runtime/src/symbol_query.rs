@@ -10,6 +10,20 @@ pub struct SymbolNameMatchRank {
     pub exact_leading: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SearchMatchRank {
+    definition_quality: u8,
+    exact_display: u8,
+    exact_terminal: u8,
+    source_bucket: u8,
+    query_kind_intent: u8,
+    query_entrypoint_intent: u8,
+    kind_bucket: u8,
+    exact_leading: u8,
+    kind_tiebreak: u8,
+    indexed_symbol: u8,
+}
+
 pub fn normalize_symbol_query(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
@@ -289,11 +303,7 @@ pub(crate) fn is_non_primary_source_hit(hit: &SearchHit) -> bool {
         .unwrap_or(false)
 }
 
-fn search_match_rank(
-    project_root: Option<&Path>,
-    query: &str,
-    hit: &SearchHit,
-) -> (u8, u8, u8, u8, u8, u8, u8, u8, u8, u8) {
+fn search_match_rank(project_root: Option<&Path>, query: &str, hit: &SearchHit) -> SearchMatchRank {
     let rank = symbol_name_match_rank(query, &hit.display_name);
     let is_exact_match =
         rank.exact_display != 0 || rank.exact_terminal != 0 || rank.exact_leading != 0;
@@ -318,18 +328,18 @@ fn search_match_rank(
         0
     };
 
-    (
+    SearchMatchRank {
         definition_quality,
-        rank.exact_display,
-        rank.exact_terminal,
+        exact_display: rank.exact_display,
+        exact_terminal: rank.exact_terminal,
         source_bucket,
         query_kind_intent,
         query_entrypoint_intent,
         kind_bucket,
-        rank.exact_leading,
+        exact_leading: rank.exact_leading,
         kind_tiebreak,
-        u8::from(hit.origin == SearchHitOrigin::IndexedSymbol),
-    )
+        indexed_symbol: u8::from(hit.origin == SearchHitOrigin::IndexedSymbol),
+    }
 }
 
 fn exact_definition_quality_bucket(

@@ -4,6 +4,17 @@ use codestory_runtime::{compare_ranked_hits, symbol_name_match_rank};
 use std::fs;
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ResolutionRank {
+    exact_display: u8,
+    exact_terminal: u8,
+    type_definition_line: u8,
+    callable_definition_line: u8,
+    declaration_anchor: u8,
+    kind_bucket: u8,
+    exact_leading: u8,
+}
+
 pub(crate) fn compare_resolution_hits(
     query: &str,
     left: &SearchHit,
@@ -17,7 +28,7 @@ pub(crate) fn compare_resolution_hits(
     )
 }
 
-pub(crate) fn resolution_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8, u8, u8, u8) {
+pub(crate) fn resolution_rank(query: &str, hit: &SearchHit) -> ResolutionRank {
     resolution_rank_with_project_root(None, query, hit)
 }
 
@@ -25,18 +36,18 @@ pub(crate) fn resolution_rank_with_project_root(
     project_root: Option<&Path>,
     query: &str,
     hit: &SearchHit,
-) -> (u8, u8, u8, u8, u8, u8, u8) {
+) -> ResolutionRank {
     let rank = symbol_name_match_rank(query, &hit.display_name);
 
-    (
-        rank.exact_display,
-        rank.exact_terminal,
-        type_definition_line_bucket(project_root, query, hit),
-        callable_definition_line_bucket(project_root, query, hit),
-        declaration_anchor_bucket(hit),
-        resolution_kind_bucket(hit.kind),
-        rank.exact_leading,
-    )
+    ResolutionRank {
+        exact_display: rank.exact_display,
+        exact_terminal: rank.exact_terminal,
+        type_definition_line: type_definition_line_bucket(project_root, query, hit),
+        callable_definition_line: callable_definition_line_bucket(project_root, query, hit),
+        declaration_anchor: declaration_anchor_bucket(hit),
+        kind_bucket: resolution_kind_bucket(hit.kind),
+        exact_leading: rank.exact_leading,
+    }
 }
 
 pub(crate) fn search_hit_matches_file_filter(

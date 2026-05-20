@@ -33,6 +33,14 @@ pub struct ReadOnlyBrowserService {
     controller: AppController,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct BrowserResolutionRank {
+    exact_display: u8,
+    exact_terminal: u8,
+    kind_bucket: u8,
+    exact_leading: u8,
+}
+
 fn query_item_matches_filter(item: &BrowserQueryItem, filter: &FilterQuery) -> bool {
     filter.kind.is_none_or(|kind| item.kind == kind)
         && filter
@@ -45,14 +53,14 @@ fn query_item_matches_filter(item: &BrowserQueryItem, filter: &FilterQuery) -> b
         })
 }
 
-fn browser_resolution_rank(query: &str, hit: &SearchHit) -> (u8, u8, u8, u8) {
+fn browser_resolution_rank(query: &str, hit: &SearchHit) -> BrowserResolutionRank {
     let rank = symbol_name_match_rank(query, &hit.display_name);
-    (
-        rank.exact_display,
-        rank.exact_terminal,
-        browser_resolution_kind_bucket(hit.kind),
-        rank.exact_leading,
-    )
+    BrowserResolutionRank {
+        exact_display: rank.exact_display,
+        exact_terminal: rank.exact_terminal,
+        kind_bucket: browser_resolution_kind_bucket(hit.kind),
+        exact_leading: rank.exact_leading,
+    }
 }
 
 fn browser_resolution_kind_bucket(kind: NodeKind) -> u8 {
