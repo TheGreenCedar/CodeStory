@@ -28,6 +28,7 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-05-08 | f24bb2c | pass, managed ONNX review fixes hash e2e | 7.59 | 0.18 | 0.47 | 0.21 | 0.16 | 0.15 | 41,974 | 35,441 | 145 | 0 | 5,822 | true |
 | 2026-05-20 | 3964d10 | pass, codestory 0.2.0 release | 8.91 | 0.19 | 0.82 | 0.53 | 0.18 | 0.17 | 43,937 | 37,086 | 145 | 0 | 6,028 | true |
 | 2026-05-20 | fea0cc5 | pass, CLI navigation next wave | 15.75 | 0.31 | 1.51 | 0.82 | 0.31 | 0.30 | 46,347 | 39,169 | 145 | 0 | 6,263 | true |
+| 2026-05-20 | 71a57a8 | pass, PR review clippy fix | 9.35 | 0.19 | 0.82 | 0.49 | 0.17 | 0.16 | 46,352 | 39,168 | 145 | 0 | 6,270 | true |
 
 ## Phase Metrics
 
@@ -51,3 +52,4 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-05-08 | f24bb2c | managed ONNX review fixes hash E2E | 7.59 | 2.93 | 0.46 | 0 | 5,822 | 0 |
 | 2026-05-20 | 3964d10 | codestory 0.2.0 release E2E | 8.91 | 3.42 | 0.65 | 0 | 6,028 | 0 |
 | 2026-05-20 | fea0cc5 | CLI navigation next wave cold E2E | 15.75 | 6.23 | 1.74 | 0 | 6,263 | 0 |
+| 2026-05-20 | 71a57a8 | PR review clippy fix cold E2E | 9.35 | 3.80 | 0.95 | 0 | 6,270 | 0 |

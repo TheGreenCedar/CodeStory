@@ -5147,18 +5147,18 @@ fn collect_nestjs_routes(source: &str, routes: &mut Vec<FrameworkRoute>) {
 
 fn collect_python_route(line: &str, line_number: u32, routes: &mut Vec<FrameworkRoute>) {
     let lower = line.to_ascii_lowercase();
-    if lower.starts_with("@app.route") || lower.starts_with("@blueprint.route") {
-        if let Some(path) = first_quoted_string(line) {
-            let method = route_methods_literal(line).unwrap_or_else(|| "GET".to_string());
-            routes.push(FrameworkRoute::new(
-                "flask",
-                method,
-                path,
-                None,
-                line_number,
-                "decorator",
-            ));
-        }
+    if (lower.starts_with("@app.route") || lower.starts_with("@blueprint.route"))
+        && let Some(path) = first_quoted_string(line)
+    {
+        let method = route_methods_literal(line).unwrap_or_else(|| "GET".to_string());
+        routes.push(FrameworkRoute::new(
+            "flask",
+            method,
+            path,
+            None,
+            line_number,
+            "decorator",
+        ));
     }
     for method in ["get", "post", "put", "patch", "delete"] {
         if lower.starts_with(&format!("@app.{method}("))
