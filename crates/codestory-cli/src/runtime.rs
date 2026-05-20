@@ -387,39 +387,6 @@ pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use tempfile::tempdir;
-
-    #[test]
-    fn project_config_cache_dir_does_not_select_managed_executable_root() {
-        let temp = tempdir().expect("temp dir");
-        let project = temp.path().join("repo");
-        let config_cache = temp.path().join("repo-controlled-cache");
-        fs::create_dir_all(&project).expect("create project");
-        fs::write(
-            project.join(".codestory.toml"),
-            format!("cache_dir = {:?}\n", config_cache.to_string_lossy()),
-        )
-        .expect("write project config");
-
-        let context = RuntimeContext::new_inspect_only(&ProjectArgs {
-            project,
-            cache_dir: None,
-        })
-        .expect("runtime context");
-
-        assert_eq!(context.storage_path, config_cache.join("codestory.db"));
-        assert_ne!(
-            context.managed_embeddings_root,
-            config_cache.join("managed-embeddings"),
-            "repo-controlled config cache_dir must not choose executable managed asset root"
-        );
-    }
-}
-
 pub(crate) fn resolve_refresh_request(
     refresh: RefreshMode,
     summary: &ProjectSummary,
@@ -606,4 +573,37 @@ fn quote_cli_path(path: &Path) -> String {
 
 fn quote_cli_value(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\\\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn project_config_cache_dir_does_not_select_managed_executable_root() {
+        let temp = tempdir().expect("temp dir");
+        let project = temp.path().join("repo");
+        let config_cache = temp.path().join("repo-controlled-cache");
+        fs::create_dir_all(&project).expect("create project");
+        fs::write(
+            project.join(".codestory.toml"),
+            format!("cache_dir = {:?}\n", config_cache.to_string_lossy()),
+        )
+        .expect("write project config");
+
+        let context = RuntimeContext::new_inspect_only(&ProjectArgs {
+            project,
+            cache_dir: None,
+        })
+        .expect("runtime context");
+
+        assert_eq!(context.storage_path, config_cache.join("codestory.db"));
+        assert_ne!(
+            context.managed_embeddings_root,
+            config_cache.join("managed-embeddings"),
+            "repo-controlled config cache_dir must not choose executable managed asset root"
+        );
+    }
 }

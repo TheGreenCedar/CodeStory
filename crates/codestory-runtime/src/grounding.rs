@@ -1000,12 +1000,14 @@ impl AppController {
         };
         let (path, bounded) = self.bounded_file_snippet_range(
             &path,
-            line,
-            line,
-            end_line,
-            context_lines,
-            crate::DIRECT_SNIPPET_MAX_BYTES,
-            crate::DIRECT_SNIPPET_TRUNCATION_SUFFIX,
+            crate::BoundedSnippetRangeOptions {
+                focus_line: line,
+                start_line: line,
+                end_line,
+                context_lines,
+                max_bytes: crate::DIRECT_SNIPPET_MAX_BYTES,
+                truncation_suffix: crate::DIRECT_SNIPPET_TRUNCATION_SUFFIX,
+            },
         )?;
 
         Ok(SnippetContextDto {

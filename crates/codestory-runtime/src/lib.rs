@@ -113,6 +113,16 @@ pub(crate) struct BoundedSnippet {
     pub(crate) truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BoundedSnippetRangeOptions<'a> {
+    pub(crate) focus_line: u32,
+    pub(crate) start_line: u32,
+    pub(crate) end_line: u32,
+    pub(crate) context_lines: usize,
+    pub(crate) max_bytes: usize,
+    pub(crate) truncation_suffix: &'a str,
+}
+
 fn exact_symbol_hit_count(query: &str, hits: &[SearchHit]) -> u32 {
     hits.iter()
         .filter(|hit| {
@@ -1917,7 +1927,7 @@ fn referenced_symbol_labels_from_edges(
         if !llm_indexable_kind(other_node.kind) {
             continue;
         }
-        let label = node_display_name(&other_node);
+        let label = node_display_name(other_node);
         if label.is_empty() || labels.contains(&label) {
             continue;
         }
@@ -4596,22 +4606,17 @@ impl AppController {
     pub(crate) fn bounded_file_snippet_range(
         &self,
         path: &str,
-        focus_line: u32,
-        start_line: u32,
-        end_line: u32,
-        context_lines: usize,
-        max_bytes: usize,
-        truncation_suffix: &str,
+        options: BoundedSnippetRangeOptions<'_>,
     ) -> Result<(String, BoundedSnippet), ApiError> {
         let candidate = self.resolve_project_file_path(path, false)?;
         let snippet = bounded_markdown_snippet_range_from_path(
             &candidate,
-            focus_line,
-            start_line,
-            end_line,
-            context_lines,
-            max_bytes,
-            truncation_suffix,
+            options.focus_line,
+            options.start_line,
+            options.end_line,
+            options.context_lines,
+            options.max_bytes,
+            options.truncation_suffix,
         )
         .map_err(|e| {
             ApiError::internal(format!("Failed to read file {}: {e}", candidate.display()))

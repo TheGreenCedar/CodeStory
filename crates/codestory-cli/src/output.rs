@@ -1047,9 +1047,10 @@ fn search_confidence(output: &SearchOutput) -> (&'static str, Vec<String>) {
         .query_assessment
         .as_ref()
         .is_some_and(|assessment| assessment.weak_top_hit);
-    let confidence = if total_hits == 0 || top_score < 0.35 {
-        "low"
-    } else if weak_top_hit && output.repo_text_hits.is_empty() {
+    let confidence = if total_hits == 0
+        || top_score < 0.35
+        || (weak_top_hit && output.repo_text_hits.is_empty())
+    {
         "low"
     } else if !output.indexed_symbol_hits.is_empty()
         && exact_symbol_hits > 0

@@ -1034,51 +1034,105 @@ fn run_drill_anchor(
     let resolution = build_query_resolution_output_with_runtime(runtime, &target);
     let verification_targets = resolution.resolved.verification_targets.clone();
 
-    match runtime.browser.symbol_context(chosen.node_id.clone()) {
+    commands.push(run_drill_symbol_context(
+        runtime,
+        output_dir,
+        format,
+        &safe_anchor,
+        &target,
+        &resolution,
+        &verification_targets,
+    ));
+    commands.push(run_drill_trail_context(
+        runtime,
+        output_dir,
+        format,
+        &safe_anchor,
+        &target,
+        &resolution,
+    ));
+    commands.push(run_drill_snippet_context(
+        runtime,
+        output_dir,
+        format,
+        &safe_anchor,
+        &target,
+        &resolution,
+        &verification_targets,
+    ));
+
+    Ok(DrillAnchorOutput {
+        anchor: anchor.to_string(),
+        typed_hit_count,
+        chosen_anchor: Some(resolution.resolved),
+        verification_targets,
+        commands,
+    })
+}
+
+fn run_drill_symbol_context(
+    runtime: &RuntimeContext,
+    output_dir: &std::path::Path,
+    format: args::OutputFormat,
+    safe_anchor: &str,
+    target: &runtime::ResolvedTarget,
+    resolution: &QueryResolutionOutput,
+    verification_targets: &[VerificationTargetOutput],
+) -> DrillCommandStatusOutput {
+    match runtime
+        .browser
+        .symbol_context(target.selected.node_id.clone())
+    {
         Ok(symbol) => {
             let markdown = render_symbol_markdown(
                 &runtime.project_root,
-                &target,
+                target,
                 &symbol,
-                &verification_targets,
+                verification_targets,
             );
             let output = SymbolJsonOutput {
                 resolution: resolution.clone(),
                 symbol: &symbol,
-                verification_targets: verification_targets.clone(),
+                verification_targets: verification_targets.to_vec(),
             };
-            commands.push(write_drill_artifact(
+            write_drill_artifact(
                 output_dir,
                 format,
                 &format!("{safe_anchor}-symbol"),
                 "symbol",
                 &output,
                 markdown,
-            ));
+            )
         }
-        Err(error) => commands.push(drill_status_error("symbol", error)),
+        Err(error) => drill_status_error("symbol", error),
     }
+}
 
+fn run_drill_trail_context(
+    runtime: &RuntimeContext,
+    output_dir: &std::path::Path,
+    format: args::OutputFormat,
+    safe_anchor: &str,
+    target: &runtime::ResolvedTarget,
+    resolution: &QueryResolutionOutput,
+) -> DrillCommandStatusOutput {
     match runtime
         .browser
-        .trail_context(drill_trail_request(&chosen.node_id))
+        .trail_context(drill_trail_request(&target.selected.node_id))
     {
         Ok(trail) => {
             let notes = trail_guidance_notes(&trail);
+            let trail_cmd = drill_trail_command(&cmd_project_args(&runtime.project_root), target);
             let mut markdown = if let Some(story) = trail.story.as_ref() {
-                let trail_cmd =
-                    drill_trail_command(&cmd_project_args(&runtime.project_root), &target);
                 render_trail_story_markdown(
                     &runtime.project_root,
-                    &target,
+                    target,
                     &trail,
                     &trail_cmd,
                     story,
                 )
             } else {
-                let trail_cmd =
-                    drill_trail_command(&cmd_project_args(&runtime.project_root), &target);
-                render_trail_markdown(&runtime.project_root, &target, &trail, &trail_cmd)
+                render_trail_markdown(&runtime.project_root, target, &trail, &trail_cmd)
             };
             if !notes.is_empty() {
                 let _ = writeln!(markdown, "notes:");
@@ -1091,51 +1145,56 @@ fn run_drill_anchor(
                 trail: &trail,
                 notes,
             };
-            commands.push(write_drill_artifact(
+            write_drill_artifact(
                 output_dir,
                 format,
                 &format!("{safe_anchor}-trail"),
                 "trail",
                 &output,
                 markdown,
-            ));
+            )
         }
-        Err(error) => commands.push(drill_status_error("trail", error)),
+        Err(error) => drill_status_error("trail", error),
     }
+}
 
-    match runtime.browser.snippet_context(chosen.node_id.clone(), 40) {
+fn run_drill_snippet_context(
+    runtime: &RuntimeContext,
+    output_dir: &std::path::Path,
+    format: args::OutputFormat,
+    safe_anchor: &str,
+    target: &runtime::ResolvedTarget,
+    resolution: &QueryResolutionOutput,
+    verification_targets: &[VerificationTargetOutput],
+) -> DrillCommandStatusOutput {
+    match runtime
+        .browser
+        .snippet_context(target.selected.node_id.clone(), 40)
+    {
         Ok(snippet) => {
             let markdown = render_snippet_markdown(
                 &runtime.project_root,
-                &target,
+                target,
                 &snippet,
                 false,
-                &verification_targets,
+                verification_targets,
             );
             let output = SnippetJsonOutput {
                 resolution: resolution.clone(),
                 snippet: &snippet,
-                verification_targets: verification_targets.clone(),
+                verification_targets: verification_targets.to_vec(),
             };
-            commands.push(write_drill_artifact(
+            write_drill_artifact(
                 output_dir,
                 format,
                 &format!("{safe_anchor}-snippet"),
                 "snippet",
                 &output,
                 markdown,
-            ));
+            )
         }
-        Err(error) => commands.push(drill_status_error("snippet", error)),
+        Err(error) => drill_status_error("snippet", error),
     }
-
-    Ok(DrillAnchorOutput {
-        anchor: anchor.to_string(),
-        typed_hit_count,
-        chosen_anchor: Some(resolution.resolved),
-        verification_targets,
-        commands,
-    })
 }
 
 fn run_drill_question_search(
@@ -1956,7 +2015,7 @@ fn redact_url_token(token: &str) -> String {
     let prefix = &token[..prefix_len];
     let url_and_suffix = &token[prefix_len..];
     let suffix_start = url_and_suffix
-        .find(|ch: char| matches!(ch, ')' | ']' | '}' | ',' | ';' | '`'))
+        .find([')', ']', '}', ',', ';', '`'])
         .unwrap_or(url_and_suffix.len());
     let (url, suffix) = url_and_suffix.split_at(suffix_start);
     format!(

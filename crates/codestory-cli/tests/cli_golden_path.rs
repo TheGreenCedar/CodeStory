@@ -1659,15 +1659,15 @@ fn context_json_reports_deep_trace_by_default() {
         "parse_investigation_event"
     );
     assert!(
-        trace_has_step(&investigated, "search"),
+        trace_has_step(investigated, "search"),
         "context starts with the current search ranking"
     );
     assert!(
-        trace_has_step(&investigated, "trail") || trace_has_step(&investigated, "neighborhood"),
+        trace_has_step(investigated, "trail") || trace_has_step(investigated, "neighborhood"),
         "context should record bounded graph expansion"
     );
     assert!(
-        trace_has_step(&investigated, "source_read"),
+        trace_has_step(investigated, "source_read"),
         "context should record bounded source/snippet reads"
     );
     let trace_steps = investigated["retrieval_trace"]["steps"]
@@ -1714,7 +1714,7 @@ fn context_json_reports_deep_trace_by_default() {
         "context synthesis should expose graph artifact bundle caps: {synthesis_step}"
     );
     assert!(
-        array_is_non_empty(&investigated, &["citations"]),
+        array_is_non_empty(investigated, &["citations"]),
         "context should return cited evidence"
     );
     assert!(

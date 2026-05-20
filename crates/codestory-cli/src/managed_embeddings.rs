@@ -470,9 +470,7 @@ fn rewrite_graph_for_cls_pooling(graph: &[u8]) -> Result<Vec<u8>> {
             if name == ONNX_POOLED_OUTPUT_NAME {
                 already_pooled = true;
             }
-            if name == ONNX_SOURCE_OUTPUT_NAME {
-                source_output = Some(name);
-            } else if source_output.is_none() {
+            if name == ONNX_SOURCE_OUTPUT_NAME || source_output.is_none() {
                 source_output = Some(name);
             }
         }
