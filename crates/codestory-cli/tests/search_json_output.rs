@@ -2,6 +2,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::Instant;
 use tempfile::tempdir;
 
 struct EnvGuard {
@@ -57,6 +58,22 @@ pub fn exact_symbol_anchor() {}
 "#,
     )
     .expect("write fixture source");
+}
+
+fn write_search_quality_fixture(root: &Path) {
+    write_retrieval_fixture(root);
+    let src = root.join("src");
+    fs::write(
+        src.join("routes.ts"),
+        r#"
+const app = express();
+app.get("/api/users", listUsers);
+function listUsers() {
+  return [];
+}
+"#,
+    )
+    .expect("write route fixture");
 }
 
 fn run_cli(workspace: &Path, args: &[&str]) -> std::process::Output {
@@ -166,4 +183,89 @@ fn search_json_emits_search_results_dto_after_repo_text_merge() {
         "repo-text scan stats should surface the configured file cap"
     );
     assert_eq!(json["limit_per_source"], Value::from(1));
+}
+
+#[test]
+#[ignore = "search-quality eval harness; run explicitly after changing search ranking or route indexing"]
+fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
+    let _env = hybrid_cli_env();
+    let workspace = tempdir().expect("workspace dir");
+    write_search_quality_fixture(workspace.path());
+
+    let index = run_cli(
+        workspace.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    assert!(
+        index.status.success(),
+        "index command failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    let expectations = [
+        ("exact_symbol_anchor", "exact_symbol_anchor"),
+        ("build snapshot digest", "build_snapshot_digest"),
+        ("/api/users", "GET /api/users"),
+    ];
+    let mut found = 0_u32;
+    let mut reciprocal_rank_sum = 0.0_f64;
+    let mut latency_ms = Vec::new();
+
+    for (query, expected) in expectations {
+        let started = Instant::now();
+        let search = run_cli(
+            workspace.path(),
+            &[
+                "search",
+                "--query",
+                query,
+                "--limit",
+                "5",
+                "--repo-text",
+                "off",
+                "--refresh",
+                "none",
+                "--format",
+                "json",
+            ],
+        );
+        latency_ms.push(started.elapsed().as_millis() as u64);
+        assert!(
+            search.status.success(),
+            "search command failed for {query}: {}",
+            String::from_utf8_lossy(&search.stderr)
+        );
+        let json: Value = serde_json::from_slice(&search.stdout).expect("parse search json");
+        let hits = json["indexed_symbol_hits"]
+            .as_array()
+            .expect("indexed_symbol_hits");
+        if let Some(position) = hits.iter().position(|hit| {
+            hit["display_name"]
+                .as_str()
+                .is_some_and(|name| name.contains(expected))
+        }) {
+            found += 1;
+            reciprocal_rank_sum += 1.0 / (position as f64 + 1.0);
+        }
+    }
+
+    let recall = found as f64 / expectations.len() as f64;
+    let mrr = reciprocal_rank_sum / expectations.len() as f64;
+    let max_latency_ms = latency_ms.into_iter().max().unwrap_or_default();
+    eprintln!(
+        "search_quality_eval recall={recall:.3} mrr={mrr:.3} max_latency_ms={max_latency_ms}"
+    );
+    assert_eq!(
+        found as usize,
+        expectations.len(),
+        "expected all eval anchors"
+    );
+    assert!(
+        mrr >= 0.50,
+        "expected useful search ordering, got mrr={mrr:.3}"
+    );
+    assert!(
+        max_latency_ms < 3_000,
+        "search latency should stay bounded on eval fixture, got {max_latency_ms}ms"
+    );
 }

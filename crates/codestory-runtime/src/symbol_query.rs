@@ -15,6 +15,9 @@ struct SearchMatchRank {
     definition_quality: u8,
     exact_display: u8,
     exact_terminal: u8,
+    camel_case_match: u8,
+    compound_term_match: u8,
+    path_term_match: u8,
     source_bucket: u8,
     query_kind_intent: u8,
     query_entrypoint_intent: u8,
@@ -184,6 +187,69 @@ fn query_terms(query: &str) -> Vec<String> {
         .collect()
 }
 
+fn camel_case_initials(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn compact_alphanumeric(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn camel_case_match_bucket(query: &str, display_name: &str, is_exact_match: bool) -> u8 {
+    if is_exact_match {
+        return 0;
+    }
+    let compact_query = compact_alphanumeric(query);
+    if compact_query.len() < 2 {
+        return 0;
+    }
+    let terminal = display_name
+        .rsplit([':', '.', '/', '\\'])
+        .next()
+        .unwrap_or(display_name);
+    let initials = camel_case_initials(terminal);
+    u8::from(!initials.is_empty() && initials == compact_query)
+}
+
+fn compound_term_match_bucket(query: &str, display_name: &str, is_exact_match: bool) -> u8 {
+    if is_exact_match {
+        return 0;
+    }
+    let terms = query_terms(query);
+    if terms.len() < 2 {
+        return 0;
+    }
+    let compact_query = terms.join("");
+    let compact_display = compact_alphanumeric(display_name);
+    u8::from(!compact_query.is_empty() && compact_display.contains(&compact_query))
+}
+
+fn path_term_match_bucket(query: &str, hit: &SearchHit, is_exact_match: bool) -> u8 {
+    if is_exact_match {
+        return 0;
+    }
+    let Some(path) = hit.file_path.as_deref() else {
+        return 0;
+    };
+    let terms = query_terms(query)
+        .into_iter()
+        .filter(|term| term.len() > 2)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return 0;
+    }
+    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+    u8::from(terms.iter().any(|term| normalized_path.contains(term)))
+}
+
 fn terms_contain_phrase(terms: &[String], phrase: &[&str]) -> bool {
     terms
         .windows(phrase.len())
@@ -332,6 +398,9 @@ fn search_match_rank(project_root: Option<&Path>, query: &str, hit: &SearchHit) 
         definition_quality,
         exact_display: rank.exact_display,
         exact_terminal: rank.exact_terminal,
+        camel_case_match: camel_case_match_bucket(query, &hit.display_name, is_exact_match),
+        compound_term_match: compound_term_match_bucket(query, &hit.display_name, is_exact_match),
+        path_term_match: path_term_match_bucket(query, hit, is_exact_match),
         source_bucket,
         query_kind_intent,
         query_entrypoint_intent,
@@ -787,6 +856,61 @@ mod tests {
         assert_eq!(
             hits.first().map(|hit| &hit.node_id),
             Some(&file_text_match_line.node_id)
+        );
+    }
+
+    #[test]
+    fn inexact_queries_boost_camel_case_symbol_matches() {
+        let camel = hit("camel", "SearchQueryAssessmentDto", NodeKind::STRUCT, 0.40);
+        let noisy = hit(
+            "noisy",
+            "search_query_assessment_details",
+            NodeKind::FUNCTION,
+            0.95,
+        );
+
+        let mut hits = [noisy, camel.clone()];
+        hits.sort_by(|left, right| compare_search_hits("SQAD", left, right));
+
+        assert_eq!(hits.first().map(|hit| &hit.node_id), Some(&camel.node_id));
+    }
+
+    #[test]
+    fn inexact_queries_boost_compound_and_path_terms() {
+        let compound = hit(
+            "compound",
+            "collectFrameworkRoutes",
+            NodeKind::FUNCTION,
+            0.40,
+        );
+        let unrelated = hit("unrelated", "collect_routes", NodeKind::FUNCTION, 0.95);
+
+        let mut hits = [unrelated, compound.clone()];
+        hits.sort_by(|left, right| compare_search_hits("framework routes", left, right));
+        assert_eq!(
+            hits.first().map(|hit| &hit.node_id),
+            Some(&compound.node_id)
+        );
+
+        let routed_file = hit_at_path(
+            "path",
+            "handler",
+            NodeKind::FUNCTION,
+            0.40,
+            "src/framework/routes.rs",
+        );
+        let high_score = hit_at_path(
+            "high",
+            "handler",
+            NodeKind::FUNCTION,
+            0.95,
+            "src/service/mod.rs",
+        );
+        let mut hits = [high_score, routed_file.clone()];
+        hits.sort_by(|left, right| compare_search_hits("framework route handler", left, right));
+        assert_eq!(
+            hits.first().map(|hit| &hit.node_id),
+            Some(&routed_file.node_id)
         );
     }
 

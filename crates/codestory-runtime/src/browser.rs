@@ -1,5 +1,6 @@
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto, ApiError, LayoutDirection,
+    AffectedAnalysisDto, AffectedAnalysisRequest, AgentAnswerDto, AgentAskRequest,
+    AgentHybridWeightsDto, ApiError, IndexedFilesDto, IndexedFilesRequest, LayoutDirection,
     ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId,
     NodeKind, NodeOccurrencesRequest, SearchHit, SearchRepoTextMode, SearchRequest,
     SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, SymbolContextDto, SymbolSummaryDto,
@@ -101,6 +102,17 @@ impl ReadOnlyBrowserService {
 
     pub fn search_results(&self, req: SearchRequest) -> Result<SearchResultsDto, ApiError> {
         self.controller.search_results(req)
+    }
+
+    pub fn indexed_files(&self, req: IndexedFilesRequest) -> Result<IndexedFilesDto, ApiError> {
+        self.controller.indexed_files(req)
+    }
+
+    pub fn affected_analysis(
+        &self,
+        req: AffectedAnalysisRequest,
+    ) -> Result<AffectedAnalysisDto, ApiError> {
+        self.controller.affected_analysis(req)
     }
 
     pub fn search_hybrid(

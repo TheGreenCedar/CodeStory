@@ -30,6 +30,9 @@ target/release/codestory-cli(.exe) search [OPTIONS]
 - **Natural-language queries** (e.g. `"how does incremental indexing work"`) also perform a repo-wide text scan and merge results by score.
 - **Concrete anchors with weak indexed results** also trigger repo text in `auto` mode. This prevents stale names such as retired UI components from looking like valid direct symbol hits.
 - When hybrid retrieval finds strong semantic matches but no lexical match, Markdown and JSON output include `did_you_mean` suggestions.
+- Ranking boosts exact and terminal symbol names, CamelCase initials, compound terms, and path co-location. Test, fixture, vendor, and external hits are dampened unless the query asks for them.
+- Import/re-export-looking exact hits are ranked below definition-looking hits when source-line evidence is available.
+- Repo-text fallback remains explicit evidence. Treat repo-text hits as clues to inspect, not as silent graph success.
 - **Hybrid weight overrides** are intended for benchmarking and tuning. Omit all three `--hybrid-*` flags for production-like runtime defaults.
 
 ## Output
@@ -65,4 +68,7 @@ target/release/codestory-cli(.exe) search --project . --query AppController --re
 
 # JSON output
 target/release/codestory-cli(.exe) search --project . --query TrailResult --format json
+
+# Search-quality eval harness after ranking changes
+cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
 ```

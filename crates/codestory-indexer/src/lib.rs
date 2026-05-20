@@ -4336,6 +4336,16 @@ struct OpenApiEndpoint {
     line: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FrameworkRoute {
+    framework: &'static str,
+    method: String,
+    path: String,
+    handler: Option<String>,
+    line: u32,
+    confidence: &'static str,
+}
+
 pub fn is_openapi_candidate_path(path: &Path) -> bool {
     let extension = path
         .extension()
@@ -4351,7 +4361,10 @@ pub fn is_text_only_candidate_path(path: &Path) -> bool {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    matches!(extension.as_str(), "svelte")
+    matches!(
+        extension.as_str(),
+        "svelte" | "vue" | "rb" | "php" | "cs" | "cshtml"
+    )
 }
 
 fn text_only_language_name(path: &Path) -> &'static str {
@@ -4363,6 +4376,10 @@ fn text_only_language_name(path: &Path) -> &'static str {
         .as_str()
     {
         "svelte" => "svelte",
+        "vue" => "vue",
+        "rb" => "ruby",
+        "php" => "php",
+        "cs" | "cshtml" => "csharp",
         _ => "text",
     }
 }
@@ -4381,7 +4398,37 @@ fn index_text_only_file(path: &Path) -> Result<IntermediateStorage> {
         line_count: source.lines().count() as u32,
     });
     local_storage.nodes.push(file_node);
+    append_text_only_framework_routes(
+        path,
+        text_only_language_name(path),
+        &source,
+        file_id,
+        &mut local_storage,
+    );
     Ok(local_storage)
+}
+
+fn append_text_only_framework_routes(
+    path: &Path,
+    language_name: &str,
+    source: &str,
+    file_id: NodeId,
+    local_storage: &mut IntermediateStorage,
+) {
+    for route in collect_framework_routes(path, language_name, source) {
+        let route_node = framework_route_node(file_id, &route);
+        let route_node_id = route_node.id;
+        local_storage.nodes.push(route_node);
+        local_storage
+            .component_access
+            .push((route_node_id, AccessKind::Public));
+        local_storage
+            .edges
+            .push(framework_route_member_edge(file_id, route_node_id, &route));
+        local_storage
+            .occurrences
+            .push(framework_route_occurrence(file_id, route_node_id, &route));
+    }
 }
 
 fn index_openapi_schema_file(path: &Path, source: &str) -> Result<Option<IntermediateStorage>> {
@@ -4592,6 +4639,588 @@ fn normalize_api_path(path: &str) -> String {
     } else {
         format!("/{trimmed}")
     }
+}
+
+fn collect_framework_routes(path: &Path, language_name: &str, source: &str) -> Vec<FrameworkRoute> {
+    let mut routes = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        let line_number = index as u32 + 1;
+        let trimmed = line.trim();
+        match language_name {
+            "javascript" | "typescript" => {
+                collect_express_route(trimmed, line_number, &mut routes);
+                collect_react_route(trimmed, line_number, &mut routes);
+                collect_sveltekit_server_route(path, trimmed, line_number, &mut routes);
+            }
+            "python" => collect_python_route(trimmed, line_number, &mut routes),
+            "java" => collect_spring_route(trimmed, line_number, &mut routes),
+            "rust" => collect_rust_web_route(trimmed, line_number, &mut routes),
+            "ruby" => collect_rails_route(trimmed, line_number, &mut routes),
+            "php" => collect_laravel_route(trimmed, line_number, &mut routes),
+            "csharp" => collect_aspnet_route(trimmed, line_number, &mut routes),
+            "vue" => collect_vue_route(trimmed, line_number, &mut routes),
+            _ => {}
+        }
+    }
+    if language_name == "svelte" {
+        collect_sveltekit_page_route(path, 1, &mut routes);
+    }
+    dedupe_framework_routes(routes)
+}
+
+fn collect_express_route(line: &str, line_number: u32, routes: &mut Vec<FrameworkRoute>) {
+    for receiver in ["app", "router"] {
+        for method in ["get", "post", "put", "patch", "delete", "head", "options"] {
+            let needle = format!("{receiver}.{method}(");
+            if let Some(args) = line.split_once(&needle).map(|(_, tail)| tail)
+                && let Some(path) = first_quoted_string(args)
+            {
+                routes.push(FrameworkRoute {
+                    framework: "express",
+                    method: method.to_ascii_uppercase(),
+                    path: normalize_api_path(&path),
+                    handler: route_handler_after_path(args, &path),
+                    line: line_number,
+                    confidence: "heuristic",
+                });
+            }
+        }
+    }
+}
+
+fn collect_react_route(line: &str, line_number: u32, routes: &mut Vec<FrameworkRoute>) {
+    if (line.contains("<Route") || line.contains(" path:"))
+        && line.contains("path")
+        && let Some(path) = value_after_key(line, "path").or_else(|| first_quoted_string(line))
+    {
+        routes.push(FrameworkRoute {
+            framework: "react-router",
+            method: "GET".to_string(),
+            path: normalize_api_path(&path),
+            handler: None,
+            line: line_number,
+            confidence: "heuristic",
+        });
+    }
+}
+
+fn collect_sveltekit_server_route(
+    path: &Path,
+    line: &str,
+    line_number: u32,
+    routes: &mut Vec<FrameworkRoute>,
+) {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if file_name != "+server.ts" && file_name != "+server.js" {
+        return;
+    }
+    for method in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
+        if line.contains(&format!("export function {method}"))
+            || line.contains(&format!("export async function {method}"))
+            || line.contains(&format!("export const {method}"))
+        {
+            routes.push(FrameworkRoute {
+                framework: "sveltekit",
+                method: method.to_string(),
+                path: sveltekit_route_path(path),
+                handler: Some(method.to_string()),
+                line: line_number,
+                confidence: "file_convention",
+            });
+        }
+    }
+}
+
+fn collect_sveltekit_page_route(path: &Path, line_number: u32, routes: &mut Vec<FrameworkRoute>) {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if file_name != "+page.svelte" {
+        return;
+    }
+    routes.push(FrameworkRoute {
+        framework: "sveltekit",
+        method: "GET".to_string(),
+        path: sveltekit_route_path(path),
+        handler: None,
+        line: line_number,
+        confidence: "file_convention",
+    });
+}
+
+fn collect_python_route(line: &str, line_number: u32, routes: &mut Vec<FrameworkRoute>) {
+    let lower = line.to_ascii_lowercase();
+    if lower.starts_with("@app.route") || lower.starts_with("@blueprint.route") {
+        if let Some(path) = first_quoted_string(line) {
+            let method = route_methods_literal(line).unwrap_or_else(|| "GET".to_string());
+            routes.push(FrameworkRoute {
+                framework: "flask",
+                method,
+                path: normalize_api_path(&path),
+                handler: None,
+                line: line_number,
+                confidence: "decorator",
+            });
+        }
+    }
+    for method in ["get", "post", "put", "patch", "delete"] {
+        if lower.starts_with(&format!("@app.{method}("))
+            && let Some(path) = first_quoted_string(line)
+        {
+            routes.push(FrameworkRoute {
+                framework: "fastapi",
+                method: method.to_ascii_uppercase(),
+                path: normalize_api_path(&path),
+                handler: None,
+                line: line_number,
+                confidence: "decorator",
+            });
+        }
+    }
+    if (line.contains("path(") || line.contains("re_path("))
+        && let Some(route_path) = first_quoted_string(line)
+    {
+        routes.push(FrameworkRoute {
+            framework: "django",
+            method: "ROUTE".to_string(),
+            path: normalize_api_path(&route_path),
+            handler: route_handler_after_path(line, &route_path),
+            line: line_number,
+            confidence: "heuristic",
+        });
+    }
+}
+
+fn collect_spring_route(line: &str, line_number: u32, routes: &mut Vec<FrameworkRoute>) {
+    let mappings = [
+        ("@GetMapping", "GET"),
+        ("@PostMapping", "POST"),
+        ("@PutMapping", "PUT"),
+        ("@PatchMapping", "PATCH"),
+        ("@DeleteMapping", "DELETE"),
+        ("@RequestMapping", "ROUTE"),
+    ];
+    for (annotation, method) in mappings {
+        if line.contains(annotation)
+            && let Some(path) = first_quoted_string(line)
+        {
+            routes.push(FrameworkRoute {
+                framework: "spring",
+                method: method.to_string(),
+                path: normalize_api_path(&path),
+                handler: None,
+                line: line_number,
+                confidence: "annotation",
+            });
+        }
+    }
+}
+
+fn collect_rust_web_route(line: &str, line_number: u32, routes: &mut Vec<FrameworkRoute>) {
+    if line.contains(".route(")
+        && let Some(path) = first_quoted_string(line)
+    {
+        let method = ["get", "post", "put", "patch", "delete"]
+            .iter()
+            .find(|method| line.contains(&format!("{method}(")))
+            .map(|method| method.to_ascii_uppercase())
+            .unwrap_or_else(|| "ROUTE".to_string());
+        let framework = if line.contains("web::") {
+            "actix"
+        } else {
+            "axum"
+        };
+        routes.push(FrameworkRoute {
+            framework,
+            method,
+            path: normalize_api_path(&path),
+            handler: handler_inside_last_call(line),
+            line: line_number,
+            confidence: "heuristic",
+        });
+    }
+    for method in ["get", "post", "put", "patch", "delete"] {
+        let attr = format!("#[{method}(");
+        if line.contains(&attr)
+            && let Some(path) = first_quoted_string(line)
+        {
+            routes.push(FrameworkRoute {
+                framework: "rocket",
+                method: method.to_ascii_uppercase(),
+                path: normalize_api_path(&path),
+                handler: None,
+                line: line_number,
+                confidence: "attribute",
+            });
+        }
+    }
+}
+
+fn collect_rails_route(line: &str, line_number: u32, routes: &mut Vec<FrameworkRoute>) {
+    for method in ["get", "post", "put", "patch", "delete", "resources"] {
+        if line.trim_start().starts_with(method)
+            && let Some(path) = first_quoted_string(line)
+        {
+            routes.push(FrameworkRoute {
+                framework: "rails",
+                method: method.to_ascii_uppercase(),
+                path: normalize_api_path(&path),
+                handler: value_after_key(line, "to"),
+                line: line_number,
+                confidence: "heuristic",
+            });
+        }
+    }
+}
+
+fn collect_laravel_route(line: &str, line_number: u32, routes: &mut Vec<FrameworkRoute>) {
+    for method in ["get", "post", "put", "patch", "delete", "any"] {
+        let needle = format!("Route::{method}(");
+        if line.contains(&needle)
+            && let Some(path) = first_quoted_string(line)
+        {
+            routes.push(FrameworkRoute {
+                framework: "laravel",
+                method: method.to_ascii_uppercase(),
+                path: normalize_api_path(&path),
+                handler: None,
+                line: line_number,
+                confidence: "heuristic",
+            });
+        }
+    }
+}
+
+fn collect_aspnet_route(line: &str, line_number: u32, routes: &mut Vec<FrameworkRoute>) {
+    let attrs = [
+        ("[HttpGet", "GET"),
+        ("[HttpPost", "POST"),
+        ("[HttpPut", "PUT"),
+        ("[HttpPatch", "PATCH"),
+        ("[HttpDelete", "DELETE"),
+        ("[Route", "ROUTE"),
+    ];
+    for (attr, method) in attrs {
+        if line.contains(attr)
+            && let Some(path) = first_quoted_string(line)
+        {
+            routes.push(FrameworkRoute {
+                framework: "aspnet",
+                method: method.to_string(),
+                path: normalize_api_path(&path),
+                handler: None,
+                line: line_number,
+                confidence: "attribute",
+            });
+        }
+    }
+}
+
+fn collect_vue_route(line: &str, line_number: u32, routes: &mut Vec<FrameworkRoute>) {
+    if line.contains("path:")
+        && let Some(path) = value_after_key(line, "path")
+    {
+        routes.push(FrameworkRoute {
+            framework: "vue-router",
+            method: "GET".to_string(),
+            path: normalize_api_path(&path),
+            handler: value_after_key(line, "name"),
+            line: line_number,
+            confidence: "heuristic",
+        });
+    }
+}
+
+fn first_quoted_string(value: &str) -> Option<String> {
+    let mut quote = None;
+    let mut start = 0;
+    for (index, ch) in value.char_indices() {
+        if ch == '"' || ch == '\'' {
+            if quote.is_none() {
+                quote = Some(ch);
+                start = index + ch.len_utf8();
+            } else if quote == Some(ch) {
+                return Some(value[start..index].to_string());
+            }
+        }
+    }
+    None
+}
+
+fn value_after_key(line: &str, key: &str) -> Option<String> {
+    let (_, tail) = line.split_once(key)?;
+    first_quoted_string(tail.split_once(':').map(|(_, value)| value).unwrap_or(tail))
+}
+
+fn route_handler_after_path(args: &str, path: &str) -> Option<String> {
+    let (_, tail) = args.split_once(path)?;
+    tail.trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == ',' || ch.is_whitespace())
+        .split([',', ')', ']'])
+        .next()
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
+        })
+        .and_then(|value| value.rsplit('.').next().map(str::to_string))
+}
+
+fn handler_inside_last_call(line: &str) -> Option<String> {
+    line.rsplit('(')
+        .next()
+        .and_then(|tail| tail.split(')').next())
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+        .map(str::to_string)
+}
+
+fn route_methods_literal(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    ["get", "post", "put", "patch", "delete"]
+        .iter()
+        .find(|method| {
+            lower.contains(&format!("\"{method}\"")) || lower.contains(&format!("'{method}'"))
+        })
+        .map(|method| method.to_ascii_uppercase())
+}
+
+fn sveltekit_route_path(path: &Path) -> String {
+    let mut parts = Vec::new();
+    let mut in_routes_dir = false;
+    for component in path.components() {
+        let value = component.as_os_str().to_string_lossy();
+        if value == "routes" {
+            in_routes_dir = true;
+            parts.clear();
+            continue;
+        }
+        if !in_routes_dir {
+            continue;
+        }
+        if value.starts_with('+') {
+            continue;
+        }
+        if value.starts_with('(') && value.ends_with(')') {
+            continue;
+        }
+        let segment = if value.starts_with("[[...") && value.ends_with("]]") {
+            format!(
+                ":{}",
+                value.trim_start_matches("[[...").trim_end_matches("]]")
+            )
+        } else if value.starts_with("[...") && value.ends_with(']') {
+            format!(
+                ":{}",
+                value.trim_start_matches("[...").trim_end_matches(']')
+            )
+        } else if value.starts_with("[[") && value.ends_with("]]") {
+            format!(":{}", value.trim_start_matches("[[").trim_end_matches("]]"))
+        } else if value.starts_with('[') && value.ends_with(']') {
+            format!(":{}", value.trim_start_matches('[').trim_end_matches(']'))
+        } else {
+            value.to_string()
+        };
+        if !segment.ends_with(".svelte") && !segment.ends_with(".ts") && !segment.ends_with(".js") {
+            parts.push(segment);
+        }
+    }
+    normalize_api_path(&parts.join("/"))
+}
+
+fn dedupe_framework_routes(routes: Vec<FrameworkRoute>) -> Vec<FrameworkRoute> {
+    let mut seen = HashSet::new();
+    routes
+        .into_iter()
+        .filter(|route| {
+            seen.insert((
+                route.framework,
+                route.method.clone(),
+                route.path.clone(),
+                route.line,
+            ))
+        })
+        .collect()
+}
+
+fn framework_route_label(route: &FrameworkRoute) -> String {
+    format!(
+        "{} {} ({} route; confidence={})",
+        route.method, route.path, route.framework, route.confidence
+    )
+}
+
+fn framework_route_canonical_id(route: &FrameworkRoute) -> String {
+    format!(
+        "framework:{}:route:{}:{}",
+        route.framework, route.method, route.path
+    )
+}
+
+fn framework_route_node(file_id: NodeId, route: &FrameworkRoute) -> Node {
+    let label = framework_route_label(route);
+    Node {
+        id: NodeId(generate_id(&framework_route_canonical_id(route))),
+        kind: NodeKind::FUNCTION,
+        serialized_name: label.clone(),
+        qualified_name: Some(format!(
+            "framework::{}::{} {}",
+            route.framework, route.method, route.path
+        )),
+        canonical_id: Some(framework_route_canonical_id(route)),
+        file_node_id: Some(file_id),
+        start_line: Some(route.line),
+        start_col: Some(1),
+        end_line: Some(route.line),
+        end_col: Some(label.len().max(1) as u32),
+    }
+}
+
+fn framework_route_member_edge(
+    file_id: NodeId,
+    route_node_id: NodeId,
+    route: &FrameworkRoute,
+) -> Edge {
+    Edge {
+        id: EdgeId(generate_edge_id(
+            file_id.0,
+            route_node_id.0,
+            EdgeKind::MEMBER,
+        )),
+        source: file_id,
+        target: route_node_id,
+        kind: EdgeKind::MEMBER,
+        file_node_id: Some(file_id),
+        line: Some(route.line),
+        certainty: Some(ResolutionCertainty::Certain),
+        ..Default::default()
+    }
+}
+
+fn framework_route_occurrence(
+    file_id: NodeId,
+    route_node_id: NodeId,
+    route: &FrameworkRoute,
+) -> Occurrence {
+    Occurrence {
+        element_id: route_node_id.0,
+        kind: OccurrenceKind::DEFINITION,
+        location: SourceLocation {
+            file_node_id: file_id,
+            start_line: route.line,
+            start_col: 1,
+            end_line: route.line,
+            end_col: framework_route_label(route).len().max(1) as u32,
+        },
+    }
+}
+
+struct FrameworkRouteSinks<'a> {
+    unique_nodes: &'a mut HashMap<NodeId, Node>,
+    result_edges: &'a mut Vec<Edge>,
+    result_occurrences: &'a mut Vec<Occurrence>,
+    component_access_by_node_id: &'a mut HashMap<NodeId, AccessKind>,
+    edge_keys: &'a mut HashSet<EdgeDedupKey>,
+    callsite_ordinals: &'a mut HashMap<(NodeId, Option<u32>), u32>,
+}
+
+fn append_framework_routes(
+    path: &Path,
+    language_name: &str,
+    source: &str,
+    file_id: NodeId,
+    flags: IndexFeatureFlags,
+    sinks: &mut FrameworkRouteSinks<'_>,
+) {
+    for route in collect_framework_routes(path, language_name, source) {
+        let route_node = framework_route_node(file_id, &route);
+        let route_node_id = route_node.id;
+        sinks
+            .unique_nodes
+            .entry(route_node_id)
+            .or_insert(route_node);
+        sinks
+            .component_access_by_node_id
+            .insert(route_node_id, AccessKind::Public);
+
+        let mut member_edge = framework_route_member_edge(file_id, route_node_id, &route);
+        if sinks.edge_keys.insert(edge_dedup_key(&member_edge, flags)) {
+            member_edge.id = EdgeId(generate_edge_id_for_edge(&member_edge, flags));
+            sinks.result_edges.push(member_edge);
+        }
+        sinks
+            .result_occurrences
+            .push(framework_route_occurrence(file_id, route_node_id, &route));
+
+        let Some(handler_name) = route.handler.as_deref() else {
+            continue;
+        };
+        let Some(handler_id) = find_framework_route_handler(sinks.unique_nodes, handler_name)
+        else {
+            continue;
+        };
+        if handler_id == route_node_id {
+            continue;
+        }
+        let mut call_edge = Edge {
+            id: EdgeId(0),
+            source: route_node_id,
+            target: handler_id,
+            kind: EdgeKind::CALL,
+            file_node_id: Some(file_id),
+            line: Some(route.line),
+            certainty: Some(ResolutionCertainty::Probable),
+            confidence: Some(0.65),
+            ..Default::default()
+        };
+        let next = sinks
+            .callsite_ordinals
+            .entry((handler_id, call_edge.line))
+            .or_insert(0);
+        *next = next.saturating_add(1);
+        ensure_callsite_identity(&mut call_edge, Some(*next));
+        if !sinks.edge_keys.insert(edge_dedup_key(&call_edge, flags)) {
+            continue;
+        }
+        call_edge.id = EdgeId(generate_edge_id_for_edge(&call_edge, flags));
+        sinks.result_edges.push(call_edge);
+    }
+}
+
+fn find_framework_route_handler(
+    nodes: &HashMap<NodeId, Node>,
+    handler_name: &str,
+) -> Option<NodeId> {
+    let terminal = handler_name
+        .rsplit(['.', ':', '#', '@'])
+        .next()
+        .unwrap_or(handler_name)
+        .trim()
+        .trim_end_matches(']')
+        .trim_end_matches('}');
+    if terminal.is_empty() {
+        return None;
+    }
+    nodes
+        .values()
+        .filter(|node| is_callable_kind(node.kind))
+        .find(|node| {
+            node.serialized_name == terminal
+                || node.qualified_name.as_deref().is_some_and(|qualified| {
+                    qualified.rsplit([':', '.', '#']).next() == Some(terminal)
+                })
+        })
+        .map(|node| node.id)
 }
 
 fn non_impl_anchor_canonical_predicate() -> &'static str {
@@ -5289,6 +5918,21 @@ pub fn index_file(
         &mut SchemaEndpointEdgeSinks {
             unique_nodes: &mut unique_nodes,
             result_edges: &mut result_edges,
+            edge_keys: &mut edge_keys,
+            callsite_ordinals: &mut callsite_ordinals,
+        },
+    );
+    append_framework_routes(
+        path,
+        language_config.language_name,
+        source,
+        file_id,
+        flags,
+        &mut FrameworkRouteSinks {
+            unique_nodes: &mut unique_nodes,
+            result_edges: &mut result_edges,
+            result_occurrences: &mut result_occurrences,
+            component_access_by_node_id: &mut component_access_by_node_id,
             edge_keys: &mut edge_keys,
             callsite_ordinals: &mut callsite_ordinals,
         },
@@ -7739,6 +8383,152 @@ function render() {
         assert!(storage.nodes.iter().any(|node| node.kind == NodeKind::FILE));
         assert!(storage.edges.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn test_text_only_sveltekit_page_indexes_file_convention_route() -> Result<()> {
+        let temp = tempdir()?;
+        let routes = temp.path().join("src/routes/users/[id]");
+        std::fs::create_dir_all(&routes)?;
+        let path = routes.join("+page.svelte");
+        std::fs::write(&path, "<h1>User</h1>\n")?;
+
+        let storage = index_text_only_file(&path)?;
+
+        assert!(storage.nodes.iter().any(|node| {
+            node.serialized_name == "GET /users/:id (sveltekit route; confidence=file_convention)"
+        }));
+        assert!(storage.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::MEMBER && edge.certainty == Some(ResolutionCertainty::Certain)
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_typescript_framework_routes_index_express_react_and_sveltekit() -> Result<()> {
+        let code = r#"
+import { Route } from "react-router-dom";
+app.get("/users", listUsers);
+export function listUsers() {
+    return [];
+}
+export function Screen() {
+    return <Route path="/dashboard" element={<Dashboard />} />;
+}
+"#;
+        let language_config = get_language_for_ext("tsx").expect("tsx config");
+        let result = index_file(
+            Path::new("src/routes/+server.tsx"),
+            code,
+            &language_config,
+            None,
+            None,
+        )?;
+        let node_by_id = result
+            .nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<HashMap<_, _>>();
+
+        let express_route = result
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name == "GET /users (express route; confidence=heuristic)")
+            .expect("express route node");
+        let handler = result
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name == "listUsers")
+            .expect("handler node");
+        assert!(result.nodes.iter().any(|node| {
+            node.serialized_name == "GET /dashboard (react-router route; confidence=heuristic)"
+        }));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.source == express_route.id
+                && edge.target == handler.id
+                && edge.certainty == Some(ResolutionCertainty::Probable)
+        }));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::MEMBER
+                && edge.target == express_route.id
+                && node_by_id
+                    .get(&edge.source)
+                    .is_some_and(|node| node.kind == NodeKind::FILE)
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_framework_route_extractors_cover_requested_web_stacks() {
+        let cases = [
+            (
+                "python",
+                Path::new("urls.py"),
+                r#"
+@app.route("/flask", methods=["POST"])
+def flask_handler(): pass
+@app.get("/fastapi")
+async def fastapi_handler(): pass
+path("django/", views.home)
+"#,
+                vec!["flask", "fastapi", "django"],
+            ),
+            (
+                "ruby",
+                Path::new("config/routes.rb"),
+                r#"get "/rails", to: "home#index""#,
+                vec!["rails"],
+            ),
+            (
+                "php",
+                Path::new("routes/web.php"),
+                r#"Route::post("/laravel", [UserController::class, "store"]);"#,
+                vec!["laravel"],
+            ),
+            (
+                "java",
+                Path::new("Controller.java"),
+                r#"@GetMapping("/spring")"#,
+                vec!["spring"],
+            ),
+            (
+                "csharp",
+                Path::new("Controller.cs"),
+                r#"[HttpGet("/aspnet")]"#,
+                vec!["aspnet"],
+            ),
+            (
+                "rust",
+                Path::new("routes.rs"),
+                r#"
+Router::new().route("/axum", get(handler));
+web::resource("/actix").route(web::get().to(handler));
+#[post("/rocket")]
+"#,
+                vec!["axum", "actix", "rocket"],
+            ),
+            (
+                "vue",
+                Path::new("router.vue"),
+                r#"{ path: "/vue", name: "VueHome" }"#,
+                vec!["vue-router"],
+            ),
+        ];
+
+        for (language, path, source, expected_frameworks) in cases {
+            let routes = collect_framework_routes(path, language, source);
+            let frameworks = routes
+                .iter()
+                .map(|route| route.framework)
+                .collect::<HashSet<_>>();
+            for expected in expected_frameworks {
+                assert!(
+                    frameworks.contains(expected),
+                    "expected {expected} route in {language}; got {routes:?}"
+                );
+            }
+        }
     }
 
     #[test]

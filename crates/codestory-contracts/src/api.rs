@@ -5,6 +5,7 @@ mod ids;
 mod types;
 
 pub use dto::{
+    AffectedAnalysisDto, AffectedAnalysisRequest, AffectedSymbolDto, AffectedTestFileDto,
     AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentCustomRetrievalConfigDto,
     AgentHybridWeightsDto, AgentResponseBlockDto, AgentResponseModeDto, AgentResponseSectionDto,
     AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto,
@@ -17,18 +18,19 @@ pub use dto::{
     GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto, GroundingCoverageDto,
     GroundingFileDigestDto, GroundingSnapshotDto, GroundingSymbolDigestDto, IndexDryRunDto,
     IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessSampleDto,
-    IndexFreshnessStatusDto, ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto,
-    NodeDetailsRequest, NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest,
-    OpenProjectRequest, ProjectSummary, ReadFileTextRequest, ReadFileTextResponse,
-    RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto,
-    RetrievalStateDto, SearchHit, SearchHitOrigin, SearchHybridLimitsDto, SearchMatchQualityDto,
-    SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest, SearchResultsDto,
-    SetUiLayoutRequest, SnippetContextDto, SnippetScopeDto, SourceOccurrenceDto,
-    StartIndexingRequest, StorageStatsDto, StoredSemanticDocsContractDto, SummaryGenerationDto,
-    SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto,
-    TrailFilterOptionsDto, TrailStoryDto, TrailStoryStepDto, UpdateBookmarkCategoryRequest,
-    UpdateBookmarkRequest, WorkspaceMemberIndexDto, WriteFileDataUrlRequest, WriteFileResponse,
-    WriteFileTextRequest,
+    IndexFreshnessStatusDto, IndexedFileDto, IndexedFileLanguageCountDto, IndexedFileRoleDto,
+    IndexedFilesDto, IndexedFilesRequest, IndexedFilesSummaryDto, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeOccurrencesRequest,
+    OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest, ProjectSummary,
+    ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
+    RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHit, SearchHitOrigin,
+    SearchHybridLimitsDto, SearchMatchQualityDto, SearchQueryAssessmentDto, SearchRepoTextMode,
+    SearchRequest, SearchResultsDto, SetUiLayoutRequest, SnippetContextDto, SnippetScopeDto,
+    SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto, StoredSemanticDocsContractDto,
+    SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
+    TrailContextDto, TrailFilterOptionsDto, TrailStoryDto, TrailStoryStepDto,
+    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WorkspaceMemberIndexDto,
+    WriteFileDataUrlRequest, WriteFileResponse, WriteFileTextRequest,
 };
 pub use errors::ApiError;
 pub use events::{AppEventPayload, IndexingPhaseTimings};

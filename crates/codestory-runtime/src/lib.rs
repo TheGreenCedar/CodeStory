@@ -1,16 +1,19 @@
 use codestory_contracts::api::{
+    AffectedAnalysisDto, AffectedAnalysisRequest, AffectedSymbolDto, AffectedTestFileDto,
     AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto, ApiError, AppEventPayload,
     BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId,
     EdgeKind, EdgeOccurrencesRequest, EmbeddingProfileContractDto, GraphEdgeDto, GraphNodeDto,
     GraphRequest, GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto,
     GroundingFileDigestDto, GroundingSnapshotDto, GroundingSymbolDigestDto, IndexDryRunDto,
     IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessSampleDto,
-    IndexFreshnessStatusDto, IndexMode, IndexingPhaseTimings, ListChildrenSymbolsRequest,
-    ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
-    NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
-    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
-    SearchHit, SearchMatchQualityDto, SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest,
+    IndexFreshnessStatusDto, IndexMode, IndexedFileDto, IndexedFileLanguageCountDto,
+    IndexedFileRoleDto, IndexedFilesDto, IndexedFilesRequest, IndexedFilesSummaryDto,
+    IndexingPhaseTimings, ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess,
+    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest,
+    OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest, ProjectSummary,
+    ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
+    RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHit,
+    SearchMatchQualityDto, SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest,
     SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
     StorageStatsDto, StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto,
     SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
@@ -31,7 +34,7 @@ use codestory_workspace::{
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
@@ -954,6 +957,51 @@ fn runtime_relative_path(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+fn normalize_path_key(path: &str) -> String {
+    path.trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_ascii_lowercase()
+}
+
+fn indexed_file_role(path: &Path) -> IndexedFileRoleDto {
+    path_role_from_key(&normalize_path_key(&path.to_string_lossy()))
+}
+
+fn path_role_from_key(path: &str) -> IndexedFileRoleDto {
+    let marked = format!("/{path}");
+    if marked.contains("/node_modules/")
+        || marked.contains("/vendor/")
+        || marked.contains("/vendors/")
+        || marked.contains("/third_party/")
+        || marked.contains("/third-party/")
+    {
+        return IndexedFileRoleDto::Vendor;
+    }
+    if marked.contains("/target/")
+        || marked.contains("/dist/")
+        || marked.contains("/build/")
+        || marked.contains(".generated.")
+        || marked.ends_with(".g.cs")
+    {
+        return IndexedFileRoleDto::Generated;
+    }
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    if marked.contains("/tests/")
+        || marked.contains("/test/")
+        || marked.contains("/spec/")
+        || file_name.contains(".test.")
+        || file_name.contains(".spec.")
+        || file_name.ends_with("_test.rs")
+        || file_name.ends_with("_test.py")
+        || file_name.ends_with("test.java")
+        || file_name.ends_with("tests.java")
+    {
+        return IndexedFileRoleDto::Test;
+    }
+    IndexedFileRoleDto::Source
 }
 
 const INDEX_FRESHNESS_INDEXED_FILE_CAP: usize = 25_000;
@@ -3933,6 +3981,291 @@ impl AppController {
             indexed_symbol_hits,
             repo_text_hits,
             hits,
+        })
+    }
+
+    pub fn indexed_files(&self, req: IndexedFilesRequest) -> Result<IndexedFilesDto, ApiError> {
+        self.ensure_consistent_read_state("Files")?;
+        let root = self.require_project_root()?;
+        let storage = self.open_storage()?;
+        let mut files = storage
+            .get_files()
+            .map_err(|e| ApiError::internal(format!("Failed to load indexed files: {e}")))?;
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+
+        let errors = storage
+            .get_errors(None)
+            .map_err(|e| ApiError::internal(format!("Failed to load index errors: {e}")))?;
+        let mut errors_by_file = HashMap::<i64, u32>::new();
+        for error in errors {
+            if let Some(file_id) = error.file_id {
+                *errors_by_file.entry(file_id.0).or_default() += 1;
+            }
+        }
+
+        let mut language_counts = BTreeMap::<String, u32>::new();
+        let mut indexed_file_count = 0_u32;
+        let mut incomplete_file_count = 0_u32;
+        let mut error_file_count = 0_u32;
+        for file in &files {
+            *language_counts.entry(file.language.clone()).or_default() += 1;
+            indexed_file_count += u32::from(file.indexed);
+            incomplete_file_count += u32::from(!file.complete);
+            error_file_count += u32::from(errors_by_file.contains_key(&file.id));
+        }
+
+        let path_filter = req.path_contains.as_deref().map(normalize_path_key);
+        let language_filter = req.language.as_deref().map(str::to_ascii_lowercase);
+        let mut visible = files
+            .into_iter()
+            .filter(|file| {
+                let role = indexed_file_role(&file.path);
+                req.role.is_none_or(|requested| requested == role)
+                    && path_filter.as_deref().is_none_or(|needle| {
+                        normalize_path_key(&runtime_relative_path(&root, &file.path))
+                            .contains(needle)
+                    })
+                    && language_filter
+                        .as_deref()
+                        .is_none_or(|language| file.language.eq_ignore_ascii_case(language))
+            })
+            .map(|file| IndexedFileDto {
+                path: runtime_relative_path(&root, &file.path),
+                language: file.language,
+                indexed: file.indexed,
+                complete: file.complete,
+                line_count: file.line_count,
+                role: indexed_file_role(&file.path),
+                error_count: errors_by_file.get(&file.id).copied().unwrap_or_default(),
+            })
+            .collect::<Vec<_>>();
+        let limit = req.limit.unwrap_or(500).clamp(1, 5000) as usize;
+        let truncated = visible.len() > limit;
+        visible.truncate(limit);
+
+        let mut coverage_notes = Vec::new();
+        if incomplete_file_count > 0 || error_file_count > 0 {
+            coverage_notes.push(format!(
+                "index usable with {incomplete_file_count} incomplete files and {error_file_count} files carrying index errors"
+            ));
+        } else {
+            coverage_notes.push("index usable; no file-level index errors recorded".to_string());
+        }
+        let language_counts = language_counts
+            .into_iter()
+            .map(|(language, file_count)| IndexedFileLanguageCountDto {
+                language,
+                file_count,
+            })
+            .collect::<Vec<_>>();
+        let file_count = language_counts
+            .iter()
+            .map(|entry| entry.file_count)
+            .sum::<u32>();
+
+        Ok(IndexedFilesDto {
+            project_root: root.to_string_lossy().to_string(),
+            usable: indexed_file_count > 0,
+            summary: IndexedFilesSummaryDto {
+                file_count,
+                indexed_file_count,
+                incomplete_file_count,
+                error_file_count,
+                truncated,
+                language_counts,
+                coverage_notes,
+            },
+            files: visible,
+        })
+    }
+
+    pub fn affected_analysis(
+        &self,
+        req: AffectedAnalysisRequest,
+    ) -> Result<AffectedAnalysisDto, ApiError> {
+        self.ensure_consistent_read_state("Affected analysis")?;
+        let root = self.require_project_root()?;
+        let depth = req.depth.unwrap_or(2).clamp(1, 8);
+        let filter = req.filter.as_deref().map(normalize_path_key);
+        let storage = self.open_storage()?;
+        let files = storage
+            .get_files()
+            .map_err(|e| ApiError::internal(format!("Failed to load indexed files: {e}")))?;
+        let nodes = storage
+            .get_nodes()
+            .map_err(|e| ApiError::internal(format!("Failed to load graph nodes: {e}")))?;
+        let edges = storage
+            .get_edges()
+            .map_err(|e| ApiError::internal(format!("Failed to load graph edges: {e}")))?;
+
+        let changed_keys = req
+            .changed_paths
+            .iter()
+            .map(|path| normalize_path_key(path))
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>();
+        let mut matched_file_ids = HashSet::<GraphNodeId>::new();
+        for file in &files {
+            let relative_key = normalize_path_key(&runtime_relative_path(&root, &file.path));
+            let absolute_key = normalize_path_key(&file.path.to_string_lossy());
+            if changed_keys.iter().any(|changed| {
+                relative_key == *changed
+                    || relative_key.ends_with(changed)
+                    || changed.ends_with(&relative_key)
+                    || absolute_key == *changed
+                    || absolute_key.ends_with(changed)
+            }) {
+                matched_file_ids.insert(codestory_contracts::graph::NodeId(file.id));
+            }
+        }
+
+        let mut labels = self.cached_labels(nodes.iter().map(|node| node.id));
+        for node in &nodes {
+            labels.entry(node.id).or_insert_with(|| {
+                node.qualified_name
+                    .clone()
+                    .unwrap_or_else(|| node.serialized_name.clone())
+            });
+        }
+        let file_path_by_id = files
+            .iter()
+            .map(|file| {
+                (
+                    codestory_contracts::graph::NodeId(file.id),
+                    runtime_relative_path(&root, &file.path),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let nodes_by_id = nodes
+            .iter()
+            .map(|node| (node.id, node.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut node_ids_by_file = HashMap::<GraphNodeId, Vec<GraphNodeId>>::new();
+        for node in &nodes {
+            if let Some(file_id) = node.file_node_id {
+                node_ids_by_file.entry(file_id).or_default().push(node.id);
+            }
+        }
+
+        let mut seeds = HashSet::<GraphNodeId>::new();
+        for file_id in &matched_file_ids {
+            seeds.insert(*file_id);
+            if let Some(file_nodes) = node_ids_by_file.get(file_id) {
+                seeds.extend(file_nodes.iter().copied());
+            }
+        }
+
+        let mut reverse_dependents = HashMap::<GraphNodeId, Vec<GraphNodeId>>::new();
+        for edge in &edges {
+            let source = edge.effective_source();
+            let target = edge.effective_target();
+            reverse_dependents.entry(target).or_default().push(source);
+        }
+
+        let mut distances = HashMap::<GraphNodeId, u32>::new();
+        let mut queue = VecDeque::<(GraphNodeId, u32)>::new();
+        for seed in seeds {
+            distances.insert(seed, 0);
+            queue.push_back((seed, 0));
+        }
+        while let Some((node_id, distance)) = queue.pop_front() {
+            if distance >= depth {
+                continue;
+            }
+            for dependent in reverse_dependents.get(&node_id).into_iter().flatten() {
+                let next_distance = distance + 1;
+                if distances
+                    .get(dependent)
+                    .is_none_or(|current| next_distance < *current)
+                {
+                    distances.insert(*dependent, next_distance);
+                    queue.push_back((*dependent, next_distance));
+                }
+            }
+        }
+
+        let mut impacted_symbols = distances
+            .iter()
+            .filter_map(|(node_id, distance)| {
+                let node = nodes_by_id.get(node_id)?;
+                if node.kind == codestory_contracts::graph::NodeKind::FILE {
+                    return None;
+                }
+                let file_path = node
+                    .file_node_id
+                    .and_then(|file_id| file_path_by_id.get(&file_id).cloned());
+                if filter.as_deref().is_some_and(|needle| {
+                    !labels
+                        .get(node_id)
+                        .is_some_and(|label| normalize_path_key(label).contains(needle))
+                        && !file_path
+                            .as_deref()
+                            .is_some_and(|path| normalize_path_key(path).contains(needle))
+                }) {
+                    return None;
+                }
+                Some(AffectedSymbolDto {
+                    node_id: NodeId::from(*node_id),
+                    display_name: labels
+                        .get(node_id)
+                        .cloned()
+                        .unwrap_or_else(|| node.serialized_name.clone()),
+                    kind: NodeKind::from(node.kind),
+                    file_path,
+                    line: node.start_line,
+                    distance: *distance,
+                })
+            })
+            .collect::<Vec<_>>();
+        impacted_symbols.sort_by(|left, right| {
+            left.distance
+                .cmp(&right.distance)
+                .then(left.file_path.cmp(&right.file_path))
+                .then(left.display_name.cmp(&right.display_name))
+        });
+        impacted_symbols.truncate(200);
+
+        let mut impacted_by_test_file = BTreeMap::<String, u32>::new();
+        for symbol in &impacted_symbols {
+            if let Some(path) = symbol.file_path.as_deref()
+                && path_role_from_key(&normalize_path_key(path)) == IndexedFileRoleDto::Test
+            {
+                *impacted_by_test_file.entry(path.to_string()).or_default() += 1;
+            }
+        }
+        let impacted_tests = impacted_by_test_file
+            .into_iter()
+            .map(|(path, impacted_symbol_count)| AffectedTestFileDto {
+                path,
+                reason: "test-like path reached by dependent graph walk".to_string(),
+                impacted_symbol_count,
+            })
+            .collect::<Vec<_>>();
+
+        let mut notes = Vec::new();
+        if matched_file_ids.is_empty() {
+            notes.push(
+                "no changed paths matched indexed files; pass repo-relative paths or reindex first"
+                    .to_string(),
+            );
+        } else {
+            notes.push(format!(
+                "matched {} indexed files; dependency walk expanded files into contained symbols",
+                matched_file_ids.len()
+            ));
+        }
+        if impacted_tests.is_empty() {
+            notes.push("no impacted test-like files found in the indexed graph".to_string());
+        }
+
+        Ok(AffectedAnalysisDto {
+            project_root: root.to_string_lossy().to_string(),
+            changed_paths: req.changed_paths,
+            matched_file_count: matched_file_ids.len().min(u32::MAX as usize) as u32,
+            depth,
+            impacted_symbols,
+            impacted_tests,
+            notes,
         })
     }
 

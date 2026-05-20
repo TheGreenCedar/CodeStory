@@ -1,17 +1,21 @@
 use anyhow::Result;
 use codestory_contracts::api::{
-    IndexFreshnessDto, IndexFreshnessStatusDto, LayoutDirection, SnippetContextDto,
-    SymbolContextDto, TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection, TrailMode,
+    GraphNodeDto, IndexFreshnessDto, IndexFreshnessStatusDto, LayoutDirection, NodeDetailsRequest,
+    SnippetContextDto, SymbolContextDto, TrailCallerScope, TrailConfigDto, TrailContextDto,
+    TrailDirection, TrailMode,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
+    fs,
     io::IsTerminal,
+    path::Path,
     time::Duration,
 };
 
 use crate::args::{
-    self, ExploreCommand, ExploreOutput, ExploreSearchOutput, ExploreStatusOutput,
-    NavigationOutput, QueryItemOutput, SearchHitOutput, TrailCommand,
+    self, ExploreBudgetOutput, ExploreCommand, ExploreOutput, ExploreSearchOutput,
+    ExploreSourceFileOutput, ExploreSourcePacketOutput, ExploreSourceSliceOutput,
+    ExploreStatusOutput, NavigationOutput, QueryItemOutput, SearchHitOutput, TrailCommand,
 };
 use crate::output::{
     emit, render_retrieval_state, render_snippet_markdown, render_symbol_markdown,
@@ -83,11 +87,13 @@ pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
     );
     let search = build_explore_search_output(&runtime.project_root, &target);
     let navigation = build_navigation_output(&runtime.project_root, &target, &trail);
+    let source_packet = build_explore_source_packet(&runtime, &opened, &trail, &snippet);
     let output = ExploreOutput {
         status,
         search,
         resolution: build_query_resolution_output(&runtime.project_root, &target),
         navigation,
+        source_packet,
         symbol: &symbol,
         trail: &trail,
         snippet: snippet.as_ref(),
@@ -98,6 +104,7 @@ pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
         status: &output.status,
         search: &output.search,
         navigation: &output.navigation,
+        source_packet: &output.source_packet,
         symbol: &symbol,
         trail: &trail,
         snippet: snippet.as_ref(),
@@ -210,6 +217,241 @@ fn build_navigation_output(
         incoming_references,
         outgoing_references,
     }
+}
+
+fn build_explore_source_packet(
+    runtime: &RuntimeContext,
+    opened: &runtime::OpenedProject,
+    trail: &TrailContextDto,
+    snippet: &Option<SnippetContextDto>,
+) -> ExploreSourcePacketOutput {
+    let budget = explore_budget(opened.summary.stats.file_count);
+    let mut slices_by_file = BTreeMap::<String, Vec<(u32, u32, String)>>::new();
+    let mut related_files = HashSet::<String>::new();
+    let mut seen_nodes = HashSet::<String>::new();
+
+    for node in trail
+        .trail
+        .nodes
+        .iter()
+        .take(budget.max_nodes_for_source as usize)
+    {
+        collect_source_slice_for_node(
+            runtime,
+            node,
+            &budget,
+            &mut slices_by_file,
+            &mut related_files,
+            &mut seen_nodes,
+        );
+    }
+    if let Some(snippet) = snippet {
+        let start = snippet
+            .line
+            .saturating_sub(snippet.requested_context.max(1))
+            .max(1);
+        let end = snippet
+            .line
+            .saturating_add(snippet.requested_context.max(1))
+            .min(start.saturating_add(budget.max_lines_per_slice));
+        slices_by_file
+            .entry(snippet.path.clone())
+            .or_default()
+            .push((start, end, snippet.node.display_name.clone()));
+        related_files.insert(display::relative_path(&runtime.project_root, &snippet.path));
+    }
+
+    let mut total_chars = 0_usize;
+    let mut files = Vec::new();
+    let mut packet_truncated = false;
+    for (path, mut slices) in slices_by_file.into_iter().take(budget.max_files as usize) {
+        slices.sort_by_key(|slice| slice.0);
+        let merged = merge_source_slices(slices);
+        let mut rendered_slices = Vec::new();
+        let mut file_chars = 0_usize;
+        let mut file_truncated = false;
+        let mut previous_end: Option<u32> = None;
+        for (start, end, labels) in merged {
+            if total_chars >= budget.max_total_chars as usize
+                || file_chars >= budget.max_chars_per_file as usize
+            {
+                file_truncated = true;
+                packet_truncated = true;
+                break;
+            }
+            let gap_before = previous_end
+                .filter(|previous: &u32| start > previous.saturating_add(1))
+                .map(|previous| {
+                    format!(
+                        "... source gap: lines {}-{} omitted ...",
+                        previous.saturating_add(1),
+                        start.saturating_sub(1)
+                    )
+                });
+            previous_end = Some(end);
+            let cap = (budget.max_chars_per_file as usize)
+                .saturating_sub(file_chars)
+                .min((budget.max_total_chars as usize).saturating_sub(total_chars));
+            let (source, slice_truncated) =
+                read_numbered_source_slice(&runtime.project_root, &path, start, end, cap)
+                    .map(|(source, truncated)| (Some(source), truncated))
+                    .unwrap_or((None, false));
+            let added = source.as_ref().map(String::len).unwrap_or_default();
+            file_chars = file_chars.saturating_add(added);
+            total_chars = total_chars.saturating_add(added);
+            file_truncated |= slice_truncated;
+            packet_truncated |= slice_truncated;
+            rendered_slices.push(ExploreSourceSliceOutput {
+                start_line: start,
+                end_line: end,
+                symbols: labels,
+                source,
+                truncated: slice_truncated,
+                gap_before,
+            });
+        }
+        files.push(ExploreSourceFileOutput {
+            path: display::relative_path(&runtime.project_root, &path),
+            slices: rendered_slices,
+            truncated: file_truncated,
+        });
+        if total_chars >= budget.max_total_chars as usize {
+            packet_truncated = true;
+            break;
+        }
+    }
+    if files.len() >= budget.max_files as usize && related_files.len() > files.len() {
+        packet_truncated = true;
+    }
+    let mut related_files = related_files.into_iter().collect::<Vec<_>>();
+    related_files.sort();
+    let mut notes = vec![
+        "source slices are line-numbered and grouped by file".to_string(),
+        "relationship map is built from the existing trail graph".to_string(),
+    ];
+    if opened.summary.stats.error_count > 0 {
+        notes.push(format!(
+            "index usable with {} recorded indexing errors; inspect doctor for partial coverage",
+            opened.summary.stats.error_count
+        ));
+    }
+    if packet_truncated {
+        notes.push("source packet truncated by adaptive explore budget".to_string());
+    }
+
+    ExploreSourcePacketOutput {
+        budget,
+        files,
+        related_files,
+        truncated: packet_truncated,
+        notes,
+    }
+}
+
+fn collect_source_slice_for_node(
+    runtime: &RuntimeContext,
+    node: &GraphNodeDto,
+    budget: &ExploreBudgetOutput,
+    slices_by_file: &mut BTreeMap<String, Vec<(u32, u32, String)>>,
+    related_files: &mut HashSet<String>,
+    seen_nodes: &mut HashSet<String>,
+) {
+    if !seen_nodes.insert(node.id.0.clone()) {
+        return;
+    }
+    let Ok(details) = runtime
+        .browser
+        .node_details(NodeDetailsRequest {
+            id: node.id.clone(),
+        })
+        .map_err(map_api_error)
+    else {
+        return;
+    };
+    let Some(path) = details.file_path else {
+        return;
+    };
+    let Some(start) = details.start_line else {
+        return;
+    };
+    let end = details
+        .end_line
+        .unwrap_or(start)
+        .min(start.saturating_add(budget.max_lines_per_slice));
+    related_files.insert(display::relative_path(&runtime.project_root, &path));
+    slices_by_file
+        .entry(path)
+        .or_default()
+        .push((start, end, details.display_name));
+}
+
+fn explore_budget(indexed_files: u32) -> ExploreBudgetOutput {
+    let (max_files, max_nodes_for_source, max_lines_per_slice, max_chars_per_file, max_total_chars) =
+        if indexed_files <= 100 {
+            (6, 24, 28, 8_000, 28_000)
+        } else if indexed_files <= 1_000 {
+            (4, 18, 22, 6_000, 18_000)
+        } else {
+            (3, 12, 16, 4_000, 12_000)
+        };
+    ExploreBudgetOutput {
+        indexed_files,
+        max_files,
+        max_nodes_for_source,
+        max_lines_per_slice,
+        max_chars_per_file,
+        max_total_chars,
+    }
+}
+
+fn merge_source_slices(slices: Vec<(u32, u32, String)>) -> Vec<(u32, u32, Vec<String>)> {
+    let mut merged = Vec::<(u32, u32, Vec<String>)>::new();
+    for (start, end, label) in slices {
+        if let Some((_, merged_end, labels)) = merged.last_mut()
+            && start <= merged_end.saturating_add(3)
+        {
+            *merged_end = (*merged_end).max(end);
+            labels.push(label);
+            continue;
+        }
+        merged.push((start, end, vec![label]));
+    }
+    merged
+}
+
+fn read_numbered_source_slice(
+    project_root: &Path,
+    path: &str,
+    start_line: u32,
+    end_line: u32,
+    char_cap: usize,
+) -> Option<(String, bool)> {
+    let raw_path = Path::new(path);
+    let full_path = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        project_root.join(raw_path)
+    };
+    let source = fs::read_to_string(full_path).ok()?;
+    let mut output = String::new();
+    let mut truncated = false;
+    for (index, line) in source.lines().enumerate() {
+        let line_number = index as u32 + 1;
+        if line_number < start_line {
+            continue;
+        }
+        if line_number > end_line {
+            break;
+        }
+        let rendered = format!("{line_number:>5}: {line}\n");
+        if output.len().saturating_add(rendered.len()) > char_cap {
+            truncated = true;
+            output.push_str("... source slice truncated by budget ...\n");
+            break;
+        }
+        output.push_str(&rendered);
+    }
+    Some((output, truncated))
 }
 
 fn build_explore_search_output(
@@ -513,6 +755,57 @@ fn render_explore_results_markdown(navigation: &NavigationOutput) -> String {
     markdown
 }
 
+fn render_explore_source_packet_markdown(source_packet: &ExploreSourcePacketOutput) -> String {
+    let mut markdown = String::new();
+    markdown.push_str(&format!(
+        "- budget: files={} nodes_for_source={} lines_per_slice={} chars_per_file={} total_chars={}\n",
+        source_packet.budget.max_files,
+        source_packet.budget.max_nodes_for_source,
+        source_packet.budget.max_lines_per_slice,
+        source_packet.budget.max_chars_per_file,
+        source_packet.budget.max_total_chars
+    ));
+    for note in &source_packet.notes {
+        markdown.push_str(&format!("- note: {note}\n"));
+    }
+    if !source_packet.related_files.is_empty() {
+        markdown.push_str("- related_files:\n");
+        for file in source_packet.related_files.iter().take(12) {
+            markdown.push_str(&format!("  - `{file}`\n"));
+        }
+    }
+    for file in &source_packet.files {
+        markdown.push_str(&format!("\n## `{}`\n", file.path));
+        for slice in &file.slices {
+            if let Some(gap) = slice.gap_before.as_deref() {
+                markdown.push_str(&format!("{gap}\n"));
+            }
+            markdown.push_str(&format!("lines {}-{}", slice.start_line, slice.end_line));
+            if !slice.symbols.is_empty() {
+                markdown.push_str(&format!(" ({})", slice.symbols.join(", ")));
+            }
+            markdown.push('\n');
+            if let Some(source) = slice.source.as_deref() {
+                markdown.push_str("```text\n");
+                markdown.push_str(source);
+                if !source.ends_with('\n') {
+                    markdown.push('\n');
+                }
+                markdown.push_str("```\n");
+            } else {
+                markdown.push_str("- source unavailable\n");
+            }
+        }
+        if file.truncated {
+            markdown.push_str("- file source truncated by budget\n");
+        }
+    }
+    if source_packet.truncated {
+        markdown.push_str("- packet truncated by adaptive budget\n");
+    }
+    markdown
+}
+
 fn explore_trail_command(
     project_root: &std::path::Path,
     target: &runtime::ResolvedTarget,
@@ -551,6 +844,7 @@ struct ExploreRenderContext<'a> {
     status: &'a ExploreStatusOutput,
     search: &'a ExploreSearchOutput,
     navigation: &'a NavigationOutput,
+    source_packet: &'a ExploreSourcePacketOutput,
     symbol: &'a SymbolContextDto,
     trail: &'a TrailContextDto,
     snippet: Option<&'a SnippetContextDto>,
@@ -620,6 +914,10 @@ fn render_explore_markdown(context: &ExploreRenderContext<'_>) -> String {
             &[],
         ));
     }
+    markdown.push_str("\nsource packet:\n");
+    markdown.push_str(&render_explore_source_packet_markdown(
+        context.source_packet,
+    ));
     markdown
 }
 
@@ -672,6 +970,10 @@ fn build_explore_panes(context: &ExploreRenderContext<'_>) -> Vec<ExplorePane> {
                     })
                     .unwrap_or_default()
             ),
+        },
+        ExplorePane {
+            label: "Source",
+            body: render_explore_source_packet_markdown(context.source_packet),
         },
     ]
 }

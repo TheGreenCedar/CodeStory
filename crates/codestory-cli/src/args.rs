@@ -1,10 +1,10 @@
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
     BookmarkCategoryDto, BookmarkDto, GroundingBudgetDto, IndexDryRunDto, IndexFreshnessDto,
-    IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind, ProjectSummary, RepoTextScanStatsDto,
-    RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin, SearchMatchQualityDto,
-    SearchQueryAssessmentDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto,
-    TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
+    IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind, ProjectSummary,
+    RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
+    SearchMatchQualityDto, SearchQueryAssessmentDto, SnippetContextDto, SummaryGenerationDto,
+    SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -38,6 +38,8 @@ pub(crate) enum Command {
     Snippet(SnippetCommand),
     Query(QueryCommand),
     Explore(ExploreCommand),
+    Files(FilesCommand),
+    Affected(AffectedCommand),
     Bookmark(BookmarkCommand),
     Serve(ServeCommand),
     GenerateCompletions(GenerateCompletionsCommand),
@@ -118,6 +120,15 @@ pub(crate) enum CliDirection {
 pub(crate) enum CliLayout {
     Horizontal,
     Vertical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CliFileRole {
+    Source,
+    Test,
+    Generated,
+    Vendor,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -678,6 +689,75 @@ pub(crate) struct ExploreCommand {
 }
 
 #[derive(Args, Debug)]
+pub(crate) struct FilesCommand {
+    #[arg(long, default_value = ".", help = "Repository root to query.")]
+    pub(crate) project: PathBuf,
+    #[arg(
+        long,
+        help = "Cache directory to use exactly as passed. If omitted, codestory-cli uses the system cache root with a per-project hashed subdirectory."
+    )]
+    pub(crate) cache_dir: Option<PathBuf>,
+    #[arg(long, help = "Only list files whose path contains this text.")]
+    pub(crate) path: Option<String>,
+    #[arg(long, help = "Only list files for this indexed language.")]
+    pub(crate) language: Option<String>,
+    #[arg(long, value_enum, help = "Only list files with this inferred role.")]
+    pub(crate) role: Option<CliFileRole>,
+    #[arg(long, default_value_t = 500)]
+    pub(crate) limit: u32,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
+    pub(crate) refresh: RefreshMode,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct AffectedCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        value_name = "PATH",
+        help = "Changed repo-relative path. If omitted, CodeStory reads git diff --name-only HEAD."
+    )]
+    pub(crate) paths: Vec<String>,
+    #[arg(long, help = "Read changed paths from stdin, one path per line.")]
+    pub(crate) stdin: bool,
+    #[arg(long, default_value_t = 2)]
+    pub(crate) depth: u32,
+    #[arg(
+        long,
+        help = "Filter impacted symbols by path or display name substring."
+    )]
+    pub(crate) filter: Option<String>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
+    pub(crate) refresh: RefreshMode,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct BookmarkCommand {
     #[command(subcommand)]
     pub(crate) action: BookmarkAction,
@@ -997,9 +1077,47 @@ pub(crate) struct ExploreOutput<'a> {
     pub(crate) search: ExploreSearchOutput,
     pub(crate) resolution: QueryResolutionOutput,
     pub(crate) navigation: NavigationOutput,
+    pub(crate) source_packet: ExploreSourcePacketOutput,
     pub(crate) symbol: &'a SymbolContextDto,
     pub(crate) trail: &'a TrailContextDto,
     pub(crate) snippet: Option<&'a SnippetContextDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExploreBudgetOutput {
+    pub(crate) indexed_files: u32,
+    pub(crate) max_files: u32,
+    pub(crate) max_nodes_for_source: u32,
+    pub(crate) max_lines_per_slice: u32,
+    pub(crate) max_chars_per_file: u32,
+    pub(crate) max_total_chars: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExploreSourceSliceOutput {
+    pub(crate) start_line: u32,
+    pub(crate) end_line: u32,
+    pub(crate) symbols: Vec<String>,
+    pub(crate) source: Option<String>,
+    pub(crate) truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) gap_before: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExploreSourceFileOutput {
+    pub(crate) path: String,
+    pub(crate) slices: Vec<ExploreSourceSliceOutput>,
+    pub(crate) truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExploreSourcePacketOutput {
+    pub(crate) budget: ExploreBudgetOutput,
+    pub(crate) files: Vec<ExploreSourceFileOutput>,
+    pub(crate) related_files: Vec<String>,
+    pub(crate) truncated: bool,
+    pub(crate) notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1120,6 +1238,18 @@ impl From<CliGroundingBudget> for GroundingBudgetDto {
             CliGroundingBudget::Strict => Self::Strict,
             CliGroundingBudget::Balanced => Self::Balanced,
             CliGroundingBudget::Max => Self::Max,
+        }
+    }
+}
+
+impl From<CliFileRole> for IndexedFileRoleDto {
+    fn from(value: CliFileRole) -> Self {
+        match value {
+            CliFileRole::Source => Self::Source,
+            CliFileRole::Test => Self::Test,
+            CliFileRole::Generated => Self::Generated,
+            CliFileRole::Vendor => Self::Vendor,
+            CliFileRole::Unknown => Self::Unknown,
         }
     }
 }

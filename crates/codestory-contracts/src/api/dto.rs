@@ -280,6 +280,107 @@ pub struct SearchResultsDto {
     pub hits: Vec<SearchHit>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexedFileRoleDto {
+    Source,
+    Test,
+    Generated,
+    Vendor,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct IndexedFilesRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<IndexedFileRoleDto>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct IndexedFileDto {
+    pub path: String,
+    pub language: String,
+    pub indexed: bool,
+    pub complete: bool,
+    pub line_count: u32,
+    pub role: IndexedFileRoleDto,
+    #[serde(default)]
+    pub error_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct IndexedFileLanguageCountDto {
+    pub language: String,
+    pub file_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct IndexedFilesSummaryDto {
+    pub file_count: u32,
+    pub indexed_file_count: u32,
+    pub incomplete_file_count: u32,
+    pub error_file_count: u32,
+    pub truncated: bool,
+    pub language_counts: Vec<IndexedFileLanguageCountDto>,
+    #[serde(default)]
+    pub coverage_notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct IndexedFilesDto {
+    pub project_root: String,
+    pub usable: bool,
+    pub summary: IndexedFilesSummaryDto,
+    pub files: Vec<IndexedFileDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedAnalysisRequest {
+    pub changed_paths: Vec<String>,
+    #[serde(default)]
+    pub depth: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedSymbolDto {
+    pub node_id: NodeId,
+    pub display_name: String,
+    pub kind: NodeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    pub distance: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedTestFileDto {
+    pub path: String,
+    pub reason: String,
+    pub impacted_symbol_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedAnalysisDto {
+    pub project_root: String,
+    pub changed_paths: Vec<String>,
+    pub matched_file_count: u32,
+    pub depth: u32,
+    pub impacted_symbols: Vec<AffectedSymbolDto>,
+    pub impacted_tests: Vec<AffectedTestFileDto>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct ListRootSymbolsRequest {
     pub limit: Option<u32>,
