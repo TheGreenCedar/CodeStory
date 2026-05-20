@@ -2,20 +2,20 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto, AgentResponseModeDto,
-    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AppEventPayload,
-    BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
-    GraphArtifactDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode, NodeId, NodeKind,
-    NodeOccurrencesRequest, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
-    RetrievalScoreBreakdownDto, SearchHit, SearchHybridLimitsDto, SearchMatchQualityDto,
-    SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest, SourceOccurrenceDto,
-    TrailCallerScope, TrailConfigDto, TrailDirection, TrailMode,
+    AffectedAnalysisRequest, AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto,
+    AgentResponseModeDto, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto,
+    AppEventPayload, BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest,
+    CreateBookmarkRequest, GraphArtifactDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode,
+    IndexedFilesRequest, NodeId, NodeKind, NodeOccurrencesRequest, RepoTextScanStatsDto,
+    RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto, SearchHit, SearchHybridLimitsDto,
+    SearchMatchQualityDto, SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest,
+    SourceOccurrenceDto, TrailCallerScope, TrailConfigDto, TrailDirection, TrailMode,
 };
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
     fs,
-    io::IsTerminal,
+    io::{IsTerminal, Read},
     net::TcpListener,
     sync::{
         Arc,
@@ -37,15 +37,16 @@ mod stdio_catalog;
 mod stdio_transport;
 
 use args::{
-    BookmarkAction, BookmarkAddCommand, BookmarkAddOutput, BookmarkCommand, BookmarkListCommand,
-    BookmarkListOutput, BookmarkOutput, BookmarkRemoveCommand, BookmarkRemoveOutput, Cli, Command,
-    CompletionShell, ContextCommand, DoctorCheckOutput, DoctorCommand, DoctorOutput,
-    DrillAnchorOutput, DrillCommand, DrillCommandStatusOutput, DrillMechanicalOutput, DrillOutput,
-    DrillVerificationChecklistItemOutput, GenerateCompletionsCommand, GroundCommand, IndexCommand,
-    IndexDryRunOutput, IndexOutput, QueryCommand, QueryOutput, QueryResolutionOutput,
-    QuerySelectorOutput, RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput, ServeCommand,
-    SetupAction, SetupCommand, SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput,
-    TrailCommand, TrailJsonOutput, VerificationTargetOutput, build_trail_request,
+    AffectedCommand, BookmarkAction, BookmarkAddCommand, BookmarkAddOutput, BookmarkCommand,
+    BookmarkListCommand, BookmarkListOutput, BookmarkOutput, BookmarkRemoveCommand,
+    BookmarkRemoveOutput, Cli, Command, CompletionShell, ContextCommand, DoctorCheckOutput,
+    DoctorCommand, DoctorOutput, DrillAnchorOutput, DrillCommand, DrillCommandStatusOutput,
+    DrillMechanicalOutput, DrillOutput, DrillVerificationChecklistItemOutput, FilesCommand,
+    GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput, IndexOutput,
+    ProjectArgs, QueryCommand, QueryOutput, QueryResolutionOutput, QuerySelectorOutput,
+    RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput, ServeCommand, SetupAction,
+    SetupCommand, SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, TrailCommand,
+    TrailJsonOutput, VerificationTargetOutput, build_trail_request,
 };
 #[cfg(test)]
 use codestory_contracts::api::TrailContextDto;
@@ -129,6 +130,8 @@ fn main() -> Result<()> {
         Command::Snippet(cmd) => run_snippet(cmd),
         Command::Query(cmd) => run_query(cmd),
         Command::Explore(cmd) => explore::run_explore(cmd),
+        Command::Files(cmd) => run_files(cmd),
+        Command::Affected(cmd) => run_affected(cmd),
         Command::Bookmark(cmd) => run_bookmark(cmd),
         Command::Serve(cmd) => run_serve(cmd),
         Command::GenerateCompletions(cmd) => run_generate_completions(cmd),
@@ -1674,6 +1677,361 @@ fn run_query(cmd: QueryCommand) -> Result<()> {
     };
     let markdown = render_query_markdown(&output);
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn run_files(cmd: FilesCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "files")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let project = ProjectArgs {
+        project: cmd.project.clone(),
+        cache_dir: cmd.cache_dir.clone(),
+    };
+    let runtime = RuntimeContext::new(&project)?;
+    let opened = runtime.ensure_open(cmd.refresh)?;
+    ensure_index_ready(&opened, "files")?;
+    let output = runtime
+        .browser
+        .indexed_files(IndexedFilesRequest {
+            path_contains: cmd.path,
+            language: cmd.language,
+            role: cmd.role.map(Into::into),
+            limit: Some(cmd.limit),
+        })
+        .map_err(map_api_error)?;
+    let markdown = render_files_markdown(&output);
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn run_affected(cmd: AffectedCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "affected")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    let opened = runtime.ensure_open(cmd.refresh)?;
+    ensure_index_ready(&opened, "affected")?;
+    let changed_paths = affected_changed_paths(&cmd)?;
+    let output = runtime
+        .browser
+        .affected_analysis(AffectedAnalysisRequest {
+            changed_paths,
+            depth: Some(cmd.depth),
+            filter: cmd.filter,
+        })
+        .map_err(map_api_error)?;
+    let markdown = render_affected_markdown(&output);
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn affected_changed_paths(cmd: &AffectedCommand) -> Result<Vec<String>> {
+    let mut paths = cmd.paths.clone();
+    if cmd.stdin {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .context("Failed to read changed paths from stdin")?;
+        paths.extend(
+            input
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned),
+        );
+    }
+    if !paths.is_empty() {
+        paths.sort();
+        paths.dedup();
+        return Ok(paths);
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&cmd.project.project)
+        .arg("diff")
+        .arg("--name-only")
+        .arg("HEAD")
+        .output()
+        .context("Failed to run git diff --name-only HEAD")?;
+    if !output.status.success() {
+        bail!(
+            "git diff --name-only HEAD failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+fn render_files_markdown(output: &codestory_contracts::api::IndexedFilesDto) -> String {
+    let mut markdown = String::new();
+    markdown.push_str("# indexed files\n\n");
+    render_files_summary(&mut markdown, output);
+    render_framework_route_coverage(&mut markdown, output);
+    render_indexed_file_rows(&mut markdown, output);
+    markdown
+}
+
+fn render_files_summary(markdown: &mut String, output: &codestory_contracts::api::IndexedFilesDto) {
+    let status = if output.usable { "usable" } else { "empty" };
+    let _ = writeln!(
+        markdown,
+        "- index: {status}; files: {}; indexed: {}; incomplete: {}; error files: {}",
+        output.summary.file_count,
+        output.summary.indexed_file_count,
+        output.summary.incomplete_file_count,
+        output.summary.error_file_count
+    );
+    if !output.summary.language_counts.is_empty() {
+        let languages = output
+            .summary
+            .language_counts
+            .iter()
+            .map(|entry| format!("{}={}", entry.language, entry.file_count))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(markdown, "- languages: {languages}");
+    }
+    for note in &output.summary.coverage_notes {
+        let _ = writeln!(markdown, "- coverage: {note}");
+    }
+}
+
+fn render_framework_route_coverage(
+    markdown: &mut String,
+    output: &codestory_contracts::api::IndexedFilesDto,
+) {
+    if !output.summary.framework_route_coverage.is_empty() {
+        markdown.push_str("\nframework route coverage:\n");
+        for entry in &output.summary.framework_route_coverage {
+            let gaps = if entry.unsupported_patterns.is_empty() {
+                "none recorded".to_string()
+            } else {
+                entry.unsupported_patterns.join("; ")
+            };
+            let known_gaps = if entry.known_gaps.is_empty() {
+                "none recorded".to_string()
+            } else {
+                entry.known_gaps.join("; ")
+            };
+            let _ = writeln!(
+                markdown,
+                "- {} ({}) status={} fixture_status={} confidence_floor={} handler_link={} promotable={} unsupported={} known_gaps={}",
+                entry.framework,
+                entry.language,
+                entry.status,
+                entry.fixture_status,
+                entry.confidence_floor,
+                entry.handler_link_support,
+                entry.promotable,
+                gaps,
+                known_gaps
+            );
+        }
+    }
+}
+
+fn render_indexed_file_rows(
+    markdown: &mut String,
+    output: &codestory_contracts::api::IndexedFilesDto,
+) {
+    markdown.push_str("\nfiles:\n");
+    for file in &output.files {
+        let markers = [
+            (!file.indexed).then_some("not-indexed"),
+            (!file.complete).then_some("incomplete"),
+            (file.error_count > 0).then_some("errors"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let marker = if markers.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", markers.join(", "))
+        };
+        let _ = writeln!(
+            markdown,
+            "- {} ({}, {:?}, {} lines){}",
+            file.path, file.language, file.role, file.line_count, marker
+        );
+    }
+    if output.summary.truncated {
+        markdown.push_str("- ... truncated by limit\n");
+    }
+}
+
+fn render_affected_markdown(output: &codestory_contracts::api::AffectedAnalysisDto) -> String {
+    let mut markdown = String::new();
+    markdown.push_str("# affected analysis\n\n");
+    render_affected_summary(&mut markdown, output);
+    render_affected_matched_files(&mut markdown, output);
+    render_affected_routes(&mut markdown, output);
+    render_affected_tests(&mut markdown, output);
+    render_affected_symbols(&mut markdown, output);
+    render_affected_footer(&mut markdown, output);
+    markdown
+}
+
+fn render_affected_summary(
+    markdown: &mut String,
+    output: &codestory_contracts::api::AffectedAnalysisDto,
+) {
+    let _ = writeln!(
+        markdown,
+        "- matched files: {}; depth: {}; impacted symbols: {}; impacted routes: {}; impacted tests: {}",
+        output.matched_file_count,
+        output.depth,
+        output.impacted_symbols.len(),
+        output.impacted_routes.len(),
+        output.impacted_tests.len()
+    );
+    if !output.changed_paths.is_empty() {
+        markdown.push_str("- changed paths:\n");
+        for path in &output.changed_paths {
+            let _ = writeln!(markdown, "  - {path}");
+        }
+    }
+    for note in &output.notes {
+        let _ = writeln!(markdown, "- note: {note}");
+    }
+}
+
+fn render_affected_matched_files(
+    markdown: &mut String,
+    output: &codestory_contracts::api::AffectedAnalysisDto,
+) {
+    if !output.matched_files.is_empty() {
+        markdown.push_str("\nmatched files:\n");
+        for file in &output.matched_files {
+            let mut markers = Vec::new();
+            if !file.complete {
+                markers.push("incomplete".to_string());
+            }
+            if file.error_count > 0 {
+                markers.push(format!("errors={}", file.error_count));
+            }
+            let marker = if markers.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", markers.join(", "))
+            };
+            let _ = writeln!(markdown, "- {} [{:?}]{marker}", file.path, file.role);
+        }
+    }
+    if !output.unmatched_paths.is_empty() {
+        markdown.push_str("\nunmatched paths:\n");
+        for path in &output.unmatched_paths {
+            let _ = writeln!(markdown, "- {}: {}", path.path, path.reason);
+        }
+    }
+}
+
+fn render_affected_routes(
+    markdown: &mut String,
+    output: &codestory_contracts::api::AffectedAnalysisDto,
+) {
+    if !output.impacted_routes.is_empty() {
+        markdown.push_str("\nimpacted routes:\n");
+        for route in output.impacted_routes.iter().take(30) {
+            let handler = route
+                .route
+                .handler
+                .as_ref()
+                .map(|handler| format!(" handler={}", handler.display_name))
+                .unwrap_or_default();
+            let framework = route
+                .route
+                .framework
+                .as_deref()
+                .map(|framework| format!(" framework={framework}"))
+                .unwrap_or_default();
+            let _ = writeln!(
+                markdown,
+                "- d{} {} {}{}{} [{}]: {}",
+                route.graph_depth,
+                route.route.method,
+                route.route.path,
+                framework,
+                handler,
+                route.confidence,
+                route.reason
+            );
+        }
+    }
+}
+
+fn render_affected_tests(
+    markdown: &mut String,
+    output: &codestory_contracts::api::AffectedAnalysisDto,
+) {
+    if !output.impacted_tests.is_empty() {
+        markdown.push_str("\nlikely impacted tests:\n");
+        for test in &output.impacted_tests {
+            let _ = writeln!(
+                markdown,
+                "- d{} {} ({} symbols, {}): {}",
+                test.graph_depth,
+                test.path,
+                test.impacted_symbol_count,
+                test.confidence,
+                test.reason
+            );
+        }
+    }
+}
+
+fn render_affected_symbols(
+    markdown: &mut String,
+    output: &codestory_contracts::api::AffectedAnalysisDto,
+) {
+    markdown.push_str("\nimpacted symbols:\n");
+    for symbol in output.impacted_symbols.iter().take(40) {
+        let location = symbol
+            .file_path
+            .as_deref()
+            .map(|path| match symbol.line {
+                Some(line) => format!("{path}:{line}"),
+                None => path.to_string(),
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        let _ = writeln!(
+            markdown,
+            "- d{} {} [{:?}] at {} ({}, {}): {}",
+            symbol.graph_depth,
+            symbol.display_name,
+            symbol.kind,
+            location,
+            symbol.node_id.0,
+            symbol.confidence,
+            symbol.reason
+        );
+    }
+    if output.impacted_symbols.len() > 40 {
+        let _ = writeln!(
+            markdown,
+            "- ... {} more symbols omitted",
+            output.impacted_symbols.len() - 40
+        );
+    }
+}
+
+fn render_affected_footer(
+    markdown: &mut String,
+    output: &codestory_contracts::api::AffectedAnalysisDto,
+) {
+    if !output.blind_spots.is_empty() {
+        markdown.push_str("\nblind spots:\n");
+        for blind_spot in &output.blind_spots {
+            let _ = writeln!(markdown, "- {blind_spot}");
+        }
+    }
+    if !output.next_commands.is_empty() {
+        markdown.push_str("\nnext_commands:\n");
+        for command in &output.next_commands {
+            let _ = writeln!(markdown, "- `{command}`");
+        }
+    }
 }
 
 fn run_serve(cmd: ServeCommand) -> Result<()> {
@@ -3274,6 +3632,7 @@ mod tests {
             end_line: None,
             end_col: None,
             member_access: None,
+            route_endpoint: None,
         }
     }
 

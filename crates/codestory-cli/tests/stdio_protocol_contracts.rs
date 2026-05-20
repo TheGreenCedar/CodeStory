@@ -593,8 +593,9 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
     )
     .clone();
 
+    let tool_names = sorted_field_values(&tools, "tools", "name");
     assert_eq!(
-        sorted_field_values(&tools, "tools", "name"),
+        tool_names,
         vec![
             "context",
             "definition",
@@ -606,6 +607,13 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
             "trail",
         ],
         "stdio browser tool names should stay stable and read-only: {tools}"
+    );
+    assert!(
+        !tool_names.iter().any(|name| name.starts_with("codestory_"))
+            && !tool_names
+                .iter()
+                .any(|name| matches!(*name, "files" | "affected")),
+        "CLI-first additions must not rename or expand serve --stdio tools: {tool_names:?}"
     );
 
     for tool in tools["tools"].as_array().expect("tools array") {

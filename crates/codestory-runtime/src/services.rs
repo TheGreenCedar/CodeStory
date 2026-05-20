@@ -1,7 +1,8 @@
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto, ApiError, BookmarkCategoryDto,
-    BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, GroundingBudgetDto,
-    GroundingSnapshotDto, IndexDryRunDto, IndexMode, IndexingPhaseTimings,
+    AffectedAnalysisDto, AffectedAnalysisRequest, AgentAnswerDto, AgentAskRequest,
+    AgentHybridWeightsDto, ApiError, BookmarkCategoryDto, BookmarkDto,
+    CreateBookmarkCategoryRequest, CreateBookmarkRequest, GroundingBudgetDto, GroundingSnapshotDto,
+    IndexDryRunDto, IndexMode, IndexedFilesDto, IndexedFilesRequest, IndexingPhaseTimings,
     ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId,
     OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, RetrievalStateDto, SearchHit,
     SearchRequest, SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
@@ -123,6 +124,17 @@ impl SearchService {
 
     pub fn search_results(&self, req: SearchRequest) -> Result<SearchResultsDto, ApiError> {
         self.controller.search_results(req)
+    }
+
+    pub fn indexed_files(&self, req: IndexedFilesRequest) -> Result<IndexedFilesDto, ApiError> {
+        self.controller.indexed_files(req)
+    }
+
+    pub fn affected_analysis(
+        &self,
+        req: AffectedAnalysisRequest,
+    ) -> Result<AffectedAnalysisDto, ApiError> {
+        self.controller.affected_analysis(req)
     }
 
     pub fn search_hybrid(

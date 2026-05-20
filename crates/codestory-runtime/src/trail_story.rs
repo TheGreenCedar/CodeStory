@@ -627,6 +627,7 @@ mod trail_story_tests {
             end_line: None,
             end_col: None,
             member_access: None,
+            route_endpoint: None,
         }
     }
 
@@ -764,6 +765,7 @@ mod trail_story_tests {
             end_line: None,
             end_col: None,
             member_access: None,
+            route_endpoint: None,
         };
         let trail = GraphResponse {
             center_id: NodeId("focus".to_string()),

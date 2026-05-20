@@ -83,6 +83,33 @@ fn run_cli(workspace: &Path, cache_dir: &Path, args: &[&str]) -> std::process::O
     command.output().expect("run codestory-cli")
 }
 
+fn run_cli_with_stdin(
+    workspace: &Path,
+    cache_dir: &Path,
+    args: &[&str],
+    stdin: &str,
+) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+        .args(args)
+        .arg("--project")
+        .arg(workspace)
+        .arg("--cache-dir")
+        .arg(cache_dir)
+        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn codestory-cli");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(stdin.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait codestory-cli")
+}
+
 fn run_cli_with_embedding_env(
     workspace: &Path,
     cache_dir: &Path,
@@ -905,6 +932,20 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
     write_tiny_rust_workspace(workspace.path());
+    let tests = workspace.path().join("tests");
+    fs::create_dir_all(&tests).expect("create tests dir");
+    fs::write(
+        tests.join("app_controller_test.rs"),
+        r#"use tiny_browser_fixture::AppController;
+
+#[test]
+fn app_controller_opens_project() {
+    let controller = AppController::new("demo");
+    assert!(controller.open_project().contains("demo"));
+}
+"#,
+    )
+    .expect("write integration test");
 
     let search_dir_snapshot =
         index_tiny_workspace_for_browser_loop(workspace.path(), cache_dir.path());
@@ -926,6 +967,8 @@ fn tiny_workspace_browser_loop_works_from_existing_cache() {
     assert_bookmark_focus_seeds_context(workspace.path(), cache_dir.path(), &bookmark_id);
 
     assert_explore_outputs_focus_context(workspace.path(), cache_dir.path(), &node_id);
+
+    assert_files_and_affected_read_existing_cache(workspace.path(), cache_dir.path());
 
     assert_query_reads_existing_cache(workspace.path(), cache_dir.path());
     assert_context_uses_db_first_trace(workspace.path(), cache_dir.path(), &node_id);
@@ -1206,6 +1249,16 @@ fn assert_explore_outputs_focus_context(workspace: &Path, cache_dir: &Path, node
         ],
     );
     assert_eq!(
+        string_field(&explore, &["profile", "requested"]),
+        "default",
+        "explore should preserve the default profile unless --profile is explicit"
+    );
+    assert_eq!(
+        string_field(&explore, &["profile", "caller_scope"]),
+        "production-only",
+        "default explore should keep production-only caller scope"
+    );
+    assert_eq!(
         string_field(&explore, &["search", "selected", "display_name"]),
         "AppController"
     );
@@ -1243,8 +1296,53 @@ fn assert_explore_outputs_focus_context(workspace: &Path, cache_dir: &Path, node
         "explore JSON should include trail detail"
     );
     assert!(
+        string_field(&explore, &["relationship_evidence", "map_source"]).contains("trail_context"),
+        "explore JSON should expose relationship evidence source"
+    );
+    assert!(
         string_field(&explore, &["snippet", "snippet"]).contains("AppController"),
         "explore JSON should include snippet detail"
+    );
+    assert!(
+        array_is_non_empty(&explore, &["source_packet", "files"]),
+        "explore JSON should include grouped source packet files"
+    );
+    assert!(
+        array_is_non_empty(&explore, &["source_packet", "notes"]),
+        "explore JSON should include source packet budget/coverage notes"
+    );
+
+    let profiled_explore = run_cli_json(
+        workspace,
+        cache_dir,
+        &[
+            "explore",
+            &format!("--id={node_id}"),
+            "--profile",
+            "test-impact",
+            "--no-tui",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        string_field(&profiled_explore, &["profile", "requested"]),
+        "test-impact",
+        "explicit explore profiles should be reflected in JSON output"
+    );
+    assert_eq!(
+        string_field(&profiled_explore, &["profile", "caller_scope"]),
+        "include-tests-and-benches",
+        "test-impact profile should include test and bench neighbors"
+    );
+    assert!(
+        profiled_explore["profile"]["depth"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 4,
+        "test-impact profile should raise the default depth floor"
     );
 
     let explore_markdown = run_cli(
@@ -1269,13 +1367,16 @@ fn assert_explore_outputs_focus_context(workspace: &Path, cache_dir: &Path, node
     for expected in [
         "# Explore",
         "status:",
+        "profile:",
         "search:",
         "results:",
         "resolution:",
         "navigation:",
+        "relationship evidence:",
         "symbol:",
         "trail:",
         "snippet:",
+        "source packet:",
         "snippet_context:",
         "semantic_runtime:",
         "output_write:",
@@ -1285,6 +1386,233 @@ fn assert_explore_outputs_focus_context(workspace: &Path, cache_dir: &Path, node
             "explore markdown should contain `{expected}`:\n{explore_markdown}"
         );
     }
+}
+
+fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &Path) {
+    let files = run_cli_json(
+        workspace,
+        cache_dir,
+        &[
+            "files",
+            "--role",
+            "test",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        files["summary"]["language_counts"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "files JSON should include language counts: {files:#}"
+    );
+    assert!(
+        files["summary"]["framework_route_coverage"]
+            .as_array()
+            .is_some_and(
+                |items| items.iter().any(|item| item["framework"] == "express"
+                    && item["promotable"] == true
+                    && item["fixture_status"].is_string()
+                    && item["unsupported_patterns"].is_array())
+                    && items.iter().any(|item| item["framework"] == "nextjs"
+                        && item["confidence_floor"] == "file_convention"
+                        && item["known_gaps"].is_array())
+                    && items.iter().any(|item| item["framework"] == "gin"
+                        && item["handler_link_support"] == "not_claimed_text_only")
+            ),
+        "files JSON should include framework route coverage matrix: {files:#}"
+    );
+    assert!(
+        files["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .any(|file| file["path"]
+                .as_str()
+                .is_some_and(|path| path.contains("app_controller_test.rs"))
+                && file["role"] == "test"),
+        "files --role test should list inferred test files: {files:#}"
+    );
+
+    let files_markdown = run_cli(
+        workspace,
+        cache_dir,
+        &[
+            "files",
+            "--language",
+            "rust",
+            "--limit",
+            "3",
+            "--refresh",
+            "none",
+            "--format",
+            "markdown",
+        ],
+    );
+    assert!(
+        files_markdown.status.success(),
+        "files markdown failed: {}",
+        String::from_utf8_lossy(&files_markdown.stderr)
+    );
+    let files_markdown = String::from_utf8_lossy(&files_markdown.stdout);
+    assert!(
+        files_markdown.contains("# indexed files")
+            && files_markdown.contains("languages:")
+            && files_markdown.contains("coverage:")
+            && files_markdown.contains("framework route coverage:"),
+        "files markdown should summarize inventory and coverage:\n{files_markdown}"
+    );
+
+    let affected = run_cli_json(
+        workspace,
+        cache_dir,
+        &[
+            "affected",
+            "src/lib.rs",
+            "--depth",
+            "2",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(affected["matched_file_count"], 1);
+    assert!(
+        affected["impacted_symbols"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| {
+                item["graph_depth"].is_number()
+                    && item["reason"].is_string()
+                    && item["confidence"].is_string()
+            })),
+        "affected JSON should expand changed files to symbols with graph evidence: {affected:#}"
+    );
+    if let Some(tests) = affected["impacted_tests"].as_array()
+        && !tests.is_empty()
+    {
+        assert!(
+            tests.iter().all(|item| {
+                item["graph_depth"].is_number()
+                    && item["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("focused test hint"))
+                    && item["confidence"].is_string()
+            }),
+            "affected test hints should expose graph evidence and caveat language: {affected:#}"
+        );
+    }
+
+    let affected_stdin = run_cli_with_stdin(
+        workspace,
+        cache_dir,
+        &[
+            "affected",
+            "--stdin",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+        "src/runtime.rs\n",
+    );
+    assert!(
+        affected_stdin.status.success(),
+        "affected --stdin failed: {}",
+        String::from_utf8_lossy(&affected_stdin.stderr)
+    );
+    let affected_stdin: Value =
+        serde_json::from_slice(&affected_stdin.stdout).expect("parse affected stdin json");
+    assert_eq!(affected_stdin["changed_paths"][0], "src/runtime.rs");
+    assert_eq!(affected_stdin["matched_file_count"], 1);
+
+    let affected_markdown = run_cli(
+        workspace,
+        cache_dir,
+        &[
+            "affected",
+            "src/lib.rs",
+            "--refresh",
+            "none",
+            "--format",
+            "markdown",
+        ],
+    );
+    assert!(
+        affected_markdown.status.success(),
+        "affected markdown failed: {}",
+        String::from_utf8_lossy(&affected_markdown.stderr)
+    );
+    let affected_markdown = String::from_utf8_lossy(&affected_markdown.stdout);
+    assert!(
+        affected_markdown.contains("# affected analysis")
+            && affected_markdown.contains("matched files:")
+            && affected_markdown.contains("impacted symbols:")
+            && affected_markdown.contains("): "),
+        "affected markdown should summarize impact:\n{affected_markdown}"
+    );
+
+    run_git(workspace, &["init"]);
+    run_git(workspace, &["add", "."]);
+    run_git(
+        workspace,
+        &[
+            "-c",
+            "user.email=codestory@example.test",
+            "-c",
+            "user.name=CodeStory Test",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+    );
+    fs::write(
+        workspace.join("src/runtime.rs"),
+        r#"pub fn normalize_project(project_name: &str) -> String {
+    format!("workspace:{project_name}")
+}
+
+pub fn schedule_index(project_path: &str) -> usize {
+    super::open_project(project_path).len()
+}
+
+pub fn changed_after_index() -> bool {
+    true
+}
+"#,
+    )
+    .expect("modify runtime fixture for git diff fallback");
+    let affected_git = run_cli_json(
+        workspace,
+        cache_dir,
+        &["affected", "--refresh", "none", "--format", "json"],
+    );
+    assert!(
+        affected_git["changed_paths"]
+            .as_array()
+            .expect("changed paths")
+            .iter()
+            .any(|path| path == "src/runtime.rs"),
+        "affected should default to git diff --name-only HEAD: {affected_git:#}"
+    );
+}
+
+fn run_git(workspace: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn assert_query_reads_existing_cache(workspace: &Path, cache_dir: &Path) {

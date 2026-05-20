@@ -2598,6 +2598,7 @@ mod tests {
             end_line: None,
             end_col: None,
             member_access: None,
+            route_endpoint: None,
         }
     }
 
