@@ -593,8 +593,9 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
     )
     .clone();
 
+    let tool_names = sorted_field_values(&tools, "tools", "name");
     assert_eq!(
-        sorted_field_values(&tools, "tools", "name"),
+        tool_names,
         vec![
             "context",
             "definition",
@@ -607,7 +608,6 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
         ],
         "stdio browser tool names should stay stable and read-only: {tools}"
     );
-    let tool_names = sorted_field_values(&tools, "tools", "name");
     assert!(
         !tool_names.iter().any(|name| name.starts_with("codestory_"))
             && !tool_names

@@ -1766,6 +1766,13 @@ fn affected_changed_paths(cmd: &AffectedCommand) -> Result<Vec<String>> {
 fn render_files_markdown(output: &codestory_contracts::api::IndexedFilesDto) -> String {
     let mut markdown = String::new();
     markdown.push_str("# indexed files\n\n");
+    render_files_summary(&mut markdown, output);
+    render_framework_route_coverage(&mut markdown, output);
+    render_indexed_file_rows(&mut markdown, output);
+    markdown
+}
+
+fn render_files_summary(markdown: &mut String, output: &codestory_contracts::api::IndexedFilesDto) {
     let status = if output.usable { "usable" } else { "empty" };
     let _ = writeln!(
         markdown,
@@ -1788,6 +1795,12 @@ fn render_files_markdown(output: &codestory_contracts::api::IndexedFilesDto) -> 
     for note in &output.summary.coverage_notes {
         let _ = writeln!(markdown, "- coverage: {note}");
     }
+}
+
+fn render_framework_route_coverage(
+    markdown: &mut String,
+    output: &codestory_contracts::api::IndexedFilesDto,
+) {
     if !output.summary.framework_route_coverage.is_empty() {
         markdown.push_str("\nframework route coverage:\n");
         for entry in &output.summary.framework_route_coverage {
@@ -1816,6 +1829,12 @@ fn render_files_markdown(output: &codestory_contracts::api::IndexedFilesDto) -> 
             );
         }
     }
+}
+
+fn render_indexed_file_rows(
+    markdown: &mut String,
+    output: &codestory_contracts::api::IndexedFilesDto,
+) {
     markdown.push_str("\nfiles:\n");
     for file in &output.files {
         let markers = [
@@ -1840,12 +1859,24 @@ fn render_files_markdown(output: &codestory_contracts::api::IndexedFilesDto) -> 
     if output.summary.truncated {
         markdown.push_str("- ... truncated by limit\n");
     }
-    markdown
 }
 
 fn render_affected_markdown(output: &codestory_contracts::api::AffectedAnalysisDto) -> String {
     let mut markdown = String::new();
     markdown.push_str("# affected analysis\n\n");
+    render_affected_summary(&mut markdown, output);
+    render_affected_matched_files(&mut markdown, output);
+    render_affected_routes(&mut markdown, output);
+    render_affected_tests(&mut markdown, output);
+    render_affected_symbols(&mut markdown, output);
+    render_affected_footer(&mut markdown, output);
+    markdown
+}
+
+fn render_affected_summary(
+    markdown: &mut String,
+    output: &codestory_contracts::api::AffectedAnalysisDto,
+) {
     let _ = writeln!(
         markdown,
         "- matched files: {}; depth: {}; impacted symbols: {}; impacted routes: {}; impacted tests: {}",
@@ -1864,6 +1895,12 @@ fn render_affected_markdown(output: &codestory_contracts::api::AffectedAnalysisD
     for note in &output.notes {
         let _ = writeln!(markdown, "- note: {note}");
     }
+}
+
+fn render_affected_matched_files(
+    markdown: &mut String,
+    output: &codestory_contracts::api::AffectedAnalysisDto,
+) {
     if !output.matched_files.is_empty() {
         markdown.push_str("\nmatched files:\n");
         for file in &output.matched_files {
@@ -1888,6 +1925,12 @@ fn render_affected_markdown(output: &codestory_contracts::api::AffectedAnalysisD
             let _ = writeln!(markdown, "- {}: {}", path.path, path.reason);
         }
     }
+}
+
+fn render_affected_routes(
+    markdown: &mut String,
+    output: &codestory_contracts::api::AffectedAnalysisDto,
+) {
     if !output.impacted_routes.is_empty() {
         markdown.push_str("\nimpacted routes:\n");
         for route in output.impacted_routes.iter().take(30) {
@@ -1916,6 +1959,12 @@ fn render_affected_markdown(output: &codestory_contracts::api::AffectedAnalysisD
             );
         }
     }
+}
+
+fn render_affected_tests(
+    markdown: &mut String,
+    output: &codestory_contracts::api::AffectedAnalysisDto,
+) {
     if !output.impacted_tests.is_empty() {
         markdown.push_str("\nlikely impacted tests:\n");
         for test in &output.impacted_tests {
@@ -1930,6 +1979,12 @@ fn render_affected_markdown(output: &codestory_contracts::api::AffectedAnalysisD
             );
         }
     }
+}
+
+fn render_affected_symbols(
+    markdown: &mut String,
+    output: &codestory_contracts::api::AffectedAnalysisDto,
+) {
     markdown.push_str("\nimpacted symbols:\n");
     for symbol in output.impacted_symbols.iter().take(40) {
         let location = symbol
@@ -1959,6 +2014,12 @@ fn render_affected_markdown(output: &codestory_contracts::api::AffectedAnalysisD
             output.impacted_symbols.len() - 40
         );
     }
+}
+
+fn render_affected_footer(
+    markdown: &mut String,
+    output: &codestory_contracts::api::AffectedAnalysisDto,
+) {
     if !output.blind_spots.is_empty() {
         markdown.push_str("\nblind spots:\n");
         for blind_spot in &output.blind_spots {
@@ -1971,7 +2032,6 @@ fn render_affected_markdown(output: &codestory_contracts::api::AffectedAnalysisD
             let _ = writeln!(markdown, "- `{command}`");
         }
     }
-    markdown
 }
 
 fn run_serve(cmd: ServeCommand) -> Result<()> {

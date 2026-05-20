@@ -6,43 +6,6 @@ use std::process::Command;
 use std::time::Instant;
 use tempfile::tempdir;
 
-struct EnvGuard {
-    key: &'static str,
-    previous: Option<String>,
-}
-
-impl EnvGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let previous = std::env::var(key).ok();
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        restore_env_value(self.key, self.previous.as_deref());
-    }
-}
-
-fn restore_env_value(key: &'static str, previous: Option<&str>) {
-    unsafe {
-        match previous {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
-        }
-    }
-}
-
-fn hybrid_cli_env() -> Vec<EnvGuard> {
-    vec![
-        EnvGuard::set("CODESTORY_HYBRID_RETRIEVAL_ENABLED", "true"),
-        EnvGuard::set("CODESTORY_EMBED_RUNTIME_MODE", "hash"),
-    ]
-}
-
 fn write_retrieval_fixture(root: &Path) {
     let src = root.join("src");
     fs::create_dir_all(&src).expect("create src dir");
@@ -102,9 +65,91 @@ fn run_cli(workspace: &Path, args: &[&str]) -> std::process::Output {
     command.output().expect("run codestory-cli")
 }
 
+fn assert_framework_route_metadata(framework: &Value) -> String {
+    let route = &framework["symbol"]["node"]["route_endpoint"];
+    assert_eq!(route["kind"], "framework_route");
+    assert_eq!(route["framework"], "express");
+    assert_eq!(route["method"], "GET");
+    assert_eq!(route["path"], "/api/users");
+    assert_eq!(route["raw_path"], "/api/users");
+    assert_eq!(route["confidence"], "heuristic");
+    assert_eq!(route["source_convention"], "heuristic");
+    assert_eq!(route["handler"]["display_name"], "listUsers");
+    assert!(
+        route["handler"]["certainty"].is_string(),
+        "route handler should expose edge certainty: {route:#}"
+    );
+    assert_eq!(route["provenance"][0], "framework:express");
+    framework["symbol"]["node"]["id"]
+        .as_str()
+        .expect("framework route node id")
+        .to_string()
+}
+
+fn assert_route_explore_context(explore: &Value) {
+    assert_eq!(explore["route_context"]["framework"], "express");
+    assert_eq!(
+        explore["route_context"]["handler"]["display_name"],
+        "listUsers"
+    );
+}
+
+fn assert_affected_route_evidence(affected: &Value) {
+    assert_eq!(affected["matched_files"][0]["path"], "src/routes.ts");
+    assert_eq!(affected["unmatched_paths"][0]["path"], "missing/file.ts");
+    assert_eq!(
+        affected["impacted_routes"][0]["route"]["framework"],
+        "express"
+    );
+    assert_eq!(
+        affected["impacted_routes"][0]["route"]["handler"]["display_name"],
+        "listUsers"
+    );
+    assert!(
+        affected["impacted_routes"][0]["graph_depth"].is_number()
+            && affected["impacted_routes"][0]["reason"].is_string()
+            && affected["impacted_routes"][0]["confidence"].is_string(),
+        "affected routes should expose graph evidence: {affected:#}"
+    );
+    assert!(
+        affected["impacted_symbols"]
+            .as_array()
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["graph_depth"].is_number()
+                        && item["reason"].is_string()
+                        && item["confidence"].is_string()
+                })
+            }),
+        "affected symbols should expose graph evidence: {affected:#}"
+    );
+    assert!(
+        affected["blind_spots"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "affected should expose blind spots for unmatched paths: {affected:#}"
+    );
+    assert!(
+        affected["next_commands"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "affected should expose next commands: {affected:#}"
+    );
+}
+
+fn assert_openapi_route_metadata(openapi: &Value) {
+    let route = &openapi["symbol"]["node"]["route_endpoint"];
+    assert_eq!(route["kind"], "openapi_endpoint");
+    assert_eq!(route["method"], "GET");
+    assert_eq!(route["path"], "/api/schema-users/{id}");
+    assert_eq!(route["params"], serde_json::json!(["id"]));
+    assert_eq!(route["confidence"], "schema");
+    assert_eq!(route["source_convention"], "openapi");
+    assert_eq!(route["provenance"][0], "openapi");
+}
+
 #[test]
 fn search_json_emits_search_results_dto_after_repo_text_merge() {
-    let _env = hybrid_cli_env();
     let workspace = tempdir().expect("workspace dir");
     write_retrieval_fixture(workspace.path());
 
@@ -204,7 +249,6 @@ fn search_json_emits_search_results_dto_after_repo_text_merge() {
 
 #[test]
 fn symbol_json_exposes_typed_route_endpoint_metadata() {
-    let _env = hybrid_cli_env();
     let workspace = tempdir().expect("workspace dir");
     write_search_quality_fixture(workspace.path());
     write_openapi_route_fixture(workspace.path());
@@ -242,29 +286,13 @@ fn symbol_json_exposes_typed_route_endpoint_metadata() {
     );
     let framework: Value =
         serde_json::from_slice(&framework.stdout).expect("parse framework symbol json");
-    let route = &framework["symbol"]["node"]["route_endpoint"];
-    assert_eq!(route["kind"], "framework_route");
-    assert_eq!(route["framework"], "express");
-    assert_eq!(route["method"], "GET");
-    assert_eq!(route["path"], "/api/users");
-    assert_eq!(route["raw_path"], "/api/users");
-    assert_eq!(route["confidence"], "heuristic");
-    assert_eq!(route["source_convention"], "heuristic");
-    assert_eq!(route["handler"]["display_name"], "listUsers");
-    assert!(
-        route["handler"]["certainty"].is_string(),
-        "route handler should expose edge certainty: {route:#}"
-    );
-    assert_eq!(route["provenance"][0], "framework:express");
-    let route_node_id = framework["symbol"]["node"]["id"]
-        .as_str()
-        .expect("framework route node id");
+    let route_node_id = assert_framework_route_metadata(&framework);
     let explore = run_cli(
         workspace.path(),
         &[
             "explore",
             "--id",
-            route_node_id,
+            &route_node_id,
             "--no-tui",
             "--refresh",
             "none",
@@ -278,11 +306,7 @@ fn symbol_json_exposes_typed_route_endpoint_metadata() {
         String::from_utf8_lossy(&explore.stderr)
     );
     let explore: Value = serde_json::from_slice(&explore.stdout).expect("parse explore json");
-    assert_eq!(explore["route_context"]["framework"], "express");
-    assert_eq!(
-        explore["route_context"]["handler"]["display_name"],
-        "listUsers"
-    );
+    assert_route_explore_context(&explore);
     let affected = run_cli(
         workspace.path(),
         &[
@@ -301,46 +325,7 @@ fn symbol_json_exposes_typed_route_endpoint_metadata() {
         String::from_utf8_lossy(&affected.stderr)
     );
     let affected: Value = serde_json::from_slice(&affected.stdout).expect("parse affected json");
-    assert_eq!(affected["matched_files"][0]["path"], "src/routes.ts");
-    assert_eq!(affected["unmatched_paths"][0]["path"], "missing/file.ts");
-    assert_eq!(
-        affected["impacted_routes"][0]["route"]["framework"],
-        "express"
-    );
-    assert_eq!(
-        affected["impacted_routes"][0]["route"]["handler"]["display_name"],
-        "listUsers"
-    );
-    assert!(
-        affected["impacted_routes"][0]["graph_depth"].is_number()
-            && affected["impacted_routes"][0]["reason"].is_string()
-            && affected["impacted_routes"][0]["confidence"].is_string(),
-        "affected routes should expose graph evidence: {affected:#}"
-    );
-    assert!(
-        affected["impacted_symbols"]
-            .as_array()
-            .is_some_and(|items| {
-                items.iter().any(|item| {
-                    item["graph_depth"].is_number()
-                        && item["reason"].is_string()
-                        && item["confidence"].is_string()
-                })
-            }),
-        "affected symbols should expose graph evidence: {affected:#}"
-    );
-    assert!(
-        affected["blind_spots"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty()),
-        "affected should expose blind spots for unmatched paths: {affected:#}"
-    );
-    assert!(
-        affected["next_commands"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty()),
-        "affected should expose next commands: {affected:#}"
-    );
+    assert_affected_route_evidence(&affected);
 
     let openapi = run_cli(
         workspace.path(),
@@ -364,20 +349,12 @@ fn symbol_json_exposes_typed_route_endpoint_metadata() {
         String::from_utf8_lossy(&openapi.stderr)
     );
     let openapi: Value = serde_json::from_slice(&openapi.stdout).expect("parse openapi json");
-    let route = &openapi["symbol"]["node"]["route_endpoint"];
-    assert_eq!(route["kind"], "openapi_endpoint");
-    assert_eq!(route["method"], "GET");
-    assert_eq!(route["path"], "/api/schema-users/{id}");
-    assert_eq!(route["params"], serde_json::json!(["id"]));
-    assert_eq!(route["confidence"], "schema");
-    assert_eq!(route["source_convention"], "openapi");
-    assert_eq!(route["provenance"][0], "openapi");
+    assert_openapi_route_metadata(&openapi);
 }
 
 #[test]
 #[ignore = "search-quality eval harness; run explicitly after changing search ranking or route indexing"]
 fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
-    let _env = hybrid_cli_env();
     let workspace = tempdir().expect("workspace dir");
     write_search_quality_fixture(workspace.path());
 
