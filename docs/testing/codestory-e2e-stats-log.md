@@ -26,6 +26,7 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-05-08 | 345fef5 | pass, branch review fixes | 59.07 | 0.18 | 0.48 | 0.20 | 0.17 | 0.16 | 41,126 | 34,784 | 145 | 0 | 5,703 | true |
 | 2026-05-08 | 1457eb8 | pass, cache hotspot telemetry working tree | 89.03 | 0.18 | 0.52 | 0.21 | 0.15 | 0.15 | 41,494 | 35,103 | 145 | 0 | 5,736 | true |
 | 2026-05-08 | f24bb2c | pass, managed ONNX review fixes hash e2e | 7.59 | 0.18 | 0.47 | 0.21 | 0.16 | 0.15 | 41,974 | 35,441 | 145 | 0 | 5,822 | true |
+| 2026-05-20 | 3964d10 | pass, codestory 0.2.0 release | 8.91 | 0.19 | 0.82 | 0.53 | 0.18 | 0.17 | 43,937 | 37,086 | 145 | 0 | 6,028 | true |
 
 ## Phase Metrics
 
@@ -47,3 +48,4 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-05-08 | 345fef5 | branch review fixes cold E2E | 59.07 | 4.95 | 47.39 | 0 | 5,703 | 0 |
 | 2026-05-08 | 1457eb8 | cache hotspot telemetry cold E2E | 89.03 | 3.12 | 82.21 | 0 | 5,736 | 0 |
 | 2026-05-08 | f24bb2c | managed ONNX review fixes hash E2E | 7.59 | 2.93 | 0.46 | 0 | 5,822 | 0 |
+| 2026-05-20 | 3964d10 | codestory 0.2.0 release E2E | 8.91 | 3.42 | 0.65 | 0 | 6,028 | 0 |
