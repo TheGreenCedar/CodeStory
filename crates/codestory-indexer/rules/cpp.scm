@@ -47,7 +47,7 @@
   attr (@name.node) start_col = (start-column @name)
   attr (@name.node) end_row = (end-row @name)
   attr (@name.node) end_col = (end-column @name)
-  attr (@name.node) canonical_role = "declaration"
+  attr (@name.node) canonical_role = "forward_declaration"
 }
 
 (struct_specifier
@@ -61,7 +61,7 @@
   attr (@name.node) start_col = (start-column @name)
   attr (@name.node) end_row = (end-row @name)
   attr (@name.node) end_col = (end-column @name)
-  attr (@name.node) canonical_role = "declaration"
+  attr (@name.node) canonical_role = "forward_declaration"
 }
 
 (enum_specifier

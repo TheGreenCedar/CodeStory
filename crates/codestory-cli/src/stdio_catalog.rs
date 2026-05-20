@@ -464,6 +464,7 @@ impl SchemaObject {
 
 const TEXT_HIT_ORIGINS: &[&str] = &["indexed_symbol", "text_match"];
 const SEARCH_REPO_TEXT_MODES: &[&str] = &["auto", "on", "off"];
+const SNIPPET_SCOPES: &[&str] = &["line_context", "function_body"];
 
 static GENERIC_OBJECT_SCHEMA: SchemaObject =
     SchemaObject::passthrough_object("Generic JSON object.");
@@ -508,7 +509,6 @@ static SEARCH_HIT_SCHEMA: SchemaObject = SchemaObject::object(
         "kind",
         "score",
         "origin",
-        "match_quality",
         "resolvable",
     ],
 );
@@ -610,10 +610,20 @@ static SNIPPET_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string("path", "Project-relative file path."),
         SchemaProperty::integer("line", "One-based focused line."),
         SchemaProperty::string("snippet", "Source snippet text."),
+        SchemaProperty::string("scope", "Snippet scope.").with_enum(SNIPPET_SCOPES),
+        SchemaProperty::integer("requested_context", "Requested context line count."),
         SchemaProperty::boolean("snippet_truncated", "Whether the snippet hit a byte cap."),
         SchemaProperty::integer("max_snippet_bytes", "Snippet byte cap.").nullable(),
     ],
-    &["node", "path", "line", "snippet"],
+    &[
+        "node",
+        "path",
+        "line",
+        "snippet",
+        "scope",
+        "requested_context",
+        "snippet_truncated",
+    ],
 );
 
 static DEFINITION_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(

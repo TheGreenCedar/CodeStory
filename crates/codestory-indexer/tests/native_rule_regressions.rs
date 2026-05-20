@@ -657,6 +657,50 @@ class ViewFactory
 }
 
 #[test]
+fn test_cpp_same_file_forward_declaration_keeps_body_as_canonical_anchor() -> anyhow::Result<()> {
+    let source = r#"
+class StorageAccess;
+
+class StorageAccess
+{
+public:
+    int open();
+};
+"#;
+    let (nodes, _edges, occurrences) =
+        index_project_with_occurrences(&[("StorageAccess.h", source)])?;
+
+    let storage_access = find_node_by_name_and_kind(&nodes, "StorageAccess", NodeKind::CLASS)
+        .ok_or_else(|| anyhow::anyhow!("expected canonical StorageAccess class node"))?;
+    assert_eq!(
+        storage_access.start_line,
+        Some(4),
+        "the class body should win the canonical anchor over the forward declaration"
+    );
+
+    let storage_access_occurrences = occurrences
+        .iter()
+        .filter(|occurrence| occurrence.element_id == storage_access.id.0)
+        .collect::<Vec<_>>();
+    assert!(
+        storage_access_occurrences
+            .iter()
+            .any(|occurrence| occurrence.kind == OccurrenceKind::DECLARATION
+                && occurrence.location.start_line == 2),
+        "expected the forward declaration occurrence to survive canonical remapping: {storage_access_occurrences:#?}"
+    );
+    assert!(
+        storage_access_occurrences
+            .iter()
+            .any(|occurrence| occurrence.kind == OccurrenceKind::DEFINITION
+                && occurrence.location.start_line == 4),
+        "expected the body definition occurrence to survive canonical remapping: {storage_access_occurrences:#?}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_cpp_pointer_returning_members_and_definitions_are_indexed() -> anyhow::Result<()> {
     let (nodes, edges) = index_project(&[(
         "Graph.cpp",

@@ -3359,7 +3359,10 @@ fn definition_occurrences(
         if let (Some(start_line), Some(start_col), Some(end_line), Some(end_col)) =
             (node.start_line, node.start_col, node.end_line, node.end_col)
         {
-            let kind = if canonical_roles.get(&node.id) == Some(&CanonicalNodeRole::Declaration) {
+            let kind = if matches!(
+                canonical_roles.get(&node.id),
+                Some(CanonicalNodeRole::Declaration | CanonicalNodeRole::ForwardDeclaration)
+            ) {
                 codestory_contracts::graph::OccurrenceKind::DECLARATION
             } else {
                 codestory_contracts::graph::OccurrenceKind::DEFINITION
@@ -3488,6 +3491,7 @@ fn qualified_name_delimiter(language_name: &str) -> &'static str {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CanonicalNodeRole {
     Declaration,
+    ForwardDeclaration,
     ImplAnchor,
     Unspecified,
 }
@@ -3495,6 +3499,7 @@ enum CanonicalNodeRole {
 fn canonical_role_from_graph_attr(value: &str) -> CanonicalNodeRole {
     match value {
         "declaration" => CanonicalNodeRole::Declaration,
+        "forward_declaration" => CanonicalNodeRole::ForwardDeclaration,
         "impl_anchor" => CanonicalNodeRole::ImplAnchor,
         _ => CanonicalNodeRole::Unspecified,
     }
@@ -3502,8 +3507,9 @@ fn canonical_role_from_graph_attr(value: &str) -> CanonicalNodeRole {
 
 fn canonical_role_priority(role: CanonicalNodeRole) -> u8 {
     match role {
-        CanonicalNodeRole::Declaration => 2,
-        CanonicalNodeRole::Unspecified => 1,
+        CanonicalNodeRole::Declaration => 3,
+        CanonicalNodeRole::Unspecified => 2,
+        CanonicalNodeRole::ForwardDeclaration => 1,
         CanonicalNodeRole::ImplAnchor => 0,
     }
 }

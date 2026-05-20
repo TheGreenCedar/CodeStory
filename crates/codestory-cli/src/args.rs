@@ -14,6 +14,8 @@ cache already has indexed files.";
 const READ_REFRESH_HELP: &str = "Read commands default to `none` so they only query the existing cache. Use `incremental` to \
 refresh an existing cache in place, or `full` after a cache reset, schema change, or indexing \
 failure.";
+const DRILL_REFRESH_HELP: &str = "Drill defaults to `full` so each report is mechanically fresh. Use `none` only after a \
+fresh index, or `incremental` to refresh an existing cache in place.";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Skill-first repo grounding runtime", long_about = None)]
@@ -453,7 +455,7 @@ pub(crate) struct DrillCommand {
         long,
         value_enum,
         default_value_t = RefreshMode::Full,
-        long_help = READ_REFRESH_HELP
+        long_help = DRILL_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
@@ -1245,6 +1247,7 @@ mod tests {
         assert!(help.contains("--label <LABEL>"));
         assert!(help.contains("--question <QUESTION>"));
         assert!(help.contains("Stored in the report only; it is not interpreted"));
+        assert!(help.contains("Drill defaults to `full`"));
     }
 
     #[test]

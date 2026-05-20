@@ -275,6 +275,12 @@ fn tool_input_schema<'a>(tools: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("tool {name} should include inputSchema: {tools}"))
 }
 
+fn tool_output_schema<'a>(tools: &'a Value, name: &str) -> &'a Value {
+    tool_by_name(tools, name)
+        .get("outputSchema")
+        .unwrap_or_else(|| panic!("tool {name} should include outputSchema: {tools}"))
+}
+
 fn required_fields(schema: &Value) -> BTreeSet<&str> {
     schema
         .get("required")
@@ -842,6 +848,43 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
             );
         }
     }
+
+    let search_hit_schema = tool_output_schema(&tools, "search")
+        .pointer("/properties/hits/items")
+        .unwrap_or_else(|| panic!("search outputSchema should describe hit items: {tools}"));
+    assert!(
+        !required_fields(search_hit_schema).contains("match_quality"),
+        "SearchHit.match_quality is optional and must not be required: {search_hit_schema}"
+    );
+    assert_eq!(
+        schema_property(search_hit_schema, "match_quality")["type"],
+        "string",
+        "SearchHit outputSchema should still advertise optional match_quality: {search_hit_schema}"
+    );
+
+    let related_hit_schema = tool_output_schema(&tools, "symbol")
+        .pointer("/properties/related_hits/items")
+        .unwrap_or_else(|| {
+            panic!("symbol outputSchema should describe related hit items: {tools}")
+        });
+    assert!(
+        !required_fields(related_hit_schema).contains("match_quality"),
+        "symbol related hits reuse SearchHit and must tolerate omitted match_quality: {related_hit_schema}"
+    );
+
+    let snippet = tool_output_schema(&tools, "snippet");
+    for field in ["scope", "requested_context", "snippet_truncated"] {
+        assert!(
+            required_fields(snippet).contains(field),
+            "snippet outputSchema should require emitted DTO field {field}: {snippet}"
+        );
+        let _ = schema_property(snippet, field);
+    }
+    assert_schema_enum_values(
+        snippet,
+        "/properties/scope/enum",
+        &["line_context", "function_body"],
+    );
 }
 
 #[test]
@@ -1249,6 +1292,61 @@ fn transcript_calls_search_tool() {
         app_controller_hit["match_quality"],
         json!("exact"),
         "stdio search hits should satisfy the advertised match_quality schema: {app_controller_hit}"
+    );
+    let app_controller_id = app_controller_hit["node_id"]
+        .as_str()
+        .expect("AppController node id")
+        .to_string();
+
+    let snippet_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "snippet-schema-fields",
+            "method": "tools/call",
+            "params": {
+                "name": "snippet",
+                "arguments": {"id": app_controller_id}
+            }
+        }),
+    );
+    let snippet_result = assert_tool_success(&snippet_response, json!("snippet-schema-fields"));
+    assert_eq!(
+        snippet_result["scope"],
+        json!("line_context"),
+        "stdio snippet should emit its scope: {snippet_result}"
+    );
+    assert_eq!(
+        snippet_result["requested_context"],
+        json!(4),
+        "stdio snippet should emit requested_context: {snippet_result}"
+    );
+    assert!(
+        snippet_result["snippet_truncated"].is_boolean(),
+        "stdio snippet should emit snippet_truncated: {snippet_result}"
+    );
+
+    let symbol_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "symbol-related-hits",
+            "method": "tools/call",
+            "params": {
+                "name": "symbol",
+                "arguments": {"query": "configure", "choose": 1}
+            }
+        }),
+    );
+    let symbol_result = assert_tool_success(&symbol_response, json!("symbol-related-hits"));
+    let related_hits = symbol_result["related_hits"]
+        .as_array()
+        .unwrap_or_else(|| panic!("symbol related_hits should be an array: {symbol_result}"));
+    assert!(
+        related_hits
+            .iter()
+            .any(|hit| hit.get("match_quality").is_none()),
+        "stdio symbol related_hits should exercise optional match_quality omission: {symbol_result}"
     );
 
     let symbols_response = send_json(
