@@ -1,6 +1,6 @@
 # CodeStory
 
-CodeStory is a local codebase grounding engine. It indexes a repository into a SQLite-backed graph, keeps grounding-oriented read models up to date, and exposes grounding, graph-query, visualization, and local-serving workflows through `codestory-cli`.
+CodeStory is a local codebase grounding engine. It indexes a repository into a SQLite-backed graph, keeps grounding-oriented read models up to date, and exposes grounding, navigation, impact-analysis, and evaluation workflows through `codestory-cli`.
 
 ## System Map
 
@@ -30,18 +30,19 @@ Use this path if you want to run the tool against a repository.
    ```powershell
    .\target\release\codestory-cli.exe index --project . --refresh auto
    ```
-4. Run the grounding workflows against the existing cache.
+4. Run the CLI workflows against the existing cache.
    ```text
-   .\target\release\codestory-cli.exe ground --project <path>
+   .\target\release\codestory-cli.exe ground --project <path> --why
    .\target\release\codestory-cli.exe search --project <path> --query <query> --why
+   .\target\release\codestory-cli.exe files --project <path> --format markdown
+   .\target\release\codestory-cli.exe explore --project <path> --query <query> --no-tui
    .\target\release\codestory-cli.exe context --project <path> --query AppController
    .\target\release\codestory-cli.exe context --project <path> --id <node-id>
+   .\target\release\codestory-cli.exe affected --project <path> --format markdown
    .\target\release\codestory-cli.exe symbol --project <path> (--id <node-id> | --query <query>)
    .\target\release\codestory-cli.exe trail --project <path> (--id <node-id> | --query <query>)
    .\target\release\codestory-cli.exe snippet --project <path> (--id <node-id> | --query <query>)
    .\target\release\codestory-cli.exe query --project <path> "trail(symbol: 'Foo') | filter(kind: function)"
-   .\target\release\codestory-cli.exe explore --project <path> --query <query>
-   .\target\release\codestory-cli.exe serve --project <path>
    .\target\release\codestory-cli.exe doctor --project <path>
    ```
 
@@ -108,7 +109,7 @@ Start here when you are contributing:
 
 ## Grounding Workflows
 
-The product surface starts with core grounding workflows and adds deeper context, graph, explorer, serving, health, and shell-integration commands:
+The product surface starts with core CLI grounding workflows and adds deeper context, file inventory, impact analysis, graph queries, explorer packets, health checks, and shell-integration commands:
 
 ```mermaid
 flowchart LR
@@ -122,8 +123,9 @@ flowchart LR
     LocalState --> Snippet["snippet"]
     LocalState --> Query["query"]
     LocalState --> Explore["explore"]
+    LocalState --> Files["files"]
+    LocalState --> Affected["affected"]
     LocalState --> Drill["drill"]
-    LocalState --> Serve["serve"]
     LocalState --> Doctor["doctor"]
 ```
 
@@ -136,14 +138,15 @@ flowchart LR
 - `trail`: follow caller/callee/reference graph around a symbol; `--story --hide-speculative` gives a readable flow with uncertainty.
 - `snippet`: fetch source context around a symbol; Markdown snippets use ANSI syntax highlighting when stdout is an interactive terminal.
 - `query`: run structured graph-query pipelines such as `trail(symbol: 'Foo', depth: 2) | filter(kind: function) | limit(10)`.
-- `explore`: interactive or bundled navigation view around a target.
+- `explore`: interactive or bundled navigation view around a target; use `--no-tui` or `--format json` for stable agent output.
+- `files`: inspect indexed file inventory, language counts, inferred roles, and framework route coverage notes.
+- `affected`: map changed files to impacted symbols, route evidence when present, likely tests, blind spots, and next commands.
 - `drill`: write a deterministic report bundle for selected anchors and an optional architecture question; defaults to `--refresh full`.
 - `bookmark`: save, list, or remove investigation focus nodes.
 - `setup embeddings`: install and validate managed embedding assets.
-- `serve`: expose HTTP/stdio read-only browser surfaces.
 - `generate-completions`: emit bash, zsh, fish, or PowerShell completions generated from the clap command model.
 
-Use `search` when you only need candidates. Use `context` when you already have one concrete target and want the deeper packet: target resolution metadata, symbol details, related hits, trail/story evidence, snippets/source context, retrieval/freshness health, citations/evidence ids, gaps/uncertainty, and optional bundle artifacts.
+Use `ground --why` for broad orientation, `search --why` for candidate discovery, `explore` for a bundled navigation packet, and `context` when you already have one concrete target and want the deeper evidence bundle: target resolution metadata, symbol details, related hits, trail/story evidence, snippets/source context, retrieval/freshness health, citations/evidence ids, gaps/uncertainty, and optional bundle artifacts. Use `files` before making coverage claims, and use `affected` before choosing focused regression checks.
 
 Do not pass broad natural-language questions to `context`. For broad repo/product questions, use `ground --why`, run one or more concrete `search --repo-text on --why` queries, select anchors, then run `context --id <node-id>` for each anchor.
 
@@ -158,6 +161,7 @@ codestory-cli doctor --project <workspace>
 codestory-cli index --project <workspace> --refresh full
 codestory-cli ground --project <workspace> --why
 codestory-cli search --project <workspace> --query "<architecture term>" --why
+codestory-cli files --project <workspace> --format markdown
 ```
 
 Candidate-to-context workflow:
@@ -165,6 +169,7 @@ Candidate-to-context workflow:
 ```powershell
 codestory-cli search --project <workspace> --query "<symbol/file/literal/API path>" --why
 # choose a concrete node_id
+codestory-cli explore --project <workspace> --id <node-id> --no-tui
 codestory-cli context --project <workspace> --id <node-id>
 ```
 
@@ -172,9 +177,35 @@ Exact symbol investigation:
 
 ```powershell
 codestory-cli symbol --project <workspace> --id <node-id>
+codestory-cli explore --project <workspace> --id <node-id> --no-tui
 codestory-cli trail --project <workspace> --id <node-id> --story --hide-speculative
 codestory-cli snippet --project <workspace> --id <node-id> --context 40
 codestory-cli context --project <workspace> --id <node-id> --bundle out/context-<name>
+```
+
+Changed-file impact workflow:
+
+```powershell
+codestory-cli index --project <workspace> --refresh incremental
+codestory-cli affected --project <workspace> --format markdown
+git diff --name-only HEAD | codestory-cli affected --project <workspace> --stdin --format json
+```
+
+Route coverage workflow:
+
+```powershell
+codestory-cli files --project <workspace> --format json
+cargo test -p codestory-indexer --lib framework_route
+cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
+```
+
+Evaluation workflow:
+
+```powershell
+cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
+cargo test -p codestory-runtime --test retrieval_eval
+cargo build --release -p codestory-cli
+cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
 ```
 
 Broad repo/product question workflow:
@@ -198,6 +229,17 @@ codestory-cli doctor --project <workspace>
 ```
 
 If retrieval is still partial, stale, or failed, use `search --repo-text on --why`, `symbol`, `trail`, and `snippet`; treat `context` output as incomplete when it reports gaps.
+
+Status words in CLI/docs output are deliberately conservative:
+
+- `supported`: fixture-backed behavior is passing and the documented coverage floor is met.
+- `heuristic`: evidence came from a pattern or convention that needs source review before a full support claim.
+- `partial`: some cases are covered, but known patterns, handler links, languages, or fixtures are missing.
+- `unsupported`: no support claim is made for that syntax, framework, language, or path.
+- `stale`: the cache or semantic evidence may not match the current workspace; run `doctor` or `index --refresh full`.
+- `non-promotable`: required fixtures, coverage notes, or validation evidence are missing or failing.
+- `ambiguous`: a query matched multiple plausible targets; rerun `search --why`, then use `--id` or `--file`.
+- `unmatched`: a changed path was not found in the persisted index; confirm the path with `files --path <fragment>` or refresh the index.
 
 ## Workspace And Config Files
 
@@ -253,7 +295,7 @@ the [research handbook](docs/research.md), with the decision matrix in
 Refresh behavior:
 
 - `index --refresh auto`: full on an empty cache, incremental once indexed files already exist
-- `ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `query`, `explore`, and `serve`: default to `--refresh none`
+- `ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `query`, `explore`, `files`, and `affected`: default to `--refresh none`
 - `drill`: defaults to `--refresh full` so each report is mechanically fresh; use `--refresh none` only after a fresh index
 - use `--refresh incremental` when you want a read command to refresh an existing cache first
 - use `--refresh full` after a cache reset, schema change, or suspected stale-state incident
@@ -320,6 +362,16 @@ Runtime-backed CLI fixture flows are an explicit heavier lane now:
 ```powershell
 cargo test -p codestory-cli --test runtime_backed_flows -- --ignored
 ```
+
+Navigation and quality gates:
+
+```powershell
+cargo test -p codestory-indexer --lib framework_route
+cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
+cargo test -p codestory-runtime --test retrieval_eval
+```
+
+Performance branches must capture a baseline before tuning and record the comparison in the testing docs. Use [performance-review-playbook.md](docs/testing/performance-review-playbook.md) for the required baseline fields, parallelization candidate gate, and rejection rules.
 
 The repo-scale runtime integration smoke test is ignored by default because it indexes the full
 `codestory` workspace and can exhaust memory. Run it only as an explicit heavy lane:

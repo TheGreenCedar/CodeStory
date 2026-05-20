@@ -662,6 +662,12 @@ pub(crate) struct ExploreCommand {
     pub(crate) project: ProjectArgs,
     #[command(flatten)]
     pub(crate) target: TargetArgs,
+    #[arg(
+        long,
+        value_enum,
+        help = "Opt into an investigation preset without changing default explore behavior."
+    )]
+    pub(crate) profile: Option<ExploreProfile>,
     #[arg(long, default_value_t = 2)]
     pub(crate) depth: u32,
     #[arg(long, default_value_t = 18)]
@@ -686,6 +692,15 @@ pub(crate) struct ExploreCommand {
         help = "Write command output to this file instead of stdout. The parent directory must already exist."
     )]
     pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ExploreProfile {
+    Route,
+    Bug,
+    Refactor,
+    TestImpact,
 }
 
 #[derive(Args, Debug)]
@@ -1073,14 +1088,38 @@ pub(crate) struct QueryOutput {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ExploreOutput<'a> {
+    pub(crate) profile: ExploreProfileOutput,
     pub(crate) status: ExploreStatusOutput,
     pub(crate) search: ExploreSearchOutput,
     pub(crate) resolution: QueryResolutionOutput,
     pub(crate) navigation: NavigationOutput,
+    pub(crate) relationship_evidence: ExploreRelationshipEvidenceOutput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) route_context: Option<codestory_contracts::api::RouteEndpointMetadataDto>,
     pub(crate) source_packet: ExploreSourcePacketOutput,
     pub(crate) symbol: &'a SymbolContextDto,
     pub(crate) trail: &'a TrailContextDto,
     pub(crate) snippet: Option<&'a SnippetContextDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExploreRelationshipEvidenceOutput {
+    pub(crate) map_source: String,
+    pub(crate) caller_scope: String,
+    pub(crate) trail_nodes: usize,
+    pub(crate) trail_edges: usize,
+    pub(crate) incoming_references: usize,
+    pub(crate) outgoing_references: usize,
+    pub(crate) notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExploreProfileOutput {
+    pub(crate) requested: String,
+    pub(crate) depth: u32,
+    pub(crate) max_nodes: u32,
+    pub(crate) caller_scope: String,
+    pub(crate) notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

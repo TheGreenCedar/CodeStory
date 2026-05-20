@@ -1788,6 +1788,34 @@ fn render_files_markdown(output: &codestory_contracts::api::IndexedFilesDto) -> 
     for note in &output.summary.coverage_notes {
         let _ = writeln!(markdown, "- coverage: {note}");
     }
+    if !output.summary.framework_route_coverage.is_empty() {
+        markdown.push_str("\nframework route coverage:\n");
+        for entry in &output.summary.framework_route_coverage {
+            let gaps = if entry.unsupported_patterns.is_empty() {
+                "none recorded".to_string()
+            } else {
+                entry.unsupported_patterns.join("; ")
+            };
+            let known_gaps = if entry.known_gaps.is_empty() {
+                "none recorded".to_string()
+            } else {
+                entry.known_gaps.join("; ")
+            };
+            let _ = writeln!(
+                markdown,
+                "- {} ({}) status={} fixture_status={} confidence_floor={} handler_link={} promotable={} unsupported={} known_gaps={}",
+                entry.framework,
+                entry.language,
+                entry.status,
+                entry.fixture_status,
+                entry.confidence_floor,
+                entry.handler_link_support,
+                entry.promotable,
+                gaps,
+                known_gaps
+            );
+        }
+    }
     markdown.push_str("\nfiles:\n");
     for file in &output.files {
         let markers = [
@@ -1820,10 +1848,11 @@ fn render_affected_markdown(output: &codestory_contracts::api::AffectedAnalysisD
     markdown.push_str("# affected analysis\n\n");
     let _ = writeln!(
         markdown,
-        "- matched files: {}; depth: {}; impacted symbols: {}; impacted tests: {}",
+        "- matched files: {}; depth: {}; impacted symbols: {}; impacted routes: {}; impacted tests: {}",
         output.matched_file_count,
         output.depth,
         output.impacted_symbols.len(),
+        output.impacted_routes.len(),
         output.impacted_tests.len()
     );
     if !output.changed_paths.is_empty() {
@@ -1835,13 +1864,69 @@ fn render_affected_markdown(output: &codestory_contracts::api::AffectedAnalysisD
     for note in &output.notes {
         let _ = writeln!(markdown, "- note: {note}");
     }
+    if !output.matched_files.is_empty() {
+        markdown.push_str("\nmatched files:\n");
+        for file in &output.matched_files {
+            let mut markers = Vec::new();
+            if !file.complete {
+                markers.push("incomplete".to_string());
+            }
+            if file.error_count > 0 {
+                markers.push(format!("errors={}", file.error_count));
+            }
+            let marker = if markers.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", markers.join(", "))
+            };
+            let _ = writeln!(markdown, "- {} [{:?}]{marker}", file.path, file.role);
+        }
+    }
+    if !output.unmatched_paths.is_empty() {
+        markdown.push_str("\nunmatched paths:\n");
+        for path in &output.unmatched_paths {
+            let _ = writeln!(markdown, "- {}: {}", path.path, path.reason);
+        }
+    }
+    if !output.impacted_routes.is_empty() {
+        markdown.push_str("\nimpacted routes:\n");
+        for route in output.impacted_routes.iter().take(30) {
+            let handler = route
+                .route
+                .handler
+                .as_ref()
+                .map(|handler| format!(" handler={}", handler.display_name))
+                .unwrap_or_default();
+            let framework = route
+                .route
+                .framework
+                .as_deref()
+                .map(|framework| format!(" framework={framework}"))
+                .unwrap_or_default();
+            let _ = writeln!(
+                markdown,
+                "- d{} {} {}{}{} [{}]: {}",
+                route.graph_depth,
+                route.route.method,
+                route.route.path,
+                framework,
+                handler,
+                route.confidence,
+                route.reason
+            );
+        }
+    }
     if !output.impacted_tests.is_empty() {
         markdown.push_str("\nlikely impacted tests:\n");
         for test in &output.impacted_tests {
             let _ = writeln!(
                 markdown,
-                "- {} ({} symbols): {}",
-                test.path, test.impacted_symbol_count, test.reason
+                "- d{} {} ({} symbols, {}): {}",
+                test.graph_depth,
+                test.path,
+                test.impacted_symbol_count,
+                test.confidence,
+                test.reason
             );
         }
     }
@@ -1857,8 +1942,14 @@ fn render_affected_markdown(output: &codestory_contracts::api::AffectedAnalysisD
             .unwrap_or_else(|| "unknown".to_string());
         let _ = writeln!(
             markdown,
-            "- d{} {} [{:?}] at {} ({})",
-            symbol.distance, symbol.display_name, symbol.kind, location, symbol.node_id.0
+            "- d{} {} [{:?}] at {} ({}, {}): {}",
+            symbol.graph_depth,
+            symbol.display_name,
+            symbol.kind,
+            location,
+            symbol.node_id.0,
+            symbol.confidence,
+            symbol.reason
         );
     }
     if output.impacted_symbols.len() > 40 {
@@ -1867,6 +1958,18 @@ fn render_affected_markdown(output: &codestory_contracts::api::AffectedAnalysisD
             "- ... {} more symbols omitted",
             output.impacted_symbols.len() - 40
         );
+    }
+    if !output.blind_spots.is_empty() {
+        markdown.push_str("\nblind spots:\n");
+        for blind_spot in &output.blind_spots {
+            let _ = writeln!(markdown, "- {blind_spot}");
+        }
+    }
+    if !output.next_commands.is_empty() {
+        markdown.push_str("\nnext_commands:\n");
+        for command in &output.next_commands {
+            let _ = writeln!(markdown, "- `{command}`");
+        }
     }
     markdown
 }
@@ -3469,6 +3572,7 @@ mod tests {
             end_line: None,
             end_col: None,
             member_access: None,
+            route_endpoint: None,
         }
     }
 

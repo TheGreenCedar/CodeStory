@@ -1,9 +1,10 @@
 use codestory_contracts::api::{
-    AffectedAnalysisDto, AffectedAnalysisRequest, AffectedSymbolDto, AffectedTestFileDto,
-    AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto, ApiError, AppEventPayload,
-    BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId,
-    EdgeKind, EdgeOccurrencesRequest, EmbeddingProfileContractDto, GraphEdgeDto, GraphNodeDto,
-    GraphRequest, GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto,
+    AffectedAnalysisDto, AffectedAnalysisRequest, AffectedMatchedFileDto, AffectedRouteDto,
+    AffectedSymbolDto, AffectedTestFileDto, AffectedUnmatchedPathDto, AgentAnswerDto,
+    AgentAskRequest, AgentHybridWeightsDto, ApiError, AppEventPayload, BookmarkCategoryDto,
+    BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind,
+    EdgeOccurrencesRequest, EmbeddingProfileContractDto, FrameworkRouteCoverageDto, GraphEdgeDto,
+    GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto,
     GroundingFileDigestDto, GroundingSnapshotDto, GroundingSymbolDigestDto, IndexDryRunDto,
     IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessSampleDto,
     IndexFreshnessStatusDto, IndexMode, IndexedFileDto, IndexedFileLanguageCountDto,
@@ -12,11 +13,12 @@ use codestory_contracts::api::{
     NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest,
     OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest, ProjectSummary,
     ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
-    RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHit,
-    SearchMatchQualityDto, SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest,
-    SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
-    StorageStatsDto, StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto,
-    SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
+    RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, RouteEndpointHandlerDto,
+    RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchMatchQualityDto,
+    SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest, SearchResultsDto,
+    SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto,
+    StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto,
+    SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
     UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WorkspaceMemberIndexDto,
     WriteFileResponse, WriteFileTextRequest,
 };
@@ -34,6 +36,7 @@ use codestory_workspace::{
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
 use rayon::prelude::*;
+use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, BufRead};
@@ -95,6 +98,469 @@ type GraphNodeId = codestory_contracts::graph::NodeId;
 type WeightedGraphMatches = Vec<(GraphNodeId, f32)>;
 type GraphNodeNameMap = HashMap<GraphNodeId, String>;
 type ExpandedSymbolMatches = Option<(WeightedGraphMatches, GraphNodeNameMap)>;
+
+#[derive(Debug, Deserialize)]
+struct RouteEndpointCanonicalMetadata {
+    kind: String,
+    #[serde(default)]
+    framework: Option<String>,
+    method: String,
+    path: String,
+    #[serde(default)]
+    raw_path: Option<String>,
+    #[serde(default)]
+    params: Vec<String>,
+    #[serde(default)]
+    confidence: Option<String>,
+    #[serde(default)]
+    source_convention: Option<String>,
+    #[serde(default)]
+    provenance: Vec<String>,
+}
+
+fn route_endpoint_metadata_from_canonical(
+    raw: &str,
+    node: &GraphNode,
+    source_file: Option<&str>,
+) -> serde_json::Result<RouteEndpointMetadataDto> {
+    let canonical = serde_json::from_str::<RouteEndpointCanonicalMetadata>(raw)?;
+    let kind = match canonical.kind.as_str() {
+        "openapi_endpoint" => RouteEndpointKindDto::OpenapiEndpoint,
+        _ => RouteEndpointKindDto::FrameworkRoute,
+    };
+    Ok(RouteEndpointMetadataDto {
+        kind,
+        framework: canonical.framework,
+        method: canonical.method,
+        path: canonical.path,
+        raw_path: canonical.raw_path,
+        params: canonical.params,
+        source_file: source_file.map(ToOwned::to_owned),
+        line: node.start_line,
+        confidence: canonical.confidence,
+        source_convention: canonical.source_convention,
+        handler: None,
+        provenance: canonical.provenance,
+    })
+}
+
+fn route_endpoint_metadata_from_openapi_label(
+    label: &str,
+    node: &GraphNode,
+    source_file: Option<&str>,
+) -> Option<RouteEndpointMetadataDto> {
+    let (method, path) = label.split_once(' ')?;
+    Some(RouteEndpointMetadataDto {
+        kind: RouteEndpointKindDto::OpenapiEndpoint,
+        framework: None,
+        method: method.to_ascii_uppercase(),
+        path: path.to_string(),
+        raw_path: Some(path.to_string()),
+        params: route_endpoint_params(path),
+        source_file: source_file.map(ToOwned::to_owned),
+        line: node.start_line,
+        confidence: Some("schema".to_string()),
+        source_convention: Some("openapi".to_string()),
+        handler: None,
+        provenance: vec!["openapi".to_string()],
+    })
+}
+
+fn route_endpoint_params(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter_map(|segment| {
+            let segment = segment.trim();
+            segment
+                .strip_prefix(':')
+                .or_else(|| {
+                    segment
+                        .strip_prefix('{')
+                        .and_then(|value| value.strip_suffix('}'))
+                })
+                .map(str::to_string)
+        })
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+fn route_handler_certainty_rank(
+    certainty: Option<codestory_contracts::graph::ResolutionCertainty>,
+) -> u8 {
+    match certainty {
+        Some(codestory_contracts::graph::ResolutionCertainty::Certain) => 3,
+        Some(codestory_contracts::graph::ResolutionCertainty::Probable) => 2,
+        Some(codestory_contracts::graph::ResolutionCertainty::Uncertain) => 1,
+        None => 0,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AffectedGraphEvidence {
+    distance: u32,
+    reason: String,
+    confidence: String,
+}
+
+fn affected_edge_kind_label(kind: codestory_contracts::graph::EdgeKind) -> &'static str {
+    match kind {
+        codestory_contracts::graph::EdgeKind::MEMBER => "member",
+        codestory_contracts::graph::EdgeKind::TYPE_USAGE => "type_usage",
+        codestory_contracts::graph::EdgeKind::USAGE => "usage",
+        codestory_contracts::graph::EdgeKind::CALL => "call",
+        codestory_contracts::graph::EdgeKind::INHERITANCE => "inheritance",
+        codestory_contracts::graph::EdgeKind::OVERRIDE => "override",
+        codestory_contracts::graph::EdgeKind::TYPE_ARGUMENT => "type_argument",
+        codestory_contracts::graph::EdgeKind::TEMPLATE_SPECIALIZATION => "template_specialization",
+        codestory_contracts::graph::EdgeKind::INCLUDE => "include",
+        codestory_contracts::graph::EdgeKind::IMPORT => "import",
+        codestory_contracts::graph::EdgeKind::MACRO_USAGE => "macro_usage",
+        codestory_contracts::graph::EdgeKind::ANNOTATION_USAGE => "annotation_usage",
+        codestory_contracts::graph::EdgeKind::UNKNOWN => "unknown",
+    }
+}
+
+fn affected_edge_confidence(edge: &codestory_contracts::graph::Edge) -> String {
+    edge_certainty_label(edge.certainty, edge.confidence).unwrap_or_else(|| "graph".to_string())
+}
+
+fn framework_route_coverage_matrix() -> Vec<FrameworkRouteCoverageDto> {
+    struct Entry {
+        framework: &'static str,
+        language: &'static str,
+        status: &'static str,
+        fixture_status: &'static str,
+        confidence_floor: &'static str,
+        handler_link_support: &'static str,
+        unsupported_patterns: &'static [&'static str],
+        known_gaps: &'static [&'static str],
+        promotable: bool,
+    }
+
+    [
+        Entry {
+            framework: "express",
+            language: "javascript/typescript",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "heuristic",
+            handler_link_support: "probable_when_handler_name_resolves",
+            unsupported_patterns: &[
+                "router composition and middleware arrays may need source review",
+                "handler linking is name-based unless graph resolution confirms the target",
+            ],
+            known_gaps: &["mounted app prefixes are not globally propagated"],
+            promotable: true,
+        },
+        Entry {
+            framework: "react-router",
+            language: "javascript/typescript",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "heuristic",
+            handler_link_support: "not_claimed",
+            unsupported_patterns: &[
+                "loader/action route objects and nested config composition are partial",
+            ],
+            known_gaps: &["generated routes are not expanded"],
+            promotable: true,
+        },
+        Entry {
+            framework: "sveltekit",
+            language: "svelte/javascript/typescript",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "file_convention",
+            handler_link_support: "probable_for_server_method_exports",
+            unsupported_patterns: &[
+                "route groups and advanced matcher params are normalized conservatively",
+            ],
+            known_gaps: &["layout load propagation is not modeled"],
+            promotable: true,
+        },
+        Entry {
+            framework: "nextjs",
+            language: "javascript/typescript",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "file_convention",
+            handler_link_support: "probable_for_route_method_exports",
+            unsupported_patterns: &["middleware rewrites and route groups require source review"],
+            known_gaps: &["parallel routes and intercepting routes are not fully modeled"],
+            promotable: true,
+        },
+        Entry {
+            framework: "remix",
+            language: "javascript/typescript",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "file_convention",
+            handler_link_support: "probable_for_loader_action_exports",
+            unsupported_patterns: &["route config composition and resource routes are partial"],
+            known_gaps: &["flat-route edge cases need more real-repo probes"],
+            promotable: true,
+        },
+        Entry {
+            framework: "astro",
+            language: "astro/javascript/typescript",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "file_convention",
+            handler_link_support: "probable_for_endpoint_method_exports",
+            unsupported_patterns: &["redirects and integration-generated routes are not expanded"],
+            known_gaps: &["content collections do not create route nodes"],
+            promotable: true,
+        },
+        Entry {
+            framework: "nuxt",
+            language: "vue/javascript/typescript",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "file_convention",
+            handler_link_support: "probable_for_server_handlers",
+            unsupported_patterns: &["route middleware and generated module routes are partial"],
+            known_gaps: &["custom router options are not evaluated"],
+            promotable: true,
+        },
+        Entry {
+            framework: "fastify",
+            language: "javascript/typescript",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "heuristic",
+            handler_link_support: "probable_when_handler_name_resolves",
+            unsupported_patterns: &[
+                "plugin prefixes and schema-only route declarations are partial",
+            ],
+            known_gaps: &["register() prefix propagation is not modeled"],
+            promotable: true,
+        },
+        Entry {
+            framework: "koa",
+            language: "javascript/typescript",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "heuristic",
+            handler_link_support: "probable_when_handler_name_resolves",
+            unsupported_patterns: &["router prefixes and middleware arrays are partial"],
+            known_gaps: &["mounted router prefixes are not globally propagated"],
+            promotable: true,
+        },
+        Entry {
+            framework: "hono",
+            language: "javascript/typescript",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "heuristic",
+            handler_link_support: "probable_when_handler_name_resolves",
+            unsupported_patterns: &["basePath/grouped routes are partial"],
+            known_gaps: &["OpenAPI helper generated routes are not expanded"],
+            promotable: true,
+        },
+        Entry {
+            framework: "nestjs",
+            language: "typescript",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "decorator",
+            handler_link_support: "probable_for_controller_method",
+            unsupported_patterns: &[
+                "global prefixes and dynamic decorator expressions are partial",
+            ],
+            known_gaps: &["module graph prefix propagation is not modeled"],
+            promotable: true,
+        },
+        Entry {
+            framework: "django",
+            language: "python",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "heuristic",
+            handler_link_support: "probable_when_handler_name_resolves",
+            unsupported_patterns: &[
+                "include() trees and namespaced URLConfs are not fully expanded",
+            ],
+            known_gaps: &["path converters beyond parameter names are not typed"],
+            promotable: true,
+        },
+        Entry {
+            framework: "flask",
+            language: "python",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "decorator",
+            handler_link_support: "not_claimed",
+            unsupported_patterns: &[
+                "blueprint prefixes and dynamic method declarations are partial",
+            ],
+            known_gaps: &["method lists are not fully enumerated"],
+            promotable: true,
+        },
+        Entry {
+            framework: "fastapi",
+            language: "python",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "decorator",
+            handler_link_support: "not_claimed",
+            unsupported_patterns: &["router prefixes and dependency-driven routing are partial"],
+            known_gaps: &["include_router prefix propagation is not modeled"],
+            promotable: true,
+        },
+        Entry {
+            framework: "rails",
+            language: "ruby",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "heuristic",
+            handler_link_support: "not_claimed",
+            unsupported_patterns: &["resource expansion is not fully enumerated"],
+            known_gaps: &["constraints/scopes are not expanded"],
+            promotable: true,
+        },
+        Entry {
+            framework: "laravel",
+            language: "php",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "heuristic",
+            handler_link_support: "not_claimed",
+            unsupported_patterns: &["controller arrays and route groups are partial"],
+            known_gaps: &["group middleware/prefix stacking is not modeled"],
+            promotable: true,
+        },
+        Entry {
+            framework: "spring",
+            language: "java",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "annotation",
+            handler_link_support: "not_claimed",
+            unsupported_patterns: &["class-level prefixes are not fully combined in every case"],
+            known_gaps: &["composed annotations are not expanded"],
+            promotable: true,
+        },
+        Entry {
+            framework: "aspnet",
+            language: "csharp",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "attribute",
+            handler_link_support: "not_claimed",
+            unsupported_patterns: &["controller-level route templates are partial"],
+            known_gaps: &["minimal API grouping is not fully modeled"],
+            promotable: true,
+        },
+        Entry {
+            framework: "axum",
+            language: "rust",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "heuristic",
+            handler_link_support: "probable_when_handler_name_resolves",
+            unsupported_patterns: &["nested routers and stateful route composition are partial"],
+            known_gaps: &["Router::nest prefix propagation is limited"],
+            promotable: true,
+        },
+        Entry {
+            framework: "actix",
+            language: "rust",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "heuristic",
+            handler_link_support: "probable_when_handler_name_resolves",
+            unsupported_patterns: &["scoped services and macros are partial"],
+            known_gaps: &["web::scope prefix propagation is limited"],
+            promotable: true,
+        },
+        Entry {
+            framework: "rocket",
+            language: "rust",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "attribute",
+            handler_link_support: "not_claimed",
+            unsupported_patterns: &["mount prefixes are not fully combined"],
+            known_gaps: &["rank/format route attributes are not modeled"],
+            promotable: true,
+        },
+        Entry {
+            framework: "gin",
+            language: "go",
+            status: "partial",
+            fixture_status: "covered_by_text_only_unit_fixture",
+            confidence_floor: "heuristic",
+            handler_link_support: "not_claimed_text_only",
+            unsupported_patterns: &["router groups and middleware chains are partial"],
+            known_gaps: &["Go parser-backed handler links are not available yet"],
+            promotable: true,
+        },
+        Entry {
+            framework: "chi",
+            language: "go",
+            status: "partial",
+            fixture_status: "covered_by_text_only_unit_fixture",
+            confidence_floor: "heuristic",
+            handler_link_support: "not_claimed_text_only",
+            unsupported_patterns: &["route groups and mounted subrouters are partial"],
+            known_gaps: &["Go parser-backed handler links are not available yet"],
+            promotable: true,
+        },
+        Entry {
+            framework: "echo",
+            language: "go",
+            status: "partial",
+            fixture_status: "covered_by_text_only_unit_fixture",
+            confidence_floor: "heuristic",
+            handler_link_support: "not_claimed_text_only",
+            unsupported_patterns: &["group prefixes are partial"],
+            known_gaps: &["Go parser-backed handler links are not available yet"],
+            promotable: true,
+        },
+        Entry {
+            framework: "fiber",
+            language: "go",
+            status: "partial",
+            fixture_status: "covered_by_text_only_unit_fixture",
+            confidence_floor: "heuristic",
+            handler_link_support: "not_claimed_text_only",
+            unsupported_patterns: &["group prefixes and mounted apps are partial"],
+            known_gaps: &["Go parser-backed handler links are not available yet"],
+            promotable: true,
+        },
+        Entry {
+            framework: "vue-router",
+            language: "vue",
+            status: "partial",
+            fixture_status: "covered_by_indexer_unit_fixture",
+            confidence_floor: "heuristic",
+            handler_link_support: "not_claimed",
+            unsupported_patterns: &["imported route arrays and generated routes are partial"],
+            known_gaps: &["Nuxt file routes are reported separately as nuxt"],
+            promotable: true,
+        },
+    ]
+    .into_iter()
+    .map(|entry| FrameworkRouteCoverageDto {
+        framework: entry.framework.to_string(),
+        language: entry.language.to_string(),
+        status: entry.status.to_string(),
+        fixture_status: entry.fixture_status.to_string(),
+        confidence_floor: entry.confidence_floor.to_string(),
+        handler_link_support: entry.handler_link_support.to_string(),
+        unsupported_patterns: entry
+            .unsupported_patterns
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        known_gaps: entry
+            .known_gaps
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        promotable: entry.promotable,
+    })
+    .collect()
+}
 
 const REPO_TEXT_SCAN_FILE_CAP: usize = 2_000;
 const REPO_TEXT_SCAN_BYTE_CAP: usize = 32 * 1024 * 1024;
@@ -4073,6 +4539,7 @@ impl AppController {
                 error_file_count,
                 truncated,
                 language_counts,
+                framework_route_coverage: framework_route_coverage_matrix(),
                 coverage_notes,
             },
             files: visible,
@@ -4097,6 +4564,15 @@ impl AppController {
         let edges = storage
             .get_edges()
             .map_err(|e| ApiError::internal(format!("Failed to load graph edges: {e}")))?;
+        let errors = storage
+            .get_errors(None)
+            .map_err(|e| ApiError::internal(format!("Failed to load index errors: {e}")))?;
+        let mut errors_by_file = HashMap::<i64, u32>::new();
+        for error in errors {
+            if let Some(file_id) = error.file_id {
+                *errors_by_file.entry(file_id.0).or_default() += 1;
+            }
+        }
 
         let changed_keys = req
             .changed_paths
@@ -4105,19 +4581,49 @@ impl AppController {
             .filter(|path| !path.is_empty())
             .collect::<Vec<_>>();
         let mut matched_file_ids = HashSet::<GraphNodeId>::new();
+        let mut matched_changed_keys = HashSet::<String>::new();
         for file in &files {
             let relative_key = normalize_path_key(&runtime_relative_path(&root, &file.path));
             let absolute_key = normalize_path_key(&file.path.to_string_lossy());
-            if changed_keys.iter().any(|changed| {
-                relative_key == *changed
-                    || relative_key.ends_with(changed)
-                    || changed.ends_with(&relative_key)
-                    || absolute_key == *changed
-                    || absolute_key.ends_with(changed)
-            }) {
+            let matched_keys = changed_keys
+                .iter()
+                .filter(|changed| {
+                    relative_key == **changed
+                        || relative_key.ends_with(*changed)
+                        || changed.ends_with(&relative_key)
+                        || absolute_key == **changed
+                        || absolute_key.ends_with(*changed)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !matched_keys.is_empty() {
                 matched_file_ids.insert(codestory_contracts::graph::NodeId(file.id));
+                matched_changed_keys.extend(matched_keys);
             }
         }
+        let mut matched_files = files
+            .iter()
+            .filter(|file| matched_file_ids.contains(&codestory_contracts::graph::NodeId(file.id)))
+            .map(|file| AffectedMatchedFileDto {
+                path: runtime_relative_path(&root, &file.path),
+                role: indexed_file_role(&file.path),
+                indexed: file.indexed,
+                complete: file.complete,
+                error_count: errors_by_file.get(&file.id).copied().unwrap_or_default(),
+            })
+            .collect::<Vec<_>>();
+        matched_files.sort_by(|left, right| left.path.cmp(&right.path));
+        let unmatched_paths = req
+            .changed_paths
+            .iter()
+            .zip(changed_keys.iter())
+            .filter(|(_, key)| !matched_changed_keys.contains(*key))
+            .map(|(path, _)| AffectedUnmatchedPathDto {
+                path: path.clone(),
+                reason: "path did not match any indexed file; reindex or pass repo-relative paths"
+                    .to_string(),
+            })
+            .collect::<Vec<_>>();
 
         let mut labels = self.cached_labels(nodes.iter().map(|node| node.id));
         for node in &nodes {
@@ -4155,30 +4661,82 @@ impl AppController {
             }
         }
 
-        let mut reverse_dependents = HashMap::<GraphNodeId, Vec<GraphNodeId>>::new();
-        for edge in &edges {
+        let mut reverse_dependents = HashMap::<GraphNodeId, Vec<(GraphNodeId, usize)>>::new();
+        for (edge_index, edge) in edges.iter().enumerate() {
             let source = edge.effective_source();
             let target = edge.effective_target();
-            reverse_dependents.entry(target).or_default().push(source);
+            reverse_dependents
+                .entry(target)
+                .or_default()
+                .push((source, edge_index));
         }
 
         let mut distances = HashMap::<GraphNodeId, u32>::new();
+        let mut evidence = HashMap::<GraphNodeId, AffectedGraphEvidence>::new();
         let mut queue = VecDeque::<(GraphNodeId, u32)>::new();
         for seed in seeds {
             distances.insert(seed, 0);
+            let seed_reason = nodes_by_id
+                .get(&seed)
+                .map(|node| {
+                    if node.kind == codestory_contracts::graph::NodeKind::FILE {
+                        "changed file matched input path"
+                    } else {
+                        "symbol declared in changed file"
+                    }
+                })
+                .unwrap_or("changed path seed");
+            evidence.insert(
+                seed,
+                AffectedGraphEvidence {
+                    distance: 0,
+                    reason: seed_reason.to_string(),
+                    confidence: "direct".to_string(),
+                },
+            );
             queue.push_back((seed, 0));
         }
         while let Some((node_id, distance)) = queue.pop_front() {
             if distance >= depth {
                 continue;
             }
-            for dependent in reverse_dependents.get(&node_id).into_iter().flatten() {
+            for (dependent, edge_id) in reverse_dependents.get(&node_id).into_iter().flatten() {
                 let next_distance = distance + 1;
                 if distances
                     .get(dependent)
                     .is_none_or(|current| next_distance < *current)
                 {
                     distances.insert(*dependent, next_distance);
+                    let edge = edges.get(*edge_id);
+                    let target_label = labels
+                        .get(&node_id)
+                        .cloned()
+                        .unwrap_or_else(|| node_id.0.to_string());
+                    let (reason, confidence) = edge
+                        .map(|edge| {
+                            (
+                                format!(
+                                    "dependent reaches changed code via {} edge to {}",
+                                    affected_edge_kind_label(edge.kind),
+                                    target_label
+                                ),
+                                affected_edge_confidence(edge),
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            (
+                                format!("dependent reaches changed code through graph walk to {target_label}"),
+                                "graph".to_string(),
+                            )
+                        });
+                    evidence.insert(
+                        *dependent,
+                        AffectedGraphEvidence {
+                            distance: next_distance,
+                            reason,
+                            confidence,
+                        },
+                    );
                     queue.push_back((*dependent, next_distance));
                 }
             }
@@ -4204,6 +4762,15 @@ impl AppController {
                 }) {
                     return None;
                 }
+                let graph_evidence =
+                    evidence
+                        .get(node_id)
+                        .cloned()
+                        .unwrap_or_else(|| AffectedGraphEvidence {
+                            distance: *distance,
+                            reason: "reached by dependent graph walk".to_string(),
+                            confidence: "graph".to_string(),
+                        });
                 Some(AffectedSymbolDto {
                     node_id: NodeId::from(*node_id),
                     display_name: labels
@@ -4214,6 +4781,9 @@ impl AppController {
                     file_path,
                     line: node.start_line,
                     distance: *distance,
+                    graph_depth: graph_evidence.distance,
+                    reason: graph_evidence.reason,
+                    confidence: graph_evidence.confidence,
                 })
             })
             .collect::<Vec<_>>();
@@ -4225,46 +4795,158 @@ impl AppController {
         });
         impacted_symbols.truncate(200);
 
-        let mut impacted_by_test_file = BTreeMap::<String, u32>::new();
+        let mut impacted_routes = distances
+            .iter()
+            .filter_map(|(node_id, distance)| {
+                let node = nodes_by_id.get(node_id)?;
+                let file_path = node
+                    .file_node_id
+                    .and_then(|file_id| file_path_by_id.get(&file_id).cloned());
+                if filter.as_deref().is_some_and(|needle| {
+                    !labels
+                        .get(node_id)
+                        .is_some_and(|label| normalize_path_key(label).contains(needle))
+                        && !file_path
+                            .as_deref()
+                            .is_some_and(|path| normalize_path_key(path).contains(needle))
+                }) {
+                    return None;
+                }
+                let display_name = labels
+                    .get(node_id)
+                    .cloned()
+                    .unwrap_or_else(|| node.serialized_name.clone());
+                let route = self.route_endpoint_metadata(
+                    &storage,
+                    node,
+                    file_path.as_deref(),
+                    &display_name,
+                )?;
+                let graph_evidence =
+                    evidence
+                        .get(node_id)
+                        .cloned()
+                        .unwrap_or_else(|| AffectedGraphEvidence {
+                            distance: *distance,
+                            reason: "route endpoint reached by dependent graph walk".to_string(),
+                            confidence: route
+                                .confidence
+                                .clone()
+                                .unwrap_or_else(|| "graph".to_string()),
+                        });
+                let confidence = route
+                    .confidence
+                    .clone()
+                    .unwrap_or_else(|| graph_evidence.confidence.clone());
+                Some(AffectedRouteDto {
+                    node_id: NodeId::from(*node_id),
+                    display_name,
+                    file_path,
+                    line: node.start_line,
+                    distance: *distance,
+                    graph_depth: graph_evidence.distance,
+                    reason: graph_evidence.reason,
+                    confidence,
+                    route,
+                })
+            })
+            .collect::<Vec<_>>();
+        impacted_routes.sort_by(|left, right| {
+            left.distance
+                .cmp(&right.distance)
+                .then(left.file_path.cmp(&right.file_path))
+                .then(left.display_name.cmp(&right.display_name))
+        });
+        impacted_routes.truncate(100);
+
+        let mut impacted_by_test_file = BTreeMap::<String, (u32, u32, String)>::new();
         for symbol in &impacted_symbols {
             if let Some(path) = symbol.file_path.as_deref()
                 && path_role_from_key(&normalize_path_key(path)) == IndexedFileRoleDto::Test
             {
-                *impacted_by_test_file.entry(path.to_string()).or_default() += 1;
+                let entry = impacted_by_test_file.entry(path.to_string()).or_insert((
+                    0,
+                    symbol.graph_depth,
+                    symbol.confidence.clone(),
+                ));
+                entry.0 += 1;
+                if symbol.graph_depth < entry.1 {
+                    entry.1 = symbol.graph_depth;
+                    entry.2.clone_from(&symbol.confidence);
+                }
             }
         }
         let impacted_tests = impacted_by_test_file
             .into_iter()
-            .map(|(path, impacted_symbol_count)| AffectedTestFileDto {
-                path,
-                reason: "test-like path reached by dependent graph walk".to_string(),
-                impacted_symbol_count,
-            })
+            .map(
+                |(path, (impacted_symbol_count, distance, confidence))| AffectedTestFileDto {
+                    path,
+                    reason: "focused test hint: test-like path reached by affected graph walk"
+                        .to_string(),
+                    confidence,
+                    distance,
+                    graph_depth: distance,
+                    impacted_symbol_count,
+                },
+            )
             .collect::<Vec<_>>();
 
         let mut notes = Vec::new();
+        let mut blind_spots = Vec::new();
         if matched_file_ids.is_empty() {
-            notes.push(
+            let note =
                 "no changed paths matched indexed files; pass repo-relative paths or reindex first"
-                    .to_string(),
-            );
+                    .to_string();
+            notes.push(note.clone());
+            blind_spots.push(note);
         } else {
             notes.push(format!(
                 "matched {} indexed files; dependency walk expanded files into contained symbols",
                 matched_file_ids.len()
             ));
         }
+        if !unmatched_paths.is_empty() {
+            blind_spots.push(format!(
+                "{} changed paths were unmatched and excluded from graph traversal",
+                unmatched_paths.len()
+            ));
+        }
+        if matched_files
+            .iter()
+            .any(|file| !file.complete || file.error_count > 0)
+        {
+            blind_spots.push(
+                "one or more matched files are incomplete or have recorded index errors"
+                    .to_string(),
+            );
+        }
+        if impacted_routes.is_empty() {
+            blind_spots.push(
+                "no route/endpoint evidence found for matched files or dependents".to_string(),
+            );
+        }
         if impacted_tests.is_empty() {
             notes.push("no impacted test-like files found in the indexed graph".to_string());
         }
+        let project = root.to_string_lossy().to_string();
+        let next_commands = vec![
+            format!("codestory-cli files --project \"{project}\" --format markdown"),
+            format!("codestory-cli doctor --project \"{project}\" --format markdown"),
+            format!("codestory-cli index --project \"{project}\" --refresh full"),
+        ];
 
         Ok(AffectedAnalysisDto {
-            project_root: root.to_string_lossy().to_string(),
+            project_root: project,
             changed_paths: req.changed_paths,
+            matched_files,
+            unmatched_paths,
             matched_file_count: matched_file_ids.len().min(u32::MAX as usize) as u32,
             depth,
             impacted_symbols,
+            impacted_routes,
             impacted_tests,
+            blind_spots,
+            next_commands,
             notes,
         })
     }
@@ -4829,6 +5511,9 @@ impl AppController {
             None => None,
         };
 
+        let route_endpoint =
+            self.route_endpoint_metadata(&storage, &node, file_path.as_deref(), &display_name);
+
         Ok(NodeDetailsDto {
             id: NodeId::from(node.id),
             kind: NodeKind::from(node.kind),
@@ -4842,6 +5527,111 @@ impl AppController {
             end_line: node.end_line,
             end_col: node.end_col,
             member_access: member_access_dto(storage.get_component_access(node.id).ok().flatten()),
+            route_endpoint,
+        })
+    }
+
+    fn route_endpoint_metadata(
+        &self,
+        storage: &Storage,
+        node: &GraphNode,
+        source_file: Option<&str>,
+        display_name: &str,
+    ) -> Option<RouteEndpointMetadataDto> {
+        let canonical_id = node.canonical_id.as_deref()?;
+        let mut metadata = if let Some(raw) = canonical_id.strip_prefix("route_endpoint:") {
+            route_endpoint_metadata_from_canonical(raw, node, source_file).ok()?
+        } else if let Some(label) = canonical_id.strip_prefix("openapi:endpoint:") {
+            route_endpoint_metadata_from_openapi_label(label, node, source_file)?
+        } else {
+            return None;
+        };
+
+        if metadata.handler.is_none() {
+            metadata.handler = self.route_endpoint_handler(storage, node);
+        }
+        if metadata.source_file.is_none() {
+            metadata.source_file = source_file.map(ToOwned::to_owned);
+        }
+        if metadata.line.is_none() {
+            metadata.line = node.start_line;
+        }
+        if metadata.provenance.is_empty() {
+            metadata.provenance.push(display_name.to_string());
+        }
+        Some(metadata)
+    }
+
+    fn route_endpoint_handler(
+        &self,
+        storage: &Storage,
+        route_node: &GraphNode,
+    ) -> Option<RouteEndpointHandlerDto> {
+        let edges = storage.get_edges().ok()?;
+        let mut candidates = edges
+            .into_iter()
+            .filter(|edge| {
+                edge.kind == codestory_contracts::graph::EdgeKind::CALL
+                    && edge.effective_source() == route_node.id
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .confidence
+                .partial_cmp(&left.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    route_handler_certainty_rank(right.certainty)
+                        .cmp(&route_handler_certainty_rank(left.certainty))
+                })
+        });
+        let (edge, target) = candidates.into_iter().find_map(|edge| {
+            let target_id = edge.effective_target();
+            let target = storage.get_node(target_id).ok().flatten()?;
+            let terminal = target
+                .qualified_name
+                .as_deref()
+                .unwrap_or(&target.serialized_name)
+                .rsplit([':', '.', '#'])
+                .next()
+                .unwrap_or(&target.serialized_name)
+                .to_ascii_lowercase();
+            if matches!(
+                terminal.as_str(),
+                "get" | "post" | "put" | "patch" | "delete" | "head" | "options" | "route"
+            ) {
+                return None;
+            }
+            Some((edge, target))
+        })?;
+        let display_name = self
+            .state
+            .lock()
+            .node_names
+            .get(&target.id)
+            .cloned()
+            .unwrap_or_else(|| {
+                target
+                    .qualified_name
+                    .clone()
+                    .unwrap_or_else(|| target.serialized_name.clone())
+            });
+        let file_path = target.file_node_id.and_then(|file_id| {
+            storage
+                .get_node(file_id)
+                .ok()
+                .flatten()
+                .map(|file_node| file_node.serialized_name)
+        });
+        Some(RouteEndpointHandlerDto {
+            node_id: NodeId::from(target.id),
+            display_name,
+            file_path,
+            line: target.start_line,
+            certainty: edge
+                .certainty
+                .map(|certainty| certainty.as_str().to_string()),
+            confidence: edge.confidence,
         })
     }
 
@@ -5464,6 +6254,61 @@ mod tests {
     #[test]
     fn llm_doc_embed_batch_size_uses_throughput_default() {
         assert_eq!(llm_doc_embed_batch_size(), 128);
+    }
+
+    #[test]
+    fn framework_route_coverage_matrix_lists_fixture_status_and_known_gaps() {
+        let coverage = framework_route_coverage_matrix();
+        let frameworks = coverage
+            .iter()
+            .map(|entry| entry.framework.as_str())
+            .collect::<HashSet<_>>();
+        for expected in [
+            "express",
+            "react-router",
+            "sveltekit",
+            "nextjs",
+            "remix",
+            "astro",
+            "nuxt",
+            "fastify",
+            "koa",
+            "hono",
+            "nestjs",
+            "django",
+            "flask",
+            "fastapi",
+            "rails",
+            "laravel",
+            "spring",
+            "aspnet",
+            "axum",
+            "actix",
+            "rocket",
+            "gin",
+            "chi",
+            "echo",
+            "fiber",
+            "vue-router",
+        ] {
+            assert!(
+                frameworks.contains(expected),
+                "coverage matrix missing {expected}"
+            );
+        }
+        assert!(coverage.iter().all(|entry| {
+            !entry.fixture_status.is_empty()
+                && !entry.confidence_floor.is_empty()
+                && !entry.handler_link_support.is_empty()
+                && !entry.unsupported_patterns.is_empty()
+                && !entry.known_gaps.is_empty()
+        }));
+        assert!(
+            coverage
+                .iter()
+                .filter(|entry| entry.language == "go")
+                .all(|entry| entry.handler_link_support == "not_claimed_text_only")
+        );
     }
 
     #[test]

@@ -13,9 +13,10 @@ use std::{
 };
 
 use crate::args::{
-    self, ExploreBudgetOutput, ExploreCommand, ExploreOutput, ExploreSearchOutput,
-    ExploreSourceFileOutput, ExploreSourcePacketOutput, ExploreSourceSliceOutput,
-    ExploreStatusOutput, NavigationOutput, QueryItemOutput, SearchHitOutput, TrailCommand,
+    self, ExploreBudgetOutput, ExploreCommand, ExploreOutput, ExploreProfile, ExploreProfileOutput,
+    ExploreRelationshipEvidenceOutput, ExploreSearchOutput, ExploreSourceFileOutput,
+    ExploreSourcePacketOutput, ExploreSourceSliceOutput, ExploreStatusOutput, NavigationOutput,
+    QueryItemOutput, SearchHitOutput, TrailCommand,
 };
 use crate::output::{
     emit, render_retrieval_state, render_snippet_markdown, render_symbol_markdown,
@@ -34,6 +35,7 @@ pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "explore")?;
+    let profile = resolve_explore_profile(cmd.profile, cmd.depth, cmd.max_nodes);
     let file_filter = cmd.target.file_filter();
     let target = resolve_target_or_emit_ambiguity(
         &runtime,
@@ -52,15 +54,15 @@ pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
             root_id: target.selected.node_id.clone(),
             mode: TrailMode::Neighborhood,
             target_id: None,
-            depth: cmd.depth,
+            depth: profile.output.depth,
             direction: TrailDirection::Both,
-            caller_scope: TrailCallerScope::ProductionOnly,
+            caller_scope: profile.caller_scope,
             edge_filter: Vec::new(),
             show_utility_calls: false,
             hide_speculative: false,
             story: false,
             node_filter: Vec::new(),
-            max_nodes: cmd.max_nodes.clamp(1, 120),
+            max_nodes: profile.output.max_nodes.clamp(1, 120),
             layout_direction: LayoutDirection::Horizontal,
         })
         .map_err(map_api_error)?;
@@ -87,12 +89,19 @@ pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
     );
     let search = build_explore_search_output(&runtime.project_root, &target);
     let navigation = build_navigation_output(&runtime.project_root, &target, &trail);
-    let source_packet = build_explore_source_packet(&runtime, &opened, &trail, &snippet);
+    let relationship_evidence =
+        build_explore_relationship_evidence(&profile.output, &trail, &navigation);
+    let route_context = symbol.node.route_endpoint.clone();
+    let source_packet =
+        build_explore_source_packet(&runtime, &opened, &trail, &snippet, &profile.output);
     let output = ExploreOutput {
+        profile: profile.output.clone(),
         status,
         search,
         resolution: build_query_resolution_output(&runtime.project_root, &target),
         navigation,
+        relationship_evidence,
+        route_context,
         source_packet,
         symbol: &symbol,
         trail: &trail,
@@ -101,9 +110,12 @@ pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
     let render_context = ExploreRenderContext {
         project_root: &runtime.project_root,
         target: &target,
+        profile: &output.profile,
         status: &output.status,
         search: &output.search,
         navigation: &output.navigation,
+        relationship_evidence: &output.relationship_evidence,
+        route_context: output.route_context.as_ref(),
         source_packet: &output.source_packet,
         symbol: &symbol,
         trail: &trail,
@@ -119,6 +131,106 @@ pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
         return run_explore_tui(&render_context);
     }
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+struct ResolvedExploreProfile {
+    caller_scope: TrailCallerScope,
+    output: ExploreProfileOutput,
+}
+
+fn resolve_explore_profile(
+    requested: Option<ExploreProfile>,
+    depth: u32,
+    max_nodes: u32,
+) -> ResolvedExploreProfile {
+    let requested_name = requested
+        .map(|profile| match profile {
+            ExploreProfile::Route => "route",
+            ExploreProfile::Bug => "bug",
+            ExploreProfile::Refactor => "refactor",
+            ExploreProfile::TestImpact => "test-impact",
+        })
+        .unwrap_or("default")
+        .to_string();
+    let (depth_floor, node_floor, caller_scope, notes) = match requested {
+        Some(ExploreProfile::Route) => (
+            3,
+            48,
+            TrailCallerScope::ProductionOnly,
+            vec![
+                "route profile widens neighborhood evidence for route, handler, and endpoint nodes"
+                    .to_string(),
+                "tests stay dampened unless they are already in the selected route neighborhood"
+                    .to_string(),
+            ],
+        ),
+        Some(ExploreProfile::Bug) => (
+            3,
+            60,
+            TrailCallerScope::IncludeTestsAndBenches,
+            vec![
+                "bug profile includes tests and benches so repro and assertion neighbors are visible"
+                    .to_string(),
+                "relationship evidence remains graph-bounded; run affected for changed-file impact"
+                    .to_string(),
+            ],
+        ),
+        Some(ExploreProfile::Refactor) => (
+            3,
+            72,
+            TrailCallerScope::IncludeTestsAndBenches,
+            vec![
+                "refactor profile expands dependents and nearby tests for blast-radius review"
+                    .to_string(),
+                "use trail or affected next when public API impact needs a deeper walk".to_string(),
+            ],
+        ),
+        Some(ExploreProfile::TestImpact) => (
+            4,
+            90,
+            TrailCallerScope::IncludeTestsAndBenches,
+            vec![
+                "test-impact profile favors test and bench neighbors for verification planning"
+                    .to_string(),
+                "test suggestions are focused hints, not proof of complete coverage".to_string(),
+            ],
+        ),
+        None => (
+            depth,
+            max_nodes,
+            TrailCallerScope::ProductionOnly,
+            vec![
+                "default profile preserves the normal explore depth, node budget, and production-only caller scope"
+                    .to_string(),
+            ],
+        ),
+    };
+    let resolved_depth = if requested.is_some() {
+        depth.max(depth_floor)
+    } else {
+        depth
+    };
+    let resolved_max_nodes = if requested.is_some() {
+        max_nodes.max(node_floor)
+    } else {
+        max_nodes
+    };
+    let caller_scope_label = match caller_scope {
+        TrailCallerScope::ProductionOnly => "production-only",
+        TrailCallerScope::IncludeTestsAndBenches => "include-tests-and-benches",
+    }
+    .to_string();
+
+    ResolvedExploreProfile {
+        caller_scope,
+        output: ExploreProfileOutput {
+            requested: requested_name,
+            depth: resolved_depth,
+            max_nodes: resolved_max_nodes,
+            caller_scope: caller_scope_label,
+            notes,
+        },
+    }
 }
 
 fn graph_node_to_query_item(
@@ -219,11 +331,48 @@ fn build_navigation_output(
     }
 }
 
+fn build_explore_relationship_evidence(
+    profile: &ExploreProfileOutput,
+    trail: &TrailContextDto,
+    navigation: &NavigationOutput,
+) -> ExploreRelationshipEvidenceOutput {
+    let mut notes = vec![
+        "relationship map is derived from trail_context edges, not a natural-language summary"
+            .to_string(),
+    ];
+    if navigation.incoming_references.is_empty() {
+        notes.push(
+            "no incoming references were visible inside the current trail envelope".to_string(),
+        );
+    }
+    if navigation.outgoing_references.is_empty() {
+        notes.push(
+            "no outgoing references were visible inside the current trail envelope".to_string(),
+        );
+    }
+    if profile.caller_scope == "production-only" {
+        notes.push("test and bench callers are excluded by this profile".to_string());
+    } else {
+        notes.push("test and bench callers are included by this profile".to_string());
+    }
+
+    ExploreRelationshipEvidenceOutput {
+        map_source: "trail_context.neighborhood".to_string(),
+        caller_scope: profile.caller_scope.clone(),
+        trail_nodes: trail.trail.nodes.len(),
+        trail_edges: trail.trail.edges.len(),
+        incoming_references: navigation.incoming_references.len(),
+        outgoing_references: navigation.outgoing_references.len(),
+        notes,
+    }
+}
+
 fn build_explore_source_packet(
     runtime: &RuntimeContext,
     opened: &runtime::OpenedProject,
     trail: &TrailContextDto,
     snippet: &Option<SnippetContextDto>,
+    profile: &ExploreProfileOutput,
 ) -> ExploreSourcePacketOutput {
     let budget = explore_budget(opened.summary.stats.file_count);
     let mut slices_by_file = BTreeMap::<String, Vec<(u32, u32, String)>>::new();
@@ -329,6 +478,12 @@ fn build_explore_source_packet(
         "source slices are line-numbered and grouped by file".to_string(),
         "relationship map is built from the existing trail graph".to_string(),
     ];
+    if profile.requested != "default" {
+        notes.push(format!(
+            "profile `{}` used depth={} max_nodes={} caller_scope={}",
+            profile.requested, profile.depth, profile.max_nodes, profile.caller_scope
+        ));
+    }
     if opened.summary.stats.error_count > 0 {
         notes.push(format!(
             "index usable with {} recorded indexing errors; inspect doctor for partial coverage",
@@ -755,6 +910,50 @@ fn render_explore_results_markdown(navigation: &NavigationOutput) -> String {
     markdown
 }
 
+fn render_explore_route_context_markdown(
+    route: &codestory_contracts::api::RouteEndpointMetadataDto,
+) -> String {
+    let mut markdown = String::new();
+    markdown.push_str(&format!("- kind: `{:?}`\n", route.kind));
+    if let Some(framework) = route.framework.as_deref() {
+        markdown.push_str(&format!("- framework: `{framework}`\n"));
+    }
+    markdown.push_str(&format!("- method: `{}`\n", route.method));
+    markdown.push_str(&format!("- path: `{}`\n", route.path));
+    if let Some(raw_path) = route.raw_path.as_deref() {
+        markdown.push_str(&format!("- raw_path: `{raw_path}`\n"));
+    }
+    if !route.params.is_empty() {
+        markdown.push_str(&format!("- params: `{}`\n", route.params.join(", ")));
+    }
+    if let Some(confidence) = route.confidence.as_deref() {
+        markdown.push_str(&format!("- confidence: `{confidence}`\n"));
+    }
+    if let Some(source_convention) = route.source_convention.as_deref() {
+        markdown.push_str(&format!("- source_convention: `{source_convention}`\n"));
+    }
+    if let Some(handler) = route.handler.as_ref() {
+        markdown.push_str(&format!(
+            "- handler: `{}` id=`{}`",
+            handler.display_name, handler.node_id.0
+        ));
+        if let Some(certainty) = handler.certainty.as_deref() {
+            markdown.push_str(&format!(" certainty=`{certainty}`"));
+        }
+        if let Some(confidence) = handler.confidence {
+            markdown.push_str(&format!(" confidence={confidence:.2}"));
+        }
+        markdown.push('\n');
+    }
+    if !route.provenance.is_empty() {
+        markdown.push_str(&format!(
+            "- provenance: `{}`\n",
+            route.provenance.join(", ")
+        ));
+    }
+    markdown
+}
+
 fn render_explore_source_packet_markdown(source_packet: &ExploreSourcePacketOutput) -> String {
     let mut markdown = String::new();
     markdown.push_str(&format!(
@@ -841,9 +1040,12 @@ fn explore_trail_command(
 struct ExploreRenderContext<'a> {
     project_root: &'a std::path::Path,
     target: &'a runtime::ResolvedTarget,
+    profile: &'a ExploreProfileOutput,
     status: &'a ExploreStatusOutput,
     search: &'a ExploreSearchOutput,
     navigation: &'a NavigationOutput,
+    relationship_evidence: &'a ExploreRelationshipEvidenceOutput,
+    route_context: Option<&'a codestory_contracts::api::RouteEndpointMetadataDto>,
     source_packet: &'a ExploreSourcePacketOutput,
     symbol: &'a SymbolContextDto,
     trail: &'a TrailContextDto,
@@ -851,11 +1053,47 @@ struct ExploreRenderContext<'a> {
     snippet_layer_note: &'a str,
 }
 
+fn render_explore_profile_markdown(profile: &ExploreProfileOutput) -> String {
+    let mut markdown = String::new();
+    markdown.push_str(&format!("- requested: `{}`\n", profile.requested));
+    markdown.push_str(&format!("- depth: {}\n", profile.depth));
+    markdown.push_str(&format!("- max_nodes: {}\n", profile.max_nodes));
+    markdown.push_str(&format!("- caller_scope: `{}`\n", profile.caller_scope));
+    for note in &profile.notes {
+        markdown.push_str(&format!("- note: {note}\n"));
+    }
+    markdown
+}
+
+fn render_explore_relationship_evidence_markdown(
+    evidence: &ExploreRelationshipEvidenceOutput,
+) -> String {
+    let mut markdown = String::new();
+    markdown.push_str(&format!("- map_source: `{}`\n", evidence.map_source));
+    markdown.push_str(&format!("- caller_scope: `{}`\n", evidence.caller_scope));
+    markdown.push_str(&format!("- trail_nodes: {}\n", evidence.trail_nodes));
+    markdown.push_str(&format!("- trail_edges: {}\n", evidence.trail_edges));
+    markdown.push_str(&format!(
+        "- incoming_references: {}\n",
+        evidence.incoming_references
+    ));
+    markdown.push_str(&format!(
+        "- outgoing_references: {}\n",
+        evidence.outgoing_references
+    ));
+    for note in &evidence.notes {
+        markdown.push_str(&format!("- note: {note}\n"));
+    }
+    markdown
+}
+
 fn render_explore_markdown(context: &ExploreRenderContext<'_>) -> String {
     let mut markdown = String::new();
     markdown.push_str("# Explore\n");
     markdown.push_str("status:\n");
     markdown.push_str(&render_explore_status_markdown(context.status));
+    markdown.push_str("profile:\n");
+    markdown.push_str(&render_explore_profile_markdown(context.profile));
     markdown.push_str("search:\n");
     markdown.push_str(&render_explore_search_markdown(context.search));
     markdown.push_str("results:\n");
@@ -888,6 +1126,16 @@ fn render_explore_markdown(context: &ExploreRenderContext<'_>) -> String {
         "- outgoing_references: {}\n",
         context.navigation.outgoing_references.len()
     ));
+    markdown.push_str("relationship evidence:\n");
+    markdown.push_str(&render_explore_relationship_evidence_markdown(
+        context.relationship_evidence,
+    ));
+    markdown.push_str("route context:\n");
+    if let Some(route) = context.route_context {
+        markdown.push_str(&render_explore_route_context_markdown(route));
+    } else {
+        markdown.push_str("- no route or endpoint metadata for this target\n");
+    }
     markdown.push_str("symbol:\n");
     markdown.push_str(&render_symbol_markdown(
         context.project_root,
@@ -933,12 +1181,20 @@ fn build_explore_panes(context: &ExploreRenderContext<'_>) -> Vec<ExplorePane> {
             body: render_explore_status_markdown(context.status),
         },
         ExplorePane {
+            label: "Profile",
+            body: render_explore_profile_markdown(context.profile),
+        },
+        ExplorePane {
             label: "Search",
             body: render_explore_search_markdown(context.search),
         },
         ExplorePane {
             label: "Results",
             body: render_explore_results_markdown(context.navigation),
+        },
+        ExplorePane {
+            label: "Evidence",
+            body: render_explore_relationship_evidence_markdown(context.relationship_evidence),
         },
         ExplorePane {
             label: "Detail",

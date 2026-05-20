@@ -330,6 +330,8 @@ pub struct IndexedFilesSummaryDto {
     pub truncated: bool,
     pub language_counts: Vec<IndexedFileLanguageCountDto>,
     #[serde(default)]
+    pub framework_route_coverage: Vec<FrameworkRouteCoverageDto>,
+    #[serde(default)]
     pub coverage_notes: Vec<String>,
 }
 
@@ -339,6 +341,21 @@ pub struct IndexedFilesDto {
     pub usable: bool,
     pub summary: IndexedFilesSummaryDto,
     pub files: Vec<IndexedFileDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct FrameworkRouteCoverageDto {
+    pub framework: String,
+    pub language: String,
+    pub status: String,
+    pub fixture_status: String,
+    pub confidence_floor: String,
+    pub handler_link_support: String,
+    #[serde(default)]
+    pub unsupported_patterns: Vec<String>,
+    #[serde(default)]
+    pub known_gaps: Vec<String>,
+    pub promotable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -360,12 +377,52 @@ pub struct AffectedSymbolDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
     pub distance: u32,
+    #[serde(default)]
+    pub graph_depth: u32,
+    pub reason: String,
+    pub confidence: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedMatchedFileDto {
+    pub path: String,
+    pub role: IndexedFileRoleDto,
+    pub indexed: bool,
+    pub complete: bool,
+    #[serde(default)]
+    pub error_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedUnmatchedPathDto {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedRouteDto {
+    pub node_id: NodeId,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    pub distance: u32,
+    #[serde(default)]
+    pub graph_depth: u32,
+    pub reason: String,
+    pub confidence: String,
+    pub route: RouteEndpointMetadataDto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AffectedTestFileDto {
     pub path: String,
     pub reason: String,
+    pub confidence: String,
+    pub distance: u32,
+    #[serde(default)]
+    pub graph_depth: u32,
     pub impacted_symbol_count: u32,
 }
 
@@ -373,10 +430,20 @@ pub struct AffectedTestFileDto {
 pub struct AffectedAnalysisDto {
     pub project_root: String,
     pub changed_paths: Vec<String>,
+    #[serde(default)]
+    pub matched_files: Vec<AffectedMatchedFileDto>,
+    #[serde(default)]
+    pub unmatched_paths: Vec<AffectedUnmatchedPathDto>,
     pub matched_file_count: u32,
     pub depth: u32,
     pub impacted_symbols: Vec<AffectedSymbolDto>,
+    #[serde(default)]
+    pub impacted_routes: Vec<AffectedRouteDto>,
     pub impacted_tests: Vec<AffectedTestFileDto>,
+    #[serde(default)]
+    pub blind_spots: Vec<String>,
+    #[serde(default)]
+    pub next_commands: Vec<String>,
     #[serde(default)]
     pub notes: Vec<String>,
 }
@@ -730,6 +797,54 @@ pub struct NodeDetailsDto {
     pub end_col: Option<u32>,
     #[serde(default)]
     pub member_access: Option<MemberAccess>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_endpoint: Option<RouteEndpointMetadataDto>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteEndpointKindDto {
+    FrameworkRoute,
+    OpenapiEndpoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
+pub struct RouteEndpointMetadataDto {
+    pub kind: RouteEndpointKindDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework: Option<String>,
+    pub method: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_path: Option<String>,
+    #[serde(default)]
+    pub params: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_convention: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler: Option<RouteEndpointHandlerDto>,
+    #[serde(default)]
+    pub provenance: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
+pub struct RouteEndpointHandlerDto {
+    pub node_id: NodeId,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certainty: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

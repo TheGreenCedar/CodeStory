@@ -1249,6 +1249,16 @@ fn assert_explore_outputs_focus_context(workspace: &Path, cache_dir: &Path, node
         ],
     );
     assert_eq!(
+        string_field(&explore, &["profile", "requested"]),
+        "default",
+        "explore should preserve the default profile unless --profile is explicit"
+    );
+    assert_eq!(
+        string_field(&explore, &["profile", "caller_scope"]),
+        "production-only",
+        "default explore should keep production-only caller scope"
+    );
+    assert_eq!(
         string_field(&explore, &["search", "selected", "display_name"]),
         "AppController"
     );
@@ -1286,6 +1296,10 @@ fn assert_explore_outputs_focus_context(workspace: &Path, cache_dir: &Path, node
         "explore JSON should include trail detail"
     );
     assert!(
+        string_field(&explore, &["relationship_evidence", "map_source"]).contains("trail_context"),
+        "explore JSON should expose relationship evidence source"
+    );
+    assert!(
         string_field(&explore, &["snippet", "snippet"]).contains("AppController"),
         "explore JSON should include snippet detail"
     );
@@ -1296,6 +1310,39 @@ fn assert_explore_outputs_focus_context(workspace: &Path, cache_dir: &Path, node
     assert!(
         array_is_non_empty(&explore, &["source_packet", "notes"]),
         "explore JSON should include source packet budget/coverage notes"
+    );
+
+    let profiled_explore = run_cli_json(
+        workspace,
+        cache_dir,
+        &[
+            "explore",
+            &format!("--id={node_id}"),
+            "--profile",
+            "test-impact",
+            "--no-tui",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        string_field(&profiled_explore, &["profile", "requested"]),
+        "test-impact",
+        "explicit explore profiles should be reflected in JSON output"
+    );
+    assert_eq!(
+        string_field(&profiled_explore, &["profile", "caller_scope"]),
+        "include-tests-and-benches",
+        "test-impact profile should include test and bench neighbors"
+    );
+    assert!(
+        profiled_explore["profile"]["depth"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 4,
+        "test-impact profile should raise the default depth floor"
     );
 
     let explore_markdown = run_cli(
@@ -1320,10 +1367,12 @@ fn assert_explore_outputs_focus_context(workspace: &Path, cache_dir: &Path, node
     for expected in [
         "# Explore",
         "status:",
+        "profile:",
         "search:",
         "results:",
         "resolution:",
         "navigation:",
+        "relationship evidence:",
         "symbol:",
         "trail:",
         "snippet:",
@@ -1358,6 +1407,22 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
             .as_array()
             .is_some_and(|items| !items.is_empty()),
         "files JSON should include language counts: {files:#}"
+    );
+    assert!(
+        files["summary"]["framework_route_coverage"]
+            .as_array()
+            .is_some_and(
+                |items| items.iter().any(|item| item["framework"] == "express"
+                    && item["promotable"] == true
+                    && item["fixture_status"].is_string()
+                    && item["unsupported_patterns"].is_array())
+                    && items.iter().any(|item| item["framework"] == "nextjs"
+                        && item["confidence_floor"] == "file_convention"
+                        && item["known_gaps"].is_array())
+                    && items.iter().any(|item| item["framework"] == "gin"
+                        && item["handler_link_support"] == "not_claimed_text_only")
+            ),
+        "files JSON should include framework route coverage matrix: {files:#}"
     );
     assert!(
         files["files"]
@@ -1395,7 +1460,8 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
     assert!(
         files_markdown.contains("# indexed files")
             && files_markdown.contains("languages:")
-            && files_markdown.contains("coverage:"),
+            && files_markdown.contains("coverage:")
+            && files_markdown.contains("framework route coverage:"),
         "files markdown should summarize inventory and coverage:\n{files_markdown}"
     );
 
@@ -1417,9 +1483,27 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
     assert!(
         affected["impacted_symbols"]
             .as_array()
-            .is_some_and(|items| !items.is_empty()),
-        "affected JSON should expand changed files to symbols: {affected:#}"
+            .is_some_and(|items| items.iter().any(|item| {
+                item["graph_depth"].is_number()
+                    && item["reason"].is_string()
+                    && item["confidence"].is_string()
+            })),
+        "affected JSON should expand changed files to symbols with graph evidence: {affected:#}"
     );
+    if let Some(tests) = affected["impacted_tests"].as_array()
+        && !tests.is_empty()
+    {
+        assert!(
+            tests.iter().all(|item| {
+                item["graph_depth"].is_number()
+                    && item["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("focused test hint"))
+                    && item["confidence"].is_string()
+            }),
+            "affected test hints should expose graph evidence and caveat language: {affected:#}"
+        );
+    }
 
     let affected_stdin = run_cli_with_stdin(
         workspace,
@@ -1465,7 +1549,8 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
     assert!(
         affected_markdown.contains("# affected analysis")
             && affected_markdown.contains("matched files:")
-            && affected_markdown.contains("impacted symbols:"),
+            && affected_markdown.contains("impacted symbols:")
+            && affected_markdown.contains("): "),
         "affected markdown should summarize impact:\n{affected_markdown}"
     );
 

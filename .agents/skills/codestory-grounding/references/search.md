@@ -54,6 +54,24 @@ When a name appears more than once, prefer typed symbol hits such as `[function]
 
 Repo-text hits from text-only surfaces such as `.svelte` files are evidence, not graph anchors. Use the excerpt to choose a symbol or open a snippet/source file for verification.
 
+For ranking or route-search changes, run the search-quality eval and interpret
+failures before promoting the change:
+
+```bash
+cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
+```
+
+- Low recall: an expected anchor is missing from indexed-symbol hits, repo-text
+  hits, or both.
+- Low MRR: the expected anchor exists, but lower-quality or noisy hits outrank
+  it.
+- High max latency: compare against the current fixture cap and performance
+  baseline before tuning.
+- Route/handler misses block route-support promotion until the coverage playbook
+  documents the gap or the fixture/search expectation is fixed.
+- Keep this eval CLI-first; do not require server, MCP, watch, or transport work
+  for Search Quality 2.0.
+
 ## Examples
 
 ```bash
