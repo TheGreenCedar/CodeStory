@@ -103,4 +103,5 @@ Read these pages first:
 - explicit `--cache-dir`: use the exact directory you passed
 - `index --refresh auto`: chooses full on an empty cache and incremental after that
 - `ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `query`, `explore`, `serve`: default to `--refresh none`
+- `drill`: defaults to `--refresh full` so report bundles are mechanically fresh
 - use `--refresh full` after deleting the cache directory, after schema-affecting changes, or when stale state is suspected

@@ -122,6 +122,7 @@ flowchart LR
     LocalState --> Snippet["snippet"]
     LocalState --> Query["query"]
     LocalState --> Explore["explore"]
+    LocalState --> Drill["drill"]
     LocalState --> Serve["serve"]
     LocalState --> Doctor["doctor"]
 ```
@@ -136,6 +137,7 @@ flowchart LR
 - `snippet`: fetch source context around a symbol; Markdown snippets use ANSI syntax highlighting when stdout is an interactive terminal.
 - `query`: run structured graph-query pipelines such as `trail(symbol: 'Foo', depth: 2) | filter(kind: function) | limit(10)`.
 - `explore`: interactive or bundled navigation view around a target.
+- `drill`: write a deterministic report bundle for selected anchors and an optional architecture question; defaults to `--refresh full`.
 - `bookmark`: save, list, or remove investigation focus nodes.
 - `setup embeddings`: install and validate managed embedding assets.
 - `serve`: expose HTTP/stdio read-only browser surfaces.
@@ -252,6 +254,7 @@ Refresh behavior:
 
 - `index --refresh auto`: full on an empty cache, incremental once indexed files already exist
 - `ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `query`, `explore`, and `serve`: default to `--refresh none`
+- `drill`: defaults to `--refresh full` so each report is mechanically fresh; use `--refresh none` only after a fresh index
 - use `--refresh incremental` when you want a read command to refresh an existing cache first
 - use `--refresh full` after a cache reset, schema change, or suspected stale-state incident
 
