@@ -3,10 +3,10 @@ use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentRetrievalPolicyModeDto,
     AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
     AgentRetrievalStepStatusDto, ClaimReadinessDto, EvidenceTypeDto, GraphArtifactDto,
-    GroundingSnapshotDto, NodeDetailsDto, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
-    RetrievalModeDto, RetrievalStateDto, SearchHit, SearchPlanChannelDto, SearchPlanDto,
-    SearchPlanPromotionStatusDto, SnippetContextDto, SymbolContextDto, TrailContextDto,
-    TrailStoryDto,
+    GroundingSnapshotDto, IndexingPhaseTimings, NodeDetailsDto, RepoTextScanStatsDto,
+    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, SearchHit,
+    SearchPlanBridgeDto, SearchPlanChannelDto, SearchPlanDto, SearchPlanPromotionStatusDto,
+    SnippetContextDto, SymbolContextDto, TrailContextDto, TrailStoryDto,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -35,12 +35,7 @@ pub(crate) fn emit<T: Serialize>(
     output_file: Option<&Path>,
 ) -> Result<()> {
     let content = render_output_content(format, value, &markdown)?;
-    if let Some(path) = output_file {
-        write_output_file(path, &content)?;
-    } else {
-        print!("{content}");
-    }
-    Ok(())
+    emit_content(&content, output_file)
 }
 
 pub(crate) fn emit_text(content: String, output_file: Option<&Path>) -> Result<()> {
@@ -48,8 +43,12 @@ pub(crate) fn emit_text(content: String, output_file: Option<&Path>) -> Result<(
     if !content.ends_with('\n') {
         content.push('\n');
     }
+    emit_content(&content, output_file)
+}
+
+fn emit_content(content: &str, output_file: Option<&Path>) -> Result<()> {
     if let Some(path) = output_file {
-        write_output_file(path, &content)?;
+        write_output_file(path, content)?;
     } else {
         print!("{content}");
     }
@@ -124,176 +123,223 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
         output.summary.stats.file_count,
         output.summary.stats.error_count
     );
-    if !output.summary.members.is_empty() {
-        let _ = writeln!(markdown, "members:");
-        for member in &output.summary.members {
-            let _ = writeln!(
-                markdown,
-                "- `{}` files={} nodes={} edges={}",
-                clean_path_string(&member.path),
-                member.file_count.unwrap_or(member.indexed_files),
-                member.node_count.unwrap_or(0),
-                member.edge_count.unwrap_or(0)
-            );
-        }
-    }
+    append_index_members(&mut markdown, output);
     let _ = writeln!(
         markdown,
         "retrieval: {}",
         render_retrieval_state(output.retrieval)
     );
     if let Some(timings) = output.phase_timings {
+        append_index_phase_timings(&mut markdown, timings);
+    }
+    append_index_summary_generation(&mut markdown, output);
+    append_next_commands(&mut markdown, &output.next_commands);
+    markdown
+}
+
+fn append_index_members(markdown: &mut String, output: &IndexOutput<'_>) {
+    if output.summary.members.is_empty() {
+        return;
+    }
+    let _ = writeln!(markdown, "members:");
+    for member in &output.summary.members {
         let _ = writeln!(
             markdown,
-            "timings_ms: parse={} flush={} resolve={} cleanup={} cache_refresh={}",
-            timings.parse_index_ms,
-            timings.projection_flush_ms,
-            timings.edge_resolution_ms,
-            timings.cleanup_ms,
-            timings.cache_refresh_ms.unwrap_or(0)
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "cache_ms",
-            &[
-                ("search_projection", timings.search_projection_rebuild_ms),
-                ("search_index", timings.search_symbol_index_ms),
-                ("runtime_publish", timings.runtime_cache_publish_ms),
-            ],
-        );
-        let _ = writeln!(
-            markdown,
-            "resolution: calls {}->{}, imports {}->{}",
-            timings.unresolved_calls_start,
-            timings.unresolved_calls_end,
-            timings.unresolved_imports_start,
-            timings.unresolved_imports_end
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "semantic_ms",
-            &[
-                ("doc_build", timings.semantic_doc_build_ms),
-                ("embedding", timings.semantic_embedding_ms),
-                ("db_upsert", timings.semantic_db_upsert_ms),
-                ("reload", timings.semantic_reload_ms),
-                ("prune", timings.semantic_prune_ms),
-            ],
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "semantic_docs",
-            &[
-                ("reused", timings.semantic_docs_reused),
-                ("embedded", timings.semantic_docs_embedded),
-                ("pending", timings.semantic_docs_pending),
-                ("stale", timings.semantic_docs_stale),
-            ],
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "staged_publish_ms",
-            &[
-                ("deferred_indexes", timings.deferred_indexes_ms),
-                ("summary_snapshot", timings.summary_snapshot_ms),
-                ("detail_snapshot", timings.detail_snapshot_ms),
-                ("publish", timings.publish_ms),
-            ],
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "setup_ms",
-            &[
-                (
-                    "existing_projection_ids",
-                    timings.setup_existing_projection_ids_ms,
-                ),
-                ("seed_symbol_table", timings.setup_seed_symbol_table_ms),
-            ],
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "flush_breakdown_ms",
-            &[
-                ("files", timings.flush_files_ms),
-                ("nodes", timings.flush_nodes_ms),
-                ("edges", timings.flush_edges_ms),
-                ("occurrences", timings.flush_occurrences_ms),
-                ("component_access", timings.flush_component_access_ms),
-                ("callable_projection", timings.flush_callable_projection_ms),
-            ],
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "resolution_ms",
-            &[
-                ("override_count", timings.resolution_override_count_ms),
-                ("unresolved_counts", timings.resolution_unresolved_counts_ms),
-                ("calls", timings.resolution_calls_ms),
-                ("imports", timings.resolution_imports_ms),
-                ("cleanup", timings.resolution_cleanup_ms),
-            ],
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "resolution_indexes_ms",
-            &[
-                ("call_candidate", timings.resolution_call_candidate_index_ms),
-                (
-                    "import_candidate",
-                    timings.resolution_import_candidate_index_ms,
-                ),
-                ("call_semantic", timings.resolution_call_semantic_index_ms),
-                (
-                    "import_semantic",
-                    timings.resolution_import_semantic_index_ms,
-                ),
-            ],
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "resolution_detail_ms",
-            &[
-                (
-                    "call_semantic_candidates",
-                    timings.resolution_call_semantic_candidates_ms,
-                ),
-                (
-                    "import_semantic_candidates",
-                    timings.resolution_import_semantic_candidates_ms,
-                ),
-                ("call_compute", timings.resolution_call_compute_ms),
-                ("import_compute", timings.resolution_import_compute_ms),
-                ("call_apply", timings.resolution_call_apply_ms),
-                ("import_apply", timings.resolution_import_apply_ms),
-                ("overrides", timings.resolution_override_resolution_ms),
-            ],
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "resolution_semantic_requests",
-            &[
-                ("call_rows", timings.resolution_call_semantic_requests),
-                (
-                    "call_unique",
-                    timings.resolution_call_semantic_unique_requests,
-                ),
-                (
-                    "call_skipped",
-                    timings.resolution_call_semantic_skipped_requests,
-                ),
-                ("import_rows", timings.resolution_import_semantic_requests),
-                (
-                    "import_unique",
-                    timings.resolution_import_semantic_unique_requests,
-                ),
-                (
-                    "import_skipped",
-                    timings.resolution_import_semantic_skipped_requests,
-                ),
-            ],
+            "- `{}` files={} nodes={} edges={}",
+            clean_path_string(&member.path),
+            member.file_count.unwrap_or(member.indexed_files),
+            member.node_count.unwrap_or(0),
+            member.edge_count.unwrap_or(0)
         );
     }
+}
+
+fn append_index_phase_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    let _ = writeln!(
+        markdown,
+        "timings_ms: parse={} flush={} resolve={} cleanup={} cache_refresh={}",
+        timings.parse_index_ms,
+        timings.projection_flush_ms,
+        timings.edge_resolution_ms,
+        timings.cleanup_ms,
+        timings.cache_refresh_ms.unwrap_or(0)
+    );
+    append_index_cache_timings(markdown, timings);
+    let _ = writeln!(
+        markdown,
+        "resolution: calls {}->{}, imports {}->{}",
+        timings.unresolved_calls_start,
+        timings.unresolved_calls_end,
+        timings.unresolved_imports_start,
+        timings.unresolved_imports_end
+    );
+    append_index_semantic_timings(markdown, timings);
+    append_index_flush_timings(markdown, timings);
+    append_index_resolution_timings(markdown, timings);
+}
+
+fn append_index_cache_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    append_optional_timings_line(
+        markdown,
+        "cache_ms",
+        &[
+            ("search_projection", timings.search_projection_rebuild_ms),
+            ("search_index", timings.search_symbol_index_ms),
+            ("runtime_publish", timings.runtime_cache_publish_ms),
+        ],
+    );
+    append_optional_timings_line(
+        markdown,
+        "staged_publish_ms",
+        &[
+            ("deferred_indexes", timings.deferred_indexes_ms),
+            ("summary_snapshot", timings.summary_snapshot_ms),
+            ("detail_snapshot", timings.detail_snapshot_ms),
+            ("publish", timings.publish_ms),
+        ],
+    );
+    append_optional_timings_line(
+        markdown,
+        "setup_ms",
+        &[
+            (
+                "existing_projection_ids",
+                timings.setup_existing_projection_ids_ms,
+            ),
+            ("seed_symbol_table", timings.setup_seed_symbol_table_ms),
+        ],
+    );
+}
+
+fn append_index_semantic_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    append_optional_timings_line(
+        markdown,
+        "semantic_ms",
+        &[
+            ("doc_build", timings.semantic_doc_build_ms),
+            ("embedding", timings.semantic_embedding_ms),
+            ("db_upsert", timings.semantic_db_upsert_ms),
+            ("reload", timings.semantic_reload_ms),
+            ("prune", timings.semantic_prune_ms),
+        ],
+    );
+    append_optional_timings_line(
+        markdown,
+        "semantic_docs",
+        &[
+            ("reused", timings.semantic_docs_reused),
+            ("embedded", timings.semantic_docs_embedded),
+            ("pending", timings.semantic_docs_pending),
+            ("stale", timings.semantic_docs_stale),
+        ],
+    );
+}
+
+fn append_index_flush_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    append_optional_timings_line(
+        markdown,
+        "flush_breakdown_ms",
+        &[
+            ("files", timings.flush_files_ms),
+            ("nodes", timings.flush_nodes_ms),
+            ("edges", timings.flush_edges_ms),
+            ("occurrences", timings.flush_occurrences_ms),
+            ("component_access", timings.flush_component_access_ms),
+            ("callable_projection", timings.flush_callable_projection_ms),
+        ],
+    );
+}
+
+fn append_index_resolution_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    append_index_resolution_core_timings(markdown, timings);
+    append_index_resolution_index_timings(markdown, timings);
+    append_index_resolution_detail_timings(markdown, timings);
+    append_index_resolution_request_counts(markdown, timings);
+}
+
+fn append_index_resolution_core_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    append_optional_timings_line(
+        markdown,
+        "resolution_ms",
+        &[
+            ("override_count", timings.resolution_override_count_ms),
+            ("unresolved_counts", timings.resolution_unresolved_counts_ms),
+            ("calls", timings.resolution_calls_ms),
+            ("imports", timings.resolution_imports_ms),
+            ("cleanup", timings.resolution_cleanup_ms),
+        ],
+    );
+}
+
+fn append_index_resolution_index_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    append_optional_timings_line(
+        markdown,
+        "resolution_indexes_ms",
+        &[
+            ("call_candidate", timings.resolution_call_candidate_index_ms),
+            (
+                "import_candidate",
+                timings.resolution_import_candidate_index_ms,
+            ),
+            ("call_semantic", timings.resolution_call_semantic_index_ms),
+            (
+                "import_semantic",
+                timings.resolution_import_semantic_index_ms,
+            ),
+        ],
+    );
+}
+
+fn append_index_resolution_detail_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    append_optional_timings_line(
+        markdown,
+        "resolution_detail_ms",
+        &[
+            (
+                "call_semantic_candidates",
+                timings.resolution_call_semantic_candidates_ms,
+            ),
+            (
+                "import_semantic_candidates",
+                timings.resolution_import_semantic_candidates_ms,
+            ),
+            ("call_compute", timings.resolution_call_compute_ms),
+            ("import_compute", timings.resolution_import_compute_ms),
+            ("call_apply", timings.resolution_call_apply_ms),
+            ("import_apply", timings.resolution_import_apply_ms),
+            ("overrides", timings.resolution_override_resolution_ms),
+        ],
+    );
+}
+
+fn append_index_resolution_request_counts(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    append_optional_timings_line(
+        markdown,
+        "resolution_semantic_requests",
+        &[
+            ("call_rows", timings.resolution_call_semantic_requests),
+            (
+                "call_unique",
+                timings.resolution_call_semantic_unique_requests,
+            ),
+            (
+                "call_skipped",
+                timings.resolution_call_semantic_skipped_requests,
+            ),
+            ("import_rows", timings.resolution_import_semantic_requests),
+            (
+                "import_unique",
+                timings.resolution_import_semantic_unique_requests,
+            ),
+            (
+                "import_skipped",
+                timings.resolution_import_semantic_skipped_requests,
+            ),
+        ],
+    );
+}
+
+fn append_index_summary_generation(markdown: &mut String, output: &IndexOutput<'_>) {
     if let Some(summary) = output.summary_generation {
         let _ = writeln!(
             markdown,
@@ -301,13 +347,16 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
             summary.generated, summary.reused, summary.skipped, summary.endpoint
         );
     }
-    if !output.next_commands.is_empty() {
-        let _ = writeln!(markdown, "next_commands:");
-        for command in &output.next_commands {
-            let _ = writeln!(markdown, "- `{command}`");
-        }
+}
+
+fn append_next_commands(markdown: &mut String, commands: &[String]) {
+    if commands.is_empty() {
+        return;
     }
-    markdown
+    let _ = writeln!(markdown, "next_commands:");
+    for command in commands {
+        let _ = writeln!(markdown, "- `{command}`");
+    }
 }
 
 pub(crate) fn render_index_dry_run_markdown(output: &IndexDryRunOutput<'_>) -> String {
@@ -645,6 +694,16 @@ fn append_search_plan(markdown: &mut String, plan: &SearchPlanDto) {
             plan.intents.join(", ")
         }
     );
+    append_search_plan_terms(markdown, plan);
+    append_search_plan_subqueries(markdown, plan);
+    append_search_plan_candidate_windows(markdown, plan);
+    append_search_plan_anchor_groups(markdown, plan);
+    append_search_plan_bridges(markdown, plan);
+    append_search_plan_repo_text_promotions(markdown, plan);
+    append_search_plan_next_steps(markdown, plan);
+}
+
+fn append_search_plan_terms(markdown: &mut String, plan: &SearchPlanDto) {
     if !plan.terms.extracted.is_empty() {
         let _ = writeln!(
             markdown,
@@ -662,22 +721,24 @@ fn append_search_plan(markdown: &mut String, plan: &SearchPlanDto) {
             .join(", ");
         let _ = writeln!(markdown, "Dropped terms: {dropped}");
     }
+}
+
+fn append_search_plan_subqueries(markdown: &mut String, plan: &SearchPlanDto) {
     if !plan.subqueries.is_empty() {
         let _ = writeln!(markdown, "Subqueries:");
         for subquery in &plan.subqueries {
-            let channels = subquery
-                .channels
-                .iter()
-                .map(format_search_plan_channel)
-                .collect::<Vec<_>>()
-                .join(", ");
             let _ = writeln!(
                 markdown,
                 "- `{}` role={} channels={}",
-                subquery.query, subquery.role, channels
+                subquery.query,
+                subquery.role,
+                format_search_plan_channels(&subquery.channels)
             );
         }
     }
+}
+
+fn append_search_plan_candidate_windows(markdown: &mut String, plan: &SearchPlanDto) {
     if !plan.candidate_windows.is_empty() {
         let _ = writeln!(markdown, "Candidate windows:");
         for window in &plan.candidate_windows {
@@ -695,6 +756,9 @@ fn append_search_plan(markdown: &mut String, plan: &SearchPlanDto) {
             }
         }
     }
+}
+
+fn append_search_plan_anchor_groups(markdown: &mut String, plan: &SearchPlanDto) {
     if !plan.anchor_groups.is_empty() {
         let _ = writeln!(markdown, "Anchor groups:");
         for group in &plan.anchor_groups {
@@ -719,41 +783,46 @@ fn append_search_plan(markdown: &mut String, plan: &SearchPlanDto) {
             }
         }
     }
+}
+
+fn append_search_plan_bridges(markdown: &mut String, plan: &SearchPlanDto) {
     if !plan.bridges.is_empty() {
         let _ = writeln!(markdown, "Bridge evidence:");
         for bridge in &plan.bridges {
-            let direction = bridge
-                .direction
-                .as_deref()
-                .map(|value| format!(" direction={value}"))
-                .unwrap_or_default();
-            let _ = writeln!(
-                markdown,
-                "- `{}` -> `{}` status={} confidence={} evidence={}{} nodes={} edges={} truncated={}",
-                bridge.from_anchor,
-                bridge.to_anchor,
-                bridge.status,
-                bridge.confidence,
-                bridge.evidence_kind,
-                direction,
-                bridge.node_count,
-                bridge.edge_count,
-                bridge.truncated
-            );
-            for note in &bridge.notes {
-                let _ = writeln!(markdown, "  note: {note}");
-            }
+            append_search_plan_bridge(markdown, bridge);
         }
     }
+}
+
+fn append_search_plan_bridge(markdown: &mut String, bridge: &SearchPlanBridgeDto) {
+    let direction = bridge
+        .direction
+        .as_deref()
+        .map(|value| format!(" direction={value}"))
+        .unwrap_or_default();
+    let _ = writeln!(
+        markdown,
+        "- `{}` -> `{}` status={} confidence={} evidence={}{} nodes={} edges={} truncated={}",
+        bridge.from_anchor,
+        bridge.to_anchor,
+        bridge.status,
+        bridge.confidence,
+        bridge.evidence_kind,
+        direction,
+        bridge.node_count,
+        bridge.edge_count,
+        bridge.truncated
+    );
+    for note in &bridge.notes {
+        let _ = writeln!(markdown, "  note: {note}");
+    }
+}
+
+fn append_search_plan_repo_text_promotions(markdown: &mut String, plan: &SearchPlanDto) {
     let _ = writeln!(markdown, "Repo-text promotions:");
     let mut wrote_repo_text_promotion = false;
     for group in &plan.anchor_groups {
-        if matches!(
-            group.promotion_status,
-            SearchPlanPromotionStatusDto::Promoted
-                | SearchPlanPromotionStatusDto::NeedsSourceRead
-                | SearchPlanPromotionStatusDto::Ambiguous
-        ) {
+        if is_repo_text_promotion_status(group.promotion_status) {
             wrote_repo_text_promotion = true;
             let _ = writeln!(
                 markdown,
@@ -767,6 +836,9 @@ fn append_search_plan(markdown: &mut String, plan: &SearchPlanDto) {
     if !wrote_repo_text_promotion {
         let _ = writeln!(markdown, "- none");
     }
+}
+
+fn append_search_plan_next_steps(markdown: &mut String, plan: &SearchPlanDto) {
     if !plan.next_commands.is_empty() {
         let _ = writeln!(markdown, "Next commands:");
         for command in &plan.next_commands {
@@ -779,6 +851,23 @@ fn append_search_plan(markdown: &mut String, plan: &SearchPlanDto) {
             let _ = writeln!(markdown, "- {check}");
         }
     }
+}
+
+fn is_repo_text_promotion_status(status: SearchPlanPromotionStatusDto) -> bool {
+    matches!(
+        status,
+        SearchPlanPromotionStatusDto::Promoted
+            | SearchPlanPromotionStatusDto::NeedsSourceRead
+            | SearchPlanPromotionStatusDto::Ambiguous
+    )
+}
+
+fn format_search_plan_channels(channels: &[SearchPlanChannelDto]) -> String {
+    channels
+        .iter()
+        .map(format_search_plan_channel)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn format_search_plan_channel(channel: &SearchPlanChannelDto) -> &'static str {
