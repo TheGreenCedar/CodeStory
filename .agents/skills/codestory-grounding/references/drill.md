@@ -53,3 +53,7 @@ target/release/codestory-cli(.exe) drill --project . --refresh none --anchors Po
 Use the drill report as the CodeStory-only phase. Draft the architecture answer from those artifacts first, then open only files named or implied by the artifacts and classify each claim against source truth. If the answer changes materially after source reads, record that as a CodeStory or agent-UX finding.
 
 Start with `evidence_packet.readiness`. Claims in `safe_to_say` are anchored enough for a draft. Claims in `inferred_claims` or `needs_verification` must stay uncertain until the listed `source_truth_checks` or equivalent source reads confirm them. Repo-text and cross-language framework hits are navigation hints unless supported by typed symbol/trail/snippet evidence or source-truth verification.
+
+The optional `question_search` artifact is intentionally partial discovery evidence. A weak natural-language top hit does not answer the question by itself; use it to refine anchors, then rely on each anchor's symbol/trail/explore/snippet artifacts and the source-truth checklist.
+
+If a trail is `structural_only=true`, it is still useful containment/type evidence, but it does not prove runtime flow or application access by itself. Follow up on concrete methods/functions from the trail with `snippet --function-body`, `explore`, or an additional anchor before drafting flow claims.

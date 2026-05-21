@@ -67,6 +67,24 @@ fn env_flag(name: &str, default: bool) -> bool {
     }
 }
 
+fn parser_direct_structural_certainty(kind: EdgeKind) -> Option<ResolutionCertainty> {
+    match kind {
+        EdgeKind::MEMBER
+        | EdgeKind::INHERITANCE
+        | EdgeKind::OVERRIDE
+        | EdgeKind::TYPE_ARGUMENT
+        | EdgeKind::TEMPLATE_SPECIALIZATION
+        | EdgeKind::INCLUDE
+        | EdgeKind::IMPORT => Some(ResolutionCertainty::Certain),
+        EdgeKind::CALL
+        | EdgeKind::USAGE
+        | EdgeKind::TYPE_USAGE
+        | EdgeKind::MACRO_USAGE
+        | EdgeKind::ANNOTATION_USAGE
+        | EdgeKind::UNKNOWN => None,
+    }
+}
+
 // Source of truth for live rule assets. Keep this registry aligned with
 // `get_language_for_ext` so dead rule files do not silently linger.
 const PYTHON_GRAPH_QUERY: &str = include_str!("../rules/python.scm");
@@ -3231,6 +3249,7 @@ fn append_manual_c_enum_member_edges(
             target: target_id,
             kind: EdgeKind::MEMBER,
             file_node_id: Some(file_id),
+            certainty: Some(ResolutionCertainty::Certain),
             ..Default::default()
         };
         if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
@@ -7455,6 +7474,7 @@ pub fn index_file(
                 kind,
                 file_node_id: Some(file_id),
                 line,
+                certainty: parser_direct_structural_certainty(kind),
                 callsite_identity,
                 ..Default::default()
             };
@@ -8326,8 +8346,10 @@ class MyClass(Parent):
             "MEMBER edge not found"
         );
         assert!(
-            result.edges.iter().any(|e| e.kind == EdgeKind::INHERITANCE),
-            "INHERITANCE edge not found"
+            result.edges.iter().any(|e| {
+                e.kind == EdgeKind::INHERITANCE && e.certainty == Some(ResolutionCertainty::Certain)
+            }),
+            "certain INHERITANCE edge not found"
         );
         assert!(!result.occurrences.is_empty(), "No occurrences found");
 
@@ -8357,8 +8379,10 @@ class MyClass extends Parent {
             "MEMBER edge not found"
         );
         assert!(
-            result.edges.iter().any(|e| e.kind == EdgeKind::INHERITANCE),
-            "INHERITANCE edge not found"
+            result.edges.iter().any(|e| {
+                e.kind == EdgeKind::INHERITANCE && e.certainty == Some(ResolutionCertainty::Certain)
+            }),
+            "certain INHERITANCE edge not found"
         );
         Ok(())
     }
@@ -8437,6 +8461,7 @@ impl AppController {
             edge.kind == EdgeKind::MEMBER
                 && edge.source == type_node.id
                 && edge.target == open_project.id
+                && edge.certainty == Some(ResolutionCertainty::Certain)
         }));
 
         Ok(())
@@ -8510,6 +8535,7 @@ impl api::Runner for nested::ScopedGeneric<String> {}
                 edge.kind == EdgeKind::MEMBER
                     && edge.source == matching[0].id
                     && edge.target == method.id
+                    && edge.certainty == Some(ResolutionCertainty::Certain)
             }));
         }
 
@@ -8529,6 +8555,7 @@ impl api::Runner for nested::ScopedGeneric<String> {}
             edge.kind == EdgeKind::INHERITANCE
                 && edge.source == scoped_generic.id
                 && edge.target == runner.id
+                && edge.certainty == Some(ResolutionCertainty::Certain)
         }));
 
         Ok(())
@@ -8784,6 +8811,7 @@ export default buildConfig({
                 edge.kind == EdgeKind::MEMBER
                     && edge.source == posts_id
                     && field_ids.contains(&edge.target)
+                    && edge.certainty == Some(ResolutionCertainty::Certain)
             }),
             "exported object config fields should be connected to their owner"
         );
@@ -9101,7 +9129,9 @@ class Derived : public Base {
                 .any(|n| n.serialized_name == "Derived" && n.kind == NodeKind::CLASS)
         );
         // Verify Membership
-        assert!(result.edges.iter().any(|e| e.kind == EdgeKind::MEMBER));
+        assert!(result.edges.iter().any(|e| {
+            e.kind == EdgeKind::MEMBER && e.certainty == Some(ResolutionCertainty::Certain)
+        }));
         // Verify Inheritance (TODO: Fix structural matching for inheritance in single-pass TS queries)
         // assert!(result.edges.iter().any(|e| e.kind == EdgeKind::INHERITANCE));
         Ok(())
@@ -9126,7 +9156,9 @@ class MyClass:
                 .any(|n| n.serialized_name == "x" && n.kind == NodeKind::VARIABLE)
         );
         // Verify IMPORT for import statement
-        assert!(result.edges.iter().any(|e| e.kind == EdgeKind::IMPORT));
+        assert!(result.edges.iter().any(|e| {
+            e.kind == EdgeKind::IMPORT && e.certainty == Some(ResolutionCertainty::Certain)
+        }));
         // Verify CALL for decorator
         assert!(result.edges.iter().any(|e| e.kind == EdgeKind::CALL));
         Ok(())
@@ -9153,7 +9185,9 @@ fn main() {
                 .any(|n| n.serialized_name == "MyTrait" && n.kind == NodeKind::INTERFACE)
         );
         // Verify Impl Inheritance
-        assert!(result.edges.iter().any(|e| e.kind == EdgeKind::INHERITANCE));
+        assert!(result.edges.iter().any(|e| {
+            e.kind == EdgeKind::INHERITANCE && e.certainty == Some(ResolutionCertainty::Certain)
+        }));
         // Verify macro CALL
         assert!(result.edges.iter().any(|e| e.kind == EdgeKind::CALL));
         Ok(())

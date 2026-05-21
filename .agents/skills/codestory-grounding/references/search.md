@@ -34,6 +34,8 @@ target/release/codestory-cli(.exe) search [OPTIONS]
 - Ranking boosts exact and terminal symbol names, CamelCase initials, compound terms, and path co-location. Test, fixture, vendor, and external hits are dampened unless the query asks for them.
 - Import/re-export-looking exact hits are ranked below definition-looking hits when source-line evidence is available.
 - Repo-text fallback remains explicit evidence. Treat repo-text hits as clues to inspect, not as silent graph success.
+- For architecture questions, broad natural-language `search` is discovery only. If `query_assessment` says `weak_top_hit=true` or there is no exact anchor, move to `drill` with concrete anchors from `ground`/`search`; do not answer from broad search hits alone.
+- `symbol`, `trail`, and `snippet` require a resolvable graph target. Semantic suggestions and repo-text hits can guide follow-up searches, but they are not promoted into graph targets by those commands.
 - **Hybrid weight overrides** are intended for benchmarking and tuning. Omit all three `--hybrid-*` flags for production-like runtime defaults.
 
 ## Output

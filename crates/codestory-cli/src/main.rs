@@ -1992,7 +1992,7 @@ fn drill_evidence_packet(
             "medium",
             ClaimReadinessDto::Partial,
             vec![
-                "natural-language search is discovery evidence; source-truth verification is still required"
+                "natural-language question search is broad discovery evidence; use drill anchors and source verification before answering"
                     .to_string(),
             ],
         ));
@@ -2179,14 +2179,20 @@ fn readiness_for_drill_command(status: &DrillCommandStatusOutput) -> ClaimReadin
     match status.command.as_str() {
         "symbol" | "snippet" | "explore" => ClaimReadinessDto::Supported,
         "trail" => ClaimReadinessDto::Partial,
-        "search" | "question_search" => ClaimReadinessDto::Anchored,
+        "search" => ClaimReadinessDto::Anchored,
+        "question_search" => ClaimReadinessDto::Partial,
         _ => ClaimReadinessDto::Partial,
     }
 }
 
 fn drill_command_notes(status: &DrillCommandStatusOutput) -> Vec<String> {
     match status.command.as_str() {
-        "search" | "question_search" => {
+        "question_search" => {
+            vec![
+                "natural-language question search is broad discovery evidence; use drill anchors and source verification before answering".to_string(),
+            ]
+        }
+        "search" => {
             vec!["search is anchor discovery, not final source-truth verification".to_string()]
         }
         "trail" => vec![
@@ -5392,6 +5398,42 @@ mod tests {
                 .needs_verification
                 .iter()
                 .any(|item| item.contains("no source-truth targets were emitted"))
+        );
+    }
+
+    #[test]
+    fn drill_question_search_is_partial_discovery_evidence() {
+        let question_search = DrillCommandStatusOutput {
+            command: "question_search".to_string(),
+            status: "ok".to_string(),
+            artifact: Some("question-search.md".to_string()),
+            error: None,
+        };
+
+        let packet = drill_evidence_packet(
+            Some("How does the public page connect to the feed?"),
+            Some(&question_search),
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        let question_item = packet
+            .items
+            .iter()
+            .find(|item| item.id == "question-search")
+            .expect("question search evidence item");
+        assert_eq!(
+            question_item.verification_status,
+            ClaimReadinessDto::Partial
+        );
+        assert!(
+            question_item
+                .notes
+                .iter()
+                .any(|note| note.contains("broad discovery evidence")),
+            "question search should not look like proof: {question_item:#?}"
         );
     }
 

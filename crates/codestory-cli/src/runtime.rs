@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 use crate::args::{ProjectArgs, QuerySelectorOutput, RefreshMode, TargetSelection};
 use crate::display::{clean_path_string, format_search_hit_target, relative_path};
 use crate::query_resolution::{
-    ResolutionRank, compare_resolution_hits, file_filter_match_bucket,
-    resolution_rank_with_project_root, search_hit_matches_file_filter,
+    ResolutionRank, compare_resolution_hits, file_filter_match_bucket, is_graph_target_candidate,
+    is_name_resolvable_graph_target, resolution_rank_with_project_root,
+    search_hit_matches_file_filter,
 };
 
 #[derive(Debug)]
@@ -225,6 +226,9 @@ fn query_resolution_alternatives(
             None,
         )
         .map_err(map_api_error)?;
+    alternatives.retain(|hit| {
+        is_graph_target_candidate(hit) && is_name_resolvable_graph_target(query, hit)
+    });
     if let Some(file_filter) = file_filter {
         alternatives
             .retain(|hit| search_hit_matches_file_filter(&runtime.project_root, hit, file_filter));
@@ -477,17 +481,22 @@ fn compare_resolution_candidates(
 }
 
 fn no_query_match_error(
-    _project_root: &Path,
+    project_root: &Path,
     query: &str,
     file_filter: Option<&str>,
 ) -> anyhow::Error {
+    let search_command = format!(
+        "codestory-cli search --project {} --query {} --limit 10",
+        quote_cli_path(project_root),
+        quote_cli_value(query)
+    );
     match file_filter {
         Some(file_filter) => anyhow!(
-            "query_resolution: No symbol matched query `{query}` within files matching `{}`. Run `codestory-cli search --query \"{query}\" --limit 10` to inspect candidates, or relax `--file`.",
+            "query_resolution: No symbol matched query `{query}` within files matching `{}`. Run `{search_command}` to inspect candidates, or relax `--file`.",
             clean_path_string(file_filter)
         ),
         None => anyhow!(
-            "query_resolution: No symbol matched query `{query}`. Run `codestory-cli search --query \"{query}\" --limit 10` to inspect candidates."
+            "query_resolution: No symbol matched query `{query}`. Run `{search_command}` to inspect candidates."
         ),
     }
 }

@@ -220,7 +220,8 @@ fn affected_edge_kind_label(kind: codestory_contracts::graph::EdgeKind) -> &'sta
 }
 
 fn affected_edge_confidence(edge: &codestory_contracts::graph::Edge) -> String {
-    edge_certainty_label(edge.certainty, edge.confidence).unwrap_or_else(|| "graph".to_string())
+    edge_certainty_label(edge.kind, edge.certainty, edge.confidence)
+        .unwrap_or_else(|| "graph".to_string())
 }
 
 fn framework_route_coverage_matrix() -> Vec<FrameworkRouteCoverageDto> {
@@ -918,7 +919,7 @@ fn search_query_assessment(
             .collect::<Vec<_>>()
             .join(", ");
         Some(format!(
-            "Architecture intent detected ({labels}); inspect production entrypoints/orchestrators first and treat repo-text hits as leads until source snippets confirm the path."
+            "Architecture intent detected ({labels}) with no exact anchor; run drill with concrete anchors from ground/search, then inspect symbol, trail, and function-body snippets before answering. Treat broad search hits as leads only."
         ))
     } else if !repo_text_hits.is_empty() {
         Some(
@@ -1157,12 +1158,36 @@ fn parse_db_id(raw: &str, field_name: &str) -> Result<i64, ApiError> {
 }
 
 fn edge_certainty_label(
+    kind: codestory_contracts::graph::EdgeKind,
     certainty: Option<codestory_contracts::graph::ResolutionCertainty>,
     confidence: Option<f32>,
 ) -> Option<String> {
     certainty
         .or_else(|| codestory_contracts::graph::ResolutionCertainty::from_confidence(confidence))
+        .or_else(|| structural_edge_default_certainty(kind))
         .map(|value| value.as_str().to_string())
+}
+
+fn structural_edge_default_certainty(
+    kind: codestory_contracts::graph::EdgeKind,
+) -> Option<codestory_contracts::graph::ResolutionCertainty> {
+    use codestory_contracts::graph::{EdgeKind, ResolutionCertainty};
+
+    match kind {
+        EdgeKind::MEMBER
+        | EdgeKind::INHERITANCE
+        | EdgeKind::OVERRIDE
+        | EdgeKind::TYPE_ARGUMENT
+        | EdgeKind::TEMPLATE_SPECIALIZATION
+        | EdgeKind::INCLUDE
+        | EdgeKind::IMPORT => Some(ResolutionCertainty::Certain),
+        EdgeKind::CALL
+        | EdgeKind::USAGE
+        | EdgeKind::TYPE_USAGE
+        | EdgeKind::MACRO_USAGE
+        | EdgeKind::ANNOTATION_USAGE
+        | EdgeKind::UNKNOWN => None,
+    }
 }
 
 fn is_structural_kind(kind: codestory_contracts::graph::NodeKind) -> bool {
@@ -1234,7 +1259,7 @@ fn graph_edge_dto(
         kind: EdgeKind::from(edge.kind),
         confidence: edge.confidence,
         certainty: if flags.include_edge_certainty {
-            edge_certainty_label(edge.certainty, edge.confidence)
+            edge_certainty_label(edge.kind, edge.certainty, edge.confidence)
         } else {
             None
         },
@@ -6395,7 +6420,7 @@ mod tests {
     use super::*;
     use codestory_contracts::graph::{
         Edge, EdgeId, EdgeKind, Node, NodeId as CoreNodeId, NodeKind, Occurrence, OccurrenceKind,
-        SourceLocation,
+        ResolutionCertainty, SourceLocation,
     };
     use crossbeam_channel::unbounded;
     use std::fs;
@@ -6472,6 +6497,51 @@ mod tests {
             ],
             _lock: lock,
         }
+    }
+
+    #[test]
+    fn graph_edge_dto_defaults_structural_member_certainty() {
+        let flags = AppGraphFeatureFlags {
+            include_edge_certainty: true,
+            include_callsite_identity: true,
+            include_candidate_targets: true,
+        };
+
+        let member = graph_edge_dto(
+            Edge {
+                id: EdgeId(1),
+                source: CoreNodeId(10),
+                target: CoreNodeId(20),
+                kind: EdgeKind::MEMBER,
+                ..Default::default()
+            },
+            flags,
+        );
+        let unresolved_call = graph_edge_dto(
+            Edge {
+                id: EdgeId(2),
+                source: CoreNodeId(10),
+                target: CoreNodeId(30),
+                kind: EdgeKind::CALL,
+                ..Default::default()
+            },
+            flags,
+        );
+        let explicit_probable = graph_edge_dto(
+            Edge {
+                id: EdgeId(3),
+                source: CoreNodeId(10),
+                target: CoreNodeId(40),
+                kind: EdgeKind::MEMBER,
+                certainty: Some(ResolutionCertainty::Probable),
+                ..Default::default()
+            },
+            flags,
+        );
+
+        assert_eq!(member.certainty.as_deref(), Some("certain"));
+        assert_eq!(unresolved_call.certainty, None);
+        assert_eq!(explicit_probable.certainty.as_deref(), Some("probable"));
     }
 
     #[test]
