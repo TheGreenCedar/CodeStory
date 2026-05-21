@@ -1,10 +1,11 @@
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
-    BookmarkCategoryDto, BookmarkDto, GroundingBudgetDto, IndexDryRunDto, IndexFreshnessDto,
-    IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind, ProjectSummary,
-    RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
-    SearchMatchQualityDto, SearchQueryAssessmentDto, SnippetContextDto, SummaryGenerationDto,
-    SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
+    BookmarkCategoryDto, BookmarkDto, EvidencePacketDto, GroundingBudgetDto, IndexDryRunDto,
+    IndexFreshnessDto, IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind,
+    ProjectSummary, RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
+    SearchHitOrigin, SearchMatchQualityDto, SearchQueryAssessmentDto, SnippetContextDto,
+    SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection,
+    TrailMode,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -1138,6 +1139,7 @@ pub(crate) struct DrillOutput {
     pub(crate) bridges: Vec<DrillBridgeOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) verification_targets: Vec<VerificationTargetOutput>,
+    pub(crate) evidence_packet: EvidencePacketDto,
     pub(crate) answer_quality_contract: DrillAnswerQualityContractOutput,
     pub(crate) claim_ledger_template: DrillClaimLedgerOutput,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

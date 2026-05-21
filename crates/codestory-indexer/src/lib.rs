@@ -3604,7 +3604,10 @@ fn canonicalize_nodes(
             .canonical_id
             .as_deref()
             .filter(|value| {
-                value.starts_with("openapi:endpoint:") || value.starts_with("route_endpoint:")
+                value.starts_with("openapi:endpoint:")
+                    || value.starts_with("route_endpoint:")
+                    || value.starts_with("tauri:command:")
+                    || value.starts_with("payload:collection:")
             })
             .map(str::to_string)
             .unwrap_or_else(|| {
@@ -4350,6 +4353,32 @@ struct FrameworkRoute {
     source_convention: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TauriCommandRegistration {
+    command: String,
+    line: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TauriCommandInvocation {
+    command: String,
+    line: u32,
+    col: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PayloadCollectionRegistration {
+    slug: String,
+    line: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PayloadCollectionUsage {
+    slug: String,
+    line: u32,
+    col: u32,
+}
+
 impl FrameworkRoute {
     fn new(
         framework: &'static str,
@@ -4433,6 +4462,12 @@ fn index_text_only_file(path: &Path) -> Result<IntermediateStorage> {
         file_id,
         &mut local_storage,
     );
+    append_text_only_tauri_invocations(
+        text_only_language_name(path),
+        &source,
+        file_id,
+        &mut local_storage,
+    );
     Ok(local_storage)
 }
 
@@ -4456,6 +4491,43 @@ fn append_text_only_framework_routes(
         local_storage
             .occurrences
             .push(framework_route_occurrence(file_id, route_node_id, &route));
+    }
+}
+
+fn append_text_only_tauri_invocations(
+    language_name: &str,
+    source: &str,
+    file_id: NodeId,
+    local_storage: &mut IntermediateStorage,
+) {
+    if language_name != "svelte" {
+        return;
+    }
+
+    for invocation in collect_tauri_command_invocations(source) {
+        let command_node = tauri_command_node(file_id, &invocation.command, invocation.line);
+        let command_node_id = command_node.id;
+        local_storage.nodes.push(command_node);
+        local_storage.edges.push(tauri_command_invoke_edge(
+            file_id,
+            file_id,
+            command_node_id,
+            &invocation,
+            index_feature_flags(),
+        ));
+        local_storage.occurrences.push(Occurrence {
+            element_id: command_node_id.0,
+            kind: OccurrenceKind::REFERENCE,
+            location: SourceLocation {
+                file_node_id: file_id,
+                start_line: invocation.line,
+                start_col: invocation.col,
+                end_line: invocation.line,
+                end_col: invocation
+                    .col
+                    .saturating_add(invocation.command.len() as u32),
+            },
+        });
     }
 }
 
@@ -5402,7 +5474,10 @@ fn exports_named_handler(line: &str, method: &str) -> bool {
 fn default_export_handler(source: &str) -> Option<String> {
     for line in source.lines() {
         let trimmed = line.trim();
-        if let Some(tail) = trimmed.strip_prefix("export default function ") {
+        if let Some(tail) = trimmed
+            .strip_prefix("export default function ")
+            .or_else(|| trimmed.strip_prefix("export default async function "))
+        {
             let name = tail
                 .split(['(', '<', ' '])
                 .next()
@@ -5808,6 +5883,142 @@ fn framework_route_occurrence(
     }
 }
 
+fn tauri_command_canonical_id(command: &str) -> String {
+    format!("tauri:command:{}", command.trim())
+}
+
+fn tauri_command_label(command: &str) -> String {
+    format!(
+        "tauri command {} (tauri command; confidence=heuristic)",
+        command.trim()
+    )
+}
+
+fn tauri_command_node(file_id: NodeId, command: &str, line: u32) -> Node {
+    let canonical_id = tauri_command_canonical_id(command);
+    let label = tauri_command_label(command);
+    Node {
+        id: NodeId(generate_id(&canonical_id)),
+        kind: NodeKind::FUNCTION,
+        serialized_name: label.clone(),
+        qualified_name: Some(format!("framework::tauri::command::{}", command.trim())),
+        canonical_id: Some(canonical_id),
+        file_node_id: Some(file_id),
+        start_line: Some(line),
+        start_col: Some(1),
+        end_line: Some(line),
+        end_col: Some(label.len().max(1) as u32),
+    }
+}
+
+fn tauri_command_member_edge(file_id: NodeId, command_node_id: NodeId, line: u32) -> Edge {
+    Edge {
+        id: EdgeId(generate_edge_id(
+            file_id.0,
+            command_node_id.0,
+            EdgeKind::MEMBER,
+        )),
+        source: file_id,
+        target: command_node_id,
+        kind: EdgeKind::MEMBER,
+        file_node_id: Some(file_id),
+        line: Some(line),
+        certainty: Some(ResolutionCertainty::Certain),
+        confidence: Some(0.95),
+        ..Default::default()
+    }
+}
+
+fn tauri_command_invoke_edge(
+    file_id: NodeId,
+    source_id: NodeId,
+    command_node_id: NodeId,
+    invocation: &TauriCommandInvocation,
+    flags: IndexFeatureFlags,
+) -> Edge {
+    let mut edge = Edge {
+        id: EdgeId(0),
+        source: source_id,
+        target: command_node_id,
+        kind: EdgeKind::CALL,
+        file_node_id: Some(file_id),
+        line: Some(invocation.line),
+        certainty: Some(ResolutionCertainty::Uncertain),
+        confidence: Some(0.45),
+        ..Default::default()
+    };
+    ensure_callsite_identity(&mut edge, Some(invocation.col));
+    edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
+    edge
+}
+
+fn payload_collection_canonical_id(slug: &str) -> String {
+    format!("payload:collection:{}", slug.trim())
+}
+
+fn payload_collection_label(slug: &str) -> String {
+    format!(
+        "payload collection {} (collection; confidence=heuristic)",
+        slug.trim()
+    )
+}
+
+fn payload_collection_node(file_id: NodeId, slug: &str, line: u32, col: u32) -> Node {
+    let canonical_id = payload_collection_canonical_id(slug);
+    let label = payload_collection_label(slug);
+    Node {
+        id: NodeId(generate_id(&canonical_id)),
+        kind: NodeKind::MODULE,
+        serialized_name: label.clone(),
+        qualified_name: Some(format!("framework::payload::collection::{}", slug.trim())),
+        canonical_id: Some(canonical_id),
+        file_node_id: Some(file_id),
+        start_line: Some(line),
+        start_col: Some(col),
+        end_line: Some(line),
+        end_col: Some(col.saturating_add(slug.len() as u32)),
+    }
+}
+
+fn payload_collection_member_edge(file_id: NodeId, collection_node_id: NodeId, line: u32) -> Edge {
+    Edge {
+        id: EdgeId(generate_edge_id(
+            file_id.0,
+            collection_node_id.0,
+            EdgeKind::MEMBER,
+        )),
+        source: file_id,
+        target: collection_node_id,
+        kind: EdgeKind::MEMBER,
+        file_node_id: Some(file_id),
+        line: Some(line),
+        certainty: Some(ResolutionCertainty::Probable),
+        confidence: Some(0.70),
+        ..Default::default()
+    }
+}
+
+fn payload_collection_occurrence(
+    file_id: NodeId,
+    collection_node_id: NodeId,
+    slug: &str,
+    line: u32,
+    col: u32,
+    kind: OccurrenceKind,
+) -> Occurrence {
+    Occurrence {
+        element_id: collection_node_id.0,
+        kind,
+        location: SourceLocation {
+            file_node_id: file_id,
+            start_line: line,
+            start_col: col,
+            end_line: line,
+            end_col: col.saturating_add(slug.len() as u32),
+        },
+    }
+}
+
 struct FrameworkRouteSinks<'a> {
     unique_nodes: &'a mut HashMap<NodeId, Node>,
     result_edges: &'a mut Vec<Edge>,
@@ -5906,6 +6117,31 @@ fn find_framework_route_handler(
         .map(|node| node.id)
 }
 
+fn find_registered_tauri_command_function(
+    nodes: &HashMap<NodeId, Node>,
+    command_name: &str,
+) -> Option<NodeId> {
+    let mut matches = nodes
+        .values()
+        .filter(|node| {
+            is_callable_kind(node.kind)
+                && !node
+                    .canonical_id
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("tauri:command:"))
+                && node_matches_name(node, command_name)
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|node| {
+        (
+            node.start_line.unwrap_or(u32::MAX),
+            node_span_width(node),
+            node.id,
+        )
+    });
+    matches.first().map(|node| node.id)
+}
+
 fn non_impl_anchor_canonical_predicate() -> &'static str {
     "AND (canonical_id IS NULL OR canonical_id NOT LIKE 'impl_anchor:%')"
 }
@@ -5977,6 +6213,172 @@ fn append_schema_endpoint_call_edges(
     }
 }
 
+struct FrameworkSymbolSinks<'a> {
+    unique_nodes: &'a mut HashMap<NodeId, Node>,
+    result_edges: &'a mut Vec<Edge>,
+    result_occurrences: &'a mut Vec<Occurrence>,
+    component_access_by_node_id: &'a mut HashMap<NodeId, AccessKind>,
+    edge_keys: &'a mut HashSet<EdgeDedupKey>,
+    callsite_ordinals: &'a mut HashMap<(NodeId, Option<u32>), u32>,
+}
+
+fn append_tauri_command_registrations(
+    language_name: &str,
+    source: &str,
+    file_id: NodeId,
+    flags: IndexFeatureFlags,
+    sinks: &mut FrameworkSymbolSinks<'_>,
+) {
+    if language_name != "rust" {
+        return;
+    }
+
+    for registration in collect_tauri_command_registrations(source) {
+        let command_node = tauri_command_node(file_id, &registration.command, registration.line);
+        let command_node_id = command_node.id;
+        sinks
+            .unique_nodes
+            .entry(command_node_id)
+            .or_insert(command_node);
+        sinks
+            .component_access_by_node_id
+            .insert(command_node_id, AccessKind::Public);
+        sinks.result_occurrences.push(payload_collection_occurrence(
+            file_id,
+            command_node_id,
+            &registration.command,
+            registration.line,
+            1,
+            OccurrenceKind::DEFINITION,
+        ));
+
+        let mut member_edge =
+            tauri_command_member_edge(file_id, command_node_id, registration.line);
+        if sinks.edge_keys.insert(edge_dedup_key(&member_edge, flags)) {
+            member_edge.id = EdgeId(generate_edge_id_for_edge(&member_edge, flags));
+            sinks.result_edges.push(member_edge);
+        }
+
+        let Some(function_id) =
+            find_registered_tauri_command_function(sinks.unique_nodes, &registration.command)
+        else {
+            continue;
+        };
+        if function_id == command_node_id {
+            continue;
+        }
+        let mut call_edge = Edge {
+            id: EdgeId(0),
+            source: command_node_id,
+            target: function_id,
+            kind: EdgeKind::CALL,
+            file_node_id: Some(file_id),
+            line: Some(registration.line),
+            certainty: Some(ResolutionCertainty::Probable),
+            confidence: Some(0.70),
+            ..Default::default()
+        };
+        let next = sinks
+            .callsite_ordinals
+            .entry((function_id, call_edge.line))
+            .or_insert(0);
+        *next = next.saturating_add(1);
+        ensure_callsite_identity(&mut call_edge, Some(*next));
+        if !sinks.edge_keys.insert(edge_dedup_key(&call_edge, flags)) {
+            continue;
+        }
+        call_edge.id = EdgeId(generate_edge_id_for_edge(&call_edge, flags));
+        sinks.result_edges.push(call_edge);
+    }
+}
+
+fn append_payload_collection_symbols(
+    language_name: &str,
+    source: &str,
+    file_id: NodeId,
+    flags: IndexFeatureFlags,
+    sinks: &mut FrameworkSymbolSinks<'_>,
+) {
+    if !matches!(language_name, "javascript" | "typescript" | "tsx") {
+        return;
+    }
+
+    for registration in collect_payload_collection_registrations(source) {
+        let collection_node =
+            payload_collection_node(file_id, &registration.slug, registration.line, 1);
+        let collection_node_id = collection_node.id;
+        sinks
+            .unique_nodes
+            .entry(collection_node_id)
+            .or_insert(collection_node);
+        sinks
+            .component_access_by_node_id
+            .insert(collection_node_id, AccessKind::Public);
+        sinks.result_occurrences.push(payload_collection_occurrence(
+            file_id,
+            collection_node_id,
+            &registration.slug,
+            registration.line,
+            1,
+            OccurrenceKind::DEFINITION,
+        ));
+
+        let mut member_edge =
+            payload_collection_member_edge(file_id, collection_node_id, registration.line);
+        if sinks.edge_keys.insert(edge_dedup_key(&member_edge, flags)) {
+            member_edge.id = EdgeId(generate_edge_id_for_edge(&member_edge, flags));
+            sinks.result_edges.push(member_edge);
+        }
+    }
+
+    for usage in collect_payload_collection_usages(source) {
+        let collection_node = payload_collection_node(file_id, &usage.slug, usage.line, usage.col);
+        let collection_node_id = collection_node.id;
+        sinks
+            .unique_nodes
+            .entry(collection_node_id)
+            .or_insert(collection_node);
+        sinks.result_occurrences.push(payload_collection_occurrence(
+            file_id,
+            collection_node_id,
+            &usage.slug,
+            usage.line,
+            usage.col,
+            OccurrenceKind::REFERENCE,
+        ));
+
+        let source_id =
+            enclosing_callable_node_id(sinks.unique_nodes, usage.line).unwrap_or(file_id);
+        if source_id == collection_node_id {
+            continue;
+        }
+        let mut edge = Edge {
+            id: EdgeId(0),
+            source: source_id,
+            target: collection_node_id,
+            kind: EdgeKind::USAGE,
+            file_node_id: Some(file_id),
+            line: Some(usage.line),
+            certainty: Some(ResolutionCertainty::Probable),
+            confidence: Some(0.65),
+            ..Default::default()
+        };
+        if edge.kind == EdgeKind::CALL && !flags.legacy_edge_identity {
+            let next = sinks
+                .callsite_ordinals
+                .entry((collection_node_id, edge.line))
+                .or_insert(0);
+            *next = next.saturating_add(1);
+            ensure_callsite_identity(&mut edge, Some(usage.col.saturating_add(*next)));
+        }
+        if !sinks.edge_keys.insert(edge_dedup_key(&edge, flags)) {
+            continue;
+        }
+        edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
+        sinks.result_edges.push(edge);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ApiEndpointCall {
     method: String,
@@ -6031,6 +6433,531 @@ fn quoted_string_literals(line: &str) -> Vec<(String, u32)> {
         out.push((value, index as u32 + 1));
     }
     out
+}
+
+fn code_before_line_comment(line: &str) -> &str {
+    let mut chars = line.char_indices().peekable();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    while let Some((index, ch)) = chars.next() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        if matches!(ch, '"' | '\'' | '`') {
+            quote = Some(ch);
+            continue;
+        }
+        if ch == '/'
+            && let Some((_, next)) = chars.peek()
+            && *next == '/'
+        {
+            return &line[..index];
+        }
+    }
+    line
+}
+
+fn quoted_value_after_key(line: &str, key: &str) -> Option<(String, u32)> {
+    let (_key_start, colon_index) = object_key_colon_index(line, key)?;
+    let value_tail = &line[colon_index + 1..];
+    let base = colon_index + 1;
+    quoted_string_literals(value_tail)
+        .into_iter()
+        .next()
+        .map(|(value, col)| (value, base as u32 + col))
+}
+
+fn object_key_colon_index(line: &str, key: &str) -> Option<(usize, usize)> {
+    let lower = line.to_ascii_lowercase();
+    let key_lower = key.to_ascii_lowercase();
+    for (key_start, _) in lower.match_indices(&key_lower) {
+        if key_start > 0
+            && lower[..key_start]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        {
+            continue;
+        }
+
+        let mut cursor = key_start + key_lower.len();
+        if lower[cursor..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        {
+            continue;
+        }
+        cursor = skip_ascii_whitespace(&lower, cursor);
+        if lower[cursor..].starts_with(':') {
+            return Some((key_start, cursor));
+        }
+    }
+    None
+}
+
+fn quoted_value_after_key_across_lines(
+    lines: &[&str],
+    line_index: usize,
+    key: &str,
+) -> Option<(String, u32, u32)> {
+    let line = lines.get(line_index)?;
+    if let Some((value, col)) = quoted_value_after_key(line, key) {
+        return Some((value, line_index as u32 + 1, col));
+    }
+
+    let code = code_before_line_comment(line);
+    object_key_colon_index(code, key)?;
+
+    for lookahead in 1..=2 {
+        let next_index = line_index + lookahead;
+        let Some(next_line) = lines.get(next_index) else {
+            break;
+        };
+        let next_code = code_before_line_comment(next_line).trim();
+        if next_code.is_empty() {
+            continue;
+        }
+        return quoted_string_literals(next_line)
+            .into_iter()
+            .next()
+            .map(|(value, col)| (value, next_index as u32 + 1, col));
+    }
+    None
+}
+
+fn structural_delta(line: &str, open: char, close: char) -> i32 {
+    let mut delta = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in code_before_line_comment(line).chars() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        if matches!(ch, '"' | '\'' | '`') {
+            quote = Some(ch);
+        } else if ch == open {
+            delta += 1;
+        } else if ch == close {
+            delta -= 1;
+        }
+    }
+    delta
+}
+
+fn collect_tauri_command_invocations(source: &str) -> Vec<TauriCommandInvocation> {
+    let mut invocations = Vec::new();
+    let mut seen = HashSet::new();
+    let mut pending_first_arg_lines = 0u8;
+    for (line_index, line) in source.lines().enumerate() {
+        let mut accepted = false;
+        for (literal, col) in quoted_string_literals(line) {
+            let pending_literal =
+                pending_first_arg_lines > 0 && is_pending_first_arg_literal(line, col);
+            if literal.trim().is_empty()
+                || (!is_tauri_invoke_context(line, col) && !pending_literal)
+            {
+                continue;
+            }
+            let command = literal.trim().to_string();
+            if seen.insert((command.clone(), line_index as u32 + 1, col)) {
+                invocations.push(TauriCommandInvocation {
+                    command,
+                    line: line_index as u32 + 1,
+                    col,
+                });
+            }
+            pending_first_arg_lines = 0;
+            accepted = true;
+            break;
+        }
+        if accepted {
+            continue;
+        }
+
+        if tauri_invoke_waits_for_first_arg(line) {
+            pending_first_arg_lines = 8;
+        } else if pending_first_arg_lines > 0 {
+            let code = code_before_line_comment(line).trim();
+            if code.is_empty() {
+                pending_first_arg_lines = pending_first_arg_lines.saturating_sub(1);
+            } else {
+                pending_first_arg_lines = 0;
+            }
+        }
+    }
+    invocations
+}
+
+fn is_tauri_invoke_context(line: &str, literal_col: u32) -> bool {
+    let literal_start = literal_col.saturating_sub(1) as usize;
+    let Some(before_literal) = line.get(..literal_start) else {
+        return false;
+    };
+    if has_line_comment_before_literal(before_literal) {
+        return false;
+    }
+    let Some(open_paren) = tauri_invoke_open_paren(before_literal) else {
+        return false;
+    };
+    before_literal[open_paren + 1..].trim().is_empty()
+}
+
+fn is_pending_first_arg_literal(line: &str, literal_col: u32) -> bool {
+    let literal_start = literal_col.saturating_sub(1) as usize;
+    let Some(before_literal) = line.get(..literal_start) else {
+        return false;
+    };
+    !has_line_comment_before_literal(before_literal) && before_literal.trim().is_empty()
+}
+
+fn tauri_invoke_waits_for_first_arg(line: &str) -> bool {
+    let code = code_before_line_comment(line);
+    let Some(open_paren) = tauri_invoke_open_paren(code) else {
+        return false;
+    };
+    code[open_paren + 1..].trim().is_empty()
+}
+
+fn tauri_invoke_open_paren(text: &str) -> Option<usize> {
+    let lower = text.to_ascii_lowercase();
+    for (index, _) in lower.match_indices("invoke") {
+        if index > 0
+            && lower[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            continue;
+        }
+
+        let mut cursor = index + "invoke".len();
+        cursor = skip_ascii_whitespace(&lower, cursor);
+        if lower[cursor..].starts_with("::") {
+            cursor += 2;
+            cursor = skip_ascii_whitespace(&lower, cursor);
+        }
+        if lower[cursor..].starts_with('<') {
+            let Some(generic_end) = lower[cursor..].find('>') else {
+                continue;
+            };
+            cursor += generic_end + 1;
+            cursor = skip_ascii_whitespace(&lower, cursor);
+        }
+        if lower[cursor..].starts_with('(') {
+            return Some(cursor);
+        }
+    }
+    None
+}
+
+fn skip_ascii_whitespace(text: &str, mut cursor: usize) -> usize {
+    while text
+        .as_bytes()
+        .get(cursor)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        cursor += 1;
+    }
+    cursor
+}
+
+fn collect_tauri_command_registrations(source: &str) -> Vec<TauriCommandRegistration> {
+    let mut registrations = Vec::new();
+    let mut seen = HashSet::new();
+    let mut pending_attr_line: Option<u32> = None;
+    let mut generate_handler_buffer: Option<(u32, String)> = None;
+
+    for (line_index, line) in source.lines().enumerate() {
+        let line_number = line_index as u32 + 1;
+        let trimmed = code_before_line_comment(line).trim();
+
+        if let Some((start_line, buffer)) = generate_handler_buffer.as_mut() {
+            if !trimmed.is_empty() {
+                buffer.push(' ');
+                buffer.push_str(trimmed);
+            }
+            if trimmed.contains(']') {
+                let commands = tauri_generate_handler_commands(buffer);
+                for command in commands {
+                    if seen.insert(command.clone()) {
+                        registrations.push(TauriCommandRegistration {
+                            command,
+                            line: *start_line,
+                        });
+                    }
+                }
+                generate_handler_buffer = None;
+            }
+            continue;
+        }
+
+        if trimmed.contains("tauri::generate_handler!") {
+            let mut buffer = trimmed.to_string();
+            if buffer.contains(']') {
+                for command in tauri_generate_handler_commands(&buffer) {
+                    if seen.insert(command.clone()) {
+                        registrations.push(TauriCommandRegistration {
+                            command,
+                            line: line_number,
+                        });
+                    }
+                }
+            } else {
+                generate_handler_buffer = Some((line_number, std::mem::take(&mut buffer)));
+            }
+        }
+
+        if trimmed.contains("#[tauri::command") {
+            pending_attr_line = Some(line_number);
+            continue;
+        }
+
+        let Some(attr_line) = pending_attr_line else {
+            continue;
+        };
+        if trimmed.is_empty() || trimmed.starts_with("#[") || trimmed.starts_with("//") {
+            continue;
+        }
+        if let Some(command) = rust_function_name(trimmed)
+            && seen.insert(command.clone())
+        {
+            registrations.push(TauriCommandRegistration {
+                command,
+                line: attr_line,
+            });
+        }
+        pending_attr_line = None;
+    }
+
+    registrations
+}
+
+fn tauri_generate_handler_commands(buffer: &str) -> Vec<String> {
+    let inside = buffer
+        .split_once('[')
+        .and_then(|(_, tail)| tail.rsplit_once(']').map(|(inside, _)| inside))
+        .unwrap_or_default();
+    inside
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':'))
+        .filter_map(|token| {
+            let name = token.rsplit("::").next().unwrap_or(token).trim();
+            if name.is_empty()
+                || matches!(
+                    name,
+                    "tauri" | "generate_handler" | "Builder" | "invoke_handler"
+                )
+            {
+                None
+            } else {
+                Some(name.to_string())
+            }
+        })
+        .collect()
+}
+
+fn rust_function_name(line: &str) -> Option<String> {
+    let (_, tail) = line.split_once("fn ")?;
+    let name = tail
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect::<String>();
+    (!name.is_empty()).then_some(name)
+}
+
+fn collect_payload_collection_registrations(source: &str) -> Vec<PayloadCollectionRegistration> {
+    let lower_source = source.to_ascii_lowercase();
+    if !lower_source.contains("collectionconfig") && !lower_source.contains("payload") {
+        return Vec::new();
+    }
+
+    let mut registrations = Vec::new();
+    let mut seen = HashSet::new();
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut block_start = 0usize;
+    let mut block_lines: Vec<&str> = Vec::new();
+    let mut brace_depth = 0i32;
+    let mut saw_open_brace = false;
+
+    for (line_index, line) in lines.iter().enumerate() {
+        let code = code_before_line_comment(line);
+        let starts_candidate =
+            block_lines.is_empty() && starts_payload_collection_config_block(code);
+        if starts_candidate {
+            block_start = line_index;
+            brace_depth = 0;
+            saw_open_brace = false;
+        }
+
+        if starts_candidate || !block_lines.is_empty() {
+            block_lines.push(line);
+            let delta = structural_delta(code, '{', '}');
+            if delta > 0 {
+                saw_open_brace = true;
+            }
+            brace_depth += delta;
+
+            if saw_open_brace && brace_depth <= 0 {
+                let block_text = block_lines.join("\n");
+                if block_text.to_ascii_lowercase().contains("collectionconfig")
+                    && let Some((slug, line, _col)) =
+                        quoted_value_after_key_in_block(&block_lines, block_start, "slug")
+                    && !slug.trim().is_empty()
+                    && seen.insert(slug.clone())
+                {
+                    registrations.push(PayloadCollectionRegistration { slug, line });
+                }
+                block_lines.clear();
+                brace_depth = 0;
+                saw_open_brace = false;
+            }
+        }
+    }
+    registrations
+}
+
+fn collect_payload_collection_usages(source: &str) -> Vec<PayloadCollectionUsage> {
+    let lower_source = source.to_ascii_lowercase();
+    if !lower_source.contains("payload.")
+        && !lower_source.contains("req.payload")
+        && !lower_source.contains("getpayload")
+    {
+        return Vec::new();
+    }
+
+    let mut usages = Vec::new();
+    let mut seen = HashSet::new();
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut pending_payload_call_lines = 0u8;
+    for (line_index, line) in lines.iter().enumerate() {
+        let code = code_before_line_comment(line);
+        if starts_payload_collection_call(code) {
+            pending_payload_call_lines = 16;
+        }
+
+        let trimmed = code.trim();
+        if pending_payload_call_lines == 0
+            || !trimmed.contains("collection")
+            || trimmed.contains("slug")
+        {
+            if pending_payload_call_lines > 0 {
+                pending_payload_call_lines =
+                    update_pending_payload_call(pending_payload_call_lines, code);
+            }
+            continue;
+        }
+
+        let Some((slug, value_line, col)) =
+            quoted_value_after_key_across_lines(&lines, line_index, "collection")
+        else {
+            pending_payload_call_lines =
+                update_pending_payload_call(pending_payload_call_lines, code);
+            continue;
+        };
+        if slug.trim().is_empty() {
+            pending_payload_call_lines =
+                update_pending_payload_call(pending_payload_call_lines, code);
+            continue;
+        }
+        if seen.insert((slug.clone(), value_line, col)) {
+            usages.push(PayloadCollectionUsage {
+                slug,
+                line: value_line,
+                col,
+            });
+        }
+        pending_payload_call_lines = update_pending_payload_call(pending_payload_call_lines, code);
+    }
+    usages
+}
+
+fn starts_payload_collection_config_block(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let trimmed = lower.trim_start();
+    let collection_config_declaration = lower.contains("collectionconfig")
+        && !trimmed.starts_with("import ")
+        && !trimmed.starts_with("type ");
+    collection_config_declaration
+        || (lower.contains("export const ") && lower.contains('{'))
+        || (lower.trim_start().starts_with("const ") && lower.contains('{'))
+}
+
+fn quoted_value_after_key_in_block(
+    block_lines: &[&str],
+    block_start: usize,
+    key: &str,
+) -> Option<(String, u32, u32)> {
+    for index in 0..block_lines.len() {
+        if !code_before_line_comment(block_lines[index]).contains(key) {
+            continue;
+        }
+        if let Some((value, line, col)) =
+            quoted_value_after_key_across_lines(block_lines, index, key)
+        {
+            return Some((value, block_start as u32 + line, col));
+        }
+    }
+    None
+}
+
+fn starts_payload_collection_call(line: &str) -> bool {
+    let compact = compact_lowercase(line);
+    [
+        "payload.find(",
+        "payload.findbyid(",
+        "payload.create(",
+        "payload.update(",
+        "payload.delete(",
+        "payload.count(",
+        "payload.restoreversion(",
+        "payload.deleteversion(",
+        "req.payload.find(",
+        "req.payload.findbyid(",
+        "req.payload.create(",
+        "req.payload.update(",
+        "req.payload.delete(",
+        "req.payload.count(",
+    ]
+    .iter()
+    .any(|needle| compact.contains(needle))
+}
+
+fn update_pending_payload_call(remaining: u8, line: &str) -> u8 {
+    if remaining == 0 {
+        return 0;
+    }
+    let delta = structural_delta(line, '(', ')');
+    if delta < 0 || code_before_line_comment(line).contains(");") {
+        0
+    } else if delta <= 0 && code_before_line_comment(line).contains(')') {
+        0
+    } else {
+        remaining.saturating_sub(1)
+    }
 }
 
 fn is_api_path_literal(value: &str) -> bool {
@@ -6601,6 +7528,34 @@ pub fn index_file(
         &mut SchemaEndpointEdgeSinks {
             unique_nodes: &mut unique_nodes,
             result_edges: &mut result_edges,
+            edge_keys: &mut edge_keys,
+            callsite_ordinals: &mut callsite_ordinals,
+        },
+    );
+    append_tauri_command_registrations(
+        language_config.language_name,
+        source,
+        file_id,
+        flags,
+        &mut FrameworkSymbolSinks {
+            unique_nodes: &mut unique_nodes,
+            result_edges: &mut result_edges,
+            result_occurrences: &mut result_occurrences,
+            component_access_by_node_id: &mut component_access_by_node_id,
+            edge_keys: &mut edge_keys,
+            callsite_ordinals: &mut callsite_ordinals,
+        },
+    );
+    append_payload_collection_symbols(
+        language_config.language_name,
+        source,
+        file_id,
+        flags,
+        &mut FrameworkSymbolSinks {
+            unique_nodes: &mut unique_nodes,
+            result_edges: &mut result_edges,
+            result_occurrences: &mut result_occurrences,
+            component_access_by_node_id: &mut component_access_by_node_id,
             edge_keys: &mut edge_keys,
             callsite_ordinals: &mut callsite_ordinals,
         },
@@ -9088,6 +10043,150 @@ function render() {
     }
 
     #[test]
+    fn test_text_only_svelte_tauri_invoke_indexes_uncertain_command_edge() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("App.svelte");
+        std::fs::write(
+            &path,
+            r#"
+<script lang="ts">
+  import { invoke } from "@tauri-apps/api/core";
+  export async function refresh() {
+    await invoke("get_snapshot");
+  }
+</script>
+"#,
+        )?;
+
+        let storage = index_text_only_file(&path)?;
+        let command = storage
+            .nodes
+            .iter()
+            .find(|node| node.canonical_id.as_deref() == Some("tauri:command:get_snapshot"))
+            .expect("tauri command node");
+
+        assert_eq!(command.kind, NodeKind::FUNCTION);
+        assert!(command.serialized_name.contains("get_snapshot"));
+        assert!(storage.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.target == command.id
+                && edge.certainty == Some(ResolutionCertainty::Uncertain)
+                && edge.confidence == Some(0.45)
+        }));
+        assert!(storage.occurrences.iter().any(|occurrence| {
+            occurrence.element_id == command.id.0 && occurrence.kind == OccurrenceKind::REFERENCE
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_svelte_tauri_invoke_variants_are_bounded_to_first_argument() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("App.svelte");
+        std::fs::write(
+            &path,
+            r#"
+<script lang="ts">
+  import { invoke } from "@tauri-apps/api/core";
+
+  export async function refresh() {
+    await invoke<Snapshot>(
+      "get_snapshot",
+      { label: "not_a_command" }
+    );
+    await window.__TAURI__.core.invoke("save_config", { name: "also_not_a_command" });
+    await invoke(commandName, { label: "dynamic_arg_not_command" });
+    // invoke("commented_out")
+  }
+</script>
+"#,
+        )?;
+
+        let storage = index_text_only_file(&path)?;
+        let canonical_ids = storage
+            .nodes
+            .iter()
+            .filter_map(|node| node.canonical_id.as_deref())
+            .collect::<Vec<_>>();
+
+        assert!(canonical_ids.contains(&"tauri:command:get_snapshot"));
+        assert!(canonical_ids.contains(&"tauri:command:save_config"));
+        assert!(!canonical_ids.contains(&"tauri:command:not_a_command"));
+        assert!(!canonical_ids.contains(&"tauri:command:also_not_a_command"));
+        assert!(!canonical_ids.contains(&"tauri:command:dynamic_arg_not_command"));
+        assert!(!canonical_ids.contains(&"tauri:command:commented_out"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_rust_tauri_command_registration_indexes_command_symbol_and_boundary() -> Result<()> {
+        let code = r#"
+#[tauri::command]
+async fn get_snapshot() -> String {
+    String::new()
+}
+
+pub fn build() {
+    tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![get_snapshot]);
+}
+"#;
+        let language_config = get_language_for_ext("rs").expect("rust config");
+        let result = index_file(
+            Path::new("src-tauri/src/lib.rs"),
+            code,
+            &language_config,
+            None,
+            None,
+        )?;
+        let command = result
+            .nodes
+            .iter()
+            .find(|node| node.canonical_id.as_deref() == Some("tauri:command:get_snapshot"))
+            .expect("tauri command node");
+        let function = result
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name == "get_snapshot" && node.kind == NodeKind::FUNCTION)
+            .expect("rust command function");
+
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::MEMBER
+                && edge.target == command.id
+                && edge.certainty == Some(ResolutionCertainty::Certain)
+        }));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.source == command.id
+                && edge.target == function.id
+                && edge.certainty == Some(ResolutionCertainty::Probable)
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_tauri_generate_handler_parses_multiline_modules_and_ignores_comments() {
+        let registrations = collect_tauri_command_registrations(
+            r#"
+pub fn build() {
+    tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            commands::get_snapshot,
+            save_config,
+            // commented_out,
+        ]);
+}
+"#,
+        );
+        let commands = registrations
+            .iter()
+            .map(|registration| registration.command.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(commands, vec!["get_snapshot", "save_config"]);
+    }
+
+    #[test]
     fn test_typescript_framework_routes_index_express_react_and_sveltekit() -> Result<()> {
         let code = r#"
 import { Route } from "react-router-dom";
@@ -9363,6 +10462,134 @@ web::resource("/actix").route(web::get().to(handler));
         assert!(canonical_id.contains(r#""raw_path":"/api/users/[id]""#));
         assert!(canonical_id.contains(r#""params":["id"]"#));
         assert!(canonical_id.contains(r#""source_convention":"file_convention""#));
+    }
+
+    #[test]
+    fn test_next_payload_collection_registration_and_page_usage_surface() -> Result<()> {
+        let code = r#"
+import type { CollectionConfig } from "payload";
+
+export const Posts: CollectionConfig = {
+  slug: "posts",
+};
+
+export async function loadWriting(payload: any) {
+  return payload.find({ collection: "posts", limit: 10 });
+}
+
+async function getCommentAuth() {
+  return { user: null };
+}
+
+async function getElsewhereFeed() {
+  return [];
+}
+
+function ElsewhereFeed(_props: { entries: unknown[] }) {
+  return null;
+}
+
+export default async function Page() {
+  const auth = await getCommentAuth();
+  const entries = await getElsewhereFeed();
+  return <ElsewhereFeed entries={entries} auth={auth} />;
+}
+"#;
+        let language_config = get_language_for_ext("tsx").expect("tsx config");
+        let result = index_file(
+            Path::new("app/writing/[slug]/page.tsx"),
+            code,
+            &language_config,
+            None,
+            None,
+        )?;
+        let route = result
+            .nodes
+            .iter()
+            .find(|node| {
+                node.serialized_name
+                    == "GET /writing/:slug (nextjs route; confidence=file_convention)"
+            })
+            .expect("next page route node");
+        let page = result
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name == "Page" && node.kind == NodeKind::FUNCTION)
+            .expect("Page function node");
+        let collection = result
+            .nodes
+            .iter()
+            .find(|node| node.canonical_id.as_deref() == Some("payload:collection:posts"))
+            .expect("payload collection node");
+        let loader = result
+            .nodes
+            .iter()
+            .find(|node| node.serialized_name == "loadWriting" && node.kind == NodeKind::FUNCTION)
+            .expect("loadWriting function node");
+
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.source == route.id
+                && edge.target == page.id
+                && edge.certainty == Some(ResolutionCertainty::Probable)
+        }));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::USAGE
+                && edge.source == loader.id
+                && edge.target == collection.id
+                && edge.certainty == Some(ResolutionCertainty::Probable)
+        }));
+        assert!(result.occurrences.iter().any(|occurrence| {
+            occurrence.element_id == collection.id.0
+                && occurrence.kind == OccurrenceKind::DEFINITION
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_payload_collection_extraction_handles_multiline_and_ignores_noise() {
+        let code = r#"
+import type { CollectionConfig } from "payload";
+
+const UiMetadata = {
+  slug: "not-a-collection",
+};
+
+export const Posts = {
+  slug:
+    "posts",
+  fields: []
+} satisfies CollectionConfig;
+
+export const Comments: CollectionConfig =
+{
+  slug: "comments",
+  fields: []
+};
+
+export async function loadWriting(payload: any) {
+  const props = { collection: "not_a_payload_call" };
+  await payload.find({
+    collection:
+      "posts",
+    where: { title: { equals: "not_a_collection" } },
+  });
+  return req.payload.create({ collection: "comments", data: {} });
+}
+"#;
+        let registrations = collect_payload_collection_registrations(code);
+        let registered = registrations
+            .iter()
+            .map(|registration| registration.slug.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(registered, vec!["posts", "comments"]);
+
+        let usages = collect_payload_collection_usages(code);
+        let used = usages
+            .iter()
+            .map(|usage| usage.slug.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(used, vec!["posts", "comments"]);
     }
 
     #[test]

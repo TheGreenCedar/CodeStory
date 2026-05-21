@@ -4,12 +4,14 @@ use clap_complete::{Shell, generate};
 use codestory_contracts::api::{
     AffectedAnalysisRequest, AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto,
     AgentResponseModeDto, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto,
-    AppEventPayload, BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest,
-    CreateBookmarkRequest, GraphArtifactDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode,
-    IndexedFilesRequest, NodeId, NodeKind, NodeOccurrencesRequest, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto, SearchHit, SearchHybridLimitsDto,
-    SearchMatchQualityDto, SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest,
-    SourceOccurrenceDto, TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection,
+    AnswerReadinessReportDto, AppEventPayload, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto,
+    CreateBookmarkCategoryRequest, CreateBookmarkRequest, EvidenceItemDto, EvidencePacketDto,
+    EvidenceSourceLocationDto, EvidenceTypeDto, GraphArtifactDto, IndexFreshnessDto,
+    IndexFreshnessStatusDto, IndexMode, IndexedFilesRequest, NodeId, NodeKind,
+    NodeOccurrencesRequest, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
+    RetrievalScoreBreakdownDto, SearchHit, SearchHybridLimitsDto, SearchMatchQualityDto,
+    SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest, SourceOccurrenceDto,
+    SourceTruthCheckDto, TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection,
     TrailMode,
 };
 use std::{
@@ -887,6 +889,15 @@ fn run_drill(cmd: DrillCommand) -> Result<()> {
     dedupe_verification_targets(&mut all_verification_targets);
     let bridge_outputs = run_drill_bridges(&runtime, &cmd.output_dir, cmd.format, &anchor_outputs);
     let claim_ledger_template = drill_claim_ledger_template(&anchor_outputs, &bridge_outputs);
+    let next_commands = drill_next_commands(&runtime.project_root, &cmd.anchors);
+    let evidence_packet = drill_evidence_packet(
+        cmd.question.as_deref(),
+        question_search.as_ref(),
+        &anchor_outputs,
+        &bridge_outputs,
+        &all_verification_targets,
+        &next_commands,
+    );
 
     let output = DrillOutput {
         project: display::clean_path_string(&opened.summary.root),
@@ -910,10 +921,11 @@ fn run_drill(cmd: DrillCommand) -> Result<()> {
         anchors: anchor_outputs,
         bridges: bridge_outputs,
         verification_targets: all_verification_targets,
+        evidence_packet,
         answer_quality_contract: drill_answer_quality_contract(),
         claim_ledger_template,
         verification_checklist: drill_verification_checklist(),
-        next_commands: drill_next_commands(&runtime.project_root, &cmd.anchors),
+        next_commands,
     };
 
     let markdown = render_drill_markdown(&output);
@@ -1961,6 +1973,346 @@ fn dedupe_verification_targets(targets: &mut Vec<VerificationTargetOutput>) {
             target.reason.clone(),
         ))
     });
+}
+
+fn drill_evidence_packet(
+    question: Option<&str>,
+    question_search: Option<&DrillCommandStatusOutput>,
+    anchors: &[DrillAnchorOutput],
+    bridges: &[DrillBridgeOutput],
+    verification_targets: &[VerificationTargetOutput],
+    next_commands: &[String],
+) -> EvidencePacketDto {
+    let mut items = Vec::new();
+    if let Some(status) = question_search {
+        items.push(evidence_item_from_command(
+            "question-search",
+            EvidenceTypeDto::SearchHit,
+            status,
+            "medium",
+            ClaimReadinessDto::Partial,
+            vec![
+                "natural-language search is discovery evidence; source-truth verification is still required"
+                    .to_string(),
+            ],
+        ));
+    }
+
+    for (index, anchor) in anchors.iter().enumerate() {
+        let anchor_id = format!("anchor-{}", index + 1);
+        match anchor.chosen_anchor.as_ref() {
+            Some(hit) => items.push(evidence_item_from_hit(&anchor_id, anchor, hit)),
+            None => items.push(EvidenceItemDto {
+                id: anchor_id.clone(),
+                evidence_type: EvidenceTypeDto::Negative,
+                command: format!("search {}", anchor.anchor),
+                status: "no_resolvable_anchor".to_string(),
+                confidence: "low".to_string(),
+                verification_status: ClaimReadinessDto::NeedsSourceRead,
+                match_quality: None,
+                source: None,
+                artifacts: drill_command_artifacts(&anchor.commands),
+                notes: vec![
+                    "no typed/resolvable anchor was selected; do not make architecture claims from this anchor"
+                        .to_string(),
+                ],
+            }),
+        }
+
+        for (command_index, status) in anchor.commands.iter().enumerate() {
+            items.push(evidence_item_from_command(
+                &format!("{anchor_id}-command-{}", command_index + 1),
+                evidence_type_for_drill_command(&status.command),
+                status,
+                if status.status == "ok" {
+                    "medium"
+                } else {
+                    "low"
+                },
+                readiness_for_drill_command(status),
+                drill_command_notes(status),
+            ));
+        }
+    }
+
+    for (index, bridge) in bridges.iter().enumerate() {
+        items.push(evidence_item_from_bridge(index + 1, bridge));
+    }
+
+    let source_truth_checks = source_truth_checks_from_targets(verification_targets);
+    let readiness = drill_answer_readiness(&items, &source_truth_checks, next_commands);
+    EvidencePacketDto {
+        packet_version: 1,
+        question: question.map(ToOwned::to_owned),
+        items,
+        readiness,
+    }
+}
+
+fn evidence_item_from_hit(
+    id: &str,
+    anchor: &DrillAnchorOutput,
+    hit: &SearchHitOutput,
+) -> EvidenceItemDto {
+    let is_repo_text = matches!(
+        hit.origin,
+        codestory_contracts::api::SearchHitOrigin::TextMatch
+    ) || !hit.resolvable;
+    EvidenceItemDto {
+        id: id.to_string(),
+        evidence_type: if is_repo_text {
+            EvidenceTypeDto::RepoText
+        } else {
+            EvidenceTypeDto::SearchHit
+        },
+        command: format!("search {}", anchor.anchor),
+        status: "selected_anchor".to_string(),
+        confidence: if is_repo_text { "low" } else { "high" }.to_string(),
+        verification_status: if is_repo_text {
+            ClaimReadinessDto::NeedsSourceRead
+        } else {
+            ClaimReadinessDto::Anchored
+        },
+        match_quality: Some(hit.match_quality),
+        source: hit
+            .file_path
+            .as_ref()
+            .map(|path| EvidenceSourceLocationDto {
+                path: path.clone(),
+                line_start: hit.line,
+                line_end: hit.line,
+            }),
+        artifacts: drill_command_artifacts(&anchor.commands),
+        notes: evidence_hit_notes(anchor, hit),
+    }
+}
+
+fn evidence_hit_notes(anchor: &DrillAnchorOutput, hit: &SearchHitOutput) -> Vec<String> {
+    let mut notes = Vec::new();
+    notes.push(format!("typed_hit_count={}", anchor.typed_hit_count));
+    if matches!(
+        hit.origin,
+        codestory_contracts::api::SearchHitOrigin::TextMatch
+    ) {
+        notes.push(
+            "repo-text hits are file/line hints only; choose a typed symbol before graph browsing"
+                .to_string(),
+        );
+    }
+    if hit.verification_targets.is_empty() {
+        notes.push("no source occurrence metadata was available for this selected hit".to_string());
+    }
+    notes
+}
+
+fn evidence_item_from_command(
+    id: &str,
+    evidence_type: EvidenceTypeDto,
+    status: &DrillCommandStatusOutput,
+    confidence: &str,
+    verification_status: ClaimReadinessDto,
+    mut notes: Vec<String>,
+) -> EvidenceItemDto {
+    if let Some(error) = status.error.as_ref() {
+        notes.push(format!("command error: {error}"));
+    }
+    EvidenceItemDto {
+        id: id.to_string(),
+        evidence_type: if status.status == "ok" {
+            evidence_type
+        } else {
+            EvidenceTypeDto::Negative
+        },
+        command: status.command.clone(),
+        status: status.status.clone(),
+        confidence: confidence.to_string(),
+        verification_status,
+        match_quality: None,
+        source: None,
+        artifacts: status.artifact.iter().cloned().collect(),
+        notes,
+    }
+}
+
+fn evidence_item_from_bridge(index: usize, bridge: &DrillBridgeOutput) -> EvidenceItemDto {
+    let evidence = &bridge.evidence;
+    let verification_status = match evidence.status.as_str() {
+        "graph_path" => ClaimReadinessDto::Supported,
+        "reverse_graph_path" | "shared_file_only" => ClaimReadinessDto::Partial,
+        "no_bridge_found" | "unresolved_anchor" | "error" => ClaimReadinessDto::NeedsSourceRead,
+        _ => ClaimReadinessDto::Inferred,
+    };
+    EvidenceItemDto {
+        id: format!("bridge-{index}"),
+        evidence_type: if bridge.command.status == "ok" {
+            EvidenceTypeDto::Bridge
+        } else {
+            EvidenceTypeDto::Negative
+        },
+        command: bridge.command.command.clone(),
+        status: evidence.status.clone(),
+        confidence: evidence.confidence.clone(),
+        verification_status,
+        match_quality: None,
+        source: None,
+        artifacts: bridge.command.artifact.iter().cloned().collect(),
+        notes: evidence.notes.clone(),
+    }
+}
+
+fn evidence_type_for_drill_command(command: &str) -> EvidenceTypeDto {
+    match command {
+        "search" | "question_search" => EvidenceTypeDto::SearchHit,
+        "symbol" => EvidenceTypeDto::SymbolContext,
+        "trail" => EvidenceTypeDto::Trail,
+        "snippet" => EvidenceTypeDto::Snippet,
+        "explore" => EvidenceTypeDto::Explore,
+        "bridge" => EvidenceTypeDto::Bridge,
+        _ => EvidenceTypeDto::Negative,
+    }
+}
+
+fn readiness_for_drill_command(status: &DrillCommandStatusOutput) -> ClaimReadinessDto {
+    if status.status != "ok" {
+        return ClaimReadinessDto::NeedsSourceRead;
+    }
+    match status.command.as_str() {
+        "symbol" | "snippet" | "explore" => ClaimReadinessDto::Supported,
+        "trail" => ClaimReadinessDto::Partial,
+        "search" | "question_search" => ClaimReadinessDto::Anchored,
+        _ => ClaimReadinessDto::Partial,
+    }
+}
+
+fn drill_command_notes(status: &DrillCommandStatusOutput) -> Vec<String> {
+    match status.command.as_str() {
+        "search" | "question_search" => {
+            vec!["search is anchor discovery, not final source-truth verification".to_string()]
+        }
+        "trail" => vec![
+            "trail evidence may omit speculative edges and should be checked against snippets/source when architecture direction matters"
+                .to_string(),
+        ],
+        "snippet" => vec!["snippet is source-backed local context for the selected target".to_string()],
+        "explore" => vec!["explore packet broadens nearby files and related symbols".to_string()],
+        _ => Vec::new(),
+    }
+}
+
+fn drill_command_artifacts(commands: &[DrillCommandStatusOutput]) -> Vec<String> {
+    commands
+        .iter()
+        .filter_map(|command| command.artifact.clone())
+        .collect()
+}
+
+fn source_truth_checks_from_targets(
+    targets: &[VerificationTargetOutput],
+) -> Vec<SourceTruthCheckDto> {
+    targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| SourceTruthCheckDto {
+            id: format!("source-truth-{}", index + 1),
+            reason: target.reason.clone(),
+            path: target.path.clone(),
+            line: Some(target.line),
+            required: true,
+        })
+        .collect()
+}
+
+fn drill_answer_readiness(
+    items: &[EvidenceItemDto],
+    source_truth_checks: &[SourceTruthCheckDto],
+    next_commands: &[String],
+) -> AnswerReadinessReportDto {
+    let overall_status = if source_truth_checks.is_empty()
+        || items.iter().any(|item| {
+            matches!(
+                item.verification_status,
+                ClaimReadinessDto::NeedsSourceRead | ClaimReadinessDto::ContradictedBySource
+            )
+        }) {
+        ClaimReadinessDto::NeedsSourceRead
+    } else if items
+        .iter()
+        .any(|item| matches!(item.verification_status, ClaimReadinessDto::Partial))
+    {
+        ClaimReadinessDto::Partial
+    } else {
+        ClaimReadinessDto::Supported
+    };
+
+    let mut safe_to_say = Vec::new();
+    let mut inferred_claims = Vec::new();
+    let mut needs_verification = Vec::new();
+    for item in items {
+        match item.verification_status {
+            ClaimReadinessDto::Anchored | ClaimReadinessDto::Supported => {
+                safe_to_say.push(format!(
+                    "{} evidence `{}` is available with {} confidence",
+                    evidence_type_label(item.evidence_type),
+                    item.id,
+                    item.confidence
+                ));
+            }
+            ClaimReadinessDto::Partial | ClaimReadinessDto::Inferred => {
+                inferred_claims.push(format!(
+                    "{} evidence `{}` is {} and must not be presented as verified architecture",
+                    evidence_type_label(item.evidence_type),
+                    item.id,
+                    readiness_label(item.verification_status)
+                ));
+            }
+            ClaimReadinessDto::NeedsSourceRead | ClaimReadinessDto::ContradictedBySource => {
+                needs_verification.push(format!(
+                    "{} evidence `{}` requires source-truth verification",
+                    evidence_type_label(item.evidence_type),
+                    item.id
+                ));
+            }
+        }
+    }
+    if source_truth_checks.is_empty() {
+        needs_verification.push(
+            "no source-truth targets were emitted; verify candidate source files before finalizing"
+                .to_string(),
+        );
+    }
+
+    AnswerReadinessReportDto {
+        overall_status,
+        safe_to_say,
+        inferred_claims,
+        needs_verification,
+        next_commands: next_commands.to_vec(),
+        source_truth_checks: source_truth_checks.to_vec(),
+    }
+}
+
+fn evidence_type_label(evidence_type: EvidenceTypeDto) -> &'static str {
+    match evidence_type {
+        EvidenceTypeDto::SearchHit => "search",
+        EvidenceTypeDto::SymbolContext => "symbol",
+        EvidenceTypeDto::Trail => "trail",
+        EvidenceTypeDto::Snippet => "snippet",
+        EvidenceTypeDto::Explore => "explore",
+        EvidenceTypeDto::Bridge => "bridge",
+        EvidenceTypeDto::RepoText => "repo-text",
+        EvidenceTypeDto::Negative => "negative",
+    }
+}
+
+fn readiness_label(readiness: ClaimReadinessDto) -> &'static str {
+    match readiness {
+        ClaimReadinessDto::Anchored => "anchored",
+        ClaimReadinessDto::Supported => "supported",
+        ClaimReadinessDto::Partial => "partial",
+        ClaimReadinessDto::Inferred => "inferred",
+        ClaimReadinessDto::NeedsSourceRead => "needs_source_read",
+        ClaimReadinessDto::ContradictedBySource => "contradicted_by_source",
+    }
 }
 
 fn drill_next_commands(project_root: &std::path::Path, anchors: &[String]) -> Vec<String> {
@@ -4959,6 +5311,87 @@ mod tests {
         assert_eq!(
             output_slug("getElsewhereFeed() / posts"),
             "getElsewhereFeed-posts"
+        );
+    }
+
+    #[test]
+    fn drill_evidence_packet_marks_partial_readiness_and_source_checks() {
+        let mut anchor = sample_drill_anchor("WorkspaceIndexer", "a");
+        anchor.commands.push(DrillCommandStatusOutput {
+            command: "search".to_string(),
+            status: "ok".to_string(),
+            artifact: Some("WorkspaceIndexer-search.md".to_string()),
+            error: None,
+        });
+        anchor.verification_targets.push(VerificationTargetOutput {
+            role: "definition".to_string(),
+            path: "crates/codestory-indexer/src/lib.rs".to_string(),
+            line: 644,
+            node_ref: Some("crates/codestory-indexer/src/lib.rs:644:WorkspaceIndexer".to_string()),
+            reason: "selected symbol definition".to_string(),
+        });
+        let bridge = DrillBridgeOutput {
+            evidence: fallback_drill_bridge(
+                Path::new("C:/repo"),
+                &anchor,
+                &sample_drill_anchor("SearchService", "b"),
+                anchor.chosen_anchor.clone().expect("from"),
+                sample_search_hit_output("b", "SearchService"),
+                &sample_bridge_trail(false),
+                Vec::new(),
+            ),
+            command: DrillCommandStatusOutput {
+                command: "bridge".to_string(),
+                status: "ok".to_string(),
+                artifact: Some("bridge.md".to_string()),
+                error: None,
+            },
+        };
+        let next_commands = vec![
+            "codestory-cli search --project C:/repo --query WorkspaceIndexer --refresh none"
+                .to_string(),
+        ];
+
+        let packet = drill_evidence_packet(
+            Some("How does indexing flow?"),
+            None,
+            &[anchor.clone()],
+            &[bridge],
+            &anchor.verification_targets,
+            &next_commands,
+        );
+
+        assert_eq!(packet.packet_version, 1);
+        assert!(
+            packet.items.iter().any(|item| item.id == "anchor-1"
+                && item.verification_status == ClaimReadinessDto::Anchored)
+        );
+        assert!(packet.items.iter().any(|item| item.id == "bridge-1"
+            && item.verification_status == ClaimReadinessDto::NeedsSourceRead));
+        assert_eq!(
+            packet.readiness.overall_status,
+            ClaimReadinessDto::NeedsSourceRead
+        );
+        assert_eq!(packet.readiness.source_truth_checks.len(), 1);
+        assert_eq!(packet.readiness.next_commands, next_commands);
+    }
+
+    #[test]
+    fn drill_evidence_packet_requires_source_truth_targets() {
+        let anchor = sample_drill_anchor("WorkspaceIndexer", "a");
+
+        let packet = drill_evidence_packet(None, None, &[anchor], &[], &[], &[]);
+
+        assert_eq!(
+            packet.readiness.overall_status,
+            ClaimReadinessDto::NeedsSourceRead
+        );
+        assert!(
+            packet
+                .readiness
+                .needs_verification
+                .iter()
+                .any(|item| item.contains("no source-truth targets were emitted"))
         );
     }
 

@@ -958,10 +958,18 @@ impl AppController {
         let path = node
             .file_path
             .clone()
-            .ok_or_else(|| ApiError::invalid_argument("Symbol has no source file."))?;
+            .ok_or_else(|| {
+                ApiError::invalid_argument(
+                    "Symbol has no source file; use symbol/trail children or occurrences to choose a path-backed anchor.",
+                )
+            })?;
         let line = node
             .start_line
-            .ok_or_else(|| ApiError::invalid_argument("Symbol has no source line."))?;
+            .ok_or_else(|| {
+                ApiError::invalid_argument(
+                    "Symbol has no source line; use occurrences or a child method before requesting a snippet.",
+                )
+            })?;
         let (path, bounded) = self.bounded_file_snippet(
             &path,
             line,
@@ -991,10 +999,18 @@ impl AppController {
         let path = node
             .file_path
             .clone()
-            .ok_or_else(|| ApiError::invalid_argument("Symbol has no source file."))?;
+            .ok_or_else(|| {
+                ApiError::invalid_argument(
+                    "Symbol has no source file; use symbol/trail children or occurrences to choose a path-backed anchor.",
+                )
+            })?;
         let line = node
             .start_line
-            .ok_or_else(|| ApiError::invalid_argument("Symbol has no source line."))?;
+            .ok_or_else(|| {
+                ApiError::invalid_argument(
+                    "Symbol has no source line; use occurrences or a child method before requesting a snippet.",
+                )
+            })?;
         let Some(end_line) = node.end_line.filter(|end| *end >= line) else {
             return self.snippet_context(node.id.clone(), context_lines);
         };

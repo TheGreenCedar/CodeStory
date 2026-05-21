@@ -1,0 +1,23 @@
+{
+  "name": "overclaim_trap",
+  "question": "Expose an overclaim trap where a high-confidence answer invents direct UI rendering.",
+  "expected_anchors": ["Posts", "getElsewhereFeed", "RootRuntimeHome"],
+  "decisive_evidence": ["Posts", "getElsewhereFeed"],
+  "required_bridges": [
+    { "from": "Posts", "to": "RootRuntimeHome" }
+  ],
+  "repo_text_dependencies": ["src/app/(frontend)/page.tsx"],
+  "claim_ledger": {
+    "claims": [
+      {
+        "id": "overclaim-direct-render",
+        "text": "getElsewhereFeed directly renders the public homepage feed.",
+        "confidence": 0.92,
+        "state": "unsupported",
+        "anchors": ["getElsewhereFeed"],
+        "overclaim": true,
+        "evidence": []
+      }
+    ]
+  }
+}

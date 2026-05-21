@@ -1,0 +1,75 @@
+{
+  "name": "real_batcave",
+  "local_only": true,
+  "project_root": "BatCave",
+  "question": "Explain how the Tauri runtime collects telemetry, stores runtime state, and exposes snapshots/controls to the app.",
+  "expected_anchors": ["RuntimeStore", "TelemetryCollector", "get_snapshot"],
+  "decisive_evidence": ["RuntimeStore", "TelemetryCollector", "get_snapshot"],
+  "required_bridges": [
+    { "from": "RuntimeStore::tick", "to": "TelemetryCollector::collect" },
+    { "from": "get_snapshot", "to": "RuntimeStore::snapshot" },
+    { "from": "App.svelte", "to": "get_snapshot" }
+  ],
+  "repo_text_dependencies": [
+    "src/BatCave.App/src/App.svelte"
+  ],
+  "claim_ledger": {
+    "claims": [
+      {
+        "id": "batcave-runtime-store-telemetry",
+        "text": "RuntimeStore owns TelemetryCollector and tick collects telemetry before materializing and persisting snapshots.",
+        "confidence": 0.86,
+        "state": "supported",
+        "anchors": ["RuntimeStore", "TelemetryCollector"],
+        "evidence": [
+          {
+            "kind": "source_truth",
+            "source_path": "src/BatCave.App/src-tauri/src/runtime_store.rs",
+            "anchor": "RuntimeStore",
+            "bridge": "RuntimeStore::tick->TelemetryCollector::collect",
+            "decisive": true
+          },
+          {
+            "kind": "source_truth",
+            "source_path": "src/BatCave.App/src-tauri/src/telemetry.rs",
+            "anchor": "TelemetryCollector",
+            "decisive": true
+          }
+        ]
+      },
+      {
+        "id": "batcave-tauri-snapshot-command",
+        "text": "get_snapshot is registered as a Tauri command and reads RuntimeStore snapshots through runtime state.",
+        "confidence": 0.84,
+        "state": "supported",
+        "anchors": ["get_snapshot"],
+        "evidence": [
+          {
+            "kind": "source_truth",
+            "source_path": "src/BatCave.App/src-tauri/src/lib.rs",
+            "anchor": "get_snapshot",
+            "bridge": "get_snapshot->RuntimeStore::snapshot",
+            "decisive": true
+          }
+        ]
+      },
+      {
+        "id": "batcave-svelte-command-integration",
+        "text": "App.svelte invokes snapshot and control commands, with browser dev fixtures as the mock boundary.",
+        "confidence": 0.72,
+        "state": "supported",
+        "anchors": ["get_snapshot"],
+        "evidence": [
+          {
+            "kind": "repo_text",
+            "source_path": "src/BatCave.App/src/App.svelte",
+            "anchor": "get_snapshot",
+            "bridge": "App.svelte->get_snapshot",
+            "decisive": true,
+            "repo_text_only": true
+          }
+        ]
+      }
+    ]
+  }
+}

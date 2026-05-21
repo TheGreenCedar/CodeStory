@@ -1,0 +1,80 @@
+{
+  "name": "real_sourcetrail",
+  "local_only": true,
+  "project_root": "Sourcetrail",
+  "question": "Explain how Sourcetrail turns project/source-group configuration into indexing work, then how indexed data is accessed by the application.",
+  "expected_anchors": ["SourceGroupCxxCdb", "IndexerJava", "StorageAccess"],
+  "decisive_evidence": ["SourceGroupCxxCdb", "IndexerJava", "StorageAccess"],
+  "required_bridges": [
+    { "from": "Project::buildIndex", "to": "TaskFillIndexerCommandsQueue" },
+    { "from": "SourceGroupCxxCdb", "to": "IndexerCommandCxx" },
+    { "from": "StorageAccessProxy", "to": "PersistentStorage" }
+  ],
+  "claim_ledger": {
+    "claims": [
+      {
+        "id": "sourcetrail-source-group-pipeline",
+        "text": "Project::buildIndex builds a per-source-group task pipeline before merge and injection.",
+        "confidence": 0.82,
+        "state": "supported",
+        "anchors": ["SourceGroupCxxCdb"],
+        "evidence": [
+          {
+            "kind": "source_truth",
+            "source_path": "src/lib/project/Project.cpp",
+            "anchor": "SourceGroupCxxCdb",
+            "bridge": "Project::buildIndex->TaskFillIndexerCommandsQueue",
+            "decisive": true
+          }
+        ]
+      },
+      {
+        "id": "sourcetrail-cdb-command-provider",
+        "text": "SourceGroupCxxCdb loads the compile database and emits C/C++ indexer commands.",
+        "confidence": 0.86,
+        "state": "supported",
+        "anchors": ["SourceGroupCxxCdb"],
+        "evidence": [
+          {
+            "kind": "source_truth",
+            "source_path": "src/lib_cxx/project/SourceGroupCxxCdb.cpp",
+            "anchor": "SourceGroupCxxCdb",
+            "bridge": "SourceGroupCxxCdb->IndexerCommandCxx",
+            "decisive": true
+          }
+        ]
+      },
+      {
+        "id": "sourcetrail-storage-access",
+        "text": "PersistentStorage implements StorageAccess and StorageAccessProxy delegates to the weak subject.",
+        "confidence": 0.76,
+        "state": "supported",
+        "anchors": ["StorageAccess"],
+        "evidence": [
+          {
+            "kind": "source_truth",
+            "source_path": "src/lib/data/storage/StorageAccess.h",
+            "anchor": "StorageAccess",
+            "bridge": "StorageAccessProxy->PersistentStorage",
+            "decisive": true
+          }
+        ]
+      },
+      {
+        "id": "sourcetrail-java-parser",
+        "text": "IndexerJava delegates command execution to JavaParser.buildIndex.",
+        "confidence": 0.82,
+        "state": "supported",
+        "anchors": ["IndexerJava"],
+        "evidence": [
+          {
+            "kind": "source_truth",
+            "source_path": "src/lib_java/data/indexer/IndexerJava.cpp",
+            "anchor": "IndexerJava",
+            "decisive": true
+          }
+        ]
+      }
+    ]
+  }
+}

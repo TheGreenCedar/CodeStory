@@ -32,6 +32,8 @@ The report includes:
 - per-anchor search, symbol, trail, explore, and snippet artifacts
 - cross-anchor bridge artifacts using graph paths first and shared-file fallback diagnostics when no graph bridge is visible
 - chosen anchor and verification targets
+- an `evidence_packet` with typed evidence items, repo-text hints, negative evidence, source locations, confidence, and readiness status
+- an Answer Readiness report with `safe_to_say`, `inferred_claims`, `needs_verification`, `next_commands`, and `source_truth_checks`
 - an answer-quality contract requiring a CodeStory-only draft before source reads and source-truth verification afterward
 - a fillable claim-ledger template for source-truth classification, correction counts, and material-revision tracking
 - a verification checklist requiring `correct`, `partial`, `misleading`, or `unsupported` classifications
@@ -49,3 +51,5 @@ target/release/codestory-cli(.exe) drill --project . --refresh none --anchors Po
 ## Interpretation
 
 Use the drill report as the CodeStory-only phase. Draft the architecture answer from those artifacts first, then open only files named or implied by the artifacts and classify each claim against source truth. If the answer changes materially after source reads, record that as a CodeStory or agent-UX finding.
+
+Start with `evidence_packet.readiness`. Claims in `safe_to_say` are anchored enough for a draft. Claims in `inferred_claims` or `needs_verification` must stay uncertain until the listed `source_truth_checks` or equivalent source reads confirm them. Repo-text and cross-language framework hits are navigation hints unless supported by typed symbol/trail/snippet evidence or source-truth verification.

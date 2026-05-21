@@ -1,0 +1,93 @@
+{
+  "name": "synthetic_agent_quality",
+  "question": "Explain the deterministic architecture path from CLI command to backend indexer and UI status.",
+  "expected_anchors": [
+    "CliCommand",
+    "ArchitecturePlanner",
+    "BackendIndexer",
+    "UiStatusPanel"
+  ],
+  "decisive_evidence": [
+    "CliCommand",
+    "ArchitecturePlanner",
+    "BackendIndexer",
+    "UiStatusPanel"
+  ],
+  "required_bridges": [
+    { "from": "CliCommand", "to": "ArchitecturePlanner" },
+    { "from": "ArchitecturePlanner", "to": "BackendIndexer" },
+    { "from": "BackendIndexer", "to": "UiStatusPanel" }
+  ],
+  "repo_text_dependencies": [
+    "src/ui/status-panel.tsx"
+  ],
+  "claim_ledger": {
+    "claims": [
+      {
+        "id": "claim-1",
+        "text": "The CLI command delegates to the architecture planner.",
+        "confidence": 0.9,
+        "state": "anchored",
+        "anchors": ["CliCommand", "ArchitecturePlanner"],
+        "evidence": [
+          {
+            "kind": "symbol",
+            "source_path": "src/cli.rs",
+            "anchor": "CliCommand",
+            "decisive": true
+          },
+          {
+            "kind": "trail",
+            "source_path": "src/cli.rs",
+            "bridge": "CliCommand->ArchitecturePlanner",
+            "decisive": true
+          },
+          {
+            "kind": "symbol",
+            "source_path": "src/planner.rs",
+            "anchor": "ArchitecturePlanner",
+            "decisive": true
+          }
+        ]
+      },
+      {
+        "id": "claim-2",
+        "text": "The natural architecture path continues into the backend indexer.",
+        "confidence": 0.84,
+        "state": "supported",
+        "anchors": ["ArchitecturePlanner", "BackendIndexer"],
+        "evidence": [
+          {
+            "kind": "trail",
+            "source_path": "src/planner.rs",
+            "bridge": "ArchitecturePlanner->BackendIndexer",
+            "decisive": true
+          },
+          {
+            "kind": "symbol",
+            "source_path": "src/backend/indexer.rs",
+            "anchor": "BackendIndexer",
+            "decisive": true
+          }
+        ]
+      },
+      {
+        "id": "claim-3",
+        "text": "The UI status panel reads persisted backend status through repo-text-only integration wiring.",
+        "confidence": 0.78,
+        "state": "supported",
+        "anchors": ["BackendIndexer", "UiStatusPanel"],
+        "evidence": [
+          {
+            "kind": "repo_text",
+            "source_path": "src/ui/status-panel.tsx",
+            "anchor": "UiStatusPanel",
+            "bridge": "BackendIndexer->UiStatusPanel",
+            "decisive": true,
+            "repo_text_only": true
+          }
+        ]
+      }
+    ]
+  }
+}

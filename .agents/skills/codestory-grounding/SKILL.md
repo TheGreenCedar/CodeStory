@@ -17,7 +17,7 @@ Use this skill to collect repo evidence with `codestory-cli` before making archi
 - `symbol`: inspect one exact symbol and relationships.
 - `trail`: follow caller, callee, and reference graph around a symbol; use `--story --hide-speculative` for readable flow evidence.
 - `snippet`: fetch source context around a symbol.
-- `drill`: run a deterministic agent-grounding packet for a natural-language question and concrete anchors, including search/symbol/trail/explore/snippet artifacts, bridge evidence, a claim-ledger template, and a source-verification checklist.
+- `drill`: run a deterministic agent-grounding packet for a natural-language question and concrete anchors, including search/symbol/trail/explore/snippet artifacts, bridge evidence, an Evidence Packet, Answer Readiness report, claim-ledger template, and source-verification checklist.
 - `query`: run structured graph-query pipelines.
 - `explore`: interactive or bundled navigation view around a target, including grouped line-numbered source packets.
 - `files`: list indexed file inventory, language counts, inferred source/test/generated/vendor roles, and partial-index markers.
@@ -37,6 +37,8 @@ Use this skill to collect repo evidence with `codestory-cli` before making archi
 7. Do not pass broad product or architecture questions to `context`. Break broad questions into concrete terms, choose anchors, then run `context --id <node-id>`.
 8. Treat command output as evidence, then open only the files needed for edits or verification.
 9. Keep navigation, route coverage, performance, and search-quality work CLI-first. Do not route these workflows through MCP, stdio, HTTP, or server behavior.
+10. For architecture answers, read `evidence_packet.readiness` before drafting. Do not present `partial`, `inferred`, or `needs_source_read` claims as verified until the source-truth checklist has been completed.
+11. Treat repo-text and cross-language framework evidence as hints unless the packet also includes typed graph evidence, snippets, or source-truth checks.
 
 ## Template Workflows
 
@@ -79,7 +81,7 @@ target/release/codestory-cli(.exe) affected --project <workspace> src/lib.rs tes
 
 ### Broad repo/product question workflow
 
-Do not pass the broad question to `context`.
+Do not pass the broad question to `context`. Prefer `drill` when the user needs an answer-quality check, not just navigation.
 
 ```
 target/release/codestory-cli(.exe) ground --project <workspace> --why
@@ -87,6 +89,20 @@ target/release/codestory-cli(.exe) search --project <workspace> --repo-text on -
 target/release/codestory-cli(.exe) search --project <workspace> --repo-text on --query "<another concrete term>" --why
 # select anchors
 target/release/codestory-cli(.exe) context --project <workspace> --id <node-id>
+```
+
+### Real-repo agent-quality drill workflow
+
+Use this workflow when the goal is to test whether CodeStory helps an agent answer a realistic architecture question.
+
+```
+target/release/codestory-cli(.exe) drill --project <workspace> --refresh full --question "<question>" --anchors AnchorA,AnchorB,AnchorC --output-dir target/drill/<slug> --format json
+# Read drill-report.json first:
+# - evidence_packet.readiness.safe_to_say
+# - evidence_packet.readiness.inferred_claims
+# - evidence_packet.readiness.needs_verification
+# - evidence_packet.readiness.source_truth_checks
+# Draft the CodeStory-only answer, then open only source files named or implied by source_truth_checks.
 ```
 
 ### Stale or unhealthy semantic retrieval
@@ -106,6 +122,7 @@ If retrieval is still partial, stale, or failed, use `search --repo-text on --wh
 target/release/codestory-cli(.exe) files --project <workspace> --format json
 cargo test -p codestory-indexer --lib framework_route
 cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
+cargo test -p codestory-cli --test agent_quality_eval
 ```
 
 ### Performance review baseline
@@ -145,6 +162,9 @@ Capture the baseline before optimization, define the no-regression threshold, an
 - `trail` should be judged by whether unrelated resolved targets disappeared. Local helper names like `once`, `from`, or `copied` can still appear as `[unknown]` nodes without indicating bad semantic resolution.
 - OpenAPI schema files index endpoint symbols such as `GET /api/users`; client literal calls can create speculative edges to those endpoints, so check certainty before treating a frontend/backend trail as verified.
 - Framework route symbols include confidence labels. Treat `file_convention` and `decorator` routes as stronger than broad `heuristic` routes, and confirm handler links before claiming an end-to-end route path.
+- Framework integration symbols have bounded fixture-backed support. `tauri:command:*` covers first-argument string-literal `invoke` calls, including multiline/generic calls, and Rust `#[tauri::command]`/`generate_handler!` registrations while rejecting argument strings and comments. `payload:collection:*` covers `CollectionConfig` slug blocks and Payload method calls with `collection:` options while rejecting unrelated slugs, props, and string substrings. Treat evidence outside those covered forms as unsupported until source verification proves it.
+- `drill` Evidence Packet readiness is the agent-facing contract: `anchored` and `supported` claims may be drafted from CodeStory evidence; `partial`, `inferred`, and `needs_source_read` claims must stay visibly uncertain until source verification completes.
+- The agent-quality evaluator is deterministic. Use it to catch unsupported high-confidence claims, overclaims, material source corrections, and confidence-calibration regressions; do not replace it with live LLM judging in CI.
 - `files`, `search`, and `explore` can report usable-but-partial indexes. Carry those coverage notes into decisions instead of silently assuming full coverage.
 - `affected` is a graph-based test-selection hint, not a replacement for the test suite. Prefer impacted tests first, then run broader gates when shared code or coverage warnings are involved.
 - Search-quality eval failures should be interpreted by query class, expected anchor, anchor bucket, MRR, max latency, and fallback source before ranking or route-support claims are promoted.

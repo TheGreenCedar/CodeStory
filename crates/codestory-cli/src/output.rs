@@ -2,9 +2,10 @@ use anyhow::{Context, Result, bail};
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentRetrievalPolicyModeDto,
     AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
-    AgentRetrievalStepStatusDto, GraphArtifactDto, GroundingSnapshotDto, NodeDetailsDto,
-    RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto,
-    SearchHit, SnippetContextDto, SymbolContextDto, TrailContextDto, TrailStoryDto,
+    AgentRetrievalStepStatusDto, ClaimReadinessDto, EvidenceTypeDto, GraphArtifactDto,
+    GroundingSnapshotDto, NodeDetailsDto, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
+    RetrievalModeDto, RetrievalStateDto, SearchHit, SnippetContextDto, SymbolContextDto,
+    TrailContextDto, TrailStoryDto,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -1626,6 +1627,7 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
         "verification_targets",
         &output.verification_targets,
     );
+    append_evidence_packet(&mut markdown, output);
     let contract = &output.answer_quality_contract;
     let _ = writeln!(
         markdown,
@@ -1712,6 +1714,122 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
         }
     }
     markdown
+}
+
+fn append_evidence_packet(markdown: &mut String, output: &DrillOutput) {
+    let packet = &output.evidence_packet;
+    let readiness = &packet.readiness;
+    let _ = writeln!(
+        markdown,
+        "evidence_packet: version={} items={} overall_status={}",
+        packet.packet_version,
+        packet.items.len(),
+        render_claim_readiness(readiness.overall_status)
+    );
+    if let Some(question) = packet.question.as_deref() {
+        let _ = writeln!(markdown, "- question: {question}");
+    }
+    if !readiness.safe_to_say.is_empty() {
+        let _ = writeln!(markdown, "- safe_to_say:");
+        for item in readiness.safe_to_say.iter().take(EVIDENCE_PREVIEW_LIMIT) {
+            let _ = writeln!(markdown, "  - {item}");
+        }
+    }
+    if !readiness.inferred_claims.is_empty() {
+        let _ = writeln!(markdown, "- inferred_or_partial:");
+        for item in readiness
+            .inferred_claims
+            .iter()
+            .take(EVIDENCE_PREVIEW_LIMIT)
+        {
+            let _ = writeln!(markdown, "  - {item}");
+        }
+    }
+    if !readiness.needs_verification.is_empty() {
+        let _ = writeln!(markdown, "- needs_verification:");
+        for item in readiness
+            .needs_verification
+            .iter()
+            .take(EVIDENCE_PREVIEW_LIMIT)
+        {
+            let _ = writeln!(markdown, "  - {item}");
+        }
+    }
+    if !readiness.source_truth_checks.is_empty() {
+        let _ = writeln!(markdown, "- source_truth_checks:");
+        for check in readiness
+            .source_truth_checks
+            .iter()
+            .take(EVIDENCE_PREVIEW_LIMIT)
+        {
+            match check.line {
+                Some(line) => {
+                    let _ = writeln!(
+                        markdown,
+                        "  - `{}`:{} required={} reason={}",
+                        check.path, line, check.required, check.reason
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        markdown,
+                        "  - `{}` required={} reason={}",
+                        check.path, check.required, check.reason
+                    );
+                }
+            }
+        }
+    }
+    if !packet.items.is_empty() {
+        let _ = writeln!(markdown, "- evidence_items:");
+        for item in packet.items.iter().take(8) {
+            let location = item
+                .source
+                .as_ref()
+                .map(|source| match source.line_start {
+                    Some(line) => format!(" `{}`:{line}", source.path),
+                    None => format!(" `{}`", source.path),
+                })
+                .unwrap_or_default();
+            let _ = writeln!(
+                markdown,
+                "  - `{}` type={} status={} confidence={} readiness={}{}",
+                item.id,
+                render_evidence_type(item.evidence_type),
+                item.status,
+                item.confidence,
+                render_claim_readiness(item.verification_status),
+                location
+            );
+            for note in item.notes.iter().take(2) {
+                let _ = writeln!(markdown, "    - {note}");
+            }
+        }
+    }
+}
+
+fn render_evidence_type(evidence_type: EvidenceTypeDto) -> &'static str {
+    match evidence_type {
+        EvidenceTypeDto::SearchHit => "search_hit",
+        EvidenceTypeDto::SymbolContext => "symbol_context",
+        EvidenceTypeDto::Trail => "trail",
+        EvidenceTypeDto::Snippet => "snippet",
+        EvidenceTypeDto::Explore => "explore",
+        EvidenceTypeDto::Bridge => "bridge",
+        EvidenceTypeDto::RepoText => "repo_text",
+        EvidenceTypeDto::Negative => "negative",
+    }
+}
+
+fn render_claim_readiness(readiness: ClaimReadinessDto) -> &'static str {
+    match readiness {
+        ClaimReadinessDto::Anchored => "anchored",
+        ClaimReadinessDto::Supported => "supported",
+        ClaimReadinessDto::Partial => "partial",
+        ClaimReadinessDto::Inferred => "inferred",
+        ClaimReadinessDto::NeedsSourceRead => "needs_source_read",
+        ClaimReadinessDto::ContradictedBySource => "contradicted_by_source",
+    }
 }
 
 fn render_drill_command_status_suffix(status: &crate::args::DrillCommandStatusOutput) -> String {

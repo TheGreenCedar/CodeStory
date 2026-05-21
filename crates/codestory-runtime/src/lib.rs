@@ -89,7 +89,7 @@ pub use symbol_query::{
     symbol_name_match_rank, terminal_symbol_segment,
 };
 pub(crate) use symbol_query::{
-    compare_search_hits_with_project_root, is_non_primary_source_hit,
+    architecture_query_intents, compare_search_hits_with_project_root, is_non_primary_source_hit,
     query_mentions_non_primary_source,
 };
 
@@ -895,11 +895,31 @@ fn search_query_assessment(
     let weak_top_hit = exact_symbol_hit_count == 0 && weak_search_top_hit(query, indexed_hits);
     let stale_or_missing_anchor =
         exact_symbol_hit_count == 0 && query_has_symbol_or_literal_signal(query);
-    let recommended_next_action = if exact_symbol_hit_count > 0 {
+    let architecture_intents = architecture_query_intents(query);
+    let recommended_next_action = if exact_symbol_hit_count > 0 && !architecture_intents.is_empty()
+    {
+        let labels = architecture_intents
+            .iter()
+            .map(|intent| intent.label())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "Architecture intent detected ({labels}); open the strongest production entrypoint/orchestrator with symbol, trail, and function-body snippet before answering."
+        ))
+    } else if exact_symbol_hit_count > 0 {
         Some(
             "Open the exact indexed hit with symbol, trail, and snippet before answering."
                 .to_string(),
         )
+    } else if !architecture_intents.is_empty() && !indexed_hits.is_empty() {
+        let labels = architecture_intents
+            .iter()
+            .map(|intent| intent.label())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "Architecture intent detected ({labels}); inspect production entrypoints/orchestrators first and treat repo-text hits as leads until source snippets confirm the path."
+        ))
     } else if !repo_text_hits.is_empty() {
         Some(
             "Use repo-text hits to choose a concrete identifier, then rerun symbol/trail/snippet."

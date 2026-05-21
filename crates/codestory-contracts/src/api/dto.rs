@@ -1215,6 +1215,92 @@ pub struct AgentAnswerDto {
     pub retrieval_trace: AgentRetrievalTraceDto,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceTypeDto {
+    SearchHit,
+    SymbolContext,
+    Trail,
+    Snippet,
+    Explore,
+    Bridge,
+    RepoText,
+    Negative,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimReadinessDto {
+    Anchored,
+    Supported,
+    Partial,
+    Inferred,
+    NeedsSourceRead,
+    ContradictedBySource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct EvidenceSourceLocationDto {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_start: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_end: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct EvidenceItemDto {
+    pub id: String,
+    pub evidence_type: EvidenceTypeDto,
+    pub command: String,
+    pub status: String,
+    pub confidence: String,
+    pub verification_status: ClaimReadinessDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_quality: Option<SearchMatchQualityDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<EvidenceSourceLocationDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SourceTruthCheckDto {
+    pub id: String,
+    pub reason: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AnswerReadinessReportDto {
+    pub overall_status: ClaimReadinessDto,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safe_to_say: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inferred_claims: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs_verification: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub next_commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_truth_checks: Vec<SourceTruthCheckDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct EvidencePacketDto {
+    pub packet_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<EvidenceItemDto>,
+    pub readiness: AnswerReadinessReportDto,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct BookmarkCategoryDto {
     pub id: String,
