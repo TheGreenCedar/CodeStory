@@ -3,9 +3,9 @@ use codestory_contracts::api::{
     BookmarkCategoryDto, BookmarkDto, EvidencePacketDto, GroundingBudgetDto, IndexDryRunDto,
     IndexFreshnessDto, IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind,
     ProjectSummary, RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
-    SearchHitOrigin, SearchMatchQualityDto, SearchQueryAssessmentDto, SnippetContextDto,
-    SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection,
-    TrailMode,
+    SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto, SearchQueryAssessmentDto,
+    SnippetContextDto, SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto,
+    TrailDirection, TrailMode,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -957,6 +957,8 @@ pub(crate) struct SearchOutput {
     pub(crate) repo_text_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) query_assessment: Option<SearchQueryAssessmentDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) search_plan: Option<SearchPlanDto>,
     pub(crate) explain: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) query_hints: Vec<String>,

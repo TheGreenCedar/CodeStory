@@ -31,6 +31,10 @@ target/release/codestory-cli(.exe) search [OPTIONS]
 - **Field-qualified queries** filter indexed and repo-text results after candidate retrieval. Supported filters are `kind:<node-kind-or-alias>`, `path:<path-fragment>`, `name:<symbol-fragment>`, and `lang:<language-or-extension>`. Example: `kind:function name:listUsers` or `path:routes.ts /api/users`.
 - **Concrete anchors with weak indexed results** also trigger repo text in `auto` mode. This prevents stale names such as retired UI components from looking like valid direct symbol hits.
 - When hybrid retrieval finds strong semantic matches but no lexical match, Markdown and JSON output include `did_you_mean` suggestions.
+- Broad architecture-style queries can include `search_plan`. The plan reports
+  extracted and dropped terms, bounded subqueries, candidate windows, anchor
+  groups, repo-text promotion status, bridge evidence, next commands, and
+  source-truth checks. It is a discovery plan, not final answer prose.
 - Ranking boosts exact and terminal symbol names, CamelCase initials, compound terms, and path co-location. Test, fixture, vendor, and external hits are dampened unless the query asks for them.
 - Import/re-export-looking exact hits are ranked below definition-looking hits when source-line evidence is available.
 - Repo-text fallback remains explicit evidence. Treat repo-text hits as clues to inspect, not as silent graph success.
@@ -53,6 +57,12 @@ Each hit includes: node ID, display name, kind, file path, line number, relevanc
 
 Search output also includes `query_assessment` with exact symbol hit count, weak-hit/stale-anchor flags, any repo-text fallback reason, and a recommended next action. Use it to avoid treating weak semantic suggestions as proof of an exact anchor.
 
+For broad architecture queries, JSON may include `search_plan`; Markdown renders
+it when `--why` is set. Prefer `typed_anchor` and `promoted` plan groups as
+follow-up anchors. Treat `ambiguous` and `needs_source_read` groups as uncertain
+until direct source verification. Use the plan's next commands to continue with
+`symbol`, `trail`, `snippet`, or `explore`.
+
 When a name appears more than once, prefer typed symbol hits such as `[function]`, `[struct]`, `[field]`, or `[file]` over `[unknown]` hits when you are verifying symbol surfacing. `[unknown]` results are often usage-like callsite or reference nodes, not the canonical definition.
 
 Repo-text hits from text-only surfaces such as `.svelte` files are evidence, not graph anchors. Use the excerpt to choose a symbol or open a snippet/source file for verification.
@@ -68,6 +78,11 @@ cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture s
   hits, or both.
 - Low MRR: the expected anchor exists, but lower-quality or noisy hits outrank
   it.
+- Missing Search Plan: a broad architecture query was not classified or
+  decomposed. Check extracted terms, architecture intent labels, and
+  `query_assessment` before changing weights.
+- Promotion precision: repo-text-only or ambiguous groups must not be high
+  confidence.
 - High max latency: compare against the current fixture cap and performance
   baseline before tuning.
 - Route/handler misses block route-support promotion until the coverage playbook

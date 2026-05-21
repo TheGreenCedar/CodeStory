@@ -14,11 +14,14 @@ use codestory_contracts::api::{
     OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest, ProjectSummary,
     ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
     RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, RouteEndpointHandlerDto,
-    RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchMatchQualityDto,
-    SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest, SearchResultsDto,
-    SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto,
-    StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto,
-    SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
+    RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
+    SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto, SearchPlanBridgeDto,
+    SearchPlanCandidateWindowDto, SearchPlanChannelDto, SearchPlanDroppedTermDto, SearchPlanDto,
+    SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto, SearchPlanSubqueryDto,
+    SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest,
+    SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
+    StorageStatsDto, StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto,
+    SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
     UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WorkspaceMemberIndexDto,
     WriteFileResponse, WriteFileTextRequest,
 };
@@ -577,6 +580,22 @@ struct RepoTextScan {
     stats: RepoTextScanStatsDto,
 }
 
+#[derive(Debug, Clone, Default)]
+struct SearchPlanExecutedEvidence {
+    indexed_symbol_hits: Vec<SearchHit>,
+    repo_text_hits: Vec<SearchHit>,
+    suggestions: Vec<SearchHit>,
+    candidate_windows: Vec<SearchPlanCandidateWindowDto>,
+}
+
+#[derive(Debug, Clone)]
+struct SearchPlanBuild {
+    plan: SearchPlanDto,
+    indexed_symbol_hits: Vec<SearchHit>,
+    repo_text_hits: Vec<SearchHit>,
+    suggestions: Vec<SearchHit>,
+}
+
 #[derive(Debug, Clone)]
 struct SearchIntentQuery {
     effective_query: String,
@@ -939,6 +958,741 @@ fn search_query_assessment(
         repo_text_fallback_reason,
         recommended_next_action,
     }
+}
+
+const SEARCH_PLAN_STOPWORDS: &[&str] = &[
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "can",
+    "code",
+    "codestory",
+    "does",
+    "explain",
+    "for",
+    "from",
+    "how",
+    "in",
+    "into",
+    "is",
+    "it",
+    "later",
+    "of",
+    "on",
+    "or",
+    "repo",
+    "repository",
+    "show",
+    "that",
+    "the",
+    "then",
+    "this",
+    "through",
+    "to",
+    "turns",
+    "what",
+    "where",
+    "which",
+    "why",
+    "with",
+];
+
+fn search_plan_terms(query: &str) -> SearchPlanTermsDto {
+    let mut extracted = Vec::new();
+    let mut dropped = Vec::new();
+    let mut seen = HashSet::new();
+    let mut dropped_seen = HashSet::new();
+
+    for raw in query.split_whitespace() {
+        let token = raw
+            .trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '"' | '\'' | '`' | ',' | '.' | ';' | ':' | '?' | '!' | '(' | ')' | '[' | ']'
+                )
+            })
+            .trim_end_matches("'s");
+        if token.is_empty() {
+            continue;
+        }
+        let fragments = token
+            .split('/')
+            .flat_map(|part| part.split('.'))
+            .flat_map(|part| part.split(':'))
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        for fragment in fragments {
+            let normalized = fragment
+                .trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'));
+            if normalized.is_empty() {
+                continue;
+            }
+            add_search_plan_term(
+                normalized,
+                &mut extracted,
+                &mut seen,
+                &mut dropped,
+                &mut dropped_seen,
+            );
+            if normalized.contains('-') {
+                for part in normalized.split('-').filter(|part| !part.is_empty()) {
+                    add_search_plan_term(
+                        part,
+                        &mut extracted,
+                        &mut seen,
+                        &mut dropped,
+                        &mut dropped_seen,
+                    );
+                }
+            }
+            for camel_part in split_camel_identifier(normalized) {
+                add_search_plan_term(
+                    &camel_part,
+                    &mut extracted,
+                    &mut seen,
+                    &mut dropped,
+                    &mut dropped_seen,
+                );
+            }
+        }
+    }
+
+    SearchPlanTermsDto { extracted, dropped }
+}
+
+fn add_search_plan_term(
+    raw: &str,
+    extracted: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    dropped: &mut Vec<SearchPlanDroppedTermDto>,
+    dropped_seen: &mut HashSet<String>,
+) {
+    let clean = raw
+        .trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        .to_string();
+    if clean.is_empty() {
+        return;
+    }
+    let lower = clean.to_ascii_lowercase();
+    if lower.len() < 3 {
+        if dropped_seen.insert(lower.clone()) {
+            dropped.push(SearchPlanDroppedTermDto {
+                term: clean,
+                reason: "too_short".to_string(),
+            });
+        }
+        return;
+    }
+    if SEARCH_PLAN_STOPWORDS.contains(&lower.as_str()) {
+        if dropped_seen.insert(lower.clone()) {
+            dropped.push(SearchPlanDroppedTermDto {
+                term: clean,
+                reason: "natural_language_filler".to_string(),
+            });
+        }
+        return;
+    }
+    let value = if clean.chars().any(|ch| ch.is_ascii_uppercase()) && clean.len() > 3 {
+        clean
+    } else {
+        lower.clone()
+    };
+    if seen.insert(value.to_ascii_lowercase()) {
+        extracted.push(value);
+    }
+}
+
+fn split_camel_identifier(value: &str) -> Vec<String> {
+    if !value.chars().any(|ch| ch.is_ascii_uppercase()) {
+        return Vec::new();
+    }
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for ch in value.chars() {
+        if ch == '_' || ch == '-' {
+            if current.len() >= 3 {
+                parts.push(current.clone());
+            }
+            current.clear();
+            continue;
+        }
+        if ch.is_ascii_uppercase() && !current.is_empty() {
+            if current.len() >= 3 {
+                parts.push(current.clone());
+            }
+            current.clear();
+        }
+        current.push(ch.to_ascii_lowercase());
+    }
+    if current.len() >= 3 {
+        parts.push(current);
+    }
+    parts
+}
+
+fn search_plan_eligible(query: &str, exact_symbol_hit_count: u32, intents: &[String]) -> bool {
+    exact_symbol_hit_count == 0
+        && !intents.is_empty()
+        && (looks_like_repo_text_query(query) || query.split_whitespace().count() >= 4)
+}
+
+fn search_plan_subqueries(
+    query: &str,
+    terms: &SearchPlanTermsDto,
+    intents: &[String],
+) -> Vec<SearchPlanSubqueryDto> {
+    if intents.is_empty() {
+        return Vec::new();
+    }
+    let mut subqueries = Vec::new();
+    let mut seen = HashSet::new();
+
+    push_search_plan_subquery(
+        &mut subqueries,
+        &mut seen,
+        query.trim().to_string(),
+        "original_question",
+        vec![
+            SearchPlanChannelDto::Semantic,
+            SearchPlanChannelDto::Lexical,
+        ],
+    );
+    let symbol_terms = terms
+        .extracted
+        .iter()
+        .filter(|term| {
+            term.chars().any(|ch| ch.is_ascii_uppercase())
+                || matches!(
+                    term.as_str(),
+                    "indexer"
+                        | "service"
+                        | "storage"
+                        | "store"
+                        | "posts"
+                        | "feed"
+                        | "auth"
+                        | "trail"
+                        | "snippet"
+                        | "workspace"
+                )
+        })
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !symbol_terms.is_empty() {
+        push_search_plan_subquery(
+            &mut subqueries,
+            &mut seen,
+            symbol_terms.join(" "),
+            "typed_anchor_terms",
+            vec![
+                SearchPlanChannelDto::TypedSymbol,
+                SearchPlanChannelDto::Lexical,
+            ],
+        );
+    }
+    for (role, needles) in [
+        (
+            "indexing_pipeline",
+            &["full", "index", "indexing", "indexer", "workspace", "store"][..],
+        ),
+        (
+            "runtime_boundary",
+            &["cli", "runtime", "command", "service"][..],
+        ),
+        (
+            "read_surface",
+            &["search", "trail", "snippet", "context", "explore"][..],
+        ),
+        (
+            "content_surface",
+            &["posts", "comments", "auth", "feed", "elsewhere"][..],
+        ),
+        (
+            "persistence_surface",
+            &["storage", "store", "payload", "collection", "snapshot"][..],
+        ),
+    ] {
+        let role_terms = terms
+            .extracted
+            .iter()
+            .filter(|term| {
+                needles
+                    .iter()
+                    .any(|needle| term.eq_ignore_ascii_case(needle))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if role_terms.len() >= 2 {
+            push_search_plan_subquery(
+                &mut subqueries,
+                &mut seen,
+                role_terms.join(" "),
+                role,
+                vec![
+                    SearchPlanChannelDto::TypedSymbol,
+                    SearchPlanChannelDto::Lexical,
+                    SearchPlanChannelDto::RepoText,
+                ],
+            );
+        }
+    }
+    if subqueries.len() < 3 {
+        let fallback = terms
+            .extracted
+            .iter()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+        push_search_plan_subquery(
+            &mut subqueries,
+            &mut seen,
+            fallback,
+            "repo_text_terms",
+            vec![
+                SearchPlanChannelDto::RepoText,
+                SearchPlanChannelDto::Lexical,
+            ],
+        );
+    }
+    subqueries
+}
+
+fn push_search_plan_subquery(
+    subqueries: &mut Vec<SearchPlanSubqueryDto>,
+    seen: &mut HashSet<String>,
+    query: String,
+    role: &str,
+    channels: Vec<SearchPlanChannelDto>,
+) {
+    let key = query.to_ascii_lowercase();
+    if !query.trim().is_empty() && seen.insert(key) && subqueries.len() < 8 {
+        subqueries.push(SearchPlanSubqueryDto {
+            query,
+            role: role.to_string(),
+            channels,
+        });
+    }
+}
+
+fn search_plan_symbol_windows(
+    subquery: &SearchPlanSubqueryDto,
+    hits: &[SearchHit],
+    suggestions: &[SearchHit],
+    limit_per_source: u32,
+    semantic_ready: bool,
+) -> Vec<SearchPlanCandidateWindowDto> {
+    let mut windows = Vec::new();
+    if subquery
+        .channels
+        .iter()
+        .any(|channel| *channel == SearchPlanChannelDto::TypedSymbol)
+    {
+        windows.push(SearchPlanCandidateWindowDto {
+            channel: SearchPlanChannelDto::TypedSymbol,
+            subquery: subquery.query.clone(),
+            limit: limit_per_source,
+            returned_count: clamp_usize_to_u32(hits.iter().filter(|hit| hit.resolvable).count()),
+            truncated: hits.len() >= limit_per_source as usize,
+            score_reasons: vec![
+                "executed typed-symbol retrieval for this planned subquery".to_string(),
+            ],
+        });
+    }
+    if subquery
+        .channels
+        .iter()
+        .any(|channel| *channel == SearchPlanChannelDto::Lexical)
+    {
+        windows.push(SearchPlanCandidateWindowDto {
+            channel: SearchPlanChannelDto::Lexical,
+            subquery: subquery.query.clone(),
+            limit: limit_per_source,
+            returned_count: clamp_usize_to_u32(
+                hits.iter()
+                    .filter(|hit| {
+                        hit.score_breakdown
+                            .as_ref()
+                            .is_none_or(|breakdown| breakdown.lexical > 0.0)
+                    })
+                    .count(),
+            ),
+            truncated: hits.len() >= limit_per_source as usize,
+            score_reasons: vec![
+                "executed lexical/name/path retrieval for this planned subquery".to_string(),
+            ],
+        });
+    }
+    if subquery
+        .channels
+        .iter()
+        .any(|channel| *channel == SearchPlanChannelDto::Semantic)
+    {
+        windows.push(SearchPlanCandidateWindowDto {
+            channel: SearchPlanChannelDto::Semantic,
+            subquery: subquery.query.clone(),
+            limit: limit_per_source,
+            returned_count: clamp_usize_to_u32(
+                hits.iter()
+                    .chain(suggestions.iter())
+                    .filter(|hit| {
+                        hit.score_breakdown
+                            .as_ref()
+                            .is_some_and(|breakdown| breakdown.semantic > 0.0)
+                    })
+                    .count(),
+            ),
+            truncated: suggestions.len() >= limit_per_source as usize,
+            score_reasons: vec![if semantic_ready {
+                "executed semantic retrieval for this planned subquery".to_string()
+            } else {
+                "semantic retrieval unavailable; this subquery relied on lexical indexed evidence"
+                    .to_string()
+            }],
+        });
+    }
+    windows
+}
+
+fn same_search_file(left: &SearchHit, right: &SearchHit) -> bool {
+    let Some(left_path) = left.file_path.as_deref() else {
+        return false;
+    };
+    let Some(right_path) = right.file_path.as_deref() else {
+        return false;
+    };
+    normalize_path_key(left_path) == normalize_path_key(right_path)
+}
+
+fn hit_matches_identifier(hit: &SearchHit, identifier: &str) -> bool {
+    let normalized_identifier = normalize_symbol_query(identifier);
+    if normalized_identifier.is_empty() {
+        return false;
+    }
+    normalize_symbol_query(&hit.display_name) == normalized_identifier
+        || terminal_symbol_segment(&hit.display_name) == normalized_identifier
+        || leading_symbol_segment(&hit.display_name) == normalized_identifier
+}
+
+fn repo_text_line_identifiers(hit: &SearchHit) -> Vec<String> {
+    let Some(path) = hit.file_path.as_deref() else {
+        return Vec::new();
+    };
+    let Some(line) = hit.line else {
+        return Vec::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let start = line.saturating_sub(3) as usize;
+    let window = contents
+        .lines()
+        .skip(start)
+        .take(5)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut identifiers = Vec::new();
+    let mut seen = HashSet::new();
+    for token in window.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')) {
+        if token.len() < 3 {
+            continue;
+        }
+        let looks_symbolic = token.chars().any(|ch| ch.is_ascii_uppercase())
+            || token.contains('_')
+            || matches!(
+                token,
+                "auth" | "feed" | "posts" | "storage" | "indexer" | "service" | "trail" | "snippet"
+            );
+        if looks_symbolic && seen.insert(token.to_ascii_lowercase()) {
+            identifiers.push(token.to_string());
+        }
+    }
+    identifiers
+}
+
+fn search_plan_anchor_groups(
+    query: &str,
+    terms: &SearchPlanTermsDto,
+    indexed_hits: &[SearchHit],
+    repo_text_hits: &[SearchHit],
+    suggestions: &[SearchHit],
+) -> Vec<SearchPlanAnchorGroupDto> {
+    let mut groups = Vec::new();
+    let mut grouped_ids = HashSet::new();
+    let mut used_repo_text = HashSet::new();
+    let mut all_symbol_hits = indexed_hits
+        .iter()
+        .chain(suggestions.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    all_symbol_hits
+        .sort_by(|left, right| compare_search_hits_with_project_root(None, query, left, right));
+    let repo_text_identifiers = repo_text_hits
+        .iter()
+        .map(repo_text_line_identifiers)
+        .collect::<Vec<_>>();
+
+    for hit in all_symbol_hits.iter().filter(|hit| hit.resolvable).take(6) {
+        if !grouped_ids.insert(hit.node_id.clone()) {
+            continue;
+        }
+        let mut supporting_hits = vec![hit.clone()];
+        let mut reasons = vec!["typed indexed symbol selected as an anchor candidate".to_string()];
+        for (repo_index, repo_hit) in repo_text_hits.iter().enumerate() {
+            if !same_search_file(hit, repo_hit) {
+                continue;
+            }
+            let identifiers = repo_text_identifiers
+                .get(repo_index)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if identifiers.is_empty() {
+                supporting_hits.push(repo_hit.clone());
+                used_repo_text.insert(repo_index);
+                reasons.push("repo-text hit appears in the same file as the anchor".to_string());
+            } else if identifiers
+                .iter()
+                .any(|identifier| hit_matches_identifier(hit, identifier))
+            {
+                supporting_hits.push(repo_hit.clone());
+                used_repo_text.insert(repo_index);
+                reasons.push("repo-text hit names this anchor in the same file".to_string());
+            }
+        }
+        let exact = search_hit_match_quality(query, hit);
+        let confidence = if matches!(
+            exact,
+            SearchMatchQualityDto::Exact | SearchMatchQualityDto::NormalizedExact
+        ) {
+            "high"
+        } else {
+            "medium"
+        };
+        groups.push(SearchPlanAnchorGroupDto {
+            anchor: hit.display_name.clone(),
+            chosen_symbol: Some(hit.clone()),
+            supporting_hits,
+            promotion_status: SearchPlanPromotionStatusDto::TypedAnchor,
+            promotion_method: Some("indexed_symbol".to_string()),
+            confidence: confidence.to_string(),
+            reasons,
+        });
+    }
+
+    for (repo_index, repo_hit) in repo_text_hits.iter().enumerate() {
+        if used_repo_text.contains(&repo_index) {
+            continue;
+        }
+        let identifiers = repo_text_identifiers
+            .get(repo_index)
+            .cloned()
+            .unwrap_or_default();
+        let promoted = identifiers.iter().find_map(|identifier| {
+            all_symbol_hits
+                .iter()
+                .find(|hit| {
+                    same_search_file(hit, repo_hit) && hit_matches_identifier(hit, identifier)
+                })
+                .cloned()
+        });
+        if let Some(symbol) = promoted {
+            if !grouped_ids.insert(symbol.node_id.clone()) {
+                continue;
+            }
+            groups.push(SearchPlanAnchorGroupDto {
+                anchor: symbol.display_name.clone(),
+                chosen_symbol: Some(symbol.clone()),
+                supporting_hits: vec![symbol, repo_hit.clone()],
+                promotion_status: SearchPlanPromotionStatusDto::Promoted,
+                promotion_method: Some("same_file_exact_identifier".to_string()),
+                confidence: "medium".to_string(),
+                reasons: vec![
+                    "repo-text lead was promoted to an indexed symbol in the same file".to_string(),
+                ],
+            });
+        } else {
+            groups.push(SearchPlanAnchorGroupDto {
+                anchor: repo_hit.display_name.clone(),
+                chosen_symbol: None,
+                supporting_hits: vec![repo_hit.clone()],
+                promotion_status: if identifiers.is_empty() {
+                    SearchPlanPromotionStatusDto::NeedsSourceRead
+                } else {
+                    SearchPlanPromotionStatusDto::Ambiguous
+                },
+                promotion_method: None,
+                confidence: "low".to_string(),
+                reasons: vec![
+                    "repo-text lead could not be bound to one indexed symbol before source reads"
+                        .to_string(),
+                ],
+            });
+        }
+    }
+
+    let term_set = terms
+        .extracted
+        .iter()
+        .map(|term| term.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    groups.sort_by(|left, right| {
+        search_plan_group_score(right, &term_set)
+            .cmp(&search_plan_group_score(left, &term_set))
+            .then_with(|| left.anchor.cmp(&right.anchor))
+    });
+    groups.truncate(8);
+    groups
+}
+
+fn search_plan_group_score(group: &SearchPlanAnchorGroupDto, terms: &HashSet<String>) -> u32 {
+    let mut score = 0;
+    if group.chosen_symbol.is_some() {
+        score += 100;
+    }
+    score += match group.promotion_status {
+        SearchPlanPromotionStatusDto::TypedAnchor => 60,
+        SearchPlanPromotionStatusDto::Promoted => 45,
+        SearchPlanPromotionStatusDto::Ambiguous => 10,
+        SearchPlanPromotionStatusDto::NeedsSourceRead => 0,
+    };
+    if group
+        .supporting_hits
+        .iter()
+        .any(|hit| hit.origin == SearchHitOrigin::TextMatch)
+    {
+        score += 12;
+    }
+    if group
+        .promotion_method
+        .as_deref()
+        .is_some_and(|method| method == "same_file_exact_identifier")
+        || group
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("names this anchor"))
+    {
+        score += 35;
+    }
+    let text = group
+        .chosen_symbol
+        .as_ref()
+        .map(|hit| {
+            format!(
+                "{} {}",
+                hit.display_name,
+                hit.file_path.as_deref().unwrap_or_default()
+            )
+        })
+        .unwrap_or_else(|| group.anchor.clone())
+        .to_ascii_lowercase();
+    score
+        + terms
+            .iter()
+            .filter(|term| text.contains(term.as_str()))
+            .count() as u32
+            * 8
+}
+
+fn search_plan_rejected_hits(
+    anchor_groups: &[SearchPlanAnchorGroupDto],
+    suggestions: &[SearchHit],
+    indexed_hits: &[SearchHit],
+) -> Vec<SearchPlanRejectedHitDto> {
+    let chosen = anchor_groups
+        .iter()
+        .filter_map(|group| group.chosen_symbol.as_ref().map(|hit| hit.node_id.clone()))
+        .collect::<HashSet<_>>();
+    suggestions
+        .iter()
+        .chain(indexed_hits.iter())
+        .filter(|hit| !chosen.contains(&hit.node_id))
+        .take(4)
+        .map(|hit| SearchPlanRejectedHitDto {
+            display_name: hit.display_name.clone(),
+            reason: "not selected after anchor grouping and evidence ranking".to_string(),
+            origin: hit.origin,
+            file_path: hit.file_path.clone(),
+            line: hit.line,
+        })
+        .collect()
+}
+
+fn search_plan_bridge_request(from: &NodeId, to: &NodeId) -> TrailConfigDto {
+    TrailConfigDto {
+        root_id: from.clone(),
+        mode: codestory_contracts::api::TrailMode::ToTargetSymbol,
+        target_id: Some(to.clone()),
+        depth: 0,
+        direction: codestory_contracts::api::TrailDirection::Outgoing,
+        caller_scope: codestory_contracts::api::TrailCallerScope::ProductionOnly,
+        edge_filter: Vec::new(),
+        show_utility_calls: false,
+        hide_speculative: true,
+        story: false,
+        node_filter: Vec::new(),
+        max_nodes: 80,
+        layout_direction: codestory_contracts::api::LayoutDirection::Horizontal,
+    }
+}
+
+fn graph_response_has_bridge(
+    graph: &codestory_contracts::api::GraphResponse,
+    from: &NodeId,
+    to: &NodeId,
+) -> bool {
+    if from == to {
+        return true;
+    }
+    graph.nodes.iter().any(|node| node.id == *from)
+        && graph.nodes.iter().any(|node| node.id == *to)
+        && !graph.edges.is_empty()
+}
+
+fn shared_file_bridge(from: &SearchHit, to: &SearchHit) -> bool {
+    same_search_file(from, to)
+}
+
+fn search_plan_next_commands(groups: &[SearchPlanAnchorGroupDto]) -> Vec<String> {
+    groups
+        .iter()
+        .filter_map(|group| group.chosen_symbol.as_ref())
+        .take(4)
+        .flat_map(|hit| {
+            [
+                format!("codestory-cli symbol --id {}", hit.node_id.0),
+                format!(
+                    "codestory-cli trail --id {} --story --hide-speculative",
+                    hit.node_id.0
+                ),
+                format!("codestory-cli snippet --id {} --context 40", hit.node_id.0),
+            ]
+        })
+        .collect()
+}
+
+fn search_plan_source_truth_checks(groups: &[SearchPlanAnchorGroupDto]) -> Vec<String> {
+    let mut checks = vec![
+        "Draft the CodeStory-only answer from selected anchors, bridge status, symbol, trail, and snippet evidence before opening source.".to_string(),
+        "Open the cited source files after the CodeStory-only draft and classify each claim as correct, partial, misleading, or unsupported.".to_string(),
+    ];
+    if groups.iter().any(|group| {
+        matches!(
+            group.promotion_status,
+            SearchPlanPromotionStatusDto::NeedsSourceRead | SearchPlanPromotionStatusDto::Ambiguous
+        )
+    }) {
+        checks.push(
+            "Repo-text-only or ambiguous groups require direct source reads before they can support architecture claims."
+                .to_string(),
+        );
+    }
+    checks
 }
 
 #[derive(Clone)]
@@ -4569,6 +5323,327 @@ impl AppController {
         result
     }
 
+    fn execute_search_plan_subqueries(
+        &self,
+        storage: &Storage,
+        subqueries: &[SearchPlanSubqueryDto],
+        filters: &[SearchIntentFilter],
+        indexed_hit_ids: &HashSet<NodeId>,
+        limit_per_source: usize,
+        hybrid_weights: Option<AgentHybridWeightsDto>,
+        hybrid_limits: Option<SearchHybridLimitsDto>,
+        semantic_ready: bool,
+    ) -> Result<SearchPlanExecutedEvidence, ApiError> {
+        let mut evidence = SearchPlanExecutedEvidence::default();
+        let project_root = self.require_project_root().ok();
+        let mut seen_repo_text_ids = indexed_hit_ids.clone();
+
+        for subquery in subqueries {
+            let uses_indexed = subquery.channels.iter().any(|channel| {
+                matches!(
+                    channel,
+                    SearchPlanChannelDto::TypedSymbol
+                        | SearchPlanChannelDto::Lexical
+                        | SearchPlanChannelDto::Semantic
+                )
+            });
+            if uses_indexed {
+                let (mut scored_hits, _) = self.search_hybrid_scored_inner(
+                    SearchRequest {
+                        query: subquery.query.clone(),
+                        repo_text: SearchRepoTextMode::Off,
+                        limit_per_source: limit_per_source as u32,
+                        hybrid_weights: hybrid_weights.clone(),
+                        hybrid_limits: hybrid_limits.clone(),
+                    },
+                    None,
+                    limit_per_source,
+                    hybrid_weights.clone(),
+                )?;
+                let mut suggestions = did_you_mean_suggestions(&scored_hits);
+                let mut hits = scored_hits
+                    .drain(..)
+                    .map(|scored| scored.hit)
+                    .collect::<Vec<_>>();
+                if should_expand_symbol_query(&subquery.query, hits.len()) {
+                    let expanded_hits = self.expanded_symbol_hits(storage, &subquery.query)?;
+                    merge_search_hits_by_node_id(&mut hits, expanded_hits);
+                }
+                apply_search_intent_filters(&mut hits, filters);
+                apply_search_intent_filters(&mut suggestions, filters);
+                hits.sort_by(|left, right| {
+                    compare_search_hits_with_project_root(
+                        project_root.as_deref(),
+                        &subquery.query,
+                        left,
+                        right,
+                    )
+                });
+                suggestions.sort_by(|left, right| {
+                    compare_search_hits_with_project_root(
+                        project_root.as_deref(),
+                        &subquery.query,
+                        left,
+                        right,
+                    )
+                });
+                dedupe_inexact_search_hits_by_display_key(&subquery.query, &mut hits);
+                hits.truncate(limit_per_source);
+                suggestions.truncate(limit_per_source);
+                annotate_search_hit_match_quality(&subquery.query, &mut hits);
+                annotate_search_hit_match_quality(&subquery.query, &mut suggestions);
+                evidence
+                    .candidate_windows
+                    .extend(search_plan_symbol_windows(
+                        subquery,
+                        &hits,
+                        &suggestions,
+                        limit_per_source as u32,
+                        semantic_ready,
+                    ));
+                merge_search_hits_by_node_id(&mut evidence.indexed_symbol_hits, hits);
+                merge_search_hits_by_node_id(&mut evidence.suggestions, suggestions);
+            }
+
+            if subquery
+                .channels
+                .iter()
+                .any(|channel| *channel == SearchPlanChannelDto::RepoText)
+            {
+                let scan = Self::collect_repo_text_hits(
+                    storage,
+                    project_root.as_deref(),
+                    &subquery.query,
+                    limit_per_source,
+                    &seen_repo_text_ids,
+                )?;
+                let mut hits = scan.hits;
+                apply_search_intent_filters(&mut hits, filters);
+                annotate_search_hit_match_quality(&subquery.query, &mut hits);
+                for hit in &hits {
+                    seen_repo_text_ids.insert(hit.node_id.clone());
+                }
+                evidence
+                    .candidate_windows
+                    .push(SearchPlanCandidateWindowDto {
+                        channel: SearchPlanChannelDto::RepoText,
+                        subquery: subquery.query.clone(),
+                        limit: limit_per_source as u32,
+                        returned_count: clamp_usize_to_u32(hits.len()),
+                        truncated: hits.len() >= limit_per_source,
+                        score_reasons: vec![
+                            "executed repo-text retrieval for this planned subquery; hits require promotion or source reads"
+                                .to_string(),
+                        ],
+                    });
+                merge_search_hits_by_node_id(&mut evidence.repo_text_hits, hits);
+            }
+        }
+
+        Ok(evidence)
+    }
+
+    fn build_search_plan(
+        &self,
+        storage: &Storage,
+        original_query: &str,
+        effective_query: &str,
+        query_assessment: &SearchQueryAssessmentDto,
+        indexed_symbol_hits: &[SearchHit],
+        repo_text_hits: &[SearchHit],
+        suggestions: &[SearchHit],
+        retrieval: &RetrievalStateDto,
+        limit_per_source: u32,
+        filters: &[SearchIntentFilter],
+        indexed_hit_ids: &HashSet<NodeId>,
+        hybrid_weights: Option<AgentHybridWeightsDto>,
+        hybrid_limits: Option<SearchHybridLimitsDto>,
+    ) -> Result<Option<SearchPlanBuild>, ApiError> {
+        let intents = architecture_query_intents(effective_query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        let eligible = search_plan_eligible(
+            effective_query,
+            query_assessment.exact_symbol_hit_count,
+            &intents,
+        );
+        if !eligible {
+            return Ok(None);
+        }
+        let terms = search_plan_terms(effective_query);
+        let subqueries = search_plan_subqueries(effective_query, &terms, &intents);
+        let mut executed = self.execute_search_plan_subqueries(
+            storage,
+            &subqueries,
+            filters,
+            indexed_hit_ids,
+            limit_per_source as usize,
+            hybrid_weights,
+            hybrid_limits,
+            retrieval.semantic_ready,
+        )?;
+        let mut plan_indexed_hits = indexed_symbol_hits.to_vec();
+        merge_search_hits_by_node_id(&mut plan_indexed_hits, executed.indexed_symbol_hits.clone());
+        let mut plan_repo_text_hits = repo_text_hits.to_vec();
+        merge_search_hits_by_node_id(&mut plan_repo_text_hits, executed.repo_text_hits.clone());
+        let mut plan_suggestions = suggestions.to_vec();
+        merge_search_hits_by_node_id(&mut plan_suggestions, executed.suggestions.clone());
+        let anchor_groups = search_plan_anchor_groups(
+            effective_query,
+            &terms,
+            &plan_indexed_hits,
+            &plan_repo_text_hits,
+            &plan_suggestions,
+        );
+        let bridges = self.search_plan_bridges(&anchor_groups);
+        if !bridges.is_empty() {
+            executed
+                .candidate_windows
+                .push(SearchPlanCandidateWindowDto {
+                    channel: SearchPlanChannelDto::Bridge,
+                    subquery: "selected_anchor_bridges".to_string(),
+                    limit: anchor_groups.len().saturating_sub(1).min(u32::MAX as usize) as u32,
+                    returned_count: clamp_usize_to_u32(bridges.len()),
+                    truncated: false,
+                    score_reasons: vec![
+                        "bridge evidence expands only after anchor grouping".to_string(),
+                    ],
+                });
+        }
+        let plan = SearchPlanDto {
+            original_query: original_query.to_string(),
+            eligible,
+            intents,
+            terms,
+            subqueries,
+            candidate_windows: executed.candidate_windows,
+            anchor_groups: anchor_groups.clone(),
+            bridges,
+            rejected_hits: search_plan_rejected_hits(
+                &anchor_groups,
+                &plan_suggestions,
+                &plan_indexed_hits,
+            ),
+            next_commands: search_plan_next_commands(&anchor_groups),
+            source_truth_checks: search_plan_source_truth_checks(&anchor_groups),
+        };
+        Ok(Some(SearchPlanBuild {
+            plan,
+            indexed_symbol_hits: executed.indexed_symbol_hits,
+            repo_text_hits: executed.repo_text_hits,
+            suggestions: executed.suggestions,
+        }))
+    }
+
+    fn search_plan_bridges(&self, groups: &[SearchPlanAnchorGroupDto]) -> Vec<SearchPlanBridgeDto> {
+        let selected = groups
+            .iter()
+            .filter_map(|group| group.chosen_symbol.as_ref().map(|hit| (group, hit)))
+            .take(5)
+            .collect::<Vec<_>>();
+        selected
+            .windows(2)
+            .map(|pair| {
+                let (from_group, from_hit) = pair[0];
+                let (to_group, to_hit) = pair[1];
+                let mut notes = Vec::new();
+                if from_hit.node_id == to_hit.node_id {
+                    return SearchPlanBridgeDto {
+                        from_anchor: from_group.anchor.clone(),
+                        to_anchor: to_group.anchor.clone(),
+                        status: "supported".to_string(),
+                        confidence: "high".to_string(),
+                        evidence_kind: "same_anchor".to_string(),
+                        direction: Some("self".to_string()),
+                        node_count: 1,
+                        edge_count: 0,
+                        truncated: false,
+                        notes,
+                    };
+                }
+                let forward = self.graph_trail(search_plan_bridge_request(
+                    &from_hit.node_id,
+                    &to_hit.node_id,
+                ));
+                if let Ok(graph) = forward
+                    && graph_response_has_bridge(&graph, &from_hit.node_id, &to_hit.node_id)
+                {
+                    return SearchPlanBridgeDto {
+                        from_anchor: from_group.anchor.clone(),
+                        to_anchor: to_group.anchor.clone(),
+                        status: "supported".to_string(),
+                        confidence: if graph.truncated { "medium" } else { "high" }.to_string(),
+                        evidence_kind: "graph_path".to_string(),
+                        direction: Some("forward".to_string()),
+                        node_count: clamp_usize_to_u32(graph.nodes.len()),
+                        edge_count: clamp_usize_to_u32(graph.edges.len()),
+                        truncated: graph.truncated,
+                        notes,
+                    };
+                }
+                let reverse = self.graph_trail(search_plan_bridge_request(
+                    &to_hit.node_id,
+                    &from_hit.node_id,
+                ));
+                if let Ok(graph) = reverse
+                    && graph_response_has_bridge(&graph, &to_hit.node_id, &from_hit.node_id)
+                {
+                    notes.push(
+                        "reverse graph path found; direction is partial evidence for the original flow"
+                            .to_string(),
+                    );
+                    return SearchPlanBridgeDto {
+                        from_anchor: from_group.anchor.clone(),
+                        to_anchor: to_group.anchor.clone(),
+                        status: "partial".to_string(),
+                        confidence: if graph.truncated { "low" } else { "medium" }.to_string(),
+                        evidence_kind: "graph_path".to_string(),
+                        direction: Some("reverse".to_string()),
+                        node_count: clamp_usize_to_u32(graph.nodes.len()),
+                        edge_count: clamp_usize_to_u32(graph.edges.len()),
+                        truncated: graph.truncated,
+                        notes,
+                    };
+                }
+                if shared_file_bridge(from_hit, to_hit) {
+                    notes.push(
+                        "anchors share a source file; this is low-confidence bridge evidence only"
+                            .to_string(),
+                    );
+                    return SearchPlanBridgeDto {
+                        from_anchor: from_group.anchor.clone(),
+                        to_anchor: to_group.anchor.clone(),
+                        status: "partial".to_string(),
+                        confidence: "low".to_string(),
+                        evidence_kind: "shared_file".to_string(),
+                        direction: None,
+                        node_count: 2,
+                        edge_count: 0,
+                        truncated: false,
+                        notes,
+                    };
+                }
+                notes.push(
+                    "no graph path or shared-file bridge found inside the bounded evidence budget"
+                        .to_string(),
+                );
+                SearchPlanBridgeDto {
+                    from_anchor: from_group.anchor.clone(),
+                    to_anchor: to_group.anchor.clone(),
+                    status: "unsupported".to_string(),
+                    confidence: "low".to_string(),
+                    evidence_kind: "isolated_anchors".to_string(),
+                    direction: None,
+                    node_count: 2,
+                    edge_count: 0,
+                    truncated: false,
+                    notes,
+                }
+            })
+            .collect()
+    }
+
     pub fn search(&self, req: SearchRequest) -> Result<Vec<SearchHit>, ApiError> {
         Ok(self.search_results(req)?.hits)
     }
@@ -4666,12 +5741,6 @@ impl AppController {
         } else {
             (Vec::new(), None)
         };
-        annotate_search_hit_match_quality(&query, &mut suggestions);
-        annotate_search_hit_match_quality(&query, &mut indexed_symbol_hits);
-        annotate_search_hit_match_quality(&query, &mut repo_text_hits);
-        let mut hits = Vec::with_capacity(indexed_symbol_hits.len() + repo_text_hits.len());
-        hits.extend(indexed_symbol_hits.iter().cloned());
-        hits.extend(repo_text_hits.iter().cloned());
         let freshness = self.index_freshness().ok();
         let query_assessment = search_query_assessment(
             &query,
@@ -4681,6 +5750,74 @@ impl AppController {
             repo_text_enabled,
             repo_text_fallback_reason,
         );
+        let mut search_plan_anchor_rank = HashMap::<NodeId, usize>::new();
+        let search_plan = match self.build_search_plan(
+            &storage,
+            &original_query,
+            &query,
+            &query_assessment,
+            &indexed_symbol_hits,
+            &repo_text_hits,
+            &suggestions,
+            &retrieval,
+            limit_per_source as u32,
+            &intent_query.filters,
+            &indexed_hit_ids,
+            req.hybrid_weights.clone(),
+            req.hybrid_limits.clone(),
+        )? {
+            Some(plan_build) => {
+                for (rank, group) in plan_build.plan.anchor_groups.iter().enumerate() {
+                    if let Some(symbol) = &group.chosen_symbol {
+                        search_plan_anchor_rank
+                            .entry(symbol.node_id.clone())
+                            .or_insert(rank);
+                        merge_search_hits_by_node_id(
+                            &mut indexed_symbol_hits,
+                            vec![symbol.clone()],
+                        );
+                    }
+                }
+                merge_search_hits_by_node_id(
+                    &mut indexed_symbol_hits,
+                    plan_build.indexed_symbol_hits,
+                );
+                merge_search_hits_by_node_id(&mut repo_text_hits, plan_build.repo_text_hits);
+                merge_search_hits_by_node_id(&mut suggestions, plan_build.suggestions);
+                Some(plan_build.plan)
+            }
+            None => None,
+        };
+        indexed_symbol_hits.sort_by(|left, right| {
+            let anchor_order = match (
+                search_plan_anchor_rank.get(&left.node_id),
+                search_plan_anchor_rank.get(&right.node_id),
+            ) {
+                (Some(left_rank), Some(right_rank)) => left_rank.cmp(right_rank),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            };
+            anchor_order.then_with(|| {
+                compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
+            })
+        });
+        dedupe_inexact_search_hits_by_display_key(&query, &mut indexed_symbol_hits);
+        indexed_symbol_hits.truncate(limit_per_source);
+        repo_text_hits.sort_by(|left, right| {
+            compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
+        });
+        repo_text_hits.truncate(limit_per_source);
+        suggestions.sort_by(|left, right| {
+            compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
+        });
+        suggestions.truncate(limit_per_source);
+        annotate_search_hit_match_quality(&query, &mut suggestions);
+        annotate_search_hit_match_quality(&query, &mut indexed_symbol_hits);
+        annotate_search_hit_match_quality(&query, &mut repo_text_hits);
+        let mut hits = Vec::with_capacity(indexed_symbol_hits.len() + repo_text_hits.len());
+        hits.extend(indexed_symbol_hits.iter().cloned());
+        hits.extend(repo_text_hits.iter().cloned());
 
         Ok(SearchResultsDto {
             query: original_query,
@@ -4690,6 +5827,7 @@ impl AppController {
             repo_text_mode,
             repo_text_enabled,
             query_assessment: Some(query_assessment),
+            search_plan,
             repo_text_stats,
             suggestions,
             indexed_symbol_hits,
@@ -7198,6 +8336,64 @@ pub fn exact_symbol_anchor() {{}}
     fn extract_symbol_search_terms_removes_stopwords_and_short_tokens() {
         let terms = extract_symbol_search_terms("How does the language parsing work in this repo?");
         assert_eq!(terms, vec!["language".to_string(), "parsing".to_string()]);
+    }
+
+    #[test]
+    fn broad_architecture_search_plan_terms_and_subqueries_are_bounded() {
+        let query = "Explain how CodeStory's full-index path flows through CLI/runtime/workspace/indexer/store and how that supports later search, trail, and snippet commands.";
+        let terms = search_plan_terms(query);
+        for expected in [
+            "full-index",
+            "full",
+            "index",
+            "cli",
+            "runtime",
+            "workspace",
+            "indexer",
+            "store",
+            "search",
+            "trail",
+            "snippet",
+        ] {
+            assert!(
+                terms
+                    .extracted
+                    .iter()
+                    .any(|term| term.eq_ignore_ascii_case(expected)),
+                "expected `{expected}` in extracted terms: {:?}",
+                terms.extracted
+            );
+        }
+        assert!(
+            terms
+                .dropped
+                .iter()
+                .any(|term| term.term.eq_ignore_ascii_case("explain")),
+            "natural-language filler should be visible as dropped terms: {:?}",
+            terms.dropped
+        );
+        let intents = architecture_query_intents(query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(!intents.is_empty(), "query should have architecture intent");
+        let subqueries = search_plan_subqueries(query, &terms, &intents);
+        assert!(
+            (3..=8).contains(&subqueries.len()),
+            "subqueries should be bounded: {subqueries:#?}"
+        );
+        assert!(
+            subqueries.iter().any(|subquery| subquery
+                .channels
+                .contains(&SearchPlanChannelDto::TypedSymbol)),
+            "subqueries should cover typed symbol discovery: {subqueries:#?}"
+        );
+        assert!(
+            subqueries
+                .iter()
+                .any(|subquery| subquery.channels.contains(&SearchPlanChannelDto::RepoText)),
+            "subqueries should cover repo text discovery: {subqueries:#?}"
+        );
     }
 
     #[test]

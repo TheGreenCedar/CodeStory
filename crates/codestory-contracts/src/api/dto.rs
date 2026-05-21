@@ -258,6 +258,123 @@ pub struct SearchQueryAssessmentDto {
     pub recommended_next_action: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchPlanChannelDto {
+    TypedSymbol,
+    Lexical,
+    Semantic,
+    RepoText,
+    Bridge,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchPlanPromotionStatusDto {
+    TypedAnchor,
+    Promoted,
+    NeedsSourceRead,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SearchPlanDroppedTermDto {
+    pub term: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SearchPlanTermsDto {
+    #[serde(default)]
+    pub extracted: Vec<String>,
+    #[serde(default)]
+    pub dropped: Vec<SearchPlanDroppedTermDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SearchPlanSubqueryDto {
+    pub query: String,
+    pub role: String,
+    #[serde(default)]
+    pub channels: Vec<SearchPlanChannelDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SearchPlanCandidateWindowDto {
+    pub channel: SearchPlanChannelDto,
+    pub subquery: String,
+    pub limit: u32,
+    pub returned_count: u32,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub score_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SearchPlanAnchorGroupDto {
+    pub anchor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen_symbol: Option<SearchHit>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supporting_hits: Vec<SearchHit>,
+    pub promotion_status: SearchPlanPromotionStatusDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion_method: Option<String>,
+    pub confidence: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SearchPlanBridgeDto {
+    pub from_anchor: String,
+    pub to_anchor: String,
+    pub status: String,
+    pub confidence: String,
+    pub evidence_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    pub node_count: u32,
+    pub edge_count: u32,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SearchPlanRejectedHitDto {
+    pub display_name: String,
+    pub reason: String,
+    pub origin: SearchHitOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SearchPlanDto {
+    pub original_query: String,
+    pub eligible: bool,
+    #[serde(default)]
+    pub intents: Vec<String>,
+    pub terms: SearchPlanTermsDto,
+    #[serde(default)]
+    pub subqueries: Vec<SearchPlanSubqueryDto>,
+    #[serde(default)]
+    pub candidate_windows: Vec<SearchPlanCandidateWindowDto>,
+    #[serde(default)]
+    pub anchor_groups: Vec<SearchPlanAnchorGroupDto>,
+    #[serde(default)]
+    pub bridges: Vec<SearchPlanBridgeDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected_hits: Vec<SearchPlanRejectedHitDto>,
+    #[serde(default)]
+    pub next_commands: Vec<String>,
+    #[serde(default)]
+    pub source_truth_checks: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchResultsDto {
     pub query: String,
@@ -269,6 +386,8 @@ pub struct SearchResultsDto {
     pub repo_text_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_assessment: Option<SearchQueryAssessmentDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_plan: Option<SearchPlanDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_text_stats: Option<RepoTextScanStatsDto>,
     #[serde(default)]

@@ -860,6 +860,12 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
     let search_hit_schema = tool_output_schema(&tools, "search")
         .pointer("/properties/hits/items")
         .unwrap_or_else(|| panic!("search outputSchema should describe hit items: {tools}"));
+    let search_output_schema = tool_output_schema(&tools, "search");
+    assert_eq!(
+        schema_property(search_output_schema, "search_plan")["type"],
+        json!(["object", "null"]),
+        "search outputSchema should allow optional SearchPlan DTOs: {search_output_schema}"
+    );
     assert!(
         !required_fields(search_hit_schema).contains("match_quality"),
         "SearchHit.match_quality is optional and must not be required: {search_hit_schema}"

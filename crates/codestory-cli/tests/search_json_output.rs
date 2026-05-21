@@ -280,6 +280,301 @@ fn search_json_emits_search_results_dto_after_repo_text_merge() {
 }
 
 #[test]
+fn broad_search_json_and_markdown_expose_search_plan() {
+    let workspace = tempdir().expect("workspace dir");
+    write_search_quality_fixture(workspace.path());
+
+    let index = run_cli(
+        workspace.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    assert!(
+        index.status.success(),
+        "index command failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    let query = "how full indexing supports search trail and snippet commands";
+    let search = run_cli(
+        workspace.path(),
+        &[
+            "search",
+            "--query",
+            query,
+            "--repo-text",
+            "on",
+            "--why",
+            "--format",
+            "json",
+            "--refresh",
+            "none",
+        ],
+    );
+    assert!(
+        search.status.success(),
+        "search command failed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let json: Value = serde_json::from_slice(&search.stdout).expect("parse search json");
+    let plan = &json["search_plan"];
+    assert!(
+        plan.is_object(),
+        "search json should expose search_plan: {json:#}"
+    );
+    assert_eq!(plan["original_query"], query);
+    assert_eq!(plan["eligible"], true);
+    let extracted = plan["terms"]["extracted"]
+        .as_array()
+        .expect("extracted terms")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    for expected in ["full", "indexing", "search", "trail", "snippet"] {
+        assert!(
+            extracted.contains(&expected),
+            "search plan should extract `{expected}` from broad query: {plan:#}"
+        );
+    }
+    assert!(
+        plan["terms"]["dropped"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "search plan should expose dropped natural-language terms: {plan:#}"
+    );
+    let subqueries = plan["subqueries"].as_array().expect("subqueries");
+    assert!(
+        (3..=8).contains(&subqueries.len()),
+        "broad query should produce bounded subqueries: {plan:#}"
+    );
+    let channels = subqueries
+        .iter()
+        .flat_map(|subquery| subquery["channels"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(channels.contains(&"typed_symbol"), "{plan:#}");
+    assert!(
+        channels.contains(&"lexical") || channels.contains(&"semantic"),
+        "{plan:#}"
+    );
+    assert!(channels.contains(&"repo_text"), "{plan:#}");
+    assert!(
+        plan["candidate_windows"].as_array().is_some_and(|items| {
+            items.iter().all(|item| {
+                item["channel"].is_string()
+                    && item["subquery"].is_string()
+                    && item["limit"].is_number()
+                    && item["returned_count"].is_number()
+                    && item["truncated"].is_boolean()
+            })
+        }),
+        "candidate windows should expose bounded retrieval state: {plan:#}"
+    );
+    assert!(
+        plan["candidate_windows"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| {
+                item["channel"] == "typed_symbol"
+                    && item["subquery"]
+                        .as_str()
+                        .is_some_and(|subquery| subquery != query)
+                    && item["returned_count"]
+                        .as_u64()
+                        .is_some_and(|count| count > 0)
+            })),
+        "candidate windows should come from executed planned subqueries, not only the original query: {plan:#}"
+    );
+    assert!(
+        plan["anchor_groups"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()
+                && items.iter().all(|item| {
+                    item["anchor"].is_string()
+                        && item["promotion_status"].is_string()
+                        && item["confidence"].is_string()
+                })),
+        "search plan should expose anchor groups: {plan:#}"
+    );
+    assert!(
+        plan["next_commands"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "search plan should provide next commands: {plan:#}"
+    );
+    assert!(
+        plan["source_truth_checks"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "search plan should provide source-truth checks: {plan:#}"
+    );
+
+    let markdown = run_cli(
+        workspace.path(),
+        &[
+            "search",
+            "--query",
+            query,
+            "--repo-text",
+            "on",
+            "--why",
+            "--format",
+            "markdown",
+            "--refresh",
+            "none",
+        ],
+    );
+    assert!(
+        markdown.status.success(),
+        "markdown search command failed: {}",
+        String::from_utf8_lossy(&markdown.stderr)
+    );
+    let markdown = String::from_utf8(markdown.stdout).expect("markdown utf8");
+    for expected in [
+        "## Search Plan",
+        "Subqueries:",
+        "Extracted terms:",
+        "Repo-text promotions:",
+        "Source-truth checks:",
+    ] {
+        assert!(
+            markdown.contains(expected),
+            "search markdown should contain `{expected}`:\n{markdown}"
+        );
+    }
+}
+
+#[test]
+fn exact_symbol_queries_preserve_fast_path_and_top_rank() {
+    let workspace = tempdir().expect("workspace dir");
+    write_search_quality_fixture(workspace.path());
+
+    let index = run_cli(
+        workspace.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    assert!(
+        index.status.success(),
+        "index command failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    for anchor in [
+        "WorkspaceIndexer",
+        "SearchService",
+        "TrailResult",
+        "SourceGroupCxxCdb",
+        "getCommentAuth",
+    ] {
+        let search = run_cli(
+            workspace.path(),
+            &[
+                "search",
+                "--query",
+                anchor,
+                "--repo-text",
+                "on",
+                "--why",
+                "--format",
+                "json",
+                "--refresh",
+                "none",
+            ],
+        );
+        assert!(
+            search.status.success(),
+            "search command failed for {anchor}: {}",
+            String::from_utf8_lossy(&search.stderr)
+        );
+        let json: Value = serde_json::from_slice(&search.stdout).expect("parse search json");
+        assert_eq!(
+            json["indexed_symbol_hits"][0]["display_name"], anchor,
+            "exact query should keep the exact typed symbol first: {json:#}"
+        );
+        assert_eq!(json["indexed_symbol_hits"][0]["origin"], "indexed_symbol");
+        assert!(
+            json["query_assessment"]["exact_symbol_hit_count"]
+                .as_u64()
+                .is_some_and(|count| count >= 1),
+            "exact query should report exact symbol hits: {json:#}"
+        );
+        assert!(
+            json["search_plan"].is_null(),
+            "exact-symbol fast path should not emit a broad search plan: {json:#}"
+        );
+    }
+}
+
+#[test]
+fn drill_question_search_artifact_keeps_broad_plan_partial() {
+    let workspace = tempdir().expect("workspace dir");
+    write_search_quality_fixture(workspace.path());
+    let output_dir = tempdir().expect("drill output dir");
+
+    let index = run_cli(
+        workspace.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    assert!(
+        index.status.success(),
+        "index command failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    let drill = run_cli(
+        workspace.path(),
+        &[
+            "drill",
+            "--question",
+            "how full indexing supports search trail and snippet commands",
+            "--anchors",
+            "WorkspaceIndexer",
+            "--output-dir",
+            output_dir.path().to_str().expect("output path"),
+            "--format",
+            "json",
+            "--refresh",
+            "none",
+        ],
+    );
+    assert!(
+        drill.status.success(),
+        "drill command failed: {}",
+        String::from_utf8_lossy(&drill.stderr)
+    );
+    let question_search_path = output_dir.path().join("question-search.json");
+    let question_search: Value = serde_json::from_slice(
+        &fs::read(&question_search_path).expect("read question-search artifact"),
+    )
+    .expect("parse question-search json");
+    assert!(
+        question_search["search_plan"].is_object(),
+        "question-search artifact should include the same broad search plan: {question_search:#}"
+    );
+    let report_path = output_dir.path().join("drill-report.json");
+    let report: Value = serde_json::from_slice(&fs::read(&report_path).expect("read drill report"))
+        .expect("parse drill report");
+    assert_eq!(report["question_search"]["status"], "ok");
+    let evidence_items = report["evidence_packet"]["items"]
+        .as_array()
+        .expect("evidence packet items");
+    let question_item = evidence_items
+        .iter()
+        .find(|item| item["id"] == "question-search")
+        .expect("question-search evidence item");
+    assert_eq!(
+        question_item["verification_status"], "partial",
+        "question search should remain partial discovery evidence: {question_item:#}"
+    );
+    assert!(
+        question_item["notes"]
+            .as_array()
+            .is_some_and(|notes| notes.iter().any(|note| note
+                .as_str()
+                .is_some_and(|text| text.contains("broad discovery")))),
+        "question-search evidence should preserve broad discovery guidance: {question_item:#}"
+    );
+}
+
+#[test]
 fn symbol_json_exposes_typed_route_endpoint_metadata() {
     let workspace = tempdir().expect("workspace dir");
     write_search_quality_fixture(workspace.path());
@@ -525,6 +820,7 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
     let mut reciprocal_rank_sum = 0.0_f64;
     let mut latency_ms = Vec::new();
     let mut anchor_buckets = BTreeMap::<String, u32>::new();
+    let mut planned_broad_queries = 0_u32;
 
     for (query, expected, repo_text) in expectations {
         let started = Instant::now();
@@ -575,6 +871,43 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
             (None, None) => "missing",
         };
         *anchor_buckets.entry(anchor_bucket.to_string()).or_default() += 1;
+        if query.starts_with("how ") {
+            let plan = &json["search_plan"];
+            assert!(
+                plan.is_object(),
+                "broad architecture query should expose a search plan: {json:#}"
+            );
+            let planned_anchor = plan["anchor_groups"]
+                .as_array()
+                .expect("anchor groups")
+                .iter()
+                .any(|group| {
+                    group["anchor"]
+                        .as_str()
+                        .is_some_and(|anchor| anchor.contains(expected))
+                        || group["chosen_symbol"]["display_name"]
+                            .as_str()
+                            .is_some_and(|name| name.contains(expected))
+                });
+            assert!(
+                planned_anchor || indexed_position.is_some() || repo_text_position.is_some(),
+                "broad architecture query should find expected anchor through hits or plan: {json:#}"
+            );
+            assert!(
+                plan["anchor_groups"]
+                    .as_array()
+                    .expect("anchor groups")
+                    .iter()
+                    .all(|group| {
+                        !matches!(
+                            group["promotion_status"].as_str(),
+                            Some("needs_source_read" | "ambiguous")
+                        ) || group["confidence"] != "high"
+                    }),
+                "unpromoted repo-text leads must not become high confidence: {json:#}"
+            );
+            planned_broad_queries += 1;
+        }
         if let Some(position) = indexed_position.or(repo_text_position) {
             found += 1;
             reciprocal_rank_sum += 1.0 / (position as f64 + 1.0);
@@ -632,6 +965,10 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
     assert!(
         mrr >= 0.50,
         "expected useful search ordering, got mrr={mrr:.3}"
+    );
+    assert_eq!(
+        planned_broad_queries, 3,
+        "expected all broad architecture eval queries to expose search plans"
     );
     assert!(
         max_latency_ms < 3_000,

@@ -540,6 +540,11 @@ static SEARCH_RESULTS_SCHEMA: SchemaObject = SchemaObject::object(
         )
         .nullable(),
         SchemaProperty::object(
+            "search_plan",
+            "Optional broad natural-language Search Plan with subqueries, anchor groups, bridge evidence, next commands, and source-truth checks.",
+        )
+        .nullable(),
+        SchemaProperty::object(
             "repo_text_stats",
             "Repo text scan cap, byte, and truncation telemetry.",
         )

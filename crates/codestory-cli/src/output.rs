@@ -4,8 +4,9 @@ use codestory_contracts::api::{
     AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
     AgentRetrievalStepStatusDto, ClaimReadinessDto, EvidenceTypeDto, GraphArtifactDto,
     GroundingSnapshotDto, NodeDetailsDto, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
-    RetrievalModeDto, RetrievalStateDto, SearchHit, SnippetContextDto, SymbolContextDto,
-    TrailContextDto, TrailStoryDto,
+    RetrievalModeDto, RetrievalStateDto, SearchHit, SearchPlanChannelDto, SearchPlanDto,
+    SearchPlanPromotionStatusDto, SnippetContextDto, SymbolContextDto, TrailContextDto,
+    TrailStoryDto,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -508,6 +509,11 @@ pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput)
     if let Some(assessment) = output.query_assessment.as_ref() {
         append_query_assessment(&mut markdown, assessment);
     }
+    if output.explain
+        && let Some(plan) = output.search_plan.as_ref()
+    {
+        append_search_plan(&mut markdown, plan);
+    }
     if output.explain {
         append_search_evidence_packet(&mut markdown, project_root, output);
     }
@@ -624,6 +630,173 @@ fn append_query_assessment(
     }
     if let Some(action) = assessment.recommended_next_action.as_deref() {
         let _ = writeln!(markdown, "recommended_next_action: {action}");
+    }
+}
+
+fn append_search_plan(markdown: &mut String, plan: &SearchPlanDto) {
+    let _ = writeln!(markdown, "## Search Plan");
+    let _ = writeln!(
+        markdown,
+        "eligible: {} intents: {}",
+        plan.eligible,
+        if plan.intents.is_empty() {
+            "none".to_string()
+        } else {
+            plan.intents.join(", ")
+        }
+    );
+    if !plan.terms.extracted.is_empty() {
+        let _ = writeln!(
+            markdown,
+            "Extracted terms: {}",
+            plan.terms.extracted.join(", ")
+        );
+    }
+    if !plan.terms.dropped.is_empty() {
+        let dropped = plan
+            .terms
+            .dropped
+            .iter()
+            .map(|term| format!("{} ({})", term.term, term.reason))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(markdown, "Dropped terms: {dropped}");
+    }
+    if !plan.subqueries.is_empty() {
+        let _ = writeln!(markdown, "Subqueries:");
+        for subquery in &plan.subqueries {
+            let channels = subquery
+                .channels
+                .iter()
+                .map(format_search_plan_channel)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                markdown,
+                "- `{}` role={} channels={}",
+                subquery.query, subquery.role, channels
+            );
+        }
+    }
+    if !plan.candidate_windows.is_empty() {
+        let _ = writeln!(markdown, "Candidate windows:");
+        for window in &plan.candidate_windows {
+            let _ = writeln!(
+                markdown,
+                "- {} query=`{}` returned={}/{} truncated={}",
+                format_search_plan_channel(&window.channel),
+                window.subquery,
+                window.returned_count,
+                window.limit,
+                window.truncated
+            );
+            for reason in &window.score_reasons {
+                let _ = writeln!(markdown, "  why: {reason}");
+            }
+        }
+    }
+    if !plan.anchor_groups.is_empty() {
+        let _ = writeln!(markdown, "Anchor groups:");
+        for group in &plan.anchor_groups {
+            let target = group
+                .chosen_symbol
+                .as_ref()
+                .map(|hit| format!(" id={}", hit.node_id.0))
+                .unwrap_or_else(|| " id=unresolved".to_string());
+            let _ = writeln!(
+                markdown,
+                "- `{}`{} promotion={} confidence={}",
+                group.anchor,
+                target,
+                format_search_plan_promotion(group.promotion_status),
+                group.confidence
+            );
+            if let Some(method) = group.promotion_method.as_deref() {
+                let _ = writeln!(markdown, "  promotion_method: {method}");
+            }
+            for reason in &group.reasons {
+                let _ = writeln!(markdown, "  why: {reason}");
+            }
+        }
+    }
+    if !plan.bridges.is_empty() {
+        let _ = writeln!(markdown, "Bridge evidence:");
+        for bridge in &plan.bridges {
+            let direction = bridge
+                .direction
+                .as_deref()
+                .map(|value| format!(" direction={value}"))
+                .unwrap_or_default();
+            let _ = writeln!(
+                markdown,
+                "- `{}` -> `{}` status={} confidence={} evidence={}{} nodes={} edges={} truncated={}",
+                bridge.from_anchor,
+                bridge.to_anchor,
+                bridge.status,
+                bridge.confidence,
+                bridge.evidence_kind,
+                direction,
+                bridge.node_count,
+                bridge.edge_count,
+                bridge.truncated
+            );
+            for note in &bridge.notes {
+                let _ = writeln!(markdown, "  note: {note}");
+            }
+        }
+    }
+    let _ = writeln!(markdown, "Repo-text promotions:");
+    let mut wrote_repo_text_promotion = false;
+    for group in &plan.anchor_groups {
+        if matches!(
+            group.promotion_status,
+            SearchPlanPromotionStatusDto::Promoted
+                | SearchPlanPromotionStatusDto::NeedsSourceRead
+                | SearchPlanPromotionStatusDto::Ambiguous
+        ) {
+            wrote_repo_text_promotion = true;
+            let _ = writeln!(
+                markdown,
+                "- `{}` promotion={} confidence={}",
+                group.anchor,
+                format_search_plan_promotion(group.promotion_status),
+                group.confidence
+            );
+        }
+    }
+    if !wrote_repo_text_promotion {
+        let _ = writeln!(markdown, "- none");
+    }
+    if !plan.next_commands.is_empty() {
+        let _ = writeln!(markdown, "Next commands:");
+        for command in &plan.next_commands {
+            let _ = writeln!(markdown, "- `{command}`");
+        }
+    }
+    if !plan.source_truth_checks.is_empty() {
+        let _ = writeln!(markdown, "Source-truth checks:");
+        for check in &plan.source_truth_checks {
+            let _ = writeln!(markdown, "- {check}");
+        }
+    }
+}
+
+fn format_search_plan_channel(channel: &SearchPlanChannelDto) -> &'static str {
+    match channel {
+        SearchPlanChannelDto::TypedSymbol => "typed_symbol",
+        SearchPlanChannelDto::Lexical => "lexical",
+        SearchPlanChannelDto::Semantic => "semantic",
+        SearchPlanChannelDto::RepoText => "repo_text",
+        SearchPlanChannelDto::Bridge => "bridge",
+    }
+}
+
+fn format_search_plan_promotion(status: SearchPlanPromotionStatusDto) -> &'static str {
+    match status {
+        SearchPlanPromotionStatusDto::TypedAnchor => "typed_anchor",
+        SearchPlanPromotionStatusDto::Promoted => "promoted",
+        SearchPlanPromotionStatusDto::NeedsSourceRead => "needs_source_read",
+        SearchPlanPromotionStatusDto::Ambiguous => "ambiguous",
     }
 }
 
@@ -3226,6 +3399,7 @@ mod tests {
                         .to_string(),
                 ),
             }),
+            search_plan: None,
             explain: true,
             query_hints: vec![
                 "codestory-cli context --project C:/repo --query build_packet".to_string(),
@@ -3427,6 +3601,7 @@ mod tests {
                     "Rerun search with --repo-text on or a shorter concrete symbol.".to_string(),
                 ),
             }),
+            search_plan: None,
             explain: true,
             query_hints: Vec::new(),
             suggestions: Vec::new(),

@@ -11,6 +11,11 @@ framework routes are discoverable after ranking or indexing changes.
 - Latency: maximum per-query wall-clock latency observed by the harness.
 - Anchor buckets: whether expected anchors appeared in `indexed_symbol_hits`,
   `repo_text_hits`, or both.
+- Search plan coverage: broad architecture queries must expose `search_plan`
+  with bounded subqueries, candidate windows, anchor groups, and source-truth
+  checks.
+- Promotion precision: repo-text-only or ambiguous plan groups must not be
+  marked high confidence.
 - Field-qualified recall: `kind:`, `path:`, `name:`, and `lang:` queries must
   keep the expected anchor while filtering unrelated hits.
 - Negative/noisy guard: a deliberately noisy query must not produce exact
@@ -54,6 +59,11 @@ search_quality_eval recall=1.000 mrr=0.833 max_latency_ms=42 anchor_buckets=inde
 - Missing `indexed_symbol_hits` means the graph/index side did not expose the
   expected anchor. Missing `repo_text_hits` means fallback text evidence did not
   find the expected file/excerpt. Missing both is a hard failure for the query.
+- Missing `search_plan` on a broad architecture query means the planner did not
+  classify or decompose the question; inspect `query_assessment`, extracted
+  terms, and architecture-intent vocabulary before changing ranking weights.
+- A `search_plan` group with `promotion_status=needs_source_read` or
+  `ambiguous` and `confidence=high` is a calibration failure.
 - A negative/noisy query that returns an exact expected anchor is a precision
   failure, even if recall looks high.
 - A route query failure blocks route-support promotion until the route coverage
@@ -70,6 +80,9 @@ search_quality_eval recall=1.000 mrr=0.833 max_latency_ms=42 anchor_buckets=inde
 - Ranking and route-search changes pass only when expected anchors remain
   present, MRR stays above the agreed threshold, max latency stays under the
   fixture cap, and fallback source stays explainable.
+- Broad architecture search changes also pass only when planned anchors remain
+  visible, repo-text promotion status remains explicit, and source-truth checks
+  are emitted for agent handoff.
 - If a candidate regresses one metric for an intentional reason, record the
   reason in the validation notes. Silent regressions are rejected.
 - Keep the eval CLI-first. Do not add or require server, MCP, watch, or

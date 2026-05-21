@@ -58,11 +58,13 @@ sequenceDiagram
 2. Runtime opens the store and ensures runtime-owned search state is available.
 3. Runtime search prefers hybrid ranking when semantic docs and a local embedding runtime are ready.
 4. When semantic retrieval is unavailable, runtime falls back to symbolic ranking and records the fallback reason in the DTO surface.
-5. Runtime maps retrieval state plus matches into contract DTOs and CLI renders them.
+5. For broad architecture-style queries, runtime assembles an optional Search Plan with extracted/dropped terms, bounded subqueries, candidate windows, anchor groups, repo-text promotion status, bridge evidence, next commands, and source-truth checks.
+6. Runtime maps retrieval state plus matches into contract DTOs and CLI renders them.
 
 When `search --why` is requested, the CLI renders compact explanations from the
 same DTO surface: origin, fallback state, and lexical/semantic/graph score
-breakdowns when runtime produced hybrid scored hits.
+breakdowns when runtime produced hybrid scored hits, plus the Search Plan when
+the broad-query planner emitted one.
 
 ## Context Command
 

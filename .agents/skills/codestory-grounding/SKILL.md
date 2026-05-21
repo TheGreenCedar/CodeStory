@@ -12,7 +12,7 @@ Use this skill to collect repo evidence with `codestory-cli` before making archi
 - `doctor`: read-only health check for project, cache, index, retrieval, semantic readiness, freshness, and relevant environment settings.
 - `index`: build or refresh the SQLite graph, search, snapshot, and semantic cache.
 - `ground`: broad repo-level orientation snapshot; use `--why` for coverage, retrieval mode, gaps, and next commands.
-- `search`: lightweight candidate discovery for symbols, files, literals, API paths, modules, or behavior terms; use `--why` for ranking reasons.
+- `search`: lightweight candidate discovery for symbols, files, literals, API paths, modules, or behavior terms; use `--why` for ranking reasons and broad-query Search Plan evidence when present.
 - `context`: deep evidence/context bundle for one concrete target selected by `--id`, `--query`, or `--bookmark`; it is not question answering and does not interpret natural-language questions.
 - `symbol`: inspect one exact symbol and relationships.
 - `trail`: follow caller, callee, and reference graph around a symbol; use `--story --hide-speculative` for readable flow evidence.
@@ -34,7 +34,7 @@ Use this skill to collect repo evidence with `codestory-cli` before making archi
 4. Use `search` for lightweight candidate discovery. Use `context` only after you have one concrete retrieval target.
 5. Use `explore` when one call should collect resolution, relationships, source slices, related files, and coverage notes around a chosen target.
 6. Use `files` before claiming coverage for a language/path area, and use `affected` before selecting regression tests for a change.
-7. Do not pass broad product or architecture questions to `context`. Break broad questions into concrete terms, choose anchors, then run `context --id <node-id>`.
+7. Do not pass broad product or architecture questions to `context`. Use `search --why` or `drill --question` to decompose broad questions into concrete anchors, then run `context --id <node-id>`.
 8. Treat command output as evidence, then open only the files needed for edits or verification.
 9. Keep navigation, route coverage, performance, and search-quality work CLI-first. Do not route these workflows through MCP, stdio, HTTP, or server behavior.
 10. For architecture answers, read `evidence_packet.readiness` before drafting. Do not present `partial`, `inferred`, or `needs_source_read` claims as verified until the source-truth checklist has been completed.
@@ -90,6 +90,12 @@ target/release/codestory-cli(.exe) search --project <workspace> --repo-text on -
 # select anchors
 target/release/codestory-cli(.exe) context --project <workspace> --id <node-id>
 ```
+
+When `search --why` emits `search_plan`, use its subqueries, anchor groups,
+repo-text promotion status, bridge evidence, next commands, and source-truth
+checks as the CodeStory-first plan. Do not treat the Search Plan as final answer
+text; it is the handoff into `symbol`, `trail`, `snippet`, `explore`, `drill`,
+and source-truth verification.
 
 ### Real-repo agent-quality drill workflow
 
@@ -157,6 +163,10 @@ Capture the baseline before optimization, define the no-regression threshold, an
   - `ambiguous`: a query matched multiple plausible targets; rerun `search --why`, then use `--id` or `--file`.
   - `unmatched`: a changed path was not found in the persisted index; confirm with `files --path <fragment>` or refresh.
 - `search` can return both typed symbol hits and `[unknown]` usage-like hits for the same name. Prefer the typed hit when verifying symbol surfacing.
+- Broad architecture `search` can return `search_plan`. Treat `typed_anchor` and
+  `promoted` groups as candidate anchors, keep `ambiguous` and
+  `needs_source_read` groups visibly uncertain, and follow the plan's
+  source-truth checks before making final claims.
 - `search` may include `did_you_mean` suggestions when semantic retrieval found close matches but lexical lookup did not. Treat these as navigation hints, not exact matches.
 - `context --query` first resolves the query to a concrete target. If the target is ambiguous, use `search --why`, then rerun `context --id`.
 - `trail` should be judged by whether unrelated resolved targets disappeared. Local helper names like `once`, `from`, or `copied` can still appear as `[unknown]` nodes without indicating bad semantic resolution.

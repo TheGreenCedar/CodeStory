@@ -63,5 +63,6 @@ Important rules:
 
 - System behavior: [runtime-execution-path.md](runtime-execution-path.md)
 - Indexing mental model: [indexing-pipeline.md](indexing-pipeline.md)
+- Natural-language search plan: [natural-language-search/blueprint.md](natural-language-search/blueprint.md)
 - Ownership details: [subsystems/contracts.md](subsystems/contracts.md), [subsystems/workspace.md](subsystems/workspace.md), [subsystems/indexer.md](subsystems/indexer.md), [subsystems/store.md](subsystems/store.md), [subsystems/runtime.md](subsystems/runtime.md), [subsystems/cli.md](subsystems/cli.md)
 - Historical context: [../decision-log.md](../decision-log.md)
