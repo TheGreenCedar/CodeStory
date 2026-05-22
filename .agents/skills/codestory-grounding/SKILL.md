@@ -131,6 +131,12 @@ cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture s
 cargo test -p codestory-cli --test agent_quality_eval
 ```
 
+The `agent_quality_eval` command above is the quick deterministic fixture gate. To score local real-repo manifests on this workstation, run the ignored evaluator explicitly:
+
+```
+cargo test -p codestory-cli --test agent_quality_eval local_real_repo_manifests_score_or_explicitly_skip_missing_repos -- --ignored --nocapture
+```
+
 ### Performance review baseline
 
 ```
@@ -174,7 +180,7 @@ Capture the baseline before optimization, define the no-regression threshold, an
 - Framework route symbols include confidence labels. Treat `file_convention` and `decorator` routes as stronger than broad `heuristic` routes, and confirm handler links before claiming an end-to-end route path.
 - Framework integration symbols have bounded fixture-backed support. `tauri:command:*` covers first-argument string-literal `invoke` calls, including multiline/generic calls, and Rust `#[tauri::command]`/`generate_handler!` registrations while rejecting argument strings and comments. `payload:collection:*` covers `CollectionConfig` slug blocks and Payload method calls with `collection:` options while rejecting unrelated slugs, props, and string substrings. Treat evidence outside those covered forms as unsupported until source verification proves it.
 - `drill` Evidence Packet readiness is the agent-facing contract: `anchored` and `supported` claims may be drafted from CodeStory evidence; `partial`, `inferred`, and `needs_source_read` claims must stay visibly uncertain until source verification completes.
-- The agent-quality evaluator is deterministic. Use it to catch unsupported high-confidence claims, overclaims, material source corrections, and confidence-calibration regressions; do not replace it with live LLM judging in CI.
+- The agent-quality evaluator is deterministic. Its gate fails unsupported high-confidence claims, overclaims, high-confidence material source corrections, and poor confidence calibration; do not replace it with live LLM judging in CI.
 - `files`, `search`, and `explore` can report usable-but-partial indexes. Carry those coverage notes into decisions instead of silently assuming full coverage.
 - `affected` is a graph-based test-selection hint, not a replacement for the test suite. Prefer impacted tests first, then run broader gates when shared code or coverage warnings are involved.
 - Search-quality eval failures should be interpreted by query class, expected anchor, anchor bucket, MRR, max latency, and fallback source before ranking or route-support claims are promoted.

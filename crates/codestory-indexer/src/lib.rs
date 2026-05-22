@@ -4808,16 +4808,22 @@ fn normalize_framework_route_path(path: &str) -> String {
 
 fn collect_framework_routes(path: &Path, language_name: &str, source: &str) -> Vec<FrameworkRoute> {
     let mut routes = Vec::new();
-    for (index, line) in source.lines().enumerate() {
+    let code_lines = route_code_lines(language_name, source);
+    let code_source = code_lines.join("\n");
+    let react_router_context = has_react_router_context(&code_source);
+    for (index, line) in code_lines.iter().enumerate() {
         let line_number = index as u32 + 1;
         let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
         match language_name {
             "javascript" | "typescript" => {
                 collect_express_route(trimmed, line_number, &mut routes);
                 collect_fastify_route(trimmed, line_number, &mut routes);
-                collect_koa_route(trimmed, line_number, &mut routes, source);
-                collect_hono_route(trimmed, line_number, &mut routes, source);
-                collect_react_route(trimmed, line_number, &mut routes);
+                collect_koa_route(trimmed, line_number, &mut routes, &code_source);
+                collect_hono_route(trimmed, line_number, &mut routes, &code_source);
+                collect_react_route(trimmed, line_number, &mut routes, react_router_context);
                 collect_sveltekit_server_route(path, trimmed, line_number, &mut routes);
                 collect_next_route_handler(path, trimmed, line_number, &mut routes);
                 collect_astro_endpoint_route(path, trimmed, line_number, &mut routes);
@@ -4826,7 +4832,7 @@ fn collect_framework_routes(path: &Path, language_name: &str, source: &str) -> V
             "python" => collect_python_route(trimmed, line_number, &mut routes),
             "java" => collect_spring_route(trimmed, line_number, &mut routes),
             "rust" => collect_rust_web_route(trimmed, line_number, &mut routes),
-            "go" => collect_go_route(trimmed, line_number, &mut routes, source),
+            "go" => collect_go_route(trimmed, line_number, &mut routes, &code_source),
             "ruby" => collect_rails_route(trimmed, line_number, &mut routes),
             "php" => collect_laravel_route(trimmed, line_number, &mut routes),
             "csharp" => collect_aspnet_route(trimmed, line_number, &mut routes),
@@ -4836,9 +4842,9 @@ fn collect_framework_routes(path: &Path, language_name: &str, source: &str) -> V
         }
     }
     if matches!(language_name, "javascript" | "typescript") {
-        collect_next_file_route(path, source, &mut routes);
-        collect_remix_file_route(path, source, &mut routes);
-        collect_nestjs_routes(source, &mut routes);
+        collect_next_file_route(path, &code_source, &mut routes);
+        collect_remix_file_route(path, &code_source, &mut routes);
+        collect_nestjs_routes(&code_source, &mut routes);
     }
     if language_name == "svelte" {
         collect_sveltekit_page_route(path, 1, &mut routes);
@@ -4850,6 +4856,122 @@ fn collect_framework_routes(path: &Path, language_name: &str, source: &str) -> V
         collect_astro_page_route(path, &mut routes);
     }
     dedupe_framework_routes(routes)
+}
+
+fn route_code_lines(language_name: &str, source: &str) -> Vec<String> {
+    if route_language_uses_c_style_comments(language_name) {
+        strip_c_style_comments(source)
+    } else {
+        source
+            .lines()
+            .map(|line| {
+                let code = code_before_line_comment(line);
+                match language_name {
+                    "python" | "ruby" => code_before_hash_comment(code).to_string(),
+                    _ => code.to_string(),
+                }
+            })
+            .collect()
+    }
+}
+
+fn route_language_uses_c_style_comments(language_name: &str) -> bool {
+    matches!(
+        language_name,
+        "javascript" | "typescript" | "java" | "rust" | "go" | "php" | "csharp" | "vue" | "astro"
+    )
+}
+
+fn strip_c_style_comments(source: &str) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    let mut chars = source.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut in_block_comment = false;
+
+    while let Some(ch) = chars.next() {
+        if in_block_comment {
+            if ch == '*'
+                && let Some('/') = chars.peek()
+            {
+                chars.next();
+                in_block_comment = false;
+            } else if ch == '\n' {
+                lines.push(String::new());
+            }
+            continue;
+        }
+
+        if let Some(active_quote) = quote {
+            if ch == '\n' {
+                lines.push(String::new());
+                if active_quote != '`' {
+                    quote = None;
+                }
+                escaped = false;
+                continue;
+            }
+            lines
+                .last_mut()
+                .expect("strip_c_style_comments keeps one current line")
+                .push(ch);
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '\n' {
+            lines.push(String::new());
+            continue;
+        }
+        if ch == '/'
+            && let Some(next) = chars.peek().copied()
+        {
+            if next == '/' {
+                chars.next();
+                for rest in chars.by_ref() {
+                    if rest == '\n' {
+                        lines.push(String::new());
+                        break;
+                    }
+                }
+                continue;
+            }
+            if next == '*' {
+                chars.next();
+                in_block_comment = true;
+                continue;
+            }
+        }
+        if matches!(ch, '"' | '\'' | '`') {
+            quote = Some(ch);
+        }
+        lines
+            .last_mut()
+            .expect("strip_c_style_comments keeps one current line")
+            .push(ch);
+    }
+
+    lines
+}
+
+fn has_react_router_context(source: &str) -> bool {
+    source.contains("react-router")
+        || source.contains("createBrowserRouter")
+        || source.contains("createHashRouter")
+        || source.contains("createMemoryRouter")
+        || source.contains("createRoutesFromElements")
+        || source.contains("RouterProvider")
+        || source.contains("RouteObject")
 }
 
 fn collect_express_route(line: &str, line_number: u32, routes: &mut Vec<FrameworkRoute>) {
@@ -4953,8 +5075,15 @@ fn collect_hono_route(
     }
 }
 
-fn collect_react_route(line: &str, line_number: u32, routes: &mut Vec<FrameworkRoute>) {
-    if (line.contains("<Route") || line.contains(" path:"))
+fn collect_react_route(
+    line: &str,
+    line_number: u32,
+    routes: &mut Vec<FrameworkRoute>,
+    react_router_context: bool,
+) {
+    let jsx_route = line.contains("<Route") && line.contains("path");
+    let object_route = react_router_context && line.contains("path:");
+    if (jsx_route || object_route)
         && line.contains("path")
         && let Some(path) = value_after_key(line, "path").or_else(|| first_quoted_string(line))
     {
@@ -5046,7 +5175,7 @@ fn collect_next_file_route(path: &Path, source: &str, routes: &mut Vec<Framework
             .file_stem()
             .and_then(|value| value.to_str())
             .unwrap_or_default();
-        if matches!(file_stem, "page" | "layout" | "template") {
+        if file_stem == "page" {
             routes.push(FrameworkRoute::new(
                 "nextjs",
                 "GET".to_string(),
@@ -5196,7 +5325,10 @@ fn collect_nestjs_routes(source: &str, routes: &mut Vec<FrameworkRoute>) {
     let mut pending: Option<(String, String, u32)> = None;
     for (index, line) in source.lines().enumerate() {
         let line_number = index as u32 + 1;
-        let trimmed = line.trim();
+        let trimmed = code_before_line_comment(line).trim();
+        if trimmed.is_empty() {
+            continue;
+        }
         if trimmed.starts_with("@Controller") {
             controller_prefix = first_quoted_string(trimmed).unwrap_or_default();
             continue;
@@ -6078,7 +6210,8 @@ fn append_framework_routes(
         let Some(handler_name) = route.handler.as_deref() else {
             continue;
         };
-        let Some(handler_id) = find_framework_route_handler(sinks.unique_nodes, handler_name)
+        let Some(handler_id) =
+            find_framework_route_handler(sinks.unique_nodes, handler_name, file_id, route.line)
         else {
             continue;
         };
@@ -6113,6 +6246,8 @@ fn append_framework_routes(
 fn find_framework_route_handler(
     nodes: &HashMap<NodeId, Node>,
     handler_name: &str,
+    file_id: NodeId,
+    route_line: u32,
 ) -> Option<NodeId> {
     let terminal = handler_name
         .rsplit(['.', ':', '#', '@'])
@@ -6124,16 +6259,40 @@ fn find_framework_route_handler(
     if terminal.is_empty() {
         return None;
     }
-    nodes
+    let matches = nodes
         .values()
-        .filter(|node| is_callable_kind(node.kind))
-        .find(|node| {
-            node.serialized_name == terminal
-                || node.qualified_name.as_deref().is_some_and(|qualified| {
-                    qualified.rsplit([':', '.', '#']).next() == Some(terminal)
-                })
+        .filter(|node| is_callable_kind(node.kind) && node_matches_name(node, terminal))
+        .collect::<Vec<_>>();
+    let mut same_file_matches = matches
+        .iter()
+        .copied()
+        .filter(|node| node.file_node_id == Some(file_id))
+        .map(|node| {
+            let start_line = node.start_line.unwrap_or(u32::MAX);
+            (
+                node.id,
+                (
+                    start_line.abs_diff(route_line),
+                    start_line,
+                    node_span_width(node),
+                ),
+            )
         })
-        .map(|node| node.id)
+        .collect::<Vec<_>>();
+
+    if same_file_matches.is_empty() {
+        return match matches.as_slice() {
+            [only] => Some(only.id),
+            _ => None,
+        };
+    }
+
+    same_file_matches.sort_by_key(|(node_id, score)| (score.0, score.1, score.2, *node_id));
+    match same_file_matches.as_slice() {
+        [first, second, ..] if first.1 == second.1 => None,
+        [first, ..] => Some(first.0),
+        [] => None,
+    }
 }
 
 fn find_registered_tauri_command_function(
@@ -6482,6 +6641,36 @@ fn code_before_line_comment(line: &str) -> &str {
             && let Some((_, next)) = chars.peek()
             && *next == '/'
         {
+            return &line[..index];
+        }
+    }
+    line
+}
+
+fn code_before_hash_comment(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, ch) in line.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        if matches!(ch, '"' | '\'') {
+            quote = Some(ch);
+            continue;
+        }
+        if ch == '#' {
             return &line[..index];
         }
     }
@@ -6970,9 +7159,8 @@ fn update_pending_payload_call(remaining: u8, line: &str) -> u8 {
         return 0;
     }
     let delta = structural_delta(line, '(', ')');
-    if delta < 0 || code_before_line_comment(line).contains(");") {
-        0
-    } else if delta <= 0 && code_before_line_comment(line).contains(')') {
+    let code = code_before_line_comment(line);
+    if delta < 0 || code.contains(");") || (delta <= 0 && code.contains(')')) {
         0
     } else {
         remaining.saturating_sub(1)
@@ -10273,6 +10461,161 @@ export function Screen() {
                     .is_some_and(|node| node.kind == NodeKind::FILE)
         }));
         Ok(())
+    }
+
+    #[test]
+    fn test_framework_routes_ignore_comment_only_declarations_and_non_router_path_configs() {
+        let routes = collect_framework_routes(
+            Path::new("src/config.ts"),
+            "typescript",
+            r#"
+const screen = { path: "/not-a-route", label: "Settings" };
+// app.get("/debug", debugHandler);
+/* app.post("/debug-block", debugHandler); */
+// <Route path="/shadow" element={<Shadow />} />;
+"#,
+        );
+
+        assert!(
+            routes.is_empty(),
+            "comment-only routes and arbitrary path configs should not emit routes: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn test_react_router_object_routes_require_router_context() {
+        let router_routes = collect_framework_routes(
+            Path::new("src/router.tsx"),
+            "typescript",
+            r#"
+import { createBrowserRouter } from "react-router-dom";
+export const router = createBrowserRouter([
+  { path: "/dashboard", element: <Dashboard /> },
+]);
+"#,
+        );
+        assert!(router_routes.iter().any(|route| {
+            route.framework == "react-router" && route.method == "GET" && route.path == "/dashboard"
+        }));
+
+        let config_routes = collect_framework_routes(
+            Path::new("src/theme.ts"),
+            "typescript",
+            r#"
+// TODO migrate this config to react-router later.
+export const item = { path: "/dashboard", label: "Dashboard" };
+"#,
+        );
+        assert!(
+            config_routes.is_empty(),
+            "bare object path config should not be treated as react-router: {config_routes:?}"
+        );
+    }
+
+    #[test]
+    fn test_nextjs_layout_and_template_files_do_not_emit_endpoint_routes() {
+        for path in [
+            Path::new("app/dashboard/layout.tsx"),
+            Path::new("app/dashboard/template.tsx"),
+        ] {
+            let routes = collect_framework_routes(
+                path,
+                "typescript",
+                r#"export default function Wrapper({ children }) { return children; }"#,
+            );
+            assert!(
+                routes
+                    .iter()
+                    .all(|route| route.framework != "nextjs" || route.method != "GET"),
+                "{path:?} should not be indexed as a Next.js endpoint route: {routes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_framework_route_handler_resolution_prefers_same_file_nearest_match() {
+        let file_id = NodeId(1);
+        let other_file_id = NodeId(2);
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            NodeId(20),
+            Node {
+                id: NodeId(20),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "handler".to_string(),
+                file_node_id: Some(other_file_id),
+                start_line: Some(5),
+                end_line: Some(5),
+                ..Default::default()
+            },
+        );
+        nodes.insert(
+            NodeId(10),
+            Node {
+                id: NodeId(10),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "handler".to_string(),
+                file_node_id: Some(file_id),
+                start_line: Some(12),
+                end_line: Some(12),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            find_framework_route_handler(&nodes, "handler", file_id, 10),
+            Some(NodeId(10))
+        );
+    }
+
+    #[test]
+    fn test_framework_route_handler_resolution_skips_ambiguous_best_match() {
+        let file_id = NodeId(1);
+        let mut nodes = HashMap::new();
+        for id in [NodeId(10), NodeId(11)] {
+            nodes.insert(
+                id,
+                Node {
+                    id,
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "handler".to_string(),
+                    file_node_id: Some(file_id),
+                    start_line: Some(12),
+                    end_line: Some(12),
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert_eq!(
+            find_framework_route_handler(&nodes, "handler", file_id, 10),
+            None
+        );
+    }
+
+    #[test]
+    fn test_framework_route_handler_resolution_skips_multiple_off_file_matches() {
+        let route_file_id = NodeId(1);
+        let mut nodes = HashMap::new();
+        for (id, file_id, line) in [(NodeId(10), NodeId(2), 5), (NodeId(11), NodeId(3), 20)] {
+            nodes.insert(
+                id,
+                Node {
+                    id,
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "handler".to_string(),
+                    file_node_id: Some(file_id),
+                    start_line: Some(line),
+                    end_line: Some(line),
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert_eq!(
+            find_framework_route_handler(&nodes, "handler", route_file_id, 10),
+            None
+        );
     }
 
     #[test]

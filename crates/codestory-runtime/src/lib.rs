@@ -1430,10 +1430,7 @@ fn search_plan_uses_channel(
     subquery: &SearchPlanSubqueryDto,
     channel: SearchPlanChannelDto,
 ) -> bool {
-    subquery
-        .channels
-        .iter()
-        .any(|candidate| *candidate == channel)
+    subquery.channels.contains(&channel)
 }
 
 fn search_plan_lexical_hit_count(hits: &[SearchHit]) -> usize {
@@ -1468,13 +1465,20 @@ fn same_search_file(left: &SearchHit, right: &SearchHit) -> bool {
 }
 
 fn hit_matches_identifier(hit: &SearchHit, identifier: &str) -> bool {
+    hit_exactly_matches_identifier(hit, identifier) || {
+        let normalized_identifier = normalize_symbol_query(identifier);
+        !normalized_identifier.is_empty()
+            && leading_symbol_segment(&hit.display_name) == normalized_identifier
+    }
+}
+
+fn hit_exactly_matches_identifier(hit: &SearchHit, identifier: &str) -> bool {
     let normalized_identifier = normalize_symbol_query(identifier);
     if normalized_identifier.is_empty() {
         return false;
     }
     normalize_symbol_query(&hit.display_name) == normalized_identifier
         || terminal_symbol_segment(&hit.display_name) == normalized_identifier
-        || leading_symbol_segment(&hit.display_name) == normalized_identifier
 }
 
 fn repo_text_line_identifiers(hit: &SearchHit) -> Vec<String> {
@@ -1658,7 +1662,8 @@ fn search_plan_anchor_groups(
             all_symbol_hits
                 .iter()
                 .find(|hit| {
-                    same_search_file(hit, repo_hit) && hit_matches_identifier(hit, identifier)
+                    same_search_file(hit, repo_hit)
+                        && hit_exactly_matches_identifier(hit, identifier)
                 })
                 .cloned()
         });
@@ -5542,11 +5547,7 @@ impl AppController {
                 merge_search_hits_by_node_id(&mut evidence.suggestions, suggestions);
             }
 
-            if subquery
-                .channels
-                .iter()
-                .any(|channel| *channel == SearchPlanChannelDto::RepoText)
-            {
+            if subquery.channels.contains(&SearchPlanChannelDto::RepoText) {
                 let scan = Self::collect_repo_text_hits(
                     storage,
                     project_root.as_deref(),
@@ -8509,6 +8510,114 @@ pub fn exact_symbol_anchor() {{}}
                 .iter()
                 .any(|subquery| subquery.channels.contains(&SearchPlanChannelDto::RepoText)),
             "subqueries should cover repo text discovery: {subqueries:#?}"
+        );
+    }
+
+    fn search_plan_test_hit(
+        id: &str,
+        display_name: &str,
+        file_path: &Path,
+        line: u32,
+        origin: SearchHitOrigin,
+        resolvable: bool,
+    ) -> SearchHit {
+        SearchHit {
+            node_id: NodeId(id.to_string()),
+            display_name: display_name.to_string(),
+            kind: codestory_contracts::api::NodeKind::METHOD,
+            file_path: Some(file_path.to_string_lossy().to_string()),
+            line: Some(line),
+            score: 1.0,
+            origin,
+            match_quality: None,
+            resolvable,
+            score_breakdown: None,
+        }
+    }
+
+    #[test]
+    fn search_plan_repo_text_owner_identifier_does_not_promote_member_symbol() {
+        let temp = tempdir().expect("create temp dir");
+        let source_path = temp.path().join("src").join("lib.rs");
+        fs::create_dir_all(source_path.parent().expect("src parent")).expect("create src");
+        fs::write(
+            &source_path,
+            "pub struct WorkspaceIndexer;\n\nimpl WorkspaceIndexer {\n    pub fn normalize_index_path(&self) {}\n}\n\n\n\n// WorkspaceIndexer coordinates indexing flow\n",
+        )
+        .expect("write source");
+        let member_hit = search_plan_test_hit(
+            "member",
+            "WorkspaceIndexer::normalize_index_path",
+            &source_path,
+            4,
+            SearchHitOrigin::IndexedSymbol,
+            false,
+        );
+        let repo_hit = search_plan_test_hit(
+            "repo",
+            "src/lib.rs:9",
+            &source_path,
+            9,
+            SearchHitOrigin::TextMatch,
+            false,
+        );
+        let query = "WorkspaceIndexer indexing flow";
+        let terms = search_plan_terms(query);
+
+        let groups = search_plan_anchor_groups(query, &terms, &[], &[repo_hit], &[member_hit]);
+
+        assert!(
+            groups.iter().any(|group| {
+                group.chosen_symbol.is_none()
+                    && matches!(
+                        group.promotion_status,
+                        SearchPlanPromotionStatusDto::Ambiguous
+                    )
+            }),
+            "owner-only repo-text mention should stay unbound instead of promoting to a member: {groups:#?}"
+        );
+    }
+
+    #[test]
+    fn search_plan_repo_text_exact_terminal_identifier_promotes_member_symbol() {
+        let temp = tempdir().expect("create temp dir");
+        let source_path = temp.path().join("src").join("lib.rs");
+        fs::create_dir_all(source_path.parent().expect("src parent")).expect("create src");
+        fs::write(
+            &source_path,
+            "pub struct WorkspaceIndexer;\n\nimpl WorkspaceIndexer {\n    pub fn normalize_index_path(&self) {}\n}\n\n\n\n// normalize_index_path normalizes storage keys before indexing\n",
+        )
+        .expect("write source");
+        let member_hit = search_plan_test_hit(
+            "member",
+            "WorkspaceIndexer::normalize_index_path",
+            &source_path,
+            4,
+            SearchHitOrigin::IndexedSymbol,
+            false,
+        );
+        let repo_hit = search_plan_test_hit(
+            "repo",
+            "src/lib.rs:9",
+            &source_path,
+            9,
+            SearchHitOrigin::TextMatch,
+            false,
+        );
+        let query = "normalize_index_path storage keys";
+        let terms = search_plan_terms(query);
+
+        let groups = search_plan_anchor_groups(query, &terms, &[], &[repo_hit], &[member_hit]);
+
+        assert!(
+            groups.iter().any(|group| {
+                group
+                    .chosen_symbol
+                    .as_ref()
+                    .is_some_and(|hit| hit.display_name == "WorkspaceIndexer::normalize_index_path")
+                    && group.promotion_method.as_deref() == Some("same_file_exact_identifier")
+            }),
+            "exact terminal identifier should still promote to the matching member: {groups:#?}"
         );
     }
 

@@ -115,6 +115,8 @@ struct ScoredClaim {
     overclaim: bool,
 }
 
+const MIN_CONFIDENCE_CALIBRATION: f64 = 0.70;
+
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -223,7 +225,7 @@ fn score_manifest(manifest: &AgentQualityManifest) -> AgentQualityScore {
         material_correction_high_confidence += usize::from(high_confidence_material_correction);
         confidence_quality += calibrated_confidence(claim.state, claim.confidence);
 
-        if high_confidence_unsupported || high_confidence_material_correction {
+        if high_confidence_unsupported || high_confidence_material_correction || claim.overclaim {
             failing_claims.push(claim.id.clone());
         }
 
@@ -323,6 +325,18 @@ fn assert_quality_gate(score: &AgentQualityScore) {
         "{} has unsupported high-confidence claims: {:?}",
         score.manifest, score.failing_claims
     );
+    assert_eq!(
+        score.metrics.overclaim_count, 0,
+        "{} has overclaims: {:?}",
+        score.manifest, score.failing_claims
+    );
+    assert!(
+        score.metrics.confidence_calibration >= MIN_CONFIDENCE_CALIBRATION,
+        "{} confidence calibration {:.3} is below {:.3}",
+        score.manifest,
+        score.metrics.confidence_calibration,
+        MIN_CONFIDENCE_CALIBRATION
+    );
 }
 
 fn write_agent_quality_outputs(manifest: &AgentQualityManifest, output_dir: &Path) {
@@ -396,6 +410,88 @@ fn unsupported_high_confidence_claims_fail_the_quality_gate() {
 
     assert!(score.metrics.unsupported_claims >= 1);
     assert!(score.metrics.overclaim_count >= 1);
+    assert_quality_gate(&score);
+}
+
+#[test]
+#[should_panic(expected = "has overclaims")]
+fn overclaims_fail_the_quality_gate_even_when_supported() {
+    let manifest = AgentQualityManifest {
+        name: "supported_overclaim_fixture".to_string(),
+        question: "Does the gate reject overclaims?".to_string(),
+        local_only: false,
+        project_root: None,
+        expected_anchors: vec!["real".to_string()],
+        decisive_evidence: vec!["real".to_string()],
+        required_bridges: Vec::new(),
+        repo_text_dependencies: Vec::new(),
+        claim_ledger: ClaimLedger {
+            claims: vec![Claim {
+                id: "overclaim".to_string(),
+                text: "Supported evidence exists, but the answer claims more than it proves."
+                    .to_string(),
+                confidence: 0.8,
+                state: ClaimState::Supported,
+                anchors: vec!["real".to_string()],
+                evidence: vec![Evidence {
+                    kind: EvidenceKind::SourceTruth,
+                    source_path: "real.rs".to_string(),
+                    anchor: Some("real".to_string()),
+                    bridge: None,
+                    decisive: true,
+                    repo_text_only: false,
+                }],
+                material_correction: false,
+                overclaim: true,
+            }],
+        },
+    };
+    let score = score_manifest(&manifest);
+
+    assert_eq!(score.metrics.unsupported_high_confidence, 0);
+    assert_eq!(score.metrics.material_correction_high_confidence, 0);
+    assert_eq!(score.metrics.overclaim_count, 1);
+    assert_quality_gate(&score);
+}
+
+#[test]
+#[should_panic(expected = "confidence calibration")]
+fn low_confidence_calibration_fails_the_quality_gate() {
+    let manifest = AgentQualityManifest {
+        name: "low_calibration_fixture".to_string(),
+        question: "Does the gate reject poorly calibrated confidence?".to_string(),
+        local_only: false,
+        project_root: None,
+        expected_anchors: vec!["real".to_string()],
+        decisive_evidence: vec!["real".to_string()],
+        required_bridges: Vec::new(),
+        repo_text_dependencies: Vec::new(),
+        claim_ledger: ClaimLedger {
+            claims: vec![Claim {
+                id: "low-confidence-supported".to_string(),
+                text: "A supported claim should not be assigned near-zero confidence.".to_string(),
+                confidence: 0.05,
+                state: ClaimState::Supported,
+                anchors: vec!["real".to_string()],
+                evidence: vec![Evidence {
+                    kind: EvidenceKind::SourceTruth,
+                    source_path: "real.rs".to_string(),
+                    anchor: Some("real".to_string()),
+                    bridge: None,
+                    decisive: true,
+                    repo_text_only: false,
+                }],
+                material_correction: false,
+                overclaim: false,
+            }],
+        },
+    };
+    let score = score_manifest(&manifest);
+
+    assert_eq!(score.metrics.unsupported_high_confidence, 0);
+    assert_eq!(score.metrics.material_correction_high_confidence, 0);
+    assert_eq!(score.metrics.overclaim_count, 0);
+    assert!(score.metrics.confidence_calibration < MIN_CONFIDENCE_CALIBRATION);
     assert_quality_gate(&score);
 }
 
