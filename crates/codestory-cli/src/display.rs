@@ -14,26 +14,28 @@ pub(crate) fn clean_path_string(path: &str) -> String {
 }
 
 pub(crate) fn relative_path(project_root: &Path, raw: &str) -> String {
+    let normalized_root = clean_path_string(&project_root.to_string_lossy());
+    let normalized_raw = clean_path_string(raw);
+    let normalized_root = normalized_root.trim_end_matches('/');
+    let normalized_raw_lower = normalized_raw.to_ascii_lowercase();
+    let normalized_root_lower = normalized_root.to_ascii_lowercase();
+
+    if normalized_raw_lower == normalized_root_lower {
+        return String::new();
+    }
+    if let Some(remainder) = normalized_raw_lower.strip_prefix(&format!("{normalized_root_lower}/"))
+    {
+        let start = normalized_raw.len() - remainder.len();
+        return normalized_raw[start..].to_string();
+    }
+
     let path = Path::new(raw);
     if !path.is_absolute() {
-        return clean_path_string(raw);
+        return normalized_raw;
     }
 
     if let Ok(relative) = path.strip_prefix(project_root) {
         return clean_path_string(&relative.to_string_lossy());
-    }
-
-    let normalized_root = clean_path_string(&project_root.to_string_lossy()).to_ascii_lowercase();
-    let normalized_raw = clean_path_string(raw);
-    let normalized_raw_lower = normalized_raw.to_ascii_lowercase();
-
-    if let Some(remainder) = normalized_raw_lower
-        .strip_prefix(&format!("{normalized_root}/"))
-        .and_then(|_| {
-            normalized_raw.strip_prefix(&(clean_path_string(&project_root.to_string_lossy()) + "/"))
-        })
-    {
-        return remainder.to_string();
     }
 
     normalized_raw

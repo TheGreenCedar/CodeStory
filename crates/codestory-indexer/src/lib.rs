@@ -4810,7 +4810,8 @@ fn collect_framework_routes(path: &Path, language_name: &str, source: &str) -> V
     let mut routes = Vec::new();
     let code_lines = route_code_lines(language_name, source);
     let code_source = code_lines.join("\n");
-    let react_router_context = has_react_router_context(&code_source);
+    let react_router_object_route_lines =
+        react_router_object_route_lines(&code_lines, &code_source);
     for (index, line) in code_lines.iter().enumerate() {
         let line_number = index as u32 + 1;
         let trimmed = line.trim();
@@ -4823,7 +4824,12 @@ fn collect_framework_routes(path: &Path, language_name: &str, source: &str) -> V
                 collect_fastify_route(trimmed, line_number, &mut routes);
                 collect_koa_route(trimmed, line_number, &mut routes, &code_source);
                 collect_hono_route(trimmed, line_number, &mut routes, &code_source);
-                collect_react_route(trimmed, line_number, &mut routes, react_router_context);
+                collect_react_route(
+                    trimmed,
+                    line_number,
+                    &mut routes,
+                    react_router_object_route_lines.contains(&line_number),
+                );
                 collect_sveltekit_server_route(path, trimmed, line_number, &mut routes);
                 collect_next_route_handler(path, trimmed, line_number, &mut routes);
                 collect_astro_endpoint_route(path, trimmed, line_number, &mut routes);
@@ -4972,6 +4978,57 @@ fn has_react_router_context(source: &str) -> bool {
         || source.contains("createRoutesFromElements")
         || source.contains("RouterProvider")
         || source.contains("RouteObject")
+}
+
+fn react_router_object_route_lines(code_lines: &[String], code_source: &str) -> HashSet<u32> {
+    let mut route_lines = HashSet::new();
+    if !has_react_router_context(code_source) {
+        return route_lines;
+    }
+
+    let mut in_router_config = false;
+    let mut delimiter_depth = 0i32;
+    for (index, line) in code_lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let starts_router_config = starts_react_router_object_config(trimmed);
+        if starts_router_config {
+            in_router_config = true;
+        }
+        if in_router_config && trimmed.contains("path:") {
+            route_lines.insert(index as u32 + 1);
+        }
+        if in_router_config {
+            delimiter_depth += react_router_config_depth_delta(trimmed);
+            if delimiter_depth <= 0 && trimmed.ends_with(';') {
+                in_router_config = false;
+                delimiter_depth = 0;
+            }
+        }
+    }
+
+    route_lines
+}
+
+fn starts_react_router_object_config(line: &str) -> bool {
+    let route_object_declaration = line.contains("RouteObject")
+        && !line.starts_with("import ")
+        && (line.contains('=') || line.contains(':') || line.contains("satisfies"));
+    line.contains("createBrowserRouter(")
+        || line.contains("createHashRouter(")
+        || line.contains("createMemoryRouter(")
+        || route_object_declaration
+}
+
+fn react_router_config_depth_delta(line: &str) -> i32 {
+    line.chars().fold(0, |depth, ch| match ch {
+        '(' | '[' | '{' => depth + 1,
+        ')' | ']' | '}' => depth - 1,
+        _ => depth,
+    })
 }
 
 fn collect_express_route(line: &str, line_number: u32, routes: &mut Vec<FrameworkRoute>) {
@@ -10509,6 +10566,36 @@ export const item = { path: "/dashboard", label: "Dashboard" };
         assert!(
             config_routes.is_empty(),
             "bare object path config should not be treated as react-router: {config_routes:?}"
+        );
+    }
+
+    #[test]
+    fn test_react_router_context_ignores_unrelated_path_objects() {
+        let routes = collect_framework_routes(
+            Path::new("src/router.tsx"),
+            "typescript",
+            r#"
+import { createBrowserRouter } from "react-router-dom";
+const buildConfig = { path: "/tmp/cache", label: "Cache dir" };
+export const router = createBrowserRouter([
+  { path: "/dashboard", element: <Dashboard /> },
+]);
+"#,
+        );
+
+        assert!(
+            routes.iter().any(|route| {
+                route.framework == "react-router"
+                    && route.method == "GET"
+                    && route.path == "/dashboard"
+            }),
+            "actual react-router route should still be indexed: {routes:?}"
+        );
+        assert!(
+            routes
+                .iter()
+                .all(|route| route.framework != "react-router" || route.path != "/tmp/cache"),
+            "unrelated object path inside a router file should not emit a route: {routes:?}"
         );
     }
 
