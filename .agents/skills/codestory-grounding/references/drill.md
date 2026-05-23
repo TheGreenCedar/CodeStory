@@ -5,7 +5,7 @@ Runs a deterministic evidence collection pass for a realistic codebase question.
 ## Usage
 
 ```
-target/release/codestory-cli(.exe) drill [OPTIONS]
+<codestory-cli> drill [OPTIONS]
 ```
 
 ## Arguments
@@ -44,10 +44,10 @@ The report includes:
 
 ```bash
 # CodeStory-first evidence packet for an architecture question
-target/release/codestory-cli(.exe) drill --project <workspace> --refresh full --question "how the public API reaches the backing store" --anchors ApiController,Repository,StorageClient --output-dir target/drill/api-store-flow
+<codestory-cli> drill --project <target-workspace> --refresh full --question "how the public API reaches the backing store" --anchors ApiController,Repository,StorageClient --output-dir target/drill/api-store-flow
 
 # JSON-first run for automation, while still writing Markdown too
-target/release/codestory-cli(.exe) drill --project <workspace> --refresh none --anchors EntryPoint,Coordinator,BackingStore --output-dir target/drill/entrypoint-flow --format json
+<codestory-cli> drill --project <target-workspace> --refresh none --anchors EntryPoint,Coordinator,BackingStore --output-dir target/drill/entrypoint-flow --format json
 ```
 
 ## Interpretation

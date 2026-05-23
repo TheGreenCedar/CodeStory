@@ -7,7 +7,7 @@ repo gates.
 ## Usage
 
 ```
-target/release/codestory-cli(.exe) affected [PATH ...] [OPTIONS]
+<codestory-cli> affected [PATH ...] [OPTIONS]
 ```
 
 ## Key Options
@@ -27,9 +27,9 @@ target/release/codestory-cli(.exe) affected [PATH ...] [OPTIONS]
 
 | Path | Command | Expected result |
 |------|---------|-----------------|
-| Current diff | `target/release/codestory-cli(.exe) affected --project . --format markdown` | Impact summary based on `git diff --name-only HEAD`. |
-| Explicit paths | `target/release/codestory-cli(.exe) affected --project . src/lib.rs --depth 3 --format json` | Matched/unmatched paths, impacted symbols, impacted routes/endpoints, likely tests, blind spots, and next commands. |
-| Stdin | `git diff --name-only HEAD | target/release/codestory-cli(.exe) affected --project . --stdin` | Same analysis using external path selection. |
+| Current diff | `<codestory-cli> affected --project <target-workspace> --format markdown` | Impact summary based on `git diff --name-only HEAD`. |
+| Explicit paths | `<codestory-cli> affected --project <target-workspace> src/lib.rs --depth 3 --format json` | Matched/unmatched paths, impacted symbols, impacted routes/endpoints, likely tests, blind spots, and next commands. |
+| Stdin | `git diff --name-only HEAD | <codestory-cli> affected --project <target-workspace> --stdin` | Same analysis using external path selection. |
 
 ## Notes
 
@@ -40,6 +40,6 @@ target/release/codestory-cli(.exe) affected [PATH ...] [OPTIONS]
 - `unmatched_paths` are workflow evidence, not noise. When paths do not match,
   rerun `files --path <fragment>` or refresh the index before assuming the graph
   is wrong.
-- If `affected` reports stale or partial coverage, run `doctor --project .` and
-  consider `index --project . --refresh full` before using the impact list to
+- If `affected` reports stale or partial coverage, run `doctor --project <target-workspace>` and
+  consider `index --project <target-workspace> --refresh full` before using the impact list to
   narrow verification.

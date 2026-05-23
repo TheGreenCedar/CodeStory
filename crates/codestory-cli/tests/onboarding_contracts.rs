@@ -72,7 +72,17 @@ fn readme_keeps_dual_track_onboarding() {
     let root = repo_root();
     let readme = fs::read_to_string(root.join("README.md")).expect("README should exist");
     assert!(readme.contains("Use CodeStory"));
+    assert!(readme.contains("Local codebase grounding for coding agents"));
+    assert!(readme.contains("Global Skill Setup"));
+    assert!(readme.contains("Benchmark Results"));
+    assert!(readme.contains("Agent Loop"));
     assert!(readme.contains("Hack on CodeStory"));
+    assert!(readme.contains(".agents/skills/codestory-grounding/SKILL.md"));
+    assert!(readme.contains("docs/testing/benchmark-results.md"));
+    assert!(readme.contains("docs/testing/codestory-e2e-stats-log.md"));
+    assert!(readme.contains("docs/testing/codestory-stdio-warm-loop-stats.md"));
+    assert!(readme.contains("scripts/codestory-agent-ab-benchmark.mjs"));
+    assert!(readme.contains("serve --stdio"));
     assert!(readme.contains("docs/architecture/overview.md"));
     assert!(readme.contains("docs/architecture/runtime-execution-path.md"));
     assert!(readme.contains("docs/contributors/debugging.md"));
@@ -91,11 +101,43 @@ fn readme_keeps_dual_track_onboarding() {
         "docs/contributors/debugging.md",
         "docs/contributors/testing-matrix.md",
         "docs/decision-log.md",
+        ".agents/skills/codestory-grounding/CODESTORY_REF",
+        ".agents/skills/codestory-grounding/scripts/setup.ps1",
+        ".agents/skills/codestory-grounding/scripts/setup.sh",
+        "scripts/codestory-agent-ab-benchmark.mjs",
     ] {
         assert!(
             root.join(path).exists(),
             "expected onboarding doc to exist: {path}"
         );
+    }
+}
+
+#[test]
+fn public_docs_avoid_competitor_and_agent_specific_framing() {
+    let root = repo_root();
+    let mut files = vec![root.join("README.md")];
+    collect_markdown_files(&root.join("docs"), &mut files);
+    collect_markdown_files(&root.join(".agents/skills/codestory-grounding"), &mut files);
+
+    for file in files {
+        let contents = fs::read_to_string(&file).expect("read public doc");
+        let lowered = contents.to_lowercase();
+        for blocked in [
+            "codegraph",
+            "codex-first",
+            "codex first",
+            "global codex",
+            "for codex users",
+            ".codex/skills",
+            ".codex\\skills",
+        ] {
+            assert!(
+                !lowered.contains(blocked),
+                "public doc should not contain `{blocked}`: {}",
+                file.display()
+            );
+        }
     }
 }
 

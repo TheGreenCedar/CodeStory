@@ -7,7 +7,7 @@ Markdown output uses ANSI syntax highlighting when stdout is an interactive term
 ## Usage
 
 ```
-target/release/codestory-cli(.exe) snippet [OPTIONS]
+<codestory-cli> snippet [OPTIONS]
 ```
 
 ## Arguments
@@ -56,20 +56,20 @@ context: requested_lines=4 max_snippet_bytes=20000
 
 ```bash
 # Snippet with default 4 lines of context
-target/release/codestory-cli(.exe) snippet --project . --query "AppController::new"
+<codestory-cli> snippet --project <target-workspace> --query "AppController::new"
 
 # More context
-target/release/codestory-cli(.exe) snippet --project . --query run_indexing --context 10
+<codestory-cli> snippet --project <target-workspace> --query run_indexing --context 10
 
 # Agent-friendly alias for the same context setting
-target/release/codestory-cli(.exe) snippet --project . --query run_indexing --lines 40
+<codestory-cli> snippet --project <target-workspace> --query run_indexing --lines 40
 
 # Prefer the full implementation body when available
-target/release/codestory-cli(.exe) snippet --project . --query run_indexing --function-body --lines 8
+<codestory-cli> snippet --project <target-workspace> --query run_indexing --function-body --lines 8
 
 # Disambiguate by file and write stable Markdown
-target/release/codestory-cli(.exe) snippet --project . --query TicTacToe --file rust_tictactoe.rs --output-file tictactoe.md
+<codestory-cli> snippet --project <target-workspace> --query TicTacToe --file rust_tictactoe.rs --output-file tictactoe.md
 
 # By node ID, JSON output
-target/release/codestory-cli(.exe) snippet --project . --id abc123def456 --format json
+<codestory-cli> snippet --project <target-workspace> --id abc123def456 --format json
 ```

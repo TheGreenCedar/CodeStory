@@ -5,7 +5,7 @@ Produces a budget-aware grounding snapshot of the entire indexed codebase: root 
 ## Usage
 
 ```
-target/release/codestory-cli(.exe) ground [OPTIONS]
+<codestory-cli> ground [OPTIONS]
 ```
 
 ## Arguments
@@ -50,14 +50,14 @@ coverage_buckets:
 
 ```bash
 # Default balanced grounding
-target/release/codestory-cli(.exe) ground --project .
+<codestory-cli> ground --project <target-workspace>
 
 # Strict grounding for quick context
-target/release/codestory-cli(.exe) ground --project . --budget strict
+<codestory-cli> ground --project <target-workspace> --budget strict
 
 # Max depth, JSON output
-target/release/codestory-cli(.exe) ground --project . --budget max --format json
+<codestory-cli> ground --project <target-workspace> --budget max --format json
 
 # Ground without refreshing the index
-target/release/codestory-cli(.exe) ground --project . --refresh none
+<codestory-cli> ground --project <target-workspace> --refresh none
 ```

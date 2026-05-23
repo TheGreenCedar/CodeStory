@@ -1,6 +1,113 @@
 # CodeStory
 
-CodeStory is a local codebase grounding engine. It indexes a repository into a SQLite-backed graph, keeps grounding-oriented read models up to date, and exposes grounding, navigation, impact-analysis, and evaluation workflows through `codestory-cli`.
+Local codebase grounding for coding agents.
+
+CodeStory turns a repository into a local SQLite graph, search index, semantic
+docs, and evidence packets so coding agents can understand the codebase before
+they start spending context on ad hoc file reads. The globally installed skill is
+the intended front door: set up the CodeStory source/binary artifact once, then
+use that skill to index explicit target workspaces and run grounded commands for
+orientation, search, context, trails, snippets, and impact checks.
+
+## Why CodeStory
+
+Ungrounded agents burn time and context rediscovering the same code paths with
+glob, grep, and file reads. CodeStory gives them a local, auditable grounding
+loop instead:
+
+```text
+doctor -> index -> ground -> search -> symbol/trail/snippet/explore -> context
+```
+
+Everything stays local. The cache is SQLite plus local search/semantic state,
+and command output carries freshness, fallback, citation, gap, and next-command
+signals so the agent can tell evidence from guesswork.
+
+## Benchmark Results
+
+Current public evidence is CodeStory's local index/read latency and
+retrieval-quality gates. Agent A/B savings are deliberately unpublished until
+the controlled with/without-CodeStory harness produces measured wall-time,
+token, cost, and tool-call rows.
+
+| Lane | Current result | Why it matters |
+| --- | ---: | --- |
+| With/without-agent savings | Pending | Run the agent A/B harness before claiming token, cost, time, or tool-call savings |
+| CodeStory repo cold index | `9.23s` | Full repo-scale gate on the Rust workspace with hash semantic mode |
+| Warm stdio agent loop smoke | `53.50ms` per `search -> symbol -> trail -> snippet` loop | Persistent read surface stays fast once an index exists |
+| Warm stdio search p95 smoke | `25.96ms` | Low-latency search budget with protocol-clean stdout |
+| Historical cross-repo retrieval gate | Hit@10 `1.0`, MRR@10 `0.826831`, search p95 `84.7ms` | Expected anchors found across `4` projects and `225` queries |
+
+See [benchmark results](docs/testing/benchmark-results.md),
+[repo-scale E2E stats](docs/testing/codestory-e2e-stats-log.md), and
+[stdio warm-loop stats](docs/testing/codestory-stdio-warm-loop-stats.md) for
+methodology, raw-source links, commands, and caveats. Use
+[`scripts/codestory-agent-ab-benchmark.mjs`](scripts/codestory-agent-ab-benchmark.mjs)
+to generate publishable with/without-agent rows; until then, README claims stay
+on measured local indexing, warm reads, protocol hygiene, and retrieval quality.
+
+## Global Skill Setup
+
+Use this path when the skill is the product surface and the CodeStory repository
+is the backing artifact it sets up once.
+
+1. Install the skill into your agent's global skill directory.
+   ```powershell
+   $SkillHome = "<agent-global-skill-directory>"
+   New-Item -ItemType Directory -Force -Path $SkillHome | Out-Null
+   Copy-Item -Recurse -Force .\.agents\skills\codestory-grounding "$SkillHome\codestory-grounding"
+   ```
+   The source skill package lives at
+   [.agents/skills/codestory-grounding/SKILL.md](.agents/skills/codestory-grounding/SKILL.md).
+2. Run the one-time setup script from the installed skill. The script clones or
+   refreshes the CodeStory source artifact, builds `codestory-cli`, and prints
+   the resolved executable path.
+   ```powershell
+   & "$SkillHome\codestory-grounding\scripts\setup.ps1"
+   ```
+   On Unix-like systems:
+   ```sh
+   sh "<agent-global-skill-directory>/codestory-grounding/scripts/setup.sh"
+   ```
+3. Optionally persist the printed CLI path for future global-skill runs.
+   ```powershell
+   setx CODESTORY_CLI "C:\Users\you\AppData\Local\CodeStory\bin\codestory-cli.exe"
+   ```
+4. If you need a different source artifact, set `CODESTORY_REPO_URL` and
+   `CODESTORY_REPO_REF` explicitly before setup; otherwise setup uses the pinned
+   `CODESTORY_REF` bundled with the skill.
+5. Choose the target workspace explicitly.
+   ```powershell
+   $TargetWorkspace = "C:\path\to\repo"
+   ```
+6. Check health, build the target index, and gather orientation.
+   ```powershell
+   $CodeStoryCli = $env:CODESTORY_CLI
+   & $CodeStoryCli doctor --project $TargetWorkspace
+   & $CodeStoryCli index --project $TargetWorkspace --refresh full
+   & $CodeStoryCli ground --project $TargetWorkspace --why
+   ```
+7. In future agent sessions, invoke the global `$codestory-grounding` skill and
+   point it at the target workspace. The source checkout stays the tool artifact,
+   not the assumed working directory.
+
+## Agent Loop
+
+| Need | Command |
+| --- | --- |
+| Health and cache readiness | `codestory-cli doctor --project <target-workspace>` |
+| Broad orientation | `codestory-cli ground --project <target-workspace> --why` |
+| Candidate discovery | `codestory-cli search --project <target-workspace> --query "<term>" --why` |
+| Exact symbol evidence | `codestory-cli symbol --project <target-workspace> --id <node-id>` |
+| Flow and dependency evidence | `codestory-cli trail --project <target-workspace> --id <node-id> --story --hide-speculative` |
+| Source excerpt | `codestory-cli snippet --project <target-workspace> --id <node-id>` |
+| Bundled navigation packet | `codestory-cli explore --project <target-workspace> --id <node-id> --no-tui` |
+| Deep context bundle | `codestory-cli context --project <target-workspace> --id <node-id>` |
+| Change impact before edits | `codestory-cli affected --project <target-workspace> --format markdown` |
+| Persistent agent read surface | `codestory-cli serve --project <target-workspace> --stdio` |
+
+Use `serve --stdio` when an agent needs repeated warm reads against an existing
+index without paying one process startup per command.
 
 ## System Map
 
@@ -14,36 +121,42 @@ flowchart LR
     Indexer --> Store
 ```
 
-## Use CodeStory
+## Use CodeStory From Source
 
-Use this path if you want to run the tool against a repository.
+Use this path if you are running the tool from this source checkout. For normal
+agent work, keep the executable and target workspace separate.
 
 1. Build the CLI.
    ```powershell
    cargo build --release -p codestory-cli
+   $CodeStoryCli = ".\target\release\codestory-cli.exe"
    ```
 2. Use the built binary from this repo checkout.
    ```powershell
-   .\target\release\codestory-cli.exe --help
+   & $CodeStoryCli --help
    ```
-3. Create or refresh the local index.
+3. Choose the repository you want to ground.
    ```powershell
-   .\target\release\codestory-cli.exe index --project . --refresh auto
+   $TargetWorkspace = "C:\path\to\repo"
    ```
-4. Run the CLI workflows against the existing cache.
+4. Create or refresh the local index.
+   ```powershell
+   & $CodeStoryCli index --project $TargetWorkspace --refresh auto
+   ```
+5. Run the CLI workflows against the existing cache.
    ```text
-   .\target\release\codestory-cli.exe ground --project <path> --why
-   .\target\release\codestory-cli.exe search --project <path> --query <query> --why
-   .\target\release\codestory-cli.exe files --project <path> --format markdown
-   .\target\release\codestory-cli.exe explore --project <path> --query <query> --no-tui
-   .\target\release\codestory-cli.exe context --project <path> --query AppController
-   .\target\release\codestory-cli.exe context --project <path> --id <node-id>
-   .\target\release\codestory-cli.exe affected --project <path> --format markdown
-   .\target\release\codestory-cli.exe symbol --project <path> (--id <node-id> | --query <query>)
-   .\target\release\codestory-cli.exe trail --project <path> (--id <node-id> | --query <query>)
-   .\target\release\codestory-cli.exe snippet --project <path> (--id <node-id> | --query <query>)
-   .\target\release\codestory-cli.exe query --project <path> "trail(symbol: 'Foo') | filter(kind: function)"
-   .\target\release\codestory-cli.exe doctor --project <path>
+   codestory-cli ground --project <target-workspace> --why
+   codestory-cli search --project <target-workspace> --query <query> --why
+   codestory-cli files --project <target-workspace> --format markdown
+   codestory-cli explore --project <target-workspace> --query <query> --no-tui
+   codestory-cli context --project <target-workspace> --query AppController
+   codestory-cli context --project <target-workspace> --id <node-id>
+   codestory-cli affected --project <target-workspace> --format markdown
+   codestory-cli symbol --project <target-workspace> (--id <node-id> | --query <query>)
+   codestory-cli trail --project <target-workspace> (--id <node-id> | --query <query>)
+   codestory-cli snippet --project <target-workspace> (--id <node-id> | --query <query>)
+   codestory-cli query --project <target-workspace> "trail(symbol: 'Foo') | filter(kind: function)"
+   codestory-cli doctor --project <target-workspace>
    ```
 
 Read commands default to `--refresh none`. They query the current cache unless you explicitly request a refresh.
@@ -159,44 +272,44 @@ Search accepts field-qualified filters when you already know part of the target:
 Fresh repo orientation:
 
 ```powershell
-codestory-cli doctor --project <workspace>
-codestory-cli index --project <workspace> --refresh full
-codestory-cli ground --project <workspace> --why
-codestory-cli search --project <workspace> --query "<architecture term>" --why
-codestory-cli files --project <workspace> --format markdown
+codestory-cli doctor --project <target-workspace>
+codestory-cli index --project <target-workspace> --refresh full
+codestory-cli ground --project <target-workspace> --why
+codestory-cli search --project <target-workspace> --query "<architecture term>" --why
+codestory-cli files --project <target-workspace> --format markdown
 ```
 
 Candidate-to-context workflow:
 
 ```powershell
-codestory-cli search --project <workspace> --query "<symbol/file/literal/API path>" --why
+codestory-cli search --project <target-workspace> --query "<symbol/file/literal/API path>" --why
 # choose a concrete node_id
-codestory-cli explore --project <workspace> --id <node-id> --no-tui
-codestory-cli context --project <workspace> --id <node-id>
+codestory-cli explore --project <target-workspace> --id <node-id> --no-tui
+codestory-cli context --project <target-workspace> --id <node-id>
 ```
 
 Exact symbol investigation:
 
 ```powershell
-codestory-cli symbol --project <workspace> --id <node-id>
-codestory-cli explore --project <workspace> --id <node-id> --no-tui
-codestory-cli trail --project <workspace> --id <node-id> --story --hide-speculative
-codestory-cli snippet --project <workspace> --id <node-id> --context 40
-codestory-cli context --project <workspace> --id <node-id> --bundle out/context-<name>
+codestory-cli symbol --project <target-workspace> --id <node-id>
+codestory-cli explore --project <target-workspace> --id <node-id> --no-tui
+codestory-cli trail --project <target-workspace> --id <node-id> --story --hide-speculative
+codestory-cli snippet --project <target-workspace> --id <node-id> --context 40
+codestory-cli context --project <target-workspace> --id <node-id> --bundle out/context-<name>
 ```
 
 Changed-file impact workflow:
 
 ```powershell
-codestory-cli index --project <workspace> --refresh incremental
-codestory-cli affected --project <workspace> --format markdown
-git diff --name-only HEAD | codestory-cli affected --project <workspace> --stdin --format json
+codestory-cli index --project <target-workspace> --refresh incremental
+codestory-cli affected --project <target-workspace> --format markdown
+git diff --name-only HEAD | codestory-cli affected --project <target-workspace> --stdin --format json
 ```
 
 Route coverage workflow:
 
 ```powershell
-codestory-cli files --project <workspace> --format json
+codestory-cli files --project <target-workspace> --format json
 cargo test -p codestory-indexer --lib framework_route
 cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
 ```
@@ -214,20 +327,20 @@ Broad repo/product question workflow:
 
 ```powershell
 # do not pass the question to context
-codestory-cli ground --project <workspace> --why
-codestory-cli search --project <workspace> --repo-text on --query "<concrete term>" --why
-codestory-cli search --project <workspace> --repo-text on --query "<another concrete term>" --why
+codestory-cli ground --project <target-workspace> --why
+codestory-cli search --project <target-workspace> --repo-text on --query "<concrete term>" --why
+codestory-cli search --project <target-workspace> --repo-text on --query "<another concrete term>" --why
 # select anchors
-codestory-cli context --project <workspace> --id <node-id>
+codestory-cli context --project <target-workspace> --id <node-id>
 ```
 
 Stale or unhealthy semantic retrieval:
 
 ```powershell
-codestory-cli doctor --project <workspace>
-codestory-cli setup embeddings --project <workspace>
-codestory-cli index --project <workspace> --refresh full
-codestory-cli doctor --project <workspace>
+codestory-cli doctor --project <target-workspace>
+codestory-cli setup embeddings --project <target-workspace>
+codestory-cli index --project <target-workspace> --refresh full
+codestory-cli doctor --project <target-workspace>
 ```
 
 If retrieval is still partial, stale, or failed, use `search --repo-text on --why`, `symbol`, `trail`, and `snippet`; treat `context` output as incomplete when it reports gaps.
@@ -253,7 +366,7 @@ CodeStory supports an optional `codestory_workspace.json` file at the repo root 
 }
 ```
 
-When the manifest is present, `index --project .` discovers all listed member roots and reports per-member refresh counts in index output. Repos without the manifest keep the single-root behavior. OpenAPI JSON/YAML schemas are treated as lightweight endpoint sources, and literal client calls such as `fetch("/api/users")` or `axios.post("/api/users")` create speculative graph edges to matching endpoint refs.
+When the manifest is present, `index --project <target-workspace>` discovers all listed member roots and reports per-member refresh counts in index output. Repos without the manifest keep the single-root behavior. OpenAPI JSON/YAML schemas are treated as lightweight endpoint sources, and literal client calls such as `fetch("/api/users")` or `axios.post("/api/users")` create speculative graph edges to matching endpoint refs.
 
 Team or user defaults can live in `.codestory.toml` at the project root or in the user home directory. CodeStory loads the home file first, then the project file, so project settings override home settings. Explicit environment variables still win over config defaults.
 
@@ -278,7 +391,7 @@ The default `index` path is a full semantic sync, not a deferred background task
 
 Hybrid retrieval setup:
 
-- managed real-model setup: run `codestory-cli setup embeddings --project .` to download the pinned Qdrant BGE-base ONNX graph plus tokenizer files into the user cache. Setup derives `model_optimized_cls_pool.onnx` from the downloaded graph so runtime receives `sentence_embedding` directly instead of the full token hidden state. The CLI seeds the managed local defaults of semantic doc window `512`, doc batch `2048`, ONNX provider `directml` on Windows or `cpu` elsewhere, ONNX per-call token budget `32768`, and in-memory stored vectors `int8` unless explicit environment variables override them.
+- managed real-model setup: run `codestory-cli setup embeddings --project <target-workspace>` to download the pinned Qdrant BGE-base ONNX graph plus tokenizer files into the user cache. Setup derives `model_optimized_cls_pool.onnx` from the downloaded graph so runtime receives `sentence_embedding` directly instead of the full token hidden state. The CLI seeds the managed local defaults of semantic doc window `512`, doc batch `2048`, ONNX provider `directml` on Windows or `cpu` elsewhere, ONNX per-call token budget `32768`, and in-memory stored vectors `int8` unless explicit environment variables override them.
 - fast local-dev semantic mode: set `CODESTORY_EMBED_RUNTIME_MODE=hash`
 - backend and profile selection: set `CODESTORY_EMBED_BACKEND=onnx`, `llamacpp`, or `hash`; default profile is `bge-base-en-v1.5`; explicit profiles include `minilm`, `bge-small-en-v1.5`, `bge-base-en-v1.5`, `qwen3-embedding-0.6b`, `embeddinggemma-300m`, `nomic-embed-text-v1.5`, `nomic-embed-text-v2-moe`, or `custom`
 - managed ONNX paths: `setup embeddings` sets `CODESTORY_EMBED_ONNX_MODEL`, `CODESTORY_EMBED_ONNX_TOKENIZER`, `CODESTORY_EMBED_ONNX_PROVIDER`, and `CODESTORY_EMBED_ONNX_BATCH_TOKENS`; set them manually only for custom ONNX assets or profiling
@@ -309,15 +422,15 @@ By default, `codestory-cli` stores per-project caches under the user cache root 
 Typical recovery flow:
 
 ```powershell
-.\target\release\codestory-cli.exe index --project . --refresh full
-.\target\release\codestory-cli.exe search --project . --query WorkspaceIndexer
+codestory-cli index --project <target-workspace> --refresh full
+codestory-cli search --project <target-workspace> --query WorkspaceIndexer
 ```
 
 If the cache itself is suspect, remove the project cache directory and rebuild:
 
 ```powershell
 Remove-Item -LiteralPath <cache-dir> -Recurse -Force
-.\target\release\codestory-cli.exe index --project . --refresh full
+codestory-cli index --project <target-workspace> --refresh full
 ```
 
 Low-memory guidance:

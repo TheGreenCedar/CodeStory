@@ -7,7 +7,7 @@ claims about what the graph can see.
 ## Usage
 
 ```
-target/release/codestory-cli(.exe) files [OPTIONS]
+<codestory-cli> files [OPTIONS]
 ```
 
 ## Key Options
@@ -27,9 +27,9 @@ target/release/codestory-cli(.exe) files [OPTIONS]
 
 | Path | Command | Expected result |
 |------|---------|-----------------|
-| Inventory | `target/release/codestory-cli(.exe) files --project . --format markdown` | Language counts, framework route coverage matrix, usable/partial index notes, and a capped file list. |
-| Coverage check | `target/release/codestory-cli(.exe) files --project . --language rust --format json` | Machine-readable file rows with `indexed`, `complete`, `role`, `error_count`, and `summary.framework_route_coverage`. |
-| Test discovery | `target/release/codestory-cli(.exe) files --project . --role test` | Test-like files inferred from path/name conventions. |
+| Inventory | `<codestory-cli> files --project <target-workspace> --format markdown` | Language counts, framework route coverage matrix, usable/partial index notes, and a capped file list. |
+| Coverage check | `<codestory-cli> files --project <target-workspace> --language rust --format json` | Machine-readable file rows with `indexed`, `complete`, `role`, `error_count`, and `summary.framework_route_coverage`. |
+| Test discovery | `<codestory-cli> files --project <target-workspace> --role test` | Test-like files inferred from path/name conventions. |
 
 ## Notes
 

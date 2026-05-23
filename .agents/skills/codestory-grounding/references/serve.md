@@ -5,7 +5,7 @@ Serves the indexed project over either a small HTTP JSON API or an MCP-style JSO
 ## Usage
 
 ```
-target/release/codestory-cli(.exe) serve [OPTIONS]
+<codestory-cli> serve [OPTIONS]
 ```
 
 ## Options
@@ -34,8 +34,8 @@ target/release/codestory-cli(.exe) serve [OPTIONS]
 
 | Path | Command | Expected result |
 |------|---------|-----------------|
-| Normal path | `target/release/codestory-cli(.exe) serve --project . --addr 127.0.0.1:3917` then `GET /health` | Local JSON service returns `{"ok": true}` and browser routes use the existing index. |
-| Failure path | If serve reports missing index, run `doctor --project .` and `index --project . --refresh full`; if bind fails, choose a free `--addr`. | Distinguishes cache readiness from port conflicts. |
+| Normal path | `<codestory-cli> serve --project <target-workspace> --addr 127.0.0.1:3917` then `GET /health` | Local JSON service returns `{"ok": true}` and browser routes use the existing index. |
+| Failure path | If serve reports missing index, run `doctor --project <target-workspace>` and `index --project <target-workspace> --refresh full`; if bind fails, choose a free `--addr`. | Distinguishes cache readiness from port conflicts. |
 | Integration edge | Use `serve --stdio` for MCP-style clients; it exposes tools for `search`, `symbol`, `trail`, `definition`, `references`, `symbols`, `snippet`, and `context`, plus project/grounding resources and prompts. | Gives agents the same read-only browser primitives without shelling each command. |
 
 ## Notes

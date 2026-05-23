@@ -5,7 +5,7 @@ Discovers project files, extracts symbols and edges via tree-sitter + semantic r
 ## Usage
 
 ```
-target/release/codestory-cli(.exe) index [OPTIONS]
+<codestory-cli> index [OPTIONS]
 ```
 
 ## Arguments
@@ -42,14 +42,18 @@ Runtime environment variables control semantic retrieval and tuning:
 | `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false` | Disable hybrid retrieval and use symbolic ranking. |
 | `CODESTORY_SEMANTIC_DOC_SCOPE=all` | Include the broader all-symbol semantic doc set. The default is durable symbols only. |
 | `CODESTORY_SEMANTIC_DOC_ALIAS_MODE` | Semantic document alias policy: `alias_variant` default, `current_alias` full legacy alias text, or `no_alias` baseline research mode. |
-| `CODESTORY_SEMANTIC_DOC_MAX_TOKENS` | Override semantic document token budget. Default is `384`, which keeps llama.cpp inputs below the physical batch window; use overrides only for controlled research. |
-| `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` | Override semantic doc embedding batch size. Default is `128`; use this only while profiling. |
+| `CODESTORY_SEMANTIC_DOC_MAX_TOKENS` | Override semantic document token budget. Use overrides only for controlled research. |
+| `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` | Override semantic doc embedding batch size. Defaults vary by backend; managed ONNX uses a larger local batch. Use this only while profiling. |
 | `CODESTORY_EMBED_RUNTIME_MODE=hash` | Use lightweight deterministic hash embeddings for local-dev semantic checks. |
-| `CODESTORY_EMBED_BACKEND=llamacpp` | Use the active real-model backend. |
-| `CODESTORY_EMBED_LLAMACPP_URL` | OpenAI-compatible llama.cpp embeddings endpoint. |
-| `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT` | Client-side concurrent embedding requests, clamped from `1` to `16`. |
+| `CODESTORY_EMBED_BACKEND=onnx` | Use the active managed real-model backend. |
+| `CODESTORY_EMBED_ONNX_MODEL` | Custom ONNX model path for profiling or non-managed assets. |
+| `CODESTORY_EMBED_ONNX_TOKENIZER` | Custom tokenizer path for profiling or non-managed assets. |
+| `CODESTORY_EMBED_ONNX_PROVIDER` | ONNX Runtime provider override, such as `directml` on Windows or `cpu`. |
+| `CODESTORY_EMBED_BACKEND=llamacpp` | Use an external legacy llama.cpp-compatible embedding endpoint intentionally. |
+| `CODESTORY_EMBED_LLAMACPP_URL` | OpenAI-compatible llama.cpp embeddings endpoint for the legacy backend. |
+| `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT` | Client-side concurrent embedding requests for the legacy backend, clamped from `1` to `16`. |
 
-Run `target/release/codestory-cli(.exe) setup embeddings --project .` to install the managed llama.cpp/BGE-base assets before expecting the default llama.cpp backend to be ready on a fresh machine.
+Run `<codestory-cli> setup embeddings --project <target-workspace>` to install the managed BGE-base ONNX graph and tokenizer assets before expecting the default ONNX backend to be ready on a fresh machine.
 
 Symbol summarization uses these additional settings:
 
@@ -104,22 +108,22 @@ Important timing fields:
 
 ```bash
 # First-time index of the current repo
-target/release/codestory-cli(.exe) index --project .
+<codestory-cli> index --project <target-workspace>
 
 # Force full re-index
-target/release/codestory-cli(.exe) index --project . --refresh full
+<codestory-cli> index --project <target-workspace> --refresh full
 
 # Index a different project, JSON output
-target/release/codestory-cli(.exe) index --project ../other-repo --format json
+<codestory-cli> index --project C:/path/to/other-repo --format json
 
 # Inspect a refresh plan without touching storage
-target/release/codestory-cli(.exe) index --project . --dry-run
+<codestory-cli> index --project <target-workspace> --dry-run
 
 # Keep the index warm during active development
-target/release/codestory-cli(.exe) index --project . --watch --progress
+<codestory-cli> index --project <target-workspace> --watch --progress
 
 # Generate deterministic local symbol summaries for a smoke run
-CODESTORY_SUMMARY_ENDPOINT=local target/release/codestory-cli(.exe) index --project . --summarize
+CODESTORY_SUMMARY_ENDPOINT=local <codestory-cli> index --project <target-workspace> --summarize
 ```
 
 ## Refresh Troubleshooting

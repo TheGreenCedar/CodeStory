@@ -5,7 +5,7 @@ Resolves a symbol by ID or query, then returns its full metadata: kind, file loc
 ## Usage
 
 ```
-target/release/codestory-cli(.exe) symbol [OPTIONS]
+<codestory-cli> symbol [OPTIONS]
 ```
 
 ## Arguments
@@ -50,14 +50,14 @@ outgoing: 2
 
 ```bash
 # Inspect by query
-target/release/codestory-cli(.exe) symbol --project . --query AppController
+<codestory-cli> symbol --project <target-workspace> --query AppController
 
 # Inspect by node ID
-target/release/codestory-cli(.exe) symbol --project . --id abc123def456
+<codestory-cli> symbol --project <target-workspace> --id abc123def456
 
 # Disambiguate a repeated symbol name by file
-target/release/codestory-cli(.exe) symbol --project . --query TicTacToe --file rust_tictactoe.rs
+<codestory-cli> symbol --project <target-workspace> --query TicTacToe --file rust_tictactoe.rs
 
 # JSON output
-target/release/codestory-cli(.exe) symbol --project . --query "WorkspaceIndexer" --format json
+<codestory-cli> symbol --project <target-workspace> --query "WorkspaceIndexer" --format json
 ```

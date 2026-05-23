@@ -5,7 +5,7 @@ Builds a directed graph trail starting from a target symbol. Supports neighborho
 ## Usage
 
 ```
-target/release/codestory-cli(.exe) trail [OPTIONS]
+<codestory-cli> trail [OPTIONS]
 ```
 
 ## Arguments
@@ -91,28 +91,28 @@ Story sections:
 
 ```bash
 # Neighborhood trail (default)
-target/release/codestory-cli(.exe) trail --project . --query AppController
+<codestory-cli> trail --project <target-workspace> --query AppController
 
 # Follow all outgoing references, deeper
-target/release/codestory-cli(.exe) trail --project . --query "run_indexing" --mode referenced --depth 3
+<codestory-cli> trail --project <target-workspace> --query "run_indexing" --mode referenced --depth 3
 
 # Incoming callers only, include tests
-target/release/codestory-cli(.exe) trail --project . --query Storage::open --mode referencing --include-tests
+<codestory-cli> trail --project <target-workspace> --query Storage::open --mode referencing --include-tests
 
 # Larger trail, vertical layout, JSON
-target/release/codestory-cli(.exe) trail --project . --query EventBus --max-nodes 50 --layout vertical --format json
+<codestory-cli> trail --project <target-workspace> --query EventBus --max-nodes 50 --layout vertical --format json
 
 # Hide low-confidence edges in Markdown or JSON output
-target/release/codestory-cli(.exe) trail --project . --query ResolutionPass --hide-speculative
+<codestory-cli> trail --project <target-workspace> --query ResolutionPass --hide-speculative
 
 # Narrative handoff for a reviewer or LLM
-target/release/codestory-cli(.exe) trail --project . --query ResolutionPass --story
+<codestory-cli> trail --project <target-workspace> --query ResolutionPass --story
 
 # Export a Graphviz DOT graph
-target/release/codestory-cli(.exe) trail --project . --query ResolutionPass --format dot --output-file trail.dot
+<codestory-cli> trail --project <target-workspace> --query ResolutionPass --format dot --output-file trail.dot
 
 # Export a Mermaid flowchart
-target/release/codestory-cli(.exe) trail --project . --query ResolutionPass --mermaid --output-file trail.mmd
+<codestory-cli> trail --project <target-workspace> --query ResolutionPass --mermaid --output-file trail.mmd
 ```
 
 ## Interpreting Trail Noise

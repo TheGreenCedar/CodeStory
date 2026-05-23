@@ -1,4 +1,4 @@
 interface:
-  display_name: "Codestory Grounding"
-  short_description: "Build the codestory-cli release binary when needed, then query the workspace directly through the release executable."
-  default_prompt: "Use $codestory-grounding to build codestory-cli when needed, refresh the index deliberately, and inspect a workspace with direct codestory-cli grounding commands before answering or editing."
+  display_name: "CodeStory Grounding"
+  short_description: "Use the global CodeStory skill to set up codestory-cli once, then query explicit target workspaces."
+  default_prompt: "Use $codestory-grounding as the global CodeStory surface for this agent: resolve or set up codestory-cli once, set an explicit target workspace, refresh the index deliberately, and inspect the workspace with direct grounding commands before answering or editing."

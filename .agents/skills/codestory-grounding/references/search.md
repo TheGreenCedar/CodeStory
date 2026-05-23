@@ -5,7 +5,7 @@ Searches the symbol index for matching nodes, optionally augmented with grep-sty
 ## Usage
 
 ```
-target/release/codestory-cli(.exe) search [OPTIONS]
+<codestory-cli> search [OPTIONS]
 ```
 
 ## Arguments
@@ -94,19 +94,19 @@ cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture s
 
 ```bash
 # Search for a symbol
-target/release/codestory-cli(.exe) search --project . --query AppController
+<codestory-cli> search --project <target-workspace> --query AppController
 
 # Natural-language search, more results
-target/release/codestory-cli(.exe) search --project . --query "how does the grounding snapshot work" --limit 20
+<codestory-cli> search --project <target-workspace> --query "how does the grounding snapshot work" --limit 20
 
 # Force repo text scanning for a symbol-like query
-target/release/codestory-cli(.exe) search --project . --query AppController --repo-text on
+<codestory-cli> search --project <target-workspace> --query AppController --repo-text on
 
 # Narrow an ambiguous result set by kind and file path
-target/release/codestory-cli(.exe) search --project . --query "kind:function path:routes.ts /api/users" --repo-text off
+<codestory-cli> search --project <target-workspace> --query "kind:function path:routes.ts /api/users" --repo-text off
 
 # JSON output
-target/release/codestory-cli(.exe) search --project . --query TrailResult --format json
+<codestory-cli> search --project <target-workspace> --query TrailResult --format json
 
 # Search-quality eval harness after ranking changes
 cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval

@@ -1,17 +1,22 @@
 ---
 name: codestory-grounding
-description: Ground repository claims and edits with `codestory-cli` workspace queries. Use when you need to index a workspace, gather broad grounding, search code, inspect a symbol, follow a trail, run a graph query, fetch a snippet, or build a deep context packet before making claims or changes in Codestory.
+description: Use extensively to ground repository claims, plans, and edits with `codestory-cli` workspace queries before answering or changing code.
 ---
 
-# Codestory Grounding
+# CodeStory Grounding
 
-Use this skill to collect repo evidence with `codestory-cli` before making architecture, navigation, or implementation claims.
+Use this skill extensively after installing it in an agent's global skill
+directory. On first use, set up the CodeStory CLI source/binary artifact once;
+after that, point the skill at explicit target workspaces. The CodeStory source
+checkout is a tool artifact unless the user is actually editing CodeStory; do
+not assume the current directory is the repository being grounded.
 
 ## Command Roles
 
 - `doctor`: read-only health check for project, cache, index, retrieval, semantic readiness, freshness, and relevant environment settings.
 - `index`: build or refresh the SQLite graph, search, snapshot, and semantic cache.
 - `ground`: broad repo-level orientation snapshot; use `--why` for coverage, retrieval mode, gaps, and next commands.
+- `packet`: bounded broad-task answer packet with citations, budget usage, sufficiency status, gaps, and follow-up commands.
 - `search`: lightweight candidate discovery for symbols, files, literals, API paths, modules, or behavior terms; use `--why` for ranking reasons and broad-query Search Plan evidence when present.
 - `context`: deep evidence/context bundle for one concrete target selected by `--id`, `--query`, or `--bookmark`; it is not question answering and does not interpret natural-language questions.
 - `symbol`: inspect one exact symbol and relationships.
@@ -29,67 +34,110 @@ Use this skill to collect repo evidence with `codestory-cli` before making archi
 
 ## Core Rules
 
-1. Build the CLI first with `cargo build --release -p codestory-cli` when verification depends on local code changes.
-2. Use the release binary directly once fresh: `target/release/codestory-cli(.exe)`.
-3. Always pass `--project <workspace>` explicitly so queries target the intended checkout.
-4. Use `search` for lightweight candidate discovery. Use `context` only after you have one concrete retrieval target.
-5. Use `explore` when one call should collect resolution, relationships, source slices, related files, and coverage notes around a chosen target.
-6. Use `files` before claiming coverage for a language/path area, and use `affected` before selecting regression tests for a change.
-7. Do not pass broad product or architecture questions to `context`. Use `search --why` or `drill --question` to decompose broad questions into concrete anchors, then run `context --id <node-id>`.
-8. Treat command output as evidence, then open only the files needed for edits or verification.
-9. Keep navigation, route coverage, performance, and search-quality work CLI-first. Do not route these workflows through MCP, stdio, HTTP, or server behavior.
-10. For architecture answers, read `evidence_packet.readiness` before drafting. Do not present `partial`, `inferred`, or `needs_source_read` claims as verified until the source-truth checklist has been completed.
-11. Treat repo-text and cross-language framework evidence as hints unless the packet also includes typed graph evidence, snippets, or source-truth checks.
+1. Treat the globally installed skill as the front door; treat the CodeStory source checkout and release binary as setup artifacts.
+2. Treat `<codestory-cli>` and `<target-workspace>` as separate values. Resolve both before running commands.
+3. Prefer a caller-provided `CODESTORY_CLI` or an installed `codestory-cli` on `PATH`. Run this skill's setup script when neither exists.
+4. Build from the CodeStory source checkout only during one-time setup, CodeStory development, or when no installed CLI is available.
+5. Always pass `--project <target-workspace>` explicitly so queries target the intended checkout.
+6. Use `packet` for broad task questions. Use `search` for lightweight candidate discovery. Use `context` only after you have one concrete retrieval target.
+7. Use `explore` when one call should collect resolution, relationships, source slices, related files, and coverage notes around a chosen target.
+8. Use `files` before claiming coverage for a language/path area, and use `affected` before selecting regression tests for a change.
+9. Do not pass broad product or architecture questions to `context`. Start with `packet`; use `drill --question` when the user needs a deterministic answer-quality packet and source-truth checklist; deepen with reported follow-up commands or concrete anchors.
+10. Treat command output as evidence, then open only the files needed for edits or verification.
+11. When `packet` reports `sufficient` and `follow_up_commands` is empty, answer from the packet; budget truncation alone is not a gap. Carry the packet's supported-claim wording into the final answer. Include a compact "Support files" list with every relevant path from `answer.citations` and `sufficiency.avoid_opening`, not only paths mentioned in prose. Use only named follow-up commands, edit targets, or verification files.
+12. For architecture answers from `drill`, read `evidence_packet.readiness` before drafting. Do not present `partial`, `inferred`, or `needs_source_read` claims as verified until the source-truth checklist has been completed.
+13. Treat repo-text and cross-language framework evidence as hints unless the packet also includes typed graph evidence, snippets, or source-truth checks.
+14. Keep navigation, route coverage, performance, and search-quality work CLI-first. Do not route these workflows through MCP, stdio, HTTP, or server behavior.
+
+## One-Time Global Setup
+
+Do this once per machine or when the CodeStory source artifact moves:
+
+1. Confirm the skill is installed under the agent's global skill directory, for example `<agent-skill-home>/codestory-grounding`.
+2. Run the setup script from this skill directory:
+   ```powershell
+   scripts/setup.ps1
+   ```
+   On Unix-like systems:
+   ```sh
+   sh scripts/setup.sh
+   ```
+3. Use the printed `CODESTORY_CLI=...` path as `<codestory-cli>`, or persist it for future sessions.
+4. If you need a different source artifact, set `CODESTORY_REPO_URL` and `CODESTORY_REPO_REF` explicitly before setup; otherwise setup uses the script's `DEFAULT_CODESTORY_REPO_REF`. That ref pins the CLI source checkout, not this installed skill version.
+5. For each target repository, run `doctor`, `index`, and `ground` with `--project <target-workspace>`.
+
+Do not rebuild or re-clone CodeStory for every target repository. Rebuild only
+when the CodeStory source artifact changes or the user asks to test local
+CodeStory edits.
+
+## Binary Resolution
+
+Use this order after the one-time setup:
+
+1. If `CODESTORY_CLI` is set, use that exact executable.
+2. Else if `codestory-cli` resolves on `PATH`, use `codestory-cli`.
+3. Else run `scripts/setup.ps1` on Windows or `sh scripts/setup.sh` on Unix-like systems from this skill directory, then use the printed `CODESTORY_CLI=...` path.
+4. Else, if the user has a local CodeStory checkout they want to use, build with `cargo build --release -p codestory-cli --manifest-path <codestory-source>/Cargo.toml` and use the release binary under that checkout.
+
+After resolving the binary, keep examples mentally expanded as:
+
+```
+<codestory-cli> <command> --project <target-workspace> ...
+```
 
 ## Template Workflows
 
 ### Fresh repo orientation
 
 ```
-target/release/codestory-cli(.exe) doctor --project <workspace>
-target/release/codestory-cli(.exe) index --project <workspace> --refresh full
-target/release/codestory-cli(.exe) ground --project <workspace> --why
-target/release/codestory-cli(.exe) search --project <workspace> --query "<architecture term>" --why
-target/release/codestory-cli(.exe) files --project <workspace> --format markdown
+<codestory-cli> doctor --project <target-workspace>
+<codestory-cli> index --project <target-workspace> --refresh full
+<codestory-cli> ground --project <target-workspace> --why
+<codestory-cli> packet --project <target-workspace> --question "<broad task question>" --budget compact
+<codestory-cli> search --project <target-workspace> --query "<architecture term>" --why
+<codestory-cli> files --project <target-workspace> --format markdown
 ```
 
 ### Candidate-to-context workflow
 
 ```
-target/release/codestory-cli(.exe) search --project <workspace> --query "<symbol/file/literal/API path>" --why
+<codestory-cli> search --project <target-workspace> --query "<symbol/file/literal/API path>" --why
 # choose a concrete node_id from search output
-target/release/codestory-cli(.exe) context --project <workspace> --id <node-id>
+<codestory-cli> context --project <target-workspace> --id <node-id>
 ```
 
 ### Exact symbol investigation
 
 ```
-target/release/codestory-cli(.exe) symbol --project <workspace> --id <node-id>
-target/release/codestory-cli(.exe) explore --project <workspace> --id <node-id> --no-tui
-target/release/codestory-cli(.exe) trail --project <workspace> --id <node-id> --story --hide-speculative
-target/release/codestory-cli(.exe) snippet --project <workspace> --id <node-id> --context 40
-target/release/codestory-cli(.exe) context --project <workspace> --id <node-id> --bundle out/context-<name>
+<codestory-cli> symbol --project <target-workspace> --id <node-id>
+<codestory-cli> explore --project <target-workspace> --id <node-id> --no-tui
+<codestory-cli> trail --project <target-workspace> --id <node-id> --story --hide-speculative
+<codestory-cli> snippet --project <target-workspace> --id <node-id> --context 40
+<codestory-cli> context --project <target-workspace> --id <node-id> --bundle out/context-<name>
 ```
 
 ### Change impact workflow
 
 ```
-target/release/codestory-cli(.exe) index --project <workspace> --refresh incremental
-target/release/codestory-cli(.exe) affected --project <workspace> --format markdown
+<codestory-cli> index --project <target-workspace> --refresh incremental
+<codestory-cli> affected --project <target-workspace> --format markdown
 # or pass explicit changed paths when git diff is not the right source:
-target/release/codestory-cli(.exe) affected --project <workspace> src/lib.rs tests/lib_test.rs --depth 3 --format json
+<codestory-cli> affected --project <target-workspace> src/lib.rs tests/lib_test.rs --depth 3 --format json
 ```
 
 ### Broad repo/product question workflow
 
-Do not pass the broad question to `context`. Prefer `drill` when the user needs an answer-quality check, not just navigation.
+Do not pass the broad question to `context`. Start with `packet`; use `drill`
+when the user needs an answer-quality check and source-truth checklist, not just
+navigation.
 
 ```
-target/release/codestory-cli(.exe) ground --project <workspace> --why
-target/release/codestory-cli(.exe) search --project <workspace> --repo-text on --query "<concrete term>" --why
-target/release/codestory-cli(.exe) search --project <workspace> --repo-text on --query "<another concrete term>" --why
+<codestory-cli> ground --project <target-workspace> --why
+<codestory-cli> packet --project <target-workspace> --question "<broad task question>" --budget compact
+<codestory-cli> search --project <target-workspace> --repo-text on --query "<concrete term>" --why
+<codestory-cli> search --project <target-workspace> --repo-text on --query "<another concrete term>" --why
 # select anchors
-target/release/codestory-cli(.exe) context --project <workspace> --id <node-id>
+<codestory-cli> context --project <target-workspace> --id <node-id>
 ```
 
 When `search --why` emits `search_plan`, use its subqueries, anchor groups,
@@ -103,7 +151,7 @@ and source-truth verification.
 Use this workflow when the goal is to test whether CodeStory helps an agent answer a realistic architecture question.
 
 ```
-target/release/codestory-cli(.exe) drill --project <workspace> --refresh full --question "<question>" --anchors AnchorA,AnchorB,AnchorC --output-dir target/drill/<slug> --format json
+<codestory-cli> drill --project <target-workspace> --refresh full --question "<question>" --anchors AnchorA,AnchorB,AnchorC --output-dir target/drill/<slug> --format json
 # Read drill-report.json first:
 # - evidence_packet.readiness.safe_to_say
 # - evidence_packet.readiness.inferred_claims
@@ -116,17 +164,17 @@ target/release/codestory-cli(.exe) drill --project <workspace> --refresh full --
 For a repeatable cross-repo regression drill from the CodeStory checkout, put cases in a JSON manifest and pass it explicitly:
 
 ```
-target/release/codestory-cli(.exe) drill-suite --project <codestory-checkout> --case-file <drill-cases.json> --refresh full --output-dir target/codestory-cross-repo-test/<stamp> --format json
+<codestory-cli> drill-suite --project <codestory-source> --case-file <drill-cases.json> --refresh full --output-dir target/codestory-cross-repo-test/<stamp> --format json
 # Read suite-report.json and suite-report.md for per-repo verdicts, freshness/retrieval state, bridge status, and next actions.
 ```
 
 ### Stale or unhealthy semantic retrieval
 
 ```
-target/release/codestory-cli(.exe) doctor --project <workspace>
-target/release/codestory-cli(.exe) setup embeddings --project <workspace>
-target/release/codestory-cli(.exe) index --project <workspace> --refresh full
-target/release/codestory-cli(.exe) doctor --project <workspace>
+<codestory-cli> doctor --project <target-workspace>
+<codestory-cli> setup embeddings --project <target-workspace>
+<codestory-cli> index --project <target-workspace> --refresh full
+<codestory-cli> doctor --project <target-workspace>
 ```
 
 If retrieval is still partial, stale, or failed, use `search --repo-text on --why`, `symbol`, `trail`, and `snippet`; treat `context` output as incomplete if it reports gaps.
@@ -134,7 +182,7 @@ If retrieval is still partial, stale, or failed, use `search --repo-text on --wh
 ### Route coverage and quality evaluation
 
 ```
-target/release/codestory-cli(.exe) files --project <workspace> --format json
+<codestory-cli> files --project <target-workspace> --format json
 cargo test -p codestory-indexer --lib framework_route
 cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
 cargo test -p codestory-cli --test agent_quality_eval
@@ -149,6 +197,7 @@ cargo test -p codestory-cli --test agent_quality_eval local_real_repo_manifests_
 ### Performance review baseline
 
 ```
+# From <codestory-source>
 cargo build --release -p codestory-cli
 cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
 cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
