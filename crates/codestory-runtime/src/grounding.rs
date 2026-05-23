@@ -1244,6 +1244,57 @@ mod tests {
     }
 
     #[test]
+    fn function_body_snippet_uses_symbol_range_when_available() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        let source_path = temp.path().join("src").join("lib.rs");
+        std::fs::create_dir_all(source_path.parent().expect("src parent")).expect("create src");
+        std::fs::write(
+            &source_path,
+            "fn before() {}\n\nfn route_handler() {\n    let first = 1;\n    let decisive = payload.create();\n    let last = first;\n}\n\nfn after() {}\n",
+        )
+        .expect("write source");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            insert_file_node(
+                &mut storage,
+                11,
+                &source_path,
+                Node {
+                    id: CoreNodeId(101),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "route_handler".to_string(),
+                    file_node_id: Some(CoreNodeId(11)),
+                    start_line: Some(3),
+                    end_line: Some(7),
+                    ..Default::default()
+                },
+            )
+            .expect("insert function");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+
+        let snippet = controller
+            .snippet_function_body_context(codestory_contracts::api::NodeId("101".to_string()), 0)
+            .expect("function body snippet");
+
+        assert_eq!(
+            snippet.scope,
+            codestory_contracts::api::SnippetScopeDto::FunctionBody
+        );
+        assert!(snippet.snippet.contains("fn route_handler()"));
+        assert!(snippet.snippet.contains("payload.create()"));
+        assert!(!snippet.snippet.contains("fn before()"));
+        assert!(!snippet.snippet.contains("fn after()"));
+    }
+
+    #[test]
     fn grounding_snapshot_caps_detailed_files_and_adds_coverage_buckets() {
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");

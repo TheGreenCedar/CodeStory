@@ -15,7 +15,7 @@ use codestory_contracts::api::{
     TrailMode,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Write as _,
     fs,
     io::{IsTerminal, Read},
@@ -43,16 +43,21 @@ use args::{
     AffectedCommand, BookmarkAction, BookmarkAddCommand, BookmarkAddOutput, BookmarkCommand,
     BookmarkListCommand, BookmarkListOutput, BookmarkOutput, BookmarkRemoveCommand,
     BookmarkRemoveOutput, Cli, Command, CompletionShell, ContextCommand, DoctorCheckOutput,
-    DoctorCommand, DoctorOutput, DrillAnchorOutput, DrillAnswerQualityContractOutput,
+    DoctorCommand, DoctorOutput, DrillAnchorConsumerOutput, DrillAnchorConsumerSummaryOutput,
+    DrillAnchorOutput, DrillAnchorTextConsumerHintOutput, DrillAnswerQualityContractOutput,
     DrillBridgeEvidenceOutput, DrillBridgeGraphPathOutput, DrillBridgeOutput,
     DrillClaimLedgerEntryOutput, DrillClaimLedgerOutput, DrillClaimLedgerScoringOutput,
-    DrillCommand, DrillCommandStatusOutput, DrillMechanicalOutput, DrillOutput,
-    DrillVerificationChecklistItemOutput, FilesCommand, GenerateCompletionsCommand, GroundCommand,
-    IndexCommand, IndexDryRunOutput, IndexOutput, ProjectArgs, QueryCommand, QueryOutput,
-    QueryResolutionOutput, QuerySelectorOutput, RepoTextMode, SearchCommand, SearchHitOutput,
-    SearchOutput, ServeCommand, SetupAction, SetupCommand, SnippetCommand, SnippetJsonOutput,
-    SymbolCommand, SymbolJsonOutput, TrailCommand, TrailJsonOutput, VerificationTargetOutput,
-    build_trail_request,
+    DrillCommand, DrillCommandStatusOutput, DrillExecutionBoundaryOutput, DrillMechanicalOutput,
+    DrillOutput, DrillSuiteCommand, DrillSuiteOutput, DrillSuiteRepoOutput,
+    DrillSuiteRetrievalBlockerOutput, DrillSummaryAnchorStatusOutput, DrillSummaryAnchorsOutput,
+    DrillSummaryBridgeStatusOutput, DrillSummaryBridgesOutput, DrillSummaryMechanicalOutput,
+    DrillSummaryOpenGapsOutput, DrillSummaryOutput, DrillSummarySourceTruthOutput,
+    DrillSummaryStatsOutput, DrillSummaryVerdictOutput, DrillVerificationChecklistItemOutput,
+    FilesCommand, GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput,
+    IndexOutput, ProjectArgs, QueryCommand, QueryOutput, QueryResolutionOutput,
+    QuerySelectorOutput, RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput, ServeCommand,
+    SetupAction, SetupCommand, SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput,
+    TrailCommand, TrailJsonOutput, VerificationTargetOutput, build_trail_request,
 };
 #[cfg(test)]
 use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
@@ -130,6 +135,7 @@ fn main() -> Result<()> {
         Command::Setup(cmd) => run_setup(cmd),
         Command::Search(cmd) => run_search(cmd),
         Command::Drill(cmd) => run_drill(cmd),
+        Command::DrillSuite(cmd) => run_drill_suite(cmd),
         Command::Symbol(cmd) => run_symbol(cmd),
         Command::Trail(cmd) => run_trail(cmd),
         Command::Snippet(cmd) => run_snippet(cmd),
@@ -861,20 +867,27 @@ fn search_request_from_command(cmd: &SearchCommand) -> SearchRequest {
 
 fn run_drill(cmd: DrillCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "drill")?;
+    let output = execute_drill(&cmd)?;
+    let contents = write_drill_outputs(cmd.format, &cmd.output_dir, &output)?;
+    print!("{}", contents.selected);
+    Ok(())
+}
+
+fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
     validate_drill_output_dir(&cmd.output_dir)?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let before = runtime.open_project_summary()?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
+    let opened = runtime.ensure_open_from_summary(cmd.refresh, before.clone())?;
     ensure_index_ready(&opened, "drill")?;
     let refresh = refresh_label(cmd.refresh, opened.refresh_mode);
-    let report_ext = match cmd.format {
-        args::OutputFormat::Markdown => "md",
-        args::OutputFormat::Json => "json",
-        args::OutputFormat::Dot => unreachable!("dot was rejected above"),
-    };
 
     let mut anchor_outputs = Vec::new();
     let mut all_verification_targets = Vec::new();
+    let stale_freshness = opened
+        .summary
+        .freshness
+        .as_ref()
+        .is_some_and(|freshness| freshness.status == IndexFreshnessStatusDto::Stale);
     let question_search = cmd
         .question
         .as_deref()
@@ -887,9 +900,20 @@ fn run_drill(cmd: DrillCommand) -> Result<()> {
         anchor_outputs.push(anchor_output);
     }
     dedupe_verification_targets(&mut all_verification_targets);
-    let bridge_outputs = run_drill_bridges(&runtime, &cmd.output_dir, cmd.format, &anchor_outputs);
+    let bridge_outputs = run_drill_bridges(
+        &runtime,
+        &cmd.output_dir,
+        cmd.format,
+        &anchor_outputs,
+        stale_freshness,
+    );
     let claim_ledger_template = drill_claim_ledger_template(&anchor_outputs, &bridge_outputs);
-    let next_commands = drill_next_commands(&runtime.project_root, &cmd.anchors);
+    let next_commands = drill_next_commands(
+        &runtime.project_root,
+        &anchor_outputs,
+        &bridge_outputs,
+        stale_freshness,
+    );
     let evidence_packet = drill_evidence_packet(
         cmd.question.as_deref(),
         question_search.as_ref(),
@@ -899,7 +923,7 @@ fn run_drill(cmd: DrillCommand) -> Result<()> {
         &next_commands,
     );
 
-    let output = DrillOutput {
+    Ok(DrillOutput {
         project: display::clean_path_string(&opened.summary.root),
         label: cmd.label.clone(),
         question: cmd.question.clone(),
@@ -915,33 +939,516 @@ fn run_drill(cmd: DrillCommand) -> Result<()> {
             after_errors: opened.summary.stats.error_count,
             refresh,
             retrieval: opened.summary.retrieval.clone(),
+            freshness: opened.summary.freshness.clone(),
             phase_timings: opened.phase_timings.clone(),
         },
         question_search,
         anchors: anchor_outputs,
         bridges: bridge_outputs,
+        execution_boundaries: drill_execution_boundaries(),
         verification_targets: all_verification_targets,
         evidence_packet,
         answer_quality_contract: drill_answer_quality_contract(),
         claim_ledger_template,
         verification_checklist: drill_verification_checklist(),
         next_commands,
-    };
+    })
+}
 
+fn write_drill_outputs(
+    format: args::OutputFormat,
+    output_dir: &std::path::Path,
+    output: &DrillOutput,
+) -> Result<DrillReportContents> {
+    let report_ext = match format {
+        args::OutputFormat::Markdown => "md",
+        args::OutputFormat::Json => "json",
+        args::OutputFormat::Dot => unreachable!("dot was rejected above"),
+    };
     let markdown = render_drill_markdown(&output);
-    let contents = render_drill_contents(cmd.format, &output, &markdown)?;
-    let report_path = cmd.output_dir.join(format!("drill-report.{report_ext}"));
+    let contents = render_drill_contents(format, output, &markdown)?;
+    let report_path = output_dir.join(format!("drill-report.{report_ext}"));
     write_drill_report_file(&report_path, &contents.selected)?;
-    let markdown_path = cmd.output_dir.join("drill-report.md");
+    let markdown_path = output_dir.join("drill-report.md");
     if report_path != markdown_path {
         write_drill_report_file(&markdown_path, &contents.markdown)?;
     }
-    let json_path = cmd.output_dir.join("drill-report.json");
+    let json_path = output_dir.join("drill-report.json");
     if report_path != json_path {
         write_drill_report_file(&json_path, &contents.json)?;
     }
-    print!("{}", contents.selected);
+    let summary = drill_summary(output);
+    let summary_json = ensure_trailing_newline(
+        serde_json::to_string_pretty(&summary).context("Failed to serialize drill summary JSON")?,
+    );
+    write_drill_report_file(&output_dir.join("drill-summary.json"), &summary_json)?;
+    Ok(contents)
+}
+
+fn run_drill_suite(cmd: DrillSuiteCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "drill-suite")?;
+    validate_drill_output_dir(&cmd.output_dir)?;
+    let suite_output = execute_codestory_real_repo_drill_suite(&cmd)?;
+    emit_drill_suite_progress(format!(
+        "writing suite reports output_dir={}",
+        display::clean_path_string(&cmd.output_dir.to_string_lossy())
+    ));
+    write_drill_suite_outputs(cmd.format, &cmd.output_dir, &suite_output)?;
+    emit_drill_suite_progress(format!(
+        "done repos={} ready={} degraded={} blocked={} output_dir={}",
+        suite_output.repo_count,
+        suite_output.ready_count,
+        suite_output.degraded_count,
+        suite_output.blocked_count,
+        suite_output.output_dir
+    ));
+    let markdown = render_drill_suite_markdown(&suite_output);
+    let selected = match cmd.format {
+        args::OutputFormat::Markdown => ensure_trailing_newline(markdown),
+        args::OutputFormat::Json => ensure_trailing_newline(
+            serde_json::to_string_pretty(&suite_output)
+                .context("Failed to serialize drill suite JSON")?,
+        ),
+        args::OutputFormat::Dot => unreachable!("dot was rejected above"),
+    };
+    print!("{selected}");
     Ok(())
+}
+
+struct DrillSuiteCase {
+    slug: &'static str,
+    project_root: std::path::PathBuf,
+    question: &'static str,
+    anchors: &'static [&'static str],
+}
+
+fn emit_drill_suite_progress(message: impl AsRef<str>) {
+    eprintln!("[drill-suite] {}", message.as_ref());
+}
+
+fn drill_suite_repo_progress_start_message(
+    index: usize,
+    total: usize,
+    case: &DrillSuiteCase,
+    repo_output_dir: &std::path::Path,
+) -> String {
+    format!(
+        "[{index}/{total}] start {} project={} output_dir={}",
+        case.slug,
+        display::clean_path_string(&case.project_root.to_string_lossy()),
+        display::clean_path_string(&repo_output_dir.to_string_lossy())
+    )
+}
+
+fn drill_suite_repo_progress_done_message(
+    index: usize,
+    total: usize,
+    slug: &str,
+    summary: &DrillSummaryOutput,
+) -> String {
+    format!(
+        "[{index}/{total}] done {slug} verdict={} anchors={}/{} bridges=graph:{} partial:{} unresolved:{} output_dir={}",
+        summary.verdict.status,
+        summary.anchors.resolved,
+        summary.anchors.requested,
+        summary.bridges.graph_path,
+        summary.bridges.partial,
+        summary.bridges.unresolved_or_error,
+        summary.output_dir
+    )
+}
+
+fn execute_codestory_real_repo_drill_suite(cmd: &DrillSuiteCommand) -> Result<DrillSuiteOutput> {
+    let owner_root = cmd
+        .project
+        .project
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve {}", cmd.project.project.display()))?;
+    let cases = codestory_real_repo_drill_suite_cases(&owner_root)?;
+    let total_cases = cases.len();
+    emit_drill_suite_progress(format!(
+        "start repos={} refresh={} output_dir={}",
+        total_cases,
+        format!("{:?}", cmd.refresh).to_ascii_lowercase(),
+        display::clean_path_string(&cmd.output_dir.to_string_lossy())
+    ));
+    let mut repos = Vec::new();
+
+    for (case_index, case) in cases.into_iter().enumerate() {
+        let progress_index = case_index + 1;
+        let repo_output_dir = cmd.output_dir.join(format!("{}-drill", case.slug));
+        emit_drill_suite_progress(drill_suite_repo_progress_start_message(
+            progress_index,
+            total_cases,
+            &case,
+            &repo_output_dir,
+        ));
+        let drill_cmd = DrillCommand {
+            project: ProjectArgs {
+                project: case.project_root.clone(),
+                cache_dir: drill_suite_case_cache_dir(cmd.project.cache_dir.as_deref(), case.slug),
+            },
+            anchors: case
+                .anchors
+                .iter()
+                .map(|anchor| (*anchor).to_string())
+                .collect(),
+            label: Some(case.slug.to_string()),
+            question: Some(case.question.to_string()),
+            output_dir: repo_output_dir.clone(),
+            refresh: cmd.refresh,
+            format: cmd.format,
+        };
+        let drill_output = execute_drill(&drill_cmd).with_context(|| {
+            format!(
+                "Failed to run {} drill for {}",
+                case.slug,
+                display::clean_path_string(&case.project_root.to_string_lossy())
+            )
+        })?;
+        write_drill_outputs(cmd.format, &repo_output_dir, &drill_output)?;
+        let summary = drill_summary(&drill_output);
+        emit_drill_suite_progress(drill_suite_repo_progress_done_message(
+            progress_index,
+            total_cases,
+            case.slug,
+            &summary,
+        ));
+        repos.push(DrillSuiteRepoOutput {
+            slug: case.slug.to_string(),
+            project: display::clean_path_string(&case.project_root.to_string_lossy()),
+            question: case.question.to_string(),
+            anchors: case
+                .anchors
+                .iter()
+                .map(|anchor| (*anchor).to_string())
+                .collect(),
+            output_dir: display::clean_path_string(&repo_output_dir.to_string_lossy()),
+            summary,
+        });
+    }
+
+    let degraded_count = repos
+        .iter()
+        .filter(|repo| repo.summary.verdict.status == "degraded")
+        .count();
+    let blocked_count = repos
+        .iter()
+        .filter(|repo| repo.summary.verdict.status == "blocked")
+        .count();
+    let ready_count = repos
+        .iter()
+        .filter(|repo| repo.summary.verdict.status == "ready")
+        .count();
+    let next_actions = repos
+        .iter()
+        .map(|repo| format!("{}: {}", repo.slug, repo.summary.verdict.next_action))
+        .collect::<Vec<_>>();
+    let retrieval_blockers = drill_suite_retrieval_blockers(&repos);
+
+    Ok(DrillSuiteOutput {
+        suite: "codestory-real-repo-agent-drill".to_string(),
+        project: display::clean_path_string(&owner_root.to_string_lossy()),
+        output_dir: display::clean_path_string(&cmd.output_dir.to_string_lossy()),
+        repo_count: repos.len(),
+        degraded_count,
+        blocked_count,
+        ready_count,
+        repos,
+        retrieval_blockers,
+        next_actions,
+    })
+}
+
+fn drill_suite_case_cache_dir(
+    suite_cache_dir: Option<&std::path::Path>,
+    slug: &str,
+) -> Option<std::path::PathBuf> {
+    suite_cache_dir.map(|cache_dir| cache_dir.join(output_slug(slug)))
+}
+
+fn codestory_real_repo_drill_suite_cases(
+    owner_root: &std::path::Path,
+) -> Result<Vec<DrillSuiteCase>> {
+    let source_repos = owner_root.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cannot derive sibling repos from {}",
+            display::clean_path_string(&owner_root.to_string_lossy())
+        )
+    })?;
+    Ok(vec![
+        DrillSuiteCase {
+            slug: "sourcetrail",
+            project_root: source_repos.join("Sourcetrail"),
+            question: "Explain how Sourcetrail turns project/source-group configuration into indexing work, then how indexed data is accessed by the application. Anchor the answer around SourceGroupCxxCdb, IndexerJava, and StorageAccess.",
+            anchors: &["SourceGroupCxxCdb", "IndexerJava", "StorageAccess"],
+        },
+        DrillSuiteCase {
+            slug: "codestory",
+            project_root: owner_root.to_path_buf(),
+            question: "Explain how CodeStory's full-index path flows through CLI/runtime/workspace/indexer/store and how that supports later search, trail, and snippet commands. Anchor the answer around WorkspaceIndexer, SearchService, and TrailResult.",
+            anchors: &["WorkspaceIndexer", "SearchService", "TrailResult"],
+        },
+        DrillSuiteCase {
+            slug: "rootandruntime",
+            project_root: source_repos.join("rootandruntime"),
+            question: "Explain how public writing/social surfaces connect to Payload collections, comment auth, and the elsewhere feed. Anchor the answer around Posts, getElsewhereFeed, and getCommentAuth.",
+            anchors: &["Posts", "getElsewhereFeed", "getCommentAuth"],
+        },
+    ])
+}
+
+fn write_drill_suite_outputs(
+    format: args::OutputFormat,
+    output_dir: &std::path::Path,
+    output: &DrillSuiteOutput,
+) -> Result<()> {
+    let markdown = render_drill_suite_markdown(output);
+    let json = ensure_trailing_newline(
+        serde_json::to_string_pretty(output).context("Failed to serialize drill suite JSON")?,
+    );
+    write_drill_report_file(&output_dir.join("suite-report.md"), &markdown)?;
+    write_drill_report_file(&output_dir.join("suite-report.json"), &json)?;
+    let selected = match format {
+        args::OutputFormat::Markdown => ensure_trailing_newline(markdown),
+        args::OutputFormat::Json => json,
+        args::OutputFormat::Dot => unreachable!("dot was rejected above"),
+    };
+    let report_ext = match format {
+        args::OutputFormat::Markdown => "md",
+        args::OutputFormat::Json => "json",
+        args::OutputFormat::Dot => unreachable!("dot was rejected above"),
+    };
+    write_drill_report_file(
+        &output_dir.join(format!("drill-suite-report.{report_ext}")),
+        &selected,
+    )
+}
+
+fn render_drill_suite_markdown(output: &DrillSuiteOutput) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# CodeStory Real-Repo Agent Drill Suite");
+    let _ = writeln!(markdown);
+    let _ = writeln!(markdown, "- suite: `{}`", output.suite);
+    let _ = writeln!(markdown, "- project: `{}`", output.project);
+    let _ = writeln!(markdown, "- output_dir: `{}`", output.output_dir);
+    let _ = writeln!(
+        markdown,
+        "- repos: {} total, {} ready, {} degraded, {} blocked",
+        output.repo_count, output.ready_count, output.degraded_count, output.blocked_count
+    );
+    if !output.retrieval_blockers.is_empty() {
+        let _ = writeln!(markdown);
+        let _ = writeln!(markdown, "## Retrieval Blockers");
+        for blocker in &output.retrieval_blockers {
+            let _ = writeln!(
+                markdown,
+                "- `{}` repos={} [{}]: {}",
+                blocker.status,
+                blocker.repo_count,
+                blocker.repos.join(", "),
+                blocker.next_action
+            );
+        }
+    }
+    let _ = writeln!(markdown);
+    let _ = writeln!(
+        markdown,
+        "| repo | verdict | freshness | retrieval | anchors | bridges | source truth | reports | next action |"
+    );
+    let _ = writeln!(markdown, "|---|---|---|---|---:|---:|---|---|---|");
+    for repo in &output.repos {
+        let reports = drill_suite_repo_report_label(repo);
+        let _ = writeln!(
+            markdown,
+            "| `{}` | {} | {} | {} | {}/{} | {} | {} | {} | {} |",
+            repo.slug,
+            repo.summary.verdict.status,
+            repo.summary
+                .mechanical
+                .freshness_status
+                .as_deref()
+                .unwrap_or("unknown"),
+            drill_suite_retrieval_label(repo.summary.mechanical.retrieval_status.as_deref()),
+            repo.summary.anchors.resolved,
+            repo.summary.anchors.requested,
+            drill_suite_bridge_label(&repo.summary.bridges),
+            drill_suite_source_truth_label(&repo.summary.source_truth),
+            reports,
+            repo.summary.verdict.next_action.replace('|', "\\|")
+        );
+    }
+    if !output.repos.is_empty() {
+        let _ = writeln!(markdown);
+        let _ = writeln!(markdown, "## Repo Artifacts");
+        for repo in &output.repos {
+            let markdown_report = drill_suite_join_artifact_path(
+                &repo.output_dir,
+                &repo.summary.full_report_markdown,
+            );
+            let json_report =
+                drill_suite_join_artifact_path(&repo.output_dir, &repo.summary.full_report_json);
+            let bridge_artifacts =
+                drill_suite_join_artifact_path(&repo.output_dir, "*-bridge.json");
+            let _ = writeln!(
+                markdown,
+                "- `{}`: report `{}`; json `{}`; bridge artifacts `{}`",
+                repo.slug, markdown_report, json_report, bridge_artifacts
+            );
+        }
+    }
+    if !output.next_actions.is_empty() {
+        let _ = writeln!(markdown);
+        let _ = writeln!(markdown, "## Next Actions");
+        for action in &output.next_actions {
+            let _ = writeln!(markdown, "- {action}");
+        }
+    }
+    ensure_trailing_newline(markdown)
+}
+
+fn drill_suite_repo_report_label(repo: &DrillSuiteRepoOutput) -> String {
+    let markdown_report =
+        drill_suite_join_artifact_path(&repo.output_dir, &repo.summary.full_report_markdown);
+    let json_report =
+        drill_suite_join_artifact_path(&repo.output_dir, &repo.summary.full_report_json);
+    format!("`{markdown_report}` / `{json_report}`").replace('|', "\\|")
+}
+
+fn drill_suite_join_artifact_path(output_dir: &str, artifact: &str) -> String {
+    if artifact.contains(':')
+        || artifact.starts_with('/')
+        || artifact.starts_with('\\')
+        || artifact.contains('/')
+        || artifact.contains('\\')
+    {
+        return artifact.to_string();
+    }
+    format!(
+        "{}/{}",
+        output_dir.trim_end_matches(['/', '\\']),
+        artifact.trim_start_matches(['/', '\\'])
+    )
+}
+
+fn drill_suite_bridge_label(bridges: &DrillSummaryBridgesOutput) -> String {
+    format!(
+        "{} graph / {} partial / {} unresolved-error",
+        bridges.graph_path, bridges.partial, bridges.unresolved_or_error
+    )
+}
+
+fn drill_suite_source_truth_label(source_truth: &DrillSummarySourceTruthOutput) -> String {
+    if source_truth.required
+        || source_truth.pending_check_count > 0
+        || source_truth.verified_check_count > 0
+    {
+        return format!(
+            "{} targets / {} verified / {} pending",
+            source_truth.target_file_count,
+            source_truth.verified_check_count,
+            source_truth.pending_check_count
+        );
+    }
+    format!(
+        "{} targets / {} checks",
+        source_truth.target_file_count, source_truth.check_count
+    )
+}
+
+fn drill_suite_retrieval_blockers(
+    repos: &[DrillSuiteRepoOutput],
+) -> Vec<DrillSuiteRetrievalBlockerOutput> {
+    let mut grouped = BTreeMap::<String, Vec<String>>::new();
+    for repo in repos {
+        let Some(status) = repo.summary.mechanical.retrieval_status.as_ref() else {
+            continue;
+        };
+        if drill_suite_retrieval_label(Some(status)) == "hybrid-ready" {
+            continue;
+        }
+        grouped
+            .entry(status.clone())
+            .or_default()
+            .push(repo.slug.clone());
+    }
+    grouped
+        .into_iter()
+        .map(|(status, repos)| {
+            let next_action = if status.contains("MissingEmbeddingRuntime") {
+                "run `codestory-cli setup embeddings --project <repo>` or treat this as an explicit symbolic-only baseline before judging semantic retrieval".to_string()
+            } else if status.contains("MissingSemanticDocs") {
+                "rerun `codestory-cli index --project <repo> --refresh full` after semantic setup, or keep symbolic-only limitations visible".to_string()
+            } else {
+                "inspect doctor/ground retrieval state before treating broad search quality as repo-specific".to_string()
+            };
+            DrillSuiteRetrievalBlockerOutput {
+                status,
+                repo_count: repos.len(),
+                repos,
+                next_action,
+            }
+        })
+        .collect()
+}
+
+fn drill_execution_boundaries() -> Vec<DrillExecutionBoundaryOutput> {
+    vec![
+        DrillExecutionBoundaryOutput {
+            command: "drill".to_string(),
+            flow: vec![
+                "codestory-cli::run_drill validates output dir and opens RuntimeContext"
+                    .to_string(),
+                "RuntimeContext::ensure_open refreshes workspace/index state before evidence commands"
+                    .to_string(),
+                "run_drill_anchor runs search, symbol, trail, explore, and function-body snippet artifacts"
+                    .to_string(),
+                "drill_evidence_packet and drill_summary turn artifacts into answer-readiness evidence"
+                    .to_string(),
+            ],
+            source_files: vec![
+                "crates/codestory-cli/src/main.rs".to_string(),
+                "crates/codestory-runtime/src/lib.rs".to_string(),
+                "crates/codestory-runtime/src/grounding.rs".to_string(),
+            ],
+        },
+        DrillExecutionBoundaryOutput {
+            command: "trail".to_string(),
+            flow: vec![
+                "codestory-cli::run_trail resolves the requested symbol into a NodeId".to_string(),
+                "CodebaseBrowser::trail_context loads focus details and delegates graph traversal"
+                    .to_string(),
+                "graph_builders::graph_trail converts TrailConfigDto into store traversal and DTO edges"
+                    .to_string(),
+                "codestory-store::get_trail performs bounded graph traversal over persisted index edges"
+                    .to_string(),
+            ],
+            source_files: vec![
+                "crates/codestory-cli/src/main.rs".to_string(),
+                "crates/codestory-runtime/src/browser.rs".to_string(),
+                "crates/codestory-runtime/src/grounding.rs".to_string(),
+                "crates/codestory-runtime/src/graph_builders.rs".to_string(),
+                "crates/codestory-store/src/storage_impl/trail.rs".to_string(),
+            ],
+        },
+        DrillExecutionBoundaryOutput {
+            command: "search/snippet".to_string(),
+            flow: vec![
+                "codestory-cli search/snippet requests go through RuntimeContext and CodebaseBrowser"
+                    .to_string(),
+                "SearchService combines indexed-symbol, repo-text, semantic, graph, and search-plan evidence"
+                    .to_string(),
+                "snippet_context reads source-backed line/function ranges for the selected NodeId"
+                    .to_string(),
+            ],
+            source_files: vec![
+                "crates/codestory-cli/src/main.rs".to_string(),
+                "crates/codestory-runtime/src/services.rs".to_string(),
+                "crates/codestory-runtime/src/grounding.rs".to_string(),
+                "crates/codestory-store/src/search.rs".to_string(),
+            ],
+        },
+    ]
 }
 
 fn validate_drill_output_dir(output_dir: &std::path::Path) -> Result<()> {
@@ -987,6 +1494,476 @@ fn write_drill_report_file(path: &std::path::Path, content: &str) -> Result<()> 
             display::clean_path_string(&path.to_string_lossy())
         )
     })
+}
+
+fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
+    let readiness = &output.evidence_packet.readiness;
+    let anchor_statuses: Vec<_> = output
+        .anchors
+        .iter()
+        .map(|anchor| {
+            let failed_command_count = anchor
+                .commands
+                .iter()
+                .filter(|command| command.status != "ok")
+                .count();
+            DrillSummaryAnchorStatusOutput {
+                anchor: anchor.anchor.clone(),
+                status: if anchor.chosen_anchor.is_some() {
+                    "resolved".to_string()
+                } else {
+                    "unresolved".to_string()
+                },
+                typed_hit_count: anchor.typed_hit_count,
+                selected: anchor
+                    .chosen_anchor
+                    .as_ref()
+                    .map(|hit| hit.display_name.clone()),
+                selected_node_id: anchor.chosen_anchor.as_ref().map(|hit| hit.node_id.clone()),
+                selected_node_ref: anchor
+                    .chosen_anchor
+                    .as_ref()
+                    .and_then(|hit| hit.node_ref.clone()),
+                selected_kind: anchor.chosen_anchor.as_ref().map(|hit| hit.kind),
+                selected_file_path: anchor
+                    .chosen_anchor
+                    .as_ref()
+                    .and_then(|hit| hit.file_path.clone()),
+                selected_line: anchor.chosen_anchor.as_ref().and_then(|hit| hit.line),
+                caller_count: anchor
+                    .consumer_summary
+                    .as_ref()
+                    .map(|summary| summary.caller_count)
+                    .unwrap_or_default(),
+                consumer_count: anchor
+                    .consumer_summary
+                    .as_ref()
+                    .map(|summary| summary.consumer_count)
+                    .unwrap_or_default(),
+                text_hint_count: anchor
+                    .consumer_summary
+                    .as_ref()
+                    .map(|summary| summary.text_hint_count)
+                    .unwrap_or_default(),
+                command_count: anchor.commands.len(),
+                failed_command_count,
+                source_truth_target_count: anchor.verification_targets.len(),
+            }
+        })
+        .collect();
+    let resolved = anchor_statuses
+        .iter()
+        .filter(|anchor| anchor.status == "resolved")
+        .count();
+    let failed_anchor_commands = anchor_statuses
+        .iter()
+        .map(|anchor| anchor.failed_command_count)
+        .sum();
+
+    let bridge_statuses: Vec<_> = output
+        .bridges
+        .iter()
+        .map(|bridge| DrillSummaryBridgeStatusOutput {
+            from_anchor: bridge.evidence.from_anchor.clone(),
+            to_anchor: bridge.evidence.to_anchor.clone(),
+            status: bridge.evidence.status.clone(),
+            confidence: bridge.evidence.confidence.clone(),
+            strategy: bridge.evidence.strategy.clone(),
+            command_status: bridge.command.status.clone(),
+        })
+        .collect();
+    let graph_path = bridge_statuses
+        .iter()
+        .filter(|bridge| matches!(bridge.status.as_str(), "graph_path" | "reverse_graph_path"))
+        .count();
+    let partial = bridge_statuses
+        .iter()
+        .filter(|bridge| {
+            matches!(
+                bridge.status.as_str(),
+                "shared_file_only" | "evidence_hint_only"
+            )
+        })
+        .count();
+    let unresolved_or_error = bridge_statuses
+        .iter()
+        .filter(|bridge| {
+            matches!(
+                bridge.status.as_str(),
+                "no_bridge_found" | "unresolved_anchor" | "error"
+            ) || bridge.command_status != "ok"
+        })
+        .count();
+
+    let mut target_files: Vec<_> = readiness
+        .source_truth_checks
+        .iter()
+        .map(|check| check.path.clone())
+        .collect();
+    dedupe_and_rank_drill_files(&mut target_files);
+
+    let needs_source_truth = readiness
+        .source_truth_checks
+        .iter()
+        .any(|check| check.required);
+    let stale_freshness = output
+        .mechanical
+        .freshness
+        .as_ref()
+        .is_some_and(|freshness| freshness.status == IndexFreshnessStatusDto::Stale);
+    let open_gap_friendly = !readiness.needs_verification.is_empty()
+        || !readiness.inferred_claims.is_empty()
+        || needs_source_truth
+        || stale_freshness;
+
+    DrillSummaryOutput {
+        summary_version: 1,
+        project: output.project.clone(),
+        label: output.label.clone(),
+        question: output.question.clone(),
+        output_dir: output.output_dir.clone(),
+        full_report_json: "drill-report.json".to_string(),
+        full_report_markdown: "drill-report.md".to_string(),
+        mechanical: DrillSummaryMechanicalOutput {
+            refresh: output.mechanical.refresh.clone(),
+            before: drill_summary_stats(
+                output.mechanical.before_files,
+                output.mechanical.before_nodes,
+                output.mechanical.before_edges,
+                output.mechanical.before_errors,
+            ),
+            after: drill_summary_stats(
+                output.mechanical.after_files,
+                output.mechanical.after_nodes,
+                output.mechanical.after_edges,
+                output.mechanical.after_errors,
+            ),
+            index_ready: output.mechanical.after_files > 0 && output.mechanical.after_errors == 0,
+            error_delta: i64::from(output.mechanical.after_errors)
+                - i64::from(output.mechanical.before_errors),
+            retrieval_status: output
+                .mechanical
+                .retrieval
+                .as_ref()
+                .map(drill_summary_retrieval_status),
+            freshness_status: output
+                .mechanical
+                .freshness
+                .as_ref()
+                .map(drill_summary_freshness_status),
+            stale_file_count: output
+                .mechanical
+                .freshness
+                .as_ref()
+                .map(drill_summary_stale_file_count)
+                .unwrap_or_default(),
+            freshness_samples: output
+                .mechanical
+                .freshness
+                .as_ref()
+                .map(drill_summary_freshness_samples)
+                .unwrap_or_default(),
+            phase_timing_available: output.mechanical.phase_timings.is_some(),
+        },
+        anchors: DrillSummaryAnchorsOutput {
+            requested: output.anchors.len(),
+            resolved,
+            unresolved: output.anchors.len().saturating_sub(resolved),
+            failed_command_count: failed_anchor_commands,
+            statuses: anchor_statuses,
+        },
+        bridges: DrillSummaryBridgesOutput {
+            total: output.bridges.len(),
+            graph_path,
+            partial,
+            unresolved_or_error,
+            statuses: bridge_statuses,
+        },
+        source_truth: DrillSummarySourceTruthOutput {
+            required: needs_source_truth,
+            check_count: readiness.source_truth_checks.len(),
+            pending_check_count: if needs_source_truth {
+                readiness.source_truth_checks.len()
+            } else {
+                0
+            },
+            verified_check_count: 0,
+            target_file_count: target_files.len(),
+            target_files,
+            checklist_item_count: output.verification_checklist.len(),
+            claim_count: output.claim_ledger_template.claims.len(),
+            pending_claim_count: output.claim_ledger_template.claims.len(),
+            verified_claim_count: 0,
+        },
+        open_gaps: DrillSummaryOpenGapsOutput {
+            overall_status: readiness.overall_status,
+            answer_quality_status: drill_answer_quality_status(
+                needs_source_truth,
+                output.claim_ledger_template.claims.len(),
+            ),
+            safe_to_say_count: readiness.safe_to_say.len(),
+            inferred_claim_count: readiness.inferred_claims.len(),
+            needs_verification_count: readiness.needs_verification.len(),
+            needs_verification_claim_count: readiness.needs_verification.len(),
+            pending_claim_count: if needs_source_truth {
+                output.claim_ledger_template.claims.len()
+            } else {
+                0
+            },
+            pending_source_truth_check_count: if needs_source_truth {
+                readiness.source_truth_checks.len()
+            } else {
+                0
+            },
+            next_command_count: readiness.next_commands.len(),
+            open_gap_friendly,
+            status: if open_gap_friendly {
+                "open_gaps_explicit".to_string()
+            } else {
+                "no_open_gaps_reported".to_string()
+            },
+        },
+        verdict: drill_summary_verdict(
+            output,
+            resolved,
+            graph_path,
+            partial,
+            unresolved_or_error,
+            needs_source_truth,
+            open_gap_friendly,
+            stale_freshness,
+        ),
+    }
+}
+
+fn drill_answer_quality_status(needs_source_truth: bool, claim_count: usize) -> String {
+    if needs_source_truth && claim_count > 0 {
+        "pending_source_verification".to_string()
+    } else if needs_source_truth {
+        "pending_source_truth_checks".to_string()
+    } else {
+        "ready_from_codestory_evidence".to_string()
+    }
+}
+
+fn drill_summary_verdict(
+    output: &DrillOutput,
+    resolved_anchors: usize,
+    graph_path_bridges: usize,
+    partial_bridges: usize,
+    unresolved_or_error_bridges: usize,
+    needs_source_truth: bool,
+    open_gap_friendly: bool,
+    stale_freshness: bool,
+) -> DrillSummaryVerdictOutput {
+    let failed_anchor_commands = output
+        .anchors
+        .iter()
+        .flat_map(|anchor| anchor.commands.iter())
+        .filter(|command| command.status != "ok")
+        .count();
+    let unresolved_anchors = output.anchors.len().saturating_sub(resolved_anchors);
+    if output.mechanical.after_files == 0 || output.mechanical.after_errors > 0 {
+        return DrillSummaryVerdictOutput {
+            status: "blocked".to_string(),
+            reason: "index is not ready or contains indexing errors".to_string(),
+            next_action: "inspect doctor/index output before trusting drill evidence".to_string(),
+        };
+    }
+    if unresolved_anchors > 0 || failed_anchor_commands > 0 {
+        return DrillSummaryVerdictOutput {
+            status: "blocked".to_string(),
+            reason: format!(
+                "unresolved_anchors={unresolved_anchors} failed_anchor_commands={failed_anchor_commands}"
+            ),
+            next_action: "repair anchor selection or inspect command errors before answering"
+                .to_string(),
+        };
+    }
+    if stale_freshness {
+        return DrillSummaryVerdictOutput {
+            status: "degraded".to_string(),
+            reason: format!(
+                "index_freshness=stale source_truth_required={} graph_bridges={graph_path_bridges}/{} partial_bridges={partial_bridges} unresolved_or_error_bridges={unresolved_or_error_bridges} pending_source_truth_checks={}",
+                needs_source_truth,
+                output.bridges.len(),
+                output.evidence_packet.readiness.source_truth_checks.len()
+            ),
+            next_action: drill_stale_freshness_next_action(output),
+        };
+    }
+    if needs_source_truth || open_gap_friendly || unresolved_or_error_bridges > 0 {
+        return DrillSummaryVerdictOutput {
+            status: "degraded".to_string(),
+            reason: format!(
+                "source_truth_required={} graph_bridges={graph_path_bridges}/{} partial_bridges={partial_bridges} unresolved_or_error_bridges={unresolved_or_error_bridges} pending_source_truth_checks={}",
+                needs_source_truth,
+                output.bridges.len(),
+                output.evidence_packet.readiness.source_truth_checks.len()
+            ),
+            next_action: drill_degraded_next_action(output, unresolved_or_error_bridges),
+        };
+    }
+    DrillSummaryVerdictOutput {
+        status: "ready".to_string(),
+        reason: "all anchors resolved and no open source-truth blockers were reported".to_string(),
+        next_action: "answer from the evidence packet and keep source verification focused"
+            .to_string(),
+    }
+}
+
+fn drill_stale_freshness_next_action(output: &DrillOutput) -> String {
+    let project = quote_command_path(std::path::Path::new(&output.project));
+    let mut action = format!(
+        "refresh stale index evidence first with `codestory-cli index --project {project} --refresh incremental`, then rerun drill before finalizing"
+    );
+    if let Some(freshness) = output.mechanical.freshness.as_ref() {
+        let samples = freshness
+            .samples
+            .iter()
+            .take(3)
+            .map(|sample| sample.path.clone())
+            .collect::<Vec<_>>();
+        if !samples.is_empty() {
+            let _ = write!(action, "; stale samples: {}", samples.join("; "));
+        }
+    }
+    action
+}
+
+fn drill_degraded_next_action(output: &DrillOutput, unresolved_or_error_bridges: usize) -> String {
+    let failed_bridge_count = output
+        .bridges
+        .iter()
+        .filter(|bridge| bridge.command.status != "ok" || bridge.evidence.status == "error")
+        .count();
+    if failed_bridge_count > 0 {
+        return format!(
+            "repair or rerun {failed_bridge_count} failed bridge evidence command(s) before treating degraded bridges as verification targets"
+        );
+    }
+    let degraded_bridge_count = output
+        .bridges
+        .iter()
+        .filter(|bridge| {
+            !matches!(
+                bridge.evidence.status.as_str(),
+                "graph_path" | "reverse_graph_path"
+            )
+        })
+        .count()
+        .max(unresolved_or_error_bridges);
+    let mut files = output
+        .evidence_packet
+        .readiness
+        .source_truth_checks
+        .iter()
+        .map(|check| check.path.clone())
+        .collect::<Vec<_>>();
+    dedupe_and_rank_drill_files(&mut files);
+
+    let mut action = "write a CodeStory-only draft".to_string();
+    let pending_claim_count = output.claim_ledger_template.claims.len();
+    if pending_claim_count > 0 && degraded_bridge_count > 0 {
+        let _ = write!(
+            action,
+            ", then verify {pending_claim_count} pending claim(s), starting with {degraded_bridge_count} degraded bridge(s)"
+        );
+    } else if pending_claim_count > 0 {
+        let _ = write!(
+            action,
+            ", then verify {pending_claim_count} pending claim(s)"
+        );
+    } else if degraded_bridge_count > 0 {
+        let _ = write!(
+            action,
+            ", then verify {degraded_bridge_count} degraded bridge(s)"
+        );
+    } else {
+        action.push_str(", then verify source-truth targets");
+    }
+    if !files.is_empty() {
+        let preview = files.into_iter().take(3).collect::<Vec<_>>().join("; ");
+        let _ = write!(action, " including {preview}");
+    }
+    if output
+        .evidence_packet
+        .readiness
+        .next_commands
+        .iter()
+        .any(|command| command.contains("--repo-text on"))
+    {
+        action.push_str("; use emitted bridge/consumer follow-up commands before finalizing");
+    }
+    action
+}
+
+fn drill_summary_stats(files: u32, nodes: u32, edges: u32, errors: u32) -> DrillSummaryStatsOutput {
+    DrillSummaryStatsOutput {
+        files,
+        nodes,
+        edges,
+        errors,
+    }
+}
+
+fn drill_summary_retrieval_status(
+    retrieval: &codestory_contracts::api::RetrievalStateDto,
+) -> String {
+    let mode = match retrieval.mode {
+        codestory_contracts::api::RetrievalModeDto::Hybrid => "hybrid",
+        codestory_contracts::api::RetrievalModeDto::Symbolic => "symbolic",
+    };
+    let readiness = if retrieval.semantic_ready {
+        "semantic_ready"
+    } else {
+        "semantic_unavailable"
+    };
+    match retrieval.fallback_reason {
+        Some(reason) => format!("{mode}:{readiness}:fallback={reason:?}"),
+        None => format!("{mode}:{readiness}"),
+    }
+}
+
+fn drill_suite_retrieval_label(status: Option<&str>) -> &str {
+    match status {
+        Some(value) if value.contains("semantic_ready") || value == "hybrid-ready" => {
+            "hybrid-ready"
+        }
+        Some(value) if value.contains("semantic_unavailable") => "symbolic-only",
+        Some("hybrid") => "hybrid",
+        Some("symbolic") => "symbolic-only",
+        Some(_) => "partial",
+        None => "unknown",
+    }
+}
+
+fn drill_summary_freshness_status(freshness: &IndexFreshnessDto) -> String {
+    match freshness.status {
+        IndexFreshnessStatusDto::Fresh => "fresh".to_string(),
+        IndexFreshnessStatusDto::Stale => "stale".to_string(),
+        IndexFreshnessStatusDto::NotChecked => "not_checked".to_string(),
+    }
+}
+
+fn drill_summary_stale_file_count(freshness: &IndexFreshnessDto) -> u32 {
+    if freshness.status == IndexFreshnessStatusDto::Stale {
+        freshness
+            .changed_file_count
+            .saturating_add(freshness.new_file_count)
+            .saturating_add(freshness.removed_file_count)
+    } else {
+        0
+    }
+}
+
+fn drill_summary_freshness_samples(freshness: &IndexFreshnessDto) -> Vec<String> {
+    freshness
+        .samples
+        .iter()
+        .take(8)
+        .map(|sample| format!("{:?}: {}", sample.kind, sample.path))
+        .collect()
 }
 
 fn normalized_drill_anchors(anchors: &[String]) -> Vec<String> {
@@ -1045,6 +2022,7 @@ fn run_drill_anchor(
             typed_hit_count,
             chosen_anchor: None,
             verification_targets: Vec::new(),
+            consumer_summary: None,
             commands,
         });
     };
@@ -1058,6 +2036,8 @@ fn run_drill_anchor(
     };
     let resolution = build_query_resolution_output_with_runtime(runtime, &target);
     let verification_targets = resolution.resolved.verification_targets.clone();
+    let consumer_summary =
+        drill_anchor_consumer_summary(runtime, anchor, &chosen, &verification_targets);
 
     commands.push(run_drill_symbol_context(
         runtime,
@@ -1099,6 +2079,7 @@ fn run_drill_anchor(
         typed_hit_count,
         chosen_anchor: Some(resolution.resolved),
         verification_targets,
+        consumer_summary,
         commands,
     })
 }
@@ -1229,22 +2210,34 @@ fn run_drill_snippet_context(
     resolution: &QueryResolutionOutput,
     verification_targets: &[VerificationTargetOutput],
 ) -> DrillCommandStatusOutput {
+    let target = prefer_function_body_target(&runtime.project_root, target.clone());
+    let target_changed = target.selected.node_id.0 != resolution.resolved.node_id;
+    let resolution = if target_changed {
+        build_query_resolution_output_with_runtime(runtime, &target)
+    } else {
+        resolution.clone()
+    };
+    let verification_targets = if target_changed {
+        resolution.resolved.verification_targets.clone()
+    } else {
+        verification_targets.to_vec()
+    };
     match runtime
         .browser
-        .snippet_context(target.selected.node_id.clone(), 40)
+        .snippet_function_body_context(target.selected.node_id.clone(), 40)
     {
         Ok(snippet) => {
             let markdown = render_snippet_markdown(
                 &runtime.project_root,
-                target,
+                &target,
                 &snippet,
                 false,
-                verification_targets,
+                &verification_targets,
             );
             let output = SnippetJsonOutput {
-                resolution: resolution.clone(),
+                resolution,
                 snippet: &snippet,
-                verification_targets: verification_targets.to_vec(),
+                verification_targets,
             };
             write_drill_artifact(
                 output_dir,
@@ -1292,13 +2285,14 @@ fn run_drill_bridges(
     output_dir: &std::path::Path,
     format: args::OutputFormat,
     anchors: &[DrillAnchorOutput],
+    stale_freshness: bool,
 ) -> Vec<DrillBridgeOutput> {
     let mut bridges = Vec::new();
     for from_index in 0..anchors.len() {
         for to_index in from_index.saturating_add(1)..anchors.len() {
             let from = &anchors[from_index];
             let to = &anchors[to_index];
-            let evidence = build_drill_bridge_evidence(runtime, from, to);
+            let evidence = build_drill_bridge_evidence(runtime, from, to, stale_freshness);
             let markdown = render_drill_bridge_markdown(&evidence);
             let command = write_drill_artifact(
                 output_dir,
@@ -1322,6 +2316,7 @@ fn build_drill_bridge_evidence(
     runtime: &RuntimeContext,
     from: &DrillAnchorOutput,
     to: &DrillAnchorOutput,
+    stale_freshness: bool,
 ) -> DrillBridgeEvidenceOutput {
     let Some(from_node) = from.chosen_anchor.clone() else {
         return unresolved_drill_bridge(from, to, "from anchor was not resolved");
@@ -1338,7 +2333,15 @@ fn build_drill_bridge_evidence(
 
     match forward {
         Ok(trail) if drill_bridge_has_graph_path(&trail, &from_id, &to_id) => {
-            graph_path_drill_bridge(&runtime.project_root, from, to, from_node, to_node, &trail)
+            graph_path_drill_bridge(
+                &runtime.project_root,
+                from,
+                to,
+                from_node,
+                to_node,
+                &trail,
+                stale_freshness,
+            )
         }
         Ok(trail) => {
             let reverse = runtime
@@ -1354,6 +2357,7 @@ fn build_drill_bridge_evidence(
                     from_node,
                     to_node,
                     &reverse_trail,
+                    stale_freshness,
                 );
             }
 
@@ -1366,9 +2370,19 @@ fn build_drill_bridge_evidence(
                 to_node,
                 &trail,
                 shared_files,
+                stale_freshness,
             )
         }
-        Err(error) => drill_bridge_error(from, to, from_node, to_node, &error.code, &error.message),
+        Err(error) => drill_bridge_error(
+            &runtime.project_root,
+            from,
+            to,
+            from_node,
+            to_node,
+            &error.code,
+            &error.message,
+            stale_freshness,
+        ),
     }
 }
 
@@ -1379,8 +2393,10 @@ fn graph_path_drill_bridge(
     from_node: SearchHitOutput,
     to_node: SearchHitOutput,
     trail: &TrailContextDto,
+    stale_freshness: bool,
 ) -> DrillBridgeEvidenceOutput {
-    DrillBridgeEvidenceOutput {
+    let endpoint_files = drill_bridge_endpoint_files(Some(&from_node), Some(&to_node));
+    let mut evidence = DrillBridgeEvidenceOutput {
         from_anchor: from.anchor.clone(),
         to_anchor: to.anchor.clone(),
         status: "graph_path".to_string(),
@@ -1394,11 +2410,16 @@ fn graph_path_drill_bridge(
             trail,
         )),
         shared_files: Vec::new(),
+        endpoint_files,
+        evidence_files: Vec::new(),
+        next_commands: Vec::new(),
         notes: vec![
             "bridge uses TrailMode::ToTargetSymbol from the earlier anchor to the later anchor"
                 .to_string(),
         ],
-    }
+    };
+    evidence.next_commands = drill_bridge_next_commands(project_root, &evidence, stale_freshness);
+    evidence
 }
 
 fn reverse_graph_path_drill_bridge(
@@ -1408,8 +2429,10 @@ fn reverse_graph_path_drill_bridge(
     from_node: SearchHitOutput,
     to_node: SearchHitOutput,
     trail: &TrailContextDto,
+    stale_freshness: bool,
 ) -> DrillBridgeEvidenceOutput {
-    DrillBridgeEvidenceOutput {
+    let endpoint_files = drill_bridge_endpoint_files(Some(&from_node), Some(&to_node));
+    let mut evidence = DrillBridgeEvidenceOutput {
         from_anchor: from.anchor.clone(),
         to_anchor: to.anchor.clone(),
         status: "reverse_graph_path".to_string(),
@@ -1419,12 +2442,17 @@ fn reverse_graph_path_drill_bridge(
         to_node: Some(to_node),
         graph_path: Some(drill_bridge_graph_path_output(project_root, "reverse", trail)),
         shared_files: Vec::new(),
+        endpoint_files,
+        evidence_files: Vec::new(),
+        next_commands: Vec::new(),
         notes: vec![
             "no forward graph path was visible; a reverse graph path was found".to_string(),
             "treat reverse paths as relationship evidence, not proof of the requested execution direction"
                 .to_string(),
         ],
-    }
+    };
+    evidence.next_commands = drill_bridge_next_commands(project_root, &evidence, stale_freshness);
+    evidence
 }
 
 fn fallback_drill_bridge(
@@ -1435,26 +2463,40 @@ fn fallback_drill_bridge(
     to_node: SearchHitOutput,
     trail: &TrailContextDto,
     shared_files: Vec<String>,
+    stale_freshness: bool,
 ) -> DrillBridgeEvidenceOutput {
+    let endpoint_files = drill_bridge_endpoint_files(Some(&from_node), Some(&to_node));
+    let evidence_files = drill_bridge_evidence_hint_files(from, to);
     let mut notes = vec![
         "no forward TrailMode::ToTargetSymbol graph path was visible between these anchors"
             .to_string(),
     ];
-    notes.push(if shared_files.is_empty() {
-        "fallback neighborhood comparison found no shared source files".to_string()
-    } else {
+    notes.push(if !shared_files.is_empty() {
         "fallback neighborhood comparison found shared source files but no graph path".to_string()
+    } else if !evidence_files.is_empty() {
+        "fallback consumer/text evidence found source files to inspect but no graph path or shared file"
+            .to_string()
+    } else {
+        "fallback neighborhood comparison found no shared source files or consumer/text evidence"
+            .to_string()
     });
-    DrillBridgeEvidenceOutput {
+    let status = if !shared_files.is_empty() {
+        "shared_file_only"
+    } else if !evidence_files.is_empty() {
+        "evidence_hint_only"
+    } else {
+        "no_bridge_found"
+    };
+    let strategy = if status == "evidence_hint_only" {
+        "to_target_symbol_then_consumer_text_hints"
+    } else {
+        "to_target_symbol_then_shared_files"
+    };
+    let mut evidence = DrillBridgeEvidenceOutput {
         from_anchor: from.anchor.clone(),
         to_anchor: to.anchor.clone(),
-        status: if shared_files.is_empty() {
-            "no_bridge_found"
-        } else {
-            "shared_file_only"
-        }
-        .to_string(),
-        strategy: "to_target_symbol_then_shared_files".to_string(),
+        status: status.to_string(),
+        strategy: strategy.to_string(),
         confidence: "low".to_string(),
         from_node: Some(from_node),
         to_node: Some(to_node),
@@ -1464,19 +2506,27 @@ fn fallback_drill_bridge(
             trail,
         )),
         shared_files,
+        endpoint_files,
+        evidence_files,
+        next_commands: Vec::new(),
         notes,
-    }
+    };
+    evidence.next_commands = drill_bridge_next_commands(project_root, &evidence, stale_freshness);
+    evidence
 }
 
 fn drill_bridge_error(
+    project_root: &std::path::Path,
     from: &DrillAnchorOutput,
     to: &DrillAnchorOutput,
     from_node: SearchHitOutput,
     to_node: SearchHitOutput,
     code: &str,
     message: &str,
+    stale_freshness: bool,
 ) -> DrillBridgeEvidenceOutput {
-    DrillBridgeEvidenceOutput {
+    let endpoint_files = drill_bridge_endpoint_files(Some(&from_node), Some(&to_node));
+    let mut evidence = DrillBridgeEvidenceOutput {
         from_anchor: from.anchor.clone(),
         to_anchor: to.anchor.clone(),
         status: "error".to_string(),
@@ -1486,8 +2536,13 @@ fn drill_bridge_error(
         to_node: Some(to_node),
         graph_path: None,
         shared_files: Vec::new(),
+        endpoint_files,
+        evidence_files: Vec::new(),
+        next_commands: Vec::new(),
         notes: vec![format!("bridge graph query failed: {code}: {message}")],
-    }
+    };
+    evidence.next_commands = drill_bridge_next_commands(project_root, &evidence, stale_freshness);
+    evidence
 }
 
 fn drill_graph_path_confidence(truncated: bool, complete: &str, truncated_value: &str) -> String {
@@ -1499,6 +2554,8 @@ fn unresolved_drill_bridge(
     to: &DrillAnchorOutput,
     reason: &str,
 ) -> DrillBridgeEvidenceOutput {
+    let endpoint_files =
+        drill_bridge_endpoint_files(from.chosen_anchor.as_ref(), to.chosen_anchor.as_ref());
     DrillBridgeEvidenceOutput {
         from_anchor: from.anchor.clone(),
         to_anchor: to.anchor.clone(),
@@ -1509,8 +2566,165 @@ fn unresolved_drill_bridge(
         to_node: to.chosen_anchor.clone(),
         graph_path: None,
         shared_files: Vec::new(),
+        endpoint_files,
+        evidence_files: Vec::new(),
+        next_commands: Vec::new(),
         notes: vec![reason.to_string()],
     }
+}
+
+fn drill_bridge_endpoint_files(
+    from_node: Option<&SearchHitOutput>,
+    to_node: Option<&SearchHitOutput>,
+) -> Vec<String> {
+    let mut files = Vec::new();
+    if let Some(path) = from_node.and_then(|node| node.file_path.clone()) {
+        files.push(path);
+    }
+    if let Some(path) = to_node.and_then(|node| node.file_path.clone()) {
+        files.push(path);
+    }
+    dedupe_and_rank_drill_files(&mut files);
+    files
+}
+
+fn drill_bridge_next_commands(
+    project_root: &std::path::Path,
+    evidence: &DrillBridgeEvidenceOutput,
+    stale_freshness: bool,
+) -> Vec<String> {
+    let project = quote_command_path(project_root);
+    let refresh = if stale_freshness {
+        "incremental"
+    } else {
+        "none"
+    };
+    let mut commands = Vec::new();
+    let bridge_query =
+        quote_command_value(&format!("{} {}", evidence.from_anchor, evidence.to_anchor));
+    commands.push(format!(
+        "codestory-cli search --project {project} --query {bridge_query} --refresh {refresh} --repo-text on --why"
+    ));
+    for node in [evidence.from_node.as_ref(), evidence.to_node.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let id = quote_command_value(&node.node_id);
+        commands.push(format!(
+            "codestory-cli trail --project {project} --id {id} --refresh {refresh} --story --hide-speculative"
+        ));
+        commands.push(format!(
+            "codestory-cli snippet --project {project} --id {id} --function-body --context 40 --refresh {refresh}"
+        ));
+    }
+
+    let mut files = evidence
+        .evidence_files
+        .iter()
+        .chain(evidence.shared_files.iter())
+        .chain(evidence.endpoint_files.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    dedupe_and_rank_drill_files(&mut files);
+    for file in files.into_iter().take(5) {
+        let query = quote_command_value(&file);
+        commands.push(format!(
+            "codestory-cli search --project {project} --query {query} --refresh {refresh} --repo-text on --why"
+        ));
+    }
+
+    let mut seen = HashSet::new();
+    commands
+        .into_iter()
+        .filter(|command| seen.insert(command.clone()))
+        .collect()
+}
+
+fn drill_bridge_evidence_hint_files(
+    from: &DrillAnchorOutput,
+    to: &DrillAnchorOutput,
+) -> Vec<String> {
+    let mut files = Vec::new();
+    push_anchor_evidence_hint_files(&mut files, from);
+    push_anchor_evidence_hint_files(&mut files, to);
+    let mut seen = HashSet::new();
+    files.retain(|path| seen.insert(path.clone()));
+    rank_drill_bridge_evidence_files(&mut files);
+    files.truncate(12);
+    files
+}
+
+fn dedupe_and_rank_drill_files(files: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    files.retain(|path| seen.insert(path.clone()));
+    rank_drill_bridge_evidence_files(files);
+}
+
+fn rank_drill_bridge_evidence_files(files: &mut Vec<String>) {
+    let mut ranked = std::mem::take(files)
+        .into_iter()
+        .enumerate()
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|(index, path)| (drill_bridge_evidence_file_rank(path), *index));
+    files.extend(ranked.into_iter().map(|(_, path)| path));
+}
+
+fn drill_bridge_evidence_file_rank(path: &str) -> u8 {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    if normalized.starts_with("src/")
+        || (normalized.contains("/src/")
+            && !normalized.contains("/test")
+            && !normalized.contains("/__tests__/"))
+    {
+        return 0;
+    }
+    if normalized.contains("/tests/")
+        || normalized.starts_with("tests/")
+        || normalized.contains(".test.")
+        || normalized.contains(".spec.")
+    {
+        return 2;
+    }
+    if normalized.contains("/benches/") || normalized.starts_with("benches/") {
+        return 3;
+    }
+    if normalized.starts_with("scripts/")
+        || normalized.contains("/scripts/")
+        || normalized.contains("migration")
+        || normalized.contains("migrate")
+        || normalized.contains("import-")
+    {
+        return 4;
+    }
+    1
+}
+
+fn push_anchor_evidence_hint_files(files: &mut Vec<String>, anchor: &DrillAnchorOutput) {
+    let Some(summary) = anchor.consumer_summary.as_ref() else {
+        return;
+    };
+    for caller in summary.callers.iter().take(3) {
+        if let Some(path) = caller.file_path.as_ref() {
+            files.push(path.clone());
+        }
+    }
+    for consumer in summary.consumers.iter().take(3) {
+        if let Some(path) = consumer.file_path.as_ref() {
+            files.push(path.clone());
+        }
+        if let Some(path) = consumer.target_file_path.as_ref() {
+            files.push(path.clone());
+        }
+    }
+    for hint in summary.text_consumer_hints.iter().take(3) {
+        if let Some(path) = hint.file_path.as_ref() {
+            files.push(path.clone());
+        }
+    }
+}
+
+fn drill_file_rank_for_agent(path: Option<&str>) -> u8 {
+    path.map(drill_bridge_evidence_file_rank).unwrap_or(9)
 }
 
 fn drill_bridge_request(root_id: &NodeId, target_id: &NodeId) -> TrailConfigDto {
@@ -1584,12 +2798,16 @@ fn drill_bridge_graph_path_output(
             format!("{source} -{:?}/{certainty}-> {target}", edge.kind)
         })
         .collect();
+    let edge_count = trail.trail.edges.len();
+    let omitted_edge_count = trail.trail.omitted_edge_count;
+    let no_path_without_omissions =
+        mode.ends_with("_no_path") && edge_count == 0 && omitted_edge_count == 0;
     DrillBridgeGraphPathOutput {
         mode: mode.to_string(),
         node_count: trail.trail.nodes.len(),
-        edge_count: trail.trail.edges.len(),
-        truncated: trail.trail.truncated,
-        omitted_edge_count: trail.trail.omitted_edge_count,
+        edge_count,
+        truncated: trail.trail.truncated && !no_path_without_omissions,
+        omitted_edge_count,
         nodes,
         edges,
     }
@@ -1686,10 +2904,28 @@ fn render_drill_bridge_markdown(evidence: &DrillBridgeEvidenceOutput) -> String 
             let _ = writeln!(markdown, "- `{file}`");
         }
     }
+    if !evidence.endpoint_files.is_empty() {
+        let _ = writeln!(markdown, "endpoint_files:");
+        for file in &evidence.endpoint_files {
+            let _ = writeln!(markdown, "- `{file}`");
+        }
+    }
+    if !evidence.evidence_files.is_empty() {
+        let _ = writeln!(markdown, "evidence_files:");
+        for file in &evidence.evidence_files {
+            let _ = writeln!(markdown, "- `{file}`");
+        }
+    }
     if !evidence.notes.is_empty() {
         let _ = writeln!(markdown, "notes:");
         for note in &evidence.notes {
             let _ = writeln!(markdown, "- {note}");
+        }
+    }
+    if !evidence.next_commands.is_empty() {
+        let _ = writeln!(markdown, "next_commands:");
+        for command in &evidence.next_commands {
+            let _ = writeln!(markdown, "- `{command}`");
         }
     }
     markdown
@@ -1749,11 +2985,12 @@ fn drill_claim_ledger_template(
             .iter()
             .filter_map(|command| command.artifact.clone())
             .collect::<Vec<_>>();
-        let source_truth_files = unique_verification_target_paths(&anchor.verification_targets);
+        let mut source_truth_files = unique_verification_target_paths(&anchor.verification_targets);
+        dedupe_and_rank_drill_files(&mut source_truth_files);
         claims.push(DrillClaimLedgerEntryOutput {
             id: format!("anchor-{}", index + 1),
             claim: format!(
-                "CodeStory evidence is sufficient to make the architecture claim involving `{}`.",
+                "Candidate architecture claim involving `{}` requires source-truth verification before the final answer.",
                 anchor.anchor
             ),
             expected_evidence,
@@ -1772,6 +3009,8 @@ fn drill_claim_ledger_template(
     for (index, bridge) in bridges.iter().enumerate() {
         let evidence = &bridge.evidence;
         let mut source_truth_files = evidence.shared_files.clone();
+        source_truth_files.extend(evidence.endpoint_files.iter().cloned());
+        source_truth_files.extend(evidence.evidence_files.iter().cloned());
         if let Some(from_node) = evidence.from_node.as_ref()
             && let Some(path) = from_node.file_path.as_ref()
         {
@@ -1782,8 +3021,7 @@ fn drill_claim_ledger_template(
         {
             source_truth_files.push(path.clone());
         }
-        source_truth_files.sort();
-        source_truth_files.dedup();
+        dedupe_and_rank_drill_files(&mut source_truth_files);
         let expected_evidence = bridge
             .command
             .artifact
@@ -1793,7 +3031,7 @@ fn drill_claim_ledger_template(
         claims.push(DrillClaimLedgerEntryOutput {
             id: format!("bridge-{}", index + 1),
             claim: format!(
-                "The bridge from `{}` to `{}` is `{}` using `{}`.",
+                "Candidate bridge claim involving `{}` to `{}` currently has status `{}` using `{}` and requires source-truth verification before the final answer.",
                 evidence.from_anchor, evidence.to_anchor, evidence.status, evidence.strategy
             ),
             expected_evidence,
@@ -1805,6 +3043,7 @@ fn drill_claim_ledger_template(
         });
     }
 
+    let pending_claim_count = claims.len() as u32;
     DrillClaimLedgerOutput {
         template_version: 1,
         instructions: vec![
@@ -1816,6 +3055,8 @@ fn drill_claim_ledger_template(
         ],
         claims,
         scoring: DrillClaimLedgerScoringOutput {
+            status: "pending_source_verification".to_string(),
+            pending_claim_count,
             correct: 0,
             partial: 0,
             misleading: 0,
@@ -1891,6 +3132,484 @@ fn choose_drill_anchor_hit(hits: &[SearchHit]) -> Option<&SearchHit> {
     hits.iter()
         .find(|hit| hit.resolvable && hit.kind != NodeKind::UNKNOWN)
         .or_else(|| hits.iter().find(|hit| hit.resolvable))
+}
+
+#[derive(Debug, Clone)]
+struct DrillConsumerTarget {
+    node_id: NodeId,
+    relation: String,
+    query: Option<String>,
+    preferred_file_path: Option<String>,
+}
+
+fn drill_anchor_consumer_summary(
+    runtime: &RuntimeContext,
+    anchor: &str,
+    hit: &SearchHit,
+    verification_targets: &[VerificationTargetOutput],
+) -> Option<DrillAnchorConsumerSummaryOutput> {
+    let mut targets = vec![DrillConsumerTarget {
+        node_id: hit.node_id.clone(),
+        relation: "selected_anchor".to_string(),
+        query: None,
+        preferred_file_path: None,
+    }];
+    targets.extend(drill_related_consumer_targets(
+        runtime,
+        anchor,
+        hit,
+        verification_targets,
+    ));
+
+    let mut inspected_any_target = false;
+    let mut truncated = false;
+    let mut omitted_edge_count = 0u32;
+    let mut callers = Vec::new();
+    let mut consumers = Vec::new();
+    let mut seen_consumers = HashSet::new();
+    let mut seen_callers = HashSet::new();
+    let mut notes = Vec::new();
+
+    for target in targets {
+        let Ok(trail) =
+            runtime
+                .browser
+                .trail_context(DrillAnchorConsumerSummaryOutput::trail_request(
+                    &target.node_id,
+                ))
+        else {
+            notes.push(format!(
+                "could not inspect consumer target `{}`{}",
+                target.relation,
+                target
+                    .query
+                    .as_ref()
+                    .map(|query| format!(" from query `{query}`"))
+                    .unwrap_or_default()
+            ));
+            continue;
+        };
+        inspected_any_target = true;
+        truncated |= trail.trail.truncated;
+        omitted_edge_count = omitted_edge_count.saturating_add(trail.trail.omitted_edge_count);
+
+        let nodes_by_id = trail
+            .trail
+            .nodes
+            .iter()
+            .map(|node| (node.id.0.clone(), node))
+            .collect::<HashMap<_, _>>();
+        let (target_name, target_kind, mut target_file_path) = nodes_by_id
+            .get(&target.node_id.0)
+            .map(|node| {
+                (
+                    node.label.clone(),
+                    Some(node.kind),
+                    node.file_path
+                        .as_deref()
+                        .map(|path| display::relative_path(&runtime.project_root, path)),
+                )
+            })
+            .unwrap_or_else(|| (target.relation.clone(), None, None));
+        if target_file_path
+            .as_ref()
+            .is_none_or(|path| drill_file_rank_for_agent(Some(path)) > 0)
+            && let Some(path) = target.preferred_file_path.clone()
+        {
+            target_file_path = Some(path);
+        }
+
+        if target.relation != "selected_anchor" {
+            let query_note = target
+                .query
+                .as_ref()
+                .map(|query| format!(" from query `{query}`"))
+                .unwrap_or_default();
+            notes.push(format!(
+                "included related consumer target `{target_name}` via `{}`{query_note}",
+                target.relation
+            ));
+        }
+
+        for edge in &trail.trail.edges {
+            if edge.target != target.node_id || edge.source == target.node_id {
+                continue;
+            }
+            let Some(source) = nodes_by_id.get(&edge.source.0) else {
+                continue;
+            };
+            let consumer = DrillAnchorConsumerOutput {
+                name: source.label.clone(),
+                kind: source.kind,
+                file_path: source
+                    .file_path
+                    .as_deref()
+                    .map(|path| display::relative_path(&runtime.project_root, path)),
+                qualified_name: source.qualified_name.clone(),
+                target_name: Some(target_name.clone()),
+                target_kind,
+                target_file_path: target_file_path.clone(),
+                target_relation: Some(target.relation.clone()),
+                edge_kind: edge.kind,
+                confidence: edge.confidence,
+                certainty: edge.certainty.clone(),
+            };
+            let consumer_key = format!("{}:{}:{:?}", edge.source.0, target.node_id.0, edge.kind);
+            if seen_consumers.insert(consumer_key) {
+                consumers.push(consumer.clone());
+            }
+            let caller_key = format!("{}:{}", edge.source.0, target.node_id.0);
+            if edge.kind == codestory_contracts::api::EdgeKind::CALL
+                && seen_callers.insert(caller_key)
+            {
+                callers.push(consumer);
+            }
+        }
+    }
+
+    if !inspected_any_target {
+        return None;
+    }
+
+    let caller_count = callers.len();
+    let consumer_count = consumers.len();
+    callers.sort_by_cached_key(|consumer| {
+        (
+            drill_file_rank_for_agent(consumer.file_path.as_deref()),
+            consumer.file_path.clone().unwrap_or_default(),
+            consumer.name.clone(),
+        )
+    });
+    consumers.sort_by_cached_key(|consumer| {
+        (
+            drill_file_rank_for_agent(consumer.file_path.as_deref()),
+            drill_file_rank_for_agent(consumer.target_file_path.as_deref()),
+            consumer.target_relation.clone().unwrap_or_default(),
+            consumer.file_path.clone().unwrap_or_default(),
+            format!("{:?}", consumer.edge_kind),
+            consumer.name.clone(),
+        )
+    });
+    callers.truncate(10);
+    consumers.truncate(12);
+
+    let mut text_consumer_hints = if consumer_count == 0 {
+        drill_anchor_text_consumer_hints(runtime, anchor, hit)
+    } else {
+        Vec::new()
+    };
+    let text_hint_count = text_consumer_hints.len();
+    text_consumer_hints.sort_by(|left, right| {
+        drill_file_rank_for_agent(left.file_path.as_deref())
+            .cmp(&drill_file_rank_for_agent(right.file_path.as_deref()))
+            .then_with(|| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                left.file_path
+                    .as_deref()
+                    .unwrap_or_default()
+                    .cmp(right.file_path.as_deref().unwrap_or_default())
+            })
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    text_consumer_hints.truncate(12);
+
+    if caller_count == 0 {
+        notes.push(
+            "no visible production callers were found in the incoming trail; runtime participation still needs source-truth verification"
+                .to_string(),
+        );
+    }
+    if consumer_count == 0 {
+        notes.push(
+            "no visible production graph consumers were found in the bounded incoming trail"
+                .to_string(),
+        );
+        if text_hint_count > 0 {
+            notes.push(format!(
+                "repo-text found {text_hint_count} consumer hints; treat them as source-truth pointers, not typed graph edges"
+            ));
+        }
+    }
+    if truncated || omitted_edge_count > 0 {
+        notes.push(format!(
+            "consumer summary is bounded: truncated={} omitted_edges={}",
+            truncated, omitted_edge_count
+        ));
+    }
+
+    Some(DrillAnchorConsumerSummaryOutput {
+        caller_count,
+        consumer_count,
+        truncated,
+        omitted_edge_count,
+        callers,
+        consumers,
+        text_hint_count,
+        text_consumer_hints,
+        notes,
+    })
+}
+
+fn drill_anchor_text_consumer_hints(
+    runtime: &RuntimeContext,
+    anchor: &str,
+    hit: &SearchHit,
+) -> Vec<DrillAnchorTextConsumerHintOutput> {
+    let Ok(results) = runtime.browser.search_results(SearchRequest {
+        query: anchor.to_string(),
+        repo_text: SearchRepoTextMode::On,
+        limit_per_source: 25,
+        hybrid_weights: None,
+        hybrid_limits: None,
+    }) else {
+        return Vec::new();
+    };
+
+    let selected_path = hit
+        .file_path
+        .as_deref()
+        .map(|path| display::relative_path(&runtime.project_root, path));
+    let mut seen = HashSet::new();
+    let mut hints = Vec::new();
+    for text_hit in results.repo_text_hits {
+        let file_path = text_hit
+            .file_path
+            .as_deref()
+            .map(|path| display::relative_path(&runtime.project_root, path));
+        if selected_path.as_ref().is_some_and(|selected| {
+            file_path
+                .as_ref()
+                .is_some_and(|candidate| candidate == selected)
+        }) {
+            continue;
+        }
+        let key = format!(
+            "{}:{}",
+            file_path.as_deref().unwrap_or(&text_hit.display_name),
+            text_hit.line.unwrap_or_default()
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        hints.push(DrillAnchorTextConsumerHintOutput {
+            name: text_hit.display_name,
+            kind: text_hit.kind,
+            file_path,
+            line: text_hit.line,
+            score: text_hit.score,
+        });
+    }
+    hints
+}
+
+impl DrillAnchorConsumerSummaryOutput {
+    fn trail_request(node_id: &NodeId) -> TrailConfigDto {
+        TrailConfigDto {
+            root_id: node_id.clone(),
+            mode: TrailMode::AllReferencing,
+            target_id: None,
+            depth: 0,
+            direction: TrailDirection::Incoming,
+            caller_scope: TrailCallerScope::ProductionOnly,
+            edge_filter: Vec::new(),
+            show_utility_calls: false,
+            hide_speculative: true,
+            story: false,
+            node_filter: Vec::new(),
+            max_nodes: 120,
+            layout_direction: codestory_contracts::api::LayoutDirection::Horizontal,
+        }
+    }
+}
+
+fn drill_related_consumer_targets(
+    runtime: &RuntimeContext,
+    anchor: &str,
+    hit: &SearchHit,
+    verification_targets: &[VerificationTargetOutput],
+) -> Vec<DrillConsumerTarget> {
+    let mut related = Vec::new();
+    let mut seen_nodes = HashSet::new();
+    let mut slug_candidates =
+        drill_payload_collection_slug_candidates(anchor, hit, verification_targets);
+    slug_candidates.truncate(4);
+
+    for slug in slug_candidates {
+        for query in [
+            format!("payload:collection:{slug}"),
+            format!("payload collection {slug}"),
+        ] {
+            let Ok(results) = runtime.browser.search_results(SearchRequest {
+                query: query.clone(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 25,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            }) else {
+                continue;
+            };
+            let Some(payload_hit) = results.indexed_symbol_hits.iter().find(|candidate| {
+                candidate.resolvable
+                    && candidate.node_id != hit.node_id
+                    && drill_is_payload_collection_hit(candidate, &slug)
+            }) else {
+                continue;
+            };
+            if seen_nodes.insert(payload_hit.node_id.0.clone()) {
+                related.push(DrillConsumerTarget {
+                    node_id: payload_hit.node_id.clone(),
+                    relation: format!("related_payload_collection:{slug}"),
+                    query: Some(query),
+                    preferred_file_path: drill_preferred_payload_collection_source_file(
+                        verification_targets,
+                        &slug,
+                    ),
+                });
+            }
+            break;
+        }
+    }
+
+    related
+}
+
+fn drill_is_payload_collection_hit(hit: &SearchHit, slug: &str) -> bool {
+    let display = hit.display_name.to_ascii_lowercase();
+    let slug = slug.to_ascii_lowercase();
+    display.contains(&format!("payload::collection::{slug}"))
+        || display.contains(&format!("payload collection {slug}"))
+        || display.contains(&format!("collection::{slug}"))
+}
+
+fn drill_preferred_payload_collection_source_file(
+    verification_targets: &[VerificationTargetOutput],
+    slug: &str,
+) -> Option<String> {
+    let slug = slug.to_ascii_lowercase();
+    verification_targets
+        .iter()
+        .filter(|target| {
+            let path = target.path.replace('\\', "/").to_ascii_lowercase();
+            path.contains("/collections/")
+                || path.contains("/collection/")
+                || path.contains(&format!("/{slug}."))
+                || target
+                    .node_ref
+                    .as_deref()
+                    .is_some_and(|node_ref| node_ref.to_ascii_lowercase().contains(&slug))
+        })
+        .min_by_key(|target| {
+            (
+                drill_file_rank_for_agent(Some(target.path.as_str())),
+                target.line,
+                target.path.clone(),
+            )
+        })
+        .map(|target| target.path.clone())
+}
+
+fn drill_payload_collection_slug_candidates(
+    anchor: &str,
+    hit: &SearchHit,
+    verification_targets: &[VerificationTargetOutput],
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    for value in [anchor, hit.display_name.as_str()]
+        .into_iter()
+        .chain(hit.file_path.as_deref())
+        .chain(verification_targets.iter().flat_map(|target| {
+            [target.path.as_str()]
+                .into_iter()
+                .chain(target.node_ref.as_deref())
+        }))
+    {
+        for slug in drill_slug_candidates_from_value(value) {
+            if seen.insert(slug.clone()) {
+                candidates.push(slug);
+            }
+        }
+    }
+    candidates
+}
+
+fn drill_slug_candidates_from_value(value: &str) -> Vec<String> {
+    let mut raw = Vec::new();
+    raw.push(value.to_string());
+    if let Some((_, tail)) = value.rsplit_once("payload:collection:") {
+        raw.push(tail.to_string());
+    }
+    if let Some((_, tail)) = value.rsplit_once("payload::collection::") {
+        raw.push(tail.to_string());
+    }
+    if let Some((_, tail)) = value.rsplit_once("collection::") {
+        raw.push(tail.to_string());
+    }
+
+    let normalized_path = value.replace('\\', "/");
+    if let Some(file_name) = normalized_path.rsplit('/').next() {
+        raw.push(file_name.to_string());
+        if let Some((stem, _)) = file_name.rsplit_once('.') {
+            raw.push(stem.to_string());
+        }
+    }
+    if let Some((_, tail)) = value.rsplit_once("::") {
+        raw.push(tail.to_string());
+    }
+
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    for raw_value in raw {
+        if let Some(slug) = drill_normalize_slug_candidate(&raw_value)
+            && seen.insert(slug.clone())
+        {
+            candidates.push(slug);
+        }
+    }
+    candidates
+}
+
+fn drill_normalize_slug_candidate(value: &str) -> Option<String> {
+    let trimmed = value
+        .trim()
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+    if trimmed.is_empty() || trimmed.len() > 80 {
+        return None;
+    }
+
+    let mut slug = String::new();
+    let mut prev_was_sep = false;
+    let mut prev_was_lower_or_digit = false;
+    for ch in trimmed.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if ch.is_ascii_uppercase() && prev_was_lower_or_digit && !prev_was_sep {
+                slug.push('-');
+            }
+            slug.push(ch.to_ascii_lowercase());
+            prev_was_sep = false;
+            prev_was_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+        } else if !slug.is_empty() && !prev_was_sep {
+            slug.push('-');
+            prev_was_sep = true;
+            prev_was_lower_or_digit = false;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty()
+        || slug.contains("payload-collection")
+        || slug.contains("source-repos")
+        || slug.contains("src-")
+    {
+        return None;
+    }
+    Some(slug)
 }
 
 fn drill_trail_request(root_id: &NodeId) -> TrailConfigDto {
@@ -2039,7 +3758,8 @@ fn drill_evidence_packet(
         items.push(evidence_item_from_bridge(index + 1, bridge));
     }
 
-    let source_truth_checks = source_truth_checks_from_targets(verification_targets);
+    let source_truth_checks =
+        source_truth_checks_from_drill_evidence(verification_targets, anchors, bridges);
     let readiness = drill_answer_readiness(&items, &source_truth_checks, next_commands);
     EvidencePacketDto {
         packet_version: 1,
@@ -2090,6 +3810,37 @@ fn evidence_item_from_hit(
 fn evidence_hit_notes(anchor: &DrillAnchorOutput, hit: &SearchHitOutput) -> Vec<String> {
     let mut notes = Vec::new();
     notes.push(format!("typed_hit_count={}", anchor.typed_hit_count));
+    if let Some(summary) = anchor.consumer_summary.as_ref() {
+        notes.push(format!(
+            "visible_production_callers={} visible_consumers={} text_consumer_hints={}",
+            summary.caller_count, summary.consumer_count, summary.text_hint_count
+        ));
+        for caller in summary.callers.iter().take(3) {
+            let path = caller.file_path.as_deref().unwrap_or("<no-file>");
+            let target = caller
+                .target_name
+                .as_deref()
+                .map(|name| format!(" -> {name}"))
+                .unwrap_or_default();
+            notes.push(format!(
+                "caller: {} [{:?}] {}{} via {:?}",
+                caller.name, caller.kind, path, target, caller.edge_kind
+            ));
+        }
+        for hint in summary.text_consumer_hints.iter().take(3) {
+            let path = hint.file_path.as_deref().unwrap_or("<no-file>");
+            notes.push(format!(
+                "text-hint: {} [{:?}] {}:{}",
+                hint.name,
+                hint.kind,
+                path,
+                hint.line
+                    .map(|line| line.to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            ));
+        }
+        notes.extend(summary.notes.iter().take(2).cloned());
+    }
     if matches!(
         hit.origin,
         codestory_contracts::api::SearchHitOrigin::TextMatch
@@ -2138,7 +3889,9 @@ fn evidence_item_from_bridge(index: usize, bridge: &DrillBridgeOutput) -> Eviden
     let evidence = &bridge.evidence;
     let verification_status = match evidence.status.as_str() {
         "graph_path" => ClaimReadinessDto::Supported,
-        "reverse_graph_path" | "shared_file_only" => ClaimReadinessDto::Partial,
+        "reverse_graph_path" | "shared_file_only" | "evidence_hint_only" => {
+            ClaimReadinessDto::Partial
+        }
         "no_bridge_found" | "unresolved_anchor" | "error" => ClaimReadinessDto::NeedsSourceRead,
         _ => ClaimReadinessDto::Inferred,
     };
@@ -2212,20 +3965,341 @@ fn drill_command_artifacts(commands: &[DrillCommandStatusOutput]) -> Vec<String>
         .collect()
 }
 
-fn source_truth_checks_from_targets(
+#[derive(Debug, Clone)]
+struct SourceTruthCheckSeed {
+    role: String,
+    detail: String,
+    path: String,
+    line: Option<u32>,
+    required: bool,
+}
+
+#[derive(Debug)]
+struct SourceTruthCheckGroup {
+    path: String,
+    line: Option<u32>,
+    required: bool,
+    roles: BTreeSet<String>,
+    details: Vec<String>,
+    omitted_detail_count: usize,
+}
+
+fn source_truth_checks_from_drill_evidence(
     targets: &[VerificationTargetOutput],
+    anchors: &[DrillAnchorOutput],
+    bridges: &[DrillBridgeOutput],
 ) -> Vec<SourceTruthCheckDto> {
-    targets
-        .iter()
+    let mut checks = Vec::new();
+    let mut seen = HashSet::new();
+    for target in targets {
+        push_source_truth_check(
+            &mut checks,
+            &mut seen,
+            source_truth_role_for_verification_reason(&target.reason),
+            target.reason.clone(),
+            target.path.clone(),
+            Some(target.line),
+            true,
+        );
+    }
+    for anchor in anchors {
+        push_consumer_source_truth_checks(&mut checks, &mut seen, anchor);
+    }
+    for bridge in bridges {
+        push_bridge_source_truth_checks(&mut checks, &mut seen, &bridge.evidence);
+    }
+    rank_source_truth_checks(&mut checks);
+    let mut checks = compact_source_truth_checks(checks);
+    rank_source_truth_checks(&mut checks);
+
+    checks
+        .into_iter()
         .enumerate()
-        .map(|(index, target)| SourceTruthCheckDto {
-            id: format!("source-truth-{}", index + 1),
-            reason: target.reason.clone(),
-            path: target.path.clone(),
-            line: Some(target.line),
-            required: true,
-        })
+        .map(
+            |(index, check): (usize, SourceTruthCheckSeed)| SourceTruthCheckDto {
+                id: format!("source-truth-{}", index + 1),
+                reason: check.detail,
+                path: check.path,
+                line: check.line,
+                required: check.required,
+            },
+        )
         .collect()
+}
+
+fn rank_source_truth_checks(checks: &mut [SourceTruthCheckSeed]) {
+    checks.sort_by_cached_key(|check| {
+        (
+            drill_file_rank_for_agent(Some(check.path.as_str())),
+            check.path.clone(),
+            check.line.unwrap_or_default(),
+            check.role.clone(),
+            check.detail.clone(),
+        )
+    });
+}
+
+fn push_source_truth_check(
+    checks: &mut Vec<SourceTruthCheckSeed>,
+    seen: &mut HashSet<(String, Option<u32>, String, String)>,
+    role: impl Into<String>,
+    detail: String,
+    path: String,
+    line: Option<u32>,
+    required: bool,
+) {
+    if path.trim().is_empty() {
+        return;
+    }
+    let role = role.into();
+    if seen.insert((path.clone(), line, role.clone(), detail.clone())) {
+        checks.push(SourceTruthCheckSeed {
+            role,
+            detail,
+            path,
+            line,
+            required,
+        });
+    }
+}
+
+fn push_consumer_source_truth_checks(
+    checks: &mut Vec<SourceTruthCheckSeed>,
+    seen: &mut HashSet<(String, Option<u32>, String, String)>,
+    anchor: &DrillAnchorOutput,
+) {
+    let Some(summary) = anchor.consumer_summary.as_ref() else {
+        return;
+    };
+
+    for caller in summary.callers.iter().take(2) {
+        if let Some(path) = caller.file_path.as_ref() {
+            push_source_truth_check(
+                checks,
+                seen,
+                "consumer",
+                format!(
+                    "consumer evidence for {}: caller {} reaches {} via {:?}",
+                    anchor.anchor,
+                    caller.name,
+                    caller
+                        .target_name
+                        .as_deref()
+                        .unwrap_or(anchor.anchor.as_str()),
+                    caller.edge_kind
+                ),
+                path.clone(),
+                None,
+                true,
+            );
+        }
+    }
+
+    for consumer in summary.consumers.iter().take(3) {
+        if let Some(path) = consumer.file_path.as_ref() {
+            push_source_truth_check(
+                checks,
+                seen,
+                "consumer",
+                format!(
+                    "consumer evidence for {}: {} uses {} via {:?}",
+                    anchor.anchor,
+                    consumer.name,
+                    consumer
+                        .target_name
+                        .as_deref()
+                        .unwrap_or(anchor.anchor.as_str()),
+                    consumer.edge_kind
+                ),
+                path.clone(),
+                None,
+                true,
+            );
+        }
+        if let Some(path) = consumer.target_file_path.as_ref() {
+            push_source_truth_check(
+                checks,
+                seen,
+                "related target",
+                format!(
+                    "consumer target for {}: verify related target {}",
+                    anchor.anchor,
+                    consumer
+                        .target_name
+                        .as_deref()
+                        .unwrap_or(anchor.anchor.as_str())
+                ),
+                path.clone(),
+                None,
+                true,
+            );
+        }
+    }
+
+    for hint in summary.text_consumer_hints.iter().take(3) {
+        if let Some(path) = hint.file_path.as_ref() {
+            push_source_truth_check(
+                checks,
+                seen,
+                "text hint",
+                format!(
+                    "text consumer hint for {}: {} matched repo text",
+                    anchor.anchor, hint.name
+                ),
+                path.clone(),
+                hint.line,
+                true,
+            );
+        }
+    }
+}
+
+fn push_bridge_source_truth_checks(
+    checks: &mut Vec<SourceTruthCheckSeed>,
+    seen: &mut HashSet<(String, Option<u32>, String, String)>,
+    bridge: &DrillBridgeEvidenceOutput,
+) {
+    let prefix = format!("bridge {} -> {}", bridge.from_anchor, bridge.to_anchor);
+    if let Some(from_node) = bridge.from_node.as_ref()
+        && let Some(path) = from_node.file_path.as_ref()
+    {
+        push_source_truth_check(
+            checks,
+            seen,
+            "bridge endpoint",
+            format!("{prefix}: verify from endpoint {}", from_node.display_name),
+            path.clone(),
+            from_node.line,
+            true,
+        );
+    }
+    if let Some(to_node) = bridge.to_node.as_ref()
+        && let Some(path) = to_node.file_path.as_ref()
+    {
+        push_source_truth_check(
+            checks,
+            seen,
+            "bridge endpoint",
+            format!("{prefix}: verify to endpoint {}", to_node.display_name),
+            path.clone(),
+            to_node.line,
+            true,
+        );
+    }
+    for path in bridge.shared_files.iter().take(3) {
+        push_source_truth_check(
+            checks,
+            seen,
+            "bridge shared file",
+            format!(
+                "{prefix}: inspect shared file for {} bridge evidence",
+                bridge.status
+            ),
+            path.clone(),
+            None,
+            true,
+        );
+    }
+    for path in bridge.evidence_files.iter().take(3) {
+        push_source_truth_check(
+            checks,
+            seen,
+            "bridge hint",
+            format!(
+                "{prefix}: inspect consumer/text evidence file for {} bridge evidence",
+                bridge.status
+            ),
+            path.clone(),
+            None,
+            true,
+        );
+    }
+}
+
+fn source_truth_role_for_verification_reason(reason: &str) -> &'static str {
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("primary source occurrence") || lower.contains("selected") {
+        "selected anchor"
+    } else if lower.contains("snippet") || lower.contains("body") {
+        "source body"
+    } else {
+        "source target"
+    }
+}
+
+fn compact_source_truth_checks(checks: Vec<SourceTruthCheckSeed>) -> Vec<SourceTruthCheckSeed> {
+    let mut groups = Vec::<SourceTruthCheckGroup>::new();
+    let mut group_by_path = HashMap::<String, usize>::new();
+    for check in checks {
+        let index = if let Some(index) = group_by_path.get(&check.path) {
+            *index
+        } else {
+            let index = groups.len();
+            group_by_path.insert(check.path.clone(), index);
+            groups.push(SourceTruthCheckGroup {
+                path: check.path.clone(),
+                line: check.line,
+                required: false,
+                roles: BTreeSet::new(),
+                details: Vec::new(),
+                omitted_detail_count: 0,
+            });
+            index
+        };
+        groups[index].push(check);
+    }
+    groups
+        .into_iter()
+        .map(SourceTruthCheckGroup::into_seed)
+        .collect()
+}
+
+impl SourceTruthCheckGroup {
+    fn push(&mut self, check: SourceTruthCheckSeed) {
+        self.required |= check.required;
+        self.roles.insert(check.role);
+        self.line = match (self.line, check.line) {
+            (Some(current), Some(next)) => Some(current.min(next)),
+            (None, Some(next)) => Some(next),
+            (current, None) => current,
+        };
+        if self.details.iter().any(|detail| detail == &check.detail) {
+            return;
+        }
+        if self.details.len() < 4 {
+            self.details.push(check.detail);
+        } else {
+            self.omitted_detail_count += 1;
+        }
+    }
+
+    fn into_seed(self) -> SourceTruthCheckSeed {
+        let roles = self.roles.into_iter().collect::<Vec<_>>().join(", ");
+        let mut detail = format!("verify {roles} evidence");
+        if !self.details.is_empty() {
+            detail.push_str(": ");
+            detail.push_str(&self.details.join("; "));
+        }
+        if self.omitted_detail_count > 0 {
+            let _ = write!(
+                detail,
+                "; plus {} more signal{}",
+                self.omitted_detail_count,
+                if self.omitted_detail_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+        }
+        SourceTruthCheckSeed {
+            role: roles,
+            detail,
+            path: self.path,
+            line: self.line,
+            required: self.required,
+        }
+    }
 }
 
 fn drill_answer_readiness(
@@ -2321,17 +4395,82 @@ fn readiness_label(readiness: ClaimReadinessDto) -> &'static str {
     }
 }
 
-fn drill_next_commands(project_root: &std::path::Path, anchors: &[String]) -> Vec<String> {
+fn drill_next_commands(
+    project_root: &std::path::Path,
+    anchors: &[DrillAnchorOutput],
+    bridges: &[DrillBridgeOutput],
+    stale_freshness: bool,
+) -> Vec<String> {
     let project = quote_command_path(project_root);
-    normalized_drill_anchors(anchors)
-        .into_iter()
+    let refresh = if stale_freshness {
+        "incremental"
+    } else {
+        "none"
+    };
+    let mut commands = anchors
+        .iter()
         .take(5)
-        .map(|anchor| {
-            format!(
-                "codestory-cli search --project {project} --query {} --refresh none --repo-text auto --why",
-                quote_command_value(&anchor)
-            )
+        .flat_map(|anchor| {
+            let query = quote_command_value(&anchor.anchor);
+            let mut commands = vec![
+                format!(
+                    "codestory-cli search --project {project} --query {query} --refresh {refresh} --repo-text auto --why"
+                ),
+            ];
+            if let Some(hit) = anchor.chosen_anchor.as_ref() {
+                let id = quote_command_value(&hit.node_id);
+                commands.push(format!(
+                    "codestory-cli symbol --project {project} --id {id} --refresh {refresh}"
+                ));
+                commands.push(format!(
+                    "codestory-cli snippet --project {project} --id {id} --function-body --context 40 --refresh {refresh}"
+                ));
+            } else {
+                commands.push(format!(
+                    "codestory-cli snippet --project {project} --query {query} --function-body --context 40 --refresh {refresh}"
+                ));
+            }
+            commands
         })
+        .collect::<Vec<_>>();
+
+    if stale_freshness {
+        commands.insert(
+            0,
+            format!("codestory-cli index --project {project} --refresh incremental"),
+        );
+    }
+
+    for bridge in bridges.iter().take(5) {
+        let evidence = &bridge.evidence;
+        if evidence.next_commands.is_empty() {
+            let bridge_query =
+                quote_command_value(&format!("{} {}", evidence.from_anchor, evidence.to_anchor));
+            commands.push(format!(
+                "codestory-cli search --project {project} --query {bridge_query} --refresh {refresh} --repo-text on --why"
+            ));
+            if let Some(from_node) = evidence.from_node.as_ref() {
+                let from_id = quote_command_value(&from_node.node_id);
+                commands.push(format!(
+                    "codestory-cli trail --project {project} --id {from_id} --refresh {refresh} --story --hide-speculative"
+                ));
+            } else {
+                let from_query = quote_command_value(&evidence.from_anchor);
+                commands.push(format!(
+                    "codestory-cli trail --project {project} --query {from_query} --refresh {refresh} --story --hide-speculative"
+                ));
+            }
+        } else {
+            for command in &evidence.next_commands {
+                commands.push(command.clone());
+            }
+        }
+    }
+
+    let mut seen = HashSet::new();
+    commands
+        .into_iter()
+        .filter(|command| seen.insert(command.clone()))
         .collect()
 }
 
@@ -2475,17 +4614,23 @@ fn trail_guidance_notes(context: &codestory_contracts::api::TrailContextDto) -> 
 }
 
 fn prefer_function_body_target(
-    runtime: &RuntimeContext,
+    project_root: &std::path::Path,
     mut target: runtime::ResolvedTarget,
 ) -> runtime::ResolvedTarget {
-    if hit_looks_like_function_body(&runtime.project_root, &target.selected) {
+    if hit_looks_like_function_body(project_root, &target.selected) {
+        return target;
+    }
+    if !matches!(target.selected.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
         return target;
     }
     let Some((index, preferred)) = target
         .alternatives
         .iter()
         .enumerate()
-        .find(|(_, hit)| hit_looks_like_function_body(&runtime.project_root, hit))
+        .find(|(_, hit)| {
+            function_body_promotion_matches(&target.selected, hit)
+                && hit_looks_like_function_body(project_root, hit)
+        })
         .map(|(index, hit)| (index, hit.clone()))
     else {
         return target;
@@ -2494,6 +4639,20 @@ fn prefer_function_body_target(
     let promoted = target.alternatives.remove(index);
     target.alternatives.insert(0, promoted);
     target
+}
+
+fn function_body_promotion_matches(selected: &SearchHit, candidate: &SearchHit) -> bool {
+    if selected.display_name == candidate.display_name {
+        return true;
+    }
+    terminal_display_name(&selected.display_name) == terminal_display_name(&candidate.display_name)
+}
+
+fn terminal_display_name(name: &str) -> &str {
+    name.rsplit_once("::")
+        .map(|(_, terminal)| terminal)
+        .or_else(|| name.rsplit_once('.').map(|(_, terminal)| terminal))
+        .unwrap_or(name)
 }
 
 fn hit_looks_like_function_body(project_root: &std::path::Path, hit: &SearchHit) -> bool {
@@ -2542,7 +4701,7 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
         cmd.output_file.as_deref(),
     )?;
     let target = if cmd.function_body {
-        prefer_function_body_target(&runtime, target)
+        prefer_function_body_target(&runtime.project_root, target)
     } else {
         target
     };
@@ -4321,7 +6480,7 @@ fn hide_speculative_trail_edges(mut context: TrailContextDto) -> TrailContextDto
         .trail
         .edges
         .into_iter()
-        .filter(|edge| !is_speculative_certainty(edge.certainty.as_deref()))
+        .filter(|edge| !is_speculative_trail_edge(edge))
         .collect::<Vec<_>>();
 
     let mut adjacency = HashMap::new();
@@ -4367,7 +6526,7 @@ fn hide_speculative_trail_edges(mut context: TrailContextDto) -> TrailContextDto
     if let Some(layout) = context.trail.canonical_layout.as_mut() {
         layout.nodes.retain(|node| reachable.contains(&node.id));
         layout.edges.retain(|edge| {
-            !is_speculative_certainty(edge.certainty.as_deref())
+            !is_speculative_certainty_label(edge.certainty.as_deref())
                 && reachable.contains(&edge.source)
                 && reachable.contains(&edge.target)
         });
@@ -4377,10 +6536,37 @@ fn hide_speculative_trail_edges(mut context: TrailContextDto) -> TrailContextDto
 }
 
 #[cfg(test)]
-fn is_speculative_certainty(certainty: Option<&str>) -> bool {
+fn is_speculative_trail_edge(edge: &codestory_contracts::api::GraphEdgeDto) -> bool {
+    if is_speculative_certainty_label(edge.certainty.as_deref()) {
+        return true;
+    }
+    is_runtime_bridge_edge(edge.kind)
+        && (is_probable_certainty_label(edge.certainty.as_deref())
+            || edge.confidence.is_some_and(|confidence| {
+                confidence < codestory_contracts::graph::ResolutionCertainty::CERTAIN_MIN
+            }))
+}
+
+#[cfg(test)]
+fn is_speculative_certainty_label(certainty: Option<&str>) -> bool {
     matches!(
         certainty.map(|value| value.to_ascii_lowercase()).as_deref(),
         Some("uncertain" | "speculative")
+    )
+}
+
+#[cfg(test)]
+fn is_probable_certainty_label(certainty: Option<&str>) -> bool {
+    certainty
+        .map(|value| value.eq_ignore_ascii_case("probable"))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn is_runtime_bridge_edge(kind: codestory_contracts::api::EdgeKind) -> bool {
+    matches!(
+        kind,
+        codestory_contracts::api::EdgeKind::CALL | codestory_contracts::api::EdgeKind::MACRO_USAGE
     )
 }
 
@@ -4641,6 +6827,7 @@ mod tests {
             typed_hit_count: 1,
             chosen_anchor: Some(sample_search_hit_output(node_id, anchor)),
             verification_targets: Vec::new(),
+            consumer_summary: None,
             commands: Vec::new(),
         }
     }
@@ -4660,6 +6847,97 @@ mod tests {
         }
     }
 
+    fn sample_drill_output_with_source_truth_files(paths: Vec<&str>) -> DrillOutput {
+        let from = sample_drill_anchor("WorkspaceIndexer", "a");
+        let to = sample_drill_anchor("SearchService", "b");
+        let mut bridge = DrillBridgeOutput {
+            evidence: fallback_drill_bridge(
+                Path::new("C:/repo"),
+                &from,
+                &to,
+                from.chosen_anchor.clone().expect("from"),
+                to.chosen_anchor.clone().expect("to"),
+                &sample_bridge_trail(false),
+                Vec::new(),
+                false,
+            ),
+            command: DrillCommandStatusOutput {
+                command: "bridge".to_string(),
+                status: "ok".to_string(),
+                artifact: Some("bridge.md".to_string()),
+                error: None,
+            },
+        };
+        bridge.evidence.evidence_files = paths.iter().map(|path| (*path).to_string()).collect();
+        let source_truth_checks = paths
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| SourceTruthCheckDto {
+                id: format!("source-truth-{}", index + 1),
+                reason: "verify surface ordering".to_string(),
+                path: path.to_string(),
+                line: None,
+                required: true,
+            })
+            .collect::<Vec<_>>();
+        DrillOutput {
+            project: "C:/repo".to_string(),
+            label: Some("sample".to_string()),
+            question: Some("How does indexing work?".to_string()),
+            output_dir: "target/drill/sample".to_string(),
+            mechanical: DrillMechanicalOutput {
+                before_files: 1,
+                before_nodes: 10,
+                before_edges: 2,
+                before_errors: 0,
+                after_files: 2,
+                after_nodes: 20,
+                after_edges: 4,
+                after_errors: 0,
+                refresh: "full".to_string(),
+                retrieval: Some(sample_retrieval()),
+                freshness: None,
+                phase_timings: Some(sample_phase_timings()),
+            },
+            question_search: None,
+            anchors: vec![from, to],
+            bridges: vec![bridge],
+            execution_boundaries: drill_execution_boundaries(),
+            verification_targets: Vec::new(),
+            evidence_packet: EvidencePacketDto {
+                packet_version: 1,
+                question: Some("How does indexing work?".to_string()),
+                items: Vec::new(),
+                readiness: AnswerReadinessReportDto {
+                    overall_status: ClaimReadinessDto::NeedsSourceRead,
+                    safe_to_say: Vec::new(),
+                    inferred_claims: Vec::new(),
+                    needs_verification: Vec::new(),
+                    next_commands: Vec::new(),
+                    source_truth_checks,
+                },
+            },
+            answer_quality_contract: drill_answer_quality_contract(),
+            claim_ledger_template: DrillClaimLedgerOutput {
+                template_version: 1,
+                instructions: Vec::new(),
+                claims: Vec::new(),
+                scoring: DrillClaimLedgerScoringOutput {
+                    status: "pending_source_verification".to_string(),
+                    pending_claim_count: 0,
+                    correct: 0,
+                    partial: 0,
+                    misleading: 0,
+                    unsupported: 0,
+                    material_revision_count: 0,
+                    score_formula: "manual".to_string(),
+                },
+            },
+            verification_checklist: drill_verification_checklist(),
+            next_commands: Vec::new(),
+        }
+    }
+
     #[test]
     fn drill_bridge_constructors_preserve_status_contract() {
         let from = sample_drill_anchor("FromAnchor", "a");
@@ -4675,11 +6953,13 @@ mod tests {
             from.chosen_anchor.clone().expect("from"),
             to.chosen_anchor.clone().expect("to"),
             &complete_trail,
+            false,
         );
         assert_eq!(forward.status, "graph_path");
         assert_eq!(forward.strategy, "to_target_symbol_forward");
         assert_eq!(forward.confidence, "high");
         assert_eq!(forward.graph_path.as_ref().expect("path").mode, "forward");
+        assert_eq!(forward.endpoint_files, vec!["src/lib.rs"]);
 
         let reverse = reverse_graph_path_drill_bridge(
             project_root,
@@ -4688,6 +6968,7 @@ mod tests {
             from.chosen_anchor.clone().expect("from"),
             to.chosen_anchor.clone().expect("to"),
             &truncated_trail,
+            false,
         );
         assert_eq!(reverse.status, "reverse_graph_path");
         assert_eq!(reverse.strategy, "to_target_symbol_reverse");
@@ -4702,10 +6983,95 @@ mod tests {
             to.chosen_anchor.clone().expect("to"),
             &complete_trail,
             vec!["src/lib.rs".to_string()],
+            false,
         );
         assert_eq!(shared_file.status, "shared_file_only");
         assert_eq!(shared_file.strategy, "to_target_symbol_then_shared_files");
         assert_eq!(shared_file.confidence, "low");
+
+        let mut hinted_from = sample_drill_anchor("FromAnchor", "a");
+        hinted_from.consumer_summary = Some(DrillAnchorConsumerSummaryOutput {
+            caller_count: 0,
+            consumer_count: 0,
+            text_hint_count: 1,
+            truncated: false,
+            omitted_edge_count: 0,
+            callers: Vec::new(),
+            consumers: Vec::new(),
+            text_consumer_hints: vec![DrillAnchorTextConsumerHintOutput {
+                name: "FromAnchorUser".to_string(),
+                kind: NodeKind::FUNCTION,
+                file_path: Some("src/from-user.rs".to_string()),
+                line: Some(12),
+                score: 1.0,
+            }],
+            notes: Vec::new(),
+        });
+        let hint_only = fallback_drill_bridge(
+            project_root,
+            &hinted_from,
+            &to,
+            hinted_from.chosen_anchor.clone().expect("from"),
+            to.chosen_anchor.clone().expect("to"),
+            &complete_trail,
+            Vec::new(),
+            false,
+        );
+        assert_eq!(hint_only.status, "evidence_hint_only");
+        assert_eq!(
+            hint_only.strategy,
+            "to_target_symbol_then_consumer_text_hints"
+        );
+        assert_eq!(hint_only.endpoint_files, vec!["src/lib.rs"]);
+        assert_eq!(hint_only.evidence_files, vec!["src/from-user.rs"]);
+        assert!(
+            hint_only
+                .next_commands
+                .iter()
+                .any(|command| command.contains("search --project")
+                    && command.contains("FromAnchor ToAnchor")),
+            "hint-only bridges should keep a bridge search follow-up: {hint_only:#?}"
+        );
+        assert!(
+            hint_only
+                .next_commands
+                .iter()
+                .any(|command| command.contains("trail --project") && command.contains("--id")),
+            "hint-only bridges should keep id-based trail follow-up: {hint_only:#?}"
+        );
+        assert!(
+            hint_only
+                .next_commands
+                .iter()
+                .any(|command| command.contains("snippet --project")
+                    && command.contains("--id")
+                    && command.contains("--function-body")),
+            "hint-only bridges should keep id-based function-body snippets: {hint_only:#?}"
+        );
+        assert!(
+            hint_only
+                .next_commands
+                .iter()
+                .any(|command| command.contains("src/from-user.rs")),
+            "hint-only bridges should search the text-hint evidence file: {hint_only:#?}"
+        );
+        let hint_markdown = render_drill_bridge_markdown(&hint_only);
+        assert!(hint_markdown.contains("next_commands:"));
+        assert!(hint_markdown.contains("src/from-user.rs"));
+
+        let shared_with_hints = fallback_drill_bridge(
+            project_root,
+            &hinted_from,
+            &to,
+            hinted_from.chosen_anchor.clone().expect("from"),
+            to.chosen_anchor.clone().expect("to"),
+            &complete_trail,
+            vec!["src/shared.rs".to_string()],
+            false,
+        );
+        assert_eq!(shared_with_hints.status, "shared_file_only");
+        assert_eq!(shared_with_hints.shared_files, vec!["src/shared.rs"]);
+        assert_eq!(shared_with_hints.evidence_files, vec!["src/from-user.rs"]);
 
         let missing = fallback_drill_bridge(
             project_root,
@@ -4715,21 +7081,211 @@ mod tests {
             to.chosen_anchor.clone().expect("to"),
             &complete_trail,
             Vec::new(),
+            false,
         );
         assert_eq!(missing.status, "no_bridge_found");
 
         let error = drill_bridge_error(
+            project_root,
             &from,
             &to,
             from.chosen_anchor.clone().expect("from"),
             to.chosen_anchor.clone().expect("to"),
             "internal",
             "failed",
+            false,
         );
         assert_eq!(error.status, "error");
         assert_eq!(error.strategy, "to_target_symbol_forward");
         assert!(error.notes[0].contains("internal: failed"));
         assert!(error.graph_path.is_none());
+    }
+
+    #[test]
+    fn no_path_bridge_graphs_do_not_report_truncated_when_nothing_was_omitted() {
+        let mut no_path = sample_bridge_trail(true);
+        no_path.trail.nodes = vec![sample_graph_node("a", "A")];
+        no_path.trail.edges.clear();
+        no_path.trail.omitted_edge_count = 0;
+
+        let graph =
+            drill_bridge_graph_path_output(Path::new("C:/repo"), "forward_no_path", &no_path);
+
+        assert_eq!(graph.edge_count, 0);
+        assert_eq!(graph.omitted_edge_count, 0);
+        assert!(
+            !graph.truncated,
+            "zero-edge no-path bridge payloads should not look like clipped path evidence"
+        );
+
+        no_path.trail.omitted_edge_count = 2;
+        let omitted_graph =
+            drill_bridge_graph_path_output(Path::new("C:/repo"), "forward_no_path", &no_path);
+
+        assert!(omitted_graph.truncated);
+        assert_eq!(omitted_graph.omitted_edge_count, 2);
+    }
+
+    #[test]
+    fn bridge_evidence_files_rank_runtime_paths_before_auxiliary_files() {
+        let mut files = vec![
+            "crates/codestory-bench/benches/ask_latency.rs".to_string(),
+            "scripts/import-wordpress-rich-content.ts".to_string(),
+            "tests/int/social-feed.int.spec.ts".to_string(),
+            "crates/codestory-runtime/src/services.rs".to_string(),
+            "src/lib/comment-auth.ts".to_string(),
+        ];
+
+        rank_drill_bridge_evidence_files(&mut files);
+
+        assert_eq!(files[0], "crates/codestory-runtime/src/services.rs");
+        assert_eq!(files[1], "src/lib/comment-auth.ts");
+        assert!(files[4].starts_with("scripts/"));
+    }
+
+    #[test]
+    fn source_truth_files_rank_runtime_paths_before_auxiliary_files() {
+        let mut output = sample_drill_output_with_source_truth_files(vec![
+            "scripts/migrate-wordpress-rich-content.ts",
+            "crates/codestory-bench/benches/ask_latency.rs",
+            "crates/codestory-runtime/src/lib.rs",
+            "tests/int/social-feed.int.spec.ts",
+            "src/lib/comment-auth.ts",
+        ]);
+
+        let summary = drill_summary(&output);
+
+        assert_eq!(
+            summary.source_truth.target_files,
+            vec![
+                "crates/codestory-runtime/src/lib.rs",
+                "src/lib/comment-auth.ts",
+                "tests/int/social-feed.int.spec.ts",
+                "crates/codestory-bench/benches/ask_latency.rs",
+                "scripts/migrate-wordpress-rich-content.ts",
+            ]
+        );
+
+        output.claim_ledger_template =
+            drill_claim_ledger_template(&output.anchors, &output.bridges);
+        let bridge_claim = output
+            .claim_ledger_template
+            .claims
+            .iter()
+            .find(|claim| claim.id == "bridge-1")
+            .expect("bridge claim");
+        let anchor_claim = output
+            .claim_ledger_template
+            .claims
+            .iter()
+            .find(|claim| claim.id == "anchor-1")
+            .expect("anchor claim");
+        assert!(
+            anchor_claim
+                .claim
+                .contains("requires source-truth verification before the final answer")
+        );
+        assert!(
+            !anchor_claim
+                .claim
+                .contains("CodeStory evidence is sufficient")
+        );
+        assert!(
+            bridge_claim
+                .claim
+                .contains("requires source-truth verification before the final answer")
+        );
+        assert!(
+            !bridge_claim
+                .claim
+                .contains("CodeStory evidence is sufficient")
+        );
+        assert!(
+            bridge_claim
+                .source_truth_files
+                .first()
+                .is_some_and(|path| path.contains("/src/") || path.starts_with("src/")),
+            "bridge claim should send agents to runtime/source files before auxiliary files: {bridge_claim:#?}"
+        );
+    }
+
+    #[test]
+    fn source_truth_checks_group_repeated_files_without_dropping_roles() {
+        let mut from = sample_drill_anchor("WorkspaceIndexer", "a");
+        from.consumer_summary = Some(DrillAnchorConsumerSummaryOutput {
+            caller_count: 1,
+            consumer_count: 1,
+            text_hint_count: 1,
+            truncated: false,
+            omitted_edge_count: 0,
+            callers: Vec::new(),
+            consumers: vec![DrillAnchorConsumerOutput {
+                name: "SearchService".to_string(),
+                kind: NodeKind::STRUCT,
+                file_path: Some("src/lib.rs".to_string()),
+                qualified_name: None,
+                target_name: Some("WorkspaceIndexer".to_string()),
+                target_kind: Some(NodeKind::FUNCTION),
+                target_file_path: Some("src/lib.rs".to_string()),
+                target_relation: Some("test".to_string()),
+                edge_kind: codestory_contracts::api::EdgeKind::CALL,
+                confidence: Some(0.95),
+                certainty: Some("certain".to_string()),
+            }],
+            text_consumer_hints: vec![DrillAnchorTextConsumerHintOutput {
+                name: "WorkspaceIndexer text hint".to_string(),
+                kind: NodeKind::FUNCTION,
+                file_path: Some("src/lib.rs".to_string()),
+                line: Some(42),
+                score: 12.0,
+            }],
+            notes: Vec::new(),
+        });
+        let to = sample_drill_anchor("SearchService", "b");
+        let mut bridge = fallback_drill_bridge(
+            Path::new("C:/repo"),
+            &from,
+            &to,
+            from.chosen_anchor.clone().expect("from"),
+            to.chosen_anchor.clone().expect("to"),
+            &sample_bridge_trail(false),
+            Vec::new(),
+            false,
+        );
+        bridge.evidence_files = vec!["src/lib.rs".to_string()];
+        let bridge = DrillBridgeOutput {
+            evidence: bridge,
+            command: DrillCommandStatusOutput {
+                command: "bridge".to_string(),
+                status: "ok".to_string(),
+                artifact: Some("bridge.md".to_string()),
+                error: None,
+            },
+        };
+        let targets = vec![VerificationTargetOutput {
+            role: "definition".to_string(),
+            path: "src/lib.rs".to_string(),
+            line: 7,
+            node_ref: None,
+            reason: "primary source occurrence selected for this symbol".to_string(),
+        }];
+
+        let checks = source_truth_checks_from_drill_evidence(&targets, &[from, to], &[bridge]);
+
+        assert_eq!(
+            checks.len(),
+            1,
+            "checks should collapse by file: {checks:#?}"
+        );
+        let check = &checks[0];
+        assert_eq!(check.path, "src/lib.rs");
+        assert!(check.required);
+        assert!(check.reason.contains("selected anchor"), "{check:#?}");
+        assert!(check.reason.contains("consumer"), "{check:#?}");
+        assert!(check.reason.contains("related target"), "{check:#?}");
+        assert!(check.reason.contains("text hint"), "{check:#?}");
+        assert!(check.reason.contains("bridge endpoint"), "{check:#?}");
+        assert!(check.reason.contains("bridge hint"), "{check:#?}");
     }
 
     #[test]
@@ -5329,6 +7885,433 @@ mod tests {
     }
 
     #[test]
+    fn drill_next_commands_push_body_aware_snippets_after_search() {
+        let anchors = vec![sample_drill_anchor(
+            "WorkspaceIndexer",
+            "workspace-indexer-id",
+        )];
+        let commands = drill_next_commands(Path::new("C:/repo"), &anchors, &[], false);
+
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("codestory-cli search")
+                    && command.contains("--query")
+                    && command.contains("WorkspaceIndexer")),
+            "drill should preserve the exact-anchor search handoff: {commands:#?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("codestory-cli snippet")
+                    && command.contains("--id")
+                    && command.contains("workspace-indexer-id")
+                    && command.contains("--function-body")
+                    && command.contains("--context 40")),
+            "drill should advertise body-aware snippets for decisive operations: {commands:#?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("codestory-cli snippet")
+                    && command.contains("--query")
+                    && command.contains("WorkspaceIndexer")),
+            "drill should use the selected anchor id for unambiguous snippet follow-ups: {commands:#?}"
+        );
+    }
+
+    #[test]
+    fn drill_summary_compacts_statuses_for_report_synthesis() {
+        let resolved_anchor = sample_drill_anchor("WorkspaceIndexer", "a");
+        let unresolved_anchor = DrillAnchorOutput {
+            anchor: "MissingAnchor".to_string(),
+            typed_hit_count: 0,
+            chosen_anchor: None,
+            verification_targets: Vec::new(),
+            consumer_summary: None,
+            commands: vec![DrillCommandStatusOutput {
+                command: "search".to_string(),
+                status: "error".to_string(),
+                artifact: None,
+                error: Some("not found".to_string()),
+            }],
+        };
+        let bridge = DrillBridgeOutput {
+            evidence: unresolved_drill_bridge(
+                &resolved_anchor,
+                &unresolved_anchor,
+                "to anchor was not resolved",
+            ),
+            command: DrillCommandStatusOutput {
+                command: "bridge".to_string(),
+                status: "ok".to_string(),
+                artifact: Some("bridge-1.md".to_string()),
+                error: None,
+            },
+        };
+        let output = DrillOutput {
+            project: "C:/repo".to_string(),
+            label: Some("sample".to_string()),
+            question: Some("How does indexing work?".to_string()),
+            output_dir: "target/drill/sample".to_string(),
+            mechanical: DrillMechanicalOutput {
+                before_files: 1,
+                before_nodes: 10,
+                before_edges: 2,
+                before_errors: 1,
+                after_files: 2,
+                after_nodes: 20,
+                after_edges: 4,
+                after_errors: 0,
+                refresh: "full".to_string(),
+                retrieval: Some(sample_retrieval()),
+                freshness: None,
+                phase_timings: Some(sample_phase_timings()),
+            },
+            question_search: None,
+            anchors: vec![resolved_anchor, unresolved_anchor],
+            bridges: vec![bridge],
+            execution_boundaries: drill_execution_boundaries(),
+            verification_targets: Vec::new(),
+            evidence_packet: EvidencePacketDto {
+                packet_version: 1,
+                question: Some("How does indexing work?".to_string()),
+                items: Vec::new(),
+                readiness: AnswerReadinessReportDto {
+                    overall_status: ClaimReadinessDto::NeedsSourceRead,
+                    safe_to_say: vec!["anchor evidence is available".to_string()],
+                    inferred_claims: vec!["bridge is unresolved".to_string()],
+                    needs_verification: vec!["read the source".to_string()],
+                    next_commands: vec![
+                        "codestory-cli snippet --query WorkspaceIndexer".to_string(),
+                    ],
+                    source_truth_checks: vec![SourceTruthCheckDto {
+                        id: "source-truth-1".to_string(),
+                        reason: "primary source occurrence".to_string(),
+                        path: "src/indexer.rs".to_string(),
+                        line: Some(12),
+                        required: true,
+                    }],
+                },
+            },
+            answer_quality_contract: drill_answer_quality_contract(),
+            claim_ledger_template: DrillClaimLedgerOutput {
+                template_version: 1,
+                instructions: Vec::new(),
+                claims: vec![DrillClaimLedgerEntryOutput {
+                    id: "claim-1".to_string(),
+                    claim: "anchor claim".to_string(),
+                    expected_evidence: Vec::new(),
+                    source_truth_files: vec!["src/indexer.rs".to_string()],
+                    pre_verification_confidence: "medium".to_string(),
+                    classification: None,
+                    changed_after_source_read: None,
+                    correction_note: None,
+                }],
+                scoring: DrillClaimLedgerScoringOutput {
+                    status: "pending_source_verification".to_string(),
+                    pending_claim_count: 1,
+                    correct: 0,
+                    partial: 0,
+                    misleading: 0,
+                    unsupported: 0,
+                    material_revision_count: 0,
+                    score_formula: "manual".to_string(),
+                },
+            },
+            verification_checklist: drill_verification_checklist(),
+            next_commands: Vec::new(),
+        };
+
+        let summary = drill_summary(&output);
+
+        assert_eq!(summary.mechanical.error_delta, -1);
+        assert!(summary.mechanical.index_ready);
+        assert_eq!(summary.anchors.requested, 2);
+        assert_eq!(summary.anchors.resolved, 1);
+        assert_eq!(summary.anchors.unresolved, 1);
+        assert_eq!(summary.anchors.failed_command_count, 1);
+        assert_eq!(summary.bridges.total, 1);
+        assert_eq!(summary.bridges.unresolved_or_error, 1);
+        assert!(summary.source_truth.required);
+        assert_eq!(summary.source_truth.target_files, vec!["src/indexer.rs"]);
+        assert_eq!(
+            summary.open_gaps.overall_status,
+            ClaimReadinessDto::NeedsSourceRead
+        );
+        assert!(summary.open_gaps.open_gap_friendly);
+        assert_eq!(summary.open_gaps.status, "open_gaps_explicit");
+
+        let from = sample_drill_anchor("FromAnchor", "from");
+        let to = sample_drill_anchor("ToAnchor", "to");
+        let mut failed_bridge_output = output.clone();
+        failed_bridge_output.anchors = vec![from.clone(), to.clone()];
+        failed_bridge_output.bridges = vec![DrillBridgeOutput {
+            evidence: drill_bridge_error(
+                Path::new("C:/repo"),
+                &from,
+                &to,
+                from.chosen_anchor.clone().expect("from"),
+                to.chosen_anchor.clone().expect("to"),
+                "internal",
+                "failed",
+                false,
+            ),
+            command: DrillCommandStatusOutput {
+                command: "bridge".to_string(),
+                status: "error".to_string(),
+                artifact: None,
+                error: Some("failed".to_string()),
+            },
+        }];
+        let failed_summary = drill_summary(&failed_bridge_output);
+        assert!(
+            failed_summary
+                .verdict
+                .next_action
+                .contains("repair or rerun"),
+            "failed bridge commands should not be presented as ordinary verification work: {failed_summary:#?}"
+        );
+    }
+
+    #[test]
+    fn drill_suite_cases_preserve_fixed_cross_repo_order_and_anchors() {
+        let owner_root = PathBuf::from("C:/Users/alber/source/repos/codestory");
+        let cases = codestory_real_repo_drill_suite_cases(&owner_root).expect("suite cases");
+
+        assert_eq!(
+            cases.iter().map(|case| case.slug).collect::<Vec<_>>(),
+            vec!["sourcetrail", "codestory", "rootandruntime"]
+        );
+        assert_eq!(
+            cases[0].project_root,
+            PathBuf::from("C:/Users/alber/source/repos/Sourcetrail")
+        );
+        assert_eq!(cases[1].project_root, owner_root);
+        assert_eq!(
+            cases[2].anchors,
+            &["Posts", "getElsewhereFeed", "getCommentAuth"]
+        );
+        assert!(cases[1].question.contains("WorkspaceIndexer"));
+    }
+
+    #[test]
+    fn drill_suite_cache_dir_isolated_per_case_when_explicit() {
+        assert_eq!(drill_suite_case_cache_dir(None, "sourcetrail"), None);
+        assert_eq!(
+            drill_suite_case_cache_dir(Some(Path::new("C:/cache/codestory-suite")), "root/runtime"),
+            Some(PathBuf::from("C:/cache/codestory-suite/root-runtime"))
+        );
+    }
+
+    #[test]
+    fn drill_suite_progress_messages_include_repo_index_and_verdict() {
+        let case = DrillSuiteCase {
+            slug: "sourcetrail",
+            project_root: PathBuf::from("C:/repos/Sourcetrail"),
+            question: "Explain how Sourcetrail indexes.",
+            anchors: &["SourceGroupCxxCdb", "IndexerJava", "StorageAccess"],
+        };
+        let start = drill_suite_repo_progress_start_message(
+            1,
+            3,
+            &case,
+            Path::new("target/drill-suite/sourcetrail-drill"),
+        );
+        assert!(start.contains("[1/3] start sourcetrail"));
+        assert!(start.contains("C:/repos/Sourcetrail"));
+        assert!(start.contains("target/drill-suite/sourcetrail-drill"));
+
+        let repo = sample_drill_suite_repo("sourcetrail", "degraded", 3, 1, 4);
+        let done = drill_suite_repo_progress_done_message(1, 3, "sourcetrail", &repo.summary);
+        assert!(done.contains("[1/3] done sourcetrail"));
+        assert!(done.contains("verdict=degraded"));
+        assert!(done.contains("anchors=3/3"));
+        assert!(done.contains("bridges=graph:2 partial:0 unresolved:1"));
+    }
+
+    #[test]
+    fn drill_suite_markdown_summarizes_verdicts_and_source_truth() {
+        let mut output = DrillSuiteOutput {
+            suite: "codestory-real-repo-agent-drill".to_string(),
+            project: "C:/repos/codestory".to_string(),
+            output_dir: "target/drill-suite".to_string(),
+            repo_count: 2,
+            degraded_count: 1,
+            blocked_count: 1,
+            ready_count: 0,
+            repos: vec![
+                sample_drill_suite_repo("sourcetrail", "degraded", 3, 1, 4),
+                sample_drill_suite_repo("codestory", "blocked", 0, 0, 2),
+            ],
+            next_actions: vec![
+                "sourcetrail: Read source truth files named by the drill.".to_string(),
+                "codestory: Re-run after fixing index failure.".to_string(),
+            ],
+            retrieval_blockers: Vec::new(),
+        };
+        output.repos[0].summary.bridges.graph_path = 0;
+        output.repos[0].summary.bridges.partial = 2;
+
+        let markdown = render_drill_suite_markdown(&output);
+
+        assert!(markdown.contains("- repos: 2 total, 0 ready, 1 degraded, 1 blocked"));
+        assert!(markdown.contains("| source truth | reports | next action |"));
+        assert!(markdown.contains(
+            "| `sourcetrail` | degraded | fresh | hybrid-ready | 3/3 | 0 graph / 2 partial / 1 unresolved-error | 1 targets / 0 verified / 4 pending |"
+        ));
+        assert!(
+            markdown.contains(
+                "| `codestory` | blocked | fresh | hybrid-ready | 3/3 | 0 graph / 0 partial / 0 unresolved-error | 1 targets / 0 verified / 2 pending |"
+            )
+        );
+        assert!(markdown.contains("## Repo Artifacts"));
+        assert!(markdown.contains("`sourcetrail`: report `target/drill-suite/sourcetrail/drill-report.md`; json `target/drill-suite/sourcetrail/drill-report.json`; bridge artifacts `target/drill-suite/sourcetrail/*-bridge.json`"));
+        assert!(markdown.contains("## Next Actions"));
+        assert!(markdown.contains("codestory: Re-run after fixing index failure."));
+    }
+
+    #[test]
+    fn drill_suite_retrieval_blockers_group_non_hybrid_repos() {
+        let mut output = DrillSuiteOutput {
+            suite: "codestory-real-repo-agent-drill".to_string(),
+            project: "C:/repos/codestory".to_string(),
+            output_dir: "target/drill-suite".to_string(),
+            repo_count: 3,
+            degraded_count: 2,
+            blocked_count: 0,
+            ready_count: 1,
+            repos: vec![
+                sample_drill_suite_repo("sourcetrail", "degraded", 3, 1, 4),
+                sample_drill_suite_repo("codestory", "ready", 3, 0, 4),
+                sample_drill_suite_repo("rootandruntime", "degraded", 3, 1, 4),
+            ],
+            next_actions: Vec::new(),
+            retrieval_blockers: Vec::new(),
+        };
+        output.repos[0].summary.mechanical.retrieval_status =
+            Some("symbolic:semantic_unavailable:fallback=MissingEmbeddingRuntime".to_string());
+        output.repos[1].summary.mechanical.retrieval_status = Some("hybrid-ready".to_string());
+        output.repos[2].summary.mechanical.retrieval_status =
+            Some("symbolic:semantic_unavailable:fallback=MissingEmbeddingRuntime".to_string());
+
+        output.retrieval_blockers = drill_suite_retrieval_blockers(&output.repos);
+
+        assert_eq!(output.retrieval_blockers.len(), 1);
+        let blocker = &output.retrieval_blockers[0];
+        assert_eq!(
+            blocker.status,
+            "symbolic:semantic_unavailable:fallback=MissingEmbeddingRuntime"
+        );
+        assert_eq!(blocker.repo_count, 2);
+        assert_eq!(blocker.repos, vec!["sourcetrail", "rootandruntime"]);
+        assert!(blocker.next_action.contains("setup embeddings"));
+
+        let markdown = render_drill_suite_markdown(&output);
+        assert!(markdown.contains("## Retrieval Blockers"));
+        assert!(markdown.contains("MissingEmbeddingRuntime"));
+        assert!(markdown.contains("[sourcetrail, rootandruntime]"));
+        assert!(!markdown.contains("codestory]"));
+    }
+
+    fn sample_drill_suite_repo(
+        slug: &str,
+        verdict: &str,
+        bridge_total: usize,
+        bridge_unresolved: usize,
+        source_check_count: usize,
+    ) -> DrillSuiteRepoOutput {
+        DrillSuiteRepoOutput {
+            slug: slug.to_string(),
+            project: format!("C:/repos/{slug}"),
+            question: format!("Question for {slug}"),
+            anchors: vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            output_dir: format!("target/drill-suite/{slug}"),
+            summary: sample_drill_summary(
+                slug,
+                verdict,
+                bridge_total,
+                bridge_unresolved,
+                source_check_count,
+            ),
+        }
+    }
+
+    fn sample_drill_summary(
+        slug: &str,
+        verdict: &str,
+        bridge_total: usize,
+        bridge_unresolved: usize,
+        source_check_count: usize,
+    ) -> DrillSummaryOutput {
+        DrillSummaryOutput {
+            summary_version: 1,
+            project: format!("C:/repos/{slug}"),
+            label: Some(slug.to_string()),
+            question: Some(format!("Question for {slug}")),
+            output_dir: format!("target/drill-suite/{slug}"),
+            full_report_json: format!("target/drill-suite/{slug}/drill-report.json"),
+            full_report_markdown: format!("target/drill-suite/{slug}/drill-report.md"),
+            mechanical: DrillSummaryMechanicalOutput {
+                refresh: "none".to_string(),
+                before: drill_summary_stats(1, 2, 3, 0),
+                after: drill_summary_stats(1, 2, 3, 0),
+                index_ready: verdict != "blocked",
+                error_delta: 0,
+                retrieval_status: Some("hybrid-ready".to_string()),
+                freshness_status: Some("fresh".to_string()),
+                stale_file_count: 0,
+                freshness_samples: Vec::new(),
+                phase_timing_available: true,
+            },
+            anchors: DrillSummaryAnchorsOutput {
+                requested: 3,
+                resolved: 3,
+                unresolved: 0,
+                failed_command_count: 0,
+                statuses: Vec::new(),
+            },
+            bridges: DrillSummaryBridgesOutput {
+                total: bridge_total,
+                graph_path: bridge_total.saturating_sub(bridge_unresolved),
+                partial: 0,
+                unresolved_or_error: bridge_unresolved,
+                statuses: Vec::new(),
+            },
+            source_truth: DrillSummarySourceTruthOutput {
+                required: true,
+                check_count: source_check_count,
+                pending_check_count: source_check_count,
+                verified_check_count: 0,
+                target_file_count: 1,
+                target_files: vec![format!("src/{slug}.rs")],
+                checklist_item_count: 4,
+                claim_count: 3,
+                pending_claim_count: 3,
+                verified_claim_count: 0,
+            },
+            open_gaps: DrillSummaryOpenGapsOutput {
+                overall_status: ClaimReadinessDto::NeedsSourceRead,
+                safe_to_say_count: 1,
+                inferred_claim_count: 1,
+                needs_verification_count: source_check_count,
+                needs_verification_claim_count: source_check_count,
+                pending_source_truth_check_count: source_check_count,
+                next_command_count: 1,
+                answer_quality_status: "pending_source_verification".to_string(),
+                pending_claim_count: 3,
+                open_gap_friendly: true,
+                status: "open_gaps_explicit".to_string(),
+            },
+            verdict: DrillSummaryVerdictOutput {
+                status: verdict.to_string(),
+                reason: "sample".to_string(),
+                next_action: "Read source truth files named by the drill.".to_string(),
+            },
+        }
+    }
+
+    #[test]
     fn drill_evidence_packet_marks_partial_readiness_and_source_checks() {
         let mut anchor = sample_drill_anchor("WorkspaceIndexer", "a");
         anchor.commands.push(DrillCommandStatusOutput {
@@ -5353,6 +8336,7 @@ mod tests {
                 sample_search_hit_output("b", "SearchService"),
                 &sample_bridge_trail(false),
                 Vec::new(),
+                false,
             ),
             command: DrillCommandStatusOutput {
                 command: "bridge".to_string(),
@@ -5386,7 +8370,19 @@ mod tests {
             packet.readiness.overall_status,
             ClaimReadinessDto::NeedsSourceRead
         );
-        assert_eq!(packet.readiness.source_truth_checks.len(), 1);
+        assert_eq!(
+            packet.readiness.source_truth_checks.len(),
+            2,
+            "source-truth checks should group repeated bridge endpoint files: {packet:#?}"
+        );
+        assert!(
+            packet
+                .readiness
+                .source_truth_checks
+                .iter()
+                .any(|check| check.reason.contains("bridge endpoint")),
+            "grouped source-truth checks should preserve bridge endpoint role: {packet:#?}"
+        );
         assert_eq!(packet.readiness.next_commands, next_commands);
     }
 
@@ -5828,6 +8824,98 @@ mod tests {
 
         hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
         assert_eq!(hits[0].node_id.0, "implementation");
+    }
+
+    fn sample_runtime_hit(
+        id: &str,
+        display_name: &str,
+        kind: NodeKind,
+        file_path: &Path,
+        line: u32,
+    ) -> SearchHit {
+        SearchHit {
+            node_id: NodeId(id.to_string()),
+            display_name: display_name.to_string(),
+            kind,
+            file_path: Some(file_path.to_string_lossy().to_string()),
+            line: Some(line),
+            score: 1.0,
+            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
+            resolvable: true,
+            score_breakdown: None,
+        }
+    }
+
+    #[test]
+    fn function_body_promotion_keeps_non_callable_selected_anchor() {
+        let temp = tempdir().expect("create temp dir");
+        let source_path = temp.path().join("posts.tsx");
+        fs::write(
+            &source_path,
+            "export const Posts = { slug: \"posts\" };\n\nexport function PostsIndexPage() {\n  return \"posts\";\n}\n",
+        )
+        .expect("write source");
+
+        let selected = sample_runtime_hit("posts", "Posts", NodeKind::CLASS, &source_path, 1);
+        let alternative = sample_runtime_hit(
+            "page",
+            "PostsIndexPage",
+            NodeKind::FUNCTION,
+            &source_path,
+            3,
+        );
+        let target = runtime::ResolvedTarget {
+            selector: QuerySelectorOutput::Query,
+            requested: "Posts".to_string(),
+            file_filter: None,
+            selected,
+            alternatives: vec![alternative],
+        };
+
+        let promoted = prefer_function_body_target(temp.path(), target);
+
+        assert_eq!(promoted.selected.node_id.0, "posts");
+        assert_eq!(promoted.selected.display_name, "Posts");
+    }
+
+    #[test]
+    fn function_body_promotion_keeps_same_callable_implementation() {
+        let temp = tempdir().expect("create temp dir");
+        let declaration_path = temp.path().join("Project.h");
+        let implementation_path = temp.path().join("Project.cpp");
+        fs::write(&declaration_path, "void Project::buildIndex();\n").expect("write declaration");
+        fs::write(
+            &implementation_path,
+            "void Project::buildIndex()\n{\n    runIndexer();\n}\n",
+        )
+        .expect("write implementation");
+
+        let selected = sample_runtime_hit(
+            "declaration",
+            "Project::buildIndex",
+            NodeKind::METHOD,
+            &declaration_path,
+            1,
+        );
+        let alternative = sample_runtime_hit(
+            "implementation",
+            "Project::buildIndex",
+            NodeKind::FUNCTION,
+            &implementation_path,
+            1,
+        );
+        let target = runtime::ResolvedTarget {
+            selector: QuerySelectorOutput::Query,
+            requested: "Project::buildIndex".to_string(),
+            file_filter: None,
+            selected,
+            alternatives: vec![alternative],
+        };
+
+        let promoted = prefer_function_body_target(temp.path(), target);
+
+        assert_eq!(promoted.selected.node_id.0, "implementation");
     }
 
     #[test]

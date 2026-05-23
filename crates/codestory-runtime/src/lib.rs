@@ -615,6 +615,11 @@ struct SearchPlanExecutedEvidence {
     candidate_windows: Vec<SearchPlanCandidateWindowDto>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct SearchPlanActivePathEvidence {
+    caller_count: u32,
+}
+
 #[derive(Debug, Clone)]
 struct SearchPlanBuild {
     plan: SearchPlanDto,
@@ -1006,7 +1011,10 @@ const SEARCH_PLAN_STOPWORDS: &[&str] = &[
     "a",
     "an",
     "and",
+    "anchor",
+    "answer",
     "are",
+    "around",
     "as",
     "at",
     "be",
@@ -1258,16 +1266,41 @@ fn push_search_plan_symbol_term_subquery(
         .extracted
         .iter()
         .filter(|term| search_plan_symbol_term(term))
-        .take(8)
         .cloned()
         .collect::<Vec<_>>();
     if symbol_terms.is_empty() {
         return;
     }
+    let mut symbol_terms = symbol_terms;
+    symbol_terms.sort_by(|left, right| {
+        search_plan_symbol_subquery_term_score(right)
+            .cmp(&search_plan_symbol_subquery_term_score(left))
+            .then_with(|| left.cmp(right))
+    });
+    for term in symbol_terms
+        .iter()
+        .filter(|term| search_plan_named_anchor_term(term))
+        .take(5)
+    {
+        push_search_plan_subquery(
+            subqueries,
+            seen,
+            term.clone(),
+            "named_anchor",
+            vec![
+                SearchPlanChannelDto::TypedSymbol,
+                SearchPlanChannelDto::Lexical,
+            ],
+        );
+    }
     push_search_plan_subquery(
         subqueries,
         seen,
-        symbol_terms.join(" "),
+        symbol_terms
+            .into_iter()
+            .take(8)
+            .collect::<Vec<_>>()
+            .join(" "),
         "typed_anchor_terms",
         vec![
             SearchPlanChannelDto::TypedSymbol,
@@ -1281,6 +1314,33 @@ fn search_plan_symbol_term(term: &str) -> bool {
         || SEARCH_PLAN_SYMBOL_TERMS
             .iter()
             .any(|symbol_term| term.eq_ignore_ascii_case(symbol_term))
+}
+
+fn search_plan_symbol_subquery_term_score(term: &str) -> u32 {
+    let uppercase_count = term.chars().filter(|ch| ch.is_ascii_uppercase()).count() as u32;
+    let lowercase_count = term.chars().filter(|ch| ch.is_ascii_lowercase()).count() as u32;
+    let mut score = term.len().min(40) as u32;
+    if uppercase_count >= 2 && lowercase_count > 0 {
+        score += 120;
+    } else if uppercase_count > 0 && lowercase_count > 0 {
+        score += 40;
+    }
+    if term.contains('_') || term.contains('-') {
+        score += 35;
+    }
+    if SEARCH_PLAN_SYMBOL_TERMS
+        .iter()
+        .any(|symbol_term| term.eq_ignore_ascii_case(symbol_term))
+    {
+        score += 20;
+    }
+    score
+}
+
+fn search_plan_named_anchor_term(term: &str) -> bool {
+    let uppercase_count = term.chars().filter(|ch| ch.is_ascii_uppercase()).count();
+    let lowercase_count = term.chars().filter(|ch| ch.is_ascii_lowercase()).count();
+    uppercase_count >= 1 && lowercase_count > 0 && term.len() >= 4
 }
 
 fn push_search_plan_role_subqueries(
@@ -1548,9 +1608,12 @@ fn search_plan_typed_anchor_group(
     repo_text_hits: &[SearchHit],
     repo_text_identifiers: &[Vec<String>],
     used_repo_text: &mut HashSet<usize>,
+    active_path_evidence: &HashMap<NodeId, SearchPlanActivePathEvidence>,
 ) -> SearchPlanAnchorGroupDto {
     let mut supporting_hits = vec![hit.clone()];
     let mut reasons = vec!["typed indexed symbol selected as an anchor candidate".to_string()];
+    let active_path = search_plan_active_path_for_hit(hit, active_path_evidence);
+    reasons.extend(search_plan_active_path_reasons(hit, active_path));
 
     for (repo_index, repo_hit) in repo_text_hits.iter().enumerate() {
         if !same_search_file(hit, repo_hit) {
@@ -1574,6 +1637,9 @@ fn search_plan_typed_anchor_group(
         supporting_hits,
         promotion_status: SearchPlanPromotionStatusDto::TypedAnchor,
         promotion_method: Some("indexed_symbol".to_string()),
+        caller_count: active_path.caller_count,
+        definition_only: search_plan_definition_only(hit, active_path),
+        no_visible_callers: search_plan_no_visible_callers(hit, active_path),
         confidence: search_plan_group_confidence(query, hit),
         reasons,
     }
@@ -1582,17 +1648,26 @@ fn search_plan_typed_anchor_group(
 fn search_plan_promoted_anchor_group(
     symbol: SearchHit,
     repo_hit: &SearchHit,
+    active_path_evidence: &HashMap<NodeId, SearchPlanActivePathEvidence>,
 ) -> SearchPlanAnchorGroupDto {
+    let active_path = search_plan_active_path_for_hit(&symbol, active_path_evidence);
+    let mut reasons =
+        vec!["repo-text lead was promoted to an indexed symbol in the same file".to_string()];
+    reasons.extend(search_plan_active_path_reasons(&symbol, active_path));
+    let definition_only = search_plan_definition_only(&symbol, active_path);
+    let no_visible_callers = search_plan_no_visible_callers(&symbol, active_path);
+
     SearchPlanAnchorGroupDto {
         anchor: symbol.display_name.clone(),
         chosen_symbol: Some(symbol.clone()),
         supporting_hits: vec![symbol, repo_hit.clone()],
         promotion_status: SearchPlanPromotionStatusDto::Promoted,
         promotion_method: Some("same_file_exact_identifier".to_string()),
+        caller_count: active_path.caller_count,
+        definition_only,
+        no_visible_callers,
         confidence: "medium".to_string(),
-        reasons: vec![
-            "repo-text lead was promoted to an indexed symbol in the same file".to_string(),
-        ],
+        reasons,
     }
 }
 
@@ -1610,6 +1685,9 @@ fn search_plan_unbound_repo_text_group(
             SearchPlanPromotionStatusDto::Ambiguous
         },
         promotion_method: None,
+        caller_count: 0,
+        definition_only: false,
+        no_visible_callers: false,
         confidence: "low".to_string(),
         reasons: vec![
             "repo-text lead could not be bound to one indexed symbol before source reads"
@@ -1618,12 +1696,96 @@ fn search_plan_unbound_repo_text_group(
     }
 }
 
+fn search_plan_active_path_for_hit(
+    hit: &SearchHit,
+    active_path_evidence: &HashMap<NodeId, SearchPlanActivePathEvidence>,
+) -> SearchPlanActivePathEvidence {
+    active_path_evidence
+        .get(&hit.node_id)
+        .copied()
+        .unwrap_or_default()
+}
+
+fn search_plan_active_path_reasons(
+    hit: &SearchHit,
+    active_path: SearchPlanActivePathEvidence,
+) -> Vec<String> {
+    if !search_plan_callable_hit(hit) {
+        return Vec::new();
+    }
+    if active_path.caller_count > 0 {
+        vec![format!(
+            "call graph shows {} visible production caller(s); rank as active-path evidence",
+            active_path.caller_count
+        )]
+    } else {
+        vec![
+            "call graph shows no visible production callers; treat as definition-only evidence unless a framework/runtime entry path is source-verified"
+                .to_string(),
+        ]
+    }
+}
+
+fn search_plan_definition_only(hit: &SearchHit, active_path: SearchPlanActivePathEvidence) -> bool {
+    search_plan_callable_hit(hit) && active_path.caller_count == 0
+}
+
+fn search_plan_no_visible_callers(
+    hit: &SearchHit,
+    active_path: SearchPlanActivePathEvidence,
+) -> bool {
+    search_plan_callable_hit(hit) && active_path.caller_count == 0
+}
+
+fn search_plan_callable_hit(hit: &SearchHit) -> bool {
+    matches!(
+        hit.kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+    )
+}
+
+fn search_plan_runtime_call_is_speculative(
+    certainty: Option<codestory_contracts::graph::ResolutionCertainty>,
+    confidence: Option<f32>,
+) -> bool {
+    matches!(
+        certainty.or_else(
+            || codestory_contracts::graph::ResolutionCertainty::from_confidence(confidence)
+        ),
+        Some(codestory_contracts::graph::ResolutionCertainty::Uncertain)
+    )
+}
+
+fn search_plan_caller_is_test_or_bench(storage: &Storage, caller_id: GraphNodeId) -> bool {
+    let Ok(Some(caller)) = storage.get_node(caller_id) else {
+        return false;
+    };
+    let Ok(Some(path)) = AppController::file_path_for_node(storage, &caller) else {
+        return false;
+    };
+    search_plan_path_is_test_or_bench(&path)
+}
+
+fn search_plan_path_is_test_or_bench(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    normalized.starts_with("tests/")
+        || normalized.starts_with("test/")
+        || normalized.starts_with("benches/")
+        || normalized.starts_with("bench/")
+        || normalized.contains("/tests/")
+        || normalized.contains("/test/")
+        || normalized.contains("/benches/")
+        || normalized.contains("/bench/")
+        || normalized.ends_with("_test.rs")
+}
+
 fn search_plan_anchor_groups(
     query: &str,
     terms: &SearchPlanTermsDto,
     indexed_hits: &[SearchHit],
     repo_text_hits: &[SearchHit],
     suggestions: &[SearchHit],
+    active_path_evidence: &HashMap<NodeId, SearchPlanActivePathEvidence>,
 ) -> Vec<SearchPlanAnchorGroupDto> {
     let mut groups = Vec::new();
     let mut grouped_ids = HashSet::new();
@@ -1650,6 +1812,7 @@ fn search_plan_anchor_groups(
             repo_text_hits,
             &repo_text_identifiers,
             &mut used_repo_text,
+            active_path_evidence,
         ));
     }
 
@@ -1671,7 +1834,11 @@ fn search_plan_anchor_groups(
             if !grouped_ids.insert(symbol.node_id.clone()) {
                 continue;
             }
-            groups.push(search_plan_promoted_anchor_group(symbol, repo_hit));
+            groups.push(search_plan_promoted_anchor_group(
+                symbol,
+                repo_hit,
+                active_path_evidence,
+            ));
         } else {
             groups.push(search_plan_unbound_repo_text_group(repo_hit, identifiers));
         }
@@ -1695,6 +1862,9 @@ fn search_plan_group_score(group: &SearchPlanAnchorGroupDto, terms: &HashSet<Str
     let mut score = 0;
     if group.chosen_symbol.is_some() {
         score += 100;
+    }
+    if group.caller_count > 0 {
+        score += 90 + group.caller_count.min(5) * 6;
     }
     score += match group.promotion_status {
         SearchPlanPromotionStatusDto::TypedAnchor => 60,
@@ -1811,7 +1981,10 @@ fn search_plan_next_commands(groups: &[SearchPlanAnchorGroupDto]) -> Vec<String>
                     "codestory-cli trail --id {} --story --hide-speculative",
                     hit.node_id.0
                 ),
-                format!("codestory-cli snippet --id {} --context 40", hit.node_id.0),
+                format!(
+                    "codestory-cli snippet --id {} --function-body --context 40",
+                    hit.node_id.0
+                ),
             ]
         })
         .collect()
@@ -5581,6 +5754,59 @@ impl AppController {
         Ok(evidence)
     }
 
+    fn search_plan_active_path_evidence<'a, I>(
+        &self,
+        storage: &Storage,
+        hits: I,
+    ) -> HashMap<NodeId, SearchPlanActivePathEvidence>
+    where
+        I: IntoIterator<Item = &'a SearchHit>,
+    {
+        let mut evidence = HashMap::new();
+        for hit in hits {
+            if evidence.contains_key(&hit.node_id) {
+                continue;
+            }
+            if let Some(active_path) = self.search_plan_active_path_evidence_for_hit(storage, hit) {
+                evidence.insert(hit.node_id.clone(), active_path);
+            }
+        }
+        evidence
+    }
+
+    fn search_plan_active_path_evidence_for_hit(
+        &self,
+        storage: &Storage,
+        hit: &SearchHit,
+    ) -> Option<SearchPlanActivePathEvidence> {
+        if !search_plan_callable_hit(hit) {
+            return None;
+        }
+        let node_id = hit.node_id.to_core().ok()?;
+        let edges = storage.get_edges_for_node_id(node_id).ok()?;
+        let mut callers = HashSet::new();
+        for edge in edges {
+            if edge.kind != codestory_contracts::graph::EdgeKind::CALL {
+                continue;
+            }
+            if search_plan_runtime_call_is_speculative(edge.certainty, edge.confidence) {
+                continue;
+            }
+            let (source, target) = edge.effective_endpoints();
+            if target != node_id || source == node_id {
+                continue;
+            }
+            if search_plan_caller_is_test_or_bench(storage, source) {
+                continue;
+            }
+            callers.insert(source);
+        }
+
+        Some(SearchPlanActivePathEvidence {
+            caller_count: callers.len().min(u32::MAX as usize) as u32,
+        })
+    }
+
     fn build_search_plan(
         &self,
         storage: &Storage,
@@ -5627,14 +5853,22 @@ impl AppController {
         merge_search_hits_by_node_id(&mut plan_repo_text_hits, executed.repo_text_hits.clone());
         let mut plan_suggestions = suggestions.to_vec();
         merge_search_hits_by_node_id(&mut plan_suggestions, executed.suggestions.clone());
+        let active_path_evidence = self.search_plan_active_path_evidence(
+            storage,
+            plan_indexed_hits.iter().chain(plan_suggestions.iter()),
+        );
         let anchor_groups = search_plan_anchor_groups(
             effective_query,
             &terms,
             &plan_indexed_hits,
             &plan_repo_text_hits,
             &plan_suggestions,
+            &active_path_evidence,
         );
-        let bridges = self.search_plan_bridges(&anchor_groups);
+        let mut bridges = self.search_plan_bridges(&anchor_groups);
+        let original_bridge_count = bridges.len();
+        bridges.retain(|bridge| !is_low_confidence_search_plan_bridge(bridge));
+        let suppressed_low_confidence_bridges = original_bridge_count.saturating_sub(bridges.len());
         if !bridges.is_empty() {
             executed
                 .candidate_windows
@@ -5648,6 +5882,12 @@ impl AppController {
                         "bridge evidence expands only after anchor grouping".to_string(),
                     ],
                 });
+        }
+        let mut source_truth_checks = search_plan_source_truth_checks(&anchor_groups);
+        if suppressed_low_confidence_bridges > 0 {
+            source_truth_checks.push(format!(
+                "Suppressed {suppressed_low_confidence_bridges} low-confidence bridge candidate(s); treat missing bridge rows as a source-truth prompt, not proof of isolation."
+            ));
         }
         let plan = SearchPlanDto {
             original_query: original_query.to_string(),
@@ -5664,7 +5904,7 @@ impl AppController {
                 &plan_indexed_hits,
             ),
             next_commands: search_plan_next_commands(&anchor_groups),
-            source_truth_checks: search_plan_source_truth_checks(&anchor_groups),
+            source_truth_checks,
         };
         Ok(Some(SearchPlanBuild {
             plan,
@@ -7266,6 +7506,10 @@ impl AppController {
     }
 }
 
+fn is_low_confidence_search_plan_bridge(bridge: &SearchPlanBridgeDto) -> bool {
+    bridge.confidence.eq_ignore_ascii_case("low")
+}
+
 #[derive(Debug, Clone)]
 struct IndexingRunSummary {
     phase_timings: IndexingPhaseTimings,
@@ -8513,6 +8757,67 @@ pub fn exact_symbol_anchor() {{}}
         );
     }
 
+    #[test]
+    fn sourcetrail_agent_question_prioritizes_named_anchor_subquery_terms() {
+        let query = "Explain how Sourcetrail turns project/source-group configuration into indexing work, then how indexed data is accessed by the application. Anchor the answer around SourceGroupCxxCdb, IndexerJava, and StorageAccess.";
+        let intents = architecture_query_intents(query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            intents.iter().any(|intent| intent == "orchestration"),
+            "explain-how architecture question should trigger a search plan: {intents:#?}"
+        );
+        let terms = search_plan_terms(query);
+        for expected in ["SourceGroupCxxCdb", "IndexerJava", "StorageAccess"] {
+            assert!(
+                terms.extracted.iter().any(|term| term == expected),
+                "expected named anchor `{expected}` in extracted terms: {:?}",
+                terms.extracted
+            );
+        }
+
+        let subqueries = search_plan_subqueries(query, &terms, &intents);
+        let typed_anchor_terms = subqueries
+            .iter()
+            .find(|subquery| subquery.role == "typed_anchor_terms")
+            .map(|subquery| subquery.query.as_str())
+            .expect("typed anchor subquery");
+        for expected in ["SourceGroupCxxCdb", "IndexerJava", "StorageAccess"] {
+            assert!(
+                subqueries
+                    .iter()
+                    .any(|subquery| subquery.role == "named_anchor" && subquery.query == expected),
+                "expected named-anchor subquery for `{expected}`: {subqueries:#?}"
+            );
+            assert!(
+                typed_anchor_terms.contains(expected),
+                "typed anchor subquery should prioritize named anchors; got `{typed_anchor_terms}`"
+            );
+        }
+    }
+
+    #[test]
+    fn public_surface_question_keeps_short_pascal_case_named_anchor() {
+        let query = "Explain how public writing/social surfaces connect to Payload collections, comment auth, and the elsewhere feed. Anchor the answer around Posts, getElsewhereFeed, and getCommentAuth.";
+        let intents = architecture_query_intents(query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(!intents.is_empty(), "query should have architecture intent");
+
+        let terms = search_plan_terms(query);
+        let subqueries = search_plan_subqueries(query, &terms, &intents);
+        for expected in ["Posts", "getElsewhereFeed", "getCommentAuth"] {
+            assert!(
+                subqueries
+                    .iter()
+                    .any(|subquery| subquery.role == "named_anchor" && subquery.query == expected),
+                "expected named-anchor subquery for `{expected}`: {subqueries:#?}"
+            );
+        }
+    }
+
     fn search_plan_test_hit(
         id: &str,
         display_name: &str,
@@ -8533,6 +8838,77 @@ pub fn exact_symbol_anchor() {{}}
             resolvable,
             score_breakdown: None,
         }
+    }
+
+    #[test]
+    fn search_plan_ranks_active_callers_above_definition_only_anchors() {
+        let temp = tempdir().expect("create temp dir");
+        let source_path = temp.path().join("src").join("feed.rs");
+        fs::create_dir_all(source_path.parent().expect("src parent")).expect("create src");
+        fs::write(
+            &source_path,
+            "pub fn getLatestSocialEntries() {}\npub fn getElsewhereFeed() {}\n",
+        )
+        .expect("write source");
+        let active = search_plan_test_hit(
+            "active",
+            "getLatestSocialEntries",
+            &source_path,
+            1,
+            SearchHitOrigin::IndexedSymbol,
+            true,
+        );
+        let definition_only = search_plan_test_hit(
+            "definition",
+            "getElsewhereFeed",
+            &source_path,
+            2,
+            SearchHitOrigin::IndexedSymbol,
+            true,
+        );
+        let query = "rootandruntime getElsewhereFeed latest social feed";
+        let terms = search_plan_terms(query);
+        let active_path_evidence = HashMap::from([
+            (
+                active.node_id.clone(),
+                SearchPlanActivePathEvidence { caller_count: 2 },
+            ),
+            (
+                definition_only.node_id.clone(),
+                SearchPlanActivePathEvidence { caller_count: 0 },
+            ),
+        ]);
+
+        let groups = search_plan_anchor_groups(
+            query,
+            &terms,
+            &[definition_only, active],
+            &[],
+            &[],
+            &active_path_evidence,
+        );
+
+        assert_eq!(
+            groups
+                .first()
+                .and_then(|group| group.chosen_symbol.as_ref())
+                .map(|hit| hit.display_name.as_str()),
+            Some("getLatestSocialEntries"),
+            "visible production callers should outrank a definition-only exact-name anchor: {groups:#?}"
+        );
+        assert!(
+            groups.iter().any(|group| {
+                group.anchor == "getElsewhereFeed"
+                    && group.caller_count == 0
+                    && group.definition_only
+                    && group.no_visible_callers
+                    && group
+                        .reasons
+                        .iter()
+                        .any(|reason| reason.contains("no visible production callers"))
+            }),
+            "definition-only callable anchors should be labeled: {groups:#?}"
+        );
     }
 
     #[test]
@@ -8564,7 +8940,14 @@ pub fn exact_symbol_anchor() {{}}
         let query = "WorkspaceIndexer indexing flow";
         let terms = search_plan_terms(query);
 
-        let groups = search_plan_anchor_groups(query, &terms, &[], &[repo_hit], &[member_hit]);
+        let groups = search_plan_anchor_groups(
+            query,
+            &terms,
+            &[],
+            &[repo_hit],
+            &[member_hit],
+            &HashMap::new(),
+        );
 
         assert!(
             groups.iter().any(|group| {
@@ -8607,7 +8990,14 @@ pub fn exact_symbol_anchor() {{}}
         let query = "normalize_index_path storage keys";
         let terms = search_plan_terms(query);
 
-        let groups = search_plan_anchor_groups(query, &terms, &[], &[repo_hit], &[member_hit]);
+        let groups = search_plan_anchor_groups(
+            query,
+            &terms,
+            &[],
+            &[repo_hit],
+            &[member_hit],
+            &HashMap::new(),
+        );
 
         assert!(
             groups.iter().any(|group| {
@@ -8618,6 +9008,12 @@ pub fn exact_symbol_anchor() {{}}
                     && group.promotion_method.as_deref() == Some("same_file_exact_identifier")
             }),
             "exact terminal identifier should still promote to the matching member: {groups:#?}"
+        );
+        let next_commands = search_plan_next_commands(&groups);
+        assert!(
+            next_commands.iter().any(|command| command
+                .contains("codestory-cli snippet --id member --function-body --context 40")),
+            "search-plan handoff should request body-aware snippets for promoted anchors: {next_commands:#?}"
         );
     }
 

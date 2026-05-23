@@ -89,7 +89,7 @@ impl RuntimeContext {
         let cache_override = args.cache_dir.as_deref().or(config.cache_dir.as_deref());
         let cache_root = cache_root_for_project(&project_root, cache_override)?;
         let managed_embeddings_root =
-            crate::managed_embeddings::managed_root(args.cache_dir.as_deref())?;
+            crate::managed_embeddings::runtime_managed_root(args.cache_dir.as_deref())?;
         crate::managed_embeddings::prepare_runtime_if_installed(&managed_embeddings_root);
         let storage_path = cache_root.join("codestory.db");
         let runtime = Runtime::new();
@@ -108,7 +108,15 @@ impl RuntimeContext {
     }
 
     pub(crate) fn ensure_open(&self, refresh: RefreshMode) -> Result<OpenedProject> {
-        let mut summary = self.open_project_summary()?;
+        let summary = self.open_project_summary()?;
+        self.ensure_open_from_summary(refresh, summary)
+    }
+
+    pub(crate) fn ensure_open_from_summary(
+        &self,
+        refresh: RefreshMode,
+        mut summary: ProjectSummary,
+    ) -> Result<OpenedProject> {
         let refresh_mode = resolve_refresh_request(refresh, &summary);
         let mut phase_timings = None;
         if let Some(mode) = refresh_mode {
@@ -609,6 +617,11 @@ mod tests {
         .expect("runtime context");
 
         assert_eq!(context.storage_path, config_cache.join("codestory.db"));
+        assert_eq!(
+            context.managed_embeddings_root,
+            crate::managed_embeddings::managed_root(None).expect("global managed root"),
+            "repo-controlled config cache_dir should not influence managed executable asset root"
+        );
         assert_ne!(
             context.managed_embeddings_root,
             config_cache.join("managed-embeddings"),

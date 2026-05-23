@@ -320,6 +320,12 @@ pub struct SearchPlanAnchorGroupDto {
     pub promotion_status: SearchPlanPromotionStatusDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promotion_method: Option<String>,
+    #[serde(default)]
+    pub caller_count: u32,
+    #[serde(default)]
+    pub definition_only: bool,
+    #[serde(default)]
+    pub no_visible_callers: bool,
     pub confidence: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasons: Vec<String>,

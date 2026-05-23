@@ -443,6 +443,15 @@ fn uncertainty_for_story(
     if !req.edge_filter.is_empty() {
         uncertainty.push("edge filters were applied before rendering".to_string());
     }
+    if let Some(focus) = nodes_by_id.get(&req.root_id)
+        && story_node_is_callable(focus)
+        && !trail_has_incoming_call_edge(trail, &req.root_id)
+    {
+        uncertainty.push(
+            "focus has no visible incoming call edges in the rendered trail; treat runtime participation as unproven unless a framework/runtime entry path is source-verified"
+                .to_string(),
+        );
+    }
     for edge in &trail.edges {
         let certainty = story_certainty(edge);
         if !is_uncertain_story_certainty(&certainty) {
@@ -454,14 +463,26 @@ fn uncertainty_for_story(
             step.edge_id, step.source, step.relation, step.target, step.certainty, step.note
         ));
     }
-    if uncertainty.is_empty() {
-        if trail.edges.is_empty() {
-            uncertainty.push("no rendered trail edges to evaluate for certainty".to_string());
-        } else {
-            uncertainty.push("all rendered trail edges are explicitly marked certain".to_string());
-        }
+    if trail.edges.is_empty() {
+        uncertainty.push("no rendered trail edges to evaluate for certainty".to_string());
+    } else if uncertainty.is_empty() {
+        uncertainty.push("all rendered trail edges are explicitly marked certain".to_string());
     }
     uncertainty
+}
+
+fn story_node_is_callable(node: &GraphNodeDto) -> bool {
+    matches!(
+        node.kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+    )
+}
+
+fn trail_has_incoming_call_edge(trail: &GraphResponse, node_id: &NodeId) -> bool {
+    trail
+        .edges
+        .iter()
+        .any(|edge| edge.kind == EdgeKind::CALL && &edge.target == node_id)
 }
 
 fn test_scope_for_story(
@@ -832,6 +853,13 @@ mod trail_story_tests {
                 .iter()
                 .any(|item| item.contains("no rendered trail edges to evaluate")),
             "empty story should not claim all edges are certain: {story:#?}"
+        );
+        assert!(
+            story
+                .uncertainty
+                .iter()
+                .any(|item| item.contains("no visible incoming call edges")),
+            "callable focus with no visible callers should be labeled: {story:#?}"
         );
     }
 

@@ -304,8 +304,13 @@ pub(crate) fn architecture_query_intents(query: &str) -> Vec<ArchitectureQueryIn
                 | "coordinate"
                 | "workflow"
                 | "flow"
+                | "flows"
+                | "connect"
+                | "connects"
+                | "connected"
         )
-    }) {
+    }) || terms_contain_phrase(&terms, &["explain", "how"])
+    {
         intents.push(ArchitectureQueryIntent::Orchestration);
     }
     if terms.iter().any(|term| {

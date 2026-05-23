@@ -17,7 +17,8 @@ Use this skill to collect repo evidence with `codestory-cli` before making archi
 - `symbol`: inspect one exact symbol and relationships.
 - `trail`: follow caller, callee, and reference graph around a symbol; use `--story --hide-speculative` for readable flow evidence.
 - `snippet`: fetch source context around a symbol.
-- `drill`: run a deterministic agent-grounding packet for a natural-language question and concrete anchors, including search/symbol/trail/explore/snippet artifacts, bridge evidence, an Evidence Packet, Answer Readiness report, claim-ledger template, and source-verification checklist.
+- `drill`: run a deterministic agent-grounding packet for a natural-language question and concrete anchors, including search/symbol/trail/explore/snippet artifacts, bridge evidence, consumer summaries, endpoint/source-truth files, an Evidence Packet, Answer Readiness report, compact `drill-summary.json`, claim-ledger template, and source-verification checklist.
+- `drill-suite`: run the fixed Sourcetrail/CodeStory/rootandruntime real-repo drill matrix from the CodeStory owner checkout, writing per-repo drill artifacts plus aggregate `suite-report.md`/`suite-report.json`; use it for cross-repo agent-UX regression measurement.
 - `query`: run structured graph-query pipelines.
 - `explore`: interactive or bundled navigation view around a target, including grouped line-numbered source packets.
 - `files`: list indexed file inventory, language counts, inferred source/test/generated/vendor roles, and partial-index markers.
@@ -108,7 +109,15 @@ target/release/codestory-cli(.exe) drill --project <workspace> --refresh full --
 # - evidence_packet.readiness.inferred_claims
 # - evidence_packet.readiness.needs_verification
 # - evidence_packet.readiness.source_truth_checks
+# Read drill-summary.json for compact status, freshness, retrieval, bridge counts, and verdict next action.
 # Draft the CodeStory-only answer, then open only source files named or implied by source_truth_checks.
+```
+
+For the repeatable cross-repo regression drill from the CodeStory checkout:
+
+```
+target/release/codestory-cli(.exe) drill-suite --project <codestory-checkout> --refresh full --output-dir target/codestory-cross-repo-test/<stamp> --format json
+# Read suite-report.json and suite-report.md for per-repo verdicts, freshness/retrieval state, bridge status, and next actions.
 ```
 
 ### Stale or unhealthy semantic retrieval
@@ -179,7 +188,7 @@ Capture the baseline before optimization, define the no-regression threshold, an
 - OpenAPI schema files index endpoint symbols such as `GET /api/users`; client literal calls can create speculative edges to those endpoints, so check certainty before treating a frontend/backend trail as verified.
 - Framework route symbols include confidence labels. Treat `file_convention` and `decorator` routes as stronger than broad `heuristic` routes, and confirm handler links before claiming an end-to-end route path.
 - Framework integration symbols have bounded fixture-backed support. `tauri:command:*` covers first-argument string-literal `invoke` calls, including multiline/generic calls, and Rust `#[tauri::command]`/`generate_handler!` registrations while rejecting argument strings and comments. `payload:collection:*` covers `CollectionConfig` slug blocks and Payload method calls with `collection:` options while rejecting unrelated slugs, props, and string substrings. Treat evidence outside those covered forms as unsupported until source verification proves it.
-- `drill` Evidence Packet readiness is the agent-facing contract: `anchored` and `supported` claims may be drafted from CodeStory evidence; `partial`, `inferred`, and `needs_source_read` claims must stay visibly uncertain until source verification completes.
+- `drill` Evidence Packet readiness is the agent-facing contract: `anchored` and `supported` claims may be drafted from CodeStory evidence; `partial`, `inferred`, and `needs_source_read` claims must stay visibly uncertain until source verification completes. Use `drill-summary.json`/`suite-report.json` for compact status comparisons; stale freshness or symbolic-only retrieval are agent-UX degradation signals even when anchors resolve.
 - The agent-quality evaluator is deterministic. Its gate fails unsupported high-confidence claims, overclaims, high-confidence material source corrections, and poor confidence calibration; do not replace it with live LLM judging in CI.
 - `files`, `search`, and `explore` can report usable-but-partial indexes. Carry those coverage notes into decisions instead of silently assuming full coverage.
 - `affected` is a graph-based test-selection hint, not a replacement for the test suite. Prefer impacted tests first, then run broader gates when shared code or coverage warnings are involved.
@@ -201,6 +210,7 @@ Detailed argument tables, output examples, and usage patterns for each command:
 - [trail](references/trail.md) - Follow a symbol's call/reference graph
 - [snippet](references/snippet.md) - Fetch source code context around a symbol
 - [drill](references/drill.md) - Build a repeatable evidence packet for agent-grounding drills
+- [drill-suite](references/drill-suite.md) - Run the fixed cross-repo real-repo agent drill matrix
 - [query](references/query.md) - Structured graph query pipelines
 - [explore](references/explore.md) - Interactive terminal exploration with Markdown/JSON fallback
 - [files](references/files.md) - Indexed file inventory and coverage markers

@@ -1805,6 +1805,27 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
     if let Some(retrieval) = output.mechanical.retrieval.as_ref() {
         let _ = writeln!(markdown, "retrieval: {}", render_retrieval_state(retrieval));
     }
+    if let Some(freshness) = output.mechanical.freshness.as_ref() {
+        let stale_count = freshness
+            .changed_file_count
+            .saturating_add(freshness.new_file_count)
+            .saturating_add(freshness.removed_file_count);
+        let _ = writeln!(
+            markdown,
+            "freshness: {:?} stale_files={} checked={} indexed={}",
+            freshness.status,
+            stale_count,
+            freshness.checked_file_count,
+            freshness.indexed_file_count
+        );
+        for sample in freshness.samples.iter().take(5) {
+            let _ = writeln!(
+                markdown,
+                "  - freshness_sample {:?}: `{}`",
+                sample.kind, sample.path
+            );
+        }
+    }
     if let Some(timings) = output.mechanical.phase_timings.as_ref() {
         let _ = writeln!(
             markdown,
@@ -1840,6 +1861,60 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
             "  verification_targets",
             &anchor.verification_targets,
         );
+        if let Some(summary) = anchor.consumer_summary.as_ref() {
+            let _ = writeln!(
+                markdown,
+                "  consumers: callers={} consumers={} text_hints={} truncated={} omitted_edges={}",
+                summary.caller_count,
+                summary.consumer_count,
+                summary.text_hint_count,
+                summary.truncated,
+                summary.omitted_edge_count
+            );
+            for caller in &summary.callers {
+                let path = caller.file_path.as_deref().unwrap_or("<no-file>");
+                let target = caller
+                    .target_name
+                    .as_deref()
+                    .map(|name| format!(" -> `{name}`"))
+                    .unwrap_or_default();
+                let certainty = caller.certainty.as_deref().unwrap_or("unknown");
+                let _ = writeln!(
+                    markdown,
+                    "  - caller `{}` [{:?}] `{}`{} edge={:?} certainty={}",
+                    caller.name, caller.kind, path, target, caller.edge_kind, certainty
+                );
+            }
+            for consumer in summary.consumers.iter().take(3) {
+                let path = consumer.file_path.as_deref().unwrap_or("<no-file>");
+                let target = consumer
+                    .target_name
+                    .as_deref()
+                    .map(|name| format!(" -> `{name}`"))
+                    .unwrap_or_default();
+                let certainty = consumer.certainty.as_deref().unwrap_or("unknown");
+                let _ = writeln!(
+                    markdown,
+                    "  - consumer `{}` [{:?}] `{}`{} edge={:?} certainty={}",
+                    consumer.name, consumer.kind, path, target, consumer.edge_kind, certainty
+                );
+            }
+            for hint in summary.text_consumer_hints.iter().take(5) {
+                let path = hint.file_path.as_deref().unwrap_or("<no-file>");
+                let line = hint
+                    .line
+                    .map(|line| line.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let _ = writeln!(
+                    markdown,
+                    "  - text-hint `{}` [{:?}] `{}`:{} score={:.2}",
+                    hint.name, hint.kind, path, line, hint.score
+                );
+            }
+            for note in &summary.notes {
+                let _ = writeln!(markdown, "  - {note}");
+            }
+        }
         for status in &anchor.commands {
             let _ = writeln!(
                 markdown,
@@ -1878,8 +1953,45 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
                     evidence.shared_files.join(", ")
                 );
             }
+            if !evidence.endpoint_files.is_empty() {
+                let _ = writeln!(
+                    markdown,
+                    "  endpoint_files: {}",
+                    evidence.endpoint_files.join(", ")
+                );
+            }
+            if !evidence.evidence_files.is_empty() {
+                let _ = writeln!(
+                    markdown,
+                    "  evidence_files: {}",
+                    evidence.evidence_files.join(", ")
+                );
+            }
+            if !evidence.next_commands.is_empty() {
+                let _ = writeln!(markdown, "  next_commands:");
+                for command in &evidence.next_commands {
+                    let _ = writeln!(markdown, "    - `{command}`");
+                }
+            }
             for note in &evidence.notes {
                 let _ = writeln!(markdown, "  - {note}");
+            }
+        }
+    }
+
+    if !output.execution_boundaries.is_empty() {
+        let _ = writeln!(markdown, "execution_boundaries:");
+        for boundary in &output.execution_boundaries {
+            let _ = writeln!(markdown, "- `{}`", boundary.command);
+            for step in &boundary.flow {
+                let _ = writeln!(markdown, "  - {step}");
+            }
+            if !boundary.source_files.is_empty() {
+                let _ = writeln!(
+                    markdown,
+                    "  source_files: {}",
+                    boundary.source_files.join(", ")
+                );
             }
         }
     }
@@ -1944,15 +2056,25 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
             );
         }
     }
-    let _ = writeln!(
-        markdown,
-        "- scoring: correct={} partial={} misleading={} unsupported={} material_revision_count={}",
-        ledger.scoring.correct,
-        ledger.scoring.partial,
-        ledger.scoring.misleading,
-        ledger.scoring.unsupported,
-        ledger.scoring.material_revision_count
-    );
+    if ledger.scoring.status == "pending_source_verification"
+        && ledger.scoring.pending_claim_count > 0
+    {
+        let _ = writeln!(
+            markdown,
+            "- score_status={} pending={}",
+            ledger.scoring.status, ledger.scoring.pending_claim_count
+        );
+    } else {
+        let _ = writeln!(
+            markdown,
+            "- scoring: correct={} partial={} misleading={} unsupported={} material_revision_count={}",
+            ledger.scoring.correct,
+            ledger.scoring.partial,
+            ledger.scoring.misleading,
+            ledger.scoring.unsupported,
+            ledger.scoring.material_revision_count
+        );
+    }
     let _ = writeln!(
         markdown,
         "- score_formula: {}",

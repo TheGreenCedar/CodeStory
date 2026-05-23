@@ -227,11 +227,15 @@ fn rich_fixture_cases() -> Vec<RichFixtureCase> {
     ]
 }
 
-fn index_single_file(filename: &str, contents: &str) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+fn index_files(files: &[(&str, &str)]) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
     let dir = tempdir()?;
     let root = dir.path();
-    let file_path = root.join(filename);
-    fs::write(&file_path, contents)?;
+    let mut files_to_index = Vec::with_capacity(files.len());
+    for (filename, contents) in files {
+        let file_path = root.join(filename);
+        fs::write(&file_path, contents)?;
+        files_to_index.push(file_path);
+    }
 
     let mut storage = Storage::new_in_memory()?;
     let indexer = WorkspaceIndexer::new(root.to_path_buf());
@@ -239,7 +243,7 @@ fn index_single_file(filename: &str, contents: &str) -> anyhow::Result<(Vec<Node
 
     let refresh_info = codestory_workspace::RefreshInfo {
         mode: codestory_workspace::BuildMode::Incremental,
-        files_to_index: vec![file_path],
+        files_to_index,
         files_to_remove: vec![],
         existing_file_ids: std::collections::HashMap::new(),
     };
@@ -247,10 +251,18 @@ fn index_single_file(filename: &str, contents: &str) -> anyhow::Result<(Vec<Node
     let errors = storage.get_errors(None)?;
     anyhow::ensure!(
         errors.is_empty(),
-        "Indexing errors for `{filename}`: {errors:?}"
+        "Indexing errors for {:?}: {errors:?}",
+        files
+            .iter()
+            .map(|(filename, _)| *filename)
+            .collect::<Vec<_>>()
     );
 
     Ok((storage.get_nodes()?, storage.get_edges()?))
+}
+
+fn index_single_file(filename: &str, contents: &str) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+    index_files(&[(filename, contents)])
 }
 
 fn is_matching_name(serialized_name: &str, wanted_name: &str) -> bool {
@@ -532,6 +544,98 @@ impl WorkspaceIndexer {
         clone_edges_from_run >= 1,
         "expected at least one clone call edge from run_incremental"
     );
+    Ok(())
+}
+
+#[test]
+fn test_cpp_receiver_call_does_not_resolve_to_unrelated_parser_method() -> anyhow::Result<()> {
+    let cpp_source = r#"
+class CxxParser {
+public:
+    void buildIndex() {}
+};
+"#;
+    let java_parser_source = r#"
+class JavaParser {
+public:
+    void buildIndex() {}
+};
+"#;
+    let indexer_source = r#"
+class ParserClient {};
+class IndexerCommandJava {};
+class IndexerStateInfo {};
+
+class JavaParser {
+public:
+    JavaParser(ParserClient*, IndexerStateInfo*) {}
+    void buildIndex(const IndexerCommandJava&);
+};
+
+class IndexerJava {
+    IndexerStateInfo* state;
+public:
+    void doIndex(const IndexerCommandJava& indexerCommand) {
+        ParserClient* parserClient = nullptr;
+        JavaParser(parserClient, state).buildIndex(indexerCommand);
+    }
+};
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("CxxParser.cpp", cpp_source),
+        ("JavaParser.cpp", java_parser_source),
+        ("IndexerJava.cpp", indexer_source),
+    ])?;
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+
+    let do_index_ids = nodes
+        .iter()
+        .filter(|node| is_matching_owned_method(&node.serialized_name, "IndexerJava", "doIndex"))
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    assert!(
+        !do_index_ids.is_empty(),
+        "expected IndexerJava::doIndex symbol to be indexed. Nodes: {:?}",
+        nodes
+            .iter()
+            .map(|node| node.serialized_name.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let cxx_build_index_id = nodes
+        .iter()
+        .find(|node| is_matching_owned_method(&node.serialized_name, "CxxParser", "buildIndex"))
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("expected CxxParser::buildIndex symbol to be indexed"))?;
+
+    let mut build_index_calls = 0usize;
+    for edge in edges.iter().filter(|edge| edge.kind == EdgeKind::CALL) {
+        if !do_index_ids.contains(&edge.source) {
+            continue;
+        }
+        let Some(target_node) = node_by_id.get(&edge.target) else {
+            continue;
+        };
+        if !is_matching_name(&target_node.serialized_name, "buildIndex") {
+            continue;
+        }
+
+        build_index_calls += 1;
+        assert_ne!(
+            edge.resolved_target,
+            Some(cxx_build_index_id),
+            "Receiver call IndexerJava::doIndex -> JavaParser(...).buildIndex must not resolve to CxxParser::buildIndex. Calls: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+
+    assert!(
+        build_index_calls >= 1,
+        "expected buildIndex receiver call from IndexerJava::doIndex. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+
     Ok(())
 }
 
