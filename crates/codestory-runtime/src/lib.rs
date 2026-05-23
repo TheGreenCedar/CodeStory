@@ -14,11 +14,14 @@ use codestory_contracts::api::{
     OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest, ProjectSummary,
     ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
     RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, RouteEndpointHandlerDto,
-    RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchMatchQualityDto,
-    SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest, SearchResultsDto,
-    SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto,
-    StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto,
-    SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
+    RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
+    SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto, SearchPlanBridgeDto,
+    SearchPlanCandidateWindowDto, SearchPlanChannelDto, SearchPlanDroppedTermDto, SearchPlanDto,
+    SearchPlanNextActionDto, SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto,
+    SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode,
+    SearchRequest, SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
+    StorageStatsDto, StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto,
+    SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
     UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WorkspaceMemberIndexDto,
     WriteFileResponse, WriteFileTextRequest,
 };
@@ -89,7 +92,7 @@ pub use symbol_query::{
     symbol_name_match_rank, terminal_symbol_segment,
 };
 pub(crate) use symbol_query::{
-    compare_search_hits_with_project_root, is_non_primary_source_hit,
+    architecture_query_intents, compare_search_hits_with_project_root, is_non_primary_source_hit,
     query_mentions_non_primary_source,
 };
 
@@ -220,327 +223,356 @@ fn affected_edge_kind_label(kind: codestory_contracts::graph::EdgeKind) -> &'sta
 }
 
 fn affected_edge_confidence(edge: &codestory_contracts::graph::Edge) -> String {
-    edge_certainty_label(edge.certainty, edge.confidence).unwrap_or_else(|| "graph".to_string())
+    edge_certainty_label(edge.kind, edge.certainty, edge.confidence)
+        .unwrap_or_else(|| "graph".to_string())
 }
 
-fn framework_route_coverage_matrix() -> Vec<FrameworkRouteCoverageDto> {
-    struct Entry {
-        framework: &'static str,
-        language: &'static str,
-        status: &'static str,
-        fixture_status: &'static str,
-        confidence_floor: &'static str,
-        handler_link_support: &'static str,
-        unsupported_patterns: &'static [&'static str],
-        known_gaps: &'static [&'static str],
-        promotable: bool,
+fn affected_dependent_evidence(
+    distance: u32,
+    edge: Option<&codestory_contracts::graph::Edge>,
+    target_label: String,
+) -> AffectedGraphEvidence {
+    let (reason, confidence) = edge
+        .map(|edge| {
+            (
+                format!(
+                    "dependent reaches changed code via {} edge to {}",
+                    affected_edge_kind_label(edge.kind),
+                    target_label
+                ),
+                affected_edge_confidence(edge),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                format!("dependent reaches changed code through graph walk to {target_label}"),
+                "graph".to_string(),
+            )
+        });
+    AffectedGraphEvidence {
+        distance,
+        reason,
+        confidence,
     }
+}
 
-    [
-        Entry {
-            framework: "express",
-            language: "javascript/typescript",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "heuristic",
-            handler_link_support: "probable_when_handler_name_resolves",
-            unsupported_patterns: &[
-                "router composition and middleware arrays may need source review",
-                "handler linking is name-based unless graph resolution confirms the target",
-            ],
-            known_gaps: &["mounted app prefixes are not globally propagated"],
-            promotable: true,
-        },
-        Entry {
-            framework: "react-router",
-            language: "javascript/typescript",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "heuristic",
-            handler_link_support: "not_claimed",
-            unsupported_patterns: &[
-                "loader/action route objects and nested config composition are partial",
-            ],
-            known_gaps: &["generated routes are not expanded"],
-            promotable: true,
-        },
-        Entry {
-            framework: "sveltekit",
-            language: "svelte/javascript/typescript",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "file_convention",
-            handler_link_support: "probable_for_server_method_exports",
-            unsupported_patterns: &[
-                "route groups and advanced matcher params are normalized conservatively",
-            ],
-            known_gaps: &["layout load propagation is not modeled"],
-            promotable: true,
-        },
-        Entry {
-            framework: "nextjs",
-            language: "javascript/typescript",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "file_convention",
-            handler_link_support: "probable_for_route_method_exports",
-            unsupported_patterns: &["middleware rewrites and route groups require source review"],
-            known_gaps: &["parallel routes and intercepting routes are not fully modeled"],
-            promotable: true,
-        },
-        Entry {
-            framework: "remix",
-            language: "javascript/typescript",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "file_convention",
-            handler_link_support: "probable_for_loader_action_exports",
-            unsupported_patterns: &["route config composition and resource routes are partial"],
-            known_gaps: &["flat-route edge cases need more real-repo probes"],
-            promotable: true,
-        },
-        Entry {
-            framework: "astro",
-            language: "astro/javascript/typescript",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "file_convention",
-            handler_link_support: "probable_for_endpoint_method_exports",
-            unsupported_patterns: &["redirects and integration-generated routes are not expanded"],
-            known_gaps: &["content collections do not create route nodes"],
-            promotable: true,
-        },
-        Entry {
-            framework: "nuxt",
-            language: "vue/javascript/typescript",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "file_convention",
-            handler_link_support: "probable_for_server_handlers",
-            unsupported_patterns: &["route middleware and generated module routes are partial"],
-            known_gaps: &["custom router options are not evaluated"],
-            promotable: true,
-        },
-        Entry {
-            framework: "fastify",
-            language: "javascript/typescript",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "heuristic",
-            handler_link_support: "probable_when_handler_name_resolves",
-            unsupported_patterns: &[
-                "plugin prefixes and schema-only route declarations are partial",
-            ],
-            known_gaps: &["register() prefix propagation is not modeled"],
-            promotable: true,
-        },
-        Entry {
-            framework: "koa",
-            language: "javascript/typescript",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "heuristic",
-            handler_link_support: "probable_when_handler_name_resolves",
-            unsupported_patterns: &["router prefixes and middleware arrays are partial"],
-            known_gaps: &["mounted router prefixes are not globally propagated"],
-            promotable: true,
-        },
-        Entry {
-            framework: "hono",
-            language: "javascript/typescript",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "heuristic",
-            handler_link_support: "probable_when_handler_name_resolves",
-            unsupported_patterns: &["basePath/grouped routes are partial"],
-            known_gaps: &["OpenAPI helper generated routes are not expanded"],
-            promotable: true,
-        },
-        Entry {
-            framework: "nestjs",
-            language: "typescript",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "decorator",
-            handler_link_support: "probable_for_controller_method",
-            unsupported_patterns: &[
-                "global prefixes and dynamic decorator expressions are partial",
-            ],
-            known_gaps: &["module graph prefix propagation is not modeled"],
-            promotable: true,
-        },
-        Entry {
-            framework: "django",
-            language: "python",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "heuristic",
-            handler_link_support: "probable_when_handler_name_resolves",
-            unsupported_patterns: &[
-                "include() trees and namespaced URLConfs are not fully expanded",
-            ],
-            known_gaps: &["path converters beyond parameter names are not typed"],
-            promotable: true,
-        },
-        Entry {
-            framework: "flask",
-            language: "python",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "decorator",
-            handler_link_support: "not_claimed",
-            unsupported_patterns: &[
-                "blueprint prefixes and dynamic method declarations are partial",
-            ],
-            known_gaps: &["method lists are not fully enumerated"],
-            promotable: true,
-        },
-        Entry {
-            framework: "fastapi",
-            language: "python",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "decorator",
-            handler_link_support: "not_claimed",
-            unsupported_patterns: &["router prefixes and dependency-driven routing are partial"],
-            known_gaps: &["include_router prefix propagation is not modeled"],
-            promotable: true,
-        },
-        Entry {
-            framework: "rails",
-            language: "ruby",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "heuristic",
-            handler_link_support: "not_claimed",
-            unsupported_patterns: &["resource expansion is not fully enumerated"],
-            known_gaps: &["constraints/scopes are not expanded"],
-            promotable: true,
-        },
-        Entry {
-            framework: "laravel",
-            language: "php",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "heuristic",
-            handler_link_support: "not_claimed",
-            unsupported_patterns: &["controller arrays and route groups are partial"],
-            known_gaps: &["group middleware/prefix stacking is not modeled"],
-            promotable: true,
-        },
-        Entry {
-            framework: "spring",
-            language: "java",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "annotation",
-            handler_link_support: "not_claimed",
-            unsupported_patterns: &["class-level prefixes are not fully combined in every case"],
-            known_gaps: &["composed annotations are not expanded"],
-            promotable: true,
-        },
-        Entry {
-            framework: "aspnet",
-            language: "csharp",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "attribute",
-            handler_link_support: "not_claimed",
-            unsupported_patterns: &["controller-level route templates are partial"],
-            known_gaps: &["minimal API grouping is not fully modeled"],
-            promotable: true,
-        },
-        Entry {
-            framework: "axum",
-            language: "rust",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "heuristic",
-            handler_link_support: "probable_when_handler_name_resolves",
-            unsupported_patterns: &["nested routers and stateful route composition are partial"],
-            known_gaps: &["Router::nest prefix propagation is limited"],
-            promotable: true,
-        },
-        Entry {
-            framework: "actix",
-            language: "rust",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "heuristic",
-            handler_link_support: "probable_when_handler_name_resolves",
-            unsupported_patterns: &["scoped services and macros are partial"],
-            known_gaps: &["web::scope prefix propagation is limited"],
-            promotable: true,
-        },
-        Entry {
-            framework: "rocket",
-            language: "rust",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "attribute",
-            handler_link_support: "not_claimed",
-            unsupported_patterns: &["mount prefixes are not fully combined"],
-            known_gaps: &["rank/format route attributes are not modeled"],
-            promotable: true,
-        },
-        Entry {
-            framework: "gin",
-            language: "go",
-            status: "partial",
-            fixture_status: "covered_by_text_only_unit_fixture",
-            confidence_floor: "heuristic",
-            handler_link_support: "not_claimed_text_only",
-            unsupported_patterns: &["router groups and middleware chains are partial"],
-            known_gaps: &["Go parser-backed handler links are not available yet"],
-            promotable: true,
-        },
-        Entry {
-            framework: "chi",
-            language: "go",
-            status: "partial",
-            fixture_status: "covered_by_text_only_unit_fixture",
-            confidence_floor: "heuristic",
-            handler_link_support: "not_claimed_text_only",
-            unsupported_patterns: &["route groups and mounted subrouters are partial"],
-            known_gaps: &["Go parser-backed handler links are not available yet"],
-            promotable: true,
-        },
-        Entry {
-            framework: "echo",
-            language: "go",
-            status: "partial",
-            fixture_status: "covered_by_text_only_unit_fixture",
-            confidence_floor: "heuristic",
-            handler_link_support: "not_claimed_text_only",
-            unsupported_patterns: &["group prefixes are partial"],
-            known_gaps: &["Go parser-backed handler links are not available yet"],
-            promotable: true,
-        },
-        Entry {
-            framework: "fiber",
-            language: "go",
-            status: "partial",
-            fixture_status: "covered_by_text_only_unit_fixture",
-            confidence_floor: "heuristic",
-            handler_link_support: "not_claimed_text_only",
-            unsupported_patterns: &["group prefixes and mounted apps are partial"],
-            known_gaps: &["Go parser-backed handler links are not available yet"],
-            promotable: true,
-        },
-        Entry {
-            framework: "vue-router",
-            language: "vue",
-            status: "partial",
-            fixture_status: "covered_by_indexer_unit_fixture",
-            confidence_floor: "heuristic",
-            handler_link_support: "not_claimed",
-            unsupported_patterns: &["imported route arrays and generated routes are partial"],
-            known_gaps: &["Nuxt file routes are reported separately as nuxt"],
-            promotable: true,
-        },
-    ]
-    .into_iter()
-    .map(|entry| FrameworkRouteCoverageDto {
+struct FrameworkRouteCoverageEntry {
+    framework: &'static str,
+    language: &'static str,
+    status: &'static str,
+    fixture_status: &'static str,
+    confidence_floor: &'static str,
+    handler_link_support: &'static str,
+    unsupported_patterns: &'static [&'static str],
+    known_gaps: &'static [&'static str],
+    promotable: bool,
+}
+
+const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
+    FrameworkRouteCoverageEntry {
+        framework: "express",
+        language: "javascript/typescript",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "heuristic",
+        handler_link_support: "probable_when_handler_name_resolves",
+        unsupported_patterns: &[
+            "router composition and middleware arrays may need source review",
+            "handler linking is name-based unless graph resolution confirms the target",
+        ],
+        known_gaps: &["mounted app prefixes are not globally propagated"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "react-router",
+        language: "javascript/typescript",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "heuristic",
+        handler_link_support: "not_claimed",
+        unsupported_patterns: &[
+            "loader/action route objects and nested config composition are partial",
+        ],
+        known_gaps: &["generated routes are not expanded"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "sveltekit",
+        language: "svelte/javascript/typescript",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "file_convention",
+        handler_link_support: "probable_for_server_method_exports",
+        unsupported_patterns: &[
+            "route groups and advanced matcher params are normalized conservatively",
+        ],
+        known_gaps: &["layout load propagation is not modeled"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "nextjs",
+        language: "javascript/typescript",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "file_convention",
+        handler_link_support: "probable_for_route_method_exports",
+        unsupported_patterns: &["middleware rewrites and route groups require source review"],
+        known_gaps: &["parallel routes and intercepting routes are not fully modeled"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "remix",
+        language: "javascript/typescript",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "file_convention",
+        handler_link_support: "probable_for_loader_action_exports",
+        unsupported_patterns: &["route config composition and resource routes are partial"],
+        known_gaps: &["flat-route edge cases need more real-repo probes"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "astro",
+        language: "astro/javascript/typescript",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "file_convention",
+        handler_link_support: "probable_for_endpoint_method_exports",
+        unsupported_patterns: &["redirects and integration-generated routes are not expanded"],
+        known_gaps: &["content collections do not create route nodes"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "nuxt",
+        language: "vue/javascript/typescript",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "file_convention",
+        handler_link_support: "probable_for_server_handlers",
+        unsupported_patterns: &["route middleware and generated module routes are partial"],
+        known_gaps: &["custom router options are not evaluated"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "fastify",
+        language: "javascript/typescript",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "heuristic",
+        handler_link_support: "probable_when_handler_name_resolves",
+        unsupported_patterns: &["plugin prefixes and schema-only route declarations are partial"],
+        known_gaps: &["register() prefix propagation is not modeled"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "koa",
+        language: "javascript/typescript",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "heuristic",
+        handler_link_support: "probable_when_handler_name_resolves",
+        unsupported_patterns: &["router prefixes and middleware arrays are partial"],
+        known_gaps: &["mounted router prefixes are not globally propagated"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "hono",
+        language: "javascript/typescript",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "heuristic",
+        handler_link_support: "probable_when_handler_name_resolves",
+        unsupported_patterns: &["basePath/grouped routes are partial"],
+        known_gaps: &["OpenAPI helper generated routes are not expanded"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "nestjs",
+        language: "typescript",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "decorator",
+        handler_link_support: "probable_for_controller_method",
+        unsupported_patterns: &["global prefixes and dynamic decorator expressions are partial"],
+        known_gaps: &["module graph prefix propagation is not modeled"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "django",
+        language: "python",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "heuristic",
+        handler_link_support: "probable_when_handler_name_resolves",
+        unsupported_patterns: &["include() trees and namespaced URLConfs are not fully expanded"],
+        known_gaps: &["path converters beyond parameter names are not typed"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "flask",
+        language: "python",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "decorator",
+        handler_link_support: "not_claimed",
+        unsupported_patterns: &["blueprint prefixes and dynamic method declarations are partial"],
+        known_gaps: &["method lists are not fully enumerated"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "fastapi",
+        language: "python",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "decorator",
+        handler_link_support: "not_claimed",
+        unsupported_patterns: &["router prefixes and dependency-driven routing are partial"],
+        known_gaps: &["include_router prefix propagation is not modeled"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "rails",
+        language: "ruby",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "heuristic",
+        handler_link_support: "not_claimed",
+        unsupported_patterns: &["resource expansion is not fully enumerated"],
+        known_gaps: &["constraints/scopes are not expanded"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "laravel",
+        language: "php",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "heuristic",
+        handler_link_support: "not_claimed",
+        unsupported_patterns: &["controller arrays and route groups are partial"],
+        known_gaps: &["group middleware/prefix stacking is not modeled"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "spring",
+        language: "java",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "annotation",
+        handler_link_support: "not_claimed",
+        unsupported_patterns: &["class-level prefixes are not fully combined in every case"],
+        known_gaps: &["composed annotations are not expanded"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "aspnet",
+        language: "csharp",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "attribute",
+        handler_link_support: "not_claimed",
+        unsupported_patterns: &["controller-level route templates are partial"],
+        known_gaps: &["minimal API grouping is not fully modeled"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "axum",
+        language: "rust",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "heuristic",
+        handler_link_support: "probable_when_handler_name_resolves",
+        unsupported_patterns: &["nested routers and stateful route composition are partial"],
+        known_gaps: &["Router::nest prefix propagation is limited"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "actix",
+        language: "rust",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "heuristic",
+        handler_link_support: "probable_when_handler_name_resolves",
+        unsupported_patterns: &["scoped services and macros are partial"],
+        known_gaps: &["web::scope prefix propagation is limited"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "rocket",
+        language: "rust",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "attribute",
+        handler_link_support: "not_claimed",
+        unsupported_patterns: &["mount prefixes are not fully combined"],
+        known_gaps: &["rank/format route attributes are not modeled"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "gin",
+        language: "go",
+        status: "partial",
+        fixture_status: "covered_by_text_only_unit_fixture",
+        confidence_floor: "heuristic",
+        handler_link_support: "not_claimed_text_only",
+        unsupported_patterns: &["router groups and middleware chains are partial"],
+        known_gaps: &["Go parser-backed handler links are not available yet"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "chi",
+        language: "go",
+        status: "partial",
+        fixture_status: "covered_by_text_only_unit_fixture",
+        confidence_floor: "heuristic",
+        handler_link_support: "not_claimed_text_only",
+        unsupported_patterns: &["route groups and mounted subrouters are partial"],
+        known_gaps: &["Go parser-backed handler links are not available yet"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "echo",
+        language: "go",
+        status: "partial",
+        fixture_status: "covered_by_text_only_unit_fixture",
+        confidence_floor: "heuristic",
+        handler_link_support: "not_claimed_text_only",
+        unsupported_patterns: &["group prefixes are partial"],
+        known_gaps: &["Go parser-backed handler links are not available yet"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "fiber",
+        language: "go",
+        status: "partial",
+        fixture_status: "covered_by_text_only_unit_fixture",
+        confidence_floor: "heuristic",
+        handler_link_support: "not_claimed_text_only",
+        unsupported_patterns: &["group prefixes and mounted apps are partial"],
+        known_gaps: &["Go parser-backed handler links are not available yet"],
+        promotable: true,
+    },
+    FrameworkRouteCoverageEntry {
+        framework: "vue-router",
+        language: "vue",
+        status: "partial",
+        fixture_status: "covered_by_indexer_unit_fixture",
+        confidence_floor: "heuristic",
+        handler_link_support: "not_claimed",
+        unsupported_patterns: &["imported route arrays and generated routes are partial"],
+        known_gaps: &["Nuxt file routes are reported separately as nuxt"],
+        promotable: true,
+    },
+];
+
+fn framework_route_coverage_matrix() -> Vec<FrameworkRouteCoverageDto> {
+    FRAMEWORK_ROUTE_COVERAGE_ENTRIES
+        .iter()
+        .map(framework_route_coverage_dto)
+        .collect()
+}
+
+fn framework_route_coverage_dto(entry: &FrameworkRouteCoverageEntry) -> FrameworkRouteCoverageDto {
+    FrameworkRouteCoverageDto {
         framework: entry.framework.to_string(),
         language: entry.language.to_string(),
         status: entry.status.to_string(),
@@ -558,8 +590,7 @@ fn framework_route_coverage_matrix() -> Vec<FrameworkRouteCoverageDto> {
             .map(|value| value.to_string())
             .collect(),
         promotable: entry.promotable,
-    })
-    .collect()
+    }
 }
 
 const REPO_TEXT_SCAN_FILE_CAP: usize = 2_000;
@@ -574,6 +605,27 @@ const DIRECT_SNIPPET_TRUNCATION_SUFFIX: &str = "\n... snippet truncated by byte 
 struct RepoTextScan {
     hits: Vec<SearchHit>,
     stats: RepoTextScanStatsDto,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SearchPlanExecutedEvidence {
+    indexed_symbol_hits: Vec<SearchHit>,
+    repo_text_hits: Vec<SearchHit>,
+    suggestions: Vec<SearchHit>,
+    candidate_windows: Vec<SearchPlanCandidateWindowDto>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SearchPlanActivePathEvidence {
+    caller_count: u32,
+}
+
+#[derive(Debug, Clone)]
+struct SearchPlanBuild {
+    plan: SearchPlanDto,
+    indexed_symbol_hits: Vec<SearchHit>,
+    repo_text_hits: Vec<SearchHit>,
+    suggestions: Vec<SearchHit>,
 }
 
 #[derive(Debug, Clone)]
@@ -895,29 +947,1120 @@ fn search_query_assessment(
     let weak_top_hit = exact_symbol_hit_count == 0 && weak_search_top_hit(query, indexed_hits);
     let stale_or_missing_anchor =
         exact_symbol_hit_count == 0 && query_has_symbol_or_literal_signal(query);
-    let recommended_next_action = if exact_symbol_hit_count > 0 {
-        Some(
-            "Open the exact indexed hit with symbol, trail, and snippet before answering."
-                .to_string(),
-        )
-    } else if !repo_text_hits.is_empty() {
-        Some(
-            "Use repo-text hits to choose a concrete identifier, then rerun symbol/trail/snippet."
-                .to_string(),
-        )
-    } else if repo_text_mode == SearchRepoTextMode::Off || !repo_text_enabled {
-        Some("Rerun search with --repo-text on or a shorter concrete symbol.".to_string())
-    } else {
-        Some("Try a shorter symbol, file name, or literal from ground output.".to_string())
-    };
+    let architecture_intents = architecture_query_intents(query);
 
     SearchQueryAssessmentDto {
         exact_symbol_hit_count,
         weak_top_hit,
         stale_or_missing_anchor,
         repo_text_fallback_reason,
-        recommended_next_action,
+        recommended_next_action: Some(search_query_recommended_next_action(
+            exact_symbol_hit_count,
+            &architecture_intents,
+            indexed_hits,
+            repo_text_hits,
+            repo_text_mode,
+            repo_text_enabled,
+        )),
     }
+}
+
+fn search_query_recommended_next_action(
+    exact_symbol_hit_count: u32,
+    architecture_intents: &[symbol_query::ArchitectureQueryIntent],
+    indexed_hits: &[SearchHit],
+    repo_text_hits: &[SearchHit],
+    repo_text_mode: SearchRepoTextMode,
+    repo_text_enabled: bool,
+) -> String {
+    if exact_symbol_hit_count > 0 && !architecture_intents.is_empty() {
+        return format!(
+            "Architecture intent detected ({}); open the strongest production entrypoint/orchestrator with symbol, trail, and function-body snippet before answering.",
+            architecture_intent_labels(architecture_intents)
+        );
+    }
+    if exact_symbol_hit_count > 0 {
+        return "Open the exact indexed hit with symbol, trail, and snippet before answering."
+            .to_string();
+    }
+    if !architecture_intents.is_empty() && !indexed_hits.is_empty() {
+        return format!(
+            "Architecture intent detected ({}) with no exact anchor; run drill with concrete anchors from ground/search, then inspect symbol, trail, and function-body snippets before answering. Treat broad search hits as leads only.",
+            architecture_intent_labels(architecture_intents)
+        );
+    }
+    if !repo_text_hits.is_empty() {
+        return "Use repo-text hits to choose a concrete identifier, then rerun symbol/trail/snippet."
+            .to_string();
+    }
+    if repo_text_mode == SearchRepoTextMode::Off || !repo_text_enabled {
+        return "Rerun search with --repo-text on or a shorter concrete symbol.".to_string();
+    }
+    "Try a shorter symbol, file name, or literal from ground output.".to_string()
+}
+
+fn architecture_intent_labels(intents: &[symbol_query::ArchitectureQueryIntent]) -> String {
+    intents
+        .iter()
+        .map(|intent| intent.label())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+const SEARCH_PLAN_STOPWORDS: &[&str] = &[
+    "a",
+    "an",
+    "and",
+    "anchor",
+    "answer",
+    "are",
+    "around",
+    "as",
+    "at",
+    "be",
+    "by",
+    "can",
+    "code",
+    "codestory",
+    "does",
+    "explain",
+    "for",
+    "from",
+    "how",
+    "in",
+    "into",
+    "is",
+    "it",
+    "later",
+    "of",
+    "on",
+    "or",
+    "repo",
+    "repository",
+    "show",
+    "that",
+    "the",
+    "then",
+    "this",
+    "through",
+    "to",
+    "turns",
+    "what",
+    "where",
+    "which",
+    "why",
+    "with",
+];
+const SEARCH_PLAN_SYMBOL_TERMS: &[&str] = &[
+    "indexer",
+    "service",
+    "storage",
+    "store",
+    "posts",
+    "feed",
+    "auth",
+    "trail",
+    "snippet",
+    "workspace",
+];
+const SEARCH_PLAN_ROLE_SPECS: &[(&str, &[&str])] = &[
+    (
+        "indexing_pipeline",
+        &["full", "index", "indexing", "indexer", "workspace", "store"],
+    ),
+    (
+        "runtime_boundary",
+        &["cli", "runtime", "command", "service"],
+    ),
+    (
+        "read_surface",
+        &["search", "trail", "snippet", "context", "explore"],
+    ),
+    (
+        "content_surface",
+        &["posts", "comments", "auth", "feed", "elsewhere"],
+    ),
+    (
+        "persistence_surface",
+        &["storage", "store", "payload", "collection", "snapshot"],
+    ),
+];
+const SEARCH_PLAN_BASE_SOURCE_TRUTH_CHECKS: &[&str] = &[
+    "Draft the CodeStory-only answer from selected anchors, bridge status, symbol, trail, and snippet evidence before opening source.",
+    "Open the cited source files after the CodeStory-only draft and classify each claim as correct, partial, misleading, or unsupported.",
+];
+const SEARCH_PLAN_REPO_TEXT_SOURCE_TRUTH_CHECK: &str = "Repo-text-only or ambiguous groups require direct source reads before they can support architecture claims.";
+
+fn search_plan_terms(query: &str) -> SearchPlanTermsDto {
+    let mut extracted = Vec::new();
+    let mut dropped = Vec::new();
+    let mut seen = HashSet::new();
+    let mut dropped_seen = HashSet::new();
+
+    for raw in query.split_whitespace() {
+        let token = raw
+            .trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '"' | '\'' | '`' | ',' | '.' | ';' | ':' | '?' | '!' | '(' | ')' | '[' | ']'
+                )
+            })
+            .trim_end_matches("'s");
+        if token.is_empty() {
+            continue;
+        }
+        let fragments = token
+            .split('/')
+            .flat_map(|part| part.split('.'))
+            .flat_map(|part| part.split(':'))
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        for fragment in fragments {
+            let normalized = fragment
+                .trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'));
+            if normalized.is_empty() {
+                continue;
+            }
+            add_search_plan_term(
+                normalized,
+                &mut extracted,
+                &mut seen,
+                &mut dropped,
+                &mut dropped_seen,
+            );
+            if normalized.contains('-') {
+                for part in normalized.split('-').filter(|part| !part.is_empty()) {
+                    add_search_plan_term(
+                        part,
+                        &mut extracted,
+                        &mut seen,
+                        &mut dropped,
+                        &mut dropped_seen,
+                    );
+                }
+            }
+            for camel_part in split_camel_identifier(normalized) {
+                add_search_plan_term(
+                    &camel_part,
+                    &mut extracted,
+                    &mut seen,
+                    &mut dropped,
+                    &mut dropped_seen,
+                );
+            }
+        }
+    }
+
+    SearchPlanTermsDto { extracted, dropped }
+}
+
+fn add_search_plan_term(
+    raw: &str,
+    extracted: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    dropped: &mut Vec<SearchPlanDroppedTermDto>,
+    dropped_seen: &mut HashSet<String>,
+) {
+    let clean = raw
+        .trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        .to_string();
+    if clean.is_empty() {
+        return;
+    }
+    let lower = clean.to_ascii_lowercase();
+    if lower.len() < 3 {
+        if dropped_seen.insert(lower.clone()) {
+            dropped.push(SearchPlanDroppedTermDto {
+                term: clean,
+                reason: "too_short".to_string(),
+            });
+        }
+        return;
+    }
+    if SEARCH_PLAN_STOPWORDS.contains(&lower.as_str()) {
+        if dropped_seen.insert(lower.clone()) {
+            dropped.push(SearchPlanDroppedTermDto {
+                term: clean,
+                reason: "natural_language_filler".to_string(),
+            });
+        }
+        return;
+    }
+    let value = if clean.chars().any(|ch| ch.is_ascii_uppercase()) && clean.len() > 3 {
+        clean
+    } else {
+        lower.clone()
+    };
+    if seen.insert(value.to_ascii_lowercase()) {
+        extracted.push(value);
+    }
+}
+
+fn split_camel_identifier(value: &str) -> Vec<String> {
+    if !value.chars().any(|ch| ch.is_ascii_uppercase()) {
+        return Vec::new();
+    }
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for ch in value.chars() {
+        if ch == '_' || ch == '-' {
+            if current.len() >= 3 {
+                parts.push(current.clone());
+            }
+            current.clear();
+            continue;
+        }
+        if ch.is_ascii_uppercase() && !current.is_empty() {
+            if current.len() >= 3 {
+                parts.push(current.clone());
+            }
+            current.clear();
+        }
+        current.push(ch.to_ascii_lowercase());
+    }
+    if current.len() >= 3 {
+        parts.push(current);
+    }
+    parts
+}
+
+fn search_plan_eligible(query: &str, exact_symbol_hit_count: u32, intents: &[String]) -> bool {
+    exact_symbol_hit_count == 0
+        && !intents.is_empty()
+        && (looks_like_repo_text_query(query) || query.split_whitespace().count() >= 4)
+}
+
+fn search_plan_subqueries(
+    query: &str,
+    terms: &SearchPlanTermsDto,
+    intents: &[String],
+) -> Vec<SearchPlanSubqueryDto> {
+    if intents.is_empty() {
+        return Vec::new();
+    }
+    let mut subqueries = Vec::new();
+    let mut seen = HashSet::new();
+
+    push_search_plan_subquery(
+        &mut subqueries,
+        &mut seen,
+        query.trim().to_string(),
+        "original_question",
+        vec![
+            SearchPlanChannelDto::Semantic,
+            SearchPlanChannelDto::Lexical,
+        ],
+    );
+    push_search_plan_symbol_term_subquery(&mut subqueries, &mut seen, terms);
+    push_search_plan_role_subqueries(&mut subqueries, &mut seen, terms);
+    push_search_plan_fallback_subquery(&mut subqueries, &mut seen, terms);
+    subqueries
+}
+
+fn push_search_plan_symbol_term_subquery(
+    subqueries: &mut Vec<SearchPlanSubqueryDto>,
+    seen: &mut HashSet<String>,
+    terms: &SearchPlanTermsDto,
+) {
+    let symbol_terms = terms
+        .extracted
+        .iter()
+        .filter(|term| search_plan_symbol_term(term))
+        .cloned()
+        .collect::<Vec<_>>();
+    if symbol_terms.is_empty() {
+        return;
+    }
+    let mut symbol_terms = symbol_terms;
+    symbol_terms.sort_by(|left, right| {
+        search_plan_symbol_subquery_term_score(right)
+            .cmp(&search_plan_symbol_subquery_term_score(left))
+            .then_with(|| left.cmp(right))
+    });
+    for term in symbol_terms
+        .iter()
+        .filter(|term| search_plan_named_anchor_term(term))
+        .take(5)
+    {
+        push_search_plan_subquery(
+            subqueries,
+            seen,
+            term.clone(),
+            "named_anchor",
+            vec![
+                SearchPlanChannelDto::TypedSymbol,
+                SearchPlanChannelDto::Lexical,
+            ],
+        );
+    }
+    push_search_plan_subquery(
+        subqueries,
+        seen,
+        symbol_terms
+            .into_iter()
+            .take(8)
+            .collect::<Vec<_>>()
+            .join(" "),
+        "typed_anchor_terms",
+        vec![
+            SearchPlanChannelDto::TypedSymbol,
+            SearchPlanChannelDto::Lexical,
+        ],
+    );
+}
+
+fn search_plan_symbol_term(term: &str) -> bool {
+    term.chars().any(|ch| ch.is_ascii_uppercase())
+        || SEARCH_PLAN_SYMBOL_TERMS
+            .iter()
+            .any(|symbol_term| term.eq_ignore_ascii_case(symbol_term))
+}
+
+fn search_plan_symbol_subquery_term_score(term: &str) -> u32 {
+    let uppercase_count = term.chars().filter(|ch| ch.is_ascii_uppercase()).count() as u32;
+    let lowercase_count = term.chars().filter(|ch| ch.is_ascii_lowercase()).count() as u32;
+    let mut score = term.len().min(40) as u32;
+    if uppercase_count >= 2 && lowercase_count > 0 {
+        score += 120;
+    } else if uppercase_count > 0 && lowercase_count > 0 {
+        score += 40;
+    }
+    if term.contains('_') || term.contains('-') {
+        score += 35;
+    }
+    if SEARCH_PLAN_SYMBOL_TERMS
+        .iter()
+        .any(|symbol_term| term.eq_ignore_ascii_case(symbol_term))
+    {
+        score += 20;
+    }
+    score
+}
+
+fn search_plan_named_anchor_term(term: &str) -> bool {
+    let uppercase_count = term.chars().filter(|ch| ch.is_ascii_uppercase()).count();
+    let lowercase_count = term.chars().filter(|ch| ch.is_ascii_lowercase()).count();
+    uppercase_count >= 1 && lowercase_count > 0 && term.len() >= 4
+}
+
+fn push_search_plan_role_subqueries(
+    subqueries: &mut Vec<SearchPlanSubqueryDto>,
+    seen: &mut HashSet<String>,
+    terms: &SearchPlanTermsDto,
+) {
+    for (role, needles) in SEARCH_PLAN_ROLE_SPECS {
+        let role_terms = search_plan_matching_terms(terms, needles);
+        if role_terms.len() >= 2 {
+            push_search_plan_subquery(
+                subqueries,
+                seen,
+                role_terms.join(" "),
+                role,
+                vec![
+                    SearchPlanChannelDto::TypedSymbol,
+                    SearchPlanChannelDto::Lexical,
+                    SearchPlanChannelDto::RepoText,
+                ],
+            );
+        }
+    }
+}
+
+fn search_plan_matching_terms(terms: &SearchPlanTermsDto, needles: &[&str]) -> Vec<String> {
+    terms
+        .extracted
+        .iter()
+        .filter(|term| {
+            needles
+                .iter()
+                .any(|needle| term.eq_ignore_ascii_case(needle))
+        })
+        .cloned()
+        .collect()
+}
+
+fn push_search_plan_fallback_subquery(
+    subqueries: &mut Vec<SearchPlanSubqueryDto>,
+    seen: &mut HashSet<String>,
+    terms: &SearchPlanTermsDto,
+) {
+    if subqueries.len() >= 3 {
+        return;
+    }
+    let fallback = terms
+        .extracted
+        .iter()
+        .take(6)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    push_search_plan_subquery(
+        subqueries,
+        seen,
+        fallback,
+        "repo_text_terms",
+        vec![
+            SearchPlanChannelDto::RepoText,
+            SearchPlanChannelDto::Lexical,
+        ],
+    );
+}
+
+fn push_search_plan_subquery(
+    subqueries: &mut Vec<SearchPlanSubqueryDto>,
+    seen: &mut HashSet<String>,
+    query: String,
+    role: &str,
+    channels: Vec<SearchPlanChannelDto>,
+) {
+    let key = query.to_ascii_lowercase();
+    if !query.trim().is_empty() && seen.insert(key) && subqueries.len() < 8 {
+        subqueries.push(SearchPlanSubqueryDto {
+            query,
+            role: role.to_string(),
+            channels,
+        });
+    }
+}
+
+fn search_plan_candidate_window(
+    channel: SearchPlanChannelDto,
+    subquery: &SearchPlanSubqueryDto,
+    limit_per_source: u32,
+    returned_count: usize,
+    truncated: bool,
+    reason: &str,
+) -> SearchPlanCandidateWindowDto {
+    SearchPlanCandidateWindowDto {
+        channel,
+        subquery: subquery.query.clone(),
+        limit: limit_per_source,
+        returned_count: clamp_usize_to_u32(returned_count),
+        truncated,
+        score_reasons: vec![reason.to_string()],
+    }
+}
+
+fn search_plan_symbol_windows(
+    subquery: &SearchPlanSubqueryDto,
+    hits: &[SearchHit],
+    suggestions: &[SearchHit],
+    limit_per_source: u32,
+    semantic_ready: bool,
+) -> Vec<SearchPlanCandidateWindowDto> {
+    let mut windows = Vec::new();
+    if search_plan_uses_channel(subquery, SearchPlanChannelDto::TypedSymbol) {
+        windows.push(search_plan_candidate_window(
+            SearchPlanChannelDto::TypedSymbol,
+            subquery,
+            limit_per_source,
+            hits.iter().filter(|hit| hit.resolvable).count(),
+            hits.len() >= limit_per_source as usize,
+            "executed typed-symbol retrieval for this planned subquery",
+        ));
+    }
+    if search_plan_uses_channel(subquery, SearchPlanChannelDto::Lexical) {
+        windows.push(search_plan_candidate_window(
+            SearchPlanChannelDto::Lexical,
+            subquery,
+            limit_per_source,
+            search_plan_lexical_hit_count(hits),
+            hits.len() >= limit_per_source as usize,
+            "executed lexical/name/path retrieval for this planned subquery",
+        ));
+    }
+    if search_plan_uses_channel(subquery, SearchPlanChannelDto::Semantic) {
+        windows.push(search_plan_candidate_window(
+            SearchPlanChannelDto::Semantic,
+            subquery,
+            limit_per_source,
+            search_plan_semantic_hit_count(hits, suggestions),
+            suggestions.len() >= limit_per_source as usize,
+            if semantic_ready {
+                "executed semantic retrieval for this planned subquery"
+            } else {
+                "semantic retrieval unavailable; this subquery relied on lexical indexed evidence"
+            },
+        ));
+    }
+    windows
+}
+
+fn search_plan_uses_channel(
+    subquery: &SearchPlanSubqueryDto,
+    channel: SearchPlanChannelDto,
+) -> bool {
+    subquery.channels.contains(&channel)
+}
+
+fn search_plan_lexical_hit_count(hits: &[SearchHit]) -> usize {
+    hits.iter()
+        .filter(|hit| {
+            hit.score_breakdown
+                .as_ref()
+                .is_none_or(|breakdown| breakdown.lexical > 0.0)
+        })
+        .count()
+}
+
+fn search_plan_semantic_hit_count(hits: &[SearchHit], suggestions: &[SearchHit]) -> usize {
+    hits.iter()
+        .chain(suggestions.iter())
+        .filter(|hit| {
+            hit.score_breakdown
+                .as_ref()
+                .is_some_and(|breakdown| breakdown.semantic > 0.0)
+        })
+        .count()
+}
+
+fn same_search_file(left: &SearchHit, right: &SearchHit) -> bool {
+    let Some(left_path) = left.file_path.as_deref() else {
+        return false;
+    };
+    let Some(right_path) = right.file_path.as_deref() else {
+        return false;
+    };
+    normalize_path_key(left_path) == normalize_path_key(right_path)
+}
+
+fn hit_matches_identifier(hit: &SearchHit, identifier: &str) -> bool {
+    hit_exactly_matches_identifier(hit, identifier) || {
+        let normalized_identifier = normalize_symbol_query(identifier);
+        !normalized_identifier.is_empty()
+            && leading_symbol_segment(&hit.display_name) == normalized_identifier
+    }
+}
+
+fn hit_exactly_matches_identifier(hit: &SearchHit, identifier: &str) -> bool {
+    let normalized_identifier = normalize_symbol_query(identifier);
+    if normalized_identifier.is_empty() {
+        return false;
+    }
+    normalize_symbol_query(&hit.display_name) == normalized_identifier
+        || terminal_symbol_segment(&hit.display_name) == normalized_identifier
+}
+
+fn repo_text_line_identifiers(hit: &SearchHit) -> Vec<String> {
+    let Some(path) = hit.file_path.as_deref() else {
+        return Vec::new();
+    };
+    let Some(line) = hit.line else {
+        return Vec::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let start = line.saturating_sub(3) as usize;
+    let window = contents
+        .lines()
+        .skip(start)
+        .take(5)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut identifiers = Vec::new();
+    let mut seen = HashSet::new();
+    for token in window.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')) {
+        if token.len() < 3 {
+            continue;
+        }
+        let looks_symbolic = token.chars().any(|ch| ch.is_ascii_uppercase())
+            || token.contains('_')
+            || matches!(
+                token,
+                "auth" | "feed" | "posts" | "storage" | "indexer" | "service" | "trail" | "snippet"
+            );
+        if looks_symbolic && seen.insert(token.to_ascii_lowercase()) {
+            identifiers.push(token.to_string());
+        }
+    }
+    identifiers
+}
+
+fn repo_text_identifiers_at(identifiers: &[Vec<String>], index: usize) -> &[String] {
+    identifiers
+        .get(index)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+fn repo_text_mentions_hit(identifiers: &[String], hit: &SearchHit) -> bool {
+    identifiers
+        .iter()
+        .any(|identifier| hit_matches_identifier(hit, identifier))
+}
+
+fn search_plan_group_confidence(query: &str, hit: &SearchHit) -> String {
+    let exact = search_hit_match_quality(query, hit);
+    if matches!(
+        exact,
+        SearchMatchQualityDto::Exact | SearchMatchQualityDto::NormalizedExact
+    ) {
+        "high".to_string()
+    } else {
+        "medium".to_string()
+    }
+}
+
+fn search_plan_typed_anchor_group(
+    query: &str,
+    hit: &SearchHit,
+    repo_text_hits: &[SearchHit],
+    repo_text_identifiers: &[Vec<String>],
+    used_repo_text: &mut HashSet<usize>,
+    active_path_evidence: &HashMap<NodeId, SearchPlanActivePathEvidence>,
+) -> SearchPlanAnchorGroupDto {
+    let mut supporting_hits = vec![hit.clone()];
+    let mut reasons = vec!["typed indexed symbol selected as an anchor candidate".to_string()];
+    let active_path = search_plan_active_path_for_hit(hit, active_path_evidence);
+    reasons.extend(search_plan_active_path_reasons(hit, active_path));
+
+    for (repo_index, repo_hit) in repo_text_hits.iter().enumerate() {
+        if !same_search_file(hit, repo_hit) {
+            continue;
+        }
+        let identifiers = repo_text_identifiers_at(repo_text_identifiers, repo_index);
+        if identifiers.is_empty() {
+            supporting_hits.push(repo_hit.clone());
+            used_repo_text.insert(repo_index);
+            reasons.push("repo-text hit appears in the same file as the anchor".to_string());
+        } else if repo_text_mentions_hit(identifiers, hit) {
+            supporting_hits.push(repo_hit.clone());
+            used_repo_text.insert(repo_index);
+            reasons.push("repo-text hit names this anchor in the same file".to_string());
+        }
+    }
+
+    SearchPlanAnchorGroupDto {
+        anchor: hit.display_name.clone(),
+        chosen_symbol: Some(hit.clone()),
+        supporting_hits,
+        promotion_status: SearchPlanPromotionStatusDto::TypedAnchor,
+        promotion_method: Some("indexed_symbol".to_string()),
+        caller_count: active_path.caller_count,
+        definition_only: search_plan_definition_only(hit, active_path),
+        no_visible_callers: search_plan_no_visible_callers(hit, active_path),
+        confidence: search_plan_group_confidence(query, hit),
+        reasons,
+    }
+}
+
+fn search_plan_promoted_anchor_group(
+    symbol: SearchHit,
+    repo_hit: &SearchHit,
+    active_path_evidence: &HashMap<NodeId, SearchPlanActivePathEvidence>,
+) -> SearchPlanAnchorGroupDto {
+    let active_path = search_plan_active_path_for_hit(&symbol, active_path_evidence);
+    let mut reasons =
+        vec!["repo-text lead was promoted to an indexed symbol in the same file".to_string()];
+    reasons.extend(search_plan_active_path_reasons(&symbol, active_path));
+    let definition_only = search_plan_definition_only(&symbol, active_path);
+    let no_visible_callers = search_plan_no_visible_callers(&symbol, active_path);
+
+    SearchPlanAnchorGroupDto {
+        anchor: symbol.display_name.clone(),
+        chosen_symbol: Some(symbol.clone()),
+        supporting_hits: vec![symbol, repo_hit.clone()],
+        promotion_status: SearchPlanPromotionStatusDto::Promoted,
+        promotion_method: Some("same_file_exact_identifier".to_string()),
+        caller_count: active_path.caller_count,
+        definition_only,
+        no_visible_callers,
+        confidence: "medium".to_string(),
+        reasons,
+    }
+}
+
+fn search_plan_unbound_repo_text_group(
+    repo_hit: &SearchHit,
+    identifiers: &[String],
+) -> SearchPlanAnchorGroupDto {
+    SearchPlanAnchorGroupDto {
+        anchor: repo_hit.display_name.clone(),
+        chosen_symbol: None,
+        supporting_hits: vec![repo_hit.clone()],
+        promotion_status: if identifiers.is_empty() {
+            SearchPlanPromotionStatusDto::NeedsSourceRead
+        } else {
+            SearchPlanPromotionStatusDto::Ambiguous
+        },
+        promotion_method: None,
+        caller_count: 0,
+        definition_only: false,
+        no_visible_callers: false,
+        confidence: "low".to_string(),
+        reasons: vec![
+            "repo-text lead could not be bound to one indexed symbol before source reads"
+                .to_string(),
+        ],
+    }
+}
+
+fn search_plan_active_path_for_hit(
+    hit: &SearchHit,
+    active_path_evidence: &HashMap<NodeId, SearchPlanActivePathEvidence>,
+) -> SearchPlanActivePathEvidence {
+    active_path_evidence
+        .get(&hit.node_id)
+        .copied()
+        .unwrap_or_default()
+}
+
+fn search_plan_active_path_reasons(
+    hit: &SearchHit,
+    active_path: SearchPlanActivePathEvidence,
+) -> Vec<String> {
+    if !search_plan_callable_hit(hit) {
+        return Vec::new();
+    }
+    if active_path.caller_count > 0 {
+        vec![format!(
+            "call graph shows {} visible production caller(s); rank as active-path evidence",
+            active_path.caller_count
+        )]
+    } else {
+        vec![
+            "call graph shows no visible production callers; treat as definition-only evidence unless a framework/runtime entry path is source-verified"
+                .to_string(),
+        ]
+    }
+}
+
+fn search_plan_definition_only(hit: &SearchHit, active_path: SearchPlanActivePathEvidence) -> bool {
+    search_plan_callable_hit(hit) && active_path.caller_count == 0
+}
+
+fn search_plan_no_visible_callers(
+    hit: &SearchHit,
+    active_path: SearchPlanActivePathEvidence,
+) -> bool {
+    search_plan_callable_hit(hit) && active_path.caller_count == 0
+}
+
+fn search_plan_callable_hit(hit: &SearchHit) -> bool {
+    matches!(
+        hit.kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+    )
+}
+
+fn search_plan_runtime_call_is_speculative(
+    certainty: Option<codestory_contracts::graph::ResolutionCertainty>,
+    confidence: Option<f32>,
+) -> bool {
+    matches!(
+        certainty.or_else(|| {
+            codestory_contracts::graph::ResolutionCertainty::from_confidence(confidence)
+        }),
+        Some(
+            codestory_contracts::graph::ResolutionCertainty::Uncertain
+                | codestory_contracts::graph::ResolutionCertainty::Probable
+        )
+    ) || confidence.is_some_and(|confidence| {
+        confidence < codestory_contracts::graph::ResolutionCertainty::CERTAIN_MIN
+    })
+}
+
+fn search_plan_caller_is_test_or_bench(storage: &Storage, caller_id: GraphNodeId) -> bool {
+    let Ok(Some(caller)) = storage.get_node(caller_id) else {
+        return false;
+    };
+    let Ok(Some(path)) = AppController::file_path_for_node(storage, &caller) else {
+        return false;
+    };
+    search_plan_path_is_test_or_bench(&path)
+}
+
+fn search_plan_path_is_test_or_bench(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    normalized.starts_with("tests/")
+        || normalized.starts_with("test/")
+        || normalized.starts_with("benches/")
+        || normalized.starts_with("bench/")
+        || normalized.starts_with("__tests__/")
+        || normalized.starts_with("__test__/")
+        || normalized.contains("/tests/")
+        || normalized.contains("/test/")
+        || normalized.contains("/__tests__/")
+        || normalized.contains("/__test__/")
+        || normalized.contains("/benches/")
+        || normalized.contains("/bench/")
+        || normalized.ends_with("_test.rs")
+        || normalized.contains(".test.")
+        || normalized.contains(".spec.")
+}
+
+fn search_plan_anchor_groups(
+    query: &str,
+    terms: &SearchPlanTermsDto,
+    indexed_hits: &[SearchHit],
+    repo_text_hits: &[SearchHit],
+    suggestions: &[SearchHit],
+    active_path_evidence: &HashMap<NodeId, SearchPlanActivePathEvidence>,
+) -> Vec<SearchPlanAnchorGroupDto> {
+    let mut groups = Vec::new();
+    let mut grouped_ids = HashSet::new();
+    let mut used_repo_text = HashSet::new();
+    let mut all_symbol_hits = indexed_hits
+        .iter()
+        .chain(suggestions.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    all_symbol_hits
+        .sort_by(|left, right| compare_search_hits_with_project_root(None, query, left, right));
+    let repo_text_identifiers = repo_text_hits
+        .iter()
+        .map(repo_text_line_identifiers)
+        .collect::<Vec<_>>();
+
+    for hit in all_symbol_hits.iter().filter(|hit| hit.resolvable).take(6) {
+        if !grouped_ids.insert(hit.node_id.clone()) {
+            continue;
+        }
+        groups.push(search_plan_typed_anchor_group(
+            query,
+            hit,
+            repo_text_hits,
+            &repo_text_identifiers,
+            &mut used_repo_text,
+            active_path_evidence,
+        ));
+    }
+
+    for (repo_index, repo_hit) in repo_text_hits.iter().enumerate() {
+        if used_repo_text.contains(&repo_index) {
+            continue;
+        }
+        let identifiers = repo_text_identifiers_at(&repo_text_identifiers, repo_index);
+        let promoted = identifiers.iter().find_map(|identifier| {
+            all_symbol_hits
+                .iter()
+                .find(|hit| {
+                    same_search_file(hit, repo_hit)
+                        && hit_exactly_matches_identifier(hit, identifier)
+                })
+                .cloned()
+        });
+        if let Some(symbol) = promoted {
+            if !grouped_ids.insert(symbol.node_id.clone()) {
+                continue;
+            }
+            groups.push(search_plan_promoted_anchor_group(
+                symbol,
+                repo_hit,
+                active_path_evidence,
+            ));
+        } else {
+            groups.push(search_plan_unbound_repo_text_group(repo_hit, identifiers));
+        }
+    }
+
+    let term_set = terms
+        .extracted
+        .iter()
+        .map(|term| term.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    groups.sort_by(|left, right| {
+        search_plan_group_score(right, &term_set)
+            .cmp(&search_plan_group_score(left, &term_set))
+            .then_with(|| left.anchor.cmp(&right.anchor))
+    });
+    groups.truncate(8);
+    groups
+}
+
+fn search_plan_group_score(group: &SearchPlanAnchorGroupDto, terms: &HashSet<String>) -> u32 {
+    let mut score = 0;
+    if group.chosen_symbol.is_some() {
+        score += 100;
+    }
+    if group.caller_count > 0 {
+        score += 90 + group.caller_count.min(5) * 6;
+    }
+    score += match group.promotion_status {
+        SearchPlanPromotionStatusDto::TypedAnchor => 60,
+        SearchPlanPromotionStatusDto::Promoted => 45,
+        SearchPlanPromotionStatusDto::Ambiguous => 10,
+        SearchPlanPromotionStatusDto::NeedsSourceRead => 0,
+    };
+    if group
+        .supporting_hits
+        .iter()
+        .any(|hit| hit.origin == SearchHitOrigin::TextMatch)
+    {
+        score += 12;
+    }
+    if group
+        .promotion_method
+        .as_deref()
+        .is_some_and(|method| method == "same_file_exact_identifier")
+        || group
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("names this anchor"))
+    {
+        score += 35;
+    }
+    let text = group
+        .chosen_symbol
+        .as_ref()
+        .map(|hit| {
+            format!(
+                "{} {}",
+                hit.display_name,
+                hit.file_path.as_deref().unwrap_or_default()
+            )
+        })
+        .unwrap_or_else(|| group.anchor.clone())
+        .to_ascii_lowercase();
+    score
+        + terms
+            .iter()
+            .filter(|term| text.contains(term.as_str()))
+            .count() as u32
+            * 8
+}
+
+fn search_plan_rejected_hits(
+    anchor_groups: &[SearchPlanAnchorGroupDto],
+    suggestions: &[SearchHit],
+    indexed_hits: &[SearchHit],
+) -> Vec<SearchPlanRejectedHitDto> {
+    let chosen = anchor_groups
+        .iter()
+        .filter_map(|group| group.chosen_symbol.as_ref().map(|hit| hit.node_id.clone()))
+        .collect::<HashSet<_>>();
+    suggestions
+        .iter()
+        .chain(indexed_hits.iter())
+        .filter(|hit| !chosen.contains(&hit.node_id))
+        .take(4)
+        .map(|hit| SearchPlanRejectedHitDto {
+            display_name: hit.display_name.clone(),
+            reason: "not selected after anchor grouping and evidence ranking".to_string(),
+            origin: hit.origin,
+            file_path: hit.file_path.clone(),
+            line: hit.line,
+        })
+        .collect()
+}
+
+fn search_plan_bridge_request(from: &NodeId, to: &NodeId) -> TrailConfigDto {
+    TrailConfigDto {
+        root_id: from.clone(),
+        mode: codestory_contracts::api::TrailMode::ToTargetSymbol,
+        target_id: Some(to.clone()),
+        depth: 0,
+        direction: codestory_contracts::api::TrailDirection::Outgoing,
+        caller_scope: codestory_contracts::api::TrailCallerScope::ProductionOnly,
+        edge_filter: Vec::new(),
+        show_utility_calls: false,
+        hide_speculative: true,
+        story: false,
+        node_filter: Vec::new(),
+        max_nodes: 80,
+        layout_direction: codestory_contracts::api::LayoutDirection::Horizontal,
+    }
+}
+
+fn graph_response_has_bridge(
+    graph: &codestory_contracts::api::GraphResponse,
+    from: &NodeId,
+    to: &NodeId,
+) -> bool {
+    if from == to {
+        return true;
+    }
+    graph.nodes.iter().any(|node| node.id == *from)
+        && graph.nodes.iter().any(|node| node.id == *to)
+        && !graph.edges.is_empty()
+}
+
+fn shared_file_bridge(from: &SearchHit, to: &SearchHit) -> bool {
+    same_search_file(from, to)
+}
+
+fn search_plan_next_actions(groups: &[SearchPlanAnchorGroupDto]) -> Vec<SearchPlanNextActionDto> {
+    groups
+        .iter()
+        .filter_map(|group| group.chosen_symbol.as_ref())
+        .take(4)
+        .flat_map(|hit| {
+            [
+                SearchPlanNextActionDto {
+                    action: "symbol".to_string(),
+                    node_id: hit.node_id.clone(),
+                    options: Vec::new(),
+                },
+                SearchPlanNextActionDto {
+                    action: "trail".to_string(),
+                    node_id: hit.node_id.clone(),
+                    options: vec!["story".to_string(), "hide_speculative".to_string()],
+                },
+                SearchPlanNextActionDto {
+                    action: "snippet".to_string(),
+                    node_id: hit.node_id.clone(),
+                    options: vec!["function_body".to_string(), "context=40".to_string()],
+                },
+            ]
+        })
+        .collect()
+}
+
+fn search_plan_next_commands(
+    project_root: &Path,
+    actions: &[SearchPlanNextActionDto],
+) -> Vec<String> {
+    let project = quote_search_plan_command_value(&project_root.to_string_lossy());
+    actions
+        .iter()
+        .filter_map(|action| match action.action.as_str() {
+            "symbol" => Some(format!(
+                "codestory-cli symbol --project {project} --id {}",
+                action.node_id.0
+            )),
+            "trail" => Some(format!(
+                "codestory-cli trail --project {project} --id {} --story --hide-speculative",
+                action.node_id.0
+            )),
+            "snippet" => Some(format!(
+                "codestory-cli snippet --project {project} --id {} --function-body --context 40",
+                action.node_id.0
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn quote_search_plan_command_value(value: &str) -> String {
+    if value.bytes().any(|byte| {
+        byte.is_ascii_whitespace()
+            || matches!(byte, b'"' | b'\'' | b'`' | b'&' | b'|' | b'<' | b'>')
+    }) {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn search_plan_source_truth_checks(groups: &[SearchPlanAnchorGroupDto]) -> Vec<String> {
+    let mut checks = SEARCH_PLAN_BASE_SOURCE_TRUTH_CHECKS
+        .iter()
+        .map(|check| (*check).to_string())
+        .collect::<Vec<_>>();
+    if search_plan_has_unbound_repo_text_group(groups) {
+        checks.push(SEARCH_PLAN_REPO_TEXT_SOURCE_TRUTH_CHECK.to_string());
+    }
+    checks
+}
+
+fn search_plan_has_unbound_repo_text_group(groups: &[SearchPlanAnchorGroupDto]) -> bool {
+    groups.iter().any(|group| {
+        matches!(
+            group.promotion_status,
+            SearchPlanPromotionStatusDto::NeedsSourceRead | SearchPlanPromotionStatusDto::Ambiguous
+        )
+    })
 }
 
 #[derive(Clone)]
@@ -1137,12 +2280,36 @@ fn parse_db_id(raw: &str, field_name: &str) -> Result<i64, ApiError> {
 }
 
 fn edge_certainty_label(
+    kind: codestory_contracts::graph::EdgeKind,
     certainty: Option<codestory_contracts::graph::ResolutionCertainty>,
     confidence: Option<f32>,
 ) -> Option<String> {
     certainty
         .or_else(|| codestory_contracts::graph::ResolutionCertainty::from_confidence(confidence))
+        .or_else(|| structural_edge_default_certainty(kind))
         .map(|value| value.as_str().to_string())
+}
+
+fn structural_edge_default_certainty(
+    kind: codestory_contracts::graph::EdgeKind,
+) -> Option<codestory_contracts::graph::ResolutionCertainty> {
+    use codestory_contracts::graph::{EdgeKind, ResolutionCertainty};
+
+    match kind {
+        EdgeKind::MEMBER
+        | EdgeKind::INHERITANCE
+        | EdgeKind::OVERRIDE
+        | EdgeKind::TYPE_ARGUMENT
+        | EdgeKind::TEMPLATE_SPECIALIZATION
+        | EdgeKind::INCLUDE
+        | EdgeKind::IMPORT => Some(ResolutionCertainty::Certain),
+        EdgeKind::CALL
+        | EdgeKind::USAGE
+        | EdgeKind::TYPE_USAGE
+        | EdgeKind::MACRO_USAGE
+        | EdgeKind::ANNOTATION_USAGE
+        | EdgeKind::UNKNOWN => None,
+    }
 }
 
 fn is_structural_kind(kind: codestory_contracts::graph::NodeKind) -> bool {
@@ -1214,7 +2381,7 @@ fn graph_edge_dto(
         kind: EdgeKind::from(edge.kind),
         confidence: edge.confidence,
         certainty: if flags.include_edge_certainty {
-            edge_certainty_label(edge.certainty, edge.confidence)
+            edge_certainty_label(edge.kind, edge.certainty, edge.confidence)
         } else {
             None
         },
@@ -1653,6 +2820,8 @@ fn path_role_from_key(path: &str) -> IndexedFileRoleDto {
     if marked.contains("/tests/")
         || marked.contains("/test/")
         || marked.contains("/spec/")
+        || marked.contains("/__tests__/")
+        || marked.contains("/__test__/")
         || file_name.contains(".test.")
         || file_name.contains(".spec.")
         || file_name.ends_with("_test.rs")
@@ -4524,6 +5693,399 @@ impl AppController {
         result
     }
 
+    fn execute_search_plan_subqueries(
+        &self,
+        storage: &Storage,
+        subqueries: &[SearchPlanSubqueryDto],
+        filters: &[SearchIntentFilter],
+        indexed_hit_ids: &HashSet<NodeId>,
+        limit_per_source: usize,
+        hybrid_weights: Option<AgentHybridWeightsDto>,
+        hybrid_limits: Option<SearchHybridLimitsDto>,
+        semantic_ready: bool,
+    ) -> Result<SearchPlanExecutedEvidence, ApiError> {
+        let mut evidence = SearchPlanExecutedEvidence::default();
+        let project_root = self.require_project_root().ok();
+        let mut seen_repo_text_ids = indexed_hit_ids.clone();
+
+        for subquery in subqueries {
+            let uses_indexed = subquery.channels.iter().any(|channel| {
+                matches!(
+                    channel,
+                    SearchPlanChannelDto::TypedSymbol
+                        | SearchPlanChannelDto::Lexical
+                        | SearchPlanChannelDto::Semantic
+                )
+            });
+            if uses_indexed {
+                let (mut scored_hits, _) = self.search_hybrid_scored_inner(
+                    SearchRequest {
+                        query: subquery.query.clone(),
+                        repo_text: SearchRepoTextMode::Off,
+                        limit_per_source: limit_per_source as u32,
+                        hybrid_weights: hybrid_weights.clone(),
+                        hybrid_limits: hybrid_limits.clone(),
+                    },
+                    None,
+                    limit_per_source,
+                    hybrid_weights.clone(),
+                )?;
+                let mut suggestions = did_you_mean_suggestions(&scored_hits);
+                let mut hits = scored_hits
+                    .drain(..)
+                    .map(|scored| scored.hit)
+                    .collect::<Vec<_>>();
+                if should_expand_symbol_query(&subquery.query, hits.len()) {
+                    let expanded_hits = self.expanded_symbol_hits(storage, &subquery.query)?;
+                    merge_search_hits_by_node_id(&mut hits, expanded_hits);
+                }
+                apply_search_intent_filters(&mut hits, filters);
+                apply_search_intent_filters(&mut suggestions, filters);
+                hits.sort_by(|left, right| {
+                    compare_search_hits_with_project_root(
+                        project_root.as_deref(),
+                        &subquery.query,
+                        left,
+                        right,
+                    )
+                });
+                suggestions.sort_by(|left, right| {
+                    compare_search_hits_with_project_root(
+                        project_root.as_deref(),
+                        &subquery.query,
+                        left,
+                        right,
+                    )
+                });
+                dedupe_inexact_search_hits_by_display_key(&subquery.query, &mut hits);
+                hits.truncate(limit_per_source);
+                suggestions.truncate(limit_per_source);
+                annotate_search_hit_match_quality(&subquery.query, &mut hits);
+                annotate_search_hit_match_quality(&subquery.query, &mut suggestions);
+                evidence
+                    .candidate_windows
+                    .extend(search_plan_symbol_windows(
+                        subquery,
+                        &hits,
+                        &suggestions,
+                        limit_per_source as u32,
+                        semantic_ready,
+                    ));
+                merge_search_hits_by_node_id(&mut evidence.indexed_symbol_hits, hits);
+                merge_search_hits_by_node_id(&mut evidence.suggestions, suggestions);
+            }
+
+            if subquery.channels.contains(&SearchPlanChannelDto::RepoText) {
+                let scan = Self::collect_repo_text_hits(
+                    storage,
+                    project_root.as_deref(),
+                    &subquery.query,
+                    limit_per_source,
+                    &seen_repo_text_ids,
+                )?;
+                let mut hits = scan.hits;
+                apply_search_intent_filters(&mut hits, filters);
+                annotate_search_hit_match_quality(&subquery.query, &mut hits);
+                for hit in &hits {
+                    seen_repo_text_ids.insert(hit.node_id.clone());
+                }
+                evidence
+                    .candidate_windows
+                    .push(SearchPlanCandidateWindowDto {
+                        channel: SearchPlanChannelDto::RepoText,
+                        subquery: subquery.query.clone(),
+                        limit: limit_per_source as u32,
+                        returned_count: clamp_usize_to_u32(hits.len()),
+                        truncated: hits.len() >= limit_per_source,
+                        score_reasons: vec![
+                            "executed repo-text retrieval for this planned subquery; hits require promotion or source reads"
+                                .to_string(),
+                        ],
+                    });
+                merge_search_hits_by_node_id(&mut evidence.repo_text_hits, hits);
+            }
+        }
+
+        Ok(evidence)
+    }
+
+    fn search_plan_active_path_evidence<'a, I>(
+        &self,
+        storage: &Storage,
+        hits: I,
+    ) -> HashMap<NodeId, SearchPlanActivePathEvidence>
+    where
+        I: IntoIterator<Item = &'a SearchHit>,
+    {
+        let mut evidence = HashMap::new();
+        for hit in hits {
+            if evidence.contains_key(&hit.node_id) {
+                continue;
+            }
+            if let Some(active_path) = self.search_plan_active_path_evidence_for_hit(storage, hit) {
+                evidence.insert(hit.node_id.clone(), active_path);
+            }
+        }
+        evidence
+    }
+
+    fn search_plan_active_path_evidence_for_hit(
+        &self,
+        storage: &Storage,
+        hit: &SearchHit,
+    ) -> Option<SearchPlanActivePathEvidence> {
+        if !search_plan_callable_hit(hit) {
+            return None;
+        }
+        let node_id = hit.node_id.to_core().ok()?;
+        let edges = storage.get_edges_for_node_id(node_id).ok()?;
+        let mut callers = HashSet::new();
+        for edge in edges {
+            if edge.kind != codestory_contracts::graph::EdgeKind::CALL {
+                continue;
+            }
+            if search_plan_runtime_call_is_speculative(edge.certainty, edge.confidence) {
+                continue;
+            }
+            let (source, target) = edge.effective_endpoints();
+            if target != node_id || source == node_id {
+                continue;
+            }
+            if search_plan_caller_is_test_or_bench(storage, source) {
+                continue;
+            }
+            callers.insert(source);
+        }
+
+        Some(SearchPlanActivePathEvidence {
+            caller_count: callers.len().min(u32::MAX as usize) as u32,
+        })
+    }
+
+    fn build_search_plan(
+        &self,
+        storage: &Storage,
+        original_query: &str,
+        effective_query: &str,
+        query_assessment: &SearchQueryAssessmentDto,
+        indexed_symbol_hits: &[SearchHit],
+        repo_text_hits: &[SearchHit],
+        suggestions: &[SearchHit],
+        retrieval: &RetrievalStateDto,
+        limit_per_source: u32,
+        filters: &[SearchIntentFilter],
+        indexed_hit_ids: &HashSet<NodeId>,
+        hybrid_weights: Option<AgentHybridWeightsDto>,
+        hybrid_limits: Option<SearchHybridLimitsDto>,
+    ) -> Result<Option<SearchPlanBuild>, ApiError> {
+        let intents = architecture_query_intents(effective_query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        let eligible = search_plan_eligible(
+            effective_query,
+            query_assessment.exact_symbol_hit_count,
+            &intents,
+        );
+        if !eligible {
+            return Ok(None);
+        }
+        let terms = search_plan_terms(effective_query);
+        let subqueries = search_plan_subqueries(effective_query, &terms, &intents);
+        let mut executed = self.execute_search_plan_subqueries(
+            storage,
+            &subqueries,
+            filters,
+            indexed_hit_ids,
+            limit_per_source as usize,
+            hybrid_weights,
+            hybrid_limits,
+            retrieval.semantic_ready,
+        )?;
+        let mut plan_indexed_hits = indexed_symbol_hits.to_vec();
+        merge_search_hits_by_node_id(&mut plan_indexed_hits, executed.indexed_symbol_hits.clone());
+        let mut plan_repo_text_hits = repo_text_hits.to_vec();
+        merge_search_hits_by_node_id(&mut plan_repo_text_hits, executed.repo_text_hits.clone());
+        let mut plan_suggestions = suggestions.to_vec();
+        merge_search_hits_by_node_id(&mut plan_suggestions, executed.suggestions.clone());
+        let active_path_evidence = self.search_plan_active_path_evidence(
+            storage,
+            plan_indexed_hits.iter().chain(plan_suggestions.iter()),
+        );
+        let anchor_groups = search_plan_anchor_groups(
+            effective_query,
+            &terms,
+            &plan_indexed_hits,
+            &plan_repo_text_hits,
+            &plan_suggestions,
+            &active_path_evidence,
+        );
+        let mut bridges = self.search_plan_bridges(&anchor_groups);
+        let original_bridge_count = bridges.len();
+        bridges.retain(|bridge| !is_low_confidence_search_plan_bridge(bridge));
+        let suppressed_low_confidence_bridges = original_bridge_count.saturating_sub(bridges.len());
+        if !bridges.is_empty() {
+            executed
+                .candidate_windows
+                .push(SearchPlanCandidateWindowDto {
+                    channel: SearchPlanChannelDto::Bridge,
+                    subquery: "selected_anchor_bridges".to_string(),
+                    limit: anchor_groups.len().saturating_sub(1).min(u32::MAX as usize) as u32,
+                    returned_count: clamp_usize_to_u32(bridges.len()),
+                    truncated: false,
+                    score_reasons: vec![
+                        "bridge evidence expands only after anchor grouping".to_string(),
+                    ],
+                });
+        }
+        let mut source_truth_checks = search_plan_source_truth_checks(&anchor_groups);
+        if suppressed_low_confidence_bridges > 0 {
+            source_truth_checks.push(format!(
+                "Suppressed {suppressed_low_confidence_bridges} low-confidence bridge candidate(s); treat missing bridge rows as a source-truth prompt, not proof of isolation."
+            ));
+        }
+        let next_actions = search_plan_next_actions(&anchor_groups);
+        let next_commands = search_plan_next_commands(
+            self.require_project_root()
+                .ok()
+                .as_deref()
+                .unwrap_or(Path::new(".")),
+            &next_actions,
+        );
+        let plan = SearchPlanDto {
+            original_query: original_query.to_string(),
+            eligible,
+            intents,
+            terms,
+            subqueries,
+            candidate_windows: executed.candidate_windows,
+            anchor_groups: anchor_groups.clone(),
+            bridges,
+            rejected_hits: search_plan_rejected_hits(
+                &anchor_groups,
+                &plan_suggestions,
+                &plan_indexed_hits,
+            ),
+            next_actions,
+            next_commands,
+            source_truth_checks,
+        };
+        Ok(Some(SearchPlanBuild {
+            plan,
+            indexed_symbol_hits: executed.indexed_symbol_hits,
+            repo_text_hits: executed.repo_text_hits,
+            suggestions: executed.suggestions,
+        }))
+    }
+
+    fn search_plan_bridges(&self, groups: &[SearchPlanAnchorGroupDto]) -> Vec<SearchPlanBridgeDto> {
+        let selected = groups
+            .iter()
+            .filter_map(|group| group.chosen_symbol.as_ref().map(|hit| (group, hit)))
+            .take(5)
+            .collect::<Vec<_>>();
+        selected
+            .windows(2)
+            .map(|pair| {
+                let (from_group, from_hit) = pair[0];
+                let (to_group, to_hit) = pair[1];
+                let mut notes = Vec::new();
+                if from_hit.node_id == to_hit.node_id {
+                    return SearchPlanBridgeDto {
+                        from_anchor: from_group.anchor.clone(),
+                        to_anchor: to_group.anchor.clone(),
+                        status: "supported".to_string(),
+                        confidence: "high".to_string(),
+                        evidence_kind: "same_anchor".to_string(),
+                        direction: Some("self".to_string()),
+                        node_count: 1,
+                        edge_count: 0,
+                        truncated: false,
+                        notes,
+                    };
+                }
+                let forward = self.graph_trail(search_plan_bridge_request(
+                    &from_hit.node_id,
+                    &to_hit.node_id,
+                ));
+                if let Ok(graph) = forward
+                    && graph_response_has_bridge(&graph, &from_hit.node_id, &to_hit.node_id)
+                {
+                    return SearchPlanBridgeDto {
+                        from_anchor: from_group.anchor.clone(),
+                        to_anchor: to_group.anchor.clone(),
+                        status: "supported".to_string(),
+                        confidence: if graph.truncated { "medium" } else { "high" }.to_string(),
+                        evidence_kind: "graph_path".to_string(),
+                        direction: Some("forward".to_string()),
+                        node_count: clamp_usize_to_u32(graph.nodes.len()),
+                        edge_count: clamp_usize_to_u32(graph.edges.len()),
+                        truncated: graph.truncated,
+                        notes,
+                    };
+                }
+                let reverse = self.graph_trail(search_plan_bridge_request(
+                    &to_hit.node_id,
+                    &from_hit.node_id,
+                ));
+                if let Ok(graph) = reverse
+                    && graph_response_has_bridge(&graph, &to_hit.node_id, &from_hit.node_id)
+                {
+                    notes.push(
+                        "reverse graph path found; direction is partial evidence for the original flow"
+                            .to_string(),
+                    );
+                    return SearchPlanBridgeDto {
+                        from_anchor: from_group.anchor.clone(),
+                        to_anchor: to_group.anchor.clone(),
+                        status: "partial".to_string(),
+                        confidence: if graph.truncated { "low" } else { "medium" }.to_string(),
+                        evidence_kind: "graph_path".to_string(),
+                        direction: Some("reverse".to_string()),
+                        node_count: clamp_usize_to_u32(graph.nodes.len()),
+                        edge_count: clamp_usize_to_u32(graph.edges.len()),
+                        truncated: graph.truncated,
+                        notes,
+                    };
+                }
+                if shared_file_bridge(from_hit, to_hit) {
+                    notes.push(
+                        "anchors share a source file; this is low-confidence bridge evidence only"
+                            .to_string(),
+                    );
+                    return SearchPlanBridgeDto {
+                        from_anchor: from_group.anchor.clone(),
+                        to_anchor: to_group.anchor.clone(),
+                        status: "partial".to_string(),
+                        confidence: "low".to_string(),
+                        evidence_kind: "shared_file".to_string(),
+                        direction: None,
+                        node_count: 2,
+                        edge_count: 0,
+                        truncated: false,
+                        notes,
+                    };
+                }
+                notes.push(
+                    "no graph path or shared-file bridge found inside the bounded evidence budget"
+                        .to_string(),
+                );
+                SearchPlanBridgeDto {
+                    from_anchor: from_group.anchor.clone(),
+                    to_anchor: to_group.anchor.clone(),
+                    status: "unsupported".to_string(),
+                    confidence: "low".to_string(),
+                    evidence_kind: "isolated_anchors".to_string(),
+                    direction: None,
+                    node_count: 2,
+                    edge_count: 0,
+                    truncated: false,
+                    notes,
+                }
+            })
+            .collect()
+    }
+
     pub fn search(&self, req: SearchRequest) -> Result<Vec<SearchHit>, ApiError> {
         Ok(self.search_results(req)?.hits)
     }
@@ -4621,12 +6183,6 @@ impl AppController {
         } else {
             (Vec::new(), None)
         };
-        annotate_search_hit_match_quality(&query, &mut suggestions);
-        annotate_search_hit_match_quality(&query, &mut indexed_symbol_hits);
-        annotate_search_hit_match_quality(&query, &mut repo_text_hits);
-        let mut hits = Vec::with_capacity(indexed_symbol_hits.len() + repo_text_hits.len());
-        hits.extend(indexed_symbol_hits.iter().cloned());
-        hits.extend(repo_text_hits.iter().cloned());
         let freshness = self.index_freshness().ok();
         let query_assessment = search_query_assessment(
             &query,
@@ -4636,6 +6192,78 @@ impl AppController {
             repo_text_enabled,
             repo_text_fallback_reason,
         );
+        let mut search_plan_anchor_rank = HashMap::<NodeId, usize>::new();
+        let search_plan = if used_repo_explanation_overview {
+            None
+        } else {
+            match self.build_search_plan(
+                &storage,
+                &original_query,
+                &query,
+                &query_assessment,
+                &indexed_symbol_hits,
+                &repo_text_hits,
+                &suggestions,
+                &retrieval,
+                limit_per_source as u32,
+                &intent_query.filters,
+                &indexed_hit_ids,
+                req.hybrid_weights.clone(),
+                req.hybrid_limits.clone(),
+            )? {
+                Some(plan_build) => {
+                    for (rank, group) in plan_build.plan.anchor_groups.iter().enumerate() {
+                        if let Some(symbol) = &group.chosen_symbol {
+                            search_plan_anchor_rank
+                                .entry(symbol.node_id.clone())
+                                .or_insert(rank);
+                            merge_search_hits_by_node_id(
+                                &mut indexed_symbol_hits,
+                                vec![symbol.clone()],
+                            );
+                        }
+                    }
+                    merge_search_hits_by_node_id(
+                        &mut indexed_symbol_hits,
+                        plan_build.indexed_symbol_hits,
+                    );
+                    merge_search_hits_by_node_id(&mut repo_text_hits, plan_build.repo_text_hits);
+                    merge_search_hits_by_node_id(&mut suggestions, plan_build.suggestions);
+                    Some(plan_build.plan)
+                }
+                None => None,
+            }
+        };
+        indexed_symbol_hits.sort_by(|left, right| {
+            let anchor_order = match (
+                search_plan_anchor_rank.get(&left.node_id),
+                search_plan_anchor_rank.get(&right.node_id),
+            ) {
+                (Some(left_rank), Some(right_rank)) => left_rank.cmp(right_rank),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            };
+            anchor_order.then_with(|| {
+                compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
+            })
+        });
+        dedupe_inexact_search_hits_by_display_key(&query, &mut indexed_symbol_hits);
+        indexed_symbol_hits.truncate(limit_per_source);
+        repo_text_hits.sort_by(|left, right| {
+            compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
+        });
+        repo_text_hits.truncate(limit_per_source);
+        suggestions.sort_by(|left, right| {
+            compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
+        });
+        suggestions.truncate(limit_per_source);
+        annotate_search_hit_match_quality(&query, &mut suggestions);
+        annotate_search_hit_match_quality(&query, &mut indexed_symbol_hits);
+        annotate_search_hit_match_quality(&query, &mut repo_text_hits);
+        let mut hits = Vec::with_capacity(indexed_symbol_hits.len() + repo_text_hits.len());
+        hits.extend(indexed_symbol_hits.iter().cloned());
+        hits.extend(repo_text_hits.iter().cloned());
 
         Ok(SearchResultsDto {
             query: original_query,
@@ -4645,6 +6273,7 @@ impl AppController {
             repo_text_mode,
             repo_text_enabled,
             query_assessment: Some(query_assessment),
+            search_plan,
             repo_text_stats,
             suggestions,
             indexed_symbol_hits,
@@ -4915,30 +6544,9 @@ impl AppController {
                         .get(&node_id)
                         .cloned()
                         .unwrap_or_else(|| node_id.0.to_string());
-                    let (reason, confidence) = edge
-                        .map(|edge| {
-                            (
-                                format!(
-                                    "dependent reaches changed code via {} edge to {}",
-                                    affected_edge_kind_label(edge.kind),
-                                    target_label
-                                ),
-                                affected_edge_confidence(edge),
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            (
-                                format!("dependent reaches changed code through graph walk to {target_label}"),
-                                "graph".to_string(),
-                            )
-                        });
                     evidence.insert(
                         *dependent,
-                        AffectedGraphEvidence {
-                            distance: next_distance,
-                            reason,
-                            confidence,
-                        },
+                        affected_dependent_evidence(next_distance, edge, target_label),
                     );
                     queue.push_back((*dependent, next_distance));
                 }
@@ -5966,6 +7574,10 @@ impl AppController {
     }
 }
 
+fn is_low_confidence_search_plan_bridge(bridge: &SearchPlanBridgeDto) -> bool {
+    bridge.confidence.eq_ignore_ascii_case("low")
+}
+
 #[derive(Debug, Clone)]
 struct IndexingRunSummary {
     phase_timings: IndexingPhaseTimings,
@@ -6375,7 +7987,7 @@ mod tests {
     use super::*;
     use codestory_contracts::graph::{
         Edge, EdgeId, EdgeKind, Node, NodeId as CoreNodeId, NodeKind, Occurrence, OccurrenceKind,
-        SourceLocation,
+        ResolutionCertainty, SourceLocation,
     };
     use crossbeam_channel::unbounded;
     use std::fs;
@@ -6452,6 +8064,51 @@ mod tests {
             ],
             _lock: lock,
         }
+    }
+
+    #[test]
+    fn graph_edge_dto_defaults_structural_member_certainty() {
+        let flags = AppGraphFeatureFlags {
+            include_edge_certainty: true,
+            include_callsite_identity: true,
+            include_candidate_targets: true,
+        };
+
+        let member = graph_edge_dto(
+            Edge {
+                id: EdgeId(1),
+                source: CoreNodeId(10),
+                target: CoreNodeId(20),
+                kind: EdgeKind::MEMBER,
+                ..Default::default()
+            },
+            flags,
+        );
+        let unresolved_call = graph_edge_dto(
+            Edge {
+                id: EdgeId(2),
+                source: CoreNodeId(10),
+                target: CoreNodeId(30),
+                kind: EdgeKind::CALL,
+                ..Default::default()
+            },
+            flags,
+        );
+        let explicit_probable = graph_edge_dto(
+            Edge {
+                id: EdgeId(3),
+                source: CoreNodeId(10),
+                target: CoreNodeId(40),
+                kind: EdgeKind::MEMBER,
+                certainty: Some(ResolutionCertainty::Probable),
+                ..Default::default()
+            },
+            flags,
+        );
+
+        assert_eq!(member.certainty.as_deref(), Some("certain"));
+        assert_eq!(unresolved_call.certainty, None);
+        assert_eq!(explicit_probable.certainty.as_deref(), Some("probable"));
     }
 
     #[test]
@@ -7111,6 +8768,370 @@ pub fn exact_symbol_anchor() {{}}
     }
 
     #[test]
+    fn broad_architecture_search_plan_terms_and_subqueries_are_bounded() {
+        let query = "Explain how CodeStory's full-index path flows through CLI/runtime/workspace/indexer/store and how that supports later search, trail, and snippet commands.";
+        let terms = search_plan_terms(query);
+        for expected in [
+            "full-index",
+            "full",
+            "index",
+            "cli",
+            "runtime",
+            "workspace",
+            "indexer",
+            "store",
+            "search",
+            "trail",
+            "snippet",
+        ] {
+            assert!(
+                terms
+                    .extracted
+                    .iter()
+                    .any(|term| term.eq_ignore_ascii_case(expected)),
+                "expected `{expected}` in extracted terms: {:?}",
+                terms.extracted
+            );
+        }
+        assert!(
+            terms
+                .dropped
+                .iter()
+                .any(|term| term.term.eq_ignore_ascii_case("explain")),
+            "natural-language filler should be visible as dropped terms: {:?}",
+            terms.dropped
+        );
+        let intents = architecture_query_intents(query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(!intents.is_empty(), "query should have architecture intent");
+        let subqueries = search_plan_subqueries(query, &terms, &intents);
+        assert!(
+            (3..=8).contains(&subqueries.len()),
+            "subqueries should be bounded: {subqueries:#?}"
+        );
+        assert!(
+            subqueries.iter().any(|subquery| subquery
+                .channels
+                .contains(&SearchPlanChannelDto::TypedSymbol)),
+            "subqueries should cover typed symbol discovery: {subqueries:#?}"
+        );
+        assert!(
+            subqueries
+                .iter()
+                .any(|subquery| subquery.channels.contains(&SearchPlanChannelDto::RepoText)),
+            "subqueries should cover repo text discovery: {subqueries:#?}"
+        );
+    }
+
+    #[test]
+    fn multi_anchor_agent_question_prioritizes_named_anchor_subquery_terms() {
+        let query = "Explain how ProjectAlpha turns configuration into processing work, then how processed data is accessed by the application. Anchor the answer around ConfigGroup, WorkerRunner, and DataAccess.";
+        let intents = architecture_query_intents(query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            intents.iter().any(|intent| intent == "orchestration"),
+            "explain-how architecture question should trigger a search plan: {intents:#?}"
+        );
+        let terms = search_plan_terms(query);
+        for expected in ["ConfigGroup", "WorkerRunner", "DataAccess"] {
+            assert!(
+                terms.extracted.iter().any(|term| term == expected),
+                "expected named anchor `{expected}` in extracted terms: {:?}",
+                terms.extracted
+            );
+        }
+
+        let subqueries = search_plan_subqueries(query, &terms, &intents);
+        let typed_anchor_terms = subqueries
+            .iter()
+            .find(|subquery| subquery.role == "typed_anchor_terms")
+            .map(|subquery| subquery.query.as_str())
+            .expect("typed anchor subquery");
+        for expected in ["ConfigGroup", "WorkerRunner", "DataAccess"] {
+            assert!(
+                subqueries
+                    .iter()
+                    .any(|subquery| subquery.role == "named_anchor" && subquery.query == expected),
+                "expected named-anchor subquery for `{expected}`: {subqueries:#?}"
+            );
+            assert!(
+                typed_anchor_terms.contains(expected),
+                "typed anchor subquery should prioritize named anchors; got `{typed_anchor_terms}`"
+            );
+        }
+    }
+
+    #[test]
+    fn public_surface_question_keeps_short_pascal_case_named_anchor() {
+        let query = "Explain how public writing/social surfaces connect to Payload collections, comment auth, and the elsewhere feed. Anchor the answer around Posts, getElsewhereFeed, and getCommentAuth.";
+        let intents = architecture_query_intents(query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(!intents.is_empty(), "query should have architecture intent");
+
+        let terms = search_plan_terms(query);
+        let subqueries = search_plan_subqueries(query, &terms, &intents);
+        for expected in ["Posts", "getElsewhereFeed", "getCommentAuth"] {
+            assert!(
+                subqueries
+                    .iter()
+                    .any(|subquery| subquery.role == "named_anchor" && subquery.query == expected),
+                "expected named-anchor subquery for `{expected}`: {subqueries:#?}"
+            );
+        }
+    }
+
+    fn search_plan_test_hit(
+        id: &str,
+        display_name: &str,
+        file_path: &Path,
+        line: u32,
+        origin: SearchHitOrigin,
+        resolvable: bool,
+    ) -> SearchHit {
+        SearchHit {
+            node_id: NodeId(id.to_string()),
+            display_name: display_name.to_string(),
+            kind: codestory_contracts::api::NodeKind::METHOD,
+            file_path: Some(file_path.to_string_lossy().to_string()),
+            line: Some(line),
+            score: 1.0,
+            origin,
+            match_quality: None,
+            resolvable,
+            score_breakdown: None,
+        }
+    }
+
+    #[test]
+    fn search_plan_ranks_active_callers_above_definition_only_anchors() {
+        let temp = tempdir().expect("create temp dir");
+        let source_path = temp.path().join("src").join("feed.rs");
+        fs::create_dir_all(source_path.parent().expect("src parent")).expect("create src");
+        fs::write(
+            &source_path,
+            "pub fn getLatestSocialEntries() {}\npub fn getElsewhereFeed() {}\n",
+        )
+        .expect("write source");
+        let active = search_plan_test_hit(
+            "active",
+            "getLatestSocialEntries",
+            &source_path,
+            1,
+            SearchHitOrigin::IndexedSymbol,
+            true,
+        );
+        let definition_only = search_plan_test_hit(
+            "definition",
+            "getElsewhereFeed",
+            &source_path,
+            2,
+            SearchHitOrigin::IndexedSymbol,
+            true,
+        );
+        let query = "getElsewhereFeed latest social feed";
+        let terms = search_plan_terms(query);
+        let active_path_evidence = HashMap::from([
+            (
+                active.node_id.clone(),
+                SearchPlanActivePathEvidence { caller_count: 2 },
+            ),
+            (
+                definition_only.node_id.clone(),
+                SearchPlanActivePathEvidence { caller_count: 0 },
+            ),
+        ]);
+
+        let groups = search_plan_anchor_groups(
+            query,
+            &terms,
+            &[definition_only, active],
+            &[],
+            &[],
+            &active_path_evidence,
+        );
+
+        assert_eq!(
+            groups
+                .first()
+                .and_then(|group| group.chosen_symbol.as_ref())
+                .map(|hit| hit.display_name.as_str()),
+            Some("getLatestSocialEntries"),
+            "visible production callers should outrank a definition-only exact-name anchor: {groups:#?}"
+        );
+        assert!(
+            groups.iter().any(|group| {
+                group.anchor == "getElsewhereFeed"
+                    && group.caller_count == 0
+                    && group.definition_only
+                    && group.no_visible_callers
+                    && group
+                        .reasons
+                        .iter()
+                        .any(|reason| reason.contains("no visible production callers"))
+            }),
+            "definition-only callable anchors should be labeled: {groups:#?}"
+        );
+    }
+
+    #[test]
+    fn search_plan_test_file_names_are_not_visible_production_callers() {
+        for path in [
+            "src/api.test.ts",
+            "src/api.spec.ts",
+            "src/api.test.tsx",
+            "src/api.spec.jsx",
+            "src/__tests__/api.ts",
+        ] {
+            assert!(
+                search_plan_path_is_test_or_bench(path),
+                "{path} should be treated as test code for active-path evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn search_plan_repo_text_owner_identifier_does_not_promote_member_symbol() {
+        let temp = tempdir().expect("create temp dir");
+        let source_path = temp.path().join("src").join("lib.rs");
+        fs::create_dir_all(source_path.parent().expect("src parent")).expect("create src");
+        fs::write(
+            &source_path,
+            "pub struct WorkspaceIndexer;\n\nimpl WorkspaceIndexer {\n    pub fn normalize_index_path(&self) {}\n}\n\n\n\n// WorkspaceIndexer coordinates indexing flow\n",
+        )
+        .expect("write source");
+        let member_hit = search_plan_test_hit(
+            "member",
+            "WorkspaceIndexer::normalize_index_path",
+            &source_path,
+            4,
+            SearchHitOrigin::IndexedSymbol,
+            false,
+        );
+        let repo_hit = search_plan_test_hit(
+            "repo",
+            "src/lib.rs:9",
+            &source_path,
+            9,
+            SearchHitOrigin::TextMatch,
+            false,
+        );
+        let query = "WorkspaceIndexer indexing flow";
+        let terms = search_plan_terms(query);
+
+        let groups = search_plan_anchor_groups(
+            query,
+            &terms,
+            &[],
+            &[repo_hit],
+            &[member_hit],
+            &HashMap::new(),
+        );
+
+        assert!(
+            groups.iter().any(|group| {
+                group.chosen_symbol.is_none()
+                    && matches!(
+                        group.promotion_status,
+                        SearchPlanPromotionStatusDto::Ambiguous
+                    )
+            }),
+            "owner-only repo-text mention should stay unbound instead of promoting to a member: {groups:#?}"
+        );
+    }
+
+    #[test]
+    fn search_plan_repo_text_exact_terminal_identifier_promotes_member_symbol() {
+        let temp = tempdir().expect("create temp dir");
+        let source_path = temp.path().join("src").join("lib.rs");
+        fs::create_dir_all(source_path.parent().expect("src parent")).expect("create src");
+        fs::write(
+            &source_path,
+            "pub struct WorkspaceIndexer;\n\nimpl WorkspaceIndexer {\n    pub fn normalize_index_path(&self) {}\n}\n\n\n\n// normalize_index_path normalizes storage keys before indexing\n",
+        )
+        .expect("write source");
+        let member_hit = search_plan_test_hit(
+            "member",
+            "WorkspaceIndexer::normalize_index_path",
+            &source_path,
+            4,
+            SearchHitOrigin::IndexedSymbol,
+            false,
+        );
+        let repo_hit = search_plan_test_hit(
+            "repo",
+            "src/lib.rs:9",
+            &source_path,
+            9,
+            SearchHitOrigin::TextMatch,
+            false,
+        );
+        let query = "normalize_index_path storage keys";
+        let terms = search_plan_terms(query);
+
+        let groups = search_plan_anchor_groups(
+            query,
+            &terms,
+            &[],
+            &[repo_hit],
+            &[member_hit],
+            &HashMap::new(),
+        );
+
+        assert!(
+            groups.iter().any(|group| {
+                group
+                    .chosen_symbol
+                    .as_ref()
+                    .is_some_and(|hit| hit.display_name == "WorkspaceIndexer::normalize_index_path")
+                    && group.promotion_method.as_deref() == Some("same_file_exact_identifier")
+            }),
+            "exact terminal identifier should still promote to the matching member: {groups:#?}"
+        );
+        let next_actions = search_plan_next_actions(&groups);
+        assert!(next_actions.iter().any(|action| {
+            action.action == "snippet"
+                && action.node_id.0 == "member"
+                && action
+                    .options
+                    .iter()
+                    .any(|option| option == "function_body")
+        }));
+        let next_commands =
+            search_plan_next_commands(Path::new("C:/repo with spaces"), &next_actions);
+        assert!(
+            next_commands.iter().any(|command| command.contains(
+                "codestory-cli snippet --project \"C:/repo with spaces\" --id member --function-body --context 40"
+            )),
+            "search-plan handoff should request body-aware snippets for promoted anchors: {next_commands:#?}"
+        );
+        assert!(
+            next_commands
+                .iter()
+                .all(|command| !command.contains("<PROJECT>")),
+            "search-plan handoffs should be transport-ready without placeholders: {next_commands:#?}"
+        );
+    }
+
+    #[test]
+    fn search_plan_speculation_policy_matches_hidden_trail_edges() {
+        assert!(search_plan_runtime_call_is_speculative(
+            Some(codestory_contracts::graph::ResolutionCertainty::Probable),
+            Some(0.70)
+        ));
+        assert!(search_plan_runtime_call_is_speculative(None, Some(0.84)));
+        assert!(!search_plan_runtime_call_is_speculative(
+            Some(codestory_contracts::graph::ResolutionCertainty::Certain),
+            Some(codestory_contracts::graph::ResolutionCertainty::CERTAIN_MIN)
+        ));
+    }
+
+    #[test]
     fn repo_explanation_overview_replacement_is_generic_only() {
         assert!(AppController::is_repo_explanation_search_query(
             "Explain how this repo fits together"
@@ -7423,6 +9444,10 @@ fn build_llm_symbol_doc_text() -> String {
             generic_results.indexed_symbol_hits.len(),
             generic_results.suggestions.len(),
             "generic repo-explanation replacement should mirror overview suggestions"
+        );
+        assert!(
+            generic_results.search_plan.is_none(),
+            "generic repo-overview replacement should not add search-plan anchors: {generic_results:?}"
         );
 
         let results = controller

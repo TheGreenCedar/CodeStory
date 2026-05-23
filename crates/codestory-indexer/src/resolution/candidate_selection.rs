@@ -10,7 +10,7 @@ pub(super) fn compute_call_resolution(
     let prepared_name = PreparedName::new(target_name.clone());
     let is_common_unqualified = is_common_unqualified_call_name(&prepared_name.original);
     let mut selected: Option<(i64, f32, ResolutionStrategy)> = None;
-    let mut semantic_fallback: Option<(i64, f32)> = None;
+    let mut semantic_fallback = UnambiguousBestCandidate::default();
     let mut candidate_ids = OrderedCandidateIds::with_capacity(8);
 
     for candidate in semantic_candidates {
@@ -24,11 +24,7 @@ pub(super) fn compute_call_resolution(
                 callsite_identity.as_deref(),
             )
         {
-            consider_selected(
-                &mut semantic_fallback,
-                candidate.target_node_id,
-                candidate.confidence,
-            );
+            semantic_fallback.consider(candidate.target_node_id, candidate.confidence);
         }
     }
 
@@ -75,7 +71,7 @@ pub(super) fn compute_call_resolution(
     if selected.is_none()
         && !is_common_unqualified
         && let Some(candidate) = candidate_index
-            .find_global_unique_readonly(&prepared_name.original, &prepared_name.ascii_lower)
+            .find_global_unique_exact_readonly(&prepared_name.original, &prepared_name.ascii_lower)
     {
         if pass.flags.store_candidates {
             candidate_ids.push(candidate);
@@ -97,7 +93,7 @@ pub(super) fn compute_call_resolution(
     }
 
     if selected.is_none()
-        && let Some((candidate, confidence)) = semantic_fallback
+        && let Some((candidate, confidence)) = semantic_fallback.selected()
     {
         selected = Some((
             candidate,
@@ -279,6 +275,37 @@ pub(super) fn compute_import_resolution(
     Ok(ComputedResolution { update, strategy })
 }
 
+#[derive(Default)]
+struct UnambiguousBestCandidate {
+    selected: Option<(i64, f32)>,
+    tied_best: bool,
+}
+
+impl UnambiguousBestCandidate {
+    fn consider(&mut self, candidate_id: i64, confidence: f32) {
+        match self.selected {
+            Some((_, selected_confidence)) if confidence > selected_confidence => {
+                self.selected = Some((candidate_id, confidence));
+                self.tied_best = false;
+            }
+            Some((selected_id, selected_confidence))
+                if confidence == selected_confidence && candidate_id != selected_id =>
+            {
+                self.tied_best = true;
+            }
+            None => {
+                self.selected = Some((candidate_id, confidence));
+                self.tied_best = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn selected(self) -> Option<(i64, f32)> {
+        (!self.tied_best).then_some(self.selected).flatten()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +442,70 @@ mod tests {
             .expect("candidate payload should be stored");
         let parsed: Vec<i64> = serde_json::from_str(&payload)?;
         assert_eq!(parsed, vec![88, 10]);
+        Ok(())
+    }
+
+    #[test]
+    fn tied_semantic_call_candidates_stay_unresolved() -> Result<()> {
+        let row = call_row(4, 1, "pkg::core::caller", "buildIndex", Some("1:1:1:1"));
+        let computed = compute_call_resolution(
+            &resolution_pass(false),
+            &CandidateIndex::default(),
+            &row,
+            &[
+                SemanticResolutionCandidate {
+                    target_node_id: 88,
+                    confidence: 0.70,
+                },
+                SemanticResolutionCandidate {
+                    target_node_id: 99,
+                    confidence: 0.70,
+                },
+            ],
+        )?;
+
+        assert_eq!(computed.strategy, None);
+        assert_eq!(computed.update.resolved_target_node_id, None);
+        Ok(())
+    }
+
+    #[test]
+    fn global_call_resolution_does_not_use_unique_method_tail() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        insert_callable(
+            &conn,
+            10,
+            "CxxParser::buildIndex",
+            "CxxParser::buildIndex",
+            2,
+            1,
+        )?;
+
+        let index = CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
+        let row = call_row(5, 1, "IndexerJava::doIndex", "buildIndex", Some("1:1:1:1"));
+        let computed = compute_call_resolution(&resolution_pass(false), &index, &row, &[])?;
+
+        assert_eq!(computed.strategy, None);
+        assert_eq!(computed.update.resolved_target_node_id, None);
+        Ok(())
+    }
+
+    #[test]
+    fn global_call_resolution_keeps_exact_unique_function_names() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        insert_callable(&conn, 10, "buildIndex", "buildIndex", 2, 1)?;
+
+        let index = CandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
+        let row = call_row(6, 1, "IndexerJava::doIndex", "buildIndex", Some("1:1:1:1"));
+        let computed = compute_call_resolution(&resolution_pass(false), &index, &row, &[])?;
+
+        assert_eq!(
+            computed.strategy,
+            Some(ResolutionStrategy::CallGlobalUnique)
+        );
+        assert_eq!(computed.update.resolved_target_node_id, Some(10));
         Ok(())
     }
 }

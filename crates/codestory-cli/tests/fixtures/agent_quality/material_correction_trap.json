@@ -1,0 +1,30 @@
+{
+  "name": "material_correction_trap",
+  "question": "Expose a source-truth correction that must lower confidence.",
+  "expected_anchors": ["WorkspaceIndexer", "SearchService", "TrailResult"],
+  "decisive_evidence": ["WorkspaceIndexer"],
+  "required_bridges": [
+    { "from": "WorkspaceIndexer", "to": "SearchService" }
+  ],
+  "claim_ledger": {
+    "claims": [
+      {
+        "id": "mutable-storage-overclaim",
+        "text": "The full index path writes directly into the live mutable storage without staged publication.",
+        "confidence": 0.88,
+        "state": "contradicted_by_source",
+        "anchors": ["WorkspaceIndexer"],
+        "material_correction": true,
+        "overclaim": true,
+        "evidence": [
+          {
+            "kind": "source_truth",
+            "source_path": "crates/codestory-runtime/src/runtime.rs",
+            "anchor": "WorkspaceIndexer",
+            "decisive": true
+          }
+        ]
+      }
+    ]
+  }
+}

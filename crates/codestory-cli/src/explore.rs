@@ -819,10 +819,11 @@ fn companion_source_slices(
         .split_once('<')
         .map(|(name, _)| name)
         .unwrap_or(display_name);
-    let member_pattern = scoped_name
-        .contains("::")
-        .then_some(scoped_name.to_string())
-        .unwrap_or_else(|| format!("{stem}::"));
+    let member_pattern = if scoped_name.contains("::") {
+        scoped_name.to_string()
+    } else {
+        format!("{stem}::")
+    };
     let fallback_pattern = format!("{stem}::");
     let mut slices = Vec::new();
     for (index, line) in source.lines().enumerate() {

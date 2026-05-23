@@ -100,6 +100,7 @@ struct CandidateIndex {
     same_file_cache: RwLock<HashMap<SameFileCacheKey, Option<i64>>>,
     same_module_cache: RwLock<HashMap<SameModuleCacheKey, Option<i64>>>,
     global_unique_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
+    global_unique_exact_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
     fuzzy_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
 }
 
@@ -1331,6 +1332,18 @@ impl CandidateIndex {
                 && suffix.len() == 1
             {
                 return Some(self.nodes[suffix[0]].id);
+            }
+            None
+        })
+    }
+
+    fn find_global_unique_exact_readonly(&self, name: &str, name_ascii_lower: &str) -> Option<i64> {
+        let key = (name.to_string(), name_ascii_lower.to_string());
+        self.cached_lookup(&self.global_unique_exact_cache, key, || {
+            if let Some(exact) = self.exact_map.get(name)
+                && exact.len() == 1
+            {
+                return Some(self.nodes[exact[0]].id);
             }
             None
         })

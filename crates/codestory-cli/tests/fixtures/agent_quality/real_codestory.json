@@ -1,0 +1,71 @@
+{
+  "name": "real_codestory",
+  "local_only": true,
+  "project_root": "codestory",
+  "question": "Explain how CodeStory's full-index path flows through CLI/runtime/workspace/indexer/store and how that supports later search, trail, and snippet commands.",
+  "expected_anchors": ["WorkspaceIndexer", "SearchService", "TrailResult"],
+  "decisive_evidence": ["WorkspaceIndexer", "SearchService", "TrailResult"],
+  "required_bridges": [
+    { "from": "run_index_once", "to": "run_indexing_blocking_inner" },
+    { "from": "run_indexing_blocking_inner", "to": "WorkspaceIndexer::new" },
+    { "from": "SnapshotStore", "to": "SearchService" }
+  ],
+  "claim_ledger": {
+    "claims": [
+      {
+        "id": "codestory-cli-runtime-handoff",
+        "text": "run_index delegates through run_index_once into runtime opening before index output is written.",
+        "confidence": 0.78,
+        "state": "supported",
+        "anchors": ["WorkspaceIndexer"],
+        "evidence": [
+          {
+            "kind": "source_truth",
+            "source_path": "crates/codestory-cli/src/main.rs",
+            "anchor": "WorkspaceIndexer",
+            "bridge": "run_index_once->run_indexing_blocking_inner",
+            "decisive": true
+          }
+        ]
+      },
+      {
+        "id": "codestory-staged-indexing",
+        "text": "Full indexing uses staged snapshot storage, constructs WorkspaceIndexer::new, runs it, then publishes staged storage.",
+        "confidence": 0.84,
+        "state": "supported",
+        "anchors": ["WorkspaceIndexer"],
+        "evidence": [
+          {
+            "kind": "source_truth",
+            "source_path": "crates/codestory-runtime/src/lib.rs",
+            "anchor": "WorkspaceIndexer",
+            "bridge": "run_indexing_blocking_inner->WorkspaceIndexer::new",
+            "decisive": true
+          }
+        ]
+      },
+      {
+        "id": "codestory-search-trail-snippet-support",
+        "text": "SearchService is a runtime facade and trail returns the shared TrailResult DTO from store trail code.",
+        "confidence": 0.80,
+        "state": "supported",
+        "anchors": ["SearchService", "TrailResult"],
+        "evidence": [
+          {
+            "kind": "source_truth",
+            "source_path": "crates/codestory-runtime/src/services.rs",
+            "anchor": "SearchService",
+            "bridge": "SnapshotStore->SearchService",
+            "decisive": true
+          },
+          {
+            "kind": "source_truth",
+            "source_path": "crates/codestory-store/src/storage_impl/trail.rs",
+            "anchor": "TrailResult",
+            "decisive": true
+          }
+        ]
+      }
+    ]
+  }
+}

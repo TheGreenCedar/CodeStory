@@ -1,0 +1,79 @@
+{
+  "name": "real_rootandruntime",
+  "local_only": true,
+  "project_root": "rootandruntime",
+  "question": "Explain how public writing/social surfaces connect to Payload collections, comment auth, and the elsewhere feed.",
+  "expected_anchors": ["Posts", "getElsewhereFeed", "getCommentAuth"],
+  "decisive_evidence": ["Posts", "getElsewhereFeed", "getCommentAuth"],
+  "required_bridges": [
+    { "from": "payload.config.ts", "to": "Posts" },
+    { "from": "homepage", "to": "RootRuntimeHome" },
+    { "from": "comments route", "to": "getCommentAuth" }
+  ],
+  "repo_text_dependencies": [
+    "src/app/(frontend)/page.tsx",
+    "src/components/PostComments.tsx",
+    "src/app/(frontend)/posts/[slug]/comments/route.ts"
+  ],
+  "claim_ledger": {
+    "claims": [
+      {
+        "id": "root-payload-registration",
+        "text": "payload.config.ts registers Posts, Comments, SocialEntries, and related collections.",
+        "confidence": 0.82,
+        "state": "supported",
+        "anchors": ["Posts"],
+        "evidence": [
+          {
+            "kind": "source_truth",
+            "source_path": "src/payload.config.ts",
+            "anchor": "Posts",
+            "bridge": "payload.config.ts->Posts",
+            "decisive": true
+          }
+        ]
+      },
+      {
+        "id": "root-homepage-feed-boundary",
+        "text": "The homepage renders persisted social entries through RootRuntimeHome; getElsewhereFeed assembles live or sync feed entries rather than directly rendering the homepage.",
+        "confidence": 0.74,
+        "state": "supported",
+        "anchors": ["getElsewhereFeed"],
+        "evidence": [
+          {
+            "kind": "repo_text",
+            "source_path": "src/app/(frontend)/page.tsx",
+            "anchor": "getElsewhereFeed",
+            "bridge": "homepage->RootRuntimeHome",
+            "decisive": true,
+            "repo_text_only": true
+          }
+        ]
+      },
+      {
+        "id": "root-comment-auth-route",
+        "text": "PostComments and the comments POST route call comment-auth helpers before creating comments.",
+        "confidence": 0.80,
+        "state": "supported",
+        "anchors": ["getCommentAuth"],
+        "evidence": [
+          {
+            "kind": "repo_text",
+            "source_path": "src/components/PostComments.tsx",
+            "anchor": "getCommentAuth",
+            "decisive": true,
+            "repo_text_only": true
+          },
+          {
+            "kind": "repo_text",
+            "source_path": "src/app/(frontend)/posts/[slug]/comments/route.ts",
+            "anchor": "getCommentAuth",
+            "bridge": "comments route->getCommentAuth",
+            "decisive": true,
+            "repo_text_only": true
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -156,6 +156,30 @@ pub(crate) fn managed_root(cache_override: Option<&Path>) -> Result<PathBuf> {
         }))
 }
 
+pub(crate) fn runtime_managed_root(cache_override: Option<&Path>) -> Result<PathBuf> {
+    runtime_managed_root_with_default(cache_override, managed_root(None)?)
+}
+
+fn runtime_managed_root_with_default(
+    cache_override: Option<&Path>,
+    default_root: PathBuf,
+) -> Result<PathBuf> {
+    let Some(cache_override) = cache_override else {
+        return Ok(default_root);
+    };
+    let explicit_root = managed_root(Some(cache_override))?;
+    if managed_endpoint_assets_available(&explicit_root)
+        || !managed_endpoint_assets_available(&default_root)
+    {
+        return Ok(explicit_root);
+    }
+    Ok(default_root)
+}
+
+fn managed_endpoint_assets_available(root: &Path) -> bool {
+    default_onnx_model_path(root).is_some() && default_onnx_tokenizer_path(root).is_some()
+}
+
 pub(crate) fn setup_embeddings(
     root: &Path,
     _quant: CliEmbeddingQuant,
@@ -303,7 +327,7 @@ pub(crate) fn prepare_runtime_if_installed(root: &Path) {
     if disabled_by_embedding_env() || legacy_llamacpp_backend_selected() {
         return;
     }
-    if default_onnx_model_path(root).is_some() && default_onnx_tokenizer_path(root).is_some() {
+    if managed_endpoint_assets_available(root) {
         set_managed_endpoint_env(root);
     }
 }
@@ -1227,6 +1251,24 @@ mod tests {
         path.to_string_lossy().replace('\\', "/")
     }
 
+    fn write_minimal_managed_onnx_assets(root: &Path) {
+        let model_dir = onnx_models_dir(root);
+        fs::create_dir_all(&model_dir).expect("model dir");
+        let model = model_dir.join("model_optimized.onnx");
+        let tokenizer = model_dir.join("tokenizer.json");
+        fs::write(&model, b"model").expect("model");
+        fs::write(&tokenizer, b"tokenizer").expect("tokenizer");
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "onnx_model_path": clean_test_path(&model),
+                "onnx_tokenizer_path": clean_test_path(&tokenizer),
+            }))
+            .expect("manifest"),
+        )
+        .expect("manifest write");
+    }
+
     #[test]
     fn setup_dry_run_reports_pinned_onnx_assets_without_writing() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1257,21 +1299,9 @@ mod tests {
     fn manifest_paths_are_under_managed_root() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = managed_root(Some(temp.path())).expect("managed root");
-        let model_dir = onnx_models_dir(&root);
-        fs::create_dir_all(&model_dir).expect("model dir");
-        let model = model_dir.join("model_optimized.onnx");
-        let tokenizer = model_dir.join("tokenizer.json");
-        fs::write(&model, b"model").expect("model");
-        fs::write(&tokenizer, b"tokenizer").expect("tokenizer");
-        fs::write(
-            root.join("manifest.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "onnx_model_path": clean_test_path(&model),
-                "onnx_tokenizer_path": clean_test_path(&tokenizer),
-            }))
-            .expect("manifest"),
-        )
-        .expect("manifest write");
+        write_minimal_managed_onnx_assets(&root);
+        let model = onnx_models_dir(&root).join("model_optimized.onnx");
+        let tokenizer = onnx_models_dir(&root).join("tokenizer.json");
 
         assert_eq!(
             default_onnx_model_path(&root).expect("model"),
@@ -1302,6 +1332,57 @@ mod tests {
 
         assert!(default_onnx_model_path(&root).is_none());
         assert!(default_onnx_tokenizer_path(&root).is_none());
+    }
+
+    #[test]
+    fn explicit_cache_runtime_uses_global_managed_assets_when_local_assets_are_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let explicit_cache = temp.path().join("isolated-cache");
+        let default_root = temp.path().join("global-managed");
+        write_minimal_managed_onnx_assets(&default_root);
+
+        let selected =
+            runtime_managed_root_with_default(Some(&explicit_cache), default_root.clone())
+                .expect("runtime managed root");
+
+        assert_eq!(
+            selected, default_root,
+            "explicit cache dirs isolate indexes, but should not force symbolic retrieval when global managed embeddings are installed"
+        );
+    }
+
+    #[test]
+    fn explicit_cache_runtime_uses_explicit_root_when_global_assets_are_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let explicit_cache = temp.path().join("isolated-cache");
+        let explicit_root = managed_root(Some(&explicit_cache)).expect("explicit root");
+        let default_root = temp.path().join("global-managed");
+
+        let selected = runtime_managed_root_with_default(Some(&explicit_cache), default_root)
+            .expect("runtime managed root");
+
+        assert_eq!(
+            selected, explicit_root,
+            "without global managed assets, explicit cache roots remain the setup target"
+        );
+    }
+
+    #[test]
+    fn explicit_cache_runtime_keeps_local_managed_assets_when_present() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let explicit_cache = temp.path().join("isolated-cache");
+        let explicit_root = managed_root(Some(&explicit_cache)).expect("explicit root");
+        let default_root = temp.path().join("global-managed");
+        write_minimal_managed_onnx_assets(&explicit_root);
+        write_minimal_managed_onnx_assets(&default_root);
+
+        let selected = runtime_managed_root_with_default(Some(&explicit_cache), default_root)
+            .expect("runtime managed root");
+
+        assert_eq!(
+            selected, explicit_root,
+            "cache-specific managed assets should still win when explicitly installed"
+        );
     }
 
     #[test]

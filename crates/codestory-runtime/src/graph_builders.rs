@@ -242,7 +242,44 @@ pub(super) fn graph_trail(
     if hide_speculative {
         response = hide_speculative_trail_edges(response);
     }
+    response = suppress_default_trail_noise(response);
     Ok(response)
+}
+
+fn suppress_default_trail_noise(mut response: GraphResponse) -> GraphResponse {
+    let original_edge_count = response.edges.len();
+    let mut seen = HashSet::new();
+    response.edges.retain(|edge| {
+        if edge.source == edge.target {
+            return false;
+        }
+        let key = (
+            edge.source.clone(),
+            edge.target.clone(),
+            edge.kind,
+            edge.callsite_identity.clone(),
+        );
+        seen.insert(key)
+    });
+    let omitted_edges = original_edge_count.saturating_sub(response.edges.len()) as u32;
+    response.omitted_edge_count = response.omitted_edge_count.saturating_add(omitted_edges);
+
+    if let Some(layout) = response.canonical_layout.as_mut() {
+        let retained = response
+            .edges
+            .iter()
+            .map(|edge| edge.id.clone())
+            .collect::<HashSet<_>>();
+        layout.edges.retain(|edge| {
+            edge.source != edge.target
+                && edge
+                    .source_edge_ids
+                    .iter()
+                    .any(|source_edge_id| retained.contains(source_edge_id))
+        });
+    }
+
+    response
 }
 
 fn hide_speculative_trail_edges(mut response: GraphResponse) -> GraphResponse {
@@ -250,7 +287,7 @@ fn hide_speculative_trail_edges(mut response: GraphResponse) -> GraphResponse {
     let retained_edges = response
         .edges
         .into_iter()
-        .filter(|edge| !is_speculative_certainty(edge.certainty.as_deref()))
+        .filter(|edge| !is_speculative_trail_edge(edge))
         .collect::<Vec<_>>();
 
     let mut adjacency = HashMap::new();
@@ -288,9 +325,16 @@ fn hide_speculative_trail_edges(mut response: GraphResponse) -> GraphResponse {
     response.omitted_edge_count = response.omitted_edge_count.saturating_add(omitted_edges);
 
     if let Some(layout) = response.canonical_layout.as_mut() {
+        let retained = response
+            .edges
+            .iter()
+            .map(|edge| edge.id.clone())
+            .collect::<HashSet<_>>();
         layout.nodes.retain(|node| reachable.contains(&node.id));
         layout.edges.retain(|edge| {
-            !is_speculative_certainty(edge.certainty.as_deref())
+            edge.source_edge_ids
+                .iter()
+                .any(|source_edge_id| retained.contains(source_edge_id))
                 && reachable.contains(&edge.source)
                 && reachable.contains(&edge.target)
         });
@@ -299,9 +343,196 @@ fn hide_speculative_trail_edges(mut response: GraphResponse) -> GraphResponse {
     response
 }
 
-fn is_speculative_certainty(certainty: Option<&str>) -> bool {
+fn is_speculative_trail_edge(edge: &GraphEdgeDto) -> bool {
+    if is_speculative_certainty_label(edge.certainty.as_deref()) {
+        return true;
+    }
+    is_runtime_bridge_edge(edge.kind)
+        && (is_probable_certainty_label(edge.certainty.as_deref())
+            || edge.confidence.is_some_and(|confidence| {
+                confidence < codestory_contracts::graph::ResolutionCertainty::CERTAIN_MIN
+            }))
+}
+
+fn is_speculative_certainty_label(certainty: Option<&str>) -> bool {
     matches!(
         certainty.map(|value| value.to_ascii_lowercase()).as_deref(),
         Some("uncertain" | "speculative")
     )
+}
+
+fn is_probable_certainty_label(certainty: Option<&str>) -> bool {
+    certainty
+        .map(|value| value.eq_ignore_ascii_case("probable"))
+        .unwrap_or(false)
+}
+
+fn is_runtime_bridge_edge(kind: EdgeKind) -> bool {
+    matches!(kind, EdgeKind::CALL | EdgeKind::MACRO_USAGE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codestory_contracts::api::{
+        CanonicalEdgeDto, CanonicalEdgeFamily, CanonicalLayoutDto, CanonicalRouteKind,
+    };
+
+    fn edge(id: i64, source: &str, target: &str) -> GraphEdgeDto {
+        GraphEdgeDto {
+            id: codestory_contracts::api::EdgeId(id.to_string()),
+            source: NodeId(source.to_string()),
+            target: NodeId(target.to_string()),
+            kind: EdgeKind::CALL,
+            confidence: Some(1.0),
+            certainty: Some("certain".to_string()),
+            callsite_identity: Some(format!("{source}->{target}")),
+            candidate_targets: Vec::new(),
+        }
+    }
+
+    fn edge_with_certainty(
+        id: i64,
+        source: &str,
+        target: &str,
+        certainty: Option<&str>,
+        confidence: Option<f32>,
+    ) -> GraphEdgeDto {
+        let mut edge = edge(id, source, target);
+        edge.certainty = certainty.map(str::to_string);
+        edge.confidence = confidence;
+        edge
+    }
+
+    fn canonical_edge(
+        id: i64,
+        source: &str,
+        target: &str,
+        certainty: Option<&str>,
+    ) -> CanonicalEdgeDto {
+        CanonicalEdgeDto {
+            id: id.to_string(),
+            source_edge_ids: vec![codestory_contracts::api::EdgeId(id.to_string())],
+            source: NodeId(source.to_string()),
+            target: NodeId(target.to_string()),
+            source_handle: "source-node".to_string(),
+            target_handle: "target-node".to_string(),
+            kind: EdgeKind::CALL,
+            certainty: certainty.map(str::to_string),
+            multiplicity: 1,
+            family: CanonicalEdgeFamily::Flow,
+            route_kind: CanonicalRouteKind::Direct,
+        }
+    }
+
+    #[test]
+    fn suppress_default_trail_noise_removes_self_edges_and_duplicates() {
+        let response = GraphResponse {
+            center_id: NodeId("a".to_string()),
+            nodes: Vec::new(),
+            edges: vec![
+                edge(1, "a", "a"),
+                edge(2, "a", "b"),
+                edge(3, "a", "b"),
+                edge(4, "b", "a"),
+            ],
+            truncated: false,
+            omitted_edge_count: 0,
+            canonical_layout: None,
+        };
+
+        let filtered = suppress_default_trail_noise(response);
+
+        assert_eq!(filtered.edges.len(), 2);
+        assert_eq!(filtered.omitted_edge_count, 2);
+        assert!(
+            filtered.edges.iter().all(|edge| edge.source != edge.target),
+            "self edges should be suppressed by default: {filtered:#?}"
+        );
+    }
+
+    #[test]
+    fn hide_speculative_trail_edges_removes_probable_and_low_confidence_edges() {
+        let response = GraphResponse {
+            center_id: NodeId("a".to_string()),
+            nodes: Vec::new(),
+            edges: vec![
+                edge_with_certainty(1, "a", "b", Some("probable"), Some(0.70)),
+                edge_with_certainty(2, "a", "c", None, Some(0.54)),
+                edge_with_certainty(3, "a", "d", Some("certain"), Some(0.85)),
+                {
+                    let mut edge = edge_with_certainty(4, "a", "e", Some("probable"), Some(0.70));
+                    edge.kind = EdgeKind::USAGE;
+                    edge
+                },
+            ],
+            truncated: false,
+            omitted_edge_count: 0,
+            canonical_layout: None,
+        };
+
+        let filtered = hide_speculative_trail_edges(response);
+
+        assert_eq!(filtered.edges.len(), 2);
+        assert!(
+            filtered
+                .edges
+                .iter()
+                .any(|edge| edge.target == NodeId("d".to_string()))
+        );
+        assert!(
+            filtered
+                .edges
+                .iter()
+                .any(|edge| edge.target == NodeId("e".to_string()))
+        );
+        assert_eq!(filtered.omitted_edge_count, 2);
+    }
+
+    #[test]
+    fn hide_speculative_trail_edges_filters_canonical_layout_by_retained_source_edges() {
+        let response = GraphResponse {
+            center_id: NodeId("a".to_string()),
+            nodes: Vec::new(),
+            edges: vec![
+                edge_with_certainty(1, "a", "b", Some("probable"), Some(0.70)),
+                edge_with_certainty(2, "a", "c", Some("certain"), Some(0.85)),
+                edge_with_certainty(3, "c", "b", Some("certain"), Some(0.85)),
+            ],
+            truncated: false,
+            omitted_edge_count: 0,
+            canonical_layout: Some(CanonicalLayoutDto {
+                schema_version: 1,
+                center_node_id: NodeId("a".to_string()),
+                nodes: Vec::new(),
+                edges: vec![
+                    canonical_edge(1, "a", "b", Some("probable")),
+                    canonical_edge(2, "a", "c", Some("certain")),
+                    canonical_edge(3, "c", "b", Some("certain")),
+                ],
+            }),
+        };
+
+        let filtered = hide_speculative_trail_edges(response);
+
+        let retained_edge_ids = filtered
+            .edges
+            .iter()
+            .map(|edge| edge.id.clone())
+            .collect::<HashSet<_>>();
+        assert!(!retained_edge_ids.contains(&codestory_contracts::api::EdgeId("1".to_string())));
+        let layout = filtered
+            .canonical_layout
+            .as_ref()
+            .expect("canonical layout should remain available");
+        assert!(
+            layout.edges.iter().all(|edge| edge
+                .source_edge_ids
+                .iter()
+                .all(|source_edge_id| retained_edge_ids.contains(source_edge_id))),
+            "canonical layout leaked a suppressed edge: {layout:#?}"
+        );
+        assert_eq!(layout.edges.len(), 2);
+        assert_eq!(filtered.omitted_edge_count, 1);
+    }
 }

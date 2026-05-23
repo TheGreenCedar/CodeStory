@@ -658,6 +658,7 @@ mod tests {
         let temp = tempdir()?;
         let root = temp.path().join("repo");
         fs::create_dir_all(&root)?;
+        fs::create_dir_all(root.join("src"))?;
         let file = root.join("src").join("..").join("main.rs");
         fs::write(&file, "fn main() {}\n")?;
         let deleted = root.join("deleted.rs");

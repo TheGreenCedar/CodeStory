@@ -1,5 +1,7 @@
 use codestory_contracts::events::EventBus;
-use codestory_contracts::graph::{AccessKind, EdgeKind, NodeKind, OccurrenceKind};
+use codestory_contracts::graph::{
+    AccessKind, EdgeKind, NodeKind, OccurrenceKind, ResolutionCertainty,
+};
 use codestory_indexer::resolution::ResolutionPass;
 use codestory_indexer::{IncrementalIndexingStats, WorkspaceIndexer};
 use codestory_store::Store as Storage;
@@ -105,6 +107,69 @@ int main() {
     assert!(my_method.file_node_id.is_some());
     assert!(my_method.start_line.is_some());
     assert!(my_method.end_line.is_some());
+
+    Ok(())
+}
+
+#[test]
+fn test_svelte_tauri_invoke_surfaces_registered_rust_command_boundary() -> anyhow::Result<()> {
+    let storage = index_project(&[
+        (
+            "src/App.svelte",
+            r#"
+<script lang="ts">
+  import { invoke } from "@tauri-apps/api/core";
+
+  export async function refresh() {
+    await invoke("get_snapshot");
+  }
+</script>
+"#,
+        ),
+        (
+            "src-tauri/src/lib.rs",
+            r#"
+#[tauri::command]
+fn get_snapshot() -> String {
+    String::new()
+}
+
+pub fn build() {
+    tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![get_snapshot]);
+}
+"#,
+        ),
+    ])?;
+
+    let nodes = storage.get_nodes()?;
+    let edges = storage.get_edges()?;
+    let command = nodes
+        .iter()
+        .find(|node| node.canonical_id.as_deref() == Some("tauri:command:get_snapshot"))
+        .ok_or_else(|| anyhow::anyhow!("missing tauri command node"))?;
+    let function = nodes
+        .iter()
+        .find(|node| node.serialized_name == "get_snapshot" && node.kind == NodeKind::FUNCTION)
+        .ok_or_else(|| anyhow::anyhow!("missing registered Rust command function"))?;
+
+    assert!(
+        edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.target == command.id
+                && edge.certainty == Some(ResolutionCertainty::Uncertain)
+        }),
+        "expected Svelte invoke() to create uncertain command evidence"
+    );
+    assert!(
+        edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.source == command.id
+                && edge.target == function.id
+                && edge.certainty == Some(ResolutionCertainty::Probable)
+        }),
+        "expected registered Tauri command symbol to link to Rust function"
+    );
 
     Ok(())
 }

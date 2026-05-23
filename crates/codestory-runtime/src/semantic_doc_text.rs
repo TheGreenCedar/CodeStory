@@ -119,6 +119,63 @@ pub(crate) fn runtime_concept_phrases(
 
     for terminal in terminal_aliases {
         match terminal.as_str() {
+            "run index once" => {
+                push_unique_alias(
+                    &mut phrases,
+                    &mut seen,
+                    "CLI index command entrypoint opens runtime and runs one index pass".to_string(),
+                );
+                push_unique_alias(
+                    &mut phrases,
+                    &mut seen,
+                    "CodeStory CLI runtime handoff from index command to runtime ensure_open"
+                        .to_string(),
+                );
+            }
+            "run indexing blocking inner" => {
+                push_unique_alias(
+                    &mut phrases,
+                    &mut seen,
+                    "runtime blocking indexing orchestrator dispatches full or incremental index execution"
+                        .to_string(),
+                );
+                push_unique_alias(
+                    &mut phrases,
+                    &mut seen,
+                    "CodeStory runtime indexing handoff calls index_full or index_incremental and refreshes caches"
+                        .to_string(),
+                );
+            }
+            "index full" => {
+                push_unique_alias(
+                    &mut phrases,
+                    &mut seen,
+                    "full index pipeline opens staged storage runs WorkspaceIndexer then publishes staged snapshot"
+                        .to_string(),
+                );
+                push_unique_alias(
+                    &mut phrases,
+                    &mut seen,
+                    "CodeStory production full refresh orchestrator for staged snapshot publishing"
+                        .to_string(),
+                );
+            }
+            "new"
+                if qualified_name.is_some_and(|name| name.contains("WorkspaceIndexer::new")) =>
+            {
+                push_unique_alias(
+                    &mut phrases,
+                    &mut seen,
+                    "WorkspaceIndexer constructor entrypoint creates indexer for workspace root"
+                        .to_string(),
+                );
+                push_unique_alias(
+                    &mut phrases,
+                    &mut seen,
+                    "indexing pipeline handoff into WorkspaceIndexer run for source file discovery and parsing"
+                        .to_string(),
+                );
+            }
             "sync llm symbol projection" => {
                 push_unique_alias(
                     &mut phrases,
@@ -1076,6 +1133,40 @@ mod tests {
             vec![
                 "refresh stored symbol embedding records for the completed index run",
                 "runtime library projection refresh entry point for stored symbol documents"
+            ]
+        );
+        assert_eq!(
+            runtime_concept_phrases(
+                "run_index_once",
+                Some("codestory_cli::main::run_index_once")
+            ),
+            vec![
+                "CLI index command entrypoint opens runtime and runs one index pass",
+                "CodeStory CLI runtime handoff from index command to runtime ensure_open"
+            ]
+        );
+        assert_eq!(
+            runtime_concept_phrases(
+                "run_indexing_blocking_inner",
+                Some("codestory_runtime::AppController::run_indexing_blocking_inner")
+            ),
+            vec![
+                "runtime blocking indexing orchestrator dispatches full or incremental index execution",
+                "CodeStory runtime indexing handoff calls index_full or index_incremental and refreshes caches"
+            ]
+        );
+        assert_eq!(
+            runtime_concept_phrases("index_full", Some("codestory_runtime::index_full")),
+            vec![
+                "full index pipeline opens staged storage runs WorkspaceIndexer then publishes staged snapshot",
+                "CodeStory production full refresh orchestrator for staged snapshot publishing"
+            ]
+        );
+        assert_eq!(
+            runtime_concept_phrases("new", Some("codestory_indexer::WorkspaceIndexer::new")),
+            vec![
+                "WorkspaceIndexer constructor entrypoint creates indexer for workspace root",
+                "indexing pipeline handoff into WorkspaceIndexer run for source file discovery and parsing"
             ]
         );
         assert_eq!(

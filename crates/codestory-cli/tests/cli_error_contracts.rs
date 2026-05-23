@@ -45,6 +45,96 @@ pub mod beta;
     .expect("write beta.rs");
 }
 
+fn write_drill_friction_workspace(root: &Path) {
+    fs::create_dir_all(root.join("src").join("collections")).expect("create collections dir");
+    fs::create_dir_all(root.join("src").join("components")).expect("create components dir");
+
+    fs::write(
+        root.join("src").join("collections").join("Posts.ts"),
+        r#"export const Posts = {
+  slug: 'posts',
+  fields: [{ name: 'title', type: 'text' }],
+}
+"#,
+    )
+    .expect("write Posts.ts");
+    fs::write(
+        root.join("src").join("collections").join("Comments.ts"),
+        r#"export const Comments = {
+  slug: 'comments',
+  fields: [{ name: 'body', type: 'textarea' }],
+}
+"#,
+    )
+    .expect("write Comments.ts");
+    fs::write(
+        root.join("src").join("payload-types.ts"),
+        r#"export interface PayloadTypes {
+  posts: Posts
+  comments: Comments
+}
+
+export interface Posts {
+  id: string
+}
+
+export interface Comments {
+  id: string
+}
+"#,
+    )
+    .expect("write payload-types.ts");
+    fs::write(
+        root.join("src")
+            .join("components")
+            .join("ElsewhereFeed.tsx"),
+        r#"export type ElsewhereFeedProps = {
+  profiles: string[]
+}
+
+export function ElsewhereFeed(props: ElsewhereFeedProps) {
+  return <section>{props.profiles.length}</section>
+}
+"#,
+    )
+    .expect("write ElsewhereFeed.tsx");
+    fs::write(
+        root.join("src").join("main.rs"),
+        r#"pub fn run_index() {}
+pub fn run_index_once() {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_rust_tauri_command_registration_indexes_command_symbol_and_boundary() {}
+}
+"#,
+    )
+    .expect("write main.rs");
+    fs::write(
+        root.join("src").join("browser.rs"),
+        r#"pub struct ReadOnlyBrowserService;
+
+impl ReadOnlyBrowserService {
+    pub fn snippet_context(&self) {}
+    pub fn trail_context(&self) {}
+}
+"#,
+    )
+    .expect("write browser.rs");
+    fs::write(
+        root.join("src").join("grounding.rs"),
+        r#"pub struct AppController;
+
+impl AppController {
+    pub fn snippet_context(&self) {}
+    pub fn trail_context(&self) {}
+}
+"#,
+    )
+    .expect("write grounding.rs");
+}
+
 fn run_cli(workspace: &Path, cache_dir: &Path, args: &[&str]) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
     command
@@ -103,6 +193,17 @@ fn parse_stdout_json(output: &std::process::Output) -> Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+fn json_string<'a>(value: &'a Value, pointer: &str) -> &'a str {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("expected string at {pointer}: {value:#}"))
+}
+
+fn normalized_path(value: &str) -> String {
+    value.replace('\\', "/")
 }
 
 fn ambiguous_error_alternatives(json: &Value) -> &Vec<Value> {
@@ -313,6 +414,136 @@ fn snippet_lines_alias_sets_context_for_agent_guesses() {
             .and_then(Value::as_u64),
         Some(12),
         "--lines should feed the same context field as --context: {json:#}"
+    );
+}
+
+#[test]
+fn graph_query_resolution_handles_real_drill_friction_patterns() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_drill_friction_workspace(workspace.path());
+    index_workspace(workspace.path(), cache_dir.path());
+
+    let posts = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "snippet",
+            "--query",
+            "Posts",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success(&posts, "Posts should resolve to the collection config");
+    let posts_json = parse_stdout_json(&posts);
+    assert!(
+        normalized_path(json_string(&posts_json, "/snippet/path"))
+            .ends_with("src/collections/Posts.ts"),
+        "Posts should choose the source collection config, not generated payload types: {posts_json:#}"
+    );
+
+    let comments = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "trail",
+            "--query",
+            "comments",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success(
+        &comments,
+        "lowercase comments should resolve to the collection config",
+    );
+    let comments_json = parse_stdout_json(&comments);
+    assert_eq!(
+        json_string(&comments_json, "/trail/focus/display_name"),
+        "Comments",
+        "comments should choose the collection anchor: {comments_json:#}"
+    );
+
+    let guessed_page = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "snippet",
+            "--query",
+            "ElsewherePage",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        !guessed_page.status.success(),
+        "guessed ElsewherePage should not silently resolve to semantic neighbors"
+    );
+    let guessed_combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&guessed_page.stdout),
+        String::from_utf8_lossy(&guessed_page.stderr)
+    );
+    assert!(
+        guessed_combined.contains("No symbol matched query `ElsewherePage`")
+            && guessed_combined.contains("search --project")
+            && !guessed_combined.contains("ambiguous_target"),
+        "guessed names should produce a scoped no-match recovery, not ambiguity: {guessed_combined}"
+    );
+
+    let run_index = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "snippet",
+            "--query",
+            "run_index_command",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success(
+        &run_index,
+        "run_index_command should resolve to production run_index",
+    );
+    let run_index_json = parse_stdout_json(&run_index);
+    assert_eq!(
+        json_string(&run_index_json, "/snippet/node/display_name"),
+        "run_index",
+        "command-shaped guesses should prefer production entrypoints over tests: {run_index_json:#}"
+    );
+
+    let snippet_context = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "snippet",
+            "--query",
+            "snippet_context",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success(
+        &snippet_context,
+        "snippet_context should prefer implementation over facade",
+    );
+    let snippet_context_json = parse_stdout_json(&snippet_context);
+    assert!(
+        normalized_path(json_string(&snippet_context_json, "/snippet/path"))
+            .ends_with("src/grounding.rs"),
+        "facade method names should resolve to implementation files: {snippet_context_json:#}"
     );
 }
 

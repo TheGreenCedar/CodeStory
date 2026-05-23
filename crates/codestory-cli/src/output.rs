@@ -2,9 +2,11 @@ use anyhow::{Context, Result, bail};
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentRetrievalPolicyModeDto,
     AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
-    AgentRetrievalStepStatusDto, GraphArtifactDto, GroundingSnapshotDto, NodeDetailsDto,
-    RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto,
-    SearchHit, SnippetContextDto, SymbolContextDto, TrailContextDto, TrailStoryDto,
+    AgentRetrievalStepStatusDto, ClaimReadinessDto, EvidenceTypeDto, GraphArtifactDto,
+    GroundingSnapshotDto, IndexingPhaseTimings, NodeDetailsDto, RepoTextScanStatsDto,
+    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, SearchHit,
+    SearchPlanBridgeDto, SearchPlanChannelDto, SearchPlanDto, SearchPlanPromotionStatusDto,
+    SnippetContextDto, SymbolContextDto, TrailContextDto, TrailStoryDto,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -33,12 +35,7 @@ pub(crate) fn emit<T: Serialize>(
     output_file: Option<&Path>,
 ) -> Result<()> {
     let content = render_output_content(format, value, &markdown)?;
-    if let Some(path) = output_file {
-        write_output_file(path, &content)?;
-    } else {
-        print!("{content}");
-    }
-    Ok(())
+    emit_content(&content, output_file)
 }
 
 pub(crate) fn emit_text(content: String, output_file: Option<&Path>) -> Result<()> {
@@ -46,8 +43,12 @@ pub(crate) fn emit_text(content: String, output_file: Option<&Path>) -> Result<(
     if !content.ends_with('\n') {
         content.push('\n');
     }
+    emit_content(&content, output_file)
+}
+
+fn emit_content(content: &str, output_file: Option<&Path>) -> Result<()> {
     if let Some(path) = output_file {
-        write_output_file(path, &content)?;
+        write_output_file(path, content)?;
     } else {
         print!("{content}");
     }
@@ -122,176 +123,223 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
         output.summary.stats.file_count,
         output.summary.stats.error_count
     );
-    if !output.summary.members.is_empty() {
-        let _ = writeln!(markdown, "members:");
-        for member in &output.summary.members {
-            let _ = writeln!(
-                markdown,
-                "- `{}` files={} nodes={} edges={}",
-                clean_path_string(&member.path),
-                member.file_count.unwrap_or(member.indexed_files),
-                member.node_count.unwrap_or(0),
-                member.edge_count.unwrap_or(0)
-            );
-        }
-    }
+    append_index_members(&mut markdown, output);
     let _ = writeln!(
         markdown,
         "retrieval: {}",
         render_retrieval_state(output.retrieval)
     );
     if let Some(timings) = output.phase_timings {
+        append_index_phase_timings(&mut markdown, timings);
+    }
+    append_index_summary_generation(&mut markdown, output);
+    append_next_commands(&mut markdown, &output.next_commands);
+    markdown
+}
+
+fn append_index_members(markdown: &mut String, output: &IndexOutput<'_>) {
+    if output.summary.members.is_empty() {
+        return;
+    }
+    let _ = writeln!(markdown, "members:");
+    for member in &output.summary.members {
         let _ = writeln!(
             markdown,
-            "timings_ms: parse={} flush={} resolve={} cleanup={} cache_refresh={}",
-            timings.parse_index_ms,
-            timings.projection_flush_ms,
-            timings.edge_resolution_ms,
-            timings.cleanup_ms,
-            timings.cache_refresh_ms.unwrap_or(0)
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "cache_ms",
-            &[
-                ("search_projection", timings.search_projection_rebuild_ms),
-                ("search_index", timings.search_symbol_index_ms),
-                ("runtime_publish", timings.runtime_cache_publish_ms),
-            ],
-        );
-        let _ = writeln!(
-            markdown,
-            "resolution: calls {}->{}, imports {}->{}",
-            timings.unresolved_calls_start,
-            timings.unresolved_calls_end,
-            timings.unresolved_imports_start,
-            timings.unresolved_imports_end
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "semantic_ms",
-            &[
-                ("doc_build", timings.semantic_doc_build_ms),
-                ("embedding", timings.semantic_embedding_ms),
-                ("db_upsert", timings.semantic_db_upsert_ms),
-                ("reload", timings.semantic_reload_ms),
-                ("prune", timings.semantic_prune_ms),
-            ],
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "semantic_docs",
-            &[
-                ("reused", timings.semantic_docs_reused),
-                ("embedded", timings.semantic_docs_embedded),
-                ("pending", timings.semantic_docs_pending),
-                ("stale", timings.semantic_docs_stale),
-            ],
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "staged_publish_ms",
-            &[
-                ("deferred_indexes", timings.deferred_indexes_ms),
-                ("summary_snapshot", timings.summary_snapshot_ms),
-                ("detail_snapshot", timings.detail_snapshot_ms),
-                ("publish", timings.publish_ms),
-            ],
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "setup_ms",
-            &[
-                (
-                    "existing_projection_ids",
-                    timings.setup_existing_projection_ids_ms,
-                ),
-                ("seed_symbol_table", timings.setup_seed_symbol_table_ms),
-            ],
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "flush_breakdown_ms",
-            &[
-                ("files", timings.flush_files_ms),
-                ("nodes", timings.flush_nodes_ms),
-                ("edges", timings.flush_edges_ms),
-                ("occurrences", timings.flush_occurrences_ms),
-                ("component_access", timings.flush_component_access_ms),
-                ("callable_projection", timings.flush_callable_projection_ms),
-            ],
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "resolution_ms",
-            &[
-                ("override_count", timings.resolution_override_count_ms),
-                ("unresolved_counts", timings.resolution_unresolved_counts_ms),
-                ("calls", timings.resolution_calls_ms),
-                ("imports", timings.resolution_imports_ms),
-                ("cleanup", timings.resolution_cleanup_ms),
-            ],
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "resolution_indexes_ms",
-            &[
-                ("call_candidate", timings.resolution_call_candidate_index_ms),
-                (
-                    "import_candidate",
-                    timings.resolution_import_candidate_index_ms,
-                ),
-                ("call_semantic", timings.resolution_call_semantic_index_ms),
-                (
-                    "import_semantic",
-                    timings.resolution_import_semantic_index_ms,
-                ),
-            ],
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "resolution_detail_ms",
-            &[
-                (
-                    "call_semantic_candidates",
-                    timings.resolution_call_semantic_candidates_ms,
-                ),
-                (
-                    "import_semantic_candidates",
-                    timings.resolution_import_semantic_candidates_ms,
-                ),
-                ("call_compute", timings.resolution_call_compute_ms),
-                ("import_compute", timings.resolution_import_compute_ms),
-                ("call_apply", timings.resolution_call_apply_ms),
-                ("import_apply", timings.resolution_import_apply_ms),
-                ("overrides", timings.resolution_override_resolution_ms),
-            ],
-        );
-        append_optional_timings_line(
-            &mut markdown,
-            "resolution_semantic_requests",
-            &[
-                ("call_rows", timings.resolution_call_semantic_requests),
-                (
-                    "call_unique",
-                    timings.resolution_call_semantic_unique_requests,
-                ),
-                (
-                    "call_skipped",
-                    timings.resolution_call_semantic_skipped_requests,
-                ),
-                ("import_rows", timings.resolution_import_semantic_requests),
-                (
-                    "import_unique",
-                    timings.resolution_import_semantic_unique_requests,
-                ),
-                (
-                    "import_skipped",
-                    timings.resolution_import_semantic_skipped_requests,
-                ),
-            ],
+            "- `{}` files={} nodes={} edges={}",
+            clean_path_string(&member.path),
+            member.file_count.unwrap_or(member.indexed_files),
+            member.node_count.unwrap_or(0),
+            member.edge_count.unwrap_or(0)
         );
     }
+}
+
+fn append_index_phase_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    let _ = writeln!(
+        markdown,
+        "timings_ms: parse={} flush={} resolve={} cleanup={} cache_refresh={}",
+        timings.parse_index_ms,
+        timings.projection_flush_ms,
+        timings.edge_resolution_ms,
+        timings.cleanup_ms,
+        timings.cache_refresh_ms.unwrap_or(0)
+    );
+    append_index_cache_timings(markdown, timings);
+    let _ = writeln!(
+        markdown,
+        "resolution: calls {}->{}, imports {}->{}",
+        timings.unresolved_calls_start,
+        timings.unresolved_calls_end,
+        timings.unresolved_imports_start,
+        timings.unresolved_imports_end
+    );
+    append_index_semantic_timings(markdown, timings);
+    append_index_flush_timings(markdown, timings);
+    append_index_resolution_timings(markdown, timings);
+}
+
+fn append_index_cache_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    append_optional_timings_line(
+        markdown,
+        "cache_ms",
+        &[
+            ("search_projection", timings.search_projection_rebuild_ms),
+            ("search_index", timings.search_symbol_index_ms),
+            ("runtime_publish", timings.runtime_cache_publish_ms),
+        ],
+    );
+    append_optional_timings_line(
+        markdown,
+        "staged_publish_ms",
+        &[
+            ("deferred_indexes", timings.deferred_indexes_ms),
+            ("summary_snapshot", timings.summary_snapshot_ms),
+            ("detail_snapshot", timings.detail_snapshot_ms),
+            ("publish", timings.publish_ms),
+        ],
+    );
+    append_optional_timings_line(
+        markdown,
+        "setup_ms",
+        &[
+            (
+                "existing_projection_ids",
+                timings.setup_existing_projection_ids_ms,
+            ),
+            ("seed_symbol_table", timings.setup_seed_symbol_table_ms),
+        ],
+    );
+}
+
+fn append_index_semantic_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    append_optional_timings_line(
+        markdown,
+        "semantic_ms",
+        &[
+            ("doc_build", timings.semantic_doc_build_ms),
+            ("embedding", timings.semantic_embedding_ms),
+            ("db_upsert", timings.semantic_db_upsert_ms),
+            ("reload", timings.semantic_reload_ms),
+            ("prune", timings.semantic_prune_ms),
+        ],
+    );
+    append_optional_timings_line(
+        markdown,
+        "semantic_docs",
+        &[
+            ("reused", timings.semantic_docs_reused),
+            ("embedded", timings.semantic_docs_embedded),
+            ("pending", timings.semantic_docs_pending),
+            ("stale", timings.semantic_docs_stale),
+        ],
+    );
+}
+
+fn append_index_flush_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    append_optional_timings_line(
+        markdown,
+        "flush_breakdown_ms",
+        &[
+            ("files", timings.flush_files_ms),
+            ("nodes", timings.flush_nodes_ms),
+            ("edges", timings.flush_edges_ms),
+            ("occurrences", timings.flush_occurrences_ms),
+            ("component_access", timings.flush_component_access_ms),
+            ("callable_projection", timings.flush_callable_projection_ms),
+        ],
+    );
+}
+
+fn append_index_resolution_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    append_index_resolution_core_timings(markdown, timings);
+    append_index_resolution_index_timings(markdown, timings);
+    append_index_resolution_detail_timings(markdown, timings);
+    append_index_resolution_request_counts(markdown, timings);
+}
+
+fn append_index_resolution_core_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    append_optional_timings_line(
+        markdown,
+        "resolution_ms",
+        &[
+            ("override_count", timings.resolution_override_count_ms),
+            ("unresolved_counts", timings.resolution_unresolved_counts_ms),
+            ("calls", timings.resolution_calls_ms),
+            ("imports", timings.resolution_imports_ms),
+            ("cleanup", timings.resolution_cleanup_ms),
+        ],
+    );
+}
+
+fn append_index_resolution_index_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    append_optional_timings_line(
+        markdown,
+        "resolution_indexes_ms",
+        &[
+            ("call_candidate", timings.resolution_call_candidate_index_ms),
+            (
+                "import_candidate",
+                timings.resolution_import_candidate_index_ms,
+            ),
+            ("call_semantic", timings.resolution_call_semantic_index_ms),
+            (
+                "import_semantic",
+                timings.resolution_import_semantic_index_ms,
+            ),
+        ],
+    );
+}
+
+fn append_index_resolution_detail_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    append_optional_timings_line(
+        markdown,
+        "resolution_detail_ms",
+        &[
+            (
+                "call_semantic_candidates",
+                timings.resolution_call_semantic_candidates_ms,
+            ),
+            (
+                "import_semantic_candidates",
+                timings.resolution_import_semantic_candidates_ms,
+            ),
+            ("call_compute", timings.resolution_call_compute_ms),
+            ("import_compute", timings.resolution_import_compute_ms),
+            ("call_apply", timings.resolution_call_apply_ms),
+            ("import_apply", timings.resolution_import_apply_ms),
+            ("overrides", timings.resolution_override_resolution_ms),
+        ],
+    );
+}
+
+fn append_index_resolution_request_counts(markdown: &mut String, timings: &IndexingPhaseTimings) {
+    append_optional_timings_line(
+        markdown,
+        "resolution_semantic_requests",
+        &[
+            ("call_rows", timings.resolution_call_semantic_requests),
+            (
+                "call_unique",
+                timings.resolution_call_semantic_unique_requests,
+            ),
+            (
+                "call_skipped",
+                timings.resolution_call_semantic_skipped_requests,
+            ),
+            ("import_rows", timings.resolution_import_semantic_requests),
+            (
+                "import_unique",
+                timings.resolution_import_semantic_unique_requests,
+            ),
+            (
+                "import_skipped",
+                timings.resolution_import_semantic_skipped_requests,
+            ),
+        ],
+    );
+}
+
+fn append_index_summary_generation(markdown: &mut String, output: &IndexOutput<'_>) {
     if let Some(summary) = output.summary_generation {
         let _ = writeln!(
             markdown,
@@ -299,13 +347,16 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
             summary.generated, summary.reused, summary.skipped, summary.endpoint
         );
     }
-    if !output.next_commands.is_empty() {
-        let _ = writeln!(markdown, "next_commands:");
-        for command in &output.next_commands {
-            let _ = writeln!(markdown, "- `{command}`");
-        }
+}
+
+fn append_next_commands(markdown: &mut String, commands: &[String]) {
+    if commands.is_empty() {
+        return;
     }
-    markdown
+    let _ = writeln!(markdown, "next_commands:");
+    for command in commands {
+        let _ = writeln!(markdown, "- `{command}`");
+    }
 }
 
 pub(crate) fn render_index_dry_run_markdown(output: &IndexDryRunOutput<'_>) -> String {
@@ -507,6 +558,11 @@ pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput)
     if let Some(assessment) = output.query_assessment.as_ref() {
         append_query_assessment(&mut markdown, assessment);
     }
+    if output.explain
+        && let Some(plan) = output.search_plan.as_ref()
+    {
+        append_search_plan(&mut markdown, plan);
+    }
     if output.explain {
         append_search_evidence_packet(&mut markdown, project_root, output);
     }
@@ -623,6 +679,213 @@ fn append_query_assessment(
     }
     if let Some(action) = assessment.recommended_next_action.as_deref() {
         let _ = writeln!(markdown, "recommended_next_action: {action}");
+    }
+}
+
+fn append_search_plan(markdown: &mut String, plan: &SearchPlanDto) {
+    let _ = writeln!(markdown, "## Search Plan");
+    let _ = writeln!(
+        markdown,
+        "eligible: {} intents: {}",
+        plan.eligible,
+        if plan.intents.is_empty() {
+            "none".to_string()
+        } else {
+            plan.intents.join(", ")
+        }
+    );
+    append_search_plan_terms(markdown, plan);
+    append_search_plan_subqueries(markdown, plan);
+    append_search_plan_candidate_windows(markdown, plan);
+    append_search_plan_anchor_groups(markdown, plan);
+    append_search_plan_bridges(markdown, plan);
+    append_search_plan_repo_text_promotions(markdown, plan);
+    append_search_plan_next_steps(markdown, plan);
+}
+
+fn append_search_plan_terms(markdown: &mut String, plan: &SearchPlanDto) {
+    if !plan.terms.extracted.is_empty() {
+        let _ = writeln!(
+            markdown,
+            "Extracted terms: {}",
+            plan.terms.extracted.join(", ")
+        );
+    }
+    if !plan.terms.dropped.is_empty() {
+        let dropped = plan
+            .terms
+            .dropped
+            .iter()
+            .map(|term| format!("{} ({})", term.term, term.reason))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(markdown, "Dropped terms: {dropped}");
+    }
+}
+
+fn append_search_plan_subqueries(markdown: &mut String, plan: &SearchPlanDto) {
+    if !plan.subqueries.is_empty() {
+        let _ = writeln!(markdown, "Subqueries:");
+        for subquery in &plan.subqueries {
+            let _ = writeln!(
+                markdown,
+                "- `{}` role={} channels={}",
+                subquery.query,
+                subquery.role,
+                format_search_plan_channels(&subquery.channels)
+            );
+        }
+    }
+}
+
+fn append_search_plan_candidate_windows(markdown: &mut String, plan: &SearchPlanDto) {
+    if !plan.candidate_windows.is_empty() {
+        let _ = writeln!(markdown, "Candidate windows:");
+        for window in &plan.candidate_windows {
+            let _ = writeln!(
+                markdown,
+                "- {} query=`{}` returned={}/{} truncated={}",
+                format_search_plan_channel(&window.channel),
+                window.subquery,
+                window.returned_count,
+                window.limit,
+                window.truncated
+            );
+            for reason in &window.score_reasons {
+                let _ = writeln!(markdown, "  why: {reason}");
+            }
+        }
+    }
+}
+
+fn append_search_plan_anchor_groups(markdown: &mut String, plan: &SearchPlanDto) {
+    if !plan.anchor_groups.is_empty() {
+        let _ = writeln!(markdown, "Anchor groups:");
+        for group in &plan.anchor_groups {
+            let target = group
+                .chosen_symbol
+                .as_ref()
+                .map(|hit| format!(" id={}", hit.node_id.0))
+                .unwrap_or_else(|| " id=unresolved".to_string());
+            let _ = writeln!(
+                markdown,
+                "- `{}`{} promotion={} confidence={}",
+                group.anchor,
+                target,
+                format_search_plan_promotion(group.promotion_status),
+                group.confidence
+            );
+            if let Some(method) = group.promotion_method.as_deref() {
+                let _ = writeln!(markdown, "  promotion_method: {method}");
+            }
+            for reason in &group.reasons {
+                let _ = writeln!(markdown, "  why: {reason}");
+            }
+        }
+    }
+}
+
+fn append_search_plan_bridges(markdown: &mut String, plan: &SearchPlanDto) {
+    if !plan.bridges.is_empty() {
+        let _ = writeln!(markdown, "Bridge evidence:");
+        for bridge in &plan.bridges {
+            append_search_plan_bridge(markdown, bridge);
+        }
+    }
+}
+
+fn append_search_plan_bridge(markdown: &mut String, bridge: &SearchPlanBridgeDto) {
+    let direction = bridge
+        .direction
+        .as_deref()
+        .map(|value| format!(" direction={value}"))
+        .unwrap_or_default();
+    let _ = writeln!(
+        markdown,
+        "- `{}` -> `{}` status={} confidence={} evidence={}{} nodes={} edges={} truncated={}",
+        bridge.from_anchor,
+        bridge.to_anchor,
+        bridge.status,
+        bridge.confidence,
+        bridge.evidence_kind,
+        direction,
+        bridge.node_count,
+        bridge.edge_count,
+        bridge.truncated
+    );
+    for note in &bridge.notes {
+        let _ = writeln!(markdown, "  note: {note}");
+    }
+}
+
+fn append_search_plan_repo_text_promotions(markdown: &mut String, plan: &SearchPlanDto) {
+    let _ = writeln!(markdown, "Repo-text promotions:");
+    let mut wrote_repo_text_promotion = false;
+    for group in &plan.anchor_groups {
+        if is_repo_text_promotion_status(group.promotion_status) {
+            wrote_repo_text_promotion = true;
+            let _ = writeln!(
+                markdown,
+                "- `{}` promotion={} confidence={}",
+                group.anchor,
+                format_search_plan_promotion(group.promotion_status),
+                group.confidence
+            );
+        }
+    }
+    if !wrote_repo_text_promotion {
+        let _ = writeln!(markdown, "- none");
+    }
+}
+
+fn append_search_plan_next_steps(markdown: &mut String, plan: &SearchPlanDto) {
+    if !plan.next_commands.is_empty() {
+        let _ = writeln!(markdown, "Next commands:");
+        for command in &plan.next_commands {
+            let _ = writeln!(markdown, "- `{command}`");
+        }
+    }
+    if !plan.source_truth_checks.is_empty() {
+        let _ = writeln!(markdown, "Source-truth checks:");
+        for check in &plan.source_truth_checks {
+            let _ = writeln!(markdown, "- {check}");
+        }
+    }
+}
+
+fn is_repo_text_promotion_status(status: SearchPlanPromotionStatusDto) -> bool {
+    matches!(
+        status,
+        SearchPlanPromotionStatusDto::Promoted
+            | SearchPlanPromotionStatusDto::NeedsSourceRead
+            | SearchPlanPromotionStatusDto::Ambiguous
+    )
+}
+
+fn format_search_plan_channels(channels: &[SearchPlanChannelDto]) -> String {
+    channels
+        .iter()
+        .map(format_search_plan_channel)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_search_plan_channel(channel: &SearchPlanChannelDto) -> &'static str {
+    match channel {
+        SearchPlanChannelDto::TypedSymbol => "typed_symbol",
+        SearchPlanChannelDto::Lexical => "lexical",
+        SearchPlanChannelDto::Semantic => "semantic",
+        SearchPlanChannelDto::RepoText => "repo_text",
+        SearchPlanChannelDto::Bridge => "bridge",
+    }
+}
+
+fn format_search_plan_promotion(status: SearchPlanPromotionStatusDto) -> &'static str {
+    match status {
+        SearchPlanPromotionStatusDto::TypedAnchor => "typed_anchor",
+        SearchPlanPromotionStatusDto::Promoted => "promoted",
+        SearchPlanPromotionStatusDto::NeedsSourceRead => "needs_source_read",
+        SearchPlanPromotionStatusDto::Ambiguous => "ambiguous",
     }
 }
 
@@ -1542,6 +1805,27 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
     if let Some(retrieval) = output.mechanical.retrieval.as_ref() {
         let _ = writeln!(markdown, "retrieval: {}", render_retrieval_state(retrieval));
     }
+    if let Some(freshness) = output.mechanical.freshness.as_ref() {
+        let stale_count = freshness
+            .changed_file_count
+            .saturating_add(freshness.new_file_count)
+            .saturating_add(freshness.removed_file_count);
+        let _ = writeln!(
+            markdown,
+            "freshness: {:?} stale_files={} checked={} indexed={}",
+            freshness.status,
+            stale_count,
+            freshness.checked_file_count,
+            freshness.indexed_file_count
+        );
+        for sample in freshness.samples.iter().take(5) {
+            let _ = writeln!(
+                markdown,
+                "  - freshness_sample {:?}: `{}`",
+                sample.kind, sample.path
+            );
+        }
+    }
     if let Some(timings) = output.mechanical.phase_timings.as_ref() {
         let _ = writeln!(
             markdown,
@@ -1577,6 +1861,60 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
             "  verification_targets",
             &anchor.verification_targets,
         );
+        if let Some(summary) = anchor.consumer_summary.as_ref() {
+            let _ = writeln!(
+                markdown,
+                "  consumers: callers={} consumers={} text_hints={} truncated={} omitted_edges={}",
+                summary.caller_count,
+                summary.consumer_count,
+                summary.text_hint_count,
+                summary.truncated,
+                summary.omitted_edge_count
+            );
+            for caller in &summary.callers {
+                let path = caller.file_path.as_deref().unwrap_or("<no-file>");
+                let target = caller
+                    .target_name
+                    .as_deref()
+                    .map(|name| format!(" -> `{name}`"))
+                    .unwrap_or_default();
+                let certainty = caller.certainty.as_deref().unwrap_or("unknown");
+                let _ = writeln!(
+                    markdown,
+                    "  - caller `{}` [{:?}] `{}`{} edge={:?} certainty={}",
+                    caller.name, caller.kind, path, target, caller.edge_kind, certainty
+                );
+            }
+            for consumer in summary.consumers.iter().take(3) {
+                let path = consumer.file_path.as_deref().unwrap_or("<no-file>");
+                let target = consumer
+                    .target_name
+                    .as_deref()
+                    .map(|name| format!(" -> `{name}`"))
+                    .unwrap_or_default();
+                let certainty = consumer.certainty.as_deref().unwrap_or("unknown");
+                let _ = writeln!(
+                    markdown,
+                    "  - consumer `{}` [{:?}] `{}`{} edge={:?} certainty={}",
+                    consumer.name, consumer.kind, path, target, consumer.edge_kind, certainty
+                );
+            }
+            for hint in summary.text_consumer_hints.iter().take(5) {
+                let path = hint.file_path.as_deref().unwrap_or("<no-file>");
+                let line = hint
+                    .line
+                    .map(|line| line.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let _ = writeln!(
+                    markdown,
+                    "  - text-hint `{}` [{:?}] `{}`:{} score={:.2}",
+                    hint.name, hint.kind, path, line, hint.score
+                );
+            }
+            for note in &summary.notes {
+                let _ = writeln!(markdown, "  - {note}");
+            }
+        }
         for status in &anchor.commands {
             let _ = writeln!(
                 markdown,
@@ -1615,8 +1953,45 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
                     evidence.shared_files.join(", ")
                 );
             }
+            if !evidence.endpoint_files.is_empty() {
+                let _ = writeln!(
+                    markdown,
+                    "  endpoint_files: {}",
+                    evidence.endpoint_files.join(", ")
+                );
+            }
+            if !evidence.evidence_files.is_empty() {
+                let _ = writeln!(
+                    markdown,
+                    "  evidence_files: {}",
+                    evidence.evidence_files.join(", ")
+                );
+            }
+            if !evidence.next_commands.is_empty() {
+                let _ = writeln!(markdown, "  next_commands:");
+                for command in &evidence.next_commands {
+                    let _ = writeln!(markdown, "    - `{command}`");
+                }
+            }
             for note in &evidence.notes {
                 let _ = writeln!(markdown, "  - {note}");
+            }
+        }
+    }
+
+    if !output.execution_boundaries.is_empty() {
+        let _ = writeln!(markdown, "execution_boundaries:");
+        for boundary in &output.execution_boundaries {
+            let _ = writeln!(markdown, "- `{}`", boundary.command);
+            for step in &boundary.flow {
+                let _ = writeln!(markdown, "  - {step}");
+            }
+            if !boundary.source_files.is_empty() {
+                let _ = writeln!(
+                    markdown,
+                    "  source_files: {}",
+                    boundary.source_files.join(", ")
+                );
             }
         }
     }
@@ -1626,6 +2001,7 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
         "verification_targets",
         &output.verification_targets,
     );
+    append_evidence_packet(&mut markdown, output);
     let contract = &output.answer_quality_contract;
     let _ = writeln!(
         markdown,
@@ -1680,15 +2056,25 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
             );
         }
     }
-    let _ = writeln!(
-        markdown,
-        "- scoring: correct={} partial={} misleading={} unsupported={} material_revision_count={}",
-        ledger.scoring.correct,
-        ledger.scoring.partial,
-        ledger.scoring.misleading,
-        ledger.scoring.unsupported,
-        ledger.scoring.material_revision_count
-    );
+    if ledger.scoring.status == "pending_source_verification"
+        && ledger.scoring.pending_claim_count > 0
+    {
+        let _ = writeln!(
+            markdown,
+            "- score_status={} pending={}",
+            ledger.scoring.status, ledger.scoring.pending_claim_count
+        );
+    } else {
+        let _ = writeln!(
+            markdown,
+            "- scoring: correct={} partial={} misleading={} unsupported={} material_revision_count={}",
+            ledger.scoring.correct,
+            ledger.scoring.partial,
+            ledger.scoring.misleading,
+            ledger.scoring.unsupported,
+            ledger.scoring.material_revision_count
+        );
+    }
     let _ = writeln!(
         markdown,
         "- score_formula: {}",
@@ -1712,6 +2098,122 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
         }
     }
     markdown
+}
+
+fn append_evidence_packet(markdown: &mut String, output: &DrillOutput) {
+    let packet = &output.evidence_packet;
+    let readiness = &packet.readiness;
+    let _ = writeln!(
+        markdown,
+        "evidence_packet: version={} items={} overall_status={}",
+        packet.packet_version,
+        packet.items.len(),
+        render_claim_readiness(readiness.overall_status)
+    );
+    if let Some(question) = packet.question.as_deref() {
+        let _ = writeln!(markdown, "- question: {question}");
+    }
+    if !readiness.safe_to_say.is_empty() {
+        let _ = writeln!(markdown, "- safe_to_say:");
+        for item in readiness.safe_to_say.iter().take(EVIDENCE_PREVIEW_LIMIT) {
+            let _ = writeln!(markdown, "  - {item}");
+        }
+    }
+    if !readiness.inferred_claims.is_empty() {
+        let _ = writeln!(markdown, "- inferred_or_partial:");
+        for item in readiness
+            .inferred_claims
+            .iter()
+            .take(EVIDENCE_PREVIEW_LIMIT)
+        {
+            let _ = writeln!(markdown, "  - {item}");
+        }
+    }
+    if !readiness.needs_verification.is_empty() {
+        let _ = writeln!(markdown, "- needs_verification:");
+        for item in readiness
+            .needs_verification
+            .iter()
+            .take(EVIDENCE_PREVIEW_LIMIT)
+        {
+            let _ = writeln!(markdown, "  - {item}");
+        }
+    }
+    if !readiness.source_truth_checks.is_empty() {
+        let _ = writeln!(markdown, "- source_truth_checks:");
+        for check in readiness
+            .source_truth_checks
+            .iter()
+            .take(EVIDENCE_PREVIEW_LIMIT)
+        {
+            match check.line {
+                Some(line) => {
+                    let _ = writeln!(
+                        markdown,
+                        "  - `{}`:{} required={} reason={}",
+                        check.path, line, check.required, check.reason
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        markdown,
+                        "  - `{}` required={} reason={}",
+                        check.path, check.required, check.reason
+                    );
+                }
+            }
+        }
+    }
+    if !packet.items.is_empty() {
+        let _ = writeln!(markdown, "- evidence_items:");
+        for item in packet.items.iter().take(8) {
+            let location = item
+                .source
+                .as_ref()
+                .map(|source| match source.line_start {
+                    Some(line) => format!(" `{}`:{line}", source.path),
+                    None => format!(" `{}`", source.path),
+                })
+                .unwrap_or_default();
+            let _ = writeln!(
+                markdown,
+                "  - `{}` type={} status={} confidence={} readiness={}{}",
+                item.id,
+                render_evidence_type(item.evidence_type),
+                item.status,
+                item.confidence,
+                render_claim_readiness(item.verification_status),
+                location
+            );
+            for note in item.notes.iter().take(2) {
+                let _ = writeln!(markdown, "    - {note}");
+            }
+        }
+    }
+}
+
+fn render_evidence_type(evidence_type: EvidenceTypeDto) -> &'static str {
+    match evidence_type {
+        EvidenceTypeDto::SearchHit => "search_hit",
+        EvidenceTypeDto::SymbolContext => "symbol_context",
+        EvidenceTypeDto::Trail => "trail",
+        EvidenceTypeDto::Snippet => "snippet",
+        EvidenceTypeDto::Explore => "explore",
+        EvidenceTypeDto::Bridge => "bridge",
+        EvidenceTypeDto::RepoText => "repo_text",
+        EvidenceTypeDto::Negative => "negative",
+    }
+}
+
+fn render_claim_readiness(readiness: ClaimReadinessDto) -> &'static str {
+    match readiness {
+        ClaimReadinessDto::Anchored => "anchored",
+        ClaimReadinessDto::Supported => "supported",
+        ClaimReadinessDto::Partial => "partial",
+        ClaimReadinessDto::Inferred => "inferred",
+        ClaimReadinessDto::NeedsSourceRead => "needs_source_read",
+        ClaimReadinessDto::ContradictedBySource => "contradicted_by_source",
+    }
 }
 
 fn render_drill_command_status_suffix(status: &crate::args::DrillCommandStatusOutput) -> String {
@@ -3108,6 +3610,7 @@ mod tests {
                         .to_string(),
                 ),
             }),
+            search_plan: None,
             explain: true,
             query_hints: vec![
                 "codestory-cli context --project C:/repo --query build_packet".to_string(),
@@ -3309,6 +3812,7 @@ mod tests {
                     "Rerun search with --repo-text on or a shorter concrete symbol.".to_string(),
                 ),
             }),
+            search_plan: None,
             explain: true,
             query_hints: Vec::new(),
             suggestions: Vec::new(),

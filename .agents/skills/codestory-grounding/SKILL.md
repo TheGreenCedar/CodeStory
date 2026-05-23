@@ -12,12 +12,13 @@ Use this skill to collect repo evidence with `codestory-cli` before making archi
 - `doctor`: read-only health check for project, cache, index, retrieval, semantic readiness, freshness, and relevant environment settings.
 - `index`: build or refresh the SQLite graph, search, snapshot, and semantic cache.
 - `ground`: broad repo-level orientation snapshot; use `--why` for coverage, retrieval mode, gaps, and next commands.
-- `search`: lightweight candidate discovery for symbols, files, literals, API paths, modules, or behavior terms; use `--why` for ranking reasons.
+- `search`: lightweight candidate discovery for symbols, files, literals, API paths, modules, or behavior terms; use `--why` for ranking reasons and broad-query Search Plan evidence when present.
 - `context`: deep evidence/context bundle for one concrete target selected by `--id`, `--query`, or `--bookmark`; it is not question answering and does not interpret natural-language questions.
 - `symbol`: inspect one exact symbol and relationships.
 - `trail`: follow caller, callee, and reference graph around a symbol; use `--story --hide-speculative` for readable flow evidence.
 - `snippet`: fetch source context around a symbol.
-- `drill`: run a deterministic agent-grounding packet for a natural-language question and concrete anchors, including search/symbol/trail/explore/snippet artifacts, bridge evidence, a claim-ledger template, and a source-verification checklist.
+- `drill`: run a deterministic agent-grounding packet for a natural-language question and concrete anchors, including search/symbol/trail/explore/snippet artifacts, bridge evidence, consumer summaries, endpoint/source-truth files, an Evidence Packet, Answer Readiness report, compact `drill-summary.json`, claim-ledger template, and source-verification checklist.
+- `drill-suite`: run a manifest-defined real-repo drill matrix from the CodeStory owner checkout, writing per-repo drill artifacts plus aggregate `suite-report.md`/`suite-report.json`; use it for cross-repo agent-UX regression measurement without baking workstation-specific repo names into the CLI.
 - `query`: run structured graph-query pipelines.
 - `explore`: interactive or bundled navigation view around a target, including grouped line-numbered source packets.
 - `files`: list indexed file inventory, language counts, inferred source/test/generated/vendor roles, and partial-index markers.
@@ -34,9 +35,11 @@ Use this skill to collect repo evidence with `codestory-cli` before making archi
 4. Use `search` for lightweight candidate discovery. Use `context` only after you have one concrete retrieval target.
 5. Use `explore` when one call should collect resolution, relationships, source slices, related files, and coverage notes around a chosen target.
 6. Use `files` before claiming coverage for a language/path area, and use `affected` before selecting regression tests for a change.
-7. Do not pass broad product or architecture questions to `context`. Break broad questions into concrete terms, choose anchors, then run `context --id <node-id>`.
+7. Do not pass broad product or architecture questions to `context`. Use `search --why` or `drill --question` to decompose broad questions into concrete anchors, then run `context --id <node-id>`.
 8. Treat command output as evidence, then open only the files needed for edits or verification.
 9. Keep navigation, route coverage, performance, and search-quality work CLI-first. Do not route these workflows through MCP, stdio, HTTP, or server behavior.
+10. For architecture answers, read `evidence_packet.readiness` before drafting. Do not present `partial`, `inferred`, or `needs_source_read` claims as verified until the source-truth checklist has been completed.
+11. Treat repo-text and cross-language framework evidence as hints unless the packet also includes typed graph evidence, snippets, or source-truth checks.
 
 ## Template Workflows
 
@@ -79,7 +82,7 @@ target/release/codestory-cli(.exe) affected --project <workspace> src/lib.rs tes
 
 ### Broad repo/product question workflow
 
-Do not pass the broad question to `context`.
+Do not pass the broad question to `context`. Prefer `drill` when the user needs an answer-quality check, not just navigation.
 
 ```
 target/release/codestory-cli(.exe) ground --project <workspace> --why
@@ -87,6 +90,34 @@ target/release/codestory-cli(.exe) search --project <workspace> --repo-text on -
 target/release/codestory-cli(.exe) search --project <workspace> --repo-text on --query "<another concrete term>" --why
 # select anchors
 target/release/codestory-cli(.exe) context --project <workspace> --id <node-id>
+```
+
+When `search --why` emits `search_plan`, use its subqueries, anchor groups,
+repo-text promotion status, bridge evidence, next commands, and source-truth
+checks as the CodeStory-first plan. Do not treat the Search Plan as final answer
+text; it is the handoff into `symbol`, `trail`, `snippet`, `explore`, `drill`,
+and source-truth verification.
+
+### Real-repo agent-quality drill workflow
+
+Use this workflow when the goal is to test whether CodeStory helps an agent answer a realistic architecture question.
+
+```
+target/release/codestory-cli(.exe) drill --project <workspace> --refresh full --question "<question>" --anchors AnchorA,AnchorB,AnchorC --output-dir target/drill/<slug> --format json
+# Read drill-report.json first:
+# - evidence_packet.readiness.safe_to_say
+# - evidence_packet.readiness.inferred_claims
+# - evidence_packet.readiness.needs_verification
+# - evidence_packet.readiness.source_truth_checks
+# Read drill-summary.json for compact status, freshness, retrieval, bridge counts, and verdict next action.
+# Draft the CodeStory-only answer, then open only source files named or implied by source_truth_checks.
+```
+
+For a repeatable cross-repo regression drill from the CodeStory checkout, put cases in a JSON manifest and pass it explicitly:
+
+```
+target/release/codestory-cli(.exe) drill-suite --project <codestory-checkout> --case-file <drill-cases.json> --refresh full --output-dir target/codestory-cross-repo-test/<stamp> --format json
+# Read suite-report.json and suite-report.md for per-repo verdicts, freshness/retrieval state, bridge status, and next actions.
 ```
 
 ### Stale or unhealthy semantic retrieval
@@ -106,6 +137,13 @@ If retrieval is still partial, stale, or failed, use `search --repo-text on --wh
 target/release/codestory-cli(.exe) files --project <workspace> --format json
 cargo test -p codestory-indexer --lib framework_route
 cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
+cargo test -p codestory-cli --test agent_quality_eval
+```
+
+The `agent_quality_eval` command above is the quick deterministic fixture gate. To score local real-repo manifests on this workstation, run the ignored evaluator explicitly:
+
+```
+cargo test -p codestory-cli --test agent_quality_eval local_real_repo_manifests_score_or_explicitly_skip_missing_repos -- --ignored --nocapture
 ```
 
 ### Performance review baseline
@@ -140,11 +178,18 @@ Capture the baseline before optimization, define the no-regression threshold, an
   - `ambiguous`: a query matched multiple plausible targets; rerun `search --why`, then use `--id` or `--file`.
   - `unmatched`: a changed path was not found in the persisted index; confirm with `files --path <fragment>` or refresh.
 - `search` can return both typed symbol hits and `[unknown]` usage-like hits for the same name. Prefer the typed hit when verifying symbol surfacing.
+- Broad architecture `search` can return `search_plan`. Treat `typed_anchor` and
+  `promoted` groups as candidate anchors, keep `ambiguous` and
+  `needs_source_read` groups visibly uncertain, and follow the plan's
+  source-truth checks before making final claims.
 - `search` may include `did_you_mean` suggestions when semantic retrieval found close matches but lexical lookup did not. Treat these as navigation hints, not exact matches.
 - `context --query` first resolves the query to a concrete target. If the target is ambiguous, use `search --why`, then rerun `context --id`.
 - `trail` should be judged by whether unrelated resolved targets disappeared. Local helper names like `once`, `from`, or `copied` can still appear as `[unknown]` nodes without indicating bad semantic resolution.
 - OpenAPI schema files index endpoint symbols such as `GET /api/users`; client literal calls can create speculative edges to those endpoints, so check certainty before treating a frontend/backend trail as verified.
 - Framework route symbols include confidence labels. Treat `file_convention` and `decorator` routes as stronger than broad `heuristic` routes, and confirm handler links before claiming an end-to-end route path.
+- Framework integration symbols have bounded fixture-backed support. `tauri:command:*` covers first-argument string-literal `invoke` calls, including multiline/generic calls, and Rust `#[tauri::command]`/`generate_handler!` registrations while rejecting argument strings and comments. `payload:collection:*` covers `CollectionConfig` slug blocks and Payload method calls with `collection:` options while rejecting unrelated slugs, props, and string substrings. Treat evidence outside those covered forms as unsupported until source verification proves it.
+- `drill` Evidence Packet readiness is the agent-facing contract: `anchored` and `supported` claims may be drafted from CodeStory evidence; `partial`, `inferred`, and `needs_source_read` claims must stay visibly uncertain until source verification completes. Use `drill-summary.json`/`suite-report.json` for compact status comparisons; stale freshness or symbolic-only retrieval are agent-UX degradation signals even when anchors resolve.
+- The agent-quality evaluator is deterministic. Its gate fails unsupported high-confidence claims, overclaims, high-confidence material source corrections, and poor confidence calibration; do not replace it with live LLM judging in CI.
 - `files`, `search`, and `explore` can report usable-but-partial indexes. Carry those coverage notes into decisions instead of silently assuming full coverage.
 - `affected` is a graph-based test-selection hint, not a replacement for the test suite. Prefer impacted tests first, then run broader gates when shared code or coverage warnings are involved.
 - Search-quality eval failures should be interpreted by query class, expected anchor, anchor bucket, MRR, max latency, and fallback source before ranking or route-support claims are promoted.
@@ -165,6 +210,7 @@ Detailed argument tables, output examples, and usage patterns for each command:
 - [trail](references/trail.md) - Follow a symbol's call/reference graph
 - [snippet](references/snippet.md) - Fetch source code context around a symbol
 - [drill](references/drill.md) - Build a repeatable evidence packet for agent-grounding drills
+- [drill-suite](references/drill-suite.md) - Run a manifest-defined cross-repo real-repo agent drill matrix
 - [query](references/query.md) - Structured graph query pipelines
 - [explore](references/explore.md) - Interactive terminal exploration with Markdown/JSON fallback
 - [files](references/files.md) - Indexed file inventory and coverage markers

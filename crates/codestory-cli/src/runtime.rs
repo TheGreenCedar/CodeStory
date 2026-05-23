@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use crate::args::{ProjectArgs, QuerySelectorOutput, RefreshMode, TargetSelection};
 use crate::display::{clean_path_string, format_search_hit_target, relative_path};
 use crate::query_resolution::{
-    ResolutionRank, compare_resolution_hits, file_filter_match_bucket,
+    ResolutionRank, compare_resolution_hits, file_filter_match_bucket, is_resolvable_graph_target,
     resolution_rank_with_project_root, search_hit_matches_file_filter,
 };
 
@@ -88,7 +88,7 @@ impl RuntimeContext {
         let cache_override = args.cache_dir.as_deref().or(config.cache_dir.as_deref());
         let cache_root = cache_root_for_project(&project_root, cache_override)?;
         let managed_embeddings_root =
-            crate::managed_embeddings::managed_root(args.cache_dir.as_deref())?;
+            crate::managed_embeddings::runtime_managed_root(args.cache_dir.as_deref())?;
         crate::managed_embeddings::prepare_runtime_if_installed(&managed_embeddings_root);
         let storage_path = cache_root.join("codestory.db");
         let runtime = Runtime::new();
@@ -107,7 +107,15 @@ impl RuntimeContext {
     }
 
     pub(crate) fn ensure_open(&self, refresh: RefreshMode) -> Result<OpenedProject> {
-        let mut summary = self.open_project_summary()?;
+        let summary = self.open_project_summary()?;
+        self.ensure_open_from_summary(refresh, summary)
+    }
+
+    pub(crate) fn ensure_open_from_summary(
+        &self,
+        refresh: RefreshMode,
+        mut summary: ProjectSummary,
+    ) -> Result<OpenedProject> {
         let refresh_mode = resolve_refresh_request(refresh, &summary);
         let mut phase_timings = None;
         if let Some(mode) = refresh_mode {
@@ -225,6 +233,7 @@ fn query_resolution_alternatives(
             None,
         )
         .map_err(map_api_error)?;
+    alternatives.retain(|hit| is_resolvable_graph_target(query, hit));
     if let Some(file_filter) = file_filter {
         alternatives
             .retain(|hit| search_hit_matches_file_filter(&runtime.project_root, hit, file_filter));
@@ -477,17 +486,22 @@ fn compare_resolution_candidates(
 }
 
 fn no_query_match_error(
-    _project_root: &Path,
+    project_root: &Path,
     query: &str,
     file_filter: Option<&str>,
 ) -> anyhow::Error {
+    let search_command = format!(
+        "codestory-cli search --project {} --query {} --limit 10",
+        quote_cli_path(project_root),
+        quote_cli_value(query)
+    );
     match file_filter {
         Some(file_filter) => anyhow!(
-            "query_resolution: No symbol matched query `{query}` within files matching `{}`. Run `codestory-cli search --query \"{query}\" --limit 10` to inspect candidates, or relax `--file`.",
+            "query_resolution: No symbol matched query `{query}` within files matching `{}`. Run `{search_command}` to inspect candidates, or relax `--file`.",
             clean_path_string(file_filter)
         ),
         None => anyhow!(
-            "query_resolution: No symbol matched query `{query}`. Run `codestory-cli search --query \"{query}\" --limit 10` to inspect candidates."
+            "query_resolution: No symbol matched query `{query}`. Run `{search_command}` to inspect candidates."
         ),
     }
 }
@@ -600,6 +614,11 @@ mod tests {
         .expect("runtime context");
 
         assert_eq!(context.storage_path, config_cache.join("codestory.db"));
+        assert_eq!(
+            context.managed_embeddings_root,
+            crate::managed_embeddings::managed_root(None).expect("global managed root"),
+            "repo-controlled config cache_dir should not influence managed executable asset root"
+        );
         assert_ne!(
             context.managed_embeddings_root,
             config_cache.join("managed-embeddings"),

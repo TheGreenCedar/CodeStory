@@ -842,7 +842,7 @@ fn setup_embeddings_dry_run_reports_pinned_managed_assets() {
 }
 
 #[test]
-fn doctor_reports_missing_managed_assets_before_setup() {
+fn doctor_reports_managed_embedding_setup_state() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
     write_tiny_rust_workspace(workspace.path());
@@ -855,16 +855,19 @@ fn doctor_reports_missing_managed_assets_before_setup() {
     );
 
     let managed = check_with_name(&doctor, "managed_embeddings");
-    assert_eq!(
-        managed["status"], "info",
-        "missing managed assets should be informational before setup: {doctor:#}"
-    );
-    assert!(
-        managed["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("setup embeddings")),
-        "doctor should name the setup command when managed assets are missing: {doctor:#}"
-    );
+    let status = managed["status"].as_str().expect("managed status");
+    let message = managed["message"].as_str().expect("managed message");
+    match status {
+        "info" => assert!(
+            message.contains("setup embeddings"),
+            "doctor should name the setup command when managed assets are missing: {doctor:#}"
+        ),
+        "ok" => assert!(
+            message.contains("Managed ONNX embeddings are installed"),
+            "doctor should report globally available managed assets for isolated cache dirs: {doctor:#}"
+        ),
+        _ => panic!("managed setup state should be informational or installed: {doctor:#}"),
+    }
 }
 
 #[test]

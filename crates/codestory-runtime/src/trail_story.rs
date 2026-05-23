@@ -57,9 +57,10 @@ pub(crate) fn build_trail_story(
     let side_effects = side_effects_for_story(project_root, trail, &nodes_by_id);
     let uncertainty = uncertainty_for_story(project_root, trail, &nodes_by_id, req);
     let test_scope = test_scope_for_story(project_root, req, &test_nodes);
-    let limits = limits_for_story(trail, req);
+    let limits = limits_for_story(trail, req, &nodes_by_id);
+    let structural_only = trail_is_structural_only(trail, &nodes_by_id);
     let summary = format!(
-        "Story trail around `{}` found {} nodes and {} edges; mode={} direction={} tests={} utility_calls={} truncated={}.",
+        "Story trail around `{}` found {} nodes and {} edges; mode={} direction={} tests={} utility_calls={} truncated={} structural_only={}.",
         focus.display_name,
         trail.nodes.len(),
         trail.edges.len(),
@@ -75,7 +76,8 @@ pub(crate) fn build_trail_story(
         } else {
             "hidden"
         },
-        trail.truncated
+        trail.truncated,
+        structural_only
     );
 
     TrailStoryDto {
@@ -260,7 +262,7 @@ fn story_node_ref(project_root: Option<&Path>, node: &GraphNodeDto) -> String {
         .file_path
         .as_deref()
         .map(|value| format!(" `{}`", story_path(project_root, value)))
-        .unwrap_or_default();
+        .unwrap_or_else(|| " [no source path]".to_string());
     format!("{} [{}]{}", node.label, story_node_kind(node.kind), path)
 }
 
@@ -269,7 +271,7 @@ fn story_focus_ref(project_root: Option<&Path>, node: &NodeDetailsDto) -> String
         .file_path
         .as_deref()
         .map(|value| format!(" `{}`", story_path(project_root, value)))
-        .unwrap_or_default();
+        .unwrap_or_else(|| " [no source path]".to_string());
     format!(
         "{} [{}]{}",
         node.display_name,
@@ -441,6 +443,15 @@ fn uncertainty_for_story(
     if !req.edge_filter.is_empty() {
         uncertainty.push("edge filters were applied before rendering".to_string());
     }
+    if let Some(focus) = nodes_by_id.get(&req.root_id)
+        && story_node_is_callable(focus)
+        && !trail_has_incoming_call_edge(trail, &req.root_id)
+    {
+        uncertainty.push(
+            "focus has no visible incoming call edges in the rendered trail; treat runtime participation as unproven unless a framework/runtime entry path is source-verified"
+                .to_string(),
+        );
+    }
     for edge in &trail.edges {
         let certainty = story_certainty(edge);
         if !is_uncertain_story_certainty(&certainty) {
@@ -452,14 +463,26 @@ fn uncertainty_for_story(
             step.edge_id, step.source, step.relation, step.target, step.certainty, step.note
         ));
     }
-    if uncertainty.is_empty() {
-        if trail.edges.is_empty() {
-            uncertainty.push("no rendered trail edges to evaluate for certainty".to_string());
-        } else {
-            uncertainty.push("all rendered trail edges are explicitly marked certain".to_string());
-        }
+    if trail.edges.is_empty() {
+        uncertainty.push("no rendered trail edges to evaluate for certainty".to_string());
+    } else if uncertainty.is_empty() {
+        uncertainty.push("all rendered trail edges are explicitly marked certain".to_string());
     }
     uncertainty
+}
+
+fn story_node_is_callable(node: &GraphNodeDto) -> bool {
+    matches!(
+        node.kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+    )
+}
+
+fn trail_has_incoming_call_edge(trail: &GraphResponse, node_id: &NodeId) -> bool {
+    trail
+        .edges
+        .iter()
+        .any(|edge| edge.kind == EdgeKind::CALL && &edge.target == node_id)
 }
 
 fn test_scope_for_story(
@@ -499,7 +522,11 @@ fn test_scope_for_story(
     scope
 }
 
-fn limits_for_story(trail: &GraphResponse, req: &TrailConfigDto) -> Vec<String> {
+fn limits_for_story(
+    trail: &GraphResponse,
+    req: &TrailConfigDto,
+    nodes_by_id: &HashMap<NodeId, &GraphNodeDto>,
+) -> Vec<String> {
     let mut limits = Vec::new();
     if trail.edges.len() > TRAIL_STORY_CORE_FLOW_LIMIT {
         limits.push(format!(
@@ -523,7 +550,63 @@ fn limits_for_story(trail: &GraphResponse, req: &TrailConfigDto) -> Vec<String> 
         limits
             .push("no edges were returned, so core flow is limited to the focus node".to_string());
     }
+    if trail_is_structural_only(trail, nodes_by_id) {
+        limits.push(
+            "structural-only trail: inspect child methods/occurrences and rerun snippet with --function-body on a concrete function or method anchor"
+                .to_string(),
+        );
+    }
+    if trail.nodes.iter().any(|node| node.file_path.is_none()) {
+        limits.push(
+            "one or more trail nodes have no source path; treat them as navigation anchors until a path-backed occurrence or snippet is opened"
+                .to_string(),
+        );
+    }
     limits
+}
+
+fn trail_is_structural_only(
+    trail: &GraphResponse,
+    nodes_by_id: &HashMap<NodeId, &GraphNodeDto>,
+) -> bool {
+    if trail.edges.is_empty() {
+        return trail
+            .nodes
+            .iter()
+            .any(|node| is_structural_story_kind(node.kind));
+    }
+    trail.edges.iter().all(|edge| {
+        matches!(
+            edge.kind,
+            EdgeKind::MEMBER
+                | EdgeKind::INHERITANCE
+                | EdgeKind::TYPE_USAGE
+                | EdgeKind::OVERRIDE
+                | EdgeKind::TYPE_ARGUMENT
+                | EdgeKind::TEMPLATE_SPECIALIZATION
+        ) || nodes_by_id
+            .get(&edge.source)
+            .is_some_and(|node| is_structural_story_kind(node.kind))
+            && nodes_by_id
+                .get(&edge.target)
+                .is_some_and(|node| is_structural_story_kind(node.kind))
+    })
+}
+
+fn is_structural_story_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::MODULE
+            | NodeKind::NAMESPACE
+            | NodeKind::PACKAGE
+            | NodeKind::FILE
+            | NodeKind::STRUCT
+            | NodeKind::CLASS
+            | NodeKind::INTERFACE
+            | NodeKind::ENUM
+            | NodeKind::UNION
+            | NodeKind::TYPEDEF
+    )
 }
 
 fn is_test_like_story_node(node: &GraphNodeDto) -> bool {
@@ -567,16 +650,20 @@ mod trail_story_tests {
     use codestory_contracts::api::{EdgeId, LayoutDirection};
 
     fn node(id: &str, label: &str, file_path: &str) -> GraphNodeDto {
+        node_of_kind(id, label, file_path, NodeKind::FUNCTION)
+    }
+
+    fn node_of_kind(id: &str, label: &str, file_path: &str, kind: NodeKind) -> GraphNodeDto {
         GraphNodeDto {
             id: NodeId(id.to_string()),
             label: label.to_string(),
-            kind: NodeKind::FUNCTION,
+            kind,
             depth: 0,
             label_policy: None,
             badge_visible_members: None,
             badge_total_members: None,
             merged_symbol_examples: Vec::new(),
-            file_path: Some(file_path.to_string()),
+            file_path: (!file_path.is_empty()).then(|| file_path.to_string()),
             qualified_name: None,
             member_access: None,
         }
@@ -588,6 +675,25 @@ mod trail_story_tests {
             source: NodeId(source.to_string()),
             target: NodeId(target.to_string()),
             kind: EdgeKind::CALL,
+            confidence: Some(0.99),
+            certainty: certainty.map(ToOwned::to_owned),
+            callsite_identity: None,
+            candidate_targets: Vec::new(),
+        }
+    }
+
+    fn edge_of_kind(
+        id: usize,
+        source: &str,
+        target: &str,
+        kind: EdgeKind,
+        certainty: Option<&str>,
+    ) -> GraphEdgeDto {
+        GraphEdgeDto {
+            id: EdgeId(format!("edge-{id}")),
+            source: NodeId(source.to_string()),
+            target: NodeId(target.to_string()),
+            kind,
             confidence: Some(0.99),
             certainty: certainty.map(ToOwned::to_owned),
             callsite_identity: None,
@@ -747,6 +853,71 @@ mod trail_story_tests {
                 .iter()
                 .any(|item| item.contains("no rendered trail edges to evaluate")),
             "empty story should not claim all edges are certain: {story:#?}"
+        );
+        assert!(
+            story
+                .uncertainty
+                .iter()
+                .any(|item| item.contains("no visible incoming call edges")),
+            "callable focus with no visible callers should be labeled: {story:#?}"
+        );
+    }
+
+    #[test]
+    fn trail_story_flags_structural_only_and_missing_paths() {
+        let focus = NodeDetailsDto {
+            id: NodeId("focus".to_string()),
+            kind: NodeKind::CLASS,
+            display_name: "SourceGroupCxxCdb".to_string(),
+            serialized_name: "SourceGroupCxxCdb".to_string(),
+            qualified_name: None,
+            canonical_id: None,
+            file_path: None,
+            start_line: None,
+            start_col: None,
+            end_line: None,
+            end_col: None,
+            member_access: None,
+            route_endpoint: None,
+        };
+        let trail = GraphResponse {
+            center_id: NodeId("focus".to_string()),
+            nodes: vec![
+                node_of_kind("focus", "SourceGroupCxxCdb", "", NodeKind::CLASS),
+                node_of_kind("member", "getIndexerCommands", "", NodeKind::METHOD),
+            ],
+            edges: vec![edge_of_kind(
+                1,
+                "focus",
+                "member",
+                EdgeKind::MEMBER,
+                Some("certain"),
+            )],
+            truncated: false,
+            omitted_edge_count: 0,
+            canonical_layout: None,
+        };
+
+        let story = build_trail_story(None, &focus, &trail, &request(true));
+
+        assert!(
+            story.summary.contains("structural_only=true"),
+            "summary should expose structural-only state: {story:#?}"
+        );
+        assert!(
+            story
+                .limits
+                .iter()
+                .any(|item| item.contains("structural-only trail")
+                    && item.contains("--function-body")),
+            "limits should point to method/body snippets: {story:#?}"
+        );
+        assert!(
+            story
+                .entry_points
+                .iter()
+                .any(|item| item.contains("[no source path]")),
+            "missing source paths should be visible: {story:#?}"
         );
     }
 
