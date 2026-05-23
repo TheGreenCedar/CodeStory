@@ -326,6 +326,93 @@ pub struct StorageStats {
     pub error_count: i64,
 }
 
+fn is_framework_synthetic_node(node: &Node) -> bool {
+    node.canonical_id.as_deref().is_some_and(|canonical_id| {
+        canonical_id.starts_with("tauri:command:")
+            || canonical_id.starts_with("payload:collection:")
+    })
+}
+
+fn preferred_framework_node(
+    conn: &Connection,
+    batch_file_paths: &HashMap<NodeId, PathBuf>,
+    existing: Node,
+    candidate: Node,
+) -> Result<Node, StorageError> {
+    let existing_rank = framework_node_source_rank(conn, batch_file_paths, &existing)?;
+    let candidate_rank = framework_node_source_rank(conn, batch_file_paths, &candidate)?;
+    if candidate_rank > existing_rank {
+        Ok(candidate)
+    } else {
+        Ok(existing)
+    }
+}
+
+fn framework_node_source_rank(
+    conn: &Connection,
+    batch_file_paths: &HashMap<NodeId, PathBuf>,
+    node: &Node,
+) -> Result<u8, StorageError> {
+    let canonical_id = node.canonical_id.as_deref().unwrap_or_default();
+    let path = framework_node_file_path(conn, batch_file_paths, node)?
+        .map(|path| normalize_framework_source_path(&path))
+        .unwrap_or_default();
+
+    if canonical_id.starts_with("tauri:command:") {
+        if path.contains("/src-tauri/") || path.ends_with(".rs") {
+            return Ok(4);
+        }
+        return Ok(u8::from(node.start_line.is_some()));
+    }
+
+    if canonical_id.starts_with("payload:collection:") {
+        if path.contains("/collections/") || path.contains("/payload.config.") {
+            return Ok(4);
+        }
+        if node.start_col == Some(1) {
+            return Ok(3);
+        }
+        return Ok(u8::from(!path.is_empty()));
+    }
+
+    Ok(0)
+}
+
+fn framework_node_file_path(
+    conn: &Connection,
+    batch_file_paths: &HashMap<NodeId, PathBuf>,
+    node: &Node,
+) -> Result<Option<PathBuf>, StorageError> {
+    let Some(file_node_id) = node.file_node_id else {
+        return Ok(None);
+    };
+    if let Some(path) = batch_file_paths.get(&file_node_id) {
+        return Ok(Some(path.clone()));
+    }
+
+    let mut stmt = conn.prepare("SELECT path FROM file WHERE id = ?1")?;
+    let mut rows = stmt.query(params![file_node_id.0])?;
+    if let Some(row) = rows.next()? {
+        let path: String = row.get(0)?;
+        return Ok(Some(PathBuf::from(path)));
+    }
+
+    let mut stmt = conn.prepare("SELECT serialized_name FROM node WHERE id = ?1")?;
+    let mut rows = stmt.query(params![file_node_id.0])?;
+    if let Some(row) = rows.next()? {
+        let path: String = row.get(0)?;
+        return Ok(Some(PathBuf::from(path)));
+    }
+
+    Ok(None)
+}
+
+fn normalize_framework_source_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroundingSnapshotState {
     Dirty,
@@ -1476,7 +1563,58 @@ impl Storage {
         ])
     }
 
+    fn prepared_nodes_for_insert(&self, nodes: &[Node]) -> Result<Vec<Node>, StorageError> {
+        let batch_file_paths = nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::FILE)
+            .map(|node| (node.id, PathBuf::from(&node.serialized_name)))
+            .collect::<HashMap<_, _>>();
+        let mut prepared = Vec::new();
+        let mut framework_nodes = HashMap::<NodeId, Node>::new();
+
+        for node in nodes {
+            if !is_framework_synthetic_node(node) {
+                prepared.push(node.clone());
+                continue;
+            }
+
+            let candidate = if let Some(existing) = framework_nodes.get(&node.id) {
+                preferred_framework_node(
+                    &self.conn,
+                    &batch_file_paths,
+                    existing.clone(),
+                    node.clone(),
+                )?
+            } else if let Some(existing) = Self::node_by_id_from_conn(&self.conn, node.id)? {
+                preferred_framework_node(&self.conn, &batch_file_paths, existing, node.clone())?
+            } else {
+                node.clone()
+            };
+            framework_nodes.insert(node.id, candidate);
+        }
+
+        prepared.extend(framework_nodes.into_values());
+        Ok(prepared)
+    }
+
+    fn node_by_id_from_conn(conn: &Connection, id: NodeId) -> Result<Option<Node>, StorageError> {
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col FROM node WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id.0])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Self::node_from_row(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn insert_node(&self, node: &Node) -> Result<(), StorageError> {
+        let prepared = self
+            .prepared_nodes_for_insert(std::slice::from_ref(node))?
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| node.clone());
         self.conn.execute(
             "INSERT INTO node (id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
@@ -1491,20 +1629,20 @@ impl Storage {
                 end_line = excluded.end_line,
                 end_col = excluded.end_col",
             params![
-                node.id.0,
-                node.kind as i32,
-                node.serialized_name,
-                node.qualified_name,
-                node.canonical_id,
-                node.file_node_id.map(|id| id.0),
-                node.start_line,
-                node.start_col,
-                node.end_line,
-                node.end_col
+                prepared.id.0,
+                prepared.kind as i32,
+                &prepared.serialized_name,
+                prepared.qualified_name.as_deref(),
+                prepared.canonical_id.as_deref(),
+                prepared.file_node_id.map(|id| id.0),
+                prepared.start_line,
+                prepared.start_col,
+                prepared.end_line,
+                prepared.end_col
             ],
         )?;
         // Update cache
-        self.cache.nodes.write().insert(node.id, node.clone());
+        self.cache.nodes.write().insert(prepared.id, prepared);
         self.invalidate_grounding_snapshots()?;
         Ok(())
     }
@@ -1534,6 +1672,7 @@ impl Storage {
 
     // Batch operations
     pub fn insert_nodes_batch(&mut self, nodes: &[Node]) -> Result<(), StorageError> {
+        let prepared_nodes = self.prepared_nodes_for_insert(nodes)?;
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
@@ -1551,10 +1690,14 @@ impl Storage {
                     end_col = excluded.end_col",
             )?;
             // Insert FILE nodes first so foreign keys to file_node_id are satisfied.
-            for node in nodes
+            for node in prepared_nodes
                 .iter()
                 .filter(|node| node.kind == NodeKind::FILE)
-                .chain(nodes.iter().filter(|node| node.kind != NodeKind::FILE))
+                .chain(
+                    prepared_nodes
+                        .iter()
+                        .filter(|node| node.kind != NodeKind::FILE),
+                )
             {
                 Self::insert_node_with_stmt(&mut stmt, node)?;
             }
@@ -1563,7 +1706,7 @@ impl Storage {
 
         // Update cache
         let mut cache = self.cache.nodes.write();
-        for node in nodes {
+        for node in &prepared_nodes {
             cache.insert(node.id, node.clone());
         }
 

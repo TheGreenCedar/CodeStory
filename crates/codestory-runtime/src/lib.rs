@@ -17,9 +17,9 @@ use codestory_contracts::api::{
     RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
     SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto, SearchPlanBridgeDto,
     SearchPlanCandidateWindowDto, SearchPlanChannelDto, SearchPlanDroppedTermDto, SearchPlanDto,
-    SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto, SearchPlanSubqueryDto,
-    SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest,
-    SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
+    SearchPlanNextActionDto, SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto,
+    SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode,
+    SearchRequest, SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
     StorageStatsDto, StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto,
     SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
     UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WorkspaceMemberIndexDto,
@@ -1749,11 +1749,16 @@ fn search_plan_runtime_call_is_speculative(
     confidence: Option<f32>,
 ) -> bool {
     matches!(
-        certainty.or_else(
-            || codestory_contracts::graph::ResolutionCertainty::from_confidence(confidence)
-        ),
-        Some(codestory_contracts::graph::ResolutionCertainty::Uncertain)
-    )
+        certainty.or_else(|| {
+            codestory_contracts::graph::ResolutionCertainty::from_confidence(confidence)
+        }),
+        Some(
+            codestory_contracts::graph::ResolutionCertainty::Uncertain
+                | codestory_contracts::graph::ResolutionCertainty::Probable
+        )
+    ) || confidence.is_some_and(|confidence| {
+        confidence < codestory_contracts::graph::ResolutionCertainty::CERTAIN_MIN
+    })
 }
 
 fn search_plan_caller_is_test_or_bench(storage: &Storage, caller_id: GraphNodeId) -> bool {
@@ -1975,28 +1980,67 @@ fn shared_file_bridge(from: &SearchHit, to: &SearchHit) -> bool {
     same_search_file(from, to)
 }
 
-fn search_plan_next_commands(groups: &[SearchPlanAnchorGroupDto]) -> Vec<String> {
+fn search_plan_next_actions(groups: &[SearchPlanAnchorGroupDto]) -> Vec<SearchPlanNextActionDto> {
     groups
         .iter()
         .filter_map(|group| group.chosen_symbol.as_ref())
         .take(4)
         .flat_map(|hit| {
             [
-                format!(
-                    "codestory-cli symbol --project <PROJECT> --id {}",
-                    hit.node_id.0
-                ),
-                format!(
-                    "codestory-cli trail --project <PROJECT> --id {} --story --hide-speculative",
-                    hit.node_id.0
-                ),
-                format!(
-                    "codestory-cli snippet --project <PROJECT> --id {} --function-body --context 40",
-                    hit.node_id.0
-                ),
+                SearchPlanNextActionDto {
+                    action: "symbol".to_string(),
+                    node_id: hit.node_id.clone(),
+                    options: Vec::new(),
+                },
+                SearchPlanNextActionDto {
+                    action: "trail".to_string(),
+                    node_id: hit.node_id.clone(),
+                    options: vec!["story".to_string(), "hide_speculative".to_string()],
+                },
+                SearchPlanNextActionDto {
+                    action: "snippet".to_string(),
+                    node_id: hit.node_id.clone(),
+                    options: vec!["function_body".to_string(), "context=40".to_string()],
+                },
             ]
         })
         .collect()
+}
+
+fn search_plan_next_commands(
+    project_root: &Path,
+    actions: &[SearchPlanNextActionDto],
+) -> Vec<String> {
+    let project = quote_search_plan_command_value(&project_root.to_string_lossy());
+    actions
+        .iter()
+        .filter_map(|action| match action.action.as_str() {
+            "symbol" => Some(format!(
+                "codestory-cli symbol --project {project} --id {}",
+                action.node_id.0
+            )),
+            "trail" => Some(format!(
+                "codestory-cli trail --project {project} --id {} --story --hide-speculative",
+                action.node_id.0
+            )),
+            "snippet" => Some(format!(
+                "codestory-cli snippet --project {project} --id {} --function-body --context 40",
+                action.node_id.0
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn quote_search_plan_command_value(value: &str) -> String {
+    if value.bytes().any(|byte| {
+        byte.is_ascii_whitespace()
+            || matches!(byte, b'"' | b'\'' | b'`' | b'&' | b'|' | b'<' | b'>')
+    }) {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    } else {
+        value.to_string()
+    }
 }
 
 fn search_plan_source_truth_checks(groups: &[SearchPlanAnchorGroupDto]) -> Vec<String> {
@@ -5900,6 +5944,14 @@ impl AppController {
                 "Suppressed {suppressed_low_confidence_bridges} low-confidence bridge candidate(s); treat missing bridge rows as a source-truth prompt, not proof of isolation."
             ));
         }
+        let next_actions = search_plan_next_actions(&anchor_groups);
+        let next_commands = search_plan_next_commands(
+            self.require_project_root()
+                .ok()
+                .as_deref()
+                .unwrap_or(Path::new(".")),
+            &next_actions,
+        );
         let plan = SearchPlanDto {
             original_query: original_query.to_string(),
             eligible,
@@ -5914,7 +5966,8 @@ impl AppController {
                 &plan_suggestions,
                 &plan_indexed_hits,
             ),
-            next_commands: search_plan_next_commands(&anchor_groups),
+            next_actions,
+            next_commands,
             source_truth_checks,
         };
         Ok(Some(SearchPlanBuild {
@@ -9040,13 +9093,42 @@ pub fn exact_symbol_anchor() {{}}
             }),
             "exact terminal identifier should still promote to the matching member: {groups:#?}"
         );
-        let next_commands = search_plan_next_commands(&groups);
+        let next_actions = search_plan_next_actions(&groups);
+        assert!(next_actions.iter().any(|action| {
+            action.action == "snippet"
+                && action.node_id.0 == "member"
+                && action
+                    .options
+                    .iter()
+                    .any(|option| option == "function_body")
+        }));
+        let next_commands =
+            search_plan_next_commands(Path::new("C:/repo with spaces"), &next_actions);
         assert!(
             next_commands.iter().any(|command| command.contains(
-                "codestory-cli snippet --project <PROJECT> --id member --function-body --context 40"
+                "codestory-cli snippet --project \"C:/repo with spaces\" --id member --function-body --context 40"
             )),
             "search-plan handoff should request body-aware snippets for promoted anchors: {next_commands:#?}"
         );
+        assert!(
+            next_commands
+                .iter()
+                .all(|command| !command.contains("<PROJECT>")),
+            "search-plan handoffs should be transport-ready without placeholders: {next_commands:#?}"
+        );
+    }
+
+    #[test]
+    fn search_plan_speculation_policy_matches_hidden_trail_edges() {
+        assert!(search_plan_runtime_call_is_speculative(
+            Some(codestory_contracts::graph::ResolutionCertainty::Probable),
+            Some(0.70)
+        ));
+        assert!(search_plan_runtime_call_is_speculative(None, Some(0.84)));
+        assert!(!search_plan_runtime_call_is_speculative(
+            Some(codestory_contracts::graph::ResolutionCertainty::Certain),
+            Some(codestory_contracts::graph::ResolutionCertainty::CERTAIN_MIN)
+        ));
     }
 
     #[test]

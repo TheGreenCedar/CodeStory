@@ -445,6 +445,18 @@ fn broad_search_json_and_markdown_expose_search_plan() {
         "search plan should provide next commands: {plan:#}"
     );
     assert!(
+        plan["next_actions"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["action"] == "snippet"
+                    && item["node_id"].is_string()
+                    && item["options"].as_array().is_some_and(|options| {
+                        options.iter().any(|option| option == "function_body")
+                    })
+            })
+        }),
+        "search plan should provide structured next actions alongside rendered commands: {plan:#}"
+    );
+    assert!(
         plan["next_commands"].as_array().is_some_and(|items| {
             items.iter().all(|item| {
                 item.as_str()

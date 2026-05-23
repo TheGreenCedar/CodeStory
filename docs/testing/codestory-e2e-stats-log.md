@@ -30,6 +30,7 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-05-20 | fea0cc5 | pass, CLI navigation next wave | 15.75 | 0.31 | 1.51 | 0.82 | 0.31 | 0.30 | 46,347 | 39,169 | 145 | 0 | 6,263 | true |
 | 2026-05-20 | 71a57a8 | pass, PR review clippy fix | 9.35 | 0.19 | 0.82 | 0.49 | 0.17 | 0.16 | 46,352 | 39,168 | 145 | 0 | 6,270 | true |
 | 2026-05-22 | 0fb2a48 | pass, agent grounding review fixes | 10.61 | 0.21 | 0.96 | 0.61 | 0.21 | 0.20 | 50,006 | 42,246 | 146 | 0 | 6,720 | true |
+| 2026-05-23 | de0dac9 | pass, agent grounding spec remediation working tree | 13.14 | 0.28 | 1.23 | 0.82 | 0.27 | 0.26 | 53,092 | 45,019 | 147 | 0 | 7,127 | true |
 
 ## Phase Metrics
 
@@ -55,3 +56,4 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-05-20 | fea0cc5 | CLI navigation next wave cold E2E | 15.75 | 6.23 | 1.74 | 0 | 6,263 | 0 |
 | 2026-05-20 | 71a57a8 | PR review clippy fix cold E2E | 9.35 | 3.80 | 0.95 | 0 | 6,270 | 0 |
 | 2026-05-22 | 0fb2a48 | agent grounding review fixes cold E2E | 10.61 | 4.25 | 0.72 | 0 | 6,720 | 0 |
+| 2026-05-23 | de0dac9 | agent grounding spec remediation cold E2E | 13.14 | 5.73 | 0.81 | 0 | 7,127 | 0 |

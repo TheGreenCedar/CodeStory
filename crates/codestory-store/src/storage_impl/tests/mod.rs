@@ -45,6 +45,116 @@ fn test_batch_inserts() -> Result<(), StorageError> {
     Ok(())
 }
 
+fn file_node(id: i64, path: &str) -> Node {
+    Node {
+        id: NodeId(id),
+        kind: NodeKind::FILE,
+        serialized_name: path.to_string(),
+        start_line: Some(1),
+        start_col: Some(1),
+        end_line: Some(1),
+        end_col: Some(1),
+        ..Default::default()
+    }
+}
+
+fn insert_file_row(storage: &Storage, id: i64, path: &str) -> Result<(), StorageError> {
+    storage.insert_file(&FileInfo {
+        id,
+        path: PathBuf::from(path),
+        language: "typescript".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 1,
+    })
+}
+
+#[test]
+fn framework_synthetic_node_source_metadata_prefers_definitions() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    insert_file_row(&storage, 1, "src/routes/+page.svelte")?;
+    insert_file_row(&storage, 2, "src-tauri/src/lib.rs")?;
+
+    let usage_file = file_node(1, "src/routes/+page.svelte");
+    let definition_file = file_node(2, "src-tauri/src/lib.rs");
+    let usage = Node {
+        id: NodeId(42),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "tauri command get_snapshot (tauri command; confidence=heuristic)"
+            .to_string(),
+        qualified_name: Some("framework::tauri::command::get_snapshot".to_string()),
+        canonical_id: Some("tauri:command:get_snapshot".to_string()),
+        file_node_id: Some(NodeId(1)),
+        start_line: Some(7),
+        start_col: Some(1),
+        ..Default::default()
+    };
+    let definition = Node {
+        file_node_id: Some(NodeId(2)),
+        start_line: Some(21),
+        ..usage.clone()
+    };
+
+    storage.insert_nodes_batch(&[usage_file.clone(), definition_file.clone(), usage.clone()])?;
+    storage.insert_nodes_batch(&[definition_file.clone(), definition.clone()])?;
+    assert_eq!(
+        storage
+            .get_node(NodeId(42))?
+            .and_then(|node| node.file_node_id),
+        Some(NodeId(2))
+    );
+
+    let mut reverse = Storage::new_in_memory()?;
+    insert_file_row(&reverse, 1, "src/routes/+page.svelte")?;
+    insert_file_row(&reverse, 2, "src-tauri/src/lib.rs")?;
+    reverse.insert_nodes_batch(&[usage_file, definition_file.clone(), definition])?;
+    reverse.insert_nodes_batch(&[definition_file, usage])?;
+    assert_eq!(
+        reverse
+            .get_node(NodeId(42))?
+            .and_then(|node| node.file_node_id),
+        Some(NodeId(2))
+    );
+
+    insert_file_row(&reverse, 3, "app/posts/[slug]/page.tsx")?;
+    insert_file_row(&reverse, 4, "src/collections/Posts.ts")?;
+    let payload_usage_file = file_node(3, "app/posts/[slug]/page.tsx");
+    let payload_definition_file = file_node(4, "src/collections/Posts.ts");
+    let payload_usage = Node {
+        id: NodeId(77),
+        kind: NodeKind::MODULE,
+        serialized_name: "payload collection posts (collection; confidence=heuristic)".to_string(),
+        qualified_name: Some("framework::payload::collection::posts".to_string()),
+        canonical_id: Some("payload:collection:posts".to_string()),
+        file_node_id: Some(NodeId(3)),
+        start_line: Some(12),
+        start_col: Some(37),
+        ..Default::default()
+    };
+    let payload_definition = Node {
+        file_node_id: Some(NodeId(4)),
+        start_line: Some(3),
+        start_col: Some(1),
+        ..payload_usage.clone()
+    };
+
+    reverse.insert_nodes_batch(&[
+        payload_definition_file.clone(),
+        payload_usage_file.clone(),
+        payload_definition,
+    ])?;
+    reverse.insert_nodes_batch(&[payload_usage_file, payload_usage])?;
+    assert_eq!(
+        reverse
+            .get_node(NodeId(77))?
+            .and_then(|node| node.file_node_id),
+        Some(NodeId(4))
+    );
+
+    Ok(())
+}
+
 #[test]
 fn test_resolution_indexes_are_created() -> Result<(), StorageError> {
     let storage = Storage::new_in_memory()?;

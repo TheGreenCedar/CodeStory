@@ -30,6 +30,7 @@ use std::{
 mod args;
 mod config;
 mod display;
+mod drill_targeting;
 mod explore;
 mod http_transport;
 mod managed_embeddings;
@@ -894,7 +895,7 @@ fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
         .as_deref()
         .map(|question| run_drill_question_search(&runtime, &cmd.output_dir, cmd.format, question))
         .transpose()?;
-    for anchor in normalized_drill_anchors(&cmd.anchors) {
+    for anchor in drill_targeting::validated_drill_anchors(&cmd.anchors, "drill")? {
         let anchor_output =
             run_drill_anchor(&runtime, &opened, &cmd.output_dir, cmd.format, &anchor)?;
         all_verification_targets.extend(anchor_output.verification_targets.iter().cloned());
@@ -1197,7 +1198,13 @@ fn drill_suite_cases_from_manifest(
     case_file: &std::path::Path,
     owner_root: &std::path::Path,
 ) -> Result<(String, Vec<DrillSuiteCase>)> {
-    let manifest_text = fs::read_to_string(case_file).with_context(|| {
+    let case_file = absolute_existing_path(case_file).with_context(|| {
+        format!(
+            "Failed to resolve drill-suite case file {}",
+            display::clean_path_string(&case_file.to_string_lossy())
+        )
+    })?;
+    let manifest_text = fs::read_to_string(&case_file).with_context(|| {
         format!(
             "Failed to read drill-suite case file {}",
             display::clean_path_string(&case_file.to_string_lossy())
@@ -1230,10 +1237,10 @@ fn drill_suite_cases_from_manifest(
         if case.question.trim().is_empty() {
             bail!("drill-suite case `{slug}` question cannot be empty");
         }
-        let anchors = normalized_drill_anchors(&case.anchors);
-        if anchors.is_empty() {
-            bail!("drill-suite case `{slug}` must name at least one anchor");
-        }
+        let anchors = drill_targeting::validated_drill_anchors(
+            &case.anchors,
+            &format!("drill-suite case `{slug}`"),
+        )?;
         let project_root = if case.project.is_absolute() {
             case.project
         } else {
@@ -1253,6 +1260,23 @@ fn drill_suite_cases_from_manifest(
             .unwrap_or_else(|| "codestory-agent-drill-suite".to_string()),
         cases,
     ))
+}
+
+fn absolute_existing_path(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("Failed to resolve current working directory")?
+            .join(path)
+    };
+    fs::metadata(&path).with_context(|| {
+        format!(
+            "Failed to access path {}",
+            display::clean_path_string(&path.to_string_lossy())
+        )
+    })?;
+    Ok(path)
 }
 
 fn blocked_drill_suite_repo_output(
@@ -1303,8 +1327,8 @@ fn blocked_drill_suite_repo_output(
             label: Some(case.slug.clone()),
             question: Some(case.question.clone()),
             output_dir: output_dir.clone(),
-            full_report_json: "drill-report.json".to_string(),
-            full_report_markdown: "drill-report.md".to_string(),
+            full_report_json: String::new(),
+            full_report_markdown: String::new(),
             mechanical: DrillSummaryMechanicalOutput {
                 refresh: refresh_label(refresh, None),
                 before: drill_summary_stats(0, 0, 0, 0),
@@ -1454,6 +1478,16 @@ fn render_drill_suite_markdown(output: &DrillSuiteOutput) -> String {
         let _ = writeln!(markdown);
         let _ = writeln!(markdown, "## Repo Artifacts");
         for repo in &output.repos {
+            if repo.summary.full_report_markdown.is_empty()
+                && repo.summary.full_report_json.is_empty()
+            {
+                let _ = writeln!(
+                    markdown,
+                    "- `{}`: no per-repo artifacts were written because the case blocked before evidence collection",
+                    repo.slug
+                );
+                continue;
+            }
             let markdown_report = drill_suite_join_artifact_path(
                 &repo.output_dir,
                 &repo.summary.full_report_markdown,
@@ -1482,6 +1516,9 @@ fn render_drill_suite_markdown(output: &DrillSuiteOutput) -> String {
 }
 
 fn drill_suite_repo_report_label(repo: &DrillSuiteRepoOutput) -> String {
+    if repo.summary.full_report_markdown.is_empty() && repo.summary.full_report_json.is_empty() {
+        return "not written (blocked before evidence)".to_string();
+    }
     let markdown_report =
         drill_suite_join_artifact_path(&repo.output_dir, &repo.summary.full_report_markdown);
     let json_report =
@@ -2140,20 +2177,6 @@ fn drill_summary_freshness_samples(freshness: &IndexFreshnessDto) -> Vec<String>
         .collect()
 }
 
-fn normalized_drill_anchors(anchors: &[String]) -> Vec<String> {
-    let mut seen = HashSet::new();
-    anchors
-        .iter()
-        .flat_map(|anchor| anchor.split(','))
-        .map(str::trim)
-        .filter(|anchor| !anchor.is_empty())
-        .filter_map(|anchor| {
-            let owned = anchor.to_string();
-            seen.insert(owned.clone()).then_some(owned)
-        })
-        .collect()
-}
-
 fn run_drill_anchor(
     runtime: &RuntimeContext,
     opened: &runtime::OpenedProject,
@@ -2184,7 +2207,9 @@ fn run_drill_anchor(
         search_markdown,
     ));
 
-    let chosen = choose_drill_anchor_hit(&search_results.indexed_symbol_hits).cloned();
+    let chosen =
+        drill_targeting::choose_drill_anchor_hit(anchor, &search_results.indexed_symbol_hits)
+            .cloned();
     let typed_hit_count = search_results
         .indexed_symbol_hits
         .iter()
@@ -3300,12 +3325,6 @@ fn ensure_trailing_newline(mut content: String) -> String {
         content.push('\n');
     }
     content
-}
-
-fn choose_drill_anchor_hit(hits: &[SearchHit]) -> Option<&SearchHit> {
-    hits.iter()
-        .find(|hit| hit.resolvable && hit.kind != NodeKind::UNKNOWN)
-        .or_else(|| hits.iter().find(|hit| hit.resolvable))
 }
 
 #[derive(Debug, Clone)]
@@ -4481,19 +4500,22 @@ fn drill_answer_readiness(
     source_truth_checks: &[SourceTruthCheckDto],
     next_commands: &[String],
 ) -> AnswerReadinessReportDto {
-    let overall_status = if source_truth_checks.is_empty()
-        || items.iter().any(|item| {
-            matches!(
-                item.verification_status,
-                ClaimReadinessDto::NeedsSourceRead | ClaimReadinessDto::ContradictedBySource
-            )
-        }) {
-        ClaimReadinessDto::NeedsSourceRead
-    } else if items
+    let pending_required_source_truth = source_truth_checks.iter().any(|check| check.required);
+    let has_source_blocked_item = items.iter().any(|item| {
+        matches!(
+            item.verification_status,
+            ClaimReadinessDto::NeedsSourceRead | ClaimReadinessDto::ContradictedBySource
+        )
+    });
+    let has_partial_item = items
         .iter()
-        .any(|item| matches!(item.verification_status, ClaimReadinessDto::Partial))
-    {
+        .any(|item| matches!(item.verification_status, ClaimReadinessDto::Partial));
+    let overall_status = if source_truth_checks.is_empty() || has_source_blocked_item {
+        ClaimReadinessDto::NeedsSourceRead
+    } else if has_partial_item {
         ClaimReadinessDto::Partial
+    } else if pending_required_source_truth {
+        ClaimReadinessDto::NeedsSourceRead
     } else {
         ClaimReadinessDto::Supported
     };
@@ -4531,6 +4553,11 @@ fn drill_answer_readiness(
     if source_truth_checks.is_empty() {
         needs_verification.push(
             "no source-truth targets were emitted; verify candidate source files before finalizing"
+                .to_string(),
+        );
+    } else if pending_required_source_truth {
+        needs_verification.push(
+            "required source-truth checks are pending; read the listed files before treating the packet as supported"
                 .to_string(),
         );
     }
@@ -6174,9 +6201,7 @@ fn build_search_output(parts: SearchOutputParts<'_>) -> SearchOutput {
         repo_text_mode: parts.repo_text.mode,
         repo_text_enabled: parts.repo_text.enabled,
         query_assessment: parts.query_assessment.cloned(),
-        search_plan: parts
-            .search_plan
-            .map(|plan| search_plan_for_project(parts.project_root, plan)),
+        search_plan: parts.search_plan.cloned(),
         explain: parts.explain,
         query_hints,
         suggestions: parts
@@ -6196,18 +6221,6 @@ fn build_search_output(parts: SearchOutputParts<'_>) -> SearchOutput {
         repo_text_hits,
         repo_text_stats: parts.repo_text_stats.cloned(),
     }
-}
-
-fn search_plan_for_project(
-    project_root: &std::path::Path,
-    plan: &codestory_contracts::api::SearchPlanDto,
-) -> codestory_contracts::api::SearchPlanDto {
-    let mut plan = plan.clone();
-    let project = quote_command_path(project_root);
-    for command in &mut plan.next_commands {
-        *command = command.replace("<PROJECT>", &project);
-    }
-    plan
 }
 
 fn build_query_resolution_output(
@@ -8059,7 +8072,7 @@ mod tests {
     #[test]
     fn drill_anchor_helpers_normalize_and_sanitize_inputs() {
         assert_eq!(
-            normalized_drill_anchors(&[
+            drill_targeting::normalized_drill_anchors(&[
                 "WorkspaceIndexer, SearchService".to_string(),
                 "WorkspaceIndexer".to_string(),
                 " TrailResult ".to_string(),
@@ -8651,6 +8664,65 @@ mod tests {
                 .iter()
                 .any(|item| item.contains("no source-truth targets were emitted"))
         );
+    }
+
+    #[test]
+    fn drill_answer_readiness_requires_pending_source_truth_checks() {
+        let item = EvidenceItemDto {
+            id: "symbol-1".to_string(),
+            evidence_type: EvidenceTypeDto::SymbolContext,
+            command: "symbol".to_string(),
+            status: "ok".to_string(),
+            confidence: "high".to_string(),
+            verification_status: ClaimReadinessDto::Supported,
+            match_quality: None,
+            source: None,
+            artifacts: Vec::new(),
+            notes: Vec::new(),
+        };
+        let check = SourceTruthCheckDto {
+            id: "source-truth-1".to_string(),
+            reason: "verify definition evidence".to_string(),
+            path: "src/lib.rs".to_string(),
+            line: Some(12),
+            required: true,
+        };
+
+        let readiness = drill_answer_readiness(&[item], &[check], &[]);
+
+        assert_eq!(readiness.overall_status, ClaimReadinessDto::NeedsSourceRead);
+        assert!(
+            readiness
+                .needs_verification
+                .iter()
+                .any(|item| item.contains("required source-truth checks are pending"))
+        );
+    }
+
+    #[test]
+    fn drill_anchor_validation_rejects_empty_after_normalization() {
+        let error =
+            drill_targeting::validated_drill_anchors(&[",, ,".to_string()], "drill").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("drill must name at least one anchor"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn drill_anchor_selection_does_not_guess_semantic_neighbors() {
+        let neighbor = sample_runtime_hit(
+            "neighbor",
+            "ElsewhereFeedProps",
+            NodeKind::TYPEDEF,
+            Path::new("src/components/ElsewhereFeed.tsx"),
+            1,
+        );
+
+        assert!(drill_targeting::choose_drill_anchor_hit("ElsewherePage", &[neighbor]).is_none());
     }
 
     #[test]

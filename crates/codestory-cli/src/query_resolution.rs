@@ -6,18 +6,18 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ResolutionRank {
-    source_truth_bucket: u8,
     exact_display: u8,
+    exact_terminal: u8,
+    exact_leading: u8,
     collection_definition_path: u8,
     exact_case_match: u8,
-    exact_terminal: u8,
+    source_truth_bucket: u8,
     inexact_query_prefix_match: u8,
     implementation_path: u8,
     type_definition_line: u8,
     callable_definition_line: u8,
     declaration_anchor: u8,
     kind_bucket: u8,
-    exact_leading: u8,
 }
 
 pub(crate) fn compare_resolution_hits(
@@ -45,18 +45,18 @@ pub(crate) fn resolution_rank_with_project_root(
     let rank = symbol_name_match_rank(query, &hit.display_name);
 
     ResolutionRank {
-        source_truth_bucket: source_truth_bucket(hit),
         exact_display: rank.exact_display,
+        exact_terminal: rank.exact_terminal,
+        exact_leading: rank.exact_leading,
         collection_definition_path: collection_definition_path_bucket(query, hit),
         exact_case_match: exact_case_match_bucket(query, hit),
-        exact_terminal: rank.exact_terminal,
+        source_truth_bucket: source_truth_bucket(hit),
         inexact_query_prefix_match: inexact_query_prefix_match_bucket(query, hit),
         implementation_path: implementation_path_bucket(hit),
         type_definition_line: type_definition_line_bucket(project_root, query, hit),
         callable_definition_line: callable_definition_line_bucket(project_root, query, hit),
         declaration_anchor: declaration_anchor_bucket(hit),
         kind_bucket: resolution_kind_bucket(hit.kind),
-        exact_leading: rank.exact_leading,
     }
 }
 
@@ -87,6 +87,10 @@ pub(crate) fn is_name_resolvable_graph_target(query: &str, hit: &SearchHit) -> b
     let terminal = codestory_runtime::terminal_symbol_segment(&hit.display_name);
     let leading = codestory_runtime::leading_symbol_segment(&hit.display_name);
     display.starts_with(&query) || terminal.starts_with(&query) || leading.starts_with(&query)
+}
+
+pub(crate) fn is_resolvable_graph_target(query: &str, hit: &SearchHit) -> bool {
+    hit.resolvable && is_graph_target_candidate(hit) && is_name_resolvable_graph_target(query, hit)
 }
 
 fn inexact_query_prefix_match_bucket(query: &str, hit: &SearchHit) -> u8 {
@@ -621,6 +625,32 @@ mod tests {
         assert_eq!(
             hits.first().map(|hit| &hit.node_id),
             Some(&collection.node_id)
+        );
+    }
+
+    #[test]
+    fn exact_non_primary_query_target_beats_inexact_primary_neighbor() {
+        let exact_script = hit(
+            "exact_script",
+            "seed_payload",
+            NodeKind::FUNCTION,
+            0.60,
+            "scripts/seed-payload.ts",
+        );
+        let inexact_primary = hit(
+            "inexact_primary",
+            "seed_payload_preview",
+            NodeKind::FUNCTION,
+            0.95,
+            "src/lib/payload-preview.ts",
+        );
+        let mut hits = [inexact_primary, exact_script.clone()];
+
+        hits.sort_by(|left, right| compare_resolution_hits("seed_payload", left, right));
+
+        assert_eq!(
+            hits.first().map(|hit| &hit.node_id),
+            Some(&exact_script.node_id)
         );
     }
 

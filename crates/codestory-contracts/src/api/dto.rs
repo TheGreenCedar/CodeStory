@@ -359,6 +359,14 @@ pub struct SearchPlanRejectedHitDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SearchPlanNextActionDto {
+    pub action: String,
+    pub node_id: NodeId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchPlanDto {
     pub original_query: String,
     pub eligible: bool,
@@ -375,6 +383,8 @@ pub struct SearchPlanDto {
     pub bridges: Vec<SearchPlanBridgeDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rejected_hits: Vec<SearchPlanRejectedHitDto>,
+    #[serde(default)]
+    pub next_actions: Vec<SearchPlanNextActionDto>,
     #[serde(default)]
     pub next_commands: Vec<String>,
     #[serde(default)]

@@ -29,7 +29,7 @@ pub use dto::{
     RouteEndpointHandlerDto, RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit,
     SearchHitOrigin, SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
     SearchPlanBridgeDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
-    SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanPromotionStatusDto,
+    SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
     SearchPlanRejectedHitDto, SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto,
     SearchRepoTextMode, SearchRequest, SearchResultsDto, SetUiLayoutRequest, SnippetContextDto,
     SnippetScopeDto, SourceOccurrenceDto, SourceTruthCheckDto, StartIndexingRequest,

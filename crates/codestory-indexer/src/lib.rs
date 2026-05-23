@@ -5263,6 +5263,9 @@ fn collect_remix_file_route(path: &Path, source: &str, routes: &mut Vec<Framewor
     if !path_has_component(path, "routes") {
         return;
     }
+    if !has_remix_route_evidence(path, source) {
+        return;
+    }
     let route_path = remix_route_path(path);
     if route_path.is_empty() {
         return;
@@ -5287,9 +5290,10 @@ fn collect_remix_file_route(path: &Path, source: &str, routes: &mut Vec<Framewor
             "file_convention",
         ));
     }
-    if routes
-        .iter()
-        .all(|route| route.framework != "remix" || route.raw_path != route_path)
+    if has_remix_default_route_evidence(source)
+        && routes
+            .iter()
+            .all(|route| route.framework != "remix" || route.raw_path != route_path)
     {
         routes.push(FrameworkRoute::new(
             "remix",
@@ -5300,6 +5304,34 @@ fn collect_remix_file_route(path: &Path, source: &str, routes: &mut Vec<Framewor
             "file_convention",
         ));
     }
+}
+
+fn has_remix_route_evidence(path: &Path, source: &str) -> bool {
+    let lower = source.to_ascii_lowercase();
+    lower.contains("@remix-run/")
+        || lower.contains(" from \"@remix-run/")
+        || lower.contains(" from '@remix-run/")
+        || lower.contains("export async function loader")
+        || lower.contains("export function loader")
+        || lower.contains("export const loader")
+        || lower.contains("export async function action")
+        || lower.contains("export function action")
+        || lower.contains("export const action")
+        || path
+            .components()
+            .any(|component| component.as_os_str().to_string_lossy() == "app")
+}
+
+fn has_remix_default_route_evidence(source: &str) -> bool {
+    let lower = source.to_ascii_lowercase();
+    lower.contains("@remix-run/")
+        || lower.contains("export default")
+        || lower.contains("export async function loader")
+        || lower.contains("export function loader")
+        || lower.contains("export const loader")
+        || lower.contains("export async function action")
+        || lower.contains("export function action")
+        || lower.contains("export const action")
 }
 
 fn collect_astro_endpoint_route(
@@ -7125,10 +7157,7 @@ fn collect_payload_collection_usages(source: &str) -> Vec<PayloadCollectionUsage
         }
 
         let trimmed = code.trim();
-        if pending_payload_call_lines == 0
-            || !trimmed.contains("collection")
-            || trimmed.contains("slug")
-        {
+        if pending_payload_call_lines == 0 || !trimmed.contains("collection") {
             if pending_payload_call_lines > 0 {
                 pending_payload_call_lines =
                     update_pending_payload_call(pending_payload_call_lines, code);
@@ -10570,6 +10599,38 @@ export const item = { path: "/dashboard", label: "Dashboard" };
     }
 
     #[test]
+    fn test_remix_file_routes_require_remix_evidence() {
+        let generic_routes = collect_framework_routes(
+            Path::new("src/routes/accounts.tsx"),
+            "typescript",
+            r#"
+export default function Accounts() {
+  return null;
+}
+"#,
+        );
+        assert!(
+            generic_routes
+                .iter()
+                .all(|route| route.framework != "remix"),
+            "generic src/routes files should not be treated as Remix routes: {generic_routes:?}"
+        );
+
+        let remix_routes = collect_framework_routes(
+            Path::new("app/routes/accounts.tsx"),
+            "typescript",
+            r#"
+export default function Accounts() {
+  return null;
+}
+"#,
+        );
+        assert!(remix_routes.iter().any(|route| {
+            route.framework == "remix" && route.method == "GET" && route.path == "/accounts"
+        }));
+    }
+
+    #[test]
     fn test_react_router_context_ignores_unrelated_path_objects() {
         let routes = collect_framework_routes(
             Path::new("src/router.tsx"),
@@ -11038,6 +11099,7 @@ export async function loadWriting(payload: any) {
       "posts",
     where: { title: { equals: "not_a_collection" } },
   });
+  await payload.find({ collection: "articles", where: { slug: { equals: "welcome" } } });
   return req.payload.create({ collection: "comments", data: {} });
 }
 "#;
@@ -11053,7 +11115,7 @@ export async function loadWriting(payload: any) {
             .iter()
             .map(|usage| usage.slug.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(used, vec!["posts", "comments"]);
+        assert_eq!(used, vec!["posts", "articles", "comments"]);
     }
 
     #[test]

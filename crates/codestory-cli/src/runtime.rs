@@ -13,9 +13,8 @@ use std::path::{Path, PathBuf};
 use crate::args::{ProjectArgs, QuerySelectorOutput, RefreshMode, TargetSelection};
 use crate::display::{clean_path_string, format_search_hit_target, relative_path};
 use crate::query_resolution::{
-    ResolutionRank, compare_resolution_hits, file_filter_match_bucket, is_graph_target_candidate,
-    is_name_resolvable_graph_target, resolution_rank_with_project_root,
-    search_hit_matches_file_filter,
+    ResolutionRank, compare_resolution_hits, file_filter_match_bucket, is_resolvable_graph_target,
+    resolution_rank_with_project_root, search_hit_matches_file_filter,
 };
 
 #[derive(Debug)]
@@ -234,9 +233,7 @@ fn query_resolution_alternatives(
             None,
         )
         .map_err(map_api_error)?;
-    alternatives.retain(|hit| {
-        is_graph_target_candidate(hit) && is_name_resolvable_graph_target(query, hit)
-    });
+    alternatives.retain(|hit| is_resolvable_graph_target(query, hit));
     if let Some(file_filter) = file_filter {
         alternatives
             .retain(|hit| search_hit_matches_file_filter(&runtime.project_root, hit, file_filter));
