@@ -7,7 +7,7 @@ Local codebase grounding for coding agents.
 <p align="center">
 <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
 <a href="Cargo.toml"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange"></a>
-<a href="docs/testing/benchmark-results.md"><img alt="Benchmarks" src="https://img.shields.io/badge/benchmarks-measured-success"></a>
+<a href="docs/testing/benchmark-results.md"><img alt="Benchmarks" src="https://img.shields.io/badge/benchmarks-documented-blue"></a>
 </p>
 
 CodeStory turns a repository into a local, queryable evidence layer: symbols,
@@ -35,13 +35,14 @@ file reads.
 ## Benchmark Results
 
 Current evidence supports local indexing, warm reads, protocol hygiene, and
-retrieval quality. An exploratory one-repeat agent A/B run also completed on
-2026-05-23: the CodeStory arm used `17.4%` fewer total tokens, but was `6.8%`
-slower and started more tool commands. Treat that as a real harness check, not a
-public savings claim.
+retrieval quality. The agent A/B harness now has a real 3-repeat baseline too,
+but it is not a savings claim yet: on the CodeStory repo prompt, the CodeStory
+arm used more median tokens, wall time, and tool starts than the no-CodeStory
+arm.
 
-- Exploratory agent A/B: `2,440,580` tokens with CodeStory vs. `2,953,233`
-  without CodeStory on the CodeStory repo prompt.
+- Agent A/B baseline: with CodeStory `2,724,490` median tokens / `306.24s` /
+  `43` tool starts; without CodeStory `1,605,030` median tokens / `214.90s` /
+  `29` tool starts.
 - CodeStory repo cold index: `9.23s`, with `47,107` nodes, `39,808` edges,
   `145` files, and `6,358` semantic docs.
 - One-shot reads after that index: search `0.92s`, symbol `0.62s`,
@@ -119,6 +120,9 @@ cargo build --release -p codestory-cli
 .\target\release\codestory-cli.exe index --project C:\path\to\repo --refresh auto
 .\target\release\codestory-cli.exe ground --project C:\path\to\repo --why
 ```
+
+On Unix-like systems, use `./target/release/codestory-cli` or an installed
+`codestory-cli` on `PATH`.
 
 Keep the executable and target workspace separate. CodeStory is the tool; the
 `--project` path is the codebase being grounded.

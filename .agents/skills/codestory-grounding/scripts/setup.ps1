@@ -34,6 +34,7 @@ function Invoke-Checked {
     }
 }
 
+# Keep this in sync with DEFAULT_CODESTORY_REPO_REF in setup.sh.
 $DEFAULT_CODESTORY_REPO_REF = "d78bf7c66a87e3454d1bfd82ba68cddd8d02004d"
 $repoUrl = if ($env:CODESTORY_REPO_URL) {
     $env:CODESTORY_REPO_URL

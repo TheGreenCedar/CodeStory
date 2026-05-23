@@ -7,6 +7,7 @@ if [[ "${1:-}" == "--dry-run" || "${1:-}" == "-n" ]]; then
 fi
 
 repo_url="${CODESTORY_REPO_URL:-https://github.com/TheGreenCedar/CodeStory.git}"
+# Keep this in sync with DEFAULT_CODESTORY_REPO_REF in setup.ps1.
 DEFAULT_CODESTORY_REPO_REF="d78bf7c66a87e3454d1bfd82ba68cddd8d02004d"
 if [[ -n "${CODESTORY_REPO_REF:-}" ]]; then
   repo_ref="$CODESTORY_REPO_REF"

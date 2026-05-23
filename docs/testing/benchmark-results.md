@@ -6,31 +6,33 @@ marketing claims do not outrun the measurements.
 
 ## Latest Agent A/B Check
 
-On 2026-05-23, the harness completed a one-repeat CodeStory repo run with the
+On 2026-05-23, the harness completed a three-repeat CodeStory repo run with the
 default Codex runner model:
 
 ```powershell
-node .\scripts\codestory-agent-ab-benchmark.mjs --quick --repos codestory --repeats 1 --timeout-ms 600000 --sandbox danger-full-access --out-dir target\agent-benchmark\codestory-quick-2026-05-23f
+node .\scripts\codestory-agent-ab-benchmark.mjs --quick --repos codestory --repeats 3 --timeout-ms 900000 --sandbox danger-full-access --publishable --out-dir target\agent-benchmark\codestory-quick-2026-05-23-r3
 ```
 
-This is an exploratory runner check, not a publishable savings claim. It used a
-single repeat on one Windows workstation, no pricing variables were configured,
-and `danger-full-access` was required because nested local command execution
-failed under `read-only` and `workspace-write` in this environment. The
-CodeStory arm did use CodeStory first: the transcript includes `doctor`,
-`ground`, `search`, `trail`, and `snippet` before the final answer.
+This is a real baseline, not a savings claim. It used one Windows workstation,
+no pricing variables were configured, and `danger-full-access` was required
+because nested local command execution failed under `read-only` and
+`workspace-write` in this environment. Before the run, the CodeStory repo cache
+was refreshed in hash semantic mode and `doctor` reported `47,327` nodes,
+`40,003` edges, `146` files, `6,379` semantic docs, and fresh inventory. The
+CodeStory arm did use CodeStory first: the transcripts include `doctor`,
+`ground`, `search`, `trail`, and `snippet` before final answers.
 
 | Arm | Wall time | Total tokens | Input tokens | Output tokens | Tool starts | Status |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Without CodeStory | `272.60s` | `2,953,233` | `2,945,377` | `7,856` | `36` | Pass |
-| With CodeStory | `291.12s` | `2,440,580` | `2,430,976` | `9,604` | `43` | Pass |
+| Without CodeStory | `214.90s` | `1,605,030` | `1,598,355` | `7,656` | `29` | `3/3` pass |
+| With CodeStory | `306.24s` | `2,724,490` | `2,715,774` | `9,536` | `43` | `3/3` pass |
 
-That one run showed `512,653` fewer total tokens with CodeStory (`17.4%`
-lower), while wall time was `18.52s` slower (`6.8%` slower) and the runner
-started `7` more tool commands. The right public statement is therefore narrow:
-the harness can now collect real with/without rows, and this exploratory row
-suggests a token-saving path worth repeating. It does not prove a general
-cost, wall-time, or tool-call win.
+This run does not support a token, wall-time, or tool-call savings claim. The
+CodeStory arm used `1,119,460` more median total tokens (`69.7%` more), took
+`91.33s` longer (`42.5%` slower), and started `14` more tool commands (`48.3%`
+more). The likely next benchmark work is to reduce duplicated ordinary file
+reads after CodeStory grounding and to add non-Rust repositories before
+promoting agent-savings claims.
 
 ## Runner Verification
 
