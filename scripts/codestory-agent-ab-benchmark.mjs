@@ -11,12 +11,15 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
 const siblingRoot = path.resolve(repoRoot, "..");
 
-const REPOS = {
+const PUBLIC_REPOS = {
   codestory: {
     path: repoRoot,
     prompt:
       "Explain how full indexing flows through CLI, runtime, workspace, indexer, and store, and how that supports search, trail, and snippet.",
   },
+};
+
+const LOCAL_REPOS = {
   freelancer: {
     path: path.join(siblingRoot, "freelancer"),
     prompt:
@@ -34,25 +37,30 @@ const REPOS = {
   },
 };
 
+const ALL_REPOS = { ...PUBLIC_REPOS, ...LOCAL_REPOS };
+
 const ARMS = {
   without_codestory:
     "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal repository exploration only.",
   with_codestory:
-    "Use CodeStory grounding first if available: run doctor, index, ground, and focused search, trail, or snippet commands before ordinary source reads. If CodeStory is unavailable, say so explicitly and continue.",
+    "Use CodeStory grounding first if available. If CODESTORY_CLI is set, use that executable; otherwise try codestory-cli on PATH. Run doctor, ground, and focused search, trail, or snippet commands before ordinary source reads. Run index only if the cache is missing and writes are allowed. If CodeStory is unavailable, say so explicitly and continue.",
 };
 
 function usage() {
   console.log(`Usage:
   node scripts/codestory-agent-ab-benchmark.mjs --list
-  node scripts/codestory-agent-ab-benchmark.mjs [--quick] [--repos names] [--repeats n] [--runner codex] [--model model] [--out-dir path] [--timeout-ms ms] [--allow-failures] [--publishable]
+  node scripts/codestory-agent-ab-benchmark.mjs [--quick] [--repos names] [--include-local-repos] [--repeats n] [--runner codex] [--model model] [--sandbox mode] [--out-dir path] [--timeout-ms ms] [--allow-failures] [--publishable]
 
 Options:
   --list          Print configured benchmark repositories and exit.
   --quick         Default to repo=codestory and repeats=1 unless explicitly set.
-  --repos         Comma-separated repo names. Known: ${Object.keys(REPOS).join(", ")}
+  --repos         Comma-separated repo names. Public: ${Object.keys(PUBLIC_REPOS).join(", ")}. Local optional: ${Object.keys(LOCAL_REPOS).join(", ")}
+  --include-local-repos
+                  Include local sibling repos in the default non-quick run.
   --repeats       Repeats per repo/arm. Default: 3, or 1 with --quick.
   --runner        Runner command family. Default: codex.
   --model         Optional model passed to codex exec.
+  --sandbox       Codex sandbox mode. Default: workspace-write.
   --out-dir       Output directory. Default: target/agent-benchmark/<timestamp>.
   --timeout-ms    Timeout per runner invocation. Default: 600000.
   --allow-failures Exit 0 even when a run fails. Intended only for exploratory dry runs.
@@ -65,9 +73,11 @@ function parseArgs(argv) {
     list: false,
     quick: false,
     repos: null,
+    includeLocalRepos: false,
     repeats: null,
     runner: "codex",
     model: null,
+    sandbox: "workspace-write",
     outDir: null,
     timeoutMs: 600000,
     allowFailures: false,
@@ -96,6 +106,10 @@ function parseArgs(argv) {
       opts.allowFailures = true;
       continue;
     }
+    if (arg === "--include-local-repos") {
+      opts.includeLocalRepos = true;
+      continue;
+    }
     if (arg === "--repos") {
       opts.repos = argv[++i]?.split(",").map((name) => name.trim()).filter(Boolean);
       continue;
@@ -112,6 +126,10 @@ function parseArgs(argv) {
       opts.model = argv[++i];
       continue;
     }
+    if (arg === "--sandbox") {
+      opts.sandbox = argv[++i];
+      continue;
+    }
     if (arg === "--out-dir") {
       opts.outDir = argv[++i];
       continue;
@@ -124,7 +142,12 @@ function parseArgs(argv) {
   }
 
   if (!opts.repos) {
-    opts.repos = opts.quick ? ["codestory"] : Object.keys(REPOS);
+    opts.repos = opts.quick
+      ? ["codestory"]
+      : [
+          ...Object.keys(PUBLIC_REPOS),
+          ...(opts.includeLocalRepos ? Object.keys(LOCAL_REPOS) : []),
+        ];
   }
   if (!opts.repeats) {
     opts.repeats = opts.quick ? 1 : 3;
@@ -135,9 +158,12 @@ function parseArgs(argv) {
   if (!Number.isInteger(opts.timeoutMs) || opts.timeoutMs < 1000) {
     throw new Error("--timeout-ms must be an integer >= 1000");
   }
+  if (!["read-only", "workspace-write", "danger-full-access"].includes(opts.sandbox)) {
+    throw new Error("--sandbox must be one of: read-only, workspace-write, danger-full-access");
+  }
   for (const name of opts.repos) {
-    if (!REPOS[name]) {
-      throw new Error(`Unknown repo '${name}'. Known: ${Object.keys(REPOS).join(", ")}`);
+    if (!ALL_REPOS[name]) {
+      throw new Error(`Unknown repo '${name}'. Known: ${Object.keys(ALL_REPOS).join(", ")}`);
     }
   }
   return opts;
@@ -148,26 +174,26 @@ function runnerCommand(opts, repoPath, prompt) {
     return {
       command: opts.runner,
       args: [prompt],
+      stdin: null,
     };
   }
 
-  const command = process.platform === "win32" ? "codex.cmd" : "codex";
-  const args = [
+  const command = process.platform === "win32" ? "cmd.exe" : "codex";
+  const codexArgs = [
     "exec",
     "--json",
     "--ephemeral",
     "--sandbox",
-    "read-only",
-    "--ask-for-approval",
-    "never",
+    opts.sandbox,
     "--cd",
     repoPath,
   ];
   if (opts.model) {
-    args.push("--model", opts.model);
+    codexArgs.push("--model", opts.model);
   }
-  args.push(prompt);
-  return { command, args };
+  codexArgs.push("-");
+  const args = process.platform === "win32" ? ["/d", "/s", "/c", "codex.cmd", ...codexArgs] : codexArgs;
+  return { command, args, stdin: prompt };
 }
 
 function composePrompt(repoName, repoConfig, armName) {
@@ -179,7 +205,8 @@ Task: ${repoConfig.prompt}
 Arm: ${armName}
 Instruction: ${ARMS[armName]}
 
-Return a concise answer with the files, symbols, and commands that support your explanation.`;
+Return a concise answer with the files, symbols, and commands that support your explanation.
+Do not edit source files. Use read-only inspection commands only, except CodeStory may write its cache if needed.`;
 }
 
 function parseJsonLines(stdout) {
@@ -199,26 +226,36 @@ function parseJsonLines(stdout) {
   return { parsed, malformed };
 }
 
-function maybeToolCallEvent(value) {
-  if (!value || typeof value !== "object") {
+function isToolType(text) {
+  const lower = String(text ?? "").toLowerCase();
+  return (
+    lower.includes("command_execution") ||
+    lower.includes("mcp_tool_call") ||
+    lower.includes("tool_call") ||
+    lower.includes("function_call") ||
+    lower.includes("tool_use") ||
+    lower.includes("web_search") ||
+    lower.includes("exec_command")
+  );
+}
+
+function isToolCallStartEvent(event) {
+  if (!event || typeof event !== "object") {
     return false;
   }
-  for (const key of ["type", "name", "kind", "event", "item_type"]) {
-    const text = String(value[key] ?? "").toLowerCase();
-    if (
-      text.includes("tool_call") ||
-      text.includes("function_call") ||
-      text.includes("tool_use") ||
-      text.includes("exec_command")
-    ) {
-      return true;
-    }
+
+  const eventType = String(event.type ?? event.event ?? "").toLowerCase();
+  const item = event.item && typeof event.item === "object" ? event.item : {};
+  const itemType = String(item.type ?? event.item_type ?? event.kind ?? event.name ?? "").toLowerCase();
+
+  if (eventType === "item.started" || eventType.endsWith(".started")) {
+    return isToolType(itemType) || isToolType(eventType);
   }
-  for (const key of ["item", "delta", "message", "call"]) {
-    if (maybeToolCallEvent(value[key])) {
-      return true;
-    }
+
+  if (eventType.includes("started") && isToolType(eventType)) {
+    return true;
   }
+
   return false;
 }
 
@@ -300,9 +337,9 @@ function estimateCost(usage) {
 }
 
 async function runOne(opts, run, outDir) {
-  const repoConfig = REPOS[run.repo];
+  const repoConfig = ALL_REPOS[run.repo];
   const prompt = composePrompt(run.repo, repoConfig, run.arm);
-  const { command, args } = runnerCommand(opts, repoConfig.path, prompt);
+  const { command, args, stdin } = runnerCommand(opts, repoConfig.path, prompt);
   const started = performance.now();
 
   const result = await new Promise((resolve) => {
@@ -310,6 +347,7 @@ async function runOne(opts, run, outDir) {
       cwd: repoConfig.path,
       env: process.env,
       shell: false,
+      stdio: [stdin == null ? "ignore" : "pipe", "pipe", "pipe"],
       windowsHide: true,
     });
     let stdout = "";
@@ -342,6 +380,9 @@ async function runOne(opts, run, outDir) {
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
     });
+    if (stdin != null) {
+      child.stdin.end(stdin);
+    }
     child.on("error", (error) => {
       finish({ exitCode: null, signal: null, error: error.message, stdout, stderr });
     });
@@ -359,7 +400,7 @@ async function runOne(opts, run, outDir) {
 
   const { parsed, malformed } = parseJsonLines(result.stdout);
   const usage = extractUsage(parsed);
-  const toolCalls = parsed.filter(maybeToolCallEvent).length;
+  const toolCalls = parsed.filter(isToolCallStartEvent).length;
   const eventTypes = {};
   for (const event of parsed) {
     const type = String(event.type ?? event.event ?? "unknown");
@@ -372,8 +413,10 @@ async function runOne(opts, run, outDir) {
     repeat: run.repeat,
     runner: opts.runner,
     model: opts.model,
+    sandbox: opts.sandbox,
     command,
-    args: args.map((arg) => (arg === prompt ? "<prompt>" : arg)),
+    args,
+    stdin: stdin == null ? null : "<prompt>",
     repo_path: repoConfig.path,
     status: result.timedOut ? "timeout" : result.exitCode === 0 ? "pass" : "fail",
     exit_code: result.exitCode,
@@ -436,6 +479,7 @@ function markdownSummary(summary, opts) {
     "",
     `Runner: \`${opts.runner}\``,
     opts.model ? `Model: \`${opts.model}\`` : "Model: runner default",
+    `Sandbox: \`${opts.sandbox}\``,
     `Host: \`${os.hostname()}\``,
     "",
     "| Repo | Arm | Runs | Success | Median wall ms | Median tokens | Median cost USD | Median tool calls |",
@@ -468,9 +512,10 @@ function formatValue(value) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.list) {
-    for (const [name, config] of Object.entries(REPOS)) {
+    for (const [name, config] of Object.entries(ALL_REPOS)) {
       const availability = existsSync(config.path) ? "available" : "missing";
-      console.log(`${name}\t${availability}\t${config.path}\t${config.prompt}`);
+      const scope = PUBLIC_REPOS[name] ? "public" : "local";
+      console.log(`${name}\t${scope}\t${availability}\t${config.path}\t${config.prompt}`);
     }
     return;
   }
@@ -506,6 +551,7 @@ async function main() {
     publishable: opts.publishable,
     allow_failures: opts.allowFailures,
     timeout_ms: opts.timeoutMs,
+    sandbox: opts.sandbox,
     output_dir: outDir,
     summary,
   };

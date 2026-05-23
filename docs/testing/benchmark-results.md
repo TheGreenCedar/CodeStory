@@ -1,30 +1,53 @@
 # CodeStory Benchmark Results
 
 This page is the short, decision-grade benchmark source for the README. It
-separates publishable agent A/B results from internal runtime budget evidence so
-marketing claims do not outrun the harness.
+separates exploratory agent A/B checks from promotable runtime evidence so
+marketing claims do not outrun the measurements.
 
-## Agent A/B Results
+## Latest Agent A/B Check
 
-Publishable with/without-CodeStory agent results are pending. Do not estimate or
-hand-author savings. The harness must generate the row, including wall time,
-token usage when available, estimated cost when pricing is configured, tool-call
-observations, runner metadata, raw transcripts, and per-run status.
+On 2026-05-23, the harness completed a one-repeat CodeStory repo run with the
+default Codex runner model:
 
 ```powershell
-node .\scripts\codestory-agent-ab-benchmark.mjs --list
-node .\scripts\codestory-agent-ab-benchmark.mjs --quick --repos codestory --repeats 1 --timeout-ms 600000
+node .\scripts\codestory-agent-ab-benchmark.mjs --quick --repos codestory --repeats 1 --timeout-ms 600000 --sandbox danger-full-access --out-dir target\agent-benchmark\codestory-quick-2026-05-23f
 ```
 
-Use `--publishable` only when the selected runner reports enough token usage to
-support a public cost/token comparison. The harness exits nonzero when any run
-fails or times out, unless `--allow-failures` is set for exploratory dry runs.
+This is an exploratory runner check, not a publishable savings claim. It used a
+single repeat on one Windows workstation, no pricing variables were configured,
+and `danger-full-access` was required because nested local command execution
+failed under `read-only` and `workspace-write` in this environment. The
+CodeStory arm did use CodeStory first: the transcript includes `doctor`,
+`ground`, `search`, `trail`, and `snippet` before the final answer.
 
-| Lane | Status | Promotion rule |
-| --- | --- | --- |
-| Agent wall time with and without CodeStory | Pending harness run | Promote medians only after all selected repo/arm/repeat runs succeed |
-| Agent token and cost deltas | Pending runner usage data | Promote only when token usage is observed, not inferred |
-| Agent tool-call deltas | Pending runner event data | Promote as observed runner events and keep raw transcripts linked |
+| Arm | Wall time | Total tokens | Input tokens | Output tokens | Tool starts | Status |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Without CodeStory | `272.60s` | `2,953,233` | `2,945,377` | `7,856` | `36` | Pass |
+| With CodeStory | `291.12s` | `2,440,580` | `2,430,976` | `9,604` | `43` | Pass |
+
+That one run showed `512,653` fewer total tokens with CodeStory (`17.4%`
+lower), while wall time was `18.52s` slower (`6.8%` slower) and the runner
+started `7` more tool commands. The right public statement is therefore narrow:
+the harness can now collect real with/without rows, and this exploratory row
+suggests a token-saving path worth repeating. It does not prove a general
+cost, wall-time, or tool-call win.
+
+## Runner Verification
+
+The current Codex CLI supports the harness flags `exec --json --ephemeral
+--sandbox --cd`. It does not support `--ask-for-approval`, so the harness does
+not pass that flag. On Windows, the harness launches `codex.cmd` through
+`cmd.exe` and sends the benchmark prompt over stdin to avoid shell quoting and
+`.cmd` spawn failures.
+
+Public harness defaults are reproducible from this repository: `--quick` and the
+default repo set use only `codestory`. Private sibling repositories are opt-in
+through `--include-local-repos` or explicit `--repos` values.
+
+Use `--publishable` only when the selected runner reports token usage and every
+run succeeds. For a public benchmark row, use at least three repeats, the same
+model, the same sandbox mode, the same cache policy, and the same semantic
+backend for both arms.
 
 ## Runtime Budgets
 
@@ -53,6 +76,11 @@ The harness writes raw stdout/stderr per run, a JSONL run ledger, a machine
 summary, and a Markdown summary under `target/agent-benchmark/<timestamp>`.
 Reported comparisons should use medians across successful repeats for the same
 runner, repository set, prompt set, cache policy, semantic backend, and model.
+
+```powershell
+node .\scripts\codestory-agent-ab-benchmark.mjs --list
+node .\scripts\codestory-agent-ab-benchmark.mjs --quick --repos codestory --repeats 3 --timeout-ms 600000 --publishable
+```
 
 Estimated cost is intentionally absent unless both token usage and pricing
 environment variables are present:
@@ -94,9 +122,10 @@ node .\scripts\cross-repo-promotion-benchmark.mjs --list
 
 ## What This Does Not Claim
 
-This page does not yet claim that CodeStory reduces agent cost, token count,
-wall time, or tool calls. Those claims require controlled with/without-agent
-measurements from the benchmark harness, not representative estimates.
+This page does not claim that CodeStory generally reduces agent cost, token
+count, wall time, or tool calls. General savings claims require repeated
+controlled with/without-agent measurements from the benchmark harness, not one
+exploratory row or representative estimates.
 
 ## Promotion Rules
 

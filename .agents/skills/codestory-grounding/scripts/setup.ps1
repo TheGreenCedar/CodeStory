@@ -34,8 +34,7 @@ function Invoke-Checked {
     }
 }
 
-$skillRoot = Split-Path -Parent $PSScriptRoot
-$repoRefPath = Join-Path $skillRoot "CODESTORY_REF"
+$DEFAULT_CODESTORY_REPO_REF = "d78bf7c66a87e3454d1bfd82ba68cddd8d02004d"
 $repoUrl = if ($env:CODESTORY_REPO_URL) {
     $env:CODESTORY_REPO_URL
 } else {
@@ -43,10 +42,8 @@ $repoUrl = if ($env:CODESTORY_REPO_URL) {
 }
 $repoRef = if ($env:CODESTORY_REPO_REF) {
     $env:CODESTORY_REPO_REF
-} elseif (Test-Path -LiteralPath $repoRefPath) {
-    (Get-Content -LiteralPath $repoRefPath -Raw).Trim()
 } else {
-    throw "CODESTORY_REPO_REF is not set and CODESTORY_REF is missing from the skill."
+    $DEFAULT_CODESTORY_REPO_REF
 }
 if (-not $repoRef) {
     throw "CODESTORY_REPO_REF resolved to an empty value."

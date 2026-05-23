@@ -7,15 +7,11 @@ if [[ "${1:-}" == "--dry-run" || "${1:-}" == "-n" ]]; then
 fi
 
 repo_url="${CODESTORY_REPO_URL:-https://github.com/TheGreenCedar/CodeStory.git}"
-skill_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-repo_ref_path="$skill_dir/CODESTORY_REF"
+DEFAULT_CODESTORY_REPO_REF="d78bf7c66a87e3454d1bfd82ba68cddd8d02004d"
 if [[ -n "${CODESTORY_REPO_REF:-}" ]]; then
   repo_ref="$CODESTORY_REPO_REF"
-elif [[ -f "$repo_ref_path" ]]; then
-  repo_ref="$(tr -d '[:space:]' < "$repo_ref_path")"
 else
-  echo "CODESTORY_REPO_REF is not set and CODESTORY_REF is missing from the skill." >&2
-  exit 1
+  repo_ref="$DEFAULT_CODESTORY_REPO_REF"
 fi
 if [[ -z "$repo_ref" ]]; then
   echo "CODESTORY_REPO_REF resolved to an empty value." >&2

@@ -101,7 +101,6 @@ fn readme_keeps_dual_track_onboarding() {
         "docs/contributors/debugging.md",
         "docs/contributors/testing-matrix.md",
         "docs/decision-log.md",
-        ".agents/skills/codestory-grounding/CODESTORY_REF",
         ".agents/skills/codestory-grounding/scripts/setup.ps1",
         ".agents/skills/codestory-grounding/scripts/setup.sh",
         "scripts/codestory-agent-ab-benchmark.mjs",
@@ -109,6 +108,17 @@ fn readme_keeps_dual_track_onboarding() {
         assert!(
             root.join(path).exists(),
             "expected onboarding doc to exist: {path}"
+        );
+    }
+
+    for path in [
+        ".agents/skills/codestory-grounding/scripts/setup.ps1",
+        ".agents/skills/codestory-grounding/scripts/setup.sh",
+    ] {
+        let setup = fs::read_to_string(root.join(path)).expect("read setup script");
+        assert!(
+            setup.contains("DEFAULT_CODESTORY_REPO_REF"),
+            "setup script should document the pinned CLI source ref: {path}"
         );
     }
 }
