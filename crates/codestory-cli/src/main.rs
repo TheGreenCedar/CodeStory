@@ -966,7 +966,7 @@ fn write_drill_outputs(
         args::OutputFormat::Json => "json",
         args::OutputFormat::Dot => unreachable!("dot was rejected above"),
     };
-    let markdown = render_drill_markdown(&output);
+    let markdown = render_drill_markdown(output);
     let contents = render_drill_contents(format, output, &markdown)?;
     let report_path = output_dir.join(format!("drill-report.{report_ext}"));
     write_drill_report_file(&report_path, &contents.selected)?;

@@ -1772,11 +1772,17 @@ fn search_plan_path_is_test_or_bench(path: &str) -> bool {
         || normalized.starts_with("test/")
         || normalized.starts_with("benches/")
         || normalized.starts_with("bench/")
+        || normalized.starts_with("__tests__/")
+        || normalized.starts_with("__test__/")
         || normalized.contains("/tests/")
         || normalized.contains("/test/")
+        || normalized.contains("/__tests__/")
+        || normalized.contains("/__test__/")
         || normalized.contains("/benches/")
         || normalized.contains("/bench/")
         || normalized.ends_with("_test.rs")
+        || normalized.contains(".test.")
+        || normalized.contains(".spec.")
 }
 
 fn search_plan_anchor_groups(
@@ -2770,6 +2776,8 @@ fn path_role_from_key(path: &str) -> IndexedFileRoleDto {
     if marked.contains("/tests/")
         || marked.contains("/test/")
         || marked.contains("/spec/")
+        || marked.contains("/__tests__/")
+        || marked.contains("/__test__/")
         || file_name.contains(".test.")
         || file_name.contains(".spec.")
         || file_name.ends_with("_test.rs")
@@ -6132,42 +6140,46 @@ impl AppController {
             repo_text_fallback_reason,
         );
         let mut search_plan_anchor_rank = HashMap::<NodeId, usize>::new();
-        let search_plan = match self.build_search_plan(
-            &storage,
-            &original_query,
-            &query,
-            &query_assessment,
-            &indexed_symbol_hits,
-            &repo_text_hits,
-            &suggestions,
-            &retrieval,
-            limit_per_source as u32,
-            &intent_query.filters,
-            &indexed_hit_ids,
-            req.hybrid_weights.clone(),
-            req.hybrid_limits.clone(),
-        )? {
-            Some(plan_build) => {
-                for (rank, group) in plan_build.plan.anchor_groups.iter().enumerate() {
-                    if let Some(symbol) = &group.chosen_symbol {
-                        search_plan_anchor_rank
-                            .entry(symbol.node_id.clone())
-                            .or_insert(rank);
-                        merge_search_hits_by_node_id(
-                            &mut indexed_symbol_hits,
-                            vec![symbol.clone()],
-                        );
+        let search_plan = if used_repo_explanation_overview {
+            None
+        } else {
+            match self.build_search_plan(
+                &storage,
+                &original_query,
+                &query,
+                &query_assessment,
+                &indexed_symbol_hits,
+                &repo_text_hits,
+                &suggestions,
+                &retrieval,
+                limit_per_source as u32,
+                &intent_query.filters,
+                &indexed_hit_ids,
+                req.hybrid_weights.clone(),
+                req.hybrid_limits.clone(),
+            )? {
+                Some(plan_build) => {
+                    for (rank, group) in plan_build.plan.anchor_groups.iter().enumerate() {
+                        if let Some(symbol) = &group.chosen_symbol {
+                            search_plan_anchor_rank
+                                .entry(symbol.node_id.clone())
+                                .or_insert(rank);
+                            merge_search_hits_by_node_id(
+                                &mut indexed_symbol_hits,
+                                vec![symbol.clone()],
+                            );
+                        }
                     }
+                    merge_search_hits_by_node_id(
+                        &mut indexed_symbol_hits,
+                        plan_build.indexed_symbol_hits,
+                    );
+                    merge_search_hits_by_node_id(&mut repo_text_hits, plan_build.repo_text_hits);
+                    merge_search_hits_by_node_id(&mut suggestions, plan_build.suggestions);
+                    Some(plan_build.plan)
                 }
-                merge_search_hits_by_node_id(
-                    &mut indexed_symbol_hits,
-                    plan_build.indexed_symbol_hits,
-                );
-                merge_search_hits_by_node_id(&mut repo_text_hits, plan_build.repo_text_hits);
-                merge_search_hits_by_node_id(&mut suggestions, plan_build.suggestions);
-                Some(plan_build.plan)
+                None => None,
             }
-            None => None,
         };
         indexed_symbol_hits.sort_by(|left, right| {
             let anchor_order = match (
@@ -8915,6 +8927,22 @@ pub fn exact_symbol_anchor() {{}}
     }
 
     #[test]
+    fn search_plan_test_file_names_are_not_visible_production_callers() {
+        for path in [
+            "src/api.test.ts",
+            "src/api.spec.ts",
+            "src/api.test.tsx",
+            "src/api.spec.jsx",
+            "src/__tests__/api.ts",
+        ] {
+            assert!(
+                search_plan_path_is_test_or_bench(path),
+                "{path} should be treated as test code for active-path evidence"
+            );
+        }
+    }
+
+    #[test]
     fn search_plan_repo_text_owner_identifier_does_not_promote_member_symbol() {
         let temp = tempdir().expect("create temp dir");
         let source_path = temp.path().join("src").join("lib.rs");
@@ -9334,6 +9362,10 @@ fn build_llm_symbol_doc_text() -> String {
             generic_results.indexed_symbol_hits.len(),
             generic_results.suggestions.len(),
             "generic repo-explanation replacement should mirror overview suggestions"
+        );
+        assert!(
+            generic_results.search_plan.is_none(),
+            "generic repo-overview replacement should not add search-plan anchors: {generic_results:?}"
         );
 
         let results = controller
