@@ -1,5 +1,6 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -85,11 +86,25 @@ struct SnippetStats {
     snippet_lines: usize,
 }
 
+#[derive(Debug)]
 struct DrillRepoCase {
-    name: &'static str,
+    name: String,
     project_root: PathBuf,
-    question: &'static str,
-    anchors: &'static [&'static str],
+    question: String,
+    anchors: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DrillRepoCaseManifest {
+    cases: Vec<DrillRepoCaseConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DrillRepoCaseConfig {
+    slug: String,
+    project: PathBuf,
+    question: String,
+    anchors: Vec<String>,
 }
 
 fn repo_root() -> PathBuf {
@@ -243,33 +258,41 @@ fn array_item_by_field<'a>(
         .unwrap_or_else(|| panic!("missing {field}={expected:?} at path {path:?}"))
 }
 
-fn drill_repo_cases() -> Vec<DrillRepoCase> {
-    let code_story = repo_root();
-    let source_repos = code_story
+fn drill_repo_cases_from_manifest(manifest_path: &Path) -> Vec<DrillRepoCase> {
+    let manifest_text = fs::read_to_string(manifest_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read CODESTORY_REAL_REPO_DRILL_CASES manifest {}: {error}",
+            manifest_path.display()
+        )
+    });
+    let manifest: DrillRepoCaseManifest =
+        serde_json::from_str(&manifest_text).unwrap_or_else(|error| {
+            panic!(
+                "failed to parse CODESTORY_REAL_REPO_DRILL_CASES manifest {}: {error}",
+                manifest_path.display()
+            )
+        });
+    let manifest_dir = manifest_path
         .parent()
-        .expect("codestory checkout has sibling repo parent")
-        .to_path_buf();
-
-    vec![
-        DrillRepoCase {
-            name: "sourcetrail",
-            project_root: source_repos.join("Sourcetrail"),
-            question: "Explain how Sourcetrail turns project/source-group configuration into indexing work, then how indexed data is accessed by the application. Anchor the answer around SourceGroupCxxCdb, IndexerJava, and StorageAccess.",
-            anchors: &["SourceGroupCxxCdb", "IndexerJava", "StorageAccess"],
-        },
-        DrillRepoCase {
-            name: "codestory",
-            project_root: code_story,
-            question: "Explain how CodeStory's full-index path flows through CLI/runtime/workspace/indexer/store and how that supports later search, trail, and snippet commands. Anchor the answer around WorkspaceIndexer, SearchService, and TrailResult.",
-            anchors: &["WorkspaceIndexer", "SearchService", "TrailResult"],
-        },
-        DrillRepoCase {
-            name: "rootandruntime",
-            project_root: source_repos.join("rootandruntime"),
-            question: "Explain how public writing/social surfaces connect to Payload collections, comment auth, and the elsewhere feed. Anchor the answer around Posts, getElsewhereFeed, and getCommentAuth.",
-            anchors: &["Posts", "getElsewhereFeed", "getCommentAuth"],
-        },
-    ]
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    manifest
+        .cases
+        .into_iter()
+        .map(|case| {
+            let project_root = if case.project.is_absolute() {
+                case.project
+            } else {
+                manifest_dir.join(case.project)
+            };
+            DrillRepoCase {
+                name: case.slug,
+                project_root,
+                question: case.question,
+                anchors: case.anchors,
+            }
+        })
+        .collect()
 }
 
 #[test]
@@ -533,7 +556,7 @@ fn codestory_repo_release_e2e_emits_stats() {
 }
 
 #[test]
-#[ignore = "real-repo drill harness; run after cargo build --release -p codestory-cli on the Windows workstation with sibling repos present"]
+#[ignore = "real-repo drill harness; set CODESTORY_REAL_REPO_DRILL_CASES to a drill-suite manifest and run after cargo build --release -p codestory-cli"]
 fn real_repo_agent_grounding_drill_emits_verification_packets() {
     let binary = release_cli_binary();
     assert!(
@@ -544,7 +567,21 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
 
     let root_output = tempdir().expect("drill output dir");
     let cache_dir = tempdir().expect("drill cache dir");
-    let cases = drill_repo_cases();
+    let Some(manifest_path) = env::var_os("CODESTORY_REAL_REPO_DRILL_CASES").map(PathBuf::from)
+    else {
+        eprintln!(
+            "skipping manifest real-repo drill suite because CODESTORY_REAL_REPO_DRILL_CASES is not set"
+        );
+        return;
+    };
+    let cases = drill_repo_cases_from_manifest(&manifest_path);
+    if cases.is_empty() {
+        eprintln!(
+            "skipping manifest real-repo drill suite because {} contains no cases",
+            manifest_path.display()
+        );
+        return;
+    }
     let missing = cases
         .iter()
         .filter(|case| !case.project_root.is_dir())
@@ -552,7 +589,7 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
         .collect::<Vec<_>>();
     if !missing.is_empty() {
         eprintln!(
-            "skipping fixed real-repo drill suite because sibling repos are missing: {}",
+            "skipping manifest real-repo drill suite because sibling repos are missing: {}",
             missing.join(", ")
         );
         return;
@@ -570,18 +607,20 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             "json".to_string(),
             "--output-dir".to_string(),
             root_output.path().display().to_string(),
+            "--case-file".to_string(),
+            manifest_path.display().to_string(),
         ],
     );
 
     assert_eq!(
-        string_field(&suite_json, &["suite"]),
-        "codestory-real-repo-agent-drill"
+        string_field(&suite_json, &["case_file"]),
+        manifest_path.display().to_string()
     );
     assert_eq!(u64_field(&suite_json, &["repo_count"]), cases.len() as u64);
     assert_eq!(
         array_len(&suite_json, &["repos"]),
         cases.len(),
-        "suite should include exactly the fixed three real-repo drill cases"
+        "suite should include exactly the manifest real-repo drill cases"
     );
     assert!(
         root_output.path().join("suite-report.md").is_file(),
@@ -599,7 +638,7 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
     );
     for case in &cases {
         assert!(
-            cache_dir.path().join(case.name).is_dir(),
+            cache_dir.path().join(case.name.as_str()).is_dir(),
             "drill-suite should isolate the explicit cache root for {}",
             case.name
         );
@@ -611,7 +650,7 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
         assert_eq!(
             string_field(repo_json, &["slug"]),
             case.name,
-            "suite should preserve fixed repo order"
+            "suite should preserve manifest repo order"
         );
         assert_eq!(
             string_field(repo_json, &["question"]),
@@ -765,14 +804,14 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             "{} drill should emit pairwise cross-anchor bridge evidence",
             case.name
         );
-        assert_compact_bridge_status_handoff(case.name, repo_json);
+        assert_compact_bridge_status_handoff(&case.name, repo_json);
         assert!(array_len(&drill_json, &["execution_boundaries"]) >= 3);
 
         for anchor_index in 0..case.anchors.len() {
             let index = anchor_index.to_string();
             assert_eq!(
                 string_field(&drill_json, &["anchors", index.as_str(), "anchor"]),
-                case.anchors[anchor_index],
+                case.anchors[anchor_index].as_str(),
                 "{} drill should keep anchor order",
                 case.name
             );
@@ -827,7 +866,7 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             }
         }
 
-        assert_real_repo_golden_expectations(case.name, repo_json);
+        assert_manifest_anchor_expectations(case, repo_json);
     }
 }
 
@@ -845,11 +884,11 @@ fn assert_question_search_names_seed_anchors(case: &DrillRepoCase, drill_json: &
     let subqueries = json_path(&question_search, &["search_plan", "subqueries"])
         .as_array()
         .expect("question search plan subqueries");
-    for anchor in case.anchors {
+    for anchor in &case.anchors {
         assert!(
             subqueries.iter().any(|subquery| {
                 subquery["role"].as_str() == Some("named_anchor")
-                    && subquery["query"].as_str() == Some(*anchor)
+                    && subquery["query"].as_str() == Some(anchor.as_str())
             }),
             "{} broad question Search Plan should preserve named-anchor subquery for {anchor}: {question_search:#}",
             case.name
@@ -887,51 +926,18 @@ fn assert_compact_bridge_status_handoff(repo_name: &str, repo_json: &Value) {
     }
 }
 
-fn assert_real_repo_golden_expectations(repo_name: &str, repo_json: &Value) {
-    match repo_name {
-        "sourcetrail" => {
-            assert_anchor_summary_min(repo_json, "SourceGroupCxxCdb", 0, 0, 1);
-            assert_anchor_summary_min(repo_json, "IndexerJava", 0, 0, 1);
-            assert_anchor_summary_min(repo_json, "StorageAccess", 0, 0, 1);
-        }
-        "codestory" => {
-            assert_anchor_summary_min(repo_json, "WorkspaceIndexer", 0, 0, 1);
-            assert_anchor_summary_min(repo_json, "SearchService", 0, 1, 0);
-            assert_anchor_summary_min(repo_json, "TrailResult", 0, 0, 1);
-        }
-        "rootandruntime" => {
-            assert_anchor_summary_min(repo_json, "Posts", 0, 1, 0);
-            assert_anchor_summary_min(repo_json, "getElsewhereFeed", 0, 0, 1);
-            assert_anchor_summary_min(repo_json, "getCommentAuth", 1, 1, 0);
-        }
-        other => panic!("unexpected drill repo {other}"),
+fn assert_manifest_anchor_expectations(case: &DrillRepoCase, repo_json: &Value) {
+    for anchor in &case.anchors {
+        assert_anchor_summary_usable(repo_json, anchor);
     }
 }
 
-fn assert_anchor_summary_min(
-    repo_json: &Value,
-    anchor: &str,
-    min_callers: u64,
-    min_consumers: u64,
-    min_text_hints: u64,
-) {
+fn assert_anchor_summary_usable(repo_json: &Value, anchor: &str) {
     let summary = array_item_by_field(
         repo_json,
         &["summary", "anchors", "statuses"],
         "anchor",
         anchor,
-    );
-    assert!(
-        u64_field(summary, &["caller_count"]) >= min_callers,
-        "{anchor} should preserve expected caller evidence"
-    );
-    assert!(
-        u64_field(summary, &["consumer_count"]) >= min_consumers,
-        "{anchor} should preserve expected consumer evidence"
-    );
-    assert!(
-        u64_field(summary, &["text_hint_count"]) >= min_text_hints,
-        "{anchor} should preserve expected repo-text hint evidence"
     );
     assert!(
         u64_field(summary, &["source_truth_target_count"]) > 0,

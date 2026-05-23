@@ -44,10 +44,10 @@ The report includes:
 
 ```bash
 # CodeStory-first evidence packet for an architecture question
-target/release/codestory-cli(.exe) drill --project . --refresh full --question "how full indexing supports search trail and snippet commands" --anchors WorkspaceIndexer,SearchService,TrailResult --output-dir target/drill/codestory
+target/release/codestory-cli(.exe) drill --project <workspace> --refresh full --question "how the public API reaches the backing store" --anchors ApiController,Repository,StorageClient --output-dir target/drill/api-store-flow
 
 # JSON-first run for automation, while still writing Markdown too
-target/release/codestory-cli(.exe) drill --project . --refresh none --anchors Posts,getElsewhereFeed,getCommentAuth --output-dir target/drill/rootandruntime --format json
+target/release/codestory-cli(.exe) drill --project <workspace> --refresh none --anchors EntryPoint,Coordinator,BackingStore --output-dir target/drill/entrypoint-flow --format json
 ```
 
 ## Interpretation

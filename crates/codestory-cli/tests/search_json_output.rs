@@ -445,6 +445,15 @@ fn broad_search_json_and_markdown_expose_search_plan() {
         "search plan should provide next commands: {plan:#}"
     );
     assert!(
+        plan["next_commands"].as_array().is_some_and(|items| {
+            items.iter().all(|item| {
+                item.as_str()
+                    .is_some_and(|command| command.contains("--project"))
+            })
+        }),
+        "search plan follow-up commands should carry an explicit project: {plan:#}"
+    );
+    assert!(
         plan["source_truth_checks"]
             .as_array()
             .is_some_and(|items| !items.is_empty()),

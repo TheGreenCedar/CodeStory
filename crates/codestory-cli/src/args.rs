@@ -481,6 +481,12 @@ pub(crate) struct DrillSuiteCommand {
     pub(crate) project: ProjectArgs,
     #[arg(
         long,
+        value_name = "FILE",
+        help = "JSON manifest describing the drill cases to run. Relative case project paths resolve from the manifest directory."
+    )]
+    pub(crate) case_file: PathBuf,
+    #[arg(
+        long,
         value_name = "DIR",
         help = "Directory where the suite report and per-repo drill artifacts are written."
     )]
@@ -1383,6 +1389,7 @@ pub(crate) struct DrillSuiteRepoOutput {
     pub(crate) question: String,
     pub(crate) anchors: Vec<String>,
     pub(crate) output_dir: String,
+    pub(crate) artifact_extension: String,
     pub(crate) summary: DrillSummaryOutput,
 }
 
@@ -1398,6 +1405,7 @@ pub(crate) struct DrillSuiteRetrievalBlockerOutput {
 pub(crate) struct DrillSuiteOutput {
     pub(crate) suite: String,
     pub(crate) project: String,
+    pub(crate) case_file: String,
     pub(crate) output_dir: String,
     pub(crate) repo_count: usize,
     pub(crate) degraded_count: usize,

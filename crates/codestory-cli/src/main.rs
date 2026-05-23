@@ -75,6 +75,7 @@ use runtime::{
     AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
     resolve_refresh_request, resolve_target,
 };
+use serde::Deserialize;
 #[cfg(test)]
 use stdio_catalog::{
     prompts_list_json as stdio_prompts_list_json, resources_list_json as stdio_resources_list_json,
@@ -1015,11 +1016,27 @@ fn run_drill_suite(cmd: DrillSuiteCommand) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct DrillSuiteCaseManifest {
+    #[serde(default)]
+    suite: Option<String>,
+    cases: Vec<DrillSuiteCaseConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DrillSuiteCaseConfig {
+    slug: String,
+    project: std::path::PathBuf,
+    question: String,
+    anchors: Vec<String>,
+}
+
+#[derive(Debug)]
 struct DrillSuiteCase {
-    slug: &'static str,
+    slug: String,
     project_root: std::path::PathBuf,
-    question: &'static str,
-    anchors: &'static [&'static str],
+    question: String,
+    anchors: Vec<String>,
 }
 
 fn emit_drill_suite_progress(message: impl AsRef<str>) {
@@ -1064,10 +1081,10 @@ fn execute_codestory_real_repo_drill_suite(cmd: &DrillSuiteCommand) -> Result<Dr
         .project
         .canonicalize()
         .with_context(|| format!("Failed to resolve {}", cmd.project.project.display()))?;
-    let cases = codestory_real_repo_drill_suite_cases(&owner_root)?;
+    let (suite_name, cases) = drill_suite_cases_from_manifest(&cmd.case_file, &owner_root)?;
     let total_cases = cases.len();
     emit_drill_suite_progress(format!(
-        "start repos={} refresh={} output_dir={}",
+        "start cases={} refresh={} output_dir={}",
         total_cases,
         format!("{:?}", cmd.refresh).to_ascii_lowercase(),
         display::clean_path_string(&cmd.output_dir.to_string_lossy())
@@ -1086,46 +1103,54 @@ fn execute_codestory_real_repo_drill_suite(cmd: &DrillSuiteCommand) -> Result<Dr
         let drill_cmd = DrillCommand {
             project: ProjectArgs {
                 project: case.project_root.clone(),
-                cache_dir: drill_suite_case_cache_dir(cmd.project.cache_dir.as_deref(), case.slug),
+                cache_dir: drill_suite_case_cache_dir(cmd.project.cache_dir.as_deref(), &case.slug),
             },
             anchors: case
                 .anchors
                 .iter()
-                .map(|anchor| (*anchor).to_string())
+                .map(|anchor| anchor.to_string())
                 .collect(),
-            label: Some(case.slug.to_string()),
-            question: Some(case.question.to_string()),
+            label: Some(case.slug.clone()),
+            question: Some(case.question.clone()),
             output_dir: repo_output_dir.clone(),
             refresh: cmd.refresh,
             format: cmd.format,
         };
-        let drill_output = execute_drill(&drill_cmd).with_context(|| {
-            format!(
-                "Failed to run {} drill for {}",
-                case.slug,
-                display::clean_path_string(&case.project_root.to_string_lossy())
-            )
-        })?;
-        write_drill_outputs(cmd.format, &repo_output_dir, &drill_output)?;
-        let summary = drill_summary(&drill_output);
-        emit_drill_suite_progress(drill_suite_repo_progress_done_message(
-            progress_index,
-            total_cases,
-            case.slug,
-            &summary,
-        ));
-        repos.push(DrillSuiteRepoOutput {
-            slug: case.slug.to_string(),
-            project: display::clean_path_string(&case.project_root.to_string_lossy()),
-            question: case.question.to_string(),
-            anchors: case
-                .anchors
-                .iter()
-                .map(|anchor| (*anchor).to_string())
-                .collect(),
-            output_dir: display::clean_path_string(&repo_output_dir.to_string_lossy()),
-            summary,
-        });
+        match execute_drill(&drill_cmd).and_then(|drill_output| {
+            write_drill_outputs(cmd.format, &repo_output_dir, &drill_output)?;
+            Ok(drill_summary(&drill_output))
+        }) {
+            Ok(summary) => {
+                emit_drill_suite_progress(drill_suite_repo_progress_done_message(
+                    progress_index,
+                    total_cases,
+                    &case.slug,
+                    &summary,
+                ));
+                repos.push(DrillSuiteRepoOutput {
+                    slug: case.slug.clone(),
+                    project: display::clean_path_string(&case.project_root.to_string_lossy()),
+                    question: case.question.clone(),
+                    anchors: case.anchors.clone(),
+                    output_dir: display::clean_path_string(&repo_output_dir.to_string_lossy()),
+                    artifact_extension: drill_artifact_extension(cmd.format).to_string(),
+                    summary,
+                });
+            }
+            Err(error) => {
+                emit_drill_suite_progress(format!(
+                    "[{progress_index}/{total_cases}] blocked {} error={}",
+                    case.slug, error
+                ));
+                repos.push(blocked_drill_suite_repo_output(
+                    &case,
+                    &repo_output_dir,
+                    cmd.refresh,
+                    cmd.format,
+                    &error.to_string(),
+                ));
+            }
+        }
     }
 
     let degraded_count = repos
@@ -1147,8 +1172,9 @@ fn execute_codestory_real_repo_drill_suite(cmd: &DrillSuiteCommand) -> Result<Dr
     let retrieval_blockers = drill_suite_retrieval_blockers(&repos);
 
     Ok(DrillSuiteOutput {
-        suite: "codestory-real-repo-agent-drill".to_string(),
+        suite: suite_name,
         project: display::clean_path_string(&owner_root.to_string_lossy()),
+        case_file: display::clean_path_string(&cmd.case_file.to_string_lossy()),
         output_dir: display::clean_path_string(&cmd.output_dir.to_string_lossy()),
         repo_count: repos.len(),
         degraded_count,
@@ -1167,35 +1193,176 @@ fn drill_suite_case_cache_dir(
     suite_cache_dir.map(|cache_dir| cache_dir.join(output_slug(slug)))
 }
 
-fn codestory_real_repo_drill_suite_cases(
+fn drill_suite_cases_from_manifest(
+    case_file: &std::path::Path,
     owner_root: &std::path::Path,
-) -> Result<Vec<DrillSuiteCase>> {
-    let source_repos = owner_root.parent().ok_or_else(|| {
-        anyhow::anyhow!(
-            "Cannot derive sibling repos from {}",
-            display::clean_path_string(&owner_root.to_string_lossy())
+) -> Result<(String, Vec<DrillSuiteCase>)> {
+    let manifest_text = fs::read_to_string(case_file).with_context(|| {
+        format!(
+            "Failed to read drill-suite case file {}",
+            display::clean_path_string(&case_file.to_string_lossy())
         )
     })?;
-    Ok(vec![
-        DrillSuiteCase {
-            slug: "sourcetrail",
-            project_root: source_repos.join("Sourcetrail"),
-            question: "Explain how Sourcetrail turns project/source-group configuration into indexing work, then how indexed data is accessed by the application. Anchor the answer around SourceGroupCxxCdb, IndexerJava, and StorageAccess.",
-            anchors: &["SourceGroupCxxCdb", "IndexerJava", "StorageAccess"],
+    let manifest: DrillSuiteCaseManifest =
+        serde_json::from_str(&manifest_text).with_context(|| {
+            format!(
+                "Failed to parse drill-suite case file {} as JSON",
+                display::clean_path_string(&case_file.to_string_lossy())
+            )
+        })?;
+    if manifest.cases.is_empty() {
+        bail!("drill-suite case file must contain at least one case");
+    }
+    let manifest_dir = case_file
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(owner_root);
+    let mut cases = Vec::with_capacity(manifest.cases.len());
+    let mut seen_slugs = HashSet::new();
+    for case in manifest.cases {
+        let slug = output_slug(&case.slug);
+        if slug.is_empty() {
+            bail!("drill-suite case slug cannot be empty");
+        }
+        if !seen_slugs.insert(slug.clone()) {
+            bail!("drill-suite case slug `{slug}` is duplicated");
+        }
+        if case.question.trim().is_empty() {
+            bail!("drill-suite case `{slug}` question cannot be empty");
+        }
+        let anchors = normalized_drill_anchors(&case.anchors);
+        if anchors.is_empty() {
+            bail!("drill-suite case `{slug}` must name at least one anchor");
+        }
+        let project_root = if case.project.is_absolute() {
+            case.project
+        } else {
+            manifest_dir.join(case.project)
+        };
+        cases.push(DrillSuiteCase {
+            slug,
+            project_root,
+            question: case.question,
+            anchors,
+        });
+    }
+    Ok((
+        manifest
+            .suite
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "codestory-agent-drill-suite".to_string()),
+        cases,
+    ))
+}
+
+fn blocked_drill_suite_repo_output(
+    case: &DrillSuiteCase,
+    repo_output_dir: &std::path::Path,
+    refresh: args::RefreshMode,
+    format: args::OutputFormat,
+    error: &str,
+) -> DrillSuiteRepoOutput {
+    let project = display::clean_path_string(&case.project_root.to_string_lossy());
+    let output_dir = display::clean_path_string(&repo_output_dir.to_string_lossy());
+    let anchor_statuses = case
+        .anchors
+        .iter()
+        .map(|anchor| DrillSummaryAnchorStatusOutput {
+            anchor: anchor.clone(),
+            status: "not_run".to_string(),
+            typed_hit_count: 0,
+            selected: None,
+            selected_node_id: None,
+            selected_node_ref: None,
+            selected_kind: None,
+            selected_file_path: None,
+            selected_line: None,
+            caller_count: 0,
+            consumer_count: 0,
+            text_hint_count: 0,
+            command_count: 0,
+            failed_command_count: 0,
+            source_truth_target_count: 0,
+        })
+        .collect::<Vec<_>>();
+    let next_action = format!(
+        "Fix or skip this case, then rerun `drill-suite`; blocked before evidence artifacts were written: {}",
+        error.replace('|', "\\|")
+    );
+
+    DrillSuiteRepoOutput {
+        slug: case.slug.clone(),
+        project: project.clone(),
+        question: case.question.clone(),
+        anchors: case.anchors.clone(),
+        output_dir: output_dir.clone(),
+        artifact_extension: drill_artifact_extension(format).to_string(),
+        summary: DrillSummaryOutput {
+            summary_version: 1,
+            project,
+            label: Some(case.slug.clone()),
+            question: Some(case.question.clone()),
+            output_dir: output_dir.clone(),
+            full_report_json: "drill-report.json".to_string(),
+            full_report_markdown: "drill-report.md".to_string(),
+            mechanical: DrillSummaryMechanicalOutput {
+                refresh: refresh_label(refresh, None),
+                before: drill_summary_stats(0, 0, 0, 0),
+                after: drill_summary_stats(0, 0, 0, 1),
+                index_ready: false,
+                error_delta: 1,
+                retrieval_status: None,
+                freshness_status: Some("unknown".to_string()),
+                stale_file_count: 0,
+                freshness_samples: Vec::new(),
+                phase_timing_available: false,
+            },
+            anchors: DrillSummaryAnchorsOutput {
+                requested: case.anchors.len(),
+                resolved: 0,
+                unresolved: case.anchors.len(),
+                failed_command_count: 1,
+                statuses: anchor_statuses,
+            },
+            bridges: DrillSummaryBridgesOutput {
+                total: 0,
+                graph_path: 0,
+                partial: 0,
+                unresolved_or_error: 0,
+                statuses: Vec::new(),
+            },
+            source_truth: DrillSummarySourceTruthOutput {
+                required: false,
+                check_count: 0,
+                pending_check_count: 0,
+                verified_check_count: 0,
+                target_file_count: 0,
+                target_files: Vec::new(),
+                checklist_item_count: 0,
+                claim_count: 0,
+                pending_claim_count: 0,
+                verified_claim_count: 0,
+            },
+            open_gaps: DrillSummaryOpenGapsOutput {
+                overall_status: ClaimReadinessDto::NeedsSourceRead,
+                answer_quality_status: "blocked_before_evidence".to_string(),
+                safe_to_say_count: 0,
+                inferred_claim_count: 0,
+                needs_verification_count: 1,
+                needs_verification_claim_count: 0,
+                pending_claim_count: 0,
+                pending_source_truth_check_count: 0,
+                next_command_count: 1,
+                open_gap_friendly: true,
+                status: "blocked".to_string(),
+            },
+            verdict: DrillSummaryVerdictOutput {
+                status: "blocked".to_string(),
+                reason: format!("drill failed before evidence collection: {error}"),
+                next_action,
+            },
         },
-        DrillSuiteCase {
-            slug: "codestory",
-            project_root: owner_root.to_path_buf(),
-            question: "Explain how CodeStory's full-index path flows through CLI/runtime/workspace/indexer/store and how that supports later search, trail, and snippet commands. Anchor the answer around WorkspaceIndexer, SearchService, and TrailResult.",
-            anchors: &["WorkspaceIndexer", "SearchService", "TrailResult"],
-        },
-        DrillSuiteCase {
-            slug: "rootandruntime",
-            project_root: source_repos.join("rootandruntime"),
-            question: "Explain how public writing/social surfaces connect to Payload collections, comment auth, and the elsewhere feed. Anchor the answer around Posts, getElsewhereFeed, and getCommentAuth.",
-            anchors: &["Posts", "getElsewhereFeed", "getCommentAuth"],
-        },
-    ])
+    }
 }
 
 fn write_drill_suite_outputs(
@@ -1214,15 +1381,19 @@ fn write_drill_suite_outputs(
         args::OutputFormat::Json => json,
         args::OutputFormat::Dot => unreachable!("dot was rejected above"),
     };
-    let report_ext = match format {
-        args::OutputFormat::Markdown => "md",
-        args::OutputFormat::Json => "json",
-        args::OutputFormat::Dot => unreachable!("dot was rejected above"),
-    };
+    let report_ext = drill_artifact_extension(format);
     write_drill_report_file(
         &output_dir.join(format!("drill-suite-report.{report_ext}")),
         &selected,
     )
+}
+
+fn drill_artifact_extension(format: args::OutputFormat) -> &'static str {
+    match format {
+        args::OutputFormat::Markdown => "md",
+        args::OutputFormat::Json => "json",
+        args::OutputFormat::Dot => unreachable!("dot was rejected above"),
+    }
 }
 
 fn render_drill_suite_markdown(output: &DrillSuiteOutput) -> String {
@@ -1231,6 +1402,7 @@ fn render_drill_suite_markdown(output: &DrillSuiteOutput) -> String {
     let _ = writeln!(markdown);
     let _ = writeln!(markdown, "- suite: `{}`", output.suite);
     let _ = writeln!(markdown, "- project: `{}`", output.project);
+    let _ = writeln!(markdown, "- case_file: `{}`", output.case_file);
     let _ = writeln!(markdown, "- output_dir: `{}`", output.output_dir);
     let _ = writeln!(
         markdown,
@@ -1288,8 +1460,10 @@ fn render_drill_suite_markdown(output: &DrillSuiteOutput) -> String {
             );
             let json_report =
                 drill_suite_join_artifact_path(&repo.output_dir, &repo.summary.full_report_json);
-            let bridge_artifacts =
-                drill_suite_join_artifact_path(&repo.output_dir, "*-bridge.json");
+            let bridge_artifacts = drill_suite_join_artifact_path(
+                &repo.output_dir,
+                &format!("*-bridge.{}", repo.artifact_extension),
+            );
             let _ = writeln!(
                 markdown,
                 "- `{}`: report `{}`; json `{}`; bridge artifacts `{}`",
@@ -6000,7 +6174,9 @@ fn build_search_output(parts: SearchOutputParts<'_>) -> SearchOutput {
         repo_text_mode: parts.repo_text.mode,
         repo_text_enabled: parts.repo_text.enabled,
         query_assessment: parts.query_assessment.cloned(),
-        search_plan: parts.search_plan.cloned(),
+        search_plan: parts
+            .search_plan
+            .map(|plan| search_plan_for_project(parts.project_root, plan)),
         explain: parts.explain,
         query_hints,
         suggestions: parts
@@ -6020,6 +6196,18 @@ fn build_search_output(parts: SearchOutputParts<'_>) -> SearchOutput {
         repo_text_hits,
         repo_text_stats: parts.repo_text_stats.cloned(),
     }
+}
+
+fn search_plan_for_project(
+    project_root: &std::path::Path,
+    plan: &codestory_contracts::api::SearchPlanDto,
+) -> codestory_contracts::api::SearchPlanDto {
+    let mut plan = plan.clone();
+    let project = quote_command_path(project_root);
+    for command in &mut plan.next_commands {
+        *command = command.replace("<PROJECT>", &project);
+    }
+    plan
 }
 
 fn build_query_resolution_output(
@@ -8075,56 +8263,82 @@ mod tests {
     }
 
     #[test]
-    fn drill_suite_cases_preserve_fixed_cross_repo_order_and_anchors() {
-        let owner_root = PathBuf::from("C:/Users/alber/source/repos/codestory");
-        let cases = codestory_real_repo_drill_suite_cases(&owner_root).expect("suite cases");
+    fn drill_suite_cases_load_manifest_order_and_anchors() {
+        let temp = tempdir().expect("manifest dir");
+        let manifest_path = temp.path().join("agent-drill-cases.json");
+        fs::write(
+            &manifest_path,
+            serde_json::json!({
+                "suite": "generic-agent-drill",
+                "cases": [
+                    {
+                        "slug": "alpha repo",
+                        "project": "alpha-project",
+                        "question": "Explain how alpha works.",
+                        "anchors": [" AlphaRoot ", "", "AlphaStore"]
+                    },
+                    {
+                        "slug": "beta",
+                        "project": "beta-project",
+                        "question": "Explain how beta works.",
+                        "anchors": ["BetaRoot"]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let owner_root = PathBuf::from("C:/owner");
+        let (suite, cases) =
+            drill_suite_cases_from_manifest(&manifest_path, &owner_root).expect("suite cases");
 
+        assert_eq!(suite, "generic-agent-drill");
         assert_eq!(
-            cases.iter().map(|case| case.slug).collect::<Vec<_>>(),
-            vec!["sourcetrail", "codestory", "rootandruntime"]
+            cases
+                .iter()
+                .map(|case| case.slug.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha-repo", "beta"]
         );
+        assert_eq!(cases[0].project_root, temp.path().join("alpha-project"));
+        assert_eq!(cases[1].project_root, temp.path().join("beta-project"));
         assert_eq!(
-            cases[0].project_root,
-            PathBuf::from("C:/Users/alber/source/repos/Sourcetrail")
+            cases[0].anchors,
+            vec!["AlphaRoot".to_string(), "AlphaStore".to_string()]
         );
-        assert_eq!(cases[1].project_root, owner_root);
-        assert_eq!(
-            cases[2].anchors,
-            &["Posts", "getElsewhereFeed", "getCommentAuth"]
-        );
-        assert!(cases[1].question.contains("WorkspaceIndexer"));
+        assert!(cases[1].question.contains("beta"));
     }
 
     #[test]
     fn drill_suite_cache_dir_isolated_per_case_when_explicit() {
-        assert_eq!(drill_suite_case_cache_dir(None, "sourcetrail"), None);
+        assert_eq!(drill_suite_case_cache_dir(None, "alpha"), None);
         assert_eq!(
-            drill_suite_case_cache_dir(Some(Path::new("C:/cache/codestory-suite")), "root/runtime"),
-            Some(PathBuf::from("C:/cache/codestory-suite/root-runtime"))
+            drill_suite_case_cache_dir(Some(Path::new("C:/cache/codestory-suite")), "beta/runtime"),
+            Some(PathBuf::from("C:/cache/codestory-suite/beta-runtime"))
         );
     }
 
     #[test]
     fn drill_suite_progress_messages_include_repo_index_and_verdict() {
         let case = DrillSuiteCase {
-            slug: "sourcetrail",
-            project_root: PathBuf::from("C:/repos/Sourcetrail"),
-            question: "Explain how Sourcetrail indexes.",
-            anchors: &["SourceGroupCxxCdb", "IndexerJava", "StorageAccess"],
+            slug: "alpha".to_string(),
+            project_root: PathBuf::from("C:/repos/alpha"),
+            question: "Explain how alpha indexes.".to_string(),
+            anchors: vec!["AlphaRoot".to_string(), "AlphaStore".to_string()],
         };
         let start = drill_suite_repo_progress_start_message(
             1,
             3,
             &case,
-            Path::new("target/drill-suite/sourcetrail-drill"),
+            Path::new("target/drill-suite/alpha-drill"),
         );
-        assert!(start.contains("[1/3] start sourcetrail"));
-        assert!(start.contains("C:/repos/Sourcetrail"));
-        assert!(start.contains("target/drill-suite/sourcetrail-drill"));
+        assert!(start.contains("[1/3] start alpha"));
+        assert!(start.contains("C:/repos/alpha"));
+        assert!(start.contains("target/drill-suite/alpha-drill"));
 
-        let repo = sample_drill_suite_repo("sourcetrail", "degraded", 3, 1, 4);
-        let done = drill_suite_repo_progress_done_message(1, 3, "sourcetrail", &repo.summary);
-        assert!(done.contains("[1/3] done sourcetrail"));
+        let repo = sample_drill_suite_repo("alpha", "degraded", 3, 1, 4);
+        let done = drill_suite_repo_progress_done_message(1, 3, "alpha", &repo.summary);
+        assert!(done.contains("[1/3] done alpha"));
         assert!(done.contains("verdict=degraded"));
         assert!(done.contains("anchors=3/3"));
         assert!(done.contains("bridges=graph:2 partial:0 unresolved:1"));
@@ -8133,20 +8347,21 @@ mod tests {
     #[test]
     fn drill_suite_markdown_summarizes_verdicts_and_source_truth() {
         let mut output = DrillSuiteOutput {
-            suite: "codestory-real-repo-agent-drill".to_string(),
-            project: "C:/repos/codestory".to_string(),
+            suite: "generic-agent-drill".to_string(),
+            project: "C:/repos/owner".to_string(),
+            case_file: "C:/repos/owner/drill-cases.json".to_string(),
             output_dir: "target/drill-suite".to_string(),
             repo_count: 2,
             degraded_count: 1,
             blocked_count: 1,
             ready_count: 0,
             repos: vec![
-                sample_drill_suite_repo("sourcetrail", "degraded", 3, 1, 4),
-                sample_drill_suite_repo("codestory", "blocked", 0, 0, 2),
+                sample_drill_suite_repo("alpha", "degraded", 3, 1, 4),
+                sample_drill_suite_repo("beta", "blocked", 0, 0, 2),
             ],
             next_actions: vec![
-                "sourcetrail: Read source truth files named by the drill.".to_string(),
-                "codestory: Re-run after fixing index failure.".to_string(),
+                "alpha: Read source truth files named by the drill.".to_string(),
+                "beta: Re-run after fixing index failure.".to_string(),
             ],
             retrieval_blockers: Vec::new(),
         };
@@ -8158,33 +8373,65 @@ mod tests {
         assert!(markdown.contains("- repos: 2 total, 0 ready, 1 degraded, 1 blocked"));
         assert!(markdown.contains("| source truth | reports | next action |"));
         assert!(markdown.contains(
-            "| `sourcetrail` | degraded | fresh | hybrid-ready | 3/3 | 0 graph / 2 partial / 1 unresolved-error | 1 targets / 0 verified / 4 pending |"
+            "| `alpha` | degraded | fresh | hybrid-ready | 3/3 | 0 graph / 2 partial / 1 unresolved-error | 1 targets / 0 verified / 4 pending |"
         ));
         assert!(
             markdown.contains(
-                "| `codestory` | blocked | fresh | hybrid-ready | 3/3 | 0 graph / 0 partial / 0 unresolved-error | 1 targets / 0 verified / 2 pending |"
+                "| `beta` | blocked | fresh | hybrid-ready | 3/3 | 0 graph / 0 partial / 0 unresolved-error | 1 targets / 0 verified / 2 pending |"
             )
         );
         assert!(markdown.contains("## Repo Artifacts"));
-        assert!(markdown.contains("`sourcetrail`: report `target/drill-suite/sourcetrail/drill-report.md`; json `target/drill-suite/sourcetrail/drill-report.json`; bridge artifacts `target/drill-suite/sourcetrail/*-bridge.json`"));
+        assert!(markdown.contains("`alpha`: report `target/drill-suite/alpha/drill-report.md`; json `target/drill-suite/alpha/drill-report.json`; bridge artifacts `target/drill-suite/alpha/*-bridge.json`"));
         assert!(markdown.contains("## Next Actions"));
-        assert!(markdown.contains("codestory: Re-run after fixing index failure."));
+        assert!(markdown.contains("beta: Re-run after fixing index failure."));
+    }
+
+    #[test]
+    fn drill_suite_blocked_case_reports_case_local_failure() {
+        let case = DrillSuiteCase {
+            slug: "alpha".to_string(),
+            project_root: PathBuf::from("C:/repos/alpha"),
+            question: "Explain alpha.".to_string(),
+            anchors: vec!["AlphaRoot".to_string(), "AlphaStore".to_string()],
+        };
+
+        let repo = blocked_drill_suite_repo_output(
+            &case,
+            Path::new("target/drill-suite/alpha-drill"),
+            RefreshMode::Full,
+            args::OutputFormat::Markdown,
+            "missing checkout",
+        );
+
+        assert_eq!(repo.slug, "alpha");
+        assert_eq!(repo.artifact_extension, "md");
+        assert_eq!(repo.summary.verdict.status, "blocked");
+        assert_eq!(repo.summary.anchors.requested, 2);
+        assert_eq!(repo.summary.anchors.resolved, 0);
+        assert_eq!(repo.summary.anchors.unresolved, 2);
+        assert!(
+            repo.summary
+                .verdict
+                .next_action
+                .contains("missing checkout")
+        );
     }
 
     #[test]
     fn drill_suite_retrieval_blockers_group_non_hybrid_repos() {
         let mut output = DrillSuiteOutput {
-            suite: "codestory-real-repo-agent-drill".to_string(),
-            project: "C:/repos/codestory".to_string(),
+            suite: "generic-agent-drill".to_string(),
+            project: "C:/repos/owner".to_string(),
+            case_file: "C:/repos/owner/drill-cases.json".to_string(),
             output_dir: "target/drill-suite".to_string(),
             repo_count: 3,
             degraded_count: 2,
             blocked_count: 0,
             ready_count: 1,
             repos: vec![
-                sample_drill_suite_repo("sourcetrail", "degraded", 3, 1, 4),
-                sample_drill_suite_repo("codestory", "ready", 3, 0, 4),
-                sample_drill_suite_repo("rootandruntime", "degraded", 3, 1, 4),
+                sample_drill_suite_repo("alpha", "degraded", 3, 1, 4),
+                sample_drill_suite_repo("beta", "ready", 3, 0, 4),
+                sample_drill_suite_repo("gamma", "degraded", 3, 1, 4),
             ],
             next_actions: Vec::new(),
             retrieval_blockers: Vec::new(),
@@ -8204,14 +8451,14 @@ mod tests {
             "symbolic:semantic_unavailable:fallback=MissingEmbeddingRuntime"
         );
         assert_eq!(blocker.repo_count, 2);
-        assert_eq!(blocker.repos, vec!["sourcetrail", "rootandruntime"]);
+        assert_eq!(blocker.repos, vec!["alpha", "gamma"]);
         assert!(blocker.next_action.contains("setup embeddings"));
 
         let markdown = render_drill_suite_markdown(&output);
         assert!(markdown.contains("## Retrieval Blockers"));
         assert!(markdown.contains("MissingEmbeddingRuntime"));
-        assert!(markdown.contains("[sourcetrail, rootandruntime]"));
-        assert!(!markdown.contains("codestory]"));
+        assert!(markdown.contains("[alpha, gamma]"));
+        assert!(!markdown.contains("beta]"));
     }
 
     fn sample_drill_suite_repo(
@@ -8227,6 +8474,7 @@ mod tests {
             question: format!("Question for {slug}"),
             anchors: vec!["A".to_string(), "B".to_string(), "C".to_string()],
             output_dir: format!("target/drill-suite/{slug}"),
+            artifact_extension: "json".to_string(),
             summary: sample_drill_summary(
                 slug,
                 verdict,

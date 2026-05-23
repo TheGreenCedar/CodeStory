@@ -1976,13 +1976,16 @@ fn search_plan_next_commands(groups: &[SearchPlanAnchorGroupDto]) -> Vec<String>
         .take(4)
         .flat_map(|hit| {
             [
-                format!("codestory-cli symbol --id {}", hit.node_id.0),
                 format!(
-                    "codestory-cli trail --id {} --story --hide-speculative",
+                    "codestory-cli symbol --project <PROJECT> --id {}",
                     hit.node_id.0
                 ),
                 format!(
-                    "codestory-cli snippet --id {} --function-body --context 40",
+                    "codestory-cli trail --project <PROJECT> --id {} --story --hide-speculative",
+                    hit.node_id.0
+                ),
+                format!(
+                    "codestory-cli snippet --project <PROJECT> --id {} --function-body --context 40",
                     hit.node_id.0
                 ),
             ]
@@ -8758,8 +8761,8 @@ pub fn exact_symbol_anchor() {{}}
     }
 
     #[test]
-    fn sourcetrail_agent_question_prioritizes_named_anchor_subquery_terms() {
-        let query = "Explain how Sourcetrail turns project/source-group configuration into indexing work, then how indexed data is accessed by the application. Anchor the answer around SourceGroupCxxCdb, IndexerJava, and StorageAccess.";
+    fn multi_anchor_agent_question_prioritizes_named_anchor_subquery_terms() {
+        let query = "Explain how ProjectAlpha turns configuration into processing work, then how processed data is accessed by the application. Anchor the answer around ConfigGroup, WorkerRunner, and DataAccess.";
         let intents = architecture_query_intents(query)
             .into_iter()
             .map(|intent| intent.label().to_string())
@@ -8769,7 +8772,7 @@ pub fn exact_symbol_anchor() {{}}
             "explain-how architecture question should trigger a search plan: {intents:#?}"
         );
         let terms = search_plan_terms(query);
-        for expected in ["SourceGroupCxxCdb", "IndexerJava", "StorageAccess"] {
+        for expected in ["ConfigGroup", "WorkerRunner", "DataAccess"] {
             assert!(
                 terms.extracted.iter().any(|term| term == expected),
                 "expected named anchor `{expected}` in extracted terms: {:?}",
@@ -8783,7 +8786,7 @@ pub fn exact_symbol_anchor() {{}}
             .find(|subquery| subquery.role == "typed_anchor_terms")
             .map(|subquery| subquery.query.as_str())
             .expect("typed anchor subquery");
-        for expected in ["SourceGroupCxxCdb", "IndexerJava", "StorageAccess"] {
+        for expected in ["ConfigGroup", "WorkerRunner", "DataAccess"] {
             assert!(
                 subqueries
                     .iter()
@@ -8866,7 +8869,7 @@ pub fn exact_symbol_anchor() {{}}
             SearchHitOrigin::IndexedSymbol,
             true,
         );
-        let query = "rootandruntime getElsewhereFeed latest social feed";
+        let query = "getElsewhereFeed latest social feed";
         let terms = search_plan_terms(query);
         let active_path_evidence = HashMap::from([
             (
@@ -9011,8 +9014,9 @@ pub fn exact_symbol_anchor() {{}}
         );
         let next_commands = search_plan_next_commands(&groups);
         assert!(
-            next_commands.iter().any(|command| command
-                .contains("codestory-cli snippet --id member --function-body --context 40")),
+            next_commands.iter().any(|command| command.contains(
+                "codestory-cli snippet --project <PROJECT> --id member --function-body --context 40"
+            )),
             "search-plan handoff should request body-aware snippets for promoted anchors: {next_commands:#?}"
         );
     }
