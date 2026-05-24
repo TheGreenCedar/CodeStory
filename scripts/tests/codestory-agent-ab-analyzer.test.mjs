@@ -17,6 +17,7 @@ import {
   packetFirstCommandForPrompt,
   publicCoreCorpusAudit,
   repoProvenanceBlockers,
+  resolveCodeStoryCli,
   scoreQuality,
   taskSnapshotForResult,
 } from "../codestory-agent-ab-benchmark.mjs";
@@ -359,6 +360,21 @@ test("packet-first telemetry treats git and help probes before packet as context
   assert.equal(helpFirst.first_successful_context_command.id, "cmd_help");
   assert.equal(helpFirst.first_successful_packet_command.id, "cmd_packet");
   assert.equal(helpFirst.packet_was_first_context_command, false);
+});
+
+test("codestory cli resolver prefers explicit path, release binary, then PATH fallback", () => {
+  const explicit = resolveCodeStoryCli({ codestoryCli: "C:/custom/codestory-cli.exe" }, () => {
+    throw new Error("explicit path should not probe local candidates");
+  });
+  assert.equal(explicit, "C:/custom/codestory-cli.exe");
+
+  const release = resolveCodeStoryCli({ codestoryCli: null }, (candidate) =>
+    candidate.includes(`${path.sep}target${path.sep}release${path.sep}`),
+  );
+  assert.match(release, /target[\\/]release[\\/]codestory-cli(?:\.exe)?$/);
+
+  const fallback = resolveCodeStoryCli({ codestoryCli: null }, () => false);
+  assert.equal(fallback, "codestory-cli");
 });
 
 test("scores expected claims without requiring exact wording", () => {

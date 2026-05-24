@@ -872,13 +872,35 @@ fn search_plan_next_commands(
                 "codestory-cli trail --project {project} --id {} --story --hide-speculative",
                 action.node_id.0
             )),
-            "snippet" => Some(format!(
-                "codestory-cli snippet --project {project} --id {} --context 40",
-                action.node_id.0
-            )),
+            "snippet" => Some(search_plan_snippet_command(project.as_str(), action)),
             _ => None,
         })
         .collect()
+}
+
+fn search_plan_snippet_command(
+    project: &str,
+    action: &codestory_contracts::api::SearchPlanNextActionDto,
+) -> String {
+    let mut command = format!(
+        "codestory-cli snippet --project {project} --id {}",
+        action.node_id.0
+    );
+    if action
+        .options
+        .iter()
+        .any(|option| option == "function_body")
+    {
+        command.push_str(" --function-body");
+    }
+    let context = action
+        .options
+        .iter()
+        .find_map(|option| option.strip_prefix("context="))
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(40);
+    let _ = write!(command, " --context {context}");
+    command
 }
 
 fn quote_search_plan_command_value(value: &str) -> String {
@@ -3189,7 +3211,8 @@ mod tests {
         GroundingCoverageDto, GroundingFileDigestDto, GroundingSnapshotDto,
         GroundingSymbolDigestDto, NodeDetailsDto, NodeId, NodeKind, RetrievalFallbackReasonDto,
         RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
-        StorageStatsDto, TrailContextDto, TrailStoryDto, TrailStoryStepDto,
+        SearchPlanNextActionDto, StorageStatsDto, TrailContextDto, TrailStoryDto,
+        TrailStoryStepDto,
     };
     use serde_json::json;
     use std::path::Path;
@@ -3719,6 +3742,34 @@ mod tests {
         assert!(
             !markdown.contains("why:"),
             "search --why should not duplicate packet evidence as legacy per-hit why lines:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn search_plan_next_commands_render_structured_snippet_options() {
+        let commands = search_plan_next_commands(
+            Path::new("C:/repo with spaces"),
+            &[
+                SearchPlanNextActionDto {
+                    action: "snippet".to_string(),
+                    node_id: NodeId("node-fn".to_string()),
+                    options: vec!["function_body".to_string(), "context=12".to_string()],
+                },
+                SearchPlanNextActionDto {
+                    action: "snippet".to_string(),
+                    node_id: NodeId("node-default".to_string()),
+                    options: vec!["context=invalid".to_string()],
+                },
+            ],
+        );
+
+        assert_eq!(
+            commands[0],
+            "codestory-cli snippet --project 'C:/repo with spaces' --id node-fn --function-body --context 12"
+        );
+        assert_eq!(
+            commands[1],
+            "codestory-cli snippet --project 'C:/repo with spaces' --id node-default --context 40"
         );
     }
 

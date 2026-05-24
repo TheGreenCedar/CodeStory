@@ -1921,17 +1921,17 @@ function formatAgentPublishableBlocker(blocker) {
   return `  ${result.repo} ${result.task_id ?? ""} ${result.arm} repeat ${result.repeat}: ${blocker.reasons.join("; ")}; total_tokens=${result.usage?.total_tokens ?? ""} packet_first=${result.packet_first_pass ?? ""} quality=${result.quality?.pass ?? ""}`;
 }
 
-function resolveCodeStoryCli(opts) {
+function resolveCodeStoryCli(opts, exists = existsSync) {
   if (opts.codestoryCli) {
     return opts.codestoryCli;
   }
-  const localCandidates = [
-    path.join(repoRoot, "target", "release", process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli"),
-    path.join(repoRoot, "target", "debug", process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli"),
-  ]
-    .filter((candidate) => existsSync(candidate))
-    .sort((left, right) => statSync(right).mtimeMs - statSync(left).mtimeMs);
-  return localCandidates[0] ?? "codestory-cli";
+  const releaseCandidate = path.join(
+    repoRoot,
+    "target",
+    "release",
+    process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli",
+  );
+  return exists(releaseCandidate) ? releaseCandidate : "codestory-cli";
 }
 
 function packetPayloadText(packet) {
@@ -2928,6 +2928,7 @@ export {
   publicCoreCorpusAudit,
   repoProvenanceBlockers,
   repoConfigFromManifest,
+  resolveCodeStoryCli,
   scoreQuality,
   taskSnapshotForResult,
 };

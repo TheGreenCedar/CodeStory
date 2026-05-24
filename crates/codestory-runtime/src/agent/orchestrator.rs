@@ -21,6 +21,7 @@ use codestory_contracts::api::{
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_MAX_RESULTS: u32 = 8;
@@ -308,6 +309,7 @@ pub(crate) fn agent_packet(
     if question.is_empty() {
         return Err(ApiError::invalid_argument("Question cannot be empty."));
     }
+    let project_root = controller.require_project_root()?;
 
     let plan = build_packet_plan(&question, req.task_class);
     let limits = packet_budget_limits(req.budget);
@@ -353,8 +355,9 @@ pub(crate) fn agent_packet(
     rank_packet_evidence(&question, &mut answer);
     append_packet_evidence_sections(&mut answer, plan.task_class, &limits);
 
-    let budget = apply_packet_budget(&question, req.budget, limits, &mut answer);
-    let sufficiency = build_packet_sufficiency(&question, plan.task_class, &answer, &budget);
+    let budget = apply_packet_budget(&project_root, &question, req.budget, limits, &mut answer);
+    let sufficiency =
+        build_packet_sufficiency(&project_root, &question, plan.task_class, &answer, &budget);
     let benchmark_trace = packet_benchmark_trace(&answer);
 
     let mut packet = AgentPacketDto {
@@ -367,7 +370,7 @@ pub(crate) fn agent_packet(
         sufficiency,
         benchmark_trace,
     };
-    enforce_packet_output_budget(&mut packet);
+    enforce_packet_output_budget(&project_root, &mut packet);
 
     Ok(packet)
 }
@@ -1350,6 +1353,7 @@ fn packet_budget_limits(mode: PacketBudgetModeDto) -> PacketBudgetLimitsDto {
 }
 
 fn apply_packet_budget(
+    project_root: &Path,
     question: &str,
     requested: PacketBudgetModeDto,
     limits: PacketBudgetLimitsDto,
@@ -1386,11 +1390,11 @@ fn apply_packet_budget(
         used,
         truncated,
         omitted_sections,
-        next_deeper_command: next_deeper_packet_command(question, requested),
+        next_deeper_command: next_deeper_packet_command(project_root, question, requested),
     }
 }
 
-fn enforce_packet_output_budget(packet: &mut AgentPacketDto) {
+fn enforce_packet_output_budget(project_root: &Path, packet: &mut AgentPacketDto) {
     for _ in 0..8 {
         let output_bytes = refresh_packet_output_bytes(packet);
         if output_bytes <= packet.budget.limits.max_output_bytes as usize {
@@ -1414,6 +1418,7 @@ fn enforce_packet_output_budget(packet: &mut AgentPacketDto) {
             packet.budget.used = packet_budget_usage(&packet.answer);
             packet.benchmark_trace = packet_benchmark_trace(&packet.answer);
             packet.sufficiency = build_packet_sufficiency(
+                project_root,
                 &packet.question,
                 packet
                     .task_class
@@ -1432,6 +1437,7 @@ fn enforce_packet_output_budget(packet: &mut AgentPacketDto) {
         push_omitted_section(&mut packet.budget, "output_bytes");
         push_omitted_section(&mut packet.budget, "packet_payload");
         packet.sufficiency = build_packet_sufficiency(
+            project_root,
             &packet.question,
             packet
                 .task_class
@@ -1698,17 +1704,26 @@ fn packet_budget_usage(answer: &AgentAnswerDto) -> PacketBudgetUsageDto {
     }
 }
 
-fn next_deeper_packet_command(question: &str, requested: PacketBudgetModeDto) -> Option<String> {
+fn next_deeper_packet_command(
+    project_root: &Path,
+    question: &str,
+    requested: PacketBudgetModeDto,
+) -> Option<String> {
     let next = match requested {
         PacketBudgetModeDto::Tiny => "compact",
         PacketBudgetModeDto::Compact => "standard",
         PacketBudgetModeDto::Standard => "deep",
         PacketBudgetModeDto::Deep => return None,
     };
+    let project = quote_packet_project_arg(project_root);
     Some(format!(
-        "codestory-cli packet --project <target-workspace> --question {} --budget {next}",
+        "codestory-cli packet --project {project} --question {} --budget {next}",
         quote_packet_command_value(question)
     ))
+}
+
+fn quote_packet_project_arg(project_root: &Path) -> String {
+    quote_packet_command_value(project_root.to_string_lossy().as_ref())
 }
 
 fn quote_packet_command_value(value: &str) -> String {
@@ -1716,6 +1731,7 @@ fn quote_packet_command_value(value: &str) -> String {
 }
 
 fn build_packet_sufficiency(
+    project_root: &Path,
     question: &str,
     task_class: PacketTaskClassDto,
     answer: &AgentAnswerDto,
@@ -1765,7 +1781,7 @@ fn build_packet_sufficiency(
         gaps.push(format!("{:?} step failed.", step.kind));
     }
 
-    let follow_up_commands = packet_follow_up_commands(question, status, budget);
+    let follow_up_commands = packet_follow_up_commands(project_root, question, status, budget);
     let open_next = follow_up_commands.clone();
     let avoid_opening = answer
         .citations
@@ -1820,10 +1836,12 @@ fn packet_budget_exceeded_hard_output_cap(budget: &PacketBudgetDto) -> bool {
 }
 
 fn packet_follow_up_commands(
+    project_root: &Path,
     question: &str,
     status: PacketSufficiencyStatusDto,
     budget: &PacketBudgetDto,
 ) -> Vec<String> {
+    let project = quote_packet_project_arg(project_root);
     match status {
         PacketSufficiencyStatusDto::Sufficient => Vec::new(),
         PacketSufficiencyStatusDto::Partial => budget
@@ -1831,14 +1849,14 @@ fn packet_follow_up_commands(
             .clone()
             .into_iter()
             .chain(std::iter::once(format!(
-                "codestory-cli search --project <target-workspace> --query {} --why",
+                "codestory-cli search --project {project} --query {} --why",
                 quote_packet_command_value(question)
             )))
             .collect(),
         PacketSufficiencyStatusDto::Insufficient => vec![
-            "codestory-cli index --project <target-workspace> --refresh full".to_string(),
+            format!("codestory-cli index --project {project} --refresh full"),
             format!(
-                "codestory-cli search --project <target-workspace> --query {} --repo-text on --why",
+                "codestory-cli search --project {project} --query {} --repo-text on --why",
                 quote_packet_command_value(question)
             ),
         ],
@@ -3549,6 +3567,10 @@ mod tests {
         }
     }
 
+    fn packet_fixture_project_root() -> &'static std::path::Path {
+        std::path::Path::new("C:/workspace/project root")
+    }
+
     fn build_sufficient_packet_fixture(
         question: &str,
         task_class: PacketTaskClassDto,
@@ -3558,9 +3580,20 @@ mod tests {
         let mut answer = packet_answer_fixture(question, citations);
         rank_packet_evidence(question, &mut answer);
         append_packet_evidence_sections(&mut answer, task_class, &limits);
-        let budget =
-            apply_packet_budget(question, PacketBudgetModeDto::Compact, limits, &mut answer);
-        let sufficiency = build_packet_sufficiency(question, task_class, &answer, &budget);
+        let budget = apply_packet_budget(
+            packet_fixture_project_root(),
+            question,
+            PacketBudgetModeDto::Compact,
+            limits,
+            &mut answer,
+        );
+        let sufficiency = build_packet_sufficiency(
+            packet_fixture_project_root(),
+            question,
+            task_class,
+            &answer,
+            &budget,
+        );
         (answer, sufficiency)
     }
 
@@ -4064,6 +4097,7 @@ mod tests {
             )],
         );
         let mut budget = apply_packet_budget(
+            packet_fixture_project_root(),
             question,
             PacketBudgetModeDto::Tiny,
             packet_budget_limits(PacketBudgetModeDto::Tiny),
@@ -4072,6 +4106,7 @@ mod tests {
         budget.truncated = true;
         budget.omitted_sections = vec!["output_bytes".to_string()];
         let partial = build_packet_sufficiency(
+            packet_fixture_project_root(),
             question,
             PacketTaskClassDto::RouteTracing,
             &partial_answer,
@@ -4093,6 +4128,20 @@ mod tests {
                 .any(|command| command.contains("codestory-cli search")),
             "partial packets should recommend targeted CodeStory search, not broad source reads: {partial:?}"
         );
+        assert!(
+            partial
+                .follow_up_commands
+                .iter()
+                .all(|command| !command.contains("<target-workspace>")),
+            "partial packet follow-up commands should be directly runnable: {partial:?}"
+        );
+        assert!(
+            partial
+                .follow_up_commands
+                .iter()
+                .all(|command| command.contains("--project 'C:/workspace/project root'")),
+            "partial packet follow-up commands should include the concrete project root: {partial:?}"
+        );
 
         let mut weak_answer = packet_answer_fixture(
             question,
@@ -4103,12 +4152,14 @@ mod tests {
             )],
         );
         let weak_budget = apply_packet_budget(
+            packet_fixture_project_root(),
             question,
             PacketBudgetModeDto::Compact,
             packet_budget_limits(PacketBudgetModeDto::Compact),
             &mut weak_answer,
         );
         let weak = build_packet_sufficiency(
+            packet_fixture_project_root(),
             question,
             PacketTaskClassDto::RouteTracing,
             &weak_answer,
@@ -4124,12 +4175,14 @@ mod tests {
 
         let mut empty_answer = packet_answer_fixture(question, Vec::new());
         let empty_budget = apply_packet_budget(
+            packet_fixture_project_root(),
             question,
             PacketBudgetModeDto::Compact,
             packet_budget_limits(PacketBudgetModeDto::Compact),
             &mut empty_answer,
         );
         let insufficient = build_packet_sufficiency(
+            packet_fixture_project_root(),
             question,
             PacketTaskClassDto::RouteTracing,
             &empty_answer,
@@ -4165,11 +4218,19 @@ mod tests {
             quoted,
             "'Inspect $env:SECRET and $(Get-ChildItem) and ''literal'''"
         );
-        let command = next_deeper_packet_command(question, PacketBudgetModeDto::Tiny)
-            .expect("tiny packet should have deeper command");
+        let command = next_deeper_packet_command(
+            packet_fixture_project_root(),
+            question,
+            PacketBudgetModeDto::Tiny,
+        )
+        .expect("tiny packet should have deeper command");
         assert!(
             command.contains("--question 'Inspect $env:SECRET and $(Get-ChildItem)"),
             "packet command should single-quote shell-sensitive question text: {command}"
+        );
+        assert!(
+            command.contains("--project 'C:/workspace/project root'"),
+            "packet command should include the concrete project root: {command}"
         );
     }
 
@@ -4224,12 +4285,14 @@ mod tests {
                 .collect(),
         );
         let budget = apply_packet_budget(
+            packet_fixture_project_root(),
             question,
             PacketBudgetModeDto::Compact,
             packet_budget_limits(PacketBudgetModeDto::Compact),
             &mut answer,
         );
         let sufficiency = build_packet_sufficiency(
+            packet_fixture_project_root(),
             question,
             PacketTaskClassDto::ArchitectureExplanation,
             &answer,
@@ -4277,8 +4340,15 @@ mod tests {
         if let AgentResponseBlockDto::Markdown { markdown } = &mut answer.sections[0].blocks[0] {
             *markdown = "payload budget evidence ".repeat(6000);
         }
-        let budget = apply_packet_budget(question, PacketBudgetModeDto::Tiny, limits, &mut answer);
+        let budget = apply_packet_budget(
+            packet_fixture_project_root(),
+            question,
+            PacketBudgetModeDto::Tiny,
+            limits,
+            &mut answer,
+        );
         let sufficiency = build_packet_sufficiency(
+            packet_fixture_project_root(),
             question,
             PacketTaskClassDto::ArchitectureExplanation,
             &answer,
@@ -4304,7 +4374,7 @@ mod tests {
             benchmark_trace,
         };
 
-        enforce_packet_output_budget(&mut packet);
+        enforce_packet_output_budget(packet_fixture_project_root(), &mut packet);
 
         let serialized_len = serde_json::to_vec(&packet).expect("serialize packet").len();
         assert!(
@@ -4380,6 +4450,7 @@ mod tests {
         });
 
         let budget = apply_packet_budget(
+            packet_fixture_project_root(),
             "Explain graph budget trimming.",
             PacketBudgetModeDto::Tiny,
             PacketBudgetLimitsDto {
@@ -4468,9 +4539,15 @@ mod tests {
             PacketTaskClassDto::ArchitectureExplanation,
             &limits,
         );
-        let budget =
-            apply_packet_budget(question, PacketBudgetModeDto::Compact, limits, &mut answer);
+        let budget = apply_packet_budget(
+            packet_fixture_project_root(),
+            question,
+            PacketBudgetModeDto::Compact,
+            limits,
+            &mut answer,
+        );
         let sufficiency = build_packet_sufficiency(
+            packet_fixture_project_root(),
             question,
             PacketTaskClassDto::ArchitectureExplanation,
             &answer,
