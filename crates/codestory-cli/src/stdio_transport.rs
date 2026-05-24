@@ -546,6 +546,7 @@ fn handle_stdio_search(
             query,
             repo_text,
             limit_per_source,
+            expand_search_plan: false,
             hybrid_weights: None,
             hybrid_limits: None,
         })

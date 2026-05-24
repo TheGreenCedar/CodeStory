@@ -61,6 +61,7 @@ fn test_cli_app_indexer_smoke() -> anyhow::Result<()> {
             query: "f0".to_string(),
             repo_text: codestory_contracts::api::SearchRepoTextMode::Off,
             limit_per_source: 10,
+            expand_search_plan: false,
             hybrid_weights: None,
             hybrid_limits: None,
         })

@@ -1423,6 +1423,25 @@ fn push_search_plan_subquery(
     }
 }
 
+fn search_plan_subqueries_for_repo_text_mode(
+    subqueries: Vec<SearchPlanSubqueryDto>,
+    allow_repo_text: bool,
+) -> Vec<SearchPlanSubqueryDto> {
+    if allow_repo_text {
+        return subqueries;
+    }
+
+    subqueries
+        .into_iter()
+        .filter_map(|mut subquery| {
+            subquery
+                .channels
+                .retain(|channel| *channel != SearchPlanChannelDto::RepoText);
+            (!subquery.channels.is_empty()).then_some(subquery)
+        })
+        .collect()
+}
+
 fn search_plan_candidate_window(
     channel: SearchPlanChannelDto,
     subquery: &SearchPlanSubqueryDto,
@@ -2005,42 +2024,6 @@ fn search_plan_next_actions(groups: &[SearchPlanAnchorGroupDto]) -> Vec<SearchPl
             ]
         })
         .collect()
-}
-
-fn search_plan_next_commands(
-    project_root: &Path,
-    actions: &[SearchPlanNextActionDto],
-) -> Vec<String> {
-    let project = quote_search_plan_command_value(&project_root.to_string_lossy());
-    actions
-        .iter()
-        .filter_map(|action| match action.action.as_str() {
-            "symbol" => Some(format!(
-                "codestory-cli symbol --project {project} --id {}",
-                action.node_id.0
-            )),
-            "trail" => Some(format!(
-                "codestory-cli trail --project {project} --id {} --story --hide-speculative",
-                action.node_id.0
-            )),
-            "snippet" => Some(format!(
-                "codestory-cli snippet --project {project} --id {} --function-body --context 40",
-                action.node_id.0
-            )),
-            _ => None,
-        })
-        .collect()
-}
-
-fn quote_search_plan_command_value(value: &str) -> String {
-    if value.bytes().any(|byte| {
-        byte.is_ascii_whitespace()
-            || matches!(byte, b'"' | b'\'' | b'`' | b'&' | b'|' | b'<' | b'>')
-    }) {
-        format!("\"{}\"", value.replace('"', "\\\""))
-    } else {
-        value.to_string()
-    }
 }
 
 fn search_plan_source_truth_checks(groups: &[SearchPlanAnchorGroupDto]) -> Vec<String> {
@@ -5723,6 +5706,7 @@ impl AppController {
                         query: subquery.query.clone(),
                         repo_text: SearchRepoTextMode::Off,
                         limit_per_source: limit_per_source as u32,
+                        expand_search_plan: false,
                         hybrid_weights: hybrid_weights.clone(),
                         hybrid_limits: hybrid_limits.clone(),
                     },
@@ -5875,6 +5859,7 @@ impl AppController {
         limit_per_source: u32,
         filters: &[SearchIntentFilter],
         indexed_hit_ids: &HashSet<NodeId>,
+        allow_repo_text: bool,
         hybrid_weights: Option<AgentHybridWeightsDto>,
         hybrid_limits: Option<SearchHybridLimitsDto>,
     ) -> Result<Option<SearchPlanBuild>, ApiError> {
@@ -5891,7 +5876,10 @@ impl AppController {
             return Ok(None);
         }
         let terms = search_plan_terms(effective_query);
-        let subqueries = search_plan_subqueries(effective_query, &terms, &intents);
+        let subqueries = search_plan_subqueries_for_repo_text_mode(
+            search_plan_subqueries(effective_query, &terms, &intents),
+            allow_repo_text,
+        );
         let mut executed = self.execute_search_plan_subqueries(
             storage,
             &subqueries,
@@ -5945,13 +5933,6 @@ impl AppController {
             ));
         }
         let next_actions = search_plan_next_actions(&anchor_groups);
-        let next_commands = search_plan_next_commands(
-            self.require_project_root()
-                .ok()
-                .as_deref()
-                .unwrap_or(Path::new(".")),
-            &next_actions,
-        );
         let plan = SearchPlanDto {
             original_query: original_query.to_string(),
             eligible,
@@ -5967,7 +5948,6 @@ impl AppController {
                 &plan_indexed_hits,
             ),
             next_actions,
-            next_commands,
             source_truth_checks,
         };
         Ok(Some(SearchPlanBuild {
@@ -6102,6 +6082,7 @@ impl AppController {
                 query: query.clone(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: req.limit_per_source,
+                expand_search_plan: false,
                 hybrid_weights: req.hybrid_weights.clone(),
                 hybrid_limits: req.hybrid_limits.clone(),
             },
@@ -6208,27 +6189,33 @@ impl AppController {
                 limit_per_source as u32,
                 &intent_query.filters,
                 &indexed_hit_ids,
+                repo_text_enabled,
                 req.hybrid_weights.clone(),
                 req.hybrid_limits.clone(),
             )? {
                 Some(plan_build) => {
-                    for (rank, group) in plan_build.plan.anchor_groups.iter().enumerate() {
-                        if let Some(symbol) = &group.chosen_symbol {
-                            search_plan_anchor_rank
-                                .entry(symbol.node_id.clone())
-                                .or_insert(rank);
-                            merge_search_hits_by_node_id(
-                                &mut indexed_symbol_hits,
-                                vec![symbol.clone()],
-                            );
+                    if req.expand_search_plan {
+                        for (rank, group) in plan_build.plan.anchor_groups.iter().enumerate() {
+                            if let Some(symbol) = &group.chosen_symbol {
+                                search_plan_anchor_rank
+                                    .entry(symbol.node_id.clone())
+                                    .or_insert(rank);
+                                merge_search_hits_by_node_id(
+                                    &mut indexed_symbol_hits,
+                                    vec![symbol.clone()],
+                                );
+                            }
                         }
+                        merge_search_hits_by_node_id(
+                            &mut indexed_symbol_hits,
+                            plan_build.indexed_symbol_hits,
+                        );
+                        merge_search_hits_by_node_id(
+                            &mut repo_text_hits,
+                            plan_build.repo_text_hits,
+                        );
+                        merge_search_hits_by_node_id(&mut suggestions, plan_build.suggestions);
                     }
-                    merge_search_hits_by_node_id(
-                        &mut indexed_symbol_hits,
-                        plan_build.indexed_symbol_hits,
-                    );
-                    merge_search_hits_by_node_id(&mut repo_text_hits, plan_build.repo_text_hits);
-                    merge_search_hits_by_node_id(&mut suggestions, plan_build.suggestions);
                     Some(plan_build.plan)
                 }
                 None => None,
@@ -9148,20 +9135,6 @@ pub fn exact_symbol_anchor() {{}}
                     .iter()
                     .any(|option| option == "function_body")
         }));
-        let next_commands =
-            search_plan_next_commands(Path::new("C:/repo with spaces"), &next_actions);
-        assert!(
-            next_commands.iter().any(|command| command.contains(
-                "codestory-cli snippet --project \"C:/repo with spaces\" --id member --function-body --context 40"
-            )),
-            "search-plan handoff should request body-aware snippets for promoted anchors: {next_commands:#?}"
-        );
-        assert!(
-            next_commands
-                .iter()
-                .all(|command| !command.contains("<PROJECT>")),
-            "search-plan handoffs should be transport-ready without placeholders: {next_commands:#?}"
-        );
     }
 
     #[test]
@@ -9369,6 +9342,7 @@ fn build_llm_symbol_doc_text() -> String {
                 query: "AppController".to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 10,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
@@ -9443,6 +9417,7 @@ fn build_llm_symbol_doc_text() -> String {
                     query: query.to_string(),
                     repo_text: SearchRepoTextMode::Off,
                     limit_per_source: 10,
+                    expand_search_plan: false,
                     hybrid_weights: None,
                     hybrid_limits: None,
                 })
@@ -9478,6 +9453,7 @@ fn build_llm_symbol_doc_text() -> String {
                 query: "Explain how this repo fits together".to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 10,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
@@ -9501,6 +9477,7 @@ fn build_llm_symbol_doc_text() -> String {
                 query: "Explain how check_winner fits in this repo".to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 10,
+                expand_search_plan: true,
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
@@ -9556,6 +9533,7 @@ fn build_llm_symbol_doc_text() -> String {
                 query: "How does the language parsing work in this repo?".to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 20,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
@@ -10024,6 +10002,7 @@ fn build_llm_symbol_doc_text() -> String {
                 query: "how does alpha work".to_string(),
                 repo_text: SearchRepoTextMode::On,
                 limit_per_source: 5,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
@@ -10111,6 +10090,7 @@ fn build_llm_symbol_doc_text() -> String {
                 query: "GlobalResourceListView".to_string(),
                 repo_text: SearchRepoTextMode::Auto,
                 limit_per_source: 5,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
@@ -10835,6 +10815,7 @@ fn build_llm_symbol_doc_text() -> String {
                 query: "check_winner".to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 10,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
@@ -10862,6 +10843,7 @@ fn build_llm_symbol_doc_text() -> String {
                 query: "check_winner".to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 10,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             })

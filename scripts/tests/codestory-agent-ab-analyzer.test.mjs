@@ -7,14 +7,18 @@ import path from "node:path";
 import {
   analyzeTranscript,
   agentPublishableBlockers,
+  assertSafeWindowsCmdArgs,
   benchmarkRunId,
   commandCategory,
   isPathInside,
+  loadTaskForResult,
   loadTasks,
   parseJsonLines,
   packetFirstCommandForPrompt,
   publicCoreCorpusAudit,
+  repoProvenanceBlockers,
   scoreQuality,
+  taskSnapshotForResult,
 } from "../codestory-agent-ab-benchmark.mjs";
 
 const RUNTIME_SERVICE_FILE = "crates/codestory-runtime/src/services.rs";
@@ -190,6 +194,14 @@ test("path containment rejects sibling-prefix directories", () => {
   assert.equal(isPathInside(root, path.join(os.tmpdir(), "codestory-agent-benchmark", "repos2", "evil")), false);
 });
 
+test("Windows Codex runner args reject cmd metacharacters", () => {
+  assert.doesNotThrow(() => assertSafeWindowsCmdArgs(["exec", "--cd", "C:\\Users\\alber\\source\\repos\\codestory"]));
+  assert.throws(
+    () => assertSafeWindowsCmdArgs(["exec", "--cd", "C:\\repo&whoami"]),
+    /unsafe Windows cmd\.exe argument/,
+  );
+});
+
 test("public-core corpus keeps publishable coverage locked", async () => {
   const tasks = await loadTasks({
     taskSuite: "public-core",
@@ -332,6 +344,23 @@ test("requires packet as the CodeStory subcommand for packet-first telemetry", (
   assert.equal(analysis.packet_was_first_context_command, false);
 });
 
+test("packet-first telemetry treats git and help probes before packet as context", () => {
+  const gitFirst = analyzeTranscript([
+    commandEvent("cmd_git", "item.completed", "git status --short", " M file"),
+    commandEvent("cmd_packet", "item.completed", '& $env:CODESTORY_CLI packet --project . --question flow', "ok"),
+  ]);
+  assert.equal(gitFirst.first_successful_context_command.id, "cmd_git");
+  assert.equal(gitFirst.packet_was_first_context_command, false);
+
+  const helpFirst = analyzeTranscript([
+    commandEvent("cmd_help", "item.completed", "codestory-cli packet --help", "Usage: codestory-cli packet"),
+    commandEvent("cmd_packet", "item.completed", "codestory-cli packet --project . --question flow", "ok"),
+  ]);
+  assert.equal(helpFirst.first_successful_context_command.id, "cmd_help");
+  assert.equal(helpFirst.first_successful_packet_command.id, "cmd_packet");
+  assert.equal(helpFirst.packet_was_first_context_command, false);
+});
+
 test("scores expected claims without requiring exact wording", () => {
   const events = [
     agentMessageEvent(
@@ -376,6 +405,26 @@ test("aggregate anchor recall uses fuzzy claim matching", () => {
   assert.equal(quality.expected_claims.recall, 1);
   assert.equal(quality.expected_anchors.recall, 1);
   assert.equal(quality.pass, true);
+});
+
+test("scores forbidden claims with the same fuzzy matcher as expected claims", () => {
+  const task = runtimeQualityTask("forbidden-claim-fixture", {
+    min_expected_file_recall: 0,
+    min_expected_symbol_recall: 0,
+    min_expected_claim_recall: 0,
+    min_citation_coverage: 0,
+    min_expected_anchor_recall: 0,
+    max_forbidden_claims: 0,
+  });
+  task.forbidden_claims = ["remote service integration"];
+
+  const quality = scoreQuality(
+    [agentMessageEvent("This integration depends on a remote service.")],
+    task,
+  );
+
+  assert.equal(quality.forbidden_claims.found, 1);
+  assert.equal(quality.pass, false);
 });
 
 test("publishable gate blocks avoidable source reads after packet", () => {
@@ -426,4 +475,86 @@ test("publishable gate requires packet before ordinary context exploration", () 
 
   assert.equal(blockers.length, 1);
   assert.match(blockers[0].reasons.join("\n"), /missing answer packet as first successful context command/);
+});
+
+test("publishable provenance requires pinned clean manifest checkout", () => {
+  const clean = {
+    repo_provenance: {
+      manifest_overridden_by_builtin: false,
+      configured: { ref: "main" },
+      manifest: { ref: "main" },
+      git_head: "abc123",
+      git_dirty: false,
+    },
+  };
+  assert.deepEqual(repoProvenanceBlockers(clean), []);
+
+  const blockers = agentPublishableBlockers(
+    [
+      {
+        repo: "codestory",
+        task_id: "codestory-indexing-flow",
+        arm: "with_codestory",
+        repeat: 1,
+        status: "pass",
+        usage: { total_tokens: 100 },
+        packet_first_required: true,
+        packet_first_pass: true,
+        quality: { pass: true },
+        transcript_analysis: {
+          ordinary_source_reads_after_first_packet: 0,
+        },
+        repo_provenance: {
+          manifest_overridden_by_builtin: true,
+          configured: { ref: "local" },
+          manifest: { ref: "main" },
+          git_head: "abc123",
+          git_dirty: true,
+        },
+      },
+    ],
+    { maxSourceReadsAfterPacket: 0, enforceRepoProvenance: true },
+  );
+
+  assert.equal(blockers.length, 1);
+  assert.match(blockers[0].reasons.join("\n"), /overridden by a built-in checkout/);
+  assert.match(blockers[0].reasons.join("\n"), /repo ref is not pinned/);
+  assert.match(blockers[0].reasons.join("\n"), /repo checkout is dirty/);
+});
+
+test("reanalysis uses the run-time task snapshot before current manifest contents", async () => {
+  await withManifestFile(
+    manifestFixture({
+      expected_claims: ["The current manifest changed."],
+    }),
+    async (manifestPath) => {
+      const snapshot = taskSnapshotForResult({
+        ...runtimeQualityTask("snapshot-task", {
+          min_expected_file_recall: 0,
+          min_expected_symbol_recall: 0,
+          min_expected_claim_recall: 1,
+          min_citation_coverage: 0,
+          min_expected_anchor_recall: 0,
+          max_forbidden_claims: 0,
+        }),
+        name: "Snapshot task",
+        suite: "fixture",
+        repo: "fixture-repo",
+        prompt: "Explain the old task.",
+        expected_claims: ["The snapshot claim is immutable."],
+        manifest_path: manifestPath,
+      });
+
+      const loaded = await loadTaskForResult(
+        {
+          task_manifest_path: manifestPath,
+          task_manifest_snapshot: snapshot,
+        },
+        {},
+        new Map(),
+      );
+
+      assert.deepEqual(loaded.expected_claims, ["The snapshot claim is immutable."]);
+    },
+  );
 });

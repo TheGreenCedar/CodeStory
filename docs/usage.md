@@ -18,7 +18,7 @@ Copy-Item -Recurse -Force .\.agents\skills\codestory-grounding "$SkillHome\codes
 On Unix-like systems:
 
 ```sh
-sh "<agent-global-skill-directory>/codestory-grounding/scripts/setup.sh"
+bash "<agent-global-skill-directory>/codestory-grounding/scripts/setup.sh"
 ```
 
 The setup script prints the resolved `CODESTORY_CLI` path. Persist it if your

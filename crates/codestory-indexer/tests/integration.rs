@@ -166,7 +166,10 @@ pub fn build() {
             edge.kind == EdgeKind::CALL
                 && edge.source == command.id
                 && edge.target == function.id
-                && edge.certainty == Some(ResolutionCertainty::Probable)
+                && matches!(
+                    edge.certainty,
+                    Some(ResolutionCertainty::Probable | ResolutionCertainty::Certain)
+                )
         }),
         "expected registered Tauri command symbol to link to Rust function"
     );

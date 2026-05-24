@@ -223,6 +223,7 @@ fn indexed_fixture(
             query: "browser_stress_entry_0".to_string(),
             repo_text: SearchRepoTextMode::Off,
             limit_per_source: 1,
+            expand_search_plan: false,
             hybrid_weights: None,
             hybrid_limits: None,
         })
@@ -245,6 +246,7 @@ fn stress_search_request(mode: SearchRepoTextMode) -> SearchRequest {
         query: "where is the browser stress repo text policy marker used".to_string(),
         repo_text: mode,
         limit_per_source: 12,
+        expand_search_plan: false,
         hybrid_weights: None,
         hybrid_limits: None,
     }

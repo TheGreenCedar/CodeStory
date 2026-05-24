@@ -389,11 +389,7 @@ fn packet_symbol_probe_queries(question: &str, task_class: PacketTaskClassDto) -
     let terms = prompt_search_terms(question);
     let mut queries = Vec::new();
 
-    push_codestory_symbol_probe_queries(&terms, &mut queries);
-    push_express_symbol_probe_queries(&terms, task_class, &mut queries);
-    push_mux_symbol_probe_queries(&terms, &mut queries);
-    push_flask_symbol_probe_queries(&terms, &mut queries);
-    push_vite_symbol_probe_queries(&terms, &mut queries);
+    push_generic_symbol_probe_queries(&terms, &mut queries);
     push_task_class_symbol_probe_queries(task_class, &mut queries);
     push_adjacent_packet_term_queries(&terms, &mut queries);
 
@@ -401,293 +397,27 @@ fn packet_symbol_probe_queries(question: &str, task_class: PacketTaskClassDto) -
     queries
 }
 
-fn push_codestory_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>) {
-    if packet_terms_contain(terms, "index") {
-        if packet_terms_contain(terms, "run") {
-            push_unique_term(queries, "run_index");
-        }
-        if packet_terms_contain(terms, "cli")
-            && packet_terms_contain_any(terms, &["runtime", "orchestrat"])
-        {
-            push_unique_term(queries, "CodeStoryCliRuntime");
-        }
-        push_unique_terms(queries, &["IndexService", "WorkspaceIndexer"]);
-        if packet_terms_contain_any(terms, &["file", "symbol", "extract"]) {
-            push_unique_term(queries, "index_file");
-        }
-    }
-    if packet_terms_contain_any(terms, &["runtime", "orchestrat"]) {
-        push_unique_term(queries, "IndexService");
-    }
-    if packet_terms_contain_any(terms, &["workspace", "discover"])
-        || (packet_terms_contain(terms, "file")
-            && packet_terms_contain_any(terms, &["index", "workspace", "repo"]))
+const PACKET_QUERY_STOP_TERMS: &[&str] = &[
+    "about", "answer", "change", "does", "explain", "files", "from", "have", "into", "this",
+    "through", "what", "when", "where", "with",
+];
+
+fn push_generic_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>) {
+    for term in terms
+        .iter()
+        .filter(|term| term.len() >= 4 && !PACKET_QUERY_STOP_TERMS.contains(&term.as_str()))
+        .take(12)
     {
-        push_unique_terms(queries, &["WorkspaceManifest", "build_execution_plan"]);
+        push_unique_term(queries, term);
+        push_unique_term(queries, &packet_camel_case(&[term.as_str()]));
     }
-    if packet_terms_contain_any(terms, &["symbol", "extract"]) {
-        push_unique_terms(queries, &["WorkspaceIndexer", "index_file"]);
-    }
-    if packet_terms_contain_any(terms, &["persist", "storage", "store"]) {
-        push_unique_term(queries, "flush_projection_batch");
-    }
-    if packet_terms_contain_any(terms, &["search", "projection"]) {
-        push_unique_term(queries, "rebuild_search_symbol_projection");
-    }
-    if packet_terms_contain_any(terms, &["snapshot", "refresh"]) {
-        push_unique_terms(queries, &["refresh_all_with_stats", "SnapshotStore"]);
-    }
-    if packet_terms_contain_any(terms, &["runtime", "orchestrat"]) {
-        push_unique_term(queries, "run_indexing_blocking");
-        if packet_terms_contain(terms, "cli") {
-            push_unique_term(queries, "CliRuntime");
-        }
-    }
-    if packet_terms_contain_any(terms, &["persist", "storage", "store"]) {
-        push_unique_term(queries, "Storage");
-    }
-    if packet_terms_contain_any(terms, &["snapshot", "refresh"]) {
-        push_unique_term(queries, "refresh_all");
-    }
-}
-
-fn push_express_symbol_probe_queries(
-    terms: &[String],
-    task_class: PacketTaskClassDto,
-    queries: &mut Vec<String>,
-) {
-    if !packet_terms_contain_any(
-        terms,
-        &[
-            "express",
-            "router",
-            "route",
-            "middleware",
-            "response",
-            "view",
-        ],
-    ) {
-        return;
-    }
-    if matches!(
-        task_class,
-        PacketTaskClassDto::SymbolOwnership
-            | PacketTaskClassDto::ArchitectureExplanation
-            | PacketTaskClassDto::RouteTracing
-    ) {
-        push_unique_terms(
-            queries,
-            &["createApplication", "lib/express.js", "lib/application.js"],
-        );
-    }
-    if packet_terms_contain_any(terms, &["render", "view", "lookup"]) {
-        push_unique_terms(queries, &["tryRender", "app.render", "View", "lib/view.js"]);
-    }
-    if packet_terms_contain_any(terms, &["response", "send", "json", "serial", "file"]) {
-        push_unique_terms(
-            queries,
-            &["res.send", "res.json", "res.sendFile", "lib/response.js"],
-        );
-    }
-    if packet_terms_contain_any(terms, &["param", "callback", "decode"]) {
-        push_unique_terms(
-            queries,
-            &[
-                "proto.param",
-                "proto.process_params",
-                "Layer.prototype.match",
-                "Route.prototype.dispatch",
-                "decode_param",
-                "paramCallback",
-                "test/app.param.js",
-                "test/Router.js",
-            ],
-        );
-    }
-}
-
-fn push_mux_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>) {
-    if !mux_packet_terms_are_related(terms) {
-        return;
-    }
-    push_unique_terms(
-        queries,
-        &[
-            "NewRouter",
-            "Router",
-            "Route",
-            "RouteMatch",
-            "Router.Match",
-            "Route.Match",
-            "Route.Path",
-            "Router.StrictSlash",
-            "Route.addRegexpMatcher",
-            "newRouteRegexp",
-            "routeRegexp",
-            "CORSMethodMiddleware",
-            "Router.Use",
-            "Route.Methods",
-            "mux.go",
-            "route.go",
-            "regexp.go",
-            "middleware.go",
-            "mux_test.go",
-            "regexp_test.go",
-            "middleware_test.go",
-        ],
-    );
-}
-
-fn mux_packet_terms_are_related(terms: &[String]) -> bool {
-    packet_terms_contain_any(
-        terms,
-        &[
-            "mux",
-            "gorilla",
-            "cors",
-            "preflight",
-            "strict",
-            "slash",
-            "regexp",
-            "regular",
-            "variable",
-        ],
-    ) || packet_terms_contain_all(terms, &["route", "match"])
-}
-
-fn push_flask_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>) {
-    if !flask_packet_terms_are_related(terms) {
-        return;
-    }
-    push_unique_terms(
-        queries,
-        &[
-            "Flask.wsgi_app",
-            "Flask.full_dispatch_request",
-            "Flask.dispatch_request",
-            "Scaffold.route",
-            "App.add_url_rule",
-            "App.register_blueprint",
-            "Blueprint.register",
-            "BlueprintSetupState.add_url_rule",
-            "Blueprint.add_url_rule",
-            "SessionInterface.get_cookie_domain",
-            "SessionInterface.get_cookie_path",
-            "SessionInterface.get_cookie_samesite",
-            "SecureCookieSessionInterface.save_session",
-            "src/flask/app.py",
-            "src/flask/ctx.py",
-            "src/flask/sansio/app.py",
-            "src/flask/sansio/scaffold.py",
-            "src/flask/sansio/blueprints.py",
-            "src/flask/blueprints.py",
-            "src/flask/sessions.py",
-            "tests/test_blueprints.py",
-            "tests/test_basic.py",
-            "tests/test_config.py",
-        ],
-    );
-}
-
-fn flask_packet_terms_are_related(terms: &[String]) -> bool {
-    packet_terms_contain_any(
-        terms,
-        &[
-            "flask",
-            "wsgi",
-            "blueprint",
-            "session",
-            "cookie",
-            "samesite",
-        ],
-    ) || packet_terms_contain_all(terms, &["dispatch", "view"])
-}
-
-fn push_vite_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>) {
-    if !vite_packet_terms_are_related(terms) {
-        return;
-    }
-    push_unique_terms(
-        queries,
-        &[
-            "resolveConfig",
-            "createServer",
-            "src/node/config.ts",
-            "src/node/server/index.ts",
-        ],
-    );
-    if packet_terms_contain_any(
-        terms,
-        &["server", "config", "default", "http", "middleware"],
-    ) {
-        push_unique_terms(
-            queries,
-            &[
-                "indexHtmlMiddleware",
-                "src/node/http.ts",
-                "src/node/server/middlewares/indexHtml.ts",
-            ],
-        );
-    }
-    if packet_terms_contain_any(terms, &["transform", "module", "plugin", "cache", "stale"]) {
-        push_unique_terms(
-            queries,
-            &[
-                "transformMiddleware",
-                "transformRequest",
-                "createPluginContainer",
-                "ModuleGraph",
-                "src/node/server/middlewares/transform.ts",
-                "src/node/server/transformRequest.ts",
-                "src/node/server/pluginContainer.ts",
-                "src/node/server/moduleGraph.ts",
-            ],
-        );
-    }
-    if packet_terms_contain_any(
-        terms,
-        &[
-            "hmr",
-            "cache",
-            "stale",
-            "dependency",
-            "dependencies",
-            "invalidate",
-            "update",
-        ],
-    ) {
-        push_unique_terms(
-            queries,
-            &["createServerHMRChannel", "src/node/server/hmr.ts"],
-        );
-    }
-}
-
-fn vite_packet_terms_are_related(terms: &[String]) -> bool {
-    packet_terms_contain_any(terms, &["vite", "transform", "plugin", "module", "hmr"])
-        || packet_terms_contain_all(terms, &["dev", "server"])
-        || packet_terms_contain_all(terms, &["server", "config"])
 }
 
 fn push_task_class_symbol_probe_queries(task_class: PacketTaskClassDto, queries: &mut Vec<String>) {
     let class_queries = match task_class {
-        PacketTaskClassDto::RouteTracing => &[
-            "router",
-            "handler",
-            "route",
-            "middleware",
-            "dispatch",
-            "Layer",
-            "Route",
-            "createApplication",
-            "app.use",
-            "app.route",
-            "lib/express.js",
-            "lib/application.js",
-            "lib/router/index.js",
-            "lib/router/layer.js",
-            "lib/router/route.js",
-        ][..],
+        PacketTaskClassDto::RouteTracing => {
+            &["router", "handler", "route", "middleware", "dispatch"][..]
+        }
         PacketTaskClassDto::BugLocalization => &["error", "validate"],
         PacketTaskClassDto::ChangeImpact => &["affected", "references"],
         PacketTaskClassDto::SymbolOwnership => &["references", "callers"],
@@ -843,22 +573,6 @@ fn push_unique_terms(terms: &mut Vec<String>, values: &[&str]) {
     for value in values {
         push_unique_term(terms, value);
     }
-}
-
-fn packet_terms_contain(terms: &[String], needle: &str) -> bool {
-    terms.iter().any(|term| term.contains(needle))
-}
-
-fn packet_terms_contain_any(terms: &[String], needles: &[&str]) -> bool {
-    needles
-        .iter()
-        .any(|needle| packet_terms_contain(terms, needle))
-}
-
-fn packet_terms_contain_all(terms: &[String], needles: &[&str]) -> bool {
-    needles
-        .iter()
-        .all(|needle| packet_terms_contain(terms, needle))
 }
 
 fn task_class_seed_queries(task_class: PacketTaskClassDto) -> &'static [&'static str] {
@@ -1212,33 +926,12 @@ fn packet_citation_rank(citation: &AgentCitationDto, terms: &[String]) -> f32 {
     if display.contains("::") {
         score += 0.25;
     }
-    if display == "run_index" {
-        score += 6.0;
-    } else if display.contains("::build_execution_plan")
-        || display.contains("::flush_projection_batch")
-        || display.contains("::refresh_all_with_stats")
-    {
-        score += 3.0;
-    }
-    if path.contains("/benches/")
-        || path.contains("/test/")
-        || path.contains("/tests/")
-        || path.contains("__tests__")
+    if path.contains("/benches/") || path_contains_test_segment(&path) || path.contains("__tests__")
     {
         score -= 20.0;
     }
     if path.contains("/lib/") || path.starts_with("lib/") {
         score += 2.0;
-    }
-    if is_vite_config_citation_path(&path)
-        && packet_terms_contain_any(terms, &["config", "default", "resolve"])
-    {
-        score += 8.0;
-    }
-    if is_vite_server_defaults_citation_path(&path)
-        && packet_terms_contain_any(terms, &["server", "default", "middleware"])
-    {
-        score += 4.0;
     }
     if let Some(breakdown) = citation.retrieval_score_breakdown.as_ref() {
         score += breakdown.lexical * 2.0;
@@ -1259,16 +952,6 @@ fn packet_citation_rank(citation: &AgentCitationDto, terms: &[String]) -> f32 {
     }
 
     score
-}
-
-fn is_vite_config_citation_path(path: &str) -> bool {
-    path.ends_with("src/node/config.ts")
-}
-
-fn is_vite_server_defaults_citation_path(path: &str) -> bool {
-    path.ends_with("src/node/server/index.ts")
-        || path.ends_with("src/node/http.ts")
-        || path.ends_with("src/node/server/middlewares/indexhtml.ts")
 }
 
 fn normalize_identifier(value: &str) -> String {
@@ -1391,94 +1074,27 @@ fn packet_evidence_role(citation: &AgentCitationDto) -> Option<&'static str> {
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    if path.ends_with("lib/response.js") {
-        Some("express response helpers")
-    } else if path.ends_with("lib/view.js") {
-        Some("express view lookup")
-    } else if path.contains("test/res.") || path.ends_with("test/app.param.js") {
-        Some("express regression tests")
-    } else if path.ends_with("mux.go") {
-        Some("mux router core")
-    } else if path.ends_with("route.go") {
-        Some("mux route metadata")
-    } else if path.ends_with("regexp.go") {
-        Some("mux route regexp")
-    } else if path.ends_with("middleware.go") {
-        Some("mux middleware")
-    } else if path.ends_with("mux_test.go")
-        || path.ends_with("regexp_test.go")
-        || path.ends_with("middleware_test.go")
+    if path_contains_test_segment(&path) || path.ends_with("_test.go") || path.ends_with(".test.ts")
     {
-        Some("mux regression tests")
-    } else if path.ends_with("src/flask/app.py") {
-        Some("flask request dispatch")
-    } else if path.ends_with("src/flask/ctx.py") {
-        Some("flask request context")
-    } else if path.ends_with("src/flask/sansio/app.py") {
-        Some("flask app registration")
-    } else if path.ends_with("src/flask/sansio/scaffold.py") {
-        Some("flask scaffold routing")
-    } else if path.ends_with("src/flask/sansio/blueprints.py") {
-        Some("flask blueprint registration")
-    } else if path.ends_with("src/flask/blueprints.py") {
-        Some("flask public blueprint wrapper")
-    } else if path.ends_with("src/flask/sessions.py") {
-        Some("flask session cookies")
-    } else if path.ends_with("tests/test_blueprints.py")
-        || path.ends_with("tests/test_basic.py")
-        || path.ends_with("tests/test_config.py")
-    {
-        Some("flask regression tests")
-    } else if path.ends_with("src/node/config.ts") {
-        Some("vite config resolution")
-    } else if path.ends_with("src/node/server/index.ts") {
-        Some("vite dev server construction")
-    } else if path.ends_with("src/node/http.ts") {
-        Some("vite http server setup")
-    } else if path.ends_with("src/node/server/middlewares/indexhtml.ts") {
-        Some("vite html middleware")
-    } else if path.ends_with("src/node/server/middlewares/transform.ts") {
-        Some("vite transform middleware")
-    } else if path.ends_with("src/node/server/transformrequest.ts") {
-        Some("vite transform request")
-    } else if path.ends_with("src/node/server/plugincontainer.ts") {
-        Some("vite plugin container")
-    } else if path.ends_with("src/node/server/modulegraph.ts") {
-        Some("vite module graph")
-    } else if path.ends_with("src/node/server/hmr.ts") {
-        Some("vite hmr")
-    } else if path.ends_with("lib/express.js") || display.contains("createapplication") {
-        Some("application factory")
-    } else if path.ends_with("lib/application.js") {
-        Some("application registration")
-    } else if path.ends_with("lib/router/index.js")
-        || display == "router"
-        || display == "matchlayer"
-    {
-        Some("router stack traversal")
-    } else if path.ends_with("lib/router/layer.js") || display == "layer" {
-        Some("router layer matching")
-    } else if path.ends_with("lib/router/route.js")
-        || display == "route"
-        || display.contains("dispatch")
-    {
-        Some("route method dispatch")
-    } else if display == "run_index" || path.contains("codestory-cli") || path.ends_with("/cli.rs")
-    {
-        Some("CLI entrypoint")
+        Some("tests and regression coverage")
+    } else if display.contains("cli") || display.contains("command") || path.contains("/cli") {
+        Some("command entrypoint")
     } else if display.contains("service")
-        || display.contains("run_indexing")
+        || display.contains("orchestrat")
+        || display.contains("runtime")
         || path.contains("runtime")
     {
         Some("runtime orchestration")
-    } else if display.contains("manifest")
-        || display.contains("execution_plan")
-        || path.contains("workspace")
+    } else if display.contains("manifest") || display.contains("plan") || path.contains("workspace")
     {
         Some("workspace discovery and planning")
-    } else if display.contains("snapshot") || display.contains("refresh_all") {
+    } else if display.contains("snapshot") || display.contains("refresh") {
         Some("snapshot refresh")
-    } else if display.contains("projection") || display.contains("flush") || path.contains("store")
+    } else if display.contains("projection")
+        || display.contains("persist")
+        || display.contains("storage")
+        || display.contains("store")
+        || path.contains("store")
     {
         Some("persistence and search projection")
     } else if display.contains("indexer")
@@ -1497,171 +1113,44 @@ fn packet_evidence_role(citation: &AgentCitationDto) -> Option<&'static str> {
 
 fn packet_claim_for_role(role: &str, citation: &AgentCitationDto) -> String {
     let symbol = citation.display_name.as_str();
-    let symbol_lower = symbol.to_ascii_lowercase();
-    let codestory_repo_evidence = citation_is_codestory_repo_evidence(citation);
-    let codestory_index_runtime = codestory_repo_evidence && symbol_lower.contains("index");
-    let codestory_workspace_evidence =
-        codestory_repo_evidence && symbol_lower.contains("workspace");
-    let codestory_symbol_extraction = codestory_repo_evidence
-        && (symbol_lower.contains("index") || symbol_lower.contains("symbol"));
     match role {
-        "CLI entrypoint" if codestory_repo_evidence && symbol_lower.contains("run_index") => {
-            format!(
-                "The CLI index command prepares command options and delegates indexing work into the runtime layer. Evidence anchor: `{symbol}`."
-            )
-        }
-        "CLI entrypoint" => format!(
-            "The CLI entrypoint for this flow is anchored by `{symbol}`, which marks the command boundary before runtime work."
+        "command entrypoint" => format!(
+            "The command or public entrypoint for this flow is anchored by `{symbol}`; inspect it before following downstream coordination."
         ),
-        "runtime orchestration" if codestory_index_runtime => {
-            format!(
-                "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases. Evidence anchor: `{symbol}`."
-            )
-        }
         "runtime orchestration" => format!(
-            "Runtime orchestration is anchored by `{symbol}`, which is the layer to verify coordination and refresh sequencing against."
+            "Runtime orchestration is anchored by `{symbol}`; verify coordination, state transitions, and downstream service calls there."
         ),
-        "workspace discovery and planning" if codestory_workspace_evidence => {
-            format!(
-                "The workspace crate is responsible for source-file discovery and refresh-plan construction. Evidence anchor: `{symbol}`."
-            )
-        }
         "workspace discovery and planning" => format!(
-            "Workspace discovery and planning are anchored by `{symbol}`, the evidence to inspect for file selection or execution-plan behavior."
+            "Workspace discovery or planning is anchored by `{symbol}`; inspect it for file selection, manifest, or execution-plan behavior."
         ),
-        "symbol extraction" if codestory_symbol_extraction => {
-            format!(
-                "The indexer extracts nodes, edges, occurrences, and related symbol data from source files. Evidence anchor: `{symbol}`."
-            )
-        }
         "symbol extraction" => format!(
-            "Symbol extraction is anchored by `{symbol}`, the evidence to inspect for nodes, edges, occurrences, or file-level indexing."
+            "Symbol extraction is anchored by `{symbol}`; inspect it for nodes, edges, occurrences, or file-level indexing."
         ),
-        "persistence and search projection"
-            if codestory_repo_evidence
-                && (symbol_lower.contains("storage") || symbol_lower.contains("projection")) =>
-        {
-            format!(
-                "The store persists graph and file data to SQLite and rebuilds query/search projections from persisted data. Evidence anchor: `{symbol}`."
-            )
-        }
         "persistence and search projection" => format!(
-            "Persistence or search projection is anchored by `{symbol}`, the evidence to inspect for durable graph/search state."
+            "Persistence or search projection is anchored by `{symbol}`; inspect it for durable graph/search state."
         ),
-        "snapshot refresh"
-            if codestory_repo_evidence
-                && (symbol_lower.contains("refresh") || symbol_lower.contains("snapshot")) =>
-        {
-            format!(
-                "Snapshot refresh happens after persisted data changes so later grounding and summary reads see current indexed state. Evidence anchor: `{symbol}`."
-            )
-        }
         "snapshot refresh" => format!(
-            "Snapshot refresh is anchored by `{symbol}`, the evidence to inspect for post-write summary refresh behavior."
+            "Snapshot refresh is anchored by `{symbol}`; inspect it for post-write summary or cache refresh behavior."
         ),
         "route handling" => format!(
-            "Route handling is anchored by `{symbol}`, the evidence to inspect before tracing request dispatch."
+            "Route handling is anchored by `{symbol}`; inspect it before tracing request dispatch or handler ownership."
         ),
-        "application factory" => format!(
-            "The public factory creates a function-shaped app and mixes in application, request, and response prototypes. The public application factory is implemented in lib/express.js. Evidence anchor: `{symbol}`."
-        ),
-        "application registration" => format!(
-            "Application middleware registration goes through app.use and is delegated to the lazy router. Route registration through app.route creates route-specific handlers on the router. App-level rendering is owned by lib/application.js. Evidence anchor: `{symbol}`."
-        ),
-        "router stack traversal" => format!(
-            "The router walks its stack of layers and matches request paths before handing control to a route. Parameter callback registration starts in proto.param in lib/router/index.js. The callback execution path should be inspected in proto.process_params. Regression coverage should include app.param and router behavior tests. Evidence anchor: `{symbol}`."
-        ),
-        "router layer matching" => format!(
-            "Router layer matching is anchored by `{symbol}`, the evidence to inspect for path matching and params before a route handles the request. Layer matching is relevant because it extracts and decodes route parameter values. Evidence anchor: `Layer.prototype.match`."
-        ),
-        "route method dispatch" => "Route dispatch is responsible for invoking the route's matching method handlers. Route dispatch is downstream of parameter processing and should be checked for handler invocation order. Evidence anchor: `Route.prototype.dispatch`.".to_string(),
-        "express response helpers" => format!(
-            "The first file to inspect is lib/response.js because res.send, res.json, and res.sendFile are implemented there. Compatibility behavior for old response helper call shapes should be checked near res.send and res.json. File-transfer validation and callback behavior should be checked separately from JSON serialization. Response serialization helpers are owned by lib/response.js. Evidence anchor: `{symbol}`."
-        ),
-        "express view lookup" => format!(
-            "View lookup and metadata are owned by lib/view.js. Evidence anchor: `{symbol}`."
-        ),
-        "express regression tests" => format!(
-            "Existing response tests are relevant because this is a behavior compatibility report. Regression coverage should include app.param and router behavior tests. Evidence anchor: `{symbol}`."
-        ),
-        "mux router core" => format!(
-            "NewRouter constructs a Router that owns routes and middleware. Router.Match is relevant for how successful matches and variables are carried into request handling. Trailing-slash behavior is configured through Router.StrictSlash. Evidence anchor: `{symbol}`."
-        ),
-        "mux route metadata" => format!(
-            "Routes hold matchers and handler metadata, while the router iterates routes to find a request match. Route.Path is relevant because it creates path matchers from route templates. Route matcher construction is an impact surface because it carries strict-slash options into regexp compilation. Route.Match and router request handling should be checked because redirect behavior is observed during matching. Route method declarations are relevant because allowed methods come from route metadata. Evidence anchor: `{symbol}`."
-        ),
-        "mux route regexp" => format!(
-            "Route template parsing and variable extraction should be inspected in regexp.go. Route template parsing and regular expression compilation are handled outside the main request dispatch method. Evidence anchor: `{symbol}`."
-        ),
-        "mux middleware" => format!(
-            "The implementation starting point is CORSMethodMiddleware in middleware.go. Middleware registration through Router.Use is relevant for how the CORS helper is installed. Evidence anchor: `{symbol}`."
-        ),
-        "mux regression tests" => format!(
-            "Regression coverage should include route regexp tests and request matching tests. Regression coverage should include mux request matching tests and route regexp tests. The focused verification target should include middleware tests before broader router tests. Evidence anchor: `{symbol}`."
-        ),
-        "flask request dispatch" => format!(
-            "Flask.wsgi_app is the WSGI entry point and creates or uses request context before dispatch. full_dispatch_request wraps preprocessing, dispatch, exception handling, and response finalization. dispatch_request invokes the view function selected by URL matching. Request-time view invocation is owned by Flask.dispatch_request. Evidence anchor: `{symbol}`."
-        ),
-        "flask request context" => format!(
-            "Flask dispatch uses request context state while moving a WSGI request through dispatch and response finalization. Evidence anchor: `{symbol}`."
-        ),
-        "flask app registration" => format!(
-            "Application-level registration starts in the sansio app registration method. Application URL rules are owned by the sansio app add_url_rule method. Evidence anchor: `{symbol}`."
-        ),
-        "flask scaffold routing" => format!(
-            "The route decorator behavior is shared through the scaffold abstraction. The route decorator registers view functions through the scaffold URL rule path rather than performing request dispatch itself. Evidence anchor: `{symbol}`."
-        ),
-        "flask blueprint registration" => format!(
-            "Nested blueprint behavior is owned by the sansio blueprint registration code. Blueprint URL rules are owned by the sansio blueprint add_url_rule path. Evidence anchor: `{symbol}`."
-        ),
-        "flask public blueprint wrapper" => format!(
-            "The public flask.blueprints module is a wrapper surface, while the core registration behavior is in the sansio blueprint module. Evidence anchor: `{symbol}`."
-        ),
-        "flask session cookies" => format!(
-            "The focused implementation file is src/flask/sessions.py because cookie attributes are read and applied there. save_session is the final write path for setting or deleting the session cookie. Cookie attribute helpers should be checked before changing response-writing behavior. Evidence anchor: `{symbol}`."
-        ),
-        "flask regression tests" => format!(
-            "URL prefix and endpoint composition should be tested through blueprint registration tests. Regression coverage should include session tests and configuration-driven cookie behavior. Evidence anchor: `{symbol}`."
-        ),
-        "vite config resolution" => format!(
-            "Configuration default changes should start in resolveConfig. Config resolution is owned by src/node/config.ts through resolveConfig. Configuration is resolved before the server finishes wiring plugins and middleware. Regression testing should include config resolution and dev-server behavior, not only type checking. Evidence anchor: `{symbol}`."
-        ),
-        "vite dev server construction" => format!(
-            "createServer is the development server construction entry point. Dev-server construction is owned by src/node/server/index.ts through createServer. Dev-server creation installs the middleware stack that later receives module requests. Dev-server construction must be checked because it consumes resolved server configuration. Evidence anchor: `{symbol}`."
-        ),
-        "vite http server setup" => format!(
-            "HTTP server setup and middleware behavior are likely impact surfaces for server defaults. Evidence anchor: `{symbol}`."
-        ),
-        "vite html middleware" => format!(
-            "HTTP server setup and middleware behavior are likely impact surfaces for server defaults. Evidence anchor: `{symbol}`."
-        ),
-        "vite transform middleware" => format!(
-            "Request-time transform routing is owned by the transform middleware. transformMiddleware filters module-like requests and delegates eligible work to transformRequest. The transformed code is sent back through the transform middleware response path. Evidence anchor: `{symbol}`."
-        ),
-        "vite transform request" => format!(
-            "Source transformation for module requests is handled by the transform request pipeline. Module transformation orchestration is owned by transformRequest. transformRequest uses the plugin container to resolve, load, and transform modules. The first implementation path to inspect is transformRequest because the report concerns reused transformed output. Evidence anchor: `{symbol}`."
-        ),
-        "vite plugin container" => format!(
-            "The plugin container is the server-facing mechanism for running plugin hooks. Plugin hook execution and module graph state are separate ownership areas. Plugin container behavior should be considered because plugin transforms can affect cache keys and output. Evidence anchor: `{symbol}`."
-        ),
-        "vite module graph" => format!(
-            "The module graph tracks module relationships and transform state for dev-server requests. The module graph is updated with module entries and transform results during the request path. ModuleGraph is relevant because dependency relationships drive invalidation. Evidence anchor: `{symbol}`."
-        ),
-        "vite hmr" => format!(
-            "HMR handling is relevant because file updates need to invalidate dependent modules. Evidence anchor: `{symbol}`."
+        "tests and regression coverage" => format!(
+            "Regression coverage for this flow is anchored by `{symbol}`; use it to choose focused verification before broader suites."
         ),
         _ => format!("Supporting evidence is anchored by `{symbol}`."),
     }
 }
 
-fn citation_is_codestory_repo_evidence(citation: &AgentCitationDto) -> bool {
-    citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .is_some_and(|path| {
-            path.contains("crates/codestory-") || path.contains("crates/codestory_")
-        })
+fn path_contains_test_segment(path: &str) -> bool {
+    path.starts_with("test/")
+        || path.starts_with("tests/")
+        || path.contains("/test/")
+        || path.contains("/tests/")
+        || path.starts_with("test\\")
+        || path.starts_with("tests\\")
+        || path.contains("\\test\\")
+        || path.contains("\\tests\\")
 }
 
 fn packet_display_path(path: &str) -> String {
@@ -2346,6 +1835,7 @@ fn execute_retrieval(
             query: prompt.to_string(),
             repo_text: SearchRepoTextMode::Off,
             limit_per_source: max_results as u32,
+            expand_search_plan: false,
             hybrid_weights: None,
             hybrid_limits: None,
         },
@@ -3111,6 +2601,7 @@ fn investigate_query_expansion(
                 query: term.clone(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: max_results as u32,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             },
@@ -3170,6 +2661,7 @@ fn investigate_repo_text_fallback(
         query: prompt.to_string(),
         repo_text: SearchRepoTextMode::On,
         limit_per_source: max_results as u32,
+        expand_search_plan: false,
         hybrid_weights: None,
         hybrid_limits: None,
     }) {
@@ -4089,7 +3581,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_plan_expands_indexing_flow_into_symbol_probes() {
+    fn packet_plan_expands_task_wording_without_fixture_specific_anchors() {
         let plan = build_packet_plan(
             "Explain how a full indexing run moves from the CLI into runtime orchestration, file discovery, symbol extraction, persistence, and search or snapshot refresh.",
             Some(PacketTaskClassDto::ArchitectureExplanation),
@@ -4101,23 +3593,36 @@ mod tests {
             .collect::<Vec<_>>();
 
         for expected in [
+            "indexing",
+            "runtime",
+            "full_indexing",
+            "IndexingRun",
+            "RuntimeOrchestration",
+            "architecture entrypoint",
+            "runtime flow",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "expected generic probe {expected} in packet plan: {queries:?}"
+            );
+        }
+        for fixture_anchor in [
             "run_index",
             "IndexService",
             "WorkspaceIndexer",
-            "WorkspaceManifest",
             "flush_projection_batch",
             "SnapshotStore",
         ] {
             assert!(
-                queries.contains(&expected),
-                "expected {expected} in packet plan: {queries:?}"
+                !queries.contains(&fixture_anchor),
+                "packet planner should not inject fixture-specific anchor {fixture_anchor}: {queries:?}"
             );
         }
     }
 
     #[test]
-    fn symbol_ownership_packet_plan_seeds_express_ownership_files() {
-        let question = "Explain which Express modules own application creation, app-level rendering, response serialization, file sending, and view lookup.";
+    fn symbol_ownership_packet_plan_seeds_generic_ownership_terms() {
+        let question = "Explain which modules own application creation, app-level rendering, response serialization, file sending, and view lookup.";
         let plan = build_packet_plan(question, Some(PacketTaskClassDto::SymbolOwnership));
         let queries = plan
             .queries
@@ -4126,33 +3631,32 @@ mod tests {
             .collect::<Vec<_>>();
 
         for expected in [
-            "createApplication",
-            "tryRender",
-            "app.render",
-            "res.send",
-            "res.json",
-            "res.sendFile",
-            "View",
-            "lib/express.js",
-            "lib/application.js",
-            "lib/response.js",
-            "lib/view.js",
+            "references",
+            "callers",
+            "definition references",
+            "application",
+            "view",
+            "lookup",
+            "application_creation",
+            "ApplicationCreation",
         ] {
             assert!(
                 queries.contains(&expected),
-                "expected {expected} in Express ownership packet plan: {queries:?}"
+                "expected {expected} in generic ownership packet plan: {queries:?}"
             );
         }
-        assert!(
-            !queries.contains(&"WorkspaceManifest"),
-            "file sending should not be mistaken for workspace file discovery: {queries:?}"
-        );
+        for fixture_anchor in ["createApplication", "lib/express.js", "lib/response.js"] {
+            assert!(
+                !queries.contains(&fixture_anchor),
+                "ownership planning should not inject fixture-specific anchor {fixture_anchor}: {queries:?}"
+            );
+        }
     }
 
     #[test]
-    fn bug_packet_plan_seeds_express_param_path() {
+    fn bug_packet_plan_seeds_generic_failure_terms_and_prompt_identifiers() {
         let question =
-            "Localize an Express app.param callback decode bug through router parameter handling.";
+            "Localize an app.param callback decode bug through router parameter handling.";
         let plan = build_packet_plan(question, Some(PacketTaskClassDto::BugLocalization));
         let queries = plan
             .queries
@@ -4161,26 +3665,31 @@ mod tests {
             .collect::<Vec<_>>();
 
         for expected in [
-            "proto.param",
-            "proto.process_params",
-            "Layer.prototype.match",
-            "Route.prototype.dispatch",
-            "decode_param",
-            "paramCallback",
-            "test/app.param.js",
-            "test/Router.js",
+            "app.param",
+            "param",
+            "callback",
+            "error",
+            "validate",
+            "error path",
+            "failure handling",
         ] {
             assert!(
                 queries.contains(&expected),
-                "expected {expected} in Express param packet plan: {queries:?}"
+                "expected {expected} in generic bug packet plan: {queries:?}"
+            );
+        }
+        for fixture_anchor in ["proto.param", "Layer.prototype.match", "test/app.param.js"] {
+            assert!(
+                !queries.contains(&fixture_anchor),
+                "bug planning should not inject fixture-specific anchor {fixture_anchor}: {queries:?}"
             );
         }
     }
 
     #[test]
-    fn mux_packet_plan_and_claims_cover_router_regexp_and_middleware() {
-        let question = "Assess the likely impact of changing mux trailing-slash redirect behavior and CORS preflight method reporting.";
-        let plan = build_packet_plan(question, Some(PacketTaskClassDto::ChangeImpact));
+    fn route_tracing_packet_plan_seeds_generic_route_terms() {
+        let question = "Trace how an application registers middleware and routes, then dispatches an incoming request through router layers to a route handler.";
+        let plan = build_packet_plan(question, Some(PacketTaskClassDto::RouteTracing));
         let queries = plan
             .queries
             .iter()
@@ -4188,165 +3697,54 @@ mod tests {
             .collect::<Vec<_>>();
 
         for expected in [
-            "Router.StrictSlash",
-            "Route.addRegexpMatcher",
-            "newRouteRegexp",
-            "CORSMethodMiddleware",
-            "Router.Use",
-            "Route.Methods",
-            "mux.go",
-            "route.go",
-            "regexp.go",
+            "router",
+            "handler",
+            "route",
+            "middleware",
+            "dispatch",
+            "route handler endpoint",
         ] {
             assert!(
                 queries.contains(&expected),
-                "expected {expected} in mux packet plan: {queries:?}"
+                "expected {expected} in route tracing packet plan: {queries:?}"
             );
         }
-
-        let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
-        let mut answer = AgentAnswerDto {
-            answer_id: "mux-fixture".to_string(),
-            prompt: question.to_string(),
-            summary: "Mux routing and middleware evidence is covered.".to_string(),
-            freshness: None,
-            sections: Vec::new(),
-            citations: vec![
-                test_packet_citation("Router.StrictSlash", "mux.go", 0.9),
-                test_packet_citation("Route.addRegexpMatcher", "route.go", 0.8),
-                test_packet_citation("newRouteRegexp", "regexp.go", 0.8),
-                test_packet_citation("CORSMethodMiddleware", "middleware.go", 0.8),
-                test_packet_citation("TestRouteMatchers", "mux_test.go", 0.7),
-            ],
-            subgraph_ids: Vec::new(),
-            retrieval_version: "test".to_string(),
-            graphs: Vec::new(),
-            retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
-                request_id: "mux-fixture".to_string(),
-                resolved_profile: AgentRetrievalPresetDto::Architecture,
-                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
-                total_latency_ms: 1,
-                sla_target_ms: None,
-                sla_missed: false,
-                annotations: Vec::new(),
-                steps: Vec::new(),
-            },
-        };
-
-        append_packet_evidence_sections(&mut answer, PacketTaskClassDto::ChangeImpact, &limits);
-        let text = answer
-            .sections
-            .iter()
-            .flat_map(|section| &section.blocks)
-            .filter_map(|block| match block {
-                AgentResponseBlockDto::Markdown { markdown } => Some(markdown.as_str()),
-                AgentResponseBlockDto::Mermaid { .. } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        for expected_claim in [
-            "Trailing-slash behavior is configured through Router.StrictSlash.",
-            "Route matcher construction is an impact surface because it carries strict-slash options into regexp compilation.",
-            "Route template parsing and variable extraction should be inspected in regexp.go.",
-            "The implementation starting point is CORSMethodMiddleware in middleware.go.",
-            "Middleware registration through Router.Use is relevant for how the CORS helper is installed.",
-            "Regression coverage should include mux request matching tests and route regexp tests.",
+        for fixture_anchor in [
+            "createApplication",
+            "lib/router/layer.js",
+            "Router.StrictSlash",
         ] {
             assert!(
-                text.contains(expected_claim),
-                "mux packet claims should include {expected_claim}: {text}"
+                !queries.contains(&fixture_anchor),
+                "route tracing should not inject fixture-specific anchor {fixture_anchor}: {queries:?}"
             );
         }
     }
 
     #[test]
-    fn flask_and_vite_packet_plans_seed_framework_anchors() {
-        let flask_plan = build_packet_plan(
-            "Trace how Flask receives a WSGI request and dispatches to a view.",
-            Some(PacketTaskClassDto::RouteTracing),
-        );
-        let flask_queries = flask_plan
-            .queries
-            .iter()
-            .map(|query| query.query.as_str())
-            .collect::<Vec<_>>();
-        for expected in [
-            "Flask.wsgi_app",
-            "Flask.full_dispatch_request",
-            "Flask.dispatch_request",
-            "Scaffold.route",
-            "src/flask/app.py",
-        ] {
-            assert!(
-                flask_queries.contains(&expected),
-                "expected {expected} in Flask packet plan: {flask_queries:?}"
-            );
-        }
-
-        let vite_plan = build_packet_plan(
-            "Explain how Vite creates a dev server, transforms modules, runs plugin hooks, and updates the module graph.",
-            Some(PacketTaskClassDto::ArchitectureExplanation),
-        );
-        let vite_queries = vite_plan
-            .queries
-            .iter()
-            .map(|query| query.query.as_str())
-            .collect::<Vec<_>>();
-        for expected in [
-            "resolveConfig",
-            "createServer",
-            "transformMiddleware",
-            "transformRequest",
-            "createPluginContainer",
-            "ModuleGraph",
-            "src/node/server/moduleGraph.ts",
-        ] {
-            assert!(
-                vite_queries.contains(&expected),
-                "expected {expected} in Vite packet plan: {vite_queries:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn flask_and_vite_packet_claims_cover_expected_surfaces() {
+    fn packet_supported_claims_use_generic_evidence_roles() {
         let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
         let mut answer = AgentAnswerDto {
-            answer_id: "framework-fixture".to_string(),
-            prompt: "Explain Flask and Vite ownership surfaces.".to_string(),
-            summary: "Framework evidence is covered.".to_string(),
+            answer_id: "generic-fixture".to_string(),
+            prompt: "Explain the packet evidence roles.".to_string(),
+            summary: "Generic evidence roles are covered.".to_string(),
             freshness: None,
             sections: Vec::new(),
             citations: vec![
-                test_packet_citation("Flask.dispatch_request", "src/flask/app.py", 0.8),
-                test_packet_citation("Scaffold.route", "src/flask/sansio/scaffold.py", 0.8),
-                test_packet_citation("Blueprint.register", "src/flask/sansio/blueprints.py", 0.8),
-                test_packet_citation("save_session", "src/flask/sessions.py", 0.8),
-                test_packet_citation("resolveConfig", "src/node/config.ts", 0.8),
-                test_packet_citation("createServer", "src/node/server/index.ts", 0.8),
-                test_packet_citation(
-                    "transformMiddleware",
-                    "src/node/server/middlewares/transform.ts",
-                    0.8,
-                ),
-                test_packet_citation(
-                    "transformRequest",
-                    "src/node/server/transformRequest.ts",
-                    0.8,
-                ),
-                test_packet_citation(
-                    "createPluginContainer",
-                    "src/node/server/pluginContainer.ts",
-                    0.8,
-                ),
-                test_packet_citation("ModuleGraph", "src/node/server/moduleGraph.ts", 0.8),
+                test_packet_citation("CliCommand", "crates/tool-cli/src/main.rs", 0.8),
+                test_packet_citation("RuntimeCoordinator", "crates/core/src/runtime.rs", 0.8),
+                test_packet_citation("WorkspacePlan", "crates/core/src/workspace/plan.rs", 0.8),
+                test_packet_citation("GraphIndexer", "crates/indexer/src/lib.rs", 0.8),
+                test_packet_citation("ProjectionStore", "crates/store/src/projection.rs", 0.8),
+                test_packet_citation("SnapshotRefresh", "crates/store/src/snapshot.rs", 0.8),
+                test_packet_citation("RouteHandler", "src/routes/user.rs", 0.8),
+                test_packet_citation("PacketRegression", "tests/packet_flow.rs", 0.8),
             ],
             subgraph_ids: Vec::new(),
             retrieval_version: "test".to_string(),
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
-                request_id: "framework-fixture".to_string(),
+                request_id: "generic-fixture".to_string(),
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -4374,67 +3772,40 @@ mod tests {
             .join("\n");
 
         for expected_claim in [
-            "Flask.wsgi_app is the WSGI entry point and creates or uses request context before dispatch.",
-            "The route decorator behavior is shared through the scaffold abstraction.",
-            "Nested blueprint behavior is owned by the sansio blueprint registration code.",
-            "The focused implementation file is src/flask/sessions.py because cookie attributes are read and applied there.",
-            "Config resolution is owned by src/node/config.ts through resolveConfig.",
-            "createServer is the development server construction entry point.",
-            "transformMiddleware filters module-like requests and delegates eligible work to transformRequest.",
-            "Module transformation orchestration is owned by transformRequest.",
-            "The plugin container is the server-facing mechanism for running plugin hooks.",
-            "The module graph tracks module relationships and transform state for dev-server requests.",
+            "The command or public entrypoint for this flow is anchored by `CliCommand`",
+            "Runtime orchestration is anchored by `RuntimeCoordinator`",
+            "Workspace discovery or planning is anchored by `WorkspacePlan`",
+            "Symbol extraction is anchored by `GraphIndexer`",
+            "Persistence or search projection is anchored by `ProjectionStore`",
+            "Snapshot refresh is anchored by `SnapshotRefresh`",
+            "Route handling is anchored by `RouteHandler`",
+            "Regression coverage for this flow is anchored by `PacketRegression`",
         ] {
             assert!(
                 text.contains(expected_claim),
-                "framework packet claims should include {expected_claim}: {text}"
+                "generic packet claims should include {expected_claim}: {text}"
             );
         }
     }
 
     #[test]
-    fn route_tracing_packet_plan_and_claims_cover_express_dispatch_flow() {
-        let question = "Trace how an Express application registers middleware and routes, then dispatches an incoming request through router layers to a route handler.";
-        let plan = build_packet_plan(question, Some(PacketTaskClassDto::RouteTracing));
-        let queries = plan
-            .queries
-            .iter()
-            .map(|query| query.query.as_str())
-            .collect::<Vec<_>>();
-
-        for expected in [
-            "createApplication",
-            "app.use",
-            "app.route",
-            "lib/express.js",
-            "lib/router/layer.js",
-            "lib/router/route.js",
-        ] {
-            assert!(
-                queries.contains(&expected),
-                "expected {expected} in route tracing packet plan: {queries:?}"
-            );
-        }
-
+    fn packet_ranking_demotes_test_paths_without_fixture_specific_boosts() {
+        let question = "Trace route dispatch through a handler.";
         let mut answer = AgentAnswerDto {
-            answer_id: "route-fixture".to_string(),
+            answer_id: "rank-fixture".to_string(),
             prompt: question.to_string(),
-            summary: "Express route flow is covered by cited anchors.".to_string(),
+            summary: "Route evidence is covered by cited anchors.".to_string(),
             freshness: None,
             sections: Vec::new(),
             citations: vec![
-                test_packet_citation("createApplication", "lib/express.js", 0.5),
-                test_packet_citation("application", "lib/application.js", 0.5),
-                test_packet_citation("router", "lib/router/index.js", 0.5),
-                test_packet_citation("Layer", "lib/router/layer.js", 0.5),
-                test_packet_citation("Route", "lib/router/route.js", 0.5),
-                test_packet_citation("test route", "test/app.router.js", 2.0),
+                test_packet_citation("RouteHandler test", "tests/router_handler.rs", 5.0),
+                test_packet_citation("RouteHandler", "src/router/handler.rs", 0.5),
             ],
             subgraph_ids: Vec::new(),
             retrieval_version: "test".to_string(),
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
-                request_id: "route-fixture".to_string(),
+                request_id: "rank-fixture".to_string(),
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -4446,111 +3817,7 @@ mod tests {
         };
 
         rank_packet_evidence(question, &mut answer);
-        append_packet_evidence_sections(
-            &mut answer,
-            PacketTaskClassDto::RouteTracing,
-            &packet_budget_limits(PacketBudgetModeDto::Compact),
-        );
-        let text = answer
-            .sections
-            .iter()
-            .flat_map(|section| &section.blocks)
-            .filter_map(|block| match block {
-                AgentResponseBlockDto::Markdown { markdown } => Some(markdown.as_str()),
-                AgentResponseBlockDto::Mermaid { .. } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(
-            answer.citations[0]
-                .file_path
-                .as_deref()
-                .is_some_and(|path| path.starts_with("lib/")),
-            "production route files should outrank test route examples: {:?}",
-            answer.citations
-        );
-        for expected_claim in [
-            "The public factory creates a function-shaped app and mixes in application, request, and response prototypes.",
-            "Application middleware registration goes through app.use and is delegated to the lazy router.",
-            "Route registration through app.route creates route-specific handlers on the router.",
-            "The router walks its stack of layers and matches request paths before handing control to a route.",
-            "Route dispatch is responsible for invoking the route's matching method handlers.",
-        ] {
-            assert!(
-                text.contains(expected_claim),
-                "route packet claims should include {expected_claim}: {text}"
-            );
-        }
-    }
-
-    #[test]
-    fn packet_claims_cover_express_bug_and_ownership_surfaces() {
-        let question = "Identify response helper and router parameter files before editing.";
-        let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
-        let mut answer = AgentAnswerDto {
-            answer_id: "express-fixture".to_string(),
-            prompt: question.to_string(),
-            summary: "Express response and router parameter evidence is covered.".to_string(),
-            freshness: None,
-            sections: Vec::new(),
-            citations: vec![
-                test_packet_citation("send", "lib/response.js", 0.9),
-                test_packet_citation("View", "lib/view.js", 0.8),
-                test_packet_citation("application", "lib/application.js", 0.7),
-                test_packet_citation("createApplication", "lib/express.js", 0.7),
-                test_packet_citation("router", "lib/router/index.js", 0.7),
-                test_packet_citation("Layer", "lib/router/layer.js", 0.7),
-                test_packet_citation("Route", "lib/router/route.js", 0.7),
-                test_packet_citation("res.send test", "test/res.send.js", 0.7),
-            ],
-            subgraph_ids: Vec::new(),
-            retrieval_version: "test".to_string(),
-            graphs: Vec::new(),
-            retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
-                request_id: "express-fixture".to_string(),
-                resolved_profile: AgentRetrievalPresetDto::Architecture,
-                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
-                total_latency_ms: 1,
-                sla_target_ms: None,
-                sla_missed: false,
-                annotations: Vec::new(),
-                steps: Vec::new(),
-            },
-        };
-
-        append_packet_evidence_sections(&mut answer, PacketTaskClassDto::BugLocalization, &limits);
-        let text = answer
-            .sections
-            .iter()
-            .flat_map(|section| &section.blocks)
-            .filter_map(|block| match block {
-                AgentResponseBlockDto::Markdown { markdown } => Some(markdown.as_str()),
-                AgentResponseBlockDto::Mermaid { .. } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        for expected_claim in [
-            "The first file to inspect is lib/response.js because res.send, res.json, and res.sendFile are implemented there.",
-            "Compatibility behavior for old response helper call shapes should be checked near res.send and res.json.",
-            "File-transfer validation and callback behavior should be checked separately from JSON serialization.",
-            "Existing response tests are relevant because this is a behavior compatibility report.",
-            "The public application factory is implemented in lib/express.js.",
-            "App-level rendering is owned by lib/application.js.",
-            "Response serialization helpers are owned by lib/response.js.",
-            "View lookup and metadata are owned by lib/view.js.",
-            "Parameter callback registration starts in proto.param in lib/router/index.js.",
-            "The callback execution path should be inspected in proto.process_params.",
-            "Layer matching is relevant because it extracts and decodes route parameter values.",
-            "Route dispatch is downstream of parameter processing and should be checked for handler invocation order.",
-            "Regression coverage should include app.param and router behavior tests.",
-        ] {
-            assert!(
-                text.contains(expected_claim),
-                "packet claims should include {expected_claim}: {text}"
-            );
-        }
+        assert_eq!(answer.citations[0].display_name, "RouteHandler");
     }
 
     #[test]
@@ -4558,77 +3825,89 @@ mod tests {
         let fixtures = [
             (
                 PacketTaskClassDto::ArchitectureExplanation,
-                "Explain how the dev server is constructed and how config flows into it.",
+                "Explain how the command runtime loads a workspace plan and refreshes snapshots.",
                 vec![
-                    test_packet_citation("resolveConfig", "src/node/config.ts", 0.9),
-                    test_packet_citation("createServer", "src/node/server/index.ts", 0.9),
-                    test_packet_citation("httpServerStart", "src/node/http.ts", 0.8),
+                    test_packet_citation("CliCommand", "crates/app-cli/src/main.rs", 0.9),
+                    test_packet_citation(
+                        "RuntimeCoordinator",
+                        "crates/app-runtime/src/runtime.rs",
+                        0.9,
+                    ),
+                    test_packet_citation("WorkspacePlan", "crates/workspace/src/plan.rs", 0.8),
                 ],
-                "createServer is the development server construction entry point",
-                "src/node/server/index.ts",
+                "Runtime orchestration is anchored by `RuntimeCoordinator`",
+                "crates/app-runtime/src/runtime.rs",
             ),
             (
                 PacketTaskClassDto::BugLocalization,
-                "Find the likely bug path for Express response sending compatibility.",
+                "Find the failure handling path for decode validation.",
                 vec![
-                    test_packet_citation("send", "lib/response.js", 0.9),
-                    test_packet_citation("View", "lib/view.js", 0.8),
-                    test_packet_citation("res.send regression", "test/res.send.js", 0.7),
+                    test_packet_citation("RuntimeErrorHandler", "src/runtime/errors.rs", 0.9),
+                    test_packet_citation("DecodeValidator", "src/validation/decode.rs", 0.8),
+                    test_packet_citation("DecodeRegression", "tests/decode_regression.rs", 0.7),
                 ],
-                "The first file to inspect is lib/response.js",
-                "lib/response.js",
+                "Runtime orchestration is anchored by `RuntimeErrorHandler`",
+                "src/runtime/errors.rs",
             ),
             (
                 PacketTaskClassDto::ChangeImpact,
-                "What changes if mux strict slash route matching behavior changes?",
+                "What changes if reference resolution behavior changes?",
                 vec![
-                    test_packet_citation("Router.StrictSlash", "mux.go", 0.9),
-                    test_packet_citation("Route.addRegexpMatcher", "route.go", 0.8),
-                    test_packet_citation("newRouteRegexp", "regexp.go", 0.8),
+                    test_packet_citation(
+                        "AffectedReferenceIndex",
+                        "crates/indexer/src/references.rs",
+                        0.9,
+                    ),
+                    test_packet_citation("ReferenceStore", "crates/store/src/references.rs", 0.8),
+                    test_packet_citation(
+                        "ReferenceRegression",
+                        "tests/reference_regression.rs",
+                        0.7,
+                    ),
                 ],
-                "Trailing-slash behavior is configured through Router.StrictSlash",
-                "mux.go",
+                "Symbol extraction is anchored by `AffectedReferenceIndex`",
+                "crates/indexer/src/references.rs",
             ),
             (
                 PacketTaskClassDto::RouteTracing,
-                "Trace how a Flask request reaches the selected view function.",
+                "Trace how a request reaches the selected handler.",
                 vec![
-                    test_packet_citation("Flask.wsgi_app", "src/flask/app.py", 0.9),
-                    test_packet_citation("RequestContext", "src/flask/ctx.py", 0.8),
-                    test_packet_citation("Flask.dispatch_request", "src/flask/app.py", 0.8),
+                    test_packet_citation("RouteDispatcher", "src/router/dispatch.rs", 0.9),
+                    test_packet_citation("RouteHandler", "src/router/handler.rs", 0.8),
+                    test_packet_citation("RouteRegression", "tests/route_regression.rs", 0.7),
                 ],
-                "dispatch_request invokes the view function selected by URL matching",
-                "src/flask/app.py",
+                "Route handling is anchored by `RouteDispatcher`",
+                "src/router/dispatch.rs",
             ),
             (
                 PacketTaskClassDto::SymbolOwnership,
-                "Who owns Vite module request transforms and module graph state?",
+                "Who owns workspace planning and graph state?",
                 vec![
                     test_packet_citation(
-                        "transformMiddleware",
-                        "src/node/server/middlewares/transform.ts",
+                        "WorkspaceOwnerPlan",
+                        "crates/workspace/src/ownership.rs",
                         0.9,
                     ),
+                    test_packet_citation("GraphStateStore", "crates/store/src/graph.rs", 0.8),
                     test_packet_citation(
-                        "transformRequest",
-                        "src/node/server/transformRequest.ts",
-                        0.9,
+                        "OwnershipRegression",
+                        "tests/ownership_regression.rs",
+                        0.7,
                     ),
-                    test_packet_citation("ModuleGraph", "src/node/server/moduleGraph.ts", 0.8),
                 ],
-                "Module transformation orchestration is owned by transformRequest",
-                "src/node/server/transformRequest.ts",
+                "Workspace discovery or planning is anchored by `WorkspaceOwnerPlan`",
+                "crates/workspace/src/ownership.rs",
             ),
             (
                 PacketTaskClassDto::EditPlanning,
-                "Plan the focused edit for Flask session cookie attribute behavior.",
+                "Plan the focused edit for configuration validation behavior.",
                 vec![
-                    test_packet_citation("save_session", "src/flask/sessions.py", 0.9),
-                    test_packet_citation("get_cookie_samesite", "src/flask/sessions.py", 0.8),
-                    test_packet_citation("test_session_cookie", "tests/test_basic.py", 0.7),
+                    test_packet_citation("ConfigValidator", "src/config/validator.rs", 0.9),
+                    test_packet_citation("ConfigEditPlan", "src/config/edit_plan.rs", 0.8),
+                    test_packet_citation("ConfigRegression", "tests/config_regression.rs", 0.7),
                 ],
-                "save_session is the final write path",
-                "src/flask/sessions.py",
+                "Regression coverage for this flow is anchored by `ConfigRegression`",
+                "tests/config_regression.rs",
             ),
         ];
 
@@ -4672,8 +3951,8 @@ mod tests {
         let mut partial_answer = packet_answer_fixture(
             question,
             vec![test_packet_citation(
-                "Route.prototype.dispatch",
-                "lib/router/route.js",
+                "RouteDispatcher",
+                "src/router/dispatch.rs",
                 0.8,
             )],
         );
@@ -4918,46 +4197,46 @@ mod tests {
     }
 
     #[test]
-    fn indexing_flow_packet_sections_and_sufficiency_cover_agent_stop_contract() {
-        let question = "Explain how a full indexing run moves from the CLI into runtime orchestration, file discovery, symbol extraction, persistence, and search or snapshot refresh.";
+    fn generic_packet_sections_and_sufficiency_cover_agent_stop_contract() {
+        let question = "Explain how a command enters runtime orchestration, workspace planning, symbol extraction, persistence, and snapshot refresh.";
         let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
         let mut answer = AgentAnswerDto {
             answer_id: "packet-fixture".to_string(),
             prompt: question.to_string(),
-            summary: "Indexing flow is covered by cited CodeStory anchors.".to_string(),
+            summary: "Runtime flow is covered by cited anchors.".to_string(),
             freshness: None,
             sections: vec![AgentResponseSectionDto {
                 id: "answer".to_string(),
                 title: "Answer".to_string(),
                 blocks: vec![AgentResponseBlockDto::Markdown {
-                    markdown: "Full indexing starts at the CLI and proceeds through runtime, workspace, indexer, store, and snapshot layers.".to_string(),
+                    markdown: "The flow starts at the command surface and proceeds through runtime, workspace, indexer, store, and snapshot layers.".to_string(),
                 }],
             }],
             citations: vec![
                 test_packet_citation(
-                    "search_quality_eval",
-                    "crates/codestory-cli/tests/search_json_output.rs",
+                    "FlowRegression",
+                    "tests/flow_regression.rs",
                     0.5,
                 ),
-                test_packet_citation("run_index", "crates/codestory-cli/src/main.rs", 0.2),
+                test_packet_citation("CliCommand", "crates/app-cli/src/main.rs", 0.2),
                 test_packet_citation(
-                    "IndexService::run_indexing",
-                    "crates/codestory-runtime/src/services.rs",
+                    "RuntimeCoordinator",
+                    "crates/app-runtime/src/services.rs",
                     0.3,
                 ),
                 test_packet_citation(
-                    "WorkspaceIndexer::build_execution_plan",
-                    "crates/codestory-workspace/src/lib.rs",
+                    "WorkspacePlan",
+                    "crates/workspace/src/plan.rs",
                     0.2,
                 ),
                 test_packet_citation(
-                    "index_file",
-                    "crates/codestory-indexer/src/lib.rs",
+                    "GraphIndexer",
+                    "crates/indexer/src/lib.rs",
                     0.2,
                 ),
                 test_packet_citation(
-                    "flush_projection_batch",
-                    "crates/codestory-store/src/snapshot_store.rs",
+                    "ProjectionStore",
+                    "crates/store/src/projection.rs",
                     0.2,
                 ),
             ],
@@ -4991,16 +4270,16 @@ mod tests {
         let top_anchor_names = answer
             .citations
             .iter()
-            .take(3)
+            .take(4)
             .map(|citation| citation.display_name.as_str())
             .collect::<Vec<_>>();
         assert!(
-            top_anchor_names.contains(&"run_index"),
-            "CLI entrypoint should stay in the high-priority indexing-flow anchors: {top_anchor_names:?}"
+            top_anchor_names.contains(&"CliCommand"),
+            "command entrypoint should stay in the high-priority flow anchors: {top_anchor_names:?}"
         );
         assert!(
-            top_anchor_names.contains(&"WorkspaceIndexer::build_execution_plan"),
-            "workspace planning should stay in the high-priority indexing-flow anchors: {top_anchor_names:?}"
+            top_anchor_names.contains(&"RuntimeCoordinator"),
+            "runtime coordination should stay in the high-priority flow anchors: {top_anchor_names:?}"
         );
         assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
         assert!(sufficiency.follow_up_commands.is_empty());
@@ -5008,14 +4287,14 @@ mod tests {
         assert!(
             sufficiency.covered_claims.iter().any(|claim| claim
                 .claim
-                .contains("runtime opens the workspace and store")),
-            "indexing-flow packet should include claim-led runtime flow notes: {sufficiency:?}"
+                .contains("Runtime orchestration is anchored by `RuntimeCoordinator`")),
+            "generic packet should include claim-led runtime flow notes: {sufficiency:?}"
         );
         assert!(
             sufficiency
                 .avoid_opening
                 .iter()
-                .any(|path| path.contains("crates/codestory-cli/src/main.rs")),
+                .any(|path| path.contains("crates/app-cli/src/main.rs")),
             "sufficient packets should tell agents cited files do not need broad re-opening: {sufficiency:?}"
         );
     }
@@ -5023,12 +4302,11 @@ mod tests {
     #[test]
     fn packet_claims_use_normalized_evidence_paths() {
         let citation = AgentCitationDto {
-            node_id: NodeId("run_index".to_string()),
-            display_name: "run_index".to_string(),
+            node_id: NodeId("CliCommand".to_string()),
+            display_name: "CliCommand".to_string(),
             kind: codestory_contracts::api::NodeKind::FUNCTION,
             file_path: Some(
-                "\\\\?\\C:\\Users\\alber\\source\\repos\\codestory\\crates\\codestory-cli\\src\\main.rs"
-                    .to_string(),
+                "\\\\?\\C:\\workspaces\\sample\\crates\\tool-cli\\src\\main.rs".to_string(),
             ),
             line: Some(193),
             score: 0.85,
@@ -5039,13 +4317,13 @@ mod tests {
             retrieval_score_breakdown: None,
         };
 
-        assert_eq!(packet_evidence_role(&citation), Some("CLI entrypoint"));
+        assert_eq!(packet_evidence_role(&citation), Some("command entrypoint"));
         assert_eq!(
             packet_display_path(citation.file_path.as_deref().unwrap()),
-            "crates/codestory-cli/src/main.rs"
+            "crates/tool-cli/src/main.rs"
         );
         assert!(
-            packet_claim_for_role("CLI entrypoint", &citation).contains("`run_index`"),
+            packet_claim_for_role("command entrypoint", &citation).contains("`CliCommand`"),
             "claim should name the evidence anchor"
         );
     }

@@ -108,7 +108,7 @@ Add task manifests:
 ```json
 {
   "repo": "codestory",
-  "task_class": "architecture_flow",
+  "task_class": "architecture_explanation",
   "prompt": "Explain how full indexing flows through CLI, runtime, workspace, indexer, and store.",
   "expected_files": [
     "crates/codestory-cli/src/main.rs",

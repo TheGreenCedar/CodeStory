@@ -4702,6 +4702,9 @@ fn append_text_only_tauri_invocations(
     if language_name != "svelte" {
         return;
     }
+    if !has_tauri_invoke_evidence(source) {
+        return;
+    }
 
     for invocation in collect_tauri_command_invocations(source) {
         let command_node = tauri_command_node(file_id, &invocation.command, invocation.line);
@@ -4728,6 +4731,13 @@ fn append_text_only_tauri_invocations(
             },
         });
     }
+}
+
+fn has_tauri_invoke_evidence(source: &str) -> bool {
+    let lower = source.to_ascii_lowercase();
+    lower.contains("@tauri-apps/api/core")
+        || lower.contains("@tauri-apps/api/tauri")
+        || lower.contains("__tauri__")
 }
 
 fn index_openapi_schema_file(path: &Path, source: &str) -> Result<Option<IntermediateStorage>> {
@@ -6398,7 +6408,7 @@ fn payload_collection_node(file_id: NodeId, slug: &str, line: u32, col: u32) -> 
     let label = payload_collection_label(slug);
     Node {
         id: NodeId(generate_id(&canonical_id)),
-        kind: NodeKind::MODULE,
+        kind: NodeKind::CONSTANT,
         serialized_name: label.clone(),
         qualified_name: Some(format!("framework::payload::collection::{}", slug.trim())),
         canonical_id: Some(canonical_id),
@@ -10574,6 +10584,37 @@ function render() {
         assert!(storage.occurrences.iter().any(|occurrence| {
             occurrence.element_id == command.id.0 && occurrence.kind == OccurrenceKind::REFERENCE
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_text_only_svelte_plain_invoke_does_not_index_tauri_command() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("App.svelte");
+        std::fs::write(
+            &path,
+            r#"
+<script lang="ts">
+  import { invoke } from "./local-rpc";
+  export async function refresh() {
+    await invoke("get_snapshot");
+  }
+</script>
+"#,
+        )?;
+
+        let storage = index_text_only_file(&path)?;
+        assert!(
+            storage.nodes.iter().all(|node| !node
+                .canonical_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("tauri:command:"))),
+            "non-Tauri Svelte invoke() should not synthesize tauri command nodes"
+        );
+        assert!(
+            storage.edges.iter().all(|edge| edge.kind != EdgeKind::CALL),
+            "non-Tauri Svelte invoke() should not synthesize tauri call edges"
+        );
         Ok(())
     }
 

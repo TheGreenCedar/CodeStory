@@ -123,7 +123,7 @@ fn framework_synthetic_node_source_metadata_prefers_definitions() -> Result<(), 
     let payload_definition_file = file_node(4, "src/collections/Posts.ts");
     let payload_usage = Node {
         id: NodeId(77),
-        kind: NodeKind::MODULE,
+        kind: NodeKind::CONSTANT,
         serialized_name: "payload collection posts (collection; confidence=heuristic)".to_string(),
         qualified_name: Some("framework::payload::collection::posts".to_string()),
         canonical_id: Some("payload:collection:posts".to_string()),
@@ -150,6 +150,59 @@ fn framework_synthetic_node_source_metadata_prefers_definitions() -> Result<(), 
             .get_node(NodeId(77))?
             .and_then(|node| node.file_node_id),
         Some(NodeId(4))
+    );
+
+    Ok(())
+}
+
+#[test]
+fn projection_flush_prefers_framework_definition_over_usage() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    insert_file_row(&storage, 1, "src/routes/+page.svelte")?;
+    insert_file_row(&storage, 2, "src-tauri/src/lib.rs")?;
+
+    let usage_file = file_node(1, "src/routes/+page.svelte");
+    let definition_file = file_node(2, "src-tauri/src/lib.rs");
+    let usage = Node {
+        id: NodeId(42),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "tauri command get_snapshot (tauri command; confidence=heuristic)"
+            .to_string(),
+        qualified_name: Some("framework::tauri::command::get_snapshot".to_string()),
+        canonical_id: Some("tauri:command:get_snapshot".to_string()),
+        file_node_id: Some(NodeId(1)),
+        start_line: Some(7),
+        start_col: Some(1),
+        ..Default::default()
+    };
+    let definition = Node {
+        file_node_id: Some(NodeId(2)),
+        start_line: Some(21),
+        ..usage.clone()
+    };
+
+    storage.insert_nodes_batch(&[usage_file, definition_file, usage])?;
+    assert_eq!(
+        storage
+            .get_node(NodeId(42))?
+            .and_then(|node| node.file_node_id),
+        Some(NodeId(1))
+    );
+
+    storage.flush_projection_batch(ProjectionBatch {
+        files: &[],
+        nodes: &[definition],
+        edges: &[],
+        occurrences: &[],
+        component_access: &[],
+        callable_projection_states: &[],
+    })?;
+
+    assert_eq!(
+        storage
+            .get_node(NodeId(42))?
+            .and_then(|node| node.file_node_id),
+        Some(NodeId(2))
     );
 
     Ok(())

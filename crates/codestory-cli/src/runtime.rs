@@ -225,6 +225,7 @@ fn query_resolution_alternatives(
                 query: query.to_owned(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 50,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             },

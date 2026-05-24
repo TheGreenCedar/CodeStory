@@ -1564,11 +1564,24 @@ impl Storage {
     }
 
     fn prepared_nodes_for_insert(&self, nodes: &[Node]) -> Result<Vec<Node>, StorageError> {
-        let batch_file_paths = nodes
+        self.prepared_nodes_for_insert_with_files(nodes, &[])
+    }
+
+    fn prepared_nodes_for_insert_with_files(
+        &self,
+        nodes: &[Node],
+        files: &[FileInfo],
+    ) -> Result<Vec<Node>, StorageError> {
+        let mut batch_file_paths = files
             .iter()
-            .filter(|node| node.kind == NodeKind::FILE)
-            .map(|node| (node.id, PathBuf::from(&node.serialized_name)))
+            .map(|info| (NodeId(info.id), info.path.clone()))
             .collect::<HashMap<_, _>>();
+        batch_file_paths.extend(
+            nodes
+                .iter()
+                .filter(|node| node.kind == NodeKind::FILE)
+                .map(|node| (node.id, PathBuf::from(&node.serialized_name))),
+        );
         let mut prepared = Vec::new();
         let mut framework_nodes = HashMap::<NodeId, Node>::new();
 
@@ -2021,6 +2034,12 @@ impl Storage {
             return Ok(breakdown);
         }
 
+        let prepared_nodes = if batch.nodes.is_empty() {
+            Vec::new()
+        } else {
+            self.prepared_nodes_for_insert_with_files(batch.nodes, batch.files)?
+        };
+
         let tx = self.conn.transaction()?;
 
         if !batch.files.is_empty() {
@@ -2048,19 +2067,27 @@ impl Storage {
             breakdown.files_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
         }
 
-        if !batch.nodes.is_empty() {
+        if !prepared_nodes.is_empty() {
             let started = std::time::Instant::now();
             let mut stmt = tx.prepare(
                 "INSERT INTO node (id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(id) DO NOTHING",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                    kind = excluded.kind,
+                    serialized_name = excluded.serialized_name,
+                    qualified_name = excluded.qualified_name,
+                    canonical_id = excluded.canonical_id,
+                    file_node_id = excluded.file_node_id,
+                    start_line = excluded.start_line,
+                    start_col = excluded.start_col,
+                    end_line = excluded.end_line,
+                    end_col = excluded.end_col",
             )?;
-            for node in batch
-                .nodes
+            for node in prepared_nodes
                 .iter()
                 .filter(|node| node.kind == NodeKind::FILE)
                 .chain(
-                    batch
-                        .nodes
+                    prepared_nodes
                         .iter()
                         .filter(|node| node.kind != NodeKind::FILE),
                 )
@@ -2161,9 +2188,9 @@ impl Storage {
 
         tx.commit()?;
 
-        if !batch.nodes.is_empty() {
+        if !prepared_nodes.is_empty() {
             let mut cache = self.cache.nodes.write();
-            for node in batch.nodes {
+            for node in prepared_nodes {
                 cache.insert(node.id, node.clone());
             }
         }

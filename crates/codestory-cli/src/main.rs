@@ -9,11 +9,11 @@ use codestory_contracts::api::{
     CreateBookmarkRequest, EvidenceItemDto, EvidencePacketDto, EvidenceSourceLocationDto,
     EvidenceTypeDto, FrameworkRouteCoverageDto, GraphArtifactDto, IndexFreshnessDto,
     IndexFreshnessStatusDto, IndexMode, IndexedFilesRequest, NodeId, NodeKind,
-    NodeOccurrencesRequest, PacketSufficiencyStatusDto, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto, SearchHit, SearchHybridLimitsDto,
-    SearchMatchQualityDto, SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest,
-    SourceOccurrenceDto, SourceTruthCheckDto, TrailCallerScope, TrailConfigDto, TrailContextDto,
-    TrailDirection, TrailMode,
+    NodeOccurrencesRequest, PacketBudgetModeDto, PacketSufficiencyStatusDto, PacketTaskClassDto,
+    RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto, SearchHit,
+    SearchHybridLimitsDto, SearchMatchQualityDto, SearchQueryAssessmentDto, SearchRepoTextMode,
+    SearchRequest, SourceOccurrenceDto, SourceTruthCheckDto, TrailCallerScope, TrailConfigDto,
+    TrailContextDto, TrailDirection, TrailMode,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -529,8 +529,16 @@ fn render_packet_markdown(project_root: &std::path::Path, packet: &AgentPacketDt
         "question: `{}`",
         packet.question.replace('\n', " ")
     );
-    let _ = writeln!(markdown, "budget: `{:?}`", packet.budget.requested);
-    let _ = writeln!(markdown, "task_class: `{:?}`", packet.plan.task_class);
+    let _ = writeln!(
+        markdown,
+        "budget: `{}`",
+        packet_budget_mode_label(packet.budget.requested)
+    );
+    let _ = writeln!(
+        markdown,
+        "task_class: `{}`",
+        packet_task_class_label(packet.plan.task_class)
+    );
     let _ = writeln!(
         markdown,
         "sufficiency: `{}`",
@@ -590,6 +598,27 @@ fn render_packet_markdown(project_root: &std::path::Path, packet: &AgentPacketDt
     markdown.push('\n');
     markdown.push_str(&render_context_markdown(project_root, &packet.answer));
     markdown
+}
+
+fn packet_budget_mode_label(mode: PacketBudgetModeDto) -> &'static str {
+    match mode {
+        PacketBudgetModeDto::Tiny => "tiny",
+        PacketBudgetModeDto::Compact => "compact",
+        PacketBudgetModeDto::Standard => "standard",
+        PacketBudgetModeDto::Deep => "deep",
+    }
+}
+
+fn packet_task_class_label(task_class: PacketTaskClassDto) -> &'static str {
+    match task_class {
+        PacketTaskClassDto::ArchitectureExplanation => "architecture_explanation",
+        PacketTaskClassDto::BugLocalization => "bug_localization",
+        PacketTaskClassDto::ChangeImpact => "change_impact",
+        PacketTaskClassDto::RouteTracing => "route_tracing",
+        PacketTaskClassDto::SymbolOwnership => "symbol_ownership",
+        PacketTaskClassDto::DataFlow => "data_flow",
+        PacketTaskClassDto::EditPlanning => "edit_planning",
+    }
 }
 
 fn packet_sufficiency_label(status: PacketSufficiencyStatusDto) -> &'static str {
@@ -964,6 +993,7 @@ fn search_request_from_command(cmd: &SearchCommand) -> SearchRequest {
         query: cmd.query.clone(),
         repo_text: to_api_repo_text_mode(cmd.repo_text),
         limit_per_source: cmd.limit.clamp(1, 50),
+        expand_search_plan: cmd.why,
         hybrid_weights: hybrid_weights(cmd.hybrid_lexical, cmd.hybrid_semantic, cmd.hybrid_graph),
         hybrid_limits: hybrid_limits(cmd.hybrid_lexical_limit, cmd.hybrid_semantic_limit),
     }
@@ -2294,6 +2324,7 @@ fn run_drill_anchor(
             query: anchor.to_string(),
             repo_text: SearchRepoTextMode::Auto,
             limit_per_source: 10,
+            expand_search_plan: false,
             hybrid_weights: None,
             hybrid_limits: None,
         })
@@ -2565,6 +2596,7 @@ fn run_drill_question_search(
             query: question.to_string(),
             repo_text: SearchRepoTextMode::On,
             limit_per_source: 10,
+            expand_search_plan: false,
             hybrid_weights: None,
             hybrid_limits: None,
         })
@@ -3659,6 +3691,7 @@ fn drill_anchor_text_consumer_hints(
         query: anchor.to_string(),
         repo_text: SearchRepoTextMode::On,
         limit_per_source: 25,
+        expand_search_plan: false,
         hybrid_weights: None,
         hybrid_limits: None,
     }) else {
@@ -3743,6 +3776,7 @@ fn drill_related_consumer_targets(
                 query: query.clone(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 25,
+                expand_search_plan: true,
                 hybrid_weights: None,
                 hybrid_limits: None,
             }) else {
@@ -6920,6 +6954,22 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    #[test]
+    fn packet_markdown_labels_use_public_wire_values() {
+        assert_eq!(
+            packet_budget_mode_label(PacketBudgetModeDto::Compact),
+            "compact"
+        );
+        assert_eq!(
+            packet_task_class_label(PacketTaskClassDto::ArchitectureExplanation),
+            "architecture_explanation"
+        );
+        assert_eq!(
+            packet_task_class_label(PacketTaskClassDto::BugLocalization),
+            "bug_localization"
+        );
+    }
 
     fn sample_retrieval() -> RetrievalStateDto {
         RetrievalStateDto {

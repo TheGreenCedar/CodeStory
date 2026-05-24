@@ -18,6 +18,11 @@ if [[ -z "$repo_ref" ]]; then
   echo "CODESTORY_REPO_REF resolved to an empty value." >&2
   exit 1
 fi
+
+redact_url_userinfo() {
+  printf '%s' "$1" | sed -E 's#^(https?://)[^/@[:space:]]+@#\1***@#'
+}
+
 codestory_home="${CODESTORY_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/codestory}"
 source_dir="$codestory_home/src"
 bin_dir="$codestory_home/bin"
@@ -28,12 +33,13 @@ case "$(uname -s)" in
 esac
 
 dest="$bin_dir/$binary_name"
+repo_url_for_display="$(redact_url_userinfo "$repo_url")"
 
 echo "CodeStory setup"
 echo "  home: $codestory_home"
 echo "  source: $source_dir"
 echo "  binary: $dest"
-echo "  repo: $repo_url"
+echo "  repo: $repo_url_for_display"
 echo "  ref: $repo_ref"
 
 if [[ "$dry_run" == "1" ]]; then
@@ -56,7 +62,8 @@ if [[ ! -d "$source_dir/.git" ]]; then
 else
   origin_url="$(git -C "$source_dir" config --get remote.origin.url)"
   if [[ "${origin_url%/}" != "${repo_url%/}" ]]; then
-    echo "CodeStory source artifact remote is '$origin_url', expected '$repo_url'. Set CODESTORY_HOME or CODESTORY_REPO_URL intentionally." >&2
+    origin_url_for_display="$(redact_url_userinfo "$origin_url")"
+    echo "CodeStory source artifact remote is '$origin_url_for_display', expected '$repo_url_for_display'. Set CODESTORY_HOME or CODESTORY_REPO_URL intentionally." >&2
     exit 1
   fi
   dirty="$(git -C "$source_dir" status --porcelain)"

@@ -562,7 +562,7 @@ pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput)
     if output.explain
         && let Some(plan) = output.search_plan.as_ref()
     {
-        append_search_plan(&mut markdown, plan);
+        append_search_plan(&mut markdown, project_root, plan);
     }
     if output.explain {
         append_search_evidence_packet(&mut markdown, project_root, output);
@@ -683,7 +683,7 @@ fn append_query_assessment(
     }
 }
 
-fn append_search_plan(markdown: &mut String, plan: &SearchPlanDto) {
+fn append_search_plan(markdown: &mut String, project_root: &Path, plan: &SearchPlanDto) {
     let _ = writeln!(markdown, "## Search Plan");
     let _ = writeln!(
         markdown,
@@ -701,7 +701,7 @@ fn append_search_plan(markdown: &mut String, plan: &SearchPlanDto) {
     append_search_plan_anchor_groups(markdown, plan);
     append_search_plan_bridges(markdown, plan);
     append_search_plan_repo_text_promotions(markdown, plan);
-    append_search_plan_next_steps(markdown, plan);
+    append_search_plan_next_steps(markdown, project_root, plan);
 }
 
 fn append_search_plan_terms(markdown: &mut String, plan: &SearchPlanDto) {
@@ -839,10 +839,11 @@ fn append_search_plan_repo_text_promotions(markdown: &mut String, plan: &SearchP
     }
 }
 
-fn append_search_plan_next_steps(markdown: &mut String, plan: &SearchPlanDto) {
-    if !plan.next_commands.is_empty() {
+fn append_search_plan_next_steps(markdown: &mut String, project_root: &Path, plan: &SearchPlanDto) {
+    let next_commands = search_plan_next_commands(project_root, &plan.next_actions);
+    if !next_commands.is_empty() {
         let _ = writeln!(markdown, "Next commands:");
-        for command in &plan.next_commands {
+        for command in &next_commands {
             let _ = writeln!(markdown, "- `{command}`");
         }
     }
@@ -851,6 +852,42 @@ fn append_search_plan_next_steps(markdown: &mut String, plan: &SearchPlanDto) {
         for check in &plan.source_truth_checks {
             let _ = writeln!(markdown, "- {check}");
         }
+    }
+}
+
+fn search_plan_next_commands(
+    project_root: &Path,
+    actions: &[codestory_contracts::api::SearchPlanNextActionDto],
+) -> Vec<String> {
+    let project = quote_search_plan_command_value(&project_root.to_string_lossy());
+    actions
+        .iter()
+        .filter_map(|action| match action.action.as_str() {
+            "symbol" => Some(format!(
+                "codestory-cli symbol --project {project} --id {}",
+                action.node_id.0
+            )),
+            "trail" => Some(format!(
+                "codestory-cli trail --project {project} --id {} --story --hide-speculative",
+                action.node_id.0
+            )),
+            "snippet" => Some(format!(
+                "codestory-cli snippet --project {project} --id {} --context 40",
+                action.node_id.0
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn quote_search_plan_command_value(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '/' | '\\' | '.' | '_' | '-'))
+    {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value.replace('"', "\\\""))
     }
 }
 

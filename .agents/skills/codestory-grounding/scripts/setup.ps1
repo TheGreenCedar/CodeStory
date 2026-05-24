@@ -22,6 +22,14 @@ function Require-Command {
     }
 }
 
+function Protect-UrlUserInfo {
+    param([string]$Url)
+    if (-not $Url) {
+        return $Url
+    }
+    return ($Url -replace "^(https?://)([^/@\s]+)@", '$1***@')
+}
+
 function Invoke-Checked {
     param(
         [string]$FilePath,
@@ -30,7 +38,8 @@ function Invoke-Checked {
 
     & $FilePath @Arguments
     if ($LASTEXITCODE -ne 0) {
-        throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $($Arguments -join ' ')"
+        $displayArgs = $Arguments | ForEach-Object { Protect-UrlUserInfo $_ }
+        throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $($displayArgs -join ' ')"
     }
 }
 
@@ -58,12 +67,13 @@ $codestoryHome = Get-CodeStoryHome
 $sourceDir = Join-Path $codestoryHome "src"
 $binDir = Join-Path $codestoryHome "bin"
 $dest = Join-Path $binDir $binaryName
+$repoUrlForDisplay = Protect-UrlUserInfo $repoUrl
 
 Write-Host "CodeStory setup"
 Write-Host "  home: $codestoryHome"
 Write-Host "  source: $sourceDir"
 Write-Host "  binary: $dest"
-Write-Host "  repo: $repoUrl"
+Write-Host "  repo: $repoUrlForDisplay"
 Write-Host "  ref: $repoRef"
 
 if ($DryRun) {
@@ -91,7 +101,8 @@ if (-not (Test-Path -LiteralPath (Join-Path $sourceDir ".git"))) {
         throw "Unable to read CodeStory source artifact remote: $sourceDir"
     }
     if ($originUrl.TrimEnd("/") -ne $repoUrl.TrimEnd("/")) {
-        throw "CodeStory source artifact remote is '$originUrl', expected '$repoUrl'. Set CODESTORY_HOME or CODESTORY_REPO_URL intentionally."
+        $originForDisplay = Protect-UrlUserInfo $originUrl
+        throw "CodeStory source artifact remote is '$originForDisplay', expected '$repoUrlForDisplay'. Set CODESTORY_HOME or CODESTORY_REPO_URL intentionally."
     }
 
     $dirty = & git -C $sourceDir status --porcelain

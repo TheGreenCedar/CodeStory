@@ -67,6 +67,8 @@ pub struct SearchRequest {
     #[serde(default = "default_search_limit_per_source")]
     pub limit_per_source: u32,
     #[serde(default)]
+    pub expand_search_plan: bool,
+    #[serde(default)]
     pub hybrid_weights: Option<AgentHybridWeightsDto>,
     #[serde(default)]
     pub hybrid_limits: Option<SearchHybridLimitsDto>,
@@ -385,8 +387,6 @@ pub struct SearchPlanDto {
     pub rejected_hits: Vec<SearchPlanRejectedHitDto>,
     #[serde(default)]
     pub next_actions: Vec<SearchPlanNextActionDto>,
-    #[serde(default)]
-    pub next_commands: Vec<String>,
     #[serde(default)]
     pub source_truth_checks: Vec<String>,
 }

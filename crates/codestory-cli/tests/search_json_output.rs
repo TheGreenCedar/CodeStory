@@ -439,10 +439,8 @@ fn broad_search_json_and_markdown_expose_search_plan() {
         "search plan should expose anchor groups: {plan:#}"
     );
     assert!(
-        plan["next_commands"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty()),
-        "search plan should provide next commands: {plan:#}"
+        plan.get("next_commands").is_none(),
+        "search plan JSON should expose structured next actions, not rendered CLI commands: {plan:#}"
     );
     assert!(
         plan["next_actions"].as_array().is_some_and(|items| {
@@ -454,16 +452,7 @@ fn broad_search_json_and_markdown_expose_search_plan() {
                     })
             })
         }),
-        "search plan should provide structured next actions alongside rendered commands: {plan:#}"
-    );
-    assert!(
-        plan["next_commands"].as_array().is_some_and(|items| {
-            items.iter().all(|item| {
-                item.as_str()
-                    .is_some_and(|command| command.contains("--project"))
-            })
-        }),
-        "search plan follow-up commands should carry an explicit project: {plan:#}"
+        "search plan should provide structured next actions for CLI renderers: {plan:#}"
     );
     assert!(
         plan["source_truth_checks"]
@@ -555,6 +544,78 @@ fn broad_search_json_and_markdown_expose_search_plan() {
             "search markdown should contain `{expected}`:\n{markdown}"
         );
     }
+}
+
+#[test]
+fn search_plan_honors_repo_text_off() {
+    let workspace = tempdir().expect("workspace dir");
+    write_search_quality_fixture(workspace.path());
+
+    let index = run_cli(
+        workspace.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    assert!(
+        index.status.success(),
+        "index command failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    let query = "how full indexing supports search trail and snippet commands";
+    let search = run_cli(
+        workspace.path(),
+        &[
+            "search",
+            "--query",
+            query,
+            "--repo-text",
+            "off",
+            "--why",
+            "--format",
+            "json",
+            "--refresh",
+            "none",
+        ],
+    );
+    assert!(
+        search.status.success(),
+        "search command failed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let json: Value = serde_json::from_slice(&search.stdout).expect("parse search json");
+    assert_eq!(json["repo_text_mode"], "off");
+    assert_eq!(json["repo_text_enabled"], false);
+    assert!(
+        json["repo_text_hits"]
+            .as_array()
+            .is_some_and(|hits| hits.is_empty()),
+        "repo_text off should not return repo-text hits: {json:#}"
+    );
+
+    let plan = &json["search_plan"];
+    assert!(
+        plan.is_object(),
+        "broad search should still expose an index-backed plan: {json:#}"
+    );
+    let subquery_channels = plan["subqueries"]
+        .as_array()
+        .expect("subqueries")
+        .iter()
+        .flat_map(|subquery| subquery["channels"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(
+        !subquery_channels.contains(&"repo_text"),
+        "repo_text off should strip repo-text plan channels: {plan:#}"
+    );
+    assert!(
+        plan["candidate_windows"]
+            .as_array()
+            .expect("candidate windows")
+            .iter()
+            .all(|window| window["channel"] != "repo_text"),
+        "repo_text off should not execute repo-text plan windows: {plan:#}"
+    );
 }
 
 #[test]

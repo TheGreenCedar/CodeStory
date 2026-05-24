@@ -292,8 +292,9 @@ families.
 The current Codex CLI supports the harness flags `exec --json --ephemeral
 --sandbox --cd`. It does not support `--ask-for-approval`, so the harness does
 not pass that flag. On Windows, the harness launches `codex.cmd` through
-`cmd.exe` and sends the benchmark prompt over stdin to avoid shell quoting and
-`.cmd` spawn failures.
+`cmd.exe`, rejects command metacharacters in runner arguments, sends the
+benchmark prompt over stdin, and kills the process tree on timeout to avoid
+orphaned runner processes.
 
 Public harness defaults are reproducible from this repository: `--quick` and the
 default repo set use only `codestory`. Private sibling repositories are opt-in
@@ -302,9 +303,11 @@ through `--include-local-repos` or explicit `--repos` values.
 Use `--publishable` only when the selected runner reports token usage and every
 run succeeds. For agent A/B rows, `--publishable` also requires with-CodeStory
 runs to execute `packet` first and stay within the post-packet ordinary
-source-read budget, which defaults to zero reads after packet. For a public
-benchmark row, use at least three repeats, the same model, the same sandbox
-mode, the same cache policy, and the same semantic backend for both arms.
+source-read budget, which defaults to zero reads after packet. Publishable rows
+must also carry clean, pinned repository provenance; local or manifest-overridden
+checkouts are diagnostic rows, not publishable public evidence. For a public
+benchmark row, use at least three repeats, the same model, the same sandbox mode,
+the same cache policy, and the same semantic backend for both arms.
 
 ## Runtime Budgets
 

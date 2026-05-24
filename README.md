@@ -34,11 +34,12 @@ file reads.
 
 ## Benchmark Results
 
-Current evidence supports local indexing, warm reads, protocol hygiene, and
-retrieval quality. The agent A/B harness now has a real 3-repeat baseline too,
-but it is not a savings claim yet: on the CodeStory repo prompt, the CodeStory
-arm used more median tokens, wall time, and tool starts than the no-CodeStory
-arm.
+Latest checked-in evidence supports local indexing, warm reads, protocol hygiene,
+and retrieval quality. The CodeStory repo index/read figures below come from the
+logged `7c891af+wt` e2e row, not this branch's current HEAD. The agent A/B
+harness now has a real 3-repeat baseline too, but it is not a savings claim yet:
+on the CodeStory repo prompt, the CodeStory arm used more median tokens, wall
+time, and tool starts than the no-CodeStory arm.
 
 - Agent A/B baseline: with CodeStory `2,724,490` median tokens / `306.24s` /
   `43` tool starts; without CodeStory `1,605,030` median tokens / `214.90s` /
@@ -106,7 +107,7 @@ pointed at whatever repository the agent is working on.
    On Unix-like systems:
 
    ```sh
-   sh "<agent-global-skill-directory>/codestory-grounding/scripts/setup.sh"
+   bash "<agent-global-skill-directory>/codestory-grounding/scripts/setup.sh"
    ```
 
 3. Persist the printed `CODESTORY_CLI` path if your agent environment does not

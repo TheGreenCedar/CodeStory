@@ -298,6 +298,7 @@ function runnerCommand(opts, repoPath, prompt) {
       command: opts.runner,
       args: [prompt],
       stdin: null,
+      killProcessTree: false,
     };
   }
 
@@ -315,8 +316,20 @@ function runnerCommand(opts, repoPath, prompt) {
     codexArgs.push("--model", opts.model);
   }
   codexArgs.push("-");
+  if (process.platform === "win32") {
+    assertSafeWindowsCmdArgs(codexArgs);
+  }
   const args = process.platform === "win32" ? ["/d", "/s", "/c", "codex.cmd", ...codexArgs] : codexArgs;
-  return { command, args, stdin: prompt };
+  return { command, args, stdin: prompt, killProcessTree: process.platform === "win32" };
+}
+
+function assertSafeWindowsCmdArgs(args) {
+  for (const arg of args) {
+    const value = String(arg ?? "");
+    if (/[;&|<>^%\r\n]/.test(value)) {
+      throw new Error(`Refusing to pass unsafe Windows cmd.exe argument to Codex runner: ${value}`);
+    }
+  }
 }
 
 function taskIdFromManifest(filePath, raw) {
@@ -430,24 +443,28 @@ function registerManifestRepo(repo, opts = {}) {
   }
   const name = config.name;
   const existing = ALL_REPOS[name];
+  const preferManifestCheckout = Boolean(opts.materializeRepos || opts.publishable);
   const manifestOverriddenByBuiltIn = Boolean(
     existing &&
+      !preferManifestCheckout &&
       (
         path.resolve(existing.path ?? "") !== path.resolve(config.path) ||
         path.resolve(existing.checkout_path ?? existing.path ?? "") !== path.resolve(config.checkout_path) ||
         (existing.ref ?? null) !== (config.ref ?? null)
       ),
   );
+  const activeConfig = preferManifestCheckout
+    ? { ...config, prompt: existing?.prompt ?? config.prompt }
+    : { ...config, ...existing };
   ALL_REPOS[name] = {
-    ...config,
-    ...existing,
+    ...activeConfig,
     manifest_url: config.url,
     manifest_ref: config.ref,
     manifest_workspace_root: config.workspace_root,
     manifest_checkout_path: config.checkout_path,
     manifest_overridden_by_builtin: manifestOverriddenByBuiltIn,
-    languages: existing?.languages?.length ? existing.languages : config.languages,
-    setup: existing?.setup?.length ? existing.setup : config.setup,
+    languages: activeConfig.languages?.length ? activeConfig.languages : config.languages,
+    setup: activeConfig.setup?.length ? activeConfig.setup : config.setup,
   };
   if (!LOCAL_REPOS[name]) {
     PUBLIC_REPOS[name] = ALL_REPOS[name];
@@ -522,6 +539,29 @@ function normalizeManifestTask(filePath, raw, opts = {}) {
     quality_thresholds: qualityThresholds,
     manifest_path: filePath,
   };
+}
+
+function taskSnapshotForResult(task) {
+  if (!task) {
+    return null;
+  }
+  return JSON.parse(
+    JSON.stringify({
+      id: task.id,
+      name: task.name,
+      suite: task.suite ?? null,
+      repo: task.repo,
+      repo_metadata: task.repo_metadata ?? null,
+      task_class: task.task_class,
+      prompt: task.prompt,
+      expected_files: task.expected_files ?? [],
+      expected_symbols: task.expected_symbols ?? [],
+      expected_claims: task.expected_claims ?? [],
+      forbidden_claims: task.forbidden_claims ?? [],
+      quality_thresholds: task.quality_thresholds ?? {},
+      manifest_path: task.manifest_path ?? null,
+    }),
+  );
 }
 
 function validateQualityThresholds(filePath, thresholds) {
@@ -678,9 +718,12 @@ async function runProcess(command, args, options = {}) {
           timedOut = true;
           const message = options.timeoutMessage ?? `Process timed out after ${options.timeoutMs}ms.`;
           stderr += `\n${message}\n`;
-          child.kill("SIGTERM");
+          terminateProcess(child, "SIGTERM", options);
           if (options.forceKillAfterMs) {
-            forceKillTimer = setTimeout(() => child.kill("SIGKILL"), options.forceKillAfterMs);
+            forceKillTimer = setTimeout(
+              () => terminateProcess(child, "SIGKILL", options),
+              options.forceKillAfterMs,
+            );
           }
         }, options.timeoutMs)
       : null;
@@ -729,6 +772,20 @@ async function runProcess(command, args, options = {}) {
   });
 }
 
+function terminateProcess(child, signal, options = {}) {
+  if (options.killProcessTree && process.platform === "win32" && child.pid) {
+    const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    killer.on("error", () => {
+      child.kill(signal);
+    });
+    return;
+  }
+  child.kill(signal);
+}
+
 async function runCheckedProcess(command, args, options = {}) {
   const result = await runProcess(command, args, options);
   if (result.status !== "pass") {
@@ -762,7 +819,7 @@ async function materializeRepos(tasks, opts) {
     assertPathInside(checkoutPath, config.path, `Materialized repo workspace path for ${name}`);
     if (!existsSync(checkoutPath)) {
       await mkdir(path.dirname(checkoutPath), { recursive: true });
-      console.log(`cloning ${name} ${config.url} -> ${checkoutPath}`);
+      console.log(`cloning ${name} ${redactUrlForDisplay(config.url)} -> ${checkoutPath}`);
       await runCheckedProcess("git", ["clone", "--filter=blob:none", "--no-checkout", config.url, checkoutPath], {
         timeoutMs: opts.timeoutMs,
       });
@@ -772,7 +829,7 @@ async function materializeRepos(tasks, opts) {
       });
       if (remote.stdout.trim() !== config.url) {
         throw new Error(
-          `Repo cache for ${name} has origin ${remote.stdout.trim()}, expected ${config.url}. Use a different --repo-cache-dir.`,
+          `Repo cache for ${name} has origin ${redactUrlForDisplay(remote.stdout.trim())}, expected ${redactUrlForDisplay(config.url)}. Use a different --repo-cache-dir.`,
         );
       }
     }
@@ -944,9 +1001,9 @@ function isSuccessfulContextCommand(command) {
     return false;
   }
   if (isHelpOrProbeCommand(command.command)) {
-    return false;
+    return true;
   }
-  return ["codestory_cli", "shell_search", "direct_file_read"].includes(command.category);
+  return ["codestory_cli", "shell_search", "direct_file_read", "git", "build_test"].includes(command.category);
 }
 
 function normalizePathLike(value) {
@@ -1187,6 +1244,13 @@ function normalizeSearchText(value) {
     .trim();
 }
 
+function redactUrlForDisplay(value) {
+  if (value == null) {
+    return value;
+  }
+  return String(value ?? "").replace(/^(https?:\/\/)([^/@\s]+)@/, "$1***@");
+}
+
 function anchorMatched(haystack, anchor) {
   const normalizedHaystack = normalizeSearchText(haystack);
   const normalizedAnchor = normalizeSearchText(anchor);
@@ -1337,7 +1401,7 @@ function scoreQualityFromText(finalAnswer, transcript, task) {
   const symbols = scoreAnchorSet(task.expected_symbols, finalAndTranscript);
   const claims = scoreClaimSet(task.expected_claims, finalAnswer);
   const citations = scoreAnchorSet(task.expected_files, finalAnswer);
-  const forbidden = scoreAnchorSet(task.forbidden_claims, finalAnswer);
+  const forbidden = scoreClaimSet(task.forbidden_claims, finalAnswer);
   const allAnchors = aggregateQualityAnchors(files, symbols, claims);
   const thresholds = task.quality_thresholds ?? {};
   const requiredFileRecall = thresholdValue(thresholds, "expected_file_recall", 0.8);
@@ -1506,7 +1570,7 @@ function estimateCost(usage) {
 async function runOne(opts, run, outDir) {
   const repoConfig = ALL_REPOS[run.repo];
   const prompt = composePrompt(run.repo, repoConfig, run.arm, run.task);
-  const { command, args, stdin } = runnerCommand(opts, repoConfig.path, prompt);
+  const { command, args, stdin, killProcessTree } = runnerCommand(opts, repoConfig.path, prompt);
   const env = { ...process.env };
   if (run.arm === "with_codestory") {
     env.CODESTORY_CLI = path.resolve(resolveCodeStoryCli(opts));
@@ -1519,6 +1583,7 @@ async function runOne(opts, run, outDir) {
     timeoutMs: opts.timeoutMs,
     timeoutMessage: `Benchmark runner timed out after ${opts.timeoutMs}ms.`,
     forceKillAfterMs: 5000,
+    killProcessTree,
   });
 
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
@@ -1549,6 +1614,7 @@ async function runOne(opts, run, outDir) {
     task_name: run.task?.name ?? null,
     task_class: run.task?.task_class ?? null,
     task_manifest_path: run.task?.manifest_path ?? null,
+    task_manifest_snapshot: taskSnapshotForResult(run.task),
     arm: run.arm,
     repeat: run.repeat,
     runner: opts.runner,
@@ -1608,13 +1674,18 @@ async function repoProvenance(config) {
     },
     manifest_overridden_by_builtin: Boolean(config.manifest_overridden_by_builtin),
     git_head: await gitOutput(["-C", checkoutPath, "rev-parse", "HEAD"], repoRoot),
-    git_origin: await gitOutput(["-C", checkoutPath, "remote", "get-url", "origin"], repoRoot),
+    git_origin: redactUrlForDisplay(
+      await gitOutput(["-C", checkoutPath, "remote", "get-url", "origin"], repoRoot),
+    ),
     git_dirty: statusShort == null ? null : statusShort.length > 0,
     git_status_short: statusShort,
   };
 }
 
 async function loadTaskForResult(result, opts, cache) {
+  if (result.task_manifest_snapshot && typeof result.task_manifest_snapshot === "object") {
+    return result.task_manifest_snapshot;
+  }
   const manifestPath = result.task_manifest_path ? path.resolve(result.task_manifest_path) : null;
   if (!manifestPath || !existsSync(manifestPath)) {
     return null;
@@ -1660,7 +1731,7 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
   const packetFirstRequired = result.packet_first_required ?? result.arm === "with_codestory";
   return {
     ...result,
-    repo_provenance: repoConfig ? await repoProvenance(repoConfig) : result.repo_provenance ?? null,
+    repo_provenance: result.repo_provenance ?? (repoConfig ? await repoProvenance(repoConfig) : null),
     usage,
     estimated_cost_usd: estimateCost(usage),
     tool_calls_observed: parsed.filter(isToolCallStartEvent).length,
@@ -1669,6 +1740,7 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
     packet_first_pass:
       !packetFirstRequired || Boolean(analysis.packet_was_first_context_command),
     quality: scoreQuality(parsed, task),
+    reanalysis_task_source: result.task_manifest_snapshot ? "snapshot" : task ? "manifest" : null,
     event_types: eventTypeCounts(parsed),
     json_events: parsed.length,
     malformed_stdout_lines: malformed.length,
@@ -1814,6 +1886,7 @@ function packetSufficiencyTelemetry(packet, quality) {
 async function runColdPacketRuntime(opts, task, repeat, outDir) {
   const repoConfig = ALL_REPOS[task.repo];
   const codestoryCli = resolveCodeStoryCli(opts);
+  const provenance = await repoProvenance(repoConfig);
   const args = [
     "packet",
     "--project",
@@ -1852,6 +1925,9 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
     repo: task.repo,
     task_id: task.id,
     task_class: task.task_class,
+    task_manifest_path: task.manifest_path ?? null,
+    task_manifest_snapshot: taskSnapshotForResult(task),
+    repo_provenance: provenance,
     mode: "cold_cli_packet",
     repeat,
     status: result.status === "pass" && !parseError ? "pass" : "fail",
@@ -1955,6 +2031,7 @@ function createStdioClient(command, args, opts) {
 async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
   const repoConfig = ALL_REPOS[repoName];
   const codestoryCli = resolveCodeStoryCli(opts);
+  const provenance = await repoProvenance(repoConfig);
   const client = createStdioClient(
     codestoryCli,
     ["serve", "--project", repoConfig.path, "--stdio", "--refresh", "none"],
@@ -1999,6 +2076,9 @@ async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
           repo: task.repo,
           task_id: task.id,
           task_class: task.task_class,
+          task_manifest_path: task.manifest_path ?? null,
+          task_manifest_snapshot: taskSnapshotForResult(task),
+          repo_provenance: provenance,
           mode: "warm_stdio_packet",
           repeat,
           status: isError ? "fail" : "pass",
@@ -2101,14 +2181,54 @@ function packetRuntimeMarkdownRow(row) {
   return `| ${cells.join(" | ")} |`;
 }
 
-function packetRuntimePublishableBlockers(results) {
-  return results.filter(
-    (row) =>
-      row.status !== "pass" ||
-      !row.quality ||
-      !row.quality.pass ||
-      row.sufficiency?.sufficient_quality_mismatch,
-  );
+function repoProvenanceBlockers(result) {
+  const provenance = result.repo_provenance;
+  if (!provenance) {
+    return ["missing repo provenance"];
+  }
+  const reasons = [];
+  if (provenance.manifest_overridden_by_builtin) {
+    reasons.push("manifest repo was overridden by a built-in checkout");
+  }
+  const configuredRef = provenance.configured?.ref ?? null;
+  const manifestRef = provenance.manifest?.ref ?? null;
+  if (!configuredRef || configuredRef === "local") {
+    reasons.push("repo ref is not pinned");
+  }
+  if (manifestRef && configuredRef && manifestRef !== configuredRef) {
+    reasons.push(`manifest ref ${manifestRef} does not match configured ref ${configuredRef}`);
+  }
+  if (!provenance.git_head) {
+    reasons.push("missing git head");
+  }
+  if (provenance.git_dirty !== false) {
+    reasons.push(provenance.git_dirty ? "repo checkout is dirty" : "repo cleanliness is unknown");
+  }
+  return reasons;
+}
+
+function packetRuntimePublishableBlockers(results, opts = {}) {
+  const enforceRepoProvenance = Boolean(opts.publishable || opts.enforceRepoProvenance);
+  return results
+    .map((row) => {
+      const reasons = [];
+      if (row.status !== "pass") {
+        reasons.push(`status=${row.status}`);
+      }
+      if (!row.quality) {
+        reasons.push("missing manifest quality score");
+      } else if (!row.quality.pass) {
+        reasons.push("manifest quality failed");
+      }
+      if (row.sufficiency?.sufficient_quality_mismatch) {
+        reasons.push("packet sufficiency says sufficient but manifest quality failed");
+      }
+      if (enforceRepoProvenance) {
+        reasons.push(...repoProvenanceBlockers(row));
+      }
+      return reasons.length ? { result: row, reasons } : null;
+    })
+    .filter(Boolean);
 }
 
 function groupTasksByRepo(tasks) {
@@ -2161,11 +2281,12 @@ async function runPacketRuntimeBenchmark(opts, tasks) {
   await writeFile(path.join(outDir, "packet-runtime-summary.json"), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
   await writeFile(path.join(outDir, "packet-runtime-summary.md"), packetRuntimeMarkdown(summary), "utf8");
 
-  const blockers = packetRuntimePublishableBlockers(results);
+  const blockers = packetRuntimePublishableBlockers(results, opts);
   if (opts.publishable && blockers.length) {
-    console.error("--publishable failed: packet runtime rows must pass and include passing manifest quality gates.");
+    console.error("--publishable failed: packet runtime rows must pass, include passing manifest quality gates, and use pinned clean repo provenance.");
     for (const blocker of blockers) {
-      console.error(`  ${blocker.repo} ${blocker.task_id} ${blocker.mode} repeat ${blocker.repeat}: status=${blocker.status} quality=${blocker.quality?.pass ?? ""}`);
+      const row = blocker.result;
+      console.error(`  ${row.repo} ${row.task_id} ${row.mode} repeat ${row.repeat}: ${blocker.reasons.join("; ")}`);
     }
     process.exitCode = 1;
   }
@@ -2257,6 +2378,7 @@ function summarizeRuns(results) {
 
 function agentPublishableBlockers(results, opts = {}) {
   const maxSourceReadsAfterPacket = opts.maxSourceReadsAfterPacket ?? 0;
+  const enforceRepoProvenance = Boolean(opts.publishable || opts.enforceRepoProvenance);
   return results
     .map((result) => {
       const reasons = [];
@@ -2282,6 +2404,9 @@ function agentPublishableBlockers(results, opts = {}) {
         readsAfterPacket > maxSourceReadsAfterPacket
       ) {
         reasons.push(`ordinary source reads after packet=${readsAfterPacket} > ${maxSourceReadsAfterPacket}`);
+      }
+      if (enforceRepoProvenance) {
+        reasons.push(...repoProvenanceBlockers(result));
       }
       return reasons.length ? { result, reasons } : null;
     })
@@ -2473,7 +2598,10 @@ function runSelfTest() {
         sufficiency: { sufficient_quality_mismatch: true },
       },
       { status: "fail", quality: { pass: true } },
-    ]).map((row) => row.status === "pass" ? row.quality?.pass ?? null : row.status),
+    ]).map((blocker) => {
+      const row = blocker.result;
+      return row.status === "pass" ? row.quality?.pass ?? null : row.status;
+    }),
     [null, false, true, "fail"],
   );
 
@@ -2621,16 +2749,20 @@ async function main() {
 export {
   analyzeTranscript,
   agentPublishableBlockers,
+  assertSafeWindowsCmdArgs,
   benchmarkRunId,
   commandCategory,
   extractCommandExecutions,
   isPathInside,
+  loadTaskForResult,
   loadTasks,
   parseJsonLines,
   packetFirstCommandForPrompt,
   publicCoreCorpusAudit,
+  repoProvenanceBlockers,
   repoConfigFromManifest,
   scoreQuality,
+  taskSnapshotForResult,
 };
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {

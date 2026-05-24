@@ -282,6 +282,7 @@ impl ReadOnlyBrowserService {
             query: query.query.clone(),
             repo_text: SearchRepoTextMode::Off,
             limit_per_source: 50,
+            expand_search_plan: false,
             hybrid_weights: None,
             hybrid_limits: None,
         })?;
@@ -306,6 +307,7 @@ impl ReadOnlyBrowserService {
                 query: query.to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 50,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             },

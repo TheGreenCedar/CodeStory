@@ -60,7 +60,7 @@ Do this once per machine or when the CodeStory source artifact moves:
    ```
    On Unix-like systems:
    ```sh
-   sh scripts/setup.sh
+   bash scripts/setup.sh
    ```
 3. Use the printed `CODESTORY_CLI=...` path as `<codestory-cli>`, or persist it for future sessions.
 4. If you need a different source artifact, set `CODESTORY_REPO_URL` and `CODESTORY_REPO_REF` explicitly before setup; otherwise setup uses the script's `DEFAULT_CODESTORY_REPO_REF`. That ref pins the CLI source checkout, not this installed skill version.
@@ -76,7 +76,7 @@ Use this order after the one-time setup:
 
 1. If `CODESTORY_CLI` is set, use that exact executable.
 2. Else if `codestory-cli` resolves on `PATH`, use `codestory-cli`.
-3. Else run `scripts/setup.ps1` on Windows or `sh scripts/setup.sh` on Unix-like systems from this skill directory, then use the printed `CODESTORY_CLI=...` path.
+3. Else run `scripts/setup.ps1` on Windows or `bash scripts/setup.sh` on Unix-like systems from this skill directory, then use the printed `CODESTORY_CLI=...` path.
 4. Else, if the user has a local CodeStory checkout they want to use, build with `cargo build --release -p codestory-cli --manifest-path <codestory-source>/Cargo.toml` and use the release binary under that checkout.
 
 After resolving the binary, keep examples mentally expanded as:
