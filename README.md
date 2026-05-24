@@ -35,9 +35,15 @@ $CodeStoryCli = ".\target\release\codestory-cli.exe"
 $TargetWorkspace = "C:\path\to\repo"
 
 & $CodeStoryCli doctor --project $TargetWorkspace
+& $CodeStoryCli setup embeddings --project $TargetWorkspace --dry-run --format json
 & $CodeStoryCli index --project $TargetWorkspace --refresh full
 & $CodeStoryCli ground --project $TargetWorkspace --why
 ```
+
+The dry run shows whether the managed embedding assets are already installed or
+what CodeStory would download for hybrid retrieval. If managed assets are not
+available and you skip `setup embeddings`, indexing still works and read
+commands report the symbolic or lexical fallback path through `doctor`.
 
 After that first index, use narrower commands instead of asking the agent to
 start over:

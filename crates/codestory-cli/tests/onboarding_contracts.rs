@@ -103,6 +103,7 @@ fn readme_keeps_customer_first_onboarding() {
     assert!(readme.contains("docs/usage.md"));
     assert!(readme.contains("docs/concepts/how-codestory-works.md"));
     assert!(readme.contains("docs/testing/benchmark-results.md"));
+    assert!(readme.contains("setup embeddings --project $TargetWorkspace --dry-run --format json"));
     assert!(readme.contains("serve --stdio"));
     assert!(readme.contains("docs/architecture/overview.md"));
     assert!(readme.contains("docs/contributors/debugging.md"));
@@ -158,6 +159,52 @@ fn readme_keeps_customer_first_onboarding() {
             "setup script should build the remote default branch when no ref is explicit: {path}"
         );
     }
+}
+
+#[test]
+fn docs_drift_contracts_keep_living_sources_explicit() {
+    let root = repo_root();
+    let readme = fs::read_to_string(root.join("README.md")).expect("README should exist");
+    let usage = fs::read_to_string(root.join("docs/usage.md")).expect("usage doc should exist");
+    let testing_matrix = fs::read_to_string(root.join("docs/contributors/testing-matrix.md"))
+        .expect("testing matrix should exist");
+    let benchmark_scorecard = fs::read_to_string(root.join("docs/testing/benchmark-results.md"))
+        .expect("benchmark scorecard should exist");
+
+    assert!(
+        readme.contains("setup embeddings --project $TargetWorkspace --dry-run --format json"),
+        "README quickstart should show first-run semantic setup dry-run"
+    );
+    assert!(
+        !usage.contains("semantic_doc_scope = \"durable\""),
+        "usage config example should omit the default durable semantic scope"
+    );
+    for accepted_scope in ["`all`", "`full`", "`all-symbols`", "`all_symbols`"] {
+        assert!(
+            usage.contains(accepted_scope),
+            "usage docs should name accepted all-symbol semantic_doc_scope value {accepted_scope}"
+        );
+    }
+    assert!(
+        testing_matrix.contains("latest row in")
+            && testing_matrix.contains("codestory-e2e-stats-log.md")
+            && testing_matrix.contains("historical")
+            && testing_matrix.contains("examples only"),
+        "testing matrix should point current timing claims at the living stats log"
+    );
+    assert!(
+        !testing_matrix.contains("The 2026-04-18 repo-scale baseline"),
+        "testing matrix should not present an old hard-coded baseline as current"
+    );
+    assert!(
+        benchmark_scorecard.contains("[benchmark ledger](benchmark-ledger.md)")
+            && benchmark_scorecard.contains("codestory-e2e-stats-log.md"),
+        "benchmark scorecard should link detailed history and living timing logs"
+    );
+    assert!(
+        root.join("docs/testing/benchmark-ledger.md").exists(),
+        "benchmark ledger should preserve detailed historical rows"
+    );
 }
 
 #[test]

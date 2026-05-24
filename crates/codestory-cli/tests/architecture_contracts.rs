@@ -175,6 +175,29 @@ fn cli_stays_thin() {
 }
 
 #[test]
+fn cli_subsystem_doc_does_not_own_command_option_matrices() {
+    let cli_doc = read("docs/architecture/subsystems/cli.md");
+    assert!(
+        cli_doc.contains("## Command Reference Ownership")
+            && cli_doc.contains("crates/codestory-cli/src/args.rs")
+            && cli_doc.contains(".agents/skills/codestory-grounding/references/*.md"),
+        "CLI subsystem doc should route option semantics to CLI help and skill refs"
+    );
+    for forbidden in [
+        "## `index` Command Options",
+        "| Option | Default | Runtime effect |",
+        "`--project <PROJECT>`",
+        "## `search` And `context` Research Options",
+        "`--hybrid-lexical <WEIGHT>`",
+    ] {
+        assert!(
+            !cli_doc.contains(forbidden),
+            "CLI subsystem doc should not own detailed command option matrix text `{forbidden}`"
+        );
+    }
+}
+
+#[test]
 fn runtime_exposes_read_only_browser_service_boundary() {
     let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
     let browser = read("crates/codestory-runtime/src/browser.rs");

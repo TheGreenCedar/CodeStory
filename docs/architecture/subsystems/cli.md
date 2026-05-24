@@ -22,30 +22,19 @@
 - add renderers in `output.rs`
 - keep business logic in runtime, not here
 
-## `index` Command Options
+## Command Reference Ownership
 
-`codestory-cli index` is the cache-building command. It parses options in `crates/codestory-cli/src/args.rs`, delegates behavior to runtime, and renders the returned summary through `crates/codestory-cli/src/output.rs`.
+This page documents CLI ownership and subsystem boundaries, not detailed option
+semantics. The canonical option contract is the generated CLI help from
+`crates/codestory-cli/src/args.rs`; the agent-facing operational reference is
+`.agents/skills/codestory-grounding/references/*.md`. README and usage docs
+should stay workflow-oriented and link to those sources instead of copying
+complete option matrices.
 
-| Option | Default | Runtime effect |
-| --- | --- | --- |
-| `--project <PROJECT>` | `.` | Selects the repository root. `--path` is accepted as an alias. Runtime opens this root, loads workspace configuration, and uses it to derive the default cache key. |
-| `--cache-dir <CACHE_DIR>` | system cache root plus project hash | Overrides the cache root exactly. The SQLite store and persisted search directory live under this directory, which makes it useful for isolated repros and cold-start benchmarks. |
-| `--refresh <auto\|full\|incremental\|none>` | `auto` | Selects the refresh strategy. `auto` resolves to `full` for an empty cache and `incremental` once indexed files already exist. |
-| `--format <markdown\|json>` | `markdown` | Chooses human-readable output or machine-readable output. JSON includes the same retrieval metadata and phase timings. |
-| `--output-file <PATH>` | stdout | Writes Markdown or JSON to a file whose parent directory already exists. |
-| `--dry-run` | off | Computes discovery and refresh-plan counts without parsing files or writing storage. |
-| `--summarize` | off | Generates cached one-sentence symbol summaries after indexing. |
-| `--progress` | off | Prints progress updates to stderr while preserving stdout for structured output. |
-| `--watch` | off | Runs once, then watches the project root and triggers incremental refreshes. `--output-file` is rejected when it points inside the watched project tree. |
-
-Refresh behavior belongs to runtime, not the CLI adapter:
-
-- `auto`: inspect stored inventory and choose `full` or `incremental`.
-- `full`: build a staged database, run the indexer for all discovered files, finalize and publish snapshots, then synchronize semantic docs before returning.
-- `incremental`: update the live database for changed/new/removed files, refresh live snapshots, and limit semantic invalidation to touched files.
-- `none`: open the current cache and return a summary without graph or semantic indexing.
-
-Semantic indexing is not a separate CLI flag. The default `index` path syncs semantic docs when embedding assets are available. Runtime-level environment variables control retrieval behavior and tuning, including `CODESTORY_HYBRID_RETRIEVAL_ENABLED`, `CODESTORY_SEMANTIC_DOC_SCOPE`, `CODESTORY_SEMANTIC_DOC_ALIAS_MODE`, `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE`, and `CODESTORY_EMBED_*`.
+Refresh behavior belongs to runtime, not the CLI adapter. The CLI parses the
+requested refresh mode, resolves project/cache paths, delegates to runtime, and
+renders the returned summary. Semantic indexing is part of the runtime-owned
+index path when embedding assets are available.
 
 ## Configuration Files
 
@@ -97,18 +86,12 @@ rather than the general CLI architecture page.
 
 `doctor` is a read-only health report for project path resolution, cache presence, index counts, retrieval state, managed embedding setup, relevant embedding environment variables, and next commands. It should stay diagnostic; it should not mutate caches or fetch model assets. `setup embeddings` is the explicit mutating path for installing pinned ONNX Runtime BGE-base assets in the user cache. Managed setup does not launch or retain an embedding server.
 
-## `search` And `context` Research Options
+## Search And Context Research Boundary
 
-`codestory-cli search` and `codestory-cli context` keep production behavior on the runtime defaults unless a caller explicitly passes hybrid research weights:
-
-| Option | Default | Runtime effect |
-| --- | --- | --- |
-| `--hybrid-lexical <WEIGHT>` | runtime default | Overrides the lexical component weight for this search request. |
-| `--hybrid-semantic <WEIGHT>` | runtime default | Overrides the semantic embedding component weight for this search request. |
-| `--hybrid-graph <WEIGHT>` | runtime default | Overrides the graph-neighborhood component weight for this search request. |
-| `--why` | off | Search-only Markdown explanations for fallback state, origin, lexical/semantic/graph score contributions, and broad-query Search Plan details when present. JSON includes the structured score breakdown and optional `search_plan` when runtime has scored or planned the query. |
-
-The runtime clamps and normalizes supplied weights before ranking. These flags exist so benchmark runs can sweep retrieval settings without changing global environment variables or production defaults.
+`codestory-cli search` and `codestory-cli context` keep production behavior on
+runtime defaults unless a caller explicitly passes hybrid research weights. The
+runtime owns clamping, normalization, scoring, and Search Plan construction; the
+CLI only forwards parsed values and renders the response.
 
 ## Serving And Integration Surface
 

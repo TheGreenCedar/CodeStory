@@ -185,6 +185,7 @@ ranking and reports the fallback reason.
 Managed setup:
 
 ```powershell
+codestory-cli setup embeddings --project <target-workspace> --dry-run --format json
 codestory-cli setup embeddings --project <target-workspace>
 codestory-cli index --project <target-workspace> --refresh full
 codestory-cli doctor --project <target-workspace>
@@ -225,8 +226,12 @@ Example:
 embedding_profile = "bge-base-en-v1.5"
 embedding_model_id = "BAAI/bge-base-en-v1.5-local"
 hybrid_retrieval_enabled = true
-semantic_doc_scope = "durable"
 ```
+
+`semantic_doc_scope` is intentionally omitted above because durable semantic
+docs are the default. Set it only when opting into the broader all-symbol scope;
+accepted all-symbol values are `all`, `full`, `all-symbols`, and `all_symbols`.
+Other values currently resolve to the durable default.
 
 ## Cache Recovery
 
