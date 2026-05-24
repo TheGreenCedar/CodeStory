@@ -3,15 +3,16 @@ use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use codestory_contracts::api::{
     AffectedAnalysisRequest, AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto,
-    AgentResponseModeDto, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto,
-    AnswerReadinessReportDto, AppEventPayload, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto,
-    CreateBookmarkCategoryRequest, CreateBookmarkRequest, EvidenceItemDto, EvidencePacketDto,
-    EvidenceSourceLocationDto, EvidenceTypeDto, GraphArtifactDto, IndexFreshnessDto,
-    IndexFreshnessStatusDto, IndexMode, IndexedFilesRequest, NodeId, NodeKind,
-    NodeOccurrencesRequest, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
-    RetrievalScoreBreakdownDto, SearchHit, SearchHybridLimitsDto, SearchMatchQualityDto,
-    SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest, SourceOccurrenceDto,
-    SourceTruthCheckDto, TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection,
+    AgentPacketDto, AgentPacketRequestDto, AgentResponseModeDto, AgentRetrievalPresetDto,
+    AgentRetrievalProfileSelectionDto, AnswerReadinessReportDto, AppEventPayload,
+    BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, CreateBookmarkCategoryRequest,
+    CreateBookmarkRequest, EvidenceItemDto, EvidencePacketDto, EvidenceSourceLocationDto,
+    EvidenceTypeDto, GraphArtifactDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode,
+    IndexedFilesRequest, NodeId, NodeKind, NodeOccurrencesRequest, PacketSufficiencyStatusDto,
+    RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto, SearchHit,
+    SearchHitOrigin, SearchHybridLimitsDto, SearchMatchQualityDto, SearchQueryAssessmentDto,
+    SearchRepoTextMode, SearchRequest, SourceOccurrenceDto, SourceTruthCheckDto,
+    TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection,
     TrailMode,
 };
 use std::{
@@ -55,7 +56,7 @@ use args::{
     DrillSummaryOpenGapsOutput, DrillSummaryOutput, DrillSummarySourceTruthOutput,
     DrillSummaryStatsOutput, DrillSummaryVerdictOutput, DrillVerificationChecklistItemOutput,
     FilesCommand, GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput,
-    IndexOutput, ProjectArgs, QueryCommand, QueryOutput, QueryResolutionOutput,
+    IndexOutput, PacketCommand, ProjectArgs, QueryCommand, QueryOutput, QueryResolutionOutput,
     QuerySelectorOutput, RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput, ServeCommand,
     SetupAction, SetupCommand, SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput,
     TrailCommand, TrailJsonOutput, VerificationTargetOutput, build_trail_request,
@@ -65,12 +66,12 @@ use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
 #[cfg(test)]
 use http_transport::search_repo_text_mode_param;
 use output::{
-    context_packet_json, emit, emit_text, render_context_markdown, render_doctor_markdown,
-    render_drill_markdown, render_ground_markdown, render_index_dry_run_markdown,
-    render_index_markdown, render_query_markdown, render_search_hit_output, render_search_markdown,
-    render_snippet_markdown, render_symbol_markdown, render_symbol_mermaid, render_trail_dot,
-    render_trail_markdown, render_trail_mermaid, render_trail_story_markdown,
-    validate_output_file_parent,
+    context_packet_json, emit, emit_text, render_agent_citation, render_context_markdown,
+    render_doctor_markdown, render_drill_markdown, render_ground_markdown,
+    render_index_dry_run_markdown, render_index_markdown, render_query_markdown,
+    render_search_hit_output, render_search_markdown, render_snippet_markdown,
+    render_symbol_markdown, render_symbol_mermaid, render_trail_dot, render_trail_markdown,
+    render_trail_mermaid, render_trail_story_markdown, validate_output_file_parent,
 };
 use runtime::{
     AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
@@ -133,6 +134,7 @@ fn main() -> Result<()> {
         Command::Index(cmd) => run_index(cmd),
         Command::Ground(cmd) => run_ground(cmd),
         Command::Context(cmd) => run_context(cmd),
+        Command::Packet(cmd) => run_packet(cmd),
         Command::Doctor(cmd) => run_doctor(cmd),
         Command::Setup(cmd) => run_setup(cmd),
         Command::Search(cmd) => run_search(cmd),
@@ -496,6 +498,106 @@ fn run_context(cmd: ContextCommand) -> Result<()> {
         write_context_bundle(bundle_dir, &output, &answer.graphs, &markdown)?;
     }
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn run_packet(cmd: PacketCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "packet")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    let opened = runtime.ensure_open(cmd.refresh)?;
+    ensure_index_ready(&opened, "packet")?;
+
+    let packet = runtime
+        .browser
+        .packet(AgentPacketRequestDto {
+            question: cmd.question,
+            budget: cmd.budget.into(),
+            task_class: cmd.task_class.map(Into::into),
+            include_evidence: !cmd.no_evidence,
+            latency_budget_ms: cmd.latency_budget_ms,
+        })
+        .map_err(map_api_error)?;
+    let markdown = render_packet_markdown(&runtime.project_root, &packet);
+    emit(cmd.format, &packet, markdown, cmd.output_file.as_deref())
+}
+
+fn render_packet_markdown(project_root: &std::path::Path, packet: &AgentPacketDto) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Packet");
+    let _ = writeln!(
+        markdown,
+        "question: `{}`",
+        packet.question.replace('\n', " ")
+    );
+    let _ = writeln!(markdown, "budget: `{:?}`", packet.budget.requested);
+    let _ = writeln!(markdown, "task_class: `{:?}`", packet.plan.task_class);
+    let _ = writeln!(
+        markdown,
+        "sufficiency: `{}`",
+        packet_sufficiency_label(packet.sufficiency.status)
+    );
+    if packet.budget.truncated {
+        let _ = writeln!(
+            markdown,
+            "truncated: `{}` ({})",
+            packet.budget.truncated,
+            packet.budget.omitted_sections.join(", ")
+        );
+    }
+
+    if !packet.plan.queries.is_empty() {
+        let _ = writeln!(markdown, "\n## Plan");
+        for query in &packet.plan.queries {
+            let _ = writeln!(markdown, "- `{}` - {}", query.query, query.purpose);
+        }
+    }
+
+    if !packet.sufficiency.covered_claims.is_empty() {
+        let _ = writeln!(markdown, "\n## Covered Claims");
+        for claim in &packet.sufficiency.covered_claims {
+            let _ = writeln!(markdown, "- {}", claim.claim);
+            for citation in claim.citations.iter().take(3) {
+                let _ = writeln!(
+                    markdown,
+                    "  - {}",
+                    render_agent_citation(project_root, citation, true)
+                );
+            }
+        }
+    }
+
+    if !packet.sufficiency.gaps.is_empty() {
+        let _ = writeln!(markdown, "\n## Gaps");
+        for gap in &packet.sufficiency.gaps {
+            let _ = writeln!(markdown, "- {gap}");
+        }
+    }
+
+    if !packet.sufficiency.follow_up_commands.is_empty() {
+        let _ = writeln!(markdown, "\n## Follow Up");
+        for command in &packet.sufficiency.follow_up_commands {
+            let _ = writeln!(markdown, "- `{command}`");
+        }
+    }
+
+    if !packet.sufficiency.avoid_opening.is_empty() {
+        let _ = writeln!(markdown, "\n## Avoid Opening");
+        for item in &packet.sufficiency.avoid_opening {
+            let _ = writeln!(markdown, "- {item}");
+        }
+    }
+
+    markdown.push('\n');
+    markdown.push_str(&render_context_markdown(project_root, &packet.answer));
+    markdown
+}
+
+fn packet_sufficiency_label(status: PacketSufficiencyStatusDto) -> &'static str {
+    match status {
+        PacketSufficiencyStatusDto::Sufficient => "sufficient",
+        PacketSufficiencyStatusDto::Partial => "partial",
+        PacketSufficiencyStatusDto::Insufficient => "insufficient",
+    }
 }
 
 fn resolve_context_target(

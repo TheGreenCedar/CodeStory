@@ -2,8 +2,9 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
     BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, EvidencePacketDto, GroundingBudgetDto,
     IndexDryRunDto, IndexFreshnessDto, IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection,
-    NodeId, NodeKind, ProjectSummary, RepoTextScanStatsDto, RetrievalScoreBreakdownDto,
-    RetrievalStateDto, SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto,
+    NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto, ProjectSummary,
+    RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
+    SearchMatchQualityDto, SearchPlanDto,
     SearchQueryAssessmentDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto,
     TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
 };
@@ -30,6 +31,7 @@ pub(crate) enum Command {
     Index(IndexCommand),
     Ground(GroundCommand),
     Context(ContextCommand),
+    Packet(PacketCommand),
     Doctor(DoctorCommand),
     Setup(SetupCommand),
     Search(SearchCommand),
@@ -102,6 +104,25 @@ pub(crate) enum CliGroundingBudget {
     Strict,
     Balanced,
     Max,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CliPacketBudget {
+    Tiny,
+    Compact,
+    Standard,
+    Deep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CliPacketTaskClass {
+    ArchitectureExplanation,
+    BugLocalization,
+    ChangeImpact,
+    RouteTracing,
+    SymbolOwnership,
+    DataFlow,
+    EditPlanning,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -300,6 +321,47 @@ pub(crate) struct ContextCommand {
         help = "Override the graph component weight for hybrid context research runs."
     )]
     pub(crate) hybrid_graph: Option<f32>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct PacketCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        long,
+        help = "Broad repository question or task to ground in one packet."
+    )]
+    pub(crate) question: String,
+    #[arg(long, value_enum, default_value_t = CliPacketBudget::Compact)]
+    pub(crate) budget: CliPacketBudget,
+    #[arg(long, value_enum)]
+    pub(crate) task_class: Option<CliPacketTaskClass>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
+    pub(crate) refresh: RefreshMode,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Omit citation edge ids and score breakdowns from the structured packet."
+    )]
+    pub(crate) no_evidence: bool,
+    #[arg(
+        long,
+        value_name = "MS",
+        help = "Optional retrieval latency budget in milliseconds."
+    )]
+    pub(crate) latency_budget_ms: Option<u32>,
 }
 
 #[derive(Args, Debug)]
@@ -1631,6 +1693,31 @@ impl From<CliGroundingBudget> for GroundingBudgetDto {
             CliGroundingBudget::Strict => Self::Strict,
             CliGroundingBudget::Balanced => Self::Balanced,
             CliGroundingBudget::Max => Self::Max,
+        }
+    }
+}
+
+impl From<CliPacketBudget> for PacketBudgetModeDto {
+    fn from(value: CliPacketBudget) -> Self {
+        match value {
+            CliPacketBudget::Tiny => Self::Tiny,
+            CliPacketBudget::Compact => Self::Compact,
+            CliPacketBudget::Standard => Self::Standard,
+            CliPacketBudget::Deep => Self::Deep,
+        }
+    }
+}
+
+impl From<CliPacketTaskClass> for PacketTaskClassDto {
+    fn from(value: CliPacketTaskClass) -> Self {
+        match value {
+            CliPacketTaskClass::ArchitectureExplanation => Self::ArchitectureExplanation,
+            CliPacketTaskClass::BugLocalization => Self::BugLocalization,
+            CliPacketTaskClass::ChangeImpact => Self::ChangeImpact,
+            CliPacketTaskClass::RouteTracing => Self::RouteTracing,
+            CliPacketTaskClass::SymbolOwnership => Self::SymbolOwnership,
+            CliPacketTaskClass::DataFlow => Self::DataFlow,
+            CliPacketTaskClass::EditPlanning => Self::EditPlanning,
         }
     }
 }

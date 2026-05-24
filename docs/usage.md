@@ -60,6 +60,8 @@ $TargetWorkspace = "C:\path\to\repo"
   semantic docs.
 - `ground`: broad repo-level orientation snapshot; `--why` explains retrieval
   mode, coverage, gaps, and next commands.
+- `packet`: bounded broad-task answer packet with citations, budget usage,
+  sufficiency status, gaps, and follow-up commands.
 - `search`: candidate discovery for symbols, files, literals, API paths,
   modules, and behavior terms.
 - `symbol`: inspect one exact symbol and relationships.
@@ -86,6 +88,7 @@ Fresh repo orientation:
 codestory-cli doctor --project <target-workspace>
 codestory-cli index --project <target-workspace> --refresh full
 codestory-cli ground --project <target-workspace> --why
+codestory-cli packet --project <target-workspace> --question "<broad task question>" --budget compact
 codestory-cli search --project <target-workspace> --query "<architecture term>" --why
 codestory-cli files --project <target-workspace> --format markdown
 ```
@@ -120,14 +123,23 @@ Broad repo question:
 
 ```powershell
 codestory-cli ground --project <target-workspace> --why
+codestory-cli packet --project <target-workspace> --question "<broad task question>" --budget compact
 codestory-cli search --project <target-workspace> --repo-text on --query "<concrete term>" --why
 codestory-cli search --project <target-workspace> --repo-text on --query "<another concrete term>" --why
 # select anchors
 codestory-cli context --project <target-workspace> --id <node-id>
 ```
 
-Do not pass broad natural-language questions directly to `context`. Use
-`ground` and `search` to find anchors, then ask for evidence around exact ids.
+Do not pass broad natural-language questions directly to `context`. Start with
+`packet`; deepen with its follow-up commands or use `ground` and `search` to
+find anchors, then ask for evidence around exact ids.
+
+When `packet` reports `sufficient` and `follow_up_commands` is empty, answer
+from the packet. Carry the packet's supported-claim wording into the final
+answer, and include a compact "Support files" list with every relevant path from
+`answer.citations` and `sufficiency.avoid_opening`, not only paths mentioned in
+prose. Budget truncation by itself is not a gap; open files only for named
+follow-ups, edits, or verification.
 
 ## Index Options
 

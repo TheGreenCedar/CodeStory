@@ -1489,7 +1489,7 @@ fn render_agent_step_summary(step: &AgentRetrievalStepDto) -> String {
     )
 }
 
-fn render_agent_citation(
+pub(crate) fn render_agent_citation(
     project_root: &Path,
     citation: &AgentCitationDto,
     include_breakdown: bool,

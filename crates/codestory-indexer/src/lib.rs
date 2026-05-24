@@ -4474,6 +4474,9 @@ fn index_text_only_file(path: &Path) -> Result<IntermediateStorage> {
         line_count: source.lines().count() as u32,
     });
     local_storage.nodes.push(file_node);
+    if text_only_language_name(path) == "go" {
+        append_text_only_go_symbols(path, &source, file_id, &mut local_storage);
+    }
     append_text_only_framework_routes(
         path,
         text_only_language_name(path),
@@ -4488,6 +4491,178 @@ fn index_text_only_file(path: &Path) -> Result<IntermediateStorage> {
         &mut local_storage,
     );
     Ok(local_storage)
+}
+
+#[derive(Debug, Clone)]
+struct TextOnlySymbol {
+    name: String,
+    kind: NodeKind,
+    line: u32,
+    col: u32,
+}
+
+fn append_text_only_go_symbols(
+    path: &Path,
+    source: &str,
+    file_id: NodeId,
+    local_storage: &mut IntermediateStorage,
+) {
+    for symbol in collect_go_text_symbols(source) {
+        let node_id = text_only_symbol_node_id(path, &symbol);
+        local_storage.nodes.push(Node {
+            id: node_id,
+            kind: symbol.kind,
+            serialized_name: symbol.name.clone(),
+            qualified_name: Some(symbol.name.clone()),
+            canonical_id: Some(format!(
+                "go:symbol:{}:{}:{}",
+                path.to_string_lossy(),
+                symbol.name,
+                symbol.line
+            )),
+            file_node_id: Some(file_id),
+            start_line: Some(symbol.line),
+            start_col: Some(symbol.col),
+            end_line: Some(symbol.line),
+            end_col: Some(symbol.col + symbol.name.len().max(1) as u32),
+        });
+        local_storage
+            .component_access
+            .push((node_id, go_symbol_access(&symbol.name)));
+        local_storage.edges.push(Edge {
+            id: EdgeId(generate_edge_id(file_id.0, node_id.0, EdgeKind::MEMBER)),
+            source: file_id,
+            target: node_id,
+            kind: EdgeKind::MEMBER,
+            file_node_id: Some(file_id),
+            line: Some(symbol.line),
+            certainty: Some(ResolutionCertainty::Certain),
+            ..Default::default()
+        });
+        local_storage.occurrences.push(Occurrence {
+            element_id: node_id.0,
+            kind: OccurrenceKind::DEFINITION,
+            location: SourceLocation {
+                file_node_id: file_id,
+                start_line: symbol.line,
+                start_col: symbol.col,
+                end_line: symbol.line,
+                end_col: symbol.col + symbol.name.len().max(1) as u32,
+            },
+        });
+    }
+}
+
+fn collect_go_text_symbols(source: &str) -> Vec<TextOnlySymbol> {
+    let mut symbols = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        let line_number = index as u32 + 1;
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if let Some((name, kind)) = parse_go_func_symbol(trimmed) {
+            let terminal_name = name.rsplit('.').next().unwrap_or(name.as_str());
+            let col = line
+                .find(terminal_name)
+                .map(|value| value as u32 + 1)
+                .unwrap_or(1);
+            symbols.push(TextOnlySymbol {
+                name,
+                kind,
+                line: line_number,
+                col,
+            });
+            continue;
+        }
+        if let Some((name, kind)) = parse_go_type_symbol(trimmed) {
+            let col = line.find(&name).map(|value| value as u32 + 1).unwrap_or(1);
+            symbols.push(TextOnlySymbol {
+                name,
+                kind,
+                line: line_number,
+                col,
+            });
+        }
+    }
+    symbols
+}
+
+fn parse_go_func_symbol(line: &str) -> Option<(String, NodeKind)> {
+    let rest = line.strip_prefix("func ")?;
+    let rest = rest.trim_start();
+    if let Some(receiver_rest) = rest.strip_prefix('(') {
+        let receiver_end = receiver_rest.find(')')?;
+        let receiver = go_receiver_type_name(&receiver_rest[..receiver_end])?;
+        let after_receiver = receiver_rest[receiver_end + 1..].trim_start();
+        let method = leading_identifier(after_receiver)?;
+        return Some((format!("{receiver}.{method}"), NodeKind::METHOD));
+    }
+
+    let name = leading_identifier(rest)?;
+    Some((name, NodeKind::FUNCTION))
+}
+
+fn parse_go_type_symbol(line: &str) -> Option<(String, NodeKind)> {
+    let rest = line.strip_prefix("type ")?;
+    let name = leading_identifier(rest)?;
+    let after_name = rest[name.len()..].trim_start();
+    let kind = if after_name.starts_with("struct") {
+        NodeKind::STRUCT
+    } else if after_name.starts_with("interface") {
+        NodeKind::INTERFACE
+    } else {
+        NodeKind::TYPEDEF
+    };
+    Some((name, kind))
+}
+
+fn leading_identifier(value: &str) -> Option<String> {
+    let mut chars = value.char_indices();
+    let (_, first) = chars.next()?;
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+    let mut end = first.len_utf8();
+    for (index, ch) in chars {
+        if ch == '_' || ch.is_ascii_alphanumeric() {
+            end = index + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some(value[..end].to_string())
+}
+
+fn go_receiver_type_name(receiver: &str) -> Option<String> {
+    let type_part = receiver.split_whitespace().last()?;
+    let cleaned = type_part
+        .trim_start_matches('*')
+        .trim_start_matches('&')
+        .trim_start_matches("[]");
+    leading_identifier(cleaned.rsplit('.').next().unwrap_or(cleaned))
+}
+
+fn text_only_symbol_node_id(path: &Path, symbol: &TextOnlySymbol) -> NodeId {
+    NodeId(generate_id(&format!(
+        "{}:{}:{}",
+        path.to_string_lossy(),
+        symbol.name,
+        symbol.line
+    )))
+}
+
+fn go_symbol_access(name: &str) -> AccessKind {
+    let terminal = name.rsplit('.').next().unwrap_or(name);
+    if terminal
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_uppercase())
+    {
+        AccessKind::Public
+    } else {
+        AccessKind::Private
+    }
 }
 
 fn append_text_only_framework_routes(
@@ -5570,8 +5745,8 @@ fn collect_go_route(line: &str, line_number: u32, routes: &mut Vec<FrameworkRout
         let needle = format!(".{method}(");
         if line.contains(&needle)
             && let Some(path) = first_quoted_string(line)
+            && let Some(framework) = go_route_framework(line, source)
         {
-            let framework = go_route_framework(line, source);
             routes.push(FrameworkRoute::new(
                 framework,
                 method.to_string(),
@@ -5585,9 +5760,10 @@ fn collect_go_route(line: &str, line_number: u32, routes: &mut Vec<FrameworkRout
         let chi_needle = format!(".{}(", method_title_case(method));
         if line.contains(&chi_needle)
             && let Some(path) = first_quoted_string(line)
+            && let Some(framework) = go_route_framework(line, source)
         {
             routes.push(FrameworkRoute::new(
-                go_route_framework(line, source),
+                framework,
                 method.to_string(),
                 path.clone(),
                 route_handler_after_path(line, &path),
@@ -5900,22 +6076,22 @@ fn join_route_paths(prefix: &str, child: &str) -> String {
     }
 }
 
-fn go_route_framework(line: &str, source: &str) -> &'static str {
+fn go_route_framework(line: &str, source: &str) -> Option<&'static str> {
     let lower_source = source.to_ascii_lowercase();
     if lower_source.contains("github.com/gin-gonic/gin") {
-        "gin"
+        Some("gin")
     } else if lower_source.contains("github.com/labstack/echo") {
-        "echo"
+        Some("echo")
     } else if lower_source.contains("github.com/gofiber/fiber") {
-        "fiber"
+        Some("fiber")
     } else if lower_source.contains("github.com/go-chi/chi") || line.contains(".Method(") {
-        "chi"
+        Some("chi")
     } else if line.contains("app.") {
-        "fiber"
+        Some("fiber")
     } else if line.contains("e.") {
-        "echo"
+        Some("echo")
     } else {
-        "gin"
+        None
     }
 }
 
@@ -10388,6 +10564,61 @@ function render() {
     }
 
     #[test]
+    fn test_text_only_go_file_indexes_functions_types_and_methods() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("mux.go");
+        std::fs::write(
+            &path,
+            r#"
+package mux
+
+type Router struct {}
+type RouteMatch struct {}
+type MiddlewareFunc func(http.Handler) http.Handler
+
+func NewRouter() *Router { return &Router{} }
+func (r *Router) Match(req *http.Request, match *RouteMatch) bool { return false }
+func (r *Router) StrictSlash(value bool) *Router { return r }
+"#,
+        )?;
+
+        let storage = index_text_only_file(&path)?;
+        let node_names = storage
+            .nodes
+            .iter()
+            .map(|node| node.serialized_name.as_str())
+            .collect::<HashSet<_>>();
+
+        for expected in [
+            "Router",
+            "RouteMatch",
+            "MiddlewareFunc",
+            "NewRouter",
+            "Router.Match",
+            "Router.StrictSlash",
+        ] {
+            assert!(
+                node_names.contains(expected),
+                "expected Go text-only symbol {expected}; got {node_names:?}"
+            );
+        }
+        assert!(storage.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::MEMBER
+                && storage
+                    .nodes
+                    .iter()
+                    .any(|node| node.id == edge.target && node.serialized_name == "Router.Match")
+        }));
+        assert!(storage.occurrences.iter().any(|occurrence| {
+            occurrence.kind == OccurrenceKind::DEFINITION
+                && storage.nodes.iter().any(|node| {
+                    node.id.0 == occurrence.element_id && node.serialized_name == "NewRouter"
+                })
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn test_svelte_tauri_invoke_variants_are_bounded_to_first_argument() -> Result<()> {
         let temp = tempdir()?;
         let path = temp.path().join("App.svelte");
@@ -10961,6 +11192,20 @@ web::resource("/actix").route(web::get().to(handler));
                 );
             }
         }
+
+        let mux_library_routes = collect_framework_routes(
+            Path::new("route.go"),
+            "go",
+            r#"
+package mux
+
+func (r *Route) Get(name string) interface{} { return r.namedRoutes[name] }
+"#,
+        );
+        assert!(
+            mux_library_routes.is_empty(),
+            "plain mux library methods should not be indexed as framework routes: {mux_library_routes:?}"
+        );
     }
 
     #[test]

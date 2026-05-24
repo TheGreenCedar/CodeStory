@@ -1,0 +1,89 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "flask-blueprint-registration-impact",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "change_impact",
+  "repo": {
+    "name": "flask",
+    "url": "https://github.com/pallets/flask.git",
+    "ref": "3.1.1",
+    "workspace_root": ".",
+    "languages": [
+      "Python"
+    ],
+    "setup": [
+      "python -m pip install -e ."
+    ]
+  },
+  "prompt": "You need to change how nested blueprints combine URL prefixes and registration options. Identify the files, symbols, and tests most likely to be affected.",
+  "expected_files": [
+    "src/flask/sansio/app.py",
+    "src/flask/sansio/blueprints.py",
+    "src/flask/blueprints.py",
+    "tests/test_blueprints.py"
+  ],
+  "expected_symbols": [
+    {
+      "name": "App.register_blueprint",
+      "path": "src/flask/sansio/app.py",
+      "kind": "method",
+      "why": "Application-level blueprint registration entry point."
+    },
+    {
+      "name": "Blueprint.register",
+      "path": "src/flask/sansio/blueprints.py",
+      "kind": "method",
+      "why": "Applies blueprint registration state and nested registrations."
+    },
+    {
+      "name": "BlueprintSetupState.add_url_rule",
+      "path": "src/flask/sansio/blueprints.py",
+      "kind": "method",
+      "why": "Combines prefixes and endpoint options while adding rules."
+    },
+    {
+      "name": "Blueprint.add_url_rule",
+      "path": "src/flask/sansio/blueprints.py",
+      "kind": "method",
+      "why": "Queues blueprint route registration behavior."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "Application-level registration starts in the sansio app registration method."
+    },
+    {
+      "text": "Nested blueprint behavior is owned by the sansio blueprint registration code."
+    },
+    {
+      "text": "URL prefix and endpoint composition should be tested through blueprint registration tests."
+    },
+    {
+      "text": "The public flask.blueprints module is a wrapper surface, while the core registration behavior is in the sansio blueprint module."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "Nested blueprint URL prefixes are controlled by the request dispatch method.",
+      "severity": "critical"
+    },
+    {
+      "text": "Blueprint registration can be changed without checking blueprint tests.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "python",
+    "change-impact",
+    "blueprints"
+  ]
+}

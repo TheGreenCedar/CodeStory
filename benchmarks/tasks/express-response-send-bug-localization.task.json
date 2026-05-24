@@ -1,0 +1,89 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "express-response-send-bug-localization",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "bug_localization",
+  "repo": {
+    "name": "express",
+    "url": "https://github.com/expressjs/express.git",
+    "ref": "4.18.2",
+    "workspace_root": ".",
+    "languages": [
+      "JavaScript"
+    ],
+    "setup": [
+      "npm install"
+    ]
+  },
+  "prompt": "A bug report says response helpers sometimes choose the wrong status, body, or content type when callers use res.send, res.json, or sendFile. Identify the primary files and functions to inspect before editing.",
+  "expected_files": [
+    "lib/response.js",
+    "test/res.send.js",
+    "test/res.json.js",
+    "test/res.sendFile.js"
+  ],
+  "expected_symbols": [
+    {
+      "name": "res.send",
+      "path": "lib/response.js",
+      "kind": "method",
+      "why": "Central response body helper with compatibility handling and content negotiation."
+    },
+    {
+      "name": "res.json",
+      "path": "lib/response.js",
+      "kind": "method",
+      "why": "Serializes JSON and delegates final sending behavior."
+    },
+    {
+      "name": "res.sendFile",
+      "path": "lib/response.js",
+      "kind": "method",
+      "why": "Handles file responses and validation before transfer."
+    },
+    {
+      "name": "sendfile",
+      "path": "lib/response.js",
+      "kind": "function",
+      "why": "Shared helper behind file transfer callbacks."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "lib/response.js implements res.send, res.json, and res.sendFile."
+    },
+    {
+      "text": "res.send and res.json contain legacy status and body overload behavior."
+    },
+    {
+      "text": "res.sendFile and sendfile handle file-transfer validation, headers, errors, and callbacks."
+    },
+    {
+      "text": "test/res.send.js, test/res.json.js, and test/res.sendFile.js cover response helper behavior."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "The bug should be fixed in the router before inspecting response helpers.",
+      "severity": "major"
+    },
+    {
+      "text": "JSON responses are implemented in lib/request.js.",
+      "severity": "critical"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.75,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "javascript",
+    "bug-localization",
+    "response"
+  ]
+}

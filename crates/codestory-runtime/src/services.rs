@@ -1,13 +1,13 @@
 use codestory_contracts::api::{
     AffectedAnalysisDto, AffectedAnalysisRequest, AgentAnswerDto, AgentAskRequest,
-    AgentHybridWeightsDto, ApiError, BookmarkCategoryDto, BookmarkDto,
-    CreateBookmarkCategoryRequest, CreateBookmarkRequest, GroundingBudgetDto, GroundingSnapshotDto,
-    IndexDryRunDto, IndexMode, IndexedFilesDto, IndexedFilesRequest, IndexingPhaseTimings,
-    ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId,
-    OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, RetrievalStateDto, SearchHit,
-    SearchRequest, SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
-    SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
-    TrailContextDto,
+    AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, BookmarkCategoryDto,
+    BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, GroundingBudgetDto,
+    GroundingSnapshotDto, IndexDryRunDto, IndexMode, IndexedFilesDto, IndexedFilesRequest,
+    IndexingPhaseTimings, ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto,
+    NodeDetailsRequest, NodeId, OpenDefinitionRequest, OpenProjectRequest, ProjectSummary,
+    RetrievalStateDto, SearchHit, SearchRequest, SearchResultsDto, SnippetContextDto,
+    SourceOccurrenceDto, StartIndexingRequest, SummaryGenerationDto, SymbolContextDto,
+    SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto,
 };
 
 use crate::AppController;
@@ -251,6 +251,10 @@ impl AgentService {
 
     pub fn ask(&self, req: AgentAskRequest) -> Result<AgentAnswerDto, ApiError> {
         self.controller.agent_ask(req)
+    }
+
+    pub fn packet(&self, req: AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError> {
+        self.controller.agent_packet(req)
     }
 }
 

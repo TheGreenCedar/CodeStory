@@ -1,25 +1,26 @@
 use codestory_contracts::api::{
     AffectedAnalysisDto, AffectedAnalysisRequest, AffectedMatchedFileDto, AffectedRouteDto,
     AffectedSymbolDto, AffectedTestFileDto, AffectedUnmatchedPathDto, AgentAnswerDto,
-    AgentAskRequest, AgentHybridWeightsDto, ApiError, AppEventPayload, BookmarkCategoryDto,
-    BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind,
-    EdgeOccurrencesRequest, EmbeddingProfileContractDto, FrameworkRouteCoverageDto, GraphEdgeDto,
-    GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto,
-    GroundingFileDigestDto, GroundingSnapshotDto, GroundingSymbolDigestDto, IndexDryRunDto,
-    IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessSampleDto,
-    IndexFreshnessStatusDto, IndexMode, IndexedFileDto, IndexedFileLanguageCountDto,
-    IndexedFileRoleDto, IndexedFilesDto, IndexedFilesRequest, IndexedFilesSummaryDto,
-    IndexingPhaseTimings, ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess,
-    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest,
-    OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest, ProjectSummary,
-    ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
-    RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, RouteEndpointHandlerDto,
-    RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
-    SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto, SearchPlanBridgeDto,
-    SearchPlanCandidateWindowDto, SearchPlanChannelDto, SearchPlanDroppedTermDto, SearchPlanDto,
-    SearchPlanNextActionDto, SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto,
-    SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode,
-    SearchRequest, SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
+    AgentAskRequest, AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError,
+    AppEventPayload, BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest,
+    CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest, EmbeddingProfileContractDto,
+    FrameworkRouteCoverageDto, GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse,
+    GroundingBudgetDto, GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingSnapshotDto,
+    GroundingSymbolDigestDto, IndexDryRunDto, IndexFreshnessChangeKindDto, IndexFreshnessDto,
+    IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexMode, IndexedFileDto,
+    IndexedFileLanguageCountDto, IndexedFileRoleDto, IndexedFilesDto, IndexedFilesRequest,
+    IndexedFilesSummaryDto, IndexingPhaseTimings, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
+    NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
+    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto,
+    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
+    RouteEndpointHandlerDto, RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit,
+    SearchHitOrigin, SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
+    SearchPlanBridgeDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
+    SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto,
+    SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto, SearchPlanSubqueryDto,
+    SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest,
+    SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
     StorageStatsDto, StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto,
     SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
     UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WorkspaceMemberIndexDto,
@@ -6867,6 +6868,48 @@ impl AppController {
             .0)
     }
 
+    pub(crate) fn search_symbolic_packet_anchors(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Result<Vec<SearchHit>, ApiError> {
+        self.ensure_search_state()?;
+        let storage = self.open_storage()?;
+        let requested_max_results = max_results.clamp(1, 50);
+        let project_root = self.require_project_root().ok();
+        let (symbolic, node_names) = {
+            let mut s = self.state.lock();
+            let engine = s.search_engine.as_mut().ok_or_else(|| {
+                ApiError::invalid_argument("Search engine not initialized. Open a project first.")
+            })?;
+            (
+                lexical_hybrid_hits(engine, query, &HashMap::new()),
+                s.node_names.clone(),
+            )
+        };
+
+        let mut hits = Vec::with_capacity(symbolic.len());
+        for scored in symbolic {
+            if let Some(mut hit) =
+                Self::build_search_hit(&storage, &node_names, scored.node_id, scored.total_score)
+            {
+                hit.score_breakdown = Some(RetrievalScoreBreakdownDto {
+                    lexical: scored.lexical_score,
+                    semantic: 0.0,
+                    graph: scored.graph_score,
+                    total: scored.total_score,
+                });
+                hits.push(hit);
+            }
+        }
+        hits.sort_by(|left, right| {
+            compare_search_hits_with_project_root(project_root.as_deref(), query, left, right)
+        });
+        annotate_search_hit_match_quality(query, &mut hits);
+        hits.truncate(requested_max_results);
+        Ok(hits)
+    }
+
     fn search_hybrid_scored_inner(
         &self,
         req: SearchRequest,
@@ -7046,6 +7089,10 @@ impl AppController {
 
     pub fn agent_ask(&self, req: AgentAskRequest) -> Result<AgentAnswerDto, ApiError> {
         agent::agent_ask(self, req)
+    }
+
+    pub fn agent_packet(&self, req: AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError> {
+        agent::agent_packet(self, req)
     }
 
     pub fn graph_neighborhood(&self, req: GraphRequest) -> Result<GraphResponse, ApiError> {

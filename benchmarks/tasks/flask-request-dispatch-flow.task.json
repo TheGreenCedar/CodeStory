@@ -1,0 +1,89 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "flask-request-dispatch-flow",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "route_tracing",
+  "repo": {
+    "name": "flask",
+    "url": "https://github.com/pallets/flask.git",
+    "ref": "3.1.1",
+    "workspace_root": ".",
+    "languages": [
+      "Python"
+    ],
+    "setup": [
+      "python -m pip install -e ."
+    ]
+  },
+  "prompt": "Trace how Flask receives a WSGI request, opens request handling, dispatches to a view, finalizes the response, and returns control to the server.",
+  "expected_files": [
+    "src/flask/app.py",
+    "src/flask/ctx.py",
+    "src/flask/sansio/app.py",
+    "src/flask/sansio/scaffold.py"
+  ],
+  "expected_symbols": [
+    {
+      "name": "Flask.wsgi_app",
+      "path": "src/flask/app.py",
+      "kind": "method",
+      "why": "WSGI entry point for request handling."
+    },
+    {
+      "name": "Flask.full_dispatch_request",
+      "path": "src/flask/app.py",
+      "kind": "method",
+      "why": "Coordinates preprocessing, dispatch, error handling, and finalization."
+    },
+    {
+      "name": "Flask.dispatch_request",
+      "path": "src/flask/app.py",
+      "kind": "method",
+      "why": "Finds and invokes the matched view function."
+    },
+    {
+      "name": "Scaffold.route",
+      "path": "src/flask/sansio/scaffold.py",
+      "kind": "method",
+      "why": "Decorator path used to register view functions."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "Flask.wsgi_app is the WSGI entry point and creates or uses request context before dispatch."
+    },
+    {
+      "text": "full_dispatch_request wraps preprocessing, dispatch, exception handling, and response finalization."
+    },
+    {
+      "text": "dispatch_request invokes the view function selected by URL matching."
+    },
+    {
+      "text": "The route decorator registers view functions through the scaffold URL rule path rather than performing request dispatch itself."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "The route decorator directly handles each incoming WSGI request.",
+      "severity": "critical"
+    },
+    {
+      "text": "Flask dispatch does not use request context.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "python",
+    "routing",
+    "wsgi"
+  ]
+}

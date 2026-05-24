@@ -253,6 +253,7 @@ Detailed argument tables, output examples, and usage patterns for each command:
 - [index](references/index.md) - Build or refresh the symbol index
 - [ground](references/ground.md) - Compact codebase context snapshot
 - [doctor](references/doctor.md) - Read-only project/cache/index/retrieval health check
+- [packet](references/packet.md) - Broad task packet with sufficiency contract
 - [search](references/search.md) - Search indexed symbols and repo text
 - [context](references/context.md) - Deep evidence packet for a concrete target
 - [symbol](references/symbol.md) - Inspect a symbol's details and relationships

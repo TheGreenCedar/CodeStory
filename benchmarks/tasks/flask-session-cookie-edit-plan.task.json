@@ -1,0 +1,89 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "flask-session-cookie-edit-plan",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "edit_planning",
+  "repo": {
+    "name": "flask",
+    "url": "https://github.com/pallets/flask.git",
+    "ref": "3.1.1",
+    "workspace_root": ".",
+    "languages": [
+      "Python"
+    ],
+    "setup": [
+      "python -m pip install -e ."
+    ]
+  },
+  "prompt": "Plan a minimal edit to change how Flask applies session cookie attributes such as domain, path, secure, partitioned, and SameSite. Identify the implementation and tests to inspect first.",
+  "expected_files": [
+    "src/flask/sessions.py",
+    "src/flask/app.py",
+    "tests/test_basic.py",
+    "tests/test_config.py"
+  ],
+  "expected_symbols": [
+    {
+      "name": "SessionInterface.get_cookie_domain",
+      "path": "src/flask/sessions.py",
+      "kind": "method",
+      "why": "Reads the configured cookie domain."
+    },
+    {
+      "name": "SessionInterface.get_cookie_path",
+      "path": "src/flask/sessions.py",
+      "kind": "method",
+      "why": "Determines the cookie path from session and application configuration."
+    },
+    {
+      "name": "SessionInterface.get_cookie_samesite",
+      "path": "src/flask/sessions.py",
+      "kind": "method",
+      "why": "Reads the SameSite attribute used when writing the session cookie."
+    },
+    {
+      "name": "SecureCookieSessionInterface.save_session",
+      "path": "src/flask/sessions.py",
+      "kind": "method",
+      "why": "Writes or deletes the session cookie on the response."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "The focused implementation file is src/flask/sessions.py because cookie attributes are read and applied there."
+    },
+    {
+      "text": "save_session is the final write path for setting or deleting the session cookie."
+    },
+    {
+      "text": "Cookie attribute helpers should be checked before changing response-writing behavior."
+    },
+    {
+      "text": "Regression coverage should include session tests and configuration-driven cookie behavior."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "Session cookie attributes are owned by the request dispatch method.",
+      "severity": "critical"
+    },
+    {
+      "text": "Changing session cookie attributes does not require checking session tests.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "python",
+    "edit-planning",
+    "sessions"
+  ]
+}

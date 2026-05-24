@@ -1363,6 +1363,16 @@ pub enum EvidenceTypeDto {
     Negative,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketBudgetModeDto {
+    Tiny,
+    #[default]
+    Compact,
+    Standard,
+    Deep,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimReadinessDto {
@@ -1436,10 +1446,160 @@ pub struct EvidencePacketDto {
     pub readiness: AnswerReadinessReportDto,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketTaskClassDto {
+    ArchitectureExplanation,
+    BugLocalization,
+    ChangeImpact,
+    RouteTracing,
+    SymbolOwnership,
+    DataFlow,
+    EditPlanning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PacketPlanQueryDto {
+    pub query: String,
+    pub purpose: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PacketPlanDto {
+    pub task_class: PacketTaskClassDto,
+    pub inferred_task_class: bool,
+    #[serde(default)]
+    pub queries: Vec<PacketPlanQueryDto>,
+    #[serde(default)]
+    pub trace: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AgentPacketRequestDto {
+    pub question: String,
+    #[serde(default)]
+    pub budget: PacketBudgetModeDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_class: Option<PacketTaskClassDto>,
+    #[serde(default = "default_include_evidence")]
+    pub include_evidence: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_budget_ms: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PacketBudgetLimitsDto {
+    pub max_anchors: u32,
+    pub max_files: u32,
+    pub max_snippets: u32,
+    pub max_trail_edges: u32,
+    pub max_output_bytes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PacketBudgetUsageDto {
+    pub anchors: u32,
+    pub files: u32,
+    pub snippets: u32,
+    pub trail_edges: u32,
+    pub output_bytes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PacketBudgetDto {
+    pub requested: PacketBudgetModeDto,
+    pub limits: PacketBudgetLimitsDto,
+    pub used: PacketBudgetUsageDto,
+    pub truncated: bool,
+    #[serde(default)]
+    pub omitted_sections: Vec<String>,
+    pub next_deeper_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketSufficiencyStatusDto {
+    Sufficient,
+    Partial,
+    Insufficient,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PacketClaimDto {
+    pub claim: String,
+    #[serde(default)]
+    pub citations: Vec<AgentCitationDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PacketSufficiencyDto {
+    pub status: PacketSufficiencyStatusDto,
+    #[serde(default)]
+    pub covered_claims: Vec<PacketClaimDto>,
+    #[serde(default)]
+    pub open_next: Vec<String>,
+    #[serde(default)]
+    pub avoid_opening: Vec<String>,
+    #[serde(default)]
+    pub gaps: Vec<String>,
+    #[serde(default)]
+    pub follow_up_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PacketBenchmarkTraceDto {
+    pub retrieval_trace: AgentRetrievalTraceDto,
+    pub source_read_steps: u32,
+    pub search_steps: u32,
+    pub trail_steps: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AgentPacketDto {
+    pub packet_id: String,
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_class: Option<PacketTaskClassDto>,
+    pub plan: PacketPlanDto,
+    pub answer: AgentAnswerDto,
+    pub budget: PacketBudgetDto,
+    pub sufficiency: PacketSufficiencyDto,
+    pub benchmark_trace: PacketBenchmarkTraceDto,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct BookmarkCategoryDto {
     pub id: String,
     pub name: String,
+}
+
+#[cfg(test)]
+mod packet_tests {
+    use super::*;
+
+    #[test]
+    fn packet_request_uses_compact_budget_by_default() {
+        let request: AgentPacketRequestDto =
+            serde_json::from_str(r#"{"question":"explain indexing"}"#).expect("deserialize");
+
+        assert_eq!(request.budget, PacketBudgetModeDto::Compact);
+        assert!(request.include_evidence);
+    }
+
+    #[test]
+    fn packet_sufficiency_serializes_status_as_snake_case() {
+        let value = serde_json::to_value(PacketSufficiencyDto {
+            status: PacketSufficiencyStatusDto::Partial,
+            covered_claims: Vec::new(),
+            open_next: vec!["codestory-cli search --query runtime".to_string()],
+            avoid_opening: Vec::new(),
+            gaps: vec!["No focused symbol selected.".to_string()],
+            follow_up_commands: Vec::new(),
+        })
+        .expect("serialize");
+
+        assert_eq!(value["status"], "partial");
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

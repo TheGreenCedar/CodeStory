@@ -43,6 +43,18 @@ arm.
 - Agent A/B baseline: with CodeStory `2,724,490` median tokens / `306.24s` /
   `43` tool starts; without CodeStory `1,605,030` median tokens / `214.90s` /
   `29` tool starts.
+- Exploratory packet-first A/B diagnostic: on the CodeStory indexing-flow task,
+  the with-CodeStory arm ran an answer packet as its first repository-context
+  command `3/3`, quality-passed `3/3`, used `167,102` median tokens / `71.92s`
+  / `2` tool starts, and made `0` ordinary source reads. The latest comparable
+  no-CodeStory baseline quality-passed `1/3`. This is quality-rescue evidence
+  with strong efficiency diagnostics, not a public savings claim yet.
+- Quality-comparable paired rows: five Express and mux tasks now quality-pass
+  `3/3` in both arms across bug localization, architecture explanation, symbol
+  ownership, edit planning, and route tracing. With CodeStory, those rows show
+  `49.1%` to `74.2%` fewer tokens, `47.2%` to `50.7%` lower wall time, and
+  `85.7%` to `88.9%` fewer tool starts. This is promising paired evidence, not
+  a general savings claim yet.
 - CodeStory repo cold index: `9.23s`, with `47,107` nodes, `39,808` edges,
   `145` files, and `6,358` semantic docs.
 - One-shot reads after that index: search `0.92s`, symbol `0.62s`,
@@ -50,6 +62,11 @@ arm.
 - Warm stdio small-fixture loop: `53.50ms` per
   `search -> symbol -> trail -> snippet` loop across `20` reps.
 - Warm stdio search p95 smoke: `25.96ms`, with protocol-clean stdout.
+- Public-core packet diagnostic: `108/108` quality-passing packet rows across
+  cold CLI and warm stdio (`18` manifests x `3` repeats x `2` modes), with every
+  row reporting `sufficient` coverage and no sufficiency/quality mismatches.
+  Warm stdio median task wall time was `3.13s` versus cold CLI `4.86s`. This is
+  packet-runtime evidence, not an agent savings claim yet.
 - Historical cross-repo retrieval gate: Hit@10 `1.0`, MRR@10 `0.826831`
   across `4` projects and `225` queries.
 
@@ -134,6 +151,7 @@ Keep the executable and target workspace separate. CodeStory is the tool; the
 | Health and cache readiness | `codestory-cli doctor --project <target-workspace>` |
 | Build or refresh an index | `codestory-cli index --project <target-workspace> --refresh full` |
 | Broad orientation | `codestory-cli ground --project <target-workspace> --why` |
+| Broad task packet | `codestory-cli packet --project <target-workspace> --question "<task>" --budget compact` |
 | Candidate discovery | `codestory-cli search --project <target-workspace> --query "<term>" --why` |
 | Exact symbol evidence | `codestory-cli symbol --project <target-workspace> --id <node-id>` |
 | Flow evidence | `codestory-cli trail --project <target-workspace> --id <node-id> --story --hide-speculative` |
@@ -143,9 +161,9 @@ Keep the executable and target workspace separate. CodeStory is the tool; the
 | Changed-file impact | `codestory-cli affected --project <target-workspace> --format markdown` |
 | Persistent read surface | `codestory-cli serve --project <target-workspace> --stdio` |
 
-Broad questions work best when you first search for concrete anchors, then ask
-for context on the exact node ids. `context` is an evidence packet, not a chat
-endpoint.
+Broad questions should start with `packet` or `ground`, then deepen through the
+reported follow-up commands. `context` is for one concrete target, not an open
+chat endpoint.
 
 ## What It Builds
 

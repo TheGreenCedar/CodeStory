@@ -974,6 +974,7 @@ fn app_controller_opens_project() {
     assert_files_and_affected_read_existing_cache(workspace.path(), cache_dir.path());
 
     assert_query_reads_existing_cache(workspace.path(), cache_dir.path());
+    assert_packet_builds_broad_task_contract(workspace.path(), cache_dir.path());
     assert_context_uses_db_first_trace(workspace.path(), cache_dir.path(), &node_id);
     remove_and_assert_bookmark_gone(workspace.path(), cache_dir.path(), &bookmark_id);
     assert_stdio_context_uses_db_first_trace(workspace.path(), cache_dir.path());
@@ -1692,6 +1693,47 @@ fn remove_and_assert_bookmark_gone(workspace: &Path, cache_dir: &Path, bookmark_
             .iter()
             .all(|bookmark| bookmark["bookmark"]["id"] != bookmark_id),
         "bookmark remove should persistently delete the saved focus"
+    );
+}
+
+fn assert_packet_builds_broad_task_contract(workspace: &Path, cache_dir: &Path) {
+    let packet = run_cli_json(
+        workspace,
+        cache_dir,
+        &[
+            "packet",
+            "--question",
+            "Explain how AppController routes project opening through normalize_project",
+            "--budget",
+            "tiny",
+            "--task-class",
+            "architecture-explanation",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        packet["budget"]["requested"], "tiny",
+        "packet should honor the requested budget: {packet:#}"
+    );
+    assert_eq!(
+        packet["plan"]["task_class"], "architecture_explanation",
+        "packet should expose the planner task class: {packet:#}"
+    );
+    assert!(
+        array_is_non_empty(&packet, &["plan", "queries"]),
+        "packet should expose planned retrieval queries: {packet:#}"
+    );
+    assert!(
+        packet
+            .pointer("/sufficiency/status")
+            .and_then(Value::as_str)
+            .is_some(),
+        "packet should expose sufficiency status: {packet:#}"
+    );
+    assert!(
+        array_is_non_empty(&packet, &["answer", "retrieval_trace", "steps"]),
+        "packet should include the underlying retrieval trace: {packet:#}"
     );
 }
 

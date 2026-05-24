@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codestory.dev/schemas/benchmark-task-manifest.schema.json",
+  "title": "Benchmark task manifest",
+  "description": "Schema for public benchmark tasks that score repository answers against expected anchors and claims.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "version",
+    "suite",
+    "task_class",
+    "repo",
+    "prompt",
+    "expected_files",
+    "expected_symbols",
+    "expected_claims",
+    "forbidden_claims",
+    "quality_thresholds"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9.-]*$"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "suite": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9.-]*$"
+    },
+    "task_class": {
+      "type": "string",
+      "enum": [
+        "architecture_explanation",
+        "bug_localization",
+        "change_impact",
+        "route_tracing",
+        "symbol_ownership",
+        "edit_planning"
+      ]
+    },
+    "repo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "url",
+        "ref"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+$"
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspace_root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "languages": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "setup": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "prompt": {
+      "type": "string",
+      "minLength": 1
+    },
+    "expected_files": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "expected_symbols": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/expected_symbol"
+      }
+    },
+    "expected_claims": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/claim"
+      }
+    },
+    "forbidden_claims": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/claim"
+      }
+    },
+    "quality_thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "min_expected_anchor_recall",
+        "min_expected_file_recall",
+        "min_expected_symbol_recall",
+        "min_expected_claim_recall",
+        "min_citation_coverage",
+        "max_forbidden_claims"
+      ],
+      "properties": {
+        "min_expected_anchor_recall": {
+          "$ref": "#/$defs/ratio"
+        },
+        "min_expected_file_recall": {
+          "$ref": "#/$defs/ratio"
+        },
+        "min_expected_symbol_recall": {
+          "$ref": "#/$defs/ratio"
+        },
+        "min_expected_claim_recall": {
+          "$ref": "#/$defs/ratio"
+        },
+        "min_citation_coverage": {
+          "$ref": "#/$defs/ratio"
+        },
+        "max_forbidden_claims": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9.-]*$"
+      },
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "ratio": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "expected_symbol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "path"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "info",
+            "minor",
+            "major",
+            "critical"
+          ]
+        }
+      }
+    }
+  }
+}

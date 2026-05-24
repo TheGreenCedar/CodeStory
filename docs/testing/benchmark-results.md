@@ -34,6 +34,259 @@ more). The likely next benchmark work is to reduce duplicated ordinary file
 reads after CodeStory grounding and to add non-Rust repositories before
 promoting agent-savings claims.
 
+### Exploratory Packet-First A/B Diagnostic
+
+After the packet workflow, `CODESTORY_CLI` injection, packet-first publishable
+gate, claim-token quality scoring, aggregate anchor scoring, PowerShell-wrapped
+command classification, and the sufficient-packet stop rule were added, a
+three-repeat manifest-backed A/B diagnostic was run for the CodeStory
+indexing-flow task:
+
+```powershell
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-manifest benchmarks\tasks\codestory-indexing-flow.task.json --repeats 3 --timeout-ms 600000 --sandbox danger-full-access --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\ab-codestory-indexing-flow-r19 --allow-failures
+node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-benchmark\ab-codestory-indexing-flow-r19
+```
+
+Strict reanalysis exposed an important flaw in the original packet-first
+telemetry: `packet --help` and later packets were being counted as packet-first.
+After the analyzer was fixed to require an answer packet with `--question` as
+the first successful repository-context command, the old row remained
+quality-positive but was no longer packet-first:
+
+| Arm | Quality | Packet first | Wall time | Total tokens | Tool starts | Direct source reads | Reads after packet |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Without CodeStory | `1/3` | n/a | `347.90s` | `3,216,267` | `43` | `31` | n/a |
+| With CodeStory r19 | `3/3` | `0/3` | `102.50s` | `362,855` | `5` | `1` | `0` |
+
+A stricter prompt then gave the agent an exact first packet command and ran
+with `--publishable`, which now fails if the answer packet is not first or if
+ordinary source reads happen after packet:
+
+```powershell
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-manifest benchmarks\tasks\codestory-indexing-flow.task.json --arms with_codestory --repeats 3 --timeout-ms 600000 --sandbox danger-full-access --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\ab-codestory-indexing-flow-r20 --publishable
+```
+
+| Arm | Quality | Answer packet first | Wall time | Total tokens | Reasoning tokens | Tool starts | Direct source reads | Reads after packet |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| With CodeStory r20 | `3/3` | `3/3` | `71.92s` | `167,102` | `1,006` | `2` | `0` | `0` |
+
+This is the first strict packet-first, publishable with-CodeStory behavior row:
+the answer packet was the first repository-context command in every repeat,
+quality passed every repeat, and the agent performed no ordinary source reads.
+It is still not a public savings claim because it is one task, the paired
+no-CodeStory baseline quality-passed only `1/3`, and the CodeStory manifest row
+uses the active local checkout.
+
+Additional strict with-CodeStory public-checkout rows were then run against
+clean materialized public repositories:
+
+```powershell
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-manifest benchmarks\tasks\vite-dev-server-architecture.task.json --arms with_codestory --repeats 3 --timeout-ms 600000 --sandbox danger-full-access --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\ab-vite-dev-server-architecture-r21 --publishable
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-manifest benchmarks\tasks\express-response-send-bug-localization.task.json --arms with_codestory --repeats 3 --timeout-ms 600000 --sandbox danger-full-access --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\ab-express-response-send-bug-localization-r22 --publishable
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-manifest benchmarks\tasks\mux-router-matching-flow.task.json --arms with_codestory --repeats 3 --timeout-ms 600000 --sandbox danger-full-access --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\ab-mux-router-matching-flow-with-r24 --publishable
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --task-ids express-response-symbol-ownership --arms with_codestory,without_codestory --repeats 3 --timeout-ms 600000 --sandbox danger-full-access --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\ab-express-response-symbol-ownership-r26 --allow-failures
+node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-benchmark\ab-express-response-symbol-ownership-r26 --publishable
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --task-ids mux-cors-middleware-edit-plan --arms with_codestory,without_codestory --repeats 3 --timeout-ms 600000 --sandbox danger-full-access --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\ab-mux-cors-middleware-edit-plan-r27 --allow-failures
+node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-benchmark\ab-mux-cors-middleware-edit-plan-r27 --publishable
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --task-ids express-application-routing-flow --arms with_codestory,without_codestory --repeats 3 --timeout-ms 600000 --sandbox danger-full-access --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\ab-express-application-routing-flow-r28 --allow-failures
+node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-benchmark\ab-express-application-routing-flow-r28 --publishable
+```
+
+| Repo | Task class | Quality | Answer packet first | Wall time | Total tokens | Reasoning tokens | Tool starts | Direct source reads |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| vite | architecture_explanation | `3/3` | `3/3` | `66.78s` | `163,815` | `1,011` | `2` | `0` |
+| express | bug_localization | `3/3` | `3/3` | `67.39s` | `164,291` | `1,018` | `2` | `0` |
+| mux | architecture_explanation | `3/3` | `3/3` | `65.12s` | `163,935` | `1,093` | `2` | `0` |
+| express | symbol_ownership | `3/3` | `3/3` | `63.28s` | `165,715` | n/a | `2` | `0` |
+| mux | edit_planning | `3/3` | `3/3` | `59.08s` | `100,833` | n/a | `2` | `0` |
+| express | route_tracing | `3/3` | `3/3` | `62.80s` | `102,137` | n/a | `2` | `0` |
+
+These rows used clean manifest checkouts (`manifest_overridden_by_builtin=false`
+and `git_dirty=false`) and passed the strict post-packet source-read budget.
+They strengthen the behavior claim across public TypeScript, JavaScript, and Go
+tasks, while Express and mux now have paired quality-comparable baselines across
+five task rows.
+
+### Quality-Comparable Paired Rows
+
+The Express response-helper bug-localization task now has a paired no-CodeStory
+baseline after its manifest claims were tightened to describe the required
+technical facts rather than packet-specific wording:
+
+```powershell
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-manifest benchmarks\tasks\express-response-send-bug-localization.task.json --arms without_codestory --repeats 3 --timeout-ms 600000 --sandbox danger-full-access --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\ab-express-response-send-bug-localization-without-r23 --allow-failures
+node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-benchmark\ab-express-response-send-bug-localization-r22 --publishable
+node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-benchmark\ab-express-response-send-bug-localization-without-r23 --publishable
+```
+
+| Arm | Quality | Answer packet first | Wall time | Total tokens | Tool starts | Direct source reads |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Without CodeStory | `3/3` | n/a | `136.57s` | `635,793` | `18` | `1` |
+| With CodeStory | `3/3` | `3/3` | `67.39s` | `164,291` | `2` | `0` |
+
+On this single quality-comparable paired row, CodeStory used `74.2%` fewer
+median total tokens, was `50.7%` faster by median wall time, and started `88.9%`
+fewer tool commands. This is still one task, so it is not a headline benchmark
+claim; it is the first row that satisfies the quality-comparable savings shape.
+
+The mux router matching-flow task adds a Go architecture row. Its baseline first
+found every expected file and symbol, but missed claim recall because the
+manifest required overly sentence-specific wording. The manifest claims were
+tightened to the underlying source facts and both arms then passed
+`--publishable` reanalysis:
+
+```powershell
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-manifest benchmarks\tasks\mux-router-matching-flow.task.json --arms with_codestory --repeats 3 --timeout-ms 600000 --sandbox danger-full-access --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\ab-mux-router-matching-flow-with-r24 --publishable
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-manifest benchmarks\tasks\mux-router-matching-flow.task.json --arms without_codestory --repeats 3 --timeout-ms 600000 --sandbox danger-full-access --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\ab-mux-router-matching-flow-without-r25 --allow-failures
+node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-benchmark\ab-mux-router-matching-flow-with-r24 --publishable
+node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-benchmark\ab-mux-router-matching-flow-without-r25 --publishable
+```
+
+| Arm | Quality | Answer packet first | Wall time | Total tokens | Tool starts | Direct source reads |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Without CodeStory | `3/3` | n/a | `123.37s` | `321,908` | `16` | `8` |
+| With CodeStory | `3/3` | `3/3` | `65.12s` | `163,935` | `2` | `0` |
+
+On this second quality-comparable paired row, CodeStory used `49.1%` fewer
+median total tokens, was `47.2%` faster by median wall time, and started `87.5%`
+fewer tool commands. It also avoided the baseline's median `8` direct source
+reads. Together, Express and mux are positive promotion seeds across JavaScript
+and Go, not a broad public aggregate.
+
+The Express response symbol-ownership task adds a second Express row and a new
+task class:
+
+```powershell
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --task-ids express-response-symbol-ownership --arms with_codestory,without_codestory --repeats 3 --timeout-ms 600000 --sandbox danger-full-access --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\ab-express-response-symbol-ownership-r26 --allow-failures
+node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-benchmark\ab-express-response-symbol-ownership-r26 --publishable
+```
+
+| Arm | Quality | Answer packet first | Wall time | Total tokens | Tool starts | Direct source reads |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Without CodeStory | `3/3` | n/a | `125.10s` | `397,110` | `15` | `0` |
+| With CodeStory | `3/3` | `3/3` | `63.28s` | `165,715` | `2` | `0` |
+
+On this third quality-comparable paired row, CodeStory used `58.3%` fewer
+median total tokens, was `49.4%` faster by median wall time, and started `86.7%`
+fewer tool commands. This row is especially useful because it covers
+`symbol_ownership`, while the earlier Express row covered `bug_localization`.
+
+The mux CORS middleware edit-planning task adds a Go edit-planning row:
+
+```powershell
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --task-ids mux-cors-middleware-edit-plan --arms with_codestory,without_codestory --repeats 3 --timeout-ms 600000 --sandbox danger-full-access --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\ab-mux-cors-middleware-edit-plan-r27 --allow-failures
+node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-benchmark\ab-mux-cors-middleware-edit-plan-r27 --publishable
+```
+
+| Arm | Quality | Answer packet first | Wall time | Total tokens | Tool starts | Citation coverage |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Without CodeStory | `3/3` | n/a | `115.12s` | `364,175` | `14` | `75%` |
+| With CodeStory | `3/3` | `3/3` | `59.08s` | `100,833` | `2` | `100%` |
+
+On this fourth quality-comparable paired row, CodeStory used `72.3%` fewer
+median total tokens, was `48.7%` faster by median wall time, and started `85.7%`
+fewer tool commands. This row matters because it tests whether the packet can
+produce an edit plan without pushing the agent into a broad file-reading pass.
+
+The Express application routing-flow task adds a JavaScript route-tracing row:
+
+```powershell
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --task-ids express-application-routing-flow --arms with_codestory,without_codestory --repeats 3 --timeout-ms 600000 --sandbox danger-full-access --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\ab-express-application-routing-flow-r28 --allow-failures
+node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-benchmark\ab-express-application-routing-flow-r28 --publishable
+```
+
+| Arm | Quality | Answer packet first | Wall time | Total tokens | Tool starts | Citation coverage |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Without CodeStory | `3/3` | n/a | `127.46s` | `334,231` | `15` | `100%` |
+| With CodeStory | `3/3` | `3/3` | `62.80s` | `102,137` | `2` | `100%` |
+
+On this fifth quality-comparable paired row, CodeStory used `69.4%` fewer
+median total tokens, was `50.7%` faster by median wall time, and started `86.7%`
+fewer tool commands. It also covers `route_tracing`, bringing the paired
+evidence set to five task rows across all currently positive paired rows.
+
+A follow-up public-core subset run added the Vite dev-server architecture task
+to test whether the packet-first stop rule generalized beyond this repository:
+
+```powershell
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --task-ids codestory-indexing-flow,vite-dev-server-architecture --arms with_codestory --repeats 3 --timeout-ms 600000 --sandbox danger-full-access --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\ab-public-core-subset-with-r1 --allow-failures
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --task-ids vite-dev-server-architecture --arms without_codestory --repeats 3 --timeout-ms 600000 --sandbox danger-full-access --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\ab-public-core-subset-vite-without-r1 --allow-failures
+node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-benchmark\ab-public-core-subset-vite-without-r1
+```
+
+| Repo | Arm | Quality | Packet first | Wall time | Total tokens | Tool starts | Direct source reads | Reads after packet |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| codestory | With CodeStory | `3/3` | `0/3` | `93.66s` | `405,789` | `6` | `1` | `0` |
+| vite | With CodeStory | `3/3` | `0/3` | `144.70s` | `472,782` | `7` | `0` | `0` |
+| vite | Without CodeStory | `1/3` | n/a | `200.16s` | `907,113` | `26` | `18` | n/a |
+
+The subset rows still show quality rescue, but they no longer support a
+packet-first claim after strict reanalysis because the agents probed or searched
+before the answer packet. The right public framing remains: CodeStory can rescue
+answer quality and avoid broad file exploration on these tasks, but headline
+savings need quality-comparable, strict packet-first baselines across a larger
+corpus.
+
+## Latest Packet Runtime Check
+
+On 2026-05-23, the release CLI completed three-repeat packet runtime runs
+against the full public-core manifest suite in both warm stdio and cold CLI
+modes:
+
+```powershell
+node .\scripts\codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite public-core --repeats 3 --packet-runtime-mode warm-stdio --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\packet-runtime-public-core-warm-r8 --timeout-ms 120000 --publishable
+node .\scripts\codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite public-core --repeats 3 --packet-runtime-mode cold-cli --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\packet-runtime-public-core-cold-r9 --timeout-ms 120000 --publishable
+```
+
+This is now repeated packet-runtime evidence, not an agent savings claim. Across
+both modes, all `108` packet rows passed operationally and quality gates. Every
+row reported `sufficient` packet coverage with `0` sufficiency/quality
+mismatches. Warm stdio task medians ranged from `2.69s` to `3.60s`, with an
+aggregate task median of `3.13s`; cold CLI task medians ranged from `4.22s` to
+`5.76s`, with an aggregate task median of `4.86s`. Median avoid-opening counts
+were `8` to `10`, and every row had `0` median follow-up commands.
+
+## Latest Public-Core Diagnostic
+
+On 2026-05-23, the public-core repositories were materialized under
+`target/agent-benchmark/repos` and indexed with the release CLI:
+
+| Repo | Indexed files | Nodes | Edges | Semantic docs |
+| --- | ---: | ---: | ---: | ---: |
+| express | `153` | `13,046` | `1,138` | `241` |
+| flask | `83` | `8,303` | `5,661` | `1,814` |
+| mux | `16` | `259` | `243` | `243` |
+| vite/packages/vite | `204` | `15,250` | `9,957` | `1,801` |
+
+The latest full-suite diagnostics are warm `r8` and cold `r9`, generated by the
+commands above. Warm median response-line size was `99,656` bytes across task
+rows, with a max task median of `112,389` bytes. Cold median response-line size
+was `165,065` bytes, reflecting process output and one-shot invocation overhead.
+Warm median packet payload size was `95,381` bytes, and max median graph payload
+size was `41,720` bytes after pruning graph nodes that were no longer referenced
+by retained trail edges.
+
+The first agent-level public-core subset has two with-CodeStory rows
+(`codestory-indexing-flow` and `vite-dev-server-architecture`) that both
+quality-passed `3/3`, but strict reanalysis shows neither row ran an answer
+packet as the first repository-context command. The corrected CodeStory
+indexing-flow r20 row fixed that prompt behavior and passed `3/3` packet-first
+with zero ordinary source reads. Vite r21, Express r22, mux r24, and Express r26
+extended that strict with-CodeStory shape to clean public checkouts. Mux r27 and
+Express r28 added edit-planning and route-tracing rows. Express r23, mux r25,
+Express r26, mux r27, and Express r28 provide the first five
+quality-comparable paired baselines. The remaining blocker is breadth: more
+repositories and language families need paired quality-passing rows before a
+headline savings claim.
+
+Expected-file recall was `100%` on the strict packet-first public-checkout
+rows except `express-response-send-bug-localization`, which still passed its
+manifest gate with `75%` file recall and `75%` citation coverage. The mux CORS
+baseline also passed with `75%` citation coverage. The next promotion blocker
+is no longer packet quality or packet-runtime medians; it is broader
+with/without-agent savings across more public repositories and language
+families.
+
 ## Runner Verification
 
 The current Codex CLI supports the harness flags `exec --json --ephemeral
@@ -47,9 +300,11 @@ default repo set use only `codestory`. Private sibling repositories are opt-in
 through `--include-local-repos` or explicit `--repos` values.
 
 Use `--publishable` only when the selected runner reports token usage and every
-run succeeds. For a public benchmark row, use at least three repeats, the same
-model, the same sandbox mode, the same cache policy, and the same semantic
-backend for both arms.
+run succeeds. For agent A/B rows, `--publishable` also requires with-CodeStory
+runs to execute `packet` first and stay within the post-packet ordinary
+source-read budget, which defaults to zero reads after packet. For a public
+benchmark row, use at least three repeats, the same model, the same sandbox
+mode, the same cache policy, and the same semantic backend for both arms.
 
 ## Runtime Budgets
 
@@ -72,17 +327,52 @@ The agent A/B harness runs the same repository prompt in two arms:
 - `without_codestory`: the agent is instructed to avoid CodeStory and use normal
   repository exploration.
 - `with_codestory`: the agent is instructed to use CodeStory grounding first,
-  then ordinary source reads only when needed.
+  run `packet` for broad repository questions, then ordinary source reads only
+  for named gaps.
 
-The harness writes raw stdout/stderr per run, a JSONL run ledger, a machine
-summary, and a Markdown summary under `target/agent-benchmark/<timestamp>`.
-Reported comparisons should use medians across successful repeats for the same
-runner, repository set, prompt set, cache policy, semantic backend, and model.
+The harness writes raw stdout/stderr per run, a JSONL run ledger, transcript
+analysis, a machine summary, and a Markdown summary under
+`target/agent-benchmark/<timestamp>`. The analyzer counts command categories,
+duplicate command patterns, duplicate direct file reads, and ordinary source
+reads after the first successful CodeStory command or packet. Reported
+comparisons should use medians across successful repeats for the same runner,
+repository set, prompt set, cache policy, semantic backend, and model.
+Each run records repository provenance, including resolved checkout path,
+manifest URL/ref, actual git HEAD, dirty status, and whether a built-in local
+repo config overrode the manifest checkout. Rows with local overrides are
+diagnostics, not public reproducibility evidence.
+For the with-CodeStory arm, the harness injects `CODESTORY_CLI` from
+`--codestory-cli` or the local release/debug binary and `--publishable` fails
+when a with-CodeStory run does not execute an answer packet with `--question`
+as the first successful repository-context command, or when it exceeds
+`--max-source-reads-after-packet` after that packet.
 
 ```powershell
 node .\scripts\codestory-agent-ab-benchmark.mjs --list
 node .\scripts\codestory-agent-ab-benchmark.mjs --quick --repos codestory --repeats 3 --timeout-ms 600000 --publishable
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --list
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --task-ids codestory-indexing-flow,vite-dev-server-architecture --arms with_codestory --repeats 3 --max-source-reads-after-packet 0 --allow-failures
+node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-benchmark\<run-dir>
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --materialize-repos --list
+node .\scripts\codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite public-core --repeats 3
 ```
+
+Manifest-backed runs load public `*.task.json` files from
+`benchmarks/tasks/`, score expected files, symbols, claims, citations, and
+forbidden claims, then fail `--publishable` when a manifest-backed run lacks
+quality scoring or misses its quality gate.
+`--reanalyze-dir` recomputes transcript analysis, packet-first telemetry,
+quality scores, and summaries from existing raw stdout JSONL files so analyzer
+fixes can be applied without spending another model run.
+
+Packet runtime runs compare cold CLI `packet` invocations with warm
+`serve --stdio` packet calls. They are runtime rows, not agent-token rows, and
+still use the manifest quality gates before a result can be promoted.
+`--publishable` also enforces repeated runs, public-core corpus shape, and
+non-null passing quality scores for every packet row. The corpus shape is now in
+place, with warm stdio medians recorded in `r8` and cold CLI medians recorded in
+`r9`; the remaining blocker for a public savings claim is still controlled
+with/without-agent improvement.
 
 Estimated cost is intentionally absent unless both token usage and pricing
 environment variables are present:

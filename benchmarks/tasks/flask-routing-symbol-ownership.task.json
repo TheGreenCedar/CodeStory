@@ -1,0 +1,89 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "flask-routing-symbol-ownership",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "symbol_ownership",
+  "repo": {
+    "name": "flask",
+    "url": "https://github.com/pallets/flask.git",
+    "ref": "3.1.1",
+    "workspace_root": ".",
+    "languages": [
+      "Python"
+    ],
+    "setup": [
+      "python -m pip install -e ."
+    ]
+  },
+  "prompt": "Explain which Flask classes own route decorator behavior, application URL rule registration, blueprint URL rule registration, and request-time dispatch.",
+  "expected_files": [
+    "src/flask/sansio/scaffold.py",
+    "src/flask/sansio/app.py",
+    "src/flask/sansio/blueprints.py",
+    "src/flask/app.py"
+  ],
+  "expected_symbols": [
+    {
+      "name": "Scaffold.route",
+      "path": "src/flask/sansio/scaffold.py",
+      "kind": "method",
+      "why": "Shared route decorator implementation."
+    },
+    {
+      "name": "App.add_url_rule",
+      "path": "src/flask/sansio/app.py",
+      "kind": "method",
+      "why": "Application-owned URL rule registration."
+    },
+    {
+      "name": "Blueprint.add_url_rule",
+      "path": "src/flask/sansio/blueprints.py",
+      "kind": "method",
+      "why": "Blueprint-owned URL rule registration."
+    },
+    {
+      "name": "Flask.dispatch_request",
+      "path": "src/flask/app.py",
+      "kind": "method",
+      "why": "Request-time view dispatch."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "The route decorator behavior is shared through the scaffold abstraction."
+    },
+    {
+      "text": "Application URL rules are owned by the sansio app add_url_rule method."
+    },
+    {
+      "text": "Blueprint URL rules are owned by the sansio blueprint add_url_rule path."
+    },
+    {
+      "text": "Request-time view invocation is owned by Flask.dispatch_request."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "Blueprint.add_url_rule is the only URL rule registration path in Flask.",
+      "severity": "major"
+    },
+    {
+      "text": "Flask.dispatch_request owns route decorator registration.",
+      "severity": "critical"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "python",
+    "symbol-ownership",
+    "routing"
+  ]
+}

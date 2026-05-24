@@ -1,0 +1,83 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "mux-cors-middleware-edit-plan",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "edit_planning",
+  "repo": {
+    "name": "mux",
+    "url": "https://github.com/gorilla/mux.git",
+    "ref": "v1.8.1",
+    "workspace_root": ".",
+    "languages": [
+      "Go"
+    ],
+    "setup": [
+      "go test ./..."
+    ]
+  },
+  "prompt": "Plan a minimal edit to adjust how mux reports allowed methods for CORS preflight responses. Identify the implementation and tests to inspect first.",
+  "expected_files": [
+    "middleware.go",
+    "middleware_test.go",
+    "mux.go",
+    "route.go"
+  ],
+  "expected_symbols": [
+    {
+      "name": "CORSMethodMiddleware",
+      "path": "middleware.go",
+      "kind": "function",
+      "why": "Builds the CORS method middleware behavior."
+    },
+    {
+      "name": "Router.Use",
+      "path": "middleware.go",
+      "kind": "method",
+      "why": "Registers middleware on the router."
+    },
+    {
+      "name": "Route.Methods",
+      "path": "route.go",
+      "kind": "method",
+      "why": "Defines methods that contribute to allowed-method behavior."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "CORSMethodMiddleware in middleware.go is the minimal implementation target."
+    },
+    {
+      "text": "getAllMethodsForRoute, Route.Methods, Route.GetMethods, or methodMatcher provide the route method list used by CORSMethodMiddleware."
+    },
+    {
+      "text": "TestCORSMethodMiddleware or TestCORSMethodMiddlewareSubrouter in middleware_test.go should be inspected before broader router tests."
+    },
+    {
+      "text": "ExampleCORSMethodMiddleware documents the public CORS middleware behavior."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "CORS allowed methods should be changed only in regexp.go.",
+      "severity": "critical"
+    },
+    {
+      "text": "Route method declarations are irrelevant to CORS preflight behavior.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "go",
+    "edit-planning",
+    "middleware"
+  ]
+}

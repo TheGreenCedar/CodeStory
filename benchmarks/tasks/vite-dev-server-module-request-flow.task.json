@@ -1,0 +1,101 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "vite-dev-server-module-request-flow",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "route_tracing",
+  "repo": {
+    "name": "vite",
+    "url": "https://github.com/vitejs/vite.git",
+    "ref": "v5.4.19",
+    "workspace_root": "packages/vite",
+    "languages": [
+      "TypeScript",
+      "JavaScript",
+      "Markdown"
+    ],
+    "setup": [
+      "pnpm install"
+    ]
+  },
+  "prompt": "Trace how a Vite dev-server request for a JavaScript or CSS module moves from server setup through middleware, module transform, plugin hooks, graph update, and HTTP response.",
+  "expected_files": [
+    "src/node/server/index.ts",
+    "src/node/server/middlewares/transform.ts",
+    "src/node/server/transformRequest.ts",
+    "src/node/server/pluginContainer.ts",
+    "src/node/server/moduleGraph.ts"
+  ],
+  "expected_symbols": [
+    {
+      "name": "createServer",
+      "path": "src/node/server/index.ts",
+      "kind": "function",
+      "why": "Public dev-server creation entry point."
+    },
+    {
+      "name": "transformMiddleware",
+      "path": "src/node/server/middlewares/transform.ts",
+      "kind": "function",
+      "why": "Handles eligible module requests and calls transformRequest."
+    },
+    {
+      "name": "transformRequest",
+      "path": "src/node/server/transformRequest.ts",
+      "kind": "function",
+      "why": "Coordinates resolving, loading, transforming, caching, and graph updates."
+    },
+    {
+      "name": "createPluginContainer",
+      "path": "src/node/server/pluginContainer.ts",
+      "kind": "function",
+      "why": "Builds the plugin hook runner used by request transforms."
+    },
+    {
+      "name": "ModuleGraph",
+      "path": "src/node/server/moduleGraph.ts",
+      "kind": "class",
+      "why": "Tracks module identity, dependencies, and transform results."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "Dev-server creation installs the middleware stack that later receives module requests."
+    },
+    {
+      "text": "transformMiddleware filters module-like requests and delegates eligible work to transformRequest."
+    },
+    {
+      "text": "transformRequest uses the plugin container to resolve, load, and transform modules."
+    },
+    {
+      "text": "The module graph is updated with module entries and transform results during the request path."
+    },
+    {
+      "text": "The transformed code is sent back through the transform middleware response path."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "JavaScript module requests bypass the dev-server middleware stack.",
+      "severity": "critical"
+    },
+    {
+      "text": "Plugin hooks are not involved in dev-server module transforms.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "typescript",
+    "mixed-monorepo",
+    "route-tracing"
+  ]
+}
