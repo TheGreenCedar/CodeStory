@@ -1,143 +1,96 @@
-# `index` — Build or Refresh the Symbol Index
+# `index` - Build or Refresh the Symbol Index
 
-Discovers project files, extracts symbols and edges via tree-sitter + semantic resolution, persists graph/search state to SQLite, and synchronizes semantic docs before returning when embedding assets are available.
+Discovers project files, extracts symbols and edges, persists graph/search state
+to SQLite, and synchronizes semantic docs when embedding assets are available.
 
 ## Usage
 
-```
+```text
 <codestory-cli> index [OPTIONS]
 ```
 
-## Arguments
+## Options
 
-| Argument | Type | Default | How it works |
-|----------|------|---------|--------------|
-| `--project` | path | `.` | Repository root to index or query. `--path` is an alias. Runtime opens this path, discovers files from the workspace configuration, and derives the default project-cache key from the resolved root. |
-| `--cache-dir` | path | *auto* | Cache directory to use exactly as passed. If omitted, `codestory-cli` uses the system cache root with a per-project hashed subdirectory. The SQLite DB and sibling persisted search directory live under this cache root. |
-| `--refresh` | enum | `auto` | Refresh strategy: `auto`, `full`, `incremental`, or `none`. This decides whether graph/snapshot/semantic indexing runs before the summary is returned. |
-| `--format` | enum | `markdown` | Output format: `markdown` or `json`. JSON exposes the same project stats, retrieval state, phase timings, semantic counters, and resolution counters for automation. |
-| `--output-file` | path | *stdout* | Write output to an existing parent directory instead of stdout. |
-| `--dry-run` | bool | off | Resolve workspace discovery and the refresh plan, then report files that would be indexed or removed without parsing files or writing storage. |
-| `--summarize` | bool | off | Generate cached one-sentence symbol summaries after the index pass. Requires `CODESTORY_SUMMARY_ENDPOINT`, unless the endpoint is `local` or `mock`. |
-| `--progress` | bool | off | Print an incremental text progress bar to stderr. Stdout stays reserved for Markdown or JSON output. |
-| `--watch` | bool | off | Run once, then keep watching the project root and perform incremental refreshes on file changes. |
+| Option | Default | Use |
+|--------|---------|-----|
+| `--project <path>` / `--path <path>` | `.` | Target repository root. Always pass this explicitly. |
+| `--cache-dir <path>` | auto | Override the per-project cache root. |
+| `--refresh <auto|full|incremental|none>` | `auto` | Choose the graph/snapshot/semantic refresh mode. |
+| `--format <markdown|json>` | `markdown` | Use JSON for automation and timing analysis. |
+| `--output-file <path>` | stdout | Write output to a file with an existing parent directory. |
+| `--dry-run` | off | Show workspace discovery and planned adds/removals without writing storage. |
+| `--summarize` | off | Generate cached symbol summaries; requires `CODESTORY_SUMMARY_ENDPOINT`, `local`, or `mock`. |
+| `--progress` | off | Print progress to stderr while preserving stdout output. |
+| `--watch` | off | Keep watching the project root and run incremental refreshes on changes. |
 
 ## Refresh Modes
 
 | Mode | Behavior |
 |------|----------|
-| `auto` | Inspect stored inventory. If the cache has no indexed files, run `full`; otherwise run `incremental`. This is the default for `index`. |
-| `full` | Build a staged SQLite database from the full workspace, parse/extract/resolve every discovered source file, copy reusable semantic docs forward from the previous live DB when present, finalize snapshots, publish the staged DB, and sync semantic docs before returning. |
-| `incremental` | Open the live DB, diff filesystem discovery against stored inventory, reindex changed/new/unindexed files, remove disappeared files, refresh live snapshots, and rebuild/prune semantic docs only for touched files. |
-| `none` | Open the existing cache and return a summary without running graph or semantic indexing. Use only when you intentionally want to inspect a known-good cache. |
+| `auto` | Use `full` for an empty cache and `incremental` otherwise. |
+| `full` | Rebuild the project graph and semantic docs from the discovered workspace. |
+| `incremental` | Reindex changed/new/unindexed files, remove disappeared files, and prune touched semantic docs. |
+| `none` | Inspect the existing cache without refreshing it. Use only after a known-good same-session index. |
 
-## Semantic Behavior
+Use `--refresh full` for first-time indexes, cache/schema uncertainty, and fixes
+for historical indexing failures. Incremental runs can leave stale error rows
+when previously failing files are not touched.
 
-There is no `index --semantic off` option in the current CLI. Semantic docs are part of the default `index` contract when embedding assets are available.
+## Semantic Retrieval
 
-Runtime environment variables control semantic retrieval and tuning:
+There is no `index --semantic off` flag. Semantic docs are part of the default
+index contract when embedding assets are ready. On a fresh machine, check the
+setup plan first:
 
-| Variable | Behavior |
-|----------|----------|
+```text
+<codestory-cli> setup embeddings --project <target-workspace> --dry-run --format json
+```
+
+Then install assets with `setup embeddings --project <target-workspace>` if the
+plan is acceptable, and rerun `index --refresh full`.
+
+High-signal environment toggles:
+
+| Variable | Use |
+|----------|-----|
 | `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false` | Disable hybrid retrieval and use symbolic ranking. |
-| `CODESTORY_SEMANTIC_DOC_SCOPE=all` | Include the broader all-symbol semantic doc set. The default is durable symbols only. |
-| `CODESTORY_SEMANTIC_DOC_ALIAS_MODE` | Semantic document alias policy: `alias_variant` default, `current_alias` full legacy alias text, or `no_alias` baseline research mode. |
-| `CODESTORY_SEMANTIC_DOC_MAX_TOKENS` | Override semantic document token budget. Use overrides only for controlled research. |
-| `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` | Override semantic doc embedding batch size. Defaults vary by backend; managed ONNX uses a larger local batch. Use this only while profiling. |
-| `CODESTORY_EMBED_RUNTIME_MODE=hash` | Use lightweight deterministic hash embeddings for local-dev semantic checks. |
-| `CODESTORY_EMBED_BACKEND=onnx` | Use the active managed real-model backend. |
-| `CODESTORY_EMBED_ONNX_MODEL` | Custom ONNX model path for profiling or non-managed assets. |
-| `CODESTORY_EMBED_ONNX_TOKENIZER` | Custom tokenizer path for profiling or non-managed assets. |
-| `CODESTORY_EMBED_ONNX_PROVIDER` | ONNX Runtime provider override, such as `directml` on Windows or `cpu`. |
-| `CODESTORY_EMBED_BACKEND=llamacpp` | Use an external legacy llama.cpp-compatible embedding endpoint intentionally. |
-| `CODESTORY_EMBED_LLAMACPP_URL` | OpenAI-compatible llama.cpp embeddings endpoint for the legacy backend. |
-| `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT` | Client-side concurrent embedding requests for the legacy backend, clamped from `1` to `16`. |
+| `CODESTORY_SEMANTIC_DOC_SCOPE=all` | Include all-symbol semantic docs. Accepted all-symbol aliases are `all`, `full`, `all-symbols`, and `all_symbols`; omitted or other values default to durable symbols. |
+| `CODESTORY_EMBED_BACKEND=onnx` | Use the managed ONNX backend. |
+| `CODESTORY_EMBED_RUNTIME_MODE=hash` | Use deterministic hash embeddings for local smoke checks. |
+| `CODESTORY_SUMMARY_ENDPOINT=local` | Enable deterministic local summaries with `--summarize`. |
 
-Run `<codestory-cli> setup embeddings --project <target-workspace>` to install the managed BGE-base ONNX graph and tokenizer assets before expecting the default ONNX backend to be ready on a fresh machine.
-
-Symbol summarization uses these additional settings:
-
-| Variable | Behavior |
-|----------|----------|
-| `CODESTORY_SUMMARY_ENDPOINT` | OpenAI chat-completions-compatible endpoint for `index --summarize`; use `local` or `mock` for deterministic local summaries. |
-| `CODESTORY_SUMMARY_API_KEY` | Optional bearer token for the summary endpoint. |
-| `CODESTORY_SUMMARY_MODEL` | Model name sent to the summary endpoint; defaults to `codestory-symbol-summary`. |
-| `CODESTORY_SUMMARY_MAX_TOKENS` | Optional `max_tokens` override for summary calls. |
+Use other embedding, alias, batch-size, tokenizer, provider, llama.cpp, and
+summary tuning variables only for focused profiling or compatibility work.
 
 ## Output
 
-Returns project stats, retrieval readiness, and phase timings. Markdown output is compact; JSON output exposes the same fields as structured data.
+Markdown returns a compact index summary. JSON exposes the same data for tools:
 
-```
-# Index
-project: `codestory`
-storage: `/path/to/codestory.db`
-refresh: `auto(incremental)`
-stats: nodes=4231 edges=8452 files=187 errors=3
-retrieval: hybrid semantic_docs=3690 model=sentence-transformers/all-MiniLM-L6-v2-local
-timings_ms: parse=1200 flush=300 resolve=450 cleanup=80 cache_refresh=0
-cache_ms: search_projection=42 search_index=210 runtime_publish=1
-semantic_ms: doc_build=115 embedding=32634 db_upsert=420 reload=18 prune=3
-semantic_docs: reused=0 embedded=3690 pending=3690 stale=0
-resolution: calls 120->15, imports 42->3
-```
+- project and storage path
+- refresh mode and discovered file/error counts
+- retrieval readiness and semantic doc counts
+- parse, flush, resolve, cleanup, cache, and semantic timing buckets
+- resolution counters and semantic reuse/embed/prune counts
 
-Important timing fields:
-
-| Field | Meaning |
-|-------|---------|
-| `timings_ms.parse` | Parse, extract, artifact-cache, and indexer preparation time. |
-| `timings_ms.flush` | Projection persistence time for graph rows and derived projection rows. |
-| `timings_ms.resolve` | Post-flush edge resolution time. |
-| `timings_ms.cleanup` | Incremental cleanup for removed/stale files. |
-| `timings_ms.cache_refresh` | Runtime cache refresh wrapper time; use `cache_ms` and `semantic_ms` fields to split the work. |
-| `cache_ms.search_projection` | SQLite rebuild of the search-symbol projection from the node table. |
-| `cache_ms.search_index` | Runtime search index construction for symbol names. |
-| `cache_ms.runtime_publish` | Publishing rebuilt node names and search engine into the live runtime state. |
-| `semantic_ms.doc_build` | Generated semantic text and hash construction. |
-| `semantic_ms.embedding` | Embedding runtime work for pending semantic docs. |
-| `semantic_ms.db_upsert` | SQLite upsert time for embedded docs. |
-| `semantic_ms.reload` | Loading persisted semantic docs into the runtime search engine when needed. |
-| `semantic_ms.prune` | Removing semantic docs that no longer belong to refreshed symbols. |
-| `semantic_docs.reused` | Existing docs accepted without embedding. |
-| `semantic_docs.embedded` | Docs newly embedded in this run. |
-| `semantic_docs.pending` | Docs that required embedding after reuse checks. |
-| `semantic_docs.stale` | Persisted docs pruned because they no longer match the refreshed symbol set. |
+Important timing fields are `timings_ms.parse`, `timings_ms.flush`,
+`timings_ms.resolve`, `timings_ms.cleanup`, `cache_ms.search_index`,
+`cache_ms.runtime_publish`, `semantic_ms.doc_build`,
+`semantic_ms.embedding`, `semantic_ms.db_upsert`, and `semantic_ms.prune`.
 
 ## Examples
 
-```bash
-# First-time index of the current repo
+```text
 <codestory-cli> index --project <target-workspace>
-
-# Force full re-index
 <codestory-cli> index --project <target-workspace> --refresh full
-
-# Index a different project, JSON output
-<codestory-cli> index --project C:/path/to/other-repo --format json
-
-# Inspect a refresh plan without touching storage
 <codestory-cli> index --project <target-workspace> --dry-run
-
-# Keep the index warm during active development
 <codestory-cli> index --project <target-workspace> --watch --progress
-
-# Generate deterministic local symbol summaries for a smoke run
 CODESTORY_SUMMARY_ENDPOINT=local <codestory-cli> index --project <target-workspace> --summarize
 ```
 
-## Refresh Troubleshooting
+## Endpoint Awareness
 
-| Situation | Recommended refresh |
-|----------|----------------------|
-| First-time indexing or after cache deletion | `--refresh full` |
-| Verifying a fix for prior indexing errors | `--refresh full` |
-| Verifying schema/storage-version or graph/query-rule changes | `--refresh full` |
-| Normal follow-up indexing after editing a few files | `--refresh incremental` or `auto` |
-| Reusing a known-good index immediately after a successful fresh build + index run | `--refresh none` |
-
-Prefer `--refresh full` when you need confidence that historical errors are gone. Incremental runs can leave stale error rows behind if the previously failing files are not reprocessed.
-
-## OpenAPI Endpoint Awareness
-
-When discovered files include OpenAPI JSON/YAML schemas, CodeStory indexes each method/path as an endpoint symbol such as `GET /api/users`. Client literals in supported source files, for example `fetch("/api/users")` and `axios.post("/api/users")`, produce speculative call edges to matching endpoint refs so monorepo trails can cross frontend/backend contract boundaries.
+When OpenAPI JSON/YAML files are indexed, CodeStory emits endpoint symbols such
+as `GET /api/users`. Client literals like `fetch("/api/users")` and
+`axios.post("/api/users")` can create speculative call edges to matching
+endpoint refs, so confirm certainty before treating frontend/backend trails as
+verified.
