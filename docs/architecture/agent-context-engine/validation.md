@@ -78,8 +78,9 @@ node .\scripts\codestory-agent-ab-benchmark.mjs --quick --repos codestory --repe
 Future quality-gated validation:
 
 ```powershell
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --list --publishable --repeats 3 --materialize-repos
 node .\scripts\codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite public-core --repeats 3 --packet-runtime-mode both --codestory-cli .\target\release\codestory-cli.exe --publishable
-node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --repeats 3 --timeout-ms 900000 --sandbox danger-full-access --publishable
+node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --repeats 3 --timeout-ms 900000 --sandbox danger-full-access --publishable --materialize-repos
 ```
 
 ## Traceability

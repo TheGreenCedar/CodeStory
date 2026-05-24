@@ -317,7 +317,7 @@ pub(crate) fn agent_packet(
     let sufficiency = build_packet_sufficiency(&question, &answer, &budget);
     let benchmark_trace = packet_benchmark_trace(&answer);
 
-    Ok(AgentPacketDto {
+    let mut packet = AgentPacketDto {
         packet_id: answer.answer_id.clone(),
         question,
         task_class: Some(plan.task_class),
@@ -326,7 +326,10 @@ pub(crate) fn agent_packet(
         budget,
         sufficiency,
         benchmark_trace,
-    })
+    };
+    enforce_packet_output_budget(&mut packet);
+
+    Ok(packet)
 }
 
 fn build_packet_plan(question: &str, requested: Option<PacketTaskClassDto>) -> PacketPlanDto {
@@ -1826,6 +1829,75 @@ fn apply_packet_budget(
     }
 }
 
+fn enforce_packet_output_budget(packet: &mut AgentPacketDto) {
+    for _ in 0..8 {
+        let output_bytes = refresh_packet_output_bytes(packet);
+        if output_bytes <= packet.budget.limits.max_output_bytes as usize {
+            break;
+        }
+
+        packet.budget.truncated = true;
+        push_omitted_section(&mut packet.budget, "output_bytes");
+        push_omitted_section(&mut packet.budget, "packet_payload");
+
+        let over_by = output_bytes.saturating_sub(packet.budget.limits.max_output_bytes as usize);
+        let current_answer_bytes = serde_json::to_vec(&packet.answer)
+            .map(|bytes| bytes.len())
+            .unwrap_or_default();
+        let next_answer_cap = current_answer_bytes
+            .saturating_sub(over_by.saturating_add(1024))
+            .max(1024);
+
+        if truncate_answer_markdown_to_byte_cap(&mut packet.answer, next_answer_cap) {
+            push_omitted_section(&mut packet.budget, "markdown_blocks");
+            packet.budget.used = packet_budget_usage(&packet.answer);
+            packet.benchmark_trace = packet_benchmark_trace(&packet.answer);
+            packet.sufficiency =
+                build_packet_sufficiency(&packet.question, &packet.answer, &packet.budget);
+            continue;
+        }
+        break;
+    }
+
+    let output_bytes = refresh_packet_output_bytes(packet);
+    if output_bytes > packet.budget.limits.max_output_bytes as usize {
+        packet.budget.truncated = true;
+        push_omitted_section(&mut packet.budget, "output_bytes");
+        push_omitted_section(&mut packet.budget, "packet_payload");
+        packet.sufficiency =
+            build_packet_sufficiency(&packet.question, &packet.answer, &packet.budget);
+    }
+}
+
+fn refresh_packet_output_bytes(packet: &mut AgentPacketDto) -> usize {
+    for _ in 0..4 {
+        let output_bytes = serialized_packet_len(packet);
+        let output_bytes_u32 = output_bytes.try_into().unwrap_or(u32::MAX);
+        if packet.budget.used.output_bytes == output_bytes_u32 {
+            return output_bytes;
+        }
+        packet.budget.used.output_bytes = output_bytes_u32;
+    }
+    serialized_packet_len(packet)
+}
+
+fn serialized_packet_len(packet: &AgentPacketDto) -> usize {
+    serde_json::to_vec(packet)
+        .map(|bytes| bytes.len())
+        .unwrap_or_default()
+}
+
+fn push_omitted_section(budget: &mut PacketBudgetDto, section: &str) {
+    if !budget
+        .omitted_sections
+        .iter()
+        .any(|existing| existing == section)
+    {
+        budget.omitted_sections.push(section.to_string());
+        budget.omitted_sections.sort();
+    }
+}
+
 fn cap_citations(answer: &mut AgentAnswerDto, limits: &PacketBudgetLimitsDto) -> bool {
     let original_len = answer.citations.len();
     let mut files = HashSet::new();
@@ -2743,8 +2815,7 @@ fn execute_retrieval(
         GraphArtifactDto::Uml { id, .. } => id.clone(),
         GraphArtifactDto::Mermaid { id, .. } => id.clone(),
     });
-    let include_structured_evidence =
-        req.include_evidence || matches!(req.response_mode, AgentResponseModeDto::Structured);
+    let include_structured_evidence = req.include_evidence;
     let scored_by_node = scored_hits
         .iter()
         .map(|scored| (scored.hit.node_id.clone(), scored))
@@ -4701,6 +4772,68 @@ mod tests {
         );
         assert!(budget.used.files <= budget.limits.max_files);
         assert!(budget.used.output_bytes <= budget.limits.max_output_bytes);
+    }
+
+    #[test]
+    fn packet_output_budget_measures_serialized_packet_payload() {
+        let question = "Explain the final packet payload budget.";
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 4,
+            max_files: 4,
+            max_snippets: 4,
+            max_trail_edges: 4,
+            max_output_bytes: 6 * 1024,
+        };
+        let max_output_bytes = limits.max_output_bytes;
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![test_packet_citation(
+                "PacketBudget",
+                "crates/codestory-runtime/src/agent/orchestrator.rs",
+                0.8,
+            )],
+        );
+        if let AgentResponseBlockDto::Markdown { markdown } = &mut answer.sections[0].blocks[0] {
+            *markdown = "payload budget evidence ".repeat(6000);
+        }
+        let budget = apply_packet_budget(question, PacketBudgetModeDto::Tiny, limits, &mut answer);
+        let sufficiency = build_packet_sufficiency(question, &answer, &budget);
+        let benchmark_trace = packet_benchmark_trace(&answer);
+        let mut packet = AgentPacketDto {
+            packet_id: answer.answer_id.clone(),
+            question: question.to_string(),
+            task_class: Some(PacketTaskClassDto::ArchitectureExplanation),
+            plan: PacketPlanDto {
+                task_class: PacketTaskClassDto::ArchitectureExplanation,
+                inferred_task_class: false,
+                queries: vec![PacketPlanQueryDto {
+                    query: question.to_string(),
+                    purpose: "fixture".to_string(),
+                }],
+                trace: Vec::new(),
+            },
+            answer,
+            budget,
+            sufficiency,
+            benchmark_trace,
+        };
+
+        enforce_packet_output_budget(&mut packet);
+
+        let serialized_len = serde_json::to_vec(&packet).expect("serialize packet").len();
+        assert!(
+            serialized_len <= max_output_bytes as usize,
+            "serialized packet should honor max_output_bytes: {serialized_len} > {}",
+            max_output_bytes
+        );
+        assert_eq!(packet.budget.used.output_bytes as usize, serialized_len);
+        assert!(packet.budget.truncated);
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .contains(&"packet_payload".to_string())
+        );
     }
 
     #[test]

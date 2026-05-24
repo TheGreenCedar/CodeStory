@@ -192,6 +192,48 @@ fn assert_tool_success(response: &Value, id: Value) -> &Value {
         .expect("tools/call success should include structuredContent")
 }
 
+fn assert_structured_citations_have_no_evidence(value: &Value) {
+    fn visit(value: &Value, citation_count: &mut usize) {
+        match value {
+            Value::Object(map) => {
+                if map.contains_key("node_id")
+                    && map.contains_key("display_name")
+                    && map.contains_key("score")
+                {
+                    *citation_count += 1;
+                    assert!(
+                        map.get("evidence_edge_ids")
+                            .and_then(Value::as_array)
+                            .is_none_or(|edges| edges.is_empty()),
+                        "citation should omit evidence edge ids when include_evidence=false: {value}"
+                    );
+                    assert!(
+                        map.get("retrieval_score_breakdown")
+                            .is_none_or(Value::is_null),
+                        "citation should omit retrieval score breakdown when include_evidence=false: {value}"
+                    );
+                }
+                for child in map.values() {
+                    visit(child, citation_count);
+                }
+            }
+            Value::Array(items) => {
+                for child in items {
+                    visit(child, citation_count);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut citation_count = 0;
+    visit(value, &mut citation_count);
+    assert!(
+        citation_count > 0,
+        "test fixture should return citations to prove evidence stripping: {value}"
+    );
+}
+
 fn assert_tool_error(response: &Value, id: Value) -> &Value {
     let result = assert_success_envelope(response, id);
     assert_eq!(
@@ -1567,6 +1609,25 @@ fn packet_tool_returns_budgeted_sufficiency_contract() {
         packet["budget"]["requested"], "tiny",
         "stdio packet should honor the requested budget: {packet}"
     );
+    let packet_bytes = serde_json::to_vec(packet)
+        .expect("serialize packet content")
+        .len();
+    let used_output_bytes = packet
+        .pointer("/budget/used/output_bytes")
+        .and_then(Value::as_u64)
+        .expect("packet budget should include output byte usage");
+    let max_output_bytes = packet
+        .pointer("/budget/limits/max_output_bytes")
+        .and_then(Value::as_u64)
+        .expect("packet budget should include output byte limit");
+    assert!(
+        used_output_bytes <= max_output_bytes,
+        "packet should fit inside its advertised output budget: {packet}"
+    );
+    assert!(
+        packet_bytes <= max_output_bytes as usize,
+        "stdio structured packet should fit inside its advertised output budget: {packet}"
+    );
     assert_eq!(
         packet["plan"]["task_class"], "architecture_explanation",
         "stdio packet should expose the planner task class: {packet}"
@@ -1598,6 +1659,50 @@ fn packet_tool_returns_budgeted_sufficiency_contract() {
             .is_some(),
         "stdio packet should include benchmark trace counters: {packet}"
     );
+}
+
+#[test]
+fn structured_packet_and_context_honor_include_evidence_false() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let packet_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "packet-no-evidence",
+            "method": "tools/call",
+            "params": {
+                "name": "packet",
+                "arguments": {
+                    "question": "Explain how AppController routes repository indexing",
+                    "budget": "tiny",
+                    "task_class": "architecture_explanation",
+                    "include_evidence": false
+                }
+            }
+        }),
+    );
+    let packet = assert_tool_success(&packet_response, json!("packet-no-evidence"));
+    assert_structured_citations_have_no_evidence(packet);
+
+    let context_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "context-no-evidence",
+            "method": "tools/call",
+            "params": {
+                "name": "context",
+                "arguments": {
+                    "query": "AppController",
+                    "include_evidence": false
+                }
+            }
+        }),
+    );
+    let context = assert_tool_success(&context_response, json!("context-no-evidence"));
+    assert_structured_citations_have_no_evidence(context);
 }
 
 #[test]

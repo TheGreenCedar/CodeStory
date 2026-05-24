@@ -55,10 +55,10 @@ arm.
   `49.1%` to `74.2%` fewer tokens, `47.2%` to `50.7%` lower wall time, and
   `85.7%` to `88.9%` fewer tool starts. This is promising paired evidence, not
   a general savings claim yet.
-- CodeStory repo cold index: `9.23s`, with `47,107` nodes, `39,808` edges,
-  `145` files, and `6,358` semantic docs.
-- One-shot reads after that index: search `0.92s`, symbol `0.62s`,
-  trail `0.20s`, snippet `0.18s`.
+- CodeStory repo cold index: `11.10s`, with `56,272` nodes, `47,628` edges,
+  `149` files, and `7,501` semantic docs.
+- One-shot reads after that index: search `1.29s`, symbol `0.86s`,
+  trail `0.25s`, snippet `0.23s`.
 - Warm stdio small-fixture loop: `53.50ms` per
   `search -> symbol -> trail -> snippet` loop across `20` reps.
 - Warm stdio search p95 smoke: `25.96ms`, with protocol-clean stdout.

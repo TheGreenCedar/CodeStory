@@ -4490,6 +4490,11 @@ fn index_text_only_file(path: &Path) -> Result<IntermediateStorage> {
         file_id,
         &mut local_storage,
     );
+    local_storage.callable_projection_states = build_callable_projection_states(
+        &local_storage.nodes,
+        &local_storage.edges,
+        &local_storage.occurrences,
+    );
     Ok(local_storage)
 }
 

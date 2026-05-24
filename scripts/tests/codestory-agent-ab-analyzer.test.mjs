@@ -1,11 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import {
   analyzeTranscript,
   agentPublishableBlockers,
+  benchmarkRunId,
   commandCategory,
+  isPathInside,
+  loadTasks,
   parseJsonLines,
+  packetFirstCommandForPrompt,
+  publicCoreCorpusAudit,
   scoreQuality,
 } from "../codestory-agent-ab-benchmark.mjs";
 
@@ -51,6 +59,44 @@ function runtimeQualityTask(id, qualityThresholds) {
   };
 }
 
+function manifestFixture(overrides = {}) {
+  return {
+    id: "fixture-task",
+    suite: "fixture",
+    task_class: "architecture_explanation",
+    repo: {
+      name: "fixture-repo",
+      url: "https://example.com/fixture.git",
+      ref: "main",
+      workspace_root: ".",
+    },
+    prompt: "Explain the fixture flow.",
+    expected_files: ["src/main.rs"],
+    expected_symbols: ["run"],
+    expected_claims: ["The fixture runs."],
+    quality_thresholds: {
+      min_expected_anchor_recall: 0.5,
+      min_expected_file_recall: 0.5,
+      min_expected_symbol_recall: 0.5,
+      min_expected_claim_recall: 0.5,
+      min_citation_coverage: 0.5,
+      max_forbidden_claims: 0,
+    },
+    ...overrides,
+  };
+}
+
+async function withManifestFile(manifest, callback) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "codestory-benchmark-manifest-"));
+  try {
+    const manifestPath = path.join(dir, "fixture.task.json");
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    return await callback(manifestPath, dir);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 test("categorizes commands without treating source paths as cli invocations", () => {
   assert.equal(commandCategory("& $env:CODESTORY_CLI packet --project . --question flow"), "codestory_cli");
   assert.equal(commandCategory('& "C:\\tools\\codestory-cli.exe" packet --project . --question flow'), "codestory_cli");
@@ -77,6 +123,95 @@ test("categorizes commands without treating source paths as cli invocations", ()
   assert.equal(commandCategory("Get-Content crates/codestory-cli/src/main.rs"), "direct_file_read");
   assert.equal(commandCategory("Get-Content C:\\tools\\codestory-cli.exe"), "direct_file_read");
   assert.equal(commandCategory("cargo test -p codestory-cli --test onboarding_contracts"), "build_test");
+});
+
+test("rejects manifest repo and workspace paths outside the cache", async () => {
+  await withManifestFile(
+    manifestFixture({
+      repo: {
+        name: "../evil",
+        url: "https://example.com/evil.git",
+        ref: "main",
+      },
+    }),
+    async (manifestPath, dir) => {
+      await assert.rejects(
+        () => loadTasks({ taskManifest: manifestPath, taskSuite: null, taskIds: null, repoCacheDir: path.join(dir, "repos") }),
+        /repo\.name/,
+      );
+    },
+  );
+
+  await withManifestFile(
+    manifestFixture({
+      repo: {
+        name: "fixture-repo",
+        url: "https://example.com/fixture.git",
+        ref: "main",
+        workspace_root: "../outside",
+      },
+    }),
+    async (manifestPath, dir) => {
+      await assert.rejects(
+        () => loadTasks({ taskManifest: manifestPath, taskSuite: null, taskIds: null, repoCacheDir: path.join(dir, "repos") }),
+        /workspace_root/,
+      );
+    },
+  );
+});
+
+test("packet-first command renders manifest text as PowerShell literals", () => {
+  const command = packetFirstCommandForPrompt(
+    "Inspect $env:SECRET and $(Get-ChildItem), then read John's file.\nNext line.",
+    { task_class: "bug_localization" },
+  );
+
+  assert.match(
+    command,
+    /--question 'Inspect \$env:SECRET and \$\(Get-ChildItem\), then read John''s file\. Next line\.'/,
+  );
+  assert.match(command, /--task-class 'bug-localization'/);
+  assert.throws(
+    () => packetFirstCommandForPrompt("Explain the task.", { task_class: "bug_localization; Remove-Item ." }),
+    /task_class/,
+  );
+});
+
+test("benchmark artifact run ids strip path separators from dynamic parts", () => {
+  assert.equal(
+    benchmarkRunId(["../repo", "task/id", "with codestory", "01"]),
+    "repo-task-id-with-codestory-01",
+  );
+});
+
+test("path containment rejects sibling-prefix directories", () => {
+  const root = path.join(os.tmpdir(), "codestory-agent-benchmark", "repos");
+  assert.equal(isPathInside(root, path.join(root, "express")), true);
+  assert.equal(isPathInside(root, path.join(os.tmpdir(), "codestory-agent-benchmark", "repos2", "evil")), false);
+});
+
+test("public-core corpus keeps publishable coverage locked", async () => {
+  const tasks = await loadTasks({
+    taskSuite: "public-core",
+    taskManifest: null,
+    taskIds: null,
+    repoCacheDir: path.join("target", "agent-benchmark", "repos"),
+  });
+  const audit = publicCoreCorpusAudit(tasks);
+
+  assert.equal(tasks.length, 18);
+  assert.equal(audit.repo_count, 5);
+  assert.deepEqual(Object.keys(audit.class_counts), [
+    "architecture_explanation",
+    "bug_localization",
+    "change_impact",
+    "edit_planning",
+    "route_tracing",
+    "symbol_ownership",
+  ]);
+  assert.deepEqual(Object.values(audit.class_counts), [3, 3, 3, 3, 3, 3]);
+  assert.deepEqual(audit.missing_classes, []);
+  assert.deepEqual(audit.underfilled_classes, []);
 });
 
 test("analyzes transcript command friction and scores manifest anchors", () => {

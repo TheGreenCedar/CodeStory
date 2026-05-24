@@ -232,12 +232,24 @@ codestory-cli index --project <target-workspace> --refresh full
 codestory-cli search --project <target-workspace> --query WorkspaceIndexer
 ```
 
-If the cache directory itself is suspect, remove only the project cache and
-rebuild:
+If the cache directory itself is suspect, get the exact project cache path from
+`doctor`, verify that it is under the CodeStory cache root, move it aside first,
+then rebuild. Remove the backup only after the fresh index is healthy:
 
 ```powershell
-Remove-Item -LiteralPath <cache-dir> -Recurse -Force
+$cacheDir = "<project-cache-dir-from-doctor>"
+$cacheRoot = Join-Path $env:LOCALAPPDATA "CodeStory"
+$resolvedCache = (Resolve-Path -LiteralPath $cacheDir).Path
+$resolvedRoot = (Resolve-Path -LiteralPath $cacheRoot).Path
+$relative = [System.IO.Path]::GetRelativePath($resolvedRoot, $resolvedCache)
+if ($relative.StartsWith("..") -or [System.IO.Path]::IsPathRooted($relative)) {
+  throw "Refusing to touch cache outside CodeStory cache root: $resolvedCache"
+}
+$backup = "$resolvedCache.bak-$(Get-Date -Format yyyyMMddHHmmss)"
+Rename-Item -LiteralPath $resolvedCache -NewName (Split-Path -Leaf $backup)
 codestory-cli index --project <target-workspace> --refresh full
+codestory-cli doctor --project <target-workspace>
+Remove-Item -LiteralPath $backup -Recurse -Force
 ```
 
 Low-memory guidance:

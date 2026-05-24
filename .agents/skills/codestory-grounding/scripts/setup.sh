@@ -8,7 +8,7 @@ fi
 
 repo_url="${CODESTORY_REPO_URL:-https://github.com/TheGreenCedar/CodeStory.git}"
 # Keep this in sync with DEFAULT_CODESTORY_REPO_REF in setup.ps1.
-DEFAULT_CODESTORY_REPO_REF="d78bf7c66a87e3454d1bfd82ba68cddd8d02004d"
+DEFAULT_CODESTORY_REPO_REF="7c891af81af64c941d4074272850e868f32fca14"
 if [[ -n "${CODESTORY_REPO_REF:-}" ]]; then
   repo_ref="$CODESTORY_REPO_REF"
 else

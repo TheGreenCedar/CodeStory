@@ -314,8 +314,8 @@ they are not substitutes for with/without-agent savings.
 
 | Lane | Current evidence | What it proves | Source |
 | --- | ---: | --- | --- |
-| CodeStory repo cold index and one-shot reads | `9.23s` index, `0.92s` search, `0.62s` symbol, `0.20s` trail, `0.18s` snippet | A release CLI can rebuild and query the CodeStory repo quickly with hash semantic mode on the Windows workstation | [codestory-e2e-stats-log.md](codestory-e2e-stats-log.md) |
-| Indexed graph scale for that run | `47,107` nodes, `39,808` edges, `145` files, `6,358` semantic docs | The repo-scale gate exercises a real Rust workspace, not only toy fixtures | [codestory-e2e-stats-log.md](codestory-e2e-stats-log.md) |
+| CodeStory repo cold index and one-shot reads | `11.10s` index, `1.29s` search, `0.86s` symbol, `0.25s` trail, `0.23s` snippet | A release CLI can rebuild and query the CodeStory repo quickly with hash semantic mode on the Windows workstation | [codestory-e2e-stats-log.md](codestory-e2e-stats-log.md) |
+| Indexed graph scale for that run | `56,272` nodes, `47,628` edges, `149` files, `7,501` semantic docs | The repo-scale gate exercises a real Rust workspace, not only toy fixtures | [codestory-e2e-stats-log.md](codestory-e2e-stats-log.md) |
 | Warm stdio agent loop smoke | `53.50ms` per `search -> symbol -> trail -> snippet` loop across `20` reps | Once an index exists, the persistent read surface stays in tens of milliseconds on the small-fixture smoke | [codestory-stdio-warm-loop-stats.md](codestory-stdio-warm-loop-stats.md) |
 | Warm stdio search p95 smoke | `25.96ms` p95 search | The smoke loop has a stable low-latency search budget and clean protocol stdout | [codestory-stdio-warm-loop-stats.md](codestory-stdio-warm-loop-stats.md) |
 | Historical cross-repo retrieval gate | Hit@10 `1.0`, adversarial Hit@10 `1.0`, MRR@10 `0.826831`, search p95 `84.7ms` across `4` projects and `225` queries | The historical externally validated retrieval profile found expected anchors across several repo families | [embedding-backend-benchmarks.md](embedding-backend-benchmarks.md) |

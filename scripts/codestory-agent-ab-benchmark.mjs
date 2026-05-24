@@ -13,6 +13,16 @@ const repoRoot = path.resolve(scriptDir, "..");
 const siblingRoot = path.resolve(repoRoot, "..");
 const defaultTaskRoot = path.join(repoRoot, "benchmarks", "tasks");
 const defaultRepoCacheRoot = path.join(repoRoot, "target", "agent-benchmark", "repos");
+const MANIFEST_REPO_NAME_PATTERN = /^[A-Za-z0-9_.-]+$/;
+const MANIFEST_TASK_ID_PATTERN = /^[a-z0-9][a-z0-9.-]*$/;
+const PACKET_TASK_CLASSES = new Set([
+  "architecture_explanation",
+  "bug_localization",
+  "change_impact",
+  "route_tracing",
+  "symbol_ownership",
+  "edit_planning",
+]);
 
 const PUBLIC_REPOS = {
   codestory: {
@@ -317,18 +327,92 @@ function taskIdFromManifest(filePath, raw) {
     .replace(/^-+|-+$/g, "");
 }
 
+function validateManifestRepoName(filePath, value) {
+  const name = String(value ?? "").trim();
+  if (!name) {
+    throw new Error(`Task manifest is missing repo.name: ${filePath}`);
+  }
+  if (!MANIFEST_REPO_NAME_PATTERN.test(name) || name === "." || name === "..") {
+    throw new Error(
+      `Task manifest repo.name must match ${MANIFEST_REPO_NAME_PATTERN} and cannot be '.' or '..': ${filePath}`,
+    );
+  }
+  return name;
+}
+
+function validateManifestTaskId(filePath, value) {
+  const id = String(value ?? "").trim();
+  if (!MANIFEST_TASK_ID_PATTERN.test(id)) {
+    throw new Error(`Task manifest id must match ${MANIFEST_TASK_ID_PATTERN}: ${filePath}`);
+  }
+  return id;
+}
+
+function validatePacketTaskClass(filePath, value) {
+  if (value == null) {
+    return null;
+  }
+  const taskClass = String(value).trim();
+  if (!PACKET_TASK_CLASSES.has(taskClass)) {
+    throw new Error(
+      `Task manifest task_class must be one of ${[...PACKET_TASK_CLASSES].join(", ")}: ${filePath}`,
+    );
+  }
+  return taskClass;
+}
+
+function isPathInside(base, candidate) {
+  const relative = path.relative(path.resolve(base), path.resolve(candidate));
+  return relative === "" || (relative && !relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function assertPathInside(base, candidate, label) {
+  if (!isPathInside(base, candidate)) {
+    throw new Error(`${label} must stay inside ${path.resolve(base)}: ${path.resolve(candidate)}`);
+  }
+  return path.resolve(candidate);
+}
+
+function normalizeWorkspaceRoot(filePath, value) {
+  if (value == null || String(value).trim() === "" || String(value).trim() === ".") {
+    return "";
+  }
+  const raw = String(value).trim().replace(/^['"]|['"]$/g, "");
+  if (
+    path.isAbsolute(raw) ||
+    path.win32.isAbsolute(raw) ||
+    path.posix.isAbsolute(raw) ||
+    /^[A-Za-z]:/.test(raw)
+  ) {
+    throw new Error(`Task manifest workspace_root must be relative: ${filePath}`);
+  }
+  const normalized = normalizePathLike(raw);
+  const parts = normalized.split("/");
+  if (
+    !normalized ||
+    normalized === "." ||
+    normalized === ".." ||
+    parts.some((part) => part === ".." || part === "")
+  ) {
+    throw new Error(`Task manifest workspace_root cannot traverse outside the checkout: ${filePath}`);
+  }
+  return normalized;
+}
+
 function repoConfigFromManifest(repo, opts = {}) {
   if (!repo || typeof repo !== "object") {
     return null;
   }
-  const name = String(repo.name ?? "").trim();
-  if (!name) {
-    return null;
-  }
+  const filePath = opts.filePath ?? "task manifest";
+  const name = validateManifestRepoName(filePath, repo.name);
   const checkoutPath = path.resolve(opts.repoCacheDir ?? defaultRepoCacheRoot, name);
-  const workspaceRoot = repo.workspace_root ? normalizePathLike(repo.workspace_root) : "";
+  assertPathInside(opts.repoCacheDir ?? defaultRepoCacheRoot, checkoutPath, "Manifest repo checkout path");
+  const workspaceRoot = normalizeWorkspaceRoot(filePath, repo.workspace_root);
+  const workspacePath = workspaceRoot ? path.join(checkoutPath, workspaceRoot) : checkoutPath;
+  assertPathInside(checkoutPath, workspacePath, "Manifest repo workspace_root");
   return {
-    path: workspaceRoot ? path.join(checkoutPath, workspaceRoot) : checkoutPath,
+    name,
+    path: workspacePath,
     checkout_path: checkoutPath,
     workspace_root: workspaceRoot || null,
     url: repo.url ?? null,
@@ -344,7 +428,8 @@ function registerManifestRepo(repo, opts = {}) {
   if (!config) {
     return;
   }
-  const existing = ALL_REPOS[repo.name];
+  const name = config.name;
+  const existing = ALL_REPOS[name];
   const manifestOverriddenByBuiltIn = Boolean(
     existing &&
       (
@@ -353,7 +438,7 @@ function registerManifestRepo(repo, opts = {}) {
         (existing.ref ?? null) !== (config.ref ?? null)
       ),
   );
-  ALL_REPOS[repo.name] = {
+  ALL_REPOS[name] = {
     ...config,
     ...existing,
     manifest_url: config.url,
@@ -364,8 +449,8 @@ function registerManifestRepo(repo, opts = {}) {
     languages: existing?.languages?.length ? existing.languages : config.languages,
     setup: existing?.setup?.length ? existing.setup : config.setup,
   };
-  if (!LOCAL_REPOS[repo.name]) {
-    PUBLIC_REPOS[repo.name] = ALL_REPOS[repo.name];
+  if (!LOCAL_REPOS[name]) {
+    PUBLIC_REPOS[name] = ALL_REPOS[name];
   }
 }
 
@@ -390,13 +475,14 @@ function textAnchorList(values) {
 }
 
 function normalizeManifestTask(filePath, raw, opts = {}) {
-  const repo = String(typeof raw.repo === "object" ? raw.repo?.name : raw.repo ?? "").trim();
-  if (!repo) {
+  const rawRepo = typeof raw.repo === "object" ? raw.repo?.name : raw.repo;
+  if (!String(rawRepo ?? "").trim()) {
     throw new Error(`Task manifest is missing repo: ${filePath}`);
   }
   if (typeof raw.repo === "object") {
-    registerManifestRepo(raw.repo, opts);
+    registerManifestRepo(raw.repo, { ...opts, filePath });
   }
+  const repo = validateManifestRepoName(filePath, rawRepo);
   if (!ALL_REPOS[repo]) {
     throw new Error(`Task manifest ${filePath} references unknown repo '${repo}'`);
   }
@@ -418,14 +504,16 @@ function normalizeManifestTask(filePath, raw, opts = {}) {
     throw new Error(`Task manifest must include at least one expected claim: ${filePath}`);
   }
   validateQualityThresholds(filePath, qualityThresholds);
+  const id = validateManifestTaskId(filePath, taskIdFromManifest(filePath, raw));
+  const taskClass = validatePacketTaskClass(filePath, raw.task_class ?? raw.taskClass);
 
   return {
-    id: taskIdFromManifest(filePath, raw),
+    id,
     name: String(raw.name ?? raw.id ?? path.basename(filePath, path.extname(filePath))),
     suite: raw.suite ?? null,
     repo,
     repo_metadata: typeof raw.repo === "object" ? raw.repo : null,
-    task_class: raw.task_class ?? raw.taskClass ?? null,
+    task_class: taskClass,
     prompt,
     expected_files: expectedFiles,
     expected_symbols: expectedSymbols,
@@ -670,9 +758,8 @@ async function materializeRepos(tasks, opts) {
   await mkdir(opts.repoCacheDir, { recursive: true });
   for (const [name, config] of repos) {
     const checkoutPath = path.resolve(config.checkout_path ?? path.join(opts.repoCacheDir, name));
-    if (!checkoutPath.startsWith(path.resolve(opts.repoCacheDir))) {
-      throw new Error(`Refusing to materialize repo outside --repo-cache-dir: ${checkoutPath}`);
-    }
+    assertPathInside(opts.repoCacheDir, checkoutPath, "Materialized repo checkout path");
+    assertPathInside(checkoutPath, config.path, `Materialized repo workspace path for ${name}`);
     if (!existsSync(checkoutPath)) {
       await mkdir(path.dirname(checkoutPath), { recursive: true });
       console.log(`cloning ${name} ${config.url} -> ${checkoutPath}`);
@@ -736,11 +823,30 @@ Do not edit source files. Use read-only inspection commands only, except CodeSto
 }
 
 function packetFirstCommandForPrompt(taskPrompt, task = null) {
-  const escapedQuestion = String(taskPrompt).replace(/"/g, '\\"').replace(/\r?\n/g, " ");
+  const question = String(taskPrompt).replace(/\r?\n/g, " ");
   const taskClass = task?.task_class
-    ? ` --task-class ${String(task.task_class).replace(/_/g, "-")}`
+    ? ` --task-class ${powershellSingleQuoted(validatePacketTaskClass("benchmark task", task.task_class).replace(/_/g, "-"))}`
     : "";
-  return `& $env:CODESTORY_CLI packet --project . --question "${escapedQuestion}"${taskClass} --budget compact --format json`;
+  return `& $env:CODESTORY_CLI packet --project . --question ${powershellSingleQuoted(question)}${taskClass} --budget compact --format json`;
+}
+
+function powershellSingleQuoted(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function artifactNamePart(value) {
+  const normalized = String(value ?? "")
+    .trim()
+    .replace(/[^A-Za-z0-9_.-]+/g, "-")
+    .replace(/^[.-]+|[.-]+$/g, "");
+  if (!normalized || normalized === "." || normalized === "..") {
+    return "unknown";
+  }
+  return normalized;
+}
+
+function benchmarkRunId(parts) {
+  return parts.map(artifactNamePart).join("-");
 }
 
 function parseJsonLines(stdout) {
@@ -1416,8 +1522,12 @@ async function runOne(opts, run, outDir) {
   });
 
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
-  const taskSlug = run.task ? `${run.task.id}-` : "";
-  const runId = `${run.repo}-${taskSlug}${run.arm}-${String(run.repeat).padStart(2, "0")}`;
+  const runId = benchmarkRunId([
+    run.repo,
+    ...(run.task ? [run.task.id] : []),
+    run.arm,
+    String(run.repeat).padStart(2, "0"),
+  ]);
   const stdoutPath = path.join(outDir, `${runId}.stdout.jsonl`);
   const stderrPath = path.join(outDir, `${runId}.stderr.txt`);
   await writeFile(stdoutPath, result.stdout, "utf8");
@@ -1735,7 +1845,7 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
     : null;
   const shape = packetShape(packet);
   const sufficiency = packetSufficiencyTelemetry(packet, quality);
-  const runId = `${task.repo}-${task.id}-cold-cli-packet-${String(repeat).padStart(2, "0")}`;
+  const runId = benchmarkRunId([task.repo, task.id, "cold-cli-packet", String(repeat).padStart(2, "0")]);
   await writeFile(path.join(outDir, `${runId}.stdout.json`), result.stdout, "utf8");
   await writeFile(path.join(outDir, `${runId}.stderr.txt`), result.stderr, "utf8");
   return {
@@ -1883,7 +1993,7 @@ async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
           : null;
         const shape = packetShape(packet);
         const sufficiency = packetSufficiencyTelemetry(packet, quality);
-        const runId = `${task.repo}-${task.id}-warm-stdio-packet-${String(repeat).padStart(2, "0")}`;
+        const runId = benchmarkRunId([task.repo, task.id, "warm-stdio-packet", String(repeat).padStart(2, "0")]);
         await writeFile(path.join(outDir, `${runId}.response.json`), `${JSON.stringify(response, null, 2)}\n`, "utf8");
         rows.push({
           repo: task.repo,
@@ -2511,9 +2621,15 @@ async function main() {
 export {
   analyzeTranscript,
   agentPublishableBlockers,
+  benchmarkRunId,
   commandCategory,
   extractCommandExecutions,
+  isPathInside,
+  loadTasks,
   parseJsonLines,
+  packetFirstCommandForPrompt,
+  publicCoreCorpusAudit,
+  repoConfigFromManifest,
   scoreQuality,
 };
 
