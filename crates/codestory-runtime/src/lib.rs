@@ -16,7 +16,8 @@ use codestory_contracts::api::{
     RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
     RouteEndpointHandlerDto, RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit,
     SearchHitOrigin, SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
-    SearchPlanBridgeDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
+    SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
+    SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
     SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
     SearchPlanRejectedHitDto, SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto,
     SearchRepoTextMode, SearchRequest, SearchResultsDto, SnippetContextDto, SourceOccurrenceDto,
@@ -5974,9 +5975,9 @@ impl AppController {
                     return SearchPlanBridgeDto {
                         from_anchor: from_group.anchor.clone(),
                         to_anchor: to_group.anchor.clone(),
-                        status: "supported".to_string(),
-                        confidence: "high".to_string(),
-                        evidence_kind: "same_anchor".to_string(),
+                        status: SearchPlanBridgeStatusDto::Supported,
+                        confidence: SearchPlanBridgeConfidenceDto::High,
+                        evidence_kind: SearchPlanBridgeEvidenceKindDto::SameAnchor,
                         direction: Some("self".to_string()),
                         node_count: 1,
                         edge_count: 0,
@@ -5994,9 +5995,13 @@ impl AppController {
                     return SearchPlanBridgeDto {
                         from_anchor: from_group.anchor.clone(),
                         to_anchor: to_group.anchor.clone(),
-                        status: "supported".to_string(),
-                        confidence: if graph.truncated { "medium" } else { "high" }.to_string(),
-                        evidence_kind: "graph_path".to_string(),
+                        status: SearchPlanBridgeStatusDto::Supported,
+                        confidence: if graph.truncated {
+                            SearchPlanBridgeConfidenceDto::Medium
+                        } else {
+                            SearchPlanBridgeConfidenceDto::High
+                        },
+                        evidence_kind: SearchPlanBridgeEvidenceKindDto::GraphPath,
                         direction: Some("forward".to_string()),
                         node_count: clamp_usize_to_u32(graph.nodes.len()),
                         edge_count: clamp_usize_to_u32(graph.edges.len()),
@@ -6018,9 +6023,13 @@ impl AppController {
                     return SearchPlanBridgeDto {
                         from_anchor: from_group.anchor.clone(),
                         to_anchor: to_group.anchor.clone(),
-                        status: "partial".to_string(),
-                        confidence: if graph.truncated { "low" } else { "medium" }.to_string(),
-                        evidence_kind: "graph_path".to_string(),
+                        status: SearchPlanBridgeStatusDto::Partial,
+                        confidence: if graph.truncated {
+                            SearchPlanBridgeConfidenceDto::Low
+                        } else {
+                            SearchPlanBridgeConfidenceDto::Medium
+                        },
+                        evidence_kind: SearchPlanBridgeEvidenceKindDto::GraphPath,
                         direction: Some("reverse".to_string()),
                         node_count: clamp_usize_to_u32(graph.nodes.len()),
                         edge_count: clamp_usize_to_u32(graph.edges.len()),
@@ -6036,9 +6045,9 @@ impl AppController {
                     return SearchPlanBridgeDto {
                         from_anchor: from_group.anchor.clone(),
                         to_anchor: to_group.anchor.clone(),
-                        status: "partial".to_string(),
-                        confidence: "low".to_string(),
-                        evidence_kind: "shared_file".to_string(),
+                        status: SearchPlanBridgeStatusDto::Partial,
+                        confidence: SearchPlanBridgeConfidenceDto::Low,
+                        evidence_kind: SearchPlanBridgeEvidenceKindDto::SharedFile,
                         direction: None,
                         node_count: 2,
                         edge_count: 0,
@@ -6053,9 +6062,9 @@ impl AppController {
                 SearchPlanBridgeDto {
                     from_anchor: from_group.anchor.clone(),
                     to_anchor: to_group.anchor.clone(),
-                    status: "unsupported".to_string(),
-                    confidence: "low".to_string(),
-                    evidence_kind: "isolated_anchors".to_string(),
+                    status: SearchPlanBridgeStatusDto::Unsupported,
+                    confidence: SearchPlanBridgeConfidenceDto::Low,
+                    evidence_kind: SearchPlanBridgeEvidenceKindDto::IsolatedAnchors,
                     direction: None,
                     node_count: 2,
                     edge_count: 0,
@@ -6174,7 +6183,7 @@ impl AppController {
             repo_text_fallback_reason,
         );
         let mut search_plan_anchor_rank = HashMap::<NodeId, usize>::new();
-        let search_plan = if used_repo_explanation_overview {
+        let search_plan = if used_repo_explanation_overview || !req.expand_search_plan {
             None
         } else {
             match self.build_search_plan(
@@ -6194,28 +6203,23 @@ impl AppController {
                 req.hybrid_limits.clone(),
             )? {
                 Some(plan_build) => {
-                    if req.expand_search_plan {
-                        for (rank, group) in plan_build.plan.anchor_groups.iter().enumerate() {
-                            if let Some(symbol) = &group.chosen_symbol {
-                                search_plan_anchor_rank
-                                    .entry(symbol.node_id.clone())
-                                    .or_insert(rank);
-                                merge_search_hits_by_node_id(
-                                    &mut indexed_symbol_hits,
-                                    vec![symbol.clone()],
-                                );
-                            }
+                    for (rank, group) in plan_build.plan.anchor_groups.iter().enumerate() {
+                        if let Some(symbol) = &group.chosen_symbol {
+                            search_plan_anchor_rank
+                                .entry(symbol.node_id.clone())
+                                .or_insert(rank);
+                            merge_search_hits_by_node_id(
+                                &mut indexed_symbol_hits,
+                                vec![symbol.clone()],
+                            );
                         }
-                        merge_search_hits_by_node_id(
-                            &mut indexed_symbol_hits,
-                            plan_build.indexed_symbol_hits,
-                        );
-                        merge_search_hits_by_node_id(
-                            &mut repo_text_hits,
-                            plan_build.repo_text_hits,
-                        );
-                        merge_search_hits_by_node_id(&mut suggestions, plan_build.suggestions);
                     }
+                    merge_search_hits_by_node_id(
+                        &mut indexed_symbol_hits,
+                        plan_build.indexed_symbol_hits,
+                    );
+                    merge_search_hits_by_node_id(&mut repo_text_hits, plan_build.repo_text_hits);
+                    merge_search_hits_by_node_id(&mut suggestions, plan_build.suggestions);
                     Some(plan_build.plan)
                 }
                 None => None,
@@ -7623,7 +7627,7 @@ impl AppController {
 }
 
 fn is_low_confidence_search_plan_bridge(bridge: &SearchPlanBridgeDto) -> bool {
-    bridge.confidence.eq_ignore_ascii_case("low")
+    bridge.confidence == SearchPlanBridgeConfidenceDto::Low
 }
 
 #[derive(Debug, Clone)]
@@ -9532,6 +9536,12 @@ fn build_llm_symbol_doc_text() -> String {
                         serialized_name: "parser_core".to_string(),
                         ..Default::default()
                     },
+                    Node {
+                        id: CoreNodeId(203),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "runtime_workspace_indexer_store_flow".to_string(),
+                        ..Default::default()
+                    },
                 ])
                 .expect("insert nodes");
         }
@@ -9543,9 +9553,11 @@ fn build_llm_symbol_doc_text() -> String {
             })
             .expect("open project");
 
-        let hits = controller
-            .search(SearchRequest {
-                query: "How does the language parsing work in this repo?".to_string(),
+        let broad_query =
+            "Explain how the full-index path flows through runtime workspace indexer and store";
+        let results_without_plan = controller
+            .search_results(SearchRequest {
+                query: broad_query.to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 20,
                 expand_search_plan: false,
@@ -9555,8 +9567,27 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("search with natural language");
 
         assert!(
-            !hits.is_empty(),
+            !results_without_plan.indexed_symbol_hits.is_empty(),
             "Expected term extraction fallback to find symbol matches"
+        );
+        assert!(
+            results_without_plan.search_plan.is_none(),
+            "search should not build Search Plan work unless requested: {results_without_plan:?}"
+        );
+
+        let results_with_plan = controller
+            .search_results(SearchRequest {
+                query: broad_query.to_string(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 20,
+                expand_search_plan: true,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            })
+            .expect("search with natural language and search plan");
+        assert!(
+            results_with_plan.search_plan.is_some(),
+            "search should build Search Plan only when requested: {results_with_plan:?}"
         );
     }
 

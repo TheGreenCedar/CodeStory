@@ -279,6 +279,31 @@ pub enum SearchPlanPromotionStatusDto {
     Ambiguous,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchPlanBridgeStatusDto {
+    Supported,
+    Partial,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchPlanBridgeConfidenceDto {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchPlanBridgeEvidenceKindDto {
+    SameAnchor,
+    GraphPath,
+    SharedFile,
+    IsolatedAnchors,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchPlanDroppedTermDto {
     pub term: String,
@@ -337,9 +362,9 @@ pub struct SearchPlanAnchorGroupDto {
 pub struct SearchPlanBridgeDto {
     pub from_anchor: String,
     pub to_anchor: String,
-    pub status: String,
-    pub confidence: String,
-    pub evidence_kind: String,
+    pub status: SearchPlanBridgeStatusDto,
+    pub confidence: SearchPlanBridgeConfidenceDto,
+    pub evidence_kind: SearchPlanBridgeEvidenceKindDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
     pub node_count: u32,
@@ -1599,6 +1624,34 @@ mod packet_tests {
         .expect("serialize");
 
         assert_eq!(value["status"], "partial");
+    }
+
+    #[test]
+    fn search_plan_bridge_contract_uses_typed_snake_case_states() {
+        let value = serde_json::to_value(SearchPlanBridgeDto {
+            from_anchor: "router".to_string(),
+            to_anchor: "handler".to_string(),
+            status: SearchPlanBridgeStatusDto::Supported,
+            confidence: SearchPlanBridgeConfidenceDto::High,
+            evidence_kind: SearchPlanBridgeEvidenceKindDto::GraphPath,
+            direction: Some("forward".to_string()),
+            node_count: 2,
+            edge_count: 1,
+            truncated: false,
+            notes: Vec::new(),
+        })
+        .expect("serialize");
+
+        assert_eq!(value["status"], "supported");
+        assert_eq!(value["confidence"], "high");
+        assert_eq!(value["evidence_kind"], "graph_path");
+        let parsed: SearchPlanBridgeDto = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed.status, SearchPlanBridgeStatusDto::Supported);
+        assert_eq!(parsed.confidence, SearchPlanBridgeConfidenceDto::High);
+        assert_eq!(
+            parsed.evidence_kind,
+            SearchPlanBridgeEvidenceKindDto::GraphPath
+        );
     }
 }
 

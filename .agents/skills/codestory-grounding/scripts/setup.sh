@@ -7,8 +7,6 @@ if [[ "${1:-}" == "--dry-run" || "${1:-}" == "-n" ]]; then
 fi
 
 repo_url="${CODESTORY_REPO_URL:-https://github.com/TheGreenCedar/CodeStory.git}"
-# Keep this in sync with DEFAULT_CODESTORY_REPO_REF in setup.ps1.
-DEFAULT_CODESTORY_REPO_REF="663c257fabb322a686a691d382dcc78a62b1acf7"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 local_checkout_root=""
 local_checkout_ref=""
@@ -27,12 +25,9 @@ if [[ -n "${CODESTORY_REPO_REF:-}" ]]; then
 elif [[ "$use_local_checkout" == "1" && -n "$local_checkout_ref" ]]; then
   repo_ref="working-tree:$local_checkout_ref"
 else
-  repo_ref="$DEFAULT_CODESTORY_REPO_REF"
+  repo_ref=""
 fi
-if [[ -z "$repo_ref" ]]; then
-  echo "CODESTORY_REPO_REF resolved to an empty value." >&2
-  exit 1
-fi
+repo_ref_for_display="${repo_ref:-remote default branch}"
 
 redact_url_userinfo() {
   printf '%s' "$1" | sed -E 's#^(https?://)[^/@[:space:]]+@#\1***@#'
@@ -59,7 +54,7 @@ echo "  home: $codestory_home"
 echo "  source: $source_dir"
 echo "  binary: $dest"
 echo "  repo: $repo_url_for_display"
-echo "  ref: $repo_ref"
+echo "  ref: $repo_ref_for_display"
 
 if [[ "$dry_run" == "1" ]]; then
   echo "Dry run only; no clone, build, or copy performed."
@@ -94,7 +89,14 @@ if [[ "$use_local_checkout" != "1" ]]; then
   fi
 
   git -C "$source_dir" fetch --tags origin
-  git -C "$source_dir" checkout --detach "$repo_ref"
+  if [[ -n "$repo_ref" ]]; then
+    git -C "$source_dir" checkout --detach "$repo_ref"
+  else
+    if ! git -C "$source_dir" rev-parse --verify --quiet origin/HEAD >/dev/null; then
+      git -C "$source_dir" remote set-head origin --auto
+    fi
+    git -C "$source_dir" checkout --detach origin/HEAD
+  fi
 fi
 
 cargo build --release -p codestory-cli --manifest-path "$source_dir/Cargo.toml"

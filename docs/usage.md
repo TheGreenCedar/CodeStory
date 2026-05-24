@@ -31,7 +31,8 @@ setx CODESTORY_CLI "C:\Users\you\AppData\Local\CodeStory\bin\codestory-cli.exe"
 The source skill package lives at
 [../.agents/skills/codestory-grounding/SKILL.md](../.agents/skills/codestory-grounding/SKILL.md).
 If you need a different source artifact, set `CODESTORY_REPO_URL` and
-`CODESTORY_REPO_REF` before running setup.
+`CODESTORY_REPO_REF` before running setup. Without an explicit ref, installed
+setup fetches and builds the remote default branch.
 
 ## Use From Source
 
@@ -122,13 +123,16 @@ git diff --name-only HEAD | codestory-cli affected --project <target-workspace> 
 Broad repo question:
 
 ```powershell
-codestory-cli ground --project <target-workspace> --why
 codestory-cli packet --project <target-workspace> --question "<broad task question>" --budget compact
 codestory-cli search --project <target-workspace> --repo-text on --query "<concrete term>" --why
 codestory-cli search --project <target-workspace> --repo-text on --query "<another concrete term>" --why
 # select anchors
 codestory-cli context --project <target-workspace> --id <node-id>
 ```
+
+Use `ground --why` first for fresh orientation, health, or coverage discovery.
+For a broad task you intend to answer, start with `packet` and only run the
+follow-up primitive commands named by the sufficiency contract.
 
 Do not pass broad natural-language questions directly to `context`. Start with
 `packet`; deepen with its follow-up commands or use `ground` and `search` to

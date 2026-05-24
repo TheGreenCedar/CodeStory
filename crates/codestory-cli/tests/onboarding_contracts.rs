@@ -25,22 +25,6 @@ fn collect_markdown_files(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn extract_default_codestory_repo_ref(path: &str, setup: &str) -> String {
-    setup
-        .lines()
-        .find(|line| line.contains("DEFAULT_CODESTORY_REPO_REF") && line.contains('='))
-        .and_then(|line| line.split_once('=').map(|(_, value)| value))
-        .map(|value| {
-            value
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'')
-                .to_string()
-        })
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| panic!("setup script should pin DEFAULT_CODESTORY_REPO_REF: {path}"))
-}
-
 fn extract_markdown_links(contents: &str) -> Vec<String> {
     let mut links = Vec::new();
     let bytes = contents.as_bytes();
@@ -146,41 +130,24 @@ fn readme_keeps_dual_track_onboarding() {
         );
     }
 
-    let mut setup_refs = Vec::new();
     for path in [
         ".agents/skills/codestory-grounding/scripts/setup.ps1",
         ".agents/skills/codestory-grounding/scripts/setup.sh",
     ] {
         let setup = fs::read_to_string(root.join(path)).expect("read setup script");
         assert!(
-            setup.contains("DEFAULT_CODESTORY_REPO_REF"),
-            "setup script should document the pinned CLI source ref: {path}"
+            !setup.contains("DEFAULT_CODESTORY_REPO_REF"),
+            "setup script should not pin a stale default CLI source ref: {path}"
         );
-        setup_refs.push((path, extract_default_codestory_repo_ref(path, &setup)));
+        assert!(
+            setup.contains("CODESTORY_REPO_REF"),
+            "setup script should keep explicit source-ref override support: {path}"
+        );
+        assert!(
+            setup.contains("origin/HEAD"),
+            "setup script should build the remote default branch when no ref is explicit: {path}"
+        );
     }
-    assert_eq!(
-        setup_refs[0].1, setup_refs[1].1,
-        "PowerShell and POSIX setup scripts should pin the same CLI source ref"
-    );
-    let args_at_ref = Command::new("git")
-        .current_dir(&root)
-        .args([
-            "show",
-            &format!("{}:crates/codestory-cli/src/args.rs", setup_refs[0].1),
-        ])
-        .output()
-        .expect("git show setup ref");
-    assert!(
-        args_at_ref.status.success(),
-        "setup ref should resolve in git: {}",
-        String::from_utf8_lossy(&args_at_ref.stderr)
-    );
-    let args_source = String::from_utf8(args_at_ref.stdout).expect("args.rs should be utf8");
-    assert!(
-        args_source.contains("Packet(PacketCommand)")
-            && args_source.contains("struct PacketCommand"),
-        "setup ref should include the packet CLI documented by the skill"
-    );
 }
 
 #[test]

@@ -5000,6 +5000,10 @@ fn collect_framework_routes(path: &Path, language_name: &str, source: &str) -> V
     let mut routes = Vec::new();
     let code_lines = route_code_lines(language_name, source);
     let code_source = code_lines.join("\n");
+    let lower_code_source = code_source.to_ascii_lowercase();
+    let has_koa_router =
+        lower_code_source.contains("@koa/router") || lower_code_source.contains("koa-router");
+    let has_hono = lower_code_source.contains("hono");
     let react_router_object_route_lines =
         react_router_object_route_lines(&code_lines, &code_source);
     for (index, line) in code_lines.iter().enumerate() {
@@ -5012,8 +5016,8 @@ fn collect_framework_routes(path: &Path, language_name: &str, source: &str) -> V
             "javascript" | "typescript" => {
                 collect_express_route(trimmed, line_number, &mut routes);
                 collect_fastify_route(trimmed, line_number, &mut routes);
-                collect_koa_route(trimmed, line_number, &mut routes, &code_source);
-                collect_hono_route(trimmed, line_number, &mut routes, &code_source);
+                collect_koa_route(trimmed, line_number, &mut routes, has_koa_router);
+                collect_hono_route(trimmed, line_number, &mut routes, has_hono);
                 collect_react_route(
                     trimmed,
                     line_number,
@@ -5273,9 +5277,13 @@ fn collect_fastify_route(line: &str, line_number: u32, routes: &mut Vec<Framewor
     }
 }
 
-fn collect_koa_route(line: &str, line_number: u32, routes: &mut Vec<FrameworkRoute>, source: &str) {
-    let lower_source = source.to_ascii_lowercase();
-    if !lower_source.contains("@koa/router") && !lower_source.contains("koa-router") {
+fn collect_koa_route(
+    line: &str,
+    line_number: u32,
+    routes: &mut Vec<FrameworkRoute>,
+    has_koa_router: bool,
+) {
+    if !has_koa_router {
         return;
     }
     for method in ["get", "post", "put", "patch", "delete", "head", "options"] {
@@ -5300,9 +5308,9 @@ fn collect_hono_route(
     line: &str,
     line_number: u32,
     routes: &mut Vec<FrameworkRoute>,
-    source: &str,
+    has_hono: bool,
 ) {
-    if !source.to_ascii_lowercase().contains("hono") {
+    if !has_hono {
         return;
     }
     for method in ["get", "post", "put", "patch", "delete", "all"] {

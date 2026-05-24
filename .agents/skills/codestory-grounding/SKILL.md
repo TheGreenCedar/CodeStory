@@ -63,7 +63,7 @@ Do this once per machine or when the CodeStory source artifact moves:
    bash scripts/setup.sh
    ```
 3. Use the printed `CODESTORY_CLI=...` path as `<codestory-cli>`, or persist it for future sessions.
-4. If you need a different source artifact, set `CODESTORY_REPO_URL` and `CODESTORY_REPO_REF` explicitly before setup. When setup runs from a CodeStory source checkout it builds that checkout's current working tree; installed copies outside a checkout use the script's default source ref.
+4. If you need a different source artifact, set `CODESTORY_REPO_URL` and `CODESTORY_REPO_REF` explicitly before setup. When setup runs from a CodeStory source checkout it builds that checkout's current working tree; installed copies outside a checkout fetch and build the remote default branch.
 5. For each target repository, run `doctor`, `index`, and `ground` with `--project <target-workspace>`.
 
 Do not rebuild or re-clone CodeStory for every target repository. Rebuild only
@@ -132,13 +132,16 @@ when the user needs an answer-quality check and source-truth checklist, not just
 navigation.
 
 ```
-<codestory-cli> ground --project <target-workspace> --why
 <codestory-cli> packet --project <target-workspace> --question "<broad task question>" --budget compact
 <codestory-cli> search --project <target-workspace> --repo-text on --query "<concrete term>" --why
 <codestory-cli> search --project <target-workspace> --repo-text on --query "<another concrete term>" --why
 # select anchors
 <codestory-cli> context --project <target-workspace> --id <node-id>
 ```
+
+Use `ground --project <target-workspace> --why` before this workflow only for
+fresh orientation, health, or coverage discovery. For answerable broad tasks,
+the first task-specific command should be `packet`.
 
 When `search --why` emits `search_plan`, use its subqueries, anchor groups,
 repo-text promotion status, bridge evidence, next commands, and source-truth

@@ -547,6 +547,47 @@ fn broad_search_json_and_markdown_expose_search_plan() {
 }
 
 #[test]
+fn broad_search_json_without_why_does_not_emit_search_plan() {
+    let workspace = tempdir().expect("workspace dir");
+    write_search_quality_fixture(workspace.path());
+
+    let index = run_cli(
+        workspace.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    assert!(
+        index.status.success(),
+        "index command failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    let search = run_cli(
+        workspace.path(),
+        &[
+            "search",
+            "--query",
+            "how full indexing supports search trail and snippet commands",
+            "--repo-text",
+            "on",
+            "--format",
+            "json",
+            "--refresh",
+            "none",
+        ],
+    );
+    assert!(
+        search.status.success(),
+        "search command failed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let json: Value = serde_json::from_slice(&search.stdout).expect("parse search json");
+    assert!(
+        json["search_plan"].is_null(),
+        "search should not emit Search Plan unless --why requested: {json:#}"
+    );
+}
+
+#[test]
 fn search_plan_honors_repo_text_off() {
     let workspace = tempdir().expect("workspace dir");
     write_search_quality_fixture(workspace.path());
@@ -1469,22 +1510,23 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
 
     for (query, expected, repo_text) in expectations {
         let started = Instant::now();
-        let search = run_cli(
-            workspace.path(),
-            &[
-                "search",
-                "--query",
-                query,
-                "--limit",
-                "5",
-                "--repo-text",
-                repo_text,
-                "--refresh",
-                "none",
-                "--format",
-                "json",
-            ],
-        );
+        let mut args = vec![
+            "search",
+            "--query",
+            query,
+            "--limit",
+            "5",
+            "--repo-text",
+            repo_text,
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ];
+        if query.starts_with("how ") {
+            args.push("--why");
+        }
+        let search = run_cli(workspace.path(), &args);
         latency_ms.push(started.elapsed().as_millis() as u64);
         assert!(
             search.status.success(),

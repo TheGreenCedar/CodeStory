@@ -1712,7 +1712,7 @@ fn next_deeper_packet_command(question: &str, requested: PacketBudgetModeDto) ->
 }
 
 fn quote_packet_command_value(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\\\""))
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn build_packet_sufficiency(
@@ -4153,6 +4153,23 @@ mod tests {
                 .iter()
                 .any(|command| command.contains("--repo-text on")),
             "insufficient packets should keep fallback exploration inside CodeStory: {insufficient:?}"
+        );
+    }
+
+    #[test]
+    fn packet_follow_up_commands_single_quote_shell_sensitive_questions() {
+        let question = "Inspect $env:SECRET and $(Get-ChildItem) and 'literal'";
+        let quoted = quote_packet_command_value(question);
+
+        assert_eq!(
+            quoted,
+            "'Inspect $env:SECRET and $(Get-ChildItem) and ''literal'''"
+        );
+        let command = next_deeper_packet_command(question, PacketBudgetModeDto::Tiny)
+            .expect("tiny packet should have deeper command");
+        assert!(
+            command.contains("--question 'Inspect $env:SECRET and $(Get-ChildItem)"),
+            "packet command should single-quote shell-sensitive question text: {command}"
         );
     }
 

@@ -5,7 +5,8 @@ use codestory_contracts::api::{
     AgentRetrievalStepStatusDto, ClaimReadinessDto, EvidenceTypeDto, GraphArtifactDto,
     GroundingSnapshotDto, IndexingPhaseTimings, NodeDetailsDto, RepoTextScanStatsDto,
     RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, SearchHit,
-    SearchPlanBridgeDto, SearchPlanChannelDto, SearchPlanDto, SearchPlanPromotionStatusDto,
+    SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
+    SearchPlanBridgeStatusDto, SearchPlanChannelDto, SearchPlanDto, SearchPlanPromotionStatusDto,
     SnippetContextDto, SymbolContextDto, TrailContextDto, TrailStoryDto,
 };
 use serde::Serialize;
@@ -806,9 +807,9 @@ fn append_search_plan_bridge(markdown: &mut String, bridge: &SearchPlanBridgeDto
         "- `{}` -> `{}` status={} confidence={} evidence={}{} nodes={} edges={} truncated={}",
         bridge.from_anchor,
         bridge.to_anchor,
-        bridge.status,
-        bridge.confidence,
-        bridge.evidence_kind,
+        format_search_plan_bridge_status(bridge.status),
+        format_search_plan_bridge_confidence(bridge.confidence),
+        format_search_plan_bridge_evidence_kind(bridge.evidence_kind),
         direction,
         bridge.node_count,
         bridge.edge_count,
@@ -887,7 +888,34 @@ fn quote_search_plan_command_value(value: &str) -> String {
     {
         value.to_string()
     } else {
-        format!("\"{}\"", value.replace('"', "\\\""))
+        format!("'{}'", value.replace('\'', "''"))
+    }
+}
+
+fn format_search_plan_bridge_status(status: SearchPlanBridgeStatusDto) -> &'static str {
+    match status {
+        SearchPlanBridgeStatusDto::Supported => "supported",
+        SearchPlanBridgeStatusDto::Partial => "partial",
+        SearchPlanBridgeStatusDto::Unsupported => "unsupported",
+    }
+}
+
+fn format_search_plan_bridge_confidence(confidence: SearchPlanBridgeConfidenceDto) -> &'static str {
+    match confidence {
+        SearchPlanBridgeConfidenceDto::High => "high",
+        SearchPlanBridgeConfidenceDto::Medium => "medium",
+        SearchPlanBridgeConfidenceDto::Low => "low",
+    }
+}
+
+fn format_search_plan_bridge_evidence_kind(
+    evidence_kind: SearchPlanBridgeEvidenceKindDto,
+) -> &'static str {
+    match evidence_kind {
+        SearchPlanBridgeEvidenceKindDto::SameAnchor => "same_anchor",
+        SearchPlanBridgeEvidenceKindDto::GraphPath => "graph_path",
+        SearchPlanBridgeEvidenceKindDto::SharedFile => "shared_file",
+        SearchPlanBridgeEvidenceKindDto::IsolatedAnchors => "isolated_anchors",
     }
 }
 

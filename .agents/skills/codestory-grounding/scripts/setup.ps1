@@ -72,8 +72,6 @@ function Get-GitHeadRef {
     return $null
 }
 
-# Keep this in sync with DEFAULT_CODESTORY_REPO_REF in setup.sh.
-$DEFAULT_CODESTORY_REPO_REF = "663c257fabb322a686a691d382dcc78a62b1acf7"
 $localCheckoutRoot = Get-LocalCheckoutRoot
 $useLocalCheckout = $localCheckoutRoot -and -not $env:CODESTORY_REPO_URL -and -not $env:CODESTORY_REPO_REF
 $localCheckoutHeadRef = if ($useLocalCheckout) { Get-GitHeadRef $localCheckoutRoot } else { $null }
@@ -87,11 +85,9 @@ $repoRef = if ($env:CODESTORY_REPO_REF) {
 } elseif ($useLocalCheckout -and $localCheckoutHeadRef) {
     "working-tree:$localCheckoutHeadRef"
 } else {
-    $DEFAULT_CODESTORY_REPO_REF
+    $null
 }
-if (-not $repoRef) {
-    throw "CODESTORY_REPO_REF resolved to an empty value."
-}
+$repoRefForDisplay = if ($repoRef) { $repoRef } else { "remote default branch" }
 
 $runningOnWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
     [System.Runtime.InteropServices.OSPlatform]::Windows
@@ -108,7 +104,7 @@ Write-Host "  home: $codestoryHome"
 Write-Host "  source: $sourceDir"
 Write-Host "  binary: $dest"
 Write-Host "  repo: $repoUrlForDisplay"
-Write-Host "  ref: $repoRef"
+Write-Host "  ref: $repoRefForDisplay"
 
 if ($DryRun) {
     Write-Host "Dry run only; no clone, build, or copy performed."
@@ -150,7 +146,15 @@ if (-not $useLocalCheckout) {
     }
 
     Invoke-Checked git @("-C", $sourceDir, "fetch", "--tags", "origin")
-    Invoke-Checked git @("-C", $sourceDir, "checkout", "--detach", $repoRef)
+    if ($repoRef) {
+        Invoke-Checked git @("-C", $sourceDir, "checkout", "--detach", $repoRef)
+    } else {
+        $originHead = & git -C $sourceDir rev-parse --verify --quiet origin/HEAD 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $originHead) {
+            Invoke-Checked git @("-C", $sourceDir, "remote", "set-head", "origin", "--auto")
+        }
+        Invoke-Checked git @("-C", $sourceDir, "checkout", "--detach", "origin/HEAD")
+    }
 }
 
 Invoke-Checked cargo @("build", "--release", "-p", "codestory-cli", "--manifest-path", (Join-Path $sourceDir "Cargo.toml"))

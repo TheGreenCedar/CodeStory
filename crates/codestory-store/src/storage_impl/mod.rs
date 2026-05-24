@@ -330,6 +330,14 @@ fn is_framework_synthetic_node(node: &Node) -> bool {
     node.canonical_id.as_deref().is_some_and(|canonical_id| {
         canonical_id.starts_with("tauri:command:")
             || canonical_id.starts_with("payload:collection:")
+            || canonical_id.starts_with("route_endpoint:")
+            || canonical_id.starts_with("openapi:endpoint:")
+    })
+}
+
+fn is_endpoint_synthetic_node(node: &Node) -> bool {
+    node.canonical_id.as_deref().is_some_and(|canonical_id| {
+        canonical_id.starts_with("route_endpoint:") || canonical_id.starts_with("openapi:endpoint:")
     })
 }
 
@@ -343,6 +351,14 @@ fn preferred_framework_node(
     let candidate_rank = framework_node_source_rank(conn, batch_file_paths, &candidate)?;
     if candidate_rank > existing_rank {
         Ok(candidate)
+    } else if candidate_rank == existing_rank && is_endpoint_synthetic_node(&candidate) {
+        let existing_key = framework_node_stable_source_key(conn, batch_file_paths, &existing)?;
+        let candidate_key = framework_node_stable_source_key(conn, batch_file_paths, &candidate)?;
+        if candidate_key < existing_key {
+            Ok(candidate)
+        } else {
+            Ok(existing)
+        }
     } else {
         Ok(existing)
     }
@@ -375,7 +391,34 @@ fn framework_node_source_rank(
         return Ok(u8::from(!path.is_empty()));
     }
 
+    if canonical_id.starts_with("route_endpoint:") || canonical_id.starts_with("openapi:endpoint:")
+    {
+        if !path.is_empty() && node.start_line.is_some() {
+            return Ok(4);
+        }
+        if !path.is_empty() {
+            return Ok(3);
+        }
+        return Ok(u8::from(node.start_line.is_some()));
+    }
+
     Ok(0)
+}
+
+fn framework_node_stable_source_key(
+    conn: &Connection,
+    batch_file_paths: &HashMap<NodeId, PathBuf>,
+    node: &Node,
+) -> Result<(String, u32, u32, String), StorageError> {
+    let path = framework_node_file_path(conn, batch_file_paths, node)?
+        .map(|path| normalize_framework_source_path(&path))
+        .unwrap_or_default();
+    Ok((
+        path,
+        node.start_line.unwrap_or(u32::MAX),
+        node.start_col.unwrap_or(u32::MAX),
+        node.serialized_name.clone(),
+    ))
 }
 
 fn framework_node_file_path(
@@ -2034,11 +2077,13 @@ impl Storage {
             return Ok(breakdown);
         }
 
+        let nodes_prepare_started = std::time::Instant::now();
         let prepared_nodes = if batch.nodes.is_empty() {
             Vec::new()
         } else {
             self.prepared_nodes_for_insert_with_files(batch.nodes, batch.files)?
         };
+        let nodes_prepare_ms = clamp_i64_to_u32(nodes_prepare_started.elapsed().as_millis() as i64);
 
         let tx = self.conn.transaction()?;
 
@@ -2068,7 +2113,7 @@ impl Storage {
         }
 
         if !prepared_nodes.is_empty() {
-            let started = std::time::Instant::now();
+            let nodes_insert_started = std::time::Instant::now();
             let mut stmt = tx.prepare(
                 "INSERT INTO node (id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
@@ -2094,7 +2139,9 @@ impl Storage {
             {
                 Self::insert_node_with_stmt(&mut stmt, node)?;
             }
-            breakdown.nodes_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+            breakdown.nodes_ms = nodes_prepare_ms.saturating_add(clamp_i64_to_u32(
+                nodes_insert_started.elapsed().as_millis() as i64,
+            ));
         }
 
         if !batch.edges.is_empty() {

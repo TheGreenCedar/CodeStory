@@ -35,7 +35,7 @@ The system shall make packet size predictable for agent context windows.
 Acceptance Criteria:
 
 1. WHEN `--budget tiny|compact|standard|deep` is passed, THE Packet Budgeter SHALL enforce maximum files, snippets, trail edges, citations, and output bytes for that mode.
-2. WHEN the packet truncates evidence, THE Sufficiency Contract SHALL identify what was omitted and how to request deeper evidence.
+2. WHEN the packet truncates evidence, THE packet SHALL expose omitted sections in budget metadata and SHALL add follow-up commands only when truncation changes the sufficiency status.
 3. WHEN `--format json` is used, THE packet SHALL expose budget usage fields so harnesses can compare actual output sizes.
 
 Traceability: benchmark transcripts showed large command-output volumes and repeated manual reads after CodeStory output.
@@ -70,11 +70,11 @@ The benchmark corpus shall be publicly reproducible.
 
 Acceptance Criteria:
 
-1. WHEN the default public benchmark runs, THE Task Corpus SHALL use at least five public repositories across at least four language families, with seven repositories and seven language families preferred for headline rows.
+1. WHEN the `public-core` public benchmark runs, THE Task Corpus SHALL use at least five public repositories across at least four language families, with seven repositories and seven language families preferred for headline rows.
 2. WHEN private sibling repositories are configured, THE harness SHALL keep them opt-in and exclude them from public README claims.
 3. WHEN benchmark rows are promoted, THE report SHALL identify repo, language, task class, repeats, cache policy, semantic backend, runner, model, sandbox, pricing assumptions, and raw medians for cost, tokens, wall time, and tool starts.
 
-Traceability: the current public default contains only the CodeStory repository; local sibling repos are opt-in.
+Traceability: the no-suite default is a CodeStory smoke path; `--task-suite public-core` is the publishable public corpus path, and local sibling repos are opt-in.
 
 ### Requirement 6: Warm Read Integration
 

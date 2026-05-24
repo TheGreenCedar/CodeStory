@@ -192,14 +192,24 @@ fn setup_embeddings_next_commands(
 }
 
 fn quote_command_path(path: &std::path::Path) -> String {
-    format!(
-        "\"{}\"",
-        display::clean_path_string(&path.to_string_lossy()).replace('"', "\\\"")
-    )
+    let value = display::clean_path_string(&path.to_string_lossy());
+    if command_value_needs_single_quotes(&value) {
+        quote_powershell_single_quoted_value(&value)
+    } else {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    }
 }
 
 fn quote_command_value(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\\\""))
+    quote_powershell_single_quoted_value(value)
+}
+
+fn command_value_needs_single_quotes(value: &str) -> bool {
+    value.chars().any(|ch| matches!(ch, '$' | '`' | '\'' | '"'))
+}
+
+fn quote_powershell_single_quoted_value(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn run_index(cmd: IndexCommand) -> Result<()> {
@@ -2596,7 +2606,7 @@ fn run_drill_question_search(
             query: question.to_string(),
             repo_text: SearchRepoTextMode::On,
             limit_per_source: 10,
-            expand_search_plan: false,
+            expand_search_plan: true,
             hybrid_weights: None,
             hybrid_limits: None,
         })
@@ -6041,22 +6051,22 @@ fn index_next_commands(
     project: &str,
     retrieval: Option<&codestory_contracts::api::RetrievalStateDto>,
 ) -> Vec<String> {
-    let project = display::clean_path_string(project);
+    let project = quote_command_path(std::path::Path::new(project));
     let mut commands = vec![
-        format!("codestory-cli ground --project \"{project}\""),
+        format!("codestory-cli ground --project {project}"),
         format!(
-            "codestory-cli search --project \"{project}\" --query \"<symbol/file/literal/API path>\" --why"
+            "codestory-cli search --project {project} --query \"<symbol/file/literal/API path>\" --why"
         ),
-        format!("codestory-cli context --project \"{project}\" --query \"<concrete target>\""),
+        format!("codestory-cli context --project {project} --query \"<concrete target>\""),
     ];
     if let Some(retrieval) = retrieval.filter(|state| !state.semantic_ready) {
         if retrieval.fallback_reason == Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime) {
             commands.push(format!(
-                "codestory-cli setup embeddings --project \"{project}\""
+                "codestory-cli setup embeddings --project {project}"
             ));
         }
         commands.push(format!(
-            "codestory-cli doctor --project \"{project}\" --format markdown"
+            "codestory-cli doctor --project {project} --format markdown"
         ));
     }
     commands
@@ -8270,6 +8280,23 @@ mod tests {
                     && command.contains("WorkspaceIndexer")),
             "drill should use the selected anchor id for unambiguous snippet follow-ups: {commands:#?}"
         );
+    }
+
+    #[test]
+    fn command_quoting_single_quotes_shell_sensitive_values() {
+        assert_eq!(
+            quote_command_value("Inspect $env:SECRET and $(Get-ChildItem) and 'literal'"),
+            "'Inspect $env:SECRET and $(Get-ChildItem) and ''literal'''"
+        );
+        assert_eq!(
+            quote_command_path(Path::new("C:/repo/$hidden")),
+            "'C:/repo/$hidden'"
+        );
+        assert_eq!(
+            quote_command_path(Path::new("C:/repo/quoted\"path")),
+            "'C:/repo/quoted\"path'"
+        );
+        assert_eq!(quote_command_path(Path::new("C:/repo")), "\"C:/repo\"");
     }
 
     #[test]

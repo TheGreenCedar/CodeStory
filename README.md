@@ -159,9 +159,9 @@ Keep the executable and target workspace separate. CodeStory is the tool; the
 | Changed-file impact | `codestory-cli affected --project <target-workspace> --format markdown` |
 | Persistent read surface | `codestory-cli serve --project <target-workspace> --stdio` |
 
-Broad questions should start with `packet` or `ground`, then deepen through the
-reported follow-up commands. `context` is for one concrete target, not an open
-chat endpoint.
+Broad task answers should start with `packet`, then deepen through the reported
+follow-up commands. Use `ground --why` first for fresh orientation or coverage
+discovery. `context` is for one concrete target, not an open chat endpoint.
 
 ## What It Builds
 

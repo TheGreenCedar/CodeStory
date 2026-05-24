@@ -156,6 +156,57 @@ fn framework_synthetic_node_source_metadata_prefers_definitions() -> Result<(), 
 }
 
 #[test]
+fn endpoint_synthetic_node_source_metadata_is_stable_for_duplicate_routes()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    insert_file_row(&storage, 10, "src/routes/admin.ts")?;
+    insert_file_row(&storage, 11, "src/routes/api.ts")?;
+
+    let admin_file = file_node(10, "src/routes/admin.ts");
+    let api_file = file_node(11, "src/routes/api.ts");
+    let canonical_id = r#"route_endpoint:{"framework":"express","method":"GET","path":"/users","raw_path":"/users","params":[],"confidence":"heuristic","source_convention":"call","provenance":["framework:express"]}"#;
+    let admin_route = Node {
+        id: NodeId(901),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "GET /users (express route; confidence=heuristic)".to_string(),
+        qualified_name: Some("framework::express::GET /users".to_string()),
+        canonical_id: Some(canonical_id.to_string()),
+        file_node_id: Some(NodeId(10)),
+        start_line: Some(8),
+        start_col: Some(1),
+        ..Default::default()
+    };
+    let api_route = Node {
+        file_node_id: Some(NodeId(11)),
+        start_line: Some(42),
+        ..admin_route.clone()
+    };
+
+    storage.insert_nodes_batch(&[api_file.clone(), admin_file.clone(), api_route.clone()])?;
+    storage.insert_nodes_batch(&[admin_file.clone(), admin_route.clone()])?;
+    assert_eq!(
+        storage
+            .get_node(NodeId(901))?
+            .and_then(|node| node.file_node_id),
+        Some(NodeId(10))
+    );
+
+    let mut reverse = Storage::new_in_memory()?;
+    insert_file_row(&reverse, 10, "src/routes/admin.ts")?;
+    insert_file_row(&reverse, 11, "src/routes/api.ts")?;
+    reverse.insert_nodes_batch(&[admin_file, api_file.clone(), admin_route])?;
+    reverse.insert_nodes_batch(&[api_file, api_route])?;
+    assert_eq!(
+        reverse
+            .get_node(NodeId(901))?
+            .and_then(|node| node.file_node_id),
+        Some(NodeId(10))
+    );
+
+    Ok(())
+}
+
+#[test]
 fn projection_flush_prefers_framework_definition_over_usage() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
     insert_file_row(&storage, 1, "src/routes/+page.svelte")?;

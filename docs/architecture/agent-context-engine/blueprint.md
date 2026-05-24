@@ -10,11 +10,10 @@ CodeStory should become the local context engine that lets agents answer and edi
 | --- | --- | --- |
 | Agent A/B baseline | The legacy broad-prompt CodeStory arm used more median tokens, wall time, and tool starts than the no-CodeStory arm on the three-repeat CodeStory prompt. | [benchmark-results.md](../../testing/benchmark-results.md) |
 | Packet-first A/B diagnostic | Strict reanalysis invalidated the older packet-first claim for the public-core subset; corrected with-CodeStory rows now run an answer packet first `3/3` and quality-pass `3/3` on CodeStory, Vite, Express, and mux tasks, with zero ordinary source reads. | [benchmark-results.md](../../testing/benchmark-results.md) |
-| Quality-comparable paired rows | Five Express and mux tasks quality-passed `3/3` in both arms across bug localization, architecture explanation, symbol ownership, edit planning, and route tracing; with CodeStory, these rows used `49.1%` to `74.2%` fewer median tokens, with lower median wall time and fewer median tool starts on every row. | [benchmark-results.md](../../testing/benchmark-results.md) |
+| Historical paired diagnostics | Five Express and mux tasks quality-passed `3/3` in both arms across bug localization, architecture explanation, symbol ownership, edit planning, and route tracing; with CodeStory, these rows used `49.1%` to `74.2%` fewer median tokens, with lower median wall time and fewer median tool starts on every row. These rows predate stricter answer-level anchor and cache-provenance gates, so they are diagnostic history until rerun or reanalyzed under the current gate. | [benchmark-results.md](../../testing/benchmark-results.md) |
 | Harness capability | The A/B harness separates public/local repos, records sandbox/model/repeats, counts tool starts, and gates publishable rows on successful token-bearing runs. | [codestory-agent-ab-benchmark.mjs](../../../scripts/codestory-agent-ab-benchmark.mjs) |
 | Existing context surface | `context` already builds a deep evidence packet around one concrete retrieval target and exposes a structured packet schema over stdio. | [args.rs](../../../crates/codestory-cli/src/args.rs), [stdio_catalog.rs](../../../crates/codestory-cli/src/stdio_catalog.rs) |
 | Existing warm transport | `serve --stdio` exposes read-only tools including search, symbol, trail, definition, references, symbols, snippet, and context. | [stdio_catalog.rs](../../../crates/codestory-cli/src/stdio_catalog.rs) |
-| External comparator | Public context-engine benchmark uses multi-repo, multi-language repeated medians and attributes wins to compact context/explore calls that prevent broad file reads. | [research.md](research.md) |
 | External context pattern | Sourcegraph documents multi-source code context and agentic context fetching as proactive, iterative retrieval around coding tasks. | [SRC-1](https://sourcegraph.com/docs/cody/core-concepts/context), [SRC-2](https://sourcegraph.com/docs/cody/core-concepts/agentic-context) |
 | Integration pattern | MCP standardizes tools, resources, and prompts for connecting models to context systems. | [SRC-3](https://modelcontextprotocol.io/specification) |
 | Navigation pattern | LSP standardizes definition, references, and document symbol operations as core code-intelligence primitives. | [SRC-4](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/) |
@@ -27,9 +26,9 @@ CodeStory should become the local context engine that lets agents answer and edi
 - Update the skill to route agents through the packet workflow first, then use primitive commands only for gaps.
 - Expand the benchmark harness from cost telemetry into behavior telemetry: duplicate reads, non-CodeStory source reads after packet, expected-anchor coverage, and answer quality.
 - Add repeatable public benchmark scenarios across multiple repositories and task classes.
-- Use the external comparator's benchmark bar as the minimum public-claims bar:
-  multi-repo, multi-language, repeated medians, raw medians, and a clear
-  explanation of why agents stop reading files.
+- Use the public benchmark bar as the minimum public-claims bar: multi-repo,
+  multi-language, repeated medians, raw medians, and a clear explanation of why
+  agents stop reading files.
 - Preserve local-first operation and explicit `--project` targeting.
 
 ### Out Of Scope
@@ -79,4 +78,3 @@ flowchart LR
 - [SRC-2] Sourcegraph agentic context documentation: https://sourcegraph.com/docs/cody/core-concepts/agentic-context
 - [SRC-3] Model Context Protocol specification: https://modelcontextprotocol.io/specification
 - [SRC-4] Language Server Protocol 3.17 specification: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/
-- External comparator source is summarized in [research.md](research.md) without naming it in public docs.
