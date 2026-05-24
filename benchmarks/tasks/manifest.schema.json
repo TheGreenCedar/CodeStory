@@ -42,6 +42,7 @@
         "change_impact",
         "route_tracing",
         "symbol_ownership",
+        "data_flow",
         "edit_planning"
       ]
     },

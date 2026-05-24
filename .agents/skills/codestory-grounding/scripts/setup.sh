@@ -8,9 +8,24 @@ fi
 
 repo_url="${CODESTORY_REPO_URL:-https://github.com/TheGreenCedar/CodeStory.git}"
 # Keep this in sync with DEFAULT_CODESTORY_REPO_REF in setup.ps1.
-DEFAULT_CODESTORY_REPO_REF="7c891af81af64c941d4074272850e868f32fca14"
+DEFAULT_CODESTORY_REPO_REF="663c257fabb322a686a691d382dcc78a62b1acf7"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+local_checkout_root=""
+local_checkout_ref=""
+if command -v git >/dev/null 2>&1; then
+  local_checkout_root="$(cd "$script_dir/../../../.." 2>/dev/null && pwd || true)"
+  if [[ -n "$local_checkout_root" && -d "$local_checkout_root/.git" ]]; then
+    local_checkout_ref="$(git -C "$local_checkout_root" rev-parse HEAD 2>/dev/null || true)"
+  fi
+fi
+use_local_checkout=0
+if [[ -n "$local_checkout_root" && -z "${CODESTORY_REPO_URL:-}" && -z "${CODESTORY_REPO_REF:-}" ]]; then
+  use_local_checkout=1
+fi
 if [[ -n "${CODESTORY_REPO_REF:-}" ]]; then
   repo_ref="$CODESTORY_REPO_REF"
+elif [[ "$use_local_checkout" == "1" && -n "$local_checkout_ref" ]]; then
+  repo_ref="working-tree:$local_checkout_ref"
 else
   repo_ref="$DEFAULT_CODESTORY_REPO_REF"
 fi
@@ -24,7 +39,11 @@ redact_url_userinfo() {
 }
 
 codestory_home="${CODESTORY_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/codestory}"
-source_dir="$codestory_home/src"
+if [[ "$use_local_checkout" == "1" ]]; then
+  source_dir="$local_checkout_root"
+else
+  source_dir="$codestory_home/src"
+fi
 bin_dir="$codestory_home/bin"
 
 case "$(uname -s)" in
@@ -53,28 +72,30 @@ command -v cargo >/dev/null 2>&1 || { echo "Required command 'cargo' was not fou
 
 mkdir -p "$codestory_home" "$bin_dir"
 
-if [[ ! -d "$source_dir/.git" ]]; then
-  if [[ -e "$source_dir" ]] && [[ -n "$(find "$source_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
-    echo "Source directory exists but is not a git checkout: $source_dir" >&2
-    exit 1
+if [[ "$use_local_checkout" != "1" ]]; then
+  if [[ ! -d "$source_dir/.git" ]]; then
+    if [[ -e "$source_dir" ]] && [[ -n "$(find "$source_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+      echo "Source directory exists but is not a git checkout: $source_dir" >&2
+      exit 1
+    fi
+    git clone "$repo_url" "$source_dir"
+  else
+    origin_url="$(git -C "$source_dir" config --get remote.origin.url)"
+    if [[ "${origin_url%/}" != "${repo_url%/}" ]]; then
+      origin_url_for_display="$(redact_url_userinfo "$origin_url")"
+      echo "CodeStory source artifact remote is '$origin_url_for_display', expected '$repo_url_for_display'. Set CODESTORY_HOME or CODESTORY_REPO_URL intentionally." >&2
+      exit 1
+    fi
+    dirty="$(git -C "$source_dir" status --porcelain)"
+    if [[ -n "$dirty" ]]; then
+      echo "CodeStory source artifact has local changes; refusing to update: $source_dir" >&2
+      exit 1
+    fi
   fi
-  git clone "$repo_url" "$source_dir"
-else
-  origin_url="$(git -C "$source_dir" config --get remote.origin.url)"
-  if [[ "${origin_url%/}" != "${repo_url%/}" ]]; then
-    origin_url_for_display="$(redact_url_userinfo "$origin_url")"
-    echo "CodeStory source artifact remote is '$origin_url_for_display', expected '$repo_url_for_display'. Set CODESTORY_HOME or CODESTORY_REPO_URL intentionally." >&2
-    exit 1
-  fi
-  dirty="$(git -C "$source_dir" status --porcelain)"
-  if [[ -n "$dirty" ]]; then
-    echo "CodeStory source artifact has local changes; refusing to update: $source_dir" >&2
-    exit 1
-  fi
-fi
 
-git -C "$source_dir" fetch --tags origin
-git -C "$source_dir" checkout --detach "$repo_ref"
+  git -C "$source_dir" fetch --tags origin
+  git -C "$source_dir" checkout --detach "$repo_ref"
+fi
 
 cargo build --release -p codestory-cli --manifest-path "$source_dir/Cargo.toml"
 

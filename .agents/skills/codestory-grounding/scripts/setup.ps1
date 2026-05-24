@@ -43,8 +43,40 @@ function Invoke-Checked {
     }
 }
 
+function Get-LocalCheckoutRoot {
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        return $null
+    }
+    $candidate = Resolve-Path (Join-Path $PSScriptRoot "..\..\..\..") -ErrorAction SilentlyContinue
+    if (-not $candidate) {
+        return $null
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $candidate.Path ".git"))) {
+        return $null
+    }
+    return $candidate.Path
+}
+
+function Get-GitHeadRef {
+    param([string]$Path)
+    if (-not $Path) {
+        return $null
+    }
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        return $null
+    }
+    $head = & git -C $Path rev-parse HEAD 2>$null
+    if ($LASTEXITCODE -eq 0 -and $head) {
+        return $head.Trim()
+    }
+    return $null
+}
+
 # Keep this in sync with DEFAULT_CODESTORY_REPO_REF in setup.sh.
-$DEFAULT_CODESTORY_REPO_REF = "7c891af81af64c941d4074272850e868f32fca14"
+$DEFAULT_CODESTORY_REPO_REF = "663c257fabb322a686a691d382dcc78a62b1acf7"
+$localCheckoutRoot = Get-LocalCheckoutRoot
+$useLocalCheckout = $localCheckoutRoot -and -not $env:CODESTORY_REPO_URL -and -not $env:CODESTORY_REPO_REF
+$localCheckoutHeadRef = if ($useLocalCheckout) { Get-GitHeadRef $localCheckoutRoot } else { $null }
 $repoUrl = if ($env:CODESTORY_REPO_URL) {
     $env:CODESTORY_REPO_URL
 } else {
@@ -52,6 +84,8 @@ $repoUrl = if ($env:CODESTORY_REPO_URL) {
 }
 $repoRef = if ($env:CODESTORY_REPO_REF) {
     $env:CODESTORY_REPO_REF
+} elseif ($useLocalCheckout -and $localCheckoutHeadRef) {
+    "working-tree:$localCheckoutHeadRef"
 } else {
     $DEFAULT_CODESTORY_REPO_REF
 }
@@ -59,12 +93,12 @@ if (-not $repoRef) {
     throw "CODESTORY_REPO_REF resolved to an empty value."
 }
 
-$isWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+$runningOnWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
     [System.Runtime.InteropServices.OSPlatform]::Windows
 )
-$binaryName = if ($isWindows) { "codestory-cli.exe" } else { "codestory-cli" }
+$binaryName = if ($runningOnWindows) { "codestory-cli.exe" } else { "codestory-cli" }
 $codestoryHome = Get-CodeStoryHome
-$sourceDir = Join-Path $codestoryHome "src"
+$sourceDir = if ($useLocalCheckout) { $localCheckoutRoot } else { Join-Path $codestoryHome "src" }
 $binDir = Join-Path $codestoryHome "bin"
 $dest = Join-Path $binDir $binaryName
 $repoUrlForDisplay = Protect-UrlUserInfo $repoUrl
@@ -87,35 +121,37 @@ Require-Command cargo
 
 New-Item -ItemType Directory -Force -Path $codestoryHome, $binDir | Out-Null
 
-if (-not (Test-Path -LiteralPath (Join-Path $sourceDir ".git"))) {
-    if (Test-Path -LiteralPath $sourceDir) {
-        $hasContents = Get-ChildItem -LiteralPath $sourceDir -Force | Select-Object -First 1
-        if ($hasContents) {
-            throw "Source directory exists but is not a git checkout: $sourceDir"
+if (-not $useLocalCheckout) {
+    if (-not (Test-Path -LiteralPath (Join-Path $sourceDir ".git"))) {
+        if (Test-Path -LiteralPath $sourceDir) {
+            $hasContents = Get-ChildItem -LiteralPath $sourceDir -Force | Select-Object -First 1
+            if ($hasContents) {
+                throw "Source directory exists but is not a git checkout: $sourceDir"
+            }
+        }
+        Invoke-Checked git @("clone", $repoUrl, $sourceDir)
+    } else {
+        $originUrl = & git -C $sourceDir config --get remote.origin.url
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to read CodeStory source artifact remote: $sourceDir"
+        }
+        if ($originUrl.TrimEnd("/") -ne $repoUrl.TrimEnd("/")) {
+            $originForDisplay = Protect-UrlUserInfo $originUrl
+            throw "CodeStory source artifact remote is '$originForDisplay', expected '$repoUrlForDisplay'. Set CODESTORY_HOME or CODESTORY_REPO_URL intentionally."
+        }
+
+        $dirty = & git -C $sourceDir status --porcelain
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to inspect CodeStory source artifact status: $sourceDir"
+        }
+        if ($dirty) {
+            throw "CodeStory source artifact has local changes; refusing to update: $sourceDir"
         }
     }
-    Invoke-Checked git @("clone", $repoUrl, $sourceDir)
-} else {
-    $originUrl = & git -C $sourceDir config --get remote.origin.url
-    if ($LASTEXITCODE -ne 0) {
-        throw "Unable to read CodeStory source artifact remote: $sourceDir"
-    }
-    if ($originUrl.TrimEnd("/") -ne $repoUrl.TrimEnd("/")) {
-        $originForDisplay = Protect-UrlUserInfo $originUrl
-        throw "CodeStory source artifact remote is '$originForDisplay', expected '$repoUrlForDisplay'. Set CODESTORY_HOME or CODESTORY_REPO_URL intentionally."
-    }
 
-    $dirty = & git -C $sourceDir status --porcelain
-    if ($LASTEXITCODE -ne 0) {
-        throw "Unable to inspect CodeStory source artifact status: $sourceDir"
-    }
-    if ($dirty) {
-        throw "CodeStory source artifact has local changes; refusing to update: $sourceDir"
-    }
+    Invoke-Checked git @("-C", $sourceDir, "fetch", "--tags", "origin")
+    Invoke-Checked git @("-C", $sourceDir, "checkout", "--detach", $repoRef)
 }
-
-Invoke-Checked git @("-C", $sourceDir, "fetch", "--tags", "origin")
-Invoke-Checked git @("-C", $sourceDir, "checkout", "--detach", $repoRef)
 
 Invoke-Checked cargo @("build", "--release", "-p", "codestory-cli", "--manifest-path", (Join-Path $sourceDir "Cargo.toml"))
 

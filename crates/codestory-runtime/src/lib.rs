@@ -6854,46 +6854,61 @@ impl AppController {
             .0)
     }
 
-    pub(crate) fn search_symbolic_packet_anchors(
+    pub(crate) fn search_symbolic_packet_anchor_batch(
         &self,
-        query: &str,
+        queries: &[String],
         max_results: usize,
-    ) -> Result<Vec<SearchHit>, ApiError> {
+    ) -> Result<Vec<(String, Vec<SearchHit>)>, ApiError> {
         self.ensure_search_state()?;
         let storage = self.open_storage()?;
         let requested_max_results = max_results.clamp(1, 50);
         let project_root = self.require_project_root().ok();
-        let (symbolic, node_names) = {
+        let (symbolic_by_query, node_names) = {
             let mut s = self.state.lock();
             let engine = s.search_engine.as_mut().ok_or_else(|| {
                 ApiError::invalid_argument("Search engine not initialized. Open a project first.")
             })?;
             (
-                lexical_hybrid_hits(engine, query, &HashMap::new()),
+                queries
+                    .iter()
+                    .map(|query| {
+                        (
+                            query.clone(),
+                            lexical_hybrid_hits(engine, query, &HashMap::new()),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
                 s.node_names.clone(),
             )
         };
 
-        let mut hits = Vec::with_capacity(symbolic.len());
-        for scored in symbolic {
-            if let Some(mut hit) =
-                Self::build_search_hit(&storage, &node_names, scored.node_id, scored.total_score)
-            {
-                hit.score_breakdown = Some(RetrievalScoreBreakdownDto {
-                    lexical: scored.lexical_score,
-                    semantic: 0.0,
-                    graph: scored.graph_score,
-                    total: scored.total_score,
-                });
-                hits.push(hit);
+        let mut results = Vec::with_capacity(symbolic_by_query.len());
+        for (query, symbolic) in symbolic_by_query {
+            let mut hits = Vec::with_capacity(symbolic.len());
+            for scored in symbolic {
+                if let Some(mut hit) = Self::build_search_hit(
+                    &storage,
+                    &node_names,
+                    scored.node_id,
+                    scored.total_score,
+                ) {
+                    hit.score_breakdown = Some(RetrievalScoreBreakdownDto {
+                        lexical: scored.lexical_score,
+                        semantic: 0.0,
+                        graph: scored.graph_score,
+                        total: scored.total_score,
+                    });
+                    hits.push(hit);
+                }
             }
+            hits.sort_by(|left, right| {
+                compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
+            });
+            annotate_search_hit_match_quality(&query, &mut hits);
+            hits.truncate(requested_max_results);
+            results.push((query, hits));
         }
-        hits.sort_by(|left, right| {
-            compare_search_hits_with_project_root(project_root.as_deref(), query, left, right)
-        });
-        annotate_search_hit_match_quality(query, &mut hits);
-        hits.truncate(requested_max_results);
-        Ok(hits)
+        Ok(results)
     }
 
     fn search_hybrid_scored_inner(

@@ -99,13 +99,12 @@ node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --repea
 
 The current three-repeat CodeStory benchmark is a negative baseline for agent savings: the with-CodeStory arm used more median tokens, wall time, and tool starts. That result should remain visible until the packet workflow and skill stop rules produce a quality-passing improvement.
 
-The current packet-first work has produced five positive quality-comparable
-paired rows: Express response-helper bug localization, mux router matching-flow
-architecture, Express response symbol ownership, mux CORS middleware edit
-planning, and Express application route tracing. It also has strict
-with-CodeStory packet-first rows on CodeStory, Vite, Express, and mux tasks.
-Treat these as promotion seeds, not a public aggregate: breadth across more
-repositories and language families is still required.
+The packet-first work has produced five historical paired diagnostics: Express
+response-helper bug localization, mux router matching-flow architecture,
+Express response symbol ownership, mux CORS middleware edit planning, and
+Express application route tracing. Those rows predate the stricter 2026-05-24
+answer-level quality and cache-provenance gates, so treat them as promotion
+seeds that require rerun or reanalysis before they support a public aggregate.
 
 ## Exit Criteria For First Promotion
 

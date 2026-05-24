@@ -33,6 +33,7 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-05-23 | de0dac9 | pass, agent grounding spec remediation working tree | 13.14 | 0.28 | 1.23 | 0.82 | 0.27 | 0.26 | 53,092 | 45,019 | 147 | 0 | 7,127 | true |
 | 2026-05-24 | 7db7fb1+wt | pass, post-rebase benchmark/packet integration | 18.04 | 0.44 | 2.28 | 0.90 | 0.33 | 0.31 | 55,977 | 47,413 | 149 | 0 | 7,466 | true |
 | 2026-05-24 | 7c891af+wt | pass, review remediation e2e | 11.10 | 0.29 | 1.29 | 0.86 | 0.25 | 0.23 | 56,272 | 47,628 | 149 | 0 | 7,501 | true |
+| 2026-05-24 | 663c257+wt | pass, review findings remediation | 12.30 | 0.24 | 1.04 | 0.65 | 0.24 | 0.21 | 56,362 | 47,659 | 149 | 0 | 7,530 | true |
 
 ## Phase Metrics
 

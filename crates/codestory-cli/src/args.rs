@@ -359,7 +359,7 @@ pub(crate) struct PacketCommand {
     #[arg(
         long,
         value_name = "MS",
-        help = "Optional retrieval latency budget in milliseconds."
+        help = "Optional packet-level latency budget in milliseconds."
     )]
     pub(crate) latency_budget_ms: Option<u32>,
 }

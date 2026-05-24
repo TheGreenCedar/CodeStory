@@ -23,7 +23,7 @@ tracing, ownership discovery, or change-impact analysis.
 | `--format <markdown|json>` | `markdown` | Human or structured output. |
 | `--output-file <path>` | none | Write output to a file. |
 | `--no-evidence` | off | Omit citation edge ids and score breakdowns. Avoid this for grounded claims. |
-| `--latency-budget-ms <n>` | none | Optional runtime latency target for integrations. |
+| `--latency-budget-ms <n>` | none | Optional packet-level latency target for integrations. |
 
 ## Agent Paths
 

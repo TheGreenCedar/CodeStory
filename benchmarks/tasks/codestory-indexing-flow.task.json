@@ -7,7 +7,7 @@
   "repo": {
     "name": "codestory",
     "url": "https://github.com/TheGreenCedar/CodeStory.git",
-    "ref": "main",
+    "ref": "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
     "workspace_root": ".",
     "languages": [
       "Rust"

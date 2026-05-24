@@ -407,6 +407,34 @@ test("aggregate anchor recall uses fuzzy claim matching", () => {
   assert.equal(quality.pass, true);
 });
 
+test("quality scoring does not promote transcript-only expected anchors", () => {
+  const task = runtimeQualityTask("runtime-flow", {
+    min_expected_file_recall: 1,
+    min_expected_symbol_recall: 1,
+    min_expected_claim_recall: 1,
+    min_citation_coverage: 1,
+    min_expected_anchor_recall: 1,
+    max_forbidden_claims: 0,
+  });
+  const events = [
+    commandEvent(
+      "cmd_1",
+      "item.completed",
+      "rg -n run_index crates/codestory-runtime/src/services.rs",
+      `${RUNTIME_SERVICE_FILE}\n${RUN_INDEX_SYMBOL}`,
+    ),
+    agentMessageEvent(RUNTIME_REFRESH_CLAIM),
+  ];
+
+  const quality = scoreQuality(events, task);
+
+  assert.equal(quality.pass, false);
+  assert.equal(quality.observed_files.recall, 1);
+  assert.equal(quality.observed_symbols.recall, 1);
+  assert.equal(quality.expected_files.recall, 0);
+  assert.equal(quality.expected_symbols.recall, 0);
+});
+
 test("scores forbidden claims with the same fuzzy matcher as expected claims", () => {
   const task = runtimeQualityTask("forbidden-claim-fixture", {
     min_expected_file_recall: 0,
@@ -481,13 +509,25 @@ test("publishable provenance requires pinned clean manifest checkout", () => {
   const clean = {
     repo_provenance: {
       manifest_overridden_by_builtin: false,
-      configured: { ref: "main" },
-      manifest: { ref: "main" },
+      configured: { ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7" },
+      manifest: { ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7" },
       git_head: "abc123",
       git_dirty: false,
     },
   };
   assert.deepEqual(repoProvenanceBlockers(clean), []);
+  assert.match(
+    repoProvenanceBlockers({
+      repo_provenance: {
+        manifest_overridden_by_builtin: false,
+        configured: { ref: "main" },
+        manifest: { ref: "main" },
+        git_head: "abc123",
+        git_dirty: false,
+      },
+    }).join("\n"),
+    /not pinned to an immutable commit or tag/,
+  );
 
   const blockers = agentPublishableBlockers(
     [
@@ -520,6 +560,38 @@ test("publishable provenance requires pinned clean manifest checkout", () => {
   assert.match(blockers[0].reasons.join("\n"), /overridden by a built-in checkout/);
   assert.match(blockers[0].reasons.join("\n"), /repo ref is not pinned/);
   assert.match(blockers[0].reasons.join("\n"), /repo checkout is dirty/);
+});
+
+test("publishable gate requires CodeStory cache provenance for CodeStory arm", () => {
+  const blockers = agentPublishableBlockers(
+    [
+      {
+        repo: "codestory",
+        task_id: "codestory-indexing-flow",
+        arm: "with_codestory",
+        repeat: 1,
+        status: "pass",
+        usage: { total_tokens: 100 },
+        packet_first_required: true,
+        packet_first_pass: true,
+        quality: { pass: true },
+        transcript_analysis: {
+          ordinary_source_reads_after_first_packet: 0,
+        },
+        repo_provenance: {
+          manifest_overridden_by_builtin: false,
+          configured: { ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7" },
+          manifest: { ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7" },
+          git_head: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+          git_dirty: false,
+        },
+      },
+    ],
+    { publishable: true },
+  );
+
+  assert.equal(blockers.length, 1);
+  assert.match(blockers[0].reasons.join("\n"), /missing CodeStory cache provenance/);
 });
 
 test("reanalysis uses the run-time task snapshot before current manifest contents", async () => {

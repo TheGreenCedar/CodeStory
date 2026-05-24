@@ -36,8 +36,8 @@ file reads.
 
 Latest checked-in evidence supports local indexing, warm reads, protocol hygiene,
 and retrieval quality. The CodeStory repo index/read figures below come from the
-logged `7c891af+wt` e2e row, not this branch's current HEAD. The agent A/B
-harness now has a real 3-repeat baseline too, but it is not a savings claim yet:
+logged `663c257+wt` review-remediation e2e row. The agent A/B harness now has a
+real 3-repeat baseline too, but it is not a savings claim yet:
 on the CodeStory repo prompt, the CodeStory arm used more median tokens, wall
 time, and tool starts than the no-CodeStory arm.
 
@@ -50,24 +50,21 @@ time, and tool starts than the no-CodeStory arm.
   / `2` tool starts, and made `0` ordinary source reads. The latest comparable
   no-CodeStory baseline quality-passed `1/3`. This is quality-rescue evidence
   with strong efficiency diagnostics, not a public savings claim yet.
-- Quality-comparable paired rows: five Express and mux tasks now quality-pass
-  `3/3` in both arms across bug localization, architecture explanation, symbol
-  ownership, edit planning, and route tracing. With CodeStory, those rows show
-  `49.1%` to `74.2%` fewer tokens, `47.2%` to `50.7%` lower wall time, and
-  `85.7%` to `88.9%` fewer tool starts. This is promising paired evidence, not
-  a general savings claim yet.
-- CodeStory repo cold index: `11.10s`, with `56,272` nodes, `47,628` edges,
-  `149` files, and `7,501` semantic docs.
-- One-shot reads after that index: search `1.29s`, symbol `0.86s`,
-  trail `0.25s`, snippet `0.23s`.
+- Historical paired diagnostics: five Express and mux tasks previously
+  quality-passed `3/3` in both arms and showed lower tokens, wall time, and tool
+  starts with CodeStory. Those rows predate the stricter answer-level anchor and
+  cache-provenance gates, so rerun or reanalyze them before treating them as
+  strict savings evidence.
+- CodeStory repo cold index: `12.30s`, with `56,362` nodes, `47,659` edges,
+  `149` files, and `7,530` semantic docs.
+- One-shot reads after that index: search `1.04s`, symbol `0.65s`,
+  trail `0.24s`, snippet `0.21s`.
 - Warm stdio small-fixture loop: `53.50ms` per
   `search -> symbol -> trail -> snippet` loop across `20` reps.
 - Warm stdio search p95 smoke: `25.96ms`, with protocol-clean stdout.
-- Public-core packet diagnostic: `108/108` quality-passing packet rows across
-  cold CLI and warm stdio (`18` manifests x `3` repeats x `2` modes), with every
-  row reporting `sufficient` coverage and no sufficiency/quality mismatches.
-  Warm stdio median task wall time was `3.13s` versus cold CLI `4.86s`. This is
-  packet-runtime evidence, not an agent savings claim yet.
+- Historical public-core packet diagnostic: `108/108` packet rows quality-passed
+  across cold CLI and warm stdio before the stricter sufficiency/provenance gates.
+  Refresh those rows before promoting packet-runtime medians.
 - Historical cross-repo retrieval gate: Hit@10 `1.0`, MRR@10 `0.826831`
   across `4` projects and `225` queries.
 

@@ -50,7 +50,7 @@ Acceptance Criteria:
 2. WHEN expected evidence coverage is low or ambiguous, THE Sufficiency Contract SHALL name the missing anchors and recommend targeted follow-ups.
 3. WHEN the agent opens broad files after a sufficient packet, THE Benchmark Harness SHALL count that as avoidable exploration.
 
-Traceability: current skill guidance tells agents to use CodeStory extensively but does not define a stopping rule.
+Traceability: current skill guidance defines packet-first routing and a stopping rule for sufficient packets; the remaining risk is keeping sufficiency tied to task coverage rather than citation existence alone.
 
 ### Requirement 4: Benchmark Quality Scoring
 
@@ -62,7 +62,7 @@ Acceptance Criteria:
 2. WHEN an agent answer omits required anchors, THE run SHALL remain successful operationally but fail the quality threshold.
 3. WHEN token or wall-time savings appear, THE benchmark report SHALL only promote them when quality thresholds pass.
 
-Traceability: the current harness records medians and tool starts, but not answer quality or duplicate exploration.
+Traceability: the current harness records medians, tool starts, answer-level quality gates, duplicate direct file reads, and ordinary source reads after packet. Remaining benchmark work should broaden strict paired rows and unsupported-claim detection rather than re-adding basic quality telemetry.
 
 ### Requirement 5: Public Multi-Repo Corpus
 
@@ -86,7 +86,7 @@ Acceptance Criteria:
 2. WHEN a benchmark uses the warm transport, THE Benchmark Harness SHALL record transport mode separately from cold CLI mode.
 3. WHEN stdio tools are listed, THE catalog SHALL preserve read-only safety metadata.
 
-Traceability: existing stdio catalog exposes read-only context and navigation tools, but not a broad packet-first task surface.
+Traceability: the stdio catalog exposes the read-only `packet` task surface plus primitive navigation tools; warm-transport validation should keep that path tested without making stdio the default for ordinary CLI navigation work.
 
 ### Requirement 7: Skill Router Simplification
 

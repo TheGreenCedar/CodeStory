@@ -47,7 +47,7 @@ not assume the current directory is the repository being grounded.
 11. When `packet` reports `sufficient` and `follow_up_commands` is empty, answer from the packet; budget truncation alone is not a gap. Carry the packet's supported-claim wording into the final answer. Include a compact "Support files" list with every relevant path from `answer.citations` and `sufficiency.avoid_opening`, not only paths mentioned in prose. Use only named follow-up commands, edit targets, or verification files.
 12. For architecture answers from `drill`, read `evidence_packet.readiness` before drafting. Do not present `partial`, `inferred`, or `needs_source_read` claims as verified until the source-truth checklist has been completed.
 13. Treat repo-text and cross-language framework evidence as hints unless the packet also includes typed graph evidence, snippets, or source-truth checks.
-14. Keep navigation, route coverage, performance, and search-quality work CLI-first. Do not route these workflows through MCP, stdio, HTTP, or server behavior.
+14. Keep navigation, route coverage, and search-quality work CLI-first. Use `serve --stdio` only when the task is specifically warm transport, protocol, or stdio integration validation; do not route ordinary CLI-navigation docs/spec work through MCP, stdio, HTTP, or server behavior.
 
 ## One-Time Global Setup
 
@@ -63,7 +63,7 @@ Do this once per machine or when the CodeStory source artifact moves:
    bash scripts/setup.sh
    ```
 3. Use the printed `CODESTORY_CLI=...` path as `<codestory-cli>`, or persist it for future sessions.
-4. If you need a different source artifact, set `CODESTORY_REPO_URL` and `CODESTORY_REPO_REF` explicitly before setup; otherwise setup uses the script's `DEFAULT_CODESTORY_REPO_REF`. That ref pins the CLI source checkout, not this installed skill version.
+4. If you need a different source artifact, set `CODESTORY_REPO_URL` and `CODESTORY_REPO_REF` explicitly before setup. When setup runs from a CodeStory source checkout it builds that checkout's current working tree; installed copies outside a checkout use the script's default source ref.
 5. For each target repository, run `doctor`, `index`, and `ground` with `--project <target-workspace>`.
 
 Do not rebuild or re-clone CodeStory for every target repository. Rebuild only

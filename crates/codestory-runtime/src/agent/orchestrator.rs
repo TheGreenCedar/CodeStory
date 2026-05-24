@@ -27,6 +27,7 @@ const DEFAULT_MAX_RESULTS: u32 = 8;
 const DEFAULT_MAX_EDGES: u32 = 260;
 const DEFAULT_SLA_TARGET_MS: u32 = 18_000;
 const MIN_PHASE_DEADLINE_MS: u128 = 750;
+const MIN_PACKET_RETRIEVAL_BUDGET_MS: u128 = 1_000;
 const WEAK_INITIAL_HIT_COUNT: usize = 3;
 const WEAK_INITIAL_TOP_SCORE: f32 = 0.30;
 const WEAK_INITIAL_MIN_LEXICAL_ANCHOR: f32 = 0.01;
@@ -111,6 +112,42 @@ struct GraphArtifactCapStats {
     retained_bytes: usize,
     omitted_count: usize,
     truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PacketLatencyBudget {
+    started_at: Instant,
+    target_ms: u128,
+}
+
+impl PacketLatencyBudget {
+    fn new(requested_ms: Option<u32>) -> Self {
+        Self {
+            started_at: Instant::now(),
+            target_ms: requested_ms
+                .unwrap_or(DEFAULT_SLA_TARGET_MS)
+                .clamp(1_000, 120_000) as u128,
+        }
+    }
+
+    fn remaining_for_agent_ask(self) -> Option<u32> {
+        let elapsed = self.started_at.elapsed().as_millis();
+        if elapsed.saturating_add(MIN_PACKET_RETRIEVAL_BUDGET_MS) > self.target_ms {
+            return None;
+        }
+        Some(clamp_u128_to_u32(self.target_ms.saturating_sub(elapsed)))
+    }
+
+    fn exhausted(self) -> bool {
+        self.started_at.elapsed().as_millis() >= self.target_ms
+    }
+
+    fn apply_to_trace(self, answer: &mut AgentAnswerDto) {
+        answer.retrieval_trace.sla_target_ms = Some(clamp_u128_to_u32(self.target_ms));
+        if (answer.retrieval_trace.total_latency_ms as u128) > self.target_ms || self.exhausted() {
+            answer.retrieval_trace.sla_missed = true;
+        }
+    }
 }
 
 pub(crate) fn agent_ask(
@@ -274,6 +311,7 @@ pub(crate) fn agent_packet(
 
     let plan = build_packet_plan(&question, req.task_class);
     let limits = packet_budget_limits(req.budget);
+    let packet_latency = PacketLatencyBudget::new(req.latency_budget_ms);
     let retrieval_profile = packet_retrieval_profile(Some(plan.task_class), req.budget, &limits);
     let retrieval_prompt = packet_retrieval_prompt(&question, &plan);
     let mut answer = agent_ask(
@@ -299,7 +337,7 @@ pub(crate) fn agent_packet(
         req.budget,
         &limits,
         req.include_evidence,
-        req.latency_budget_ms,
+        packet_latency,
         &mut answer,
     );
     run_packet_anchor_expansion(
@@ -308,13 +346,15 @@ pub(crate) fn agent_packet(
         req.budget,
         &limits,
         req.include_evidence,
+        packet_latency,
         &mut answer,
     );
+    packet_latency.apply_to_trace(&mut answer);
     rank_packet_evidence(&question, &mut answer);
     append_packet_evidence_sections(&mut answer, plan.task_class, &limits);
 
     let budget = apply_packet_budget(&question, req.budget, limits, &mut answer);
-    let sufficiency = build_packet_sufficiency(&question, &answer, &budget);
+    let sufficiency = build_packet_sufficiency(&question, plan.task_class, &answer, &budget);
     let benchmark_trace = packet_benchmark_trace(&answer);
 
     let mut packet = AgentPacketDto {
@@ -635,7 +675,7 @@ fn run_packet_planned_subqueries(
     budget: PacketBudgetModeDto,
     limits: &PacketBudgetLimitsDto,
     include_evidence: bool,
-    latency_budget_ms: Option<u32>,
+    packet_latency: PacketLatencyBudget,
     answer: &mut AgentAnswerDto,
 ) {
     let limit = packet_subquery_limit(budget);
@@ -648,6 +688,14 @@ fn run_packet_planned_subqueries(
     }
 
     for query in plan.queries.iter().skip(1).take(limit) {
+        let Some(remaining_latency_ms) = packet_latency.remaining_for_agent_ask() else {
+            answer.retrieval_trace.sla_missed = true;
+            answer.retrieval_trace.annotations.push(format!(
+                "packet_subqueries stopped because packet latency budget {}ms was exhausted",
+                packet_latency.target_ms
+            ));
+            break;
+        };
         let retrieval_profile = packet_retrieval_profile(Some(plan.task_class), budget, limits);
         let subquery = agent_ask(
             controller,
@@ -657,7 +705,7 @@ fn run_packet_planned_subqueries(
                 focus_node_id: None,
                 max_results: Some((limits.max_anchors / 2).clamp(1, 10)),
                 response_mode: AgentResponseModeDto::Structured,
-                latency_budget_ms,
+                latency_budget_ms: Some(remaining_latency_ms),
                 include_evidence,
                 hybrid_weights: None,
             },
@@ -670,6 +718,7 @@ fn run_packet_planned_subqueries(
                 error
             )),
         }
+        packet_latency.apply_to_trace(answer);
     }
 }
 
@@ -688,6 +737,7 @@ fn run_packet_anchor_expansion(
     budget: PacketBudgetModeDto,
     limits: &PacketBudgetLimitsDto,
     include_evidence: bool,
+    packet_latency: PacketLatencyBudget,
     answer: &mut AgentAnswerDto,
 ) {
     let query_limit = packet_anchor_probe_limit(budget);
@@ -706,14 +756,33 @@ fn run_packet_anchor_expansion(
         .collect::<HashSet<_>>();
     let per_query_limit = (limits.max_anchors / 2).clamp(2, 6) as usize;
 
-    for query in packet_anchor_probe_queries(plan)
+    let queries = packet_anchor_probe_queries(plan)
         .into_iter()
         .take(query_limit)
-    {
-        let started_at = Instant::now();
-        let result = controller.search_symbolic_packet_anchors(&query, per_query_limit);
-        match result {
-            Ok(hits) => {
+        .collect::<Vec<_>>();
+    if queries.is_empty() {
+        return;
+    }
+    if packet_latency.exhausted() {
+        answer.retrieval_trace.sla_missed = true;
+        answer.retrieval_trace.annotations.push(format!(
+            "packet_anchor_probes stopped because packet latency budget {}ms was exhausted",
+            packet_latency.target_ms
+        ));
+        return;
+    }
+
+    let started_at = Instant::now();
+    let result = controller.search_symbolic_packet_anchor_batch(&queries, per_query_limit);
+    let duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
+    answer.retrieval_trace.total_latency_ms = answer
+        .retrieval_trace
+        .total_latency_ms
+        .saturating_add(duration_ms);
+    match result {
+        Ok(results) => {
+            let per_step_duration = duration_ms / results.len().max(1) as u32;
+            for (query, hits) in results {
                 let mut added = 0usize;
                 for hit in hits
                     .iter()
@@ -729,7 +798,7 @@ fn run_packet_anchor_expansion(
                 answer.retrieval_trace.steps.push(AgentRetrievalStepDto {
                     kind: AgentRetrievalStepKindDto::Search,
                     status: AgentRetrievalStepStatusDto::Ok,
-                    duration_ms: clamp_u128_to_u32(started_at.elapsed().as_millis()),
+                    duration_ms: per_step_duration,
                     input: vec![field("query", query.clone())],
                     output: vec![
                         field("hits", hits.len().to_string()),
@@ -745,11 +814,13 @@ fn run_packet_anchor_expansion(
                     added
                 ));
             }
-            Err(error) => {
+        }
+        Err(error) => {
+            for query in queries {
                 answer.retrieval_trace.steps.push(AgentRetrievalStepDto {
                     kind: AgentRetrievalStepKindDto::Search,
                     status: AgentRetrievalStepStatusDto::Error,
-                    duration_ms: clamp_u128_to_u32(started_at.elapsed().as_millis()),
+                    duration_ms: 0,
                     input: vec![field("query", query.clone())],
                     output: Vec::new(),
                     message: Some(error.message.clone()),
@@ -762,6 +833,7 @@ fn run_packet_anchor_expansion(
             }
         }
     }
+    packet_latency.apply_to_trace(answer);
 }
 
 fn packet_anchor_probe_limit(budget: PacketBudgetModeDto) -> usize {
@@ -1341,8 +1413,14 @@ fn enforce_packet_output_budget(packet: &mut AgentPacketDto) {
             push_omitted_section(&mut packet.budget, "markdown_blocks");
             packet.budget.used = packet_budget_usage(&packet.answer);
             packet.benchmark_trace = packet_benchmark_trace(&packet.answer);
-            packet.sufficiency =
-                build_packet_sufficiency(&packet.question, &packet.answer, &packet.budget);
+            packet.sufficiency = build_packet_sufficiency(
+                &packet.question,
+                packet
+                    .task_class
+                    .unwrap_or(PacketTaskClassDto::ArchitectureExplanation),
+                &packet.answer,
+                &packet.budget,
+            );
             continue;
         }
         break;
@@ -1353,8 +1431,14 @@ fn enforce_packet_output_budget(packet: &mut AgentPacketDto) {
         packet.budget.truncated = true;
         push_omitted_section(&mut packet.budget, "output_bytes");
         push_omitted_section(&mut packet.budget, "packet_payload");
-        packet.sufficiency =
-            build_packet_sufficiency(&packet.question, &packet.answer, &packet.budget);
+        packet.sufficiency = build_packet_sufficiency(
+            &packet.question,
+            packet
+                .task_class
+                .unwrap_or(PacketTaskClassDto::ArchitectureExplanation),
+            &packet.answer,
+            &packet.budget,
+        );
     }
 }
 
@@ -1633,6 +1717,7 @@ fn quote_packet_command_value(value: &str) -> String {
 
 fn build_packet_sufficiency(
     question: &str,
+    task_class: PacketTaskClassDto,
     answer: &AgentAnswerDto,
     budget: &PacketBudgetDto,
 ) -> PacketSufficiencyDto {
@@ -1641,9 +1726,12 @@ fn build_packet_sufficiency(
         .steps
         .iter()
         .any(|step| step.status == AgentRetrievalStepStatusDto::Error);
+    let min_citations = packet_sufficiency_min_citations(task_class);
+    let has_minimum_coverage = answer.citations.len() >= min_citations;
     let status = if answer.citations.is_empty() {
         PacketSufficiencyStatusDto::Insufficient
-    } else if has_errors || packet_budget_exceeded_hard_output_cap(budget) {
+    } else if has_errors || !has_minimum_coverage || packet_budget_exceeded_hard_output_cap(budget)
+    {
         PacketSufficiencyStatusDto::Partial
     } else {
         PacketSufficiencyStatusDto::Sufficient
@@ -1652,6 +1740,14 @@ fn build_packet_sufficiency(
     let mut gaps = Vec::new();
     if answer.citations.is_empty() {
         gaps.push("No cited anchors were found for the question.".to_string());
+    }
+    if !answer.citations.is_empty() && !has_minimum_coverage {
+        gaps.push(format!(
+            "{:?} packet found only {} cited anchor(s); at least {} are required before treating the packet as sufficient.",
+            task_class,
+            answer.citations.len(),
+            min_citations
+        ));
     }
     if budget.truncated && status != PacketSufficiencyStatusDto::Sufficient {
         gaps.push(format!(
@@ -1702,6 +1798,17 @@ fn build_packet_sufficiency(
         avoid_opening,
         gaps,
         follow_up_commands,
+    }
+}
+
+fn packet_sufficiency_min_citations(task_class: PacketTaskClassDto) -> usize {
+    match task_class {
+        PacketTaskClassDto::BugLocalization | PacketTaskClassDto::SymbolOwnership => 2,
+        PacketTaskClassDto::ArchitectureExplanation
+        | PacketTaskClassDto::ChangeImpact
+        | PacketTaskClassDto::RouteTracing
+        | PacketTaskClassDto::DataFlow
+        | PacketTaskClassDto::EditPlanning => 3,
     }
 }
 
@@ -3453,7 +3560,7 @@ mod tests {
         append_packet_evidence_sections(&mut answer, task_class, &limits);
         let budget =
             apply_packet_budget(question, PacketBudgetModeDto::Compact, limits, &mut answer);
-        let sufficiency = build_packet_sufficiency(question, &answer, &budget);
+        let sufficiency = build_packet_sufficiency(question, task_class, &answer, &budget);
         (answer, sufficiency)
     }
 
@@ -3964,7 +4071,12 @@ mod tests {
         );
         budget.truncated = true;
         budget.omitted_sections = vec!["output_bytes".to_string()];
-        let partial = build_packet_sufficiency(question, &partial_answer, &budget);
+        let partial = build_packet_sufficiency(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &partial_answer,
+            &budget,
+        );
 
         assert_eq!(partial.status, PacketSufficiencyStatusDto::Partial);
         assert!(
@@ -3982,6 +4094,34 @@ mod tests {
             "partial packets should recommend targeted CodeStory search, not broad source reads: {partial:?}"
         );
 
+        let mut weak_answer = packet_answer_fixture(
+            question,
+            vec![test_packet_citation(
+                "RouteDispatcher",
+                "src/router/dispatch.rs",
+                0.8,
+            )],
+        );
+        let weak_budget = apply_packet_budget(
+            question,
+            PacketBudgetModeDto::Compact,
+            packet_budget_limits(PacketBudgetModeDto::Compact),
+            &mut weak_answer,
+        );
+        let weak = build_packet_sufficiency(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &weak_answer,
+            &weak_budget,
+        );
+        assert_eq!(weak.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            weak.gaps
+                .iter()
+                .any(|gap| gap.contains("at least 3 are required")),
+            "single-citation route packets should name the coverage gap: {weak:?}"
+        );
+
         let mut empty_answer = packet_answer_fixture(question, Vec::new());
         let empty_budget = apply_packet_budget(
             question,
@@ -3989,7 +4129,12 @@ mod tests {
             packet_budget_limits(PacketBudgetModeDto::Compact),
             &mut empty_answer,
         );
-        let insufficient = build_packet_sufficiency(question, &empty_answer, &empty_budget);
+        let insufficient = build_packet_sufficiency(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &empty_answer,
+            &empty_budget,
+        );
 
         assert_eq!(
             insufficient.status,
@@ -4009,6 +4154,41 @@ mod tests {
                 .any(|command| command.contains("--repo-text on")),
             "insufficient packets should keep fallback exploration inside CodeStory: {insufficient:?}"
         );
+    }
+
+    #[test]
+    fn merged_packet_latency_recomputes_sla_against_packet_budget() {
+        let mut answer = packet_answer_fixture(
+            "Explain the packet latency budget.",
+            vec![
+                test_packet_citation("A", "src/a.rs", 0.8),
+                test_packet_citation("B", "src/b.rs", 0.8),
+                test_packet_citation("C", "src/c.rs", 0.8),
+            ],
+        );
+        answer.retrieval_trace.total_latency_ms = 900;
+        answer.retrieval_trace.sla_missed = false;
+        let mut subanswer =
+            packet_answer_fixture("subquery", vec![test_packet_citation("D", "src/d.rs", 0.8)]);
+        subanswer.retrieval_trace.total_latency_ms = 250;
+        merge_packet_subanswer(
+            &mut answer,
+            subanswer,
+            &PacketPlanQueryDto {
+                query: "subquery".to_string(),
+                purpose: "fixture".to_string(),
+            },
+        );
+
+        PacketLatencyBudget {
+            started_at: Instant::now(),
+            target_ms: 1_000,
+        }
+        .apply_to_trace(&mut answer);
+
+        assert_eq!(answer.retrieval_trace.total_latency_ms, 1_150);
+        assert!(answer.retrieval_trace.sla_missed);
+        assert_eq!(answer.retrieval_trace.sla_target_ms, Some(1_000));
     }
 
     #[test]
@@ -4032,7 +4212,12 @@ mod tests {
             packet_budget_limits(PacketBudgetModeDto::Compact),
             &mut answer,
         );
-        let sufficiency = build_packet_sufficiency(question, &answer, &budget);
+        let sufficiency = build_packet_sufficiency(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &answer,
+            &budget,
+        );
 
         assert!(
             budget.truncated && budget.omitted_sections.contains(&"citations".to_string()),
@@ -4076,7 +4261,12 @@ mod tests {
             *markdown = "payload budget evidence ".repeat(6000);
         }
         let budget = apply_packet_budget(question, PacketBudgetModeDto::Tiny, limits, &mut answer);
-        let sufficiency = build_packet_sufficiency(question, &answer, &budget);
+        let sufficiency = build_packet_sufficiency(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &answer,
+            &budget,
+        );
         let benchmark_trace = packet_benchmark_trace(&answer);
         let mut packet = AgentPacketDto {
             packet_id: answer.answer_id.clone(),
@@ -4263,7 +4453,12 @@ mod tests {
         );
         let budget =
             apply_packet_budget(question, PacketBudgetModeDto::Compact, limits, &mut answer);
-        let sufficiency = build_packet_sufficiency(question, &answer, &budget);
+        let sufficiency = build_packet_sufficiency(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &answer,
+            &budget,
+        );
 
         assert_eq!(answer.sections[0].id, "packet-evidence-ledger");
         assert_eq!(answer.sections[1].id, "packet-flow-claims");

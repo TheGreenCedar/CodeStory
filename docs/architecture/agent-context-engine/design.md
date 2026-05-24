@@ -157,7 +157,7 @@ These DTOs should preserve existing citation, retrieval, trail, snippet, and rou
 
 | Failure | Expected behavior |
 | --- | --- |
-| No index | Packet returns `insufficient` with exact `index` command. |
+| No index | CLI and stdio packet entrypoints fail at the command preflight with an exact `index --refresh full` command before packet construction. |
 | Stale index | Packet includes stale warning and decides whether evidence remains usable. |
 | Ambiguous query | Packet reports ambiguity and suggested anchors. |
 | Budget exceeded | Packet truncates low-confidence sections and reports deeper command. |

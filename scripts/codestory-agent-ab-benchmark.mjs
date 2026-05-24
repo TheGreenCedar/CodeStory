@@ -21,6 +21,7 @@ const PACKET_TASK_CLASSES = new Set([
   "change_impact",
   "route_tracing",
   "symbol_ownership",
+  "data_flow",
   "edit_planning",
 ]);
 
@@ -991,6 +992,19 @@ function isCodestoryPacketCommand(command) {
   );
 }
 
+function isCodestoryIndexCommand(command) {
+  const shellText = String(command ?? "").replace(/\\"/g, '"');
+  const indexExecutablePath =
+    String.raw`['"]?(?:[A-Z]:)?(?:[^;&|\r\n"']*[\\/])*codestory-cli(?:\.exe)?['"]?\s+index\b`;
+  return (
+    /^\s*codestory-cli(?:\.exe)?\s+index\b/i.test(shellText) ||
+    new RegExp(`^\\s*${indexExecutablePath}`, "i").test(shellText) ||
+    new RegExp(`[;&|]\\s*${indexExecutablePath}`, "i").test(shellText) ||
+    /&\s*\$env:CODESTORY_CLI\s+index\b/i.test(shellText) ||
+    /&\s*\$[a-z_][a-z0-9_]*\s+index\b/i.test(shellText)
+  );
+}
+
 function isHelpOrProbeCommand(command) {
   const shellText = String(command ?? "").replace(/\\"/g, '"');
   return /(?:^|\s)(?:--help|-h)(?:\s|$)/i.test(shellText) || /\bGet-Command\s+codestory-cli\b/i.test(shellText);
@@ -1190,6 +1204,9 @@ function analyzeTranscript(events, projectRoot = null) {
       command.exit_code === 0 &&
       isCodestoryPacketCommand(command.command),
   );
+  const codestoryIndexCommands = commands.filter(
+    (command) => command.category === "codestory_cli" && isCodestoryIndexCommand(command.command),
+  );
   const firstSuccessfulContextCommand = commands.find(isSuccessfulContextCommand);
   const sourceReads = directFileReads.filter((read) => read.source_like && read.repo_like);
   const afterIndex = (first) =>
@@ -1230,6 +1247,7 @@ function analyzeTranscript(events, projectRoot = null) {
       firstSuccessfulPacket != null &&
       firstSuccessfulContextCommand != null &&
       firstSuccessfulPacket.id === firstSuccessfulContextCommand.id,
+    codestory_index_commands_observed: codestoryIndexCommands.length,
     ordinary_source_reads_after_first_codestory: afterIndex(firstSuccessfulCodeStory),
     ordinary_source_reads_after_first_packet: afterIndex(firstSuccessfulPacket),
     final_answer_chars: extractFinalAnswer(events).length,
@@ -1397,12 +1415,15 @@ function scoreQualityFromText(finalAnswer, transcript, task) {
   }
   const finalAndTranscript = `${finalAnswer}\n${transcript}`;
 
-  const files = scoreAnchorSet(task.expected_files, finalAndTranscript);
-  const symbols = scoreAnchorSet(task.expected_symbols, finalAndTranscript);
+  const observedFiles = scoreAnchorSet(task.expected_files, finalAndTranscript);
+  const observedSymbols = scoreAnchorSet(task.expected_symbols, finalAndTranscript);
+  const files = scoreAnchorSet(task.expected_files, finalAnswer);
+  const symbols = scoreAnchorSet(task.expected_symbols, finalAnswer);
   const claims = scoreClaimSet(task.expected_claims, finalAnswer);
   const citations = scoreAnchorSet(task.expected_files, finalAnswer);
   const forbidden = scoreClaimSet(task.forbidden_claims, finalAnswer);
   const allAnchors = aggregateQualityAnchors(files, symbols, claims);
+  const observedAnchors = aggregateQualityAnchors(observedFiles, observedSymbols, claims);
   const thresholds = task.quality_thresholds ?? {};
   const requiredFileRecall = thresholdValue(thresholds, "expected_file_recall", 0.8);
   const requiredSymbolRecall = thresholdValue(thresholds, "expected_symbol_recall", 0.7);
@@ -1434,6 +1455,9 @@ function scoreQualityFromText(finalAnswer, transcript, task) {
     expected_anchors: allAnchors,
     expected_files: files,
     expected_symbols: symbols,
+    observed_anchors: observedAnchors,
+    observed_files: observedFiles,
+    observed_symbols: observedSymbols,
     expected_claims: claims,
     citation_coverage: citations,
     forbidden_claims: {
@@ -1607,6 +1631,13 @@ async function runOne(opts, run, outDir) {
   const packetFirstPass =
     !packetFirstRequired || Boolean(analysis.packet_was_first_context_command);
   const quality = scoreQuality(parsed, run.task);
+  const cacheProvenance = run.arm === "with_codestory"
+    ? await codestoryCacheProvenance(opts, repoConfig, {
+        codestory_index_commands_observed: analysis.codestory_index_commands_observed,
+        indexing_in_timed_run: analysis.codestory_index_commands_observed > 0,
+        transport_mode: "agent_runner",
+      })
+    : null;
 
   return {
     repo: run.repo,
@@ -1626,6 +1657,7 @@ async function runOne(opts, run, outDir) {
     codestory_cli_env: run.arm === "with_codestory" ? env.CODESTORY_CLI : null,
     repo_path: repoConfig.path,
     repo_provenance: provenance,
+    codestory_cache_provenance: cacheProvenance,
     status: result.timedOut ? "timeout" : result.exitCode === 0 ? "pass" : "fail",
     exit_code: result.exitCode,
     signal: result.signal,
@@ -1682,6 +1714,74 @@ async function repoProvenance(config) {
   };
 }
 
+function semanticBackendName(retrieval) {
+  if (!retrieval || typeof retrieval !== "object") {
+    return "unknown";
+  }
+  return (
+    retrieval.current_embedding?.backend ??
+    retrieval.stored_embedding?.embedding_backend ??
+    (retrieval.semantic_ready ? "unknown" : "symbolic-only")
+  );
+}
+
+function cachePolicyForRun(observations = {}) {
+  return observations.indexing_in_timed_run
+    ? "timed-run-indexed-cache"
+    : "existing-cache-read-only";
+}
+
+async function codestoryCacheProvenance(opts, config, observations = {}) {
+  let codestoryCli;
+  try {
+    codestoryCli = resolveCodeStoryCli(opts);
+  } catch (error) {
+    return {
+      codestory_cli: null,
+      cache_policy: cachePolicyForRun(observations),
+      indexing_in_timed_run: observations.indexing_in_timed_run ?? null,
+      codestory_index_commands_observed: observations.codestory_index_commands_observed ?? null,
+      transport_mode: observations.transport_mode ?? null,
+      doctor_status: "error",
+      doctor_error: error.message,
+    };
+  }
+
+  const doctor = await runProcess(
+    codestoryCli,
+    ["doctor", "--project", config.path, "--format", "json"],
+    { timeoutMs: Math.min(opts.timeoutMs ?? 600_000, 60_000) },
+  );
+  let output = null;
+  let parseError = null;
+  if (doctor.status === "pass") {
+    try {
+      output = JSON.parse(doctor.stdout);
+    } catch (error) {
+      parseError = error.message;
+    }
+  }
+  const retrieval = output?.retrieval ?? null;
+  return {
+    codestory_cli: path.resolve(codestoryCli),
+    project: output?.project ?? config.path,
+    storage_path: output?.storage_path ?? null,
+    indexed: output?.indexed ?? null,
+    freshness_status: output?.freshness?.status ?? null,
+    semantic_ready: retrieval?.semantic_ready ?? null,
+    semantic_backend: semanticBackendName(retrieval),
+    semantic_doc_count: retrieval?.semantic_doc_count ?? null,
+    embedding_model: retrieval?.embedding_model ?? retrieval?.current_embedding?.model_id ?? null,
+    cache_policy: cachePolicyForRun(observations),
+    indexing_in_timed_run: observations.indexing_in_timed_run ?? null,
+    codestory_index_commands_observed: observations.codestory_index_commands_observed ?? null,
+    transport_mode: observations.transport_mode ?? null,
+    doctor_status: doctor.status === "pass" && !parseError ? "pass" : "fail",
+    doctor_exit_code: doctor.exitCode,
+    doctor_error: doctor.error ?? parseError,
+  };
+}
+
 async function loadTaskForResult(result, opts, cache) {
   if (result.task_manifest_snapshot && typeof result.task_manifest_snapshot === "object") {
     return result.task_manifest_snapshot;
@@ -1729,9 +1829,19 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
   const usage = extractUsage(parsed);
   const analysis = analyzeTranscript(parsed, result.repo_path ?? repoConfig?.path ?? runDir);
   const packetFirstRequired = result.packet_first_required ?? result.arm === "with_codestory";
+  const cacheProvenance = result.codestory_cache_provenance ?? (
+    repoConfig && result.arm === "with_codestory"
+      ? await codestoryCacheProvenance(opts, repoConfig, {
+          codestory_index_commands_observed: analysis.codestory_index_commands_observed,
+          indexing_in_timed_run: analysis.codestory_index_commands_observed > 0,
+          transport_mode: "agent_runner",
+        })
+      : null
+  );
   return {
     ...result,
     repo_provenance: result.repo_provenance ?? (repoConfig ? await repoProvenance(repoConfig) : null),
+    codestory_cache_provenance: cacheProvenance,
     usage,
     estimated_cost_usd: estimateCost(usage),
     tool_calls_observed: parsed.filter(isToolCallStartEvent).length,
@@ -1887,6 +1997,11 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
   const repoConfig = ALL_REPOS[task.repo];
   const codestoryCli = resolveCodeStoryCli(opts);
   const provenance = await repoProvenance(repoConfig);
+  const cacheProvenance = await codestoryCacheProvenance(opts, repoConfig, {
+    codestory_index_commands_observed: 0,
+    indexing_in_timed_run: false,
+    transport_mode: "cold_cli_packet",
+  });
   const args = [
     "packet",
     "--project",
@@ -1928,6 +2043,7 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
     task_manifest_path: task.manifest_path ?? null,
     task_manifest_snapshot: taskSnapshotForResult(task),
     repo_provenance: provenance,
+    codestory_cache_provenance: cacheProvenance,
     mode: "cold_cli_packet",
     repeat,
     status: result.status === "pass" && !parseError ? "pass" : "fail",
@@ -2032,6 +2148,11 @@ async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
   const repoConfig = ALL_REPOS[repoName];
   const codestoryCli = resolveCodeStoryCli(opts);
   const provenance = await repoProvenance(repoConfig);
+  const cacheProvenance = await codestoryCacheProvenance(opts, repoConfig, {
+    codestory_index_commands_observed: 0,
+    indexing_in_timed_run: false,
+    transport_mode: "warm_stdio_packet",
+  });
   const client = createStdioClient(
     codestoryCli,
     ["serve", "--project", repoConfig.path, "--stdio", "--refresh", "none"],
@@ -2079,6 +2200,7 @@ async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
           task_manifest_path: task.manifest_path ?? null,
           task_manifest_snapshot: taskSnapshotForResult(task),
           repo_provenance: provenance,
+          codestory_cache_provenance: cacheProvenance,
           mode: "warm_stdio_packet",
           repeat,
           status: isError ? "fail" : "pass",
@@ -2192,8 +2314,8 @@ function repoProvenanceBlockers(result) {
   }
   const configuredRef = provenance.configured?.ref ?? null;
   const manifestRef = provenance.manifest?.ref ?? null;
-  if (!configuredRef || configuredRef === "local") {
-    reasons.push("repo ref is not pinned");
+  if (!isPinnedRepoRef(configuredRef)) {
+    reasons.push("repo ref is not pinned to an immutable commit or tag");
   }
   if (manifestRef && configuredRef && manifestRef !== configuredRef) {
     reasons.push(`manifest ref ${manifestRef} does not match configured ref ${configuredRef}`);
@@ -2203,6 +2325,47 @@ function repoProvenanceBlockers(result) {
   }
   if (provenance.git_dirty !== false) {
     reasons.push(provenance.git_dirty ? "repo checkout is dirty" : "repo cleanliness is unknown");
+  }
+  return reasons;
+}
+
+function isPinnedRepoRef(ref) {
+  const value = String(ref ?? "").trim();
+  if (!value || value === "local") {
+    return false;
+  }
+  if (/^[0-9a-f]{7,40}$/i.test(value)) {
+    return true;
+  }
+  if (/^refs\/tags\/[^/\s]+$/i.test(value)) {
+    return true;
+  }
+  if (/^v?\d+\.\d+(?:\.\d+)?(?:[-+][A-Za-z0-9._-]+)?$/.test(value)) {
+    return true;
+  }
+  return false;
+}
+
+function cacheProvenanceBlockers(result) {
+  const provenance = result.codestory_cache_provenance;
+  if (!provenance) {
+    return ["missing CodeStory cache provenance"];
+  }
+  const reasons = [];
+  if (provenance.doctor_status !== "pass") {
+    reasons.push("CodeStory doctor provenance failed");
+  }
+  if (!provenance.storage_path) {
+    reasons.push("missing CodeStory cache path");
+  }
+  if (!provenance.cache_policy) {
+    reasons.push("missing CodeStory cache policy");
+  }
+  if (provenance.semantic_backend == null) {
+    reasons.push("missing CodeStory semantic backend");
+  }
+  if (provenance.indexing_in_timed_run == null) {
+    reasons.push("missing timed-run indexing provenance");
   }
   return reasons;
 }
@@ -2225,6 +2388,7 @@ function packetRuntimePublishableBlockers(results, opts = {}) {
       }
       if (enforceRepoProvenance) {
         reasons.push(...repoProvenanceBlockers(row));
+        reasons.push(...cacheProvenanceBlockers(row));
       }
       return reasons.length ? { result: row, reasons } : null;
     })
@@ -2407,6 +2571,9 @@ function agentPublishableBlockers(results, opts = {}) {
       }
       if (enforceRepoProvenance) {
         reasons.push(...repoProvenanceBlockers(result));
+      }
+      if (result.arm === "with_codestory" && (opts.publishable || opts.enforceCacheProvenance)) {
+        reasons.push(...cacheProvenanceBlockers(result));
       }
       return reasons.length ? { result, reasons } : null;
     })

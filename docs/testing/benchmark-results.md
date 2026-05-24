@@ -4,6 +4,12 @@ This page is the short, decision-grade benchmark source for the README. It
 separates exploratory agent A/B checks from promotable runtime evidence so
 marketing claims do not outrun the measurements.
 
+Runs recorded before the 2026-05-24 harness tightening are historical unless
+they are reanalyzed or rerun with answer-level expected-file/symbol recall,
+immutable manifest refs, and CodeStory cache provenance. The harness now keeps
+transcript-observed anchors separate from anchors actually present in the final
+answer, so tool output alone cannot make a row quality-pass.
+
 ## Latest Agent A/B Check
 
 On 2026-05-23, the harness completed a three-repeat CodeStory repo run with the
@@ -104,10 +110,10 @@ node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-ben
 These rows used clean manifest checkouts (`manifest_overridden_by_builtin=false`
 and `git_dirty=false`) and passed the strict post-packet source-read budget.
 They strengthen the behavior claim across public TypeScript, JavaScript, and Go
-tasks, while Express and mux now have paired quality-comparable baselines across
-five task rows.
+tasks, while the Express and mux paired rows are now treated as historical
+diagnostics until rerun or reanalyzed under the stricter 2026-05-24 gates.
 
-### Quality-Comparable Paired Rows
+### Historical Paired Diagnostics
 
 The Express response-helper bug-localization task now has a paired no-CodeStory
 baseline after its manifest claims were tightened to describe the required
@@ -124,10 +130,10 @@ node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-ben
 | Without CodeStory | `3/3` | n/a | `136.57s` | `635,793` | `18` | `1` |
 | With CodeStory | `3/3` | `3/3` | `67.39s` | `164,291` | `2` | `0` |
 
-On this single quality-comparable paired row, CodeStory used `74.2%` fewer
-median total tokens, was `50.7%` faster by median wall time, and started `88.9%`
-fewer tool commands. This is still one task, so it is not a headline benchmark
-claim; it is the first row that satisfies the quality-comparable savings shape.
+Under the pre-2026-05-24 quality scorer, this paired row showed `74.2%` fewer
+median total tokens, `50.7%` faster median wall time, and `88.9%` fewer tool
+commands. Treat it as historical until it is rerun or reanalyzed with
+answer-level expected-file/symbol recall and cache provenance.
 
 The mux router matching-flow task adds a Go architecture row. Its baseline first
 found every expected file and symbol, but missed claim recall because the
@@ -147,11 +153,11 @@ node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-ben
 | Without CodeStory | `3/3` | n/a | `123.37s` | `321,908` | `16` | `8` |
 | With CodeStory | `3/3` | `3/3` | `65.12s` | `163,935` | `2` | `0` |
 
-On this second quality-comparable paired row, CodeStory used `49.1%` fewer
-median total tokens, was `47.2%` faster by median wall time, and started `87.5%`
-fewer tool commands. It also avoided the baseline's median `8` direct source
-reads. Together, Express and mux are positive promotion seeds across JavaScript
-and Go, not a broad public aggregate.
+Under the pre-2026-05-24 quality scorer, this paired row showed `49.1%` fewer
+median total tokens, `47.2%` faster median wall time, and `87.5%` fewer tool
+commands. It also avoided the baseline's median `8` direct source reads. Treat
+it as historical until it is rerun or reanalyzed with answer-level
+expected-file/symbol recall and cache provenance.
 
 The Express response symbol-ownership task adds a second Express row and a new
 task class:
@@ -166,9 +172,9 @@ node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-ben
 | Without CodeStory | `3/3` | n/a | `125.10s` | `397,110` | `15` | `0` |
 | With CodeStory | `3/3` | `3/3` | `63.28s` | `165,715` | `2` | `0` |
 
-On this third quality-comparable paired row, CodeStory used `58.3%` fewer
-median total tokens, was `49.4%` faster by median wall time, and started `86.7%`
-fewer tool commands. This row is especially useful because it covers
+Under the pre-2026-05-24 quality scorer, this paired row showed `58.3%` fewer
+median total tokens, `49.4%` faster median wall time, and `86.7%` fewer tool
+commands. This row is especially useful as historical context because it covers
 `symbol_ownership`, while the earlier Express row covered `bug_localization`.
 
 The mux CORS middleware edit-planning task adds a Go edit-planning row:
@@ -183,10 +189,11 @@ node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-ben
 | Without CodeStory | `3/3` | n/a | `115.12s` | `364,175` | `14` | `75%` |
 | With CodeStory | `3/3` | `3/3` | `59.08s` | `100,833` | `2` | `100%` |
 
-On this fourth quality-comparable paired row, CodeStory used `72.3%` fewer
-median total tokens, was `48.7%` faster by median wall time, and started `85.7%`
-fewer tool commands. This row matters because it tests whether the packet can
-produce an edit plan without pushing the agent into a broad file-reading pass.
+Under the pre-2026-05-24 quality scorer, this paired row showed `72.3%` fewer
+median total tokens, `48.7%` faster median wall time, and `85.7%` fewer tool
+commands. It remains useful historical context because it tested whether the
+packet could produce an edit plan without pushing the agent into a broad
+file-reading pass.
 
 The Express application routing-flow task adds a JavaScript route-tracing row:
 
@@ -200,10 +207,10 @@ node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-ben
 | Without CodeStory | `3/3` | n/a | `127.46s` | `334,231` | `15` | `100%` |
 | With CodeStory | `3/3` | `3/3` | `62.80s` | `102,137` | `2` | `100%` |
 
-On this fifth quality-comparable paired row, CodeStory used `69.4%` fewer
-median total tokens, was `50.7%` faster by median wall time, and started `86.7%`
-fewer tool commands. It also covers `route_tracing`, bringing the paired
-evidence set to five task rows across all currently positive paired rows.
+Under the pre-2026-05-24 quality scorer, this paired row showed `69.4%` fewer
+median total tokens, `50.7%` faster median wall time, and `86.7%` fewer tool
+commands. It also covers `route_tracing`, bringing the historical paired
+diagnostic set to five task rows.
 
 A follow-up public-core subset run added the Vite dev-server architecture task
 to test whether the packet-first stop rule generalized beyond this repository:
@@ -224,8 +231,8 @@ The subset rows still show quality rescue, but they no longer support a
 packet-first claim after strict reanalysis because the agents probed or searched
 before the answer packet. The right public framing remains: CodeStory can rescue
 answer quality and avoid broad file exploration on these tasks, but headline
-savings need quality-comparable, strict packet-first baselines across a larger
-corpus.
+savings need strict, quality-passing paired baselines across a larger corpus
+under the answer-level quality and cache-provenance gates.
 
 ## Latest Packet Runtime Check
 
@@ -274,10 +281,10 @@ indexing-flow r20 row fixed that prompt behavior and passed `3/3` packet-first
 with zero ordinary source reads. Vite r21, Express r22, mux r24, and Express r26
 extended that strict with-CodeStory shape to clean public checkouts. Mux r27 and
 Express r28 added edit-planning and route-tracing rows. Express r23, mux r25,
-Express r26, mux r27, and Express r28 provide the first five
-quality-comparable paired baselines. The remaining blocker is breadth: more
-repositories and language families need paired quality-passing rows before a
-headline savings claim.
+Express r26, mux r27, and Express r28 provide five historical paired
+diagnostic rows. The remaining blocker is breadth under the stricter gates:
+more repositories and language families need paired quality-passing rows before
+a headline savings claim.
 
 Expected-file recall was `100%` on the strict packet-first public-checkout
 rows except `express-response-send-bug-localization`, which still passed its
@@ -304,10 +311,12 @@ Use `--publishable` only when the selected runner reports token usage and every
 run succeeds. For agent A/B rows, `--publishable` also requires with-CodeStory
 runs to execute `packet` first and stay within the post-packet ordinary
 source-read budget, which defaults to zero reads after packet. Publishable rows
-must also carry clean, pinned repository provenance; local or manifest-overridden
-checkouts are diagnostic rows, not publishable public evidence. For a public
-benchmark row, use at least three repeats, the same model, the same sandbox mode,
-the same cache policy, and the same semantic backend for both arms.
+must carry clean repository provenance pinned to an immutable commit or tag plus
+CodeStory cache provenance from `doctor --format json`; local, branch-like,
+manifest-overridden, or cache-opaque checkouts are diagnostic rows, not
+publishable public evidence. For a public benchmark row, use at least three
+repeats, the same model, the same sandbox mode, the same cache policy, and the
+same semantic backend for both arms.
 
 ## Runtime Budgets
 
@@ -317,8 +326,8 @@ they are not substitutes for with/without-agent savings.
 
 | Lane | Current evidence | What it proves | Source |
 | --- | ---: | --- | --- |
-| CodeStory repo cold index and one-shot reads | `11.10s` index, `1.29s` search, `0.86s` symbol, `0.25s` trail, `0.23s` snippet | A release CLI can rebuild and query the CodeStory repo quickly with hash semantic mode on the Windows workstation | [codestory-e2e-stats-log.md](codestory-e2e-stats-log.md) |
-| Indexed graph scale for that run | `56,272` nodes, `47,628` edges, `149` files, `7,501` semantic docs | The repo-scale gate exercises a real Rust workspace, not only toy fixtures | [codestory-e2e-stats-log.md](codestory-e2e-stats-log.md) |
+| CodeStory repo cold index and one-shot reads | `12.30s` index, `1.04s` search, `0.65s` symbol, `0.24s` trail, `0.21s` snippet | A release CLI can rebuild and query the CodeStory repo quickly with hash semantic mode on the Windows workstation | [codestory-e2e-stats-log.md](codestory-e2e-stats-log.md) |
+| Indexed graph scale for that run | `56,362` nodes, `47,659` edges, `149` files, `7,530` semantic docs | The repo-scale gate exercises a real Rust workspace, not only toy fixtures | [codestory-e2e-stats-log.md](codestory-e2e-stats-log.md) |
 | Warm stdio agent loop smoke | `53.50ms` per `search -> symbol -> trail -> snippet` loop across `20` reps | Once an index exists, the persistent read surface stays in tens of milliseconds on the small-fixture smoke | [codestory-stdio-warm-loop-stats.md](codestory-stdio-warm-loop-stats.md) |
 | Warm stdio search p95 smoke | `25.96ms` p95 search | The smoke loop has a stable low-latency search budget and clean protocol stdout | [codestory-stdio-warm-loop-stats.md](codestory-stdio-warm-loop-stats.md) |
 | Historical cross-repo retrieval gate | Hit@10 `1.0`, adversarial Hit@10 `1.0`, MRR@10 `0.826831`, search p95 `84.7ms` across `4` projects and `225` queries | The historical externally validated retrieval profile found expected anchors across several repo families | [embedding-backend-benchmarks.md](embedding-backend-benchmarks.md) |
@@ -362,8 +371,9 @@ node .\scripts\codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite pu
 
 Manifest-backed runs load public `*.task.json` files from
 `benchmarks/tasks/`, score expected files, symbols, claims, citations, and
-forbidden claims, then fail `--publishable` when a manifest-backed run lacks
-quality scoring or misses its quality gate.
+forbidden claims in the final answer, and separately report transcript-observed
+anchors for diagnostics. They fail `--publishable` when a manifest-backed run
+lacks quality scoring or misses its answer-level quality gate.
 `--reanalyze-dir` recomputes transcript analysis, packet-first telemetry,
 quality scores, and summaries from existing raw stdout JSONL files so analyzer
 fixes can be applied without spending another model run.
@@ -371,11 +381,11 @@ fixes can be applied without spending another model run.
 Packet runtime runs compare cold CLI `packet` invocations with warm
 `serve --stdio` packet calls. They are runtime rows, not agent-token rows, and
 still use the manifest quality gates before a result can be promoted.
-`--publishable` also enforces repeated runs, public-core corpus shape, and
-non-null passing quality scores for every packet row. The corpus shape is now in
-place, with warm stdio medians recorded in `r8` and cold CLI medians recorded in
-`r9`; the remaining blocker for a public savings claim is still controlled
-with/without-agent improvement.
+`--publishable` also enforces repeated runs, public-core corpus shape, immutable
+repo refs, CodeStory cache provenance, and non-null passing answer-level quality
+scores for every packet row. The earlier warm stdio `r8` and cold CLI `r9`
+medians remain useful historical diagnostics, but rows should be refreshed
+before being promoted under the stricter gates.
 
 Estimated cost is intentionally absent unless both token usage and pricing
 environment variables are present:

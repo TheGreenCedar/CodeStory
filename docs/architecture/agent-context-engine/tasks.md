@@ -40,13 +40,15 @@ Implemented in this branch:
   response-helper bug-localization task, mux router matching-flow task, Express
   response symbol-ownership task, mux CORS middleware edit-planning task, and
   Express application route-tracing task.
-- Five quality-comparable paired rows exist. Both arms quality-passed `3/3` on
-  Express bug localization (`74.2%` fewer median tokens, `50.7%` lower median
-  wall time, `88.9%` fewer median tool starts with CodeStory), mux router
-  matching-flow (`49.1%`, `47.2%`, `87.5%`), Express symbol ownership
-  (`58.3%`, `49.4%`, `86.7%`), mux CORS edit planning (`72.3%`, `48.7%`,
-  `85.7%`), and Express application route tracing (`69.4%`, `50.7%`,
-  `86.7%`). These are still promotion seeds, not a headline benchmark claim.
+- Five historical paired diagnostics exist. Under the pre-2026-05-24 quality
+  scorer, both arms quality-passed `3/3` on Express bug localization (`74.2%`
+  fewer median tokens, `50.7%` lower median wall time, `88.9%` fewer median
+  tool starts with CodeStory), mux router matching-flow (`49.1%`, `47.2%`,
+  `87.5%`), Express symbol ownership (`58.3%`, `49.4%`, `86.7%`), mux CORS
+  edit planning (`72.3%`, `48.7%`, `85.7%`), and Express application route
+  tracing (`69.4%`, `50.7%`, `86.7%`). Rerun or reanalyze them under the
+  answer-level quality and cache-provenance gates before using them as savings
+  evidence.
 - The harness can reanalyze existing run directories from raw stdout JSONL after
   analyzer fixes, so quality-scoring corrections do not require a fresh model
   run.
@@ -59,14 +61,15 @@ Implemented in this branch:
 
 Still open before public savings claims:
 
-- More quality-comparable paired rows across additional public repositories and
-  language families after the strict packet-first and post-packet ordinary
-  source-read gates show stable stop behavior.
-- Baseline comparability for savings claims: Express and mux have positive
-  paired rows across five task rows, but CodeStory indexing-flow and Vite
-  dev-server architecture still have quality-uneven no-CodeStory baselines
-  (`1/3`), so they support quality-rescue evidence rather than aggregate
-  savings. A Python/Flask row is the next best breadth target.
+- More strict paired rows across additional public repositories and language
+  families after the answer-level quality, cache-provenance, packet-first, and
+  post-packet ordinary source-read gates show stable stop behavior.
+- Baseline comparability for savings claims: Express and mux have historical
+  paired diagnostics across five task rows, but those rows need strict
+  reanalysis or rerun. CodeStory indexing-flow and Vite dev-server architecture
+  still have quality-uneven no-CodeStory baselines (`1/3`), so they support
+  quality-rescue evidence rather than aggregate savings. A Python/Flask row is
+  the next best breadth target.
 
 ## Milestone 1: Benchmark Truth
 

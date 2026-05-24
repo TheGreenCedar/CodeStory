@@ -30,14 +30,16 @@ files, symbols, claims, citations, and forbidden-claim checks for that manifest.
 It does not by itself establish speed, cost, or product headline claims.
 
 Repository metadata in each manifest records the intended public clone target,
-pin, optional workspace root, languages, and lightweight setup notes. The
+immutable commit or tag ref, optional workspace root, languages, and lightweight setup notes. The
 benchmark harness must still know how to map each `repo.name` to a local clone
 before it can execute the task. Until that mapping exists, the manifest remains
 valid corpus data but is not runnable through the harness.
 
 Expected setup is intentionally simple:
 
-- Clone the public repository URL at the manifest `repo.ref`.
+- Clone the public repository URL at the manifest `repo.ref`; branch-like refs
+  such as `main` are allowed for local diagnostics only and fail publishable
+  provenance gates.
 - Run the listed setup commands only when the benchmark runner needs local
   dependency metadata or tests.
 - Treat `repo.workspace_root` as the benchmark working directory when it is
