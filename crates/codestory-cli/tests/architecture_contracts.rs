@@ -336,13 +336,13 @@ fn web_cockpit_stays_deferred_until_browser_surface_gate_opens() {
 
     for required in [
         "Status: deferred.",
-        "Do not add a new `browse` command, web cockpit route, or browser-specific web UI",
+        "Do not add a new `browse` command, web UI route, or browser-specific UI",
         "Tool, resource, and prompt manifests",
         "Warm stdio/browser-loop p50, p95, and p99",
         "Current Promotion Budget",
         "docs/testing/codestory-stdio-warm-loop-stats.md",
         "Browser stress lanes",
-        "`explore` must demonstrate the cockpit workflow",
+        "`explore` must demonstrate the browser workflow",
         "Screenshot-visible review",
     ] {
         assert!(
@@ -354,9 +354,8 @@ fn web_cockpit_stays_deferred_until_browser_surface_gate_opens() {
     assert!(
         runtime_path.contains("browser surface gate")
             && runtime_path.contains("Do not add a")
-            && runtime_path.contains(
-                "separate `browse` command, web cockpit route, or browser-specific web UI"
-            ),
+            && runtime_path
+                .contains("separate `browse` command, web UI route, or browser-specific UI"),
         "runtime execution path should point future UI work at the browser surface gate"
     );
     assert!(
@@ -368,7 +367,7 @@ fn web_cockpit_stays_deferred_until_browser_surface_gate_opens() {
             && warm_stats.contains("| snippet | 50 ms |")
             && warm_stats.contains("| resources/read:status | 50 ms |")
             && warm_stats.contains("| full `search -> symbol -> trail -> snippet` loop | 250 ms |")
-            && warm_stats.contains("### Web Cockpit Promotion Budget")
+            && warm_stats.contains("### Web UI Promotion Budget")
             && warm_stats.contains("| each default read operation | 500 ms |")
             && warm_stats.contains("| full `search -> symbol -> trail -> snippet` loop | 1.5 s |")
             && warm_stats.contains("browser surface gate stays closed"),
@@ -383,13 +382,13 @@ fn web_cockpit_stays_deferred_until_browser_surface_gate_opens() {
     for forbidden in ["Browse(", "BrowseCommand", "WebCockpit", "CockpitCommand"] {
         assert!(
             !command_enum.contains(forbidden),
-            "web cockpit/browse surface is deferred; unexpected CLI command {forbidden}"
+            "web UI/browse surface is deferred; unexpected CLI command {forbidden}"
         );
     }
     for forbidden_route in ["\"/browse\"", "\"/cockpit\"", "\"/ui\"", "\"/web\""] {
         assert!(
             !http_routes.contains(forbidden_route),
-            "web cockpit/browse route is deferred until the browser surface gate opens: {forbidden_route}"
+            "web UI/browse route is deferred until the browser surface gate opens: {forbidden_route}"
         );
     }
 }

@@ -10,146 +10,82 @@ Local codebase grounding for coding agents.
 <a href="docs/testing/benchmark-results.md"><img alt="Benchmarks" src="https://img.shields.io/badge/benchmarks-documented-blue"></a>
 </p>
 
-CodeStory turns a repository into a local, queryable evidence layer: symbols,
-relationships, source snippets, search hits, semantic docs, and freshness notes.
-It is built for coding agents that need to understand a codebase before they
-spend half the session reading the same five files sideways.
+CodeStory builds a local evidence layer for a repository. It indexes files,
+symbols, relationships, snippets, search state, and freshness notes into a
+per-project SQLite cache, then exposes that evidence through a CLI and
+`serve --stdio`.
 
-Everything stays local. The CLI writes user-cache SQLite and search artifacts
-keyed by the target project path, reports when evidence is stale or partial, and
-keeps commands explicit about which workspace they are reading.
+Use it when a coding agent needs repository context before explaining behavior,
+planning a change, or choosing files to inspect. The workflow is explicit: check
+cache health, build or refresh the index, find candidate symbols, inspect
+relationships, pull snippets, and return an answer tied to source evidence.
 
-## Why It Exists
+Repository contents and inference stay local after the required tool or model
+assets are installed. Setup can fetch the CodeStory source artifact or managed
+embedding assets; the indexed project data stays in the user cache and commands
+stay explicit about which workspace they read.
 
-Agents are fast, but ungrounded agents are also weirdly committed to rediscovering
-the obvious. CodeStory gives them a repeatable loop:
+## Try It On A Repo
 
-```text
-doctor -> index -> ground -> search -> symbol/trail/snippet/explore -> context
-```
-
-Use it when you want source-backed orientation, focused navigation, change-impact
-hints, or a persistent `serve --stdio` read surface instead of a pile of ad hoc
-file reads.
-
-## Benchmark Results
-
-Latest checked-in evidence supports local indexing, warm reads, protocol hygiene,
-and retrieval quality. The CodeStory repo index/read figures below come from the
-logged `663c257+wt` review-remediation e2e row. The agent A/B harness now has a
-real 3-repeat baseline too, but it is not a savings claim yet:
-on the CodeStory repo prompt, the CodeStory arm used more median tokens, wall
-time, and tool starts than the no-CodeStory arm.
-
-- Agent A/B baseline: with CodeStory `2,724,490` median tokens / `306.24s` /
-  `43` tool starts; without CodeStory `1,605,030` median tokens / `214.90s` /
-  `29` tool starts.
-- Exploratory packet-first A/B diagnostic: on the CodeStory indexing-flow task,
-  the with-CodeStory arm ran an answer packet as its first repository-context
-  command `3/3`, quality-passed `3/3`, used `167,102` median tokens / `71.92s`
-  / `2` tool starts, and made `0` ordinary source reads. The latest comparable
-  no-CodeStory baseline quality-passed `1/3`. This is quality-rescue evidence
-  with strong efficiency diagnostics, not a public savings claim yet.
-- Historical paired diagnostics: five Express and mux tasks previously
-  quality-passed `3/3` in both arms and showed lower tokens, wall time, and tool
-  starts with CodeStory. Those rows predate the stricter answer-level anchor and
-  cache-provenance gates, so rerun or reanalyze them before treating them as
-  strict savings evidence.
-- CodeStory repo cold index: `12.30s`, with `56,362` nodes, `47,659` edges,
-  `149` files, and `7,530` semantic docs.
-- One-shot reads after that index: search `1.04s`, symbol `0.65s`,
-  trail `0.24s`, snippet `0.21s`.
-- Warm stdio small-fixture loop: `53.50ms` per
-  `search -> symbol -> trail -> snippet` loop across `20` reps.
-- Warm stdio search p95 smoke: `25.96ms`, with protocol-clean stdout.
-- Historical public-core packet diagnostic: `108/108` packet rows quality-passed
-  across cold CLI and warm stdio before the stricter sufficiency/provenance gates.
-  Refresh those rows before promoting packet-runtime medians.
-- Historical cross-repo retrieval gate: Hit@10 `1.0`, MRR@10 `0.826831`
-  across `4` projects and `225` queries.
-
-Read the benchmark source before promoting numbers:
-[docs/testing/benchmark-results.md](docs/testing/benchmark-results.md),
-[docs/testing/codestory-e2e-stats-log.md](docs/testing/codestory-e2e-stats-log.md),
-and
-[docs/testing/codestory-stdio-warm-loop-stats.md](docs/testing/codestory-stdio-warm-loop-stats.md).
-Generate repeatable with/without rows with
-[`scripts/codestory-agent-ab-benchmark.mjs`](scripts/codestory-agent-ab-benchmark.mjs).
-
-## Global Skill Setup
-
-Use this path when CodeStory is installed once as a grounding skill and then
-pointed at whatever repository the agent is working on.
-
-1. Install the skill into your agent's global skill directory. `$SkillHome`
-   should be whatever global skill home your agent documents.
-
-   ```powershell
-   $SkillHome = "<agent-global-skill-directory>"
-   New-Item -ItemType Directory -Force -Path $SkillHome | Out-Null
-   Copy-Item -Recurse -Force .\.agents\skills\codestory-grounding "$SkillHome\codestory-grounding"
-   ```
-
-   Source package:
-   [.agents/skills/codestory-grounding/SKILL.md](.agents/skills/codestory-grounding/SKILL.md).
-
-2. Run the one-time setup script from the installed skill. It clones or
-   refreshes the CodeStory CLI source artifact, builds the binary, and prints
-   `CODESTORY_CLI=<path>`.
-
-   ```powershell
-   & "$SkillHome\codestory-grounding\scripts\setup.ps1"
-   ```
-
-   On Unix-like systems:
-
-   ```sh
-   bash "<agent-global-skill-directory>/codestory-grounding/scripts/setup.sh"
-   ```
-
-3. Persist the printed `CODESTORY_CLI` path if your agent environment does not
-   preserve it between sessions.
-
-   ```powershell
-   setx CODESTORY_CLI "C:\Users\you\AppData\Local\CodeStory\bin\codestory-cli.exe"
-   ```
-
-To ground a repository:
+From this checkout, build the CLI and point it at any repository:
 
 ```powershell
-$CodeStoryCli = $env:CODESTORY_CLI
+cargo build --release -p codestory-cli
+$CodeStoryCli = ".\target\release\codestory-cli.exe"
 $TargetWorkspace = "C:\path\to\repo"
+
 & $CodeStoryCli doctor --project $TargetWorkspace
 & $CodeStoryCli index --project $TargetWorkspace --refresh full
 & $CodeStoryCli ground --project $TargetWorkspace --why
 ```
 
-For the longer command guide, see [docs/usage.md](docs/usage.md).
-
-## Use CodeStory
-
-From this source checkout:
+After that first index, use narrower commands instead of asking the agent to
+start over:
 
 ```powershell
-cargo build --release -p codestory-cli
-.\target\release\codestory-cli.exe index --project C:\path\to\repo --refresh auto
-.\target\release\codestory-cli.exe ground --project C:\path\to\repo --why
+& $CodeStoryCli search --project $TargetWorkspace --query "request routing" --why
+& $CodeStoryCli trail --project $TargetWorkspace --id <node-id> --story --hide-speculative
+& $CodeStoryCli snippet --project $TargetWorkspace --id <node-id> --context 40
 ```
 
-On Unix-like systems, use `./target/release/codestory-cli` or an installed
-`codestory-cli` on `PATH`.
+A good CodeStory-backed answer should name the source files it used, say when
+evidence is stale or partial, and give the next concrete command when more proof
+is needed.
 
-Keep the executable and target workspace separate. CodeStory is the tool; the
-`--project` path is the codebase being grounded.
+For task-shaped flows, use [docs/usage.md](docs/usage.md).
 
-## Agent Loop
+## Install As An Agent Skill
+
+Use this path when CodeStory should be installed once as a grounding skill and
+then pointed at whatever repository an agent is working on.
+
+```powershell
+$SkillHome = "<agent-global-skill-directory>"
+New-Item -ItemType Directory -Force -Path $SkillHome | Out-Null
+Copy-Item -Recurse -Force .\.agents\skills\codestory-grounding "$SkillHome\codestory-grounding"
+& "$SkillHome\codestory-grounding\scripts\setup.ps1"
+```
+
+On Unix-like systems:
+
+```sh
+bash "<agent-global-skill-directory>/codestory-grounding/scripts/setup.sh"
+```
+
+The setup script prints `CODESTORY_CLI=<path>`. Persist that path if your agent
+environment does not preserve variables between sessions.
+
+The skill package lives at
+[.agents/skills/codestory-grounding/SKILL.md](.agents/skills/codestory-grounding/SKILL.md).
+
+## Core Flow
 
 | Need | Command |
 | --- | --- |
 | Health and cache readiness | `codestory-cli doctor --project <target-workspace>` |
 | Build or refresh an index | `codestory-cli index --project <target-workspace> --refresh full` |
 | Broad orientation | `codestory-cli ground --project <target-workspace> --why` |
-| Broad task packet | `codestory-cli packet --project <target-workspace> --question "<task>" --budget compact` |
+| Broad task evidence | `codestory-cli packet --project <target-workspace> --question "<task>" --budget compact` |
 | Candidate discovery | `codestory-cli search --project <target-workspace> --query "<term>" --why` |
 | Exact symbol evidence | `codestory-cli symbol --project <target-workspace> --id <node-id>` |
 | Flow evidence | `codestory-cli trail --project <target-workspace> --id <node-id> --story --hide-speculative` |
@@ -159,9 +95,8 @@ Keep the executable and target workspace separate. CodeStory is the tool; the
 | Changed-file impact | `codestory-cli affected --project <target-workspace> --format markdown` |
 | Persistent read surface | `codestory-cli serve --project <target-workspace> --stdio` |
 
-Broad task answers should start with `packet`, then deepen through the reported
-follow-up commands. Use `ground --why` first for fresh orientation or coverage
-discovery. `context` is for one concrete target, not an open chat endpoint.
+Use `packet` for broad task questions. Use `context` after you have one concrete
+target. Use `doctor` when output looks stale, incomplete, or inconsistent.
 
 ## What It Builds
 
@@ -170,30 +105,44 @@ flowchart LR
     Repo["repository"] --> Workspace["workspace discovery"]
     Workspace --> Indexer["symbol and edge extraction"]
     Indexer --> Store["SQLite store"]
-    Store --> CLI["CLI and stdio reads"]
+    Store --> Runtime["retrieval and context assembly"]
+    Runtime --> CLI["CLI and stdio reads"]
     CLI --> Agent["coding agent"]
 ```
 
-The Rust workspace is split by responsibility:
+CodeStory builds a local evidence layer so agents can request grounded context
+instead of relying on ad hoc file reads.
 
-- `codestory-contracts`: shared API, graph, trail, grounding, and event types.
-- `codestory-workspace`: repo discovery, manifests, and refresh plans.
-- `codestory-indexer`: parsing, extraction, resolution, and indexing tests.
-- `codestory-store`: SQLite persistence, snapshots, trails, bookmarks, and search.
-- `codestory-runtime`: orchestration, grounding, search, trails, and agent flows.
-- `codestory-cli`: thin command and rendering surface.
-- `codestory-bench`: Criterion benchmark lanes.
+For the system model, start with
+[docs/concepts/how-codestory-works.md](docs/concepts/how-codestory-works.md),
+then [docs/architecture/overview.md](docs/architecture/overview.md).
 
-## Hack on CodeStory
+## Evidence
 
-Start with the architecture and contributor docs, then run Cargo checks serially
-because this workspace shares build locks.
+The benchmark docs are deliberately cautious. They separate current checked-in
+benchmark history from the state of your local cache, which can drift and should
+be checked with `doctor`.
 
-- [docs/architecture/overview.md](docs/architecture/overview.md)
-- [docs/architecture/runtime-execution-path.md](docs/architecture/runtime-execution-path.md)
+- Public evidence summary and caveats:
+  [docs/testing/benchmark-results.md](docs/testing/benchmark-results.md)
+- Repo-scale timing history:
+  [docs/testing/codestory-e2e-stats-log.md](docs/testing/codestory-e2e-stats-log.md)
+- Warm stdio loop evidence:
+  [docs/testing/codestory-stdio-warm-loop-stats.md](docs/testing/codestory-stdio-warm-loop-stats.md)
+- Repeatable with/without harness:
+  [`scripts/codestory-agent-ab-benchmark.mjs`](scripts/codestory-agent-ab-benchmark.mjs)
+
+Do not promote a single benchmark row into a universal savings claim.
+
+## Hack On CodeStory
+
+Start with the contributor docs, then run Cargo checks serially because this
+workspace shares build locks.
+
+- [docs/contributors/getting-started.md](docs/contributors/getting-started.md)
 - [docs/contributors/debugging.md](docs/contributors/debugging.md)
 - [docs/contributors/testing-matrix.md](docs/contributors/testing-matrix.md)
-- [docs/contributors/getting-started.md](docs/contributors/getting-started.md)
+- [docs/architecture/runtime-execution-path.md](docs/architecture/runtime-execution-path.md)
 - [docs/architecture/subsystems/contracts.md](docs/architecture/subsystems/contracts.md)
 - [docs/architecture/subsystems/workspace.md](docs/architecture/subsystems/workspace.md)
 - [docs/architecture/subsystems/indexer.md](docs/architecture/subsystems/indexer.md)

@@ -34,11 +34,11 @@ p95 limits:
 | full `search -> symbol -> trail -> snippet` loop | 250 ms |
 
 The 2026-05-06 baseline passes this smoke budget, but it remains a
-small-fixture smoke, not web-cockpit promotion evidence.
+small-fixture smoke, not separate web UI promotion evidence.
 
-### Web Cockpit Promotion Budget
+### Web UI Promotion Budget
 
-Before starting or promoting a separate web cockpit, record a current warm run
+Before starting or promoting a separate web UI, record a current warm run
 against CodeStory itself or another representative real repository on the target
 machine class. The run must meet:
 
@@ -48,7 +48,7 @@ machine class. The run must meet:
 | full `search -> symbol -> trail -> snippet` loop | 1.5 s |
 
 The browser surface gate stays closed until a current real-repo run in this log
-meets the Web Cockpit Promotion Budget, and the stress-lane gate for the target
+meets the Web UI Promotion Budget, and the stress-lane gate for the target
 scale also passes.
 
 ## Baseline Payload Sizes

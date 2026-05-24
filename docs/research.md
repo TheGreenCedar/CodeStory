@@ -1,7 +1,7 @@
 # CodeStory Research Handbook
 
-This is the human front door for CodeStory research. It keeps only the durable
-decisions and points to the comparison matrix, not raw run ledgers.
+This page summarizes CodeStory research decisions. It keeps only the durable
+decisions and points to the comparison matrix, not raw run output.
 
 ## Current Decisions
 
@@ -29,11 +29,12 @@ Read [codestory-e2e-stats-log.md](testing/codestory-e2e-stats-log.md) for the
 rolling index/search timing history. This is the release-style sanity check for
 semantic indexing behavior and cache reuse.
 
-### Product And UX Research
+### Product Direction
 
-Read [project-delight-roadmap.md](project-delight-roadmap.md) for the product
-direction around target context packets, explainable retrieval, navigation UX, MCP serving, setup
-help, and implemented roadmap work.
+Read [project-delight-roadmap.md](project-delight-roadmap.md) for current product
+direction around target context packets, explainable retrieval, navigation UX,
+serving, and setup help. Treat it as direction, not benchmark proof or a
+changelog.
 
 ### Architecture And Documentation Research
 
@@ -53,4 +54,5 @@ architecture docs because clear live-system explanations are more useful here.
 4. Update the comparison matrix in the same change that adds or rejects a
    meaningful research lane; do not let a single first-pass score outrank a
    failed repeat.
-5. Do not commit raw run ledgers, dashboard exports, or local artifact catalogs.
+5. Do not commit raw run transcripts, dashboard exports, or local artifact
+   catalogs.

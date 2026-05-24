@@ -72,7 +72,24 @@ Index output should expose:
 
 ## Read And Query Output
 
-Read commands default to `--refresh none` so they query the current cache unless the caller requests a refresh. `drill` is the exception: it defaults to `--refresh full` so generated report bundles are mechanically fresh, records the CodeStory-only/source-truth answer-quality contract, writes per-anchor search/symbol/trail/explore/snippet artifacts, adds cross-anchor bridge evidence, and emits a claim-ledger template for source-truth classification. `ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `query`, and `explore` all support `--format markdown|json` and `--output-file <PATH>`; `trail` additionally supports Graphviz DOT via `--format dot`, while `symbol` and `trail` support Mermaid via `--mermaid`. `search --query` also accepts field-qualified filters such as `kind:function`, `path:routes.ts`, `name:listUsers`, and `lang:typescript` for narrowing candidate sets without hiding the original query text in output. Broad architecture-style `search` responses may include `search_plan` in JSON and render a Search Plan section with `--why`; this is a discovery/evidence plan with subqueries, candidate windows, anchor groups, repo-text promotion status, bridge evidence, next commands, and source-truth checks, not answer prose.
+Read commands default to `--refresh none` so they query the current cache unless
+the caller requests a refresh.
+
+`ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `query`, and
+`explore` all support `--format markdown|json` and `--output-file <PATH>`.
+`trail` additionally supports Graphviz DOT via `--format dot`; `symbol` and
+`trail` support Mermaid via `--mermaid`.
+
+`search --query` accepts field-qualified filters such as `kind:function`,
+`path:routes.ts`, `name:listUsers`, and `lang:typescript` for narrowing
+candidate sets without hiding the original query text. Broad architecture-style
+`search` responses may include a Search Plan when `--why` is requested. Treat
+that as discovery evidence and next-command guidance, not final answer prose.
+
+`drill` is the exception to the default refresh posture: it defaults to
+`--refresh full` so generated report bundles are mechanically fresh. Its
+agent-quality classification details live in the grounding skill references
+rather than the general CLI architecture page.
 
 `query` is intentionally small. It parses source operations (`search`, `symbol`, `trail`) followed by stream refinements (`filter`, `limit`) and rejects malformed or unknown named arguments rather than silently ignoring typos.
 

@@ -1,9 +1,8 @@
 # Embedding Pipeline Decision Matrix
 
 This is the curated decision record for CodeStory embedding, indexing, and
-retrieval performance work. It replaces raw packet diaries with the evidence a
-reader needs to understand what was tried, what was rejected, and what still
-needs proof.
+retrieval performance work. It keeps the evidence needed to understand what was
+tried, what was rejected, and what still needs proof.
 
 ## Decision Summary
 
@@ -18,13 +17,13 @@ needs proof.
 | Primary metric shape | `pipeline_score = 1000000 * (0.7 * quality + 0.2 * speed + 0.1 * memory) * quality_gate_penalty` |
 | Memory component shape | Model footprint, persisted vector footprint, and cache/index footprint; peak RAM is reported separately when sampled |
 | Default-change rule | Do not promote a faster row when MRR, Hit@10, rank profile, repeat behavior, or cross-repo behavior regresses |
-| Perfect-score rule | Treat perfect retrieval scores as suspicious until split isolation, leakage checks, tainted-query exclusion, cache replay blocking, adversarial buckets, and a fresh confirmation run all agree |
+| Perfect-score rule | Treat perfect retrieval scores as unpromoted until split isolation, leakage checks, tainted-query exclusion, cache replay blocking, adversarial buckets, and a fresh confirmation run all agree |
 
 The corrected 2026-04-28 loop excludes historically tainted query text and
 requires `promotion_eligible=true`. After broadening to 74 clean holdout queries,
 the useful local scores are no longer perfect: Q8/r6 full-text holds
 `MRR@10=0.9824324324324325`, `Hit@10=1`, and
-`Hit@1=0.972972972972973`. Segment 2 restarted the experiment ledger with this
+`Hit@1=0.972972972972973`. Segment 2 restarted the experiment log with this
 profile as the fresh baseline: first measured baseline
 `pipeline_score=909369.1102743357`; repeat `909844.2157260955`. That repeat
 also showed peak-RAM sampling variance, so tiny memory deltas need repeat
@@ -103,7 +102,8 @@ The measured work covered these families:
 
 ## How To Use This Matrix
 
-Use this file as the first stop for embedding and pipeline decisions. If a new
-candidate is added, update the matrix with the candidate shape, the best
+Use this file as the primary reference for embedding and pipeline decisions. If
+a new candidate is added, update the matrix with the candidate shape, the best
 decision-grade metric row, the quality/rank signal, the speed and footprint
-signal, and the decision. Do not add raw run ledgers or diary files to the repo.
+signal, and the decision. Do not add raw run transcripts or local artifact
+catalogs to the repo.

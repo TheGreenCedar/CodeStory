@@ -130,7 +130,7 @@ rerun the speed and retrieval-quality comparison described in
 [`embedding-backend-benchmarks.md`](../testing/embedding-backend-benchmarks.md).
 Start from the human summary in [`research.md`](../research.md). For new
 research lanes, keep the benchmark case shape, quality signal, speed signal,
-and decision current in the matrix instead of adding raw run diaries.
+and decision current in the matrix instead of adding raw run transcripts.
 
 For indexing performance work, run the full bench when practical:
 

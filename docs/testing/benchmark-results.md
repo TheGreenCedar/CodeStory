@@ -320,14 +320,16 @@ same semantic backend for both arms.
 
 ## Runtime Budgets
 
-These numbers are current local evidence for the CodeStory runtime itself. They
-show that the index and read surfaces fit inside an agent workflow budget, but
-they are not substitutes for with/without-agent savings.
+These numbers are checked-in benchmark history for the CodeStory runtime itself.
+They show that the index and read surfaces can fit inside an agent workflow
+budget, but they are not substitutes for with/without-agent savings and they are
+not a live report of your current cache. Run `doctor` when current local state
+matters.
 
 | Lane | Current evidence | What it proves | Source |
 | --- | ---: | --- | --- |
-| CodeStory repo cold index and one-shot reads | `12.30s` index, `1.04s` search, `0.65s` symbol, `0.24s` trail, `0.21s` snippet | A release CLI can rebuild and query the CodeStory repo quickly with hash semantic mode on the Windows workstation | [codestory-e2e-stats-log.md](codestory-e2e-stats-log.md) |
-| Indexed graph scale for that run | `56,362` nodes, `47,659` edges, `149` files, `7,530` semantic docs | The repo-scale gate exercises a real Rust workspace, not only toy fixtures | [codestory-e2e-stats-log.md](codestory-e2e-stats-log.md) |
+| CodeStory repo cold index and one-shot reads | `11.39s` index, `1.06s` search, `0.66s` symbol, `0.21s` trail, `0.19s` snippet | A release CLI can rebuild and query the CodeStory repo quickly with hash semantic mode on the Windows workstation | [codestory-e2e-stats-log.md](codestory-e2e-stats-log.md) |
+| Indexed graph scale for that run | `56,531` nodes, `47,806` edges, `149` files, `7,566` semantic docs | The repo-scale gate exercises a real Rust workspace, not only toy fixtures | [codestory-e2e-stats-log.md](codestory-e2e-stats-log.md) |
 | Warm stdio agent loop smoke | `53.50ms` per `search -> symbol -> trail -> snippet` loop across `20` reps | Once an index exists, the persistent read surface stays in tens of milliseconds on the small-fixture smoke | [codestory-stdio-warm-loop-stats.md](codestory-stdio-warm-loop-stats.md) |
 | Warm stdio search p95 smoke | `25.96ms` p95 search | The smoke loop has a stable low-latency search budget and clean protocol stdout | [codestory-stdio-warm-loop-stats.md](codestory-stdio-warm-loop-stats.md) |
 | Historical cross-repo retrieval gate | Hit@10 `1.0`, adversarial Hit@10 `1.0`, MRR@10 `0.826831`, search p95 `84.7ms` across `4` projects and `225` queries | The historical externally validated retrieval profile found expected anchors across several repo families | [embedding-backend-benchmarks.md](embedding-backend-benchmarks.md) |
@@ -342,7 +344,7 @@ The agent A/B harness runs the same repository prompt in two arms:
   run `packet` for broad repository questions, then ordinary source reads only
   for named gaps.
 
-The harness writes raw stdout/stderr per run, a JSONL run ledger, transcript
+The harness writes raw stdout/stderr per run, a JSONL run log, transcript
 analysis, a machine summary, and a Markdown summary under
 `target/agent-benchmark/<timestamp>`. The analyzer counts command categories,
 duplicate command patterns, duplicate direct file reads, and ordinary source

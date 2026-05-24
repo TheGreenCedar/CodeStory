@@ -1,10 +1,9 @@
 # CodeStory Usage
 
-This is the command shelf behind the README. It keeps setup, operating loops,
-retrieval defaults, and recovery notes in one place without making the front page
-do reference-manual duty.
+This is the operator guide. It keeps setup, common workflows, retrieval defaults,
+and recovery notes in one place.
 
-## Global Skill Setup
+## Install The Skill
 
 Install the grounding skill once, then point it at explicit target workspaces.
 
@@ -49,9 +48,76 @@ Pick a target workspace explicitly:
 
 ```powershell
 $TargetWorkspace = "C:\path\to\repo"
+& $CodeStoryCli doctor --project $TargetWorkspace
 & $CodeStoryCli index --project $TargetWorkspace --refresh auto
 & $CodeStoryCli ground --project $TargetWorkspace --why
 ```
+
+## Common Workflows
+
+### I need a repo overview
+
+```powershell
+codestory-cli doctor --project <target-workspace>
+codestory-cli index --project <target-workspace> --refresh full
+codestory-cli ground --project <target-workspace> --why
+```
+
+Use this when the repository is new to the agent. `doctor` tells you whether the
+cache and retrieval state are usable. `ground --why` gives broad orientation and
+reports limited coverage or gaps.
+
+### I need evidence for a broad question
+
+```powershell
+codestory-cli packet --project <target-workspace> --question "<broad task question>" --budget compact
+```
+
+Use `packet` for questions like "how does routing work?" or "what owns indexing
+state?" It returns citations, gaps, and follow-up commands. If the packet says
+the evidence is incomplete, follow the named commands instead of opening
+unstructured source files directly.
+
+### I need to understand one symbol or file
+
+```powershell
+codestory-cli search --project <target-workspace> --query "<symbol/file/literal/API path>" --why
+codestory-cli explore --project <target-workspace> --id <node-id> --no-tui
+codestory-cli trail --project <target-workspace> --id <node-id> --story --hide-speculative
+codestory-cli snippet --project <target-workspace> --id <node-id> --context 40
+```
+
+Start with `search`, pick a concrete `node-id`, then inspect the relationships
+and source. Use `context` when you want a bundled handoff around that target:
+
+```powershell
+codestory-cli context --project <target-workspace> --id <node-id> --bundle out/context-name
+```
+
+`context` is target-first. It is not an open chat endpoint.
+
+### I changed files and need likely impact
+
+```powershell
+codestory-cli index --project <target-workspace> --refresh incremental
+codestory-cli affected --project <target-workspace> --format markdown
+git diff --name-only HEAD | codestory-cli affected --project <target-workspace> --stdin --format json
+```
+
+Treat `affected` as test-selection evidence, not a replacement for tests.
+
+### The cache or retrieval looks stale
+
+```powershell
+codestory-cli doctor --project <target-workspace>
+codestory-cli index --project <target-workspace> --refresh full
+codestory-cli doctor --project <target-workspace>
+```
+
+If `doctor` reports stale inventory, semantic contract mismatch, missing managed
+assets, or a fallback retrieval mode, fix that layer before investigating answer
+quality. Treat the health report as the first source of truth for cache and
+retrieval state.
 
 ## Core Commands
 
@@ -61,8 +127,8 @@ $TargetWorkspace = "C:\path\to\repo"
   semantic docs.
 - `ground`: broad repo-level orientation snapshot; `--why` explains retrieval
   mode, coverage, gaps, and next commands.
-- `packet`: bounded broad-task answer packet with citations, budget usage,
-  sufficiency status, gaps, and follow-up commands.
+- `packet`: bounded broad-task evidence packet with citations, budget usage,
+  gaps, and follow-up commands.
 - `search`: candidate discovery for symbols, files, literals, API paths,
   modules, and behavior terms.
 - `symbol`: inspect one exact symbol and relationships.
@@ -80,70 +146,6 @@ $TargetWorkspace = "C:\path\to\repo"
 - `setup embeddings`: install managed local embedding assets.
 - `serve --stdio`: persistent local read surface for repeated agent queries.
 - `generate-completions`: emit shell completions from the command model.
-
-## Template Workflows
-
-Fresh repo orientation:
-
-```powershell
-codestory-cli doctor --project <target-workspace>
-codestory-cli index --project <target-workspace> --refresh full
-codestory-cli ground --project <target-workspace> --why
-codestory-cli packet --project <target-workspace> --question "<broad task question>" --budget compact
-codestory-cli search --project <target-workspace> --query "<architecture term>" --why
-codestory-cli files --project <target-workspace> --format markdown
-```
-
-Candidate to context:
-
-```powershell
-codestory-cli search --project <target-workspace> --query "<symbol/file/literal/API path>" --why
-# choose a concrete node_id
-codestory-cli explore --project <target-workspace> --id <node-id> --no-tui
-codestory-cli context --project <target-workspace> --id <node-id>
-```
-
-Exact symbol investigation:
-
-```powershell
-codestory-cli symbol --project <target-workspace> --id <node-id>
-codestory-cli trail --project <target-workspace> --id <node-id> --story --hide-speculative
-codestory-cli snippet --project <target-workspace> --id <node-id> --context 40
-codestory-cli context --project <target-workspace> --id <node-id> --bundle out/context-name
-```
-
-Changed-file impact:
-
-```powershell
-codestory-cli index --project <target-workspace> --refresh incremental
-codestory-cli affected --project <target-workspace> --format markdown
-git diff --name-only HEAD | codestory-cli affected --project <target-workspace> --stdin --format json
-```
-
-Broad repo question:
-
-```powershell
-codestory-cli packet --project <target-workspace> --question "<broad task question>" --budget compact
-codestory-cli search --project <target-workspace> --repo-text on --query "<concrete term>" --why
-codestory-cli search --project <target-workspace> --repo-text on --query "<another concrete term>" --why
-# select anchors
-codestory-cli context --project <target-workspace> --id <node-id>
-```
-
-Use `ground --why` first for fresh orientation, health, or coverage discovery.
-For a broad task you intend to answer, start with `packet` and only run the
-follow-up primitive commands named by the sufficiency contract.
-
-Do not pass broad natural-language questions directly to `context`. Start with
-`packet`; deepen with its follow-up commands or use `ground` and `search` to
-find anchors, then ask for evidence around exact ids.
-
-When `packet` reports `sufficient` and `follow_up_commands` is empty, answer
-from the packet. Carry the packet's supported-claim wording into the final
-answer, and include a compact "Support files" list with every relevant path from
-`answer.citations` and `sufficiency.avoid_opening`, not only paths mentioned in
-prose. Budget truncation by itself is not a gap; open files only for named
-follow-ups, edits, or verification.
 
 ## Index Options
 
@@ -304,6 +306,7 @@ changes.
 
 ## Further Reading
 
+- [concepts/how-codestory-works.md](concepts/how-codestory-works.md)
 - [architecture/overview.md](architecture/overview.md)
 - [architecture/runtime-execution-path.md](architecture/runtime-execution-path.md)
 - [contributors/debugging.md](contributors/debugging.md)
