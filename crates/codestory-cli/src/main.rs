@@ -7,13 +7,13 @@ use codestory_contracts::api::{
     AgentRetrievalProfileSelectionDto, AnswerReadinessReportDto, AppEventPayload,
     BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, CreateBookmarkCategoryRequest,
     CreateBookmarkRequest, EvidenceItemDto, EvidencePacketDto, EvidenceSourceLocationDto,
-    EvidenceTypeDto, GraphArtifactDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode,
-    IndexedFilesRequest, NodeId, NodeKind, NodeOccurrencesRequest, PacketSufficiencyStatusDto,
-    RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto, SearchHit,
-    SearchHitOrigin, SearchHybridLimitsDto, SearchMatchQualityDto, SearchQueryAssessmentDto,
-    SearchRepoTextMode, SearchRequest, SourceOccurrenceDto, SourceTruthCheckDto,
-    TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection,
-    TrailMode,
+    EvidenceTypeDto, FrameworkRouteCoverageDto, GraphArtifactDto, IndexFreshnessDto,
+    IndexFreshnessStatusDto, IndexMode, IndexedFilesRequest, NodeId, NodeKind,
+    NodeOccurrencesRequest, PacketSufficiencyStatusDto, RepoTextScanStatsDto,
+    RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto, SearchHit, SearchHybridLimitsDto,
+    SearchMatchQualityDto, SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest,
+    SourceOccurrenceDto, SourceTruthCheckDto, TrailCallerScope, TrailConfigDto, TrailContextDto,
+    TrailDirection, TrailMode,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -5204,30 +5204,31 @@ fn render_framework_route_coverage(
     if !output.summary.framework_route_coverage.is_empty() {
         markdown.push_str("\nframework route coverage:\n");
         for entry in &output.summary.framework_route_coverage {
-            let gaps = if entry.unsupported_patterns.is_empty() {
-                "none recorded".to_string()
-            } else {
-                entry.unsupported_patterns.join("; ")
-            };
-            let known_gaps = if entry.known_gaps.is_empty() {
-                "none recorded".to_string()
-            } else {
-                entry.known_gaps.join("; ")
-            };
-            let _ = writeln!(
-                markdown,
-                "- {} ({}) status={} fixture_status={} confidence_floor={} handler_link={} promotable={} unsupported={} known_gaps={}",
-                entry.framework,
-                entry.language,
-                entry.status,
-                entry.fixture_status,
-                entry.confidence_floor,
-                entry.handler_link_support,
-                entry.promotable,
-                gaps,
-                known_gaps
-            );
+            let _ = writeln!(markdown, "{}", framework_route_coverage_row(entry));
         }
+    }
+}
+
+fn framework_route_coverage_row(entry: &FrameworkRouteCoverageDto) -> String {
+    format!(
+        "- {} ({}) status={} fixture_status={} confidence_floor={} handler_link={} promotable={} unsupported={} known_gaps={}",
+        entry.framework,
+        entry.language,
+        entry.status,
+        entry.fixture_status,
+        entry.confidence_floor,
+        entry.handler_link_support,
+        entry.promotable,
+        joined_or_none_recorded(&entry.unsupported_patterns),
+        joined_or_none_recorded(&entry.known_gaps)
+    )
+}
+
+fn joined_or_none_recorded(values: &[String]) -> String {
+    if values.is_empty() {
+        "none recorded".to_string()
+    } else {
+        values.join("; ")
     }
 }
 
@@ -6014,10 +6015,8 @@ fn index_next_commands(
         ),
         format!("codestory-cli context --project \"{project}\" --query \"<concrete target>\""),
     ];
-    if retrieval.is_some_and(|state| !state.semantic_ready) {
-        if retrieval.is_some_and(|state| {
-            state.fallback_reason == Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime)
-        }) {
+    if let Some(retrieval) = retrieval.filter(|state| !state.semantic_ready) {
+        if retrieval.fallback_reason == Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime) {
             commands.push(format!(
                 "codestory-cli setup embeddings --project \"{project}\""
             ));

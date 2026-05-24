@@ -4,9 +4,9 @@ use codestory_contracts::api::{
     IndexDryRunDto, IndexFreshnessDto, IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection,
     NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto, ProjectSummary,
     RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
-    SearchMatchQualityDto, SearchPlanDto,
-    SearchQueryAssessmentDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto,
-    TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
+    SearchMatchQualityDto, SearchPlanDto, SearchQueryAssessmentDto, SnippetContextDto,
+    SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection,
+    TrailMode,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

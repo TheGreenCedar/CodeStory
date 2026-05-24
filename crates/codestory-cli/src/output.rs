@@ -18,7 +18,8 @@ use std::path::Path;
 
 use crate::args::{
     CliTrailMode, DoctorOutput, DrillOutput, IndexDryRunOutput, IndexOutput, OutputFormat,
-    QueryOutput, SearchHitOutput, SearchOutput, TrailCommand, VerificationTargetOutput,
+    QueryItemOutput, QueryOutput, SearchHitOutput, SearchOutput, TrailCommand,
+    VerificationTargetOutput,
 };
 use crate::display::{
     clean_path_string, default_trail_direction, format_budget, format_direction, format_kind,
@@ -1306,21 +1307,23 @@ fn search_confidence(output: &SearchOutput) -> (&'static str, Vec<String>) {
         .as_ref()
         .map(|assessment| assessment.exact_symbol_hit_count)
         .unwrap_or(0);
-    let weak_top_hit = output
+    let has_no_hits = total_hits == 0;
+    let has_weak_indexed_top_hit = output
         .query_assessment
         .as_ref()
         .is_some_and(|assessment| assessment.weak_top_hit);
-    let confidence = if total_hits == 0
-        || top_score < 0.35
-        || (weak_top_hit && output.repo_text_hits.is_empty())
-    {
-        "low"
-    } else if !output.indexed_symbol_hits.is_empty()
+    let has_strong_indexed_match = !output.indexed_symbol_hits.is_empty()
         && exact_symbol_hits > 0
         && top_score >= 0.75
         && output.retrieval.fallback_reason.is_none()
-        && output.retrieval.semantic_ready
-    {
+        && output.retrieval.semantic_ready;
+    let has_weak_indexed_top_hit_without_repo_text =
+        has_weak_indexed_top_hit && output.repo_text_hits.is_empty();
+    let has_low_confidence =
+        has_no_hits || top_score < 0.35 || has_weak_indexed_top_hit_without_repo_text;
+    let confidence = if has_low_confidence {
+        "low"
+    } else if has_strong_indexed_match {
         "high"
     } else {
         "medium"
@@ -2280,28 +2283,32 @@ pub(crate) fn render_query_markdown(output: &QueryOutput) -> String {
     let _ = writeln!(markdown, "query: `{}`", output.query);
     let _ = writeln!(markdown, "items: {}", output.items.len());
     for item in &output.items {
-        let mut line = format!(
-            "- [{}] {} [{}]",
-            item.node_id,
-            item.display_name,
-            format_kind(item.kind)
-        );
-        if let Some(path) = item.file_path.as_deref() {
-            let _ = write!(line, " {path}");
-        }
-        if let Some(line_no) = item.line {
-            let _ = write!(line, ":{line_no}");
-        }
-        if let Some(depth) = item.depth {
-            let _ = write!(line, " depth={depth}");
-        }
-        if let Some(node_ref) = item.node_ref.as_deref() {
-            let _ = write!(line, " ref=`{node_ref}`");
-        }
-        let _ = write!(line, " source={}", item.source);
-        let _ = writeln!(markdown, "{line}");
+        let _ = writeln!(markdown, "{}", render_query_item_line(item));
     }
     markdown
+}
+
+fn render_query_item_line(item: &QueryItemOutput) -> String {
+    let mut line = format!(
+        "- [{}] {} [{}]",
+        item.node_id,
+        item.display_name,
+        format_kind(item.kind)
+    );
+    if let Some(path) = item.file_path.as_deref() {
+        let _ = write!(line, " {path}");
+    }
+    if let Some(line_no) = item.line {
+        let _ = write!(line, ":{line_no}");
+    }
+    if let Some(depth) = item.depth {
+        let _ = write!(line, " depth={depth}");
+    }
+    if let Some(node_ref) = item.node_ref.as_deref() {
+        let _ = write!(line, " ref=`{node_ref}`");
+    }
+    let _ = write!(line, " source={}", item.source);
+    line
 }
 
 pub(crate) fn render_symbol_mermaid(context: &SymbolContextDto) -> String {

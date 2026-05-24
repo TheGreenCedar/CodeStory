@@ -302,7 +302,7 @@ impl WorkspaceDiscovery {
                 let source_root = discovery_root(&full_path);
 
                 if full_path.is_file() {
-                    if should_include_discovered_path(
+                    if !should_include_discovered_path(
                         &full_path,
                         false,
                         &workspace_root,
@@ -311,12 +311,20 @@ impl WorkspaceDiscovery {
                         &group.language,
                         &exclude_patterns,
                     ) {
-                        push_discovered_file(&mut all_files, &mut seen, full_path, &workspace_root);
-                        if source_file_limit_exceeded(&all_files, max_files) {
-                            return Ok(None);
-                        }
+                        continue;
                     }
-                } else if full_path.is_dir() {
+                    if !push_discovered_file_within_limit(
+                        &mut all_files,
+                        &mut seen,
+                        full_path,
+                        &workspace_root,
+                        max_files,
+                    ) {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                if full_path.is_dir() {
                     let mut builder = ignore::WalkBuilder::new(&full_path);
                     builder.follow_links(true);
                     builder.require_git(false);
@@ -337,16 +345,17 @@ impl WorkspaceDiscovery {
                         )
                     });
                     for entry in builder.build().filter_map(|e| e.ok()) {
-                        if entry.file_type().is_some_and(|kind| kind.is_file()) {
-                            push_discovered_file(
-                                &mut all_files,
-                                &mut seen,
-                                entry.into_path(),
-                                &workspace_root,
-                            );
-                            if source_file_limit_exceeded(&all_files, max_files) {
-                                return Ok(None);
-                            }
+                        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                            continue;
+                        }
+                        if !push_discovered_file_within_limit(
+                            &mut all_files,
+                            &mut seen,
+                            entry.into_path(),
+                            &workspace_root,
+                            max_files,
+                        ) {
+                            return Ok(None);
                         }
                     }
                 }
@@ -434,6 +443,17 @@ impl WorkspaceDiscovery {
 
 fn source_file_limit_exceeded(files: &[PathBuf], max_files: Option<usize>) -> bool {
     max_files.is_some_and(|max_files| files.len() > max_files)
+}
+
+fn push_discovered_file_within_limit(
+    files: &mut Vec<PathBuf>,
+    seen: &mut HashSet<String>,
+    path: PathBuf,
+    workspace_root: &Path,
+    max_files: Option<usize>,
+) -> bool {
+    push_discovered_file(files, seen, path, workspace_root);
+    !source_file_limit_exceeded(files, max_files)
 }
 
 fn empty_incremental_plan() -> RefreshPlan {

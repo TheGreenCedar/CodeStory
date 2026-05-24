@@ -384,141 +384,132 @@ fn build_packet_plan(question: &str, requested: Option<PacketTaskClassDto>) -> P
 
 fn packet_symbol_probe_queries(question: &str, task_class: PacketTaskClassDto) -> Vec<String> {
     let terms = prompt_search_terms(question);
-    let has = |needle: &str| terms.iter().any(|term| term.contains(needle));
-    let express_related = has("express")
-        || has("router")
-        || has("route")
-        || has("middleware")
-        || has("response")
-        || has("view");
-    let express_response_related =
-        has("response") || has("send") || has("json") || has("serial") || has("file");
-    let express_render_related = has("render") || has("view") || has("lookup");
-    let express_param_related = has("param") || has("callback") || has("decode");
-    let mux_related = has("mux")
-        || has("gorilla")
-        || has("cors")
-        || has("preflight")
-        || has("strict")
-        || has("slash")
-        || has("regexp")
-        || has("regular")
-        || has("variable")
-        || (has("route") && has("match"));
-    let flask_related = has("flask")
-        || has("wsgi")
-        || has("blueprint")
-        || has("session")
-        || has("cookie")
-        || has("samesite")
-        || (has("dispatch") && has("view"));
-    let vite_related = has("vite")
-        || (has("dev") && has("server"))
-        || has("transform")
-        || has("plugin")
-        || has("module")
-        || has("hmr")
-        || (has("server") && has("config"));
-    let vite_transform_related =
-        has("transform") || has("module") || has("plugin") || has("cache") || has("stale");
-    let vite_hmr_related = has("hmr")
-        || has("cache")
-        || has("stale")
-        || has("dependency")
-        || has("dependencies")
-        || has("invalidate")
-        || has("update");
-    let vite_server_defaults_related =
-        has("server") || has("config") || has("default") || has("http") || has("middleware");
     let mut queries = Vec::new();
 
-    if has("index") {
-        if has("run") {
-            push_unique_term(&mut queries, "run_index");
+    push_codestory_symbol_probe_queries(&terms, &mut queries);
+    push_express_symbol_probe_queries(&terms, task_class, &mut queries);
+    push_mux_symbol_probe_queries(&terms, &mut queries);
+    push_flask_symbol_probe_queries(&terms, &mut queries);
+    push_vite_symbol_probe_queries(&terms, &mut queries);
+    push_task_class_symbol_probe_queries(task_class, &mut queries);
+    push_adjacent_packet_term_queries(&terms, &mut queries);
+
+    queries.truncate(32);
+    queries
+}
+
+fn push_codestory_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>) {
+    if packet_terms_contain(terms, "index") {
+        if packet_terms_contain(terms, "run") {
+            push_unique_term(queries, "run_index");
         }
-        if has("cli") && (has("runtime") || has("orchestrat")) {
-            push_unique_term(&mut queries, "CodeStoryCliRuntime");
+        if packet_terms_contain(terms, "cli")
+            && packet_terms_contain_any(terms, &["runtime", "orchestrat"])
+        {
+            push_unique_term(queries, "CodeStoryCliRuntime");
         }
-        push_unique_term(&mut queries, "IndexService");
-        push_unique_term(&mut queries, "WorkspaceIndexer");
-        if has("file") || has("symbol") || has("extract") {
-            push_unique_term(&mut queries, "index_file");
+        push_unique_terms(queries, &["IndexService", "WorkspaceIndexer"]);
+        if packet_terms_contain_any(terms, &["file", "symbol", "extract"]) {
+            push_unique_term(queries, "index_file");
         }
     }
-    if has("runtime") || has("orchestrat") {
-        push_unique_term(&mut queries, "IndexService");
+    if packet_terms_contain_any(terms, &["runtime", "orchestrat"]) {
+        push_unique_term(queries, "IndexService");
     }
-    if has("workspace")
-        || has("discover")
-        || (has("file") && (has("index") || has("workspace") || has("repo")))
+    if packet_terms_contain_any(terms, &["workspace", "discover"])
+        || (packet_terms_contain(terms, "file")
+            && packet_terms_contain_any(terms, &["index", "workspace", "repo"]))
     {
-        push_unique_term(&mut queries, "WorkspaceManifest");
-        push_unique_term(&mut queries, "build_execution_plan");
+        push_unique_terms(queries, &["WorkspaceManifest", "build_execution_plan"]);
     }
-    if has("symbol") || has("extract") {
-        push_unique_term(&mut queries, "WorkspaceIndexer");
-        push_unique_term(&mut queries, "index_file");
+    if packet_terms_contain_any(terms, &["symbol", "extract"]) {
+        push_unique_terms(queries, &["WorkspaceIndexer", "index_file"]);
     }
-    if has("persist") || has("storage") || has("store") {
-        push_unique_term(&mut queries, "flush_projection_batch");
+    if packet_terms_contain_any(terms, &["persist", "storage", "store"]) {
+        push_unique_term(queries, "flush_projection_batch");
     }
-    if has("search") || has("projection") {
-        push_unique_term(&mut queries, "rebuild_search_symbol_projection");
+    if packet_terms_contain_any(terms, &["search", "projection"]) {
+        push_unique_term(queries, "rebuild_search_symbol_projection");
     }
-    if has("snapshot") || has("refresh") {
-        push_unique_term(&mut queries, "refresh_all_with_stats");
-        push_unique_term(&mut queries, "SnapshotStore");
+    if packet_terms_contain_any(terms, &["snapshot", "refresh"]) {
+        push_unique_terms(queries, &["refresh_all_with_stats", "SnapshotStore"]);
     }
-    if has("runtime") || has("orchestrat") {
-        push_unique_term(&mut queries, "run_indexing_blocking");
-        if has("cli") {
-            push_unique_term(&mut queries, "CliRuntime");
+    if packet_terms_contain_any(terms, &["runtime", "orchestrat"]) {
+        push_unique_term(queries, "run_indexing_blocking");
+        if packet_terms_contain(terms, "cli") {
+            push_unique_term(queries, "CliRuntime");
         }
     }
-    if has("persist") || has("storage") || has("store") {
-        push_unique_term(&mut queries, "Storage");
+    if packet_terms_contain_any(terms, &["persist", "storage", "store"]) {
+        push_unique_term(queries, "Storage");
     }
-    if has("snapshot") || has("refresh") {
-        push_unique_term(&mut queries, "refresh_all");
+    if packet_terms_contain_any(terms, &["snapshot", "refresh"]) {
+        push_unique_term(queries, "refresh_all");
     }
+}
 
-    if express_related {
-        if matches!(
-            task_class,
-            PacketTaskClassDto::SymbolOwnership
-                | PacketTaskClassDto::ArchitectureExplanation
-                | PacketTaskClassDto::RouteTracing
-        ) {
-            push_unique_term(&mut queries, "createApplication");
-            push_unique_term(&mut queries, "lib/express.js");
-            push_unique_term(&mut queries, "lib/application.js");
-        }
-        if express_render_related {
-            push_unique_term(&mut queries, "tryRender");
-            push_unique_term(&mut queries, "app.render");
-            push_unique_term(&mut queries, "View");
-            push_unique_term(&mut queries, "lib/view.js");
-        }
-        if express_response_related {
-            push_unique_term(&mut queries, "res.send");
-            push_unique_term(&mut queries, "res.json");
-            push_unique_term(&mut queries, "res.sendFile");
-            push_unique_term(&mut queries, "lib/response.js");
-        }
-        if express_param_related {
-            push_unique_term(&mut queries, "proto.param");
-            push_unique_term(&mut queries, "proto.process_params");
-            push_unique_term(&mut queries, "Layer.prototype.match");
-            push_unique_term(&mut queries, "Route.prototype.dispatch");
-            push_unique_term(&mut queries, "decode_param");
-            push_unique_term(&mut queries, "paramCallback");
-            push_unique_term(&mut queries, "test/app.param.js");
-            push_unique_term(&mut queries, "test/Router.js");
-        }
+fn push_express_symbol_probe_queries(
+    terms: &[String],
+    task_class: PacketTaskClassDto,
+    queries: &mut Vec<String>,
+) {
+    if !packet_terms_contain_any(
+        terms,
+        &[
+            "express",
+            "router",
+            "route",
+            "middleware",
+            "response",
+            "view",
+        ],
+    ) {
+        return;
     }
+    if matches!(
+        task_class,
+        PacketTaskClassDto::SymbolOwnership
+            | PacketTaskClassDto::ArchitectureExplanation
+            | PacketTaskClassDto::RouteTracing
+    ) {
+        push_unique_terms(
+            queries,
+            &["createApplication", "lib/express.js", "lib/application.js"],
+        );
+    }
+    if packet_terms_contain_any(terms, &["render", "view", "lookup"]) {
+        push_unique_terms(queries, &["tryRender", "app.render", "View", "lib/view.js"]);
+    }
+    if packet_terms_contain_any(terms, &["response", "send", "json", "serial", "file"]) {
+        push_unique_terms(
+            queries,
+            &["res.send", "res.json", "res.sendFile", "lib/response.js"],
+        );
+    }
+    if packet_terms_contain_any(terms, &["param", "callback", "decode"]) {
+        push_unique_terms(
+            queries,
+            &[
+                "proto.param",
+                "proto.process_params",
+                "Layer.prototype.match",
+                "Route.prototype.dispatch",
+                "decode_param",
+                "paramCallback",
+                "test/app.param.js",
+                "test/Router.js",
+            ],
+        );
+    }
+}
 
-    if mux_related {
-        for query in [
+fn push_mux_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>) {
+    if !mux_packet_terms_are_related(terms) {
+        return;
+    }
+    push_unique_terms(
+        queries,
+        &[
             "NewRouter",
             "Router",
             "Route",
@@ -540,13 +531,34 @@ fn packet_symbol_probe_queries(question: &str, task_class: PacketTaskClassDto) -
             "mux_test.go",
             "regexp_test.go",
             "middleware_test.go",
-        ] {
-            push_unique_term(&mut queries, query);
-        }
-    }
+        ],
+    );
+}
 
-    if flask_related {
-        for query in [
+fn mux_packet_terms_are_related(terms: &[String]) -> bool {
+    packet_terms_contain_any(
+        terms,
+        &[
+            "mux",
+            "gorilla",
+            "cors",
+            "preflight",
+            "strict",
+            "slash",
+            "regexp",
+            "regular",
+            "variable",
+        ],
+    ) || packet_terms_contain_all(terms, &["route", "match"])
+}
+
+fn push_flask_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>) {
+    if !flask_packet_terms_are_related(terms) {
+        return;
+    }
+    push_unique_terms(
+        queries,
+        &[
             "Flask.wsgi_app",
             "Flask.full_dispatch_request",
             "Flask.dispatch_request",
@@ -570,31 +582,54 @@ fn packet_symbol_probe_queries(question: &str, task_class: PacketTaskClassDto) -
             "tests/test_blueprints.py",
             "tests/test_basic.py",
             "tests/test_config.py",
-        ] {
-            push_unique_term(&mut queries, query);
-        }
-    }
+        ],
+    );
+}
 
-    if vite_related {
-        for query in [
+fn flask_packet_terms_are_related(terms: &[String]) -> bool {
+    packet_terms_contain_any(
+        terms,
+        &[
+            "flask",
+            "wsgi",
+            "blueprint",
+            "session",
+            "cookie",
+            "samesite",
+        ],
+    ) || packet_terms_contain_all(terms, &["dispatch", "view"])
+}
+
+fn push_vite_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>) {
+    if !vite_packet_terms_are_related(terms) {
+        return;
+    }
+    push_unique_terms(
+        queries,
+        &[
             "resolveConfig",
             "createServer",
             "src/node/config.ts",
             "src/node/server/index.ts",
-        ] {
-            push_unique_term(&mut queries, query);
-        }
-        if vite_server_defaults_related {
-            for query in [
+        ],
+    );
+    if packet_terms_contain_any(
+        terms,
+        &["server", "config", "default", "http", "middleware"],
+    ) {
+        push_unique_terms(
+            queries,
+            &[
                 "indexHtmlMiddleware",
                 "src/node/http.ts",
                 "src/node/server/middlewares/indexHtml.ts",
-            ] {
-                push_unique_term(&mut queries, query);
-            }
-        }
-        if vite_transform_related {
-            for query in [
+            ],
+        );
+    }
+    if packet_terms_contain_any(terms, &["transform", "module", "plugin", "cache", "stale"]) {
+        push_unique_terms(
+            queries,
+            &[
                 "transformMiddleware",
                 "transformRequest",
                 "createPluginContainer",
@@ -603,66 +638,72 @@ fn packet_symbol_probe_queries(question: &str, task_class: PacketTaskClassDto) -
                 "src/node/server/transformRequest.ts",
                 "src/node/server/pluginContainer.ts",
                 "src/node/server/moduleGraph.ts",
-            ] {
-                push_unique_term(&mut queries, query);
-            }
-        }
-        if vite_hmr_related {
-            for query in ["createServerHMRChannel", "src/node/server/hmr.ts"] {
-                push_unique_term(&mut queries, query);
-            }
-        }
+            ],
+        );
     }
-
-    match task_class {
-        PacketTaskClassDto::RouteTracing => {
-            push_unique_term(&mut queries, "router");
-            push_unique_term(&mut queries, "handler");
-            push_unique_term(&mut queries, "route");
-            push_unique_term(&mut queries, "middleware");
-            push_unique_term(&mut queries, "dispatch");
-            push_unique_term(&mut queries, "Layer");
-            push_unique_term(&mut queries, "Route");
-            push_unique_term(&mut queries, "createApplication");
-            push_unique_term(&mut queries, "app.use");
-            push_unique_term(&mut queries, "app.route");
-            push_unique_term(&mut queries, "lib/express.js");
-            push_unique_term(&mut queries, "lib/application.js");
-            push_unique_term(&mut queries, "lib/router/index.js");
-            push_unique_term(&mut queries, "lib/router/layer.js");
-            push_unique_term(&mut queries, "lib/router/route.js");
-        }
-        PacketTaskClassDto::BugLocalization => {
-            push_unique_term(&mut queries, "error");
-            push_unique_term(&mut queries, "validate");
-        }
-        PacketTaskClassDto::ChangeImpact => {
-            push_unique_term(&mut queries, "affected");
-            push_unique_term(&mut queries, "references");
-        }
-        PacketTaskClassDto::SymbolOwnership => {
-            push_unique_term(&mut queries, "references");
-            push_unique_term(&mut queries, "callers");
-        }
-        PacketTaskClassDto::EditPlanning => {
-            push_unique_term(&mut queries, "tests");
-            push_unique_term(&mut queries, "config");
-        }
-        PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => {}
+    if packet_terms_contain_any(
+        terms,
+        &[
+            "hmr",
+            "cache",
+            "stale",
+            "dependency",
+            "dependencies",
+            "invalidate",
+            "update",
+        ],
+    ) {
+        push_unique_terms(
+            queries,
+            &["createServerHMRChannel", "src/node/server/hmr.ts"],
+        );
     }
+}
 
+fn vite_packet_terms_are_related(terms: &[String]) -> bool {
+    packet_terms_contain_any(terms, &["vite", "transform", "plugin", "module", "hmr"])
+        || packet_terms_contain_all(terms, &["dev", "server"])
+        || packet_terms_contain_all(terms, &["server", "config"])
+}
+
+fn push_task_class_symbol_probe_queries(task_class: PacketTaskClassDto, queries: &mut Vec<String>) {
+    let class_queries = match task_class {
+        PacketTaskClassDto::RouteTracing => &[
+            "router",
+            "handler",
+            "route",
+            "middleware",
+            "dispatch",
+            "Layer",
+            "Route",
+            "createApplication",
+            "app.use",
+            "app.route",
+            "lib/express.js",
+            "lib/application.js",
+            "lib/router/index.js",
+            "lib/router/layer.js",
+            "lib/router/route.js",
+        ][..],
+        PacketTaskClassDto::BugLocalization => &["error", "validate"],
+        PacketTaskClassDto::ChangeImpact => &["affected", "references"],
+        PacketTaskClassDto::SymbolOwnership => &["references", "callers"],
+        PacketTaskClassDto::EditPlanning => &["tests", "config"],
+        PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[],
+    };
+    push_unique_terms(queries, class_queries);
+}
+
+fn push_adjacent_packet_term_queries(terms: &[String], queries: &mut Vec<String>) {
     for window in terms.windows(2).take(8) {
         if let [left, right] = window {
-            push_unique_term(&mut queries, &format!("{left}_{right}"));
+            push_unique_term(queries, &format!("{left}_{right}"));
             push_unique_term(
-                &mut queries,
+                queries,
                 &packet_camel_case(&[left.as_str(), right.as_str()]),
             );
         }
     }
-
-    queries.truncate(32);
-    queries
 }
 
 fn packet_concept_queries(question: &str) -> Vec<String> {
@@ -793,6 +834,28 @@ fn push_unique_term(terms: &mut Vec<String>, value: &str) {
     if !terms.iter().any(|term| term.eq_ignore_ascii_case(value)) {
         terms.push(value.to_string());
     }
+}
+
+fn push_unique_terms(terms: &mut Vec<String>, values: &[&str]) {
+    for value in values {
+        push_unique_term(terms, value);
+    }
+}
+
+fn packet_terms_contain(terms: &[String], needle: &str) -> bool {
+    terms.iter().any(|term| term.contains(needle))
+}
+
+fn packet_terms_contain_any(terms: &[String], needles: &[&str]) -> bool {
+    needles
+        .iter()
+        .any(|needle| packet_terms_contain(terms, needle))
+}
+
+fn packet_terms_contain_all(terms: &[String], needles: &[&str]) -> bool {
+    needles
+        .iter()
+        .all(|needle| packet_terms_contain(terms, needle))
 }
 
 fn task_class_seed_queries(task_class: PacketTaskClassDto) -> &'static [&'static str] {
@@ -1045,34 +1108,9 @@ fn merge_packet_subanswer(
         .steps
         .extend(subanswer.retrieval_trace.steps);
 
-    let mut citation_keys = answer
-        .citations
-        .iter()
-        .map(packet_citation_key)
-        .collect::<HashSet<_>>();
-    for citation in subanswer.citations {
-        if citation_keys.insert(packet_citation_key(&citation)) {
-            answer.citations.push(citation);
-        }
-    }
-
-    let mut subgraph_ids = answer.subgraph_ids.iter().cloned().collect::<HashSet<_>>();
-    for subgraph_id in subanswer.subgraph_ids {
-        if subgraph_ids.insert(subgraph_id.clone()) {
-            answer.subgraph_ids.push(subgraph_id);
-        }
-    }
-
-    let mut graph_ids = answer
-        .graphs
-        .iter()
-        .map(graph_artifact_id)
-        .collect::<HashSet<_>>();
-    for graph in subanswer.graphs {
-        if graph_ids.insert(graph_artifact_id(&graph)) {
-            answer.graphs.push(graph);
-        }
-    }
+    extend_unique_citations(&mut answer.citations, subanswer.citations);
+    extend_unique_strings(&mut answer.subgraph_ids, subanswer.subgraph_ids);
+    extend_unique_graphs(&mut answer.graphs, subanswer.graphs);
 
     answer.sections.push(AgentResponseSectionDto {
         id: format!("packet-subquery-{}", sanitize_section_id(&query.query)),
@@ -1098,6 +1136,39 @@ fn packet_citation_key(citation: &AgentCitationDto) -> String {
 fn graph_artifact_id(graph: &GraphArtifactDto) -> String {
     match graph {
         GraphArtifactDto::Uml { id, .. } | GraphArtifactDto::Mermaid { id, .. } => id.clone(),
+    }
+}
+
+fn extend_unique_citations(
+    citations: &mut Vec<AgentCitationDto>,
+    additional: Vec<AgentCitationDto>,
+) {
+    let mut keys = citations
+        .iter()
+        .map(packet_citation_key)
+        .collect::<HashSet<_>>();
+    for citation in additional {
+        if keys.insert(packet_citation_key(&citation)) {
+            citations.push(citation);
+        }
+    }
+}
+
+fn extend_unique_strings(values: &mut Vec<String>, additional: Vec<String>) {
+    let mut seen = values.iter().cloned().collect::<HashSet<_>>();
+    for value in additional {
+        if seen.insert(value.clone()) {
+            values.push(value);
+        }
+    }
+}
+
+fn extend_unique_graphs(graphs: &mut Vec<GraphArtifactDto>, additional: Vec<GraphArtifactDto>) {
+    let mut ids = graphs.iter().map(graph_artifact_id).collect::<HashSet<_>>();
+    for graph in additional {
+        if ids.insert(graph_artifact_id(&graph)) {
+            graphs.push(graph);
+        }
     }
 }
 
@@ -1156,16 +1227,13 @@ fn packet_citation_rank(citation: &AgentCitationDto, terms: &[String]) -> f32 {
     if path.contains("/lib/") || path.starts_with("lib/") {
         score += 2.0;
     }
-    let has_rank_term = |needle: &str| terms.iter().any(|term| term.contains(needle));
-    if path.ends_with("src/node/config.ts")
-        && (has_rank_term("config") || has_rank_term("default") || has_rank_term("resolve"))
+    if is_vite_config_citation_path(&path)
+        && packet_terms_contain_any(terms, &["config", "default", "resolve"])
     {
         score += 8.0;
     }
-    if (path.ends_with("src/node/server/index.ts")
-        || path.ends_with("src/node/http.ts")
-        || path.ends_with("src/node/server/middlewares/indexhtml.ts"))
-        && (has_rank_term("server") || has_rank_term("default") || has_rank_term("middleware"))
+    if is_vite_server_defaults_citation_path(&path)
+        && packet_terms_contain_any(terms, &["server", "default", "middleware"])
     {
         score += 4.0;
     }
@@ -1188,6 +1256,16 @@ fn packet_citation_rank(citation: &AgentCitationDto, terms: &[String]) -> f32 {
     }
 
     score
+}
+
+fn is_vite_config_citation_path(path: &str) -> bool {
+    path.ends_with("src/node/config.ts")
+}
+
+fn is_vite_server_defaults_citation_path(path: &str) -> bool {
+    path.ends_with("src/node/server/index.ts")
+        || path.ends_with("src/node/http.ts")
+        || path.ends_with("src/node/server/middlewares/indexhtml.ts")
 }
 
 fn normalize_identifier(value: &str) -> String {
@@ -1243,23 +1321,26 @@ fn packet_evidence_ledger_markdown(
         "Use these cited anchors first. They are ranked for the task wording before lower-confidence retrieval diagnostics.\n",
     );
     for citation in answer.citations.iter().take(limits.max_anchors as usize) {
-        let path = citation
-            .file_path
-            .as_deref()
-            .map(packet_display_path)
-            .unwrap_or_else(|| "<unknown path>".to_string());
-        let line = citation
-            .line
-            .map(|line| format!(":{line}"))
-            .unwrap_or_default();
-        let role = packet_evidence_role(citation).unwrap_or("supporting evidence");
-        let _ = writeln!(
-            markdown,
-            "- `{}` ({:?}) - `{}`{} - {} - score {:.3}",
-            citation.display_name, citation.kind, path, line, role, citation.score
-        );
+        let _ = writeln!(markdown, "{}", packet_evidence_ledger_row(citation));
     }
     markdown
+}
+
+fn packet_evidence_ledger_row(citation: &AgentCitationDto) -> String {
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_else(|| "<unknown path>".to_string());
+    let line = citation
+        .line
+        .map(|line| format!(":{line}"))
+        .unwrap_or_default();
+    let role = packet_evidence_role(citation).unwrap_or("supporting evidence");
+    format!(
+        "- `{}` ({:?}) - `{}`{} - {} - score {:.3}",
+        citation.display_name, citation.kind, path, line, role, citation.score
+    )
 }
 
 fn packet_flow_claims_markdown(claims: &[PacketClaimDto]) -> String {
@@ -1415,6 +1496,11 @@ fn packet_claim_for_role(role: &str, citation: &AgentCitationDto) -> String {
     let symbol = citation.display_name.as_str();
     let symbol_lower = symbol.to_ascii_lowercase();
     let codestory_repo_evidence = citation_is_codestory_repo_evidence(citation);
+    let codestory_index_runtime = codestory_repo_evidence && symbol_lower.contains("index");
+    let codestory_workspace_evidence =
+        codestory_repo_evidence && symbol_lower.contains("workspace");
+    let codestory_symbol_extraction = codestory_repo_evidence
+        && (symbol_lower.contains("index") || symbol_lower.contains("symbol"));
     match role {
         "CLI entrypoint" if codestory_repo_evidence && symbol_lower.contains("run_index") => {
             format!(
@@ -1424,7 +1510,7 @@ fn packet_claim_for_role(role: &str, citation: &AgentCitationDto) -> String {
         "CLI entrypoint" => format!(
             "The CLI entrypoint for this flow is anchored by `{symbol}`, which marks the command boundary before runtime work."
         ),
-        "runtime orchestration" if codestory_repo_evidence && symbol_lower.contains("index") => {
+        "runtime orchestration" if codestory_index_runtime => {
             format!(
                 "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases. Evidence anchor: `{symbol}`."
             )
@@ -1432,9 +1518,7 @@ fn packet_claim_for_role(role: &str, citation: &AgentCitationDto) -> String {
         "runtime orchestration" => format!(
             "Runtime orchestration is anchored by `{symbol}`, which is the layer to verify coordination and refresh sequencing against."
         ),
-        "workspace discovery and planning"
-            if codestory_repo_evidence && symbol_lower.contains("workspace") =>
-        {
+        "workspace discovery and planning" if codestory_workspace_evidence => {
             format!(
                 "The workspace crate is responsible for source-file discovery and refresh-plan construction. Evidence anchor: `{symbol}`."
             )
@@ -1442,10 +1526,7 @@ fn packet_claim_for_role(role: &str, citation: &AgentCitationDto) -> String {
         "workspace discovery and planning" => format!(
             "Workspace discovery and planning are anchored by `{symbol}`, the evidence to inspect for file selection or execution-plan behavior."
         ),
-        "symbol extraction"
-            if codestory_repo_evidence
-                && (symbol_lower.contains("index") || symbol_lower.contains("symbol")) =>
-        {
+        "symbol extraction" if codestory_symbol_extraction => {
             format!(
                 "The indexer extracts nodes, edges, occurrences, and related symbol data from source files. Evidence anchor: `{symbol}`."
             )
@@ -1490,9 +1571,7 @@ fn packet_claim_for_role(role: &str, citation: &AgentCitationDto) -> String {
         "router layer matching" => format!(
             "Router layer matching is anchored by `{symbol}`, the evidence to inspect for path matching and params before a route handles the request. Layer matching is relevant because it extracts and decodes route parameter values. Evidence anchor: `Layer.prototype.match`."
         ),
-        "route method dispatch" => format!(
-            "Route dispatch is responsible for invoking the route's matching method handlers. Route dispatch is downstream of parameter processing and should be checked for handler invocation order. Evidence anchor: `Route.prototype.dispatch`."
-        ),
+        "route method dispatch" => "Route dispatch is responsible for invoking the route's matching method handlers. Route dispatch is downstream of parameter processing and should be checked for handler invocation order. Evidence anchor: `Route.prototype.dispatch`.".to_string(),
         "express response helpers" => format!(
             "The first file to inspect is lib/response.js because res.send, res.json, and res.sendFile are implemented there. Compatibility behavior for old response helper call shapes should be checked near res.send and res.json. File-transfer validation and callback behavior should be checked separately from JSON serialization. Response serialization helpers are owned by lib/response.js. Evidence anchor: `{symbol}`."
         ),
@@ -2531,11 +2610,7 @@ fn execute_retrieval(
                             ),
                             trail_output,
                         );
-                        trace.annotate(format!(
-                            "Trail {} was truncated at max_nodes={}.",
-                            idx + 1,
-                            plan.max_nodes
-                        ));
+                        trace.annotate(trail_truncated_annotation(idx + 1, plan.max_nodes));
                     } else {
                         trace.finish_ok(trail_step, trail_output);
                     }
@@ -3124,6 +3199,10 @@ fn evidence_edge_ids_for_node(
     edge_ids
 }
 
+fn trail_truncated_annotation(trail_number: usize, max_nodes: u32) -> String {
+    format!("Trail {trail_number} was truncated at max_nodes={max_nodes}.")
+}
+
 fn sanitize_plan_filters(plan: &TrailPlan, options: &TrailFilterOptionsDto) -> TrailPlan {
     let mut sanitized = plan.clone();
 
@@ -3515,21 +3594,7 @@ fn retrieval_markdown(
     } else {
         markdown.push_str("\nTop indexed matches:\n");
         for hit in bundle.hits.iter().take(6) {
-            let location = match (&hit.file_path, hit.line) {
-                (Some(path), Some(line)) => format!(" ({}:{})", path, line),
-                (Some(path), None) => format!(" ({})", path),
-                _ => String::new(),
-            };
-            let _ = writeln!(
-                markdown,
-                "- **{}** [{:?}] origin `{}` resolvable `{}` score `{:.3}`{}",
-                hit.display_name,
-                hit.kind,
-                hit.origin.as_str(),
-                hit.resolvable,
-                hit.score,
-                location
-            );
+            write_indexed_match_markdown(&mut markdown, hit);
         }
     }
 
@@ -3546,6 +3611,27 @@ fn retrieval_markdown(
     }
 
     markdown
+}
+
+fn write_indexed_match_markdown(markdown: &mut String, hit: &SearchHit) {
+    let _ = writeln!(
+        markdown,
+        "- **{}** [{:?}] origin `{}` resolvable `{}` score `{:.3}`{}",
+        hit.display_name,
+        hit.kind,
+        hit.origin.as_str(),
+        hit.resolvable,
+        hit.score,
+        search_hit_location_suffix(hit)
+    );
+}
+
+fn search_hit_location_suffix(hit: &SearchHit) -> String {
+    match (&hit.file_path, hit.line) {
+        (Some(path), Some(line)) => format!(" ({}:{})", path, line),
+        (Some(path), None) => format!(" ({})", path),
+        _ => String::new(),
+    }
 }
 
 fn first_mermaid_graph_id(graphs: &[GraphArtifactDto]) -> Option<String> {

@@ -236,29 +236,28 @@ fn stdio_tool_text(value: &serde_json::Value) -> String {
 
 fn stdio_packet_text(packet: &serde_json::Value) -> String {
     let mut text = String::new();
-    if let Some(packet_id) = packet.get("packet_id").and_then(|value| value.as_str()) {
-        text.push_str("packet_id: ");
-        text.push_str(packet_id);
-        text.push('\n');
-    }
-    if let Some(question) = packet.get("question").and_then(|value| value.as_str()) {
-        text.push_str("question: ");
-        text.push_str(question);
-        text.push('\n');
-    }
-    if let Some(task_class) = packet.get("task_class").and_then(|value| value.as_str()) {
-        text.push_str("task_class: ");
-        text.push_str(task_class);
-        text.push('\n');
-    }
-    if let Some(status) = packet
-        .pointer("/sufficiency/status")
-        .and_then(|value| value.as_str())
-    {
-        text.push_str("sufficiency: ");
-        text.push_str(status);
-        text.push('\n');
-    }
+    append_packet_text_field(
+        &mut text,
+        "packet_id",
+        packet.get("packet_id").and_then(|value| value.as_str()),
+    );
+    append_packet_text_field(
+        &mut text,
+        "question",
+        packet.get("question").and_then(|value| value.as_str()),
+    );
+    append_packet_text_field(
+        &mut text,
+        "task_class",
+        packet.get("task_class").and_then(|value| value.as_str()),
+    );
+    append_packet_text_field(
+        &mut text,
+        "sufficiency",
+        packet
+            .pointer("/sufficiency/status")
+            .and_then(|value| value.as_str()),
+    );
 
     for section in packet
         .pointer("/answer/sections")
@@ -307,6 +306,16 @@ fn stdio_packet_text(packet: &serde_json::Value) -> String {
     } else {
         text
     }
+}
+
+fn append_packet_text_field(text: &mut String, label: &str, value: Option<&str>) {
+    let Some(value) = value else {
+        return;
+    };
+    text.push_str(label);
+    text.push_str(": ");
+    text.push_str(value);
+    text.push('\n');
 }
 
 fn append_packet_string_array(text: &mut String, title: &str, value: Option<&serde_json::Value>) {

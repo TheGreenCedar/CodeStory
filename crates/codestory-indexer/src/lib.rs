@@ -5313,12 +5313,7 @@ fn collect_react_route(
     routes: &mut Vec<FrameworkRoute>,
     react_router_context: bool,
 ) {
-    let jsx_route = line.contains("<Route") && line.contains("path");
-    let object_route = react_router_context && line.contains("path:");
-    if (jsx_route || object_route)
-        && line.contains("path")
-        && let Some(path) = value_after_key(line, "path").or_else(|| first_quoted_string(line))
-    {
+    if let Some(path) = react_route_path(line, react_router_context) {
         routes.push(FrameworkRoute::new(
             "react-router",
             "GET".to_string(),
@@ -5328,6 +5323,15 @@ fn collect_react_route(
             "heuristic",
         ));
     }
+}
+
+fn react_route_path(line: &str, react_router_context: bool) -> Option<String> {
+    let jsx_route = line.contains("<Route") && line.contains("path");
+    let object_route = react_router_context && line.contains("path:");
+    if !(jsx_route || object_route) {
+        return None;
+    }
+    value_after_key(line, "path").or_else(|| first_quoted_string(line))
 }
 
 fn collect_sveltekit_server_route(
@@ -5958,31 +5962,36 @@ fn strip_route_extension(segment: &str) -> String {
 
 fn file_route_segment(segment: &str) -> Option<String> {
     let segment = strip_route_extension(segment);
-    if segment.is_empty()
-        || matches!(
-            segment.as_str(),
-            "page" | "route" | "layout" | "template" | "+page"
-        )
-        || segment.starts_with('_')
-        || (segment.starts_with('(') && segment.ends_with(')'))
-    {
+    if is_ignored_file_route_segment(&segment) {
         return None;
     }
-    let segment = segment
-        .strip_suffix(".get")
-        .or_else(|| segment.strip_suffix(".post"))
-        .or_else(|| segment.strip_suffix(".put"))
-        .or_else(|| segment.strip_suffix(".patch"))
-        .or_else(|| segment.strip_suffix(".delete"))
-        .or_else(|| segment.strip_suffix(".head"))
-        .or_else(|| segment.strip_suffix(".options"))
-        .unwrap_or(&segment)
-        .to_string();
+    let segment = strip_route_method_suffix(&segment).to_string();
     if segment == "index" {
         None
     } else {
         Some(segment)
     }
+}
+
+fn is_ignored_file_route_segment(segment: &str) -> bool {
+    if segment.is_empty()
+        || matches!(segment, "page" | "route" | "layout" | "template" | "+page")
+        || segment.starts_with('_')
+    {
+        return true;
+    }
+    segment.starts_with('(') && segment.ends_with(')')
+}
+
+fn strip_route_method_suffix(segment: &str) -> &str {
+    for suffix in [
+        ".get", ".post", ".put", ".patch", ".delete", ".head", ".options",
+    ] {
+        if let Some(stem) = segment.strip_suffix(suffix) {
+            return stem;
+        }
+    }
+    segment
 }
 
 fn file_route_path_from_segments(segments: &[String]) -> String {

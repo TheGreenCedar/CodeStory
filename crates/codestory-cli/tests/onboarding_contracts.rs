@@ -67,6 +67,25 @@ fn normalize_local_link_target(raw: &str) -> Option<String> {
     )
 }
 
+fn assert_public_doc_avoids_agent_specific_framing(file: &Path, contents: &str) {
+    let lowered = contents.to_lowercase();
+    for blocked in [
+        "codegraph",
+        "codex-first",
+        "codex first",
+        "global codex",
+        "for codex users",
+        ".codex/skills",
+        ".codex\\skills",
+    ] {
+        assert!(
+            !lowered.contains(blocked),
+            "public doc should not contain `{blocked}`: {}",
+            file.display()
+        );
+    }
+}
+
 #[test]
 fn readme_keeps_dual_track_onboarding() {
     let root = repo_root();
@@ -132,22 +151,7 @@ fn public_docs_avoid_competitor_and_agent_specific_framing() {
 
     for file in files {
         let contents = fs::read_to_string(&file).expect("read public doc");
-        let lowered = contents.to_lowercase();
-        for blocked in [
-            "codegraph",
-            "codex-first",
-            "codex first",
-            "global codex",
-            "for codex users",
-            ".codex/skills",
-            ".codex\\skills",
-        ] {
-            assert!(
-                !lowered.contains(blocked),
-                "public doc should not contain `{blocked}`: {}",
-                file.display()
-            );
-        }
+        assert_public_doc_avoids_agent_specific_framing(&file, &contents);
     }
 }
 

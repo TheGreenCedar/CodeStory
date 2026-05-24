@@ -95,6 +95,10 @@ Options:
 `);
 }
 
+function commaSeparatedList(value) {
+  return value?.split(",").map((name) => name.trim()).filter(Boolean);
+}
+
 function parseArgs(argv) {
   const opts = {
     list: false,
@@ -178,11 +182,11 @@ function parseArgs(argv) {
       continue;
     }
     if (arg === "--repos") {
-      opts.repos = argv[++i]?.split(",").map((name) => name.trim()).filter(Boolean);
+      opts.repos = commaSeparatedList(argv[++i]);
       continue;
     }
     if (arg === "--arms") {
-      opts.arms = argv[++i]?.split(",").map((name) => name.trim()).filter(Boolean);
+      opts.arms = commaSeparatedList(argv[++i]);
       continue;
     }
     if (arg === "--task-suite") {
@@ -190,7 +194,7 @@ function parseArgs(argv) {
       continue;
     }
     if (arg === "--task-ids") {
-      opts.taskIds = argv[++i]?.split(",").map((name) => name.trim()).filter(Boolean);
+      opts.taskIds = commaSeparatedList(argv[++i]);
       continue;
     }
     if (arg === "--task-manifest") {
@@ -579,13 +583,32 @@ async function runProcess(command, args, options = {}) {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let settled = false;
+    let forceKillTimer = null;
     const timeoutTimer = options.timeoutMs
       ? setTimeout(() => {
           timedOut = true;
-          stderr += `\nProcess timed out after ${options.timeoutMs}ms.\n`;
+          const message = options.timeoutMessage ?? `Process timed out after ${options.timeoutMs}ms.`;
+          stderr += `\n${message}\n`;
           child.kill("SIGTERM");
+          if (options.forceKillAfterMs) {
+            forceKillTimer = setTimeout(() => child.kill("SIGKILL"), options.forceKillAfterMs);
+          }
         }, options.timeoutMs)
       : null;
+    function finish(payload) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+      }
+      if (forceKillTimer) {
+        clearTimeout(forceKillTimer);
+      }
+      resolve({ timedOut, ...payload });
+    }
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
     });
@@ -596,16 +619,24 @@ async function runProcess(command, args, options = {}) {
       child.stdin.end(options.stdin);
     }
     child.on("error", (error) => {
-      if (timeoutTimer) {
-        clearTimeout(timeoutTimer);
-      }
-      resolve({ status: timedOut ? "timeout" : "error", exitCode: null, stdout, stderr, error: error.message });
+      finish({
+        status: timedOut ? "timeout" : "error",
+        exitCode: null,
+        signal: null,
+        stdout,
+        stderr,
+        error: error.message,
+      });
     });
     child.on("close", (exitCode, signal) => {
-      if (timeoutTimer) {
-        clearTimeout(timeoutTimer);
-      }
-      resolve({ status: timedOut ? "timeout" : exitCode === 0 ? "pass" : "fail", exitCode, signal, stdout, stderr, error: null });
+      finish({
+        status: timedOut ? "timeout" : exitCode === 0 ? "pass" : "fail",
+        exitCode,
+        signal,
+        stdout,
+        stderr,
+        error: null,
+      });
     });
   });
 }
@@ -1375,54 +1406,13 @@ async function runOne(opts, run, outDir) {
     env.CODESTORY_CLI = path.resolve(resolveCodeStoryCli(opts));
   }
   const started = performance.now();
-
-  const result = await new Promise((resolve) => {
-    const child = spawn(command, args, {
-      cwd: repoConfig.path,
-      env,
-      shell: false,
-      stdio: [stdin == null ? "ignore" : "pipe", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let settled = false;
-    let forceKillTimer = null;
-    const timeoutTimer = setTimeout(() => {
-      timedOut = true;
-      stderr += `\nBenchmark runner timed out after ${opts.timeoutMs}ms.\n`;
-      child.kill("SIGTERM");
-      forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 5000);
-    }, opts.timeoutMs);
-
-    function finish(payload) {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timeoutTimer);
-      if (forceKillTimer) {
-        clearTimeout(forceKillTimer);
-      }
-      resolve({ timedOut, ...payload });
-    }
-
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-    if (stdin != null) {
-      child.stdin.end(stdin);
-    }
-    child.on("error", (error) => {
-      finish({ exitCode: null, signal: null, error: error.message, stdout, stderr });
-    });
-    child.on("close", (exitCode, signal) => {
-      finish({ exitCode, signal, error: null, stdout, stderr });
-    });
+  const result = await runProcess(command, args, {
+    cwd: repoConfig.path,
+    env,
+    stdin,
+    timeoutMs: opts.timeoutMs,
+    timeoutMessage: `Benchmark runner timed out after ${opts.timeoutMs}ms.`,
+    forceKillAfterMs: 5000,
   });
 
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
@@ -1442,11 +1432,6 @@ async function runOne(opts, run, outDir) {
   const packetFirstPass =
     !packetFirstRequired || Boolean(analysis.packet_was_first_context_command);
   const quality = scoreQuality(parsed, run.task);
-  const eventTypes = {};
-  for (const event of parsed) {
-    const type = String(event.type ?? event.event ?? "unknown");
-    eventTypes[type] = (eventTypes[type] ?? 0) + 1;
-  }
 
   return {
     repo: run.repo,
@@ -1477,7 +1462,7 @@ async function runOne(opts, run, outDir) {
     packet_first_required: packetFirstRequired,
     packet_first_pass: packetFirstPass,
     quality,
-    event_types: eventTypes,
+    event_types: eventTypeCounts(parsed),
     json_events: parsed.length,
     malformed_stdout_lines: malformed.length,
     stdout_path: stdoutPath,
@@ -1538,6 +1523,10 @@ function eventTypeCounts(events) {
     counts[type] = (counts[type] ?? 0) + 1;
   }
   return counts;
+}
+
+async function writeJsonlRows(filePath, rows) {
+  await writeFile(filePath, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "utf8");
 }
 
 async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
@@ -1627,15 +1616,17 @@ async function reanalyzeAgentRunDirectory(opts) {
     if (blockers.length) {
       console.error("--publishable failed for reanalyzed runs.");
       for (const blocker of blockers) {
-        const result = blocker.result;
-        console.error(
-          `  ${result.repo} ${result.task_id ?? ""} ${result.arm} repeat ${result.repeat}: ${blocker.reasons.join("; ")}; total_tokens=${result.usage?.total_tokens ?? ""} packet_first=${result.packet_first_pass ?? ""} quality=${result.quality?.pass ?? ""}`,
-        );
+        console.error(formatAgentPublishableBlocker(blocker));
       }
       process.exitCode = 1;
     }
   }
   console.log(`reanalyzed ${rows.length} runs in ${runDir}`);
+}
+
+function formatAgentPublishableBlocker(blocker) {
+  const result = blocker.result;
+  return `  ${result.repo} ${result.task_id ?? ""} ${result.arm} repeat ${result.repeat}: ${blocker.reasons.join("; ")}; total_tokens=${result.usage?.total_tokens ?? ""} packet_first=${result.packet_first_pass ?? ""} quality=${result.quality?.pass ?? ""}`;
 }
 
 function resolveCodeStoryCli(opts) {
@@ -1970,14 +1961,34 @@ function packetRuntimeMarkdown(summary) {
     "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ];
   for (const row of summary) {
-    const sufficiency = Object.entries(row.sufficiency_status_counts ?? {})
-      .map(([status, count]) => `${status}:${count}`)
-      .join(", ");
-    lines.push(
-      `| ${row.repo} | ${row.task_id} | ${row.mode} | ${row.runs} | ${row.successful_runs} | ${row.quality_pass_runs} | ${sufficiency} | ${formatValue(row.sufficient_quality_mismatch_runs)} | ${formatValue(row.median_wall_ms)} | ${formatValue(row.median_response_bytes)} | ${formatValue(row.median_packet_bytes)} | ${formatValue(row.median_packet_graph_bytes)} | ${formatValue(row.median_avoid_opening_count)} | ${formatValue(row.median_follow_up_commands_count)} | ${formatPercent(row.median_expected_file_recall)} | ${formatPercent(row.median_citation_coverage)} |`,
-    );
+    lines.push(packetRuntimeMarkdownRow(row));
   }
   return `${lines.join("\n")}\n`;
+}
+
+function packetRuntimeMarkdownRow(row) {
+  const sufficiency = Object.entries(row.sufficiency_status_counts ?? {})
+    .map(([status, count]) => `${status}:${count}`)
+    .join(", ");
+  const cells = [
+    row.repo,
+    row.task_id,
+    row.mode,
+    row.runs,
+    row.successful_runs,
+    row.quality_pass_runs,
+    sufficiency,
+    formatValue(row.sufficient_quality_mismatch_runs),
+    formatValue(row.median_wall_ms),
+    formatValue(row.median_response_bytes),
+    formatValue(row.median_packet_bytes),
+    formatValue(row.median_packet_graph_bytes),
+    formatValue(row.median_avoid_opening_count),
+    formatValue(row.median_follow_up_commands_count),
+    formatPercent(row.median_expected_file_recall),
+    formatPercent(row.median_citation_coverage),
+  ];
+  return `| ${cells.join(" | ")} |`;
 }
 
 function packetRuntimePublishableBlockers(results) {
@@ -1988,6 +1999,17 @@ function packetRuntimePublishableBlockers(results) {
       !row.quality.pass ||
       row.sufficiency?.sufficient_quality_mismatch,
   );
+}
+
+function groupTasksByRepo(tasks) {
+  const byRepo = new Map();
+  for (const task of tasks) {
+    if (!byRepo.has(task.repo)) {
+      byRepo.set(task.repo, []);
+    }
+    byRepo.get(task.repo).push(task);
+  }
+  return byRepo;
 }
 
 async function runPacketRuntimeBenchmark(opts, tasks) {
@@ -2011,19 +2033,12 @@ async function runPacketRuntimeBenchmark(opts, tasks) {
     }
   }
   if (modes.includes("warm-stdio")) {
-    const byRepo = new Map();
-    for (const task of tasks) {
-      if (!byRepo.has(task.repo)) {
-        byRepo.set(task.repo, []);
-      }
-      byRepo.get(task.repo).push(task);
-    }
-    for (const [repoName, repoTasks] of byRepo) {
+    for (const [repoName, repoTasks] of groupTasksByRepo(tasks)) {
       console.log(`packet-runtime warm-stdio ${repoName} tasks=${repoTasks.length} repeats=${opts.repeats}`);
       results.push(...(await runWarmPacketRuntimeGroup(opts, repoName, repoTasks, outDir)));
     }
   }
-  await writeFile(path.join(outDir, "packet-runtime-runs.jsonl"), `${results.map((row) => JSON.stringify(row)).join("\n")}\n`, "utf8");
+  await writeJsonlRows(path.join(outDir, "packet-runtime-runs.jsonl"), results);
   const summary = summarizePacketRuntimeRuns(results);
   const payload = {
     generated_at: new Date().toISOString(),
@@ -2176,9 +2191,7 @@ function markdownSummary(summary, opts) {
     "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ];
   for (const row of summary) {
-    lines.push(
-      `| ${row.repo} | ${row.task_id ?? ""} | ${row.arm} | ${row.runs} | ${row.successful_runs} | ${packetFirstLabel(row)} | ${qualityPassLabel(row)} | ${formatValue(row.median_wall_ms)} | ${formatValue(row.median_total_tokens)} | ${formatValue(row.median_estimated_cost_usd)} | ${formatValue(row.median_tool_calls_observed)} | ${formatValue(row.median_direct_source_reads_total)} | ${formatValue(row.median_source_reads_after_codestory)} | ${formatValue(row.median_source_reads_after_packet)} | ${formatPercent(row.median_expected_file_recall)} | ${formatPercent(row.median_citation_coverage)} |`,
-    );
+    lines.push(markdownSummaryRow(row));
   }
   lines.push(
     "",
@@ -2187,6 +2200,28 @@ function markdownSummary(summary, opts) {
     "",
   );
   return lines.join("\n");
+}
+
+function markdownSummaryRow(row) {
+  const cells = [
+    row.repo,
+    row.task_id ?? "",
+    row.arm,
+    row.runs,
+    row.successful_runs,
+    packetFirstLabel(row),
+    qualityPassLabel(row),
+    formatValue(row.median_wall_ms),
+    formatValue(row.median_total_tokens),
+    formatValue(row.median_estimated_cost_usd),
+    formatValue(row.median_tool_calls_observed),
+    formatValue(row.median_direct_source_reads_total),
+    formatValue(row.median_source_reads_after_codestory),
+    formatValue(row.median_source_reads_after_packet),
+    formatPercent(row.median_expected_file_recall),
+    formatPercent(row.median_citation_coverage),
+  ];
+  return `| ${cells.join(" | ")} |`;
 }
 
 function qualityPassLabel(row) {
@@ -2335,6 +2370,28 @@ function runSelfTest() {
   console.log("self-test passed");
 }
 
+function planAgentRuns(opts, tasks) {
+  const plannedRuns = [];
+  if (tasks.length) {
+    for (const task of tasks) {
+      for (const arm of opts.arms) {
+        for (let repeat = 1; repeat <= opts.repeats; repeat += 1) {
+          plannedRuns.push({ repo: task.repo, arm, repeat, task });
+        }
+      }
+    }
+  } else {
+    for (const repo of opts.repos) {
+      for (const arm of opts.arms) {
+        for (let repeat = 1; repeat <= opts.repeats; repeat += 1) {
+          plannedRuns.push({ repo, arm, repeat, task: null });
+        }
+      }
+    }
+  }
+  return plannedRuns;
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.selfTest) {
@@ -2387,31 +2444,13 @@ async function main() {
   const outDir = path.resolve(opts.outDir ?? path.join(repoRoot, "target", "agent-benchmark", timestamp));
   await mkdir(outDir, { recursive: true });
 
-  const plannedRuns = [];
-  if (tasks.length) {
-    for (const task of tasks) {
-      for (const arm of opts.arms) {
-        for (let repeat = 1; repeat <= opts.repeats; repeat += 1) {
-          plannedRuns.push({ repo: task.repo, arm, repeat, task });
-        }
-      }
-    }
-  } else {
-    for (const repo of opts.repos) {
-      for (const arm of opts.arms) {
-        for (let repeat = 1; repeat <= opts.repeats; repeat += 1) {
-          plannedRuns.push({ repo, arm, repeat, task: null });
-        }
-      }
-    }
-  }
-
+  const plannedRuns = planAgentRuns(opts, tasks);
   const results = [];
   for (const run of plannedRuns) {
     console.log(`running ${run.repo} ${run.arm} repeat ${run.repeat}/${opts.repeats}`);
     const result = await runOne(opts, run, outDir);
     results.push(result);
-    await writeFile(path.join(outDir, "runs.jsonl"), `${results.map((row) => JSON.stringify(row)).join("\n")}\n`, "utf8");
+    await writeJsonlRows(path.join(outDir, "runs.jsonl"), results);
   }
 
   const summary = summarizeRuns(results);
@@ -2454,16 +2493,13 @@ async function main() {
 
   if (opts.publishable) {
     const blockers = agentPublishableBlockers(results, opts);
-    if (blockers.length) {
-      console.error("--publishable failed: every run must pass, report total token usage, pass manifest quality gates when present, run packet first when required, and stay within the post-packet source-read budget.");
-      for (const blocker of blockers) {
-        const result = blocker.result;
-        console.error(
-          `  ${result.repo} ${result.task_id ?? ""} ${result.arm} repeat ${result.repeat}: ${blocker.reasons.join("; ")}; total_tokens=${result.usage?.total_tokens ?? ""} packet_first=${result.packet_first_pass ?? ""} quality=${result.quality?.pass ?? ""}`,
-        );
+      if (blockers.length) {
+        console.error("--publishable failed: every run must pass, report total token usage, pass manifest quality gates when present, run packet first when required, and stay within the post-packet source-read budget.");
+        for (const blocker of blockers) {
+          console.error(formatAgentPublishableBlocker(blocker));
+        }
+        exitCode = 1;
       }
-      exitCode = 1;
-    }
   }
 
   console.log(`wrote ${outDir}`);

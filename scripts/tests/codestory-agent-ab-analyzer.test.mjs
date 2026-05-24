@@ -9,6 +9,11 @@ import {
   scoreQuality,
 } from "../codestory-agent-ab-benchmark.mjs";
 
+const RUNTIME_SERVICE_FILE = "crates/codestory-runtime/src/services.rs";
+const RUN_INDEX_SYMBOL = "IndexService::run_indexing_blocking";
+const RUNTIME_REFRESH_CLAIM =
+  "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases.";
+
 function commandEvent(id, type, command, aggregatedOutput = "", exitCode = 0) {
   return {
     type,
@@ -20,6 +25,29 @@ function commandEvent(id, type, command, aggregatedOutput = "", exitCode = 0) {
       exit_code: type.endsWith(".completed") ? exitCode : null,
       status: type.endsWith(".completed") ? "completed" : "in_progress",
     },
+  };
+}
+
+function agentMessageEvent(text) {
+  return {
+    type: "item.completed",
+    item: {
+      id: "msg_1",
+      type: "agent_message",
+      text,
+    },
+  };
+}
+
+function runtimeQualityTask(id, qualityThresholds) {
+  return {
+    id,
+    task_class: "architecture_explanation",
+    expected_files: [RUNTIME_SERVICE_FILE],
+    expected_symbols: [RUN_INDEX_SYMBOL],
+    expected_claims: [RUNTIME_REFRESH_CLAIM],
+    forbidden_claims: [],
+    quality_thresholds: qualityThresholds,
   };
 }
 
@@ -171,69 +199,44 @@ test("requires packet as the CodeStory subcommand for packet-first telemetry", (
 
 test("scores expected claims without requiring exact wording", () => {
   const events = [
-    {
-      type: "item.completed",
-      item: {
-        id: "msg_1",
-        type: "agent_message",
-        text: "Runtime orchestration opens the workspace and store, chooses full or incremental indexing, and coordinates refresh phases.",
-      },
-    },
+    agentMessageEvent(
+      "Runtime orchestration opens the workspace and store, chooses full or incremental indexing, and coordinates refresh phases.",
+    ),
   ];
 
-  const quality = scoreQuality(events, {
-    id: "claim-fixture",
-    task_class: "architecture_explanation",
-    expected_files: ["crates/codestory-runtime/src/services.rs"],
-    expected_symbols: ["IndexService::run_indexing_blocking"],
-    expected_claims: [
-      "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases.",
-    ],
-    forbidden_claims: [],
-    quality_thresholds: {
+  const quality = scoreQuality(
+    events,
+    runtimeQualityTask("claim-fixture", {
       min_expected_file_recall: 0,
       min_expected_symbol_recall: 0,
       min_expected_claim_recall: 1,
       min_citation_coverage: 0,
       min_expected_anchor_recall: 0,
       max_forbidden_claims: 0,
-    },
-  });
+    }),
+  );
 
   assert.equal(quality.expected_claims.recall, 1);
 });
 
 test("aggregate anchor recall uses fuzzy claim matching", () => {
   const events = [
-    {
-      type: "item.completed",
-      item: {
-        id: "msg_1",
-        type: "agent_message",
-        text:
-          "In crates/codestory-runtime/src/services.rs, IndexService::run_indexing_blocking opens the workspace and store, chooses full or incremental indexing, and coordinates refresh phases.",
-      },
-    },
+    agentMessageEvent(
+      "In crates/codestory-runtime/src/services.rs, IndexService::run_indexing_blocking opens the workspace and store, chooses full or incremental indexing, and coordinates refresh phases.",
+    ),
   ];
 
-  const quality = scoreQuality(events, {
-    id: "aggregate-claim-fixture",
-    task_class: "architecture_explanation",
-    expected_files: ["crates/codestory-runtime/src/services.rs"],
-    expected_symbols: ["IndexService::run_indexing_blocking"],
-    expected_claims: [
-      "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases.",
-    ],
-    forbidden_claims: [],
-    quality_thresholds: {
+  const quality = scoreQuality(
+    events,
+    runtimeQualityTask("aggregate-claim-fixture", {
       min_expected_file_recall: 1,
       min_expected_symbol_recall: 1,
       min_expected_claim_recall: 1,
       min_citation_coverage: 1,
       min_expected_anchor_recall: 1,
       max_forbidden_claims: 0,
-    },
-  });
+    }),
+  );
 
   assert.equal(quality.expected_claims.recall, 1);
   assert.equal(quality.expected_anchors.recall, 1);
