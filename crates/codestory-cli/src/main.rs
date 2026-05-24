@@ -1032,12 +1032,21 @@ fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
         .freshness
         .as_ref()
         .is_some_and(|freshness| freshness.status == IndexFreshnessStatusDto::Stale);
+    let drill_anchors = drill_targeting::validated_drill_anchors(&cmd.anchors, "drill")?;
     let question_search = cmd
         .question
         .as_deref()
-        .map(|question| run_drill_question_search(&runtime, &cmd.output_dir, cmd.format, question))
+        .map(|question| {
+            run_drill_question_search(
+                &runtime,
+                &cmd.output_dir,
+                cmd.format,
+                question,
+                &drill_anchors,
+            )
+        })
         .transpose()?;
-    for anchor in drill_targeting::validated_drill_anchors(&cmd.anchors, "drill")? {
+    for anchor in drill_anchors {
         let anchor_output =
             run_drill_anchor(&runtime, &opened, &cmd.output_dir, cmd.format, &anchor)?;
         all_verification_targets.extend(anchor_output.verification_targets.iter().cloned());
@@ -2599,11 +2608,13 @@ fn run_drill_question_search(
     output_dir: &std::path::Path,
     format: args::OutputFormat,
     question: &str,
+    anchors: &[String],
 ) -> Result<DrillCommandStatusOutput> {
+    let query = drill_question_search_query(question, anchors);
     let search_results = runtime
         .browser
         .search_results(SearchRequest {
-            query: question.to_string(),
+            query,
             repo_text: SearchRepoTextMode::On,
             limit_per_source: 10,
             expand_search_plan: true,
@@ -2621,6 +2632,13 @@ fn run_drill_question_search(
         &search_output,
         search_markdown,
     ))
+}
+
+fn drill_question_search_query(question: &str, anchors: &[String]) -> String {
+    if anchors.is_empty() {
+        return question.to_string();
+    }
+    format!("{question}\nSeed anchors: {}", anchors.join(", "))
 }
 
 fn run_drill_bridges(

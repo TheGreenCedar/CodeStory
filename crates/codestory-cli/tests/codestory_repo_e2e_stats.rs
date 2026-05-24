@@ -622,9 +622,10 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
         ],
     );
 
+    let reported_case_file = PathBuf::from(string_field(&suite_json, &["case_file"]));
     assert_eq!(
-        string_field(&suite_json, &["case_file"]),
-        manifest_path.display().to_string()
+        reported_case_file, manifest_path,
+        "suite should report the configured case file path"
     );
     assert_eq!(u64_field(&suite_json, &["repo_count"]), cases.len() as u64);
     assert_eq!(

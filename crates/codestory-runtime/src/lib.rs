@@ -1252,10 +1252,43 @@ fn search_plan_subqueries(
             SearchPlanChannelDto::Lexical,
         ],
     );
+    push_search_plan_seed_anchor_subqueries(&mut subqueries, &mut seen, query);
     push_search_plan_symbol_term_subquery(&mut subqueries, &mut seen, terms);
     push_search_plan_role_subqueries(&mut subqueries, &mut seen, terms);
     push_search_plan_fallback_subquery(&mut subqueries, &mut seen, terms);
     subqueries
+}
+
+fn push_search_plan_seed_anchor_subqueries(
+    subqueries: &mut Vec<SearchPlanSubqueryDto>,
+    seen: &mut HashSet<String>,
+    query: &str,
+) {
+    for anchor in search_plan_seed_anchor_terms(query).into_iter().take(5) {
+        push_search_plan_subquery(
+            subqueries,
+            seen,
+            anchor,
+            "named_anchor",
+            vec![
+                SearchPlanChannelDto::TypedSymbol,
+                SearchPlanChannelDto::Lexical,
+            ],
+        );
+    }
+}
+
+fn search_plan_seed_anchor_terms(query: &str) -> Vec<String> {
+    const MARKER: &str = "Seed anchors:";
+    query
+        .split(MARKER)
+        .skip(1)
+        .map(|rest| rest.lines().next().unwrap_or(rest))
+        .flat_map(|anchors| anchors.split(','))
+        .map(str::trim)
+        .filter(|anchor| !anchor.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn push_search_plan_symbol_term_subquery(
@@ -8913,6 +8946,31 @@ pub fn exact_symbol_anchor() {{}}
             assert!(
                 typed_anchor_terms.contains(expected),
                 "typed anchor subquery should prioritize named anchors; got `{typed_anchor_terms}`"
+            );
+        }
+    }
+
+    #[test]
+    fn search_plan_preserves_seed_anchor_line_exactly() {
+        let query = "Explain how a full indexing run moves through the runtime. Seed anchors: run_index, IndexService::run_indexing_blocking, WorkspaceIndexer::run";
+        let intents = architecture_query_intents(query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(!intents.is_empty(), "query should have architecture intent");
+
+        let terms = search_plan_terms(query);
+        let subqueries = search_plan_subqueries(query, &terms, &intents);
+        for expected in [
+            "run_index",
+            "IndexService::run_indexing_blocking",
+            "WorkspaceIndexer::run",
+        ] {
+            assert!(
+                subqueries
+                    .iter()
+                    .any(|subquery| subquery.role == "named_anchor" && subquery.query == expected),
+                "expected exact seed-anchor subquery for `{expected}`: {subqueries:#?}"
             );
         }
     }
