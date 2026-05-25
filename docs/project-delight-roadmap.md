@@ -21,6 +21,9 @@ These capabilities are represented in the current CLI/runtime surface:
 - `symbol`, `trail`, `snippet`, and `explore` support focused navigation around
   concrete targets.
 - `context` builds a DB-first evidence bundle around one concrete target.
+- `drill` and `drill-suite` turn a realistic codebase question into an evidence
+  packet, source-truth checklist, optional claim ledger, expected-file recall,
+  and separate mechanical versus answer-quality verdicts.
 - `serve --stdio` exposes the read surface for repeated agent queries.
 
 ## Next
@@ -31,20 +34,29 @@ to trust and harder to misuse:
 1. **Make target-context packets sharper**
    - Improve `context` so it gathers the right neighborhood around one target
      with fewer manual hops.
-   - Keep it target-first; broad open-ended questions belong in `packet`.
+   - Keep it target-first; broad open-ended questions belong in `packet` or a
+     `drill`/`drill-suite` run that records source-truth verification.
 
-2. **Make retrieval explanations more useful**
+2. **Make answer-quality gates harder to bypass**
+   - Treat source-truth correction counts as product evidence, not test noise.
+   - Keep `drill-suite --ledger` as the repeatable loop for proving whether a
+     CodeStory-only draft survived focused source reads.
+   - A green index/build is not enough; final-answer status must stay pending or
+     degraded until claim classifications prove no misleading or unsupported
+     claims remain.
+
+3. **Make retrieval explanations more useful**
    - Keep improving `--why` output for lexical, semantic, graph, fallback, and
      freshness signals.
    - The goal is to show why a result appeared and when not to trust it.
 
-3. **Improve repository navigation**
+4. **Improve repository navigation**
    - Keep hardening `explore`, definition, references, symbol browsing, trails,
      and snippets before adding a separate web UI.
    - A new surface should be added only when it solves a workflow that the
      current surfaces do not.
 
-4. **Simplify setup**
+5. **Simplify setup**
    - Managed embeddings, profile selection, and fallback messaging should make
      first use clear.
    - If the model path, backend, or doc shape is stale, `doctor` should say so

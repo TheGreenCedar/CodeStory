@@ -6,10 +6,11 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ResolutionRank {
+    collection_definition_path: u8,
+    concrete_exact_anchor: u8,
     exact_display: u8,
     exact_terminal: u8,
     exact_leading: u8,
-    collection_definition_path: u8,
     exact_case_match: u8,
     source_truth_bucket: u8,
     inexact_query_prefix_match: u8,
@@ -45,10 +46,11 @@ pub(crate) fn resolution_rank_with_project_root(
     let rank = symbol_name_match_rank(query, &hit.display_name);
 
     ResolutionRank {
+        collection_definition_path: collection_definition_path_bucket(query, hit),
+        concrete_exact_anchor: concrete_exact_anchor_bucket(query, hit),
         exact_display: rank.exact_display,
         exact_terminal: rank.exact_terminal,
         exact_leading: rank.exact_leading,
-        collection_definition_path: collection_definition_path_bucket(query, hit),
         exact_case_match: exact_case_match_bucket(query, hit),
         source_truth_bucket: source_truth_bucket(hit),
         inexact_query_prefix_match: inexact_query_prefix_match_bucket(query, hit),
@@ -167,6 +169,33 @@ fn exact_case_match_bucket(query: &str, hit: &SearchHit) -> u8 {
         return 1;
     }
     0
+}
+
+fn concrete_exact_anchor_bucket(query: &str, hit: &SearchHit) -> u8 {
+    let rank = symbol_name_match_rank(query, &hit.display_name);
+    if rank.exact_display == 0 && rank.exact_terminal == 0 && rank.exact_leading == 0 {
+        return 0;
+    }
+
+    match hit.kind {
+        NodeKind::STRUCT
+        | NodeKind::CLASS
+        | NodeKind::INTERFACE
+        | NodeKind::ANNOTATION
+        | NodeKind::ENUM
+        | NodeKind::UNION
+        | NodeKind::TYPEDEF => 4,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO => 3,
+        NodeKind::GLOBAL_VARIABLE | NodeKind::CONSTANT => 2,
+        NodeKind::FIELD | NodeKind::VARIABLE | NodeKind::ENUM_CONSTANT => 1,
+        NodeKind::MODULE
+        | NodeKind::NAMESPACE
+        | NodeKind::PACKAGE
+        | NodeKind::FILE
+        | NodeKind::TYPE_PARAMETER
+        | NodeKind::BUILTIN_TYPE
+        | NodeKind::UNKNOWN => 0,
+    }
 }
 
 fn terminal_segment_raw(value: &str) -> &str {
@@ -573,6 +602,13 @@ mod tests {
             0.95,
             "src/payload-generated-schema.ts",
         );
+        let generated_interface = hit(
+            "generated_interface",
+            "Posts",
+            NodeKind::INTERFACE,
+            0.95,
+            "src/payload-types.ts",
+        );
         let script_field = hit(
             "script_field",
             "posts",
@@ -589,6 +625,7 @@ mod tests {
         );
         let mut hits = [
             generated_field,
+            generated_interface,
             script_field,
             preview_field,
             collection.clone(),
@@ -599,6 +636,32 @@ mod tests {
         assert_eq!(
             hits.first().map(|hit| &hit.node_id),
             Some(&collection.node_id)
+        );
+    }
+
+    #[test]
+    fn exact_architecture_anchor_prefers_concrete_symbol_over_module_export() {
+        let module_export = hit(
+            "module_export",
+            "SearchService",
+            NodeKind::MODULE,
+            0.95,
+            "crates/codestory-runtime/src/lib.rs",
+        );
+        let concrete = hit(
+            "concrete",
+            "codestory_runtime::services::SearchService",
+            NodeKind::STRUCT,
+            0.60,
+            "crates/codestory-runtime/src/search.rs",
+        );
+        let mut hits = [module_export, concrete.clone()];
+
+        hits.sort_by(|left, right| compare_resolution_hits("SearchService", left, right));
+
+        assert_eq!(
+            hits.first().map(|hit| &hit.node_id),
+            Some(&concrete.node_id)
         );
     }
 

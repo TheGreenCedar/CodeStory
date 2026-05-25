@@ -26,6 +26,17 @@ The fixture verifies:
 - expected file, symbol, claim, and citation recall;
 - missed anchors as quality evidence, separate from operational run status.
 
+`drill-suite` answer-quality ledgers are the repo-grounded counterpart to this
+transcript scorer. Use the transcript harness to check how an agent behaved; use
+`drill-suite --ledger <file>` to merge focused source-truth classifications back
+into a real-repo evidence packet. Ledger claim classifications are `correct`,
+`partial`, `misleading`, and `unsupported`, and the suite keeps the final
+answer-quality verdict separate from green index/build mechanics.
+
+For source-truth recall, `drill` now feeds the broad question search and bounded
+supplemental searches into the verification target list. Treat those targets as
+candidate files for verification, not as final answer support.
+
 Keep `node .\scripts\codestory-agent-ab-benchmark.mjs --list` as the cheapest
 configuration smoke check.
 

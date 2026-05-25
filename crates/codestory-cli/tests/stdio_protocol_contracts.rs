@@ -1298,6 +1298,17 @@ fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
         .expect("remove indexed file after indexing");
 
     let mut server = spawn_stdio_server(&fixture);
+    let warmup = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-freshness-warmup",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    assert_success_envelope(&warmup, json!("status-freshness-warmup"));
+
     let mut elapsed = Vec::new();
     let mut last_status = Value::Null;
     for index in 0..12 {

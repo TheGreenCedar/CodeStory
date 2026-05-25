@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 const RECOMMENDED_QUERY_LIMIT: usize = 5;
+const FUNCTION_BODY_FALLBACK_MAX_SCAN_LINES: usize = 400;
+const FUNCTION_BODY_FALLBACK_BRACE_SEARCH_LINES: usize = 40;
 
 #[derive(Debug, Clone, Copy)]
 struct GroundingBudgetConfig {
@@ -987,6 +989,9 @@ impl AppController {
             requested_context: context_lines as u32,
             snippet_truncated: bounded.truncated,
             max_snippet_bytes: Some(crate::DIRECT_SNIPPET_MAX_BYTES as u32),
+            range_source: None,
+            fallback_reason: None,
+            truncation_guidance: snippet_truncation_guidance(bounded.truncated, context_lines),
         })
     }
 
@@ -1011,15 +1016,56 @@ impl AppController {
                     "Symbol has no source line; use occurrences or a child method before requesting a snippet.",
                 )
             })?;
-        let Some(end_line) = node.end_line.filter(|end| *end >= line) else {
-            return self.snippet_context(node.id.clone(), context_lines);
+        let range = match node.end_line.filter(|end| *end >= line) {
+            Some(end_line) if end_line > line => Some(FunctionBodyRange {
+                end_line,
+                range_source: "indexed_symbol_range",
+                fallback_reason: None,
+            }),
+            Some(end_line) => {
+                match self.brace_balanced_function_body_end_line(&path, line)? {
+                    Some(fallback_end_line) if fallback_end_line > end_line => {
+                        Some(FunctionBodyRange {
+                            end_line: fallback_end_line,
+                            range_source: "brace_balanced_fallback",
+                            fallback_reason: Some(format!(
+                                "indexed function-body range ended at line {end_line}; expanded with bounded brace-balanced fallback"
+                            )),
+                        })
+                    }
+                    _ => Some(FunctionBodyRange {
+                        end_line,
+                        range_source: "indexed_symbol_range",
+                        fallback_reason: None,
+                    }),
+                }
+            }
+            None => self
+                .brace_balanced_function_body_end_line(&path, line)?
+                .map(|end_line| FunctionBodyRange {
+                    end_line,
+                    range_source: "brace_balanced_fallback",
+                    fallback_reason: Some(
+                        "indexed function-body range was unavailable; inferred a bounded brace-balanced range"
+                            .to_string(),
+                    ),
+                }),
+        };
+        let Some(range) = range else {
+            let mut context = self.snippet_context(node.id.clone(), context_lines)?;
+            context.fallback_reason = Some(
+                "function-body range was unavailable and brace-balanced fallback did not find a supported body; fell back to line_context"
+                    .to_string(),
+            );
+            context.range_source = Some("line_context".to_string());
+            return Ok(context);
         };
         let (path, bounded) = self.bounded_file_snippet_range(
             &path,
             crate::BoundedSnippetRangeOptions {
                 focus_line: line,
                 start_line: line,
-                end_line,
+                end_line: range.end_line,
                 context_lines,
                 max_bytes: crate::DIRECT_SNIPPET_MAX_BYTES,
                 truncation_suffix: crate::DIRECT_SNIPPET_TRUNCATION_SUFFIX,
@@ -1035,7 +1081,153 @@ impl AppController {
             requested_context: context_lines as u32,
             snippet_truncated: bounded.truncated,
             max_snippet_bytes: Some(crate::DIRECT_SNIPPET_MAX_BYTES as u32),
+            range_source: Some(range.range_source.to_string()),
+            fallback_reason: range.fallback_reason,
+            truncation_guidance: snippet_truncation_guidance(bounded.truncated, context_lines),
         })
+    }
+
+    fn brace_balanced_function_body_end_line(
+        &self,
+        path: &str,
+        start_line: u32,
+    ) -> Result<Option<u32>, ApiError> {
+        if !path_supports_brace_balanced_function_fallback(path) {
+            return Ok(None);
+        }
+        let source = self.read_file_text(codestory_contracts::api::ReadFileTextRequest {
+            path: path.to_string(),
+        })?;
+        Ok(brace_balanced_body_end_line(&source.text, start_line))
+    }
+}
+
+struct FunctionBodyRange {
+    end_line: u32,
+    range_source: &'static str,
+    fallback_reason: Option<String>,
+}
+
+fn snippet_truncation_guidance(truncated: bool, context_lines: usize) -> Option<String> {
+    truncated.then(|| {
+        format!(
+            "rerun with a smaller --context than {context_lines}, choose a narrower symbol, or use source verification for the omitted tail"
+        )
+    })
+}
+
+fn path_supports_brace_balanced_function_fallback(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "ts" | "tsx"
+                    | "js"
+                    | "jsx"
+                    | "rs"
+                    | "c"
+                    | "cc"
+                    | "cpp"
+                    | "cxx"
+                    | "h"
+                    | "hh"
+                    | "hpp"
+                    | "hxx"
+                    | "java"
+                    | "cs"
+                    | "go"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn brace_balanced_body_end_line(source: &str, start_line: u32) -> Option<u32> {
+    let start_index = start_line.checked_sub(1)? as usize;
+    let mut depth = 0usize;
+    let mut saw_opening_brace = false;
+    let mut in_block_comment = false;
+
+    for (offset, line) in source
+        .lines()
+        .enumerate()
+        .skip(start_index)
+        .take(FUNCTION_BODY_FALLBACK_MAX_SCAN_LINES)
+    {
+        scan_braces_in_line(
+            line,
+            &mut depth,
+            &mut saw_opening_brace,
+            &mut in_block_comment,
+        );
+        if saw_opening_brace && depth == 0 {
+            return Some((offset + 1) as u32);
+        }
+        if !saw_opening_brace
+            && offset.saturating_sub(start_index) >= FUNCTION_BODY_FALLBACK_BRACE_SEARCH_LINES
+        {
+            return None;
+        }
+    }
+    None
+}
+
+fn scan_braces_in_line(
+    line: &str,
+    depth: &mut usize,
+    saw_opening_brace: &mut bool,
+    in_block_comment: &mut bool,
+) {
+    let mut chars = line.chars().peekable();
+    let mut string_delimiter: Option<char> = None;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if *in_block_comment {
+            if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                *in_block_comment = false;
+            }
+            continue;
+        }
+        if let Some(delimiter) = string_delimiter {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == delimiter {
+                string_delimiter = None;
+            }
+            continue;
+        }
+        if ch == '/' {
+            match chars.peek() {
+                Some('/') => break,
+                Some('*') => {
+                    chars.next();
+                    *in_block_comment = true;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if matches!(ch, '"' | '\'' | '`') {
+            string_delimiter = Some(ch);
+            continue;
+        }
+        if ch == '{' {
+            *saw_opening_brace = true;
+            *depth = depth.saturating_add(1);
+            continue;
+        }
+        if ch == '}' && *saw_opening_brace {
+            *depth = depth.saturating_sub(1);
+        }
     }
 }
 
@@ -1292,6 +1484,127 @@ mod tests {
         assert!(snippet.snippet.contains("payload.create()"));
         assert!(!snippet.snippet.contains("fn before()"));
         assert!(!snippet.snippet.contains("fn after()"));
+    }
+
+    #[test]
+    fn function_body_snippet_uses_brace_balanced_fallback_when_range_is_missing() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        let source_path = temp
+            .path()
+            .join("src")
+            .join("app")
+            .join("api")
+            .join("comments")
+            .join("route.ts");
+        std::fs::create_dir_all(source_path.parent().expect("route parent"))
+            .expect("create route parent");
+        std::fs::write(
+            &source_path,
+            "import { getPayload } from 'payload';\n\nexport async function POST(request: Request) {\n    const payload = await getPayload();\n    const existing = await payload.find({ collection: 'comments' });\n    if (!existing.totalDocs) {\n        const saved = await payload.create({ collection: 'comments', data: { body: 'ok' } });\n        return Response.json(saved);\n    }\n    return Response.json({ ok: true });\n}\n\nexport function helper() { return null; }\n",
+        )
+        .expect("write route");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            insert_file_node(
+                &mut storage,
+                11,
+                &source_path,
+                Node {
+                    id: CoreNodeId(101),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "POST".to_string(),
+                    file_node_id: Some(CoreNodeId(11)),
+                    start_line: Some(3),
+                    end_line: None,
+                    ..Default::default()
+                },
+            )
+            .expect("insert function");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+
+        let snippet = controller
+            .snippet_function_body_context(codestory_contracts::api::NodeId("101".to_string()), 0)
+            .expect("function body snippet");
+
+        assert_eq!(
+            snippet.scope,
+            codestory_contracts::api::SnippetScopeDto::FunctionBody
+        );
+        assert_eq!(
+            snippet.range_source.as_deref(),
+            Some("brace_balanced_fallback")
+        );
+        assert!(
+            snippet.fallback_reason.as_deref().is_some_and(
+                |reason| reason.contains("indexed function-body range was unavailable")
+            )
+        );
+        assert!(snippet.snippet.contains("payload.find"));
+        assert!(snippet.snippet.contains("payload.create"));
+        assert!(!snippet.snippet.contains("helper"));
+    }
+
+    #[test]
+    fn function_body_snippet_reports_line_context_fallback_when_body_is_unavailable() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        let source_path = temp.path().join("src").join("route.ts");
+        std::fs::create_dir_all(source_path.parent().expect("src parent")).expect("create src");
+        std::fs::write(
+            &source_path,
+            "export const POST = makeHandler(payload.create);\n",
+        )
+        .expect("write route");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            insert_file_node(
+                &mut storage,
+                11,
+                &source_path,
+                Node {
+                    id: CoreNodeId(101),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "POST".to_string(),
+                    file_node_id: Some(CoreNodeId(11)),
+                    start_line: Some(1),
+                    end_line: None,
+                    ..Default::default()
+                },
+            )
+            .expect("insert function");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+
+        let snippet = controller
+            .snippet_function_body_context(codestory_contracts::api::NodeId("101".to_string()), 0)
+            .expect("line context fallback");
+
+        assert_eq!(
+            snippet.scope,
+            codestory_contracts::api::SnippetScopeDto::LineContext
+        );
+        assert_eq!(snippet.range_source.as_deref(), Some("line_context"));
+        assert!(
+            snippet
+                .fallback_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("fell back to line_context"))
+        );
+        assert!(snippet.snippet.contains("payload.create"));
     }
 
     #[test]

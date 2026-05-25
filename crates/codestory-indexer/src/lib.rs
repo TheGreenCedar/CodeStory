@@ -4394,6 +4394,7 @@ struct PayloadCollectionRegistration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PayloadCollectionUsage {
     slug: String,
+    operation: String,
     line: u32,
     col: u32,
 }
@@ -6836,6 +6837,10 @@ fn append_payload_collection_symbols(
             line: Some(usage.line),
             certainty: Some(ResolutionCertainty::Probable),
             confidence: Some(0.65),
+            callsite_identity: Some(format!(
+                "payload:{}:{}:{}:{}",
+                usage.operation, usage.slug, usage.line, usage.col
+            )),
             ..Default::default()
         };
         if edge.kind == EdgeKind::CALL && !flags.legacy_edge_identity {
@@ -7357,44 +7362,85 @@ fn collect_payload_collection_usages(source: &str) -> Vec<PayloadCollectionUsage
     let mut usages = Vec::new();
     let mut seen = HashSet::new();
     let lines = source.lines().collect::<Vec<_>>();
-    let mut pending_payload_call_lines = 0u8;
+    let mut pending_payload_call: Option<(&'static str, u8)> = None;
     for (line_index, line) in lines.iter().enumerate() {
         let code = code_before_line_comment(line);
-        if starts_payload_collection_call(code) {
-            pending_payload_call_lines = 16;
+        if let Some(operation) = payload_collection_call_operation(code) {
+            pending_payload_call = Some((operation, 16));
         }
 
         let trimmed = code.trim();
-        if pending_payload_call_lines == 0 || !trimmed.contains("collection") {
-            if pending_payload_call_lines > 0 {
-                pending_payload_call_lines =
-                    update_pending_payload_call(pending_payload_call_lines, code);
-            }
+        let Some((operation, remaining)) = pending_payload_call else {
+            continue;
+        };
+        if !trimmed.contains("collection") {
+            let updated = update_pending_payload_call(remaining, code);
+            pending_payload_call = if updated == 0 {
+                None
+            } else {
+                Some((operation, updated))
+            };
             continue;
         }
 
         let Some((slug, value_line, col)) =
             quoted_value_after_key_across_lines(&lines, line_index, "collection")
         else {
-            pending_payload_call_lines =
-                update_pending_payload_call(pending_payload_call_lines, code);
+            let updated = update_pending_payload_call(remaining, code);
+            pending_payload_call = if updated == 0 {
+                None
+            } else {
+                Some((operation, updated))
+            };
             continue;
         };
         if slug.trim().is_empty() {
-            pending_payload_call_lines =
-                update_pending_payload_call(pending_payload_call_lines, code);
+            let updated = update_pending_payload_call(remaining, code);
+            pending_payload_call = if updated == 0 {
+                None
+            } else {
+                Some((operation, updated))
+            };
             continue;
         }
-        if seen.insert((slug.clone(), value_line, col)) {
+        if seen.insert((slug.clone(), operation.to_string(), value_line, col)) {
             usages.push(PayloadCollectionUsage {
                 slug,
+                operation: operation.to_string(),
                 line: value_line,
                 col,
             });
         }
-        pending_payload_call_lines = update_pending_payload_call(pending_payload_call_lines, code);
+        let updated = update_pending_payload_call(remaining, code);
+        pending_payload_call = if updated == 0 {
+            None
+        } else {
+            Some((operation, updated))
+        };
     }
     usages
+}
+
+fn payload_collection_call_operation(line: &str) -> Option<&'static str> {
+    let compact = compact_lowercase(line);
+    [
+        ("payload.find(", "find"),
+        ("payload.findbyid(", "find_by_id"),
+        ("payload.create(", "create"),
+        ("payload.update(", "update"),
+        ("payload.delete(", "delete"),
+        ("payload.count(", "count"),
+        ("payload.restoreversion(", "restore_version"),
+        ("payload.deleteversion(", "delete_version"),
+        ("req.payload.find(", "find"),
+        ("req.payload.findbyid(", "find_by_id"),
+        ("req.payload.create(", "create"),
+        ("req.payload.update(", "update"),
+        ("req.payload.delete(", "delete"),
+        ("req.payload.count(", "count"),
+    ]
+    .iter()
+    .find_map(|(needle, operation)| compact.contains(needle).then_some(*operation))
 }
 
 fn starts_payload_collection_config_block(line: &str) -> bool {
@@ -7424,28 +7470,6 @@ fn quoted_value_after_key_in_block(
         }
     }
     None
-}
-
-fn starts_payload_collection_call(line: &str) -> bool {
-    let compact = compact_lowercase(line);
-    [
-        "payload.find(",
-        "payload.findbyid(",
-        "payload.create(",
-        "payload.update(",
-        "payload.delete(",
-        "payload.count(",
-        "payload.restoreversion(",
-        "payload.deleteversion(",
-        "req.payload.find(",
-        "req.payload.findbyid(",
-        "req.payload.create(",
-        "req.payload.update(",
-        "req.payload.delete(",
-        "req.payload.count(",
-    ]
-    .iter()
-    .any(|needle| compact.contains(needle))
 }
 
 fn update_pending_payload_call(remaining: u8, line: &str) -> u8 {
@@ -11371,6 +11395,10 @@ export default async function Page() {
                 && edge.source == loader.id
                 && edge.target == collection.id
                 && edge.certainty == Some(ResolutionCertainty::Probable)
+                && edge
+                    .callsite_identity
+                    .as_deref()
+                    .is_some_and(|identity| identity.starts_with("payload:find:posts:"))
         }));
         assert!(result.occurrences.iter().any(|occurrence| {
             occurrence.element_id == collection.id.0
@@ -11421,9 +11449,16 @@ export async function loadWriting(payload: any) {
         let usages = collect_payload_collection_usages(code);
         let used = usages
             .iter()
-            .map(|usage| usage.slug.as_str())
+            .map(|usage| (usage.slug.as_str(), usage.operation.as_str()))
             .collect::<Vec<_>>();
-        assert_eq!(used, vec!["posts", "articles", "comments"]);
+        assert_eq!(
+            used,
+            vec![
+                ("posts", "find"),
+                ("articles", "find"),
+                ("comments", "create")
+            ]
+        );
     }
 
     #[test]

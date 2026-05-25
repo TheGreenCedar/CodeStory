@@ -17,6 +17,9 @@ single heuristic hit.
   parser-backed handler links exist.
 - Existing OpenAPI endpoint indexing remains separate and should continue to
   produce endpoint symbols and speculative client-call edges.
+- Payload collection config and usage extraction is tracked as data bridge
+  evidence. Usage edges preserve operation metadata such as `find`, `create`,
+  `update`, `delete`, and `count` in edge callsite identity.
 
 ## Support Status
 
@@ -55,18 +58,21 @@ be checked with `files --path <fragment>` or a fresh index.
 2. Assert route node label, method, path, confidence, and file membership.
 3. Assert handler links only when existing graph evidence can resolve the
    handler.
-4. Run `codestory-cli files --project <fixture> --format json` and inspect
+4. For data bridge work, assert collection registration nodes, operation-aware
+   usage edges, and the relevant `payload:<operation>:<slug>:...` callsite
+   identity.
+5. Run `codestory-cli files --project <fixture> --format json` and inspect
    `summary.framework_route_coverage` for framework, language, status,
    fixture status, confidence floor, handler-link support, unsupported
    patterns, known gaps, and promotable status.
-5. Run `cargo test -p codestory-indexer --lib framework_route`.
-6. Run the search-quality eval harness when route names should be discoverable:
+6. Run `cargo test -p codestory-indexer --lib framework_route`.
+7. Run the search-quality eval harness when route names should be discoverable:
 
    ```
    cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
    ```
 
-7. For broader claims, probe at least one real repo or representative sample and
+8. For broader claims, probe at least one real repo or representative sample and
    record any unsupported syntax as partial coverage.
 
 ## Reporting Rules
@@ -75,6 +81,8 @@ be checked with `files --path <fragment>` or a fresh index.
 - Say `partial` or `heuristic` when handler resolution is not proven.
 - Say `route node plus handler edge` only when a test or real probe shows the
   edge.
+- Say `data_collection_usage` only when the graph path includes Payload
+  collection nodes or operation-aware usage edges.
 - Keep unsupported framework syntax visible in coverage notes, docs, or tests
   rather than treating absence as success.
 - Mark the framework `non-promotable` when required fixtures fail, a known gap

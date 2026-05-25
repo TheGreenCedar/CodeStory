@@ -300,7 +300,12 @@ pub enum SearchPlanBridgeConfidenceDto {
 pub enum SearchPlanBridgeEvidenceKindDto {
     SameAnchor,
     GraphPath,
+    FrameworkRoute,
+    ComponentUsage,
+    DataCollectionUsage,
     SharedFile,
+    RepoTextHint,
+    SourceTruthOnly,
     IsolatedAnchors,
 }
 
@@ -518,9 +523,32 @@ pub struct FrameworkRouteCoverageDto {
     pub promotable: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AffectedChangeKindDto {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    Untracked,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedChangeRecordDto {
+    pub path: String,
+    pub kind: AffectedChangeKindDto,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AffectedAnalysisRequest {
     pub changed_paths: Vec<String>,
+    #[serde(default)]
+    pub change_records: Vec<AffectedChangeRecordDto>,
     #[serde(default)]
     pub depth: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -549,6 +577,12 @@ pub struct AffectedMatchedFileDto {
     pub role: IndexedFileRoleDto,
     pub indexed: bool,
     pub complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_kind: Option<AffectedChangeKindDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
     #[serde(default)]
     pub error_count: u32,
 }
@@ -557,6 +591,12 @@ pub struct AffectedMatchedFileDto {
 pub struct AffectedUnmatchedPathDto {
     pub path: String,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_kind: Option<AffectedChangeKindDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -590,6 +630,8 @@ pub struct AffectedTestFileDto {
 pub struct AffectedAnalysisDto {
     pub project_root: String,
     pub changed_paths: Vec<String>,
+    #[serde(default)]
+    pub change_records: Vec<AffectedChangeRecordDto>,
     #[serde(default)]
     pub matched_files: Vec<AffectedMatchedFileDto>,
     #[serde(default)]
@@ -1053,6 +1095,12 @@ pub struct SnippetContextDto {
     pub snippet_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_snippet_bytes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_guidance: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

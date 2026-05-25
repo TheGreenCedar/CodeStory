@@ -1,21 +1,22 @@
 use codestory_contracts::api::{
-    AffectedAnalysisDto, AffectedAnalysisRequest, AffectedMatchedFileDto, AffectedRouteDto,
-    AffectedSymbolDto, AffectedTestFileDto, AffectedUnmatchedPathDto, AgentAnswerDto,
-    AgentAskRequest, AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError,
-    AppEventPayload, BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest,
-    CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest, EmbeddingProfileContractDto,
-    FrameworkRouteCoverageDto, GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse,
-    GroundingBudgetDto, GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingSnapshotDto,
-    GroundingSymbolDigestDto, IndexDryRunDto, IndexFreshnessChangeKindDto, IndexFreshnessDto,
-    IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexMode, IndexedFileDto,
-    IndexedFileLanguageCountDto, IndexedFileRoleDto, IndexedFilesDto, IndexedFilesRequest,
-    IndexedFilesSummaryDto, IndexingPhaseTimings, ListChildrenSymbolsRequest,
-    ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
-    NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
-    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
-    RouteEndpointHandlerDto, RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit,
-    SearchHitOrigin, SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
+    AffectedAnalysisDto, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
+    AffectedMatchedFileDto, AffectedRouteDto, AffectedSymbolDto, AffectedTestFileDto,
+    AffectedUnmatchedPathDto, AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto,
+    AgentPacketDto, AgentPacketRequestDto, ApiError, AppEventPayload, BookmarkCategoryDto,
+    BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind,
+    EdgeOccurrencesRequest, EmbeddingProfileContractDto, FrameworkRouteCoverageDto, GraphEdgeDto,
+    GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto,
+    GroundingFileDigestDto, GroundingSnapshotDto, GroundingSymbolDigestDto, IndexDryRunDto,
+    IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessSampleDto,
+    IndexFreshnessStatusDto, IndexMode, IndexedFileDto, IndexedFileLanguageCountDto,
+    IndexedFileRoleDto, IndexedFilesDto, IndexedFilesRequest, IndexedFilesSummaryDto,
+    IndexingPhaseTimings, ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess,
+    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest,
+    OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest, ProjectSummary,
+    ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
+    RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, RouteEndpointHandlerDto,
+    RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
+    SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
     SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
     SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
     SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
@@ -203,6 +204,59 @@ struct AffectedGraphEvidence {
     distance: u32,
     reason: String,
     confidence: String,
+}
+
+fn normalized_affected_change_records(
+    req: &AffectedAnalysisRequest,
+) -> Vec<AffectedChangeRecordDto> {
+    if !req.change_records.is_empty() {
+        return req.change_records.clone();
+    }
+    req.changed_paths
+        .iter()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| AffectedChangeRecordDto {
+            path: path.trim().to_string(),
+            kind: AffectedChangeKindDto::Unknown,
+            status: "path".to_string(),
+            previous_path: None,
+        })
+        .collect()
+}
+
+fn affected_change_record_keys(record: &AffectedChangeRecordDto) -> Vec<String> {
+    let mut keys = Vec::new();
+    let path = normalize_path_key(&record.path);
+    if !path.is_empty() {
+        keys.push(path);
+    }
+    if let Some(previous_path) = record.previous_path.as_deref() {
+        let previous = normalize_path_key(previous_path);
+        if !previous.is_empty() {
+            keys.push(previous);
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn affected_unmatched_reason(record: &AffectedChangeRecordDto) -> String {
+    match record.kind {
+        AffectedChangeKindDto::Deleted => {
+            "deleted path did not match any indexed file; the index may already be stale or the path was never indexed"
+                .to_string()
+        }
+        AffectedChangeKindDto::Renamed | AffectedChangeKindDto::Copied => {
+            "renamed/copied path did not match current or previous indexed file path; reindex if the file moved"
+                .to_string()
+        }
+        AffectedChangeKindDto::Untracked => {
+            "untracked path is not in the index yet; run index --refresh incremental before graph traversal"
+                .to_string()
+        }
+        _ => "path did not match any indexed file; reindex or pass repo-relative paths".to_string(),
+    }
 }
 
 fn affected_edge_kind_label(kind: codestory_contracts::graph::EdgeKind) -> &'static str {
@@ -2027,6 +2081,46 @@ fn graph_response_has_bridge(
     graph.nodes.iter().any(|node| node.id == *from)
         && graph.nodes.iter().any(|node| node.id == *to)
         && !graph.edges.is_empty()
+}
+
+fn graph_bridge_evidence_kind(graph: &GraphResponse) -> SearchPlanBridgeEvidenceKindDto {
+    if graph.edges.iter().any(|edge| {
+        edge.callsite_identity
+            .as_deref()
+            .is_some_and(|identity| identity.starts_with("payload:"))
+    }) || graph
+        .nodes
+        .iter()
+        .any(|node| node.label.contains("payload collection "))
+    {
+        return SearchPlanBridgeEvidenceKindDto::DataCollectionUsage;
+    }
+    if graph.nodes.iter().any(|node| {
+        node.label.contains(" route; confidence=")
+            || node
+                .qualified_name
+                .as_deref()
+                .is_some_and(|name| name.starts_with("framework::"))
+    }) {
+        return SearchPlanBridgeEvidenceKindDto::FrameworkRoute;
+    }
+    if graph.edges.iter().any(|edge| edge.kind == EdgeKind::CALL)
+        && graph.nodes.iter().any(|node| {
+            matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                && node.file_path.as_deref().is_some_and(|path| {
+                    let path = path.to_ascii_lowercase();
+                    path.ends_with(".tsx") || path.ends_with(".jsx")
+                })
+                && node
+                    .label
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_uppercase())
+        })
+    {
+        return SearchPlanBridgeEvidenceKindDto::ComponentUsage;
+    }
+    SearchPlanBridgeEvidenceKindDto::GraphPath
 }
 
 fn shared_file_bridge(from: &SearchHit, to: &SearchHit) -> bool {
@@ -6034,7 +6128,7 @@ impl AppController {
                         } else {
                             SearchPlanBridgeConfidenceDto::High
                         },
-                        evidence_kind: SearchPlanBridgeEvidenceKindDto::GraphPath,
+                        evidence_kind: graph_bridge_evidence_kind(&graph),
                         direction: Some("forward".to_string()),
                         node_count: clamp_usize_to_u32(graph.nodes.len()),
                         edge_count: clamp_usize_to_u32(graph.edges.len()),
@@ -6062,7 +6156,7 @@ impl AppController {
                         } else {
                             SearchPlanBridgeConfidenceDto::Medium
                         },
-                        evidence_kind: SearchPlanBridgeEvidenceKindDto::GraphPath,
+                        evidence_kind: graph_bridge_evidence_kind(&graph),
                         direction: Some("reverse".to_string()),
                         node_count: clamp_usize_to_u32(graph.nodes.len()),
                         edge_count: clamp_usize_to_u32(graph.edges.len()),
@@ -6430,54 +6524,75 @@ impl AppController {
             }
         }
 
-        let changed_keys = req
-            .changed_paths
-            .iter()
-            .map(|path| normalize_path_key(path))
-            .filter(|path| !path.is_empty())
-            .collect::<Vec<_>>();
+        let change_records = normalized_affected_change_records(&req);
         let mut matched_file_ids = HashSet::<GraphNodeId>::new();
         let mut matched_changed_keys = HashSet::<String>::new();
+        let mut matched_record_by_file_id = HashMap::<GraphNodeId, AffectedChangeRecordDto>::new();
         for file in &files {
             let relative_key = normalize_path_key(&runtime_relative_path(&root, &file.path));
             let absolute_key = normalize_path_key(&file.path.to_string_lossy());
-            let matched_keys = changed_keys
+            let mut matched_records = Vec::new();
+            let matched_keys = change_records
                 .iter()
-                .filter(|changed| {
-                    relative_key == **changed
-                        || relative_key.ends_with(*changed)
-                        || changed.ends_with(&relative_key)
-                        || absolute_key == **changed
-                        || absolute_key.ends_with(*changed)
+                .flat_map(|record| {
+                    affected_change_record_keys(record)
+                        .into_iter()
+                        .map(move |key| (record, key))
                 })
-                .cloned()
+                .filter_map(|(record, changed)| {
+                    let changed = changed.as_str();
+                    let matched = relative_key == changed
+                        || relative_key.ends_with(changed)
+                        || changed.ends_with(&relative_key)
+                        || absolute_key == changed
+                        || absolute_key.ends_with(changed);
+                    matched.then_some((record, changed.to_string()))
+                })
                 .collect::<Vec<_>>();
             if !matched_keys.is_empty() {
-                matched_file_ids.insert(codestory_contracts::graph::NodeId(file.id));
-                matched_changed_keys.extend(matched_keys);
+                let file_id = codestory_contracts::graph::NodeId(file.id);
+                matched_file_ids.insert(file_id);
+                for (record, key) in matched_keys {
+                    matched_changed_keys.insert(key);
+                    matched_records.push(record.clone());
+                }
+                if let Some(record) = matched_records.first() {
+                    matched_record_by_file_id.insert(file_id, record.clone());
+                }
             }
         }
         let mut matched_files = files
             .iter()
             .filter(|file| matched_file_ids.contains(&codestory_contracts::graph::NodeId(file.id)))
-            .map(|file| AffectedMatchedFileDto {
-                path: runtime_relative_path(&root, &file.path),
-                role: indexed_file_role(&file.path),
-                indexed: file.indexed,
-                complete: file.complete,
-                error_count: errors_by_file.get(&file.id).copied().unwrap_or_default(),
+            .map(|file| {
+                let file_id = codestory_contracts::graph::NodeId(file.id);
+                let record = matched_record_by_file_id.get(&file_id);
+                AffectedMatchedFileDto {
+                    path: runtime_relative_path(&root, &file.path),
+                    role: indexed_file_role(&file.path),
+                    indexed: file.indexed,
+                    complete: file.complete,
+                    change_kind: record.map(|record| record.kind.clone()),
+                    change_status: record.map(|record| record.status.clone()),
+                    previous_path: record.and_then(|record| record.previous_path.clone()),
+                    error_count: errors_by_file.get(&file.id).copied().unwrap_or_default(),
+                }
             })
             .collect::<Vec<_>>();
         matched_files.sort_by(|left, right| left.path.cmp(&right.path));
-        let unmatched_paths = req
-            .changed_paths
+        let unmatched_paths = change_records
             .iter()
-            .zip(changed_keys.iter())
-            .filter(|(_, key)| !matched_changed_keys.contains(*key))
-            .map(|(path, _)| AffectedUnmatchedPathDto {
-                path: path.clone(),
-                reason: "path did not match any indexed file; reindex or pass repo-relative paths"
-                    .to_string(),
+            .filter(|record| {
+                affected_change_record_keys(record)
+                    .iter()
+                    .all(|key| !matched_changed_keys.contains(key))
+            })
+            .map(|record| AffectedUnmatchedPathDto {
+                path: record.path.clone(),
+                reason: affected_unmatched_reason(record),
+                change_kind: Some(record.kind.clone()),
+                change_status: Some(record.status.clone()),
+                previous_path: record.previous_path.clone(),
             })
             .collect::<Vec<_>>();
 
@@ -6773,6 +6888,7 @@ impl AppController {
         Ok(AffectedAnalysisDto {
             project_root: project,
             changed_paths: req.changed_paths,
+            change_records,
             matched_files,
             unmatched_paths,
             matched_file_count: matched_file_ids.len().min(u32::MAX as usize) as u32,

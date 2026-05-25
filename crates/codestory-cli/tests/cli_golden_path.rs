@@ -1567,6 +1567,8 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
             "user.email=codestory@example.test",
             "-c",
             "user.name=CodeStory Test",
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "-m",
             "fixture",

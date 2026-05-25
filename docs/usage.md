@@ -102,9 +102,12 @@ codestory-cli context --project <target-workspace> --id <node-id> --bundle out/c
 codestory-cli index --project <target-workspace> --refresh incremental
 codestory-cli affected --project <target-workspace> --format markdown
 git diff --name-only HEAD | codestory-cli affected --project <target-workspace> --stdin --format json
+git diff --name-status HEAD | codestory-cli affected --project <target-workspace> --stdin --stdin-format name-status --format json
 ```
 
-Treat `affected` as test-selection evidence, not a replacement for tests.
+Treat `affected` as test-selection evidence, not a replacement for tests. The
+default command preserves git name-status records; path-only stdin remains
+available when another tool already chose the file list.
 
 ### The cache or retrieval looks stale
 

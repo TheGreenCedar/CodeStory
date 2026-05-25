@@ -936,7 +936,12 @@ fn format_search_plan_bridge_evidence_kind(
     match evidence_kind {
         SearchPlanBridgeEvidenceKindDto::SameAnchor => "same_anchor",
         SearchPlanBridgeEvidenceKindDto::GraphPath => "graph_path",
+        SearchPlanBridgeEvidenceKindDto::FrameworkRoute => "framework_route",
+        SearchPlanBridgeEvidenceKindDto::ComponentUsage => "component_usage",
+        SearchPlanBridgeEvidenceKindDto::DataCollectionUsage => "data_collection_usage",
         SearchPlanBridgeEvidenceKindDto::SharedFile => "shared_file",
+        SearchPlanBridgeEvidenceKindDto::RepoTextHint => "repo_text_hint",
+        SearchPlanBridgeEvidenceKindDto::SourceTruthOnly => "source_truth_only",
         SearchPlanBridgeEvidenceKindDto::IsolatedAnchors => "isolated_anchors",
     }
 }
@@ -2735,12 +2740,21 @@ pub(crate) fn render_snippet_markdown(
         context.requested_context,
         context.max_snippet_bytes.unwrap_or_default()
     );
+    if let Some(range_source) = context.range_source.as_deref() {
+        let _ = writeln!(markdown, "range_source: {range_source}");
+    }
+    if let Some(reason) = context.fallback_reason.as_deref() {
+        let _ = writeln!(markdown, "fallback_reason: {reason}");
+    }
     if context.snippet_truncated {
         let _ = writeln!(
             markdown,
             "snippet_truncated: true (max_snippet_bytes={})",
             context.max_snippet_bytes.unwrap_or_default()
         );
+        if let Some(guidance) = context.truncation_guidance.as_deref() {
+            let _ = writeln!(markdown, "truncation_guidance: {guidance}");
+        }
     }
     append_verification_targets(&mut markdown, "verification_targets", verification_targets);
     let fence = snippet_fence(&context.snippet);
