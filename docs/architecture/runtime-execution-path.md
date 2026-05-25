@@ -107,9 +107,9 @@ reuses the same runtime calls for `/definition`, `/references`, `/symbols`, and
 stdio MCP-style resources/prompts/tools. `doctor` opens the project summary and
 reports cache/index/retrieval health without mutating state.
 
-`explore` remains the cockpit surface until the
+`explore` remains the browser surface until the
 [browser surface gate](browser-surface-gate.md) is satisfied. Do not add a
-separate `browse` command, web cockpit route, or browser-specific web UI without
+separate `browse` command, web UI route, or browser-specific UI without
 current manifest, warm-loop, stress-lane, explore, and screenshot-review
 evidence.
 

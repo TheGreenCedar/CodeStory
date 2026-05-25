@@ -1,7 +1,8 @@
 use codestory_contracts::api::{
-    AffectedAnalysisDto, AffectedAnalysisRequest, AffectedMatchedFileDto, AffectedRouteDto,
-    AffectedSymbolDto, AffectedTestFileDto, AffectedUnmatchedPathDto, AgentAnswerDto,
-    AgentAskRequest, AgentHybridWeightsDto, ApiError, AppEventPayload, BookmarkCategoryDto,
+    AffectedAnalysisDto, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
+    AffectedMatchedFileDto, AffectedRouteDto, AffectedSymbolDto, AffectedTestFileDto,
+    AffectedUnmatchedPathDto, AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto,
+    AgentPacketDto, AgentPacketRequestDto, ApiError, AppEventPayload, BookmarkCategoryDto,
     BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind,
     EdgeOccurrencesRequest, EmbeddingProfileContractDto, FrameworkRouteCoverageDto, GraphEdgeDto,
     GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto,
@@ -15,15 +16,16 @@ use codestory_contracts::api::{
     ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
     RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, RouteEndpointHandlerDto,
     RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
-    SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto, SearchPlanBridgeDto,
-    SearchPlanCandidateWindowDto, SearchPlanChannelDto, SearchPlanDroppedTermDto, SearchPlanDto,
-    SearchPlanNextActionDto, SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto,
-    SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode,
-    SearchRequest, SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
-    StorageStatsDto, StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto,
-    SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
-    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WorkspaceMemberIndexDto,
-    WriteFileResponse, WriteFileTextRequest,
+    SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
+    SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
+    SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
+    SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
+    SearchPlanRejectedHitDto, SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto,
+    SearchRepoTextMode, SearchRequest, SearchResultsDto, SnippetContextDto, SourceOccurrenceDto,
+    StartIndexingRequest, StorageStatsDto, StoredSemanticDocsContractDto, SummaryGenerationDto,
+    SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto,
+    TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
+    WorkspaceMemberIndexDto, WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
 use codestory_contracts::graph::{Edge as GraphEdge, Node as GraphNode};
@@ -202,6 +204,59 @@ struct AffectedGraphEvidence {
     distance: u32,
     reason: String,
     confidence: String,
+}
+
+fn normalized_affected_change_records(
+    req: &AffectedAnalysisRequest,
+) -> Vec<AffectedChangeRecordDto> {
+    if !req.change_records.is_empty() {
+        return req.change_records.clone();
+    }
+    req.changed_paths
+        .iter()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| AffectedChangeRecordDto {
+            path: path.trim().to_string(),
+            kind: AffectedChangeKindDto::Unknown,
+            status: "path".to_string(),
+            previous_path: None,
+        })
+        .collect()
+}
+
+fn affected_change_record_keys(record: &AffectedChangeRecordDto) -> Vec<String> {
+    let mut keys = Vec::new();
+    let path = normalize_path_key(&record.path);
+    if !path.is_empty() {
+        keys.push(path);
+    }
+    if let Some(previous_path) = record.previous_path.as_deref() {
+        let previous = normalize_path_key(previous_path);
+        if !previous.is_empty() {
+            keys.push(previous);
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn affected_unmatched_reason(record: &AffectedChangeRecordDto) -> String {
+    match record.kind {
+        AffectedChangeKindDto::Deleted => {
+            "deleted path did not match any indexed file; the index may already be stale or the path was never indexed"
+                .to_string()
+        }
+        AffectedChangeKindDto::Renamed | AffectedChangeKindDto::Copied => {
+            "renamed/copied path did not match current or previous indexed file path; reindex if the file moved"
+                .to_string()
+        }
+        AffectedChangeKindDto::Untracked => {
+            "untracked path is not in the index yet; run index --refresh incremental before graph traversal"
+                .to_string()
+        }
+        _ => "path did not match any indexed file; reindex or pass repo-relative paths".to_string(),
+    }
 }
 
 fn affected_edge_kind_label(kind: codestory_contracts::graph::EdgeKind) -> &'static str {
@@ -1251,10 +1306,43 @@ fn search_plan_subqueries(
             SearchPlanChannelDto::Lexical,
         ],
     );
+    push_search_plan_seed_anchor_subqueries(&mut subqueries, &mut seen, query);
     push_search_plan_symbol_term_subquery(&mut subqueries, &mut seen, terms);
     push_search_plan_role_subqueries(&mut subqueries, &mut seen, terms);
     push_search_plan_fallback_subquery(&mut subqueries, &mut seen, terms);
     subqueries
+}
+
+fn push_search_plan_seed_anchor_subqueries(
+    subqueries: &mut Vec<SearchPlanSubqueryDto>,
+    seen: &mut HashSet<String>,
+    query: &str,
+) {
+    for anchor in search_plan_seed_anchor_terms(query).into_iter().take(5) {
+        push_search_plan_subquery(
+            subqueries,
+            seen,
+            anchor,
+            "named_anchor",
+            vec![
+                SearchPlanChannelDto::TypedSymbol,
+                SearchPlanChannelDto::Lexical,
+            ],
+        );
+    }
+}
+
+fn search_plan_seed_anchor_terms(query: &str) -> Vec<String> {
+    const MARKER: &str = "Seed anchors:";
+    query
+        .split(MARKER)
+        .skip(1)
+        .map(|rest| rest.lines().next().unwrap_or(rest))
+        .flat_map(|anchors| anchors.split(','))
+        .map(str::trim)
+        .filter(|anchor| !anchor.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn push_search_plan_symbol_term_subquery(
@@ -1421,6 +1509,25 @@ fn push_search_plan_subquery(
             channels,
         });
     }
+}
+
+fn search_plan_subqueries_for_repo_text_mode(
+    subqueries: Vec<SearchPlanSubqueryDto>,
+    allow_repo_text: bool,
+) -> Vec<SearchPlanSubqueryDto> {
+    if allow_repo_text {
+        return subqueries;
+    }
+
+    subqueries
+        .into_iter()
+        .filter_map(|mut subquery| {
+            subquery
+                .channels
+                .retain(|channel| *channel != SearchPlanChannelDto::RepoText);
+            (!subquery.channels.is_empty()).then_some(subquery)
+        })
+        .collect()
 }
 
 fn search_plan_candidate_window(
@@ -1976,6 +2083,46 @@ fn graph_response_has_bridge(
         && !graph.edges.is_empty()
 }
 
+fn graph_bridge_evidence_kind(graph: &GraphResponse) -> SearchPlanBridgeEvidenceKindDto {
+    if graph.edges.iter().any(|edge| {
+        edge.callsite_identity
+            .as_deref()
+            .is_some_and(|identity| identity.starts_with("payload:"))
+    }) || graph
+        .nodes
+        .iter()
+        .any(|node| node.label.contains("payload collection "))
+    {
+        return SearchPlanBridgeEvidenceKindDto::DataCollectionUsage;
+    }
+    if graph.nodes.iter().any(|node| {
+        node.label.contains(" route; confidence=")
+            || node
+                .qualified_name
+                .as_deref()
+                .is_some_and(|name| name.starts_with("framework::"))
+    }) {
+        return SearchPlanBridgeEvidenceKindDto::FrameworkRoute;
+    }
+    if graph.edges.iter().any(|edge| edge.kind == EdgeKind::CALL)
+        && graph.nodes.iter().any(|node| {
+            matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                && node.file_path.as_deref().is_some_and(|path| {
+                    let path = path.to_ascii_lowercase();
+                    path.ends_with(".tsx") || path.ends_with(".jsx")
+                })
+                && node
+                    .label
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_uppercase())
+        })
+    {
+        return SearchPlanBridgeEvidenceKindDto::ComponentUsage;
+    }
+    SearchPlanBridgeEvidenceKindDto::GraphPath
+}
+
 fn shared_file_bridge(from: &SearchHit, to: &SearchHit) -> bool {
     same_search_file(from, to)
 }
@@ -2005,42 +2152,6 @@ fn search_plan_next_actions(groups: &[SearchPlanAnchorGroupDto]) -> Vec<SearchPl
             ]
         })
         .collect()
-}
-
-fn search_plan_next_commands(
-    project_root: &Path,
-    actions: &[SearchPlanNextActionDto],
-) -> Vec<String> {
-    let project = quote_search_plan_command_value(&project_root.to_string_lossy());
-    actions
-        .iter()
-        .filter_map(|action| match action.action.as_str() {
-            "symbol" => Some(format!(
-                "codestory-cli symbol --project {project} --id {}",
-                action.node_id.0
-            )),
-            "trail" => Some(format!(
-                "codestory-cli trail --project {project} --id {} --story --hide-speculative",
-                action.node_id.0
-            )),
-            "snippet" => Some(format!(
-                "codestory-cli snippet --project {project} --id {} --function-body --context 40",
-                action.node_id.0
-            )),
-            _ => None,
-        })
-        .collect()
-}
-
-fn quote_search_plan_command_value(value: &str) -> String {
-    if value.bytes().any(|byte| {
-        byte.is_ascii_whitespace()
-            || matches!(byte, b'"' | b'\'' | b'`' | b'&' | b'|' | b'<' | b'>')
-    }) {
-        format!("\"{}\"", value.replace('"', "\\\""))
-    } else {
-        value.to_string()
-    }
 }
 
 fn search_plan_source_truth_checks(groups: &[SearchPlanAnchorGroupDto]) -> Vec<String> {
@@ -5723,6 +5834,7 @@ impl AppController {
                         query: subquery.query.clone(),
                         repo_text: SearchRepoTextMode::Off,
                         limit_per_source: limit_per_source as u32,
+                        expand_search_plan: false,
                         hybrid_weights: hybrid_weights.clone(),
                         hybrid_limits: hybrid_limits.clone(),
                     },
@@ -5875,6 +5987,7 @@ impl AppController {
         limit_per_source: u32,
         filters: &[SearchIntentFilter],
         indexed_hit_ids: &HashSet<NodeId>,
+        allow_repo_text: bool,
         hybrid_weights: Option<AgentHybridWeightsDto>,
         hybrid_limits: Option<SearchHybridLimitsDto>,
     ) -> Result<Option<SearchPlanBuild>, ApiError> {
@@ -5891,7 +6004,10 @@ impl AppController {
             return Ok(None);
         }
         let terms = search_plan_terms(effective_query);
-        let subqueries = search_plan_subqueries(effective_query, &terms, &intents);
+        let subqueries = search_plan_subqueries_for_repo_text_mode(
+            search_plan_subqueries(effective_query, &terms, &intents),
+            allow_repo_text,
+        );
         let mut executed = self.execute_search_plan_subqueries(
             storage,
             &subqueries,
@@ -5945,13 +6061,6 @@ impl AppController {
             ));
         }
         let next_actions = search_plan_next_actions(&anchor_groups);
-        let next_commands = search_plan_next_commands(
-            self.require_project_root()
-                .ok()
-                .as_deref()
-                .unwrap_or(Path::new(".")),
-            &next_actions,
-        );
         let plan = SearchPlanDto {
             original_query: original_query.to_string(),
             eligible,
@@ -5967,7 +6076,6 @@ impl AppController {
                 &plan_indexed_hits,
             ),
             next_actions,
-            next_commands,
             source_truth_checks,
         };
         Ok(Some(SearchPlanBuild {
@@ -5994,9 +6102,9 @@ impl AppController {
                     return SearchPlanBridgeDto {
                         from_anchor: from_group.anchor.clone(),
                         to_anchor: to_group.anchor.clone(),
-                        status: "supported".to_string(),
-                        confidence: "high".to_string(),
-                        evidence_kind: "same_anchor".to_string(),
+                        status: SearchPlanBridgeStatusDto::Supported,
+                        confidence: SearchPlanBridgeConfidenceDto::High,
+                        evidence_kind: SearchPlanBridgeEvidenceKindDto::SameAnchor,
                         direction: Some("self".to_string()),
                         node_count: 1,
                         edge_count: 0,
@@ -6014,9 +6122,13 @@ impl AppController {
                     return SearchPlanBridgeDto {
                         from_anchor: from_group.anchor.clone(),
                         to_anchor: to_group.anchor.clone(),
-                        status: "supported".to_string(),
-                        confidence: if graph.truncated { "medium" } else { "high" }.to_string(),
-                        evidence_kind: "graph_path".to_string(),
+                        status: SearchPlanBridgeStatusDto::Supported,
+                        confidence: if graph.truncated {
+                            SearchPlanBridgeConfidenceDto::Medium
+                        } else {
+                            SearchPlanBridgeConfidenceDto::High
+                        },
+                        evidence_kind: graph_bridge_evidence_kind(&graph),
                         direction: Some("forward".to_string()),
                         node_count: clamp_usize_to_u32(graph.nodes.len()),
                         edge_count: clamp_usize_to_u32(graph.edges.len()),
@@ -6038,9 +6150,13 @@ impl AppController {
                     return SearchPlanBridgeDto {
                         from_anchor: from_group.anchor.clone(),
                         to_anchor: to_group.anchor.clone(),
-                        status: "partial".to_string(),
-                        confidence: if graph.truncated { "low" } else { "medium" }.to_string(),
-                        evidence_kind: "graph_path".to_string(),
+                        status: SearchPlanBridgeStatusDto::Partial,
+                        confidence: if graph.truncated {
+                            SearchPlanBridgeConfidenceDto::Low
+                        } else {
+                            SearchPlanBridgeConfidenceDto::Medium
+                        },
+                        evidence_kind: graph_bridge_evidence_kind(&graph),
                         direction: Some("reverse".to_string()),
                         node_count: clamp_usize_to_u32(graph.nodes.len()),
                         edge_count: clamp_usize_to_u32(graph.edges.len()),
@@ -6056,9 +6172,9 @@ impl AppController {
                     return SearchPlanBridgeDto {
                         from_anchor: from_group.anchor.clone(),
                         to_anchor: to_group.anchor.clone(),
-                        status: "partial".to_string(),
-                        confidence: "low".to_string(),
-                        evidence_kind: "shared_file".to_string(),
+                        status: SearchPlanBridgeStatusDto::Partial,
+                        confidence: SearchPlanBridgeConfidenceDto::Low,
+                        evidence_kind: SearchPlanBridgeEvidenceKindDto::SharedFile,
                         direction: None,
                         node_count: 2,
                         edge_count: 0,
@@ -6073,9 +6189,9 @@ impl AppController {
                 SearchPlanBridgeDto {
                     from_anchor: from_group.anchor.clone(),
                     to_anchor: to_group.anchor.clone(),
-                    status: "unsupported".to_string(),
-                    confidence: "low".to_string(),
-                    evidence_kind: "isolated_anchors".to_string(),
+                    status: SearchPlanBridgeStatusDto::Unsupported,
+                    confidence: SearchPlanBridgeConfidenceDto::Low,
+                    evidence_kind: SearchPlanBridgeEvidenceKindDto::IsolatedAnchors,
                     direction: None,
                     node_count: 2,
                     edge_count: 0,
@@ -6102,6 +6218,7 @@ impl AppController {
                 query: query.clone(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: req.limit_per_source,
+                expand_search_plan: false,
                 hybrid_weights: req.hybrid_weights.clone(),
                 hybrid_limits: req.hybrid_limits.clone(),
             },
@@ -6193,7 +6310,7 @@ impl AppController {
             repo_text_fallback_reason,
         );
         let mut search_plan_anchor_rank = HashMap::<NodeId, usize>::new();
-        let search_plan = if used_repo_explanation_overview {
+        let search_plan = if used_repo_explanation_overview || !req.expand_search_plan {
             None
         } else {
             match self.build_search_plan(
@@ -6208,6 +6325,7 @@ impl AppController {
                 limit_per_source as u32,
                 &intent_query.filters,
                 &indexed_hit_ids,
+                repo_text_enabled,
                 req.hybrid_weights.clone(),
                 req.hybrid_limits.clone(),
             )? {
@@ -6406,54 +6524,75 @@ impl AppController {
             }
         }
 
-        let changed_keys = req
-            .changed_paths
-            .iter()
-            .map(|path| normalize_path_key(path))
-            .filter(|path| !path.is_empty())
-            .collect::<Vec<_>>();
+        let change_records = normalized_affected_change_records(&req);
         let mut matched_file_ids = HashSet::<GraphNodeId>::new();
         let mut matched_changed_keys = HashSet::<String>::new();
+        let mut matched_record_by_file_id = HashMap::<GraphNodeId, AffectedChangeRecordDto>::new();
         for file in &files {
             let relative_key = normalize_path_key(&runtime_relative_path(&root, &file.path));
             let absolute_key = normalize_path_key(&file.path.to_string_lossy());
-            let matched_keys = changed_keys
+            let mut matched_records = Vec::new();
+            let matched_keys = change_records
                 .iter()
-                .filter(|changed| {
-                    relative_key == **changed
-                        || relative_key.ends_with(*changed)
-                        || changed.ends_with(&relative_key)
-                        || absolute_key == **changed
-                        || absolute_key.ends_with(*changed)
+                .flat_map(|record| {
+                    affected_change_record_keys(record)
+                        .into_iter()
+                        .map(move |key| (record, key))
                 })
-                .cloned()
+                .filter_map(|(record, changed)| {
+                    let changed = changed.as_str();
+                    let matched = relative_key == changed
+                        || relative_key.ends_with(changed)
+                        || changed.ends_with(&relative_key)
+                        || absolute_key == changed
+                        || absolute_key.ends_with(changed);
+                    matched.then_some((record, changed.to_string()))
+                })
                 .collect::<Vec<_>>();
             if !matched_keys.is_empty() {
-                matched_file_ids.insert(codestory_contracts::graph::NodeId(file.id));
-                matched_changed_keys.extend(matched_keys);
+                let file_id = codestory_contracts::graph::NodeId(file.id);
+                matched_file_ids.insert(file_id);
+                for (record, key) in matched_keys {
+                    matched_changed_keys.insert(key);
+                    matched_records.push(record.clone());
+                }
+                if let Some(record) = matched_records.first() {
+                    matched_record_by_file_id.insert(file_id, record.clone());
+                }
             }
         }
         let mut matched_files = files
             .iter()
             .filter(|file| matched_file_ids.contains(&codestory_contracts::graph::NodeId(file.id)))
-            .map(|file| AffectedMatchedFileDto {
-                path: runtime_relative_path(&root, &file.path),
-                role: indexed_file_role(&file.path),
-                indexed: file.indexed,
-                complete: file.complete,
-                error_count: errors_by_file.get(&file.id).copied().unwrap_or_default(),
+            .map(|file| {
+                let file_id = codestory_contracts::graph::NodeId(file.id);
+                let record = matched_record_by_file_id.get(&file_id);
+                AffectedMatchedFileDto {
+                    path: runtime_relative_path(&root, &file.path),
+                    role: indexed_file_role(&file.path),
+                    indexed: file.indexed,
+                    complete: file.complete,
+                    change_kind: record.map(|record| record.kind.clone()),
+                    change_status: record.map(|record| record.status.clone()),
+                    previous_path: record.and_then(|record| record.previous_path.clone()),
+                    error_count: errors_by_file.get(&file.id).copied().unwrap_or_default(),
+                }
             })
             .collect::<Vec<_>>();
         matched_files.sort_by(|left, right| left.path.cmp(&right.path));
-        let unmatched_paths = req
-            .changed_paths
+        let unmatched_paths = change_records
             .iter()
-            .zip(changed_keys.iter())
-            .filter(|(_, key)| !matched_changed_keys.contains(*key))
-            .map(|(path, _)| AffectedUnmatchedPathDto {
-                path: path.clone(),
-                reason: "path did not match any indexed file; reindex or pass repo-relative paths"
-                    .to_string(),
+            .filter(|record| {
+                affected_change_record_keys(record)
+                    .iter()
+                    .all(|key| !matched_changed_keys.contains(key))
+            })
+            .map(|record| AffectedUnmatchedPathDto {
+                path: record.path.clone(),
+                reason: affected_unmatched_reason(record),
+                change_kind: Some(record.kind.clone()),
+                change_status: Some(record.status.clone()),
+                previous_path: record.previous_path.clone(),
             })
             .collect::<Vec<_>>();
 
@@ -6749,6 +6888,7 @@ impl AppController {
         Ok(AffectedAnalysisDto {
             project_root: project,
             changed_paths: req.changed_paths,
+            change_records,
             matched_files,
             unmatched_paths,
             matched_file_count: matched_file_ids.len().min(u32::MAX as usize) as u32,
@@ -6865,6 +7005,63 @@ impl AppController {
         Ok(self
             .search_hybrid_scored_inner(req, focus_node_id, max_results, request_weights)?
             .0)
+    }
+
+    pub(crate) fn search_symbolic_packet_anchor_batch(
+        &self,
+        queries: &[String],
+        max_results: usize,
+    ) -> Result<Vec<(String, Vec<SearchHit>)>, ApiError> {
+        self.ensure_search_state()?;
+        let storage = self.open_storage()?;
+        let requested_max_results = max_results.clamp(1, 50);
+        let project_root = self.require_project_root().ok();
+        let (symbolic_by_query, node_names) = {
+            let mut s = self.state.lock();
+            let engine = s.search_engine.as_mut().ok_or_else(|| {
+                ApiError::invalid_argument("Search engine not initialized. Open a project first.")
+            })?;
+            (
+                queries
+                    .iter()
+                    .map(|query| {
+                        (
+                            query.clone(),
+                            lexical_hybrid_hits(engine, query, &HashMap::new()),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                s.node_names.clone(),
+            )
+        };
+
+        let mut results = Vec::with_capacity(symbolic_by_query.len());
+        for (query, symbolic) in symbolic_by_query {
+            let mut hits = Vec::with_capacity(symbolic.len());
+            for scored in symbolic {
+                if let Some(mut hit) = Self::build_search_hit(
+                    &storage,
+                    &node_names,
+                    scored.node_id,
+                    scored.total_score,
+                ) {
+                    hit.score_breakdown = Some(RetrievalScoreBreakdownDto {
+                        lexical: scored.lexical_score,
+                        semantic: 0.0,
+                        graph: scored.graph_score,
+                        total: scored.total_score,
+                    });
+                    hits.push(hit);
+                }
+            }
+            hits.sort_by(|left, right| {
+                compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
+            });
+            annotate_search_hit_match_quality(&query, &mut hits);
+            hits.truncate(requested_max_results);
+            results.push((query, hits));
+        }
+        Ok(results)
     }
 
     fn search_hybrid_scored_inner(
@@ -7046,6 +7243,10 @@ impl AppController {
 
     pub fn agent_ask(&self, req: AgentAskRequest) -> Result<AgentAnswerDto, ApiError> {
         agent::agent_ask(self, req)
+    }
+
+    pub fn agent_packet(&self, req: AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError> {
+        agent::agent_packet(self, req)
     }
 
     pub fn graph_neighborhood(&self, req: GraphRequest) -> Result<GraphResponse, ApiError> {
@@ -7575,7 +7776,7 @@ impl AppController {
 }
 
 fn is_low_confidence_search_plan_bridge(bridge: &SearchPlanBridgeDto) -> bool {
-    bridge.confidence.eq_ignore_ascii_case("low")
+    bridge.confidence == SearchPlanBridgeConfidenceDto::Low
 }
 
 #[derive(Debug, Clone)]
@@ -8866,6 +9067,31 @@ pub fn exact_symbol_anchor() {{}}
     }
 
     #[test]
+    fn search_plan_preserves_seed_anchor_line_exactly() {
+        let query = "Explain how a full indexing run moves through the runtime. Seed anchors: run_index, IndexService::run_indexing_blocking, WorkspaceIndexer::run";
+        let intents = architecture_query_intents(query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(!intents.is_empty(), "query should have architecture intent");
+
+        let terms = search_plan_terms(query);
+        let subqueries = search_plan_subqueries(query, &terms, &intents);
+        for expected in [
+            "run_index",
+            "IndexService::run_indexing_blocking",
+            "WorkspaceIndexer::run",
+        ] {
+            assert!(
+                subqueries
+                    .iter()
+                    .any(|subquery| subquery.role == "named_anchor" && subquery.query == expected),
+                "expected exact seed-anchor subquery for `{expected}`: {subqueries:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn public_surface_question_keeps_short_pascal_case_named_anchor() {
         let query = "Explain how public writing/social surfaces connect to Payload collections, comment auth, and the elsewhere feed. Anchor the answer around Posts, getElsewhereFeed, and getCommentAuth.";
         let intents = architecture_query_intents(query)
@@ -9102,20 +9328,6 @@ pub fn exact_symbol_anchor() {{}}
                     .iter()
                     .any(|option| option == "function_body")
         }));
-        let next_commands =
-            search_plan_next_commands(Path::new("C:/repo with spaces"), &next_actions);
-        assert!(
-            next_commands.iter().any(|command| command.contains(
-                "codestory-cli snippet --project \"C:/repo with spaces\" --id member --function-body --context 40"
-            )),
-            "search-plan handoff should request body-aware snippets for promoted anchors: {next_commands:#?}"
-        );
-        assert!(
-            next_commands
-                .iter()
-                .all(|command| !command.contains("<PROJECT>")),
-            "search-plan handoffs should be transport-ready without placeholders: {next_commands:#?}"
-        );
     }
 
     #[test]
@@ -9323,6 +9535,7 @@ fn build_llm_symbol_doc_text() -> String {
                 query: "AppController".to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 10,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
@@ -9397,6 +9610,7 @@ fn build_llm_symbol_doc_text() -> String {
                     query: query.to_string(),
                     repo_text: SearchRepoTextMode::Off,
                     limit_per_source: 10,
+                    expand_search_plan: false,
                     hybrid_weights: None,
                     hybrid_limits: None,
                 })
@@ -9432,6 +9646,7 @@ fn build_llm_symbol_doc_text() -> String {
                 query: "Explain how this repo fits together".to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 10,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
@@ -9455,6 +9670,7 @@ fn build_llm_symbol_doc_text() -> String {
                 query: "Explain how check_winner fits in this repo".to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 10,
+                expand_search_plan: true,
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
@@ -9494,6 +9710,12 @@ fn build_llm_symbol_doc_text() -> String {
                         serialized_name: "parser_core".to_string(),
                         ..Default::default()
                     },
+                    Node {
+                        id: CoreNodeId(203),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "runtime_workspace_indexer_store_flow".to_string(),
+                        ..Default::default()
+                    },
                 ])
                 .expect("insert nodes");
         }
@@ -9505,19 +9727,41 @@ fn build_llm_symbol_doc_text() -> String {
             })
             .expect("open project");
 
-        let hits = controller
-            .search(SearchRequest {
-                query: "How does the language parsing work in this repo?".to_string(),
+        let broad_query =
+            "Explain how the full-index path flows through runtime workspace indexer and store";
+        let results_without_plan = controller
+            .search_results(SearchRequest {
+                query: broad_query.to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 20,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
             .expect("search with natural language");
 
         assert!(
-            !hits.is_empty(),
+            !results_without_plan.indexed_symbol_hits.is_empty(),
             "Expected term extraction fallback to find symbol matches"
+        );
+        assert!(
+            results_without_plan.search_plan.is_none(),
+            "search should not build Search Plan work unless requested: {results_without_plan:?}"
+        );
+
+        let results_with_plan = controller
+            .search_results(SearchRequest {
+                query: broad_query.to_string(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 20,
+                expand_search_plan: true,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            })
+            .expect("search with natural language and search plan");
+        assert!(
+            results_with_plan.search_plan.is_some(),
+            "search should build Search Plan only when requested: {results_with_plan:?}"
         );
     }
 
@@ -9978,6 +10222,7 @@ fn build_llm_symbol_doc_text() -> String {
                 query: "how does alpha work".to_string(),
                 repo_text: SearchRepoTextMode::On,
                 limit_per_source: 5,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
@@ -10065,6 +10310,7 @@ fn build_llm_symbol_doc_text() -> String {
                 query: "GlobalResourceListView".to_string(),
                 repo_text: SearchRepoTextMode::Auto,
                 limit_per_source: 5,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
@@ -10789,6 +11035,7 @@ fn build_llm_symbol_doc_text() -> String {
                 query: "check_winner".to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 10,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
@@ -10816,6 +11063,7 @@ fn build_llm_symbol_doc_text() -> String {
                 query: "check_winner".to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 10,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             })

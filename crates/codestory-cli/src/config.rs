@@ -108,24 +108,29 @@ fn set_env_if_absent(name: &str, value: Option<&str>) {
 }
 
 #[cfg(test)]
+static CONFIG_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn config_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    CONFIG_ENV_TEST_LOCK
+        .lock()
+        .expect("config env test lock should not be poisoned")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::sync::{Mutex, MutexGuard};
     use tempfile::tempdir;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     struct EnvRestore {
-        _lock: MutexGuard<'static, ()>,
+        _lock: std::sync::MutexGuard<'static, ()>,
         values: Vec<(&'static str, Option<OsString>)>,
     }
 
     impl EnvRestore {
         fn capture(names: &[&'static str]) -> Self {
-            let lock = ENV_LOCK
-                .lock()
-                .expect("env test lock should not be poisoned");
+            let lock = config_env_test_lock();
             let values = names
                 .iter()
                 .map(|name| (*name, std::env::var_os(name)))

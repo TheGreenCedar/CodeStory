@@ -2,10 +2,11 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
     BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, EvidencePacketDto, GroundingBudgetDto,
     IndexDryRunDto, IndexFreshnessDto, IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection,
-    NodeId, NodeKind, ProjectSummary, RepoTextScanStatsDto, RetrievalScoreBreakdownDto,
-    RetrievalStateDto, SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto,
-    SearchQueryAssessmentDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto,
-    TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
+    NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto, ProjectSummary,
+    RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
+    SearchMatchQualityDto, SearchPlanDto, SearchQueryAssessmentDto, SnippetContextDto,
+    SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection,
+    TrailMode,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -30,6 +31,7 @@ pub(crate) enum Command {
     Index(IndexCommand),
     Ground(GroundCommand),
     Context(ContextCommand),
+    Packet(PacketCommand),
     Doctor(DoctorCommand),
     Setup(SetupCommand),
     Search(SearchCommand),
@@ -102,6 +104,25 @@ pub(crate) enum CliGroundingBudget {
     Strict,
     Balanced,
     Max,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CliPacketBudget {
+    Tiny,
+    Compact,
+    Standard,
+    Deep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CliPacketTaskClass {
+    ArchitectureExplanation,
+    BugLocalization,
+    ChangeImpact,
+    RouteTracing,
+    SymbolOwnership,
+    DataFlow,
+    EditPlanning,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -303,6 +324,47 @@ pub(crate) struct ContextCommand {
 }
 
 #[derive(Args, Debug)]
+pub(crate) struct PacketCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        long,
+        help = "Broad repository question or task to ground in one packet."
+    )]
+    pub(crate) question: String,
+    #[arg(long, value_enum, default_value_t = CliPacketBudget::Compact)]
+    pub(crate) budget: CliPacketBudget,
+    #[arg(long, value_enum)]
+    pub(crate) task_class: Option<CliPacketTaskClass>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
+    pub(crate) refresh: RefreshMode,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Omit citation edge ids and score breakdowns from the structured packet."
+    )]
+    pub(crate) no_evidence: bool,
+    #[arg(
+        long,
+        value_name = "MS",
+        help = "Optional packet-level latency budget in milliseconds."
+    )]
+    pub(crate) latency_budget_ms: Option<u32>,
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct DoctorCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
@@ -485,6 +547,12 @@ pub(crate) struct DrillSuiteCommand {
         help = "JSON manifest describing the drill cases to run. Relative case project paths resolve from the manifest directory."
     )]
     pub(crate) case_file: PathBuf,
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Optional source-truth ledger JSON to merge into the suite report after verification."
+    )]
+    pub(crate) ledger: Option<PathBuf>,
     #[arg(
         long,
         value_name = "DIR",
@@ -767,17 +835,45 @@ pub(crate) struct FilesCommand {
     pub(crate) output_file: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum AffectedChangeSource {
+    Head,
+    Staged,
+    Unstaged,
+    Untracked,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum AffectedStdinFormat {
+    Path,
+    NameStatus,
+}
+
 #[derive(Args, Debug)]
 pub(crate) struct AffectedCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
     #[arg(
         value_name = "PATH",
-        help = "Changed repo-relative path. If omitted, CodeStory reads git diff --name-only HEAD."
+        help = "Changed repo-relative path. If omitted, CodeStory reads git diff --name-status HEAD."
     )]
     pub(crate) paths: Vec<String>,
     #[arg(long, help = "Read changed paths from stdin, one path per line.")]
     pub(crate) stdin: bool,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = AffectedStdinFormat::Path,
+        help = "Interpret --stdin as path-only lines or git diff --name-status rows."
+    )]
+    pub(crate) stdin_format: AffectedStdinFormat,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = AffectedChangeSource::Head,
+        help = "Default git source when no paths/stdin are supplied."
+    )]
+    pub(crate) changes: AffectedChangeSource,
     #[arg(long, default_value_t = 2)]
     pub(crate) depth: u32,
     #[arg(
@@ -1080,6 +1176,7 @@ pub(crate) struct DrillBridgeEvidenceOutput {
     pub(crate) status: String,
     pub(crate) strategy: String,
     pub(crate) confidence: String,
+    pub(crate) evidence_kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) from_node: Option<SearchHitOutput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1295,6 +1392,14 @@ pub(crate) struct DrillSummaryBridgesOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct DrillSummarySourceTruthTargetOutput {
+    pub(crate) path: String,
+    pub(crate) role: String,
+    pub(crate) rank_reason: String,
+    pub(crate) check_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct DrillSummarySourceTruthOutput {
     pub(crate) required: bool,
     pub(crate) check_count: usize,
@@ -1302,6 +1407,7 @@ pub(crate) struct DrillSummarySourceTruthOutput {
     pub(crate) verified_check_count: usize,
     pub(crate) target_file_count: usize,
     pub(crate) target_files: Vec<String>,
+    pub(crate) target_file_details: Vec<DrillSummarySourceTruthTargetOutput>,
     pub(crate) checklist_item_count: usize,
     pub(crate) claim_count: usize,
     pub(crate) pending_claim_count: usize,
@@ -1367,6 +1473,8 @@ pub(crate) struct DrillOutput {
     pub(crate) mechanical: DrillMechanicalOutput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) question_search: Option<DrillCommandStatusOutput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) question_supplemental_searches: Vec<DrillCommandStatusOutput>,
     pub(crate) anchors: Vec<DrillAnchorOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) bridges: Vec<DrillBridgeOutput>,
@@ -1391,6 +1499,56 @@ pub(crate) struct DrillSuiteRepoOutput {
     pub(crate) output_dir: String,
     pub(crate) artifact_extension: String,
     pub(crate) summary: DrillSummaryOutput,
+    pub(crate) expectations: DrillSuiteExpectationOutput,
+    pub(crate) answer_quality: DrillSuiteAnswerQualityOutput,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DrillSuiteExpectationOutput {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) source_truth_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) false_claims: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) min_anchor_resolution: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) allow_partial_bridges: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DrillSuiteLayerFindingOutput {
+    pub(crate) layer: String,
+    pub(crate) status: String,
+    pub(crate) detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DrillSuiteAnswerQualityOutput {
+    pub(crate) ledger_status: String,
+    pub(crate) final_answer_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) draft_written: Option<bool>,
+    pub(crate) claim_count: usize,
+    pub(crate) claim_correct_count: usize,
+    pub(crate) claim_partial_count: usize,
+    pub(crate) claim_misleading_count: usize,
+    pub(crate) claim_unsupported_count: usize,
+    pub(crate) claim_unclassified_count: usize,
+    pub(crate) material_revision_count: usize,
+    pub(crate) expected_file_count: usize,
+    pub(crate) expected_file_found_count: usize,
+    pub(crate) expected_file_missing_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expected_file_recall: Option<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) missing_expected_files: Vec<String>,
+    pub(crate) forbidden_claim_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) forbidden_claim_hits: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) layer_findings: Vec<DrillSuiteLayerFindingOutput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1411,6 +1569,10 @@ pub(crate) struct DrillSuiteOutput {
     pub(crate) degraded_count: usize,
     pub(crate) blocked_count: usize,
     pub(crate) ready_count: usize,
+    pub(crate) answer_ready_count: usize,
+    pub(crate) answer_degraded_count: usize,
+    pub(crate) answer_failed_count: usize,
+    pub(crate) answer_pending_count: usize,
     pub(crate) repos: Vec<DrillSuiteRepoOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) retrieval_blockers: Vec<DrillSuiteRetrievalBlockerOutput>,
@@ -1635,6 +1797,31 @@ impl From<CliGroundingBudget> for GroundingBudgetDto {
     }
 }
 
+impl From<CliPacketBudget> for PacketBudgetModeDto {
+    fn from(value: CliPacketBudget) -> Self {
+        match value {
+            CliPacketBudget::Tiny => Self::Tiny,
+            CliPacketBudget::Compact => Self::Compact,
+            CliPacketBudget::Standard => Self::Standard,
+            CliPacketBudget::Deep => Self::Deep,
+        }
+    }
+}
+
+impl From<CliPacketTaskClass> for PacketTaskClassDto {
+    fn from(value: CliPacketTaskClass) -> Self {
+        match value {
+            CliPacketTaskClass::ArchitectureExplanation => Self::ArchitectureExplanation,
+            CliPacketTaskClass::BugLocalization => Self::BugLocalization,
+            CliPacketTaskClass::ChangeImpact => Self::ChangeImpact,
+            CliPacketTaskClass::RouteTracing => Self::RouteTracing,
+            CliPacketTaskClass::SymbolOwnership => Self::SymbolOwnership,
+            CliPacketTaskClass::DataFlow => Self::DataFlow,
+            CliPacketTaskClass::EditPlanning => Self::EditPlanning,
+        }
+    }
+}
+
 impl From<CliFileRole> for IndexedFileRoleDto {
     fn from(value: CliFileRole) -> Self {
         match value {
@@ -1771,6 +1958,14 @@ mod tests {
         assert!(help.contains("--question <QUESTION>"));
         assert!(help.contains("Stored in the report only; it is not interpreted"));
         assert!(help.contains("Drill defaults to `full`"));
+    }
+
+    #[test]
+    fn drill_suite_help_exposes_source_truth_ledger() {
+        let help = render_subcommand_help("drill-suite");
+        assert!(help.contains("--case-file <FILE>"));
+        assert!(help.contains("--ledger <FILE>"));
+        assert!(help.contains("source-truth ledger JSON"));
     }
 
     #[test]

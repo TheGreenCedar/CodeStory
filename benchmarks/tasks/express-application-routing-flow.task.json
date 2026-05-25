@@ -1,0 +1,99 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "express-application-routing-flow",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "route_tracing",
+  "repo": {
+    "name": "express",
+    "url": "https://github.com/expressjs/express.git",
+    "ref": "4.18.2",
+    "workspace_root": ".",
+    "languages": [
+      "JavaScript"
+    ],
+    "setup": [
+      "npm install"
+    ]
+  },
+  "prompt": "Trace how an Express application registers middleware and routes, then dispatches an incoming request through router layers to a route handler. Cite the source files that support the path.",
+  "expected_files": [
+    "lib/express.js",
+    "lib/application.js",
+    "lib/router/index.js",
+    "lib/router/layer.js",
+    "lib/router/route.js"
+  ],
+  "expected_symbols": [
+    {
+      "name": "createApplication",
+      "path": "lib/express.js",
+      "kind": "function",
+      "why": "Creates the callable application object and mixes in application behavior."
+    },
+    {
+      "name": "app.use",
+      "path": "lib/application.js",
+      "kind": "method",
+      "why": "Registers middleware on the application router."
+    },
+    {
+      "name": "app.route",
+      "path": "lib/application.js",
+      "kind": "method",
+      "why": "Creates a route entry through the application router."
+    },
+    {
+      "name": "router",
+      "path": "lib/router/index.js",
+      "kind": "function",
+      "why": "Dispatches requests through the router stack."
+    },
+    {
+      "name": "Route.prototype.dispatch",
+      "path": "lib/router/route.js",
+      "kind": "method",
+      "why": "Invokes matching handlers for a route."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "createApplication returns an app function that calls app.handle for incoming requests."
+    },
+    {
+      "text": "app.use calls lazyrouter and delegates middleware registration to router.use."
+    },
+    {
+      "text": "HTTP verb helpers or app.route create route-specific handlers through this._router.route."
+    },
+    {
+      "text": "Router.handle walks the router stack and matches layers or paths before route dispatch."
+    },
+    {
+      "text": "Route.dispatch invokes the matching method handlers for a route."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "Express dispatches requests directly from the application object without using router layers.",
+      "severity": "critical"
+    },
+    {
+      "text": "Middleware registered with app.use is stored only on the request object.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "javascript",
+    "routing",
+    "middleware"
+  ]
+}

@@ -1,0 +1,93 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "express-router-param-bug-localization",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "bug_localization",
+  "repo": {
+    "name": "express",
+    "url": "https://github.com/expressjs/express.git",
+    "ref": "4.18.2",
+    "workspace_root": ".",
+    "languages": [
+      "JavaScript"
+    ],
+    "setup": [
+      "npm install"
+    ]
+  },
+  "prompt": "A bug report says route parameter callbacks sometimes run with the wrong value, run too many times, or fail to decode malformed parameters cleanly. Identify the primary files and functions to inspect before editing.",
+  "expected_files": [
+    "lib/router/index.js",
+    "lib/router/layer.js",
+    "lib/router/route.js",
+    "test/app.param.js",
+    "test/Router.js"
+  ],
+  "expected_symbols": [
+    {
+      "name": "proto.param",
+      "path": "lib/router/index.js",
+      "kind": "method",
+      "why": "Registers parameter callbacks on the router."
+    },
+    {
+      "name": "proto.process_params",
+      "path": "lib/router/index.js",
+      "kind": "method",
+      "why": "Runs registered parameter callbacks for matched layer parameters."
+    },
+    {
+      "name": "Layer.prototype.match",
+      "path": "lib/router/layer.js",
+      "kind": "method",
+      "why": "Extracts path parameter values from the matched layer."
+    },
+    {
+      "name": "Route.prototype.dispatch",
+      "path": "lib/router/route.js",
+      "kind": "method",
+      "why": "Invokes the route stack after router-level parameter processing."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "Parameter callback registration starts in proto.param in lib/router/index.js."
+    },
+    {
+      "text": "The callback execution path should be inspected in proto.process_params."
+    },
+    {
+      "text": "Layer matching is relevant because it extracts and decodes route parameter values."
+    },
+    {
+      "text": "Route dispatch is downstream of parameter processing and should be checked for handler invocation order."
+    },
+    {
+      "text": "Regression coverage should include app.param and router behavior tests."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "Route parameters are decoded and processed by lib/response.js.",
+      "severity": "critical"
+    },
+    {
+      "text": "Parameter callbacks run before a router layer matches the request path.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "javascript",
+    "bug-localization",
+    "routing"
+  ]
+}

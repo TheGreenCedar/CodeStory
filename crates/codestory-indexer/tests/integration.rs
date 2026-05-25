@@ -166,7 +166,10 @@ pub fn build() {
             edge.kind == EdgeKind::CALL
                 && edge.source == command.id
                 && edge.target == function.id
-                && edge.certainty == Some(ResolutionCertainty::Probable)
+                && matches!(
+                    edge.certainty,
+                    Some(ResolutionCertainty::Probable | ResolutionCertainty::Certain)
+                )
         }),
         "expected registered Tauri command symbol to link to Rust function"
     );
@@ -368,6 +371,79 @@ fn keep() { fresh(); }
         states
             .iter()
             .any(|state| state.symbol_key.contains("fresh"))
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_incremental_go_text_only_structural_change_removes_stale_projection() -> anyhow::Result<()>
+{
+    let dir = tempdir()?;
+    let root = dir.path();
+    let file_path = root.join("mux.go");
+
+    fs::write(
+        &file_path,
+        r#"
+package mux
+
+type Router struct {}
+
+func (r *Router) StrictSlash(value bool) *Router { return r }
+func (r *Router) Handle(path string) {}
+"#,
+    )?;
+
+    let mut storage = Storage::new_in_memory()?;
+    run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
+
+    let before_nodes = storage.get_nodes()?;
+    assert!(
+        before_nodes
+            .iter()
+            .any(|node| node.serialized_name == "Router.StrictSlash"),
+        "expected initial Go text-only method projection"
+    );
+    let file_id = before_nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::FILE && node.serialized_name.ends_with("mux.go"))
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("missing Go file node"))?;
+    assert!(
+        storage
+            .get_callable_projection_states_for_file(file_id.0)?
+            .iter()
+            .any(|state| state.symbol_key.contains("Router.StrictSlash")),
+        "Go text-only indexing should persist callable projection state"
+    );
+
+    fs::write(
+        &file_path,
+        r#"
+package mux
+
+type Router struct {}
+
+func (r *Router) Handle(path string) {}
+"#,
+    )?;
+
+    run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
+
+    let after_nodes = storage.get_nodes()?;
+    assert!(
+        !after_nodes
+            .iter()
+            .any(|node| node.serialized_name == "Router.StrictSlash"),
+        "stale Go text-only method should be removed after structural refresh"
+    );
+    let states_after = storage.get_callable_projection_states_for_file(file_id.0)?;
+    assert!(
+        states_after
+            .iter()
+            .all(|state| !state.symbol_key.contains("Router.StrictSlash")),
+        "stale Go text-only projection state should be removed"
     );
 
     Ok(())

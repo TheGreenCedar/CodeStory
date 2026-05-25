@@ -1,26 +1,34 @@
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::trace::{TraceRecorder, field};
 use crate::{
-    AppController, FocusedSourceContext, HybridSearchScoredHit, fallback_mermaid,
-    hybrid_retrieval_enabled, mermaid_flowchart, mermaid_gantt, mermaid_sequence,
+    AppController, FocusedSourceContext, HybridSearchScoredHit, clamp_u128_to_u32,
+    fallback_mermaid, hybrid_retrieval_enabled, mermaid_flowchart, mermaid_gantt, mermaid_sequence,
 };
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentResponseBlockDto, AgentResponseModeDto,
-    AgentResponseSectionDto, AgentRetrievalPolicyModeDto, AgentRetrievalStepKindDto, ApiError,
-    EdgeId, GraphArtifactDto, GraphRequest, GraphResponse, GroundingBudgetDto, IndexFreshnessDto,
-    IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeOccurrencesRequest,
-    RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest,
-    TrailConfigDto, TrailFilterOptionsDto,
+    AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentCustomRetrievalConfigDto,
+    AgentPacketDto, AgentPacketRequestDto, AgentResponseBlockDto, AgentResponseModeDto,
+    AgentResponseSectionDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
+    AgentRetrievalProfileSelectionDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
+    AgentRetrievalStepStatusDto, ApiError, EdgeId, GraphArtifactDto, GraphRequest, GraphResponse,
+    GroundingBudgetDto, IndexFreshnessDto, IndexFreshnessStatusDto, NodeDetailsDto,
+    NodeDetailsRequest, NodeId, NodeOccurrencesRequest, PacketBenchmarkTraceDto, PacketBudgetDto,
+    PacketBudgetLimitsDto, PacketBudgetModeDto, PacketBudgetUsageDto, PacketClaimDto,
+    PacketPlanDto, PacketPlanQueryDto, PacketSufficiencyDto, PacketSufficiencyStatusDto,
+    PacketTaskClassDto, RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin,
+    SearchMatchQualityDto, SearchRepoTextMode, SearchRequest, TrailConfigDto,
+    TrailFilterOptionsDto,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_MAX_RESULTS: u32 = 8;
 const DEFAULT_MAX_EDGES: u32 = 260;
 const DEFAULT_SLA_TARGET_MS: u32 = 18_000;
 const MIN_PHASE_DEADLINE_MS: u128 = 750;
+const MIN_PACKET_RETRIEVAL_BUDGET_MS: u128 = 1_000;
 const WEAK_INITIAL_HIT_COUNT: usize = 3;
 const WEAK_INITIAL_TOP_SCORE: f32 = 0.30;
 const WEAK_INITIAL_MIN_LEXICAL_ANCHOR: f32 = 0.01;
@@ -105,6 +113,42 @@ struct GraphArtifactCapStats {
     retained_bytes: usize,
     omitted_count: usize,
     truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PacketLatencyBudget {
+    started_at: Instant,
+    target_ms: u128,
+}
+
+impl PacketLatencyBudget {
+    fn new(requested_ms: Option<u32>) -> Self {
+        Self {
+            started_at: Instant::now(),
+            target_ms: requested_ms
+                .unwrap_or(DEFAULT_SLA_TARGET_MS)
+                .clamp(1_000, 120_000) as u128,
+        }
+    }
+
+    fn remaining_for_agent_ask(self) -> Option<u32> {
+        let elapsed = self.started_at.elapsed().as_millis();
+        if elapsed.saturating_add(MIN_PACKET_RETRIEVAL_BUDGET_MS) > self.target_ms {
+            return None;
+        }
+        Some(clamp_u128_to_u32(self.target_ms.saturating_sub(elapsed)))
+    }
+
+    fn exhausted(self) -> bool {
+        self.started_at.elapsed().as_millis() >= self.target_ms
+    }
+
+    fn apply_to_trace(self, answer: &mut AgentAnswerDto) {
+        answer.retrieval_trace.sla_target_ms = Some(clamp_u128_to_u32(self.target_ms));
+        if (answer.retrieval_trace.total_latency_ms as u128) > self.target_ms || self.exhausted() {
+            answer.retrieval_trace.sla_missed = true;
+        }
+    }
 }
 
 pub(crate) fn agent_ask(
@@ -257,6 +301,1600 @@ pub(crate) fn agent_ask(
     })
 }
 
+pub(crate) fn agent_packet(
+    controller: &AppController,
+    req: AgentPacketRequestDto,
+) -> Result<AgentPacketDto, ApiError> {
+    let question = req.question.trim().to_string();
+    if question.is_empty() {
+        return Err(ApiError::invalid_argument("Question cannot be empty."));
+    }
+    let project_root = controller.require_project_root()?;
+
+    let plan = build_packet_plan(&question, req.task_class);
+    let limits = packet_budget_limits(req.budget);
+    let packet_latency = PacketLatencyBudget::new(req.latency_budget_ms);
+    let retrieval_profile = packet_retrieval_profile(Some(plan.task_class), req.budget, &limits);
+    let retrieval_prompt = packet_retrieval_prompt(&question, &plan);
+    let mut answer = agent_ask(
+        controller,
+        AgentAskRequest {
+            prompt: retrieval_prompt,
+            retrieval_profile,
+            focus_node_id: None,
+            max_results: Some(limits.max_anchors.clamp(1, 25)),
+            response_mode: AgentResponseModeDto::Structured,
+            latency_budget_ms: req.latency_budget_ms,
+            include_evidence: req.include_evidence,
+            hybrid_weights: None,
+        },
+    )?;
+    answer
+        .retrieval_trace
+        .annotations
+        .push(packet_plan_annotation(&plan));
+    run_packet_planned_subqueries(
+        controller,
+        &plan,
+        req.budget,
+        &limits,
+        req.include_evidence,
+        packet_latency,
+        &mut answer,
+    );
+    run_packet_anchor_expansion(
+        controller,
+        &plan,
+        req.budget,
+        &limits,
+        req.include_evidence,
+        packet_latency,
+        &mut answer,
+    );
+    packet_latency.apply_to_trace(&mut answer);
+    rank_packet_evidence(&question, &mut answer);
+    append_packet_evidence_sections(&mut answer, plan.task_class, &limits);
+
+    let budget = apply_packet_budget(&project_root, &question, req.budget, limits, &mut answer);
+    let sufficiency =
+        build_packet_sufficiency(&project_root, &question, plan.task_class, &answer, &budget);
+    let benchmark_trace = packet_benchmark_trace(&answer);
+
+    let mut packet = AgentPacketDto {
+        packet_id: answer.answer_id.clone(),
+        question,
+        task_class: Some(plan.task_class),
+        plan,
+        answer,
+        budget,
+        sufficiency,
+        benchmark_trace,
+    };
+    enforce_packet_output_budget(&project_root, &mut packet);
+
+    Ok(packet)
+}
+
+fn build_packet_plan(question: &str, requested: Option<PacketTaskClassDto>) -> PacketPlanDto {
+    let task_class = requested.unwrap_or_else(|| infer_packet_task_class(question));
+    let mut queries = Vec::new();
+    push_packet_query(
+        &mut queries,
+        question,
+        "original task phrasing for semantic and repo-text retrieval",
+    );
+    for term in extract_packet_query_terms(question) {
+        push_packet_query(
+            &mut queries,
+            &term,
+            "concrete symbol, file, route, or code term",
+        );
+    }
+    for query in packet_symbol_probe_queries(question, task_class) {
+        push_packet_query(
+            &mut queries,
+            &query,
+            "symbol probe expanded from task wording",
+        );
+    }
+    for query in task_class_seed_queries(task_class) {
+        push_packet_query(&mut queries, query, "task-class retrieval seed");
+    }
+    for query in packet_concept_queries(question) {
+        push_packet_query(
+            &mut queries,
+            &query,
+            "natural-language concept from task wording",
+        );
+    }
+    queries.truncate(32);
+
+    let mut trace = vec![format!(
+        "task_class={:?} source={}",
+        task_class,
+        if requested.is_some() {
+            "request"
+        } else {
+            "heuristic"
+        }
+    )];
+    trace.push(format!("planned_queries={}", queries.len()));
+
+    PacketPlanDto {
+        task_class,
+        inferred_task_class: requested.is_none(),
+        queries,
+        trace,
+    }
+}
+
+fn packet_symbol_probe_queries(question: &str, task_class: PacketTaskClassDto) -> Vec<String> {
+    let terms = prompt_search_terms(question);
+    let mut queries = Vec::new();
+
+    push_generic_symbol_probe_queries(&terms, &mut queries);
+    push_task_class_symbol_probe_queries(task_class, &mut queries);
+    push_adjacent_packet_term_queries(&terms, &mut queries);
+
+    queries.truncate(32);
+    queries
+}
+
+const PACKET_QUERY_STOP_TERMS: &[&str] = &[
+    "about", "answer", "change", "does", "explain", "files", "from", "have", "into", "this",
+    "through", "what", "when", "where", "with",
+];
+
+fn push_generic_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>) {
+    for term in terms
+        .iter()
+        .filter(|term| term.len() >= 4 && !PACKET_QUERY_STOP_TERMS.contains(&term.as_str()))
+        .take(12)
+    {
+        push_unique_term(queries, term);
+        push_unique_term(queries, &packet_camel_case(&[term.as_str()]));
+    }
+}
+
+fn push_task_class_symbol_probe_queries(task_class: PacketTaskClassDto, queries: &mut Vec<String>) {
+    let class_queries = match task_class {
+        PacketTaskClassDto::RouteTracing => {
+            &["router", "handler", "route", "middleware", "dispatch"][..]
+        }
+        PacketTaskClassDto::BugLocalization => &["error", "validate"],
+        PacketTaskClassDto::ChangeImpact => &["affected", "references"],
+        PacketTaskClassDto::SymbolOwnership => &["references", "callers"],
+        PacketTaskClassDto::EditPlanning => &["tests", "config"],
+        PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[],
+    };
+    push_unique_terms(queries, class_queries);
+}
+
+fn push_adjacent_packet_term_queries(terms: &[String], queries: &mut Vec<String>) {
+    for window in terms.windows(2).take(8) {
+        if let [left, right] = window {
+            push_unique_term(queries, &format!("{left}_{right}"));
+            push_unique_term(
+                queries,
+                &packet_camel_case(&[left.as_str(), right.as_str()]),
+            );
+        }
+    }
+}
+
+fn packet_concept_queries(question: &str) -> Vec<String> {
+    prompt_search_terms(question)
+        .into_iter()
+        .filter(|term| {
+            term.len() >= 4
+                && !matches!(
+                    term.as_str(),
+                    "answer"
+                        | "cite"
+                        | "cites"
+                        | "explain"
+                        | "files"
+                        | "full"
+                        | "into"
+                        | "moves"
+                        | "support"
+                        | "through"
+                )
+        })
+        .take(8)
+        .collect()
+}
+
+fn packet_camel_case(words: &[&str]) -> String {
+    let mut value = String::new();
+    for word in words {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            value.push(first.to_ascii_uppercase());
+            value.extend(chars.map(|ch| ch.to_ascii_lowercase()));
+        }
+    }
+    value
+}
+
+fn infer_packet_task_class(question: &str) -> PacketTaskClassDto {
+    let lower = question.to_ascii_lowercase();
+    if contains_any(
+        &lower,
+        &["bug", "error", "failing", "failed", "broken", "crash"],
+    ) {
+        PacketTaskClassDto::BugLocalization
+    } else if contains_any(
+        &lower,
+        &["impact", "affected", "regression", "risk", "blast radius"],
+    ) {
+        PacketTaskClassDto::ChangeImpact
+    } else if contains_any(&lower, &["route", "endpoint", "handler", "api path"]) {
+        PacketTaskClassDto::RouteTracing
+    } else if contains_any(&lower, &["owner", "owns", "who calls", "references"]) {
+        PacketTaskClassDto::SymbolOwnership
+    } else if contains_any(&lower, &["data flow", "flow", "pipeline", "through"]) {
+        PacketTaskClassDto::DataFlow
+    } else if contains_any(
+        &lower,
+        &[
+            "where to edit",
+            "edit",
+            "change",
+            "modify",
+            "implement",
+            "add ",
+        ],
+    ) {
+        PacketTaskClassDto::EditPlanning
+    } else {
+        PacketTaskClassDto::ArchitectureExplanation
+    }
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn extract_packet_query_terms(question: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut quoted = false;
+    let mut quote = '\0';
+    let mut start = 0usize;
+    for (index, ch) in question.char_indices() {
+        if matches!(ch, '`' | '"' | '\'') {
+            if quoted && ch == quote {
+                push_unique_term(&mut terms, question[start..index].trim());
+                quoted = false;
+            } else if !quoted {
+                quoted = true;
+                quote = ch;
+                start = index + ch.len_utf8();
+            }
+        }
+    }
+
+    for token in question.split_whitespace() {
+        let token = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                ',' | '.' | ';' | ':' | '?' | '!' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '`'
+            )
+        });
+        if is_packet_code_like_term(token) {
+            push_unique_term(&mut terms, token);
+        }
+    }
+    terms.truncate(5);
+    terms
+}
+
+fn is_packet_code_like_term(token: &str) -> bool {
+    if token.len() < 3 {
+        return false;
+    }
+    token.contains("::")
+        || token.contains('/')
+        || token.contains('\\')
+        || token.contains('.')
+        || token.contains('_')
+        || token.contains('-')
+        || token.chars().skip(1).any(|ch| ch.is_ascii_uppercase())
+}
+
+fn push_unique_term(terms: &mut Vec<String>, value: &str) {
+    let value = value.trim();
+    if value.len() < 3 {
+        return;
+    }
+    if !terms.iter().any(|term| term.eq_ignore_ascii_case(value)) {
+        terms.push(value.to_string());
+    }
+}
+
+fn push_unique_terms(terms: &mut Vec<String>, values: &[&str]) {
+    for value in values {
+        push_unique_term(terms, value);
+    }
+}
+
+fn task_class_seed_queries(task_class: PacketTaskClassDto) -> &'static [&'static str] {
+    match task_class {
+        PacketTaskClassDto::ArchitectureExplanation => &["architecture entrypoint", "runtime flow"],
+        PacketTaskClassDto::BugLocalization => &["error path", "failure handling"],
+        PacketTaskClassDto::ChangeImpact => &["affected symbols", "impacted tests"],
+        PacketTaskClassDto::RouteTracing => &["route handler endpoint", "references"],
+        PacketTaskClassDto::SymbolOwnership => &["definition references", "callers"],
+        PacketTaskClassDto::DataFlow => &["pipeline flow", "storage handoff"],
+        PacketTaskClassDto::EditPlanning => &["edit candidates", "test coverage"],
+    }
+}
+
+fn push_packet_query(queries: &mut Vec<PacketPlanQueryDto>, query: &str, purpose: &str) {
+    let query = query.trim();
+    if query.is_empty() {
+        return;
+    }
+    if queries
+        .iter()
+        .any(|existing| existing.query.eq_ignore_ascii_case(query))
+    {
+        return;
+    }
+    queries.push(PacketPlanQueryDto {
+        query: query.to_string(),
+        purpose: purpose.to_string(),
+    });
+}
+
+fn packet_retrieval_prompt(question: &str, plan: &PacketPlanDto) -> String {
+    if plan.queries.len() <= 1 {
+        return question.to_string();
+    }
+    let mut prompt = String::from(question);
+    prompt.push_str("\n\nPlanned CodeStory queries:");
+    for query in &plan.queries {
+        let _ = write!(prompt, "\n- {} ({})", query.query, query.purpose);
+    }
+    prompt
+}
+
+fn packet_plan_annotation(plan: &PacketPlanDto) -> String {
+    let queries = plan
+        .queries
+        .iter()
+        .map(|query| query.query.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!(
+        "packet_plan task_class={:?} inferred={} queries={}",
+        plan.task_class, plan.inferred_task_class, queries
+    )
+}
+
+fn run_packet_planned_subqueries(
+    controller: &AppController,
+    plan: &PacketPlanDto,
+    budget: PacketBudgetModeDto,
+    limits: &PacketBudgetLimitsDto,
+    include_evidence: bool,
+    packet_latency: PacketLatencyBudget,
+    answer: &mut AgentAnswerDto,
+) {
+    let limit = packet_subquery_limit(budget);
+    if limit == 0 {
+        answer
+            .retrieval_trace
+            .annotations
+            .push("packet_subqueries skipped budget=tiny".to_string());
+        return;
+    }
+
+    for query in plan.queries.iter().skip(1).take(limit) {
+        let Some(remaining_latency_ms) = packet_latency.remaining_for_agent_ask() else {
+            answer.retrieval_trace.sla_missed = true;
+            answer.retrieval_trace.annotations.push(format!(
+                "packet_subqueries stopped because packet latency budget {}ms was exhausted",
+                packet_latency.target_ms
+            ));
+            break;
+        };
+        let retrieval_profile = packet_retrieval_profile(Some(plan.task_class), budget, limits);
+        let subquery = agent_ask(
+            controller,
+            AgentAskRequest {
+                prompt: query.query.clone(),
+                retrieval_profile,
+                focus_node_id: None,
+                max_results: Some((limits.max_anchors / 2).clamp(1, 10)),
+                response_mode: AgentResponseModeDto::Structured,
+                latency_budget_ms: Some(remaining_latency_ms),
+                include_evidence,
+                hybrid_weights: None,
+            },
+        );
+        match subquery {
+            Ok(subanswer) => merge_packet_subanswer(answer, subanswer, query),
+            Err(error) => answer.retrieval_trace.annotations.push(format!(
+                "packet_subquery_failed query=`{}` error={:?}",
+                query.query.replace('`', "'"),
+                error
+            )),
+        }
+        packet_latency.apply_to_trace(answer);
+    }
+}
+
+fn packet_subquery_limit(budget: PacketBudgetModeDto) -> usize {
+    match budget {
+        PacketBudgetModeDto::Tiny => 0,
+        PacketBudgetModeDto::Compact => 2,
+        PacketBudgetModeDto::Standard => 4,
+        PacketBudgetModeDto::Deep => 6,
+    }
+}
+
+fn run_packet_anchor_expansion(
+    controller: &AppController,
+    plan: &PacketPlanDto,
+    budget: PacketBudgetModeDto,
+    limits: &PacketBudgetLimitsDto,
+    include_evidence: bool,
+    packet_latency: PacketLatencyBudget,
+    answer: &mut AgentAnswerDto,
+) {
+    let query_limit = packet_anchor_probe_limit(budget);
+    if query_limit == 0 {
+        answer
+            .retrieval_trace
+            .annotations
+            .push("packet_anchor_probes skipped budget=tiny".to_string());
+        return;
+    }
+
+    let mut citation_keys = answer
+        .citations
+        .iter()
+        .map(packet_citation_key)
+        .collect::<HashSet<_>>();
+    let per_query_limit = (limits.max_anchors / 2).clamp(2, 6) as usize;
+
+    let queries = packet_anchor_probe_queries(plan)
+        .into_iter()
+        .take(query_limit)
+        .collect::<Vec<_>>();
+    if queries.is_empty() {
+        return;
+    }
+    if packet_latency.exhausted() {
+        answer.retrieval_trace.sla_missed = true;
+        answer.retrieval_trace.annotations.push(format!(
+            "packet_anchor_probes stopped because packet latency budget {}ms was exhausted",
+            packet_latency.target_ms
+        ));
+        return;
+    }
+
+    let started_at = Instant::now();
+    let result = controller.search_symbolic_packet_anchor_batch(&queries, per_query_limit);
+    let duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
+    answer.retrieval_trace.total_latency_ms = answer
+        .retrieval_trace
+        .total_latency_ms
+        .saturating_add(duration_ms);
+    match result {
+        Ok(results) => {
+            let per_step_duration = duration_ms / results.len().max(1) as u32;
+            for (query, hits) in results {
+                let mut added = 0usize;
+                for hit in hits
+                    .iter()
+                    .filter(|hit| packet_anchor_hit_is_relevant(hit))
+                    .take(3)
+                {
+                    let citation = to_citation_from_hit(hit, None, None, include_evidence);
+                    if citation_keys.insert(packet_citation_key(&citation)) {
+                        answer.citations.push(citation);
+                        added = added.saturating_add(1);
+                    }
+                }
+                answer.retrieval_trace.steps.push(AgentRetrievalStepDto {
+                    kind: AgentRetrievalStepKindDto::Search,
+                    status: AgentRetrievalStepStatusDto::Ok,
+                    duration_ms: per_step_duration,
+                    input: vec![field("query", query.clone())],
+                    output: vec![
+                        field("hits", hits.len().to_string()),
+                        field("accepted_hits", added.to_string()),
+                        field("mode", "symbolic_packet_anchor_probe"),
+                    ],
+                    message: Some("Packet symbol probe expanded broad task wording.".to_string()),
+                });
+                answer.retrieval_trace.annotations.push(format!(
+                    "packet_anchor_probe query=`{}` hits={} added={}",
+                    query.replace('`', "'"),
+                    hits.len(),
+                    added
+                ));
+            }
+        }
+        Err(error) => {
+            for query in queries {
+                answer.retrieval_trace.steps.push(AgentRetrievalStepDto {
+                    kind: AgentRetrievalStepKindDto::Search,
+                    status: AgentRetrievalStepStatusDto::Error,
+                    duration_ms: 0,
+                    input: vec![field("query", query.clone())],
+                    output: Vec::new(),
+                    message: Some(error.message.clone()),
+                });
+                answer.retrieval_trace.annotations.push(format!(
+                    "packet_anchor_probe_failed query=`{}` error={}",
+                    query.replace('`', "'"),
+                    error.message
+                ));
+            }
+        }
+    }
+    packet_latency.apply_to_trace(answer);
+}
+
+fn packet_anchor_probe_limit(budget: PacketBudgetModeDto) -> usize {
+    match budget {
+        PacketBudgetModeDto::Tiny => 0,
+        PacketBudgetModeDto::Compact => 24,
+        PacketBudgetModeDto::Standard => 24,
+        PacketBudgetModeDto::Deep => 32,
+    }
+}
+
+fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
+    plan.queries
+        .iter()
+        .skip(1)
+        .filter(|query| {
+            query.purpose.contains("symbol probe")
+                || query.purpose.contains("concrete symbol")
+                || is_packet_code_like_term(&query.query)
+        })
+        .map(|query| query.query.clone())
+        .collect()
+}
+
+fn packet_anchor_hit_is_relevant(hit: &SearchHit) -> bool {
+    if hit.origin != SearchHitOrigin::IndexedSymbol || !hit.resolvable {
+        return false;
+    }
+    matches!(
+        hit.match_quality,
+        Some(
+            SearchMatchQualityDto::Exact
+                | SearchMatchQualityDto::NormalizedExact
+                | SearchMatchQualityDto::Prefix
+        )
+    ) || hit
+        .score_breakdown
+        .as_ref()
+        .is_some_and(|breakdown| breakdown.lexical >= 0.25 || breakdown.graph >= 0.25)
+}
+
+fn merge_packet_subanswer(
+    answer: &mut AgentAnswerDto,
+    subanswer: AgentAnswerDto,
+    query: &PacketPlanQueryDto,
+) {
+    answer.retrieval_trace.total_latency_ms = answer
+        .retrieval_trace
+        .total_latency_ms
+        .saturating_add(subanswer.retrieval_trace.total_latency_ms);
+    answer.retrieval_trace.sla_missed |= subanswer.retrieval_trace.sla_missed;
+    answer.retrieval_trace.annotations.push(format!(
+        "packet_subquery query=`{}` purpose=`{}` citations={} sections={}",
+        query.query.replace('`', "'"),
+        query.purpose.replace('`', "'"),
+        subanswer.citations.len(),
+        subanswer.sections.len()
+    ));
+    answer
+        .retrieval_trace
+        .steps
+        .extend(subanswer.retrieval_trace.steps);
+
+    extend_unique_citations(&mut answer.citations, subanswer.citations);
+    extend_unique_strings(&mut answer.subgraph_ids, subanswer.subgraph_ids);
+    extend_unique_graphs(&mut answer.graphs, subanswer.graphs);
+
+    answer.sections.push(AgentResponseSectionDto {
+        id: format!("packet-subquery-{}", sanitize_section_id(&query.query)),
+        title: format!("Planned query: {}", query.query),
+        blocks: vec![AgentResponseBlockDto::Markdown {
+            markdown: format!(
+                "Purpose: {}\n\nSummary: {}\n\nUse the packet citations and retrieval trace for exact files, symbols, and confidence.",
+                query.purpose, subanswer.summary
+            ),
+        }],
+    });
+}
+
+fn packet_citation_key(citation: &AgentCitationDto) -> String {
+    format!(
+        "{}\t{}\t{}",
+        citation.node_id.0,
+        citation.file_path.as_deref().unwrap_or_default(),
+        citation.line.unwrap_or_default()
+    )
+}
+
+fn graph_artifact_id(graph: &GraphArtifactDto) -> String {
+    match graph {
+        GraphArtifactDto::Uml { id, .. } | GraphArtifactDto::Mermaid { id, .. } => id.clone(),
+    }
+}
+
+fn extend_unique_citations(
+    citations: &mut Vec<AgentCitationDto>,
+    additional: Vec<AgentCitationDto>,
+) {
+    let mut keys = citations
+        .iter()
+        .map(packet_citation_key)
+        .collect::<HashSet<_>>();
+    for citation in additional {
+        if keys.insert(packet_citation_key(&citation)) {
+            citations.push(citation);
+        }
+    }
+}
+
+fn extend_unique_strings(values: &mut Vec<String>, additional: Vec<String>) {
+    let mut seen = values.iter().cloned().collect::<HashSet<_>>();
+    for value in additional {
+        if seen.insert(value.clone()) {
+            values.push(value);
+        }
+    }
+}
+
+fn extend_unique_graphs(graphs: &mut Vec<GraphArtifactDto>, additional: Vec<GraphArtifactDto>) {
+    let mut ids = graphs.iter().map(graph_artifact_id).collect::<HashSet<_>>();
+    for graph in additional {
+        if ids.insert(graph_artifact_id(&graph)) {
+            graphs.push(graph);
+        }
+    }
+}
+
+fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
+    let terms = packet_rank_terms(question);
+    answer.citations.sort_by(|left, right| {
+        packet_citation_rank(right, &terms)
+            .partial_cmp(&packet_citation_rank(left, &terms))
+            .unwrap_or(Ordering::Equal)
+    });
+}
+
+fn packet_rank_terms(question: &str) -> Vec<String> {
+    let mut terms = prompt_search_terms(question);
+    for query in packet_symbol_probe_queries(question, infer_packet_task_class(question)) {
+        push_unique_term(&mut terms, &normalize_identifier(&query));
+    }
+    terms
+}
+
+fn packet_citation_rank(citation: &AgentCitationDto, terms: &[String]) -> f32 {
+    let display = citation.display_name.to_ascii_lowercase();
+    let normalized_display = normalize_identifier(&citation.display_name);
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let mut score = citation.score;
+    if citation.origin == SearchHitOrigin::IndexedSymbol {
+        score += 1.0;
+    }
+    if citation.resolvable {
+        score += 0.5;
+    }
+    if display.contains("::") {
+        score += 0.25;
+    }
+    if path.contains("/benches/") || path_contains_test_segment(&path) || path.contains("__tests__")
+    {
+        score -= 20.0;
+    }
+    if path.contains("/lib/") || path.starts_with("lib/") {
+        score += 2.0;
+    }
+    if let Some(breakdown) = citation.retrieval_score_breakdown.as_ref() {
+        score += breakdown.lexical * 2.0;
+        score += breakdown.graph;
+    }
+
+    for term in terms {
+        if term.len() < 3 {
+            continue;
+        }
+        let normalized_term = normalize_identifier(term);
+        if !normalized_term.is_empty() && normalized_display.contains(&normalized_term) {
+            score += 1.25;
+        }
+        if path.contains(term) {
+            score += 0.5;
+        }
+    }
+
+    score
+}
+
+fn normalize_identifier(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn append_packet_evidence_sections(
+    answer: &mut AgentAnswerDto,
+    _task_class: PacketTaskClassDto,
+    limits: &PacketBudgetLimitsDto,
+) {
+    if answer.citations.is_empty() {
+        return;
+    }
+
+    let ledger_markdown = packet_evidence_ledger_markdown(answer, limits);
+    answer.sections.insert(
+        0,
+        AgentResponseSectionDto {
+            id: "packet-evidence-ledger".to_string(),
+            title: "Packet Evidence Ledger".to_string(),
+            blocks: vec![AgentResponseBlockDto::Markdown {
+                markdown: ledger_markdown,
+            }],
+        },
+    );
+
+    let claims = packet_supported_claims(answer);
+    if !claims.is_empty() {
+        answer.sections.insert(
+            1,
+            AgentResponseSectionDto {
+                id: "packet-flow-claims".to_string(),
+                title: "Packet Claims".to_string(),
+                blocks: vec![AgentResponseBlockDto::Markdown {
+                    markdown: packet_flow_claims_markdown(&claims),
+                }],
+            },
+        );
+    }
+}
+
+fn packet_evidence_ledger_markdown(
+    answer: &AgentAnswerDto,
+    limits: &PacketBudgetLimitsDto,
+) -> String {
+    let mut markdown = String::new();
+    markdown.push_str(
+        "Use these cited anchors first. They are ranked for the task wording before lower-confidence retrieval diagnostics.\n",
+    );
+    for citation in answer.citations.iter().take(limits.max_anchors as usize) {
+        let _ = writeln!(markdown, "{}", packet_evidence_ledger_row(citation));
+    }
+    markdown
+}
+
+fn packet_evidence_ledger_row(citation: &AgentCitationDto) -> String {
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_else(|| "<unknown path>".to_string());
+    let line = citation
+        .line
+        .map(|line| format!(":{line}"))
+        .unwrap_or_default();
+    let role = packet_evidence_role(citation).unwrap_or("supporting evidence");
+    format!(
+        "- `{}` ({:?}) - `{}`{} - {} - score {:.3}",
+        citation.display_name, citation.kind, path, line, role, citation.score
+    )
+}
+
+fn packet_flow_claims_markdown(claims: &[PacketClaimDto]) -> String {
+    let mut markdown = String::new();
+    markdown.push_str("Supported claims for a compact agent answer:\n");
+    for claim in claims {
+        let citation = claim.citations.first();
+        let suffix = citation
+            .and_then(|citation| citation.file_path.as_deref())
+            .map(packet_display_path)
+            .map(|path| format!(" (`{path}`)"))
+            .unwrap_or_default();
+        let _ = writeln!(markdown, "- {}{}", claim.claim, suffix);
+    }
+    markdown
+}
+
+fn packet_supported_claims(answer: &AgentAnswerDto) -> Vec<PacketClaimDto> {
+    let mut claims = Vec::new();
+    let mut seen_roles = HashSet::new();
+    for citation in &answer.citations {
+        let Some(role) = packet_evidence_role(citation) else {
+            continue;
+        };
+        if !seen_roles.insert(role) {
+            continue;
+        }
+        claims.push(PacketClaimDto {
+            claim: packet_claim_for_role(role, citation),
+            citations: vec![citation.clone()],
+        });
+        if claims.len() >= 12 {
+            break;
+        }
+    }
+    claims
+}
+
+fn packet_evidence_role(citation: &AgentCitationDto) -> Option<&'static str> {
+    let display = citation.display_name.to_ascii_lowercase();
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if path_contains_test_segment(&path) || path.ends_with("_test.go") || path.ends_with(".test.ts")
+    {
+        Some("tests and regression coverage")
+    } else if display.contains("cli") || display.contains("command") || path.contains("/cli") {
+        Some("command entrypoint")
+    } else if display.contains("service")
+        || display.contains("orchestrat")
+        || display.contains("runtime")
+        || path.contains("runtime")
+    {
+        Some("runtime orchestration")
+    } else if display.contains("manifest") || display.contains("plan") || path.contains("workspace")
+    {
+        Some("workspace discovery and planning")
+    } else if display.contains("snapshot") || display.contains("refresh") {
+        Some("snapshot refresh")
+    } else if display.contains("projection")
+        || display.contains("persist")
+        || display.contains("storage")
+        || display.contains("store")
+        || path.contains("store")
+    {
+        Some("persistence and search projection")
+    } else if display.contains("indexer")
+        || display.contains("index_file")
+        || display.contains("symbol")
+        || path.contains("indexer")
+    {
+        Some("symbol extraction")
+    } else if display.contains("route") || display.contains("handler") || display.contains("router")
+    {
+        Some("route handling")
+    } else {
+        None
+    }
+}
+
+fn packet_claim_for_role(role: &str, citation: &AgentCitationDto) -> String {
+    let symbol = citation.display_name.as_str();
+    match role {
+        "command entrypoint" => format!(
+            "The command or public entrypoint for this flow is anchored by `{symbol}`; inspect it before following downstream coordination."
+        ),
+        "runtime orchestration" => format!(
+            "Runtime orchestration is anchored by `{symbol}`; verify coordination, state transitions, and downstream service calls there."
+        ),
+        "workspace discovery and planning" => format!(
+            "Workspace discovery or planning is anchored by `{symbol}`; inspect it for file selection, manifest, or execution-plan behavior."
+        ),
+        "symbol extraction" => format!(
+            "Symbol extraction is anchored by `{symbol}`; inspect it for nodes, edges, occurrences, or file-level indexing."
+        ),
+        "persistence and search projection" => format!(
+            "Persistence or search projection is anchored by `{symbol}`; inspect it for durable graph/search state."
+        ),
+        "snapshot refresh" => format!(
+            "Snapshot refresh is anchored by `{symbol}`; inspect it for post-write summary or cache refresh behavior."
+        ),
+        "route handling" => format!(
+            "Route handling is anchored by `{symbol}`; inspect it before tracing request dispatch or handler ownership."
+        ),
+        "tests and regression coverage" => format!(
+            "Regression coverage for this flow is anchored by `{symbol}`; use it to choose focused verification before broader suites."
+        ),
+        _ => format!("Supporting evidence is anchored by `{symbol}`."),
+    }
+}
+
+fn path_contains_test_segment(path: &str) -> bool {
+    path.starts_with("test/")
+        || path.starts_with("tests/")
+        || path.contains("/test/")
+        || path.contains("/tests/")
+        || path.starts_with("test\\")
+        || path.starts_with("tests\\")
+        || path.contains("\\test\\")
+        || path.contains("\\tests\\")
+}
+
+fn packet_display_path(path: &str) -> String {
+    let normalized = path.trim_start_matches("\\\\?\\").replace('\\', "/");
+    for prefix in [
+        "crates/",
+        "src/",
+        "packages/",
+        "apps/",
+        "lib/",
+        "tests/",
+        "benches/",
+    ] {
+        if normalized.starts_with(prefix) {
+            return normalized;
+        }
+    }
+    for marker in [
+        "/crates/",
+        "/src/",
+        "/packages/",
+        "/apps/",
+        "/lib/",
+        "/tests/",
+        "/benches/",
+    ] {
+        if let Some(index) = normalized.find(marker) {
+            return normalized[index + 1..].to_string();
+        }
+    }
+    normalized
+}
+
+fn sanitize_section_id(value: &str) -> String {
+    let mut id = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while id.contains("--") {
+        id = id.replace("--", "-");
+    }
+    id.trim_matches('-').chars().take(48).collect()
+}
+
+fn packet_retrieval_profile(
+    task_class: Option<PacketTaskClassDto>,
+    budget: PacketBudgetModeDto,
+    limits: &PacketBudgetLimitsDto,
+) -> AgentRetrievalProfileSelectionDto {
+    let preset = match task_class {
+        Some(PacketTaskClassDto::BugLocalization) | Some(PacketTaskClassDto::EditPlanning) => {
+            AgentRetrievalPresetDto::Investigate
+        }
+        Some(PacketTaskClassDto::ChangeImpact) | Some(PacketTaskClassDto::SymbolOwnership) => {
+            AgentRetrievalPresetDto::Impact
+        }
+        Some(PacketTaskClassDto::RouteTracing) => AgentRetrievalPresetDto::Callflow,
+        Some(PacketTaskClassDto::ArchitectureExplanation)
+        | Some(PacketTaskClassDto::DataFlow)
+        | None => AgentRetrievalPresetDto::Architecture,
+    };
+
+    if matches!(
+        budget,
+        PacketBudgetModeDto::Tiny | PacketBudgetModeDto::Compact
+    ) {
+        return AgentRetrievalProfileSelectionDto::Custom {
+            config: AgentCustomRetrievalConfigDto {
+                depth: if matches!(budget, PacketBudgetModeDto::Tiny) {
+                    1
+                } else {
+                    2
+                },
+                max_nodes: limits.max_trail_edges.clamp(10, 2_000),
+                include_edge_occurrences: matches!(
+                    task_class,
+                    Some(PacketTaskClassDto::ChangeImpact | PacketTaskClassDto::RouteTracing)
+                ),
+                enable_source_reads: true,
+                ..AgentCustomRetrievalConfigDto::default()
+            },
+        };
+    }
+
+    AgentRetrievalProfileSelectionDto::Preset { preset }
+}
+
+fn packet_budget_limits(mode: PacketBudgetModeDto) -> PacketBudgetLimitsDto {
+    match mode {
+        PacketBudgetModeDto::Tiny => PacketBudgetLimitsDto {
+            max_anchors: 3,
+            max_files: 3,
+            max_snippets: 6,
+            max_trail_edges: 12,
+            max_output_bytes: 24 * 1024,
+        },
+        PacketBudgetModeDto::Compact => PacketBudgetLimitsDto {
+            max_anchors: 10,
+            max_files: 10,
+            max_snippets: 12,
+            max_trail_edges: 30,
+            max_output_bytes: 96 * 1024,
+        },
+        PacketBudgetModeDto::Standard => PacketBudgetLimitsDto {
+            max_anchors: 10,
+            max_files: 10,
+            max_snippets: 24,
+            max_trail_edges: 60,
+            max_output_bytes: 128 * 1024,
+        },
+        PacketBudgetModeDto::Deep => PacketBudgetLimitsDto {
+            max_anchors: 25,
+            max_files: 25,
+            max_snippets: 80,
+            max_trail_edges: 240,
+            max_output_bytes: 512 * 1024,
+        },
+    }
+}
+
+fn apply_packet_budget(
+    project_root: &Path,
+    question: &str,
+    requested: PacketBudgetModeDto,
+    limits: PacketBudgetLimitsDto,
+    answer: &mut AgentAnswerDto,
+) -> PacketBudgetDto {
+    let mut truncated = false;
+    let mut omitted_sections = Vec::new();
+
+    if cap_citations(answer, &limits) {
+        truncated = true;
+        omitted_sections.push("citations".to_string());
+    }
+    if cap_graph_edges(answer, limits.max_trail_edges) {
+        truncated = true;
+        omitted_sections.push("trail_edges".to_string());
+    }
+    if truncate_answer_markdown_to_byte_cap(answer, limits.max_output_bytes as usize) {
+        truncated = true;
+        omitted_sections.push("markdown_blocks".to_string());
+    }
+
+    let used = packet_budget_usage(answer);
+    if used.output_bytes > limits.max_output_bytes {
+        truncated = true;
+        omitted_sections.push("output_bytes".to_string());
+    }
+
+    omitted_sections.sort();
+    omitted_sections.dedup();
+
+    PacketBudgetDto {
+        requested,
+        limits,
+        used,
+        truncated,
+        omitted_sections,
+        next_deeper_command: next_deeper_packet_command(project_root, question, requested),
+    }
+}
+
+fn enforce_packet_output_budget(project_root: &Path, packet: &mut AgentPacketDto) {
+    for _ in 0..8 {
+        let output_bytes = refresh_packet_output_bytes(packet);
+        if output_bytes <= packet.budget.limits.max_output_bytes as usize {
+            break;
+        }
+
+        packet.budget.truncated = true;
+        push_omitted_section(&mut packet.budget, "output_bytes");
+        push_omitted_section(&mut packet.budget, "packet_payload");
+
+        let over_by = output_bytes.saturating_sub(packet.budget.limits.max_output_bytes as usize);
+        let current_answer_bytes = serde_json::to_vec(&packet.answer)
+            .map(|bytes| bytes.len())
+            .unwrap_or_default();
+        let next_answer_cap = current_answer_bytes
+            .saturating_sub(over_by.saturating_add(1024))
+            .max(1024);
+
+        if truncate_answer_markdown_to_byte_cap(&mut packet.answer, next_answer_cap) {
+            push_omitted_section(&mut packet.budget, "markdown_blocks");
+            packet.budget.used = packet_budget_usage(&packet.answer);
+            packet.benchmark_trace = packet_benchmark_trace(&packet.answer);
+            packet.sufficiency = build_packet_sufficiency(
+                project_root,
+                &packet.question,
+                packet
+                    .task_class
+                    .unwrap_or(PacketTaskClassDto::ArchitectureExplanation),
+                &packet.answer,
+                &packet.budget,
+            );
+            continue;
+        }
+        break;
+    }
+
+    let output_bytes = refresh_packet_output_bytes(packet);
+    if output_bytes > packet.budget.limits.max_output_bytes as usize {
+        packet.budget.truncated = true;
+        push_omitted_section(&mut packet.budget, "output_bytes");
+        push_omitted_section(&mut packet.budget, "packet_payload");
+        packet.sufficiency = build_packet_sufficiency(
+            project_root,
+            &packet.question,
+            packet
+                .task_class
+                .unwrap_or(PacketTaskClassDto::ArchitectureExplanation),
+            &packet.answer,
+            &packet.budget,
+        );
+    }
+}
+
+fn refresh_packet_output_bytes(packet: &mut AgentPacketDto) -> usize {
+    for _ in 0..4 {
+        let output_bytes = serialized_packet_len(packet);
+        let output_bytes_u32 = output_bytes.try_into().unwrap_or(u32::MAX);
+        if packet.budget.used.output_bytes == output_bytes_u32 {
+            return output_bytes;
+        }
+        packet.budget.used.output_bytes = output_bytes_u32;
+    }
+    serialized_packet_len(packet)
+}
+
+fn serialized_packet_len(packet: &AgentPacketDto) -> usize {
+    serde_json::to_vec(packet)
+        .map(|bytes| bytes.len())
+        .unwrap_or_default()
+}
+
+fn push_omitted_section(budget: &mut PacketBudgetDto, section: &str) {
+    if !budget
+        .omitted_sections
+        .iter()
+        .any(|existing| existing == section)
+    {
+        budget.omitted_sections.push(section.to_string());
+        budget.omitted_sections.sort();
+    }
+}
+
+fn cap_citations(answer: &mut AgentAnswerDto, limits: &PacketBudgetLimitsDto) -> bool {
+    let original_len = answer.citations.len();
+    let mut files = HashSet::new();
+    let mut roles = HashSet::new();
+    let mut kept = Vec::new();
+    let mut deferred = Vec::new();
+
+    for citation in answer.citations.drain(..) {
+        let file = citation.file_path.as_deref().map(packet_display_path);
+        let role = packet_evidence_role(&citation);
+        let file_is_new = file.as_ref().is_some_and(|path| !files.contains(path));
+        let role_is_new = role.is_some_and(|role| !roles.contains(role));
+        if kept.len() < limits.max_anchors as usize
+            && (file_is_new || role_is_new || kept.is_empty())
+            && packet_file_fits_limit(file.as_deref(), &files, limits.max_files)
+        {
+            if let Some(path) = file {
+                files.insert(path);
+            }
+            if let Some(role) = role {
+                roles.insert(role);
+            }
+            kept.push(citation);
+        } else {
+            deferred.push(citation);
+        }
+    }
+
+    for citation in deferred {
+        if kept.len() >= limits.max_anchors as usize {
+            continue;
+        }
+        let file = citation.file_path.as_deref().map(packet_display_path);
+        if !packet_file_fits_limit(file.as_deref(), &files, limits.max_files) {
+            continue;
+        }
+        if let Some(path) = file {
+            files.insert(path);
+        }
+        kept.push(citation);
+    }
+
+    let truncated = kept.len() < original_len;
+    answer.citations = kept;
+    truncated
+}
+
+fn packet_file_fits_limit(path: Option<&str>, files: &HashSet<String>, max_files: u32) -> bool {
+    path.is_none_or(|path| files.contains(path) || files.len() < max_files as usize)
+}
+
+fn cap_graph_edges(answer: &mut AgentAnswerDto, max_edges: u32) -> bool {
+    let mut remaining = max_edges as usize;
+    let mut truncated = false;
+    for artifact in &mut answer.graphs {
+        let GraphArtifactDto::Uml { graph, .. } = artifact else {
+            continue;
+        };
+        if graph.edges.len() > remaining {
+            let omitted = graph.edges.len() - remaining;
+            graph.edges.truncate(remaining);
+            graph.truncated = true;
+            graph.omitted_edge_count = graph
+                .omitted_edge_count
+                .saturating_add(omitted.try_into().unwrap_or(u32::MAX));
+            truncated = true;
+            remaining = 0;
+        } else {
+            remaining = remaining.saturating_sub(graph.edges.len());
+        }
+        if prune_graph_to_retained_edges(graph) {
+            truncated = true;
+        }
+    }
+    truncated
+}
+
+fn prune_graph_to_retained_edges(graph: &mut GraphResponse) -> bool {
+    let original_nodes = graph.nodes.len();
+    let original_layout_nodes = graph
+        .canonical_layout
+        .as_ref()
+        .map(|layout| layout.nodes.len())
+        .unwrap_or_default();
+    let original_layout_edges = graph
+        .canonical_layout
+        .as_ref()
+        .map(|layout| layout.edges.len())
+        .unwrap_or_default();
+    let mut retained_node_ids = HashSet::new();
+    retained_node_ids.insert(graph.center_id.clone());
+    let retained_edge_ids = graph
+        .edges
+        .iter()
+        .map(|edge| edge.id.clone())
+        .collect::<HashSet<_>>();
+
+    for edge in &graph.edges {
+        retained_node_ids.insert(edge.source.clone());
+        retained_node_ids.insert(edge.target.clone());
+    }
+
+    graph
+        .nodes
+        .retain(|node| retained_node_ids.contains(&node.id));
+
+    if let Some(layout) = graph.canonical_layout.as_mut() {
+        layout.edges.retain(|edge| {
+            let endpoints_retained = retained_node_ids.contains(&edge.source)
+                && retained_node_ids.contains(&edge.target);
+            let source_edge_retained = edge.source_edge_ids.is_empty()
+                || edge
+                    .source_edge_ids
+                    .iter()
+                    .any(|edge_id| retained_edge_ids.contains(edge_id));
+            endpoints_retained && source_edge_retained
+        });
+        layout
+            .nodes
+            .retain(|node| retained_node_ids.contains(&node.id));
+    }
+
+    let pruned = graph.nodes.len() < original_nodes
+        || graph
+            .canonical_layout
+            .as_ref()
+            .map(|layout| layout.nodes.len() < original_layout_nodes)
+            .unwrap_or(false)
+        || graph
+            .canonical_layout
+            .as_ref()
+            .map(|layout| layout.edges.len() < original_layout_edges)
+            .unwrap_or(false);
+    if pruned {
+        graph.truncated = true;
+    }
+    pruned
+}
+
+fn truncate_answer_markdown_to_byte_cap(answer: &mut AgentAnswerDto, byte_cap: usize) -> bool {
+    let mut truncated = false;
+    for _ in 0..8 {
+        let Ok(bytes) = serde_json::to_vec(answer) else {
+            return truncated;
+        };
+        if bytes.len() <= byte_cap {
+            return truncated;
+        }
+        let Some((section_index, block_index, len)) = largest_markdown_block(answer) else {
+            return truncated;
+        };
+        if len <= 256 {
+            return truncated;
+        }
+        if let AgentResponseBlockDto::Markdown { markdown } =
+            &mut answer.sections[section_index].blocks[block_index]
+        {
+            truncate_markdown_block(markdown);
+            truncated = true;
+        }
+    }
+    truncated
+}
+
+fn largest_markdown_block(answer: &AgentAnswerDto) -> Option<(usize, usize, usize)> {
+    let mut largest = None;
+    for (section_index, section) in answer.sections.iter().enumerate() {
+        for (block_index, block) in section.blocks.iter().enumerate() {
+            if let AgentResponseBlockDto::Markdown { markdown } = block {
+                let len = markdown.len();
+                if largest.is_none_or(|(_, _, existing)| len > existing) {
+                    largest = Some((section_index, block_index, len));
+                }
+            }
+        }
+    }
+    largest
+}
+
+fn truncate_markdown_block(markdown: &mut String) {
+    const SUFFIX: &str = "\n\n... packet section truncated by budget ...\n";
+    let keep_chars = markdown.chars().count() / 2;
+    let mut keep_byte = markdown.len();
+    if let Some((index, _)) = markdown.char_indices().nth(keep_chars) {
+        keep_byte = index;
+    }
+    markdown.truncate(keep_byte);
+    markdown.push_str(SUFFIX);
+}
+
+fn packet_budget_usage(answer: &AgentAnswerDto) -> PacketBudgetUsageDto {
+    let files = answer
+        .citations
+        .iter()
+        .filter_map(|citation| citation.file_path.as_deref())
+        .collect::<HashSet<_>>()
+        .len();
+    let trail_edges = answer
+        .graphs
+        .iter()
+        .map(|artifact| match artifact {
+            GraphArtifactDto::Uml { graph, .. } => graph.edges.len(),
+            GraphArtifactDto::Mermaid { .. } => 0,
+        })
+        .sum::<usize>();
+    let snippets = answer
+        .retrieval_trace
+        .steps
+        .iter()
+        .filter(|step| {
+            step.kind == AgentRetrievalStepKindDto::SourceRead
+                && step.status == AgentRetrievalStepStatusDto::Ok
+        })
+        .count();
+    let output_bytes = serde_json::to_vec(answer)
+        .map(|bytes| bytes.len())
+        .unwrap_or_default();
+
+    PacketBudgetUsageDto {
+        anchors: answer.citations.len().try_into().unwrap_or(u32::MAX),
+        files: files.try_into().unwrap_or(u32::MAX),
+        snippets: snippets.try_into().unwrap_or(u32::MAX),
+        trail_edges: trail_edges.try_into().unwrap_or(u32::MAX),
+        output_bytes: output_bytes.try_into().unwrap_or(u32::MAX),
+    }
+}
+
+fn next_deeper_packet_command(
+    project_root: &Path,
+    question: &str,
+    requested: PacketBudgetModeDto,
+) -> Option<String> {
+    let next = match requested {
+        PacketBudgetModeDto::Tiny => "compact",
+        PacketBudgetModeDto::Compact => "standard",
+        PacketBudgetModeDto::Standard => "deep",
+        PacketBudgetModeDto::Deep => return None,
+    };
+    let project = quote_packet_project_arg(project_root);
+    Some(format!(
+        "codestory-cli packet --project {project} --question {} --budget {next}",
+        quote_packet_command_value(question)
+    ))
+}
+
+fn quote_packet_project_arg(project_root: &Path) -> String {
+    quote_packet_command_value(project_root.to_string_lossy().as_ref())
+}
+
+fn quote_packet_command_value(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn build_packet_sufficiency(
+    project_root: &Path,
+    question: &str,
+    task_class: PacketTaskClassDto,
+    answer: &AgentAnswerDto,
+    budget: &PacketBudgetDto,
+) -> PacketSufficiencyDto {
+    let has_errors = answer
+        .retrieval_trace
+        .steps
+        .iter()
+        .any(|step| step.status == AgentRetrievalStepStatusDto::Error);
+    let min_citations = packet_sufficiency_min_citations(task_class);
+    let has_minimum_coverage = answer.citations.len() >= min_citations;
+    let status = if answer.citations.is_empty() {
+        PacketSufficiencyStatusDto::Insufficient
+    } else if has_errors || !has_minimum_coverage || packet_budget_exceeded_hard_output_cap(budget)
+    {
+        PacketSufficiencyStatusDto::Partial
+    } else {
+        PacketSufficiencyStatusDto::Sufficient
+    };
+
+    let mut gaps = Vec::new();
+    if answer.citations.is_empty() {
+        gaps.push("No cited anchors were found for the question.".to_string());
+    }
+    if !answer.citations.is_empty() && !has_minimum_coverage {
+        gaps.push(format!(
+            "{:?} packet found only {} cited anchor(s); at least {} are required before treating the packet as sufficient.",
+            task_class,
+            answer.citations.len(),
+            min_citations
+        ));
+    }
+    if budget.truncated && status != PacketSufficiencyStatusDto::Sufficient {
+        gaps.push(format!(
+            "Packet was truncated by {:?} budget: {}.",
+            budget.requested,
+            budget.omitted_sections.join(", ")
+        ));
+    }
+    for step in answer
+        .retrieval_trace
+        .steps
+        .iter()
+        .filter(|step| step.status == AgentRetrievalStepStatusDto::Error)
+    {
+        gaps.push(format!("{:?} step failed.", step.kind));
+    }
+
+    let follow_up_commands = packet_follow_up_commands(project_root, question, status, budget);
+    let open_next = follow_up_commands.clone();
+    let avoid_opening = answer
+        .citations
+        .iter()
+        .filter_map(|citation| citation.file_path.as_ref())
+        .map(|path| packet_display_path(path))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .take(12)
+        .map(|path| {
+            format!(
+                "{} because this packet already includes a citation for the current answer.",
+                path
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut covered_claims = packet_supported_claims(answer);
+    if covered_claims.is_empty() {
+        covered_claims.push(PacketClaimDto {
+            claim: answer.summary.clone(),
+            citations: answer.citations.iter().take(6).cloned().collect(),
+        });
+    }
+
+    PacketSufficiencyDto {
+        status,
+        covered_claims,
+        open_next,
+        avoid_opening,
+        gaps,
+        follow_up_commands,
+    }
+}
+
+fn packet_sufficiency_min_citations(task_class: PacketTaskClassDto) -> usize {
+    match task_class {
+        PacketTaskClassDto::BugLocalization | PacketTaskClassDto::SymbolOwnership => 2,
+        PacketTaskClassDto::ArchitectureExplanation
+        | PacketTaskClassDto::ChangeImpact
+        | PacketTaskClassDto::RouteTracing
+        | PacketTaskClassDto::DataFlow
+        | PacketTaskClassDto::EditPlanning => 3,
+    }
+}
+
+fn packet_budget_exceeded_hard_output_cap(budget: &PacketBudgetDto) -> bool {
+    budget
+        .omitted_sections
+        .iter()
+        .any(|section| section == "output_bytes")
+}
+
+fn packet_follow_up_commands(
+    project_root: &Path,
+    question: &str,
+    status: PacketSufficiencyStatusDto,
+    budget: &PacketBudgetDto,
+) -> Vec<String> {
+    let project = quote_packet_project_arg(project_root);
+    match status {
+        PacketSufficiencyStatusDto::Sufficient => Vec::new(),
+        PacketSufficiencyStatusDto::Partial => budget
+            .next_deeper_command
+            .clone()
+            .into_iter()
+            .chain(std::iter::once(format!(
+                "codestory-cli search --project {project} --query {} --why",
+                quote_packet_command_value(question)
+            )))
+            .collect(),
+        PacketSufficiencyStatusDto::Insufficient => vec![
+            format!("codestory-cli index --project {project} --refresh full"),
+            format!(
+                "codestory-cli search --project {project} --query {} --repo-text on --why",
+                quote_packet_command_value(question)
+            ),
+        ],
+    }
+}
+
+fn packet_benchmark_trace(answer: &AgentAnswerDto) -> PacketBenchmarkTraceDto {
+    let mut source_read_steps = 0;
+    let mut search_steps = 0;
+    let mut trail_steps = 0;
+    for step in &answer.retrieval_trace.steps {
+        match step.kind {
+            AgentRetrievalStepKindDto::SourceRead => source_read_steps += 1,
+            AgentRetrievalStepKindDto::Search
+            | AgentRetrievalStepKindDto::SemanticQueryEmbedding
+            | AgentRetrievalStepKindDto::SemanticCandidateRetrieval
+            | AgentRetrievalStepKindDto::HybridRerank
+            | AgentRetrievalStepKindDto::QueryExpansion
+            | AgentRetrievalStepKindDto::RepoTextFallback => search_steps += 1,
+            AgentRetrievalStepKindDto::Trail
+            | AgentRetrievalStepKindDto::Neighborhood
+            | AgentRetrievalStepKindDto::TrailFilterOptions => trail_steps += 1,
+            AgentRetrievalStepKindDto::NodeDetails
+            | AgentRetrievalStepKindDto::NodeOccurrences
+            | AgentRetrievalStepKindDto::EdgeOccurrences
+            | AgentRetrievalStepKindDto::MermaidSynthesis
+            | AgentRetrievalStepKindDto::AnswerSynthesis => {}
+        }
+    }
+
+    PacketBenchmarkTraceDto {
+        retrieval_trace: answer.retrieval_trace.clone(),
+        source_read_steps,
+        search_steps,
+        trail_steps,
+    }
+}
+
 fn cap_graph_artifacts(
     graphs: &mut Vec<GraphArtifactDto>,
     byte_cap: usize,
@@ -322,6 +1960,7 @@ fn execute_retrieval(
             query: prompt.to_string(),
             repo_text: SearchRepoTextMode::Off,
             limit_per_source: max_results as u32,
+            expand_search_plan: false,
             hybrid_weights: None,
             hybrid_limits: None,
         },
@@ -658,11 +2297,7 @@ fn execute_retrieval(
                             ),
                             trail_output,
                         );
-                        trace.annotate(format!(
-                            "Trail {} was truncated at max_nodes={}.",
-                            idx + 1,
-                            plan.max_nodes
-                        ));
+                        trace.annotate(trail_truncated_annotation(idx + 1, plan.max_nodes));
                     } else {
                         trace.finish_ok(trail_step, trail_output);
                     }
@@ -795,8 +2430,7 @@ fn execute_retrieval(
         GraphArtifactDto::Uml { id, .. } => id.clone(),
         GraphArtifactDto::Mermaid { id, .. } => id.clone(),
     });
-    let include_structured_evidence =
-        req.include_evidence || matches!(req.response_mode, AgentResponseModeDto::Structured);
+    let include_structured_evidence = req.include_evidence;
     let scored_by_node = scored_hits
         .iter()
         .map(|scored| (scored.hit.node_id.clone(), scored))
@@ -1092,6 +2726,7 @@ fn investigate_query_expansion(
                 query: term.clone(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: max_results as u32,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             },
@@ -1151,6 +2786,7 @@ fn investigate_repo_text_fallback(
         query: prompt.to_string(),
         repo_text: SearchRepoTextMode::On,
         limit_per_source: max_results as u32,
+        expand_search_plan: false,
         hybrid_weights: None,
         hybrid_limits: None,
     }) {
@@ -1249,6 +2885,10 @@ fn evidence_edge_ids_for_node(
     edge_ids.sort_by(|left, right| left.0.cmp(&right.0));
     edge_ids.truncate(12);
     edge_ids
+}
+
+fn trail_truncated_annotation(trail_number: usize, max_nodes: u32) -> String {
+    format!("Trail {trail_number} was truncated at max_nodes={max_nodes}.")
 }
 
 fn sanitize_plan_filters(plan: &TrailPlan, options: &TrailFilterOptionsDto) -> TrailPlan {
@@ -1642,21 +3282,7 @@ fn retrieval_markdown(
     } else {
         markdown.push_str("\nTop indexed matches:\n");
         for hit in bundle.hits.iter().take(6) {
-            let location = match (&hit.file_path, hit.line) {
-                (Some(path), Some(line)) => format!(" ({}:{})", path, line),
-                (Some(path), None) => format!(" ({})", path),
-                _ => String::new(),
-            };
-            let _ = writeln!(
-                markdown,
-                "- **{}** [{:?}] origin `{}` resolvable `{}` score `{:.3}`{}",
-                hit.display_name,
-                hit.kind,
-                hit.origin.as_str(),
-                hit.resolvable,
-                hit.score,
-                location
-            );
+            write_indexed_match_markdown(&mut markdown, hit);
         }
     }
 
@@ -1673,6 +3299,27 @@ fn retrieval_markdown(
     }
 
     markdown
+}
+
+fn write_indexed_match_markdown(markdown: &mut String, hit: &SearchHit) {
+    let _ = writeln!(
+        markdown,
+        "- **{}** [{:?}] origin `{}` resolvable `{}` score `{:.3}`{}",
+        hit.display_name,
+        hit.kind,
+        hit.origin.as_str(),
+        hit.resolvable,
+        hit.score,
+        search_hit_location_suffix(hit)
+    );
+}
+
+fn search_hit_location_suffix(hit: &SearchHit) -> String {
+    match (&hit.file_path, hit.line) {
+        (Some(path), Some(line)) => format!(" ({}:{})", path, line),
+        (Some(path), None) => format!(" ({})", path),
+        _ => String::new(),
+    }
 }
 
 fn first_mermaid_graph_id(graphs: &[GraphArtifactDto]) -> Option<String> {
@@ -1869,6 +3516,87 @@ mod tests {
         hit
     }
 
+    fn test_packet_citation(display_name: &str, file_path: &str, score: f32) -> AgentCitationDto {
+        AgentCitationDto {
+            node_id: NodeId(display_name.to_string()),
+            display_name: display_name.to_string(),
+            kind: codestory_contracts::api::NodeKind::FUNCTION,
+            file_path: Some(file_path.to_string()),
+            line: Some(10),
+            score,
+            origin: SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
+                lexical: 0.4,
+                semantic: 0.2,
+                graph: 0.3,
+                total: score,
+            }),
+        }
+    }
+
+    fn packet_answer_fixture(question: &str, citations: Vec<AgentCitationDto>) -> AgentAnswerDto {
+        AgentAnswerDto {
+            answer_id: "packet-fixture".to_string(),
+            prompt: question.to_string(),
+            summary: "Fixture packet is covered by cited anchors.".to_string(),
+            freshness: None,
+            sections: vec![AgentResponseSectionDto {
+                id: "answer".to_string(),
+                title: "Answer".to_string(),
+                blocks: vec![AgentResponseBlockDto::Markdown {
+                    markdown: "Packet answer assembled from cited anchors.".to_string(),
+                }],
+            }],
+            citations,
+            subgraph_ids: Vec::new(),
+            retrieval_version: "test".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
+                request_id: "packet-fixture".to_string(),
+                resolved_profile: AgentRetrievalPresetDto::Architecture,
+                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+                total_latency_ms: 1,
+                sla_target_ms: None,
+                sla_missed: false,
+                annotations: Vec::new(),
+                steps: Vec::new(),
+            },
+        }
+    }
+
+    fn packet_fixture_project_root() -> &'static std::path::Path {
+        std::path::Path::new("C:/workspace/project root")
+    }
+
+    fn build_sufficient_packet_fixture(
+        question: &str,
+        task_class: PacketTaskClassDto,
+        citations: Vec<AgentCitationDto>,
+    ) -> (AgentAnswerDto, PacketSufficiencyDto) {
+        let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
+        let mut answer = packet_answer_fixture(question, citations);
+        rank_packet_evidence(question, &mut answer);
+        append_packet_evidence_sections(&mut answer, task_class, &limits);
+        let budget = apply_packet_budget(
+            packet_fixture_project_root(),
+            question,
+            PacketBudgetModeDto::Compact,
+            limits,
+            &mut answer,
+        );
+        let sufficiency = build_packet_sufficiency(
+            packet_fixture_project_root(),
+            question,
+            task_class,
+            &answer,
+            &budget,
+        );
+        (answer, sufficiency)
+    }
+
     #[test]
     fn investigation_mode_is_explicit_preset_only() {
         let mut profile = latency_profile();
@@ -1952,6 +3680,941 @@ mod tests {
         assert!(!is_repo_explanation_prompt(
             "Where is build_llm_symbol_doc_text used?"
         ));
+    }
+
+    #[test]
+    fn packet_plan_infers_task_class_and_code_terms() {
+        let plan = build_packet_plan(
+            "Trace the /api/users route through AppController and UserStore",
+            None,
+        );
+
+        assert_eq!(plan.task_class, PacketTaskClassDto::RouteTracing);
+        assert!(plan.inferred_task_class);
+        assert!(
+            plan.queries.iter().any(|query| query.query == "/api/users"),
+            "route-like terms should become concrete packet queries: {plan:?}"
+        );
+        assert!(
+            plan.queries
+                .iter()
+                .any(|query| query.query == "AppController"),
+            "CamelCase symbols should become concrete packet queries: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn requested_packet_task_class_overrides_heuristic() {
+        let plan = build_packet_plan(
+            "What would change if the indexing cache format moved?",
+            Some(PacketTaskClassDto::ChangeImpact),
+        );
+
+        assert_eq!(plan.task_class, PacketTaskClassDto::ChangeImpact);
+        assert!(!plan.inferred_task_class);
+        assert!(
+            plan.queries
+                .iter()
+                .any(|query| query.query.contains("affected")),
+            "change impact plans should seed affected-symbol queries: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn packet_plan_expands_task_wording_without_fixture_specific_anchors() {
+        let plan = build_packet_plan(
+            "Explain how a full indexing run moves from the CLI into runtime orchestration, file discovery, symbol extraction, persistence, and search or snapshot refresh.",
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "indexing",
+            "runtime",
+            "full_indexing",
+            "IndexingRun",
+            "RuntimeOrchestration",
+            "architecture entrypoint",
+            "runtime flow",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "expected generic probe {expected} in packet plan: {queries:?}"
+            );
+        }
+        for fixture_anchor in [
+            "run_index",
+            "IndexService",
+            "WorkspaceIndexer",
+            "flush_projection_batch",
+            "SnapshotStore",
+        ] {
+            assert!(
+                !queries.contains(&fixture_anchor),
+                "packet planner should not inject fixture-specific anchor {fixture_anchor}: {queries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_ownership_packet_plan_seeds_generic_ownership_terms() {
+        let question = "Explain which modules own application creation, app-level rendering, response serialization, file sending, and view lookup.";
+        let plan = build_packet_plan(question, Some(PacketTaskClassDto::SymbolOwnership));
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "references",
+            "callers",
+            "definition references",
+            "application",
+            "view",
+            "lookup",
+            "application_creation",
+            "ApplicationCreation",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "expected {expected} in generic ownership packet plan: {queries:?}"
+            );
+        }
+        for fixture_anchor in ["createApplication", "lib/express.js", "lib/response.js"] {
+            assert!(
+                !queries.contains(&fixture_anchor),
+                "ownership planning should not inject fixture-specific anchor {fixture_anchor}: {queries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bug_packet_plan_seeds_generic_failure_terms_and_prompt_identifiers() {
+        let question =
+            "Localize an app.param callback decode bug through router parameter handling.";
+        let plan = build_packet_plan(question, Some(PacketTaskClassDto::BugLocalization));
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "app.param",
+            "param",
+            "callback",
+            "error",
+            "validate",
+            "error path",
+            "failure handling",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "expected {expected} in generic bug packet plan: {queries:?}"
+            );
+        }
+        for fixture_anchor in ["proto.param", "Layer.prototype.match", "test/app.param.js"] {
+            assert!(
+                !queries.contains(&fixture_anchor),
+                "bug planning should not inject fixture-specific anchor {fixture_anchor}: {queries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_tracing_packet_plan_seeds_generic_route_terms() {
+        let question = "Trace how an application registers middleware and routes, then dispatches an incoming request through router layers to a route handler.";
+        let plan = build_packet_plan(question, Some(PacketTaskClassDto::RouteTracing));
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "router",
+            "handler",
+            "route",
+            "middleware",
+            "dispatch",
+            "route handler endpoint",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "expected {expected} in route tracing packet plan: {queries:?}"
+            );
+        }
+        for fixture_anchor in [
+            "createApplication",
+            "lib/router/layer.js",
+            "Router.StrictSlash",
+        ] {
+            assert!(
+                !queries.contains(&fixture_anchor),
+                "route tracing should not inject fixture-specific anchor {fixture_anchor}: {queries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_supported_claims_use_generic_evidence_roles() {
+        let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
+        let mut answer = AgentAnswerDto {
+            answer_id: "generic-fixture".to_string(),
+            prompt: "Explain the packet evidence roles.".to_string(),
+            summary: "Generic evidence roles are covered.".to_string(),
+            freshness: None,
+            sections: Vec::new(),
+            citations: vec![
+                test_packet_citation("CliCommand", "crates/tool-cli/src/main.rs", 0.8),
+                test_packet_citation("RuntimeCoordinator", "crates/core/src/runtime.rs", 0.8),
+                test_packet_citation("WorkspacePlan", "crates/core/src/workspace/plan.rs", 0.8),
+                test_packet_citation("GraphIndexer", "crates/indexer/src/lib.rs", 0.8),
+                test_packet_citation("ProjectionStore", "crates/store/src/projection.rs", 0.8),
+                test_packet_citation("SnapshotRefresh", "crates/store/src/snapshot.rs", 0.8),
+                test_packet_citation("RouteHandler", "src/routes/user.rs", 0.8),
+                test_packet_citation("PacketRegression", "tests/packet_flow.rs", 0.8),
+            ],
+            subgraph_ids: Vec::new(),
+            retrieval_version: "test".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
+                request_id: "generic-fixture".to_string(),
+                resolved_profile: AgentRetrievalPresetDto::Architecture,
+                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+                total_latency_ms: 1,
+                sla_target_ms: None,
+                sla_missed: false,
+                annotations: Vec::new(),
+                steps: Vec::new(),
+            },
+        };
+
+        append_packet_evidence_sections(
+            &mut answer,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &limits,
+        );
+        let text = answer
+            .sections
+            .iter()
+            .flat_map(|section| &section.blocks)
+            .filter_map(|block| match block {
+                AgentResponseBlockDto::Markdown { markdown } => Some(markdown.as_str()),
+                AgentResponseBlockDto::Mermaid { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for expected_claim in [
+            "The command or public entrypoint for this flow is anchored by `CliCommand`",
+            "Runtime orchestration is anchored by `RuntimeCoordinator`",
+            "Workspace discovery or planning is anchored by `WorkspacePlan`",
+            "Symbol extraction is anchored by `GraphIndexer`",
+            "Persistence or search projection is anchored by `ProjectionStore`",
+            "Snapshot refresh is anchored by `SnapshotRefresh`",
+            "Route handling is anchored by `RouteHandler`",
+            "Regression coverage for this flow is anchored by `PacketRegression`",
+        ] {
+            assert!(
+                text.contains(expected_claim),
+                "generic packet claims should include {expected_claim}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_ranking_demotes_test_paths_without_fixture_specific_boosts() {
+        let question = "Trace route dispatch through a handler.";
+        let mut answer = AgentAnswerDto {
+            answer_id: "rank-fixture".to_string(),
+            prompt: question.to_string(),
+            summary: "Route evidence is covered by cited anchors.".to_string(),
+            freshness: None,
+            sections: Vec::new(),
+            citations: vec![
+                test_packet_citation("RouteHandler test", "tests/router_handler.rs", 5.0),
+                test_packet_citation("RouteHandler", "src/router/handler.rs", 0.5),
+            ],
+            subgraph_ids: Vec::new(),
+            retrieval_version: "test".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
+                request_id: "rank-fixture".to_string(),
+                resolved_profile: AgentRetrievalPresetDto::Architecture,
+                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+                total_latency_ms: 1,
+                sla_target_ms: None,
+                sla_missed: false,
+                annotations: Vec::new(),
+                steps: Vec::new(),
+            },
+        };
+
+        rank_packet_evidence(question, &mut answer);
+        assert_eq!(answer.citations[0].display_name, "RouteHandler");
+    }
+
+    #[test]
+    fn sufficient_packets_stop_broad_exploration_across_task_classes() {
+        let fixtures = [
+            (
+                PacketTaskClassDto::ArchitectureExplanation,
+                "Explain how the command runtime loads a workspace plan and refreshes snapshots.",
+                vec![
+                    test_packet_citation("CliCommand", "crates/app-cli/src/main.rs", 0.9),
+                    test_packet_citation(
+                        "RuntimeCoordinator",
+                        "crates/app-runtime/src/runtime.rs",
+                        0.9,
+                    ),
+                    test_packet_citation("WorkspacePlan", "crates/workspace/src/plan.rs", 0.8),
+                ],
+                "Runtime orchestration is anchored by `RuntimeCoordinator`",
+                "crates/app-runtime/src/runtime.rs",
+            ),
+            (
+                PacketTaskClassDto::BugLocalization,
+                "Find the failure handling path for decode validation.",
+                vec![
+                    test_packet_citation("RuntimeErrorHandler", "src/runtime/errors.rs", 0.9),
+                    test_packet_citation("DecodeValidator", "src/validation/decode.rs", 0.8),
+                    test_packet_citation("DecodeRegression", "tests/decode_regression.rs", 0.7),
+                ],
+                "Runtime orchestration is anchored by `RuntimeErrorHandler`",
+                "src/runtime/errors.rs",
+            ),
+            (
+                PacketTaskClassDto::ChangeImpact,
+                "What changes if reference resolution behavior changes?",
+                vec![
+                    test_packet_citation(
+                        "AffectedReferenceIndex",
+                        "crates/indexer/src/references.rs",
+                        0.9,
+                    ),
+                    test_packet_citation("ReferenceStore", "crates/store/src/references.rs", 0.8),
+                    test_packet_citation(
+                        "ReferenceRegression",
+                        "tests/reference_regression.rs",
+                        0.7,
+                    ),
+                ],
+                "Symbol extraction is anchored by `AffectedReferenceIndex`",
+                "crates/indexer/src/references.rs",
+            ),
+            (
+                PacketTaskClassDto::RouteTracing,
+                "Trace how a request reaches the selected handler.",
+                vec![
+                    test_packet_citation("RouteDispatcher", "src/router/dispatch.rs", 0.9),
+                    test_packet_citation("RouteHandler", "src/router/handler.rs", 0.8),
+                    test_packet_citation("RouteRegression", "tests/route_regression.rs", 0.7),
+                ],
+                "Route handling is anchored by `RouteDispatcher`",
+                "src/router/dispatch.rs",
+            ),
+            (
+                PacketTaskClassDto::SymbolOwnership,
+                "Who owns workspace planning and graph state?",
+                vec![
+                    test_packet_citation(
+                        "WorkspaceOwnerPlan",
+                        "crates/workspace/src/ownership.rs",
+                        0.9,
+                    ),
+                    test_packet_citation("GraphStateStore", "crates/store/src/graph.rs", 0.8),
+                    test_packet_citation(
+                        "OwnershipRegression",
+                        "tests/ownership_regression.rs",
+                        0.7,
+                    ),
+                ],
+                "Workspace discovery or planning is anchored by `WorkspaceOwnerPlan`",
+                "crates/workspace/src/ownership.rs",
+            ),
+            (
+                PacketTaskClassDto::EditPlanning,
+                "Plan the focused edit for configuration validation behavior.",
+                vec![
+                    test_packet_citation("ConfigValidator", "src/config/validator.rs", 0.9),
+                    test_packet_citation("ConfigEditPlan", "src/config/edit_plan.rs", 0.8),
+                    test_packet_citation("ConfigRegression", "tests/config_regression.rs", 0.7),
+                ],
+                "Regression coverage for this flow is anchored by `ConfigRegression`",
+                "tests/config_regression.rs",
+            ),
+        ];
+
+        for (task_class, question, citations, expected_claim, avoid_path) in fixtures {
+            let (_answer, sufficiency) =
+                build_sufficient_packet_fixture(question, task_class, citations);
+
+            assert_eq!(
+                sufficiency.status,
+                PacketSufficiencyStatusDto::Sufficient,
+                "task class {task_class:?} should be sufficient: {sufficiency:?}"
+            );
+            assert!(
+                sufficiency.follow_up_commands.is_empty(),
+                "sufficient {task_class:?} packets should not recommend broad follow-up commands: {sufficiency:?}"
+            );
+            assert!(
+                sufficiency.open_next.is_empty(),
+                "sufficient {task_class:?} packets should not name generic open-next work: {sufficiency:?}"
+            );
+            assert!(
+                sufficiency
+                    .covered_claims
+                    .iter()
+                    .any(|claim| claim.claim.contains(expected_claim)),
+                "sufficient {task_class:?} packet should name the covered task claim `{expected_claim}`: {sufficiency:?}"
+            );
+            assert!(
+                sufficiency
+                    .avoid_opening
+                    .iter()
+                    .any(|entry| entry.contains(avoid_path)),
+                "sufficient {task_class:?} packet should discourage reopening cited path `{avoid_path}`: {sufficiency:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_and_insufficient_packets_recommend_targeted_followups() {
+        let question = "Explain route dispatch with enough evidence to stop.";
+        let mut partial_answer = packet_answer_fixture(
+            question,
+            vec![test_packet_citation(
+                "RouteDispatcher",
+                "src/router/dispatch.rs",
+                0.8,
+            )],
+        );
+        let mut budget = apply_packet_budget(
+            packet_fixture_project_root(),
+            question,
+            PacketBudgetModeDto::Tiny,
+            packet_budget_limits(PacketBudgetModeDto::Tiny),
+            &mut partial_answer,
+        );
+        budget.truncated = true;
+        budget.omitted_sections = vec!["output_bytes".to_string()];
+        let partial = build_packet_sufficiency(
+            packet_fixture_project_root(),
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &partial_answer,
+            &budget,
+        );
+
+        assert_eq!(partial.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            partial
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("--budget compact")),
+            "partial packets should recommend the next deeper packet command: {partial:?}"
+        );
+        assert!(
+            partial
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("codestory-cli search")),
+            "partial packets should recommend targeted CodeStory search, not broad source reads: {partial:?}"
+        );
+        assert!(
+            partial
+                .follow_up_commands
+                .iter()
+                .all(|command| !command.contains("<target-workspace>")),
+            "partial packet follow-up commands should be directly runnable: {partial:?}"
+        );
+        assert!(
+            partial
+                .follow_up_commands
+                .iter()
+                .all(|command| command.contains("--project 'C:/workspace/project root'")),
+            "partial packet follow-up commands should include the concrete project root: {partial:?}"
+        );
+
+        let mut weak_answer = packet_answer_fixture(
+            question,
+            vec![test_packet_citation(
+                "RouteDispatcher",
+                "src/router/dispatch.rs",
+                0.8,
+            )],
+        );
+        let weak_budget = apply_packet_budget(
+            packet_fixture_project_root(),
+            question,
+            PacketBudgetModeDto::Compact,
+            packet_budget_limits(PacketBudgetModeDto::Compact),
+            &mut weak_answer,
+        );
+        let weak = build_packet_sufficiency(
+            packet_fixture_project_root(),
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &weak_answer,
+            &weak_budget,
+        );
+        assert_eq!(weak.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            weak.gaps
+                .iter()
+                .any(|gap| gap.contains("at least 3 are required")),
+            "single-citation route packets should name the coverage gap: {weak:?}"
+        );
+
+        let mut empty_answer = packet_answer_fixture(question, Vec::new());
+        let empty_budget = apply_packet_budget(
+            packet_fixture_project_root(),
+            question,
+            PacketBudgetModeDto::Compact,
+            packet_budget_limits(PacketBudgetModeDto::Compact),
+            &mut empty_answer,
+        );
+        let insufficient = build_packet_sufficiency(
+            packet_fixture_project_root(),
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &empty_answer,
+            &empty_budget,
+        );
+
+        assert_eq!(
+            insufficient.status,
+            PacketSufficiencyStatusDto::Insufficient
+        );
+        assert!(
+            insufficient
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("codestory-cli index")),
+            "insufficient packets should recommend indexing before broad exploration: {insufficient:?}"
+        );
+        assert!(
+            insufficient
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("--repo-text on")),
+            "insufficient packets should keep fallback exploration inside CodeStory: {insufficient:?}"
+        );
+    }
+
+    #[test]
+    fn packet_follow_up_commands_single_quote_shell_sensitive_questions() {
+        let question = "Inspect $env:SECRET and $(Get-ChildItem) and 'literal'";
+        let quoted = quote_packet_command_value(question);
+
+        assert_eq!(
+            quoted,
+            "'Inspect $env:SECRET and $(Get-ChildItem) and ''literal'''"
+        );
+        let command = next_deeper_packet_command(
+            packet_fixture_project_root(),
+            question,
+            PacketBudgetModeDto::Tiny,
+        )
+        .expect("tiny packet should have deeper command");
+        assert!(
+            command.contains("--question 'Inspect $env:SECRET and $(Get-ChildItem)"),
+            "packet command should single-quote shell-sensitive question text: {command}"
+        );
+        assert!(
+            command.contains("--project 'C:/workspace/project root'"),
+            "packet command should include the concrete project root: {command}"
+        );
+    }
+
+    #[test]
+    fn merged_packet_latency_recomputes_sla_against_packet_budget() {
+        let mut answer = packet_answer_fixture(
+            "Explain the packet latency budget.",
+            vec![
+                test_packet_citation("A", "src/a.rs", 0.8),
+                test_packet_citation("B", "src/b.rs", 0.8),
+                test_packet_citation("C", "src/c.rs", 0.8),
+            ],
+        );
+        answer.retrieval_trace.total_latency_ms = 900;
+        answer.retrieval_trace.sla_missed = false;
+        let mut subanswer =
+            packet_answer_fixture("subquery", vec![test_packet_citation("D", "src/d.rs", 0.8)]);
+        subanswer.retrieval_trace.total_latency_ms = 250;
+        merge_packet_subanswer(
+            &mut answer,
+            subanswer,
+            &PacketPlanQueryDto {
+                query: "subquery".to_string(),
+                purpose: "fixture".to_string(),
+            },
+        );
+
+        PacketLatencyBudget {
+            started_at: Instant::now(),
+            target_ms: 1_000,
+        }
+        .apply_to_trace(&mut answer);
+
+        assert_eq!(answer.retrieval_trace.total_latency_ms, 1_150);
+        assert!(answer.retrieval_trace.sla_missed);
+        assert_eq!(answer.retrieval_trace.sla_target_ms, Some(1_000));
+    }
+
+    #[test]
+    fn citation_budget_truncation_keeps_sufficient_stop_signal() {
+        let question = "Explain the compact packet stop rule.";
+        let mut answer = packet_answer_fixture(
+            question,
+            (0..14)
+                .map(|index| {
+                    test_packet_citation(
+                        &format!("symbol_{index}"),
+                        &format!("src/file_{index}.rs"),
+                        0.8,
+                    )
+                })
+                .collect(),
+        );
+        let budget = apply_packet_budget(
+            packet_fixture_project_root(),
+            question,
+            PacketBudgetModeDto::Compact,
+            packet_budget_limits(PacketBudgetModeDto::Compact),
+            &mut answer,
+        );
+        let sufficiency = build_packet_sufficiency(
+            packet_fixture_project_root(),
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &answer,
+            &budget,
+        );
+
+        assert!(
+            budget.truncated && budget.omitted_sections.contains(&"citations".to_string()),
+            "fixture should exercise normal citation budget truncation: {budget:?}"
+        );
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Sufficient,
+            "budgeted citation clipping should not force broad follow-up when the compact packet still has cited anchors: {sufficiency:?}"
+        );
+        assert!(sufficiency.follow_up_commands.is_empty());
+        assert_eq!(answer.citations.len(), 10);
+        assert!(
+            sufficiency.gaps.is_empty(),
+            "normal compact-budget truncation should stay in budget metadata, not sufficiency gaps: {sufficiency:?}"
+        );
+        assert!(budget.used.files <= budget.limits.max_files);
+        assert!(budget.used.output_bytes <= budget.limits.max_output_bytes);
+    }
+
+    #[test]
+    fn packet_output_budget_measures_serialized_packet_payload() {
+        let question = "Explain the final packet payload budget.";
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 4,
+            max_files: 4,
+            max_snippets: 4,
+            max_trail_edges: 4,
+            max_output_bytes: 6 * 1024,
+        };
+        let max_output_bytes = limits.max_output_bytes;
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![test_packet_citation(
+                "PacketBudget",
+                "crates/codestory-runtime/src/agent/orchestrator.rs",
+                0.8,
+            )],
+        );
+        if let AgentResponseBlockDto::Markdown { markdown } = &mut answer.sections[0].blocks[0] {
+            *markdown = "payload budget evidence ".repeat(6000);
+        }
+        let budget = apply_packet_budget(
+            packet_fixture_project_root(),
+            question,
+            PacketBudgetModeDto::Tiny,
+            limits,
+            &mut answer,
+        );
+        let sufficiency = build_packet_sufficiency(
+            packet_fixture_project_root(),
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &answer,
+            &budget,
+        );
+        let benchmark_trace = packet_benchmark_trace(&answer);
+        let mut packet = AgentPacketDto {
+            packet_id: answer.answer_id.clone(),
+            question: question.to_string(),
+            task_class: Some(PacketTaskClassDto::ArchitectureExplanation),
+            plan: PacketPlanDto {
+                task_class: PacketTaskClassDto::ArchitectureExplanation,
+                inferred_task_class: false,
+                queries: vec![PacketPlanQueryDto {
+                    query: question.to_string(),
+                    purpose: "fixture".to_string(),
+                }],
+                trace: Vec::new(),
+            },
+            answer,
+            budget,
+            sufficiency,
+            benchmark_trace,
+        };
+
+        enforce_packet_output_budget(packet_fixture_project_root(), &mut packet);
+
+        let serialized_len = serde_json::to_vec(&packet).expect("serialize packet").len();
+        assert!(
+            serialized_len <= max_output_bytes as usize,
+            "serialized packet should honor max_output_bytes: {serialized_len} > {}",
+            max_output_bytes
+        );
+        assert_eq!(packet.budget.used.output_bytes as usize, serialized_len);
+        assert!(packet.budget.truncated);
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .contains(&"packet_payload".to_string())
+        );
+    }
+
+    #[test]
+    fn graph_budget_prunes_nodes_not_referenced_by_retained_edges() {
+        fn node(id: &str) -> codestory_contracts::api::GraphNodeDto {
+            codestory_contracts::api::GraphNodeDto {
+                id: NodeId(id.to_string()),
+                label: id.to_string(),
+                kind: codestory_contracts::api::NodeKind::FUNCTION,
+                depth: 1,
+                label_policy: None,
+                badge_visible_members: None,
+                badge_total_members: None,
+                merged_symbol_examples: Vec::new(),
+                file_path: None,
+                qualified_name: None,
+                member_access: None,
+            }
+        }
+
+        fn edge(id: &str, source: &str, target: &str) -> codestory_contracts::api::GraphEdgeDto {
+            codestory_contracts::api::GraphEdgeDto {
+                id: EdgeId(id.to_string()),
+                source: NodeId(source.to_string()),
+                target: NodeId(target.to_string()),
+                kind: codestory_contracts::api::EdgeKind::CALL,
+                confidence: None,
+                certainty: None,
+                callsite_identity: None,
+                candidate_targets: Vec::new(),
+            }
+        }
+
+        let mut answer = packet_answer_fixture(
+            "Explain graph budget trimming.",
+            vec![test_packet_citation("center", "src/center.rs", 0.9)],
+        );
+        answer.graphs.push(GraphArtifactDto::Uml {
+            id: "graph".to_string(),
+            title: "Graph".to_string(),
+            graph: GraphResponse {
+                center_id: NodeId("center".to_string()),
+                nodes: vec![
+                    node("center"),
+                    node("kept"),
+                    node("dropped_a"),
+                    node("dropped_b"),
+                ],
+                edges: vec![
+                    edge("edge_1", "center", "kept"),
+                    edge("edge_2", "kept", "dropped_a"),
+                    edge("edge_3", "dropped_a", "dropped_b"),
+                ],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        });
+
+        let budget = apply_packet_budget(
+            packet_fixture_project_root(),
+            "Explain graph budget trimming.",
+            PacketBudgetModeDto::Tiny,
+            PacketBudgetLimitsDto {
+                max_trail_edges: 1,
+                ..packet_budget_limits(PacketBudgetModeDto::Tiny)
+            },
+            &mut answer,
+        );
+
+        let GraphArtifactDto::Uml { graph, .. } = &answer.graphs[0] else {
+            panic!("expected UML graph");
+        };
+        let node_ids = graph
+            .nodes
+            .iter()
+            .map(|node| node.id.0.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(node_ids, vec!["center", "kept"]);
+        assert!(graph.truncated);
+        assert!(budget.omitted_sections.contains(&"trail_edges".to_string()));
+    }
+
+    #[test]
+    fn generic_packet_sections_and_sufficiency_cover_agent_stop_contract() {
+        let question = "Explain how a command enters runtime orchestration, workspace planning, symbol extraction, persistence, and snapshot refresh.";
+        let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
+        let mut answer = AgentAnswerDto {
+            answer_id: "packet-fixture".to_string(),
+            prompt: question.to_string(),
+            summary: "Runtime flow is covered by cited anchors.".to_string(),
+            freshness: None,
+            sections: vec![AgentResponseSectionDto {
+                id: "answer".to_string(),
+                title: "Answer".to_string(),
+                blocks: vec![AgentResponseBlockDto::Markdown {
+                    markdown: "The flow starts at the command surface and proceeds through runtime, workspace, indexer, store, and snapshot layers.".to_string(),
+                }],
+            }],
+            citations: vec![
+                test_packet_citation(
+                    "FlowRegression",
+                    "tests/flow_regression.rs",
+                    0.5,
+                ),
+                test_packet_citation("CliCommand", "crates/app-cli/src/main.rs", 0.2),
+                test_packet_citation(
+                    "RuntimeCoordinator",
+                    "crates/app-runtime/src/services.rs",
+                    0.3,
+                ),
+                test_packet_citation(
+                    "WorkspacePlan",
+                    "crates/workspace/src/plan.rs",
+                    0.2,
+                ),
+                test_packet_citation(
+                    "GraphIndexer",
+                    "crates/indexer/src/lib.rs",
+                    0.2,
+                ),
+                test_packet_citation(
+                    "ProjectionStore",
+                    "crates/store/src/projection.rs",
+                    0.2,
+                ),
+            ],
+            subgraph_ids: Vec::new(),
+            retrieval_version: "test".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
+                request_id: "packet-fixture".to_string(),
+                resolved_profile: AgentRetrievalPresetDto::Architecture,
+                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+                total_latency_ms: 1,
+                sla_target_ms: None,
+                sla_missed: false,
+                annotations: Vec::new(),
+                steps: Vec::new(),
+            },
+        };
+
+        rank_packet_evidence(question, &mut answer);
+        append_packet_evidence_sections(
+            &mut answer,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &limits,
+        );
+        let budget = apply_packet_budget(
+            packet_fixture_project_root(),
+            question,
+            PacketBudgetModeDto::Compact,
+            limits,
+            &mut answer,
+        );
+        let sufficiency = build_packet_sufficiency(
+            packet_fixture_project_root(),
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &answer,
+            &budget,
+        );
+
+        assert_eq!(answer.sections[0].id, "packet-evidence-ledger");
+        assert_eq!(answer.sections[1].id, "packet-flow-claims");
+        let top_anchor_names = answer
+            .citations
+            .iter()
+            .take(4)
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            top_anchor_names.contains(&"CliCommand"),
+            "command entrypoint should stay in the high-priority flow anchors: {top_anchor_names:?}"
+        );
+        assert!(
+            top_anchor_names.contains(&"RuntimeCoordinator"),
+            "runtime coordination should stay in the high-priority flow anchors: {top_anchor_names:?}"
+        );
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
+        assert!(sufficiency.follow_up_commands.is_empty());
+        assert!(sufficiency.open_next.is_empty());
+        assert!(
+            sufficiency.covered_claims.iter().any(|claim| claim
+                .claim
+                .contains("Runtime orchestration is anchored by `RuntimeCoordinator`")),
+            "generic packet should include claim-led runtime flow notes: {sufficiency:?}"
+        );
+        assert!(
+            sufficiency
+                .avoid_opening
+                .iter()
+                .any(|path| path.contains("crates/app-cli/src/main.rs")),
+            "sufficient packets should tell agents cited files do not need broad re-opening: {sufficiency:?}"
+        );
+    }
+
+    #[test]
+    fn packet_claims_use_normalized_evidence_paths() {
+        let citation = AgentCitationDto {
+            node_id: NodeId("CliCommand".to_string()),
+            display_name: "CliCommand".to_string(),
+            kind: codestory_contracts::api::NodeKind::FUNCTION,
+            file_path: Some(
+                "\\\\?\\C:\\workspaces\\sample\\crates\\tool-cli\\src\\main.rs".to_string(),
+            ),
+            line: Some(193),
+            score: 0.85,
+            origin: SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+        };
+
+        assert_eq!(packet_evidence_role(&citation), Some("command entrypoint"));
+        assert_eq!(
+            packet_display_path(citation.file_path.as_deref().unwrap()),
+            "crates/tool-cli/src/main.rs"
+        );
+        assert!(
+            packet_claim_for_role("command entrypoint", &citation).contains("`CliCommand`"),
+            "claim should name the evidence anchor"
+        );
     }
 
     #[test]

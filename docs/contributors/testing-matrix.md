@@ -89,7 +89,10 @@ cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocap
 
 Append the emitted headline metrics to `docs/testing/codestory-e2e-stats-log.md`. Include graph seconds, semantic seconds, semantic docs reused, semantic docs embedded, total index seconds, and whether `retrieval.semantic_ready` was true.
 
-The 2026-04-18 repo-scale baseline for the default durable semantic scope is `38.43s` cold index, `2.92s` graph phase, `32.07s` semantic phase, and `3,690` embedded semantic docs. A repeat full refresh on the same cache was `7.56s` with `3,690` docs reused and `0` embedded.
+For the current repo-scale baseline, use the latest row in
+[`codestory-e2e-stats-log.md`](../testing/codestory-e2e-stats-log.md). Older
+rows, including the 2026-04-18 durable-scope measurements, are historical
+examples only; do not copy them into current performance claims.
 
 ## CLI Boundary And Output Changes
 
@@ -130,7 +133,7 @@ rerun the speed and retrieval-quality comparison described in
 [`embedding-backend-benchmarks.md`](../testing/embedding-backend-benchmarks.md).
 Start from the human summary in [`research.md`](../research.md). For new
 research lanes, keep the benchmark case shape, quality signal, speed signal,
-and decision current in the matrix instead of adding raw run diaries.
+and decision current in the matrix instead of adding raw run transcripts.
 
 For indexing performance work, run the full bench when practical:
 

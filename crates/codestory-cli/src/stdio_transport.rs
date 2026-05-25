@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::{
-    AgentAskRequest, AgentResponseModeDto, AgentRetrievalPresetDto,
+    AgentAskRequest, AgentPacketRequestDto, AgentResponseModeDto, AgentRetrievalPresetDto,
     AgentRetrievalProfileSelectionDto, GroundingBudgetDto, ListChildrenSymbolsRequest,
-    ListRootSymbolsRequest, NodeId, NodeKind, SearchRepoTextMode, SearchRequest, TrailDirection,
+    ListRootSymbolsRequest, NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto,
+    SearchRepoTextMode, SearchRequest, TrailDirection,
 };
 use std::io::{BufRead, Write};
 
@@ -214,15 +215,126 @@ fn stdio_jsonrpc_tool_call_from_legacy(
 }
 
 fn stdio_tool_call_success(structured_content: serde_json::Value) -> serde_json::Value {
+    let text = stdio_tool_text(&structured_content);
     serde_json::json!({
         "content": [
             {
                 "type": "text",
-                "text": stdio_json_text(&structured_content)
+                "text": text
             }
         ],
         "structuredContent": structured_content
     })
+}
+
+fn stdio_tool_text(value: &serde_json::Value) -> String {
+    if value.get("packet_id").is_some() && value.get("answer").is_some() {
+        return stdio_packet_text(value);
+    }
+    stdio_json_text(value)
+}
+
+fn stdio_packet_text(packet: &serde_json::Value) -> String {
+    let mut text = String::new();
+    append_packet_text_field(
+        &mut text,
+        "packet_id",
+        packet.get("packet_id").and_then(|value| value.as_str()),
+    );
+    append_packet_text_field(
+        &mut text,
+        "question",
+        packet.get("question").and_then(|value| value.as_str()),
+    );
+    append_packet_text_field(
+        &mut text,
+        "task_class",
+        packet.get("task_class").and_then(|value| value.as_str()),
+    );
+    append_packet_text_field(
+        &mut text,
+        "sufficiency",
+        packet
+            .pointer("/sufficiency/status")
+            .and_then(|value| value.as_str()),
+    );
+
+    for section in packet
+        .pointer("/answer/sections")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let id = section.get("id").and_then(|value| value.as_str());
+        if !matches!(id, Some("packet-evidence-ledger" | "packet-flow-claims")) {
+            continue;
+        }
+        if let Some(title) = section.get("title").and_then(|value| value.as_str()) {
+            text.push('\n');
+            text.push_str(title);
+            text.push('\n');
+        }
+        for block in section
+            .get("blocks")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Some(markdown) = block.get("markdown").and_then(|value| value.as_str()) {
+                text.push_str(markdown);
+                if !markdown.ends_with('\n') {
+                    text.push('\n');
+                }
+            }
+        }
+    }
+
+    append_packet_string_array(&mut text, "gaps", packet.pointer("/sufficiency/gaps"));
+    append_packet_string_array(
+        &mut text,
+        "open_next",
+        packet.pointer("/sufficiency/open_next"),
+    );
+    append_packet_string_array(
+        &mut text,
+        "follow_up_commands",
+        packet.pointer("/sufficiency/follow_up_commands"),
+    );
+
+    if text.trim().is_empty() {
+        stdio_json_text(packet)
+    } else {
+        text
+    }
+}
+
+fn append_packet_text_field(text: &mut String, label: &str, value: Option<&str>) {
+    let Some(value) = value else {
+        return;
+    };
+    text.push_str(label);
+    text.push_str(": ");
+    text.push_str(value);
+    text.push('\n');
+}
+
+fn append_packet_string_array(text: &mut String, title: &str, value: Option<&serde_json::Value>) {
+    let Some(items) = value.and_then(|value| value.as_array()) else {
+        return;
+    };
+    if items.is_empty() {
+        return;
+    }
+    text.push('\n');
+    text.push_str(title);
+    text.push_str(":\n");
+    for item in items.iter().take(8) {
+        if let Some(item) = item.as_str() {
+            text.push_str("- ");
+            text.push_str(item);
+            text.push('\n');
+        }
+    }
 }
 
 fn stdio_tool_call_error(error: &serde_json::Value) -> serde_json::Value {
@@ -303,6 +415,7 @@ fn handle_stdio_tool_call(
         .unwrap_or_default()
         .to_string();
     match name {
+        "packet" => handle_stdio_packet(runtime, request),
         "search" => handle_stdio_search(runtime, request, query),
         "symbol" => handle_stdio_symbol(runtime, request),
         "trail" => handle_stdio_trail(runtime, request),
@@ -313,6 +426,100 @@ fn handle_stdio_tool_call(
         "context" => handle_stdio_context(runtime, request),
         _ => serde_json::json!({"error": "unknown tool"}),
     }
+}
+
+fn handle_stdio_packet(runtime: &RuntimeContext, request: &serde_json::Value) -> serde_json::Value {
+    let Some(question) = request
+        .pointer("/params/arguments/question")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return serde_json::json!({"error": "packet.question is required"});
+    };
+    let budget = match stdio_packet_budget(request) {
+        Ok(budget) => budget,
+        Err(error) => return serde_json::json!({"error": error.to_string()}),
+    };
+    let task_class = match stdio_packet_task_class(request) {
+        Ok(task_class) => task_class,
+        Err(error) => return serde_json::json!({"error": error.to_string()}),
+    };
+    let latency_budget_ms = match stdio_packet_latency_budget(request) {
+        Ok(latency_budget_ms) => latency_budget_ms,
+        Err(error) => return serde_json::json!({"error": error.to_string()}),
+    };
+    let include_evidence = request
+        .pointer("/params/arguments/include_evidence")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    runtime
+        .browser
+        .packet(AgentPacketRequestDto {
+            question: question.to_string(),
+            budget,
+            task_class,
+            include_evidence,
+            latency_budget_ms,
+        })
+        .map(|packet| serde_json::json!({"result": packet}))
+        .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))
+}
+
+fn stdio_packet_budget(request: &serde_json::Value) -> Result<PacketBudgetModeDto> {
+    match request
+        .pointer("/params/arguments/budget")
+        .and_then(|value| value.as_str())
+        .unwrap_or("compact")
+    {
+        "tiny" => Ok(PacketBudgetModeDto::Tiny),
+        "compact" => Ok(PacketBudgetModeDto::Compact),
+        "standard" => Ok(PacketBudgetModeDto::Standard),
+        "deep" => Ok(PacketBudgetModeDto::Deep),
+        value => {
+            bail!("packet.budget must be one of tiny, compact, standard, or deep; got {value}")
+        }
+    }
+}
+
+fn stdio_packet_task_class(request: &serde_json::Value) -> Result<Option<PacketTaskClassDto>> {
+    let Some(task_class) = request
+        .pointer("/params/arguments/task_class")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let task_class = match task_class {
+        "architecture_explanation" => PacketTaskClassDto::ArchitectureExplanation,
+        "bug_localization" => PacketTaskClassDto::BugLocalization,
+        "change_impact" => PacketTaskClassDto::ChangeImpact,
+        "route_tracing" => PacketTaskClassDto::RouteTracing,
+        "symbol_ownership" => PacketTaskClassDto::SymbolOwnership,
+        "data_flow" => PacketTaskClassDto::DataFlow,
+        "edit_planning" => PacketTaskClassDto::EditPlanning,
+        value => bail!(
+            "packet.task_class must be one of architecture_explanation, bug_localization, change_impact, route_tracing, symbol_ownership, data_flow, or edit_planning; got {value}"
+        ),
+    };
+    Ok(Some(task_class))
+}
+
+fn stdio_packet_latency_budget(request: &serde_json::Value) -> Result<Option<u32>> {
+    let Some(value) = request.pointer("/params/arguments/latency_budget_ms") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(value) = value.as_u64() else {
+        bail!("packet.latency_budget_ms must be an integer");
+    };
+    if !(1_000..=120_000).contains(&value) {
+        bail!("packet.latency_budget_ms must be between 1000 and 120000");
+    }
+    Ok(Some(value as u32))
 }
 
 fn handle_stdio_search(
@@ -339,6 +546,7 @@ fn handle_stdio_search(
             query,
             repo_text,
             limit_per_source,
+            expand_search_plan: false,
             hybrid_weights: None,
             hybrid_limits: None,
         })
@@ -675,6 +883,14 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
             },
             {
                 "method": "tools/call",
+                "tool": "packet",
+                "arguments": {
+                    "question": "<broad-task-question>",
+                    "budget": "compact"
+                }
+            },
+            {
+                "method": "tools/call",
                 "tool": "search",
                 "arguments": {
                     "query": "<symbol-or-concept>",
@@ -706,6 +922,14 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
             },
             {
                 "method": "tools/call",
+                "tool": "packet",
+                "arguments": {
+                    "question": "<broad-task-question>",
+                    "budget": "compact"
+                }
+            },
+            {
+                "method": "tools/call",
                 "tool": "search",
                 "arguments": {
                     "query": "<symbol-or-task>",
@@ -734,6 +958,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
         ],
         "safety_notes": [
             "All stdio tools are read-only, non-destructive, idempotent, local-only, and closed-world.",
+            "Use packet for broad task questions; use context only after selecting one concrete target.",
             "Use continuation links from search or definition results before broadening retrieval.",
             "Keep search limits bounded; stdio search clamps limit to 1..50.",
             "Treat repo-text hits as evidence until a resolvable symbol is selected."

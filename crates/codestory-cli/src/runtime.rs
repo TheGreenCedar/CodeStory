@@ -225,6 +225,7 @@ fn query_resolution_alternatives(
                 query: query.to_owned(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 50,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             },
@@ -597,6 +598,7 @@ mod tests {
 
     #[test]
     fn project_config_cache_dir_does_not_select_managed_executable_root() {
+        let _env_lock = crate::config::config_env_test_lock();
         let temp = tempdir().expect("temp dir");
         let project = temp.path().join("repo");
         let config_cache = temp.path().join("repo-controlled-cache");

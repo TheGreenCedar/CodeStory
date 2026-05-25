@@ -195,6 +195,7 @@ fn search_symbols(controller: &AppController, query: &str, max_results: u32) -> 
                 query: query.to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: max_results,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             },
@@ -373,6 +374,7 @@ fn exact_literal_query_returns_repo_text_hit_with_line_evidence() {
             query: "CODESTORY_BROWSER_LITERAL".to_string(),
             repo_text: SearchRepoTextMode::On,
             limit_per_source: 8,
+            expand_search_plan: false,
             hybrid_weights: None,
             hybrid_limits: None,
         })

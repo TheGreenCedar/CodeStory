@@ -5,7 +5,7 @@ Runs a compact pipeline over indexed CodeStory data. Use it when you want a shor
 ## Usage
 
 ```
-target/release/codestory-cli(.exe) query [OPTIONS] <QUERY>
+<codestory-cli> query [OPTIONS] <QUERY>
 ```
 
 ## Arguments
@@ -36,14 +36,14 @@ Unknown operation names, unknown named arguments, invalid node kinds, and malfor
 
 ```bash
 # Find matching functions
-target/release/codestory-cli(.exe) query --project . "search(query: 'check_winner') | filter(kind: function) | limit(5)"
+<codestory-cli> query --project <target-workspace> "search(query: 'check_winner') | filter(kind: function) | limit(5)"
 
 # Inspect one symbol and keep children from a file fragment
-target/release/codestory-cli(.exe) query --project . "symbol(query: 'AppController') | filter(file: 'runtime')"
+<codestory-cli> query --project <target-workspace> "symbol(query: 'AppController') | filter(file: 'runtime')"
 
 # Follow outgoing trail context for a symbol
-target/release/codestory-cli(.exe) query --project . "trail(symbol: 'ResolutionPass', depth: 2, direction: outgoing) | filter(kind: function) | limit(10)"
+<codestory-cli> query --project <target-workspace> "trail(symbol: 'ResolutionPass', depth: 2, direction: outgoing) | filter(kind: function) | limit(10)"
 
 # Machine-readable output
-target/release/codestory-cli(.exe) query --project . "search(query: 'WorkspaceIndexer') | limit(3)" --format json
+<codestory-cli> query --project <target-workspace> "search(query: 'WorkspaceIndexer') | limit(3)" --format json
 ```

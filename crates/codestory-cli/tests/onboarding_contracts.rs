@@ -67,18 +67,56 @@ fn normalize_local_link_target(raw: &str) -> Option<String> {
     )
 }
 
+fn assert_public_doc_avoids_agent_specific_framing(file: &Path, contents: &str) {
+    let lowered = contents.to_lowercase();
+    for blocked in [
+        "codegraph",
+        "codex-first",
+        "codex first",
+        "global codex",
+        "for codex users",
+        ".codex/skills",
+        ".codex\\skills",
+    ] {
+        assert!(
+            !lowered.contains(blocked),
+            "public doc should not contain `{blocked}`: {}",
+            file.display()
+        );
+    }
+}
+
 #[test]
-fn readme_keeps_dual_track_onboarding() {
+fn readme_keeps_customer_first_onboarding() {
     let root = repo_root();
     let readme = fs::read_to_string(root.join("README.md")).expect("README should exist");
-    assert!(readme.contains("Use CodeStory"));
-    assert!(readme.contains("Hack on CodeStory"));
+    assert!(readme.contains("Try It On A Repo"));
+    assert!(readme.contains("What It Builds"));
+    assert!(readme.contains("Local codebase grounding for coding agents"));
+    assert!(readme.contains("Install As An Agent Skill"));
+    assert!(readme.contains("Core Flow"));
+    assert!(readme.contains("Hack On CodeStory"));
+    assert!(readme.contains("A good CodeStory-backed answer should name"));
+    assert!(readme.contains("benchmark history"));
+    assert!(readme.contains("checked with `doctor`"));
+    assert!(readme.contains(".agents/skills/codestory-grounding/SKILL.md"));
+    assert!(readme.contains("docs/usage.md"));
+    assert!(readme.contains("docs/concepts/how-codestory-works.md"));
+    assert!(readme.contains("docs/testing/benchmark-results.md"));
+    assert!(readme.contains("setup embeddings --project $TargetWorkspace --dry-run --format json"));
+    assert!(readme.contains("serve --stdio"));
     assert!(readme.contains("docs/architecture/overview.md"));
-    assert!(readme.contains("docs/architecture/runtime-execution-path.md"));
     assert!(readme.contains("docs/contributors/debugging.md"));
     assert!(readme.contains("docs/contributors/testing-matrix.md"));
+    assert!(
+        readme.find("Try It On A Repo").expect("quickstart section")
+            < readme.find("Evidence").expect("evidence section"),
+        "README should show the usable path before benchmark evidence"
+    );
 
     for path in [
+        "docs/usage.md",
+        "docs/concepts/how-codestory-works.md",
         "docs/architecture/overview.md",
         "docs/architecture/runtime-execution-path.md",
         "docs/architecture/subsystems/contracts.md",
@@ -90,11 +128,115 @@ fn readme_keeps_dual_track_onboarding() {
         "docs/contributors/getting-started.md",
         "docs/contributors/debugging.md",
         "docs/contributors/testing-matrix.md",
+        "docs/internal/README.md",
+        "docs/internal/llm-default-codebase-browser-plan.md",
         "docs/decision-log.md",
+        ".agents/skills/codestory-grounding/scripts/setup.ps1",
+        ".agents/skills/codestory-grounding/scripts/setup.sh",
+        "scripts/codestory-agent-ab-benchmark.mjs",
     ] {
         assert!(
             root.join(path).exists(),
             "expected onboarding doc to exist: {path}"
+        );
+    }
+
+    for path in [
+        ".agents/skills/codestory-grounding/scripts/setup.ps1",
+        ".agents/skills/codestory-grounding/scripts/setup.sh",
+    ] {
+        let setup = fs::read_to_string(root.join(path)).expect("read setup script");
+        assert!(
+            !setup.contains("DEFAULT_CODESTORY_REPO_REF"),
+            "setup script should not pin a stale default CLI source ref: {path}"
+        );
+        assert!(
+            setup.contains("CODESTORY_REPO_REF"),
+            "setup script should keep explicit source-ref override support: {path}"
+        );
+        assert!(
+            setup.contains("origin/HEAD"),
+            "setup script should build the remote default branch when no ref is explicit: {path}"
+        );
+    }
+}
+
+#[test]
+fn docs_drift_contracts_keep_living_sources_explicit() {
+    let root = repo_root();
+    let readme = fs::read_to_string(root.join("README.md")).expect("README should exist");
+    let usage = fs::read_to_string(root.join("docs/usage.md")).expect("usage doc should exist");
+    let testing_matrix = fs::read_to_string(root.join("docs/contributors/testing-matrix.md"))
+        .expect("testing matrix should exist");
+    let benchmark_scorecard = fs::read_to_string(root.join("docs/testing/benchmark-results.md"))
+        .expect("benchmark scorecard should exist");
+
+    assert!(
+        readme.contains("setup embeddings --project $TargetWorkspace --dry-run --format json"),
+        "README quickstart should show first-run semantic setup dry-run"
+    );
+    assert!(
+        !usage.contains("semantic_doc_scope = \"durable\""),
+        "usage config example should omit the default durable semantic scope"
+    );
+    for accepted_scope in ["`all`", "`full`", "`all-symbols`", "`all_symbols`"] {
+        assert!(
+            usage.contains(accepted_scope),
+            "usage docs should name accepted all-symbol semantic_doc_scope value {accepted_scope}"
+        );
+    }
+    assert!(
+        testing_matrix.contains("latest row in")
+            && testing_matrix.contains("codestory-e2e-stats-log.md")
+            && testing_matrix.contains("historical")
+            && testing_matrix.contains("examples only"),
+        "testing matrix should point current timing claims at the living stats log"
+    );
+    assert!(
+        !testing_matrix.contains("The 2026-04-18 repo-scale baseline"),
+        "testing matrix should not present an old hard-coded baseline as current"
+    );
+    assert!(
+        benchmark_scorecard.contains("[benchmark ledger](benchmark-ledger.md)")
+            && benchmark_scorecard.contains("codestory-e2e-stats-log.md"),
+        "benchmark scorecard should link detailed history and living timing logs"
+    );
+    assert!(
+        root.join("docs/testing/benchmark-ledger.md").exists(),
+        "benchmark ledger should preserve detailed historical rows"
+    );
+}
+
+#[test]
+fn public_docs_avoid_competitor_and_agent_specific_framing() {
+    let root = repo_root();
+    let mut files = vec![root.join("README.md")];
+    collect_markdown_files(&root.join("docs"), &mut files);
+    collect_markdown_files(&root.join(".agents/skills/codestory-grounding"), &mut files);
+
+    for file in files {
+        let contents = fs::read_to_string(&file).expect("read public doc");
+        assert_public_doc_avoids_agent_specific_framing(&file, &contents);
+    }
+}
+
+#[test]
+fn usage_doc_keeps_agent_contract_terms_out_of_operator_flow() {
+    let root = repo_root();
+    let usage = fs::read_to_string(root.join("docs/usage.md")).expect("usage doc should exist");
+    assert!(usage.contains("Common Workflows"));
+    assert!(usage.contains("I need a repo overview"));
+    assert!(usage.contains("I need evidence for a broad question"));
+    assert!(usage.contains("The cache or retrieval looks stale"));
+    for blocked in [
+        "sufficiency.avoid_opening",
+        "supported-claim wording",
+        "claim-ledger",
+        "Support files",
+    ] {
+        assert!(
+            !usage.contains(blocked),
+            "operator usage doc should not expose agent-internal contract term {blocked}"
         );
     }
 }
@@ -128,7 +270,7 @@ fn codestory_grounding_skill_command_refs_track_cli_commands() {
     let skill_root = root.join(".agents/skills/codestory-grounding");
     let commands = [
         "index", "ground", "doctor", "search", "symbol", "trail", "snippet", "query", "explore",
-        "bookmark", "context", "drill", "setup", "serve",
+        "bookmark", "context", "packet", "drill", "setup", "serve",
     ];
 
     for command in commands {

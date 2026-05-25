@@ -5,7 +5,7 @@ Runs a deterministic evidence collection pass for a realistic codebase question.
 ## Usage
 
 ```
-target/release/codestory-cli(.exe) drill [OPTIONS]
+<codestory-cli> drill [OPTIONS]
 ```
 
 ## Arguments
@@ -29,13 +29,14 @@ The report includes:
 
 - mechanical index status before and after refresh
 - optional question repo-text search artifact
+- bounded supplemental question searches for likely public surfaces, data collections, and store modules when the question terms imply them
 - per-anchor search, symbol, trail, explore, and snippet artifacts
-- per-anchor `consumer_summary` entries for visible callers, related collection/API consumers, and ranked repo-text hints
+- per-anchor `consumer_summary` entries for visible callers, related collection/API/native method consumers, and ranked repo-text hints
 - cross-anchor bridge artifacts using graph paths first, then endpoint files, shared-file fallback diagnostics, and ranked `evidence_files` when no graph bridge is visible
 - chosen anchor, endpoint files, and source-truth verification targets
 - an `evidence_packet` with typed evidence items, repo-text hints, negative evidence, source locations, confidence, and readiness status
 - an Answer Readiness report with `safe_to_say`, `inferred_claims`, `needs_verification`, `next_commands`, and `source_truth_checks`
-- compact mechanical status, retrieval/freshness status, bridge counts, source-truth file list, and verdict/next action in `drill-summary.json`
+- compact mechanical status, retrieval/freshness status, bridge counts, source-truth file list plus target roles/ranking reasons, and verdict/next action in `drill-summary.json`
 - an answer-quality contract requiring a CodeStory-only draft before source reads and source-truth verification afterward
 - a fillable claim-ledger template for source-truth classification, correction counts, and material-revision tracking
 - a verification checklist requiring `correct`, `partial`, `misleading`, or `unsupported` classifications
@@ -44,20 +45,22 @@ The report includes:
 
 ```bash
 # CodeStory-first evidence packet for an architecture question
-target/release/codestory-cli(.exe) drill --project <workspace> --refresh full --question "how the public API reaches the backing store" --anchors ApiController,Repository,StorageClient --output-dir target/drill/api-store-flow
+<codestory-cli> drill --project <target-workspace> --refresh full --question "how the public API reaches the backing store" --anchors ApiController,Repository,StorageClient --output-dir target/drill/api-store-flow
 
 # JSON-first run for automation, while still writing Markdown too
-target/release/codestory-cli(.exe) drill --project <workspace> --refresh none --anchors EntryPoint,Coordinator,BackingStore --output-dir target/drill/entrypoint-flow --format json
+<codestory-cli> drill --project <target-workspace> --refresh none --anchors EntryPoint,Coordinator,BackingStore --output-dir target/drill/entrypoint-flow --format json
 ```
 
 ## Interpretation
 
 Use the drill report as the CodeStory-only phase. Draft the architecture answer from those artifacts first, then open only files named or implied by the artifacts and classify each claim against source truth. If the answer changes materially after source reads, record that as a CodeStory or agent-UX finding.
 
-Start with `drill-summary.json` for compact health, retrieval/freshness state, bridge status, and the verdict next action, then read `evidence_packet.readiness`. Claims in `safe_to_say` are anchored enough for a draft. Claims in `inferred_claims` or `needs_verification` must stay uncertain until the listed `source_truth_checks` or equivalent source reads confirm them. Repo-text and cross-language framework hits are navigation hints unless supported by typed symbol/trail/snippet evidence or source-truth verification.
+Start with `drill-summary.json` for compact health, retrieval/freshness state, bridge status, bridge `evidence_kind`, source-truth target roles, and the verdict next action, then read `evidence_packet.readiness`. Claims in `safe_to_say` are anchored enough for a draft. Claims in `inferred_claims` or `needs_verification` must stay uncertain until the listed `source_truth_checks` or equivalent source reads confirm them. Repo-text and cross-language framework hits are navigation hints unless supported by typed symbol/trail/snippet evidence or source-truth verification. A `source_truth_only` bridge is deliberately not proof; it means CodeStory found the concrete files to read but no typed graph/framework/data path strong enough to answer without source verification.
 
 If `drill-summary.json` reports stale freshness, refresh the index before promoting claims. If retrieval is symbolic-only or semantic fallback is reported, broad natural-language recall is degraded even when exact anchors resolve; use repo-text, symbol, trail, snippet, and source-truth files deliberately.
 
-The optional `question_search` artifact is intentionally partial discovery evidence. A weak natural-language top hit does not answer the question by itself; use it to refine anchors, then rely on each anchor's symbol/trail/explore/snippet artifacts and the source-truth checklist.
+The optional `question_search` artifact and any `question_supplemental_searches` are intentionally partial discovery evidence. They can add public page, component, collection, and store files to the source-truth checklist when the broad question points there, but they do not prove the architecture by themselves. Use them to avoid missing verification files, then rely on each anchor's symbol/trail/explore/snippet artifacts and focused source reads before promoting claims.
 
 If a trail is `structural_only=true`, it is still useful containment/type evidence, but it does not prove runtime flow or application access by itself. Follow up on concrete methods/functions from the trail with `snippet --function-body`, `explore`, or an additional anchor before drafting flow claims.
+
+For native Sourcetrail-style anchors, `consumer_summary` may add bounded related targets such as `SourceGroupCxxCdb::getIndexerCommands` or `IndexerJava::doIndex`. Treat these as concrete follow-up anchors for snippets/trails; member containment still needs source-truth verification before claiming runtime invocation.

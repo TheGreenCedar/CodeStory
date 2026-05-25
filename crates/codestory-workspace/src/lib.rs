@@ -86,6 +86,13 @@ pub struct WorkspaceMembersManifest {
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceDiscovery;
 
+#[derive(Debug, Clone)]
+struct CompiledExcludePattern {
+    raw: String,
+    patterns: Vec<glob::Pattern>,
+    match_absolute: bool,
+}
+
 impl WorkspaceManifest {
     pub fn from_parts(settings: WorkspaceSettings, manifest_path: PathBuf) -> Self {
         Self {
@@ -295,7 +302,7 @@ impl WorkspaceDiscovery {
                 let source_root = discovery_root(&full_path);
 
                 if full_path.is_file() {
-                    if should_include_discovered_path(
+                    if !should_include_discovered_path(
                         &full_path,
                         false,
                         &workspace_root,
@@ -304,12 +311,20 @@ impl WorkspaceDiscovery {
                         &group.language,
                         &exclude_patterns,
                     ) {
-                        push_discovered_file(&mut all_files, &mut seen, full_path, &workspace_root);
-                        if source_file_limit_exceeded(&all_files, max_files) {
-                            return Ok(None);
-                        }
+                        continue;
                     }
-                } else if full_path.is_dir() {
+                    if !push_discovered_file_within_limit(
+                        &mut all_files,
+                        &mut seen,
+                        full_path,
+                        &workspace_root,
+                        max_files,
+                    ) {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                if full_path.is_dir() {
                     let mut builder = ignore::WalkBuilder::new(&full_path);
                     builder.follow_links(true);
                     builder.require_git(false);
@@ -330,16 +345,17 @@ impl WorkspaceDiscovery {
                         )
                     });
                     for entry in builder.build().filter_map(|e| e.ok()) {
-                        if entry.file_type().is_some_and(|kind| kind.is_file()) {
-                            push_discovered_file(
-                                &mut all_files,
-                                &mut seen,
-                                entry.into_path(),
-                                &workspace_root,
-                            );
-                            if source_file_limit_exceeded(&all_files, max_files) {
-                                return Ok(None);
-                            }
+                        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                            continue;
+                        }
+                        if !push_discovered_file_within_limit(
+                            &mut all_files,
+                            &mut seen,
+                            entry.into_path(),
+                            &workspace_root,
+                            max_files,
+                        ) {
+                            return Ok(None);
                         }
                     }
                 }
@@ -429,6 +445,17 @@ fn source_file_limit_exceeded(files: &[PathBuf], max_files: Option<usize>) -> bo
     max_files.is_some_and(|max_files| files.len() > max_files)
 }
 
+fn push_discovered_file_within_limit(
+    files: &mut Vec<PathBuf>,
+    seen: &mut HashSet<String>,
+    path: PathBuf,
+    workspace_root: &Path,
+    max_files: Option<usize>,
+) -> bool {
+    push_discovered_file(files, seen, path, workspace_root);
+    !source_file_limit_exceeded(files, max_files)
+}
+
 fn empty_incremental_plan() -> RefreshPlan {
     RefreshPlan {
         mode: RefreshMode::Incremental,
@@ -452,10 +479,20 @@ fn workspace_root(manifest: &WorkspaceManifest) -> PathBuf {
         .unwrap_or_else(|_| normalize_lexical_path(&manifest.root_dir()))
 }
 
-fn compile_exclude_patterns(patterns: &[String]) -> Result<Vec<glob::Pattern>> {
+fn compile_exclude_patterns(patterns: &[String]) -> Result<Vec<CompiledExcludePattern>> {
     patterns
         .iter()
-        .map(|pattern| glob::Pattern::new(pattern).map_err(anyhow::Error::from))
+        .map(|pattern| {
+            let mut patterns = vec![glob::Pattern::new(pattern).map_err(anyhow::Error::from)?];
+            if let Some(root_relative) = pattern.strip_prefix("**/") {
+                patterns.push(glob::Pattern::new(root_relative).map_err(anyhow::Error::from)?);
+            }
+            Ok(CompiledExcludePattern {
+                raw: pattern.clone(),
+                patterns,
+                match_absolute: Path::new(pattern).is_absolute(),
+            })
+        })
         .collect()
 }
 
@@ -471,7 +508,7 @@ fn should_include_discovered_path(
     source_root: &Path,
     filter_by_language: bool,
     language: &Language,
-    exclude_patterns: &[glob::Pattern],
+    exclude_patterns: &[CompiledExcludePattern],
 ) -> bool {
     let normalized = normalize_lexical_path(path);
     if let Ok(canonical) = normalized.canonicalize()
@@ -492,19 +529,63 @@ fn is_excluded_path(
     path: &Path,
     workspace_root: &Path,
     source_root: &Path,
-    exclude_patterns: &[glob::Pattern],
+    exclude_patterns: &[CompiledExcludePattern],
 ) -> bool {
     exclude_patterns.iter().any(|pattern| {
-        pattern.matches_path(path)
-            || path
-                .strip_prefix(workspace_root)
-                .ok()
-                .is_some_and(|relative| pattern.matches_path(relative))
-            || path
-                .strip_prefix(source_root)
-                .ok()
-                .is_some_and(|relative| pattern.matches_path(relative))
+        (pattern.match_absolute && pattern.matches(path))
+            || relative_path_for_matching(path, workspace_root)
+                .as_deref()
+                .is_some_and(|relative| pattern.matches(relative))
+            || relative_path_for_matching(path, source_root)
+                .as_deref()
+                .is_some_and(|relative| pattern.matches(relative))
     })
+}
+
+impl CompiledExcludePattern {
+    fn matches(&self, path: &Path) -> bool {
+        self.patterns
+            .iter()
+            .any(|pattern| pattern.matches_path(path))
+            || self.matches_root_or_nested_directory(path)
+    }
+
+    fn matches_root_or_nested_directory(&self, path: &Path) -> bool {
+        let raw = self.raw.replace('\\', "/");
+        let Some(directory) = raw
+            .strip_prefix("**/")
+            .and_then(|value| value.strip_suffix("/**"))
+        else {
+            return false;
+        };
+        let path = path.to_string_lossy().replace('\\', "/");
+        path == directory
+            || path.starts_with(&format!("{directory}/"))
+            || path.contains(&format!("/{directory}/"))
+    }
+}
+
+fn relative_path_for_matching(path: &Path, root: &Path) -> Option<PathBuf> {
+    if let Ok(relative) = path.strip_prefix(root) {
+        return Some(relative.to_path_buf());
+    }
+
+    let path_key = normalize_exclude_match_key(path);
+    let root_key = normalize_exclude_match_key(root);
+    if path_key == root_key {
+        return Some(PathBuf::new());
+    }
+    let root_prefix = format!("{}/", root_key.trim_end_matches('/'));
+    path_key
+        .strip_prefix(&root_prefix)
+        .map(|relative| PathBuf::from(relative.replace('/', std::path::MAIN_SEPARATOR_STR)))
+}
+
+fn normalize_exclude_match_key(path: &Path) -> String {
+    normalize_path_key(path)
+        .trim_start_matches("//?/")
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn matches_source_group_language(path: &Path, language: &Language) -> bool {
@@ -761,6 +842,40 @@ mod tests {
         assert!(files.contains(&root.join("app.ts")));
         assert!(files.contains(&root.join("App.svelte")));
         assert!(files.contains(&root.join("src").join("main.py")));
+        Ok(())
+    }
+
+    #[test]
+    fn synthetic_workspace_under_excluded_parent_still_discovers_repo_files() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp
+            .path()
+            .join("target")
+            .join("agent-benchmark")
+            .join("repos")
+            .join("express");
+        fs::create_dir_all(root.join("lib"))?;
+        fs::create_dir_all(root.join("target"))?;
+        fs::write(
+            root.join("lib").join("application.js"),
+            "exports.init = function init() {};\n",
+        )?;
+        fs::write(
+            root.join("target").join("generated.js"),
+            "exports.generated = true;\n",
+        )?;
+
+        let manifest = WorkspaceManifest::open(root.clone())?;
+        let files = WorkspaceDiscovery.source_files(&manifest)?;
+
+        assert!(
+            files.contains(&root.join("lib").join("application.js")),
+            "parent target directory should not exclude the selected workspace: {files:?}"
+        );
+        assert!(
+            !files.contains(&root.join("target").join("generated.js")),
+            "repo-local target directory should remain excluded: {files:?}"
+        );
         Ok(())
     }
 

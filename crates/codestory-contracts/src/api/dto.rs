@@ -67,6 +67,8 @@ pub struct SearchRequest {
     #[serde(default = "default_search_limit_per_source")]
     pub limit_per_source: u32,
     #[serde(default)]
+    pub expand_search_plan: bool,
+    #[serde(default)]
     pub hybrid_weights: Option<AgentHybridWeightsDto>,
     #[serde(default)]
     pub hybrid_limits: Option<SearchHybridLimitsDto>,
@@ -277,6 +279,36 @@ pub enum SearchPlanPromotionStatusDto {
     Ambiguous,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchPlanBridgeStatusDto {
+    Supported,
+    Partial,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchPlanBridgeConfidenceDto {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchPlanBridgeEvidenceKindDto {
+    SameAnchor,
+    GraphPath,
+    FrameworkRoute,
+    ComponentUsage,
+    DataCollectionUsage,
+    SharedFile,
+    RepoTextHint,
+    SourceTruthOnly,
+    IsolatedAnchors,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchPlanDroppedTermDto {
     pub term: String,
@@ -335,9 +367,9 @@ pub struct SearchPlanAnchorGroupDto {
 pub struct SearchPlanBridgeDto {
     pub from_anchor: String,
     pub to_anchor: String,
-    pub status: String,
-    pub confidence: String,
-    pub evidence_kind: String,
+    pub status: SearchPlanBridgeStatusDto,
+    pub confidence: SearchPlanBridgeConfidenceDto,
+    pub evidence_kind: SearchPlanBridgeEvidenceKindDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
     pub node_count: u32,
@@ -385,8 +417,6 @@ pub struct SearchPlanDto {
     pub rejected_hits: Vec<SearchPlanRejectedHitDto>,
     #[serde(default)]
     pub next_actions: Vec<SearchPlanNextActionDto>,
-    #[serde(default)]
-    pub next_commands: Vec<String>,
     #[serde(default)]
     pub source_truth_checks: Vec<String>,
 }
@@ -493,9 +523,32 @@ pub struct FrameworkRouteCoverageDto {
     pub promotable: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AffectedChangeKindDto {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    Untracked,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedChangeRecordDto {
+    pub path: String,
+    pub kind: AffectedChangeKindDto,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AffectedAnalysisRequest {
     pub changed_paths: Vec<String>,
+    #[serde(default)]
+    pub change_records: Vec<AffectedChangeRecordDto>,
     #[serde(default)]
     pub depth: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -524,6 +577,12 @@ pub struct AffectedMatchedFileDto {
     pub role: IndexedFileRoleDto,
     pub indexed: bool,
     pub complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_kind: Option<AffectedChangeKindDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
     #[serde(default)]
     pub error_count: u32,
 }
@@ -532,6 +591,12 @@ pub struct AffectedMatchedFileDto {
 pub struct AffectedUnmatchedPathDto {
     pub path: String,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_kind: Option<AffectedChangeKindDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -565,6 +630,8 @@ pub struct AffectedTestFileDto {
 pub struct AffectedAnalysisDto {
     pub project_root: String,
     pub changed_paths: Vec<String>,
+    #[serde(default)]
+    pub change_records: Vec<AffectedChangeRecordDto>,
     #[serde(default)]
     pub matched_files: Vec<AffectedMatchedFileDto>,
     #[serde(default)]
@@ -1028,6 +1095,12 @@ pub struct SnippetContextDto {
     pub snippet_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_snippet_bytes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_guidance: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -1363,6 +1436,16 @@ pub enum EvidenceTypeDto {
     Negative,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketBudgetModeDto {
+    Tiny,
+    #[default]
+    Compact,
+    Standard,
+    Deep,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimReadinessDto {
@@ -1436,10 +1519,188 @@ pub struct EvidencePacketDto {
     pub readiness: AnswerReadinessReportDto,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketTaskClassDto {
+    ArchitectureExplanation,
+    BugLocalization,
+    ChangeImpact,
+    RouteTracing,
+    SymbolOwnership,
+    DataFlow,
+    EditPlanning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PacketPlanQueryDto {
+    pub query: String,
+    pub purpose: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PacketPlanDto {
+    pub task_class: PacketTaskClassDto,
+    pub inferred_task_class: bool,
+    #[serde(default)]
+    pub queries: Vec<PacketPlanQueryDto>,
+    #[serde(default)]
+    pub trace: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AgentPacketRequestDto {
+    pub question: String,
+    #[serde(default)]
+    pub budget: PacketBudgetModeDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_class: Option<PacketTaskClassDto>,
+    #[serde(default = "default_include_evidence")]
+    pub include_evidence: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_budget_ms: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PacketBudgetLimitsDto {
+    pub max_anchors: u32,
+    pub max_files: u32,
+    pub max_snippets: u32,
+    pub max_trail_edges: u32,
+    pub max_output_bytes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PacketBudgetUsageDto {
+    pub anchors: u32,
+    pub files: u32,
+    pub snippets: u32,
+    pub trail_edges: u32,
+    pub output_bytes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PacketBudgetDto {
+    pub requested: PacketBudgetModeDto,
+    pub limits: PacketBudgetLimitsDto,
+    pub used: PacketBudgetUsageDto,
+    pub truncated: bool,
+    #[serde(default)]
+    pub omitted_sections: Vec<String>,
+    pub next_deeper_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketSufficiencyStatusDto {
+    Sufficient,
+    Partial,
+    Insufficient,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PacketClaimDto {
+    pub claim: String,
+    #[serde(default)]
+    pub citations: Vec<AgentCitationDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PacketSufficiencyDto {
+    pub status: PacketSufficiencyStatusDto,
+    #[serde(default)]
+    pub covered_claims: Vec<PacketClaimDto>,
+    #[serde(default)]
+    pub open_next: Vec<String>,
+    #[serde(default)]
+    pub avoid_opening: Vec<String>,
+    #[serde(default)]
+    pub gaps: Vec<String>,
+    #[serde(default)]
+    pub follow_up_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PacketBenchmarkTraceDto {
+    pub retrieval_trace: AgentRetrievalTraceDto,
+    pub source_read_steps: u32,
+    pub search_steps: u32,
+    pub trail_steps: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AgentPacketDto {
+    pub packet_id: String,
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_class: Option<PacketTaskClassDto>,
+    pub plan: PacketPlanDto,
+    pub answer: AgentAnswerDto,
+    pub budget: PacketBudgetDto,
+    pub sufficiency: PacketSufficiencyDto,
+    pub benchmark_trace: PacketBenchmarkTraceDto,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct BookmarkCategoryDto {
     pub id: String,
     pub name: String,
+}
+
+#[cfg(test)]
+mod packet_tests {
+    use super::*;
+
+    #[test]
+    fn packet_request_uses_compact_budget_by_default() {
+        let request: AgentPacketRequestDto =
+            serde_json::from_str(r#"{"question":"explain indexing"}"#).expect("deserialize");
+
+        assert_eq!(request.budget, PacketBudgetModeDto::Compact);
+        assert!(request.include_evidence);
+    }
+
+    #[test]
+    fn packet_sufficiency_serializes_status_as_snake_case() {
+        let value = serde_json::to_value(PacketSufficiencyDto {
+            status: PacketSufficiencyStatusDto::Partial,
+            covered_claims: Vec::new(),
+            open_next: vec!["codestory-cli search --query runtime".to_string()],
+            avoid_opening: Vec::new(),
+            gaps: vec!["No focused symbol selected.".to_string()],
+            follow_up_commands: Vec::new(),
+        })
+        .expect("serialize");
+
+        assert_eq!(value["status"], "partial");
+    }
+
+    #[test]
+    fn search_plan_bridge_contract_uses_typed_snake_case_states() {
+        let value = serde_json::to_value(SearchPlanBridgeDto {
+            from_anchor: "router".to_string(),
+            to_anchor: "handler".to_string(),
+            status: SearchPlanBridgeStatusDto::Supported,
+            confidence: SearchPlanBridgeConfidenceDto::High,
+            evidence_kind: SearchPlanBridgeEvidenceKindDto::GraphPath,
+            direction: Some("forward".to_string()),
+            node_count: 2,
+            edge_count: 1,
+            truncated: false,
+            notes: Vec::new(),
+        })
+        .expect("serialize");
+
+        assert_eq!(value["status"], "supported");
+        assert_eq!(value["confidence"], "high");
+        assert_eq!(value["evidence_kind"], "graph_path");
+        let parsed: SearchPlanBridgeDto = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed.status, SearchPlanBridgeStatusDto::Supported);
+        assert_eq!(parsed.confidence, SearchPlanBridgeConfidenceDto::High);
+        assert_eq!(
+            parsed.evidence_kind,
+            SearchPlanBridgeEvidenceKindDto::GraphPath
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

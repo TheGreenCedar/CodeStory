@@ -192,6 +192,48 @@ fn assert_tool_success(response: &Value, id: Value) -> &Value {
         .expect("tools/call success should include structuredContent")
 }
 
+fn assert_structured_citations_have_no_evidence(value: &Value) {
+    fn visit(value: &Value, citation_count: &mut usize) {
+        match value {
+            Value::Object(map) => {
+                if map.contains_key("node_id")
+                    && map.contains_key("display_name")
+                    && map.contains_key("score")
+                {
+                    *citation_count += 1;
+                    assert!(
+                        map.get("evidence_edge_ids")
+                            .and_then(Value::as_array)
+                            .is_none_or(|edges| edges.is_empty()),
+                        "citation should omit evidence edge ids when include_evidence=false: {value}"
+                    );
+                    assert!(
+                        map.get("retrieval_score_breakdown")
+                            .is_none_or(Value::is_null),
+                        "citation should omit retrieval score breakdown when include_evidence=false: {value}"
+                    );
+                }
+                for child in map.values() {
+                    visit(child, citation_count);
+                }
+            }
+            Value::Array(items) => {
+                for child in items {
+                    visit(child, citation_count);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut citation_count = 0;
+    visit(value, &mut citation_count);
+    assert!(
+        citation_count > 0,
+        "test fixture should return citations to prove evidence stripping: {value}"
+    );
+}
+
 fn assert_tool_error(response: &Value, id: Value) -> &Value {
     let result = assert_success_envelope(response, id);
     assert_eq!(
@@ -599,6 +641,7 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
         vec![
             "context",
             "definition",
+            "packet",
             "references",
             "search",
             "snippet",
@@ -613,7 +656,7 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
             && !tool_names
                 .iter()
                 .any(|name| matches!(*name, "files" | "affected")),
-        "CLI-first additions must not rename or expand serve --stdio tools: {tool_names:?}"
+        "stdio tool names should stay agent-facing and avoid shell/file mutation surfaces: {tool_names:?}"
     );
 
     for tool in tools["tools"].as_array().expect("tools array") {
@@ -687,6 +730,49 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         search_limit.get("maximum"),
         Some(&json!(50)),
         "search.limit should document the bounded default search page: {search}"
+    );
+
+    let packet = tool_input_schema(&tools, "packet");
+    assert_eq!(
+        packet["type"], "object",
+        "packet schema should be object: {packet}"
+    );
+    assert!(
+        required_fields(packet).contains("question"),
+        "packet.question should be required: {packet}"
+    );
+    assert_eq!(
+        schema_property(packet, "question")["type"],
+        "string",
+        "packet.question should be a string: {packet}"
+    );
+    assert_schema_enum_values(
+        packet,
+        "/properties/budget/enum",
+        &["tiny", "compact", "standard", "deep"],
+    );
+    assert_eq!(
+        schema_property(packet, "budget").get("default"),
+        Some(&json!("compact")),
+        "packet.budget should document the stdio default: {packet}"
+    );
+    assert_schema_enum_values(
+        packet,
+        "/properties/task_class/enum",
+        &[
+            "architecture_explanation",
+            "bug_localization",
+            "change_impact",
+            "route_tracing",
+            "symbol_ownership",
+            "data_flow",
+            "edit_planning",
+        ],
+    );
+    assert_eq!(
+        schema_property(packet, "include_evidence").get("default"),
+        Some(&json!(true)),
+        "packet.include_evidence should document the stdio default: {packet}"
     );
 
     for name in ["symbol", "definition", "references", "snippet"] {
@@ -816,6 +902,7 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
     for name in [
         "context",
         "definition",
+        "packet",
         "references",
         "search",
         "snippet",
@@ -854,6 +941,19 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
                     && output_schema.pointer("/properties/prompt").is_none(),
                 "context outputSchema should not expose answer/prompt DTO names: {tool}"
             );
+        }
+        if name == "packet" {
+            assert_eq!(
+                schema_property(output_schema, "packet_id")["type"],
+                "string",
+                "packet outputSchema should expose a stable packet id: {tool}"
+            );
+            for field in ["plan", "answer", "budget", "sufficiency", "benchmark_trace"] {
+                assert!(
+                    required_fields(output_schema).contains(field),
+                    "packet outputSchema should require {field}: {tool}"
+                );
+            }
         }
     }
 
@@ -1198,6 +1298,17 @@ fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
         .expect("remove indexed file after indexing");
 
     let mut server = spawn_stdio_server(&fixture);
+    let warmup = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-freshness-warmup",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    assert_success_envelope(&warmup, json!("status-freshness-warmup"));
+
     let mut elapsed = Vec::new();
     let mut last_status = Value::Null;
     for index in 0..12 {
@@ -1253,7 +1364,7 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
     );
     let mut strings = Vec::new();
     string_values_recursive(&guide, &mut strings);
-    for expected in ["search", "definition", "snippet"] {
+    for expected in ["packet", "search", "definition", "snippet"] {
         assert!(
             strings.iter().any(|value| value.contains(expected)),
             "agent guide should recommend {expected} in its call sequence: {guide}"
@@ -1460,6 +1571,149 @@ fn context_tool_maps_target_id_to_deep_browser_request() {
                 .any(|field| field["key"] == "center_id" && field["value"] == node_id)),
         "stdio context.id should seed the browser focus node: {neighborhood_step}"
     );
+}
+
+#[test]
+fn packet_tool_returns_budgeted_sufficiency_contract() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "packet-contract",
+            "method": "tools/call",
+            "params": {
+                "name": "packet",
+                "arguments": {
+                    "question": "Explain how AppController routes repository indexing",
+                    "budget": "tiny",
+                    "task_class": "architecture_explanation"
+                }
+            }
+        }),
+    );
+
+    let packet = assert_tool_success(&response, json!("packet-contract"));
+    let text = response
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("stdio packet should include readable text content: {response}"));
+    assert!(
+        text.contains("packet_id:") && text.contains("sufficiency:"),
+        "stdio packet text should summarize packet identity and sufficiency: {text}"
+    );
+    assert!(
+        !text.trim_start().starts_with('{'),
+        "stdio packet text should be a digest, not duplicated JSON: {text}"
+    );
+    assert!(
+        !text.contains("\"retrieval_trace\""),
+        "stdio packet text should leave full traces in structuredContent only: {text}"
+    );
+    assert_eq!(
+        packet["question"], "Explain how AppController routes repository indexing",
+        "stdio packet should preserve the requested question: {packet}"
+    );
+    assert_eq!(
+        packet["budget"]["requested"], "tiny",
+        "stdio packet should honor the requested budget: {packet}"
+    );
+    let packet_bytes = serde_json::to_vec(packet)
+        .expect("serialize packet content")
+        .len();
+    let used_output_bytes = packet
+        .pointer("/budget/used/output_bytes")
+        .and_then(Value::as_u64)
+        .expect("packet budget should include output byte usage");
+    let max_output_bytes = packet
+        .pointer("/budget/limits/max_output_bytes")
+        .and_then(Value::as_u64)
+        .expect("packet budget should include output byte limit");
+    assert!(
+        used_output_bytes <= max_output_bytes,
+        "packet should fit inside its advertised output budget: {packet}"
+    );
+    assert!(
+        packet_bytes <= max_output_bytes as usize,
+        "stdio structured packet should fit inside its advertised output budget: {packet}"
+    );
+    assert_eq!(
+        packet["plan"]["task_class"], "architecture_explanation",
+        "stdio packet should expose the planner task class: {packet}"
+    );
+    assert!(
+        packet["plan"]["queries"]
+            .as_array()
+            .is_some_and(|queries| !queries.is_empty()),
+        "stdio packet should expose planned retrieval queries: {packet}"
+    );
+    assert!(
+        packet
+            .pointer("/answer/retrieval_trace/steps")
+            .and_then(Value::as_array)
+            .is_some_and(|steps| !steps.is_empty()),
+        "stdio packet should expose the underlying retrieval trace: {packet}"
+    );
+    assert!(
+        packet
+            .pointer("/sufficiency/status")
+            .and_then(Value::as_str)
+            .is_some(),
+        "stdio packet should include a sufficiency status: {packet}"
+    );
+    assert!(
+        packet
+            .pointer("/benchmark_trace/source_read_steps")
+            .and_then(Value::as_u64)
+            .is_some(),
+        "stdio packet should include benchmark trace counters: {packet}"
+    );
+}
+
+#[test]
+fn structured_packet_and_context_honor_include_evidence_false() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let packet_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "packet-no-evidence",
+            "method": "tools/call",
+            "params": {
+                "name": "packet",
+                "arguments": {
+                    "question": "Explain how AppController routes repository indexing",
+                    "budget": "tiny",
+                    "task_class": "architecture_explanation",
+                    "include_evidence": false
+                }
+            }
+        }),
+    );
+    let packet = assert_tool_success(&packet_response, json!("packet-no-evidence"));
+    assert_structured_citations_have_no_evidence(packet);
+
+    let context_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "context-no-evidence",
+            "method": "tools/call",
+            "params": {
+                "name": "context",
+                "arguments": {
+                    "query": "AppController",
+                    "include_evidence": false
+                }
+            }
+        }),
+    );
+    let context = assert_tool_success(&context_response, json!("context-no-evidence"));
+    assert_structured_citations_have_no_evidence(context);
 }
 
 #[test]

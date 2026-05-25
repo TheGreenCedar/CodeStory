@@ -556,7 +556,7 @@ fn codestory_repo_release_e2e_emits_stats() {
 }
 
 #[test]
-#[ignore = "real-repo drill harness; set CODESTORY_REAL_REPO_DRILL_CASES to a drill-suite manifest and run after cargo build --release -p codestory-cli"]
+#[ignore = "real-repo drill harness; set CODESTORY_REAL_REPO_DRILL_CASES to a drill-suite manifest and run after cargo build --release -p codestory-cli; set CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1 only for intentional local skips"]
 fn real_repo_agent_grounding_drill_emits_verification_packets() {
     let binary = release_cli_binary();
     assert!(
@@ -569,18 +569,22 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
     let cache_dir = tempdir().expect("drill cache dir");
     let Some(manifest_path) = env::var_os("CODESTORY_REAL_REPO_DRILL_CASES").map(PathBuf::from)
     else {
-        eprintln!(
-            "skipping manifest real-repo drill suite because CODESTORY_REAL_REPO_DRILL_CASES is not set"
+        if allow_skip_real_repo_drill_cases() {
+            eprintln!(
+                "intentionally skipping manifest real-repo drill suite because CODESTORY_REAL_REPO_DRILL_CASES is not set and CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1"
+            );
+            return;
+        }
+        panic!(
+            "CODESTORY_REAL_REPO_DRILL_CASES is required for the ignored real-repo drill suite. Set CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1 only for an intentional local skip."
         );
-        return;
     };
     let cases = drill_repo_cases_from_manifest(&manifest_path);
     if cases.is_empty() {
-        eprintln!(
-            "skipping manifest real-repo drill suite because {} contains no cases",
+        panic!(
+            "real-repo drill suite manifest contains no cases: {}",
             manifest_path.display()
         );
-        return;
     }
     let missing = cases
         .iter()
@@ -588,11 +592,17 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
         .map(|case| format!("{} ({})", case.name, case.project_root.display()))
         .collect::<Vec<_>>();
     if !missing.is_empty() {
-        eprintln!(
-            "skipping manifest real-repo drill suite because sibling repos are missing: {}",
+        if allow_skip_real_repo_drill_cases() {
+            eprintln!(
+                "intentionally skipping manifest real-repo drill suite because configured repos are missing and CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1: {}",
+                missing.join(", ")
+            );
+            return;
+        }
+        panic!(
+            "real-repo drill suite cannot run because configured repos are missing: {}. Set CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1 only for an intentional local skip before invoking the ignored test.",
             missing.join(", ")
         );
-        return;
     }
 
     let (_seconds, suite_json) = run_cli_json(
@@ -612,9 +622,10 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
         ],
     );
 
+    let reported_case_file = PathBuf::from(string_field(&suite_json, &["case_file"]));
     assert_eq!(
-        string_field(&suite_json, &["case_file"]),
-        manifest_path.display().to_string()
+        reported_case_file, manifest_path,
+        "suite should report the configured case file path"
     );
     assert_eq!(u64_field(&suite_json, &["repo_count"]), cases.len() as u64);
     assert_eq!(
@@ -868,6 +879,11 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
 
         assert_manifest_anchor_expectations(case, repo_json);
     }
+}
+
+fn allow_skip_real_repo_drill_cases() -> bool {
+    env::var("CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn assert_question_search_names_seed_anchors(case: &DrillRepoCase, drill_json: &Value) {

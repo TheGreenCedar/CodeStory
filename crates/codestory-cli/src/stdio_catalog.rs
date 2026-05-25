@@ -465,6 +465,16 @@ impl SchemaObject {
 const TEXT_HIT_ORIGINS: &[&str] = &["indexed_symbol", "text_match"];
 const SEARCH_REPO_TEXT_MODES: &[&str] = &["auto", "on", "off"];
 const SNIPPET_SCOPES: &[&str] = &["line_context", "function_body"];
+const PACKET_BUDGETS: &[&str] = &["tiny", "compact", "standard", "deep"];
+const PACKET_TASK_CLASSES: &[&str] = &[
+    "architecture_explanation",
+    "bug_localization",
+    "change_impact",
+    "route_tracing",
+    "symbol_ownership",
+    "data_flow",
+    "edit_planning",
+];
 
 static GENERIC_OBJECT_SCHEMA: SchemaObject =
     SchemaObject::passthrough_object("Generic JSON object.");
@@ -708,6 +718,37 @@ static CONTEXT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
     ],
 );
 
+static AGENT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
+    "CodeStory broad task packet DTO.",
+    &[
+        SchemaProperty::string("packet_id", "Stable packet id."),
+        SchemaProperty::string("question", "Packet question."),
+        SchemaProperty::string("task_class", "Optional task class.")
+            .with_enum(PACKET_TASK_CLASSES)
+            .nullable(),
+        SchemaProperty::object("plan", "Packet planner trace."),
+        SchemaProperty::object("answer", "Underlying DB-first answer packet."),
+        SchemaProperty::object("budget", "Budget limits, usage, and truncation metadata."),
+        SchemaProperty::object(
+            "sufficiency",
+            "Covered claims, gaps, and follow-up contract.",
+        ),
+        SchemaProperty::object(
+            "benchmark_trace",
+            "Benchmark-oriented retrieval trace summary.",
+        ),
+    ],
+    &[
+        "packet_id",
+        "question",
+        "plan",
+        "answer",
+        "budget",
+        "sufficiency",
+        "benchmark_trace",
+    ],
+);
+
 static SEARCH_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Search indexed symbols and repo text.",
     &[
@@ -795,7 +836,40 @@ static CONTEXT_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
 )
 .with_any_of_required(&[&["query"], &["id"], &["bookmark"]]);
 
+static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Build a broad task packet with budget and sufficiency metadata.",
+    &[
+        SchemaProperty::string_required("question", "Broad repository question or task.")
+            .with_min_length(1),
+        SchemaProperty::string("budget", "Packet budget.")
+            .with_enum(PACKET_BUDGETS)
+            .with_default(ValueLiteral::String("compact")),
+        SchemaProperty::string("task_class", "Optional task class.")
+            .with_enum(PACKET_TASK_CLASSES)
+            .nullable(),
+        SchemaProperty::boolean(
+            "include_evidence",
+            "Include citation edge ids and score details.",
+        )
+        .with_default(ValueLiteral::Boolean(true)),
+        SchemaProperty::integer(
+            "latency_budget_ms",
+            "Optional retrieval latency budget in milliseconds.",
+        )
+        .with_bounds(1000, 120000)
+        .nullable(),
+    ],
+    &["question"],
+);
+
 static TOOLS: &[ToolSpec] = &[
+    ToolSpec {
+        name: "packet",
+        description: "Build a broad task packet with a sufficiency contract.",
+        input_schema: PACKET_INPUT_SCHEMA,
+        output_schema: Some(SchemaSpec::Object(AGENT_PACKET_SCHEMA)),
+        safety: SafetyMetadata::read_only(),
+    },
     ToolSpec {
         name: "search",
         description: "Search indexed symbols and repo text.",

@@ -1,58 +1,80 @@
-# CodeStory Essence & Delight Roadmap
+# CodeStory Product Direction
 
-CodeStory is building a local-first, language-aware code understanding substrate that turns repositories into durable, queryable knowledge (symbols, edges, trails, snippets, and search projections), then exposes that intelligence through a practical CLI and serving interface so both humans and agents can reason about real codebases with less guesswork.
+This page is product direction, not proof that every idea below is fully done.
+For measured behavior, use the benchmark docs. For architecture truth, use the
+architecture docs.
 
-## High-impact changes (delight-focused, not bug fixes)
+CodeStory is meant to be the local codebase browser an agent uses before it
+starts manual file inspection: index the repo, keep the evidence local, explain
+retrieval, and hand back cited context.
 
-1. **Ship a deep `context` command that auto-plans retrieval around one target**
-   - Add a first-class command (`codestory-cli context`) that performs iterative context gathering across `search`, `symbol`, `trail`, and `snippet` after a concrete target has been selected.
-   - Why this is high impact: this removes manual evidence choreography for users once they have an anchor, while keeping lightweight discovery in `search`.
-   - Research signal: Sourcegraph documents that proactive, iterative context gathering improves response quality and reduces user burden in coding assistants.
+## Now
 
-2. **Make retrieval explainable by default (`--why` mode + score breakdown)**
-   - Add explainability output to `search` and `ground`: lexical/semantic/graph contributions, top matched evidence, and fallback reasons in a compact “why these results” section.
-   - Why this is high impact: trust and debuggability become product features. Users will tune prompts/queries faster and keep confidence when retrieval quality dips.
-   - Research signal: modern context systems emphasize multi-source retrieval/ranking; users need visibility into which source won and why.
+These capabilities are represented in the current CLI/runtime surface:
 
-3. **Add a polished “code navigation UX lane” (definition/references/symbol pane parity) in `explore` and `serve`**
-   - Build a fast path for `go to definition`, `find references`, and repository symbol browsing as explicit operations in the explorer and HTTP endpoints.
-   - Why this is high impact: navigation primitives are daily workflows; making them one-keystroke/one-call lowers friction and positions CodeStory as an always-on code map.
-   - Research signal: GitHub’s code navigation and LSP both treat definition/reference workflows as foundational developer experience features.
+- `doctor` reports project, cache, index, retrieval, managed embedding setup, and
+  next-command health.
+- `index` builds graph state, snapshots, lexical search state, and semantic docs
+  in the local cache.
+- `ground --why` gives broad repo orientation with retrieval and coverage notes.
+- `search --why` exposes candidate results and retrieval explanations.
+- `symbol`, `trail`, `snippet`, and `explore` support focused navigation around
+  concrete targets.
+- `context` builds a DB-first evidence bundle around one concrete target.
+- `drill` and `drill-suite` turn a realistic codebase question into an evidence
+  packet, source-truth checklist, optional claim ledger, expected-file recall,
+  and separate mechanical versus answer-quality verdicts.
+- `serve --stdio` exposes the read surface for repeated agent queries.
 
-4. **Productize MCP as a first-class integration surface (resources/prompts/tools, not only tools)**
-   - Expand `serve --stdio` beyond basic tool exposure into richer MCP compatibility: explicit resources, templates, prompts, and safety metadata.
-   - Why this is high impact: CodeStory can become the local “context backbone” for multiple AI clients (editors, agents, terminals) without custom glue.
-   - Research signal: MCP spec centers standard access to resources/prompts/tools; broader MCP feature coverage increases interoperability and adoption.
+## Next
 
-5. **Introduce “delightful zero-setup semantic mode” with model bootstrap + profile wizard**
-   - Today symbolic fallback is graceful; push further by offering a guided setup that can fetch/validate local embedding assets, benchmark profiles quickly, and choose a sane default for the machine.
-   - Why this is high impact: it closes the gap between “it runs” and “it feels magical” for first-time users, especially on fresh environments.
-   - Research signal: hybrid retrieval quality rises when multiple context channels (lexical + structure + semantic) are available and tuned.
+The highest-value improvements are still about making the evidence loop easier
+to trust and harder to misuse:
 
-## Small QoL changes
+1. **Make target-context packets sharper**
+   - Improve `context` so it gathers the right neighborhood around one target
+     with fewer manual hops.
+   - Keep it target-first; broad open-ended questions belong in `packet` or a
+     `drill`/`drill-suite` run that records source-truth verification.
 
-1. **`codestory-cli doctor`**: one command to report environment health, cache status, retrieval mode, model asset presence, and common remediation steps.
-2. **Saved query presets**: lightweight named recipes (e.g., `impact:<symbol>`, `oncall:<error>`) to make repeated investigations instant.
-3. **Result sharing artifacts**: one-flag output bundles (`--bundle`) that include markdown summary + machine JSON for team handoffs.
-4. **Progressive onboarding output**: after first `index`, print a short “next 3 useful commands” tutorial tailored to repo size and retrieval availability.
-5. **Search ergonomics**: add typo suggestions and optional query rewriting hints when confidence is low.
+2. **Make answer-quality gates harder to bypass**
+   - Treat source-truth correction counts as product evidence, not test noise.
+   - Keep `drill-suite --ledger` as the repeatable loop for proving whether a
+     CodeStory-only draft survived focused source reads.
+   - A green index/build is not enough; final-answer status must stay pending or
+     degraded until claim classifications prove no misleading or unsupported
+     claims remain.
 
-## Implementation snapshot
+3. **Make retrieval explanations more useful**
+   - Keep improving `--why` output for lexical, semantic, graph, fallback, and
+     freshness signals.
+   - The goal is to show why a result appeared and when not to trust it.
 
-This roadmap is now represented in the CLI/runtime surface:
+4. **Improve repository navigation**
+   - Keep hardening `explore`, definition, references, symbol browsing, trails,
+     and snippets before adding a separate web UI.
+   - A new surface should be added only when it solves a workflow that the
+     current surfaces do not.
 
-- `context` builds a DB-first evidence packet with retrieval trace, citations, graphs, and shareable `--bundle` artifacts around one concrete target.
-- `search --why` and `ground --why` add human-readable retrieval explanations; search JSON carries score breakdowns when runtime produces hybrid scored hits.
-- `explore` JSON/Markdown includes definition plus incoming/outgoing reference navigation metadata.
-- `serve` now exposes navigation HTTP routes (`/definition`, `/references`, `/symbols`) and `serve --stdio` publishes tools, resources, resource templates, and prompts.
-- `doctor` reports project/cache/index/retrieval health, embedding-related environment settings, and next commands.
+5. **Simplify setup**
+   - Managed embeddings, profile selection, and fallback messaging should make
+     first use clear.
+   - If the model path, backend, or doc shape is stale, `doctor` should say so
+     plainly.
 
-## External research references
+## Later
 
-- Sourcegraph, *Cody Context* docs: multi-source context retrieval (keyword search, search API, code graph) and context-window quality tradeoffs.
-- Sourcegraph, *Code Graph* docs: graph structure (definitions/references/symbols) as core contextual signal.
-- Sourcegraph, *Agentic Context Fetching* docs: proactive and iterative context gathering with tool use including MCP.
-- GitHub docs, *Navigating code on GitHub*: first-class symbol browsing, go-to-definition, and find-references UX patterns.
-- Microsoft, *Language Server Protocol*: standardized features for go-to-definition/find-references and broad editor interoperability.
-- Model Context Protocol specification: standardized resources/prompts/tools and explicit safety/consent requirements.
-- SQLite FTS5 docs: native ranking (`bm25`/`rank`) and snippet/highlight primitives useful for explainability and readable search hits.
+- Saved query presets for repeated investigations.
+- Shareable result bundles that pair Markdown summaries with machine JSON.
+- Better typo and low-confidence query suggestions.
+- A separate web UI only after the browser surface gate has current evidence.
+
+## Research References
+
+- Sourcegraph, *Cody Context* docs: multi-source context retrieval and context-window tradeoffs.
+- Sourcegraph, *Code Graph* docs: graph structure as contextual signal.
+- Sourcegraph, *Agentic Context Fetching* docs: proactive and iterative context gathering.
+- GitHub docs, *Navigating code on GitHub*: symbol browsing, go-to-definition, and find-references patterns.
+- Microsoft, *Language Server Protocol*: standard definition/reference workflows.
+- Model Context Protocol specification: resources, prompts, tools, and safety/consent requirements.
+- SQLite FTS5 docs: ranking and snippet/highlight primitives.

@@ -1,0 +1,85 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "vite-config-change-impact",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "change_impact",
+  "repo": {
+    "name": "vite",
+    "url": "https://github.com/vitejs/vite.git",
+    "ref": "v5.4.19",
+    "workspace_root": "packages/vite",
+    "languages": [
+      "TypeScript",
+      "JavaScript",
+      "Markdown"
+    ],
+    "setup": [
+      "pnpm install"
+    ]
+  },
+  "prompt": "Assess the likely impact of changing how Vite resolves server-related configuration defaults. Identify implementation areas and regression surfaces before editing.",
+  "expected_files": [
+    "src/node/config.ts",
+    "src/node/server/index.ts",
+    "src/node/http.ts",
+    "src/node/server/middlewares/indexHtml.ts"
+  ],
+  "expected_symbols": [
+    {
+      "name": "resolveConfig",
+      "path": "src/node/config.ts",
+      "kind": "function",
+      "why": "Resolves defaults and merged user config."
+    },
+    {
+      "name": "createServer",
+      "path": "src/node/server/index.ts",
+      "kind": "function",
+      "why": "Consumes resolved server configuration while creating dev-server state."
+    },
+    {
+      "name": "indexHtmlMiddleware",
+      "path": "src/node/server/middlewares/indexHtml.ts",
+      "kind": "function",
+      "why": "Server defaults can affect HTML serving behavior."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "Configuration default changes should start in resolveConfig."
+    },
+    {
+      "text": "Dev-server construction must be checked because it consumes resolved server configuration."
+    },
+    {
+      "text": "HTTP server setup and middleware behavior are likely impact surfaces for server defaults."
+    },
+    {
+      "text": "Regression testing should include config resolution and dev-server behavior, not only type checking."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "Server configuration defaults are isolated from createServer.",
+      "severity": "critical"
+    },
+    {
+      "text": "Changing config defaults never affects middleware behavior.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.67,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "typescript",
+    "mixed-monorepo",
+    "change-impact"
+  ]
+}

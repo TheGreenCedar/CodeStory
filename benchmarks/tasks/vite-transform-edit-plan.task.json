@@ -1,0 +1,91 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "vite-transform-edit-plan",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "edit_planning",
+  "repo": {
+    "name": "vite",
+    "url": "https://github.com/vitejs/vite.git",
+    "ref": "v5.4.19",
+    "workspace_root": "packages/vite",
+    "languages": [
+      "TypeScript",
+      "JavaScript",
+      "Markdown"
+    ],
+    "setup": [
+      "pnpm install"
+    ]
+  },
+  "prompt": "Plan a minimal edit for a dev-server transform cache bug where stale module transforms are reused after an imported dependency changes. Identify the first files and symbols to inspect.",
+  "expected_files": [
+    "src/node/server/transformRequest.ts",
+    "src/node/server/moduleGraph.ts",
+    "src/node/server/hmr.ts",
+    "src/node/server/pluginContainer.ts"
+  ],
+  "expected_symbols": [
+    {
+      "name": "transformRequest",
+      "path": "src/node/server/transformRequest.ts",
+      "kind": "function",
+      "why": "Main request transform path likely to read or write cached transform results."
+    },
+    {
+      "name": "ModuleGraph",
+      "path": "src/node/server/moduleGraph.ts",
+      "kind": "class",
+      "why": "Tracks dependency relationships and module invalidation state."
+    },
+    {
+      "name": "createServerHMRChannel",
+      "path": "src/node/server/hmr.ts",
+      "kind": "function",
+      "why": "HMR behavior is relevant when dependency updates should invalidate transformed modules."
+    },
+    {
+      "name": "createPluginContainer",
+      "path": "src/node/server/pluginContainer.ts",
+      "kind": "function",
+      "why": "Plugin transforms can influence cached transform output."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "The first implementation path to inspect is transformRequest because the report concerns reused transformed output."
+    },
+    {
+      "text": "ModuleGraph is relevant because dependency relationships drive invalidation."
+    },
+    {
+      "text": "HMR handling is relevant because file updates need to invalidate dependent modules."
+    },
+    {
+      "text": "Plugin container behavior should be considered because plugin transforms can affect cache keys and output."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "The change can be localized to the command-line entry point without inspecting server transform code.",
+      "severity": "critical"
+    },
+    {
+      "text": "Dependency invalidation is unrelated to the module graph.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "typescript",
+    "mixed-monorepo",
+    "edit-planning"
+  ]
+}

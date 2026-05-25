@@ -1,18 +1,18 @@
-# Plan: Make CodeStory An LLM's Default Codebase Browser
+# Internal Plan: Make CodeStory An LLM's Default Codebase Browser
 
 **Generated**: 2026-05-06
 **Estimated complexity**: High
-**Status**: planning artifact
+**Status**: historical planning artifact; status reviewed on 2026-05-24
 
 ## Overview
 
-CodeStory already has the core substrate for an agent-native codebase browser:
+CodeStory already has the core substrate for an agent-facing codebase browser:
 local indexing, a SQLite-backed symbol/edge graph, semantic docs, grounding
 snapshots, search, symbol inspection, trails, snippets, DB-first `context`, a TUI
 `explore` path, HTTP routes, and MCP-style stdio serving.
 
-The next product leap is not another isolated command. It is making those
-primitives act like one trustworthy browsing layer that an LLM naturally uses
+The next product step is not another isolated command. It is making those
+primitives act like one browsing layer that an LLM can use
 before reaching for ad hoc file reads.
 
 The reviewed direction is:
@@ -36,17 +36,20 @@ CodeStory's durable promise is strong:
 - The architecture docs and contract tests preserve the intended crate split.
 - The repo-scale e2e stats gate already measures index/search/symbol/trail/snippet behavior.
 
-The main limitations are sharper:
+This plan is retained as design history, not as the current delivery backlog.
+The status of the original limitations is:
 
-- Local external-agent execution has been removed from high-level retrieval; the remaining risk is keeping the DB-first browser contract from regressing.
-- `.codestory.toml` documents `embedding_model`, but the config maps it to an env var the runtime does not read for active embedding profile selection.
-- The repo-local `codestory-grounding` skill has stale crate names and lacks detailed refs for `context`, `doctor`, `explore`, and `serve`.
-- CLI help must keep `--format dot` trail-only so non-trail commands expose only `markdown|json`.
-- The best product-flow tests are ignored or heavy; there is no small always-on "index then browse" golden path.
-- HTTP/stdio tool schemas and prompts are handwritten in the CLI.
-- `context` is still mostly a one-pass evidence packet, and exact integration targets can return weak or zero-hit packets.
-- Freshness/profile mismatch signals are not first-class browser outputs.
-- Performance evidence is strong for this repo, but not yet for 10k-100k file agent loops.
+| Area | Status | Current note |
+| --- | --- | --- |
+| DB-first browser contract | Completed, guarded | High-level retrieval no longer carries local external-agent execution controls; architecture and onboarding contracts protect the read-only boundary. |
+| `.codestory.toml` embedding mapping | Completed | `embedding_profile` and `embedding_model_id` map to runtime env names; legacy `embedding_model` remains a deprecated alias. |
+| Repo-local grounding skill refs | Completed, guarded | Command refs exist for the browser surfaces and onboarding tests check required reference shape. |
+| Trail-only DOT output | Completed, guarded | CLI help and command contracts keep DOT scoped to trail output. |
+| Fast browser golden path | Completed | `cli_golden_path` covers the small always-on index-then-browse loop. |
+| HTTP/stdio schema generation | Still open | Tool schemas and prompts are still handwritten in the CLI. |
+| `context` packet quality | Superseded by packet/search-plan work | `packet`, `search --why`, and structured follow-up commands now carry more of the agent handoff path. |
+| Freshness/profile mismatch signals | Partly complete | `doctor` and read outputs report retrieval/freshness state; continue improving where review evidence shows ambiguity. |
+| Large-repo performance evidence | Still open | Repo-scale and public-core rows exist, but 10k-100k file agent-loop evidence remains future work. |
 
 ## Sprint 0: Safety, Drift, And Fast Tripwires
 
@@ -405,18 +408,18 @@ The main limitations are sharper:
 
 ## Sprint 5: Delight UX On The Existing Surface
 
-**Goal**: make CodeStory feel delightful without creating duplicate UI surfaces prematurely.
+**Goal**: improve the existing browser flow without creating duplicate UI surfaces prematurely.
 
 **Demo/validation**
 
 - `explore` flow improves for keyboard-first navigation.
-- No new `browse` command until its distinction from `explore` is obvious.
+- No new `browse` command until its distinction from `explore` is clear.
 - Accessibility and text-equivalent review for any graph-heavy UI.
 
 ### Task 5.1: Improve `explore` Before Adding `browse`
 
 - **Location**: `crates/codestory-cli/src/main.rs`, explore rendering/TUI modules if split.
-- **Description**: evolve the current TUI into the default cockpit path.
+- **Description**: evolve the current TUI into the default browser path.
 - **Acceptance criteria**:
   - Project/status pane shows retrieval mode, fallback, freshness, and next useful command.
   - Search/results/detail/trail/snippet panes are keyboard reachable.
@@ -450,11 +453,11 @@ The main limitations are sharper:
 
 ### Task 5.4: Defer Web Cockpit Until Contracts Are Stable
 
-- **Description**: only add a web cockpit after read-only service, protocol catalog, status/freshness, and warm-loop telemetry are stable.
+- **Description**: only add a separate web UI after read-only service, protocol catalog, status/freshness, and warm-loop telemetry are stable.
 - **Acceptance criteria for starting web work**:
   - Tool/resource manifest stable.
   - Warm p95 thresholds are met.
-  - Existing `explore` experience proves the cockpit workflow.
+  - Existing `explore` experience proves the browser workflow.
   - Screenshot-visible review loop is planned before implementation.
 
 ## Suggested First Three PRs
@@ -486,7 +489,7 @@ The main limitations are sharper:
 ## Review Risks
 
 - **Protocol overreach**: do not freeze a rich manifest until service boundaries are clean.
-- **UI duplication**: improve `explore` first; defer `browse` and web cockpit.
+- **UI duplication**: improve `explore` first; defer `browse` and a separate web UI.
 - **Latency waterfall**: deep `context` must be budgeted before graph/source phases.
 - **Repo-text I/O**: add global caps before repo-text participates in high-level bundles.
 - **Config churn**: support legacy `embedding_model` while introducing precise `embedding_profile` and `embedding_model_id`.
@@ -503,4 +506,4 @@ CodeStory is credibly acting as an LLM's default codebase browser when:
 - MCP/stdio clients receive stable schemas, read-only annotations, JSON-RPC-shaped errors, and continuation resource links;
 - warm stdio/browser-loop p95 timings are measured and bounded;
 - repo-scale and stress-lane gates protect index/search/trail/snippet behavior before releases;
-- `explore` provides a useful cockpit-like flow without requiring a separate web app.
+- `explore` provides a useful browser-style flow without requiring a separate web app.

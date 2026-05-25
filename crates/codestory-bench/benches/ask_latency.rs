@@ -72,6 +72,7 @@ fn bench_ask_retrieval_latency(c: &mut Criterion) {
         query: "permission policy checks".to_string(),
         repo_text: codestory_contracts::api::SearchRepoTextMode::Off,
         limit_per_source: 12,
+        expand_search_plan: false,
         hybrid_weights: None,
         hybrid_limits: None,
     };
@@ -87,6 +88,7 @@ fn bench_ask_retrieval_latency(c: &mut Criterion) {
                             query: query.query.clone(),
                             repo_text: codestory_contracts::api::SearchRepoTextMode::Off,
                             limit_per_source: 12,
+                            expand_search_plan: false,
                             hybrid_weights: None,
                             hybrid_limits: None,
                         },

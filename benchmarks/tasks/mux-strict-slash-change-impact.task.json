@@ -1,0 +1,90 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "mux-strict-slash-change-impact",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "change_impact",
+  "repo": {
+    "name": "mux",
+    "url": "https://github.com/gorilla/mux.git",
+    "ref": "v1.8.1",
+    "workspace_root": ".",
+    "languages": [
+      "Go"
+    ],
+    "setup": [
+      "go test ./..."
+    ]
+  },
+  "prompt": "Assess the likely impact of changing mux trailing-slash redirect behavior. Identify implementation areas and regression surfaces before editing.",
+  "expected_files": [
+    "mux.go",
+    "route.go",
+    "regexp.go",
+    "mux_test.go",
+    "regexp_test.go"
+  ],
+  "expected_symbols": [
+    {
+      "name": "Router.StrictSlash",
+      "path": "mux.go",
+      "kind": "method",
+      "why": "Configures trailing-slash behavior for new routes."
+    },
+    {
+      "name": "Route.Match",
+      "path": "route.go",
+      "kind": "method",
+      "why": "Evaluates route matchers and records match state."
+    },
+    {
+      "name": "Route.addRegexpMatcher",
+      "path": "route.go",
+      "kind": "method",
+      "why": "Passes strict-slash options into path regexp construction."
+    },
+    {
+      "name": "newRouteRegexp",
+      "path": "regexp.go",
+      "kind": "function",
+      "why": "Compiles route templates and redirect-aware path matching expressions."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "Trailing-slash behavior is configured through Router.StrictSlash."
+    },
+    {
+      "text": "Route matcher construction is an impact surface because it carries strict-slash options into regexp compilation."
+    },
+    {
+      "text": "Route.Match and router request handling should be checked because redirect behavior is observed during matching."
+    },
+    {
+      "text": "Regression coverage should include mux request matching tests and route regexp tests."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "Strict slash behavior is isolated from route regexp construction.",
+      "severity": "critical"
+    },
+    {
+      "text": "Path prefix routes and subrouters cannot be affected by trailing-slash configuration.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "go",
+    "change-impact",
+    "routing"
+  ]
+}

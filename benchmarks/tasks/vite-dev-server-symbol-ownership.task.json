@@ -1,0 +1,108 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "vite-dev-server-symbol-ownership",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "symbol_ownership",
+  "repo": {
+    "name": "vite",
+    "url": "https://github.com/vitejs/vite.git",
+    "ref": "v5.4.19",
+    "workspace_root": "packages/vite",
+    "languages": [
+      "TypeScript",
+      "JavaScript",
+      "Markdown"
+    ],
+    "setup": [
+      "pnpm install"
+    ]
+  },
+  "prompt": "Explain which Vite modules own config resolution, dev-server construction, transform middleware, module transformation, plugin hook execution, and module graph state.",
+  "expected_files": [
+    "src/node/config.ts",
+    "src/node/server/index.ts",
+    "src/node/server/middlewares/transform.ts",
+    "src/node/server/transformRequest.ts",
+    "src/node/server/pluginContainer.ts",
+    "src/node/server/moduleGraph.ts"
+  ],
+  "expected_symbols": [
+    {
+      "name": "resolveConfig",
+      "path": "src/node/config.ts",
+      "kind": "function",
+      "why": "Owns merged config resolution and defaults."
+    },
+    {
+      "name": "createServer",
+      "path": "src/node/server/index.ts",
+      "kind": "function",
+      "why": "Owns public dev-server construction."
+    },
+    {
+      "name": "transformMiddleware",
+      "path": "src/node/server/middlewares/transform.ts",
+      "kind": "function",
+      "why": "Owns request-time transform middleware behavior."
+    },
+    {
+      "name": "transformRequest",
+      "path": "src/node/server/transformRequest.ts",
+      "kind": "function",
+      "why": "Owns transform request orchestration."
+    },
+    {
+      "name": "createPluginContainer",
+      "path": "src/node/server/pluginContainer.ts",
+      "kind": "function",
+      "why": "Owns construction of the plugin hook execution container."
+    },
+    {
+      "name": "ModuleGraph",
+      "path": "src/node/server/moduleGraph.ts",
+      "kind": "class",
+      "why": "Owns module graph state and transform result tracking."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "Config resolution is owned by src/node/config.ts through resolveConfig."
+    },
+    {
+      "text": "Dev-server construction is owned by src/node/server/index.ts through createServer."
+    },
+    {
+      "text": "Request-time transform routing is owned by the transform middleware."
+    },
+    {
+      "text": "Module transformation orchestration is owned by transformRequest."
+    },
+    {
+      "text": "Plugin hook execution and module graph state are separate ownership areas."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "The module graph owns config resolution defaults.",
+      "severity": "major"
+    },
+    {
+      "text": "Dev-server module transforms are owned by the production build entry point.",
+      "severity": "critical"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "typescript",
+    "mixed-monorepo",
+    "symbol-ownership"
+  ]
+}

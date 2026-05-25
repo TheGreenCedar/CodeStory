@@ -1,23 +1,26 @@
 # Browser Surface Gate
 
+This is maintainer governance, not the product quickstart. It exists to stop a
+new web UI or `browse` command from being added before the evidence exists.
+
 CodeStory should keep `explore`, `serve --stdio`, and the read-only browser
-service as the default codebase-browser surfaces until a separate web cockpit or
+service as the default codebase-browser surfaces until a separate web UI or
 `browse` command has evidence that it solves a different workflow.
 
 ## Current Status
 
 Status: deferred.
 
-`explore` is the cockpit path for now. It already bundles project status,
+`explore` is the browser path for now. It already bundles project status,
 query resolution, navigation results, symbol details, trail context, snippets,
 and next commands without introducing another UI surface.
 
-Do not add a new `browse` command, web cockpit route, or browser-specific web UI
+Do not add a new `browse` command, web UI route, or browser-specific UI
 until all of the gates below have current evidence in the repo.
 
 ## Promotion Gates
 
-Before starting web cockpit work:
+Before starting web UI work:
 
 - Tool, resource, and prompt manifests must be stable under stdio catalog tests.
 - HTTP and stdio browser contracts must stay aligned with the read-only browser
@@ -29,7 +32,7 @@ Before starting web cockpit work:
   Cockpit Promotion Budget.
 - Browser stress lanes must pass at the intended scale, and synthetic evidence
   must not be treated as real-repository promotion proof.
-- `explore` must demonstrate the cockpit workflow in JSON/Markdown and
+- `explore` must demonstrate the browser workflow in JSON/Markdown and
   keyboard-first TUI paths.
 - Screenshot-visible review must be planned before implementation, with one
   reviewer for the full viewport and one reviewer for the changed surface or
@@ -48,7 +51,7 @@ Before starting web cockpit work:
 - `docs/testing/codestory-stress-lanes.md` defines browser-scale stress lanes
   and promotion thresholds.
 - `crates/codestory-cli/tests/cli_golden_path.rs` keeps `explore` useful as the
-  bundled cockpit path.
+  bundled browser path.
 
 ## When The Gate Opens
 

@@ -5,7 +5,7 @@ Builds an opinionated context bundle around one concrete retrieval target. This 
 ## Usage
 
 ```
-target/release/codestory-cli(.exe) context [OPTIONS] (--id <NODE_ID> | --query <QUERY> | --bookmark <BOOKMARK_ID>)
+<codestory-cli> context [OPTIONS] (--id <NODE_ID> | --query <QUERY> | --bookmark <BOOKMARK_ID>)
 ```
 
 ## Key Options
@@ -28,8 +28,8 @@ target/release/codestory-cli(.exe) context [OPTIONS] (--id <NODE_ID> | --query <
 
 | Path | Command | Expected result |
 |------|---------|-----------------|
-| Normal path | `target/release/codestory-cli(.exe) context --project . --query AppController` | Markdown context packet with resolution metadata, retrieval trace, citations, gaps, and next commands. |
-| Failure path | If the target is ambiguous or missing, run `search --project . --query "<target>" --why`, choose a concrete `node_id`, then rerun `context --id <node_id>`. If cache or semantic health is weak, run `doctor --project .`, `setup embeddings --project .` when needed, and `index --project . --refresh full`. | Keeps context tied to a resolvable target and avoids treating stale retrieval as strong evidence. |
+| Normal path | `<codestory-cli> context --project <target-workspace> --query AppController` | Markdown context packet with resolution metadata, retrieval trace, citations, gaps, and next commands. |
+| Failure path | If the target is ambiguous or missing, run `search --project <target-workspace> --query "<target>" --why`, choose a concrete `node_id`, then rerun `context --id <node_id>`. If cache or semantic health is weak, run `doctor --project <target-workspace>`, `setup embeddings --project <target-workspace>` when needed, and `index --project <target-workspace> --refresh full`. | Keeps context tied to a resolvable target and avoids treating stale retrieval as strong evidence. |
 | Integration edge | Use `search --why`, `explore`, or `bookmark list` first, then pass the selected node via `--id <node_id>` or `--bookmark <bookmark_id>`; use `--bundle out/context-AppController` for reviewer handoff. | Converts candidate discovery into a deeper, shareable evidence packet. |
 
 ## Notes

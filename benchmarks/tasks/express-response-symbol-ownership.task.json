@@ -1,0 +1,95 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "express-response-symbol-ownership",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "symbol_ownership",
+  "repo": {
+    "name": "express",
+    "url": "https://github.com/expressjs/express.git",
+    "ref": "4.18.2",
+    "workspace_root": ".",
+    "languages": [
+      "JavaScript"
+    ],
+    "setup": [
+      "npm install"
+    ]
+  },
+  "prompt": "Explain which Express modules own application creation, app-level rendering, response serialization, file sending, and view lookup.",
+  "expected_files": [
+    "lib/express.js",
+    "lib/application.js",
+    "lib/response.js",
+    "lib/view.js"
+  ],
+  "expected_symbols": [
+    {
+      "name": "createApplication",
+      "path": "lib/express.js",
+      "kind": "function",
+      "why": "Owns creation of the public app callable."
+    },
+    {
+      "name": "app.render",
+      "path": "lib/application.js",
+      "kind": "method",
+      "why": "Owns app-level view rendering."
+    },
+    {
+      "name": "res.send",
+      "path": "lib/response.js",
+      "kind": "method",
+      "why": "Owns response body sending."
+    },
+    {
+      "name": "res.json",
+      "path": "lib/response.js",
+      "kind": "method",
+      "why": "Owns JSON response serialization."
+    },
+    {
+      "name": "View",
+      "path": "lib/view.js",
+      "kind": "function",
+      "why": "Owns view lookup and rendering metadata."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "The public application factory is implemented in lib/express.js."
+    },
+    {
+      "text": "App-level rendering is owned by lib/application.js."
+    },
+    {
+      "text": "Response serialization helpers are owned by lib/response.js."
+    },
+    {
+      "text": "View lookup and metadata are owned by lib/view.js."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "View lookup is implemented in lib/router/route.js.",
+      "severity": "major"
+    },
+    {
+      "text": "JSON serialization is owned by the request prototype.",
+      "severity": "critical"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "javascript",
+    "symbol-ownership",
+    "response"
+  ]
+}

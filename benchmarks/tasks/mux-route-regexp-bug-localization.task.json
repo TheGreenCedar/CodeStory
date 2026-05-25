@@ -1,0 +1,90 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "mux-route-regexp-bug-localization",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "bug_localization",
+  "repo": {
+    "name": "mux",
+    "url": "https://github.com/gorilla/mux.git",
+    "ref": "v1.8.1",
+    "workspace_root": ".",
+    "languages": [
+      "Go"
+    ],
+    "setup": [
+      "go test ./..."
+    ]
+  },
+  "prompt": "A bug report says routes with variables and custom regular expressions match the wrong path or produce wrong variables. Localize the likely implementation and regression tests.",
+  "expected_files": [
+    "regexp.go",
+    "route.go",
+    "mux.go",
+    "mux_test.go",
+    "regexp_test.go"
+  ],
+  "expected_symbols": [
+    {
+      "name": "newRouteRegexp",
+      "path": "regexp.go",
+      "kind": "function",
+      "why": "Parses templates and compiles route matching regular expressions."
+    },
+    {
+      "name": "routeRegexp",
+      "path": "regexp.go",
+      "kind": "type",
+      "why": "Stores compiled regular expressions and variable names."
+    },
+    {
+      "name": "Route.Path",
+      "path": "route.go",
+      "kind": "method",
+      "why": "Adds path matchers that use route regular expressions."
+    },
+    {
+      "name": "Router.Match",
+      "path": "mux.go",
+      "kind": "method",
+      "why": "Runs route matching and populates the match result."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "Route template parsing and variable extraction should be inspected in regexp.go."
+    },
+    {
+      "text": "Route.Path is relevant because it creates path matchers from route templates."
+    },
+    {
+      "text": "Router.Match is relevant for how successful matches and variables are carried into request handling."
+    },
+    {
+      "text": "Regression coverage should include route regexp tests and request matching tests."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "Variable route matching is implemented only in middleware.go.",
+      "severity": "critical"
+    },
+    {
+      "text": "Custom route regular expressions do not affect path matching.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "go",
+    "bug-localization",
+    "routing"
+  ]
+}

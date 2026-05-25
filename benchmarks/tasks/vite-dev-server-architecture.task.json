@@ -1,0 +1,101 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "vite-dev-server-architecture",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "architecture_explanation",
+  "repo": {
+    "name": "vite",
+    "url": "https://github.com/vitejs/vite.git",
+    "ref": "v5.4.19",
+    "workspace_root": "packages/vite",
+    "languages": [
+      "TypeScript",
+      "JavaScript",
+      "Markdown"
+    ],
+    "setup": [
+      "pnpm install"
+    ]
+  },
+  "prompt": "Explain how Vite creates a development server, resolves configuration, wires the plugin container, tracks modules, and transforms source during requests.",
+  "expected_files": [
+    "src/node/server/index.ts",
+    "src/node/config.ts",
+    "src/node/server/pluginContainer.ts",
+    "src/node/server/moduleGraph.ts",
+    "src/node/server/transformRequest.ts"
+  ],
+  "expected_symbols": [
+    {
+      "name": "createServer",
+      "path": "src/node/server/index.ts",
+      "kind": "function",
+      "why": "Main dev server construction entry point."
+    },
+    {
+      "name": "resolveConfig",
+      "path": "src/node/config.ts",
+      "kind": "function",
+      "why": "Resolves user and default configuration before server wiring."
+    },
+    {
+      "name": "createPluginContainer",
+      "path": "src/node/server/pluginContainer.ts",
+      "kind": "function",
+      "why": "Builds the plugin execution surface used by the server."
+    },
+    {
+      "name": "ModuleGraph",
+      "path": "src/node/server/moduleGraph.ts",
+      "kind": "class",
+      "why": "Tracks module relationships and transform state."
+    },
+    {
+      "name": "transformRequest",
+      "path": "src/node/server/transformRequest.ts",
+      "kind": "function",
+      "why": "Transforms requested modules through the server pipeline."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "createServer is the development server construction entry point."
+    },
+    {
+      "text": "Configuration is resolved before the server finishes wiring plugins and middleware."
+    },
+    {
+      "text": "The plugin container is the server-facing mechanism for running plugin hooks."
+    },
+    {
+      "text": "The module graph tracks module relationships and transform state for dev-server requests."
+    },
+    {
+      "text": "Source transformation for module requests is handled by the transform request pipeline."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "The dev server transforms source without using resolved configuration or plugins.",
+      "severity": "critical"
+    },
+    {
+      "text": "The module graph is only a production build artifact.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "typescript",
+    "mixed-monorepo",
+    "dev-server"
+  ]
+}

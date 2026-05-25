@@ -7,7 +7,7 @@ Markdown output uses ANSI syntax highlighting when stdout is an interactive term
 ## Usage
 
 ```
-target/release/codestory-cli(.exe) snippet [OPTIONS]
+<codestory-cli> snippet [OPTIONS]
 ```
 
 ## Arguments
@@ -27,9 +27,9 @@ target/release/codestory-cli(.exe) snippet [OPTIONS]
 
 ## Output
 
-Markdown output includes `context: scope=<line_context|function_body> requested_lines=<n> max_snippet_bytes=<bytes>`. JSON includes the same `scope`, `requested_context`, `snippet_truncated`, and `max_snippet_bytes` fields. If `snippet_truncated` is true, the byte cap stopped the output; raising `--context` alone may not reveal more code.
+Markdown output includes `context: scope=<line_context|function_body> requested_lines=<n> max_snippet_bytes=<bytes>`. JSON includes the same `scope`, `requested_context`, `snippet_truncated`, and `max_snippet_bytes` fields, plus `range_source`, `fallback_reason`, and `truncation_guidance` when applicable. If `snippet_truncated` is true, the byte cap stopped the output; follow `truncation_guidance` rather than assuming more `--context` will reveal the omitted code.
 
-When `--function-body` is set, snippet prefers an implementation/body-looking function or method hit over a declaration-looking hit when possible. If source ranges are unavailable, it falls back to normal line context.
+When `--function-body` is set, snippet prefers an implementation/body-looking function or method hit over a declaration-looking hit when possible. If indexed source ranges are missing or suspicious, supported brace languages attempt a bounded brace-balanced fallback before degrading. If fallback fails, output keeps `scope=line_context` and reports the fallback reason explicitly.
 
 ```
 # Snippet
@@ -56,20 +56,20 @@ context: requested_lines=4 max_snippet_bytes=20000
 
 ```bash
 # Snippet with default 4 lines of context
-target/release/codestory-cli(.exe) snippet --project . --query "AppController::new"
+<codestory-cli> snippet --project <target-workspace> --query "AppController::new"
 
 # More context
-target/release/codestory-cli(.exe) snippet --project . --query run_indexing --context 10
+<codestory-cli> snippet --project <target-workspace> --query run_indexing --context 10
 
 # Agent-friendly alias for the same context setting
-target/release/codestory-cli(.exe) snippet --project . --query run_indexing --lines 40
+<codestory-cli> snippet --project <target-workspace> --query run_indexing --lines 40
 
 # Prefer the full implementation body when available
-target/release/codestory-cli(.exe) snippet --project . --query run_indexing --function-body --lines 8
+<codestory-cli> snippet --project <target-workspace> --query run_indexing --function-body --lines 8
 
 # Disambiguate by file and write stable Markdown
-target/release/codestory-cli(.exe) snippet --project . --query TicTacToe --file rust_tictactoe.rs --output-file tictactoe.md
+<codestory-cli> snippet --project <target-workspace> --query TicTacToe --file rust_tictactoe.rs --output-file tictactoe.md
 
 # By node ID, JSON output
-target/release/codestory-cli(.exe) snippet --project . --id abc123def456 --format json
+<codestory-cli> snippet --project <target-workspace> --id abc123def456 --format json
 ```

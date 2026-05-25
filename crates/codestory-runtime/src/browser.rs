@@ -1,10 +1,11 @@
 use codestory_contracts::api::{
     AffectedAnalysisDto, AffectedAnalysisRequest, AgentAnswerDto, AgentAskRequest,
-    AgentHybridWeightsDto, ApiError, IndexedFilesDto, IndexedFilesRequest, LayoutDirection,
-    ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId,
-    NodeKind, NodeOccurrencesRequest, SearchHit, SearchRepoTextMode, SearchRequest,
-    SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, SymbolContextDto, SymbolSummaryDto,
-    TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection, TrailMode,
+    AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, IndexedFilesDto,
+    IndexedFilesRequest, LayoutDirection, ListChildrenSymbolsRequest, ListRootSymbolsRequest,
+    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest, SearchHit,
+    SearchRepoTextMode, SearchRequest, SearchResultsDto, SnippetContextDto, SourceOccurrenceDto,
+    SymbolContextDto, SymbolSummaryDto, TrailCallerScope, TrailConfigDto, TrailContextDto,
+    TrailDirection, TrailMode,
 };
 use codestory_contracts::query::{
     FilterQuery, GraphQueryAst, GraphQueryOperation, SearchQuery as BrowserSearchQuery,
@@ -94,6 +95,10 @@ impl ReadOnlyBrowserService {
 
     pub fn ask(&self, req: AgentAskRequest) -> Result<AgentAnswerDto, ApiError> {
         self.controller.agent_ask(req)
+    }
+
+    pub fn packet(&self, req: AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError> {
+        self.controller.agent_packet(req)
     }
 
     pub fn search(&self, req: SearchRequest) -> Result<Vec<SearchHit>, ApiError> {
@@ -277,6 +282,7 @@ impl ReadOnlyBrowserService {
             query: query.query.clone(),
             repo_text: SearchRepoTextMode::Off,
             limit_per_source: 50,
+            expand_search_plan: false,
             hybrid_weights: None,
             hybrid_limits: None,
         })?;
@@ -301,6 +307,7 @@ impl ReadOnlyBrowserService {
                 query: query.to_string(),
                 repo_text: SearchRepoTextMode::Off,
                 limit_per_source: 50,
+                expand_search_plan: false,
                 hybrid_weights: None,
                 hybrid_limits: None,
             },

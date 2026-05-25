@@ -5,7 +5,8 @@ use codestory_contracts::api::{
     AgentRetrievalStepStatusDto, ClaimReadinessDto, EvidenceTypeDto, GraphArtifactDto,
     GroundingSnapshotDto, IndexingPhaseTimings, NodeDetailsDto, RepoTextScanStatsDto,
     RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, SearchHit,
-    SearchPlanBridgeDto, SearchPlanChannelDto, SearchPlanDto, SearchPlanPromotionStatusDto,
+    SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
+    SearchPlanBridgeStatusDto, SearchPlanChannelDto, SearchPlanDto, SearchPlanPromotionStatusDto,
     SnippetContextDto, SymbolContextDto, TrailContextDto, TrailStoryDto,
 };
 use serde::Serialize;
@@ -18,7 +19,8 @@ use std::path::Path;
 
 use crate::args::{
     CliTrailMode, DoctorOutput, DrillOutput, IndexDryRunOutput, IndexOutput, OutputFormat,
-    QueryOutput, SearchHitOutput, SearchOutput, TrailCommand, VerificationTargetOutput,
+    QueryItemOutput, QueryOutput, SearchHitOutput, SearchOutput, TrailCommand,
+    VerificationTargetOutput,
 };
 use crate::display::{
     clean_path_string, default_trail_direction, format_budget, format_direction, format_kind,
@@ -561,7 +563,7 @@ pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput)
     if output.explain
         && let Some(plan) = output.search_plan.as_ref()
     {
-        append_search_plan(&mut markdown, plan);
+        append_search_plan(&mut markdown, project_root, plan);
     }
     if output.explain {
         append_search_evidence_packet(&mut markdown, project_root, output);
@@ -682,7 +684,7 @@ fn append_query_assessment(
     }
 }
 
-fn append_search_plan(markdown: &mut String, plan: &SearchPlanDto) {
+fn append_search_plan(markdown: &mut String, project_root: &Path, plan: &SearchPlanDto) {
     let _ = writeln!(markdown, "## Search Plan");
     let _ = writeln!(
         markdown,
@@ -700,7 +702,7 @@ fn append_search_plan(markdown: &mut String, plan: &SearchPlanDto) {
     append_search_plan_anchor_groups(markdown, plan);
     append_search_plan_bridges(markdown, plan);
     append_search_plan_repo_text_promotions(markdown, plan);
-    append_search_plan_next_steps(markdown, plan);
+    append_search_plan_next_steps(markdown, project_root, plan);
 }
 
 fn append_search_plan_terms(markdown: &mut String, plan: &SearchPlanDto) {
@@ -805,9 +807,9 @@ fn append_search_plan_bridge(markdown: &mut String, bridge: &SearchPlanBridgeDto
         "- `{}` -> `{}` status={} confidence={} evidence={}{} nodes={} edges={} truncated={}",
         bridge.from_anchor,
         bridge.to_anchor,
-        bridge.status,
-        bridge.confidence,
-        bridge.evidence_kind,
+        format_search_plan_bridge_status(bridge.status),
+        format_search_plan_bridge_confidence(bridge.confidence),
+        format_search_plan_bridge_evidence_kind(bridge.evidence_kind),
         direction,
         bridge.node_count,
         bridge.edge_count,
@@ -838,10 +840,11 @@ fn append_search_plan_repo_text_promotions(markdown: &mut String, plan: &SearchP
     }
 }
 
-fn append_search_plan_next_steps(markdown: &mut String, plan: &SearchPlanDto) {
-    if !plan.next_commands.is_empty() {
+fn append_search_plan_next_steps(markdown: &mut String, project_root: &Path, plan: &SearchPlanDto) {
+    let next_commands = search_plan_next_commands(project_root, &plan.next_actions);
+    if !next_commands.is_empty() {
         let _ = writeln!(markdown, "Next commands:");
-        for command in &plan.next_commands {
+        for command in &next_commands {
             let _ = writeln!(markdown, "- `{command}`");
         }
     }
@@ -850,6 +853,96 @@ fn append_search_plan_next_steps(markdown: &mut String, plan: &SearchPlanDto) {
         for check in &plan.source_truth_checks {
             let _ = writeln!(markdown, "- {check}");
         }
+    }
+}
+
+fn search_plan_next_commands(
+    project_root: &Path,
+    actions: &[codestory_contracts::api::SearchPlanNextActionDto],
+) -> Vec<String> {
+    let project = quote_search_plan_command_value(&project_root.to_string_lossy());
+    actions
+        .iter()
+        .filter_map(|action| match action.action.as_str() {
+            "symbol" => Some(format!(
+                "codestory-cli symbol --project {project} --id {}",
+                action.node_id.0
+            )),
+            "trail" => Some(format!(
+                "codestory-cli trail --project {project} --id {} --story --hide-speculative",
+                action.node_id.0
+            )),
+            "snippet" => Some(search_plan_snippet_command(project.as_str(), action)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn search_plan_snippet_command(
+    project: &str,
+    action: &codestory_contracts::api::SearchPlanNextActionDto,
+) -> String {
+    let mut command = format!(
+        "codestory-cli snippet --project {project} --id {}",
+        action.node_id.0
+    );
+    if action
+        .options
+        .iter()
+        .any(|option| option == "function_body")
+    {
+        command.push_str(" --function-body");
+    }
+    let context = action
+        .options
+        .iter()
+        .find_map(|option| option.strip_prefix("context="))
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(40);
+    let _ = write!(command, " --context {context}");
+    command
+}
+
+fn quote_search_plan_command_value(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '/' | '\\' | '.' | '_' | '-'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+}
+
+fn format_search_plan_bridge_status(status: SearchPlanBridgeStatusDto) -> &'static str {
+    match status {
+        SearchPlanBridgeStatusDto::Supported => "supported",
+        SearchPlanBridgeStatusDto::Partial => "partial",
+        SearchPlanBridgeStatusDto::Unsupported => "unsupported",
+    }
+}
+
+fn format_search_plan_bridge_confidence(confidence: SearchPlanBridgeConfidenceDto) -> &'static str {
+    match confidence {
+        SearchPlanBridgeConfidenceDto::High => "high",
+        SearchPlanBridgeConfidenceDto::Medium => "medium",
+        SearchPlanBridgeConfidenceDto::Low => "low",
+    }
+}
+
+fn format_search_plan_bridge_evidence_kind(
+    evidence_kind: SearchPlanBridgeEvidenceKindDto,
+) -> &'static str {
+    match evidence_kind {
+        SearchPlanBridgeEvidenceKindDto::SameAnchor => "same_anchor",
+        SearchPlanBridgeEvidenceKindDto::GraphPath => "graph_path",
+        SearchPlanBridgeEvidenceKindDto::FrameworkRoute => "framework_route",
+        SearchPlanBridgeEvidenceKindDto::ComponentUsage => "component_usage",
+        SearchPlanBridgeEvidenceKindDto::DataCollectionUsage => "data_collection_usage",
+        SearchPlanBridgeEvidenceKindDto::SharedFile => "shared_file",
+        SearchPlanBridgeEvidenceKindDto::RepoTextHint => "repo_text_hint",
+        SearchPlanBridgeEvidenceKindDto::SourceTruthOnly => "source_truth_only",
+        SearchPlanBridgeEvidenceKindDto::IsolatedAnchors => "isolated_anchors",
     }
 }
 
@@ -1306,21 +1399,23 @@ fn search_confidence(output: &SearchOutput) -> (&'static str, Vec<String>) {
         .as_ref()
         .map(|assessment| assessment.exact_symbol_hit_count)
         .unwrap_or(0);
-    let weak_top_hit = output
+    let has_no_hits = total_hits == 0;
+    let has_weak_indexed_top_hit = output
         .query_assessment
         .as_ref()
         .is_some_and(|assessment| assessment.weak_top_hit);
-    let confidence = if total_hits == 0
-        || top_score < 0.35
-        || (weak_top_hit && output.repo_text_hits.is_empty())
-    {
-        "low"
-    } else if !output.indexed_symbol_hits.is_empty()
+    let has_strong_indexed_match = !output.indexed_symbol_hits.is_empty()
         && exact_symbol_hits > 0
         && top_score >= 0.75
         && output.retrieval.fallback_reason.is_none()
-        && output.retrieval.semantic_ready
-    {
+        && output.retrieval.semantic_ready;
+    let has_weak_indexed_top_hit_without_repo_text =
+        has_weak_indexed_top_hit && output.repo_text_hits.is_empty();
+    let has_low_confidence =
+        has_no_hits || top_score < 0.35 || has_weak_indexed_top_hit_without_repo_text;
+    let confidence = if has_low_confidence {
+        "low"
+    } else if has_strong_indexed_match {
         "high"
     } else {
         "medium"
@@ -1489,7 +1584,7 @@ fn render_agent_step_summary(step: &AgentRetrievalStepDto) -> String {
     )
 }
 
-fn render_agent_citation(
+pub(crate) fn render_agent_citation(
     project_root: &Path,
     citation: &AgentCitationDto,
     include_breakdown: bool,
@@ -2280,28 +2375,32 @@ pub(crate) fn render_query_markdown(output: &QueryOutput) -> String {
     let _ = writeln!(markdown, "query: `{}`", output.query);
     let _ = writeln!(markdown, "items: {}", output.items.len());
     for item in &output.items {
-        let mut line = format!(
-            "- [{}] {} [{}]",
-            item.node_id,
-            item.display_name,
-            format_kind(item.kind)
-        );
-        if let Some(path) = item.file_path.as_deref() {
-            let _ = write!(line, " {path}");
-        }
-        if let Some(line_no) = item.line {
-            let _ = write!(line, ":{line_no}");
-        }
-        if let Some(depth) = item.depth {
-            let _ = write!(line, " depth={depth}");
-        }
-        if let Some(node_ref) = item.node_ref.as_deref() {
-            let _ = write!(line, " ref=`{node_ref}`");
-        }
-        let _ = write!(line, " source={}", item.source);
-        let _ = writeln!(markdown, "{line}");
+        let _ = writeln!(markdown, "{}", render_query_item_line(item));
     }
     markdown
+}
+
+fn render_query_item_line(item: &QueryItemOutput) -> String {
+    let mut line = format!(
+        "- [{}] {} [{}]",
+        item.node_id,
+        item.display_name,
+        format_kind(item.kind)
+    );
+    if let Some(path) = item.file_path.as_deref() {
+        let _ = write!(line, " {path}");
+    }
+    if let Some(line_no) = item.line {
+        let _ = write!(line, ":{line_no}");
+    }
+    if let Some(depth) = item.depth {
+        let _ = write!(line, " depth={depth}");
+    }
+    if let Some(node_ref) = item.node_ref.as_deref() {
+        let _ = write!(line, " ref=`{node_ref}`");
+    }
+    let _ = write!(line, " source={}", item.source);
+    line
 }
 
 pub(crate) fn render_symbol_mermaid(context: &SymbolContextDto) -> String {
@@ -2641,12 +2740,21 @@ pub(crate) fn render_snippet_markdown(
         context.requested_context,
         context.max_snippet_bytes.unwrap_or_default()
     );
+    if let Some(range_source) = context.range_source.as_deref() {
+        let _ = writeln!(markdown, "range_source: {range_source}");
+    }
+    if let Some(reason) = context.fallback_reason.as_deref() {
+        let _ = writeln!(markdown, "fallback_reason: {reason}");
+    }
     if context.snippet_truncated {
         let _ = writeln!(
             markdown,
             "snippet_truncated: true (max_snippet_bytes={})",
             context.max_snippet_bytes.unwrap_or_default()
         );
+        if let Some(guidance) = context.truncation_guidance.as_deref() {
+            let _ = writeln!(markdown, "truncation_guidance: {guidance}");
+        }
     }
     append_verification_targets(&mut markdown, "verification_targets", verification_targets);
     let fence = snippet_fence(&context.snippet);
@@ -3117,7 +3225,8 @@ mod tests {
         GroundingCoverageDto, GroundingFileDigestDto, GroundingSnapshotDto,
         GroundingSymbolDigestDto, NodeDetailsDto, NodeId, NodeKind, RetrievalFallbackReasonDto,
         RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
-        StorageStatsDto, TrailContextDto, TrailStoryDto, TrailStoryStepDto,
+        SearchPlanNextActionDto, StorageStatsDto, TrailContextDto, TrailStoryDto,
+        TrailStoryStepDto,
     };
     use serde_json::json;
     use std::path::Path;
@@ -3647,6 +3756,34 @@ mod tests {
         assert!(
             !markdown.contains("why:"),
             "search --why should not duplicate packet evidence as legacy per-hit why lines:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn search_plan_next_commands_render_structured_snippet_options() {
+        let commands = search_plan_next_commands(
+            Path::new("C:/repo with spaces"),
+            &[
+                SearchPlanNextActionDto {
+                    action: "snippet".to_string(),
+                    node_id: NodeId("node-fn".to_string()),
+                    options: vec!["function_body".to_string(), "context=12".to_string()],
+                },
+                SearchPlanNextActionDto {
+                    action: "snippet".to_string(),
+                    node_id: NodeId("node-default".to_string()),
+                    options: vec!["context=invalid".to_string()],
+                },
+            ],
+        );
+
+        assert_eq!(
+            commands[0],
+            "codestory-cli snippet --project 'C:/repo with spaces' --id node-fn --function-body --context 12"
+        );
+        assert_eq!(
+            commands[1],
+            "codestory-cli snippet --project 'C:/repo with spaces' --id node-default --context 40"
         );
     }
 

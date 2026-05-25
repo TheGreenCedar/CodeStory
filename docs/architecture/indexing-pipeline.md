@@ -151,7 +151,7 @@ Projection flushes write more than the core graph:
 - component access tuples
 - callable projection state
 
-The store flush path invalidates grounding snapshots as part of persistence. That is why the docs should treat projection flush as both a write boundary and a derived-state invalidation boundary.
+The store flush path invalidates grounding snapshots as part of persistence. Projection flush is both a write boundary and a derived-state invalidation boundary.
 
 ### 8. Resolution happens after flushes
 
@@ -215,7 +215,7 @@ Embedding throughput is optimized for the local embedding path:
 - ONNX embeddings use `CODESTORY_EMBED_ONNX_MODEL`, `CODESTORY_EMBED_ONNX_TOKENIZER`, and `CODESTORY_EMBED_ONNX_PROVIDER` for the local model graph, tokenizer, and execution provider; managed setup points the model path at a derived CLS-pooled graph to avoid returning full token hidden states
 - the managed ONNX path seeds the current local throughput shape: semantic doc window `512`, doc batch `2048`, per-call ONNX token budget `32768`, DirectML on Windows or CPU elsewhere, and stored vectors `int8`; it does not start or retain an embedding server process
 
-The repo-scale cold baseline on 2026-04-18 was `38.43s` total index time with `2.92s` graph phase, `32.07s` semantic phase, and `3,690` semantic docs embedded. A repeat full refresh on the same cache was `7.56s` with `3,690` semantic docs reused and `0` embedded. Keep new measurements in [codestory-e2e-stats-log.md](../testing/codestory-e2e-stats-log.md).
+Keep measured repo-scale timings in [codestory-e2e-stats-log.md](../testing/codestory-e2e-stats-log.md). Architecture explains the lifecycle; the testing log owns time-specific numbers because caches, backends, and workstation state drift.
 
 ## Mental Model
 
@@ -267,7 +267,8 @@ The index summary reports graph and semantic work separately:
 - `semantic_docs.pending`: docs that needed embedding after reuse checks
 - `semantic_docs.stale`: persisted docs pruned because they no longer match the refreshed symbol set
 
-Use these fields before blaming parser, graph, or SQLite code for a slow `index` run.
+Use these fields before changing parser, graph, or SQLite code for a slow
+`index` run.
 
 ## How To Debug Indexing
 
@@ -284,7 +285,10 @@ Then use live tooling if you need workspace-specific evidence:
 - `codestory-cli search --project . --query <symbol>`
 - the repo-local `codestory-grounding` skill in `.agents/skills/codestory-grounding/SKILL.md`
 
-Treat the grounding workflows as follow-up evidence, not the primary explanation. Local grounding and search-state rebuilds can depend on semantic retrieval assets and current machine health, so the architecture docs should remain the first stop when you are learning the pipeline.
+Treat the grounding workflows as follow-up evidence, not the primary
+explanation. Local grounding and search-state rebuilds can depend on semantic
+retrieval assets and current machine health, so the architecture docs should
+remain the primary reference when you are learning the pipeline.
 
 ## Verification Targets
 

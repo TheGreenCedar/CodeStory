@@ -1,0 +1,131 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "codestory-indexing-flow",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "architecture_explanation",
+  "repo": {
+    "name": "codestory",
+    "url": "https://github.com/TheGreenCedar/CodeStory.git",
+    "ref": "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+    "workspace_root": ".",
+    "languages": [
+      "Rust"
+    ],
+    "setup": [
+      "cargo metadata --no-deps"
+    ]
+  },
+  "prompt": "Explain how a full indexing run moves from the CLI into runtime orchestration, file discovery, symbol extraction, persistence, and search or snapshot refresh. Cite the files that support the answer.",
+  "expected_files": [
+    "crates/codestory-cli/src/main.rs",
+    "crates/codestory-cli/src/runtime.rs",
+    "crates/codestory-runtime/src/services.rs",
+    "crates/codestory-runtime/src/lib.rs",
+    "crates/codestory-workspace/src/lib.rs",
+    "crates/codestory-indexer/src/lib.rs",
+    "crates/codestory-store/src/storage_impl/mod.rs",
+    "crates/codestory-store/src/snapshot_store.rs"
+  ],
+  "expected_symbols": [
+    {
+      "name": "run_index",
+      "path": "crates/codestory-cli/src/main.rs",
+      "kind": "function",
+      "why": "CLI entry for the index command."
+    },
+    {
+      "name": "IndexService::run_indexing_blocking",
+      "path": "crates/codestory-runtime/src/services.rs",
+      "kind": "method",
+      "why": "Runtime-owned indexing service entry point."
+    },
+    {
+      "name": "WorkspaceManifest::build_execution_plan",
+      "path": "crates/codestory-workspace/src/lib.rs",
+      "kind": "method",
+      "why": "Builds the refresh plan used during indexing."
+    },
+    {
+      "name": "WorkspaceIndexer::run",
+      "path": "crates/codestory-indexer/src/lib.rs",
+      "kind": "method",
+      "why": "Runs source indexing over workspace files."
+    },
+    {
+      "name": "index_file",
+      "path": "crates/codestory-indexer/src/lib.rs",
+      "kind": "function",
+      "why": "Extracts file-level nodes, edges, and occurrences."
+    },
+    {
+      "name": "Storage::flush_projection_batch",
+      "path": "crates/codestory-store/src/storage_impl/mod.rs",
+      "kind": "method",
+      "why": "Persists graph projection batches produced by indexing."
+    },
+    {
+      "name": "Storage::rebuild_search_symbol_projection_from_node_table",
+      "path": "crates/codestory-store/src/storage_impl/mod.rs",
+      "kind": "method",
+      "why": "Refreshes the search projection from persisted graph data."
+    },
+    {
+      "name": "SnapshotStore::refresh_all_with_stats",
+      "path": "crates/codestory-store/src/snapshot_store.rs",
+      "kind": "method",
+      "why": "Refreshes summary and detail snapshots after data changes."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "The CLI index command prepares command options and delegates indexing work into the runtime layer."
+    },
+    {
+      "text": "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases."
+    },
+    {
+      "text": "The workspace crate is responsible for source-file discovery and refresh-plan construction."
+    },
+    {
+      "text": "The indexer extracts nodes, edges, occurrences, and related symbol data from source files."
+    },
+    {
+      "text": "The store persists graph and file data to SQLite and rebuilds query/search projections from persisted data."
+    },
+    {
+      "text": "Snapshot refresh happens after persisted data changes so later grounding and summary reads see current indexed state."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "The CLI directly parses source files for normal indexing instead of delegating indexing orchestration.",
+      "severity": "critical"
+    },
+    {
+      "text": "Indexing results are only kept in memory and are not persisted.",
+      "severity": "critical"
+    },
+    {
+      "text": "The workspace crate performs symbol extraction from source text.",
+      "severity": "major"
+    },
+    {
+      "text": "A remote service is required for a normal full indexing run.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.8,
+    "min_expected_file_recall": 0.8,
+    "min_expected_symbol_recall": 0.75,
+    "min_expected_claim_recall": 0.8,
+    "min_citation_coverage": 0.8,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "rust",
+    "workspace",
+    "indexing"
+  ]
+}

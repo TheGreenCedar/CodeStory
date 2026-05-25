@@ -1,0 +1,95 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "mux-router-matching-flow",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "architecture_explanation",
+  "repo": {
+    "name": "mux",
+    "url": "https://github.com/gorilla/mux.git",
+    "ref": "v1.8.1",
+    "workspace_root": ".",
+    "languages": [
+      "Go"
+    ],
+    "setup": [
+      "go test ./..."
+    ]
+  },
+  "prompt": "Explain how gorilla/mux builds a router, records route matchers, matches an HTTP request, and invokes middleware or the selected handler.",
+  "expected_files": [
+    "mux.go",
+    "route.go",
+    "middleware.go",
+    "regexp.go"
+  ],
+  "expected_symbols": [
+    {
+      "name": "NewRouter",
+      "path": "mux.go",
+      "kind": "function",
+      "why": "Constructs the Router."
+    },
+    {
+      "name": "Router",
+      "path": "mux.go",
+      "kind": "type",
+      "why": "Owns route list, matching options, middleware, and request dispatch."
+    },
+    {
+      "name": "Route",
+      "path": "route.go",
+      "kind": "type",
+      "why": "Owns per-route matchers and handler metadata."
+    },
+    {
+      "name": "RouteMatch",
+      "path": "mux.go",
+      "kind": "type",
+      "why": "Carries the matching route, handler, and variables."
+    },
+    {
+      "name": "newRouteRegexp",
+      "path": "regexp.go",
+      "kind": "function",
+      "why": "Compiles route templates into matching expressions."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "NewRouter constructs a Router that owns routes and middleware."
+    },
+    {
+      "text": "Routes record matchers and handlers used during request matching."
+    },
+    {
+      "text": "RouteMatch carries the selected route, handler, and variables across matching."
+    },
+    {
+      "text": "Route template parsing and regular expression compilation happen during route setup through addRegexpMatcher and newRouteRegexp."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "Route regular expressions are compiled for every request instead of during route setup.",
+      "severity": "major"
+    },
+    {
+      "text": "Middleware is unrelated to request dispatch in the router.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "go",
+    "architecture",
+    "routing"
+  ]
+}
