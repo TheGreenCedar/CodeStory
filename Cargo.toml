@@ -5,6 +5,7 @@ members = [
     "crates/codestory-workspace",
     "crates/codestory-store",
     "crates/codestory-indexer",
+    "crates/codestory-retrieval",
     "crates/codestory-runtime",
     "crates/codestory-cli",
     "crates/codestory-bench",
@@ -16,6 +17,7 @@ codestory-contracts = { path = "crates/codestory-contracts" }
 codestory-workspace = { path = "crates/codestory-workspace" }
 codestory-store = { path = "crates/codestory-store" }
 codestory-indexer = { path = "crates/codestory-indexer" }
+codestory-retrieval = { path = "crates/codestory-retrieval" }
 codestory-runtime = { path = "crates/codestory-runtime" }
 codestory-bench = { path = "crates/codestory-bench" }
 
@@ -75,6 +77,7 @@ feature-probe = "0.1.1"
 tempfile = "3.10"
 toml = "0.8"
 sha2 = "0.10"
+ureq = "2.12"
 
 criterion = "0.8.2"
 proptest = "1.5"

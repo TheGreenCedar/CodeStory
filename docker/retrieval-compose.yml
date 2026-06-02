@@ -1,0 +1,64 @@
+# CodeStory retrieval sidecars (Qdrant + Zoekt).
+# Pins must match docs/ops/retrieval-sidecars.md and crates/codestory-retrieval/src/config.rs.
+#
+# Start via:
+#   node scripts/setup-retrieval-env.mjs
+# or:
+#   cargo run -p codestory-cli -- retrieval bootstrap
+
+name: codestory-retrieval
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    container_name: codestory-qdrant
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${CODESTORY_QDRANT_HTTP_PORT:-6333}:6333"
+      - "127.0.0.1:${CODESTORY_QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - type: bind
+        source: ${CODESTORY_QDRANT_DATA_DIR:?set CODESTORY_QDRANT_DATA_DIR}
+        target: /qdrant/storage
+
+  # Zoekt webserver (mount index dir populated by `retrieval index`).
+  zoekt:
+    image: sourcegraph/zoekt-webserver:0.0.0-20250506123554-490422d1adb4
+    container_name: codestory-zoekt
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${CODESTORY_ZOEKT_PORT:-6070}:6070"
+    volumes:
+      - type: bind
+        source: ${CODESTORY_ZOEKT_DATA_DIR:?set CODESTORY_ZOEKT_DATA_DIR}
+        target: /data/index
+
+  # BAAI/bge-base-en-v1.5 embeddings via llama.cpp OpenAI-compatible API (768-dim).
+  # Model GGUF must exist under CODESTORY_EMBED_MODEL_DIR (see setup-retrieval-env.mjs).
+  embed:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: codestory-embed
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${CODESTORY_EMBED_PORT:-8080}:8080"
+    volumes:
+      - type: bind
+        source: ${CODESTORY_EMBED_MODEL_DIR:?set CODESTORY_EMBED_MODEL_DIR}
+        target: /models
+        read_only: true
+    command:
+      - --embeddings
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8080"
+      - -m
+      - /models/bge-base-en-v1.5.Q8_0.gguf
+      - -c
+      - "512"
+      - -b
+      - "1024"
+      - -ub
+      - "1024"
+      - -np
+      - "6"
