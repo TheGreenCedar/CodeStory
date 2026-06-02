@@ -6,17 +6,25 @@ use std::collections::{HashMap, HashSet};
 
 mod c;
 mod cpp;
+mod csharp;
+mod go;
 mod java;
 mod javascript;
+mod php;
 mod python;
+mod ruby;
 mod rust;
 mod typescript;
 
 use c::CSemanticResolver;
 use cpp::CppSemanticResolver;
+use csharp::CSharpSemanticResolver;
+use go::GoSemanticResolver;
 use java::JavaSemanticResolver;
 use javascript::JavaScriptSemanticResolver;
+use php::PhpSemanticResolver;
 use python::PythonSemanticResolver;
+use ruby::RubySemanticResolver;
 use rust::RustSemanticResolver;
 use typescript::TypeScriptSemanticResolver;
 
@@ -285,6 +293,10 @@ pub struct SemanticResolverRegistry {
     rust: RustSemanticResolver,
     ts: TypeScriptSemanticResolver,
     java: JavaSemanticResolver,
+    go: GoSemanticResolver,
+    ruby: RubySemanticResolver,
+    php: PhpSemanticResolver,
+    csharp: CSharpSemanticResolver,
 }
 
 impl SemanticResolverRegistry {
@@ -298,6 +310,10 @@ impl SemanticResolverRegistry {
             rust: RustSemanticResolver,
             ts: TypeScriptSemanticResolver,
             java: JavaSemanticResolver,
+            go: GoSemanticResolver,
+            ruby: RubySemanticResolver,
+            php: PhpSemanticResolver,
+            csharp: CSharpSemanticResolver,
         }
     }
 
@@ -313,11 +329,17 @@ impl SemanticResolverRegistry {
         match detect_language(request.file_path.as_deref()) {
             Some("c") => self.c.resolve(index, request),
             Some("cpp") => self.cpp.resolve(index, request),
-            Some("javascript") => self.javascript.resolve(index, request),
+            Some("javascript") | Some("vue") | Some("svelte") | Some("astro") => {
+                self.javascript.resolve(index, request)
+            }
             Some("python") => self.python.resolve(index, request),
             Some("rust") => self.rust.resolve(index, request),
             Some("typescript") => self.ts.resolve(index, request),
             Some("java") => self.java.resolve(index, request),
+            Some("go") => self.go.resolve(index, request),
+            Some("ruby") => self.ruby.resolve(index, request),
+            Some("php") => self.php.resolve(index, request),
+            Some("csharp") => self.csharp.resolve(index, request),
             _ => Ok(Vec::new()),
         }
     }
@@ -338,6 +360,13 @@ pub(crate) fn detect_language(path: Option<&str>) -> Option<&'static str> {
         "py" | "pyi" => Some("python"),
         "rs" => Some("rust"),
         "ts" | "tsx" | "mts" | "cts" => Some("typescript"),
+        "vue" => Some("vue"),
+        "svelte" => Some("svelte"),
+        "astro" => Some("astro"),
+        "go" => Some("go"),
+        "rb" => Some("ruby"),
+        "php" => Some("php"),
+        "cs" => Some("csharp"),
         _ => None,
     }
 }
@@ -508,19 +537,24 @@ fn tail_component(value: &str) -> Option<&str> {
 fn language_family_bucket(language: &'static str) -> &'static str {
     match language {
         "c" | "cpp" => "native",
-        "javascript" | "typescript" => "webscript",
+        "javascript" | "typescript" | "vue" | "svelte" | "astro" => "webscript",
         "python" => "python",
         "rust" => "rust",
         "java" => "java",
+        "go" => "go",
+        "ruby" => "ruby",
+        "php" => "php",
+        "csharp" => "csharp",
+        "html" | "css" | "sql" => "structural",
         _ => language,
     }
 }
 
 fn compatible_language_families(
-    caller_language: Option<&str>,
-    candidate_language: Option<&str>,
+    caller_language_family: Option<&str>,
+    candidate_language_family: Option<&str>,
 ) -> bool {
-    match (caller_language, candidate_language) {
+    match (caller_language_family, candidate_language_family) {
         (Some(lhs), Some(rhs)) => lhs == rhs,
         _ => true,
     }
@@ -578,6 +612,9 @@ mod tests {
             ("a.tsx", Some("typescript")),
             ("a.mts", Some("typescript")),
             ("a.cts", Some("typescript")),
+            ("a.vue", Some("vue")),
+            ("a.svelte", Some("svelte")),
+            ("a.astro", Some("astro")),
             ("a.unknown", None),
         ];
         for (path, language) in expected {
@@ -699,6 +736,41 @@ mod tests {
             out.is_empty(),
             "unexpected cross-language fuzzy import candidates: {out:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_call_candidates_allow_webscript_cross_template_and_ts() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        insert_file_node(&conn, 1, "App.vue")?;
+        insert_file_node(&conn, 2, "util.ts")?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                40_i64,
+                NodeKind::FUNCTION as i32,
+                "formatTitle",
+                "formatTitle",
+                2_i64,
+                3_i64
+            ],
+        )?;
+
+        let index = SemanticCandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
+        let out = resolve_call_candidates(
+            &index,
+            &[NodeKind::FUNCTION as i32],
+            "formatTitle",
+            Some(1),
+            detect_language(Some("App.vue")),
+            0.82,
+            0.70,
+        )?;
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].target_node_id, 40);
         Ok(())
     }
 }

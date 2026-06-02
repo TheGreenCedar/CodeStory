@@ -1,7 +1,7 @@
 use super::*;
 use codestory_contracts::graph::{
-    AccessKind, Edge, EdgeId, EdgeKind, NodeId, NodeKind, ResolutionCertainty, SourceLocation,
-    TrailConfig, TrailDirection,
+    AccessKind, Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
+    ResolutionCertainty, SourceLocation, TrailConfig, TrailDirection,
 };
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -67,6 +67,7 @@ fn insert_file_row(storage: &Storage, id: i64, path: &str) -> Result<(), Storage
         indexed: true,
         complete: true,
         line_count: 1,
+        file_role: FileRole::Source,
     })
 }
 
@@ -351,6 +352,7 @@ fn test_update_file_metadata_preserves_resolution_support_snapshot() -> Result<(
         indexed: true,
         complete: true,
         line_count: 10,
+        file_role: FileRole::Source,
     })?;
     storage.put_resolution_support_snapshot(1, br#"{"hot":true}"#)?;
 
@@ -362,6 +364,7 @@ fn test_update_file_metadata_preserves_resolution_support_snapshot() -> Result<(
         indexed: true,
         complete: true,
         line_count: 10,
+        file_role: FileRole::Source,
     })?;
 
     assert!(storage.has_ready_resolution_support_snapshot(1)?);
@@ -732,16 +735,26 @@ fn test_search_symbol_projection_round_trip_and_backfill() -> Result<(), Storage
     let mut storage = Storage::new_in_memory()?;
     storage.insert_nodes_batch(&[
         Node {
+            id: NodeId(699),
+            kind: NodeKind::FILE,
+            serialized_name: "src/lib.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
             id: NodeId(700),
             kind: NodeKind::FUNCTION,
             serialized_name: "short_name".to_string(),
             qualified_name: Some("pkg::short_name".to_string()),
+            file_node_id: Some(NodeId(699)),
+            start_line: Some(10),
+            end_line: Some(12),
             ..Default::default()
         },
         Node {
             id: NodeId(701),
             kind: NodeKind::METHOD,
             serialized_name: "secondary".to_string(),
+            file_node_id: Some(NodeId(699)),
             ..Default::default()
         },
     ])?;
@@ -760,16 +773,99 @@ fn test_search_symbol_projection_round_trip_and_backfill() -> Result<(), Storage
     let projection = storage.get_search_symbol_projection_batch_after(None, 10)?;
     assert_eq!(projection.len(), 2);
     assert_eq!(projection[0].display_name, "pkg::short_name");
+    let details = storage.get_search_symbol_projection_detail_batch_after(None, 10)?;
+    assert_eq!(details.len(), 2);
+    assert_eq!(details[0].file_path.as_deref(), Some("src/lib.rs"));
+    assert_eq!(details[0].start_line, Some(10));
+    assert_eq!(details[0].end_line, Some(12));
 
     storage.clear_search_symbol_projection()?;
     assert_eq!(storage.get_search_symbol_projection_count()?, 0);
 
     let rebuilt = storage.rebuild_search_symbol_projection_from_node_table()?;
-    assert_eq!(rebuilt, 2);
+    assert_eq!(rebuilt, 3);
     let projection = storage.get_search_symbol_projection_batch_after(None, 10)?;
-    assert_eq!(projection.len(), 2);
-    assert_eq!(projection[0].display_name, "pkg::short_name");
-    assert_eq!(projection[1].display_name, "secondary");
+    assert_eq!(projection.len(), 3);
+    assert_eq!(projection[0].display_name, "src/lib.rs");
+    assert_eq!(projection[1].display_name, "pkg::short_name");
+    assert_eq!(projection[2].display_name, "secondary");
+    Ok(())
+}
+
+#[test]
+fn test_scoped_search_symbol_projection_rebuild() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(800),
+            kind: NodeKind::FILE,
+            serialized_name: "src/changed.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(801),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "old_name".to_string(),
+            qualified_name: Some("pkg::old_name".to_string()),
+            file_node_id: Some(NodeId(800)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(810),
+            kind: NodeKind::FILE,
+            serialized_name: "src/untouched.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(811),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "untouched".to_string(),
+            qualified_name: Some("pkg::untouched".to_string()),
+            file_node_id: Some(NodeId(810)),
+            ..Default::default()
+        },
+    ])?;
+    assert_eq!(
+        storage.rebuild_search_symbol_projection_from_node_table()?,
+        4
+    );
+
+    storage.insert_nodes_batch(&[Node {
+        id: NodeId(801),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "renamed".to_string(),
+        qualified_name: Some("pkg::renamed".to_string()),
+        file_node_id: Some(NodeId(800)),
+        ..Default::default()
+    }])?;
+    storage.upsert_search_symbol_projection_batch(&[SearchSymbolProjection {
+        node_id: NodeId(811),
+        display_name: "stale_other_file".to_string(),
+    }])?;
+
+    let touched = HashSet::from([NodeId(800)]);
+    assert_eq!(
+        storage.rebuild_search_symbol_projection_for_file_scope(&touched)?,
+        2
+    );
+
+    let projection = storage.get_search_symbol_projection_batch_after(None, 10)?;
+    let names_by_id: HashMap<_, _> = projection
+        .into_iter()
+        .map(|entry| (entry.node_id, entry.display_name))
+        .collect();
+    assert_eq!(
+        names_by_id.get(&NodeId(800)).map(String::as_str),
+        Some("src/changed.rs")
+    );
+    assert_eq!(
+        names_by_id.get(&NodeId(801)).map(String::as_str),
+        Some("pkg::renamed")
+    );
+    assert_eq!(
+        names_by_id.get(&NodeId(811)).map(String::as_str),
+        Some("stale_other_file")
+    );
     Ok(())
 }
 
@@ -798,6 +894,7 @@ fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
         indexed: true,
         complete: true,
         line_count: 10,
+        file_role: FileRole::Source,
     })?;
     storage.insert_nodes_batch(&[file_node.clone(), function_node.clone()])?;
     storage.insert_edges_batch(&[Edge {
@@ -889,6 +986,7 @@ fn test_callable_projection_state_round_trip() -> Result<(), StorageError> {
         indexed: true,
         complete: true,
         line_count: 40,
+        file_role: FileRole::Source,
     })?;
     storage.insert_nodes_batch(&[
         Node {
@@ -968,6 +1066,7 @@ fn test_delete_callable_projection_states_for_file() -> Result<(), StorageError>
         indexed: true,
         complete: true,
         line_count: 40,
+        file_role: FileRole::Source,
     })?;
     storage.insert_file(&FileInfo {
         id: 12,
@@ -977,6 +1076,7 @@ fn test_delete_callable_projection_states_for_file() -> Result<(), StorageError>
         indexed: true,
         complete: true,
         line_count: 10,
+        file_role: FileRole::Source,
     })?;
     storage.insert_nodes_batch(&[
         Node {
@@ -1090,6 +1190,7 @@ fn test_delete_projection_for_callers_removes_callable_scoped_data() -> Result<(
         indexed: true,
         complete: true,
         line_count: 50,
+        file_role: FileRole::Source,
     })?;
     storage.insert_nodes_batch(&[
         file_node.clone(),
@@ -1295,6 +1396,7 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
             indexed: true,
             complete: true,
             line_count: 10,
+            file_role: FileRole::Source,
         }])?;
 
         {
@@ -1307,6 +1409,7 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
                 indexed: true,
                 complete: true,
                 line_count: 20,
+                file_role: FileRole::Source,
             }])?;
             staged.finalize_staged_snapshot()?;
         }
@@ -1412,12 +1515,68 @@ fn test_file_storage() -> Result<(), StorageError> {
         indexed: true,
         complete: true,
         line_count: 100,
+        file_role: FileRole::Source,
     };
     storage.insert_file(&info)?;
     let files = storage.get_files()?;
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].path, PathBuf::from("src/main.rs"));
     assert_eq!(files[0].line_count, 100);
+    Ok(())
+}
+
+#[test]
+fn batched_nodes_and_occurrences_match_single_node_lookup() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FILE,
+            serialized_name: "src/main.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "run".to_string(),
+            file_node_id: Some(NodeId(1)),
+            start_line: Some(10),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_occurrences_batch(&[Occurrence {
+        element_id: NodeId(2).0,
+        kind: OccurrenceKind::DEFINITION,
+        location: SourceLocation {
+            file_node_id: NodeId(1),
+            start_line: 10,
+            start_col: 0,
+            end_line: 10,
+            end_col: 4,
+        },
+    }])?;
+
+    let batched_nodes = storage.get_nodes_by_ids(&[NodeId(1), NodeId(2)])?;
+    assert_eq!(batched_nodes.len(), 2);
+    assert_eq!(
+        batched_nodes
+            .get(&NodeId(2))
+            .map(|node| node.serialized_name.as_str()),
+        Some("run")
+    );
+
+    let batched_occurrences = storage.get_occurrences_for_node_ids(&[NodeId(2)])?;
+    assert_eq!(
+        batched_occurrences.get(&NodeId(2)).map(|occs| occs.len()),
+        Some(1)
+    );
+    assert_eq!(
+        storage
+            .get_occurrences_for_node(NodeId(2))?
+            .first()
+            .map(|occ| occ.location.start_line),
+        Some(10)
+    );
     Ok(())
 }
 
@@ -1512,6 +1671,7 @@ fn test_error_storage() -> Result<(), StorageError> {
         indexed: true,
         complete: true,
         line_count: 100,
+        file_role: FileRole::Source,
     };
     storage.insert_file(&info)?;
     let error = codestory_contracts::graph::ErrorInfo {
@@ -1580,6 +1740,7 @@ fn test_delete_file_projection() -> Result<(), StorageError> {
         indexed: true,
         complete: true,
         line_count: 10,
+        file_role: FileRole::Source,
     })?;
     storage.insert_nodes_batch(&[file_node.clone(), func_node.clone()])?;
 
@@ -1631,6 +1792,13 @@ fn test_delete_file_projection() -> Result<(), StorageError> {
         embedding: vec![0.1_f32; 384],
         updated_at_epoch_ms: 1,
     }])?;
+    storage.upsert_symbol_summaries_batch(&[SymbolSummaryRecord {
+        node_id: func_node.id,
+        content_hash: "semantic-hash-foo".to_string(),
+        summary: "foo symbol summary".to_string(),
+        model: "test-model".to_string(),
+        updated_at_epoch_ms: 2,
+    }])?;
     storage.upsert_search_symbol_projection_batch(&[SearchSymbolProjection {
         node_id: func_node.id,
         display_name: "foo".to_string(),
@@ -1662,6 +1830,11 @@ fn test_delete_file_projection() -> Result<(), StorageError> {
     assert!(storage.get_occurrences()?.is_empty());
     assert!(storage.get_all_llm_symbol_docs()?.is_empty());
     assert_eq!(storage.get_search_symbol_projection_count()?, 0);
+    let symbol_summary_count: i64 =
+        storage
+            .conn
+            .query_row("SELECT count(*) FROM symbol_summary", [], |row| row.get(0))?;
+    assert_eq!(symbol_summary_count, 0);
     assert!(
         storage
             .get_callable_projection_states_for_file(file_node_id)?
@@ -1692,6 +1865,7 @@ fn test_delete_file_projection_preserves_cross_file_edges_and_clears_resolution(
         indexed: true,
         complete: true,
         line_count: 10,
+        file_role: FileRole::Source,
     })?;
     storage.insert_file(&FileInfo {
         id: file_b_id,
@@ -1701,6 +1875,7 @@ fn test_delete_file_projection_preserves_cross_file_edges_and_clears_resolution(
         indexed: true,
         complete: true,
         line_count: 10,
+        file_role: FileRole::Source,
     })?;
 
     let file_a = Node {
@@ -1757,10 +1932,32 @@ fn test_delete_file_projection_preserves_cross_file_edges_and_clears_resolution(
         ..Default::default()
     }])?;
 
+    storage.upsert_callable_projection_states(&[
+        CallableProjectionState {
+            file_id: file_a_id,
+            symbol_key: "src/a.rs::caller:FUNCTION".to_string(),
+            node_id: caller_in_a.id,
+            signature_hash: 111,
+            body_hash: 211,
+            start_line: 1,
+            end_line: 2,
+        },
+        CallableProjectionState {
+            file_id: file_a_id,
+            symbol_key: "src/a.rs::stale-callee:FUNCTION".to_string(),
+            node_id: callee_in_b.id,
+            signature_hash: 112,
+            body_hash: 212,
+            start_line: 3,
+            end_line: 4,
+        },
+    ])?;
+
     let summary = storage.delete_file_projection(file_b_id)?;
     assert_eq!(summary.canonical_file_node_id, file_b_id);
     assert_eq!(summary.removed_node_count, 2);
     assert_eq!(summary.removed_edge_count, 0);
+    assert_eq!(summary.removed_callable_projection_state_count, 1);
 
     let edges = storage.get_edges()?;
     assert_eq!(edges.len(), 1);
@@ -1776,6 +1973,9 @@ fn test_delete_file_projection_preserves_cross_file_edges_and_clears_resolution(
     assert!(storage.get_node(file_b.id)?.is_none());
     assert!(storage.get_node(callee_in_b.id)?.is_none());
     assert!(storage.get_node(caller_in_a.id)?.is_some());
+    let remaining_states = storage.get_callable_projection_states_for_file(file_a_id)?;
+    assert_eq!(remaining_states.len(), 1);
+    assert_eq!(remaining_states[0].node_id, caller_in_a.id);
 
     Ok(())
 }
@@ -2060,6 +2260,161 @@ fn test_trail_to_target_symbol_simple_path() -> Result<(), StorageError> {
 }
 
 #[test]
+fn test_trail_to_target_symbol_prunes_unreachable_incoming_fanout() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+
+    let mut nodes = vec![
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "Root".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "Middle".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(3),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "Bridge".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(4),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "Target".to_string(),
+            ..Default::default()
+        },
+    ];
+    for id in 100..130 {
+        nodes.push(Node {
+            id: NodeId(id),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("Noise{id}"),
+            ..Default::default()
+        });
+    }
+    storage.insert_nodes_batch(&nodes)?;
+
+    let mut edges = vec![
+        Edge {
+            id: EdgeId(1),
+            source: NodeId(1),
+            target: NodeId(2),
+            kind: EdgeKind::CALL,
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(2),
+            source: NodeId(2),
+            target: NodeId(3),
+            kind: EdgeKind::CALL,
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(3),
+            source: NodeId(3),
+            target: NodeId(4),
+            kind: EdgeKind::CALL,
+            ..Default::default()
+        },
+    ];
+    for id in 100..130 {
+        edges.push(Edge {
+            id: EdgeId(id),
+            source: NodeId(id),
+            target: NodeId(4),
+            kind: EdgeKind::CALL,
+            ..Default::default()
+        });
+    }
+    storage.insert_edges_batch(&edges)?;
+
+    let result = storage.get_trail(&TrailConfig {
+        root_id: NodeId(1),
+        mode: TrailMode::ToTargetSymbol,
+        target_id: Some(NodeId(4)),
+        depth: 3,
+        direction: TrailDirection::Outgoing,
+        caller_scope: TrailCallerScope::IncludeTestsAndBenches,
+        edge_filter: vec![],
+        show_utility_calls: true,
+        node_filter: Vec::new(),
+        max_nodes: 4,
+    })?;
+
+    assert_eq!(
+        result.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+        vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)]
+    );
+    assert_eq!(
+        result.edges.iter().map(|edge| edge.id).collect::<Vec<_>>(),
+        vec![EdgeId(1), EdgeId(2), EdgeId(3)]
+    );
+    assert!(!result.truncated);
+
+    Ok(())
+}
+
+#[test]
+fn test_trail_to_target_symbol_no_path_returns_endpoints() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "A".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "B".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(3),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "C".to_string(),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[Edge {
+        id: EdgeId(1),
+        source: NodeId(1),
+        target: NodeId(2),
+        kind: EdgeKind::CALL,
+        ..Default::default()
+    }])?;
+
+    let result = storage.get_trail(&TrailConfig {
+        root_id: NodeId(1),
+        mode: TrailMode::ToTargetSymbol,
+        target_id: Some(NodeId(3)),
+        depth: 0,
+        direction: TrailDirection::Outgoing,
+        caller_scope: TrailCallerScope::IncludeTestsAndBenches,
+        edge_filter: vec![],
+        show_utility_calls: true,
+        node_filter: Vec::new(),
+        max_nodes: 100,
+    })?;
+
+    assert_eq!(
+        result.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+        vec![NodeId(1), NodeId(3)]
+    );
+    assert!(result.edges.is_empty());
+    assert!(!result.truncated);
+
+    Ok(())
+}
+
+#[test]
 fn test_trail_ignores_ambiguous_call_resolutions() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
 
@@ -2317,6 +2672,7 @@ fn test_grounding_queries_rank_symbols_and_roots() -> Result<(), StorageError> {
         indexed: true,
         complete: true,
         line_count: 10,
+        file_role: FileRole::Source,
     })?;
     storage.insert_file(&FileInfo {
         id: 200,
@@ -2326,6 +2682,7 @@ fn test_grounding_queries_rank_symbols_and_roots() -> Result<(), StorageError> {
         indexed: true,
         complete: true,
         line_count: 10,
+        file_role: FileRole::Source,
     })?;
     storage.insert_nodes_batch(&[
         codestory_contracts::graph::Node {

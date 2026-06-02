@@ -9,6 +9,7 @@ pub(super) fn compute_call_resolution(
     let (edge_id, file_id, caller_qualified, _, target_name, _, callsite_identity) = row;
     let prepared_name = PreparedName::new(target_name.clone());
     let is_common_unqualified = is_common_unqualified_call_name(&prepared_name.original);
+    let is_owner_qualified = is_owner_qualified_call_name(&prepared_name.original);
     let mut selected: Option<(i64, f32, ResolutionStrategy)> = None;
     let mut semantic_fallback = UnambiguousBestCandidate::default();
     let mut candidate_ids = OrderedCandidateIds::with_capacity(8);
@@ -76,9 +77,27 @@ pub(super) fn compute_call_resolution(
         if pass.flags.store_candidates {
             candidate_ids.push(candidate);
         }
+        let confidence = if is_owner_qualified {
+            pass.policy.call_same_file
+        } else {
+            pass.policy.call_global_unique
+        };
+        selected = Some((candidate, confidence, ResolutionStrategy::CallGlobalUnique));
+    }
+
+    if selected.is_none()
+        && is_owner_qualified
+        && let Some(candidate) = candidate_index.find_global_unique_owner_alias_readonly(
+            &prepared_name.original,
+            &prepared_name.ascii_lower,
+        )
+    {
+        if pass.flags.store_candidates {
+            candidate_ids.push(candidate);
+        }
         selected = Some((
             candidate,
-            pass.policy.call_global_unique,
+            pass.policy.call_same_file,
             ResolutionStrategy::CallGlobalUnique,
         ));
     }
@@ -93,6 +112,7 @@ pub(super) fn compute_call_resolution(
     }
 
     if selected.is_none()
+        && !is_owner_qualified
         && let Some((candidate, confidence)) = semantic_fallback.selected()
     {
         selected = Some((
@@ -116,6 +136,10 @@ pub(super) fn compute_call_resolution(
     let selected_pair = selected.map(|(candidate, confidence, _)| (candidate, confidence));
     let update = build_resolved_edge_update(*edge_id, selected_pair, candidate_ids.as_slice())?;
     Ok(ComputedResolution { update, strategy })
+}
+
+fn is_owner_qualified_call_name(name: &str) -> bool {
+    name.contains("::") || name.contains('.')
 }
 
 pub(super) fn compute_import_resolution(

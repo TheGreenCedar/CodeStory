@@ -1,6 +1,6 @@
 use codestory_contracts::events::EventBus;
 use codestory_contracts::graph::{
-    AccessKind, EdgeKind, NodeKind, OccurrenceKind, ResolutionCertainty,
+    AccessKind, EdgeKind, NodeId, NodeKind, OccurrenceKind, ResolutionCertainty,
 };
 use codestory_indexer::resolution::ResolutionPass;
 use codestory_indexer::{IncrementalIndexingStats, WorkspaceIndexer};
@@ -107,6 +107,43 @@ int main() {
     assert!(my_method.file_node_id.is_some());
     assert!(my_method.start_line.is_some());
     assert!(my_method.end_line.is_some());
+
+    Ok(())
+}
+
+#[test]
+fn test_failed_file_attempt_is_recorded_as_incomplete_with_attached_error() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let root = dir.path();
+    let file_path = root.join("broken.ts");
+
+    let mut storage = Storage::new_in_memory()?;
+    run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
+
+    let files = storage.get_files()?;
+    assert_eq!(
+        files.len(),
+        1,
+        "failed attempts should still record file inventory"
+    );
+    let file = &files[0];
+    assert_eq!(file.path, file_path);
+    assert!(file.indexed);
+    assert!(!file.complete);
+
+    let errors = storage.get_errors(None)?;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].file_id, Some(NodeId(file.id)));
+
+    run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
+
+    let errors = storage.get_errors(None)?;
+    assert_eq!(
+        errors.len(),
+        1,
+        "reindexing the same failed file should replace, not duplicate, its error"
+    );
+    assert_eq!(errors[0].file_id, Some(NodeId(file.id)));
 
     Ok(())
 }
@@ -377,8 +414,7 @@ fn keep() { fresh(); }
 }
 
 #[test]
-fn test_incremental_go_text_only_structural_change_removes_stale_projection() -> anyhow::Result<()>
-{
+fn test_incremental_go_structural_change_removes_stale_projection() -> anyhow::Result<()> {
     let dir = tempdir()?;
     let root = dir.path();
     let file_path = root.join("mux.go");
@@ -402,8 +438,8 @@ func (r *Router) Handle(path string) {}
     assert!(
         before_nodes
             .iter()
-            .any(|node| node.serialized_name == "Router.StrictSlash"),
-        "expected initial Go text-only method projection"
+            .any(|node| node.serialized_name == "StrictSlash"),
+        "expected initial Go parser-backed method projection"
     );
     let file_id = before_nodes
         .iter()
@@ -414,8 +450,8 @@ func (r *Router) Handle(path string) {}
         storage
             .get_callable_projection_states_for_file(file_id.0)?
             .iter()
-            .any(|state| state.symbol_key.contains("Router.StrictSlash")),
-        "Go text-only indexing should persist callable projection state"
+            .any(|state| state.symbol_key.contains("StrictSlash")),
+        "Go parser-backed indexing should persist callable projection state"
     );
 
     fs::write(
@@ -435,15 +471,15 @@ func (r *Router) Handle(path string) {}
     assert!(
         !after_nodes
             .iter()
-            .any(|node| node.serialized_name == "Router.StrictSlash"),
-        "stale Go text-only method should be removed after structural refresh"
+            .any(|node| node.serialized_name == "StrictSlash"),
+        "stale Go method should be removed after structural refresh"
     );
     let states_after = storage.get_callable_projection_states_for_file(file_id.0)?;
     assert!(
         states_after
             .iter()
-            .all(|state| !state.symbol_key.contains("Router.StrictSlash")),
-        "stale Go text-only projection state should be removed"
+            .all(|state| !state.symbol_key.contains("StrictSlash")),
+        "stale Go projection state should be removed"
     );
 
     Ok(())

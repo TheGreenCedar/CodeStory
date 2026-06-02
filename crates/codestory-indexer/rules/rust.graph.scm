@@ -48,6 +48,25 @@
   attr (@name.node) end_col = (end-column @name)
 }
 
+(enum_item
+  name: (type_identifier) @enum_name
+  body: (enum_variant_list
+    (enum_variant
+      name: (identifier) @variant_name)))
+{
+  node @variant_name.node
+  attr (@variant_name.node) kind = "ENUM_CONSTANT"
+  attr (@variant_name.node) canonical_role = "declaration"
+  attr (@variant_name.node) name = (source-text @variant_name)
+  attr (@variant_name.node) start_row = (start-row @variant_name)
+  attr (@variant_name.node) start_col = (start-column @variant_name)
+  attr (@variant_name.node) end_row = (end-row @variant_name)
+  attr (@variant_name.node) end_col = (end-column @variant_name)
+
+  edge @enum_name.node -> @variant_name.node
+  attr (@enum_name.node -> @variant_name.node) kind = "MEMBER"
+}
+
 (union_item
   name: (type_identifier) @name)
 {
@@ -501,4 +520,3 @@
   edge @alias_name.node -> @module_path.node
   attr (@alias_name.node -> @module_path.node) kind = "IMPORT"
 }
-

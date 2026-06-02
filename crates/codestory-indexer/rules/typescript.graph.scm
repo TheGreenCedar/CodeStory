@@ -313,16 +313,16 @@
   (class_heritage
     (extends_clause value: (_) @parent_name)))
 {
-  node @parent_name.node
-  attr (@parent_name.node) kind = "CLASS"
-  attr (@parent_name.node) name = (source-text @parent_name)
-  attr (@parent_name.node) start_row = (start-row @parent_name)
-  attr (@parent_name.node) start_col = (start-column @parent_name)
-  attr (@parent_name.node) end_row = (end-row @parent_name)
-  attr (@parent_name.node) end_col = (end-column @parent_name)
+  node @parent_name.inheritance_node
+  attr (@parent_name.inheritance_node) kind = "CLASS"
+  attr (@parent_name.inheritance_node) name = (source-text @parent_name)
+  attr (@parent_name.inheritance_node) start_row = (start-row @parent_name)
+  attr (@parent_name.inheritance_node) start_col = (start-column @parent_name)
+  attr (@parent_name.inheritance_node) end_row = (end-row @parent_name)
+  attr (@parent_name.inheritance_node) end_col = (end-column @parent_name)
 
-  edge @class_name.node -> @parent_name.node
-  attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
+  edge @class_name.node -> @parent_name.inheritance_node
+  attr (@class_name.node -> @parent_name.inheritance_node) kind = "INHERITANCE"
 }
 
 (class_declaration

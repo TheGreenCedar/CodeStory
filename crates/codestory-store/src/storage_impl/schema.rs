@@ -49,7 +49,8 @@ const TABLE_STATEMENTS: &[&str] = &[
         modification_time INTEGER,
         indexed INTEGER DEFAULT 0,
         complete INTEGER DEFAULT 0,
-        line_count INTEGER DEFAULT 0
+        line_count INTEGER DEFAULT 0,
+        file_role TEXT NOT NULL DEFAULT 'source'
     )",
     "CREATE TABLE IF NOT EXISTS local_symbol (
         id INTEGER PRIMARY KEY,
@@ -206,6 +207,21 @@ const TABLE_STATEMENTS: &[&str] = &[
         snapshot_blob,
         built_at_epoch_ms
     ) VALUES (1, 0, 0, NULL, NULL)",
+    "CREATE TABLE IF NOT EXISTS retrieval_index_manifest (
+        project_id TEXT PRIMARY KEY,
+        zoekt_version TEXT NOT NULL,
+        qdrant_collection TEXT NOT NULL,
+        scip_revision TEXT,
+        built_at_epoch_ms INTEGER NOT NULL,
+        disk_bytes INTEGER,
+        degraded_modes_json TEXT NOT NULL DEFAULT '[]',
+        embedding_backend TEXT,
+        embedding_dim INTEGER,
+        sidecar_schema_version INTEGER,
+        sidecar_input_hash TEXT,
+        sidecar_generation TEXT,
+        projection_count INTEGER
+    )",
 ];
 
 const LOAD_TIME_INDEX_STATEMENTS: &[&str] = &[
@@ -253,6 +269,8 @@ const SECONDARY_INDEX_STATEMENTS: &[&str] = &[
      ON grounding_node_snapshot(is_root, node_rank, sort_start_line, display_name, node_id)",
     "CREATE INDEX IF NOT EXISTS idx_index_artifact_cache_key
      ON index_artifact_cache(cache_key)",
+    "CREATE INDEX IF NOT EXISTS idx_retrieval_index_manifest_built_at
+     ON retrieval_index_manifest(built_at_epoch_ms)",
 ];
 
 pub(super) fn create_tables(conn: &Connection) -> Result<(), StorageError> {
@@ -353,6 +371,22 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     if stored_version < 13 {
         migrate_v13_llm_symbol_doc_embedding_contract(&storage.conn)?;
         storage.set_schema_version(13)?;
+    }
+    if stored_version < 14 {
+        migrate_v14_retrieval_index_manifest(&storage.conn)?;
+        storage.set_schema_version(14)?;
+    }
+    if stored_version < 15 {
+        migrate_v15_retrieval_manifest_embedding(&storage.conn)?;
+        storage.set_schema_version(15)?;
+    }
+    if stored_version < 16 {
+        migrate_v16_file_role(&storage.conn)?;
+        storage.set_schema_version(16)?;
+    }
+    if stored_version < 17 {
+        migrate_v17_retrieval_manifest_sidecar_generation(&storage.conn)?;
+        storage.set_schema_version(17)?;
     }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
@@ -455,6 +489,60 @@ pub(super) fn migrate_v13_llm_symbol_doc_embedding_contract(
     try_add_column(conn, "llm_symbol_doc", "embedding_profile TEXT")?;
     try_add_column(conn, "llm_symbol_doc", "embedding_backend TEXT")?;
     try_add_column(conn, "llm_symbol_doc", "doc_shape TEXT")?;
+    Ok(())
+}
+
+pub(super) fn migrate_v15_retrieval_manifest_embedding(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    try_add_column(conn, "retrieval_index_manifest", "embedding_backend TEXT")?;
+    try_add_column(conn, "retrieval_index_manifest", "embedding_dim INTEGER")?;
+    Ok(())
+}
+
+pub(super) fn migrate_v16_file_role(conn: &Connection) -> Result<(), StorageError> {
+    try_add_column(conn, "file", "file_role TEXT NOT NULL DEFAULT 'source'")?;
+    conn.execute(
+        "UPDATE file
+         SET file_role = 'source'
+         WHERE file_role IS NULL OR TRIM(file_role) = ''",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(super) fn migrate_v17_retrieval_manifest_sidecar_generation(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    try_add_column(
+        conn,
+        "retrieval_index_manifest",
+        "sidecar_schema_version INTEGER",
+    )?;
+    try_add_column(conn, "retrieval_index_manifest", "sidecar_input_hash TEXT")?;
+    try_add_column(conn, "retrieval_index_manifest", "sidecar_generation TEXT")?;
+    try_add_column(conn, "retrieval_index_manifest", "projection_count INTEGER")?;
+    Ok(())
+}
+
+pub(super) fn migrate_v14_retrieval_index_manifest(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS retrieval_index_manifest (
+            project_id TEXT PRIMARY KEY,
+            zoekt_version TEXT NOT NULL,
+            qdrant_collection TEXT NOT NULL,
+            scip_revision TEXT,
+            built_at_epoch_ms INTEGER NOT NULL,
+            disk_bytes INTEGER,
+            degraded_modes_json TEXT NOT NULL DEFAULT '[]'
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_retrieval_index_manifest_built_at
+         ON retrieval_index_manifest(built_at_epoch_ms)",
+        [],
+    )?;
     Ok(())
 }
 

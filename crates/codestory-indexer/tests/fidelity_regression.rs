@@ -810,6 +810,36 @@ fn test_rust_struct_enum_and_local_bindings_are_indexed() -> anyhow::Result<()> 
 }
 
 #[test]
+fn test_rust_enum_variants_are_indexed_as_owned_constants() -> anyhow::Result<()> {
+    let source = r#"
+enum Subcommand {
+    Exec(ExecCli),
+    Review(ReviewCommand),
+}
+"#;
+    let (nodes, edges) = index_single_file("subcommand.rs", source)?;
+
+    assert!(has_node_with_kind(
+        &nodes,
+        NodeKind::ENUM_CONSTANT,
+        "Subcommand::Exec"
+    ));
+    assert!(has_node_with_kind(
+        &nodes,
+        NodeKind::ENUM_CONSTANT,
+        "Subcommand::Review"
+    ));
+    assert!(has_edge_between_names(
+        &edges,
+        &nodes,
+        EdgeKind::MEMBER,
+        "Subcommand",
+        "Subcommand::Exec"
+    ));
+    Ok(())
+}
+
+#[test]
 fn test_python_module_constants_and_decorators_are_preserved() -> anyhow::Result<()> {
     let source = r#"
 MAX_RETRIES = 3

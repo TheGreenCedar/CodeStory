@@ -101,6 +101,7 @@ struct CandidateIndex {
     same_module_cache: RwLock<HashMap<SameModuleCacheKey, Option<i64>>>,
     global_unique_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
     global_unique_exact_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
+    global_owner_alias_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
     fuzzy_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
 }
 
@@ -111,6 +112,8 @@ struct ResolvedEdgeUpdate {
     confidence: Option<f32>,
     certainty: Option<&'static str>,
     candidate_payload: Option<String>,
+    /// When false, resolution had no match and indexer-provided confidence/certainty are kept.
+    touch_metadata: bool,
 }
 
 #[derive(Default, Debug)]
@@ -705,6 +708,7 @@ impl ResolutionPass {
             ));
         }
         query.push_str(" WHERE e.kind = ?1 AND e.resolved_target_node_id IS NULL");
+        sql::append_resolution_worklist_metadata_filter(&mut query, kind);
 
         let count: i64 = conn.query_row(&query, params![kind as i32], |row| row.get(0))?;
         Ok(count as usize)
@@ -935,23 +939,25 @@ fn build_resolved_edge_update(
     candidates: &[i64],
 ) -> Result<ResolvedEdgeUpdate> {
     let candidate_payload = candidate_json(candidates)?;
-    let (resolved_target_node_id, confidence, certainty) = if let Some((target_id, confidence)) =
-        selected
-    {
-        (
-            Some(target_id),
-            Some(confidence),
-            ResolutionCertainty::from_confidence(Some(confidence)).map(ResolutionCertainty::as_str),
-        )
-    } else {
-        (None, None, None)
-    };
+    let (touch_metadata, resolved_target_node_id, confidence, certainty) =
+        if let Some((target_id, confidence)) = selected {
+            (
+                true,
+                Some(target_id),
+                Some(confidence),
+                ResolutionCertainty::from_confidence(Some(confidence))
+                    .map(ResolutionCertainty::as_str),
+            )
+        } else {
+            (false, None, None, None)
+        };
     Ok(ResolvedEdgeUpdate {
         edge_id,
         resolved_target_node_id,
         confidence,
         certainty,
         candidate_payload,
+        touch_metadata,
     })
 }
 
@@ -972,6 +978,53 @@ fn collect_candidate_pool_from_index(
             }
         }
     }
+}
+
+fn split_owner_member_name(name: &str) -> Option<(&str, &str)> {
+    name.rsplit_once("::")
+        .or_else(|| name.rsplit_once('.'))
+        .filter(|(owner, member)| !owner.is_empty() && !member.is_empty())
+}
+
+fn owner_alias_compatible(requested_owner: &str, candidate_owner: &str) -> bool {
+    if requested_owner == candidate_owner {
+        return false;
+    }
+    let requested = owner_alias_token(requested_owner);
+    let candidate = owner_alias_token(candidate_owner);
+    if requested.is_empty() || candidate.is_empty() {
+        return false;
+    }
+    if requested == candidate {
+        return true;
+    }
+    owner_token_manifest_alias(requested, candidate)
+        || owner_token_manifest_alias(candidate, requested)
+        || owner_token_store_alias(requested, candidate)
+}
+
+fn owner_alias_token(owner: &str) -> &str {
+    owner
+        .rsplit([':', '.', '<', ' ', '&'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(owner)
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+}
+
+fn owner_token_manifest_alias(shorter: &str, longer: &str) -> bool {
+    longer
+        .strip_prefix(shorter)
+        .is_some_and(|suffix| suffix == "Manifest")
+}
+
+fn owner_token_store_alias(left: &str, right: &str) -> bool {
+    matches!(
+        (
+            left.to_ascii_lowercase().as_str(),
+            right.to_ascii_lowercase().as_str()
+        ),
+        ("store", "storage") | ("storage", "store")
+    )
 }
 
 fn semantic_language_bucket(file_path: Option<&str>) -> Option<&'static str> {
@@ -1346,6 +1399,38 @@ impl CandidateIndex {
                 return Some(self.nodes[exact[0]].id);
             }
             None
+        })
+    }
+
+    fn find_global_unique_owner_alias_readonly(
+        &self,
+        name: &str,
+        name_ascii_lower: &str,
+    ) -> Option<i64> {
+        let key = (name.to_string(), name_ascii_lower.to_string());
+        self.cached_lookup(&self.global_owner_alias_cache, key, || {
+            let (requested_owner, requested_member) = split_owner_member_name(name)?;
+            let mut selected = None;
+            let mut ambiguous = false;
+            for node in &self.nodes {
+                let Some((candidate_owner, candidate_member)) =
+                    split_owner_member_name(&node.serialized_name)
+                else {
+                    continue;
+                };
+                if candidate_member != requested_member {
+                    continue;
+                }
+                if !owner_alias_compatible(requested_owner, candidate_owner) {
+                    continue;
+                }
+                if selected.is_some_and(|id| id != node.id) {
+                    ambiguous = true;
+                    break;
+                }
+                selected = Some(node.id);
+            }
+            (!ambiguous).then_some(selected).flatten()
         })
     }
 
@@ -1990,6 +2075,7 @@ mod tests {
                 kind INTEGER NOT NULL,
                 serialized_name TEXT NOT NULL,
                 qualified_name TEXT,
+                canonical_id TEXT,
                 file_node_id INTEGER,
                 start_line INTEGER
             );",
@@ -2321,6 +2407,7 @@ mod tests {
                 kind INTEGER NOT NULL,
                 serialized_name TEXT NOT NULL,
                 qualified_name TEXT,
+                canonical_id TEXT,
                 file_node_id INTEGER,
                 start_line INTEGER NOT NULL DEFAULT 0
             );
@@ -2330,6 +2417,8 @@ mod tests {
                 source_node_id INTEGER NOT NULL,
                 target_node_id INTEGER NOT NULL,
                 resolved_target_node_id INTEGER,
+                confidence REAL,
+                certainty TEXT,
                 callsite_identity TEXT
             );",
         )?;
@@ -2410,6 +2499,87 @@ mod tests {
     }
 
     #[test]
+    fn test_preclassified_call_edges_stay_out_of_resolution_worklist() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE node (
+                id INTEGER PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                serialized_name TEXT NOT NULL,
+                qualified_name TEXT,
+                canonical_id TEXT,
+                file_node_id INTEGER,
+                start_line INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE edge (
+                id INTEGER PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                source_node_id INTEGER NOT NULL,
+                target_node_id INTEGER NOT NULL,
+                resolved_target_node_id INTEGER,
+                confidence REAL,
+                certainty TEXT,
+                callsite_identity TEXT
+            );",
+        )?;
+
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, NULL, NULL, 1)",
+            params![100_i64, NodeKind::FILE as i32, "/repo/src/routes.ts"],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![
+                1_i64,
+                NodeKind::FUNCTION as i32,
+                "route_handler",
+                "routes::route_handler",
+                100_i64
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![
+                10_i64,
+                NodeKind::FUNCTION as i32,
+                "handle",
+                "routes::handle",
+                100_i64
+            ],
+        )?;
+
+        conn.execute(
+            "INSERT INTO edge (id, kind, source_node_id, target_node_id, resolved_target_node_id, confidence, certainty, callsite_identity)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, NULL)",
+            params![1000_i64, EdgeKind::CALL as i32, 1_i64, 10_i64],
+        )?;
+        conn.execute(
+            "INSERT INTO edge (id, kind, source_node_id, target_node_id, resolved_target_node_id, confidence, certainty, callsite_identity)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL)",
+            params![
+                1001_i64,
+                EdgeKind::CALL as i32,
+                1_i64,
+                10_i64,
+                0.65_f64,
+                ResolutionCertainty::Probable.as_str()
+            ],
+        )?;
+
+        let context = ScopeCallerContext::prepare(&conn, None)?;
+        let rows = sql::unresolved_edges(&conn, EdgeKind::CALL, &context)?;
+        let count = ResolutionPass::count_unresolved_on_conn(&conn, EdgeKind::CALL, &context)?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 1000_i64);
+        assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[test]
     fn test_exact_lookup_cache_reuses_same_file_key() -> Result<()> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(
@@ -2417,6 +2587,7 @@ mod tests {
                 id INTEGER PRIMARY KEY,
                 kind INTEGER NOT NULL,
                 serialized_name TEXT NOT NULL,
+                canonical_id TEXT,
                 file_node_id INTEGER,
                 start_line INTEGER NOT NULL DEFAULT 0
             );",

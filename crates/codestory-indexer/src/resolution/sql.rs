@@ -95,8 +95,15 @@ pub(super) fn unresolved_edges(
          JOIN node caller ON caller.id = e.source_node_id
          JOIN node target ON target.id = e.target_node_id
          LEFT JOIN node file_node ON file_node.id = caller.file_node_id
-         WHERE e.kind = ?1 AND e.resolved_target_node_id IS NULL",
+         WHERE e.kind = ?1 AND e.resolved_target_node_id IS NULL
+           AND (target.canonical_id IS NULL OR (
+             target.canonical_id NOT LIKE 'tauri:command:%'
+             AND target.canonical_id NOT LIKE 'openapi:endpoint:%'
+             AND target.canonical_id NOT LIKE 'route_endpoint:%'
+             AND target.canonical_id NOT LIKE 'payload:collection:%'
+           ))",
     );
+    append_resolution_worklist_metadata_filter(&mut query, kind);
     if scope_context.is_scoped() {
         query.push_str(&format!(
             " AND e.source_node_id IN (SELECT caller_id FROM {SCOPED_CALLER_TABLE})"
@@ -108,6 +115,12 @@ pub(super) fn unresolved_edges(
     let rows = stmt.query_map(params![kind as i32], map_unresolved_edge_row)?;
     let collected = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(collected)
+}
+
+pub(super) fn append_resolution_worklist_metadata_filter(query: &mut String, kind: EdgeKind) {
+    if kind == EdgeKind::CALL {
+        query.push_str(" AND e.confidence IS NULL AND e.certainty IS NULL");
+    }
 }
 
 pub(super) fn apply_resolution_updates(
@@ -124,7 +137,8 @@ pub(super) fn apply_resolution_updates(
             resolved_target_node_id INTEGER,
             confidence REAL,
             certainty TEXT,
-            candidate_target_node_ids TEXT
+            candidate_target_node_ids TEXT,
+            touch_metadata INTEGER NOT NULL DEFAULT 0
          );
          DELETE FROM resolution_edge_updates;",
     )?;
@@ -136,8 +150,9 @@ pub(super) fn apply_resolution_updates(
                 resolved_target_node_id,
                 confidence,
                 certainty,
-                candidate_target_node_ids
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                candidate_target_node_ids,
+                touch_metadata
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         for update in updates {
             insert.execute(params![
@@ -146,16 +161,29 @@ pub(super) fn apply_resolution_updates(
                 update.confidence,
                 update.certainty,
                 update.candidate_payload.as_deref(),
+                i32::from(update.touch_metadata),
             ])?;
         }
     }
 
     conn.execute(
         "UPDATE edge
-         SET resolved_target_node_id = staged.resolved_target_node_id,
-             confidence = staged.confidence,
-             certainty = staged.certainty,
-             candidate_target_node_ids = staged.candidate_target_node_ids
+         SET resolved_target_node_id = CASE
+                 WHEN staged.touch_metadata = 1 THEN staged.resolved_target_node_id
+                 ELSE edge.resolved_target_node_id
+             END,
+             confidence = CASE
+                 WHEN staged.touch_metadata = 1 THEN staged.confidence
+                 ELSE edge.confidence
+             END,
+             certainty = CASE
+                 WHEN staged.touch_metadata = 1 THEN staged.certainty
+                 ELSE edge.certainty
+             END,
+             candidate_target_node_ids = COALESCE(
+                 staged.candidate_target_node_ids,
+                 edge.candidate_target_node_ids
+             )
          FROM resolution_edge_updates AS staged
          WHERE edge.id = staged.edge_id",
         [],

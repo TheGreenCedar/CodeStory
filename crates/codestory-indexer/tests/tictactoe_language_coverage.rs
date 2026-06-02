@@ -10,6 +10,10 @@ const JAVASCRIPT_SOURCE: &str = include_str!("fixtures/tictactoe/javascript_tict
 const TYPESCRIPT_SOURCE: &str = include_str!("fixtures/tictactoe/typescript_tictactoe.ts");
 const CPP_SOURCE: &str = include_str!("fixtures/tictactoe/cpp_tictactoe.cpp");
 const C_SOURCE: &str = include_str!("fixtures/tictactoe/c_tictactoe.c");
+const GO_SOURCE: &str = include_str!("fixtures/tictactoe/go_tictactoe.go");
+const RUBY_SOURCE: &str = include_str!("fixtures/tictactoe/ruby_tictactoe.rb");
+const PHP_SOURCE: &str = include_str!("fixtures/tictactoe/php_tictactoe.php");
+const CSHARP_SOURCE: &str = include_str!("fixtures/tictactoe/csharp_tictactoe.cs");
 
 type NamePair = (&'static str, &'static str);
 
@@ -245,6 +249,97 @@ const TYPESCRIPT_INHERITANCE: &[NamePair] = &[
 const CPP_INHERITANCE: &[NamePair] = &[("TicTacToe", "GameObject")];
 const C_INHERITANCE: &[NamePair] = &[];
 
+const GO_SYMBOLS: &[(NodeKind, &str)] = &[
+    (NodeKind::STRUCT, "Field"),
+    (NodeKind::STRUCT, "GameObject"),
+    (NodeKind::STRUCT, "HumanPlayer"),
+    (NodeKind::STRUCT, "ArtificialPlayer"),
+    (NodeKind::STRUCT, "TicTacToe"),
+    (NodeKind::FUNCTION, "numberIn"),
+    (NodeKind::FUNCTION, "numberOut"),
+    (NodeKind::FUNCTION, "stringOut"),
+    (NodeKind::METHOD, "makeMove"),
+    (NodeKind::METHOD, "sameInRow"),
+    (NodeKind::METHOD, "turn"),
+    (NodeKind::METHOD, "minMax"),
+    (NodeKind::METHOD, "run"),
+    (NodeKind::FUNCTION, "main"),
+];
+const RUBY_SYMBOLS: &[(NodeKind, &str)] = &[
+    (NodeKind::CLASS, "GameObject"),
+    (NodeKind::CLASS, "Field"),
+    (NodeKind::CLASS, "Player"),
+    (NodeKind::CLASS, "HumanPlayer"),
+    (NodeKind::CLASS, "ArtificialPlayer"),
+    (NodeKind::CLASS, "TicTacToe"),
+    (NodeKind::FUNCTION, "numberIn"),
+    (NodeKind::FUNCTION, "numberOut"),
+    (NodeKind::FUNCTION, "stringOut"),
+    (NodeKind::METHOD, "makeMove"),
+    (NodeKind::METHOD, "sameInRow"),
+    (NodeKind::METHOD, "turn"),
+    (NodeKind::METHOD, "minMax"),
+    (NodeKind::METHOD, "run"),
+];
+const PHP_SYMBOLS: &[(NodeKind, &str)] = &[
+    (NodeKind::CLASS, "GameObject"),
+    (NodeKind::CLASS, "Field"),
+    (NodeKind::INTERFACE, "Player"),
+    (NodeKind::CLASS, "HumanPlayer"),
+    (NodeKind::CLASS, "ArtificialPlayer"),
+    (NodeKind::CLASS, "TicTacToe"),
+    (NodeKind::FUNCTION, "numberIn"),
+    (NodeKind::FUNCTION, "numberOut"),
+    (NodeKind::FUNCTION, "stringOut"),
+    (NodeKind::METHOD, "makeMove"),
+    (NodeKind::METHOD, "sameInRow"),
+    (NodeKind::METHOD, "turn"),
+    (NodeKind::METHOD, "minMax"),
+    (NodeKind::METHOD, "run"),
+];
+const CSHARP_SYMBOLS: &[(NodeKind, &str)] = &[
+    (NodeKind::CLASS, "GameObject"),
+    (NodeKind::CLASS, "Field"),
+    (NodeKind::INTERFACE, "Player"),
+    (NodeKind::CLASS, "HumanPlayer"),
+    (NodeKind::CLASS, "ArtificialPlayer"),
+    (NodeKind::CLASS, "TicTacToe"),
+    (NodeKind::METHOD, "numberIn"),
+    (NodeKind::METHOD, "numberOut"),
+    (NodeKind::METHOD, "stringOut"),
+    (NodeKind::METHOD, "makeMove"),
+    (NodeKind::METHOD, "sameInRow"),
+    (NodeKind::METHOD, "turn"),
+    (NodeKind::METHOD, "minMax"),
+    (NodeKind::METHOD, "run"),
+    (NodeKind::METHOD, "Main"),
+];
+
+const GO_IMPORTS: &[&str] = &["\"fmt\"", "\"math/rand\""];
+const RUBY_IMPORTS: &[&str] = &["\"random\""];
+const PHP_IMPORTS: &[&str] = &["Random\\Randomizer"];
+const CSHARP_IMPORTS: &[&str] = &["System"];
+
+const GO_CALLS: &[&str] = &["numberIn", "stringOut", "makeMove", "minMax"];
+const RUBY_CALLS: &[&str] = &["numberIn", "stringOut", "makeMove", "minMax"];
+const PHP_CALLS: &[&str] = &["numberIn", "stringOut", "makeMove", "minMax"];
+const CSHARP_CALLS: &[&str] = &["numberIn", "stringOut", "makeMove", "minMax"];
+
+const GO_MEMBERS: &[NamePair] = &[];
+const RUBY_MEMBERS: &[NamePair] = &[];
+const PHP_MEMBERS: &[NamePair] = &[];
+const CSHARP_MEMBERS: &[NamePair] = &[];
+
+const GO_INHERITANCE: &[NamePair] = &[];
+const RUBY_INHERITANCE: &[NamePair] = &[
+    ("Field", "GameObject"),
+    ("HumanPlayer", "Player"),
+    ("ArtificialPlayer", "Player"),
+    ("TicTacToe", "GameObject"),
+];
+const PHP_INHERITANCE: &[NamePair] = &[("Field", "GameObject"), ("TicTacToe", "GameObject")];
+const CSHARP_INHERITANCE: &[NamePair] = &[("Field", "GameObject"), ("TicTacToe", "GameObject")];
+
 #[derive(Clone, Copy)]
 struct FixtureCase {
     language: &'static str,
@@ -352,6 +447,58 @@ fn fixture_cases() -> Vec<FixtureCase> {
             required_call_targets: C_CALLS,
             required_member_pairs: C_MEMBERS,
             required_inheritance_pairs: C_INHERITANCE,
+        },
+        FixtureCase {
+            language: "go",
+            filename: "game.go",
+            extension: "go",
+            source: GO_SOURCE,
+            min_nodes: 12,
+            min_edges: 10,
+            required_symbols: GO_SYMBOLS,
+            required_import_targets: GO_IMPORTS,
+            required_call_targets: GO_CALLS,
+            required_member_pairs: GO_MEMBERS,
+            required_inheritance_pairs: GO_INHERITANCE,
+        },
+        FixtureCase {
+            language: "ruby",
+            filename: "game.rb",
+            extension: "rb",
+            source: RUBY_SOURCE,
+            min_nodes: 12,
+            min_edges: 10,
+            required_symbols: RUBY_SYMBOLS,
+            required_import_targets: RUBY_IMPORTS,
+            required_call_targets: RUBY_CALLS,
+            required_member_pairs: RUBY_MEMBERS,
+            required_inheritance_pairs: RUBY_INHERITANCE,
+        },
+        FixtureCase {
+            language: "php",
+            filename: "game.php",
+            extension: "php",
+            source: PHP_SOURCE,
+            min_nodes: 12,
+            min_edges: 10,
+            required_symbols: PHP_SYMBOLS,
+            required_import_targets: PHP_IMPORTS,
+            required_call_targets: PHP_CALLS,
+            required_member_pairs: PHP_MEMBERS,
+            required_inheritance_pairs: PHP_INHERITANCE,
+        },
+        FixtureCase {
+            language: "csharp",
+            filename: "game.cs",
+            extension: "cs",
+            source: CSHARP_SOURCE,
+            min_nodes: 12,
+            min_edges: 10,
+            required_symbols: CSHARP_SYMBOLS,
+            required_import_targets: CSHARP_IMPORTS,
+            required_call_targets: CSHARP_CALLS,
+            required_member_pairs: CSHARP_MEMBERS,
+            required_inheritance_pairs: CSHARP_INHERITANCE,
         },
     ]
 }
@@ -464,6 +611,10 @@ fn test_language_extension_coverage_and_names() {
         ("hpp", "cpp"),
         ("hxx", "cpp"),
         ("c", "c"),
+        ("go", "go"),
+        ("rb", "ruby"),
+        ("php", "php"),
+        ("cs", "csharp"),
     ];
 
     for (ext, expected_name) in expected {
