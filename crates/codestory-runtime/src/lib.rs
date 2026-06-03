@@ -10265,12 +10265,13 @@ pub fn beta() {}
     fn write_reindex_semantic_fixture(root: &std::path::Path, digest_text: &str) {
         let src = root.join("src");
         fs::create_dir_all(&src).expect("create src dir");
+        let digest_identifier = digest_text.replace(' ', "_");
         fs::write(
             src.join("lib.rs"),
             format!(
                 r#"
 /// {digest_text}
-pub fn build_snapshot_digest() -> &'static str {{
+pub fn build_snapshot_digest({digest_identifier}: &str) -> &'static str {{
     "{digest_text}"
 }}
 
@@ -13948,7 +13949,7 @@ fn build_llm_symbol_doc_text() -> String {
         assert!(
             initial_docs
                 .iter()
-                .any(|doc| doc.doc_text.contains("initial compressed digest")),
+                .any(|doc| doc.doc_text.contains("initial_compressed_digest")),
             "initial digest docs should include fixture source text: {:?}",
             initial_docs
                 .iter()
@@ -13973,7 +13974,7 @@ fn build_llm_symbol_doc_text() -> String {
         assert!(
             updated_docs
                 .iter()
-                .any(|doc| doc.doc_text.contains("updated compressed digest")),
+                .any(|doc| doc.doc_text.contains("updated_compressed_digest")),
             "updated digest docs should include fixture source text: {:?}",
             updated_docs
                 .iter()
@@ -13983,7 +13984,7 @@ fn build_llm_symbol_doc_text() -> String {
         assert!(
             !updated_docs
                 .iter()
-                .any(|doc| doc.doc_text.contains("initial compressed digest")),
+                .any(|doc| doc.doc_text.contains("initial_compressed_digest")),
             "full index should rebuild semantic docs instead of reusing stale persisted content"
         );
     }
