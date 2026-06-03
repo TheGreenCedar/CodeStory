@@ -1,0 +1,21 @@
+[package]
+name = "codestory-retrieval"
+version = "0.4.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+codestory-contracts = { workspace = true }
+codestory-store = { workspace = true }
+codestory-workspace = { workspace = true }
+directories = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+ureq = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
