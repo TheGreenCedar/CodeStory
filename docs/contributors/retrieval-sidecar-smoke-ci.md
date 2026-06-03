@@ -5,7 +5,9 @@ Full index/query on the monorepo may exceed runner budgets; the job runs bootstr
 `--skip-compose --wait-secs 0`, asserts `retrieval status` returns the clean pre-index
 `retrieval_manifest_missing` shape through the CLI integration test suite, and runs
 runtime/retrieval protocol plus non-live CLI search contract tests. This job is not a full sidecar
-readiness gate.
+readiness gate. The workflow restores a Rust build cache before the Cargo steps; a new cache key may
+still pay one cold compile, but later pushes should reuse the warmed target and Cargo dependency
+state.
 
 **Preflight reference:** [`docs/ops/retrieval-sidecars.md`](../ops/retrieval-sidecars.md#preflight-smoke-contract)
 
@@ -35,6 +37,7 @@ paths:
 ## Job sketch (PowerShell)
 
 ```powershell
+# After checkout, Node setup, Rust toolchain setup, and Rust cache restore:
 node scripts/lint-retrieval-generalization.mjs
 cargo test -p codestory-cli --test retrieval_bootstrap_contracts
 cargo test -p codestory-runtime --lib
@@ -51,14 +54,15 @@ retrieval manifest required for `retrieval_mode == "full"`.
 ## Pass criteria
 
 1. Generalization lint exits 0.
-2. `cargo test -p codestory-cli --test retrieval_bootstrap_contracts` exits 0, including the
+2. Rust cache restore/save completes or gracefully misses without masking later failures.
+3. `cargo test -p codestory-cli --test retrieval_bootstrap_contracts` exits 0, including the
    bootstrap/status assertion that reports `degraded_reason == "retrieval_manifest_missing"` and
    non-`full` mode on a clean temp project before indexing.
-3. `cargo test -p codestory-runtime --lib` exits 0.
-4. `cargo test -p codestory-runtime --test retrieval_generalization_guard` exits 0.
-5. `cargo test -p codestory-cli --test stdio_protocol_contracts` exits 0.
-6. `cargo test -p codestory-cli --test search_json_output` exits 0 for non-live fail-closed search contracts.
-7. `cargo test -p codestory-retrieval` exits 0.
+4. `cargo test -p codestory-runtime --lib` exits 0.
+5. `cargo test -p codestory-runtime --test retrieval_generalization_guard` exits 0.
+6. `cargo test -p codestory-cli --test stdio_protocol_contracts` exits 0.
+7. `cargo test -p codestory-cli --test search_json_output` exits 0 for non-live fail-closed search contracts.
+8. `cargo test -p codestory-retrieval` exits 0.
 
 ## Pins
 
@@ -79,12 +83,14 @@ cargo test -p codestory-retrieval
 
 The workflow runs the lint script and focused test targets. The manifest-missing smoke lives in
 `retrieval_bootstrap_contracts` so Cargo builds the CLI through the integration-test path instead of
-paying for a standalone build step before the tests. `retrieval_generalization_guard` invokes the
-same lint from Rust for cross-platform CI parity. This smoke job does not claim stdio, CLI, or
-runtime full-mode success. Full readiness evidence requires a separate fixture run that starts real
-sidecars, provisions `bge-base-en-v1.5.Q8_0.gguf`, runs `retrieval index`, and verifies
-`retrieval_mode == "full"`. The live success contracts are intentionally outside the normal smoke
-gate: set `CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1` before running the stdio full-mode
+paying for a standalone build step before the tests. The Rust cache is configured to save even on
+failure, which keeps failed follow-up pushes from repeatedly paying the full Windows cold-compile
+cost. `retrieval_generalization_guard` invokes the same lint from Rust for cross-platform CI parity.
+This smoke job does not claim stdio, CLI, or runtime full-mode success. Full readiness evidence
+requires a separate fixture run that starts real sidecars, provisions `bge-base-en-v1.5.Q8_0.gguf`,
+runs `retrieval index`, and verifies `retrieval_mode == "full"`. The live success contracts are
+intentionally outside the normal smoke gate: set `CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1` before
+running the stdio full-mode
 contracts with `-- --ignored --nocapture`, run
 `cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_json_emits_sidecar_primary_results_without_repo_text_fallback`
 for the CLI lane, and run the ignored `retrieval_eval_*` tests with

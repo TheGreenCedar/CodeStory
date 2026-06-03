@@ -46,6 +46,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+
       - name: Generalization lint (production paths)
         run: node scripts/lint-retrieval-generalization.mjs
 
