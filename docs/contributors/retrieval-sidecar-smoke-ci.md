@@ -35,8 +35,8 @@ paths:
 ```powershell
 node scripts/lint-retrieval-generalization.mjs
 
-cargo build --release -p codestory-cli
-$cli = ".\target\release\codestory-cli.exe"
+cargo build -p codestory-cli
+$cli = ".\target\debug\codestory-cli.exe"
 
 & $cli retrieval bootstrap --project . --skip-compose --wait-secs 0
 if ($LASTEXITCODE -ne 0) {
@@ -74,7 +74,7 @@ retrieval manifest required for `retrieval_mode == "full"`.
 ## Pass criteria
 
 1. Generalization lint exits 0.
-2. Release `codestory-cli` build exits 0.
+2. Debug `codestory-cli` build exits 0.
 3. `retrieval bootstrap --project . --skip-compose --wait-secs 0` exits 0 with logs visible for diagnostics.
 4. `retrieval status --project .` emits readable JSON and reports `degraded_reason ==
    "retrieval_manifest_missing"` and non-`full` mode on the clean runner before indexing.
@@ -100,11 +100,11 @@ cargo test -p codestory-cli --test search_json_output
 cargo test -p codestory-retrieval
 ```
 
-The workflow runs the lint script and the listed test targets; `retrieval_generalization_guard`
-invokes the same lint from Rust for cross-platform CI parity. This smoke job does not claim
-stdio, CLI, or runtime full-mode success. Full readiness evidence requires a separate fixture run
-that starts real sidecars, provisions `bge-base-en-v1.5.Q8_0.gguf`, runs `retrieval index`, and
-verifies `retrieval_mode == "full"`. The live success contracts are intentionally outside the
+The workflow runs the lint script, a debug CLI manifest-missing smoke, and the listed test targets;
+`retrieval_generalization_guard` invokes the same lint from Rust for cross-platform CI parity. This
+smoke job does not claim stdio, CLI, or runtime full-mode success. Full readiness evidence requires
+a separate fixture run that starts real sidecars, provisions `bge-base-en-v1.5.Q8_0.gguf`, runs
+`retrieval index`, and verifies `retrieval_mode == "full"`. The live success contracts are intentionally outside the
 normal smoke gate: set `CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1` before running the stdio full-mode
 contracts with `-- --ignored --nocapture`, run
 `cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_json_emits_sidecar_primary_results_without_repo_text_fallback`

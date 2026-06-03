@@ -48,13 +48,13 @@ jobs:
       - name: Generalization lint (production paths)
         run: node scripts/lint-retrieval-generalization.mjs
 
-      - name: Build release CLI
-        run: cargo build --release -p codestory-cli
+      - name: Build debug CLI
+        run: cargo build -p codestory-cli
 
       - name: Retrieval manifest-missing shape check
         shell: pwsh
         run: |
-          $cli = ".\target\release\codestory-cli.exe"
+          $cli = ".\target\debug\codestory-cli.exe"
           & $cli retrieval bootstrap --project . --skip-compose --wait-secs 0
           if ($LASTEXITCODE -ne 0) {
             throw "retrieval bootstrap failed with exit code $LASTEXITCODE"
