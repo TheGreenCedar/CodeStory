@@ -15,6 +15,10 @@ single heuristic hit.
 - Rust: Axum, Actix, Rocket.
 - Go: Gin, Chi, Echo, Fiber as text-only partial route extraction until Go
   parser-backed handler links exist.
+- Kotlin/Swift/Dart (unmapped today): Ktor, Vapor, and Shelf heuristics are
+  implemented in `collect_framework_routes` for when those language paths index
+  source files; fixture coverage lives in
+  `test_framework_route_extractors_cover_requested_web_stacks`.
 - Existing OpenAPI endpoint indexing remains separate and should continue to
   produce endpoint symbols and speculative client-call edges.
 - Payload collection config and usage extraction is tracked as data bridge

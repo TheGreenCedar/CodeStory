@@ -1,6 +1,9 @@
-# `search` — Search Indexed Symbols and Repo Text
+# `search` — Search Mandatory Sidecar Indexes
 
-Searches the symbol index for matching nodes, optionally augmented with grep-style text hits across the repo. Results are ranked by relevance score and deduplicated.
+Searches the mandatory local sidecar indexes for matching symbols, files,
+semantic candidates, and graph-neighborhood evidence. A product search requires
+`retrieval_mode=full`; stale, stubbed, hash-vector, or missing sidecars are
+fail-closed states.
 
 ## Usage
 
@@ -16,20 +19,23 @@ Searches the symbol index for matching nodes, optionally augmented with grep-sty
 | `--cache-dir` | path | *auto* | Override the cache directory |
 | `--query` | string | **required** | Search term — symbol name or natural-language text |
 | `--limit` | integer | `10` | Maximum results per provenance group, capped at 50 |
-| `--repo-text` | enum | `auto` | Repo text scanning: `auto`, `on`, or `off`. `auto` also scans repo text when indexed hits are weak or no exact concrete anchor matched |
+| `--repo-text` | enum | `auto` | Diagnostic repo-text scanning: `auto`, `on`, or `off`. Repo-text hits are navigation clues and must not replace exact sidecar evidence |
 | `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
 | `--format` | enum | `markdown` | Output format: `markdown` or `json` |
 | `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
-| `--hybrid-lexical` | float | runtime default | Override lexical weight for hybrid-search research |
-| `--hybrid-semantic` | float | runtime default | Override semantic weight for hybrid-search research |
-| `--hybrid-graph` | float | runtime default | Override graph-neighborhood weight for hybrid-search research |
+| `--hybrid-*` | n/a | unsupported | Hybrid tuning overrides are rejected under mandatory sidecar search because ignored weights would be misleading |
 
 ## Query Behavior
 
-- **Symbol-like queries** (e.g. `AppController`, `run_indexing`) search the indexed symbol table.
-- **Natural-language queries** (e.g. `"how does incremental indexing work"`) also perform a repo-wide text scan and merge results by score.
+- **Symbol-like queries** (e.g. `AppController`, `run_indexing`) search exact
+  and normalized symbol lanes first.
+- **Natural-language queries** (e.g. `"how does incremental indexing work"`)
+  search semantic and graph-aware sidecar evidence. Repo-text may appear as
+  diagnostic evidence, but it is not proof of a symbol or graph relationship.
 - **Field-qualified queries** filter indexed and repo-text results after candidate retrieval. Supported filters are `kind:<node-kind-or-alias>`, `path:<path-fragment>`, `name:<symbol-fragment>`, and `lang:<language-or-extension>`. Example: `kind:function name:listUsers` or `path:routes.ts /api/users`.
-- **Concrete anchors with weak indexed results** also trigger repo text in `auto` mode. This prevents stale names such as retired UI components from looking like valid direct symbol hits.
+- **Concrete anchors with weak indexed results** may report repo-text diagnostics
+  in `auto` mode. Treat this as an uncertainty signal, not as successful graph
+  grounding.
 - When hybrid retrieval finds strong semantic matches but no lexical match, Markdown and JSON output include `did_you_mean` suggestions.
 - Broad architecture-style queries can include `search_plan`. The plan reports
   extracted and dropped terms, bounded subqueries, candidate windows, anchor
@@ -37,10 +43,11 @@ Searches the symbol index for matching nodes, optionally augmented with grep-sty
   source-truth checks. It is a discovery plan, not final answer prose.
 - Ranking boosts exact and terminal symbol names, CamelCase initials, compound terms, and path co-location. Test, fixture, vendor, and external hits are dampened unless the query asks for them.
 - Import/re-export-looking exact hits are ranked below definition-looking hits when source-line evidence is available.
-- Repo-text fallback remains explicit evidence. Treat repo-text hits as clues to inspect, not as silent graph success.
+- Repo-text evidence remains explicit navigation evidence. Treat repo-text hits
+  as clues to inspect, not as sidecar success.
 - For architecture questions, broad natural-language `search` is discovery only. If `query_assessment` says `weak_top_hit=true` or there is no exact anchor, move to `drill` with concrete anchors from `ground`/`search`; do not answer from broad search hits alone.
 - `symbol`, `trail`, and `snippet` require a resolvable graph target. Semantic suggestions and repo-text hits can guide follow-up searches, but they are not promoted into graph targets by those commands.
-- **Hybrid weight overrides** are intended for benchmarking and tuning. Omit all three `--hybrid-*` flags for production-like runtime defaults.
+- **Hybrid weight overrides** are unsupported. `search --hybrid-*` flags are rejected under mandatory sidecar search; use sidecar configuration and fixture-backed tests for ranking experiments instead.
 
 ## Output
 
@@ -55,7 +62,7 @@ hits: 3
 
 Each hit includes: node ID, display name, kind, file path, line number, relevance score, provenance, and `match_quality` (`exact`, `normalized_exact`, `prefix`, `fuzzy`, `semantic_suggestion`, or `repo_text`).
 
-Search output also includes `query_assessment` with exact symbol hit count, weak-hit/stale-anchor flags, any repo-text fallback reason, and a recommended next action. Use it to avoid treating weak semantic suggestions as proof of an exact anchor.
+Search output also includes `query_assessment` with exact symbol hit count, weak-hit/stale-anchor flags, any repo-text diagnostic reason, and a recommended next action. Use it to avoid treating weak semantic suggestions as proof of an exact anchor.
 
 For broad architecture queries, JSON may include `search_plan`; Markdown renders
 it when `--why` is set. Prefer `typed_anchor` and `promoted` plan groups as
@@ -65,7 +72,9 @@ until direct source verification. Use the plan's next commands to continue with
 
 When a name appears more than once, prefer typed symbol hits such as `[function]`, `[struct]`, `[field]`, or `[file]` over `[unknown]` hits when you are verifying symbol surfacing. `[unknown]` results are often usage-like callsite or reference nodes, not the canonical definition.
 
-Repo-text hits from text-only surfaces such as `.svelte` files are evidence, not graph anchors. Use the excerpt to choose a symbol or open a snippet/source file for verification.
+Repo-text hits from text-only surfaces such as `.svelte` files are navigation
+clues, not sidecar evidence or graph anchors. Use the excerpt to choose a symbol
+or open a snippet/source file for verification.
 
 For ranking or route-search changes, run the search-quality eval and interpret
 failures before promoting the change:
@@ -96,10 +105,10 @@ cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture s
 # Search for a symbol
 <codestory-cli> search --project <target-workspace> --query AppController
 
-# Natural-language search, more results
+# Natural-language sidecar search, more results
 <codestory-cli> search --project <target-workspace> --query "how does the grounding snapshot work" --limit 20
 
-# Force repo text scanning for a symbol-like query
+# Diagnostic repo-text scan for a symbol-like query
 <codestory-cli> search --project <target-workspace> --query AppController --repo-text on
 
 # Narrow an ambiguous result set by kind and file path

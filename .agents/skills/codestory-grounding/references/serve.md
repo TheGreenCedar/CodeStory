@@ -43,3 +43,4 @@ Serves the indexed project over either a small HTTP JSON API or an MCP-style JSO
 - `serve` is local by default on `127.0.0.1`; do not bind wider unless the user explicitly needs remote access.
 - HTTP only accepts GET requests for the documented routes.
 - Start it after a successful index or with an intentional refresh mode.
+- In one `serve --stdio` process, identical successful `packet` and search-fragment requests are cached with small LRUs keyed by request arguments, the current SQLite/WAL fingerprint, and a mandatory sidecar-readiness fingerprint. The sidecar fingerprint includes the active embedding backend, sidecar state-file metadata, strict retrieval mode, degraded reason, manifest generation/input hash/backend/dimension, and status errors. This is for repeated agent calls only; changed index files, sidecar state drift, and strict stale/unavailable readiness bypass the cache.

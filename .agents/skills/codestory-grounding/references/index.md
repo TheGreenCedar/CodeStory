@@ -53,14 +53,14 @@ High-signal environment toggles:
 
 | Variable | Use |
 |----------|-----|
-| `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false` | Disable hybrid retrieval and use symbolic ranking. |
 | `CODESTORY_SEMANTIC_DOC_SCOPE=all` | Include all-symbol semantic docs. Accepted all-symbol aliases are `all`, `full`, `all-symbols`, and `all_symbols`; omitted or other values default to durable symbols. |
-| `CODESTORY_EMBED_BACKEND=onnx` | Use the managed ONNX backend. |
-| `CODESTORY_EMBED_RUNTIME_MODE=hash` | Use deterministic hash embeddings for local smoke checks. |
+| `CODESTORY_EMBED_BACKEND=llamacpp` | Use the mandatory local llama.cpp embedding sidecar. |
+| `CODESTORY_EMBED_LLAMACPP_URL=http://127.0.0.1:8080/v1/embeddings` | Product embedding endpoint for bge-base sidecar vectors. |
 | `CODESTORY_SUMMARY_ENDPOINT=local` | Enable deterministic local summaries with `--summarize`. |
 
-Use other embedding, alias, batch-size, tokenizer, provider, llama.cpp, and
-summary tuning variables only for focused profiling or compatibility work.
+Use other embedding, alias, batch-size, tokenizer, provider, hash, ONNX, and
+summary tuning variables only for focused diagnostics or historical comparisons.
+Agent-facing retrieval requires full sidecar readiness.
 
 ## Output
 

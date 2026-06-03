@@ -212,8 +212,11 @@ Embedding throughput is optimized for the local embedding path:
 
 - pending semantic docs are sorted by generated text length before embedding, which keeps batches close to uniform length
 - the default semantic embedding batch size is `128`, with `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` available for profiling
-- ONNX embeddings use `CODESTORY_EMBED_ONNX_MODEL`, `CODESTORY_EMBED_ONNX_TOKENIZER`, and `CODESTORY_EMBED_ONNX_PROVIDER` for the local model graph, tokenizer, and execution provider; managed setup points the model path at a derived CLS-pooled graph to avoid returning full token hidden states
-- the managed ONNX path seeds the current local throughput shape: semantic doc window `512`, doc batch `2048`, per-call ONNX token budget `32768`, DirectML on Windows or CPU elsewhere, and stored vectors `int8`; it does not start or retain an embedding server process
+- product sidecar embeddings use `CODESTORY_EMBED_BACKEND=llamacpp` and the
+  local `CODESTORY_EMBED_LLAMACPP_URL` endpoint; the manifest must record
+  `llamacpp:bge-base-en-v1.5`
+- ONNX and hash embedding paths are historical or diagnostic lanes unless a
+  future spec promotes them with fresh sidecar-quality evidence
 
 Keep measured repo-scale timings in [codestory-e2e-stats-log.md](../testing/codestory-e2e-stats-log.md). Architecture explains the lifecycle; the testing log owns time-specific numbers because caches, backends, and workstation state drift.
 
@@ -247,7 +250,9 @@ Full refresh builds a staged database and publishes it only after staged finaliz
 
 Semantic docs are persisted in SQLite with generated-text metadata. Reuse is keyed by schema version, generated text hash, embedding model, and embedding dimension. On full refresh, runtime copies prior semantic docs forward into the staged database before semantic sync checks them. On incremental refresh, runtime passes a touched-file scope so only docs belonging to changed files are rebuilt or pruned.
 
-Cold start still has to embed any semantic doc that has no reusable row. The cold path is kept under control by using the durable-symbol default scope, length-bucketed batches, the managed ONNX batch defaults, and stored vector quantization.
+Cold start still has to embed any semantic doc that has no reusable row. The
+cold path is kept under control by using the durable-symbol default scope,
+length-bucketed batches, full sidecar readiness, and stored vector quantization.
 
 ### What timing output means
 

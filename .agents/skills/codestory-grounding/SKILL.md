@@ -38,7 +38,13 @@ checkout is only the tool artifact unless the user is editing CodeStory itself.
 - When `packet` reports `sufficient` and `follow_up_commands` is empty, answer
   from the packet; budget truncation alone is not a gap. Preserve supported-claim
   wording and include a compact "Support files" list from `answer.citations` and
-  `sufficiency.avoid_opening`.
+  `sufficiency.avoid_opening`. Do not run ordinary source reads, `rg`, `grep`, or
+  `git show` only to verify packet citations; run more commands only for a named
+  unresolved gap, an edit target, or a user-requested worktree proof.
+- When `packet` reports `partial`, read `sufficiency.follow_up_commands` and run
+  those commands in order. Prefer listed targeted `search --why` commands before
+  escalating to a larger packet budget. As soon as a follow-up packet becomes
+  sufficient, stop exploration and answer from that packet.
 - When `search --why` emits `search_plan`, use its subqueries, anchor groups,
   bridge evidence, next commands, and source-truth checks as the follow-up plan,
   not as final answer prose.
@@ -48,9 +54,10 @@ checkout is only the tool artifact unless the user is editing CodeStory itself.
 - Treat repo-text, semantic suggestions, speculative OpenAPI edges, and
   cross-language framework hits as navigation hints until typed graph evidence,
   snippets, trails, or direct source reads support the claim.
-- If `doctor` reports semantic retrieval as partial, stale, or failed, prefer
-  `search --repo-text on --why`, `symbol`, `trail`, and `snippet` until a full
-  refresh and embedding setup restore healthy retrieval.
+- If `doctor` reports retrieval as partial, stale, stubbed, hash-vector, or
+  failed, treat product retrieval as unavailable until `retrieval_mode=full` is
+  restored. Repo-text output is diagnostic only; do not use it as a substitute
+  for mandatory sidecar evidence.
 
 ## Command Routing
 
@@ -75,7 +82,7 @@ Detailed argument tables, output examples, and usage patterns for each command:
 - [ground](references/ground.md) - Compact codebase context snapshot
 - [doctor](references/doctor.md) - Read-only project/cache/index/retrieval health check
 - [packet](references/packet.md) - Broad task packet with sufficiency contract
-- [search](references/search.md) - Search indexed symbols and repo text
+- [search](references/search.md) - Search mandatory sidecar indexes
 - [context](references/context.md) - Deep evidence packet for a concrete target
 - [symbol](references/symbol.md) - Inspect a symbol's details and relationships
 - [trail](references/trail.md) - Follow a symbol's call/reference graph
@@ -83,7 +90,7 @@ Detailed argument tables, output examples, and usage patterns for each command:
 - [drill](references/drill.md) - Build a repeatable evidence packet for agent-grounding drills
 - [drill-suite](references/drill-suite.md) - Run a manifest-defined cross-repo real-repo agent drill matrix
 - [query](references/query.md) - Structured graph query pipelines
-- [explore](references/explore.md) - Interactive terminal exploration with Markdown/JSON fallback
+- [explore](references/explore.md) - Interactive terminal exploration with Markdown/JSON output
 - [files](references/files.md) - Indexed file inventory and coverage markers
 - [affected](references/affected.md) - Changed-file impact analysis
 - [bookmark](references/bookmark.md) - Save reusable investigation focus nodes

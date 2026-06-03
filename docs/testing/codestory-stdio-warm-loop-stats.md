@@ -63,6 +63,16 @@ From the 2026-05-06 baseline:
 | snippet | 20 | 744 | 744 |
 | resources/read:status | 20 | 1,003 | 1,003 |
 
+## Packet Cache Probe
+
+`serve --stdio` keeps a small in-process LRU for identical successful `packet`
+requests. The key includes request arguments plus the SQLite DB/WAL fingerprint,
+so a changed index bypasses the cached packet.
+
+| Date | Commit | Scenario | First packet ms | Repeated packet ms | Speedup | Same packet id | Trace steps | Protocol stderr |
+| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: |
+| 2026-05-25 | pending | CodeStory repo, release binary, `--refresh none`, repeated identical tiny packet | 3495.60 | 0.93 | 3754.27x | true | 13 | 0 bytes |
+
 ## Notes
 
 - The baseline is a small-fixture release-binary smoke, not a repo-scale promotion gate.

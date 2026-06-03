@@ -83,6 +83,7 @@ Allowed claim classifications are `correct`, `partial`, `misleading`, and
 | `--output-dir` | path | **required** | Directory for aggregate suite reports and per-case drill artifacts |
 | `--refresh` | enum | `full` | Refresh strategy passed to each per-case drill: `auto`, `full`, `incremental`, `none` |
 | `--format` | enum | `json` | Primary aggregate output format: `json` or `markdown` |
+| `--jobs` | integer | `1` | Read-only workers for `--refresh none`; multiple cases run in parallel, a single case parallelizes anchors and bridge checks |
 
 ## Output
 
@@ -98,10 +99,19 @@ retrieval mode, anchor resolution, bridge status, source-truth check counts,
 expected-file recall, source-truth target roles/ranking reasons, bridge
 `evidence_kind`, claim classification counts, and next actions. A case can
 be mechanically healthy but still `degraded` when source-truth verification is
-required, bridge evidence is partial, retrieval is symbolic-only, freshness is
+required, bridge evidence is partial, retrieval needs repair, freshness is
 stale, expected files were missed, or the ledger records partial/materially
 revised claims. A failed case is recorded as `blocked` instead of aborting the
 whole suite, so other manifest cases still produce evidence.
+
+`--jobs` is default-off and only applies to read-only `--refresh none` loops.
+It leaves refreshing or indexing runs serialized, caps worker count
+automatically, preserves final manifest order in aggregate reports, and writes
+each single-case drill's anchor and bridge artifacts in deterministic report
+order.
+Measure it on the target suite before treating it as a speed-up: multi-case
+manifests can benefit from parallel isolated cases, while single-case anchor
+and bridge checks may be limited by storage and graph traversal contention.
 
 Per-case `drill` runs include the broad question search plus bounded
 supplemental searches for terms such as public pages, home components, Payload

@@ -1,0 +1,73 @@
+# Windows retrieval manifest-missing shape smoke.
+# Contract: docs/contributors/retrieval-sidecar-smoke-ci.md
+
+name: retrieval-sidecar-smoke
+
+on:
+  pull_request:
+    paths:
+      - crates/codestory-retrieval/**
+      - crates/codestory-contracts/**
+      - crates/codestory-store/Cargo.toml
+      - crates/codestory-store/src/**
+      - crates/codestory-cli/src/retrieval.rs
+      - crates/codestory-cli/src/main.rs
+      - crates/codestory-cli/src/args.rs
+      - crates/codestory-cli/src/runtime.rs
+      - crates/codestory-cli/src/stdio_*.rs
+      - crates/codestory-cli/tests/retrieval_bootstrap_contracts.rs
+      - crates/codestory-cli/tests/search_json_output.rs
+      - crates/codestory-cli/tests/stdio_protocol_contracts.rs
+      - crates/codestory-runtime/src/**
+      - crates/codestory-indexer/Cargo.toml
+      - crates/codestory-indexer/src/lib.rs
+      - crates/codestory-runtime/tests/retrieval_generalization_guard.rs
+      - scripts/lint-retrieval-generalization.mjs
+      - scripts/**retrieval**
+      - docs/ops/retrieval-sidecars.md
+      - docs/contributors/retrieval-sidecar-smoke-ci.md
+      - docs/architecture/retrieval-*.md
+      - docs/testing/retrieval-architecture.md
+      - docker/retrieval-compose.yml
+      - .github/workflows/retrieval-sidecar-smoke.yml
+  workflow_dispatch:
+
+jobs:
+  windows-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+
+      - name: Generalization lint (production paths)
+        run: node scripts/lint-retrieval-generalization.mjs
+
+      - name: Retrieval bootstrap manifest-missing contract
+        run: cargo test -p codestory-cli --test retrieval_bootstrap_contracts
+
+      - name: Runtime library contract tests
+        run: cargo test -p codestory-runtime --lib
+
+      - name: Retrieval generalization guard (Rust)
+        run: cargo test -p codestory-runtime --test retrieval_generalization_guard
+
+      - name: Stdio protocol contract tests
+        run: cargo test -p codestory-cli --test stdio_protocol_contracts
+
+      - name: CLI search JSON fail-closed contract tests
+        run: cargo test -p codestory-cli --test search_json_output
+
+      - name: Retrieval crate unit tests
+        run: cargo test -p codestory-retrieval

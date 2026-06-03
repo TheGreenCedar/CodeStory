@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CodeStory sidecar retrieval auto-rollback triggers",
+  "description": "When CODESTORY_RETRIEVAL default is enabled, fail closed and warn if any trigger fires on consecutive full local-real benchmark runs.",
+  "version": 1,
+  "env": {
+    "shadow_mode": "CODESTORY_RETRIEVAL_SHADOW",
+    "zoekt": "CODESTORY_ZOEKT_ENABLED",
+    "qdrant": "CODESTORY_QDRANT_ENABLED"
+  },
+  "baseline_artifact_dir": "target/agent-benchmark/baseline-pre-retrieval",
+  "comparison_artifact": "packet-runtime-summary.json",
+  "consecutive_runs_required": 2,
+  "triggers": [
+    {
+      "id": "p95_packet_wall_regression",
+      "metric": "p95_packet_wall_ms",
+      "threshold": "+25%",
+      "baseline": "baseline-pre-retrieval/local-real",
+      "measurement": "packet-runtime-summary.json"
+    },
+    {
+      "id": "retrieval_p99_regression",
+      "metric": "retrieval_p99_ms",
+      "threshold": "+50%",
+      "baseline": "baseline-pre-retrieval/shadow-sidecar",
+      "measurement": "trace aggregates"
+    },
+    {
+      "id": "quality_pass_runs_drop",
+      "metric": "quality_pass_runs",
+      "threshold": ">=1 repo regression",
+      "baseline": "baseline-pre-retrieval/local-real",
+      "measurement": "packet-runtime-summary.json"
+    },
+    {
+      "id": "sufficient_quality_mismatch_increase",
+      "metric": "sufficient_quality_mismatch_runs",
+      "threshold": "increase vs prior run",
+      "baseline": "baseline-pre-retrieval/local-real",
+      "measurement": "packet-runtime-summary.json"
+    },
+    {
+      "id": "degraded_mode_rate",
+      "metric": "degraded_mode_rate",
+      "threshold": ">5%",
+      "baseline": "baseline-pre-retrieval/shadow-sidecar",
+      "measurement": "retrieval_shadow traces"
+    },
+    {
+      "id": "holdout_claim_recall_floor",
+      "metric": "holdout_claim_recall",
+      "threshold": "<50% when sufficient",
+      "baseline": "baseline-pre-retrieval/local-real",
+      "measurement": "packet-runtime-summary.json"
+    }
+  ],
+  "actions": [
+    "Fail closed; do not set CODESTORY_RETRIEVAL=0",
+    "File incident note in docs/testing/retrieval-architecture.md",
+    "Block promotion until root cause resolved"
+  ]
+}

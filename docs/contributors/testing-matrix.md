@@ -68,7 +68,9 @@ cargo test -p codestory-runtime
 cargo test -p codestory-runtime --test retrieval_eval
 ```
 
-Run `retrieval_eval` when search or grounding quality may have changed.
+Run `retrieval_eval` when search or grounding quality may have changed. By default it verifies
+that plain indexing fails closed for sidecar-primary search. To run the full quality assertions,
+prepare real sidecars and set `CODESTORY_RETRIEVAL_EVAL_FULL_TESTS=1`.
 The repo-scale runtime integration test is ignored by default because it indexes the full
 `codestory` workspace and can exhaust memory on developer machines.
 Only run it as an explicit heavy lane:
@@ -87,7 +89,12 @@ cargo build --release -p codestory-cli
 cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
 ```
 
-Append the emitted headline metrics to `docs/testing/codestory-e2e-stats-log.md`. Include graph seconds, semantic seconds, semantic docs reused, semantic docs embedded, total index seconds, and whether `retrieval.semantic_ready` was true.
+The real-repo drill portion fails closed unless `CODESTORY_REAL_REPO_DRILL_CASES`
+points at a prepared manifest. Use `CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1`
+only for intentional local stats-only rows; those rows are not real-drill release
+evidence.
+
+Append the emitted headline metrics to `docs/testing/codestory-e2e-stats-log.md`. Include graph seconds, semantic seconds, semantic docs reused, semantic docs embedded, total index seconds, `retrieval_index_seconds`, `retrieval_status_seconds`, and whether `sidecar_status_after_retrieval_index` plus `search.sidecar_shadow_retrieval_mode` were `full`.
 
 For the current repo-scale baseline, use the latest row in
 [`codestory-e2e-stats-log.md`](../testing/codestory-e2e-stats-log.md). Older

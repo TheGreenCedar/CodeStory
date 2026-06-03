@@ -34,16 +34,18 @@ cargo build --release -p codestory-cli
 $CodeStoryCli = ".\target\release\codestory-cli.exe"
 $TargetWorkspace = "C:\path\to\repo"
 
+cargo retrieval-setup
 & $CodeStoryCli doctor --project $TargetWorkspace
 & $CodeStoryCli setup embeddings --project $TargetWorkspace --dry-run --format json
 & $CodeStoryCli index --project $TargetWorkspace --refresh full
+& $CodeStoryCli retrieval index --project $TargetWorkspace --refresh auto
 & $CodeStoryCli ground --project $TargetWorkspace --why
 ```
 
-The dry run shows whether the managed embedding assets are already installed or
-what CodeStory would download for hybrid retrieval. If managed assets are not
-available and you skip `setup embeddings`, indexing still works and read
-commands report the symbolic or lexical fallback path through `doctor`.
+Current packet/search evidence requires the local Zoekt, Qdrant, SCIP, and
+llama.cpp embedding sidecars to reach `retrieval_mode=full`; missing assets,
+stale manifests, disabled sidecars, or diagnostic embedding modes are setup
+failures to fix before trusting agent context.
 
 After that first index, use narrower commands instead of asking the agent to
 start over:
@@ -59,6 +61,29 @@ evidence is stale or partial, and give the next concrete command when more proof
 is needed.
 
 For task-shaped flows, use [docs/usage.md](docs/usage.md).
+
+## Retrieval sidecars
+
+For Zoekt/Qdrant/SCIP packet retrieval, run once from this repository root
+(Windows, macOS, or Linux):
+
+```sh
+cargo retrieval-setup
+```
+
+`cargo retrieval-setup` builds `codestory-cli` if needed, starts Docker Compose sidecars when
+Docker is available, writes local sidecar state, and waits for health probes. Check status with
+`cargo retrieval-status`.
+
+Bootstrap modifiers (pass through `cargo run`):
+
+```sh
+cargo run -p codestory-cli -- retrieval bootstrap --project . --skip-compose
+cargo run -p codestory-cli -- retrieval bootstrap --project . --wait-secs 120
+```
+
+Thin wrapper (same bootstrap, optional holdout clone): `node scripts/setup-retrieval-env.mjs`.
+Details: [docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md).
 
 ## Install As An Agent Skill
 

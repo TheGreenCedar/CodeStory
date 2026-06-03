@@ -9603,8 +9603,11 @@ mod tests {
                 EnvGuard::remove(EMBEDDING_LAYER_NORM_ENV),
                 EnvGuard::remove(EMBEDDING_TRUNCATE_DIM_ENV),
                 EnvGuard::remove(EMBEDDING_EXPECTED_DIM_ENV),
+                EnvGuard::remove(SEMANTIC_DOC_SCOPE_ENV),
                 EnvGuard::remove(SEMANTIC_DOC_ALIAS_MODE_ENV),
                 EnvGuard::remove(SEMANTIC_DOC_MAX_TOKENS_ENV),
+                EnvGuard::remove(SEMANTIC_STREAM_PENDING_DOCS_ENV),
+                EnvGuard::remove(SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV),
             ],
             _lock: lock,
         }
@@ -9834,6 +9837,9 @@ mod tests {
 
     #[test]
     fn semantic_doc_scope_defaults_to_durable_symbols_and_all_scope_is_opt_in() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _env = EnvGuard::remove(SEMANTIC_DOC_SCOPE_ENV);
         assert_eq!(
             semantic_doc_scope_from_env(),
@@ -10259,12 +10265,13 @@ pub fn beta() {}
     fn write_reindex_semantic_fixture(root: &std::path::Path, digest_text: &str) {
         let src = root.join("src");
         fs::create_dir_all(&src).expect("create src dir");
+        let digest_identifier = digest_text.replace(' ', "_");
         fs::write(
             src.join("lib.rs"),
             format!(
                 r#"
 /// {digest_text}
-pub fn build_snapshot_digest() -> &'static str {{
+pub fn build_snapshot_digest({digest_identifier}: &str) -> &'static str {{
     "{digest_text}"
 }}
 
@@ -13932,13 +13939,23 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("initial full index");
 
         let storage = Storage::open(&storage_path).expect("open storage after initial index");
-        let initial_doc = storage
+        let initial_docs = storage
             .get_all_llm_symbol_docs()
             .expect("load initial semantic docs")
             .into_iter()
-            .find(|doc| doc.display_name == "build_snapshot_digest")
-            .expect("initial digest doc");
-        assert!(initial_doc.doc_text.contains("initial compressed digest"));
+            .filter(|doc| doc.display_name == "build_snapshot_digest")
+            .collect::<Vec<_>>();
+        assert!(!initial_docs.is_empty(), "initial digest doc");
+        assert!(
+            initial_docs
+                .iter()
+                .any(|doc| doc.doc_text.contains("initial_compressed_digest")),
+            "initial digest docs should include fixture source text: {:?}",
+            initial_docs
+                .iter()
+                .map(|doc| doc.doc_text.as_str())
+                .collect::<Vec<_>>()
+        );
         drop(storage);
 
         write_reindex_semantic_fixture(workspace.path(), "updated compressed digest");
@@ -13947,15 +13964,27 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("rerun full index");
 
         let storage = Storage::open(&storage_path).expect("open storage after rerun");
-        let updated_doc = storage
+        let updated_docs = storage
             .get_all_llm_symbol_docs()
             .expect("load updated semantic docs")
             .into_iter()
-            .find(|doc| doc.display_name == "build_snapshot_digest")
-            .expect("updated digest doc");
-        assert!(updated_doc.doc_text.contains("updated compressed digest"));
+            .filter(|doc| doc.display_name == "build_snapshot_digest")
+            .collect::<Vec<_>>();
+        assert!(!updated_docs.is_empty(), "updated digest doc");
         assert!(
-            !updated_doc.doc_text.contains("initial compressed digest"),
+            updated_docs
+                .iter()
+                .any(|doc| doc.doc_text.contains("updated_compressed_digest")),
+            "updated digest docs should include fixture source text: {:?}",
+            updated_docs
+                .iter()
+                .map(|doc| doc.doc_text.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !updated_docs
+                .iter()
+                .any(|doc| doc.doc_text.contains("initial_compressed_digest")),
             "full index should rebuild semantic docs instead of reusing stale persisted content"
         );
     }

@@ -17,7 +17,7 @@ flowchart LR
 User-visible guarantees come from those boundaries:
 
 - Project evidence is stored in a local per-workspace cache.
-- Read commands can report stale, partial, or fallback retrieval state.
+- Read commands can report stale, partial, or non-`full` retrieval state.
 - CLI rendering stays thin; orchestration belongs to runtime.
 - Full refreshes can publish a staged store; incremental refreshes update the
   live store and refresh derived views.

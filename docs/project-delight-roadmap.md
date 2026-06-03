@@ -57,8 +57,8 @@ to trust and harder to misuse:
      current surfaces do not.
 
 5. **Simplify setup**
-   - Managed embeddings, profile selection, and fallback messaging should make
-     first use clear.
+   - Managed embeddings, profile selection, and fail-closed diagnostics should
+     make first use clear.
    - If the model path, backend, or doc shape is stale, `doctor` should say so
      plainly.
 

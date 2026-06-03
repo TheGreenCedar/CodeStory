@@ -118,9 +118,9 @@ codestory-cli doctor --project <target-workspace>
 ```
 
 If `doctor` reports stale inventory, semantic contract mismatch, missing managed
-assets, or a fallback retrieval mode, fix that layer before investigating answer
-quality. Treat the health report as the first source of truth for cache and
-retrieval state.
+assets, or a non-`full` retrieval mode, fix that layer before investigating
+answer quality. Treat the health report as the first source of truth for cache
+and retrieval state.
 
 ## Core Commands
 
@@ -181,32 +181,56 @@ reset, schema change, or suspected stale-state incident.
 
 ## Retrieval Defaults
 
-Hybrid retrieval is the intended default when local embedding assets are
-available. If they are unavailable, CodeStory falls back to symbolic or lexical
-ranking and reports the fallback reason.
+Sidecar retrieval is mandatory for agent-facing packet/search workflows. A
+project is usable only when the local Zoekt, Qdrant, and SCIP sidecars report
+`retrieval_mode=full`; missing sidecars, stale manifests, or embedding-contract
+drift fail closed instead of falling back to an older local search path.
 
-Managed setup:
+Product sidecar setup:
+
+```powershell
+codestory-cli retrieval bootstrap --project <target-workspace>
+$env:CODESTORY_EMBED_BACKEND = "llamacpp"
+$env:CODESTORY_EMBED_LLAMACPP_URL = "http://127.0.0.1:8080/v1/embeddings"
+codestory-cli index --project <target-workspace> --refresh full
+codestory-cli retrieval index --project <target-workspace> --refresh full
+codestory-cli retrieval status --project <target-workspace> --format json
+codestory-cli doctor --project <target-workspace>
+```
+
+Plain `codestory-cli index` builds the core SQLite code index. It does not
+generate or prove sidecar readiness. Run `codestory-cli retrieval index` only
+after the local sidecar services, llama.cpp embedding endpoint, and
+`bge-base-en-v1.5` model configuration are ready, then require `retrieval
+status --format json` to report `retrieval_mode: "full"` before trusting
+agent-facing packet/search evidence.
+
+Legacy managed embedding setup is local semantic/diagnostic only:
 
 ```powershell
 codestory-cli setup embeddings --project <target-workspace> --dry-run --format json
 codestory-cli setup embeddings --project <target-workspace>
-codestory-cli index --project <target-workspace> --refresh full
-codestory-cli doctor --project <target-workspace>
 ```
+
+Those commands install managed ONNX assets. They do not start llama.cpp, create
+the retrieval manifest, or prove product sidecar readiness.
 
 Useful environment knobs:
 
-- `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false`: lexical-only mode.
-- `CODESTORY_EMBED_RUNTIME_MODE=hash`: fast local development semantics.
-- `CODESTORY_EMBED_BACKEND=onnx`, `llamacpp`, or `hash`: backend selection.
-- `CODESTORY_EMBED_PROFILE=bge-base-en-v1.5`: default managed profile unless
-  overridden.
+- `CODESTORY_EMBED_BACKEND=llamacpp`: product embedding sidecar selection.
+- `CODESTORY_EMBED_LLAMACPP_URL=http://127.0.0.1:8080/v1/embeddings`: local
+  bge-base-en-v1.5 embedding endpoint.
 - `CODESTORY_SEMANTIC_DOC_SCOPE=all`: include lower-signal symbols while
   investigating.
 - `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE=<n>`: override only while profiling.
 
+Hash embeddings, ONNX-only experiments, lexical-only switches, and non-sidecar
+embedding paths are diagnostic or historical comparison modes only.
+Agent-facing packet/search evidence requires repaired sidecars and
+`retrieval_mode=full`.
+
 `index`, `ground`, `search`, `context`, and `doctor` report retrieval mode and
-fallback notes when retrieval state is available.
+degraded-state notes when retrieval state is available.
 
 ## Workspace And Config
 
@@ -270,8 +294,8 @@ Low-memory guidance:
 
 - Prefer `index --refresh incremental` over repeated full refreshes.
 - Avoid running multiple Cargo commands at once in this repo.
-- If embedding assets are unavailable or too heavy, symbolic retrieval remains
-  supported and is reported explicitly.
+- If embedding assets or retrieval sidecars are unavailable, fix that setup
+  layer before using packet/search evidence for broad agent grounding.
 - If a cold index is slow, inspect semantic timing before changing parser or
   graph code.
 
@@ -299,6 +323,10 @@ cargo test -p codestory-indexer --test fidelity_regression
 cargo test -p codestory-indexer --test tictactoe_language_coverage
 cargo test -p codestory-runtime --test retrieval_eval
 ```
+
+`retrieval_eval` runs a fail-closed sidecar-primary check by default. Set
+`CODESTORY_RETRIEVAL_EVAL_FULL_TESTS=1` only in an environment with real full sidecars to run the
+semantic quality assertions.
 
 Heavy repo-scale timing lane:
 

@@ -3,7 +3,7 @@
 ## Project Structure & Module Organization
 - Rust workspace is defined in `Cargo.toml`; crates live under `crates/`.
 - Primary runtime surface is `crates/codestory-cli`; the repo-local skill lives under `.agents/skills/codestory-grounding`.
-- Workspace crates: `codestory-contracts`, `codestory-workspace`, `codestory-store`, `codestory-indexer`, `codestory-runtime`, `codestory-cli`, `codestory-bench`.
+- Workspace crates: `codestory-contracts`, `codestory-workspace`, `codestory-store`, `codestory-indexer`, `codestory-retrieval`, `codestory-runtime`, `codestory-cli`, `codestory-bench`.
 - Runtime artifacts: user-cache SQLite grounding indexes keyed by repo path; build outputs in `target/`.
 
 ## Architecture Overview
@@ -38,6 +38,9 @@
 ## Commit & Pull Request Guidelines
 - Commit messages are short, lowercase, imperative (e.g., `fix minimap`, `refactor graph style`).
 - PRs should include a summary, tests run, linked issues, and relevant artifacts for behavior changes.
+
+## Retrieval documentation
+- Canonical sidecar retrieval docs are `docs/architecture/retrieval-design.md`, `docs/architecture/retrieval-parser-compat-matrix.md`, `docs/testing/retrieval-architecture.md`, and `docs/ops/retrieval-sidecars.md`.
 
 ## Security & Configuration Tips
 - Keep secrets out of the repo; pass credentials via environment variables.
