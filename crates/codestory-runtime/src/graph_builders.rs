@@ -246,6 +246,106 @@ pub(super) fn graph_trail(
     Ok(response)
 }
 
+pub(super) fn graph_direct_references(
+    controller: &AppController,
+    req: TrailConfigDto,
+) -> Result<GraphResponse, ApiError> {
+    let root_id = req.root_id.to_core()?;
+    let graph_flags = app_graph_flags();
+    let edge_filter = req
+        .edge_filter
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<_>>();
+    let storage = controller.open_storage()?;
+    let mut edges = storage
+        .get_incoming_edges_for_node_id(
+            root_id,
+            &edge_filter,
+            req.caller_scope.into(),
+            req.show_utility_calls,
+        )
+        .map_err(|e| ApiError::internal(format!("Failed to load incoming references: {e}")))?;
+    edges.sort_by_key(|edge| edge.id.0);
+
+    let max_nodes = req.max_nodes.clamp(10, 100_000) as usize;
+    let mut selected_node_ids = Vec::with_capacity(max_nodes.min(edges.len().saturating_add(1)));
+    let mut selected = HashSet::new();
+    selected_node_ids.push(root_id);
+    selected.insert(root_id);
+
+    let mut retained_edges = Vec::new();
+    let mut truncated = false;
+    let mut omitted_edge_count = 0u32;
+    for edge in edges {
+        let edge = edge.with_effective_endpoints();
+        let (source, target) = (edge.source, edge.target);
+        if target != root_id || source == root_id {
+            continue;
+        }
+        if !selected.contains(&source) {
+            if selected_node_ids.len() >= max_nodes {
+                truncated = true;
+                omitted_edge_count = omitted_edge_count.saturating_add(1);
+                continue;
+            }
+            selected.insert(source);
+            selected_node_ids.push(source);
+        }
+        retained_edges.push(edge);
+    }
+
+    let mut node_dtos = Vec::with_capacity(selected_node_ids.len());
+    for id in selected_node_ids {
+        let (label, kind, file_path, qualified_name, member_access) = match storage.get_node(id) {
+            Ok(Some(node)) => {
+                let access = storage.get_component_access(node.id).ok().flatten();
+                (
+                    node_display_name(&node),
+                    NodeKind::from(node.kind),
+                    AppController::file_path_for_node(&storage, &node)
+                        .ok()
+                        .flatten(),
+                    node.qualified_name,
+                    member_access_dto(access),
+                )
+            }
+            _ => (id.0.to_string(), NodeKind::UNKNOWN, None, None, None),
+        };
+
+        node_dtos.push(GraphNodeDto {
+            id: NodeId::from(id),
+            label,
+            kind,
+            depth: if id == root_id { 0 } else { 1 },
+            label_policy: Some("qualified_or_serialized".to_string()),
+            badge_visible_members: None,
+            badge_total_members: None,
+            merged_symbol_examples: Vec::new(),
+            file_path,
+            qualified_name,
+            member_access,
+        });
+    }
+
+    let edge_dtos = retained_edges
+        .into_iter()
+        .map(|edge| graph_edge_dto(edge, graph_flags))
+        .collect::<Vec<_>>();
+    let mut response = GraphResponse {
+        center_id: NodeId::from(root_id),
+        nodes: node_dtos,
+        edges: edge_dtos,
+        truncated,
+        omitted_edge_count,
+        canonical_layout: None,
+    };
+    if req.hide_speculative {
+        response = hide_speculative_trail_edges(response);
+    }
+    Ok(suppress_default_trail_noise(response))
+}
+
 fn suppress_default_trail_noise(mut response: GraphResponse) -> GraphResponse {
     let original_edge_count = response.edges.len();
     let mut seen = HashSet::new();

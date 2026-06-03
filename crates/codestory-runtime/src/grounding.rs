@@ -1,6 +1,8 @@
 use super::*;
 use crate::trail_story::build_trail_story;
 use codestory_contracts::api::SearchHitOrigin;
+#[cfg(test)]
+use codestory_store::FileRole;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -855,6 +857,9 @@ impl AppController {
                     codestory_contracts::api::RetrievalFallbackReasonDto::MissingSemanticDocs => {
                         "missing_semantic_docs"
                     }
+                    codestory_contracts::api::RetrievalFallbackReasonDto::DegradedRuntime => {
+                        "degraded_runtime"
+                    }
                 };
                 retrieval_note.push_str(&format!(" fallback={reason}."));
             }
@@ -907,7 +912,7 @@ impl AppController {
             .collect::<Result<Vec<_>, ApiError>>()?;
 
         let related_hits = self
-            .lexical_symbol_hits(&node.display_name, 6)?
+            .resolve_indexed_symbol_candidates(&node.display_name, 6)?
             .into_iter()
             .filter(|hit| hit.node_id != node_id)
             .take(6)
@@ -1254,6 +1259,7 @@ mod tests {
             indexed: true,
             complete: true,
             line_count: 10,
+            file_role: FileRole::Source,
         })?;
         storage.insert_nodes_batch(&[
             Node {
@@ -1678,6 +1684,7 @@ mod tests {
                     indexed: true,
                     complete: true,
                     line_count: 10,
+                    file_role: FileRole::Source,
                 })
                 .expect("insert file");
             storage
@@ -1753,6 +1760,7 @@ mod tests {
                         indexed: true,
                         complete: true,
                         line_count: 10,
+                        file_role: FileRole::Source,
                     })
                     .expect("insert file");
                 storage
@@ -1865,6 +1873,7 @@ mod tests {
                     indexed: true,
                     complete: true,
                     line_count: 10,
+                    file_role: FileRole::Source,
                 })
                 .expect("insert file");
             storage
@@ -1962,6 +1971,7 @@ mod tests {
                     indexed: true,
                     complete: true,
                     line_count: 10,
+                    file_role: FileRole::Source,
                 })
                 .expect("insert file");
             storage
@@ -2050,6 +2060,7 @@ mod tests {
                     indexed: true,
                     complete: true,
                     line_count: 10,
+                    file_role: FileRole::Source,
                 })
                 .expect("insert file");
             storage
@@ -2173,6 +2184,7 @@ mod tests {
                     indexed: true,
                     complete: true,
                     line_count: 10,
+                    file_role: FileRole::Source,
                 })
                 .expect("insert file");
             storage

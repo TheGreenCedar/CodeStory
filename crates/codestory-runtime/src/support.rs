@@ -1,4 +1,6 @@
+#[cfg(test)]
 use crate::search_runtime::HybridSearchConfig;
+#[cfg(test)]
 use codestory_contracts::api::{AgentHybridWeightsDto, SearchHybridLimitsDto};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -21,6 +23,7 @@ fn env_flag_enabled(var_name: &str, default: bool) -> bool {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn normalized_hybrid_weights(
     request_weights: Option<AgentHybridWeightsDto>,
     fallback: &HybridSearchConfig,
@@ -52,6 +55,7 @@ pub(crate) fn normalized_hybrid_weights(
     (lexical / sum, semantic / sum, graph / sum)
 }
 
+#[cfg(test)]
 pub(crate) fn apply_hybrid_limits(
     request_limits: Option<SearchHybridLimitsDto>,
     config: &mut HybridSearchConfig,

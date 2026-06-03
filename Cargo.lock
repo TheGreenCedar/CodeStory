@@ -498,6 +498,7 @@ dependencies = [
  "anyhow",
  "codestory-contracts",
  "codestory-indexer",
+ "codestory-retrieval",
  "codestory-store",
  "codestory-workspace",
  "crossbeam-channel",

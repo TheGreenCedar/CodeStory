@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CodeStory Eval Probe Manifest",
+  "type": "object",
+  "required": [
+    "flow_hint_rules",
+    "required_probe_rules",
+    "citation_rank_adjustments"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "description": { "type": "string" },
+    "flow_hint_rules": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/probe_rule" }
+    },
+    "required_probe_rules": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/probe_rule" }
+    },
+    "citation_rank_adjustments": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/rank_adjustment" }
+    }
+  },
+  "$defs": {
+    "probe_rule": {
+      "type": "object",
+      "required": ["all_terms", "any_terms", "queries"],
+      "additionalProperties": false,
+      "properties": {
+        "all_terms": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "any_terms": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "queries": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1
+        }
+      }
+    },
+    "rank_adjustment": {
+      "type": "object",
+      "required": ["normalized_display", "path", "boost"],
+      "additionalProperties": false,
+      "properties": {
+        "normalized_display": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "boost": { "type": "number" }
+      }
+    }
+  }
+}

@@ -1,6 +1,8 @@
 use codestory_contracts::graph::NodeKind;
 use std::collections::HashSet;
 
+use crate::symbol_query::symbol_query_tokens;
+
 pub(crate) fn semantic_doc_language_from_path(path: Option<&str>) -> Option<&'static str> {
     let ext = path?
         .rsplit('.')
@@ -631,8 +633,13 @@ pub(crate) fn runtime_concept_phrases(
                 );
             }
             "get indexer command provider"
-                if qualified_name
-                    .is_some_and(|name| name.contains("SourceGroupCxxCdb::getIndexerCommandProvider")) =>
+                if semantic_qualified_name_has_terms(
+                    qualified_name,
+                    &["source", "group", "indexer", "command", "provider"],
+                ) && semantic_qualified_name_has_any_term(
+                    qualified_name,
+                    &["cxx", "cdb", "compile", "database"],
+                ) =>
             {
                 push_unique_alias(
                     &mut phrases,
@@ -783,8 +790,10 @@ pub(crate) fn runtime_concept_phrases(
                 );
             }
             "get full text search locations"
-                if qualified_name
-                    .is_some_and(|name| name.contains("StorageAccess::getFullTextSearchLocations")) =>
+                if semantic_qualified_name_has_terms(
+                    qualified_name,
+                    &["storage", "access", "full", "text", "search", "locations"],
+                ) =>
             {
                 push_unique_alias(
                     &mut phrases,
@@ -800,8 +809,10 @@ pub(crate) fn runtime_concept_phrases(
                 );
             }
             "get autocompletion matches"
-                if qualified_name
-                    .is_some_and(|name| name.contains("StorageAccess::getAutocompletionMatches")) =>
+                if semantic_qualified_name_has_terms(
+                    qualified_name,
+                    &["storage", "access", "autocompletion", "matches"],
+                ) =>
             {
                 push_unique_alias(
                     &mut phrases,
@@ -862,6 +873,26 @@ pub(crate) fn runtime_concept_phrases(
     phrases
 }
 
+fn semantic_qualified_name_has_terms(qualified_name: Option<&str>, required: &[&str]) -> bool {
+    let Some(name) = qualified_name else {
+        return false;
+    };
+    let tokens = symbol_query_tokens(name);
+    required
+        .iter()
+        .all(|term| tokens.iter().any(|token| token == term))
+}
+
+fn semantic_qualified_name_has_any_term(qualified_name: Option<&str>, required: &[&str]) -> bool {
+    let Some(name) = qualified_name else {
+        return false;
+    };
+    let tokens = symbol_query_tokens(name);
+    required
+        .iter()
+        .any(|term| tokens.iter().any(|token| token == term))
+}
+
 pub(crate) fn semantic_path_aliases(file_path: Option<&str>, limit: usize) -> Vec<String> {
     let Some(path) = file_path else {
         return Vec::new();
@@ -906,66 +937,13 @@ fn push_unique_alias(aliases: &mut Vec<String>, seen: &mut HashSet<String>, alia
     aliases.push(alias.to_string());
 }
 
-fn split_identifier_segment(segment: &str) -> Vec<String> {
-    let chars = segment.chars().collect::<Vec<_>>();
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-
-    for (idx, ch) in chars.iter().copied().enumerate() {
-        if !ch.is_ascii_alphanumeric() {
-            if !current.is_empty() {
-                tokens.push(current.to_ascii_lowercase());
-                current.clear();
-            }
-            continue;
-        }
-
-        let prev = idx.checked_sub(1).and_then(|prev| chars.get(prev)).copied();
-        let next = chars.get(idx + 1).copied();
-        let starts_new_token = !current.is_empty()
-            && prev.is_some_and(|prev| {
-                (prev.is_ascii_lowercase() && ch.is_ascii_uppercase())
-                    || (prev.is_ascii_digit() && ch.is_ascii_alphabetic())
-                    || (prev.is_ascii_alphabetic() && ch.is_ascii_digit())
-                    || (prev.is_ascii_uppercase()
-                        && ch.is_ascii_uppercase()
-                        && next.is_some_and(|next| next.is_ascii_lowercase()))
-            });
-        if starts_new_token {
-            tokens.push(current.to_ascii_lowercase());
-            current.clear();
-        }
-        current.push(ch);
-    }
-
-    if !current.is_empty() {
-        tokens.push(current.to_ascii_lowercase());
-    }
-
-    tokens
-}
-
-fn symbol_alias_tokens(value: &str) -> Vec<String> {
-    let normalized = value.replace("::", " ").replace("->", " ").replace(
-        [
-            '.', '#', '/', '\\', '_', '-', ':', '<', '>', '(', ')', '[', ']', '{', '}',
-        ],
-        " ",
-    );
-    normalized
-        .split_whitespace()
-        .flat_map(split_identifier_segment)
-        .filter(|token| !token.is_empty())
-        .collect()
-}
-
 fn normalized_symbol_alias(value: &str) -> Option<String> {
-    let alias = symbol_alias_tokens(value).join(" ");
+    let alias = symbol_query_tokens(value).join(" ");
     (!alias.is_empty()).then_some(alias)
 }
 
 fn expanded_symbol_aliases(value: &str) -> Vec<String> {
-    let tokens = symbol_alias_tokens(value);
+    let tokens = symbol_query_tokens(value);
     if tokens.is_empty() {
         return Vec::new();
     }

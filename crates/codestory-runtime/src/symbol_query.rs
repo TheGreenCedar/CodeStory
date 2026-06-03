@@ -1,5 +1,6 @@
 use codestory_contracts::api::{NodeKind, SearchHit, SearchHitOrigin};
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -12,21 +13,39 @@ pub struct SymbolNameMatchRank {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SearchMatchRank {
+    full_definition: u8,
     definition_quality: u8,
+    qualified_prefix_path: u8,
     exact_display: u8,
     exact_terminal: u8,
+    exact_leading: u8,
+    source_bucket: u8,
     camel_case_match: u8,
     compound_term_match: u8,
     path_term_match: u8,
     architecture_role_intent: u8,
     architecture_source_bucket: u8,
-    source_bucket: u8,
     query_kind_intent: u8,
     query_entrypoint_intent: u8,
     kind_bucket: u8,
-    exact_leading: u8,
     kind_tiebreak: u8,
     indexed_symbol: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrievalFileRole {
+    Source,
+    Test,
+    Docs,
+    Benchmark,
+    Generated,
+    Vendor,
+}
+
+impl RetrievalFileRole {
+    pub fn is_non_primary(self) -> bool {
+        !matches!(self, Self::Source)
+    }
 }
 
 pub fn normalize_symbol_query(value: &str) -> String {
@@ -49,7 +68,60 @@ pub fn leading_symbol_segment(value: &str) -> String {
         .unwrap_or_default()
 }
 
-pub fn symbol_name_match_rank(query: &str, display_name: &str) -> SymbolNameMatchRank {
+pub fn symbol_query_tokens(value: &str) -> Vec<String> {
+    let normalized = value.replace("::", " ").replace("->", " ").replace(
+        [
+            '.', '#', '/', '\\', '_', '-', ':', '<', '>', '(', ')', '[', ']', '{', '}',
+        ],
+        " ",
+    );
+    normalized
+        .split_whitespace()
+        .flat_map(split_identifier_segment)
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn split_identifier_segment(segment: &str) -> Vec<String> {
+    let chars = segment.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+
+    for (idx, ch) in chars.iter().copied().enumerate() {
+        if !ch.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                tokens.push(current.to_ascii_lowercase());
+                current.clear();
+            }
+            continue;
+        }
+
+        let prev = idx.checked_sub(1).and_then(|prev| chars.get(prev)).copied();
+        let next = chars.get(idx + 1).copied();
+        let starts_new_token = !current.is_empty()
+            && prev.is_some_and(|prev| {
+                (prev.is_ascii_lowercase() && ch.is_ascii_uppercase())
+                    || (prev.is_ascii_digit() && ch.is_ascii_alphabetic())
+                    || (prev.is_ascii_alphabetic() && ch.is_ascii_digit())
+                    || (prev.is_ascii_uppercase()
+                        && ch.is_ascii_uppercase()
+                        && next.is_some_and(|next| next.is_ascii_lowercase()))
+            });
+        if starts_new_token {
+            tokens.push(current.to_ascii_lowercase());
+            current.clear();
+        }
+        current.push(ch);
+    }
+
+    if !current.is_empty() {
+        tokens.push(current.to_ascii_lowercase());
+    }
+
+    tokens
+}
+
+fn symbol_name_match_rank_single(query: &str, display_name: &str) -> SymbolNameMatchRank {
     let query = normalize_symbol_query(query);
     let display = normalize_symbol_query(display_name);
     let terminal = terminal_symbol_segment(display_name);
@@ -60,6 +132,232 @@ pub fn symbol_name_match_rank(query: &str, display_name: &str) -> SymbolNameMatc
         exact_terminal: u8::from(terminal == query),
         exact_leading: u8::from(leading == query),
     }
+}
+
+fn best_symbol_name_match(query: &str, display_name: &str) -> (SymbolNameMatchRank, String) {
+    let trimmed = trim_symbol_candidate(query);
+    let mut best_query = trimmed.to_string();
+    let mut best_rank = symbol_name_match_rank_single(trimmed, display_name);
+
+    for term in exact_symbol_query_terms(query) {
+        let rank = symbol_name_match_rank_single(&term, display_name);
+        if rank > best_rank {
+            best_rank = rank;
+            best_query = term;
+        }
+    }
+
+    (best_rank, best_query)
+}
+
+pub fn symbol_name_match_rank(query: &str, display_name: &str) -> SymbolNameMatchRank {
+    best_symbol_name_match(query, display_name).0
+}
+
+pub(crate) fn exact_symbol_query_terms(query: &str) -> Vec<String> {
+    let trimmed = trim_symbol_candidate(query);
+    if looks_like_standalone_symbol_query(trimmed) {
+        let mut terms = Vec::new();
+        let mut seen = HashSet::new();
+        push_exact_symbol_query_term(trimmed, &mut terms, &mut seen);
+        if let Some((_, terminal)) = qualified_symbol_query_parts(trimmed) {
+            push_exact_symbol_query_term(terminal, &mut terms, &mut seen);
+        }
+        return terms;
+    }
+
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+    let mut candidate = String::new();
+    for ch in query.chars() {
+        if is_symbol_query_char(ch) {
+            candidate.push(ch);
+            continue;
+        }
+        push_embedded_symbol_candidate(&candidate, &mut terms, &mut seen);
+        candidate.clear();
+    }
+    push_embedded_symbol_candidate(&candidate, &mut terms, &mut seen);
+    terms
+}
+
+fn push_exact_symbol_query_term(raw: &str, terms: &mut Vec<String>, seen: &mut HashSet<String>) {
+    let candidate = trim_symbol_candidate(raw);
+    if !looks_like_standalone_symbol_query(candidate) {
+        return;
+    }
+    let normalized = normalize_symbol_query(candidate);
+    if seen.insert(normalized) {
+        terms.push(candidate.to_string());
+    }
+}
+
+pub(crate) fn looks_like_standalone_symbol_query(query: &str) -> bool {
+    let trimmed = trim_symbol_candidate(query);
+    !trimmed.is_empty()
+        && !trimmed.chars().any(char::is_whitespace)
+        && trimmed.chars().any(|ch| ch.is_ascii_alphabetic())
+        && trimmed.chars().all(is_symbol_query_char)
+}
+
+/// Natural-language prompt with embedded symbol-like tokens (not a standalone symbol query).
+#[cfg(test)]
+pub(crate) fn mixed_natural_language_query(query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || looks_like_standalone_symbol_query(trimmed) {
+        return false;
+    }
+    if !trimmed.contains(char::is_whitespace) {
+        return false;
+    }
+    !exact_symbol_query_terms(query).is_empty()
+}
+
+fn push_embedded_symbol_candidate(raw: &str, terms: &mut Vec<String>, seen: &mut HashSet<String>) {
+    let candidate = trim_symbol_candidate(raw);
+    if terms.len() >= 8
+        || !looks_like_standalone_symbol_query(candidate)
+        || !has_embedded_exact_symbol_signal(candidate)
+    {
+        return;
+    }
+
+    let normalized = normalize_symbol_query(candidate);
+    if seen.insert(normalized) {
+        terms.push(candidate.to_string());
+    }
+}
+
+fn trim_symbol_candidate(value: &str) -> &str {
+    value
+        .trim()
+        .trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'))
+}
+
+fn is_symbol_query_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '.' | '$')
+}
+
+fn has_embedded_exact_symbol_signal(value: &str) -> bool {
+    value.contains('_')
+        || value.contains("::")
+        || value.contains('.')
+        || value.contains('$')
+        || value.chars().skip(1).any(|ch| ch.is_ascii_uppercase())
+}
+
+fn qualified_symbol_query_parts(query: &str) -> Option<(&str, &str)> {
+    let trimmed = trim_symbol_candidate(query);
+    let index = trimmed.rfind("::")?;
+    let prefix = trimmed[..index].trim();
+    let terminal = trimmed[index + 2..].trim();
+    if prefix.is_empty() || terminal.is_empty() {
+        return None;
+    }
+    Some((prefix, terminal))
+}
+
+pub fn retrieval_file_role_from_path(path: &str) -> RetrievalFileRole {
+    let normalized = normalize_retrieval_path(path);
+    let marked = format!("/{normalized}");
+    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+
+    if path_contains_any(
+        &marked,
+        &[
+            "/node_modules/",
+            "/src/external/",
+            "/external/",
+            "/vendor/",
+            "/vendors/",
+            "/third_party/",
+            "/third-party/",
+        ],
+    ) {
+        return RetrievalFileRole::Vendor;
+    }
+
+    if path_contains_any(&marked, &["/target/", "/dist/", "/build/", "/generated/"])
+        || marked.contains("/schema/typescript/")
+        || marked.contains(".generated.")
+        || file_name.contains("generated")
+        || file_name.contains("payload-types")
+        || file_name.ends_with(".g.cs")
+    {
+        return RetrievalFileRole::Generated;
+    }
+
+    if path_contains_any(
+        &marked,
+        &["/benches/", "/bench/", "/benchmarks/", "/benchmark/"],
+    ) || (marked.contains("/scripts/")
+        && (marked.contains("bench") || marked.contains("benchmark")))
+    {
+        return RetrievalFileRole::Benchmark;
+    }
+
+    if path_contains_any(
+        &marked,
+        &[
+            "/bin/test/",
+            "/test/data/",
+            "/tests/",
+            "/test/",
+            "/spec/",
+            "/fixtures/",
+            "/fixture/",
+            "/examples/",
+            "/example/",
+            "/__tests__/",
+            "/__test__/",
+            "-test-client/",
+            "_test_client/",
+        ],
+    ) || file_name.contains(".test.")
+        || file_name.contains(".spec.")
+        || file_name.ends_with("_test.rs")
+        || file_name.ends_with("_tests.rs")
+        || file_name.ends_with("_test.py")
+        || file_name.ends_with("_tests.py")
+        || file_name.ends_with("_test.ts")
+        || file_name.ends_with("_tests.ts")
+        || file_name.ends_with("_test.tsx")
+        || file_name.ends_with("_tests.tsx")
+        || file_name.ends_with("test.java")
+        || file_name.ends_with("tests.java")
+    {
+        return RetrievalFileRole::Test;
+    }
+
+    if path_contains_any(&marked, &["/docs/", "/doc/"])
+        || matches!(file_name, "readme.md" | "changelog.md")
+    {
+        return RetrievalFileRole::Docs;
+    }
+
+    RetrievalFileRole::Source
+}
+
+pub fn retrieval_file_role_for_hit(hit: &SearchHit) -> RetrievalFileRole {
+    if hit.display_name.starts_with("tests::") {
+        return RetrievalFileRole::Test;
+    }
+    hit.file_path
+        .as_deref()
+        .map(retrieval_file_role_from_path)
+        .unwrap_or(RetrievalFileRole::Source)
+}
+
+fn normalize_retrieval_path(path: &str) -> String {
+    path.trim_start_matches("\\\\?\\")
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn path_contains_any(path: &str, markers: &[&str]) -> bool {
+    markers.iter().any(|marker| path.contains(marker))
 }
 
 pub fn compare_ranked_hits<T: Ord>(
@@ -578,12 +876,15 @@ pub(crate) fn query_mentions_non_primary_source(query: &str) -> bool {
     })
 }
 
-fn is_non_primary_source_term(term: &str) -> bool {
+pub(crate) fn is_non_primary_source_term(term: &str) -> bool {
     matches!(
         term,
         "test"
             | "tests"
             | "testing"
+            | "doc"
+            | "docs"
+            | "documentation"
             | "example"
             | "examples"
             | "sample"
@@ -599,6 +900,7 @@ fn is_non_primary_source_term(term: &str) -> bool {
             | "vendor"
             | "vendors"
             | "vendored"
+            | "generated"
             | "thirdparty"
             | "third_party"
             | "third-party"
@@ -606,17 +908,30 @@ fn is_non_primary_source_term(term: &str) -> bool {
 }
 
 fn is_non_primary_source_exclusion_context(terms: &[String], index: usize) -> bool {
-    let start = index.saturating_sub(3);
-    terms[start..index].iter().any(|term| {
+    let start = index.saturating_sub(8);
+    let end = (index + 9).min(terms.len());
+    terms[start..end].iter().any(|term| {
         matches!(
             term.as_str(),
             "avoid"
                 | "demote"
+                | "demotes"
+                | "demoted"
+                | "downrank"
+                | "downranking"
                 | "exclude"
                 | "excluding"
                 | "hide"
                 | "ignore"
                 | "omit"
+                | "pollute"
+                | "pollution"
+                | "precision"
+                | "primary"
+                | "prod"
+                | "production"
+                | "role"
+                | "roles"
                 | "skip"
                 | "without"
         )
@@ -624,45 +939,17 @@ fn is_non_primary_source_exclusion_context(terms: &[String], index: usize) -> bo
 }
 
 pub(crate) fn is_non_primary_source_hit(hit: &SearchHit) -> bool {
-    if hit.display_name.starts_with("tests::") {
-        return true;
-    }
-
-    hit.file_path
-        .as_deref()
-        .map(|path| {
-            let path = format!("/{}", path.replace('\\', "/").to_ascii_lowercase());
-            let non_primary_marker = [
-                "/bin/test/",
-                "/test/data/",
-                "/tests/",
-                "/fixtures/",
-                "/fixture/",
-                "/examples/",
-                "/example/",
-                "/src/external/",
-                "/external/",
-                "/vendor/",
-                "/vendors/",
-                "/third_party/",
-                "/third-party/",
-            ]
-            .iter()
-            .any(|marker| path.contains(marker));
-            let script_benchmark_harness = path.contains("/scripts/")
-                && (path.contains("bench") || path.contains("benchmark"));
-
-            non_primary_marker || script_benchmark_harness
-        })
-        .unwrap_or(false)
+    retrieval_file_role_for_hit(hit).is_non_primary()
 }
 
 fn search_match_rank(project_root: Option<&Path>, query: &str, hit: &SearchHit) -> SearchMatchRank {
-    let rank = symbol_name_match_rank(query, &hit.display_name);
+    let (rank, matched_symbol_query) = best_symbol_name_match(query, &hit.display_name);
     let is_exact_match =
         rank.exact_display != 0 || rank.exact_terminal != 0 || rank.exact_leading != 0;
+    let full_definition = full_definition_bucket(project_root, query, hit);
     let definition_quality =
-        exact_definition_quality_bucket(project_root, query, hit, is_exact_match);
+        exact_definition_quality_bucket(project_root, &matched_symbol_query, hit, is_exact_match);
+    let qualified_prefix_path = qualified_prefix_path_bucket(query, hit);
     let source_bucket = u8::from(
         is_exact_match
             || query_mentions_non_primary_source(query)
@@ -686,22 +973,91 @@ fn search_match_rank(project_root: Option<&Path>, query: &str, hit: &SearchHit) 
     };
 
     SearchMatchRank {
+        full_definition,
         definition_quality,
+        qualified_prefix_path,
         exact_display: rank.exact_display,
         exact_terminal: rank.exact_terminal,
+        exact_leading: rank.exact_leading,
+        source_bucket,
         camel_case_match: camel_case_match_bucket(query, &hit.display_name, is_exact_match),
         compound_term_match: compound_term_match_bucket(query, &hit.display_name, is_exact_match),
         path_term_match: path_term_match_bucket(query, hit, is_exact_match),
         architecture_role_intent,
         architecture_source_bucket,
-        source_bucket,
         query_kind_intent,
         query_entrypoint_intent,
         kind_bucket,
-        exact_leading: rank.exact_leading,
         kind_tiebreak,
         indexed_symbol: u8::from(hit.origin == SearchHitOrigin::IndexedSymbol),
     }
+}
+
+fn full_definition_bucket(project_root: Option<&Path>, query: &str, hit: &SearchHit) -> u8 {
+    if normalize_symbol_query(&hit.display_name) != normalize_symbol_query(query) {
+        return 0;
+    }
+    if is_type_like_kind(hit.kind) {
+        return type_hit_line_quality(project_root, query, hit);
+    }
+    let Some(trimmed) = hit_source_line_without_comment(project_root, hit) else {
+        return 1;
+    };
+    if is_import_or_reexport_line(&trimmed) {
+        return 0;
+    }
+    2
+}
+
+fn qualified_prefix_path_bucket(query: &str, hit: &SearchHit) -> u8 {
+    let Some((prefix, terminal)) = qualified_symbol_query_parts(query) else {
+        return 0;
+    };
+    if terminal_symbol_segment(&hit.display_name) != normalize_symbol_query(terminal) {
+        return 0;
+    }
+    let Some(path) = hit.file_path.as_deref() else {
+        return 0;
+    };
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return 0;
+    }
+
+    let normalized_prefix = normalize_symbol_query(prefix);
+    let hyphenated_prefix = normalized_prefix.replace('_', "-");
+    if !hyphenated_prefix.is_empty() && segments.iter().any(|segment| *segment == hyphenated_prefix)
+    {
+        return 3;
+    }
+
+    let trailing_prefix_segment = normalized_prefix
+        .rsplit('_')
+        .next()
+        .unwrap_or(normalized_prefix.as_str())
+        .replace('_', "-");
+    if trailing_prefix_segment.len() >= 3
+        && segments
+            .iter()
+            .any(|segment| *segment == trailing_prefix_segment)
+    {
+        return 2;
+    }
+
+    let compact_prefix = compact_alphanumeric(prefix);
+    if compact_prefix.len() >= 3
+        && segments
+            .iter()
+            .any(|segment| compact_alphanumeric(segment) == compact_prefix)
+    {
+        return 1;
+    }
+
+    0
 }
 
 fn exact_definition_quality_bucket(
@@ -955,6 +1311,19 @@ mod tests {
     ) -> SearchHit {
         let mut hit = hit(id, display_name, kind, score);
         hit.file_path = Some(path.to_string());
+        hit
+    }
+
+    fn hit_at_path_line(
+        id: &str,
+        display_name: &str,
+        kind: NodeKind,
+        score: f32,
+        path: &str,
+        line: u32,
+    ) -> SearchHit {
+        let mut hit = hit_at_path(id, display_name, kind, score, path);
+        hit.line = Some(line);
         hit
     }
 
@@ -1321,6 +1690,136 @@ mod tests {
     }
 
     #[test]
+    fn qualified_symbol_terms_include_terminal_for_definition_resolution() {
+        assert_eq!(
+            exact_symbol_query_terms("codex_exec::Cli"),
+            vec!["codex_exec::Cli".to_string(), "Cli".to_string()]
+        );
+        assert_eq!(
+            exact_symbol_query_terms("Subcommand::Exec"),
+            vec!["Subcommand::Exec".to_string(), "Exec".to_string()]
+        );
+    }
+
+    #[test]
+    fn qualified_symbol_query_prefers_matching_crate_definition_over_import_alias() {
+        let temp = tempdir().expect("create temp dir");
+        let project_root = temp.path();
+        fs::create_dir_all(project_root.join("codex-rs/exec/src")).expect("create exec dirs");
+        fs::create_dir_all(project_root.join("codex-rs/file-search/src"))
+            .expect("create file-search dirs");
+        fs::write(
+            project_root.join("codex-rs/exec/src/main.rs"),
+            "use codex_exec::Cli;\n",
+        )
+        .expect("write import");
+        fs::write(
+            project_root.join("codex-rs/exec/src/cli.rs"),
+            "pub struct Cli {\n}\n",
+        )
+        .expect("write target struct");
+        fs::write(
+            project_root.join("codex-rs/file-search/src/cli.rs"),
+            "pub struct Cli {\n}\n",
+        )
+        .expect("write distractor struct");
+
+        let import_alias = hit_at_path_line(
+            "import",
+            "codex_exec::Cli",
+            NodeKind::MODULE,
+            0.85,
+            "codex-rs/exec/src/main.rs",
+            1,
+        );
+        let target_definition = hit_at_path_line(
+            "target",
+            "Cli",
+            NodeKind::STRUCT,
+            0.80,
+            "codex-rs/exec/src/cli.rs",
+            1,
+        );
+        let higher_scored_distractor = hit_at_path_line(
+            "distractor",
+            "Cli",
+            NodeKind::STRUCT,
+            0.99,
+            "codex-rs/file-search/src/cli.rs",
+            1,
+        );
+
+        let mut hits = [
+            import_alias,
+            higher_scored_distractor,
+            target_definition.clone(),
+        ];
+        hits.sort_by(|left, right| {
+            compare_search_hits_with_project_root(
+                Some(project_root),
+                "codex_exec::Cli",
+                left,
+                right,
+            )
+        });
+
+        assert_eq!(
+            hits.first().map(|hit| &hit.node_id),
+            Some(&target_definition.node_id)
+        );
+    }
+
+    #[test]
+    fn qualified_symbol_query_keeps_full_exact_non_import_definition_first() {
+        let temp = tempdir().expect("create temp dir");
+        let project_root = temp.path();
+        fs::create_dir_all(project_root.join("codex-rs/cli/src")).expect("create cli dirs");
+        fs::create_dir_all(project_root.join("codex-rs/core/src")).expect("create core dirs");
+        fs::write(
+            project_root.join("codex-rs/cli/src/main.rs"),
+            "enum Subcommand {\n    Exec(ExecCli),\n}\n",
+        )
+        .expect("write enum");
+        fs::write(
+            project_root.join("codex-rs/core/src/exec.rs"),
+            "pub fn exec() {}\n",
+        )
+        .expect("write function");
+
+        let exact_variant = hit_at_path_line(
+            "variant",
+            "Subcommand::Exec",
+            NodeKind::ENUM_CONSTANT,
+            0.80,
+            "codex-rs/cli/src/main.rs",
+            2,
+        );
+        let terminal_callable = hit_at_path_line(
+            "callable",
+            "exec",
+            NodeKind::FUNCTION,
+            0.99,
+            "codex-rs/core/src/exec.rs",
+            1,
+        );
+
+        let mut hits = [terminal_callable, exact_variant.clone()];
+        hits.sort_by(|left, right| {
+            compare_search_hits_with_project_root(
+                Some(project_root),
+                "Subcommand::Exec",
+                left,
+                right,
+            )
+        });
+
+        assert_eq!(
+            hits.first().map(|hit| &hit.node_id),
+            Some(&exact_variant.node_id)
+        );
+    }
+
+    #[test]
     fn inexact_queries_boost_camel_case_symbol_matches() {
         let camel = hit("camel", "SearchQueryAssessmentDto", NodeKind::STRUCT, 0.40);
         let noisy = hit(
@@ -1400,6 +1899,34 @@ mod tests {
         assert_eq!(
             hits.first().map(|hit| &hit.node_id),
             Some(&production.node_id)
+        );
+    }
+
+    #[test]
+    fn file_role_ranking_queries_do_not_opt_into_non_primary_roles() {
+        assert!(!query_mentions_non_primary_source(
+            "central file role ranking tests docs bench generated vendor search packet context semantic"
+        ));
+        assert!(query_mentions_non_primary_source("docs search ranking"));
+    }
+
+    #[test]
+    fn file_role_classification_catches_colocated_and_helper_tests() {
+        assert_eq!(
+            retrieval_file_role_from_path(
+                "codex-rs/exec/src/event_processor_with_jsonl_output_tests.rs"
+            ),
+            RetrievalFileRole::Test
+        );
+        assert_eq!(
+            retrieval_file_role_from_path("codex-rs/app-server-test-client/src/lib.rs"),
+            RetrievalFileRole::Test
+        );
+        assert_eq!(
+            retrieval_file_role_from_path(
+                "codex-rs/app-server-protocol/schema/typescript/index.ts"
+            ),
+            RetrievalFileRole::Generated
         );
     }
 
@@ -1488,6 +2015,93 @@ mod tests {
         assert_eq!(
             hits.first().map(|hit| &hit.node_id),
             Some(&application_script.node_id)
+        );
+    }
+
+    #[test]
+    fn inexact_queries_downrank_non_primary_roles_unless_requested() {
+        let production = hit_at_path(
+            "production",
+            "rank_search_hits",
+            NodeKind::FUNCTION,
+            0.40,
+            "crates/codestory-runtime/src/symbol_query.rs",
+        );
+        let docs = hit_at_path(
+            "docs",
+            "search_ranking_notes",
+            NodeKind::FUNCTION,
+            0.95,
+            "docs/testing/search-ranking.md",
+        );
+        let bench = hit_at_path(
+            "bench",
+            "search_ranking_bench",
+            NodeKind::FUNCTION,
+            0.95,
+            "crates/codestory-bench/benches/search_ranking.rs",
+        );
+        let generated = hit_at_path(
+            "generated",
+            "generated_search_ranking",
+            NodeKind::FUNCTION,
+            0.95,
+            "target/generated/search_ranking.rs",
+        );
+        let vendor = hit_at_path(
+            "vendor",
+            "vendor_search_ranking",
+            NodeKind::FUNCTION,
+            0.95,
+            "vendor/search/ranking.rs",
+        );
+
+        for non_primary in [
+            docs.clone(),
+            bench.clone(),
+            generated.clone(),
+            vendor.clone(),
+        ] {
+            let mut hits = [non_primary, production.clone()];
+            hits.sort_by(|left, right| {
+                compare_search_hits("production search ranking behavior", left, right)
+            });
+
+            assert_eq!(
+                hits.first().map(|hit| &hit.node_id),
+                Some(&production.node_id)
+            );
+        }
+
+        let mut doc_hits = [production.clone(), docs.clone()];
+        doc_hits.sort_by(|left, right| compare_search_hits("docs search ranking", left, right));
+        assert_eq!(
+            doc_hits.first().map(|hit| &hit.node_id),
+            Some(&docs.node_id)
+        );
+
+        let mut bench_hits = [production.clone(), bench.clone()];
+        bench_hits
+            .sort_by(|left, right| compare_search_hits("benchmark search ranking", left, right));
+        assert_eq!(
+            bench_hits.first().map(|hit| &hit.node_id),
+            Some(&bench.node_id)
+        );
+
+        let mut generated_hits = [production.clone(), generated.clone()];
+        generated_hits
+            .sort_by(|left, right| compare_search_hits("generated search ranking", left, right));
+        assert_eq!(
+            generated_hits.first().map(|hit| &hit.node_id),
+            Some(&generated.node_id)
+        );
+
+        let mut vendor_hits = [production, vendor.clone()];
+        vendor_hits
+            .sort_by(|left, right| compare_search_hits("vendor search ranking", left, right));
+        assert_eq!(
+            vendor_hits.first().map(|hit| &hit.node_id),
+            Some(&vendor.node_id)
         );
     }
 
@@ -1590,6 +2204,53 @@ mod tests {
         assert_eq!(
             hits.first().map(|hit| &hit.node_id),
             Some(&implementation.node_id)
+        );
+    }
+
+    #[test]
+    fn embedded_exact_symbol_terms_sort_ahead_of_semantic_distractors() {
+        let exact = hit(
+            "exact",
+            "SearchEngine::search_hybrid_with_scores",
+            NodeKind::METHOD,
+            0.30,
+        );
+        let semantic = hit("semantic", "search_match_rank", NodeKind::FUNCTION, 0.95);
+
+        let mut hits = [semantic, exact.clone()];
+        hits.sort_by(|left, right| {
+            compare_search_hits(
+                "exact symbol first semantic ranking search_hybrid_with_scores",
+                left,
+                right,
+            )
+        });
+
+        assert_eq!(hits.first().map(|hit| &hit.node_id), Some(&exact.node_id));
+    }
+
+    #[test]
+    fn mixed_natural_language_query_requires_whitespace_and_embedded_symbol() {
+        assert!(mixed_natural_language_query(
+            "how ExtensionHostManager starts"
+        ));
+        assert!(!mixed_natural_language_query("ExtensionHostManager"));
+        assert!(!mixed_natural_language_query("explain the architecture"));
+    }
+
+    #[test]
+    fn embedded_generic_terms_do_not_create_exact_symbol_matches() {
+        let exact_generic = hit("generic", "current", NodeKind::VARIABLE, 0.30);
+        let semantic = hit("semantic", "architecture_summary", NodeKind::FUNCTION, 0.95);
+
+        let mut hits = [exact_generic, semantic.clone()];
+        hits.sort_by(|left, right| {
+            compare_search_hits("study current architecture boundaries", left, right)
+        });
+
+        assert_eq!(
+            hits.first().map(|hit| &hit.node_id),
+            Some(&semantic.node_id)
         );
     }
 
