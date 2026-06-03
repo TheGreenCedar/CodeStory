@@ -3,8 +3,9 @@
 **Status:** workflow checked in at [`.github/workflows/retrieval-sidecar-smoke.yml`](../../.github/workflows/retrieval-sidecar-smoke.yml).
 Full index/query on the monorepo may exceed runner budgets; the job runs bootstrap with
 `--skip-compose --wait-secs 0`, asserts `retrieval status` returns the clean pre-index
-`retrieval_manifest_missing` shape, and runs runtime/retrieval protocol plus non-live CLI search
-contract tests. This job is not a full sidecar readiness gate.
+`retrieval_manifest_missing` shape through the CLI integration test suite, and runs
+runtime/retrieval protocol plus non-live CLI search contract tests. This job is not a full sidecar
+readiness gate.
 
 **Preflight reference:** [`docs/ops/retrieval-sidecars.md`](../ops/retrieval-sidecars.md#preflight-smoke-contract)
 
@@ -22,6 +23,7 @@ paths:
   - crates/codestory-retrieval/**
   - crates/codestory-cli/src/**/retrieval*
   - crates/codestory-cli/src/stdio_*.rs
+  - crates/codestory-cli/tests/retrieval_bootstrap_contracts.rs
   - crates/codestory-cli/tests/search_json_output.rs
   - crates/codestory-cli/tests/stdio_protocol_contracts.rs
   - crates/codestory-runtime/src/**
@@ -34,32 +36,7 @@ paths:
 
 ```powershell
 node scripts/lint-retrieval-generalization.mjs
-
-cargo build -p codestory-cli
-$cli = ".\target\debug\codestory-cli.exe"
-
-& $cli retrieval bootstrap --project . --skip-compose --wait-secs 0
-if ($LASTEXITCODE -ne 0) {
-  throw "retrieval bootstrap failed with exit code $LASTEXITCODE"
-}
-
-$statusJson = & $cli retrieval status --project .
-if ($LASTEXITCODE -ne 0) {
-  throw "retrieval status failed with exit code $LASTEXITCODE"
-}
-
-$statusText = ($statusJson | Out-String).Trim()
-Write-Host $statusText
-$status = $statusText | ConvertFrom-Json
-
-if ($status.degraded_reason -ne "retrieval_manifest_missing") {
-  throw "retrieval-sidecar-smoke expected manifest-missing shape before indexing"
-}
-
-if ($status.retrieval_mode -eq "full") {
-  throw "manifest-missing shape check must not report full mode before retrieval index"
-}
-
+cargo test -p codestory-cli --test retrieval_bootstrap_contracts
 cargo test -p codestory-runtime --lib
 cargo test -p codestory-runtime --test retrieval_generalization_guard
 cargo test -p codestory-cli --test stdio_protocol_contracts
@@ -74,15 +51,14 @@ retrieval manifest required for `retrieval_mode == "full"`.
 ## Pass criteria
 
 1. Generalization lint exits 0.
-2. Debug `codestory-cli` build exits 0.
-3. `retrieval bootstrap --project . --skip-compose --wait-secs 0` exits 0 with logs visible for diagnostics.
-4. `retrieval status --project .` emits readable JSON and reports `degraded_reason ==
-   "retrieval_manifest_missing"` and non-`full` mode on the clean runner before indexing.
-5. `cargo test -p codestory-runtime --lib` exits 0.
-6. `cargo test -p codestory-runtime --test retrieval_generalization_guard` exits 0.
-7. `cargo test -p codestory-cli --test stdio_protocol_contracts` exits 0.
-8. `cargo test -p codestory-cli --test search_json_output` exits 0 for non-live fail-closed search contracts.
-9. `cargo test -p codestory-retrieval` exits 0.
+2. `cargo test -p codestory-cli --test retrieval_bootstrap_contracts` exits 0, including the
+   bootstrap/status assertion that reports `degraded_reason == "retrieval_manifest_missing"` and
+   non-`full` mode on a clean temp project before indexing.
+3. `cargo test -p codestory-runtime --lib` exits 0.
+4. `cargo test -p codestory-runtime --test retrieval_generalization_guard` exits 0.
+5. `cargo test -p codestory-cli --test stdio_protocol_contracts` exits 0.
+6. `cargo test -p codestory-cli --test search_json_output` exits 0 for non-live fail-closed search contracts.
+7. `cargo test -p codestory-retrieval` exits 0.
 
 ## Pins
 
@@ -93,6 +69,7 @@ Match [`docs/ops/retrieval-sidecars.md`](../ops/retrieval-sidecars.md) version t
 
 ```powershell
 node scripts/lint-retrieval-generalization.mjs
+cargo test -p codestory-cli --test retrieval_bootstrap_contracts
 cargo test -p codestory-runtime --lib
 cargo test -p codestory-runtime --test retrieval_generalization_guard
 cargo test -p codestory-cli --test stdio_protocol_contracts
@@ -100,12 +77,14 @@ cargo test -p codestory-cli --test search_json_output
 cargo test -p codestory-retrieval
 ```
 
-The workflow runs the lint script, a debug CLI manifest-missing smoke, and the listed test targets;
-`retrieval_generalization_guard` invokes the same lint from Rust for cross-platform CI parity. This
-smoke job does not claim stdio, CLI, or runtime full-mode success. Full readiness evidence requires
-a separate fixture run that starts real sidecars, provisions `bge-base-en-v1.5.Q8_0.gguf`, runs
-`retrieval index`, and verifies `retrieval_mode == "full"`. The live success contracts are intentionally outside the
-normal smoke gate: set `CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1` before running the stdio full-mode
+The workflow runs the lint script and focused test targets. The manifest-missing smoke lives in
+`retrieval_bootstrap_contracts` so Cargo builds the CLI through the integration-test path instead of
+paying for a standalone build step before the tests. `retrieval_generalization_guard` invokes the
+same lint from Rust for cross-platform CI parity. This smoke job does not claim stdio, CLI, or
+runtime full-mode success. Full readiness evidence requires a separate fixture run that starts real
+sidecars, provisions `bge-base-en-v1.5.Q8_0.gguf`, runs `retrieval index`, and verifies
+`retrieval_mode == "full"`. The live success contracts are intentionally outside the normal smoke
+gate: set `CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1` before running the stdio full-mode
 contracts with `-- --ignored --nocapture`, run
 `cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_json_emits_sidecar_primary_results_without_repo_text_fallback`
 for the CLI lane, and run the ignored `retrieval_eval_*` tests with

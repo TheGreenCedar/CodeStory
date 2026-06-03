@@ -15,6 +15,7 @@ on:
       - crates/codestory-cli/src/args.rs
       - crates/codestory-cli/src/runtime.rs
       - crates/codestory-cli/src/stdio_*.rs
+      - crates/codestory-cli/tests/retrieval_bootstrap_contracts.rs
       - crates/codestory-cli/tests/search_json_output.rs
       - crates/codestory-cli/tests/stdio_protocol_contracts.rs
       - crates/codestory-runtime/src/**
@@ -48,41 +49,8 @@ jobs:
       - name: Generalization lint (production paths)
         run: node scripts/lint-retrieval-generalization.mjs
 
-      - name: Build debug CLI
-        run: cargo build -p codestory-cli
-
-      - name: Retrieval manifest-missing shape check
-        shell: pwsh
-        run: |
-          $cli = ".\target\debug\codestory-cli.exe"
-          & $cli retrieval bootstrap --project . --skip-compose --wait-secs 0
-          if ($LASTEXITCODE -ne 0) {
-            throw "retrieval bootstrap failed with exit code $LASTEXITCODE"
-          }
-
-          $statusJson = & $cli retrieval status --project .
-          if ($LASTEXITCODE -ne 0) {
-            throw "retrieval status failed with exit code $LASTEXITCODE"
-          }
-
-          $statusText = ($statusJson | Out-String).Trim()
-          Write-Host $statusText
-
-          $status = $statusText | ConvertFrom-Json
-          $actualMode = if ($status.retrieval_mode) { $status.retrieval_mode } else { "<missing>" }
-          $degradedReason = if ($status.degraded_reason) { $status.degraded_reason } else { "<none>" }
-
-          if ($degradedReason -ne "retrieval_manifest_missing") {
-            Write-Host "retrieval status JSON:"
-            Write-Host $statusText
-            throw "retrieval-sidecar-smoke expected manifest-missing shape before indexing; actual mode='$actualMode'; degraded reason='$degradedReason'"
-          }
-
-          if ($actualMode -eq "full") {
-            Write-Host "retrieval status JSON:"
-            Write-Host $statusText
-            throw "manifest-missing shape check must not report full mode before retrieval index"
-          }
+      - name: Retrieval bootstrap manifest-missing contract
+        run: cargo test -p codestory-cli --test retrieval_bootstrap_contracts
 
       - name: Runtime library contract tests
         run: cargo test -p codestory-runtime --lib

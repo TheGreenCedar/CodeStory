@@ -19,6 +19,20 @@ fn run_bootstrap(project: &std::path::Path, extra_args: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).expect("parse bootstrap json")
 }
 
+fn run_status(project: &std::path::Path, extra_args: &[&str]) -> Value {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    command.args(["retrieval", "status", "--project"]);
+    command.arg(project);
+    command.args(extra_args);
+    let output = command.output().expect("run retrieval status");
+    assert!(
+        output.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("parse status json")
+}
+
 fn create_valid_cache_with_cli(project: &std::path::Path, cache: &std::path::Path) {
     let output = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
         .args(["index", "--project"])
@@ -81,6 +95,46 @@ fn bootstrap_json_includes_storage_repair_fields() {
             || repair["prune_suppressed_reason"].is_string(),
         "prune_suppressed_reason must be null or string: {}",
         repair["prune_suppressed_reason"]
+    );
+}
+
+#[test]
+fn bootstrap_then_status_reports_manifest_missing_before_indexing() {
+    let project = tempdir().expect("project");
+    fs::write(project.path().join("lib.rs"), "pub fn main() {}\n").expect("source");
+    let cache = tempdir().expect("cache");
+    let cache_arg = cache.path().to_str().expect("utf8 cache");
+
+    let bootstrap = run_bootstrap(
+        project.path(),
+        &[
+            "--cache-dir",
+            cache_arg,
+            "--skip-compose",
+            "--wait-secs",
+            "0",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        bootstrap["storage_repair"].is_object(),
+        "bootstrap output missing storage repair: {bootstrap}"
+    );
+
+    let status = run_status(
+        project.path(),
+        &["--cache-dir", cache_arg, "--format", "json"],
+    );
+    assert_eq!(
+        status["degraded_reason"].as_str(),
+        Some("retrieval_manifest_missing"),
+        "status should report manifest-missing shape before indexing: {status}"
+    );
+    assert_ne!(
+        status["retrieval_mode"].as_str(),
+        Some("full"),
+        "manifest-missing status must not report full mode before retrieval index: {status}"
     );
 }
 
