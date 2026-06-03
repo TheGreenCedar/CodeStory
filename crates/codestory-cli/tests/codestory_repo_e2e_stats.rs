@@ -22,6 +22,8 @@ struct RepoE2eStats {
     semantic_docs_embedded: u64,
     semantic_docs_pending: u64,
     semantic_docs_stale: u64,
+    retrieval_index_seconds: f64,
+    retrieval_status_seconds: f64,
     ground_seconds: f64,
     search_seconds: f64,
     symbol_seconds: f64,
@@ -41,13 +43,15 @@ struct IndexStats {
     edge_count: u64,
     file_count: u64,
     error_count: u64,
-    retrieval_mode: String,
+    sidecar_status_after_retrieval_index: String,
+    legacy_index_retrieval_mode: String,
     semantic_doc_count: u64,
 }
 
 #[derive(Debug, Serialize)]
 struct GroundStats {
-    retrieval_mode: String,
+    sidecar_status_after_retrieval_index: String,
+    legacy_ground_retrieval_mode: String,
     root_symbols: usize,
     file_digests: usize,
     coverage_total_files: u64,
@@ -56,7 +60,8 @@ struct GroundStats {
 #[derive(Debug, Serialize)]
 struct SearchStats {
     query: String,
-    retrieval_mode: String,
+    sidecar_shadow_retrieval_mode: String,
+    legacy_search_retrieval_mode: String,
     semantic_doc_count: u64,
     indexed_symbol_hits: usize,
     repo_text_hits: usize,
@@ -146,7 +151,9 @@ fn run_cli_json(
         .arg(project_root)
         .arg("--cache-dir")
         .arg(cache_dir)
-        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
+        .env_remove("CODESTORY_EMBED_RUNTIME_MODE")
+        .env("CODESTORY_EMBED_BACKEND", "llamacpp")
+        .env("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1")
         .output()
         .expect("run codestory-cli");
     let seconds = started.elapsed().as_secs_f64();
@@ -323,6 +330,35 @@ fn codestory_repo_release_e2e_emits_stats() {
 
     let storage_path = PathBuf::from(string_field(&index_json, &["storage_path"]));
     let search_dir = search_dir_for_storage(storage_path.as_path());
+
+    let (retrieval_index_seconds, _retrieval_index_json) = run_cli_json(
+        &binary,
+        project_root.as_path(),
+        cache_dir.path(),
+        &[
+            "retrieval".to_string(),
+            "index".to_string(),
+            "--refresh".to_string(),
+            "none".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ],
+    );
+
+    let (retrieval_status_seconds, retrieval_status_json) = run_cli_json(
+        &binary,
+        project_root.as_path(),
+        cache_dir.path(),
+        &[
+            "retrieval".to_string(),
+            "status".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ],
+    );
+    let sidecar_retrieval_mode =
+        string_field(&retrieval_status_json, &["retrieval_mode"]).to_string();
+
     let search_dir_before = fs::metadata(&search_dir)
         .expect("search dir metadata before reads")
         .modified()
@@ -451,6 +487,8 @@ fn codestory_repo_release_e2e_emits_stats() {
             &index_json,
             &["phase_timings", "semantic_docs_stale"],
         ),
+        retrieval_index_seconds,
+        retrieval_status_seconds,
         ground_seconds,
         search_seconds,
         symbol_seconds,
@@ -461,18 +499,28 @@ fn codestory_repo_release_e2e_emits_stats() {
             edge_count: u64_field(&index_json, &["summary", "stats", "edge_count"]),
             file_count: u64_field(&index_json, &["summary", "stats", "file_count"]),
             error_count: u64_field(&index_json, &["summary", "stats", "error_count"]),
-            retrieval_mode: string_field(&index_json, &["retrieval", "mode"]).to_string(),
+            sidecar_status_after_retrieval_index: sidecar_retrieval_mode.clone(),
+            legacy_index_retrieval_mode: string_field(&index_json, &["retrieval", "mode"])
+                .to_string(),
             semantic_doc_count: u64_field(&index_json, &["retrieval", "semantic_doc_count"]),
         },
         ground: GroundStats {
-            retrieval_mode: string_field(&ground_json, &["retrieval", "mode"]).to_string(),
+            sidecar_status_after_retrieval_index: sidecar_retrieval_mode.clone(),
+            legacy_ground_retrieval_mode: string_field(&ground_json, &["retrieval", "mode"])
+                .to_string(),
             root_symbols: array_len(&ground_json, &["root_symbols"]),
             file_digests: array_len(&ground_json, &["files"]),
             coverage_total_files: u64_field(&ground_json, &["coverage", "total_files"]),
         },
         search: SearchStats {
             query: string_field(&search_json, &["query"]).to_string(),
-            retrieval_mode: string_field(&search_json, &["retrieval", "mode"]).to_string(),
+            sidecar_shadow_retrieval_mode: string_field(
+                &search_json,
+                &["retrieval_shadow", "retrieval_mode"],
+            )
+            .to_string(),
+            legacy_search_retrieval_mode: string_field(&search_json, &["retrieval", "mode"])
+                .to_string(),
             semantic_doc_count: u64_field(&search_json, &["retrieval", "semantic_doc_count"]),
             indexed_symbol_hits: array_len(&search_json, &["indexed_symbol_hits"]),
             repo_text_hits: array_len(&search_json, &["repo_text_hits"]),
@@ -509,6 +557,18 @@ fn codestory_repo_release_e2e_emits_stats() {
     assert_eq!(
         stats.index.error_count, 0,
         "full repo index should finish without errors"
+    );
+    assert_eq!(
+        stats.index.sidecar_status_after_retrieval_index, "full",
+        "retrieval status after retrieval index should be full before trusting index/ground/search evidence"
+    );
+    assert_eq!(
+        stats.ground.sidecar_status_after_retrieval_index, "full",
+        "strict grounding should reuse the prepared full sidecar retrieval state"
+    );
+    assert_eq!(
+        stats.search.sidecar_shadow_retrieval_mode, "full",
+        "search should expose full sidecar retrieval shadow"
     );
     assert!(
         stats.index.semantic_doc_count > 0,
@@ -556,7 +616,7 @@ fn codestory_repo_release_e2e_emits_stats() {
 }
 
 #[test]
-#[ignore = "real-repo drill harness; set CODESTORY_REAL_REPO_DRILL_CASES to a drill-suite manifest and run after cargo build --release -p codestory-cli; set CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1 only for intentional local skips"]
+#[ignore = "real-repo drill release gate; set CODESTORY_REAL_REPO_DRILL_CASES or CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1 and run after cargo build --release -p codestory-cli"]
 fn real_repo_agent_grounding_drill_emits_verification_packets() {
     let binary = release_cli_binary();
     assert!(
@@ -576,7 +636,7 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             return;
         }
         panic!(
-            "CODESTORY_REAL_REPO_DRILL_CASES is required for the ignored real-repo drill suite. Set CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1 only for an intentional local skip."
+            "real-repo drill suite cannot run because CODESTORY_REAL_REPO_DRILL_CASES is not set. Set CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1 only for an intentional local skip before invoking the ignored test."
         );
     };
     let cases = drill_repo_cases_from_manifest(&manifest_path);

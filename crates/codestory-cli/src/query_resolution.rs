@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use codestory_contracts::api::{NodeKind, SearchHit, SearchMatchQualityDto};
-use codestory_runtime::{compare_ranked_hits, symbol_name_match_rank};
+use codestory_runtime::{compare_ranked_hits, retrieval_file_role_for_hit, symbol_name_match_rank};
 use std::fs;
 use std::path::Path;
 
@@ -124,41 +124,7 @@ fn source_truth_bucket(hit: &SearchHit) -> u8 {
 }
 
 fn is_non_primary_or_generated_hit(hit: &SearchHit) -> bool {
-    if hit.display_name.starts_with("tests::") {
-        return true;
-    }
-
-    hit.file_path
-        .as_deref()
-        .map(|path| {
-            let path = format!("/{}", normalize_path_fragment(path));
-            let non_primary_marker = [
-                "/bin/test/",
-                "/test/data/",
-                "/tests/",
-                "/fixtures/",
-                "/fixture/",
-                "/examples/",
-                "/example/",
-                "/src/external/",
-                "/external/",
-                "/vendor/",
-                "/vendors/",
-                "/third_party/",
-                "/third-party/",
-                "/scripts/",
-            ]
-            .iter()
-            .any(|marker| path.contains(marker));
-            let generated_marker = path.contains("generated")
-                || path.contains("payload-types")
-                || path.contains("/target/")
-                || path.contains("/dist/")
-                || path.contains("/build/");
-
-            non_primary_marker || generated_marker
-        })
-        .unwrap_or(false)
+    retrieval_file_role_for_hit(hit).is_non_primary()
 }
 
 fn exact_case_match_bucket(query: &str, hit: &SearchHit) -> u8 {
@@ -748,6 +714,57 @@ mod tests {
             hits.first().map(|hit| &hit.node_id),
             Some(&production.node_id)
         );
+    }
+
+    #[test]
+    fn inexact_resolution_prefers_production_over_non_primary_roles() {
+        let production = hit(
+            "production",
+            "resolve_context_target",
+            NodeKind::FUNCTION,
+            0.60,
+            "crates/codestory-cli/src/runtime.rs",
+        );
+        let generated = hit(
+            "generated",
+            "resolve_context_target_generated",
+            NodeKind::FUNCTION,
+            0.95,
+            "target/generated/runtime.rs",
+        );
+        let docs = hit(
+            "docs",
+            "resolve_context_target_docs",
+            NodeKind::FUNCTION,
+            0.95,
+            "docs/runtime.md",
+        );
+        let bench = hit(
+            "bench",
+            "resolve_context_target_bench",
+            NodeKind::FUNCTION,
+            0.95,
+            "benches/runtime.rs",
+        );
+        let vendor = hit(
+            "vendor",
+            "resolve_context_target_vendor",
+            NodeKind::FUNCTION,
+            0.95,
+            "vendor/runtime.rs",
+        );
+
+        for non_primary in [generated, docs, bench, vendor] {
+            let mut hits = [non_primary, production.clone()];
+            hits.sort_by(|left, right| {
+                compare_resolution_hits("resolve_context_target", left, right)
+            });
+
+            assert_eq!(
+                hits.first().map(|hit| &hit.node_id),
+                Some(&production.node_id)
+            );
+        }
     }
 
     #[test]

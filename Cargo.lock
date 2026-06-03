@@ -409,6 +409,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "codestory-contracts",
+ "codestory-retrieval",
  "codestory-runtime",
  "crossbeam-channel",
  "crossterm",

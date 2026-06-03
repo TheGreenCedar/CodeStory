@@ -1,4 +1,4 @@
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -491,22 +491,27 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
     let fixture = indexed_fixture();
     let (_server, addr) = spawn_http_server(&fixture);
 
-    let search = get_json(&addr, "/search?q=AppController&repo_text=off");
-    assert_eq!(search["query"], "AppController");
-    assert_eq!(search["limit_per_source"], 10);
-    assert_nonempty_array(&search, "/indexed_symbol_hits");
-    let app_controller_hit = search
-        .pointer("/indexed_symbol_hits")
-        .and_then(Value::as_array)
-        .and_then(|hits| {
-            hits.iter()
-                .find(|hit| hit["display_name"] == "AppController")
-        })
-        .unwrap_or_else(|| panic!("missing AppController hit in /search: {search}"));
+    let search = http_get(&addr, "/search?q=AppController&repo_text=off")
+        .expect("search fail-closed response");
     assert_eq!(
-        app_controller_hit["match_quality"],
-        json!("exact"),
-        "HTTP /search should include match_quality on raw SearchResultsDto hits: {app_controller_hit}"
+        search.status, 400,
+        "HTTP /search is product search and should fail closed without full sidecars: {}",
+        search.body
+    );
+    assert_eq!(
+        search.body.pointer("/error/code").and_then(Value::as_str),
+        Some("search_unavailable"),
+        "HTTP /search should return a structured mandatory-sidecar error: {}",
+        search.body
+    );
+    assert!(
+        search
+            .body
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("sidecar retrieval primary")),
+        "HTTP /search should explain the sidecar-primary boundary: {}",
+        search.body
     );
 
     let definition = get_json(&addr, "/definition?q=AppController");

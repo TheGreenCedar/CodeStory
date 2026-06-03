@@ -1052,7 +1052,7 @@ fn explore_layer_notes(
             retrieval
                 .fallback_message
                 .as_deref()
-                .unwrap_or("semantic retrieval fallback is active")
+                .unwrap_or("semantic retrieval is not full")
         ),
         None => "semantic_runtime: retrieval state unavailable".to_string(),
     });

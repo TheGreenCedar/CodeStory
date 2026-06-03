@@ -5,6 +5,7 @@ use codestory_contracts::api::{
     ListRootSymbolsRequest, NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto,
     SearchRepoTextMode, SearchRequest, TrailDirection,
 };
+use codestory_retrieval::SidecarLayout;
 use std::io::{BufRead, Write};
 
 use crate::args;
@@ -24,15 +25,18 @@ use crate::{
     build_ambiguous_target_error_output, build_query_resolution_output, build_search_hit_output,
 };
 
+const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
+
 pub(crate) fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
+    let mut state = StdioServerState::default();
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(response) = handle_stdio_message(&runtime, &line) {
+        if let Some(response) = handle_stdio_message(&runtime, &mut state, &line) {
             writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
             stdout.flush()?;
         }
@@ -40,7 +44,17 @@ pub(crate) fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
     Ok(())
 }
 
-fn handle_stdio_message(runtime: &RuntimeContext, line: &str) -> Option<serde_json::Value> {
+#[derive(Default)]
+struct StdioServerState {
+    packet_cache: StdioPacketCache,
+    search_cache: StdioSearchFragmentCache,
+}
+
+fn handle_stdio_message(
+    runtime: &RuntimeContext,
+    state: &mut StdioServerState,
+    line: &str,
+) -> Option<serde_json::Value> {
     let request: serde_json::Value = match serde_json::from_str(line) {
         Ok(value) => value,
         Err(error) => {
@@ -138,7 +152,7 @@ fn handle_stdio_message(runtime: &RuntimeContext, line: &str) -> Option<serde_js
             }
             return Some(stdio_jsonrpc_tool_call_from_legacy(
                 id,
-                handle_stdio_tool_call(runtime, &request),
+                handle_stdio_tool_call(runtime, state, &request),
             ));
         }
         _ => {
@@ -403,6 +417,7 @@ fn stdio_initialize_result_json(request: &serde_json::Value) -> serde_json::Valu
 
 fn handle_stdio_tool_call(
     runtime: &RuntimeContext,
+    state: &mut StdioServerState,
     request: &serde_json::Value,
 ) -> serde_json::Value {
     let name = request
@@ -415,8 +430,8 @@ fn handle_stdio_tool_call(
         .unwrap_or_default()
         .to_string();
     match name {
-        "packet" => handle_stdio_packet(runtime, request),
-        "search" => handle_stdio_search(runtime, request, query),
+        "packet" => handle_stdio_packet(runtime, state, request),
+        "search" => handle_stdio_search(runtime, state, request, query),
         "symbol" => handle_stdio_symbol(runtime, request),
         "trail" => handle_stdio_trail(runtime, request),
         "definition" => handle_stdio_definition(runtime, request),
@@ -428,7 +443,11 @@ fn handle_stdio_tool_call(
     }
 }
 
-fn handle_stdio_packet(runtime: &RuntimeContext, request: &serde_json::Value) -> serde_json::Value {
+fn handle_stdio_packet(
+    runtime: &RuntimeContext,
+    state: &mut StdioServerState,
+    request: &serde_json::Value,
+) -> serde_json::Value {
     let Some(question) = request
         .pointer("/params/arguments/question")
         .and_then(|value| value.as_str())
@@ -453,7 +472,19 @@ fn handle_stdio_packet(runtime: &RuntimeContext, request: &serde_json::Value) ->
         .pointer("/params/arguments/include_evidence")
         .and_then(|value| value.as_bool())
         .unwrap_or(true);
-    runtime
+    let cache_key = stdio_packet_cache_key(
+        stdio_storage_fingerprint(&runtime.storage_path),
+        stdio_mandatory_sidecar_fingerprint(&runtime.project_root, &runtime.storage_path),
+        question,
+        budget,
+        task_class,
+        include_evidence,
+        latency_budget_ms,
+    );
+    if let Some(cached) = state.packet_cache.get(&cache_key) {
+        return cached;
+    }
+    let response = runtime
         .browser
         .packet(AgentPacketRequestDto {
             question: question.to_string(),
@@ -463,7 +494,225 @@ fn handle_stdio_packet(runtime: &RuntimeContext, request: &serde_json::Value) ->
             latency_budget_ms,
         })
         .map(|packet| serde_json::json!({"result": packet}))
-        .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))
+        .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}));
+    if response.get("result").is_some() {
+        state.packet_cache.insert(cache_key, response.clone());
+    }
+    response
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StdioPacketCacheKey {
+    storage_fingerprint: String,
+    sidecar_fingerprint: String,
+    question: String,
+    budget: &'static str,
+    task_class: Option<&'static str>,
+    include_evidence: bool,
+    latency_budget_ms: Option<u32>,
+}
+
+struct StdioLruCache<K> {
+    entries: std::collections::VecDeque<(K, serde_json::Value)>,
+    capacity: usize,
+}
+
+impl<K: Clone + PartialEq> StdioLruCache<K> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: std::collections::VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn get(&mut self, key: &K) -> Option<serde_json::Value> {
+        let position = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| candidate == key)?;
+        let entry = self.entries.remove(position)?;
+        let value = entry.1.clone();
+        self.entries.push_back(entry);
+        Some(value)
+    }
+
+    fn insert(&mut self, key: K, value: serde_json::Value) {
+        if let Some(position) = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| candidate == &key)
+        {
+            self.entries.remove(position);
+        }
+        self.entries.push_back((key, value));
+        while self.entries.len() > self.capacity {
+            self.entries.pop_front();
+        }
+    }
+}
+
+struct StdioPacketCache {
+    lru: StdioLruCache<StdioPacketCacheKey>,
+}
+
+impl Default for StdioPacketCache {
+    fn default() -> Self {
+        Self {
+            lru: StdioLruCache::new(STDIO_PACKET_CACHE_CAPACITY),
+        }
+    }
+}
+
+impl StdioPacketCache {
+    fn get(&mut self, key: &StdioPacketCacheKey) -> Option<serde_json::Value> {
+        self.lru.get(key)
+    }
+
+    fn insert(&mut self, key: StdioPacketCacheKey, value: serde_json::Value) {
+        self.lru.insert(key, value);
+    }
+}
+
+fn stdio_packet_cache_key(
+    storage_fingerprint: String,
+    sidecar_fingerprint: String,
+    question: &str,
+    budget: PacketBudgetModeDto,
+    task_class: Option<PacketTaskClassDto>,
+    include_evidence: bool,
+    latency_budget_ms: Option<u32>,
+) -> StdioPacketCacheKey {
+    StdioPacketCacheKey {
+        storage_fingerprint,
+        sidecar_fingerprint,
+        question: question.to_string(),
+        budget: stdio_packet_budget_label(budget),
+        task_class: task_class.map(stdio_packet_task_class_label),
+        include_evidence,
+        latency_budget_ms,
+    }
+}
+
+fn stdio_packet_budget_label(budget: PacketBudgetModeDto) -> &'static str {
+    match budget {
+        PacketBudgetModeDto::Tiny => "tiny",
+        PacketBudgetModeDto::Compact => "compact",
+        PacketBudgetModeDto::Standard => "standard",
+        PacketBudgetModeDto::Deep => "deep",
+    }
+}
+
+fn stdio_packet_task_class_label(task_class: PacketTaskClassDto) -> &'static str {
+    match task_class {
+        PacketTaskClassDto::ArchitectureExplanation => "architecture_explanation",
+        PacketTaskClassDto::BugLocalization => "bug_localization",
+        PacketTaskClassDto::ChangeImpact => "change_impact",
+        PacketTaskClassDto::RouteTracing => "route_tracing",
+        PacketTaskClassDto::SymbolOwnership => "symbol_ownership",
+        PacketTaskClassDto::DataFlow => "data_flow",
+        PacketTaskClassDto::EditPlanning => "edit_planning",
+    }
+}
+
+fn stdio_storage_fingerprint(storage_path: &std::path::Path) -> String {
+    let mut parts = vec![stdio_path_fingerprint(storage_path)];
+    parts.push(stdio_path_fingerprint(
+        &storage_path.with_extension("db-wal"),
+    ));
+    parts.push(stdio_path_fingerprint(
+        &storage_path.with_extension("db-shm"),
+    ));
+    parts.join("|")
+}
+
+fn stdio_mandatory_sidecar_fingerprint(
+    project_root: &std::path::Path,
+    storage_path: &std::path::Path,
+) -> String {
+    let layout = SidecarLayout::from_env();
+    let status = codestory_retrieval::strict_sidecar_status(project_root, Some(storage_path)).map(
+        |report| StdioSidecarStatusFingerprint {
+            retrieval_mode: report.retrieval_mode,
+            degraded_reason: report.degraded_reason,
+            manifest: report.manifest,
+        },
+    );
+    stdio_mandatory_sidecar_fingerprint_from_status(
+        codestory_retrieval::embedding_runtime_id(),
+        stdio_path_fingerprint(&layout.state_file),
+        status,
+    )
+}
+
+struct StdioSidecarStatusFingerprint {
+    retrieval_mode: String,
+    degraded_reason: Option<String>,
+    manifest: Option<codestory_retrieval::RetrievalIndexManifest>,
+}
+
+fn stdio_mandatory_sidecar_fingerprint_from_status(
+    active_embedding_backend: impl AsRef<str>,
+    sidecar_state_fingerprint: impl AsRef<str>,
+    status: std::result::Result<StdioSidecarStatusFingerprint, anyhow::Error>,
+) -> String {
+    let mut parts = vec![
+        format!(
+            "active_embedding_backend:{}",
+            active_embedding_backend.as_ref()
+        ),
+        format!("sidecar_state:{}", sidecar_state_fingerprint.as_ref()),
+    ];
+
+    match status {
+        Ok(report) => {
+            parts.push(format!("retrieval_mode:{}", report.retrieval_mode));
+            parts.push(format!(
+                "degraded_reason:{}",
+                report.degraded_reason.unwrap_or_default()
+            ));
+            if let Some(manifest) = report.manifest {
+                parts.push(format!(
+                    "manifest_generation:{}",
+                    manifest.sidecar_generation.unwrap_or_default()
+                ));
+                parts.push(format!(
+                    "manifest_input_hash:{}",
+                    manifest.sidecar_input_hash.unwrap_or_default()
+                ));
+                parts.push(format!(
+                    "manifest_embedding_backend:{}",
+                    manifest.embedding_backend.unwrap_or_default()
+                ));
+                parts.push(format!(
+                    "manifest_embedding_dim:{}",
+                    manifest
+                        .embedding_dim
+                        .map(|value| value.to_string())
+                        .unwrap_or_default()
+                ));
+            } else {
+                parts.push("manifest:<missing>".to_string());
+            }
+        }
+        Err(error) => {
+            parts.push(format!("status_error:{error}"));
+        }
+    }
+
+    parts.join("|")
+}
+
+fn stdio_path_fingerprint(path: &std::path::Path) -> String {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return "missing".to_string();
+    };
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("len:{}:mtime_ms:{}", metadata.len(), modified_ms)
 }
 
 fn stdio_packet_budget(request: &serde_json::Value) -> Result<PacketBudgetModeDto> {
@@ -524,6 +773,7 @@ fn stdio_packet_latency_budget(request: &serde_json::Value) -> Result<Option<u32
 
 fn handle_stdio_search(
     runtime: &RuntimeContext,
+    state: &mut StdioServerState,
     request: &serde_json::Value,
     query: String,
 ) -> serde_json::Value {
@@ -540,10 +790,28 @@ fn handle_stdio_search(
         .and_then(|value| value.as_u64())
         .map(|value| value.clamp(1, 50) as u32)
         .unwrap_or(10);
-    runtime
+    let cache_key = StdioSearchFragmentCacheKey {
+        storage_fingerprint: stdio_storage_fingerprint(&runtime.storage_path),
+        sidecar_fingerprint: stdio_mandatory_sidecar_fingerprint(
+            &runtime.project_root,
+            &runtime.storage_path,
+        ),
+        query: query.trim().to_ascii_lowercase(),
+        repo_text: match repo_text {
+            SearchRepoTextMode::On => "on",
+            SearchRepoTextMode::Off => "off",
+            SearchRepoTextMode::Auto => "auto",
+        }
+        .to_string(),
+        limit_per_source,
+    };
+    if let Some(cached) = state.search_cache.get(&cache_key) {
+        return cached;
+    }
+    let response = runtime
         .browser
         .search_results(SearchRequest {
-            query,
+            query: query.clone(),
             repo_text,
             limit_per_source,
             expand_search_plan: false,
@@ -551,7 +819,44 @@ fn handle_stdio_search(
             hybrid_limits: None,
         })
         .map(|result| serde_json::json!({"result": enrich_stdio_search_result(result)}))
-        .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))
+        .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}));
+    if response.get("result").is_some() {
+        state.search_cache.insert(cache_key, response.clone());
+    }
+    response
+}
+
+const STDIO_SEARCH_FRAGMENT_CACHE_CAPACITY: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StdioSearchFragmentCacheKey {
+    storage_fingerprint: String,
+    sidecar_fingerprint: String,
+    query: String,
+    repo_text: String,
+    limit_per_source: u32,
+}
+
+struct StdioSearchFragmentCache {
+    lru: StdioLruCache<StdioSearchFragmentCacheKey>,
+}
+
+impl Default for StdioSearchFragmentCache {
+    fn default() -> Self {
+        Self {
+            lru: StdioLruCache::new(STDIO_SEARCH_FRAGMENT_CACHE_CAPACITY),
+        }
+    }
+}
+
+impl StdioSearchFragmentCache {
+    fn get(&mut self, key: &StdioSearchFragmentCacheKey) -> Option<serde_json::Value> {
+        self.lru.get(key)
+    }
+
+    fn insert(&mut self, key: StdioSearchFragmentCacheKey, value: serde_json::Value) {
+        self.lru.insert(key, value);
+    }
 }
 
 fn handle_stdio_symbol(runtime: &RuntimeContext, request: &serde_json::Value) -> serde_json::Value {
@@ -866,17 +1171,27 @@ fn read_stdio_resource(runtime: &RuntimeContext, uri: &str) -> serde_json::Value
 fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Value> {
     let summary = runtime.open_project_summary()?;
     let retrieval = summary.retrieval.as_ref();
-    Ok(serde_json::json!({
-        "project_root": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
-        "storage_path": crate::display::clean_path_string(&runtime.storage_path.to_string_lossy()),
-        "storage_exists": runtime.storage_path.exists(),
-        "retrieval_mode": retrieval.map(|state| state.mode),
-        "semantic_ready": retrieval.is_some_and(|state| state.semantic_ready),
-        "semantic_doc_count": retrieval.map(|state| state.semantic_doc_count).unwrap_or(0),
-        "fallback_reason": retrieval.and_then(|state| state.fallback_reason),
-        "fallback_message": retrieval.and_then(|state| state.fallback_message.as_deref()),
-        "index_freshness": summary.freshness,
-        "recommended_next_calls": [
+    let sidecar = match codestory_retrieval::strict_sidecar_status(
+        &runtime.project_root,
+        Some(&runtime.storage_path),
+    ) {
+        Ok(report) => serde_json::json!({
+            "retrieval_mode": report.retrieval_mode,
+            "degraded_reason": report.degraded_reason,
+            "manifest_generation": report.manifest.as_ref().and_then(|manifest| manifest.sidecar_generation.as_deref()),
+            "manifest_input_hash": report.manifest.as_ref().and_then(|manifest| manifest.sidecar_input_hash.as_deref()),
+        }),
+        Err(error) => serde_json::json!({
+            "retrieval_mode": "unavailable",
+            "degraded_reason": format!("sidecar_status_error: {error}"),
+        }),
+    };
+    let sidecar_mode = sidecar
+        .get("retrieval_mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unavailable");
+    let recommended_next_calls = if sidecar_mode == "full" {
+        serde_json::json!([
             {
                 "method": "resources/read",
                 "uri": "codestory://agent-guide"
@@ -908,7 +1223,52 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
                 "method": "resources/read",
                 "uri": "codestory://trail/<node_id-from-search>"
             }
-        ]
+        ])
+    } else {
+        serde_json::json!([
+            {
+                "method": "cli",
+                "command": "codestory-cli retrieval status --project <repo>"
+            },
+            {
+                "method": "cli",
+                "command": "codestory-cli retrieval index --project <repo> --refresh full"
+            },
+            {
+                "method": "resources/read",
+                "uri": "codestory://status"
+            },
+            {
+                "method": "resources/read",
+                "uri": "codestory://agent-guide"
+            },
+            {
+                "method": "tools/call",
+                "tool": "search",
+                "arguments": {
+                    "query": "<symbol-or-concept>",
+                    "limit": 10
+                }
+            }
+        ])
+    };
+    Ok(serde_json::json!({
+        "project_root": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+        "storage_path": crate::display::clean_path_string(&runtime.storage_path.to_string_lossy()),
+        "storage_exists": runtime.storage_path.exists(),
+        "retrieval_mode": sidecar["retrieval_mode"],
+        "degraded_reason": sidecar["degraded_reason"],
+        "sidecar_retrieval": sidecar,
+        "legacy_semantic_diagnostics": {
+            "mode": retrieval.map(|state| state.mode),
+            "semantic_ready": retrieval.is_some_and(|state| state.semantic_ready),
+            "semantic_doc_count": retrieval.map(|state| state.semantic_doc_count).unwrap_or(0),
+            "fallback_reason": retrieval.and_then(|state| state.fallback_reason),
+            "fallback_message": retrieval.and_then(|state| state.fallback_message.as_deref()),
+            "diagnostic_only": true
+        },
+        "index_freshness": summary.freshness,
+        "recommended_next_calls": recommended_next_calls
     }))
 }
 
@@ -961,7 +1321,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
             "Use packet for broad task questions; use context only after selecting one concrete target.",
             "Use continuation links from search or definition results before broadening retrieval.",
             "Keep search limits bounded; stdio search clamps limit to 1..50.",
-            "Treat repo-text hits as evidence until a resolvable symbol is selected."
+            "Treat repo-text hits as navigation clues until backed by resolvable sidecar or source evidence."
         ]
     })
 }
@@ -1067,5 +1427,336 @@ fn read_stdio_template_resource(runtime: &RuntimeContext, uri: &str) -> Result<s
             .map(|value| serde_json::json!(value))
             .map_err(map_api_error),
         _ => bail!("unknown resource"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn packet_key(question: &str, storage_fingerprint: &str) -> StdioPacketCacheKey {
+        stdio_packet_cache_key(
+            storage_fingerprint.to_string(),
+            "sidecar-full".to_string(),
+            question,
+            PacketBudgetModeDto::Compact,
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            true,
+            Some(15_000),
+        )
+    }
+
+    #[test]
+    fn stdio_search_fragment_cache_reuses_matching_queries() {
+        let mut cache = StdioSearchFragmentCache::default();
+        let key = StdioSearchFragmentCacheKey {
+            storage_fingerprint: "snapshot-a".to_string(),
+            sidecar_fingerprint: "sidecar-full".to_string(),
+            query: "run_index".to_string(),
+            repo_text: "auto".to_string(),
+            limit_per_source: 10,
+        };
+        let response = json!({"result": {"hits": []}});
+        cache.insert(key.clone(), response.clone());
+        assert_eq!(cache.get(&key), Some(response));
+        assert_eq!(
+            cache.get(&StdioSearchFragmentCacheKey {
+                query: "other".to_string(),
+                ..key.clone()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn stdio_search_fragment_cache_evicts_least_recently_used_entry() {
+        let mut cache = StdioSearchFragmentCache::default();
+        let first = StdioSearchFragmentCacheKey {
+            storage_fingerprint: "snapshot-a".to_string(),
+            sidecar_fingerprint: "sidecar-full".to_string(),
+            query: "first".to_string(),
+            repo_text: "auto".to_string(),
+            limit_per_source: 10,
+        };
+        let second = StdioSearchFragmentCacheKey {
+            query: "second".to_string(),
+            ..first.clone()
+        };
+
+        cache.insert(first.clone(), json!({"result": {"hits": ["first"]}}));
+        cache.insert(second.clone(), json!({"result": {"hits": ["second"]}}));
+        assert!(cache.get(&first).is_some());
+
+        for index in 0..(STDIO_SEARCH_FRAGMENT_CACHE_CAPACITY - 1) {
+            cache.insert(
+                StdioSearchFragmentCacheKey {
+                    query: format!("extra-{index}"),
+                    ..first.clone()
+                },
+                json!({"result": {"hits": [format!("extra-{index}")]}}),
+            );
+        }
+
+        assert!(cache.get(&first).is_some());
+        assert_eq!(cache.get(&second), None);
+    }
+
+    #[test]
+    fn stdio_packet_cache_reuses_successful_packets_by_lru_key() {
+        let mut cache = StdioPacketCache::default();
+        let key = packet_key("Explain packet caching.", "snapshot-a");
+        let response = json!({"result": {"packet_id": "packet-1"}});
+
+        cache.insert(key.clone(), response.clone());
+
+        assert_eq!(cache.get(&key), Some(response));
+        assert_eq!(
+            cache.get(&packet_key("Explain a different packet.", "snapshot-a")),
+            None
+        );
+    }
+
+    #[test]
+    fn stdio_packet_cache_evicts_least_recently_used_entry() {
+        let mut cache = StdioPacketCache::default();
+        let first = packet_key("first", "snapshot-a");
+        let second = packet_key("second", "snapshot-a");
+
+        cache.insert(first.clone(), json!({"result": {"packet_id": "first"}}));
+        cache.insert(second.clone(), json!({"result": {"packet_id": "second"}}));
+        assert!(cache.get(&first).is_some());
+
+        for index in 0..(STDIO_PACKET_CACHE_CAPACITY - 1) {
+            cache.insert(
+                packet_key(&format!("extra-{index}"), "snapshot-a"),
+                json!({"result": {"packet_id": format!("extra-{index}")}}),
+            );
+        }
+
+        assert!(cache.get(&first).is_some());
+        assert_eq!(cache.get(&second), None);
+    }
+
+    #[test]
+    fn stdio_packet_cache_key_changes_with_request_arguments_and_snapshot() {
+        let base = stdio_packet_cache_key(
+            "snapshot-a".to_string(),
+            "sidecar-full".to_string(),
+            "Explain packet caching.",
+            PacketBudgetModeDto::Compact,
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            true,
+            Some(15_000),
+        );
+        assert_ne!(
+            base,
+            stdio_packet_cache_key(
+                "snapshot-b".to_string(),
+                "sidecar-full".to_string(),
+                "Explain packet caching.",
+                PacketBudgetModeDto::Compact,
+                Some(PacketTaskClassDto::ArchitectureExplanation),
+                true,
+                Some(15_000),
+            )
+        );
+        assert_ne!(
+            base,
+            stdio_packet_cache_key(
+                "snapshot-a".to_string(),
+                "sidecar-full".to_string(),
+                "Explain packet caching.",
+                PacketBudgetModeDto::Tiny,
+                Some(PacketTaskClassDto::ArchitectureExplanation),
+                true,
+                Some(15_000),
+            )
+        );
+        assert_ne!(
+            base,
+            stdio_packet_cache_key(
+                "snapshot-a".to_string(),
+                "sidecar-full".to_string(),
+                "Explain packet caching.",
+                PacketBudgetModeDto::Compact,
+                Some(PacketTaskClassDto::EditPlanning),
+                true,
+                Some(15_000),
+            )
+        );
+        assert_ne!(
+            base,
+            stdio_packet_cache_key(
+                "snapshot-a".to_string(),
+                "sidecar-full".to_string(),
+                "Explain packet caching.",
+                PacketBudgetModeDto::Compact,
+                Some(PacketTaskClassDto::ArchitectureExplanation),
+                false,
+                Some(15_000),
+            )
+        );
+        assert_ne!(
+            base,
+            stdio_packet_cache_key(
+                "snapshot-a".to_string(),
+                "sidecar-full".to_string(),
+                "Explain packet caching.",
+                PacketBudgetModeDto::Compact,
+                Some(PacketTaskClassDto::ArchitectureExplanation),
+                true,
+                Some(30_000),
+            )
+        );
+    }
+
+    #[test]
+    fn stdio_cache_keys_track_sidecar_fingerprint_without_sqlite_change() {
+        let storage_fingerprint = "snapshot-a".to_string();
+        let full_sidecar =
+            "retrieval_mode:full|manifest_generation:project-a|manifest_input_hash:hash-a";
+        let stale_sidecar = "retrieval_mode:unavailable|degraded_reason:sidecar_manifest_stale";
+
+        let packet_full = stdio_packet_cache_key(
+            storage_fingerprint.clone(),
+            full_sidecar.to_string(),
+            "Explain packet caching.",
+            PacketBudgetModeDto::Compact,
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            true,
+            Some(15_000),
+        );
+        let packet_stale = stdio_packet_cache_key(
+            storage_fingerprint.clone(),
+            stale_sidecar.to_string(),
+            "Explain packet caching.",
+            PacketBudgetModeDto::Compact,
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            true,
+            Some(15_000),
+        );
+        assert_ne!(packet_full, packet_stale);
+
+        let search_full = StdioSearchFragmentCacheKey {
+            storage_fingerprint: storage_fingerprint.clone(),
+            sidecar_fingerprint: full_sidecar.to_string(),
+            query: "handler".to_string(),
+            repo_text: "auto".to_string(),
+            limit_per_source: 10,
+        };
+        let search_stale = StdioSearchFragmentCacheKey {
+            sidecar_fingerprint: stale_sidecar.to_string(),
+            ..search_full.clone()
+        };
+        assert_ne!(search_full, search_stale);
+        assert_eq!(
+            search_full.storage_fingerprint, search_stale.storage_fingerprint,
+            "regression must cover sidecar status drift without SQLite fingerprint changes"
+        );
+    }
+
+    #[test]
+    fn stdio_product_cache_key_uses_strict_sidecar_readiness() {
+        let storage_fingerprint = "sqlite-and-wal-stable".to_string();
+        let manifest = codestory_retrieval::RetrievalIndexManifest {
+            project_id: "project-a".into(),
+            zoekt_version: "zoekt-real-v1".into(),
+            qdrant_collection: "codestory_project_a_hash_a".into(),
+            scip_revision: Some("graph-test".into()),
+            built_at_epoch_ms: 1,
+            disk_bytes: None,
+            degraded_modes_json: "[]".into(),
+            embedding_backend: Some(codestory_retrieval::embedding_runtime_id()),
+            embedding_dim: Some(codestory_retrieval::RETRIEVAL_EMBEDDING_DIM as i32),
+            sidecar_schema_version: Some(codestory_retrieval::SIDECAR_SCHEMA_VERSION),
+            sidecar_input_hash: Some("hash-a".into()),
+            sidecar_generation: Some("project-a-hash-a".into()),
+            projection_count: Some(12),
+        };
+        let before_stale = stdio_mandatory_sidecar_fingerprint_from_status(
+            codestory_retrieval::embedding_runtime_id(),
+            "state-file-stable",
+            Ok(StdioSidecarStatusFingerprint {
+                retrieval_mode: "full".into(),
+                degraded_reason: None,
+                manifest: Some(manifest.clone()),
+            }),
+        );
+        let successful_key = stdio_packet_cache_key(
+            storage_fingerprint.clone(),
+            before_stale.clone(),
+            "Explain strict readiness.",
+            PacketBudgetModeDto::Compact,
+            None,
+            true,
+            None,
+        );
+        let mut cache = StdioPacketCache::default();
+        cache.insert(
+            successful_key.clone(),
+            json!({"result": {"packet_id": "cached"}}),
+        );
+
+        let after_stale = stdio_mandatory_sidecar_fingerprint_from_status(
+            codestory_retrieval::embedding_runtime_id(),
+            "state-file-stable",
+            Ok(StdioSidecarStatusFingerprint {
+                retrieval_mode: "unavailable".into(),
+                degraded_reason: Some(
+                    "sidecar_manifest_stale: indexable_file_added_or_changed_after_sidecar_manifest: src/new_module.rs"
+                        .into(),
+                ),
+                manifest: Some(manifest),
+            }),
+        );
+        let stale_key = stdio_packet_cache_key(
+            storage_fingerprint.clone(),
+            after_stale.clone(),
+            "Explain strict readiness.",
+            PacketBudgetModeDto::Compact,
+            None,
+            true,
+            None,
+        );
+
+        assert_ne!(before_stale, after_stale);
+        assert!(
+            before_stale.contains("retrieval_mode:full"),
+            "the successful key must be tied to full strict sidecar readiness: {before_stale}"
+        );
+        assert!(
+            after_stale.contains("sidecar_manifest_stale"),
+            "stdio product cache key must encode strict stale status: {after_stale}"
+        );
+        assert_eq!(
+            successful_key.storage_fingerprint, stale_key.storage_fingerprint,
+            "the regression must cover sidecar drift without SQLite fingerprint changes"
+        );
+        assert!(
+            cache.get(&successful_key).is_some(),
+            "the full strict-readiness key should represent a successful warm cache entry"
+        );
+        assert_eq!(
+            cache.get(&stale_key),
+            None,
+            "same-server cached product result must not be returned once strict status is stale"
+        );
+    }
+
+    #[test]
+    fn stdio_storage_fingerprint_tracks_db_and_wal_changes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("codestory.db");
+        std::fs::write(&db_path, b"one").expect("write db");
+        let initial = stdio_storage_fingerprint(&db_path);
+
+        std::fs::write(&db_path, b"one-two").expect("rewrite db");
+        let rewritten = stdio_storage_fingerprint(&db_path);
+        assert_ne!(initial, rewritten);
+
+        std::fs::write(temp.path().join("codestory.db-wal"), b"wal").expect("write wal");
+        let with_wal = stdio_storage_fingerprint(&db_path);
+        assert_ne!(rewritten, with_wal);
     }
 }

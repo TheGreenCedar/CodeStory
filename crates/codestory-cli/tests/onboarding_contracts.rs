@@ -128,8 +128,6 @@ fn readme_keeps_customer_first_onboarding() {
         "docs/contributors/getting-started.md",
         "docs/contributors/debugging.md",
         "docs/contributors/testing-matrix.md",
-        "docs/internal/README.md",
-        "docs/internal/llm-default-codebase-browser-plan.md",
         "docs/decision-log.md",
         ".agents/skills/codestory-grounding/scripts/setup.ps1",
         ".agents/skills/codestory-grounding/scripts/setup.sh",

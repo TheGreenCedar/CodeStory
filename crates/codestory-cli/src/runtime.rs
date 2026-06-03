@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use codestory_contracts::api::{
     ApiError, AppEventPayload, IndexMode, IndexingPhaseTimings, NodeDetailsDto, NodeDetailsRequest,
-    ProjectSummary, SearchHit, SearchRepoTextMode, SearchRequest,
+    ProjectSummary, SearchHit,
 };
 use codestory_runtime::{
     BookmarkService, GroundingService, IndexService, ProjectService, ReadOnlyBrowserService,
@@ -32,6 +32,7 @@ pub(crate) struct RuntimeContext {
     pub(crate) browser: ReadOnlyBrowserService,
     pub(crate) events: crossbeam_channel::Receiver<AppEventPayload>,
     pub(crate) project_root: PathBuf,
+    pub(crate) cache_root: PathBuf,
     pub(crate) storage_path: PathBuf,
     pub(crate) managed_embeddings_root: PathBuf,
 }
@@ -101,6 +102,7 @@ impl RuntimeContext {
             browser: runtime.browser_service(),
             events,
             project_root,
+            cache_root,
             storage_path,
             managed_embeddings_root,
         })
@@ -218,23 +220,14 @@ fn query_resolution_alternatives(
     query: &str,
     file_filter: Option<&str>,
 ) -> Result<Vec<SearchHit>> {
-    let mut alternatives = runtime
-        .browser
-        .search_hybrid(
-            SearchRequest {
-                query: query.to_owned(),
-                repo_text: SearchRepoTextMode::Off,
-                limit_per_source: 50,
-                expand_search_plan: false,
-                hybrid_weights: None,
-                hybrid_limits: None,
-            },
-            None,
-            Some(50),
-            None,
-        )
-        .map_err(map_api_error)?;
+    let mut alternatives = query_resolution_search_hits(runtime, query)?;
     alternatives.retain(|hit| is_resolvable_graph_target(query, hit));
+    if alternatives.is_empty()
+        && let Some(stem) = command_query_resolution_stem(query)
+    {
+        alternatives = query_resolution_search_hits(runtime, &stem)?;
+        alternatives.retain(|hit| is_resolvable_graph_target(query, hit));
+    }
     if let Some(file_filter) = file_filter {
         alternatives
             .retain(|hit| search_hit_matches_file_filter(&runtime.project_root, hit, file_filter));
@@ -251,6 +244,24 @@ fn query_resolution_alternatives(
         compare_resolution_candidates(&runtime.project_root, query, file_filter, left, right)
     });
     Ok(alternatives)
+}
+
+fn query_resolution_search_hits(runtime: &RuntimeContext, query: &str) -> Result<Vec<SearchHit>> {
+    runtime
+        .browser
+        .resolve_indexed_symbol_candidates(query, 50)
+        .map_err(map_api_error)
+}
+
+fn command_query_resolution_stem(query: &str) -> Option<String> {
+    for suffix in ["_command", "_cmd", "_handler"] {
+        if let Some(stem) = query.strip_suffix(suffix)
+            && stem.len() >= 4
+        {
+            return Some(stem.to_string());
+        }
+    }
+    None
 }
 
 fn resolve_chosen_query_target(

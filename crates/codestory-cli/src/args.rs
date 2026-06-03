@@ -3,10 +3,10 @@ use codestory_contracts::api::{
     BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, EvidencePacketDto, GroundingBudgetDto,
     IndexDryRunDto, IndexFreshnessDto, IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection,
     NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto, ProjectSummary,
-    RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
-    SearchMatchQualityDto, SearchPlanDto, SearchQueryAssessmentDto, SnippetContextDto,
-    SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection,
-    TrailMode,
+    RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalShadowDto, RetrievalStateDto,
+    SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto, SearchQueryAssessmentDto,
+    SnippetContextDto, SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto,
+    TrailDirection, TrailMode,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -47,6 +47,7 @@ pub(crate) enum Command {
     Bookmark(BookmarkCommand),
     Serve(ServeCommand),
     GenerateCompletions(GenerateCompletionsCommand),
+    Retrieval(RetrievalCommand),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -80,6 +81,17 @@ fn parse_read_output_format(value: &str) -> Result<OutputFormat, String> {
         other => Err(format!(
             "invalid output format `{other}`; expected `markdown` or `json`"
         )),
+    }
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid positive integer `{value}`"))?;
+    if parsed == 0 {
+        Err("value must be greater than zero".to_string())
+    } else {
+        Ok(parsed)
     }
 }
 
@@ -362,6 +374,12 @@ pub(crate) struct PacketCommand {
         help = "Optional packet-level latency budget in milliseconds."
     )]
     pub(crate) latency_budget_ms: Option<u32>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write per-step packet retrieval trace JSON for golden scoring."
+    )]
+    pub(crate) step_trace_out: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -375,6 +393,96 @@ pub(crate) struct DoctorCommand {
         value_name = "PATH",
         help = "Write command output to this file instead of stdout. The parent directory must already exist."
     )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct RetrievalCommand {
+    #[command(subcommand)]
+    pub(crate) action: RetrievalAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum RetrievalAction {
+    /// Start Docker Compose sidecars (when available), prepare cache dirs, and wait for health.
+    Bootstrap(RetrievalBootstrapCommand),
+    /// Prepare local sidecar data directories and write sidecar state (does not start Docker).
+    Up,
+    /// Remove local sidecar state file (does not stop external processes).
+    Down,
+    /// Probe Zoekt, Qdrant, and SCIP availability for the project.
+    Status(RetrievalStatusCommand),
+    /// Run workspace index then persist retrieval_index_manifest sidecar metadata.
+    Index(RetrievalIndexCommand),
+    /// Execute a standalone sidecar retrieval query against indexed sidecar metadata.
+    Query(RetrievalQueryCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct RetrievalQueryCommand {
+    /// Natural-language, symbol, or path query string.
+    pub(crate) query: String,
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        long,
+        value_name = "MS",
+        help = "Hard deadline for the staged retrieval plan."
+    )]
+    pub(crate) budget_ms: Option<u64>,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
+    pub(crate) format: OutputFormat,
+    #[arg(long, value_name = "PATH")]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct RetrievalBootstrapCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        long,
+        help = "Skip docker compose even when Docker is installed (dirs + state file only)."
+    )]
+    pub(crate) skip_compose: bool,
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value_t = 90,
+        help = "Seconds to wait for Zoekt and Qdrant HTTP probes (0 = no wait)."
+    )]
+    pub(crate) wait_secs: u64,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Override docker/retrieval-compose.yml path."
+    )]
+    pub(crate) compose_file: Option<PathBuf>,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
+    pub(crate) format: OutputFormat,
+    #[arg(long, value_name = "PATH")]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct RetrievalStatusCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
+    pub(crate) format: OutputFormat,
+    #[arg(long, value_name = "PATH")]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct RetrievalIndexCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(long, value_enum, default_value_t = RefreshMode::Auto, help = INDEX_REFRESH_HELP)]
+    pub(crate) refresh: RefreshMode,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
+    pub(crate) format: OutputFormat,
+    #[arg(long, value_name = "PATH")]
     pub(crate) output_file: Option<PathBuf>,
 }
 
@@ -463,37 +571,42 @@ pub(crate) struct SearchCommand {
     pub(crate) output_file: Option<PathBuf>,
     #[arg(
         long,
-        help = "Show compact ranking and fallback explanations for each result."
+        help = "Show compact ranking, uncertainty, and next-action explanations for each result."
     )]
     pub(crate) why: bool,
     #[arg(
         long = "hybrid-lexical",
         value_name = "WEIGHT",
-        help = "Override the lexical component weight for hybrid search research runs."
+        hide = true,
+        help = "Unsupported for product search under mandatory sidecar retrieval."
     )]
     pub(crate) hybrid_lexical: Option<f32>,
     #[arg(
         long = "hybrid-semantic",
         value_name = "WEIGHT",
-        help = "Override the semantic component weight for hybrid search research runs."
+        hide = true,
+        help = "Unsupported for product search under mandatory sidecar retrieval."
     )]
     pub(crate) hybrid_semantic: Option<f32>,
     #[arg(
         long = "hybrid-graph",
         value_name = "WEIGHT",
-        help = "Override the graph component weight for hybrid search research runs."
+        hide = true,
+        help = "Unsupported for product search under mandatory sidecar retrieval."
     )]
     pub(crate) hybrid_graph: Option<f32>,
     #[arg(
         long = "hybrid-lexical-limit",
         value_name = "N",
-        help = "Override the lexical candidate limit for hybrid search research runs."
+        hide = true,
+        help = "Unsupported for product search under mandatory sidecar retrieval."
     )]
     pub(crate) hybrid_lexical_limit: Option<u32>,
     #[arg(
         long = "hybrid-semantic-limit",
         value_name = "N",
-        help = "Override the semantic candidate limit for hybrid search research runs."
+        hide = true,
+        help = "Unsupported for product search under mandatory sidecar retrieval."
     )]
     pub(crate) hybrid_semantic_limit: Option<u32>,
 }
@@ -535,6 +648,14 @@ pub(crate) struct DrillCommand {
     pub(crate) refresh: RefreshMode,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 1,
+        value_parser = parse_positive_usize,
+        help = "Read-only anchor and bridge evidence workers for --refresh none drills. Defaults to 1."
+    )]
+    pub(crate) jobs: usize,
 }
 
 #[derive(Args, Debug)]
@@ -568,6 +689,14 @@ pub(crate) struct DrillSuiteCommand {
     pub(crate) refresh: RefreshMode,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
     pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 1,
+        value_parser = parse_positive_usize,
+        help = "Read-only case, anchor, and bridge workers for --refresh none drill suites. Defaults to 1."
+    )]
+    pub(crate) jobs: usize,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1075,6 +1204,8 @@ pub(crate) struct SearchOutput {
     pub(crate) query: String,
     pub(crate) retrieval: RetrievalStateDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retrieval_shadow: Option<RetrievalShadowDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) freshness: Option<IndexFreshnessDto>,
     pub(crate) limit_per_source: u32,
     pub(crate) repo_text_mode: RepoTextMode,
@@ -1129,6 +1260,17 @@ pub(crate) struct SnippetJsonOutput<'a> {
     pub(crate) verification_targets: Vec<VerificationTargetOutput>,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct DrillRuntimeTimingsOutput {
+    pub(crate) total_ms: u64,
+    pub(crate) setup_ms: u64,
+    pub(crate) question_search_ms: u64,
+    pub(crate) anchor_resolution_ms: u64,
+    pub(crate) supplemental_search_ms: u64,
+    pub(crate) bridge_evidence_ms: u64,
+    pub(crate) evidence_assembly_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DrillMechanicalOutput {
     pub(crate) before_files: u32,
@@ -1143,15 +1285,19 @@ pub(crate) struct DrillMechanicalOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retrieval: Option<RetrievalStateDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sidecar_retrieval_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) freshness: Option<IndexFreshnessDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) phase_timings: Option<IndexingPhaseTimings>,
+    pub(crate) drill_timings: DrillRuntimeTimingsOutput,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DrillCommandStatusOutput {
     pub(crate) command: String,
     pub(crate) status: String,
+    pub(crate) duration_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) artifact: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1251,6 +1397,15 @@ pub(crate) struct DrillAnchorConsumerSummaryOutput {
     pub(crate) notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct DrillAnchorTimingsOutput {
+    pub(crate) total_ms: u64,
+    pub(crate) search_ms: u64,
+    pub(crate) resolution_ms: u64,
+    pub(crate) consumer_summary_ms: u64,
+    pub(crate) command_artifacts_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DrillAnchorOutput {
     pub(crate) anchor: String,
@@ -1260,6 +1415,7 @@ pub(crate) struct DrillAnchorOutput {
     pub(crate) verification_targets: Vec<VerificationTargetOutput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) consumer_summary: Option<DrillAnchorConsumerSummaryOutput>,
+    pub(crate) timings: DrillAnchorTimingsOutput,
     pub(crate) commands: Vec<DrillCommandStatusOutput>,
 }
 
@@ -1336,6 +1492,7 @@ pub(crate) struct DrillSummaryMechanicalOutput {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) freshness_samples: Vec<String>,
     pub(crate) phase_timing_available: bool,
+    pub(crate) drill_timings: DrillRuntimeTimingsOutput,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1360,6 +1517,13 @@ pub(crate) struct DrillSummaryAnchorStatusOutput {
     pub(crate) text_hint_count: usize,
     pub(crate) command_count: usize,
     pub(crate) failed_command_count: usize,
+    pub(crate) command_duration_ms: u64,
+    pub(crate) total_duration_ms: u64,
+    pub(crate) resolution_duration_ms: u64,
+    pub(crate) consumer_summary_duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) slowest_command: Option<String>,
+    pub(crate) slowest_command_ms: u64,
     pub(crate) source_truth_target_count: usize,
 }
 
@@ -1741,11 +1905,26 @@ pub(crate) struct DoctorCheckOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct DoctorSidecarStatusOutput {
+    pub(crate) retrieval_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) degraded_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) manifest_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) manifest_input_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct DoctorOutput {
     pub(crate) project: String,
     pub(crate) storage_path: String,
     pub(crate) indexed: bool,
     pub(crate) stats: codestory_contracts::api::StorageStatsDto,
+    pub(crate) retrieval_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) degraded_reason: Option<String>,
+    pub(crate) sidecar_retrieval: DoctorSidecarStatusOutput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retrieval: Option<RetrievalStateDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1956,6 +2135,7 @@ mod tests {
         assert!(help.contains("--output-dir <DIR>"));
         assert!(help.contains("--label <LABEL>"));
         assert!(help.contains("--question <QUESTION>"));
+        assert!(help.contains("--jobs <N>"));
         assert!(help.contains("Stored in the report only; it is not interpreted"));
         assert!(help.contains("Drill defaults to `full`"));
     }
@@ -1965,7 +2145,69 @@ mod tests {
         let help = render_subcommand_help("drill-suite");
         assert!(help.contains("--case-file <FILE>"));
         assert!(help.contains("--ledger <FILE>"));
+        assert!(help.contains("--jobs <N>"));
         assert!(help.contains("source-truth ledger JSON"));
+    }
+
+    #[test]
+    fn drill_jobs_parse_with_conservative_default() {
+        let drill = Cli::try_parse_from([
+            "codestory-cli",
+            "drill",
+            "--anchors",
+            "A,B",
+            "--output-dir",
+            "target/drill/test",
+        ])
+        .expect("drill default jobs");
+        match drill.command {
+            Command::Drill(cmd) => assert_eq!(cmd.jobs, 1),
+            _ => panic!("expected drill command"),
+        }
+
+        let drill = Cli::try_parse_from([
+            "codestory-cli",
+            "drill",
+            "--anchors",
+            "A,B",
+            "--output-dir",
+            "target/drill/test",
+            "--jobs",
+            "4",
+        ])
+        .expect("drill explicit jobs");
+        match drill.command {
+            Command::Drill(cmd) => assert_eq!(cmd.jobs, 4),
+            _ => panic!("expected drill command"),
+        }
+
+        let invalid = Cli::try_parse_from([
+            "codestory-cli",
+            "drill-suite",
+            "--case-file",
+            "cases.json",
+            "--output-dir",
+            "target/drill-suite/test",
+            "--jobs",
+            "0",
+        ]);
+        assert!(invalid.is_err(), "--jobs 0 should be rejected");
+
+        let suite = Cli::try_parse_from([
+            "codestory-cli",
+            "drill-suite",
+            "--case-file",
+            "cases.json",
+            "--output-dir",
+            "target/drill-suite/test",
+            "--jobs",
+            "3",
+        ])
+        .expect("drill-suite explicit jobs");
+        match suite.command {
+            Command::DrillSuite(cmd) => assert_eq!(cmd.jobs, 3),
+            _ => panic!("expected drill-suite command"),
+        }
     }
 
     #[test]
