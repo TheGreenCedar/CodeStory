@@ -1,0 +1,102 @@
+{
+  "$schema": "../manifest.schema.json",
+  "id": "redis-server-event-loop",
+  "version": 1,
+  "suite": "holdout-retrieval",
+  "task_class": "architecture_explanation",
+  "repo": {
+    "name": "redis",
+    "url": "https://github.com/redis/redis.git",
+    "ref": "7.2.4",
+    "workspace_root": ".",
+    "languages": [
+      "C"
+    ],
+    "setup": [
+      "No dependency setup is required for read-only benchmark inspection."
+    ]
+  },
+  "prompt": "Explain how the Redis server starts its event loop, reads client commands from the network, and dispatches them through processCommand and call. Cite the source files that support the path.",
+  "expected_files": [
+    "src/server.c",
+    "src/ae.c",
+    "src/networking.c",
+    "src/server.h"
+  ],
+  "expected_symbols": [
+    {
+      "name": "main",
+      "path": "src/server.c",
+      "kind": "function",
+      "why": "Server bootstrap and event loop startup."
+    },
+    {
+      "name": "aeMain",
+      "path": "src/ae.c",
+      "kind": "function",
+      "why": "Runs the file and time event loop until stop is set."
+    },
+    {
+      "name": "readQueryFromClient",
+      "path": "src/networking.c",
+      "kind": "function",
+      "why": "Reads bytes from a client connection into the query buffer."
+    },
+    {
+      "name": "processCommand",
+      "path": "src/server.c",
+      "kind": "function",
+      "why": "Parses and validates an executed client command."
+    },
+    {
+      "name": "call",
+      "path": "src/server.c",
+      "kind": "function",
+      "why": "Invokes the command implementation and propagates flags."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "main initializes the server and enters aeMain on the shared event loop."
+    },
+    {
+      "text": "aeProcessEvents polls readable/writable fds and invokes registered file event handlers."
+    },
+    {
+      "text": "readQueryFromClient appends socket input and drives processInputBuffer when a full command is available."
+    },
+    {
+      "text": "processCommand resolves the command table entry and enforces ACL, arity, and cluster checks."
+    },
+    {
+      "text": "call executes the command proc and handles propagation, monitoring, and slowlog accounting."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "Redis executes commands synchronously in main without the ae event loop.",
+      "severity": "critical"
+    },
+    {
+      "text": "Client queries are parsed entirely inside call before processCommand runs.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.65,
+    "min_expected_symbol_recall": 0.65,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.65,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "holdout",
+    "c",
+    "server",
+    "generalization"
+  ],
+  "notes": [
+    "Generalization holdout for sidecar retrieval (L-tier). Do not tune planner or ranker heuristics against this manifest."
+  ]
+}

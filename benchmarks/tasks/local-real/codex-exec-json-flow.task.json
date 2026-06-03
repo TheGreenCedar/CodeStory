@@ -1,0 +1,139 @@
+{
+  "$schema": "../manifest.schema.json",
+  "id": "codex-exec-json-flow",
+  "version": 1,
+  "suite": "local-real",
+  "task_class": "architecture_explanation",
+  "repo": {
+    "name": "codex",
+    "url": "https://github.com/openai/codex.git",
+    "ref": "9f42c89c0112771dc29100a6f3fc904049b2655f",
+    "workspace_root": ".",
+    "languages": [
+      "Rust",
+      "TypeScript"
+    ],
+    "setup": [
+      "No dependency setup is required for read-only benchmark inspection."
+    ]
+  },
+  "prompt": "Explain how `codex exec --json` flows from the top-level CLI into the exec runtime, app-server thread and turn start requests, and JSONL event output. Cite the source files that support the path.",
+  "expected_files": [
+    "codex-rs/cli/src/main.rs",
+    "codex-rs/exec/src/main.rs",
+    "codex-rs/exec/src/cli.rs",
+    "codex-rs/exec/src/lib.rs",
+    "codex-rs/exec/src/event_processor.rs",
+    "codex-rs/exec/src/event_processor_with_jsonl_output.rs",
+    "codex-rs/exec/src/exec_events.rs"
+  ],
+  "expected_verification_files": [
+    "codex-rs/exec/tests/event_processor_with_json_output.rs"
+  ],
+  "expected_symbols": [
+    {
+      "name": "Subcommand::Exec",
+      "path": "codex-rs/cli/src/main.rs",
+      "kind": "enum variant",
+      "why": "Top-level CLI subcommand that routes non-interactive execution."
+    },
+    {
+      "name": "codex_exec::Cli",
+      "path": "codex-rs/exec/src/cli.rs",
+      "kind": "struct",
+      "why": "Defines exec-specific flags such as --json, --ephemeral, prompt, and resume/review subcommands."
+    },
+    {
+      "name": "run_main",
+      "query": "codex_exec::run_main",
+      "path": "codex-rs/exec/src/lib.rs",
+      "kind": "function",
+      "why": "Main exec runtime entry point after CLI parsing."
+    },
+    {
+      "name": "run_exec_session",
+      "path": "codex-rs/exec/src/lib.rs",
+      "kind": "function",
+      "why": "Creates the event processor, starts the app-server client, and sends thread/turn requests."
+    },
+    {
+      "name": "ThreadStartParams",
+      "path": "codex-rs/exec/src/lib.rs",
+      "kind": "type",
+      "why": "Carries model, cwd, permissions, sandbox, and thread metadata into the app-server thread start."
+    },
+    {
+      "name": "TurnStartParams",
+      "path": "codex-rs/exec/src/lib.rs",
+      "kind": "type",
+      "why": "Carries the user prompt and turn settings into the app-server turn start."
+    },
+    {
+      "name": "EventProcessor",
+      "path": "codex-rs/exec/src/event_processor.rs",
+      "kind": "trait",
+      "why": "Abstracts human and JSON event output handling."
+    },
+    {
+      "name": "EventProcessorWithJsonOutput",
+      "path": "codex-rs/exec/src/event_processor_with_jsonl_output.rs",
+      "kind": "struct",
+      "why": "Maps app-server notifications into JSONL thread events."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "The top-level Codex CLI has an Exec subcommand that delegates non-interactive execution into the codex_exec crate."
+    },
+    {
+      "text": "The codex-exec binary parses exec-specific CLI options and calls codex_exec::run_main."
+    },
+    {
+      "text": "The exec CLI defines --json as the switch that chooses JSONL stdout output."
+    },
+    {
+      "text": "run_main loads config, resolves sandbox and approval settings, and builds the in-process app-server start arguments."
+    },
+    {
+      "text": "run_exec_session chooses EventProcessorWithJsonOutput in JSON mode and EventProcessorWithHumanOutput otherwise."
+    },
+    {
+      "text": "run_exec_session starts or resumes an app-server thread, then sends TurnStartParams with the prompt input."
+    },
+    {
+      "text": "EventProcessorWithJsonOutput serializes typed thread events as JSON lines on stdout."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "codex exec bypasses the app-server path and talks directly to the model provider.",
+      "severity": "critical"
+    },
+    {
+      "text": "--json is handled by printing human output and converting it after the run completes.",
+      "severity": "major"
+    },
+    {
+      "text": "ThreadStartParams and TurnStartParams are only used by the interactive TUI, not by codex exec.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.75,
+    "min_expected_file_recall": 0.75,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.8,
+    "min_citation_coverage": 0.75,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "local",
+    "rust",
+    "cli",
+    "exec",
+    "jsonl"
+  ],
+  "notes": [
+    "Local-real task for the user-requested sibling checkout. This is not public promotion evidence unless rerun against a pinned clean checkout with repeated paired rows."
+  ]
+}

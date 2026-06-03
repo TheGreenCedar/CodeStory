@@ -1,0 +1,103 @@
+{
+  "$schema": "../manifest.schema.json",
+  "id": "ripgrep-search-pipeline",
+  "version": 1,
+  "suite": "holdout-retrieval",
+  "task_class": "architecture_explanation",
+  "repo": {
+    "name": "ripgrep",
+    "url": "https://github.com/BurntSushi/ripgrep.git",
+    "ref": "14.1.0",
+    "workspace_root": ".",
+    "languages": [
+      "Rust"
+    ],
+    "setup": [
+      "No dependency setup is required for read-only benchmark inspection."
+    ]
+  },
+  "prompt": "Explain how ripgrep parses CLI flags, walks candidate files, and executes a search over each haystack through matcher, searcher, and printer components. Cite the source files that support the path.",
+  "expected_files": [
+    "crates/core/main.rs",
+    "crates/core/flags/mod.rs",
+    "crates/core/flags/hiargs.rs",
+    "crates/core/haystack.rs",
+    "crates/core/search.rs"
+  ],
+  "expected_symbols": [
+    {
+      "name": "main",
+      "path": "crates/core/main.rs",
+      "kind": "function",
+      "why": "CLI entry point that delegates into the search driver."
+    },
+    {
+      "name": "run",
+      "path": "crates/core/main.rs",
+      "kind": "function",
+      "why": "Selects search, files, types, or generate modes after flag parsing."
+    },
+    {
+      "name": "search",
+      "path": "crates/core/main.rs",
+      "kind": "function",
+      "why": "Single-threaded directory walk and per-file search loop."
+    },
+    {
+      "name": "SearchWorker",
+      "path": "crates/core/search.rs",
+      "kind": "struct",
+      "why": "Coordinates matcher, searcher, and printer for each haystack."
+    },
+    {
+      "name": "SearchWorker::search",
+      "path": "crates/core/search.rs",
+      "kind": "method",
+      "why": "Executes one haystack search including preprocessors and decompression."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "main calls run after flags::parse and routes into search or parallel search modes."
+    },
+    {
+      "text": "HiArgs builds walkers, matchers, searchers, and printers used by the search driver."
+    },
+    {
+      "text": "search walks haystacks from the ignore crate and invokes SearchWorker per file."
+    },
+    {
+      "text": "SearchWorker connects a PatternMatcher, grep searcher, and Printer for each haystack."
+    },
+    {
+      "text": "search_parallel uses walk_builder().build_parallel() to search files concurrently."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "ripgrep searches files without building haystacks from the directory walker.",
+      "severity": "critical"
+    },
+    {
+      "text": "Flag parsing happens inside SearchWorker instead of before run selects a mode.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.65,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "holdout",
+    "rust",
+    "search",
+    "generalization"
+  ],
+  "notes": [
+    "Generalization holdout for sidecar retrieval. Do not tune planner or ranker heuristics against this manifest."
+  ]
+}

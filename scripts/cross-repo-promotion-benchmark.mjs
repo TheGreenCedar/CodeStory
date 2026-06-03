@@ -21,7 +21,10 @@ const outDir =
 const listOnly = process.argv.includes("--list") || process.env.CODESTORY_CROSS_REPO_LIST === "1";
 const skipIndex = process.argv.includes("--skip-index") || process.env.CODESTORY_CROSS_REPO_SKIP_INDEX === "1";
 const allowFail = process.env.CODESTORY_CROSS_REPO_ALLOW_FAIL === "1";
-const requiredProjects = Number(process.env.CODESTORY_CROSS_REPO_REQUIRED_PROJECTS ?? 4);
+const includeDeprecated =
+  process.argv.includes("--include-deprecated") ||
+  process.env.CODESTORY_CROSS_REPO_INCLUDE_DEPRECATED === "1";
+const requiredProjects = Number(process.env.CODESTORY_CROSS_REPO_REQUIRED_PROJECTS ?? 2);
 const minAggregateHit10 = Number(process.env.CODESTORY_CROSS_REPO_MIN_HIT10 ?? 0.85);
 const minAggregateMrr10 = Number(process.env.CODESTORY_CROSS_REPO_MIN_MRR10 ?? 0.7);
 const minProjectHit10 = Number(process.env.CODESTORY_CROSS_REPO_MIN_PROJECT_HIT10 ?? 0.75);
@@ -42,6 +45,7 @@ const suites = [
   {
     id: "freelancer",
     name: "freelancer",
+    deprecated: true,
     language_mix: "Rust/Tauri + TypeScript/React desktop app",
     pathCandidates: [String.raw`C:\Users\alber\source\repos\freelancer`],
     queries: [
@@ -183,6 +187,7 @@ const suites = [
   {
     id: "traderotate",
     name: "traderotate",
+    deprecated: true,
     language_mix: "JavaScript Hardhat/Remix arbitrage runners",
     pathCandidates: [String.raw`C:\Users\alber\source\repos\traderotate`],
     queries: [
@@ -476,7 +481,9 @@ const suites = [
 ];
 
 const activeSuites = suites.filter(
-  (suite) => selectedProjectIds.size === 0 || selectedProjectIds.has(suite.id.toLowerCase()),
+  (suite) =>
+    (includeDeprecated || !suite.deprecated) &&
+    (selectedProjectIds.size === 0 || selectedProjectIds.has(suite.id.toLowerCase())),
 );
 
 const resolvedSuites = activeSuites.map((suite) => ({
@@ -1121,7 +1128,7 @@ function configureProfile(name, env) {
   env.CODESTORY_EMBED_LLAMACPP_URL = url;
   env.CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT = llamaRequestCount;
   env.CODESTORY_SEMANTIC_DOC_MAX_TOKENS =
-    process.env.CODESTORY_CROSS_REPO_SEMANTIC_DOC_MAX_TOKENS ?? "384";
+    process.env.CODESTORY_CROSS_REPO_SEMANTIC_DOC_MAX_TOKENS ?? "128";
   delete env.CODESTORY_EMBED_MAX_TOKENS;
   delete env.CODESTORY_EMBED_QUERY_PREFIX;
   delete env.CODESTORY_EMBED_DOCUMENT_PREFIX;

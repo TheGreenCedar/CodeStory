@@ -2,7 +2,7 @@ use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind,
     Occurrence, OccurrenceKind, SourceLocation,
 };
-use codestory_store::{FileInfo, Store as Storage};
+use codestory_store::{FileInfo, FileRole, Store as Storage};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -70,6 +70,7 @@ fn build_cleanup_storage() -> anyhow::Result<CleanupFixture> {
             id: file_id,
             path: PathBuf::from(format!("/bench/file_{file_idx}.rs")),
             language: "rust".to_string(),
+            file_role: FileRole::Source,
             modification_time: file_idx as i64,
             indexed: true,
             complete: true,

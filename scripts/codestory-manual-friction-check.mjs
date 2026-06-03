@@ -2,6 +2,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { benchmarkChildEnv } from "./codestory-benchmark-contract.mjs";
 
 const repoRoot = resolve(process.cwd());
 const artifactDir = join(repoRoot, "target", "autoresearch");
@@ -16,9 +17,9 @@ if (args.has("--help") || args.has("-h")) {
 
 Runs the CodeStory skill-first manual-friction harness across ../Sourcetrail,
 ../rootandruntime, and this repo. The gap list is seeded from the three manual
-subagent tracks: first-class repo explanation, semantic health, broad-search
+subagent tracks: packet-first repo explanation, semantic health, broad-search
 drift, grounding recommendation quality, object/config trails, snippet context,
-format validation, and skill-only guidance. Emits METRIC quality_gap=<count>
+format validation, and current skill guidance. Emits METRIC quality_gap=<count>
 and writes a JSON report under target/autoresearch/.`);
   process.exit(0);
 }
@@ -69,10 +70,7 @@ function runCli(commandArgs, options = {}) {
   const result = spawnSync(cliPath, commandArgs, {
     cwd: repoRoot,
     encoding: "utf8",
-    env: {
-      ...process.env,
-      NO_COLOR: "1",
-    },
+    env: benchmarkChildEnv(process.env, { NO_COLOR: "1" }),
     timeout: options.timeoutMs ?? 180_000,
   });
   return {
@@ -206,28 +204,45 @@ function checkBroadSearch(repoName, searchJson) {
   }
 }
 
-function checkExplain(repoName, explainJson) {
-  if (!Array.isArray(explainJson?.workflow) || !explainJson.workflow.includes("anchor_search")) {
-    addGap(repoName, "explain_workflow_missing", 1, "explain output does not report the guided workflow");
+function checkPacket(repoName, packetJson) {
+  const sufficiency = packetJson?.sufficiency ?? {};
+  const status = sufficiency.status ?? null;
+  if (!["sufficient", "partial"].includes(status)) {
+    addGap(repoName, "packet_status_unusable", 1, "packet output is neither sufficient nor partial", {
+      status,
+    });
   }
-  if (!Array.isArray(explainJson?.anchors) || explainJson.anchors.length === 0) {
-    addGap(repoName, "explain_missing_anchors", 1, "explain output has no architecture anchors");
+  const citations = packetJson?.answer?.citations ?? [];
+  const avoidOpening = sufficiency.avoid_opening ?? [];
+  if (!Array.isArray(citations) || citations.length === 0) {
+    addGap(repoName, "packet_missing_citations", 1, "packet answer has no structured citations");
+  }
+  if (
+    status === "sufficient" &&
+    Array.isArray(sufficiency.follow_up_commands) &&
+    sufficiency.follow_up_commands.length > 0
+  ) {
+    addGap(repoName, "packet_sufficient_with_followups", 2, "sufficient packet still asks for follow-up commands", {
+      follow_up_commands: sufficiency.follow_up_commands,
+    });
+  }
+  if (!Array.isArray(avoidOpening)) {
+    addGap(repoName, "packet_avoid_opening_malformed", 2, "packet sufficiency avoid_opening is not a list");
+  }
+  const retrievalTrace = packetJson?.answer?.retrieval_trace;
+  if (!retrievalTrace || typeof retrievalTrace !== "object") {
+    addGap(repoName, "packet_missing_retrieval_trace", 2, "packet answer does not expose retrieval trace telemetry");
   }
   const text = fieldText({
-    anchors: explainJson?.anchors ?? [],
-    answer: {
-      summary: explainJson?.answer?.summary,
-      citations: explainJson?.answer?.citations ?? [],
-      sections: explainJson?.answer?.sections ?? [],
-      annotations: explanationAnnotations(explainJson?.answer?.retrieval_trace?.annotations),
-    },
+    citations,
+    sufficiency,
+    sections: packetJson?.answer?.sections ?? [],
+    supported_claims: packetJson?.answer?.supported_claims ?? [],
+    annotations: explanationAnnotations(retrievalTrace?.annotations),
   });
-  if (!text.includes("repo_explain_db_first_no_local_agent") && !text.includes("repo_explain_local_agent")) {
-    addGap(repoName, "explain_mode_unlabeled", 2, "explain output does not label repo-explain DB-first/local-agent mode");
-  }
   for (const term of repoBadTerms(repoName)) {
     if (text.includes(term)) {
-      addGap(repoName, "explain_drift", 1, `explain output drifted into ${term}`);
+      addGap(repoName, "packet_drift", 1, `packet output drifted into ${term}`);
     }
   }
 }
@@ -262,11 +277,14 @@ function checkSkillGuidance(repoName) {
     return;
   }
   const skillText = String(report.skill_text ?? "").toLowerCase();
-  if (!skillText.includes("explain --project")) {
-    addGap(repoName, "skill_missing_explain_flow", 1, "skill does not route broad repo explanations through explain");
+  if (!skillText.includes("start broad repo") || !skillText.includes("`packet`")) {
+    addGap(repoName, "skill_missing_packet_flow", 1, "skill does not route broad repo explanations through packet");
   }
-  if (!skillText.includes("do not run `git status`")) {
-    addGap(repoName, "skill_only_constraint_gap", 2, "skill-only manual tests do not explicitly forbid git status");
+  if (!skillText.includes("sufficiency.follow_up_commands")) {
+    addGap(repoName, "skill_missing_followup_contract", 2, "skill does not name the packet follow-up contract");
+  }
+  if (!skillText.includes("do not pass broad natural-language questions directly to `context`")) {
+    addGap(repoName, "skill_missing_context_boundary", 2, "skill does not preserve packet-before-context boundary");
   }
 }
 
@@ -423,53 +441,22 @@ if (!existsSync(cliPath)) {
       checkBroadSearch(repoName, broadSearch.json);
     }
 
-    const explain = runJson(repoName, [
-      "explain",
+    const packet = runJson(repoName, [
+      "packet",
       "--project",
       repoPath,
+      "--question",
+      "How does this repo fit together?",
+      "--budget",
+      "compact",
       "--refresh",
       "none",
       "--format",
       "json",
     ], 240_000);
-    repoReport.commands.push(compactTranscript(explain.result));
-    if (explain.json) {
-      checkExplain(repoName, explain.json);
-    }
-
-    const ask = runJson(repoName, [
-      "ask",
-      "--project",
-      repoPath,
-      "--investigate",
-      "--format",
-      "json",
-      "How does this repo fit together?",
-    ], 240_000);
-    repoReport.commands.push(compactTranscript(ask.result));
-    if (ask.json) {
-      const answerText = fieldText(ask.json);
-      const driftText = fieldText({
-        answer: ask.json.answer,
-        hits: ask.json.hits,
-        citations: ask.json.citations,
-        sections: ask.json.sections,
-        retrieval_trace: {
-          annotations: explanationAnnotations(ask.json.retrieval_trace?.annotations),
-          steps: ask.json.retrieval_trace?.steps,
-        },
-      });
-      if (answerText.includes("low confidence")) {
-        addGap(repoName, "ask_low_confidence", 2, "broad explanation ask still reports low confidence");
-      }
-      for (const term of repoBadTerms(repoName)) {
-        if (driftText.includes(term)) {
-          addGap(repoName, "ask_drift", 1, `broad explanation drifted into ${term}`);
-        }
-      }
-      if (!answerText.includes("db-first retrieval packet") && !answerText.includes("mode=db_first_no_local_agent")) {
-        addGap(repoName, "ask_mode_unlabeled", 2, "ask output does not clearly label DB-first/no-local-agent mode");
-      }
+    repoReport.commands.push(compactTranscript(packet.result));
+    if (packet.json) {
+      checkPacket(repoName, packet.json);
     }
 
     if (repoName === "rootandruntime") {
