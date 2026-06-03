@@ -4,7 +4,7 @@ use codestory_contracts::api::{
     AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
     AgentRetrievalStepStatusDto, ClaimReadinessDto, EvidenceTypeDto, GraphArtifactDto,
     GroundingSnapshotDto, IndexingPhaseTimings, NodeDetailsDto, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, SearchHit,
+    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, SearchHit, SearchHitOrigin,
     SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
     SearchPlanBridgeStatusDto, SearchPlanChannelDto, SearchPlanDto, SearchPlanPromotionStatusDto,
     SnippetContextDto, SymbolContextDto, TrailContextDto, TrailStoryDto,
@@ -566,6 +566,7 @@ pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput)
         append_search_plan(&mut markdown, project_root, plan);
     }
     if output.explain {
+        append_search_sidecar_diagnostics(&mut markdown, output);
         append_search_evidence_packet(&mut markdown, project_root, output);
     }
     if !output.suggestions.is_empty() {
@@ -617,6 +618,98 @@ fn append_search_hit_why(markdown: &mut String, hit: &SearchHitOutput) {
     }
     for why in &hit.why {
         let _ = writeln!(markdown, "  why: {why}");
+    }
+}
+
+fn append_search_sidecar_diagnostics(markdown: &mut String, output: &SearchOutput) {
+    let Some(shadow) = output.retrieval_shadow.as_ref() else {
+        return;
+    };
+    let budget = shadow
+        .total_budget_ms
+        .map(|ms| ms.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let cancel = shadow.cancel_reason.as_deref().unwrap_or("none");
+    let degraded = shadow.degraded_reason.as_deref().unwrap_or("none");
+    let _ = writeln!(markdown, "Sidecar diagnostics:");
+    let _ = writeln!(
+        markdown,
+        "- mode={} total_ms={} budget_ms={} cache_hit={} degraded={} cancel={}",
+        shadow.retrieval_mode,
+        shadow.retrieval_total_ms,
+        budget,
+        shadow.cache_hit,
+        degraded,
+        cancel
+    );
+    let _ = writeln!(
+        markdown,
+        "- candidates={} resolved={} unresolved={}",
+        shadow.candidate_count, shadow.resolved_hit_count, shadow.unresolved_candidate_count
+    );
+
+    if !shadow.stage_timings.is_empty() {
+        let _ = writeln!(markdown, "Sidecar stages:");
+        for stage in shadow.stage_timings.iter().take(EVIDENCE_PREVIEW_LIMIT + 3) {
+            let cancel = stage.cancel_reason.as_deref().unwrap_or("none");
+            let _ = writeln!(
+                markdown,
+                "- {} elapsed_ms={} candidates_added={} marginal_gain={:.3} cache_hit={} degraded={} cancel={}",
+                stage.stage,
+                stage.elapsed_ms,
+                stage.candidates_added,
+                stage.marginal_gain,
+                stage.cache_hit,
+                stage.degraded,
+                cancel
+            );
+        }
+    }
+
+    if !shadow.candidate_resolution_counts.is_empty() {
+        let _ = writeln!(markdown, "Sidecar candidate resolution:");
+        for entry in &shadow.candidate_resolution_counts {
+            let _ = writeln!(markdown, "- {}: {}", entry.resolution, entry.count);
+        }
+    }
+
+    if !shadow.candidates.is_empty() {
+        let _ = writeln!(markdown, "Sidecar candidate window:");
+        for candidate in shadow.candidates.iter().take(EVIDENCE_PREVIEW_LIMIT) {
+            let symbol = candidate.symbol_name.as_deref().unwrap_or("n/a");
+            let line = candidate
+                .line
+                .map(|line| line.to_string())
+                .unwrap_or_else(|| "n/a".to_string());
+            let resolution = candidate.resolution.as_deref().unwrap_or("unlabeled");
+            let admission = candidate.admission_status.as_deref().unwrap_or("unlabeled");
+            let loss_reason = candidate.loss_reason.as_deref().unwrap_or("none");
+            let final_rank = candidate
+                .final_rank
+                .map(|rank| rank.to_string())
+                .unwrap_or_else(|| "n/a".to_string());
+            let search_hit_rank = candidate
+                .search_hit_rank
+                .map(|rank| rank.to_string())
+                .unwrap_or_else(|| "n/a".to_string());
+            let resolved_node = candidate.resolved_node_id.as_deref().unwrap_or("n/a");
+            let _ = writeln!(
+                markdown,
+                "- rank={} source={} path={} line={} symbol={} resolution={} admission={} loss_reason={} search_hit_rank={} final_rank={} node={} score={:.3}",
+                candidate.rank,
+                candidate.source,
+                candidate.file_path,
+                line,
+                symbol,
+                resolution,
+                admission,
+                loss_reason,
+                search_hit_rank,
+                final_rank,
+                resolved_node,
+                candidate.score
+            );
+        }
     }
 }
 
@@ -701,6 +794,7 @@ fn append_search_plan(markdown: &mut String, project_root: &Path, plan: &SearchP
     append_search_plan_candidate_windows(markdown, plan);
     append_search_plan_anchor_groups(markdown, plan);
     append_search_plan_bridges(markdown, plan);
+    append_search_plan_rejected_hits(markdown, plan);
     append_search_plan_repo_text_promotions(markdown, plan);
     append_search_plan_next_steps(markdown, project_root, plan);
 }
@@ -837,6 +931,39 @@ fn append_search_plan_repo_text_promotions(markdown: &mut String, plan: &SearchP
     }
     if !wrote_repo_text_promotion {
         let _ = writeln!(markdown, "- none");
+    }
+}
+
+fn append_search_plan_rejected_hits(markdown: &mut String, plan: &SearchPlanDto) {
+    if plan.rejected_hits.is_empty() {
+        return;
+    }
+    let _ = writeln!(markdown, "Rejected candidates:");
+    for hit in &plan.rejected_hits {
+        let location = hit
+            .file_path
+            .as_deref()
+            .map(|path| {
+                hit.line
+                    .map(|line| format!(" {path}:{line}"))
+                    .unwrap_or_else(|| format!(" {path}"))
+            })
+            .unwrap_or_default();
+        let _ = writeln!(
+            markdown,
+            "- `{}` origin={}{}",
+            hit.display_name,
+            format_search_hit_origin(hit.origin),
+            location
+        );
+        let _ = writeln!(markdown, "  why: {}", hit.reason);
+    }
+}
+
+fn format_search_hit_origin(origin: SearchHitOrigin) -> &'static str {
+    match origin {
+        SearchHitOrigin::IndexedSymbol => "indexed_symbol",
+        SearchHitOrigin::TextMatch => "repo_text",
     }
 }
 
@@ -1642,6 +1769,7 @@ fn format_retrieval_fallback_reason(reason: RetrievalFallbackReasonDto) -> &'sta
         RetrievalFallbackReasonDto::DisabledByConfig => "disabled_by_config",
         RetrievalFallbackReasonDto::MissingEmbeddingRuntime => "missing_embedding_runtime",
         RetrievalFallbackReasonDto::MissingSemanticDocs => "missing_semantic_docs",
+        RetrievalFallbackReasonDto::DegradedRuntime => "degraded_runtime",
     }
 }
 
@@ -1826,8 +1954,18 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
         output.stats.file_count,
         output.stats.error_count
     );
+    let _ = writeln!(
+        markdown,
+        "sidecar_retrieval: mode={} degraded_reason={}",
+        output.retrieval_mode,
+        output.degraded_reason.as_deref().unwrap_or("none")
+    );
     if let Some(retrieval) = output.retrieval.as_ref() {
-        let _ = writeln!(markdown, "retrieval: {}", render_retrieval_state(retrieval));
+        let _ = writeln!(
+            markdown,
+            "legacy_semantic_diagnostic: {}",
+            render_retrieval_state(retrieval)
+        );
     }
     let attention = output
         .checks
@@ -1930,6 +2068,18 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
             timings.cache_refresh_ms.unwrap_or(0)
         );
     }
+    let drill_timings = &output.mechanical.drill_timings;
+    let _ = writeln!(
+        markdown,
+        "drill_timings_ms: total={} setup={} question_search={} anchors={} supplemental_search={} bridges={} evidence_assembly={}",
+        drill_timings.total_ms,
+        drill_timings.setup_ms,
+        drill_timings.question_search_ms,
+        drill_timings.anchor_resolution_ms,
+        drill_timings.supplemental_search_ms,
+        drill_timings.bridge_evidence_ms,
+        drill_timings.evidence_assembly_ms
+    );
     if let Some(status) = output.question_search.as_ref() {
         let _ = writeln!(
             markdown,
@@ -2322,7 +2472,10 @@ fn render_drill_command_status_suffix(status: &crate::args::DrillCommandStatusOu
         .as_deref()
         .map(|error| format!(" error=\"{}\"", error.replace('"', "\\\"")))
         .unwrap_or_default();
-    format!("[{}]{}{}", status.status, artifact, error)
+    format!(
+        "[{} duration_ms={}]{}{}",
+        status.status, status.duration_ms, artifact, error
+    )
 }
 
 pub(crate) fn render_symbol_markdown(
@@ -3176,6 +3329,9 @@ fn snippet_language(path: &str) -> &'static str {
         "rb" => "ruby",
         "php" => "php",
         "swift" => "swift",
+        "svelte" => "svelte",
+        "vue" => "vue",
+        "astro" => "astro",
         "json" => "json",
         "toml" => "toml",
         "md" => "markdown",
@@ -3225,7 +3381,7 @@ mod tests {
         GroundingCoverageDto, GroundingFileDigestDto, GroundingSnapshotDto,
         GroundingSymbolDigestDto, NodeDetailsDto, NodeId, NodeKind, RetrievalFallbackReasonDto,
         RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
-        SearchPlanNextActionDto, StorageStatsDto, TrailContextDto, TrailStoryDto,
+        SearchPlanNextActionDto, SemanticModeDto, StorageStatsDto, TrailContextDto, TrailStoryDto,
         TrailStoryStepDto,
     };
     use serde_json::json;
@@ -3275,6 +3431,7 @@ mod tests {
             mode: RetrievalModeDto::Hybrid,
             hybrid_configured: true,
             semantic_ready: true,
+            semantic_mode: SemanticModeDto::Enabled,
             semantic_doc_count: 12,
             embedding_model: Some("bge-small-en-v1.5".to_string()),
             current_embedding: None,
@@ -3672,6 +3829,8 @@ mod tests {
                 total_latency_ms: 15,
                 sla_target_ms: Some(500),
                 sla_missed: false,
+                semantic_fallback_count: 0,
+                semantic_fallbacks: Vec::new(),
                 annotations: vec!["semantic retrieval ready".to_string()],
                 steps: vec![AgentRetrievalStepDto {
                     kind: AgentRetrievalStepKindDto::Search,
@@ -3681,6 +3840,7 @@ mod tests {
                     output: Vec::new(),
                     message: Some("checked indexed symbols".to_string()),
                 }],
+                retrieval_shadow: None,
             },
         };
 
@@ -3705,6 +3865,7 @@ mod tests {
         let output = crate::args::SearchOutput {
             query: "packet output".to_string(),
             retrieval: sample_retrieval(),
+            retrieval_shadow: None,
             freshness: None,
             limit_per_source: 1,
             repo_text_mode: crate::args::RepoTextMode::Auto,
@@ -3883,6 +4044,8 @@ mod tests {
                 total_latency_ms: 650,
                 sla_target_ms: Some(500),
                 sla_missed: true,
+                semantic_fallback_count: 0,
+                semantic_fallbacks: Vec::new(),
                 annotations: vec!["weak hits after fallback".to_string()],
                 steps: vec![
                     AgentRetrievalStepDto {
@@ -3902,6 +4065,7 @@ mod tests {
                         message: Some("source reads skipped by budget".to_string()),
                     },
                 ],
+                retrieval_shadow: None,
             },
         };
 
@@ -3936,6 +4100,7 @@ mod tests {
         let output = crate::args::SearchOutput {
             query: "packet output".to_string(),
             retrieval,
+            retrieval_shadow: None,
             freshness: None,
             limit_per_source: 1,
             repo_text_mode: crate::args::RepoTextMode::Off,
@@ -3946,7 +4111,7 @@ mod tests {
                 stale_or_missing_anchor: false,
                 repo_text_fallback_reason: None,
                 recommended_next_action: Some(
-                    "Rerun search with --repo-text on or a shorter concrete symbol.".to_string(),
+                    "Run retrieval index to restore full sidecar mode, then rerun search --why with a shorter concrete symbol.".to_string(),
                 ),
             }),
             search_plan: None,

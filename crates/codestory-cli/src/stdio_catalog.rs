@@ -540,13 +540,18 @@ static SEARCH_RESULTS_SCHEMA: SchemaObject = SchemaObject::object(
     &[
         SchemaProperty::string("query", "Search query."),
         SchemaProperty::object("retrieval", "Retrieval state DTO."),
+        SchemaProperty::object(
+            "retrieval_shadow",
+            "Optional sidecar shadow retrieval trace DTO.",
+        )
+        .nullable(),
         SchemaProperty::integer("limit_per_source", "Per-source result limit."),
         SchemaProperty::string("repo_text_mode", "Repo text search mode.")
             .with_enum(SEARCH_REPO_TEXT_MODES),
         SchemaProperty::boolean("repo_text_enabled", "Whether repo text search was enabled."),
         SchemaProperty::object(
             "query_assessment",
-            "Exactness, weak-hit, repo-text fallback, and next-action assessment.",
+            "Exactness, weak-hit, repo-text diagnostic, and next-action assessment.",
         )
         .nullable(),
         SchemaProperty::object(

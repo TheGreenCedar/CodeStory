@@ -437,22 +437,6 @@ pub fn parse_investigation_event(payload: &str) -> &'static str {
     .expect("write router.rs");
 }
 
-fn trace_has_step(value: &Value, kind: &str) -> bool {
-    value["retrieval_trace"]["steps"]
-        .as_array()
-        .expect("retrieval trace steps")
-        .iter()
-        .any(|step| step["kind"] == kind)
-}
-
-fn trace_field_value<'a>(step: &'a Value, bucket: &str, key: &str) -> Option<&'a str> {
-    step[bucket].as_array()?.iter().find_map(|field| {
-        (field["key"] == key)
-            .then(|| field["value"].as_str())
-            .flatten()
-    })
-}
-
 #[test]
 fn read_commands_report_changed_openapi_index_freshness() {
     let workspace = tempdir().expect("workspace dir");
@@ -644,6 +628,35 @@ fn doctor_reports_current_and_stored_semantic_doc_embedding_contract() {
             "doctor should report stored semantic-doc `{field}` metadata: {doctor:#}"
         );
     }
+
+    assert_ne!(
+        doctor["retrieval_mode"], "full",
+        "legacy hash semantic readiness must not make mandatory sidecar retrieval look full: {doctor:#}"
+    );
+    assert!(
+        doctor["sidecar_retrieval"]["retrieval_mode"].is_string(),
+        "doctor should expose first-class sidecar retrieval mode: {doctor:#}"
+    );
+    let sidecar_check = check_with_name(&doctor, "sidecar_retrieval");
+    assert_eq!(
+        sidecar_check["status"], "warn",
+        "doctor should warn when mandatory sidecar retrieval is unavailable despite legacy semantic docs: {doctor:#}"
+    );
+    let next_commands = doctor["next_commands"]
+        .as_array()
+        .expect("doctor next commands");
+    let first_next_commands = next_commands
+        .iter()
+        .take(3)
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        first_next_commands.contains("retrieval status")
+            && first_next_commands.contains("retrieval index")
+            && !first_next_commands.contains("packet"),
+        "doctor should recommend sidecar status/index repair before packet/search when mode is not full: {doctor:#}"
+    );
 }
 
 #[test]
@@ -957,7 +970,17 @@ fn app_controller_opens_project() {
 
     assert_ground_reads_existing_cache(workspace.path(), cache_dir.path());
 
-    let node_id = search_app_controller_from_existing_cache(workspace.path(), cache_dir.path());
+    let node_id = ground_symbol_node_id_from_existing_cache(
+        workspace.path(),
+        cache_dir.path(),
+        "AppController",
+        None,
+    );
+    assert_product_search_fails_closed_without_full_sidecars(
+        workspace.path(),
+        cache_dir.path(),
+        "AppController",
+    );
 
     assert_symbol_reads_focus_node(workspace.path(), cache_dir.path(), &node_id);
 
@@ -967,17 +990,29 @@ fn app_controller_opens_project() {
 
     let bookmark_id = add_and_assert_bookmark_focus(workspace.path(), cache_dir.path(), &node_id);
 
-    assert_bookmark_focus_seeds_context(workspace.path(), cache_dir.path(), &bookmark_id);
+    assert_context_bookmark_fails_closed_without_full_sidecars(
+        workspace.path(),
+        cache_dir.path(),
+        &bookmark_id,
+    );
 
     assert_explore_outputs_focus_context(workspace.path(), cache_dir.path(), &node_id);
 
     assert_files_and_affected_read_existing_cache(workspace.path(), cache_dir.path());
 
-    assert_query_reads_existing_cache(workspace.path(), cache_dir.path());
+    assert_query_search_fails_closed_without_full_sidecars(workspace.path(), cache_dir.path());
     assert_packet_builds_broad_task_contract(workspace.path(), cache_dir.path());
-    assert_context_uses_db_first_trace(workspace.path(), cache_dir.path(), &node_id);
+    assert_context_id_fails_closed_without_full_sidecars(
+        workspace.path(),
+        cache_dir.path(),
+        &node_id,
+    );
     remove_and_assert_bookmark_gone(workspace.path(), cache_dir.path(), &bookmark_id);
-    assert_stdio_context_uses_db_first_trace(workspace.path(), cache_dir.path());
+    assert_stdio_context_id_fails_closed_without_full_sidecars(
+        workspace.path(),
+        cache_dir.path(),
+        &node_id,
+    );
 
     search_dir_snapshot.assert_unchanged();
 }
@@ -1034,14 +1069,54 @@ fn assert_ground_reads_existing_cache(workspace: &Path, cache_dir: &Path) {
     );
 }
 
-fn search_app_controller_from_existing_cache(workspace: &Path, cache_dir: &Path) -> String {
-    let search = run_cli_json(
+fn ground_symbol_node_id_from_existing_cache(
+    workspace: &Path,
+    cache_dir: &Path,
+    symbol: &str,
+    file_path_suffix: Option<&str>,
+) -> String {
+    let ground = run_cli_json(
+        workspace,
+        cache_dir,
+        &["ground", "--refresh", "none", "--format", "json"],
+    );
+    let mut symbols = Vec::new();
+    if let Some(root_symbols) = ground["root_symbols"].as_array() {
+        symbols.extend(root_symbols.iter());
+    }
+    if let Some(files) = ground["files"].as_array() {
+        for file in files {
+            if let Some(file_symbols) = file["symbols"].as_array() {
+                symbols.extend(file_symbols.iter());
+            }
+        }
+    }
+    let label_prefix = format!("{symbol} @ ");
+    let hit = symbols
+        .into_iter()
+        .find(|item| {
+            let Some(label) = item["label"].as_str() else {
+                return false;
+            };
+            label.starts_with(&label_prefix)
+                && file_path_suffix.is_none_or(|suffix| label.contains(&suffix.replace('\\', "/")))
+        })
+        .unwrap_or_else(|| panic!("ground should find {symbol} in the existing cache: {ground:#}"));
+    string_field(hit, &["id"]).to_string()
+}
+
+fn assert_product_search_fails_closed_without_full_sidecars(
+    workspace: &Path,
+    cache_dir: &Path,
+    query: &str,
+) {
+    let output = run_cli(
         workspace,
         cache_dir,
         &[
             "search",
             "--query",
-            "AppController",
+            query,
             "--repo-text",
             "off",
             "--limit",
@@ -1053,17 +1128,24 @@ fn search_app_controller_from_existing_cache(workspace: &Path, cache_dir: &Path)
         ],
     );
     assert!(
-        array_is_non_empty(&search, &["indexed_symbol_hits"]),
-        "search should find AppController in the existing cache"
+        !output.status.success(),
+        "product search should fail closed without full sidecars"
+    );
+    assert_sidecar_failure_output(output);
+}
+
+fn assert_sidecar_failure_output(output: std::process::Output) {
+    let failure = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        search["retrieval"]["stored_embedding"]["doc_count"]
-            .as_u64()
-            .unwrap_or(0)
-            > 0,
-        "search should preserve stored semantic-doc contract metadata"
+        failure.contains("sidecar retrieval")
+            && (failure.contains("expected mode=full")
+                || failure.contains("retrieval_manifest_missing")),
+        "command should explain the mandatory sidecar gate, got: {failure}"
     );
-    string_field(&search, &["indexed_symbol_hits", "0", "node_id"]).to_string()
 }
 
 fn assert_symbol_reads_focus_node(workspace: &Path, cache_dir: &Path, node_id: &str) {
@@ -1197,8 +1279,12 @@ fn add_and_assert_bookmark_focus(workspace: &Path, cache_dir: &Path, node_id: &s
     bookmark_id
 }
 
-fn assert_bookmark_focus_seeds_context(workspace: &Path, cache_dir: &Path, bookmark_id: &str) {
-    let context = run_cli_json(
+fn assert_context_bookmark_fails_closed_without_full_sidecars(
+    workspace: &Path,
+    cache_dir: &Path,
+    bookmark_id: &str,
+) {
+    let output = run_cli(
         workspace,
         cache_dir,
         &[
@@ -1211,31 +1297,11 @@ fn assert_bookmark_focus_seeds_context(workspace: &Path, cache_dir: &Path, bookm
             "json",
         ],
     );
-    let packet = &context["context"];
     assert!(
-        packet["retrieval_trace"]["steps"]
-            .as_array()
-            .expect("bookmark context trace steps")
-            .iter()
-            .any(|step| step["input"].as_array().is_some_and(|fields| fields
-                .iter()
-                .any(|field| field["key"] == "has_focus" && field["value"] == "true"))),
-        "context --bookmark should explicitly seed focused retrieval"
+        !output.status.success(),
+        "context --bookmark should fail closed without full sidecars"
     );
-    assert!(
-        packet["retrieval_trace"]["annotations"]
-            .as_array()
-            .expect("bookmark context trace annotations")
-            .iter()
-            .any(|annotation| {
-                let Some(annotation) = annotation.as_str() else {
-                    return false;
-                };
-                annotation.contains(&format!("bookmark_focus id={bookmark_id}"))
-                    && annotation.contains("comment=`entry point under review`")
-            }),
-        "context --bookmark should preserve bookmark identity in the retrieval trace"
-    );
+    assert_sidecar_failure_output(output);
 }
 
 fn assert_explore_outputs_focus_context(workspace: &Path, cache_dir: &Path, node_id: &str) {
@@ -1621,8 +1687,8 @@ fn run_git(workspace: &Path, args: &[&str]) {
     );
 }
 
-fn assert_query_reads_existing_cache(workspace: &Path, cache_dir: &Path) {
-    let query = run_cli_json(
+fn assert_query_search_fails_closed_without_full_sidecars(workspace: &Path, cache_dir: &Path) {
+    let output = run_cli(
         workspace,
         cache_dir,
         &[
@@ -1635,13 +1701,18 @@ fn assert_query_reads_existing_cache(workspace: &Path, cache_dir: &Path) {
         ],
     );
     assert!(
-        array_is_non_empty(&query, &["items"]),
-        "query should read from the existing cache"
+        !output.status.success(),
+        "query search DSL should fail closed without full sidecars"
     );
+    assert_sidecar_failure_output(output);
 }
 
-fn assert_context_uses_db_first_trace(workspace: &Path, cache_dir: &Path, node_id: &str) {
-    let context = run_cli_json(
+fn assert_context_id_fails_closed_without_full_sidecars(
+    workspace: &Path,
+    cache_dir: &Path,
+    node_id: &str,
+) {
+    let output = run_cli(
         workspace,
         cache_dir,
         &[
@@ -1653,27 +1724,11 @@ fn assert_context_uses_db_first_trace(workspace: &Path, cache_dir: &Path, node_i
             "json",
         ],
     );
-    let packet = &context["context"];
-    assert_eq!(
-        string_field(&context, &["resolution", "resolved", "node_id"]),
-        node_id
-    );
     assert!(
-        array_is_non_empty(packet, &["sections"]),
-        "context should return a DB-first evidence packet"
+        !output.status.success(),
+        "context --id should fail closed without full sidecars"
     );
-    assert!(
-        array_is_non_empty(packet, &["retrieval_trace", "steps"]),
-        "context should include a retrieval trace"
-    );
-    assert!(
-        packet["retrieval_trace"]["steps"]
-            .as_array()
-            .expect("trace steps")
-            .iter()
-            .all(|step| step["kind"] != "local_agent"),
-        "CLI context should not include removed local-agent trace steps"
-    );
+    assert_sidecar_failure_output(output);
 }
 
 fn remove_and_assert_bookmark_gone(workspace: &Path, cache_dir: &Path, bookmark_id: &str) {
@@ -1699,21 +1754,31 @@ fn remove_and_assert_bookmark_gone(workspace: &Path, cache_dir: &Path, bookmark_
 }
 
 fn assert_packet_builds_broad_task_contract(workspace: &Path, cache_dir: &Path) {
-    let packet = run_cli_json(
-        workspace,
-        cache_dir,
-        &[
-            "packet",
-            "--question",
-            "Explain how AppController routes project opening through normalize_project",
-            "--budget",
-            "tiny",
-            "--task-class",
-            "architecture-explanation",
-            "--format",
-            "json",
-        ],
-    );
+    let args = [
+        "packet",
+        "--question",
+        "Explain how AppController routes project opening through normalize_project",
+        "--budget",
+        "tiny",
+        "--task-class",
+        "architecture-explanation",
+        "--format",
+        "json",
+    ];
+    let output = run_cli(workspace, cache_dir, &args);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let combined = format!("{stderr}\n{stdout}");
+        assert!(
+            combined.contains("sidecar retrieval")
+                || combined.contains("retrieval sidecar")
+                || combined.contains("mandatory"),
+            "packet without full sidecars should fail closed with a sidecar diagnostic, got stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        return;
+    }
+    let packet: Value = serde_json::from_slice(&output.stdout).expect("parse packet json output");
     assert_eq!(
         packet["budget"]["requested"], "tiny",
         "packet should honor the requested budget: {packet:#}"
@@ -1737,22 +1802,38 @@ fn assert_packet_builds_broad_task_contract(workspace: &Path, cache_dir: &Path) 
         array_is_non_empty(&packet, &["answer", "retrieval_trace", "steps"]),
         "packet should include the underlying retrieval trace: {packet:#}"
     );
+    assert_eq!(
+        packet["answer"]["retrieval_version"], "sidecar",
+        "successful packet output must come from mandatory sidecar retrieval: {packet:#}"
+    );
 }
 
-fn assert_stdio_context_uses_db_first_trace(workspace: &Path, cache_dir: &Path) {
-    let stdio = run_stdio_request(
-        workspace,
-        cache_dir,
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"context","arguments":{"query":"AppController"}}}"#,
+fn assert_stdio_context_id_fails_closed_without_full_sidecars(
+    workspace: &Path,
+    cache_dir: &Path,
+    node_id: &str,
+) {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "context",
+            "arguments": {
+                "id": node_id
+            }
+        }
+    })
+    .to_string();
+    let stdio = run_stdio_request(workspace, cache_dir, &request);
+    assert_eq!(
+        stdio["result"]["isError"], true,
+        "stdio context --id should return a tool error without full sidecars: {stdio:#}"
     );
-    let stdio_result = &stdio["result"]["structuredContent"];
+    let message = stdio["result"]["structuredContent"]["message"].as_str();
     assert!(
-        stdio_result["retrieval_trace"]["steps"]
-            .as_array()
-            .expect("stdio context trace steps")
-            .iter()
-            .all(|step| step["kind"] != "local_agent"),
-        "stdio context should not include removed local-agent trace steps"
+        message.is_some_and(|message| message.contains("sidecar retrieval")),
+        "stdio context --id should fail closed without full sidecars: {stdio:#}"
     );
 }
 
@@ -1789,35 +1870,17 @@ fn bookmarks_degrade_gracefully_after_reindex_removes_target() {
         &["index", "--refresh", "full", "--format", "json"],
     );
 
-    let search = run_cli_json(
+    assert_product_search_fails_closed_without_full_sidecars(
         workspace.path(),
         cache_dir.path(),
-        &[
-            "search",
-            "--query",
-            "normalize_project",
-            "--repo-text",
-            "off",
-            "--limit",
-            "10",
-            "--refresh",
-            "none",
-            "--format",
-            "json",
-        ],
+        "normalize_project",
     );
-    let target = search["indexed_symbol_hits"]
-        .as_array()
-        .expect("indexed symbol hits")
-        .iter()
-        .find(|hit| {
-            hit["display_name"] == "normalize_project"
-                && hit["file_path"]
-                    .as_str()
-                    .is_some_and(|path| path.ends_with("src/runtime.rs"))
-        })
-        .unwrap_or_else(|| panic!("normalize_project hit should exist: {search:#}"));
-    let node_id = target["node_id"].as_str().expect("node id");
+    let node_id = ground_symbol_node_id_from_existing_cache(
+        workspace.path(),
+        cache_dir.path(),
+        "normalize_project",
+        Some("src/runtime.rs"),
+    );
 
     let bookmark = run_cli_json(
         workspace.path(),
@@ -1938,20 +2001,11 @@ fn read_commands_report_stale_index_freshness_without_refreshing_cache() {
     fs::remove_file(workspace.path().join("src").join("removed_after_index.rs"))
         .expect("remove indexed file after indexing");
 
-    let search = run_cli_json(
+    assert_product_search_fails_closed_without_full_sidecars(
         workspace.path(),
         cache_dir.path(),
-        &[
-            "search",
-            "--query",
-            "AppController",
-            "--refresh",
-            "none",
-            "--format",
-            "json",
-        ],
+        "AppController",
     );
-    assert_stale_freshness_counts(&search, "search --refresh none");
 
     let doctor = run_cli_json(
         workspace.path(),
@@ -1997,22 +2051,19 @@ fn context_json_reports_deep_trace_by_default() {
         "index should discover investigation fixture symbols"
     );
 
-    let search = run_cli_json(
+    assert_product_search_fails_closed_without_full_sidecars(
         workspace.path(),
         cache_dir.path(),
-        &[
-            "search",
-            "--query",
-            "parse_investigation_event",
-            "--refresh",
-            "none",
-            "--format",
-            "json",
-        ],
+        "parse_investigation_event",
     );
-    let node_id = string_field(&search, &["indexed_symbol_hits", "0", "node_id"]).to_string();
+    let node_id = ground_symbol_node_id_from_existing_cache(
+        workspace.path(),
+        cache_dir.path(),
+        "parse_investigation_event",
+        None,
+    );
 
-    let context = run_cli_json(
+    let context = run_cli(
         workspace.path(),
         cache_dir.path(),
         &[
@@ -2024,91 +2075,9 @@ fn context_json_reports_deep_trace_by_default() {
             "json",
         ],
     );
-    let investigated = &context["context"];
-    assert_eq!(
-        investigated["retrieval_trace"]["resolved_profile"], "investigate",
-        "context should use the deep investigation profile by default: {investigated:#}"
-    );
-    assert_eq!(
-        string_field(&context, &["resolution", "resolved", "display_name"]),
-        "parse_investigation_event"
-    );
     assert!(
-        trace_has_step(investigated, "search"),
-        "context starts with the current search ranking"
+        !context.status.success(),
+        "context --id should fail closed without full sidecars"
     );
-    assert!(
-        trace_has_step(investigated, "trail") || trace_has_step(investigated, "neighborhood"),
-        "context should record bounded graph expansion"
-    );
-    assert!(
-        trace_has_step(investigated, "source_read"),
-        "context should record bounded source/snippet reads"
-    );
-    let trace_steps = investigated["retrieval_trace"]["steps"]
-        .as_array()
-        .expect("trace steps");
-    if let Some(trail_step) = trace_steps.iter().find(|step| step["kind"] == "trail") {
-        assert!(
-            trace_field_value(trail_step, "input", "max_nodes").is_some()
-                || trace_field_value(trail_step, "output", "max_nodes").is_some(),
-            "trail trace should expose the active max_nodes cap: {trail_step}"
-        );
-    }
-    let source_step = trace_steps
-        .iter()
-        .find(|step| step["kind"] == "source_read")
-        .expect("source_read step");
-    if source_step["status"] == "ok" {
-        let max_source_bytes = trace_field_value(source_step, "output", "max_source_bytes")
-            .and_then(|value| value.parse::<u64>().ok())
-            .expect("max_source_bytes output");
-        let snippet_bytes = trace_field_value(source_step, "output", "snippet_bytes")
-            .and_then(|value| value.parse::<u64>().ok())
-            .expect("snippet_bytes output");
-        assert!(
-            snippet_bytes <= max_source_bytes,
-            "source_read should report snippet bytes within cap: {source_step}"
-        );
-    }
-    if let Some(repo_text_step) = trace_steps
-        .iter()
-        .find(|step| step["kind"] == "repo_text_fallback")
-    {
-        assert!(
-            trace_field_value(repo_text_step, "output", "file_cap").is_some(),
-            "repo-text fallback trace should expose scan caps: {repo_text_step}"
-        );
-    }
-    let synthesis_step = trace_steps
-        .iter()
-        .find(|step| step["kind"] == "context_synthesis")
-        .expect("context synthesis step");
-    assert!(
-        trace_field_value(synthesis_step, "output", "graph_artifact_byte_cap").is_some(),
-        "context synthesis should expose graph artifact bundle caps: {synthesis_step}"
-    );
-    assert!(
-        array_is_non_empty(investigated, &["citations"]),
-        "context should return cited evidence"
-    );
-    assert!(
-        investigated["retrieval_trace"]["resolved_profile"] == "investigate"
-            || investigated["retrieval_trace"]["annotations"]
-                .as_array()
-                .expect("trace annotations")
-                .iter()
-                .any(|annotation| {
-                    annotation.as_str().is_some_and(|value| {
-                        let value = value.to_ascii_lowercase();
-                        value.contains("what i checked") || value.contains("investigation")
-                    })
-                }),
-        "context JSON should expose the named mode or what-I-checked trace"
-    );
-
-    assert!(
-        trace_steps.iter().all(|step| step["kind"] != "local_agent"),
-        "context should not include removed local-agent trace steps"
-    );
+    assert_sidecar_failure_output(context);
 }

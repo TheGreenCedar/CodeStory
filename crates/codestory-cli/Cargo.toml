@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 codestory-contracts = { workspace = true }
+codestory-retrieval = { workspace = true }
 codestory-runtime = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }

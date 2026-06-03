@@ -88,17 +88,24 @@ pub(crate) fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStrea
                 .and_then(|value| value.parse::<u32>().ok())
                 .unwrap_or(10)
                 .clamp(1, 100);
-            let results = runtime
-                .browser
-                .search_results(SearchRequest {
-                    query,
-                    repo_text,
-                    limit_per_source,
-                    expand_search_plan: false,
-                    hybrid_weights: None,
-                    hybrid_limits: None,
-                })
-                .map_err(map_api_error)?;
+            let results = match runtime.browser.search_results(SearchRequest {
+                query,
+                repo_text,
+                limit_per_source,
+                expand_search_plan: false,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            }) {
+                Ok(results) => results,
+                Err(error) => {
+                    return write_http_error_json(
+                        &mut stream,
+                        400,
+                        "search_unavailable",
+                        map_api_error(error).to_string(),
+                    );
+                }
+            };
             write_http_json(&mut stream, 200, &results)
         }
         "/symbol" => {
