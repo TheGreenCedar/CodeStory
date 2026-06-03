@@ -16,6 +16,7 @@ use thiserror::Error;
 
 mod bookmarks;
 mod helpers;
+mod retrieval_manifest;
 mod row_mapping;
 mod schema;
 mod trail;
@@ -25,7 +26,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 13;
+const SCHEMA_VERSION: u32 = 17;
 const GROUNDING_SNAPSHOT_VERSION: i64 = 1;
 const GROUNDING_SNAPSHOT_STATE_DIRTY: i64 = 0;
 const GROUNDING_SNAPSHOT_STATE_BUILDING: i64 = 1;
@@ -38,6 +39,8 @@ const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id,
                  JOIN node t ON t.id = e.target_node_id
                  LEFT JOIN node f ON f.id = e.file_node_id";
 const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = 200;
+const NODE_LOOKUP_BATCH_SIZE: usize = 200;
+const OCCURRENCE_LOOKUP_BATCH_SIZE: usize = 200;
 
 fn clamp_i64_to_u32(value: i64) -> u32 {
     if value <= 0 {
@@ -316,6 +319,126 @@ pub struct FileInfo {
     pub indexed: bool,
     pub complete: bool,
     pub line_count: u32,
+    #[serde(default)]
+    pub file_role: FileRole,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileRole {
+    #[default]
+    Source,
+    Entrypoint,
+    Test,
+    Docs,
+    Benchmark,
+    Generated,
+    Vendor,
+}
+
+impl FileRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Entrypoint => "entrypoint",
+            Self::Test => "test",
+            Self::Docs => "docs",
+            Self::Benchmark => "benchmark",
+            Self::Generated => "generated",
+            Self::Vendor => "vendor",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "entrypoint" => Self::Entrypoint,
+            "test" => Self::Test,
+            "docs" => Self::Docs,
+            "benchmark" => Self::Benchmark,
+            "generated" => Self::Generated,
+            "vendor" => Self::Vendor,
+            _ => Self::Source,
+        }
+    }
+
+    pub fn classify_path(path: &Path) -> Self {
+        let normalized = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        let marked = format!("/{normalized}");
+        let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+
+        if marked.contains("/node_modules/")
+            || marked.contains("/vendor/")
+            || marked.contains("/third_party/")
+            || marked.contains("/third-party/")
+            || marked.contains("/external/")
+        {
+            return Self::Vendor;
+        }
+        if marked.contains("/target/")
+            || marked.contains("/dist/")
+            || marked.contains("/build/")
+            || marked.contains("/generated/")
+            || marked.contains("/schema/typescript/")
+            || marked.contains(".generated.")
+            || file_name.ends_with(".g.cs")
+            || file_name.contains("payload-types")
+        {
+            return Self::Generated;
+        }
+        if marked.contains("/tests/")
+            || marked.contains("/test/")
+            || marked.contains("/spec/")
+            || marked.contains("/fixtures/")
+            || marked.contains("/__tests__/")
+            || marked.contains("-test-client/")
+            || marked.contains("_test_client/")
+            || file_name.contains(".test.")
+            || file_name.contains(".spec.")
+            || file_name.ends_with("_test.rs")
+            || file_name.ends_with("_tests.rs")
+            || file_name.ends_with("_test.py")
+            || file_name.ends_with("_tests.py")
+            || file_name.ends_with("_test.ts")
+            || file_name.ends_with("_tests.ts")
+            || file_name.ends_with("_test.tsx")
+            || file_name.ends_with("_tests.tsx")
+        {
+            return Self::Test;
+        }
+        if marked.contains("/docs/")
+            || marked.contains("/doc/")
+            || matches!(file_name, "readme.md" | "changelog.md")
+        {
+            return Self::Docs;
+        }
+        if marked.contains("/benchmarks/")
+            || marked.contains("/benchmark/")
+            || marked.contains("/benches/")
+            || marked.contains("/bench/")
+        {
+            return Self::Benchmark;
+        }
+        if matches!(
+            file_name,
+            "main.rs"
+                | "lib.rs"
+                | "mod.rs"
+                | "main.ts"
+                | "main.tsx"
+                | "main.js"
+                | "main.jsx"
+                | "index.ts"
+                | "index.tsx"
+                | "index.js"
+                | "index.jsx"
+        ) {
+            return Self::Entrypoint;
+        }
+        Self::Source
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -550,6 +673,16 @@ pub struct CallerProjectionRemovalSummary {
 pub struct SearchSymbolProjection {
     pub node_id: NodeId,
     pub display_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchSymbolProjectionDetail {
+    pub node_id: NodeId,
+    pub display_name: String,
+    pub node_kind: Option<i64>,
+    pub file_path: Option<String>,
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -967,7 +1100,8 @@ impl Storage {
                  modification_time = ?4,
                  indexed = ?5,
                  complete = ?6,
-                 line_count = ?7
+                 line_count = ?7,
+                 file_role = ?8
              WHERE id = ?1",
             params![
                 info.id,
@@ -977,6 +1111,7 @@ impl Storage {
                 i32::from(info.indexed),
                 i32::from(info.complete),
                 info.line_count,
+                info.file_role.as_str(),
             ],
         )?;
         self.mark_grounding_snapshots_dirty()?;
@@ -1570,6 +1705,7 @@ impl Storage {
                 indexed: row.get::<_, i32>(4)? != 0,
                 complete: row.get::<_, i32>(5)? != 0,
                 line_count: row.get(6)?,
+                file_role: FileRole::Source,
             },
             symbol_count: clamp_i64_to_u32(row.get::<_, i64>(7)?),
             best_node_rank: row.get::<_, i64>(8)?.min(u8::MAX as i64) as u8,
@@ -2088,15 +2224,22 @@ impl Storage {
         let tx = self.conn.transaction()?;
 
         if !batch.files.is_empty() {
+            let placeholders = question_placeholders(batch.files.len());
+            tx.execute(
+                &format!("DELETE FROM error WHERE file_id IN ({placeholders})"),
+                params_from_iter(batch.files.iter().map(|file| file.id)),
+            )?;
+
             let started = std::time::Instant::now();
             let mut stmt = tx.prepare(
-                "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count, file_role)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(id) DO UPDATE SET
                     modification_time=excluded.modification_time,
                     indexed=excluded.indexed,
                     complete=excluded.complete,
-                    line_count=excluded.line_count",
+                    line_count=excluded.line_count,
+                    file_role=excluded.file_role",
             )?;
             for info in batch.files {
                 stmt.execute(params![
@@ -2107,6 +2250,7 @@ impl Storage {
                     i32::from(info.indexed),
                     i32::from(info.complete),
                     info.line_count,
+                    info.file_role.as_str(),
                 ])?;
             }
             breakdown.files_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
@@ -2423,6 +2567,43 @@ impl Storage {
         Ok(out)
     }
 
+    pub fn get_search_symbol_projection_detail_batch_after(
+        &self,
+        after_node_id: Option<NodeId>,
+        limit: usize,
+    ) -> Result<Vec<SearchSymbolProjectionDetail>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                projection.node_id,
+                projection.display_name,
+                node.kind,
+                file.serialized_name,
+                node.start_line,
+                node.end_line
+             FROM search_symbol_projection projection
+             LEFT JOIN node ON node.id = projection.node_id
+             LEFT JOIN node file ON file.id = node.file_node_id
+             WHERE (?1 IS NULL OR projection.node_id > ?1)
+             ORDER BY projection.node_id ASC
+             LIMIT ?2",
+        )?;
+        let after_node_id = after_node_id.map(|id| id.0);
+        let limit = limit.min(i64::MAX as usize) as i64;
+        let mut rows = stmt.query(params![after_node_id, limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(SearchSymbolProjectionDetail {
+                node_id: NodeId(row.get(0)?),
+                display_name: row.get(1)?,
+                node_kind: row.get(2)?,
+                file_path: row.get(3)?,
+                start_line: row.get(4)?,
+                end_line: row.get(5)?,
+            });
+        }
+        Ok(out)
+    }
+
     pub fn get_search_symbol_projection_count(&self) -> Result<u32, StorageError> {
         let count =
             self.conn
@@ -2430,6 +2611,16 @@ impl Storage {
                     row.get::<_, i64>(0)
                 })?;
         Ok(clamp_i64_to_u32(count))
+    }
+
+    pub fn max_indexed_file_modification_time(&self) -> Result<Option<i64>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT MAX(modification_time) FROM file WHERE indexed = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     pub fn clear_search_symbol_projection(&mut self) -> Result<usize, StorageError> {
@@ -2457,6 +2648,52 @@ impl Storage {
                 END
              FROM node",
             [],
+        )?;
+        tx.commit()?;
+        Ok(inserted.min(u32::MAX as usize) as u32)
+    }
+
+    pub fn rebuild_search_symbol_projection_for_file_scope(
+        &mut self,
+        file_node_ids: &HashSet<NodeId>,
+    ) -> Result<u32, StorageError> {
+        if file_node_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut file_ids: Vec<i64> = file_node_ids.iter().map(|id| id.0).collect();
+        file_ids.sort_unstable();
+        file_ids.dedup();
+        let placeholders = numbered_placeholders(1, file_ids.len());
+        let file_scope_predicate =
+            format!("id IN ({placeholders}) OR file_node_id IN ({placeholders})");
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            &format!(
+                "DELETE FROM search_symbol_projection
+                 WHERE node_id IN (
+                    SELECT id FROM node WHERE {file_scope_predicate}
+                 )"
+            ),
+            params_from_iter(file_ids.iter().copied()),
+        )?;
+        let inserted = tx.execute(
+            &format!(
+                "INSERT INTO search_symbol_projection (
+                    node_id,
+                    display_name
+                 )
+                 SELECT
+                    id,
+                    CASE
+                        WHEN qualified_name IS NOT NULL AND TRIM(qualified_name) != '' THEN qualified_name
+                        ELSE serialized_name
+                    END
+                 FROM node
+                 WHERE {file_scope_predicate}"
+            ),
+            params_from_iter(file_ids.iter().copied()),
         )?;
         tx.commit()?;
         Ok(inserted.min(u32::MAX as usize) as u32)
@@ -3176,6 +3413,87 @@ impl Storage {
         }
     }
 
+    pub fn get_nodes_by_ids(&self, ids: &[NodeId]) -> Result<HashMap<NodeId, Node>, StorageError> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut unique_ids = Vec::new();
+        let mut seen_ids = HashSet::new();
+        let mut nodes_by_id = HashMap::new();
+        for id in ids {
+            if !seen_ids.insert(*id) {
+                continue;
+            }
+            if let Some(node) = self.cache.nodes.read().get(id) {
+                nodes_by_id.insert(*id, node.clone());
+            } else {
+                unique_ids.push(*id);
+            }
+        }
+
+        for chunk in unique_ids.chunks(NODE_LOOKUP_BATCH_SIZE) {
+            let placeholders = numbered_placeholders(1, chunk.len());
+            let query = format!(
+                "SELECT id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col FROM node WHERE id IN ({placeholders})"
+            );
+            let params = chunk.iter().map(|id| Value::from(id.0));
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(params))?;
+            let mut cache = self.cache.nodes.write();
+            while let Some(row) = rows.next()? {
+                let node = Self::node_from_row(row)?;
+                cache.insert(node.id, node.clone());
+                nodes_by_id.insert(node.id, node);
+            }
+        }
+
+        Ok(nodes_by_id)
+    }
+
+    pub fn get_occurrences_for_node_ids(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<HashMap<NodeId, Vec<Occurrence>>, StorageError> {
+        if node_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut unique_ids = Vec::new();
+        let mut seen_ids = HashSet::new();
+        for node_id in node_ids {
+            if seen_ids.insert(*node_id) {
+                unique_ids.push(*node_id);
+            }
+        }
+
+        let mut occurrences_by_node = unique_ids
+            .iter()
+            .copied()
+            .map(|node_id| (node_id, Vec::new()))
+            .collect::<HashMap<_, _>>();
+
+        for chunk in unique_ids.chunks(OCCURRENCE_LOOKUP_BATCH_SIZE) {
+            let placeholders = numbered_placeholders(1, chunk.len());
+            let query = format!(
+                "SELECT element_id, kind, file_node_id, start_line, start_col, end_line, end_col FROM occurrence WHERE element_id IN ({placeholders})"
+            );
+            let params = chunk.iter().map(|id| Value::from(id.0));
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(params))?;
+            while let Some(row) = rows.next()? {
+                let occurrence = Self::occurrence_from_row(row)?;
+                if let Some(occurrences) =
+                    occurrences_by_node.get_mut(&NodeId(occurrence.element_id))
+                {
+                    occurrences.push(occurrence);
+                }
+            }
+        }
+
+        Ok(occurrences_by_node)
+    }
+
     pub fn get_occurrences_for_node(
         &self,
         node_id: codestory_contracts::graph::NodeId,
@@ -3210,15 +3528,16 @@ impl Storage {
 
     pub fn insert_file(&self, info: &FileInfo) -> Result<(), StorageError> {
         self.conn.execute(
-            "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count) 
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) 
-             ON CONFLICT(id) DO UPDATE SET 
-                path=excluded.path, 
-                language=excluded.language, 
-                modification_time=excluded.modification_time, 
-                indexed=excluded.indexed, 
-                complete=excluded.complete, 
-                line_count=excluded.line_count",
+            "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count, file_role)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                path=excluded.path,
+                language=excluded.language,
+                modification_time=excluded.modification_time,
+                indexed=excluded.indexed,
+                complete=excluded.complete,
+                line_count=excluded.line_count,
+                file_role=excluded.file_role",
             params![
                 info.id,
                 info.path.to_string_lossy(),
@@ -3227,6 +3546,7 @@ impl Storage {
                 i32::from(info.indexed),
                 i32::from(info.complete),
                 info.line_count,
+                info.file_role.as_str(),
             ],
         )?;
         self.invalidate_grounding_snapshots()?;
@@ -3240,15 +3560,16 @@ impl Storage {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count) 
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) 
-                 ON CONFLICT(id) DO UPDATE SET 
-                    path=excluded.path, 
-                    language=excluded.language, 
-                    modification_time=excluded.modification_time, 
-                    indexed=excluded.indexed, 
-                    complete=excluded.complete, 
-                    line_count=excluded.line_count"
+                "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count, file_role)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET
+                    path=excluded.path,
+                    language=excluded.language,
+                    modification_time=excluded.modification_time,
+                    indexed=excluded.indexed,
+                    complete=excluded.complete,
+                    line_count=excluded.line_count,
+                    file_role=excluded.file_role"
             )?;
             for info in files {
                 stmt.execute(params![
@@ -3259,6 +3580,7 @@ impl Storage {
                     i32::from(info.indexed),
                     i32::from(info.complete),
                     info.line_count,
+                    info.file_role.as_str(),
                 ])?;
             }
         }
@@ -3269,7 +3591,7 @@ impl Storage {
 
     pub fn get_files(&self) -> Result<Vec<FileInfo>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, language, modification_time, indexed, complete, line_count FROM file",
+            "SELECT id, path, language, modification_time, indexed, complete, line_count, file_role FROM file",
         )?;
         let file_iter = stmt.query_map([], |row| {
             Ok(FileInfo {
@@ -3280,6 +3602,7 @@ impl Storage {
                 indexed: row.get::<_, i32>(4)? != 0,
                 complete: row.get::<_, i32>(5)? != 0,
                 line_count: row.get(6)?,
+                file_role: FileRole::from_db_value(&row.get::<_, String>(7)?),
             })
         })?;
 
@@ -3293,6 +3616,7 @@ impl Storage {
     pub fn get_files_ordered_limit(&self, limit: usize) -> Result<Vec<FileInfo>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, path, language, modification_time, indexed, complete, line_count
+             , file_role
              FROM file
              ORDER BY path ASC, id ASC
              LIMIT ?1",
@@ -3306,6 +3630,7 @@ impl Storage {
                 indexed: row.get::<_, i32>(4)? != 0,
                 complete: row.get::<_, i32>(5)? != 0,
                 line_count: row.get(6)?,
+                file_role: FileRole::from_db_value(&row.get::<_, String>(7)?),
             })
         })?;
 
@@ -3327,7 +3652,7 @@ impl Storage {
         for chunk in paths.chunks(500) {
             let placeholders = question_placeholders(chunk.len());
             let sql = format!(
-                "SELECT id, path, language, modification_time, indexed, complete, line_count
+                "SELECT id, path, language, modification_time, indexed, complete, line_count, file_role
                  FROM file
                  WHERE path IN ({placeholders})"
             );
@@ -3344,11 +3669,38 @@ impl Storage {
                     indexed: row.get::<_, i32>(4)? != 0,
                     complete: row.get::<_, i32>(5)? != 0,
                     line_count: row.get(6)?,
+                    file_role: FileRole::from_db_value(&row.get::<_, String>(7)?),
                 };
                 files.insert(file.path.clone(), file);
             }
         }
         Ok(files)
+    }
+
+    pub fn get_file_roles_by_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<HashMap<String, FileRole>, StorageError> {
+        if paths.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut roles = HashMap::with_capacity(paths.len());
+        for chunk in paths.chunks(500) {
+            let placeholders = question_placeholders(chunk.len());
+            let sql = format!(
+                "SELECT path, file_role
+                 FROM file
+                 WHERE path IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(chunk.iter().cloned()))?;
+            while let Some(row) = rows.next()? {
+                let path: String = row.get(0)?;
+                let role = FileRole::from_db_value(&row.get::<_, String>(1)?);
+                roles.insert(path, role);
+            }
+        }
+        Ok(roles)
     }
 
     pub fn get_file_node_count(&self) -> Result<i64, StorageError> {
@@ -3892,7 +4244,7 @@ impl Storage {
 
     pub fn get_file_by_path(&self, path: &Path) -> Result<Option<FileInfo>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, language, modification_time, indexed, complete, line_count FROM file WHERE path = ?1",
+            "SELECT id, path, language, modification_time, indexed, complete, line_count, file_role FROM file WHERE path = ?1",
         )?;
         let mut rows = stmt.query(params![path.to_string_lossy()])?;
 
@@ -3905,6 +4257,7 @@ impl Storage {
                 indexed: row.get::<_, i32>(4)? != 0,
                 complete: row.get::<_, i32>(5)? != 0,
                 line_count: row.get(6)?,
+                file_role: FileRole::from_db_value(&row.get::<_, String>(7)?),
             }))
         } else {
             Ok(None)
@@ -4014,7 +4367,7 @@ impl Storage {
     /// Get symbols that have no parent (root namespaces, top-level classes, etc.)
     pub fn get_root_symbols(&self) -> Result<Vec<Node>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col FROM node 
+            "SELECT id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col FROM node
              WHERE id NOT IN (SELECT target_node_id FROM edge WHERE kind = ?1)
              AND kind != ?2", // Exclude files from symbol tree roots for now
         )?;
@@ -4172,7 +4525,11 @@ impl Storage {
         )?;
 
         let removed_callable_projection_state_count = tx.execute(
-            "DELETE FROM callable_projection_state WHERE file_id = ?1",
+            &format!(
+                "DELETE FROM callable_projection_state
+                 WHERE file_id = ?1
+                 OR node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})"
+            ),
             params![file_node_id],
         )?;
 
@@ -4192,6 +4549,13 @@ impl Storage {
         tx.execute(
             &format!(
                 "DELETE FROM search_symbol_projection
+                 WHERE node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})"
+            ),
+            [],
+        )?;
+        tx.execute(
+            &format!(
+                "DELETE FROM symbol_summary
                  WHERE node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})"
             ),
             [],
@@ -4397,6 +4761,24 @@ impl Storage {
     pub fn get_edges_for_node_id(&self, node_id: NodeId) -> Result<Vec<Edge>, StorageError> {
         trail::get_edges_for_node_id(self, node_id)
     }
+
+    /// Get direct incoming edges for a node using the same filters as trail traversal.
+    pub fn get_incoming_edges_for_node_id(
+        &self,
+        node_id: NodeId,
+        edge_filter: &[EdgeKind],
+        caller_scope: TrailCallerScope,
+        show_utility_calls: bool,
+    ) -> Result<Vec<Edge>, StorageError> {
+        trail::get_edges_for_node(
+            self,
+            node_id,
+            &TrailDirection::Incoming,
+            edge_filter,
+            caller_scope,
+            show_utility_calls,
+        )
+    }
 }
 
 fn neighbor_for_direction(
@@ -4581,6 +4963,7 @@ mod grounding_snapshot_fast_path_tests {
             indexed: true,
             complete: true,
             line_count: 32,
+            file_role: FileRole::classify_path(Path::new(path)),
         })?;
 
         let mut nodes = vec![Node {
@@ -4718,6 +5101,8 @@ mod grounding_snapshot_fast_path_tests {
         Ok(())
     }
 }
+
+pub use retrieval_manifest::RetrievalIndexManifest;
 
 #[cfg(test)]
 mod tests;

@@ -25,7 +25,9 @@ pub mod compilation_database;
 pub mod intermediate_storage;
 pub mod resolution;
 pub mod semantic;
+pub mod structural;
 pub mod symbol_table;
+pub mod template_pipeline;
 use cache::{CachedIndexArtifact, build_index_artifact_cache_key};
 pub use cancellation::CancellationToken;
 use intermediate_storage::IntermediateStorage;
@@ -98,6 +100,10 @@ const TSX_GRAPH_QUERY: &str = include_str!("../rules/tsx.graph.scm");
 const TSX_TAGS_QUERY: &str = TYPESCRIPT_TAGS_QUERY;
 const CPP_GRAPH_QUERY: &str = include_str!("../rules/cpp.scm");
 const C_GRAPH_QUERY: &str = include_str!("../rules/c.scm");
+const GO_GRAPH_QUERY: &str = include_str!("../rules/go.scm");
+const RUBY_GRAPH_QUERY: &str = include_str!("../rules/ruby.scm");
+const PHP_GRAPH_QUERY: &str = include_str!("../rules/php.scm");
+const CSHARP_GRAPH_QUERY: &str = include_str!("../rules/csharp.scm");
 
 #[derive(Debug, Clone, Copy)]
 enum LanguageRuleset {
@@ -109,6 +115,10 @@ enum LanguageRuleset {
     Tsx,
     Cpp,
     C,
+    Go,
+    Ruby,
+    Php,
+    CSharp,
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +253,16 @@ impl LanguageRuleset {
                 compiled_rules_cache(language, CPP_GRAPH_QUERY, None, &CPP_RULES)
             }
             LanguageRuleset::C => compiled_rules_cache(language, C_GRAPH_QUERY, None, &C_RULES),
+            LanguageRuleset::Go => compiled_rules_cache(language, GO_GRAPH_QUERY, None, &GO_RULES),
+            LanguageRuleset::Ruby => {
+                compiled_rules_cache(language, RUBY_GRAPH_QUERY, None, &RUBY_RULES)
+            }
+            LanguageRuleset::Php => {
+                compiled_rules_cache(language, PHP_GRAPH_QUERY, None, &PHP_RULES)
+            }
+            LanguageRuleset::CSharp => {
+                compiled_rules_cache(language, CSHARP_GRAPH_QUERY, None, &CSHARP_RULES)
+            }
         }
     }
 }
@@ -281,6 +301,10 @@ static TYPESCRIPT_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceL
 static TSX_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static CPP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static C_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
+static GO_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
+static RUBY_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
+static PHP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
+static CSHARP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 
 fn tag_definition_priority(definition: &TagDefinition) -> (u8, u8, u8) {
     let role_priority = canonical_role_priority(definition.canonical_role);
@@ -316,6 +340,7 @@ fn tag_definition_kind(kind: &str) -> Option<NodeKind> {
         "function" => Some(NodeKind::FUNCTION),
         "method" => Some(NodeKind::METHOD),
         "field" => Some(NodeKind::FIELD),
+        "enum_constant" => Some(NodeKind::ENUM_CONSTANT),
         "variable" => Some(NodeKind::VARIABLE),
         _ => None,
     }
@@ -925,8 +950,18 @@ impl WorkspaceIndexer {
                     || !batched_storage.nodes.is_empty()
                     || !batched_storage.edges.is_empty()
                     || !batched_storage.occurrences.is_empty();
+                let pipeline_flush =
+                    std::env::var("CODESTORY_PIPELINE_FLUSH")
+                        .ok()
+                        .is_some_and(|value| {
+                            matches!(
+                                value.trim().to_ascii_lowercase().as_str(),
+                                "1" | "true" | "yes" | "on"
+                            )
+                        });
                 if should_flush
-                    && (batched_storage.nodes.len() >= batch_config.node_batch_size
+                    && (pipeline_flush
+                        || batched_storage.nodes.len() >= batch_config.node_batch_size
                         || batched_storage.edges.len() >= batch_config.edge_batch_size
                         || batched_storage.occurrences.len() >= batch_config.occurrence_batch_size)
                 {
@@ -1244,22 +1279,75 @@ impl WorkspaceIndexer {
                 Ok(None) => {}
                 Err(err_storage) => return Err(err_storage),
             }
+            if let Some(template_kind) = template_pipeline::template_kind_for_path(&full_path) {
+                return match prepare_template_index_work(&full_path, template_kind) {
+                    Ok(local_storage) => Ok(PreparedIndexWork::Immediate(local_storage)),
+                    Err(error) => {
+                        let local_storage = incomplete_file_storage(
+                            &full_path,
+                            None,
+                            template_pipeline::template_surface_language(&full_path)
+                                .unwrap_or("template"),
+                            codestory_contracts::graph::ErrorInfo {
+                                message: format!(
+                                    "Failed to index template file {:?}: {}",
+                                    path, error
+                                ),
+                                file_id: None,
+                                line: None,
+                                column: None,
+                                is_fatal: false,
+                                index_step: codestory_contracts::graph::IndexStep::Indexing,
+                            },
+                        );
+                        Err(local_storage)
+                    }
+                };
+            }
+            if structural::is_structural_candidate_path(&full_path) {
+                return match structural::index_structural_file(&full_path) {
+                    Ok(local_storage) => Ok(PreparedIndexWork::Immediate(local_storage)),
+                    Err(error) => {
+                        let local_storage = incomplete_file_storage(
+                            &full_path,
+                            None,
+                            structural::structural_language_name(&full_path),
+                            codestory_contracts::graph::ErrorInfo {
+                                message: format!(
+                                    "Failed to index structural file {:?}: {}",
+                                    path, error
+                                ),
+                                file_id: None,
+                                line: None,
+                                column: None,
+                                is_fatal: false,
+                                index_step: codestory_contracts::graph::IndexStep::Indexing,
+                            },
+                        );
+                        Err(local_storage)
+                    }
+                };
+            }
             if is_text_only_candidate_path(&full_path) {
                 return match index_text_only_file(&full_path) {
                     Ok(local_storage) => Ok(PreparedIndexWork::Immediate(local_storage)),
                     Err(error) => {
-                        let mut local_storage = IntermediateStorage::default();
-                        local_storage.add_error(codestory_contracts::graph::ErrorInfo {
-                            message: format!(
-                                "Failed to index text-only file {:?}: {}",
-                                path, error
-                            ),
-                            file_id: None,
-                            line: None,
-                            column: None,
-                            is_fatal: false,
-                            index_step: codestory_contracts::graph::IndexStep::Indexing,
-                        });
+                        let local_storage = incomplete_file_storage(
+                            &full_path,
+                            None,
+                            text_only_language_name(&full_path),
+                            codestory_contracts::graph::ErrorInfo {
+                                message: format!(
+                                    "Failed to index text-only file {:?}: {}",
+                                    path, error
+                                ),
+                                file_id: None,
+                                line: None,
+                                column: None,
+                                is_fatal: false,
+                                index_step: codestory_contracts::graph::IndexStep::Indexing,
+                            },
+                        );
                         Err(local_storage)
                     }
                 };
@@ -1270,15 +1358,19 @@ impl WorkspaceIndexer {
         let bytes = match std::fs::read(&full_path) {
             Ok(bytes) => bytes,
             Err(e) => {
-                let mut local_storage = IntermediateStorage::default();
-                local_storage.add_error(codestory_contracts::graph::ErrorInfo {
-                    message: format!("Failed to read {:?}: {}", path, e),
-                    file_id: None,
-                    line: None,
-                    column: None,
-                    is_fatal: true,
-                    index_step: codestory_contracts::graph::IndexStep::Collection,
-                });
+                let local_storage = incomplete_file_storage(
+                    &full_path,
+                    None,
+                    language_config.language_name,
+                    codestory_contracts::graph::ErrorInfo {
+                        message: format!("Failed to read {:?}: {}", path, e),
+                        file_id: None,
+                        line: None,
+                        column: None,
+                        is_fatal: true,
+                        index_step: codestory_contracts::graph::IndexStep::Collection,
+                    },
+                );
                 return Err(local_storage);
             }
         };
@@ -1316,12 +1408,13 @@ impl WorkspaceIndexer {
                             && let Err(error) = storage.update_file_metadata(file_info)
                         {
                             let mut local_storage = IntermediateStorage::default();
+                            let file_id = NodeId(file_info.id);
                             local_storage.add_error(codestory_contracts::graph::ErrorInfo {
                                 message: format!(
                                     "Failed to refresh cached file metadata for {:?}: {:?}",
                                     full_path, error
                                 ),
-                                file_id: None,
+                                file_id: Some(file_id),
                                 line: None,
                                 column: None,
                                 is_fatal: false,
@@ -1382,29 +1475,36 @@ impl WorkspaceIndexer {
         let source = match std::fs::read_to_string(full_path) {
             Ok(source) => source,
             Err(error) => {
-                let mut local_storage = IntermediateStorage::default();
-                local_storage.add_error(codestory_contracts::graph::ErrorInfo {
-                    message: format!("Failed to read {:?}: {}", full_path, error),
-                    file_id: None,
-                    line: None,
-                    column: None,
-                    is_fatal: true,
-                    index_step: codestory_contracts::graph::IndexStep::Collection,
-                });
+                let local_storage = incomplete_file_storage(
+                    full_path,
+                    None,
+                    "openapi",
+                    codestory_contracts::graph::ErrorInfo {
+                        message: format!("Failed to read {:?}: {}", full_path, error),
+                        file_id: None,
+                        line: None,
+                        column: None,
+                        is_fatal: true,
+                        index_step: codestory_contracts::graph::IndexStep::Collection,
+                    },
+                );
                 return Err(local_storage);
             }
         };
         index_openapi_schema_file(full_path, &source).map_err(|error| {
-            let mut local_storage = IntermediateStorage::default();
-            local_storage.add_error(codestory_contracts::graph::ErrorInfo {
-                message: format!("Failed to index OpenAPI schema {:?}: {}", full_path, error),
-                file_id: None,
-                line: None,
-                column: None,
-                is_fatal: false,
-                index_step: codestory_contracts::graph::IndexStep::Indexing,
-            });
-            local_storage
+            incomplete_file_storage(
+                full_path,
+                Some(&source),
+                "openapi",
+                codestory_contracts::graph::ErrorInfo {
+                    message: format!("Failed to index OpenAPI schema {:?}: {}", full_path, error),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: codestory_contracts::graph::IndexStep::Indexing,
+                },
+            )
         })
     }
 
@@ -1413,7 +1513,6 @@ impl WorkspaceIndexer {
         prepared_input: &PreparedIndexInput,
         symbol_table: &Arc<SymbolTable>,
     ) -> PreparedIndexJobResult {
-        let mut local_storage = IntermediateStorage::default();
         match index_file(
             &prepared_input.full_path,
             &prepared_input.source,
@@ -1431,21 +1530,26 @@ impl WorkspaceIndexer {
                             cache_key: prepared_input.artifact_cache_key.clone(),
                             artifact_blob,
                         });
-                local_storage = artifact.into_intermediate_storage();
+                let local_storage = artifact.into_intermediate_storage();
                 PreparedIndexJobResult {
                     local_storage,
                     cache_write,
                 }
             }
             Err(e) => {
-                local_storage.add_error(codestory_contracts::graph::ErrorInfo {
-                    message: format!("Failed to index {:?}: {}", prepared_input.full_path, e),
-                    file_id: None,
-                    line: None,
-                    column: None,
-                    is_fatal: false,
-                    index_step: codestory_contracts::graph::IndexStep::Indexing,
-                });
+                let local_storage = incomplete_file_storage(
+                    &prepared_input.full_path,
+                    Some(&prepared_input.source),
+                    prepared_input.language_config.language_name,
+                    codestory_contracts::graph::ErrorInfo {
+                        message: format!("Failed to index {:?}: {}", prepared_input.full_path, e),
+                        file_id: None,
+                        line: None,
+                        column: None,
+                        is_fatal: false,
+                        index_step: codestory_contracts::graph::IndexStep::Indexing,
+                    },
+                );
                 PreparedIndexJobResult {
                     local_storage,
                     cache_write: None,
@@ -1508,7 +1612,7 @@ fn accumulate_flush_breakdown(
         .saturating_add(u64::from(breakdown.callable_projection_ms));
 }
 
-fn file_node_from_source(path: &Path, source: &str) -> (Node, String, NodeId) {
+pub(crate) fn file_node_from_source(path: &Path, source: &str) -> (Node, String, NodeId) {
     let file_name = path.to_string_lossy().to_string();
     let file_id = NodeId(WorkspaceIndexer::canonical_file_node_id_for_path(path));
     let line_count = source.lines().count() as u32;
@@ -1525,6 +1629,31 @@ fn file_node_from_source(path: &Path, source: &str) -> (Node, String, NodeId) {
     };
 
     (file_node, file_name, file_id)
+}
+
+fn incomplete_file_storage(
+    path: &Path,
+    source: Option<&str>,
+    language: impl Into<String>,
+    mut error: codestory_contracts::graph::ErrorInfo,
+) -> IntermediateStorage {
+    let source = source.unwrap_or("");
+    let (file_node, _file_name, file_id) = file_node_from_source(path, source);
+    let mut local_storage = IntermediateStorage::default();
+    local_storage.files.push(codestory_store::FileInfo {
+        id: file_id.0,
+        path: path.to_path_buf(),
+        language: language.into(),
+        modification_time: file_modification_time(path),
+        indexed: true,
+        complete: false,
+        line_count: source.lines().count() as u32,
+        file_role: codestory_store::FileRole::classify_path(path),
+    });
+    local_storage.nodes.push(file_node);
+    error.file_id = Some(file_id);
+    local_storage.add_error(error);
+    local_storage
 }
 
 fn node_kind_from_graph_kind(kind_str: &str) -> NodeKind {
@@ -2458,6 +2587,707 @@ fn collect_rust_generic_type_argument_edges(tree: &Tree, source: &str) -> Vec<Ma
         }
     });
     edges
+}
+
+#[derive(Debug, Clone)]
+struct RustReceiverCallHint {
+    method_name: String,
+    qualified_method_name: String,
+    start_line: u32,
+    start_col: u32,
+}
+
+type RustStructFieldTypes = HashMap<(String, String), String>;
+type RustMethodReturnTypes = HashMap<(String, String), String>;
+type RustTypeAliases = HashMap<String, String>;
+
+fn collect_rust_receiver_call_hints(tree: &Tree, source: &str) -> Vec<RustReceiverCallHint> {
+    let aliases = collect_rust_type_aliases(tree, source);
+    let field_types = collect_rust_struct_field_types(tree, source, &aliases);
+    let method_return_types = collect_rust_method_return_types(tree, source, &aliases);
+    let mut hints = Vec::new();
+
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "call_expression" {
+            return;
+        }
+        let Some(function_node) = node.child_by_field_name("function") else {
+            return;
+        };
+        if function_node.kind() != "field_expression" {
+            return;
+        }
+        let Some(method_node) = function_node.child_by_field_name("field") else {
+            return;
+        };
+        let Some(method_name) = node_source_text(method_node, source)
+            .map(|value| value.trim().to_string())
+            .filter(|value| is_rust_identifier_like(value))
+        else {
+            return;
+        };
+        let Some(receiver_node) = function_node.child_by_field_name("value") else {
+            return;
+        };
+        let impl_owner = rust_enclosing_impl_owner(node, source, &aliases);
+        let value_types = rust_enclosing_value_types(
+            node,
+            source,
+            &aliases,
+            &field_types,
+            &method_return_types,
+            impl_owner.as_deref(),
+        );
+        let Some(owner_name) = infer_rust_receiver_owner(
+            receiver_node,
+            source,
+            impl_owner.as_deref(),
+            &field_types,
+            &method_return_types,
+            &value_types,
+            &aliases,
+        )
+        .filter(|value| is_rust_type_like_name(value)) else {
+            return;
+        };
+        if rust_enclosing_generic_type_params(node, source).contains(&owner_name) {
+            return;
+        }
+        let position = method_node.start_position();
+        hints.push(RustReceiverCallHint {
+            method_name: method_name.clone(),
+            qualified_method_name: format!("{owner_name}::{method_name}"),
+            start_line: position.row as u32 + 1,
+            start_col: position.column as u32 + 1,
+        });
+    });
+
+    hints
+}
+
+fn apply_rust_receiver_call_hints(
+    tree: &Tree,
+    source: &str,
+    unique_nodes: &mut HashMap<NodeId, Node>,
+) {
+    let hints = collect_rust_receiver_call_hints(tree, source);
+    if hints.is_empty() {
+        return;
+    }
+
+    for hint in hints {
+        for node in unique_nodes.values_mut() {
+            if node.kind == NodeKind::UNKNOWN
+                && node.serialized_name == hint.method_name
+                && node.start_line == Some(hint.start_line)
+                && node.start_col == Some(hint.start_col)
+            {
+                node.serialized_name = hint.qualified_method_name.clone();
+                node.qualified_name = Some(hint.qualified_method_name.clone());
+            }
+        }
+    }
+}
+
+fn collect_rust_type_aliases(tree: &Tree, source: &str) -> RustTypeAliases {
+    let mut aliases = RustTypeAliases::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "use_declaration" {
+            return;
+        }
+        let alias_surface = node
+            .child_by_field_name("argument")
+            .and_then(|argument| node_source_text(argument, source))
+            .or_else(|| node_source_text(node, source));
+        let Some(alias_surface) = alias_surface else {
+            return;
+        };
+        collect_rust_aliases_from_surface(&alias_surface, &mut aliases);
+    });
+    aliases
+}
+
+fn collect_rust_aliases_from_surface(surface: &str, aliases: &mut RustTypeAliases) {
+    for segment in surface.split(',') {
+        let segment = segment
+            .trim()
+            .trim_start_matches("use ")
+            .trim_end_matches(';')
+            .trim();
+        let Some((raw_target, raw_alias)) = segment.rsplit_once(" as ") else {
+            continue;
+        };
+        let Some(alias) = rust_tail_identifier(raw_alias) else {
+            continue;
+        };
+        let Some(target) = rust_tail_identifier(raw_target) else {
+            continue;
+        };
+        if is_rust_type_like_name(&alias) && is_rust_type_like_name(&target) {
+            aliases.insert(alias, target);
+        }
+    }
+}
+
+fn collect_rust_struct_field_types(
+    tree: &Tree,
+    source: &str,
+    aliases: &RustTypeAliases,
+) -> RustStructFieldTypes {
+    let mut fields = RustStructFieldTypes::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "struct_item" {
+            return;
+        }
+        let Some(owner) = node
+            .child_by_field_name("name")
+            .and_then(|name| node_source_text(name, source))
+            .and_then(|name| normalize_rust_type_owner_name(&name, aliases))
+        else {
+            return;
+        };
+        walk_tree_nodes(node, &mut |field_node| {
+            if field_node.kind() != "field_declaration" {
+                return;
+            }
+            let Some(field_name) = field_node
+                .child_by_field_name("name")
+                .and_then(|name| node_source_text(name, source))
+                .map(|name| name.trim().to_string())
+                .filter(|name| is_rust_identifier_like(name))
+            else {
+                return;
+            };
+            let Some(field_type) = field_node
+                .child_by_field_name("type")
+                .and_then(|ty| node_source_text(ty, source))
+                .and_then(|ty| normalize_rust_type_owner_name(&ty, aliases))
+            else {
+                return;
+            };
+            fields.insert((owner.clone(), field_name), field_type);
+        });
+    });
+    fields
+}
+
+fn collect_rust_method_return_types(
+    tree: &Tree,
+    source: &str,
+    aliases: &RustTypeAliases,
+) -> RustMethodReturnTypes {
+    let mut return_types = RustMethodReturnTypes::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "function_item" {
+            return;
+        }
+        let Some(owner) = rust_enclosing_impl_owner(node, source, aliases) else {
+            return;
+        };
+        let Some(method_name) = node
+            .child_by_field_name("name")
+            .and_then(|name| node_source_text(name, source))
+            .map(|name| name.trim().to_string())
+            .filter(|name| is_rust_identifier_like(name))
+        else {
+            return;
+        };
+        let Some(return_type) = rust_function_return_type_text(node, source)
+            .and_then(|ty| normalize_rust_return_owner_name(&ty, aliases, Some(&owner)))
+        else {
+            return;
+        };
+        return_types.insert((owner, method_name), return_type);
+    });
+    return_types
+}
+
+fn rust_function_return_type_text(function_node: TsNode<'_>, source: &str) -> Option<String> {
+    if let Some(return_node) = function_node
+        .child_by_field_name("return_type")
+        .or_else(|| {
+            let mut cursor = function_node.walk();
+            function_node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "return_type")
+        })
+        && let Some(return_type) = node_source_text(return_node, source)
+    {
+        return Some(
+            return_type
+                .trim()
+                .trim_start_matches("->")
+                .trim()
+                .to_string(),
+        );
+    }
+
+    let surface = node_source_text(function_node, source)?;
+    let signature = surface.split('{').next().unwrap_or(&surface);
+    let (_, return_type) = signature.rsplit_once("->")?;
+    Some(return_type.trim().to_string())
+}
+
+fn rust_enclosing_impl_owner(
+    node: TsNode<'_>,
+    source: &str,
+    aliases: &RustTypeAliases,
+) -> Option<String> {
+    let mut cursor = Some(node);
+    while let Some(current) = cursor {
+        if current.kind() == "impl_item" {
+            return current
+                .child_by_field_name("type")
+                .and_then(|ty| node_source_text(ty, source))
+                .and_then(|ty| normalize_rust_type_owner_name(&ty, aliases));
+        }
+        cursor = current.parent();
+    }
+    None
+}
+
+fn rust_enclosing_value_types(
+    call_node: TsNode<'_>,
+    source: &str,
+    aliases: &RustTypeAliases,
+    field_types: &RustStructFieldTypes,
+    method_return_types: &RustMethodReturnTypes,
+    impl_owner: Option<&str>,
+) -> HashMap<String, String> {
+    let mut function_node = None;
+    let mut cursor = call_node.parent();
+    while let Some(current) = cursor {
+        if current.kind() == "function_item" {
+            function_node = Some(current);
+            break;
+        }
+        cursor = current.parent();
+    }
+
+    let Some(function_node) = function_node else {
+        return HashMap::new();
+    };
+
+    let mut value_types = HashMap::new();
+    let call_start_byte = call_node.start_byte();
+    walk_tree_nodes(function_node, &mut |node| {
+        if node.start_byte() > call_start_byte {
+            return;
+        }
+        if !matches!(node.kind(), "parameter" | "let_declaration") {
+            return;
+        }
+        let Some(pattern_node) = node.child_by_field_name("pattern") else {
+            return;
+        };
+        let Some(value_name) = rust_pattern_identifier(pattern_node, source) else {
+            return;
+        };
+        let type_name = node
+            .child_by_field_name("type")
+            .and_then(|ty| node_source_text(ty, source))
+            .and_then(|ty| normalize_rust_type_owner_name(&ty, aliases))
+            .or_else(|| {
+                if node.kind() != "let_declaration" {
+                    return None;
+                }
+                node.child_by_field_name("value").and_then(|value| {
+                    infer_rust_value_owner_from_expression(
+                        value,
+                        source,
+                        impl_owner,
+                        field_types,
+                        method_return_types,
+                        &value_types,
+                        aliases,
+                    )
+                })
+            });
+        let Some(type_name) = type_name else {
+            return;
+        };
+        value_types.insert(value_name, type_name);
+    });
+    value_types
+}
+
+fn infer_rust_receiver_owner(
+    receiver_node: TsNode<'_>,
+    source: &str,
+    impl_owner: Option<&str>,
+    field_types: &RustStructFieldTypes,
+    method_return_types: &RustMethodReturnTypes,
+    value_types: &HashMap<String, String>,
+    aliases: &RustTypeAliases,
+) -> Option<String> {
+    match receiver_node.kind() {
+        "self" => impl_owner.map(str::to_string),
+        "identifier" => node_source_text(receiver_node, source)
+            .map(|name| name.trim().to_string())
+            .and_then(|name| {
+                if name == "Self" {
+                    impl_owner.map(str::to_string)
+                } else {
+                    value_types.get(&name).cloned()
+                }
+            }),
+        "field_expression" => {
+            let field_name = receiver_node
+                .child_by_field_name("field")
+                .and_then(|field| node_source_text(field, source))
+                .map(|name| name.trim().to_string())
+                .filter(|name| is_rust_identifier_like(name))?;
+            let value_node = receiver_node.child_by_field_name("value")?;
+            let owner_name = infer_rust_receiver_owner(
+                value_node,
+                source,
+                impl_owner,
+                field_types,
+                method_return_types,
+                value_types,
+                aliases,
+            )?;
+            field_types.get(&(owner_name, field_name)).cloned()
+        }
+        "call_expression" | "try_expression" | "parenthesized_expression" => {
+            infer_rust_value_owner_from_expression(
+                receiver_node,
+                source,
+                impl_owner,
+                field_types,
+                method_return_types,
+                value_types,
+                aliases,
+            )
+        }
+        _ => None,
+    }
+}
+
+fn infer_rust_value_owner_from_expression(
+    expr_node: TsNode<'_>,
+    source: &str,
+    impl_owner: Option<&str>,
+    field_types: &RustStructFieldTypes,
+    method_return_types: &RustMethodReturnTypes,
+    value_types: &HashMap<String, String>,
+    aliases: &RustTypeAliases,
+) -> Option<String> {
+    match expr_node.kind() {
+        "call_expression" => infer_rust_call_return_owner(
+            expr_node,
+            source,
+            impl_owner,
+            field_types,
+            method_return_types,
+            value_types,
+            aliases,
+        ),
+        "try_expression" | "parenthesized_expression" | "await_expression" => {
+            let mut cursor = expr_node.walk();
+            expr_node.named_children(&mut cursor).find_map(|child| {
+                infer_rust_value_owner_from_expression(
+                    child,
+                    source,
+                    impl_owner,
+                    field_types,
+                    method_return_types,
+                    value_types,
+                    aliases,
+                )
+            })
+        }
+        "if_expression" => {
+            let mut inferred = HashSet::new();
+            walk_tree_nodes(expr_node, &mut |node| {
+                if node.kind() != "call_expression" {
+                    return;
+                }
+                if let Some(owner) = infer_rust_call_return_owner(
+                    node,
+                    source,
+                    impl_owner,
+                    field_types,
+                    method_return_types,
+                    value_types,
+                    aliases,
+                ) {
+                    inferred.insert(owner);
+                }
+            });
+            (inferred.len() == 1)
+                .then(|| inferred.into_iter().next())
+                .flatten()
+        }
+        "field_expression" | "identifier" | "self" => infer_rust_receiver_owner(
+            expr_node,
+            source,
+            impl_owner,
+            field_types,
+            method_return_types,
+            value_types,
+            aliases,
+        ),
+        _ => None,
+    }
+}
+
+fn infer_rust_call_return_owner(
+    call_node: TsNode<'_>,
+    source: &str,
+    impl_owner: Option<&str>,
+    field_types: &RustStructFieldTypes,
+    method_return_types: &RustMethodReturnTypes,
+    value_types: &HashMap<String, String>,
+    aliases: &RustTypeAliases,
+) -> Option<String> {
+    let function_node = call_node.child_by_field_name("function")?;
+    match function_node.kind() {
+        "field_expression" => {
+            let method_name = function_node
+                .child_by_field_name("field")
+                .and_then(|field| node_source_text(field, source))
+                .map(|name| name.trim().to_string())
+                .filter(|name| is_rust_identifier_like(name))?;
+            let value_node = function_node.child_by_field_name("value")?;
+            let receiver_owner = infer_rust_receiver_owner(
+                value_node,
+                source,
+                impl_owner,
+                field_types,
+                method_return_types,
+                value_types,
+                aliases,
+            )?;
+            method_return_types
+                .get(&(receiver_owner.clone(), method_name.clone()))
+                .cloned()
+                .or_else(|| {
+                    rust_type_preserving_adapter_method(&method_name).then_some(receiver_owner)
+                })
+        }
+        "scoped_identifier" => {
+            let (owner_name, method_name) =
+                rust_scoped_function_owner_and_name(function_node, source, aliases, impl_owner)?;
+            method_return_types
+                .get(&(owner_name.clone(), method_name.clone()))
+                .cloned()
+                .or_else(|| {
+                    rust_constructor_like_associated_method(&method_name).then_some(owner_name)
+                })
+        }
+        _ => None,
+    }
+}
+
+fn rust_scoped_function_owner_and_name(
+    function_node: TsNode<'_>,
+    source: &str,
+    aliases: &RustTypeAliases,
+    impl_owner: Option<&str>,
+) -> Option<(String, String)> {
+    let surface = node_source_text(function_node, source)?;
+    let (raw_owner, raw_method) = surface.rsplit_once("::")?;
+    let mut owner_name = normalize_rust_type_owner_name(raw_owner, aliases)?;
+    if owner_name == "Self" {
+        owner_name = impl_owner?.to_string();
+    }
+    let method_name = rust_tail_identifier(raw_method)?;
+    Some((owner_name, method_name))
+}
+
+fn rust_type_preserving_adapter_method(method_name: &str) -> bool {
+    matches!(
+        method_name,
+        "map_err" | "context" | "with_context" | "inspect" | "inspect_err"
+    )
+}
+
+fn rust_constructor_like_associated_method(method_name: &str) -> bool {
+    method_name == "new"
+        || method_name == "open"
+        || method_name == "default"
+        || method_name == "from"
+        || method_name.starts_with("new_")
+}
+
+fn rust_pattern_identifier(pattern_node: TsNode<'_>, source: &str) -> Option<String> {
+    if pattern_node.kind() == "identifier" {
+        return node_source_text(pattern_node, source)
+            .map(|name| name.trim().to_string())
+            .filter(|name| is_rust_identifier_like(name));
+    }
+
+    let mut found = None;
+    walk_tree_nodes(pattern_node, &mut |node| {
+        if found.is_none() && node.kind() == "identifier" {
+            found = node_source_text(node, source)
+                .map(|name| name.trim().to_string())
+                .filter(|name| is_rust_identifier_like(name));
+        }
+    });
+    found
+}
+
+fn rust_enclosing_generic_type_params(node: TsNode<'_>, source: &str) -> HashSet<String> {
+    let mut params = HashSet::new();
+    let mut cursor = Some(node);
+    while let Some(current) = cursor {
+        if matches!(
+            current.kind(),
+            "function_item" | "impl_item" | "struct_item" | "enum_item" | "trait_item"
+        ) {
+            collect_rust_generic_type_params(current, source, &mut params);
+        }
+        cursor = current.parent();
+    }
+    params
+}
+
+fn collect_rust_generic_type_params(node: TsNode<'_>, source: &str, params: &mut HashSet<String>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "type_parameters" {
+            continue;
+        }
+        let Some(raw_params) = node_source_text(child, source) else {
+            continue;
+        };
+        for part in split_top_level_type_arguments(&raw_params) {
+            if let Some(name) = rust_generic_param_name(&part) {
+                params.insert(name);
+            }
+        }
+    }
+}
+
+fn rust_generic_param_name(value: &str) -> Option<String> {
+    let raw = value.trim();
+    if raw.starts_with('\'') || raw.is_empty() {
+        return None;
+    }
+    let name = raw
+        .split(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
+        .next()
+        .unwrap_or_default();
+    is_rust_identifier_like(name).then(|| name.to_string())
+}
+
+fn normalize_rust_return_owner_name(
+    raw_type: &str,
+    aliases: &RustTypeAliases,
+    impl_owner: Option<&str>,
+) -> Option<String> {
+    let mut value = raw_type
+        .trim()
+        .trim_start_matches("->")
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    if let Some((before_where, _)) = value.split_once(" where ") {
+        value = before_where.trim();
+    }
+    if let Some(rest) = value.strip_prefix("impl ") {
+        value = rest.trim();
+    }
+
+    let owner_surface = value
+        .find('<')
+        .and_then(|generic_start| {
+            let owner = rust_tail_identifier(&value[..generic_start])?;
+            matches!(
+                owner.as_str(),
+                "Result" | "Option" | "Box" | "Arc" | "Rc" | "Cow"
+            )
+            .then(|| split_top_level_type_arguments(value).into_iter().next())
+            .flatten()
+        })
+        .unwrap_or_else(|| value.to_string());
+
+    let mut owner = normalize_rust_type_owner_name(&owner_surface, aliases)?;
+    if owner == "Self" {
+        owner = impl_owner?.to_string();
+    }
+    Some(owner)
+}
+
+fn normalize_rust_type_owner_name(raw_type: &str, aliases: &RustTypeAliases) -> Option<String> {
+    let mut value = raw_type.trim();
+    loop {
+        let trimmed = value.trim_start();
+        if let Some(rest) = trimmed.strip_prefix('&') {
+            value = rest.trim_start();
+            if let Some(rest) = strip_rust_lifetime_prefix(value) {
+                value = rest;
+            }
+            if let Some(rest) = value.strip_prefix("mut ") {
+                value = rest.trim_start();
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("mut ") {
+            value = rest.trim_start();
+            continue;
+        }
+        value = trimmed;
+        break;
+    }
+
+    if let Some(rest) = value.strip_prefix("dyn ") {
+        value = rest.trim_start();
+    }
+    if value == "Self" {
+        return Some(value.to_string());
+    }
+
+    let generic_start = value.find('<').unwrap_or(value.len());
+    let owner_surface = value[..generic_start].trim();
+    let mut owner = rust_tail_identifier(owner_surface)?;
+    if let Some(alias_target) = aliases.get(&owner) {
+        owner = alias_target.clone();
+    }
+    is_rust_type_like_name(&owner).then_some(owner)
+}
+
+fn strip_rust_lifetime_prefix(value: &str) -> Option<&str> {
+    let value = value.trim_start();
+    let rest = value.strip_prefix('\'')?;
+    let end = rest
+        .char_indices()
+        .find_map(|(idx, ch)| (!(ch == '_' || ch.is_ascii_alphanumeric())).then_some(idx))
+        .unwrap_or(rest.len());
+    Some(rest[end..].trim_start())
+}
+
+fn rust_tail_identifier(surface: &str) -> Option<String> {
+    let trimmed = surface
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '{' | '}' | '(' | ')' | ';'));
+    let tail = trimmed
+        .rsplit(|ch: char| !(ch == '_' || ch == ':' || ch.is_ascii_alphanumeric()))
+        .find(|part| !part.is_empty())
+        .unwrap_or(trimmed)
+        .rsplit("::")
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    is_rust_identifier_like(tail).then(|| tail.to_string())
+}
+
+fn is_rust_identifier_like(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn is_rust_type_like_name(value: &str) -> bool {
+    value
+        .chars()
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_uppercase())
 }
 
 fn collect_cpp_template_type_argument_edges(tree: &Tree, source: &str) -> Vec<ManualEdgeSpec> {
@@ -4370,6 +5200,7 @@ struct FrameworkRoute {
     line: u32,
     confidence: &'static str,
     source_convention: &'static str,
+    extraction_provenance: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4417,7 +5248,13 @@ impl FrameworkRoute {
             line,
             confidence,
             source_convention: confidence,
+            extraction_provenance: "line_scan",
         }
+    }
+
+    fn with_extraction_provenance(mut self, extraction_provenance: &'static str) -> Self {
+        self.extraction_provenance = extraction_provenance;
+        self
     }
 }
 
@@ -4436,10 +5273,7 @@ pub fn is_text_only_candidate_path(path: &Path) -> bool {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    matches!(
-        extension.as_str(),
-        "svelte" | "vue" | "astro" | "go" | "rb" | "php" | "cs" | "cshtml"
-    )
+    matches!(extension.as_str(), "go" | "rb" | "php" | "cs" | "cshtml")
 }
 
 fn text_only_language_name(path: &Path) -> &'static str {
@@ -4461,6 +5295,79 @@ fn text_only_language_name(path: &Path) -> &'static str {
     }
 }
 
+fn prepare_template_index_work(
+    path: &Path,
+    template_kind: template_pipeline::TemplateKind,
+) -> Result<IntermediateStorage> {
+    let source = std::fs::read_to_string(path)?;
+    index_template_file(path, template_kind, &source)
+}
+
+fn index_template_file(
+    path: &Path,
+    template_kind: template_pipeline::TemplateKind,
+    source: &str,
+) -> Result<IntermediateStorage> {
+    let prepared = template_pipeline::prepare_template_source(template_kind, source);
+    let script_ext = match prepared.script_language {
+        "typescript" => "ts",
+        _ => "js",
+    };
+    let language_config = get_language_for_ext(script_ext)
+        .ok_or_else(|| anyhow!("missing tree-sitter config for template script language"))?;
+
+    let mut index_result = index_file(path, &prepared.blanked, &language_config, None, None)?;
+    let surface_language = template_pipeline::template_surface_language(path).unwrap_or("template");
+    if let Some(file_info) = index_result.files.first_mut() {
+        file_info.language = surface_language.to_string();
+    }
+
+    let file_id = index_result
+        .files
+        .first()
+        .map(|file| NodeId(file.id))
+        .unwrap_or_else(|| file_node_from_source(path, source).2);
+
+    let mut local_storage = IntermediateStorage::default();
+    local_storage.files.extend(index_result.files);
+    local_storage.nodes.extend(index_result.nodes);
+    local_storage.occurrences.extend(index_result.occurrences);
+    append_text_only_framework_routes(path, surface_language, source, file_id, &mut local_storage);
+    // Insert Tauri invoke edges before tree-sitter CALL edges so SQLite ON CONFLICT keeps
+    // the heuristic uncertain boundary evidence when identities collide.
+    append_text_only_tauri_invocations(surface_language, source, file_id, &mut local_storage);
+    local_storage.edges.extend(index_result.edges);
+    template_pipeline::delegate_template_style_blocks(
+        path,
+        &prepared.style_blocks,
+        file_id,
+        &mut local_storage,
+    );
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("template");
+    let flags = index_feature_flags();
+    let (final_nodes, id_remap) =
+        canonicalize_nodes(file_name, local_storage.nodes, &HashMap::new());
+    let new_file_id = id_remap.get(&file_id).copied().unwrap_or(file_id);
+    local_storage.nodes = final_nodes;
+    remap_file_affinity(&mut local_storage.nodes, new_file_id);
+    remap_edges(&mut local_storage.edges, new_file_id, &id_remap, flags);
+    remap_occurrences(&mut local_storage.occurrences, &id_remap);
+    if let Some(file_info) = local_storage.files.first_mut()
+        && let Some(remapped) = id_remap.get(&NodeId(file_info.id))
+    {
+        file_info.id = remapped.0;
+    }
+    local_storage.callable_projection_states = build_callable_projection_states(
+        &local_storage.nodes,
+        &local_storage.edges,
+        &local_storage.occurrences,
+    );
+    Ok(local_storage)
+}
+
 fn index_text_only_file(path: &Path) -> Result<IntermediateStorage> {
     let source = std::fs::read_to_string(path)?;
     let mut local_storage = IntermediateStorage::default();
@@ -4473,6 +5380,7 @@ fn index_text_only_file(path: &Path) -> Result<IntermediateStorage> {
         indexed: true,
         complete: true,
         line_count: source.lines().count() as u32,
+        file_role: codestory_store::FileRole::classify_path(path),
     });
     local_storage.nodes.push(file_node);
     if text_only_language_name(path) == "go" {
@@ -4679,6 +5587,7 @@ fn append_text_only_framework_routes(
     local_storage: &mut IntermediateStorage,
 ) {
     for route in collect_framework_routes(path, language_name, source) {
+        let route = route.with_extraction_provenance("text_only");
         let route_node = framework_route_node(file_id, &route);
         let route_node_id = route_node.id;
         local_storage.nodes.push(route_node);
@@ -4760,6 +5669,7 @@ fn index_openapi_schema_file(path: &Path, source: &str) -> Result<Option<Interme
         indexed: true,
         complete: true,
         line_count: source.lines().count() as u32,
+        file_role: codestory_store::FileRole::classify_path(path),
     });
     local_storage.nodes.push(file_node);
 
@@ -5005,6 +5915,10 @@ fn collect_framework_routes(path: &Path, language_name: &str, source: &str) -> V
     let has_koa_router =
         lower_code_source.contains("@koa/router") || lower_code_source.contains("koa-router");
     let has_hono = lower_code_source.contains("hono");
+    let has_ktor = lower_code_source.contains("ktor");
+    let has_vapor = lower_code_source.contains("vapor");
+    let has_shelf =
+        lower_code_source.contains("package:shelf") || lower_code_source.contains("shelf_router");
     let react_router_object_route_lines =
         react_router_object_route_lines(&code_lines, &code_source);
     for (index, line) in code_lines.iter().enumerate() {
@@ -5037,6 +5951,9 @@ fn collect_framework_routes(path: &Path, language_name: &str, source: &str) -> V
             "ruby" => collect_rails_route(trimmed, line_number, &mut routes),
             "php" => collect_laravel_route(trimmed, line_number, &mut routes),
             "csharp" => collect_aspnet_route(trimmed, line_number, &mut routes),
+            "kotlin" => collect_ktor_route(trimmed, line_number, &mut routes, has_ktor),
+            "swift" => collect_vapor_route(trimmed, line_number, &mut routes, has_vapor),
+            "dart" => collect_shelf_route(trimmed, line_number, &mut routes, has_shelf),
             "vue" => collect_vue_route(trimmed, line_number, &mut routes),
             "astro" => collect_astro_endpoint_route(path, trimmed, line_number, &mut routes),
             _ => {}
@@ -5079,7 +5996,17 @@ fn route_code_lines(language_name: &str, source: &str) -> Vec<String> {
 fn route_language_uses_c_style_comments(language_name: &str) -> bool {
     matches!(
         language_name,
-        "javascript" | "typescript" | "java" | "rust" | "go" | "php" | "csharp" | "vue" | "astro"
+        "javascript"
+            | "typescript"
+            | "java"
+            | "rust"
+            | "go"
+            | "php"
+            | "csharp"
+            | "kotlin"
+            | "dart"
+            | "vue"
+            | "astro"
     )
 }
 
@@ -5837,6 +6764,101 @@ fn collect_laravel_route(line: &str, line_number: u32, routes: &mut Vec<Framewor
     }
 }
 
+fn collect_ktor_route(
+    line: &str,
+    line_number: u32,
+    routes: &mut Vec<FrameworkRoute>,
+    has_ktor: bool,
+) {
+    if !has_ktor {
+        return;
+    }
+    for method in ["get", "post", "put", "patch", "delete", "head", "options"] {
+        let attr = format!("@{method}(");
+        if line.contains(&attr)
+            && let Some(path) = first_quoted_string(line)
+        {
+            routes.push(FrameworkRoute::new(
+                "ktor",
+                method.to_ascii_uppercase(),
+                path,
+                None,
+                line_number,
+                "annotation",
+            ));
+            continue;
+        }
+        for prefix in ["", "."] {
+            let needle = format!("{prefix}{method}(");
+            if line.contains(&needle)
+                && let Some(path) = first_quoted_string(line)
+            {
+                routes.push(FrameworkRoute::new(
+                    "ktor",
+                    method.to_ascii_uppercase(),
+                    path.clone(),
+                    route_handler_after_path(line, &path),
+                    line_number,
+                    "heuristic",
+                ));
+            }
+        }
+    }
+}
+
+fn collect_vapor_route(
+    line: &str,
+    line_number: u32,
+    routes: &mut Vec<FrameworkRoute>,
+    has_vapor: bool,
+) {
+    if !has_vapor && !line.contains("routes.") && !line.contains("app.") {
+        return;
+    }
+    for method in ["get", "post", "put", "patch", "delete"] {
+        let dotted = format!(".{method}(");
+        let bare = format!("{method}(");
+        if (line.contains(&dotted) || line.trim_start().starts_with(&bare))
+            && let Some(path) = first_quoted_string(line)
+        {
+            routes.push(FrameworkRoute::new(
+                "vapor",
+                method.to_ascii_uppercase(),
+                path.clone(),
+                value_after_key(line, "use"),
+                line_number,
+                "heuristic",
+            ));
+        }
+    }
+}
+
+fn collect_shelf_route(
+    line: &str,
+    line_number: u32,
+    routes: &mut Vec<FrameworkRoute>,
+    has_shelf: bool,
+) {
+    if !has_shelf && !line.contains("router.") && !line.contains("Router()") {
+        return;
+    }
+    for method in ["get", "post", "put", "patch", "delete", "head"] {
+        let needle = format!(".{method}(");
+        if line.contains(&needle)
+            && let Some(path) = first_quoted_string(line)
+        {
+            routes.push(FrameworkRoute::new(
+                "shelf",
+                method.to_ascii_uppercase(),
+                path.clone(),
+                route_handler_after_path(line, &path),
+                line_number,
+                "heuristic",
+            ));
+        }
+    }
+}
+
 fn collect_aspnet_route(line: &str, line_number: u32, routes: &mut Vec<FrameworkRoute>) {
     let attrs = [
         ("[HttpGet", "GET"),
@@ -6252,7 +7274,11 @@ fn framework_route_canonical_id(route: &FrameworkRoute) -> String {
             "params": route_params(&route.path),
             "confidence": route.confidence,
             "source_convention": route.source_convention,
-            "provenance": [format!("framework:{}", route.framework)],
+            "extraction_provenance": route.extraction_provenance,
+            "provenance": [
+                format!("framework:{}", route.framework),
+                format!("extraction:{}", route.extraction_provenance),
+            ],
         })
     )
 }
@@ -6486,6 +7512,7 @@ fn append_framework_routes(
     sinks: &mut FrameworkRouteSinks<'_>,
 ) {
     for route in collect_framework_routes(path, language_name, source) {
+        let route = route.with_extraction_provenance("ast_indexed");
         let route_node = framework_route_node(file_id, &route);
         let route_node_id = route_node.id;
         sinks
@@ -7691,6 +8718,7 @@ pub fn index_file(
         indexed: true,
         complete: !tree.root_node().has_error(),
         line_count: source.lines().count() as u32,
+        file_role: codestory_store::FileRole::classify_path(path),
     });
 
     // 1. First pass: Create nodes and a temporary mapping from GraphNodeId -> OurNodeId
@@ -8102,6 +9130,10 @@ pub fn index_file(
         },
     );
 
+    if language_config.language_name == "rust" {
+        apply_rust_receiver_call_hints(&tree, source, &mut unique_nodes);
+    }
+
     if !unique_nodes.is_empty() {
         result_nodes.extend(unique_nodes.values().cloned());
     }
@@ -8235,6 +9267,34 @@ pub fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
             C_GRAPH_QUERY,
             None,
             LanguageRuleset::C,
+        )),
+        "go" => Some(make_language_config(
+            tree_sitter_go::LANGUAGE.into(),
+            "go",
+            GO_GRAPH_QUERY,
+            None,
+            LanguageRuleset::Go,
+        )),
+        "rb" => Some(make_language_config(
+            tree_sitter_ruby::LANGUAGE.into(),
+            "ruby",
+            RUBY_GRAPH_QUERY,
+            None,
+            LanguageRuleset::Ruby,
+        )),
+        "php" => Some(make_language_config(
+            tree_sitter_php::LANGUAGE_PHP.into(),
+            "php",
+            PHP_GRAPH_QUERY,
+            None,
+            LanguageRuleset::Php,
+        )),
+        "cs" => Some(make_language_config(
+            tree_sitter_c_sharp::LANGUAGE.into(),
+            "csharp",
+            CSHARP_GRAPH_QUERY,
+            None,
+            LanguageRuleset::CSharp,
         )),
         _ => None,
     }
@@ -8389,7 +9449,7 @@ fn call_edge_still_has_unresolved_placeholder(edge: &Edge, callable_ids: &HashSe
     !callable_ids.contains(&edge.source) || edge.source == edge.target
 }
 
-fn build_callable_projection_states(
+pub(crate) fn build_callable_projection_states(
     nodes: &[Node],
     edges: &[Edge],
     occurrences: &[Occurrence],
@@ -10576,6 +11636,17 @@ function render() {
         assert!(storage.nodes.iter().any(|node| {
             node.serialized_name == "GET /users/:id (sveltekit route; confidence=file_convention)"
         }));
+        let route = storage
+            .nodes
+            .iter()
+            .find(|node| {
+                node.serialized_name
+                    == "GET /users/:id (sveltekit route; confidence=file_convention)"
+            })
+            .expect("sveltekit route node");
+        let canonical_id = route.canonical_id.as_deref().expect("route canonical id");
+        assert!(canonical_id.contains(r#""extraction_provenance":"text_only""#));
+        assert!(canonical_id.contains(r#""extraction:text_only""#));
         assert!(storage.edges.iter().any(|edge| {
             edge.kind == EdgeKind::MEMBER && edge.certainty == Some(ResolutionCertainty::Certain)
         }));
@@ -10615,6 +11686,157 @@ function render() {
         }));
         assert!(storage.occurrences.iter().any(|occurrence| {
             occurrence.element_id == command.id.0 && occurrence.kind == OccurrenceKind::REFERENCE
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_template_svelte_tauri_invoke_survives_projection_flush() -> Result<()> {
+        let source = r#"
+<script lang="ts">
+  import { invoke } from "@tauri-apps/api/core";
+  export async function refresh() {
+    await invoke("get_snapshot");
+  }
+</script>
+"#;
+        let local = index_template_file(
+            Path::new("src/App.svelte"),
+            template_pipeline::TemplateKind::Svelte,
+            source,
+        )?;
+        let command = local
+            .nodes
+            .iter()
+            .find(|node| node.canonical_id.as_deref() == Some("tauri:command:get_snapshot"))
+            .expect("tauri command node");
+        assert!(local.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.target == command.id
+                && edge.certainty == Some(ResolutionCertainty::Uncertain)
+        }));
+
+        let mut storage = Storage::new_in_memory()?;
+        storage
+            .projections()
+            .flush_projection_batch(codestory_store::ProjectionBatch {
+                files: &local.files,
+                nodes: &local.nodes,
+                edges: &local.edges,
+                occurrences: &local.occurrences,
+                component_access: &local.component_access,
+                callable_projection_states: &local.callable_projection_states,
+            })?;
+
+        let edges = storage.get_edges()?;
+        assert!(
+            edges.iter().any(|edge| {
+                edge.kind == EdgeKind::CALL
+                    && edge.target == command.id
+                    && edge.certainty == Some(ResolutionCertainty::Uncertain)
+            }),
+            "flush should preserve uncertain tauri invoke edge: {edges:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_workspace_svelte_tauri_invoke_indexes_uncertain_command_edge() -> Result<()> {
+        use codestory_contracts::events::EventBus;
+        use codestory_workspace::RefreshInfo;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let root = dir.path();
+        let svelte = root.join("src/App.svelte");
+        fs::create_dir_all(svelte.parent().expect("parent"))?;
+        fs::write(
+            &svelte,
+            r#"
+<script lang="ts">
+  import { invoke } from "@tauri-apps/api/core";
+  export async function refresh() {
+    await invoke("get_snapshot");
+  }
+</script>
+"#,
+        )?;
+        let rust = root.join("src-tauri/src/lib.rs");
+        fs::create_dir_all(rust.parent().expect("parent"))?;
+        fs::write(
+            &rust,
+            r#"
+#[tauri::command]
+fn get_snapshot() -> String {
+    String::new()
+}
+
+pub fn build() {
+    tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![get_snapshot]);
+}
+"#,
+        )?;
+
+        let mut storage = Storage::new_in_memory()?;
+        let bus = EventBus::new();
+        let indexer = WorkspaceIndexer::new(root.to_path_buf());
+        let refresh_info = RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![svelte, rust],
+            files_to_remove: vec![],
+            existing_file_ids: std::collections::HashMap::new(),
+        };
+        indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
+
+        let nodes = storage.get_nodes()?;
+        let edges = storage.get_edges()?;
+        let command = nodes
+            .iter()
+            .find(|node| node.canonical_id.as_deref() == Some("tauri:command:get_snapshot"))
+            .expect("tauri command node");
+        assert!(
+            edges.iter().any(|edge| {
+                edge.kind == EdgeKind::CALL
+                    && edge.target == command.id
+                    && edge.certainty == Some(ResolutionCertainty::Uncertain)
+            }),
+            "expected uncertain invoke edge to command {:?}, got {:?}",
+            command.id,
+            edges
+                .iter()
+                .filter(|edge| edge.target == command.id)
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_template_svelte_tauri_invoke_indexes_uncertain_command_edge() -> Result<()> {
+        let source = r#"
+<script lang="ts">
+  import { invoke } from "@tauri-apps/api/core";
+  export async function refresh() {
+    await invoke("get_snapshot");
+  }
+</script>
+"#;
+        let storage = index_template_file(
+            Path::new("src/App.svelte"),
+            template_pipeline::TemplateKind::Svelte,
+            source,
+        )?;
+        let command = storage
+            .nodes
+            .iter()
+            .find(|node| node.canonical_id.as_deref() == Some("tauri:command:get_snapshot"))
+            .expect("tauri command node");
+
+        assert!(storage.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.target == command.id
+                && edge.certainty == Some(ResolutionCertainty::Uncertain)
         }));
         Ok(())
     }
@@ -10843,6 +12065,12 @@ export function Screen() {
             .iter()
             .find(|node| node.serialized_name == "GET /users (express route; confidence=heuristic)")
             .expect("express route node");
+        let express_canonical_id = express_route
+            .canonical_id
+            .as_deref()
+            .expect("express route canonical id");
+        assert!(express_canonical_id.contains(r#""extraction_provenance":"ast_indexed""#));
+        assert!(express_canonical_id.contains(r#""extraction:ast_indexed""#));
         let handler = result
             .nodes
             .iter()
@@ -11264,6 +12492,41 @@ web::resource("/actix").route(web::get().to(handler));
                 r#"{ path: "/vue", name: "VueHome" }"#,
                 vec!["vue-router"],
             ),
+            (
+                "kotlin",
+                Path::new("Routing.kt"),
+                r#"
+import io.ktor.server.routing.*
+fun Application.module() {
+  routing {
+    get("/ktor/users") { }
+    post("/ktor/users") { }
+  }
+}
+"#,
+                vec!["ktor"],
+            ),
+            (
+                "swift",
+                Path::new("routes.swift"),
+                r#"
+import Vapor
+func routes(_ app: Application) throws {
+  app.get("vapor/users", use: UserController.index)
+}
+"#,
+                vec!["vapor"],
+            ),
+            (
+                "dart",
+                Path::new("routes.dart"),
+                r#"
+import 'package:shelf_router/shelf_router.dart';
+final router = Router();
+router.get('/shelf/users', usersHandler);
+"#,
+                vec!["shelf"],
+            ),
         ];
 
         for (language, path, source, expected_frameworks) in cases {
@@ -11319,6 +12582,8 @@ func (r *Route) Get(name string) interface{} { return r.namedRoutes[name] }
         assert!(canonical_id.contains(r#""raw_path":"/api/users/[id]""#));
         assert!(canonical_id.contains(r#""params":["id"]"#));
         assert!(canonical_id.contains(r#""source_convention":"file_convention""#));
+        assert!(canonical_id.contains(r#""extraction_provenance":"line_scan""#));
+        assert!(canonical_id.contains(r#""extraction:line_scan""#));
     }
 
     #[test]

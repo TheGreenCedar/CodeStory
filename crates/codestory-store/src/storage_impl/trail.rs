@@ -134,12 +134,6 @@ pub(super) fn get_trail_to_target(
         TrailDirection::Outgoing,
         &traversal_options,
     )?;
-    let (dist_to_target, truncated_to_target) = bfs_distances(
-        storage,
-        target_id,
-        TrailDirection::Incoming,
-        &traversal_options,
-    )?;
 
     if !dist_from_root.contains_key(&target_id) {
         let mut result = TrailResult::default();
@@ -152,10 +146,17 @@ pub(super) fn get_trail_to_target(
         {
             result.nodes.push(node);
         }
-        result.truncated = truncated_from_root || truncated_to_target;
+        result.truncated = truncated_from_root;
         super::apply_trail_node_filter(&mut result, config);
         return Ok(result);
     }
+
+    let (dist_to_target, truncated_to_target) = bfs_distances_to_target_through_root_reachable(
+        storage,
+        target_id,
+        &dist_from_root,
+        &traversal_options,
+    )?;
 
     let mut included: HashSet<NodeId> = HashSet::new();
     for (id, d_root) in &dist_from_root {
@@ -353,6 +354,61 @@ fn bfs_distances(
             };
             if let std::collections::hash_map::Entry::Vacant(entry) = dist.entry(neighbor_id) {
                 let next_depth = depth.saturating_add(1);
+                entry.insert(next_depth);
+                queue.push_back((neighbor_id, next_depth));
+            }
+        }
+    }
+
+    Ok((dist, truncated))
+}
+
+fn bfs_distances_to_target_through_root_reachable(
+    storage: &Storage,
+    target_id: NodeId,
+    dist_from_root: &HashMap<NodeId, u32>,
+    options: &BfsTraversalOptions<'_>,
+) -> Result<(HashMap<NodeId, u32>, bool), StorageError> {
+    let mut dist: HashMap<NodeId, u32> = HashMap::new();
+    let mut queue: VecDeque<(NodeId, u32)> = VecDeque::new();
+    let mut truncated = false;
+
+    dist.insert(target_id, 0);
+    queue.push_back((target_id, 0));
+
+    while let Some((current_id, depth)) = queue.pop_front() {
+        if dist.len() >= options.max_nodes {
+            truncated = true;
+            break;
+        }
+        if depth >= options.max_depth {
+            continue;
+        }
+
+        let edges = get_edges_for_node(
+            storage,
+            current_id,
+            &TrailDirection::Incoming,
+            options.edge_filter,
+            options.caller_scope,
+            options.show_utility_calls,
+        )?;
+        for edge in edges {
+            let Some(neighbor_id) =
+                super::neighbor_for_direction(current_id, TrailDirection::Incoming, &edge)
+            else {
+                continue;
+            };
+            let Some(&dist_root) = dist_from_root.get(&neighbor_id) else {
+                continue;
+            };
+            let next_depth = depth.saturating_add(1);
+            if options.max_depth != u32::MAX
+                && dist_root as u64 + next_depth as u64 > options.max_depth as u64
+            {
+                continue;
+            }
+            if let std::collections::hash_map::Entry::Vacant(entry) = dist.entry(neighbor_id) {
                 entry.insert(next_depth);
                 queue.push_back((neighbor_id, next_depth));
             }

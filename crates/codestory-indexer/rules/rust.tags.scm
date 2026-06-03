@@ -12,6 +12,11 @@
 (enum_item
   name: (type_identifier) @definition.enum)
 
+(enum_item
+  body: (enum_variant_list
+    (enum_variant
+      name: (identifier) @definition.enum_constant)))
+
 (union_item
   (visibility_modifier) @access
   name: (type_identifier) @definition.union)

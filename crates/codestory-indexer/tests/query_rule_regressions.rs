@@ -265,6 +265,40 @@ class Example extends Base implements IFoo {
 }
 
 #[test]
+fn test_typescript_extends_factory_call_indexes_without_duplicate_variable() -> anyhow::Result<()> {
+    let (nodes, edges) = index_project(&[(
+        "main.ts",
+        r#"
+function mock<T>(): { new(): T } {
+  return class {} as any;
+}
+
+interface IGitService {}
+
+class TestGitService extends mock<IGitService>() {
+  getRecentRepositories() {
+    return [];
+  }
+}
+"#,
+    )])?;
+
+    assert!(has_node_kind(&nodes, "TestGitService", NodeKind::CLASS));
+    assert!(
+        edge_between_matching(
+            &nodes,
+            &edges,
+            EdgeKind::INHERITANCE,
+            |name| matches_name(name, "TestGitService"),
+            |name| name.contains("mock<IGitService>()")
+        ),
+        "expected TestGitService inheritance edge to the factory superclass expression"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_tsx_parenthesized_jsx_component_and_props_are_tracked() -> anyhow::Result<()> {
     let (nodes, edges) = index_project(&[(
         "App.tsx",

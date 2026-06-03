@@ -1,5 +1,5 @@
 use codestory_contracts::events::EventBus;
-use codestory_contracts::graph::{Edge, EdgeKind, Node};
+use codestory_contracts::graph::{Edge, EdgeKind, Node, ResolutionCertainty};
 use codestory_indexer::WorkspaceIndexer;
 use codestory_store::Store as Storage;
 use std::collections::{HashMap, HashSet};
@@ -544,6 +544,481 @@ impl WorkspaceIndexer {
         clone_edges_from_run >= 1,
         "expected at least one clone call edge from run_incremental"
     );
+    Ok(())
+}
+
+#[test]
+fn test_rust_self_field_receiver_calls_resolve_to_declared_field_owner() -> anyhow::Result<()> {
+    let source = r#"
+struct AppController;
+impl AppController {
+    fn run_indexing_blocking_without_runtime_refresh(&self) {}
+}
+
+struct ProjectService;
+impl ProjectService {
+    fn run_indexing_blocking_without_runtime_refresh(&self) {}
+}
+
+struct IndexService {
+    controller: AppController,
+}
+impl IndexService {
+    fn run_indexing_blocking_without_runtime_refresh(&self) {
+        self.controller.run_indexing_blocking_without_runtime_refresh();
+    }
+}
+
+struct RuntimeContext {
+    index: IndexService,
+}
+impl RuntimeContext {
+    fn ensure_open_from_summary(&self) {
+        self.index.run_indexing_blocking_without_runtime_refresh();
+    }
+}
+"#;
+
+    let (nodes, edges) = index_single_file("main.rs", source)?;
+
+    assert_resolved_call_to_method_owner(
+        "rust self field receiver",
+        &nodes,
+        &edges,
+        "RuntimeContext::ensure_open_from_summary",
+        "IndexService",
+        "run_indexing_blocking_without_runtime_refresh",
+    );
+    assert_resolved_call_to_method_owner(
+        "rust self field receiver",
+        &nodes,
+        &edges,
+        "IndexService::run_indexing_blocking_without_runtime_refresh",
+        "AppController",
+        "run_indexing_blocking_without_runtime_refresh",
+    );
+
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let project_method_id = nodes
+        .iter()
+        .find(|node| {
+            is_matching_owned_method(
+                &node.serialized_name,
+                "ProjectService",
+                "run_indexing_blocking_without_runtime_refresh",
+            )
+        })
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("expected ProjectService method node"))?;
+    let index_service_ids = nodes
+        .iter()
+        .filter(|node| {
+            is_matching_owned_method(
+                &node.serialized_name,
+                "IndexService",
+                "run_indexing_blocking_without_runtime_refresh",
+            )
+        })
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    assert!(
+        !index_service_ids.is_empty(),
+        "expected IndexService method node"
+    );
+
+    for edge in edges.iter().filter(|edge| edge.kind == EdgeKind::CALL) {
+        if !index_service_ids.contains(&edge.source) {
+            continue;
+        }
+        let Some(target_node) = node_by_id.get(&edge.target) else {
+            continue;
+        };
+        if !is_matching_name(
+            &target_node.serialized_name,
+            "run_indexing_blocking_without_runtime_refresh",
+        ) {
+            continue;
+        }
+        assert_ne!(
+            edge.resolved_target,
+            Some(project_method_id),
+            "self.controller call must not resolve to unrelated ProjectService method. Calls: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_rust_parameter_receiver_call_resolves_to_declared_parameter_type() -> anyhow::Result<()> {
+    let source = r#"
+struct OtherStorage;
+impl OtherStorage {
+    fn projections(&mut self) {}
+}
+
+struct Storage;
+impl Storage {
+    fn projections(&mut self) {}
+}
+
+struct WorkspaceIndexer;
+impl WorkspaceIndexer {
+    fn flush_projection_batch(storage: &mut Storage) {
+        storage.projections();
+    }
+}
+"#;
+
+    let (nodes, edges) = index_single_file("main.rs", source)?;
+    assert_resolved_call_to_method_owner(
+        "rust parameter receiver",
+        &nodes,
+        &edges,
+        "WorkspaceIndexer::flush_projection_batch",
+        "Storage",
+        "projections",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_rust_constructor_inferred_receiver_call_resolves_to_owner_method() -> anyhow::Result<()> {
+    let source = r#"
+struct Error;
+
+struct RuntimeContext;
+impl RuntimeContext {
+    fn new() -> Result<Self, Error> {
+        Ok(Self)
+    }
+
+    fn new_inspect_only() -> Result<Self, Error> {
+        Ok(Self)
+    }
+
+    fn ensure_open(&self) {
+        self.ensure_open_from_summary();
+    }
+
+    fn ensure_open_from_summary(&self) {}
+}
+
+fn run(dry_run: bool) -> Result<(), Error> {
+    let runtime = if dry_run {
+        RuntimeContext::new_inspect_only()?
+    } else {
+        RuntimeContext::new()?
+    };
+    runtime.ensure_open();
+    Ok(())
+}
+"#;
+
+    let (nodes, edges) = index_single_file("main.rs", source)?;
+    assert_resolved_call_to_method_owner(
+        "rust constructor-inferred receiver",
+        &nodes,
+        &edges,
+        "run",
+        "RuntimeContext",
+        "ensure_open",
+    );
+    assert_resolved_call_to_method_owner(
+        "rust constructor-inferred receiver",
+        &nodes,
+        &edges,
+        "RuntimeContext::ensure_open",
+        "RuntimeContext",
+        "ensure_open_from_summary",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_rust_chained_receiver_call_uses_method_return_type() -> anyhow::Result<()> {
+    let source = r#"
+struct Storage;
+struct ProjectionStore;
+struct SnapshotStore;
+
+impl Storage {
+    fn projections(&mut self) -> ProjectionStore {
+        ProjectionStore
+    }
+
+    fn snapshots(&self) -> SnapshotStore {
+        SnapshotStore
+    }
+}
+
+impl ProjectionStore {
+    fn flush_projection_batch(&mut self) {}
+}
+
+impl SnapshotStore {
+    fn refresh_all_with_stats(&self) {}
+}
+
+struct WorkspaceIndexer;
+impl WorkspaceIndexer {
+    fn flush_projection_batch(storage: &mut Storage) {
+        storage.projections().flush_projection_batch();
+    }
+}
+
+fn refresh(storage: &Storage) {
+    storage.snapshots().refresh_all_with_stats();
+}
+"#;
+
+    let (nodes, edges) = index_single_file("main.rs", source)?;
+    assert_resolved_call_to_method_owner(
+        "rust chained receiver return",
+        &nodes,
+        &edges,
+        "WorkspaceIndexer::flush_projection_batch",
+        "ProjectionStore",
+        "flush_projection_batch",
+    );
+    assert_resolved_call_to_method_owner(
+        "rust chained receiver return",
+        &nodes,
+        &edges,
+        "refresh",
+        "SnapshotStore",
+        "refresh_all_with_stats",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_rust_owner_alias_receiver_call_resolves_to_manifest_owner() -> anyhow::Result<()> {
+    let source = r#"
+struct WorkspaceManifest;
+impl WorkspaceManifest {
+    fn build_execution_plan(&self) {}
+}
+
+type Workspace = WorkspaceManifest;
+
+fn run(workspace: &Workspace) {
+    workspace.build_execution_plan();
+}
+"#;
+
+    let (nodes, edges) = index_single_file("main.rs", source)?;
+    assert_resolved_call_to_method_owner(
+        "rust owner alias receiver call",
+        &nodes,
+        &edges,
+        "run",
+        "WorkspaceManifest",
+        "build_execution_plan",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_rust_owner_prefix_without_known_alias_stays_unresolved() -> anyhow::Result<()> {
+    let source = r#"
+struct WorkspaceRunner;
+impl WorkspaceRunner {
+    fn build_execution_plan(&self) {}
+}
+
+fn run(workspace: &Workspace) {
+    workspace.build_execution_plan();
+}
+"#;
+
+    let (nodes, edges) = index_single_file("main.rs", source)?;
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    let mut found = 0usize;
+    for edge in edges.iter().filter(|edge| edge.kind == EdgeKind::CALL) {
+        let Some(source) = node_by_id.get(&edge.source) else {
+            continue;
+        };
+        let Some(target) = node_by_id.get(&edge.target) else {
+            continue;
+        };
+        if is_matching_name(&source.serialized_name, "run")
+            && target.serialized_name.contains("build_execution_plan")
+        {
+            found += 1;
+            assert!(
+                edge.resolved_target.is_none(),
+                "unknown owner prefix should not resolve to unrelated owner. Calls: {:?}",
+                describe_call_edges(&edges, &nodes)
+            );
+        }
+    }
+    assert!(
+        found > 0,
+        "expected unresolved build_execution_plan call. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_rust_store_alias_receiver_call_resolves_to_storage_owner() -> anyhow::Result<()> {
+    let source = r#"
+struct Storage;
+impl Storage {
+    fn flush_projection_batch(&mut self) {}
+}
+
+type Store = Storage;
+
+struct ProjectionStore<'a> {
+    storage: &'a mut Store,
+}
+impl<'a> ProjectionStore<'a> {
+    fn flush_projection_batch(&mut self) {
+        self.storage.flush_projection_batch();
+    }
+}
+"#;
+
+    let (nodes, edges) = index_single_file("main.rs", source)?;
+    assert_resolved_call_to_method_owner(
+        "rust store alias receiver call",
+        &nodes,
+        &edges,
+        "ProjectionStore::flush_projection_batch",
+        "Storage",
+        "flush_projection_batch",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_rust_cross_file_receiver_call_is_certain_owner_qualified_path() -> anyhow::Result<()> {
+    let service_source = r#"
+pub struct IndexService;
+impl IndexService {
+    pub fn run_indexing_blocking_without_runtime_refresh(&self) {}
+}
+"#;
+    let runtime_source = r#"
+use crate::service::IndexService;
+
+struct RuntimeContext {
+    index: IndexService,
+}
+impl RuntimeContext {
+    fn ensure_open_from_summary(&self) {
+        self.index.run_indexing_blocking_without_runtime_refresh();
+    }
+}
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("service.rs", service_source),
+        ("runtime.rs", runtime_source),
+    ])?;
+    assert_resolved_call_to_method_owner(
+        "rust cross-file receiver",
+        &nodes,
+        &edges,
+        "RuntimeContext::ensure_open_from_summary",
+        "IndexService",
+        "run_indexing_blocking_without_runtime_refresh",
+    );
+
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let caller_ids = nodes
+        .iter()
+        .filter(|node| {
+            is_matching_owned_method(
+                &node.serialized_name,
+                "RuntimeContext",
+                "ensure_open_from_summary",
+            )
+        })
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    let edge = edges
+        .iter()
+        .find(|edge| {
+            edge.kind == EdgeKind::CALL
+                && caller_ids.contains(&edge.source)
+                && edge
+                    .resolved_target
+                    .and_then(|target_id| node_by_id.get(&target_id))
+                    .is_some_and(|node| {
+                        is_matching_owned_method(
+                            &node.serialized_name,
+                            "IndexService",
+                            "run_indexing_blocking_without_runtime_refresh",
+                        )
+                    })
+        })
+        .ok_or_else(|| anyhow::anyhow!("expected cross-file receiver call edge"))?;
+    assert_eq!(
+        edge.certainty,
+        Some(ResolutionCertainty::Certain),
+        "cross-file owner-qualified receiver calls should survive hide-speculative trail filters"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_rust_untyped_common_receiver_call_remains_unresolved() -> anyhow::Result<()> {
+    let source = r#"
+struct NavigationHistory;
+impl NavigationHistory {
+    fn push(&mut self, _x: i32) {}
+}
+
+fn run() {
+    let mut items = Vec::new();
+    items.push(1);
+}
+"#;
+
+    let (nodes, edges) = index_single_file("main.rs", source)?;
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let navigation_push_id = nodes
+        .iter()
+        .find(|node| is_matching_owned_method(&node.serialized_name, "NavigationHistory", "push"))
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("expected NavigationHistory::push symbol"))?;
+    let run_ids = nodes
+        .iter()
+        .filter(|node| is_matching_name(&node.serialized_name, "run"))
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+
+    let mut push_edges = 0usize;
+    for edge in edges.iter().filter(|edge| edge.kind == EdgeKind::CALL) {
+        if !run_ids.contains(&edge.source) {
+            continue;
+        }
+        let Some(target_node) = node_by_id.get(&edge.target) else {
+            continue;
+        };
+        if !is_matching_name(&target_node.serialized_name, "push") {
+            continue;
+        }
+        push_edges += 1;
+        assert_ne!(
+            edge.resolved_target,
+            Some(navigation_push_id),
+            "untyped Vec::push receiver must not resolve to unrelated NavigationHistory::push"
+        );
+    }
+    assert!(push_edges >= 1, "expected a push call edge from run");
+
     Ok(())
 }
 
