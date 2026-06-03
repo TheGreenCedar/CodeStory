@@ -114,6 +114,22 @@ pub enum RetrievalFallbackReasonDto {
     DisabledByConfig,
     MissingEmbeddingRuntime,
     MissingSemanticDocs,
+    DegradedRuntime,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticModeDto {
+    #[default]
+    DisabledByConfig,
+    DegradedRuntime,
+    Enabled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct SemanticFallbackRecordDto {
+    pub query: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -121,6 +137,8 @@ pub struct RetrievalStateDto {
     pub mode: RetrievalModeDto,
     pub hybrid_configured: bool,
     pub semantic_ready: bool,
+    #[serde(default)]
+    pub semantic_mode: SemanticModeDto,
     pub semantic_doc_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
@@ -425,6 +443,8 @@ pub struct SearchPlanDto {
 pub struct SearchResultsDto {
     pub query: String,
     pub retrieval: RetrievalStateDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_shadow: Option<RetrievalShadowDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freshness: Option<IndexFreshnessDto>,
     pub limit_per_source: u32,
@@ -1393,6 +1413,100 @@ pub struct AgentRetrievalStepDto {
     pub message: Option<String>,
 }
 
+/// Per-stage timing from sidecar retrieval shadow runs.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct RetrievalStageTimingDto {
+    pub stage: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<u32>,
+    pub elapsed_ms: u32,
+    #[serde(default)]
+    pub candidates_added: u32,
+    #[serde(default)]
+    pub marginal_gain: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_reason: Option<String>,
+    #[serde(default)]
+    pub cache_hit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_latency_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub degraded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stub_reason: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+/// Truncated sidecar candidate row for shadow trace export.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct RetrievalCandidateSummaryDto {
+    pub rank: u32,
+    pub file_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_name: Option<String>,
+    pub score: f32,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_hit_rank: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_rank: Option<u32>,
+}
+
+/// Aggregated sidecar candidate resolution labels for loss-point diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct RetrievalCandidateResolutionCountDto {
+    pub resolution: String,
+    pub count: u32,
+}
+
+/// Shadow sidecar retrieval diagnostics emitted alongside packet output.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct RetrievalShadowDto {
+    pub retrieval_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
+    pub retrieval_total_ms: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_budget_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_reason: Option<String>,
+    #[serde(default)]
+    pub cache_hit: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stage_timings: Vec<RetrievalStageTimingDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<RetrievalCandidateSummaryDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub would_rank: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub candidate_count: u32,
+    #[serde(default)]
+    pub resolved_hit_count: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub unresolved_candidate_count: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_resolution_counts: Vec<RetrievalCandidateResolutionCountDto>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentRetrievalTraceDto {
     pub request_id: String,
@@ -1404,8 +1518,14 @@ pub struct AgentRetrievalTraceDto {
     #[serde(default)]
     pub sla_missed: bool,
     #[serde(default)]
+    pub semantic_fallback_count: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub semantic_fallbacks: Vec<SemanticFallbackRecordDto>,
+    #[serde(default)]
     pub annotations: Vec<String>,
     pub steps: Vec<AgentRetrievalStepDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_shadow: Option<RetrievalShadowDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -1657,6 +1777,114 @@ mod packet_tests {
 
         assert_eq!(request.budget, PacketBudgetModeDto::Compact);
         assert!(request.include_evidence);
+    }
+
+    #[test]
+    fn retrieval_shadow_serializes_snake_case_fields() {
+        let shadow = RetrievalShadowDto {
+            retrieval_mode: "full".to_string(),
+            degraded_reason: None,
+            retrieval_total_ms: 42,
+            total_budget_ms: Some(1_000),
+            cancel_reason: None,
+            cache_hit: false,
+            stage_timings: vec![RetrievalStageTimingDto {
+                stage: "stage1_zoekt_lexical".to_string(),
+                deadline_ms: Some(120),
+                elapsed_ms: 18,
+                candidates_added: 3,
+                marginal_gain: 0.25,
+                cancel_reason: None,
+                cache_hit: false,
+                sidecar_latency_ms: Some(18),
+                degraded: false,
+                stub_reason: None,
+            }],
+            candidates: vec![RetrievalCandidateSummaryDto {
+                rank: 1,
+                file_path: "src/lib.rs".to_string(),
+                line: Some(12),
+                symbol_name: Some("extension_service".to_string()),
+                score: 0.9,
+                source: "zoekt".to_string(),
+                resolution: Some("node_unresolved".to_string()),
+                admission_status: Some("unresolved".to_string()),
+                loss_reason: Some("node_unresolved".to_string()),
+                resolved_node_id: None,
+                search_hit_rank: None,
+                final_rank: None,
+            }],
+            would_rank: vec!["src/lib.rs".to_string()],
+            error: None,
+            candidate_count: 1,
+            resolved_hit_count: 0,
+            unresolved_candidate_count: 1,
+            candidate_resolution_counts: vec![RetrievalCandidateResolutionCountDto {
+                resolution: "node_unresolved".to_string(),
+                count: 1,
+            }],
+        };
+        let value = serde_json::to_value(&shadow).expect("serialize");
+        assert_eq!(value["retrieval_mode"], "full");
+        assert_eq!(value["retrieval_total_ms"], 42);
+        assert_eq!(value["stage_timings"][0]["stage"], "stage1_zoekt_lexical");
+        assert_eq!(value["candidates"][0]["source"], "zoekt");
+        assert_eq!(value["candidates"][0]["line"], 12);
+        assert_eq!(value["candidates"][0]["resolution"], "node_unresolved");
+        assert_eq!(value["candidates"][0]["admission_status"], "unresolved");
+        assert_eq!(value["candidates"][0]["loss_reason"], "node_unresolved");
+        assert_eq!(value["unresolved_candidate_count"], 1);
+        assert_eq!(
+            value["candidate_resolution_counts"][0]["resolution"],
+            "node_unresolved"
+        );
+        assert_eq!(value["would_rank"][0], "src/lib.rs");
+        let parsed: RetrievalShadowDto = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed.retrieval_mode, "full");
+        assert_eq!(parsed.would_rank, vec!["src/lib.rs".to_string()]);
+        assert_eq!(parsed.unresolved_candidate_count, 1);
+    }
+
+    #[test]
+    fn agent_retrieval_trace_round_trips_retrieval_shadow() {
+        let trace = AgentRetrievalTraceDto {
+            request_id: "r1".to_string(),
+            resolved_profile: AgentRetrievalPresetDto::Architecture,
+            policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+            total_latency_ms: 10,
+            sla_target_ms: None,
+            sla_missed: false,
+            semantic_fallback_count: 0,
+            semantic_fallbacks: Vec::new(),
+            annotations: Vec::new(),
+            steps: Vec::new(),
+            retrieval_shadow: Some(RetrievalShadowDto {
+                retrieval_mode: "unavailable".to_string(),
+                degraded_reason: Some("sidecar_unavailable".to_string()),
+                retrieval_total_ms: 0,
+                total_budget_ms: None,
+                cancel_reason: Some("mandatory_sidecar_unavailable".to_string()),
+                cache_hit: false,
+                stage_timings: Vec::new(),
+                candidates: Vec::new(),
+                would_rank: Vec::new(),
+                error: None,
+                candidate_count: 0,
+                resolved_hit_count: 0,
+                unresolved_candidate_count: 0,
+                candidate_resolution_counts: Vec::new(),
+            }),
+        };
+        let value = serde_json::to_value(&trace).expect("serialize");
+        assert_eq!(value["retrieval_shadow"]["retrieval_mode"], "unavailable");
+        let parsed: AgentRetrievalTraceDto = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(
+            parsed
+                .retrieval_shadow
+                .as_ref()
+                .map(|shadow| shadow.retrieval_mode.as_str()),
+            Some("unavailable")
+        );
     }
 
     #[test]

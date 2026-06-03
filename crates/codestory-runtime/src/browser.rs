@@ -1,11 +1,11 @@
 use codestory_contracts::api::{
     AffectedAnalysisDto, AffectedAnalysisRequest, AgentAnswerDto, AgentAskRequest,
-    AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, IndexedFilesDto,
-    IndexedFilesRequest, LayoutDirection, ListChildrenSymbolsRequest, ListRootSymbolsRequest,
-    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest, SearchHit,
-    SearchRepoTextMode, SearchRequest, SearchResultsDto, SnippetContextDto, SourceOccurrenceDto,
-    SymbolContextDto, SymbolSummaryDto, TrailCallerScope, TrailConfigDto, TrailContextDto,
-    TrailDirection, TrailMode,
+    AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, GraphResponse,
+    IndexedFilesDto, IndexedFilesRequest, LayoutDirection, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
+    NodeOccurrencesRequest, SearchHit, SearchRepoTextMode, SearchRequest, SearchResultsDto,
+    SnippetContextDto, SourceOccurrenceDto, SymbolContextDto, SymbolSummaryDto, TrailCallerScope,
+    TrailConfigDto, TrailContextDto, TrailDirection, TrailMode,
 };
 use codestory_contracts::query::{
     FilterQuery, GraphQueryAst, GraphQueryOperation, SearchQuery as BrowserSearchQuery,
@@ -109,6 +109,15 @@ impl ReadOnlyBrowserService {
         self.controller.search_results(req)
     }
 
+    pub fn resolve_indexed_symbol_candidates(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Result<Vec<SearchHit>, ApiError> {
+        self.controller
+            .resolve_indexed_symbol_candidates(query, max_results)
+    }
+
     pub fn indexed_files(&self, req: IndexedFilesRequest) -> Result<IndexedFilesDto, ApiError> {
         self.controller.indexed_files(req)
     }
@@ -145,6 +154,10 @@ impl ReadOnlyBrowserService {
 
     pub fn references_context(&self, req: TrailConfigDto) -> Result<TrailContextDto, ApiError> {
         self.controller.trail_context(req)
+    }
+
+    pub fn direct_references_graph(&self, req: TrailConfigDto) -> Result<GraphResponse, ApiError> {
+        self.controller.graph_direct_references(req)
     }
 
     pub fn snippet_context(
@@ -302,19 +315,9 @@ impl ReadOnlyBrowserService {
     }
 
     fn resolve_query(&self, query: &str) -> Result<SearchHit, ApiError> {
-        let mut hits = self.controller.search_hybrid(
-            SearchRequest {
-                query: query.to_string(),
-                repo_text: SearchRepoTextMode::Off,
-                limit_per_source: 50,
-                expand_search_plan: false,
-                hybrid_weights: None,
-                hybrid_limits: None,
-            },
-            None,
-            Some(50),
-            None,
-        )?;
+        let mut hits = self
+            .controller
+            .resolve_indexed_symbol_candidates(query, 50)?;
         hits.sort_by(|left, right| {
             compare_ranked_hits(
                 left,

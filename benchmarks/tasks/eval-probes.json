@@ -1,0 +1,304 @@
+{
+  "$schema": "./eval-probes.schema.json",
+  "description": "Diagnostic-only eval probe data for local holdout manifests. Loaded only when CODESTORY_EVAL_PROBES is enabled.",
+  "flow_hint_rules": [
+    {
+      "all_terms": ["exec", "runtime"],
+      "any_terms": [],
+      "queries": ["exec_runtime", "run_exec", "run_exec_session", "run_main"]
+    },
+    {
+      "all_terms": ["exec", "cli"],
+      "any_terms": [],
+      "queries": [
+        "exec_cli",
+        "codex_exec",
+        "codex_exec::Cli",
+        "codex_exec::run_main",
+        "ExecSharedCliOptions",
+        "Subcommand",
+        "Subcommand::Exec"
+      ]
+    },
+    {
+      "all_terms": ["thread", "start"],
+      "any_terms": [],
+      "queries": ["thread_start", "ThreadStartParams", "thread_start_params"]
+    },
+    {
+      "all_terms": ["turn", "start"],
+      "any_terms": [],
+      "queries": ["turn_start", "TurnStartParams", "turn_start_params"]
+    },
+    {
+      "all_terms": [],
+      "any_terms": ["json", "jsonl"],
+      "queries": [
+        "json_output",
+        "jsonl_output",
+        "event_processor",
+        "EventProcessor",
+        "EventProcessor::process_server_notification",
+        "exec_events",
+        "exec_events::ThreadEvent",
+        "ExecEvent"
+      ]
+    },
+    {
+      "all_terms": ["jsonl"],
+      "any_terms": [],
+      "queries": [
+        "EventProcessorWithJsonOutput",
+        "event_processor_with_jsonl_output",
+        "JsonlEvent"
+      ]
+    },
+    {
+      "all_terms": ["cli"],
+      "any_terms": [],
+      "queries": ["Subcommand", "subcommand"]
+    },
+    {
+      "all_terms": ["source", "group"],
+      "any_terms": [],
+      "queries": [
+        "source_group",
+        "SourceGroup",
+        "SourceGroupSettings",
+        "SourceGroupFactory",
+        "SourceGroupFactoryModule",
+        "SourceGroupCxxCdb",
+        "SourceGroupCxxCdb::getIndexerCommandProvider",
+        "IndexerCommandCxx",
+        "IndexerCommandCxx::IndexerCommandCxx",
+        "IndexerCommandJava",
+        "IndexerJava",
+        "IndexerJava::doIndex",
+        "getIndexerCommands",
+        "getIndexerCommandProvider"
+      ]
+    },
+    {
+      "all_terms": [],
+      "any_terms": ["indexing", "indexed", "indexer"],
+      "queries": [
+        "buildIndex",
+        "TaskBuildIndex",
+        "TaskFillIndexerCommandsQueue",
+        "IndexerCommand"
+      ]
+    },
+    {
+      "all_terms": [],
+      "any_terms": ["storage", "persistent"],
+      "queries": [
+        "StorageAccess",
+        "StorageAccessProxy",
+        "StorageAccessProxy::setSubject",
+        "PersistentStorage",
+        "PersistentStorage::PersistentStorage",
+        "storage_access",
+        "persistent_storage"
+      ]
+    },
+    {
+      "all_terms": ["data"],
+      "any_terms": ["access", "accessed"],
+      "queries": [
+        "StorageAccess",
+        "StorageAccessProxy",
+        "StorageAccessProxy::setSubject",
+        "PersistentStorage",
+        "PersistentStorage::PersistentStorage",
+        "storage_access",
+        "persistent_storage"
+      ]
+    },
+    {
+      "all_terms": ["workbench"],
+      "any_terms": ["startup", "start", "extension", "host", "activation", "command", "execution"],
+      "queries": [
+        "Workbench",
+        "Workbench.startup",
+        "ExtensionService",
+        "ExtensionService._scanWebExtensions",
+        "ExtensionHostManager",
+        "ExtensionHostManager.startup",
+        "AbstractExtHostExtensionService",
+        "AbstractExtHostExtensionService._startExtensionHost",
+        "AbstractExtHostExtensionService.activateByIdWithErrors",
+        "ExtHostCommands",
+        "ExtHostCommands.executeCommand"
+      ]
+    },
+    {
+      "all_terms": ["extension", "host"],
+      "any_terms": [],
+      "queries": [
+        "ExtensionHostManager",
+        "ExtensionHostManager.startup",
+        "AbstractExtHostExtensionService",
+        "_startExtensionHost",
+        "activateByIdWithErrors",
+        "$activateByEvent"
+      ]
+    },
+    {
+      "all_terms": ["extension"],
+      "any_terms": ["activation", "activate"],
+      "queries": [
+        "AbstractExtHostExtensionService",
+        "_activateByEvent",
+        "activateByIdWithErrors",
+        "$activateByEvent"
+      ]
+    },
+    {
+      "all_terms": ["extension"],
+      "any_terms": ["command", "commands", "execution"],
+      "queries": [
+        "ExtHostCommands",
+        "ExtHostCommands.executeCommand",
+        "executeCommand"
+      ]
+    },
+    {
+      "all_terms": ["host"],
+      "any_terms": ["command", "commands", "execution"],
+      "queries": [
+        "ExtHostCommands",
+        "ExtHostCommands.executeCommand",
+        "executeCommand"
+      ]
+    },
+    {
+      "all_terms": [],
+      "any_terms": [
+        "payload",
+        "posts",
+        "post",
+        "writing",
+        "comments",
+        "comment",
+        "social",
+        "elsewhere",
+        "feed",
+        "rss"
+      ],
+      "queries": [
+        "payload_config",
+        "payload config",
+        "src/payload.config.ts",
+        "buildConfig",
+        "getPayloadClient",
+        "payload client",
+        "src/lib/payload.ts",
+        "Posts",
+        "PostPage",
+        "getPostBySlug",
+        "getAllPosts",
+        "Comments",
+        "POST /posts/:slug/comments",
+        "getApprovedCommentsForPost",
+        "getCommentAuthContextFromHeaders",
+        "comment_submission",
+        "comment_submission_guard",
+        "comment-submission-guard",
+        "src/lib/comment-submission-guard.ts",
+        "isCommentSubmissionOriginAllowed",
+        "isCommentSubmissionTimingAllowed",
+        "consumeCommentSubmissionRateLimit",
+        "SocialEntries",
+        "getLatestSocialEntries",
+        "social_entries",
+        "feed.xml"
+      ]
+    }
+  ],
+  "required_probe_rules": [
+    {
+      "all_terms": ["exec"],
+      "any_terms": ["runtime", "session"],
+      "queries": ["run_exec_session"]
+    },
+    {
+      "all_terms": ["exec"],
+      "any_terms": ["cli", "command", "subcommand"],
+      "queries": ["ExecSharedCliOptions", "Subcommand", "run_main"]
+    },
+    {
+      "all_terms": [],
+      "any_terms": ["json", "jsonl"],
+      "queries": ["EventProcessorWithJsonOutput", "EventProcessor", "exec_events"]
+    },
+    {
+      "all_terms": ["thread"],
+      "any_terms": ["start", "starts", "started"],
+      "queries": ["ThreadStartParams"]
+    },
+    {
+      "all_terms": ["turn"],
+      "any_terms": ["start", "starts", "started"],
+      "queries": ["TurnStartParams"]
+    },
+    {
+      "all_terms": [],
+      "any_terms": ["storage", "persistent"],
+      "queries": [
+        "StorageAccess",
+        "StorageAccessProxy::setSubject",
+        "PersistentStorage",
+        "PersistentStorage::PersistentStorage"
+      ]
+    },
+    {
+      "all_terms": ["data"],
+      "any_terms": ["access", "accessed"],
+      "queries": [
+        "StorageAccess",
+        "StorageAccessProxy::setSubject",
+        "PersistentStorage",
+        "PersistentStorage::PersistentStorage"
+      ]
+    },
+    {
+      "all_terms": [],
+      "any_terms": ["indexing", "indexed", "indexer"],
+      "queries": [
+        "Project::buildIndex",
+        "SourceGroupCxxCdb",
+        "SourceGroupCxxCdb::getIndexerCommandProvider",
+        "TaskFillIndexerCommandsQueue",
+        "IndexerCommandCxx",
+        "IndexerJava::doIndex"
+      ]
+    }
+  ],
+  "citation_rank_adjustments": [
+    {
+      "normalized_display": "workbenchstartup",
+      "path": "src/vs/workbench/browser/workbench.ts",
+      "boost": 26.0
+    },
+    {
+      "normalized_display": "extensionservice",
+      "path": "src/vs/workbench/services/extensions/browser/extensionservice.ts",
+      "boost": 28.0
+    },
+    {
+      "normalized_display": "extensionhostmanager",
+      "path": "src/vs/workbench/services/extensions/common/extensionhostmanager.ts",
+      "boost": 28.0
+    },
+    {
+      "normalized_display": "exthostcommands",
+      "path": "src/vs/workbench/api/common/exthostcommands.ts",
+      "boost": 28.0
+    },
+    {
+      "normalized_display": "buildconfig",
+      "path": "src/payload.config.ts",
+      "boost": 24.0
+    }
+  ]
+}

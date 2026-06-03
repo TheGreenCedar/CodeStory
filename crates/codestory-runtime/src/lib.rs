@@ -21,10 +21,10 @@ use codestory_contracts::api::{
     SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
     SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
     SearchPlanRejectedHitDto, SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto,
-    SearchRepoTextMode, SearchRequest, SearchResultsDto, SnippetContextDto, SourceOccurrenceDto,
-    StartIndexingRequest, StorageStatsDto, StoredSemanticDocsContractDto, SummaryGenerationDto,
-    SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto,
-    TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
+    SearchRepoTextMode, SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto,
+    SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto, StoredSemanticDocsContractDto,
+    SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
+    TrailContextDto, TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
     WorkspaceMemberIndexDto, WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
@@ -47,9 +47,10 @@ use std::fmt::Write as _;
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod agent;
+pub use agent::packet_step_trace_json;
 mod browser;
 mod graph_builders;
 mod graph_canonical;
@@ -81,22 +82,28 @@ pub use services::{
     TrailService,
 };
 pub(crate) use support::{
-    FocusedSourceContext, HYBRID_RETRIEVAL_ENABLED_ENV, aggregate_symbol_matches,
-    apply_hybrid_limits, clamp_i64_to_u32, clamp_u64_to_u32, clamp_u128_to_u32, clamp_usize_to_u32,
-    extract_symbol_search_terms, file_text_match_line, hybrid_retrieval_enabled,
-    looks_like_repo_text_query, node_display_name, normalized_hybrid_weights, preferred_occurrence,
-    query_has_symbol_or_literal_signal, read_searchable_file_contents, should_expand_symbol_query,
+    FocusedSourceContext, HYBRID_RETRIEVAL_ENABLED_ENV, aggregate_symbol_matches, clamp_i64_to_u32,
+    clamp_u64_to_u32, clamp_u128_to_u32, clamp_usize_to_u32, extract_symbol_search_terms,
+    file_text_match_line, hybrid_retrieval_enabled, looks_like_repo_text_query, node_display_name,
+    preferred_occurrence, query_has_symbol_or_literal_signal, read_searchable_file_contents,
+    should_expand_symbol_query,
 };
+#[cfg(test)]
+pub(crate) use support::{apply_hybrid_limits, normalized_hybrid_weights};
 #[cfg(test)]
 use symbol_query::compare_search_hits;
 pub use symbol_query::{
-    SymbolNameMatchRank, compare_ranked_hits, leading_symbol_segment, normalize_symbol_query,
-    symbol_name_match_rank, terminal_symbol_segment,
+    RetrievalFileRole, SymbolNameMatchRank, compare_ranked_hits, leading_symbol_segment,
+    normalize_symbol_query, retrieval_file_role_for_hit, retrieval_file_role_from_path,
+    symbol_name_match_rank, symbol_query_tokens, terminal_symbol_segment,
 };
 pub(crate) use symbol_query::{
-    architecture_query_intents, compare_search_hits_with_project_root, is_non_primary_source_hit,
+    architecture_query_intents, compare_search_hits_with_project_root, exact_symbol_query_terms,
+    is_non_primary_source_term, looks_like_standalone_symbol_query,
     query_mentions_non_primary_source,
 };
+#[cfg(test)]
+pub(crate) use symbol_query::{is_non_primary_source_hit, mixed_natural_language_query};
 
 type Storage = Store;
 type GraphNodeId = codestory_contracts::graph::NodeId;
@@ -147,6 +154,35 @@ fn route_endpoint_metadata_from_canonical(
         handler: None,
         provenance: canonical.provenance,
     })
+}
+
+fn route_endpoint_extraction_score_adjustment(canonical_id: Option<&str>) -> f32 {
+    let Some(raw) = canonical_id.and_then(|value| value.strip_prefix("route_endpoint:")) else {
+        return 0.0;
+    };
+    let Ok(canonical) = serde_json::from_str::<RouteEndpointCanonicalMetadata>(raw) else {
+        return 0.0;
+    };
+
+    if canonical
+        .provenance
+        .iter()
+        .any(|entry| entry == "extraction:ast_indexed")
+    {
+        return 0.025;
+    }
+    if canonical
+        .provenance
+        .iter()
+        .any(|entry| entry == "extraction:text_only")
+    {
+        return -0.025;
+    }
+    0.0
+}
+
+fn route_endpoint_adjusted_search_score(score: f32, canonical_id: Option<&str>) -> f32 {
+    (score + route_endpoint_extraction_score_adjustment(canonical_id)).max(0.0)
 }
 
 fn route_endpoint_metadata_from_openapi_label(
@@ -566,44 +602,44 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "gin",
         language: "go",
         status: "partial",
-        fixture_status: "covered_by_text_only_unit_fixture",
+        fixture_status: "covered_by_indexer_unit_fixture",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed_text_only",
         unsupported_patterns: &["router groups and middleware chains are partial"],
-        known_gaps: &["Go parser-backed handler links are not available yet"],
+        known_gaps: &["group middleware/prefix stacking is not modeled"],
         promotable: true,
     },
     FrameworkRouteCoverageEntry {
         framework: "chi",
         language: "go",
         status: "partial",
-        fixture_status: "covered_by_text_only_unit_fixture",
+        fixture_status: "covered_by_indexer_unit_fixture",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed_text_only",
         unsupported_patterns: &["route groups and mounted subrouters are partial"],
-        known_gaps: &["Go parser-backed handler links are not available yet"],
+        known_gaps: &["group middleware/prefix stacking is not modeled"],
         promotable: true,
     },
     FrameworkRouteCoverageEntry {
         framework: "echo",
         language: "go",
         status: "partial",
-        fixture_status: "covered_by_text_only_unit_fixture",
+        fixture_status: "covered_by_indexer_unit_fixture",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed_text_only",
         unsupported_patterns: &["group prefixes are partial"],
-        known_gaps: &["Go parser-backed handler links are not available yet"],
+        known_gaps: &["group middleware/prefix stacking is not modeled"],
         promotable: true,
     },
     FrameworkRouteCoverageEntry {
         framework: "fiber",
         language: "go",
         status: "partial",
-        fixture_status: "covered_by_text_only_unit_fixture",
+        fixture_status: "covered_by_indexer_unit_fixture",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed_text_only",
         unsupported_patterns: &["group prefixes and mounted apps are partial"],
-        known_gaps: &["Go parser-backed handler links are not available yet"],
+        known_gaps: &["group middleware/prefix stacking is not modeled"],
         promotable: true,
     },
     FrameworkRouteCoverageEntry {
@@ -659,6 +695,7 @@ const DIRECT_SNIPPET_TRUNCATION_SUFFIX: &str = "\n... snippet truncated by byte 
 #[derive(Debug, Clone)]
 struct RepoTextScan {
     hits: Vec<SearchHit>,
+    #[cfg(test)]
     stats: RepoTextScanStatsDto,
 }
 
@@ -679,8 +716,6 @@ struct SearchPlanActivePathEvidence {
 struct SearchPlanBuild {
     plan: SearchPlanDto,
     indexed_symbol_hits: Vec<SearchHit>,
-    repo_text_hits: Vec<SearchHit>,
-    suggestions: Vec<SearchHit>,
 }
 
 #[derive(Debug, Clone)]
@@ -916,8 +951,15 @@ fn search_hit_match_quality(query: &str, hit: &SearchHit) -> SearchMatchQualityD
     let display_normalized = normalize_symbol_query(&hit.display_name);
     let terminal = terminal_symbol_segment(&hit.display_name);
     let leading = leading_symbol_segment(&hit.display_name);
-    if hit.display_name == query {
+    let exact_terms = exact_symbol_query_terms(query);
+    if hit.display_name == query || exact_terms.contains(&hit.display_name) {
         return SearchMatchQualityDto::Exact;
+    }
+    if exact_terms.iter().any(|term| {
+        let normalized = normalize_symbol_query(term);
+        display_normalized == normalized || terminal == normalized || leading == normalized
+    }) {
+        return SearchMatchQualityDto::NormalizedExact;
     }
     if display_normalized == query_normalized
         || terminal == query_normalized
@@ -967,6 +1009,7 @@ fn weak_search_top_hit(query: &str, hits: &[SearchHit]) -> bool {
     })
 }
 
+#[cfg(test)]
 fn repo_text_auto_fallback_reason(query: &str, indexed_hits: &[SearchHit]) -> Option<String> {
     if query.trim().is_empty() {
         return None;
@@ -1049,7 +1092,7 @@ fn search_query_recommended_next_action(
             .to_string();
     }
     if repo_text_mode == SearchRepoTextMode::Off || !repo_text_enabled {
-        return "Rerun search with --repo-text on or a shorter concrete symbol.".to_string();
+        return "Run retrieval index to restore full sidecar mode, then rerun search --why with a shorter concrete symbol.".to_string();
     }
     "Try a shorter symbol, file name, or literal from ground output.".to_string()
 }
@@ -1075,6 +1118,9 @@ const SEARCH_PLAN_STOPWORDS: &[&str] = &[
     "be",
     "by",
     "can",
+    "cite",
+    "cited",
+    "cites",
     "code",
     "codestory",
     "does",
@@ -1117,19 +1163,98 @@ const SEARCH_PLAN_SYMBOL_TERMS: &[&str] = &[
     "trail",
     "snippet",
     "workspace",
+    "persistence",
+    "snapshot",
 ];
+const SEARCH_PLAN_OPTIONAL_SUBQUERY_LIMIT: usize = 8;
+const SEARCH_PLAN_MAX_SEED_ANCHORS: usize = 32;
+const SEARCH_PLAN_SEED_ANCHOR_MARKER: &str = "Seed anchors:";
+const SEARCH_PLAN_EXPLICIT_ANCHOR_MARKER: &str = "Anchor the answer around";
 const SEARCH_PLAN_ROLE_SPECS: &[(&str, &[&str])] = &[
     (
         "indexing_pipeline",
         &["full", "index", "indexing", "indexer", "workspace", "store"],
     ),
     (
+        "build_index_entrypoint",
+        &["project", "indexing", "build", "index"],
+    ),
+    (
+        "source_group_configuration",
+        &[
+            "project",
+            "source-group",
+            "source",
+            "group",
+            "configuration",
+        ],
+    ),
+    (
+        "indexing_work",
+        &["indexing", "indexed", "indexer", "command", "work"],
+    ),
+    (
+        "storage_access_surface",
+        &[
+            "storage",
+            "access",
+            "accessed",
+            "data",
+            "application",
+            "persistence",
+        ],
+    ),
+    (
+        "workspace_discovery",
+        &["workspace", "file", "discovery", "source"],
+    ),
+    (
+        "symbol_extraction",
+        &["symbol", "extraction", "indexer", "indexing"],
+    ),
+    (
         "runtime_boundary",
         &["cli", "runtime", "command", "service"],
     ),
     (
+        "exec_cli_surface",
+        &["exec", "cli", "json", "subcommand", "runtime"],
+    ),
+    (
+        "exec_event_output_surface",
+        &[
+            "exec",
+            "event",
+            "events",
+            "json",
+            "jsonl",
+            "output",
+            "event processor",
+        ],
+    ),
+    (
         "read_surface",
         &["search", "trail", "snippet", "context", "explore"],
+    ),
+    (
+        "collection_config_surface",
+        &[
+            "payload",
+            "collection",
+            "collections",
+            "schema",
+            "hooks",
+            "access",
+            "config",
+        ],
+    ),
+    (
+        "comment_submission_surface",
+        &["comments", "comment", "auth", "submission", "guard"],
+    ),
+    (
+        "public_feed_surface",
+        &["feed", "rss", "elsewhere", "social", "entries"],
     ),
     (
         "content_surface",
@@ -1137,7 +1262,15 @@ const SEARCH_PLAN_ROLE_SPECS: &[(&str, &[&str])] = &[
     ),
     (
         "persistence_surface",
-        &["storage", "store", "payload", "collection", "snapshot"],
+        &[
+            "storage",
+            "store",
+            "persistence",
+            "payload",
+            "collection",
+            "snapshot",
+            "refresh",
+        ],
     ),
 ];
 const SEARCH_PLAN_BASE_SOURCE_TRUTH_CHECKS: &[&str] = &[
@@ -1205,8 +1338,147 @@ fn search_plan_terms(query: &str) -> SearchPlanTermsDto {
             }
         }
     }
+    drop_search_plan_brand_terms_for_content_flow(query, &mut extracted, &mut dropped);
+    add_search_plan_inferred_architecture_terms(
+        query,
+        &mut extracted,
+        &mut seen,
+        &mut dropped,
+        &mut dropped_seen,
+    );
 
     SearchPlanTermsDto { extracted, dropped }
+}
+
+fn add_search_plan_inferred_architecture_terms(
+    query: &str,
+    extracted: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    dropped: &mut Vec<SearchPlanDroppedTermDto>,
+    dropped_seen: &mut HashSet<String>,
+) {
+    let lower = query.to_ascii_lowercase();
+    let has_source_group = lower.contains("source-group")
+        || (search_plan_query_has_token(&lower, "source")
+            && search_plan_query_has_token(&lower, "group"));
+    if has_source_group {
+        add_search_plan_term("SourceGroup", extracted, seen, dropped, dropped_seen);
+    }
+
+    let has_indexing_work = search_plan_query_has_token(&lower, "indexing")
+        && (search_plan_query_has_token(&lower, "work")
+            || search_plan_query_has_token(&lower, "command")
+            || has_source_group);
+    if has_indexing_work {
+        add_search_plan_term("build", extracted, seen, dropped, dropped_seen);
+        add_search_plan_term("index", extracted, seen, dropped, dropped_seen);
+        add_search_plan_term("BuildIndex", extracted, seen, dropped, dropped_seen);
+        add_search_plan_term("indexer", extracted, seen, dropped, dropped_seen);
+        add_search_plan_term("IndexerCommand", extracted, seen, dropped, dropped_seen);
+    }
+
+    let has_data_access = search_plan_query_has_token(&lower, "data")
+        && (search_plan_query_has_token(&lower, "access")
+            || search_plan_query_has_token(&lower, "accessed"))
+        && search_plan_query_has_token(&lower, "application");
+    if has_data_access {
+        add_search_plan_term("access", extracted, seen, dropped, dropped_seen);
+        add_search_plan_term("storage", extracted, seen, dropped, dropped_seen);
+        add_search_plan_term("persistence", extracted, seen, dropped, dropped_seen);
+    }
+
+    let has_event_output = search_plan_query_has_token(&lower, "event")
+        && (search_plan_query_has_token(&lower, "output")
+            || search_plan_query_has_token(&lower, "notification")
+            || search_plan_query_has_token(&lower, "notifications")
+            || search_plan_query_has_token(&lower, "jsonl"));
+    if has_event_output {
+        add_search_plan_term("EventProcessor", extracted, seen, dropped, dropped_seen);
+    }
+
+    if search_plan_query_has_exec_json_flow(&lower) {
+        for term in [
+            "exec cli",
+            "exec runtime",
+            "exec session",
+            "event processor",
+            "event output",
+            "thread start",
+            "turn start",
+        ] {
+            add_search_plan_term(term, extracted, seen, dropped, dropped_seen);
+        }
+    }
+
+    if search_plan_query_has_payload_content_flow(&lower) {
+        for term in [
+            "content config",
+            "collection config",
+            "Posts",
+            "Comments",
+            "social entries",
+            "post page",
+            "content client",
+            "comment submission",
+            "comment auth",
+            "feed",
+        ] {
+            add_search_plan_term(term, extracted, seen, dropped, dropped_seen);
+        }
+    }
+}
+
+fn search_plan_query_has_exec_json_flow(lower_query: &str) -> bool {
+    search_plan_query_has_token(lower_query, "exec")
+        && (search_plan_query_has_token(lower_query, "json")
+            || search_plan_query_has_token(lower_query, "jsonl"))
+        && (search_plan_query_has_token(lower_query, "event")
+            || search_plan_query_has_token(lower_query, "events")
+            || search_plan_query_has_token(lower_query, "output"))
+}
+
+fn search_plan_query_has_token(lower_query: &str, token: &str) -> bool {
+    lower_query
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| part == token)
+}
+
+fn search_plan_query_has_payload_content_flow(lower_query: &str) -> bool {
+    search_plan_query_has_token(lower_query, "payload")
+        && (search_plan_query_has_token(lower_query, "posts")
+            || search_plan_query_has_token(lower_query, "post")
+            || search_plan_query_has_token(lower_query, "writing"))
+        && (search_plan_query_has_token(lower_query, "comments")
+            || search_plan_query_has_token(lower_query, "comment")
+            || search_plan_query_has_token(lower_query, "feed")
+            || search_plan_query_has_token(lower_query, "rss")
+            || search_plan_query_has_token(lower_query, "elsewhere")
+            || search_plan_query_has_token(lower_query, "social"))
+}
+
+fn drop_search_plan_brand_terms_for_content_flow(
+    query: &str,
+    extracted: &mut Vec<String>,
+    dropped: &mut Vec<SearchPlanDroppedTermDto>,
+) {
+    let lower = query.to_ascii_lowercase();
+    if !(search_plan_query_has_payload_content_flow(&lower)
+        && search_plan_query_has_token(&lower, "root")
+        && search_plan_query_has_token(&lower, "runtime"))
+    {
+        return;
+    }
+
+    extracted.retain(|term| {
+        let is_brand = term.eq_ignore_ascii_case("root") || term.eq_ignore_ascii_case("runtime");
+        if is_brand {
+            dropped.push(SearchPlanDroppedTermDto {
+                term: term.clone(),
+                reason: "brand_phrase_in_content_flow".to_string(),
+            });
+        }
+        !is_brand
+    });
 }
 
 fn add_search_plan_term(
@@ -1280,9 +1552,52 @@ fn split_camel_identifier(value: &str) -> Vec<String> {
 }
 
 fn search_plan_eligible(query: &str, exact_symbol_hit_count: u32, intents: &[String]) -> bool {
-    exact_symbol_hit_count == 0
-        && !intents.is_empty()
-        && (looks_like_repo_text_query(query) || query.split_whitespace().count() >= 4)
+    let broad_query = looks_like_repo_text_query(query) || query.split_whitespace().count() >= 4;
+    let has_seed_anchors = query.contains(SEARCH_PLAN_SEED_ANCHOR_MARKER);
+    let broad_explanation_prompt =
+        search_plan_broad_explanation_prompt_with_architecture_terms(query);
+    !intents.is_empty()
+        && broad_query
+        && (exact_symbol_hit_count == 0 || has_seed_anchors || broad_explanation_prompt)
+}
+
+fn search_plan_broad_explanation_prompt_with_architecture_terms(query: &str) -> bool {
+    let lower = query.to_ascii_lowercase();
+    let asks_for_flow = lower.contains("explain how")
+        || lower.contains("trace how")
+        || lower.starts_with("how ")
+        || lower.contains(" how ");
+    if !asks_for_flow {
+        return false;
+    }
+    let tokens = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<HashSet<_>>();
+    [
+        "cli",
+        "command",
+        "runtime",
+        "workspace",
+        "indexer",
+        "indexing",
+        "store",
+        "storage",
+        "persistence",
+        "snapshot",
+        "search",
+        "trail",
+        "snippet",
+        "configuration",
+        "source",
+        "activation",
+        "host",
+        "execution",
+    ]
+    .iter()
+    .filter(|term| tokens.contains(**term))
+    .count()
+        >= 3
 }
 
 fn search_plan_subqueries(
@@ -1307,8 +1622,10 @@ fn search_plan_subqueries(
         ],
     );
     push_search_plan_seed_anchor_subqueries(&mut subqueries, &mut seen, query);
+    push_search_plan_explicit_anchor_subqueries(&mut subqueries, &mut seen, query);
     push_search_plan_symbol_term_subquery(&mut subqueries, &mut seen, terms);
     push_search_plan_role_subqueries(&mut subqueries, &mut seen, terms);
+    push_search_plan_named_anchor_subqueries(&mut subqueries, &mut seen, terms);
     push_search_plan_fallback_subquery(&mut subqueries, &mut seen, terms);
     subqueries
 }
@@ -1318,8 +1635,11 @@ fn push_search_plan_seed_anchor_subqueries(
     seen: &mut HashSet<String>,
     query: &str,
 ) {
-    for anchor in search_plan_seed_anchor_terms(query).into_iter().take(5) {
-        push_search_plan_subquery(
+    for anchor in search_plan_seed_anchor_terms(query)
+        .into_iter()
+        .take(SEARCH_PLAN_MAX_SEED_ANCHORS)
+    {
+        push_required_search_plan_subquery(
             subqueries,
             seen,
             anchor,
@@ -1333,13 +1653,44 @@ fn push_search_plan_seed_anchor_subqueries(
 }
 
 fn search_plan_seed_anchor_terms(query: &str) -> Vec<String> {
-    const MARKER: &str = "Seed anchors:";
     query
-        .split(MARKER)
+        .split(SEARCH_PLAN_SEED_ANCHOR_MARKER)
         .skip(1)
         .map(|rest| rest.lines().next().unwrap_or(rest))
         .flat_map(|anchors| anchors.split(','))
         .map(str::trim)
+        .filter(|anchor| !anchor.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn push_search_plan_explicit_anchor_subqueries(
+    subqueries: &mut Vec<SearchPlanSubqueryDto>,
+    seen: &mut HashSet<String>,
+    query: &str,
+) {
+    for anchor in search_plan_explicit_anchor_terms(query) {
+        push_required_search_plan_subquery(
+            subqueries,
+            seen,
+            anchor,
+            "named_anchor",
+            vec![
+                SearchPlanChannelDto::TypedSymbol,
+                SearchPlanChannelDto::Lexical,
+            ],
+        );
+    }
+}
+
+fn search_plan_explicit_anchor_terms(query: &str) -> Vec<String> {
+    let Some(rest) = query.split(SEARCH_PLAN_EXPLICIT_ANCHOR_MARKER).nth(1) else {
+        return Vec::new();
+    };
+    let anchor_text = rest.split('.').next().unwrap_or(rest).trim();
+    anchor_text
+        .split(',')
+        .map(|part| part.trim().trim_start_matches("and ").trim())
         .filter(|anchor| !anchor.is_empty())
         .map(ToOwned::to_owned)
         .collect()
@@ -1350,21 +1701,33 @@ fn push_search_plan_symbol_term_subquery(
     seen: &mut HashSet<String>,
     terms: &SearchPlanTermsDto,
 ) {
-    let symbol_terms = terms
-        .extracted
-        .iter()
-        .filter(|term| search_plan_symbol_term(term))
-        .cloned()
-        .collect::<Vec<_>>();
+    let symbol_terms = sorted_search_plan_symbol_terms(terms);
     if symbol_terms.is_empty() {
         return;
     }
-    let mut symbol_terms = symbol_terms;
-    symbol_terms.sort_by(|left, right| {
-        search_plan_symbol_subquery_term_score(right)
-            .cmp(&search_plan_symbol_subquery_term_score(left))
-            .then_with(|| left.cmp(right))
-    });
+    push_search_plan_subquery(
+        subqueries,
+        seen,
+        symbol_terms
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" "),
+        "typed_anchor_terms",
+        vec![
+            SearchPlanChannelDto::TypedSymbol,
+            SearchPlanChannelDto::Lexical,
+        ],
+    );
+}
+
+fn push_search_plan_named_anchor_subqueries(
+    subqueries: &mut Vec<SearchPlanSubqueryDto>,
+    seen: &mut HashSet<String>,
+    terms: &SearchPlanTermsDto,
+) {
+    let symbol_terms = sorted_search_plan_symbol_terms(terms);
     for term in symbol_terms
         .iter()
         .filter(|term| search_plan_named_anchor_term(term))
@@ -1381,20 +1744,21 @@ fn push_search_plan_symbol_term_subquery(
             ],
         );
     }
-    push_search_plan_subquery(
-        subqueries,
-        seen,
-        symbol_terms
-            .into_iter()
-            .take(8)
-            .collect::<Vec<_>>()
-            .join(" "),
-        "typed_anchor_terms",
-        vec![
-            SearchPlanChannelDto::TypedSymbol,
-            SearchPlanChannelDto::Lexical,
-        ],
-    );
+}
+
+fn sorted_search_plan_symbol_terms(terms: &SearchPlanTermsDto) -> Vec<String> {
+    let mut symbol_terms = terms
+        .extracted
+        .iter()
+        .filter(|term| search_plan_symbol_term(term))
+        .cloned()
+        .collect::<Vec<_>>();
+    symbol_terms.sort_by(|left, right| {
+        search_plan_symbol_subquery_term_score(right)
+            .cmp(&search_plan_symbol_subquery_term_score(left))
+            .then_with(|| left.cmp(right))
+    });
+    symbol_terms
 }
 
 fn search_plan_symbol_term(term: &str) -> bool {
@@ -1502,7 +1866,27 @@ fn push_search_plan_subquery(
     channels: Vec<SearchPlanChannelDto>,
 ) {
     let key = query.to_ascii_lowercase();
-    if !query.trim().is_empty() && seen.insert(key) && subqueries.len() < 8 {
+    if !query.trim().is_empty()
+        && seen.insert(key)
+        && subqueries.len() < SEARCH_PLAN_OPTIONAL_SUBQUERY_LIMIT
+    {
+        subqueries.push(SearchPlanSubqueryDto {
+            query,
+            role: role.to_string(),
+            channels,
+        });
+    }
+}
+
+fn push_required_search_plan_subquery(
+    subqueries: &mut Vec<SearchPlanSubqueryDto>,
+    seen: &mut HashSet<String>,
+    query: String,
+    role: &str,
+    channels: Vec<SearchPlanChannelDto>,
+) {
+    let key = query.to_ascii_lowercase();
+    if !query.trim().is_empty() && seen.insert(key) {
         subqueries.push(SearchPlanSubqueryDto {
             query,
             role: role.to_string(),
@@ -1879,22 +2263,10 @@ fn search_plan_caller_is_test_or_bench(storage: &Storage, caller_id: GraphNodeId
 }
 
 fn search_plan_path_is_test_or_bench(path: &str) -> bool {
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    normalized.starts_with("tests/")
-        || normalized.starts_with("test/")
-        || normalized.starts_with("benches/")
-        || normalized.starts_with("bench/")
-        || normalized.starts_with("__tests__/")
-        || normalized.starts_with("__test__/")
-        || normalized.contains("/tests/")
-        || normalized.contains("/test/")
-        || normalized.contains("/__tests__/")
-        || normalized.contains("/__test__/")
-        || normalized.contains("/benches/")
-        || normalized.contains("/bench/")
-        || normalized.ends_with("_test.rs")
-        || normalized.contains(".test.")
-        || normalized.contains(".spec.")
+    matches!(
+        retrieval_file_role_from_path(path),
+        RetrievalFileRole::Test | RetrievalFileRole::Benchmark
+    )
 }
 
 fn search_plan_anchor_groups(
@@ -1920,8 +2292,13 @@ fn search_plan_anchor_groups(
         .map(repo_text_line_identifiers)
         .collect::<Vec<_>>();
 
-    for hit in all_symbol_hits.iter().filter(|hit| hit.resolvable).take(6) {
+    let mut grouped_anchor_names = HashSet::new();
+    for hit in all_symbol_hits.iter().filter(|hit| hit.resolvable).take(16) {
         if !grouped_ids.insert(hit.node_id.clone()) {
+            continue;
+        }
+        let anchor_name = hit.display_name.to_ascii_lowercase();
+        if !grouped_anchor_names.insert(anchor_name) {
             continue;
         }
         groups.push(search_plan_typed_anchor_group(
@@ -2032,24 +2409,69 @@ fn search_plan_rejected_hits(
     anchor_groups: &[SearchPlanAnchorGroupDto],
     suggestions: &[SearchHit],
     indexed_hits: &[SearchHit],
+    repo_text_hits: &[SearchHit],
 ) -> Vec<SearchPlanRejectedHitDto> {
     let chosen = anchor_groups
         .iter()
         .filter_map(|group| group.chosen_symbol.as_ref().map(|hit| hit.node_id.clone()))
         .collect::<HashSet<_>>();
-    suggestions
+    let mut seen = HashSet::new();
+    let mut rejected = suggestions
         .iter()
         .chain(indexed_hits.iter())
-        .filter(|hit| !chosen.contains(&hit.node_id))
-        .take(4)
-        .map(|hit| SearchPlanRejectedHitDto {
+        .chain(repo_text_hits.iter())
+        .filter(|hit| !chosen.contains(&hit.node_id) && seen.insert(hit.node_id.clone()))
+        .map(|hit| {
+            let coverage = architecture_coverage_for_hit(hit);
+            let coverage_score = coverage
+                .as_ref()
+                .map(|coverage| coverage.score)
+                .unwrap_or(0);
+            (hit, coverage, coverage_score)
+        })
+        .collect::<Vec<_>>();
+
+    rejected.sort_by(
+        |(left, left_coverage, left_score), (right, right_coverage, right_score)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| right_coverage.is_some().cmp(&left_coverage.is_some()))
+                .then_with(|| {
+                    (right.origin == SearchHitOrigin::TextMatch)
+                        .cmp(&(left.origin == SearchHitOrigin::TextMatch))
+                })
+        },
+    );
+
+    rejected
+        .into_iter()
+        .take(8)
+        .map(|(hit, coverage, _)| SearchPlanRejectedHitDto {
             display_name: hit.display_name.clone(),
-            reason: "not selected after anchor grouping and evidence ranking".to_string(),
+            reason: search_plan_rejected_hit_reason(hit, coverage.as_ref()),
             origin: hit.origin,
             file_path: hit.file_path.clone(),
             line: hit.line,
         })
         .collect()
+}
+
+fn search_plan_rejected_hit_reason(
+    hit: &SearchHit,
+    coverage: Option<&ArchitectureCoverage>,
+) -> String {
+    let source = match hit.origin {
+        SearchHitOrigin::IndexedSymbol => "indexed_symbol",
+        SearchHitOrigin::TextMatch => "repo_text",
+    };
+    if let Some(coverage) = coverage {
+        format!(
+            "not selected after anchor grouping and final coverage ranking; source={source}; coverage_key={}; coverage_score={}",
+            coverage.key, coverage.score
+        )
+    } else {
+        format!("not selected after anchor grouping and evidence ranking; source={source}")
+    }
 }
 
 fn search_plan_bridge_request(from: &NodeId, to: &NodeId) -> TrailConfigDto {
@@ -2823,11 +3245,11 @@ fn build_search_state(
     hydrate_semantic_docs: bool,
 ) -> Result<SearchStateBuildResult, ApiError> {
     let projection_started = Instant::now();
-    storage
-        .rebuild_search_symbol_projection_from_node_table()
-        .map_err(|e| {
-            ApiError::internal(format!("Failed to rebuild search symbol projection: {e}"))
-        })?;
+    match llm_refresh_file_scope {
+        Some(scope) => storage.rebuild_search_symbol_projection_for_file_scope(scope),
+        None => storage.rebuild_search_symbol_projection_from_node_table(),
+    }
+    .map_err(|e| ApiError::internal(format!("Failed to rebuild search symbol projection: {e}")))?;
     let search_projection_rebuild_ms = clamp_u128_to_u32(projection_started.elapsed().as_millis());
 
     let search_index_started = Instant::now();
@@ -2910,44 +3332,22 @@ fn indexed_file_role(path: &Path) -> IndexedFileRoleDto {
 }
 
 fn path_role_from_key(path: &str) -> IndexedFileRoleDto {
-    let marked = format!("/{path}");
-    if marked.contains("/node_modules/")
-        || marked.contains("/vendor/")
-        || marked.contains("/vendors/")
-        || marked.contains("/third_party/")
-        || marked.contains("/third-party/")
-    {
-        return IndexedFileRoleDto::Vendor;
+    match retrieval_file_role_from_path(path) {
+        RetrievalFileRole::Test => IndexedFileRoleDto::Test,
+        RetrievalFileRole::Generated => IndexedFileRoleDto::Generated,
+        RetrievalFileRole::Vendor => IndexedFileRoleDto::Vendor,
+        RetrievalFileRole::Source | RetrievalFileRole::Docs | RetrievalFileRole::Benchmark => {
+            IndexedFileRoleDto::Source
+        }
     }
-    if marked.contains("/target/")
-        || marked.contains("/dist/")
-        || marked.contains("/build/")
-        || marked.contains(".generated.")
-        || marked.ends_with(".g.cs")
-    {
-        return IndexedFileRoleDto::Generated;
-    }
-    let file_name = path.rsplit('/').next().unwrap_or(path);
-    if marked.contains("/tests/")
-        || marked.contains("/test/")
-        || marked.contains("/spec/")
-        || marked.contains("/__tests__/")
-        || marked.contains("/__test__/")
-        || file_name.contains(".test.")
-        || file_name.contains(".spec.")
-        || file_name.ends_with("_test.rs")
-        || file_name.ends_with("_test.py")
-        || file_name.ends_with("test.java")
-        || file_name.ends_with("tests.java")
-    {
-        return IndexedFileRoleDto::Test;
-    }
-    IndexedFileRoleDto::Source
 }
 
 const INDEX_FRESHNESS_INDEXED_FILE_CAP: usize = 25_000;
 const INDEX_FRESHNESS_CURRENT_FILE_CAP: usize = 25_000;
 const INDEX_FRESHNESS_SAMPLE_LIMIT: usize = 8;
+const INDEX_FRESHNESS_CACHE_DEFAULT_TTL_SECS: u64 = 60;
+#[cfg(test)]
+const EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP: usize = 80;
 
 fn not_checked_index_freshness(
     reason: impl Into<String>,
@@ -3353,7 +3753,7 @@ const LLM_DOC_EMBED_BATCH_SIZE_ENV: &str = "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE";
 const SEMANTIC_DOC_SCOPE_ENV: &str = "CODESTORY_SEMANTIC_DOC_SCOPE";
 const SEMANTIC_DOC_ALIAS_MODE_ENV: &str = "CODESTORY_SEMANTIC_DOC_ALIAS_MODE";
 const SEMANTIC_DOC_MAX_TOKENS_ENV: &str = "CODESTORY_SEMANTIC_DOC_MAX_TOKENS";
-const SEMANTIC_DOC_DEFAULT_MAX_TOKENS: usize = 384;
+const SEMANTIC_DOC_DEFAULT_MAX_TOKENS: usize = 128;
 const SEMANTIC_STREAM_PENDING_DOCS_ENV: &str = "CODESTORY_SEMANTIC_STREAM_PENDING_DOCS";
 const SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV: &str =
     "CODESTORY_SEMANTIC_STREAM_SORT_WINDOW_BATCHES";
@@ -3575,10 +3975,13 @@ fn retrieval_state_from_parts(
     fallback_message: Option<String>,
     current_embedding: Option<EmbeddingProfileContractDto>,
     stored_embedding: Option<StoredSemanticDocsContractDto>,
+    runtime_degraded: bool,
 ) -> RetrievalStateDto {
     let hybrid_configured = hybrid_retrieval_enabled();
     let fallback_reason = if !hybrid_configured {
         Some(RetrievalFallbackReasonDto::DisabledByConfig)
+    } else if runtime_degraded {
+        Some(RetrievalFallbackReasonDto::DegradedRuntime)
     } else if !embedding_runtime_available {
         Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime)
     } else if semantic_doc_count == 0 {
@@ -3586,7 +3989,14 @@ fn retrieval_state_from_parts(
     } else {
         None
     };
-    let semantic_ready = hybrid_configured && embedding_runtime_available && semantic_doc_count > 0;
+    let semantic_mode = if !hybrid_configured {
+        SemanticModeDto::DisabledByConfig
+    } else if runtime_degraded || !embedding_runtime_available || semantic_doc_count == 0 {
+        SemanticModeDto::DegradedRuntime
+    } else {
+        SemanticModeDto::Enabled
+    };
+    let semantic_ready = semantic_mode == SemanticModeDto::Enabled;
     let mode = if semantic_ready {
         RetrievalModeDto::Hybrid
     } else {
@@ -3594,10 +4004,14 @@ fn retrieval_state_from_parts(
     };
     let fallback_message = fallback_message.or_else(|| match fallback_reason {
         Some(RetrievalFallbackReasonDto::DisabledByConfig) => Some(format!(
-            "Hybrid retrieval disabled by {HYBRID_RETRIEVAL_ENABLED_ENV}=false; using symbolic ranking."
+            "Hybrid retrieval disabled by {HYBRID_RETRIEVAL_ENABLED_ENV}=false; agent-facing retrieval is not full."
         )),
         Some(RetrievalFallbackReasonDto::MissingSemanticDocs) => Some(
-            "Semantic assets are available, but semantic symbol docs have not been built yet. Run `index` or reopen the project to populate them."
+            "Semantic assets are available, but semantic symbol docs have not been built yet. Run `retrieval index --refresh full` to repair full sidecar readiness."
+                .to_string(),
+        ),
+        Some(RetrievalFallbackReasonDto::DegradedRuntime) => Some(
+            "Hybrid retrieval is configured but degraded at runtime; agent-facing retrieval is not full."
                 .to_string(),
         ),
         _ => None,
@@ -3607,6 +4021,7 @@ fn retrieval_state_from_parts(
         mode,
         hybrid_configured,
         semantic_ready,
+        semantic_mode,
         semantic_doc_count,
         embedding_model,
         current_embedding,
@@ -3616,6 +4031,7 @@ fn retrieval_state_from_parts(
     }
 }
 
+#[cfg(test)]
 fn retrieval_state_from_engine(engine: &SearchEngine) -> RetrievalStateDto {
     let probe = embedding_runtime_availability_from_env();
     let current_embedding = current_embedding_contract_from_env();
@@ -3638,9 +4054,11 @@ fn retrieval_state_from_engine(engine: &SearchEngine) -> RetrievalStateDto {
         },
         current_embedding,
         None,
+        false,
     )
 }
 
+#[cfg(test)]
 fn retrieval_state_from_engine_with_storage_contract(
     engine: &SearchEngine,
     storage_retrieval: &RetrievalStateDto,
@@ -3672,6 +4090,7 @@ fn retrieval_state_from_storage(storage: &Storage) -> Result<RetrievalStateDto, 
         probe.fallback_message,
         current_embedding,
         Some(stored_embedding),
+        false,
     ))
 }
 
@@ -4182,8 +4601,14 @@ fn build_llm_symbol_doc_text(
 }
 
 fn map_llm_doc_to_search(doc: LlmSymbolDoc) -> LlmSearchDoc {
+    let file_role = doc
+        .file_path
+        .as_deref()
+        .map(retrieval_file_role_from_path)
+        .unwrap_or(RetrievalFileRole::Source);
     LlmSearchDoc {
         node_id: doc.node_id,
+        file_role,
         doc_text: doc.doc_text,
         embedding: doc.embedding,
     }
@@ -4364,7 +4789,7 @@ fn sync_llm_symbol_projection(
 
     if let Err(error) = engine.set_embedding_runtime_from_env() {
         tracing::warn!(
-            "embedding runtime unavailable ({error}); semantic ask retrieval will be unavailable until managed ONNX assets are installed with `codestory-cli setup embeddings` or embedding env points at a reachable runtime. Set {EMBEDDING_RUNTIME_MODE_ENV}=hash for local-dev embeddings, or set {HYBRID_RETRIEVAL_ENABLED_ENV}=false for lexical-only retrieval."
+            "embedding runtime unavailable ({error}); semantic ask retrieval will be unavailable until managed ONNX assets are installed with `codestory-cli setup embeddings` or embedding env points at a reachable runtime. Agent-facing retrieval must be repaired to full sidecar readiness before packet/search evidence is trusted."
         );
         if hydrate_semantic_docs {
             let reload_started = Instant::now();
@@ -4544,37 +4969,20 @@ pub(crate) struct HybridSearchScoredHit {
     pub total_score: f32,
 }
 
-fn lexical_hybrid_hits(
-    engine: &mut SearchEngine,
+#[cfg(test)]
+fn exact_symbol_merged_lexical_hybrid_hits(
+    engine: &SearchEngine,
     query: &str,
     graph_boosts: &HashMap<codestory_contracts::graph::NodeId, f32>,
 ) -> Vec<HybridSearchHit> {
-    let lexical = engine.search_symbol_with_scores(query);
-    let lexical_max = lexical
-        .iter()
-        .map(|(_, score)| *score)
-        .fold(0.0_f32, f32::max)
-        .max(1.0);
-    lexical
-        .into_iter()
-        .map(|(node_id, score)| {
-            let lexical_score = (score / lexical_max).clamp(0.0, 1.0);
-            let graph_score = graph_boosts
-                .get(&node_id)
-                .copied()
-                .unwrap_or(0.0)
-                .clamp(0.0, 1.0);
-            HybridSearchHit {
-                node_id,
-                lexical_score,
-                semantic_score: 0.0,
-                graph_score,
-                total_score: (0.85 * lexical_score + 0.15 * graph_score).clamp(0.0, 1.0),
-            }
-        })
-        .collect::<Vec<_>>()
+    crate::search::lexical::exact_symbol_merged_lexical_hybrid_hits_for_symbols(
+        engine.symbols(),
+        query,
+        graph_boosts,
+    )
 }
 
+#[cfg(test)]
 struct HybridHitsContext<'a> {
     req: &'a SearchRequest,
     graph_boosts: &'a HashMap<codestory_contracts::graph::NodeId, f32>,
@@ -4582,46 +4990,130 @@ struct HybridHitsContext<'a> {
     request_weights: Option<AgentHybridWeightsDto>,
     prefer_primary_sources: bool,
     storage_retrieval: &'a RetrievalStateDto,
+    use_exact_symbol_lexical_fast_path: bool,
 }
 
+#[cfg(test)]
 fn hybrid_hits_for_retrieval_state(
     engine: &mut SearchEngine,
     context: HybridHitsContext<'_>,
     retrieval: &mut RetrievalStateDto,
 ) -> Vec<HybridSearchHit> {
-    if retrieval.mode != RetrievalModeDto::Hybrid {
-        return lexical_hybrid_hits(engine, &context.req.query, context.graph_boosts);
-    }
-
-    let config = hybrid_search_config_for_request(
-        context.req,
-        context.requested_max_results,
-        context.request_weights,
-        context.prefer_primary_sources,
-    );
-    match engine.search_hybrid_with_scores(&context.req.query, context.graph_boosts, config) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(
-                "Hybrid retrieval failed for query {:?}; falling back to symbolic ranking: {}",
-                context.req.query,
-                error
-            );
-            *retrieval = retrieval_state_from_parts(
-                engine.semantic_doc_count(),
-                engine.embedding_model_id().map(str::to_string),
-                false,
-                Some(format!(
-                    "Semantic query fallback engaged after runtime error: {error}"
-                )),
-                current_embedding_contract_from_env(),
-                context.storage_retrieval.stored_embedding.clone(),
-            );
-            lexical_hybrid_hits(engine, &context.req.query, context.graph_boosts)
+    let uses_hybrid = !semantic_disabled_by_request_weights(context.request_weights.as_ref())
+        && !context.use_exact_symbol_lexical_fast_path
+        && retrieval.mode == RetrievalModeDto::Hybrid;
+    let mut hits = if !uses_hybrid {
+        exact_symbol_merged_lexical_hybrid_hits(engine, &context.req.query, context.graph_boosts)
+    } else {
+        let config = hybrid_search_config_for_request(
+            context.req,
+            context.requested_max_results,
+            context.request_weights.clone(),
+            context.prefer_primary_sources,
+        );
+        match engine.search_hybrid_with_scores(&context.req.query, context.graph_boosts, config) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    "Hybrid retrieval failed for query {:?}; falling back to symbolic ranking: {}",
+                    context.req.query,
+                    error
+                );
+                *retrieval = retrieval_state_from_parts(
+                    engine.semantic_doc_count(),
+                    engine.embedding_model_id().map(str::to_string),
+                    engine.embedding_runtime_configured(),
+                    Some(format!(
+                        "Semantic query fallback engaged after runtime error: {error}"
+                    )),
+                    context.storage_retrieval.current_embedding.clone(),
+                    context.storage_retrieval.stored_embedding.clone(),
+                    true,
+                );
+                exact_symbol_merged_lexical_hybrid_hits(
+                    engine,
+                    &context.req.query,
+                    context.graph_boosts,
+                )
+            }
         }
+    };
+    if uses_hybrid
+        && context.request_weights.is_none()
+        && !mixed_natural_language_query(&context.req.query)
+    {
+        let additional = exact_symbol_merged_lexical_hybrid_hits(
+            engine,
+            &context.req.query,
+            context.graph_boosts,
+        );
+        merge_hybrid_hits_by_node_id(&mut hits, additional);
+    }
+    hits
+}
+
+#[cfg(test)]
+fn exact_symbol_lexical_fast_path(
+    req: &SearchRequest,
+    request_weights: Option<&AgentHybridWeightsDto>,
+) -> bool {
+    request_weights.is_none()
+        && req.hybrid_weights.is_none()
+        && req
+            .hybrid_limits
+            .as_ref()
+            .and_then(|limits| limits.semantic)
+            .is_none()
+        && !exact_symbol_query_terms(&req.query).is_empty()
+        && has_fast_path_symbol_signal(&req.query)
+}
+
+#[cfg(test)]
+fn semantic_disabled_by_request_weights(request_weights: Option<&AgentHybridWeightsDto>) -> bool {
+    request_weights
+        .and_then(|weights| weights.semantic)
+        .is_some_and(|semantic| semantic <= f32::EPSILON)
+}
+
+#[cfg(test)]
+fn has_fast_path_symbol_signal(query: &str) -> bool {
+    let trimmed = query.trim();
+    looks_like_standalone_symbol_query(trimmed)
+        && (trimmed.contains('_')
+            || trimmed.contains("::")
+            || trimmed.contains('.')
+            || trimmed.contains('$')
+            || trimmed
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_uppercase())
+            || trimmed.chars().skip(1).any(|ch| ch.is_ascii_uppercase()))
+}
+
+#[cfg(test)]
+fn merge_hybrid_hits_by_node_id(hits: &mut Vec<HybridSearchHit>, additional: Vec<HybridSearchHit>) {
+    let mut existing = hits
+        .iter()
+        .enumerate()
+        .map(|(index, hit)| (hit.node_id, index))
+        .collect::<HashMap<_, _>>();
+
+    for hit in additional {
+        if let Some(index) = existing.get(&hit.node_id).copied() {
+            let current = &mut hits[index];
+            current.lexical_score = current.lexical_score.max(hit.lexical_score);
+            current.semantic_score = current.semantic_score.max(hit.semantic_score);
+            current.graph_score = current.graph_score.max(hit.graph_score);
+            current.total_score = current.total_score.max(hit.total_score);
+            continue;
+        }
+
+        existing.insert(hit.node_id, hits.len());
+        hits.push(hit);
     }
 }
 
+#[cfg(test)]
 fn hybrid_search_config_for_request(
     req: &SearchRequest,
     requested_max_results: usize,
@@ -4638,32 +5130,26 @@ fn hybrid_search_config_for_request(
     config.lexical_weight = lexical_weight;
     config.semantic_weight = semantic_weight;
     config.graph_weight = graph_weight;
-    let exact_symbol_query = looks_like_exact_symbol_query(&req.query);
-    if !has_request_weights && exact_symbol_query {
+    let has_exact_symbol_terms = !exact_symbol_query_terms(&req.query).is_empty();
+    let mixed_nl = mixed_natural_language_query(&req.query);
+    if !has_request_weights && has_exact_symbol_terms && !mixed_nl {
         config.lexical_weight = 0.85;
         config.semantic_weight = 0.15;
         config.graph_weight = 0.0;
-        config.max_results = requested_max_results.saturating_mul(50).clamp(50, 1_000);
-        config.lexical_limit = config.lexical_limit.max(200);
+        config.max_results = requested_max_results
+            .saturating_mul(5)
+            .clamp(requested_max_results, EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP);
+        config.lexical_limit = config.lexical_limit.max(80);
         config.semantic_limit = config.semantic_limit.max(20);
     }
     apply_hybrid_limits(req.hybrid_limits.clone(), &mut config);
-    if prefer_primary_sources && !exact_symbol_query {
+    if prefer_primary_sources && !has_exact_symbol_terms {
         config.max_results = requested_max_results.saturating_mul(5).min(80);
     }
     config
 }
 
-fn looks_like_exact_symbol_query(query: &str) -> bool {
-    let trimmed = query.trim();
-    !trimmed.is_empty()
-        && !trimmed.chars().any(char::is_whitespace)
-        && trimmed.chars().any(|ch| ch.is_ascii_alphabetic())
-        && trimmed
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '.' | '$'))
-}
-
+#[cfg(test)]
 fn should_pretruncate_primary_source_window(
     query: &str,
     prefer_primary_sources: bool,
@@ -4671,8 +5157,13 @@ fn should_pretruncate_primary_source_window(
     requested_max_results: usize,
 ) -> bool {
     prefer_primary_sources
-        && !looks_like_exact_symbol_query(query)
+        && exact_symbol_query_terms(query).is_empty()
         && candidate_count > requested_max_results
+}
+
+#[cfg(test)]
+fn primary_source_retention_threshold(requested_max_results: usize) -> usize {
+    requested_max_results.clamp(1, 3)
 }
 
 fn merge_search_hits_by_node_id(hits: &mut Vec<SearchHit>, additional: Vec<SearchHit>) {
@@ -4693,6 +5184,728 @@ fn merge_search_hits_by_node_id(hits: &mut Vec<SearchHit>, additional: Vec<Searc
         existing.insert(hit.node_id.clone(), hits.len());
         hits.push(hit);
     }
+}
+
+fn search_plan_subquery_candidate_limit(subquery: &SearchPlanSubqueryDto, limit: usize) -> usize {
+    if subquery.role == "original_question"
+        && architecture_query_intents(&subquery.query).is_empty()
+    {
+        limit
+    } else {
+        limit.saturating_mul(5).clamp(limit, 50)
+    }
+}
+
+#[cfg(test)]
+fn truncate_repo_text_hits_for_query(query: &str, hits: &mut Vec<SearchHit>, limit: usize) {
+    if limit == 0 {
+        hits.clear();
+        return;
+    }
+    if hits.len() <= limit {
+        return;
+    }
+    if architecture_query_intents(query).is_empty() {
+        hits.truncate(limit);
+        return;
+    }
+    diversify_architecture_repo_text_hits(query, hits, limit);
+}
+
+#[cfg(test)]
+fn diversify_architecture_repo_text_hits(query: &str, hits: &mut Vec<SearchHit>, limit: usize) {
+    let query_terms = search_plan_terms(query)
+        .extracted
+        .into_iter()
+        .map(|term| term.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut selected = hits
+        .iter()
+        .take(limit)
+        .cloned()
+        .enumerate()
+        .collect::<Vec<_>>();
+
+    for (candidate_rank, candidate) in hits.iter().enumerate().skip(limit) {
+        let candidate_score = architecture_repo_text_surface_score(&query_terms, candidate);
+        if candidate_score == 0 {
+            continue;
+        }
+        let Some(candidate_key) = architecture_repo_text_surface_key(candidate) else {
+            continue;
+        };
+        if selected.iter().any(|(_, hit)| {
+            architecture_repo_text_surface_key(hit).as_ref() == Some(&candidate_key)
+        }) {
+            continue;
+        }
+        let Some(replace_index) =
+            architecture_repo_text_replacement_index(&query_terms, &selected, candidate_score)
+        else {
+            continue;
+        };
+        selected[replace_index] = (candidate_rank, candidate.clone());
+    }
+
+    selected.sort_by_key(|(rank, _)| *rank);
+    *hits = selected.into_iter().map(|(_, hit)| hit).collect();
+}
+
+#[cfg(test)]
+fn architecture_repo_text_replacement_index(
+    query_terms: &HashSet<String>,
+    selected: &[(usize, SearchHit)],
+    candidate_score: u32,
+) -> Option<usize> {
+    let mut bucket_counts = HashMap::<String, usize>::new();
+    for (_, hit) in selected {
+        if let Some(bucket) = architecture_repo_text_bucket_key(hit) {
+            *bucket_counts.entry(bucket).or_default() += 1;
+        }
+    }
+
+    selected
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (rank, hit))| {
+            let bucket = architecture_repo_text_bucket_key(hit)?;
+            if bucket_counts.get(&bucket).copied().unwrap_or_default() <= 1 {
+                return None;
+            }
+            let score = architecture_repo_text_surface_score(query_terms, hit);
+            let strong_distinct_surface = candidate_score >= 3 && score <= candidate_score + 1;
+            (candidate_score >= score || strong_distinct_surface).then_some((index, score, *rank))
+        })
+        .min_by_key(|(_, score, rank)| (*score, std::cmp::Reverse(*rank)))
+        .map(|(index, _, _)| index)
+}
+
+#[cfg(test)]
+fn architecture_repo_text_surface_score(query_terms: &HashSet<String>, hit: &SearchHit) -> u32 {
+    let Some(path) = hit.file_path.as_deref() else {
+        return 0;
+    };
+    if retrieval_file_role_from_path(path).is_non_primary() {
+        return 0;
+    }
+    architecture_repo_text_surface_terms(path)
+        .into_iter()
+        .filter(|term| query_terms.contains(*term))
+        .count()
+        .min(u32::MAX as usize) as u32
+}
+
+#[cfg(test)]
+fn architecture_repo_text_surface_terms(path: &str) -> Vec<&'static str> {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let path_terms = architecture_coverage_terms(path, "");
+    let mut terms = Vec::new();
+    if normalized.contains("sourcegroup")
+        || normalized.contains("source_group")
+        || normalized.contains("source-group")
+        || architecture_has_all_terms(&path_terms, &["source", "group"])
+    {
+        terms.extend(["source", "group", "source-group", "configuration"]);
+    }
+    if architecture_has_all_terms(&path_terms, &["source", "group"])
+        && architecture_has_any_term(&path_terms, &["cxx", "cdb", "compile", "database"])
+    {
+        terms.extend(["source", "group", "source-group", "cxx", "cdb", "indexing"]);
+    }
+    if normalized.contains("lib_cxx") || normalized.contains("/cxx/") {
+        terms.extend(["cxx", "indexing", "indexer"]);
+    }
+    if normalized.contains("lib_java") || normalized.contains("/java/") {
+        terms.extend(["java", "indexing", "indexer"]);
+    }
+    if normalized.contains("/data/indexer/") || normalized.contains("indexercommand") {
+        terms.extend(["data", "indexer", "indexing", "command", "work"]);
+    }
+    if normalized.contains("/data/storage/")
+        || architecture_has_all_terms(&path_terms, &["storage", "access"])
+        || architecture_has_all_terms(&path_terms, &["persistent", "storage"])
+    {
+        terms.extend(["data", "storage", "access", "persistence"]);
+    }
+    if normalized.contains("/project/") {
+        terms.extend(["project", "source", "group", "configuration"]);
+    }
+    if normalized.contains("codestory-cli") {
+        terms.extend(["cli", "command", "entrypoint"]);
+    }
+    if normalized.contains("codestory-workspace") {
+        terms.extend(["workspace", "file", "discovery", "source"]);
+    }
+    if normalized.contains("codestory-indexer") {
+        terms.extend(["indexer", "indexing", "symbol", "extraction", "extract"]);
+    }
+    if normalized.contains("codestory-store") {
+        terms.extend(["store", "storage", "persistence", "persist"]);
+    }
+    if normalized.contains("snapshot") {
+        terms.extend(["snapshot", "refresh"]);
+    }
+    if normalized.contains("storage_impl") || normalized.contains("/storage_impl/") {
+        terms.extend(["storage", "persistence", "projection", "sqlite"]);
+    }
+    if normalized.contains("/collections/") {
+        terms.extend(["payload", "collection", "collections"]);
+        if architecture_has_any_term(&path_terms, &["post", "posts"]) {
+            terms.extend(["posts", "post", "writing"]);
+        }
+        if architecture_has_any_term(&path_terms, &["comment", "comments"]) {
+            terms.extend(["comments", "comment"]);
+        }
+        if architecture_has_all_terms(&path_terms, &["social", "entries"]) {
+            terms.extend(["social", "elsewhere", "feed"]);
+        }
+    }
+    if normalized.ends_with("/lib/payload.ts") {
+        terms.extend(["payload", "client"]);
+    }
+    if normalized.contains("/lib/content-data/") {
+        terms.extend(["content"]);
+        if normalized.ends_with("/post-content.ts") {
+            terms.extend(["posts", "post", "writing"]);
+        }
+        if normalized.ends_with("/comment-content.ts") {
+            terms.extend(["comments", "comment"]);
+        }
+        if normalized.ends_with("/social-entry-content.ts") {
+            terms.extend(["social", "elsewhere", "feed"]);
+        }
+    }
+    if normalized.ends_with("/app/feed.xml/route.ts") {
+        terms.extend(["feed", "rss"]);
+    }
+    if normalized.ends_with("/posts/[slug]/comments/route.ts") {
+        terms.extend(["posts", "comments", "comment", "submission"]);
+    }
+    if normalized.contains("codestory-runtime") {
+        if normalized.ends_with("/lib.rs") {
+            terms.extend(["runtime", "orchestration", "indexing"]);
+        }
+        if normalized.contains("/services.rs") {
+            terms.extend(["runtime", "service", "orchestration", "indexing"]);
+        }
+        if normalized.contains("/search") || normalized.contains("search_runtime") {
+            terms.extend(["search"]);
+        }
+        if normalized.contains("symbol_query") {
+            terms.extend(["symbol", "search"]);
+        }
+        if normalized.contains("/agent/") || normalized.contains("orchestrator") {
+            terms.extend(["orchestration"]);
+        }
+        if normalized.contains("graph") {
+            terms.extend(["graph"]);
+        }
+    }
+    terms
+}
+
+#[cfg(test)]
+fn architecture_repo_text_surface_key(hit: &SearchHit) -> Option<String> {
+    architecture_repo_text_path_key(hit, true)
+}
+
+#[cfg(test)]
+fn architecture_repo_text_bucket_key(hit: &SearchHit) -> Option<String> {
+    architecture_repo_text_path_key(hit, false)
+}
+
+#[cfg(test)]
+fn architecture_repo_text_path_key(hit: &SearchHit, include_surface: bool) -> Option<String> {
+    let path = normalize_repo_text_path(hit.file_path.as_deref()?);
+    let parts = path.split('/').collect::<Vec<_>>();
+    if let Some(crate_index) = parts.iter().position(|part| *part == "crates") {
+        let crate_name = parts.get(crate_index + 1)?;
+        if !include_surface {
+            return Some(format!("crates/{crate_name}"));
+        }
+        let surface = parts
+            .iter()
+            .skip(crate_index + 2)
+            .position(|part| *part == "src")
+            .and_then(|src_offset| parts.get(crate_index + 3 + src_offset))
+            .map(|part| part.trim_end_matches(".rs"))
+            .unwrap_or("root");
+        return Some(format!("crates/{crate_name}/{surface}"));
+    }
+    let src_index = parts.iter().position(|part| *part == "src")?;
+    let root = parts.get(src_index + 1)?;
+    let domain = parts.get(src_index + 2).copied().unwrap_or("root");
+    if !include_surface {
+        return Some(format!("src/{root}/{domain}"));
+    }
+    let stem = parts
+        .last()
+        .map(|part| part.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(part))
+        .unwrap_or("root");
+    Some(format!("src/{root}/{domain}/{stem}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchitectureCoverage {
+    key: String,
+    score: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchitectureCoverageLane {
+    Indexed,
+    RepoText,
+}
+
+#[derive(Debug, Clone)]
+struct ArchitectureCoverageCandidate {
+    lane: ArchitectureCoverageLane,
+    source_rank: usize,
+    hit: SearchHit,
+    coverage: ArchitectureCoverage,
+}
+
+fn apply_architecture_cross_source_coverage(
+    query: &str,
+    indexed_symbol_hits: &mut Vec<SearchHit>,
+    repo_text_hits: &mut Vec<SearchHit>,
+    indexed_candidates: &[SearchHit],
+    repo_text_candidates: &[SearchHit],
+    limit: usize,
+) {
+    if limit == 0 || architecture_query_intents(query).is_empty() {
+        return;
+    }
+    indexed_symbol_hits.truncate(limit);
+    repo_text_hits.truncate(limit);
+
+    let mut selected_ids = indexed_symbol_hits
+        .iter()
+        .chain(repo_text_hits.iter())
+        .map(|hit| hit.node_id.clone())
+        .collect::<HashSet<_>>();
+    let mut selected_paths = indexed_symbol_hits
+        .iter()
+        .chain(repo_text_hits.iter())
+        .filter_map(|hit| hit.file_path.as_deref())
+        .map(normalize_repo_text_path)
+        .collect::<HashSet<_>>();
+    let mut selected_keys =
+        architecture_selected_coverage_keys(indexed_symbol_hits, repo_text_hits);
+
+    let mut candidates = indexed_candidates
+        .iter()
+        .enumerate()
+        .skip(limit)
+        .filter_map(|(rank, hit)| {
+            architecture_coverage_candidate(
+                ArchitectureCoverageLane::Indexed,
+                rank,
+                hit,
+                &selected_ids,
+                &selected_paths,
+                &selected_keys,
+            )
+        })
+        .chain(
+            repo_text_candidates
+                .iter()
+                .enumerate()
+                .skip(limit)
+                .filter_map(|(rank, hit)| {
+                    architecture_coverage_candidate(
+                        ArchitectureCoverageLane::RepoText,
+                        rank,
+                        hit,
+                        &selected_ids,
+                        &selected_paths,
+                        &selected_keys,
+                    )
+                }),
+        )
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        right
+            .coverage
+            .score
+            .cmp(&left.coverage.score)
+            .then_with(|| left.source_rank.cmp(&right.source_rank))
+            .then_with(|| left.coverage.key.cmp(&right.coverage.key))
+    });
+
+    let mut replacement_count = 0usize;
+    let replacement_limit = limit.min(8);
+    for candidate in candidates {
+        if selected_keys.contains(&candidate.coverage.key)
+            || selected_ids.contains(&candidate.hit.node_id)
+            || candidate
+                .hit
+                .file_path
+                .as_deref()
+                .map(normalize_repo_text_path)
+                .is_some_and(|path| selected_paths.contains(&path))
+        {
+            continue;
+        }
+        let Some(replace_index) = architecture_coverage_replacement_index(
+            indexed_symbol_hits,
+            repo_text_hits,
+            candidate.lane,
+            candidate.coverage.score,
+        ) else {
+            continue;
+        };
+
+        match candidate.lane {
+            ArchitectureCoverageLane::Indexed => {
+                selected_ids.remove(&indexed_symbol_hits[replace_index].node_id);
+                if let Some(path) = indexed_symbol_hits[replace_index].file_path.as_deref() {
+                    selected_paths.remove(&normalize_repo_text_path(path));
+                }
+                indexed_symbol_hits[replace_index] = candidate.hit.clone();
+            }
+            ArchitectureCoverageLane::RepoText => {
+                selected_ids.remove(&repo_text_hits[replace_index].node_id);
+                if let Some(path) = repo_text_hits[replace_index].file_path.as_deref() {
+                    selected_paths.remove(&normalize_repo_text_path(path));
+                }
+                repo_text_hits[replace_index] = candidate.hit.clone();
+            }
+        }
+        selected_ids.insert(candidate.hit.node_id.clone());
+        if let Some(path) = candidate.hit.file_path.as_deref() {
+            selected_paths.insert(normalize_repo_text_path(path));
+        }
+        selected_keys.insert(candidate.coverage.key);
+        replacement_count += 1;
+        if replacement_count >= replacement_limit {
+            break;
+        }
+    }
+}
+
+fn architecture_coverage_candidate(
+    lane: ArchitectureCoverageLane,
+    source_rank: usize,
+    hit: &SearchHit,
+    selected_ids: &HashSet<NodeId>,
+    selected_paths: &HashSet<String>,
+    selected_keys: &HashSet<String>,
+) -> Option<ArchitectureCoverageCandidate> {
+    if selected_ids.contains(&hit.node_id) {
+        return None;
+    }
+    if hit
+        .file_path
+        .as_deref()
+        .map(normalize_repo_text_path)
+        .is_some_and(|path| selected_paths.contains(&path))
+    {
+        return None;
+    }
+    let coverage = architecture_coverage_for_hit(hit)?;
+    (!selected_keys.contains(&coverage.key)).then(|| ArchitectureCoverageCandidate {
+        lane,
+        source_rank,
+        hit: hit.clone(),
+        coverage,
+    })
+}
+
+fn architecture_selected_coverage_keys(
+    indexed_symbol_hits: &[SearchHit],
+    repo_text_hits: &[SearchHit],
+) -> HashSet<String> {
+    indexed_symbol_hits
+        .iter()
+        .chain(repo_text_hits.iter())
+        .filter_map(architecture_coverage_for_hit)
+        .map(|coverage| coverage.key)
+        .collect()
+}
+
+fn architecture_coverage_replacement_index(
+    indexed_symbol_hits: &[SearchHit],
+    repo_text_hits: &[SearchHit],
+    lane: ArchitectureCoverageLane,
+    candidate_score: u32,
+) -> Option<usize> {
+    let key_counts = architecture_coverage_key_counts(indexed_symbol_hits, repo_text_hits);
+    let hits = match lane {
+        ArchitectureCoverageLane::Indexed => indexed_symbol_hits,
+        ArchitectureCoverageLane::RepoText => repo_text_hits,
+    };
+    hits.iter()
+        .enumerate()
+        .filter_map(|(index, hit)| {
+            let coverage = architecture_coverage_for_hit(hit);
+            let score = coverage
+                .as_ref()
+                .map(|coverage| coverage.score)
+                .unwrap_or(0);
+            let protected = coverage.as_ref().is_some_and(|coverage| {
+                coverage.score >= 8 && key_counts.get(&coverage.key).copied().unwrap_or(0) <= 1
+            });
+            if protected || score > candidate_score {
+                return None;
+            }
+            Some((index, score))
+        })
+        .min_by_key(|(_, score)| *score)
+        .map(|(index, _)| index)
+}
+
+fn architecture_coverage_key_counts(
+    indexed_symbol_hits: &[SearchHit],
+    repo_text_hits: &[SearchHit],
+) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for coverage in indexed_symbol_hits
+        .iter()
+        .chain(repo_text_hits.iter())
+        .filter_map(architecture_coverage_for_hit)
+    {
+        *counts.entry(coverage.key).or_default() += 1;
+    }
+    counts
+}
+
+fn architecture_coverage_for_hit(hit: &SearchHit) -> Option<ArchitectureCoverage> {
+    let path = hit.file_path.as_deref()?;
+    if retrieval_file_role_from_path(path).is_non_primary() {
+        return None;
+    }
+    let normalized = normalize_repo_text_path(path);
+    let terms = architecture_coverage_terms(path, &hit.display_name);
+    let source_kind = architecture_source_kind(&normalized);
+    let coverage = if normalized.contains("/cli/src/main.rs") {
+        ArchitectureCoverage {
+            key: format!("cli:top_level_entrypoint:{source_kind}"),
+            score: 8,
+        }
+    } else if normalized.contains("/exec/src/main.rs") {
+        ArchitectureCoverage {
+            key: format!("exec:binary_entrypoint:{source_kind}"),
+            score: 9,
+        }
+    } else if normalized.contains("/exec/src/cli.rs") {
+        ArchitectureCoverage {
+            key: format!("exec:cli_options:{source_kind}"),
+            score: 10,
+        }
+    } else if normalized.contains("/exec/src/lib.rs") {
+        ArchitectureCoverage {
+            key: format!("exec:runtime:{source_kind}"),
+            score: 9,
+        }
+    } else if normalized.contains("/exec/src/")
+        && architecture_has_all_terms(&terms, &["exec", "events"])
+        && architecture_path_stem(&normalized).contains("events")
+    {
+        ArchitectureCoverage {
+            key: format!("exec:events:{source_kind}"),
+            score: 9,
+        }
+    } else if normalized.contains("/exec/src/")
+        && architecture_has_all_terms(&terms, &["event", "processor", "jsonl", "output"])
+    {
+        ArchitectureCoverage {
+            key: format!("exec:jsonl_event_processor:{source_kind}"),
+            score: 9,
+        }
+    } else if normalized.contains("/exec/src/")
+        && architecture_has_all_terms(&terms, &["event", "processor"])
+    {
+        ArchitectureCoverage {
+            key: format!("exec:event_processor:{source_kind}"),
+            score: 8,
+        }
+    } else if architecture_has_all_terms(&terms, &["source", "group"])
+        && architecture_has_any_term(&terms, &["config", "cdb", "compile", "database", "cxx"])
+    {
+        ArchitectureCoverage {
+            key: format!("source_group:configuration:{source_kind}"),
+            score: 10,
+        }
+    } else if architecture_has_all_terms(&terms, &["indexer", "command", "cxx"]) {
+        ArchitectureCoverage {
+            key: format!("indexing:cxx_command:{source_kind}"),
+            score: 10,
+        }
+    } else if architecture_has_all_terms(&terms, &["indexer", "java"]) {
+        ArchitectureCoverage {
+            key: format!("indexing:java:{source_kind}"),
+            score: if source_kind == "impl" { 10 } else { 8 },
+        }
+    } else if architecture_has_all_terms(&terms, &["storage", "access", "proxy"]) {
+        ArchitectureCoverage {
+            key: format!("storage:access_proxy:{source_kind}"),
+            score: if source_kind == "impl" { 10 } else { 8 },
+        }
+    } else if architecture_has_all_terms(&terms, &["persistent", "storage"]) {
+        ArchitectureCoverage {
+            key: format!("storage:persistent:{source_kind}"),
+            score: 8,
+        }
+    } else if architecture_has_all_terms(&terms, &["storage", "access"]) {
+        ArchitectureCoverage {
+            key: format!("storage:access:{source_kind}"),
+            score: 9,
+        }
+    } else if normalized.ends_with("/project.cpp")
+        || architecture_has_all_terms(&terms, &["project", "build", "index"])
+    {
+        ArchitectureCoverage {
+            key: format!("project:build_index:{source_kind}"),
+            score: 8,
+        }
+    } else if normalized.contains("/data/indexer/")
+        || architecture_has_all_terms(&terms, &["indexer", "command"])
+    {
+        ArchitectureCoverage {
+            key: format!(
+                "indexing:{}:{source_kind}",
+                architecture_path_stem(&normalized)
+            ),
+            score: 4,
+        }
+    } else if normalized.contains("sourcegroup") && normalized.contains("/project/") {
+        ArchitectureCoverage {
+            key: format!(
+                "source_group:{}:{source_kind}",
+                architecture_path_stem(&normalized)
+            ),
+            score: 4,
+        }
+    } else if architecture_has_all_terms(&terms, &["payload", "config"])
+        && normalized.ends_with(".ts")
+    {
+        ArchitectureCoverage {
+            key: format!("payload:config:{source_kind}"),
+            score: 9,
+        }
+    } else if normalized.contains("/collections/")
+        && architecture_has_any_term(&terms, &["post", "posts"])
+    {
+        ArchitectureCoverage {
+            key: format!("payload:posts_collection:{source_kind}"),
+            score: 10,
+        }
+    } else if normalized.contains("/collections/")
+        && architecture_has_any_term(&terms, &["comment", "comments"])
+    {
+        ArchitectureCoverage {
+            key: format!("payload:comments_collection:{source_kind}"),
+            score: 10,
+        }
+    } else if normalized.contains("/collections/")
+        && architecture_has_all_terms(&terms, &["social", "entries"])
+    {
+        ArchitectureCoverage {
+            key: format!("payload:social_entries_collection:{source_kind}"),
+            score: 9,
+        }
+    } else if normalized.contains("/posts/")
+        && normalized.contains("/comments/")
+        && architecture_has_all_terms(&terms, &["comments", "route"])
+    {
+        ArchitectureCoverage {
+            key: format!("comments:submission_route:{source_kind}"),
+            score: 10,
+        }
+    } else if architecture_has_all_terms(&terms, &["feed", "route"]) {
+        ArchitectureCoverage {
+            key: format!("feed:rss_route:{source_kind}"),
+            score: 10,
+        }
+    } else if normalized.contains("/lib/")
+        && architecture_has_all_terms(&terms, &["payload"])
+        && architecture_has_any_term(&terms, &["client", "lib"])
+    {
+        ArchitectureCoverage {
+            key: format!("payload:client:{source_kind}"),
+            score: 10,
+        }
+    } else if normalized.contains("/content-data/")
+        && architecture_has_all_terms(&terms, &["post", "content"])
+    {
+        ArchitectureCoverage {
+            key: format!("content:post_data:{source_kind}"),
+            score: 10,
+        }
+    } else if normalized.contains("/content-data/")
+        && architecture_has_all_terms(&terms, &["comment", "content"])
+    {
+        ArchitectureCoverage {
+            key: format!("content:comment_data:{source_kind}"),
+            score: 10,
+        }
+    } else if normalized.contains("/content-data/")
+        && architecture_has_all_terms(&terms, &["social", "content"])
+    {
+        ArchitectureCoverage {
+            key: format!("content:social_data:{source_kind}"),
+            score: 9,
+        }
+    } else {
+        return None;
+    };
+    Some(coverage)
+}
+
+fn architecture_coverage_terms(path: &str, display_name: &str) -> HashSet<String> {
+    let mut terms = HashSet::new();
+    for raw in [path, display_name] {
+        for fragment in raw.split(|ch: char| !ch.is_ascii_alphanumeric()) {
+            if fragment.is_empty() {
+                continue;
+            }
+            terms.insert(fragment.to_ascii_lowercase());
+            for camel_part in split_camel_identifier(fragment) {
+                terms.insert(camel_part);
+            }
+        }
+    }
+    terms
+}
+
+fn architecture_has_all_terms(terms: &HashSet<String>, required: &[&str]) -> bool {
+    required.iter().all(|term| terms.contains(*term))
+}
+
+fn architecture_has_any_term(terms: &HashSet<String>, required: &[&str]) -> bool {
+    required.iter().any(|term| terms.contains(*term))
+}
+
+fn architecture_source_kind(path: &str) -> &'static str {
+    if path.ends_with(".h") || path.ends_with(".hpp") || path.ends_with(".hh") {
+        "decl"
+    } else if path.ends_with(".cpp")
+        || path.ends_with(".cxx")
+        || path.ends_with(".cc")
+        || path.ends_with(".c")
+        || path.ends_with(".rs")
+        || path.ends_with(".ts")
+        || path.ends_with(".tsx")
+        || path.ends_with(".js")
+        || path.ends_with(".jsx")
+    {
+        "impl"
+    } else {
+        "file"
+    }
+}
+
+fn architecture_path_stem(path: &str) -> &str {
+    path.rsplit('/')
+        .next()
+        .and_then(|file| file.rsplit_once('.').map(|(stem, _)| stem))
+        .unwrap_or(path)
+}
+
+fn normalize_repo_text_path(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
 }
 
 fn dedupe_inexact_search_hits_by_display_key(query: &str, hits: &mut Vec<SearchHit>) {
@@ -4729,12 +5942,51 @@ fn did_you_mean_suggestions(scored_hits: &[HybridSearchScoredHit]) -> Vec<Search
         .collect()
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+struct HybridSearchInstrumentation {
+    symbol_table_size: usize,
+    exact_symbol_merge_queries: usize,
+    hybrid_max_results: usize,
+    hybrid_lexical_limit: usize,
+    hybrid_semantic_limit: usize,
+    mixed_natural_language: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedIndexFreshness {
+    value: IndexFreshnessDto,
+    cached_at: Instant,
+}
+
 struct AppState {
     project_root: Option<PathBuf>,
     storage_path: Option<PathBuf>,
     node_names: HashMap<codestory_contracts::graph::NodeId, String>,
     search_engine: Option<SearchEngine>,
     is_indexing: bool,
+    index_freshness_cache: Option<CachedIndexFreshness>,
+    #[cfg(test)]
+    #[allow(dead_code)]
+    last_hybrid_instrumentation: Option<HybridSearchInstrumentation>,
+}
+
+fn index_freshness_cache_ttl_secs() -> u64 {
+    std::env::var("CODESTORY_INDEX_FRESHNESS_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|ttl| *ttl > 0)
+        .unwrap_or(INDEX_FRESHNESS_CACHE_DEFAULT_TTL_SECS)
+}
+
+fn publish_search_engine(state: &mut AppState, engine: SearchEngine) {
+    state.index_freshness_cache = None;
+    state.search_engine = Some(engine);
+}
+
+fn clear_search_engine(state: &mut AppState) {
+    state.search_engine = None;
 }
 
 /// GUI-agnostic orchestrator for CodeStory.
@@ -4744,6 +5996,7 @@ struct AppState {
 #[derive(Clone)]
 pub struct AppController {
     state: Arc<Mutex<AppState>>,
+    sidecar_query_cache: Arc<Mutex<codestory_retrieval::RetrievalCache>>,
     grounding_detail_refresh: Arc<Mutex<()>>,
     events_tx: Sender<AppEventPayload>,
     events_rx: Receiver<AppEventPayload>,
@@ -4765,7 +6018,11 @@ impl AppController {
                 node_names: HashMap::new(),
                 search_engine: None,
                 is_indexing: false,
+                index_freshness_cache: None,
+                #[cfg(test)]
+                last_hybrid_instrumentation: None,
             })),
+            sidecar_query_cache: Arc::new(Mutex::new(codestory_retrieval::RetrievalCache::new())),
             grounding_detail_refresh: Arc::new(Mutex::new(())),
             events_tx,
             events_rx,
@@ -4866,7 +6123,8 @@ impl AppController {
     fn clear_search_state(&self) {
         let mut s = self.state.lock();
         s.node_names.clear();
-        s.search_engine = None;
+        clear_search_engine(&mut s);
+        self.sidecar_query_cache.lock().clear();
     }
 
     fn ensure_consistent_read_state(&self, operation: &str) -> Result<(), ApiError> {
@@ -4894,7 +6152,7 @@ impl AppController {
         let mut s = self.state.lock();
         if s.search_engine.is_none() {
             s.node_names = node_names;
-            s.search_engine = Some(engine);
+            publish_search_engine(&mut s, engine);
         }
 
         Ok(())
@@ -5037,7 +6295,7 @@ impl AppController {
             kind: NodeKind::from(node.kind),
             file_path,
             line,
-            score,
+            score: route_endpoint_adjusted_search_score(score, node.canonical_id.as_deref()),
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
@@ -5045,6 +6303,8 @@ impl AppController {
         })
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn repo_text_enabled_for_mode(
         mode: SearchRepoTextMode,
         query: &str,
@@ -5083,6 +6343,7 @@ impl AppController {
         if query.trim().is_empty() || limit == 0 {
             return Ok(RepoTextScan {
                 hits: Vec::new(),
+                #[cfg(test)]
                 stats,
             });
         }
@@ -5163,7 +6424,11 @@ impl AppController {
         });
         hits.truncate(limit);
         stats.duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
-        Ok(RepoTextScan { hits, stats })
+        Ok(RepoTextScan {
+            hits,
+            #[cfg(test)]
+            stats,
+        })
     }
 
     fn repo_text_scan_should_stop(stats: &mut RepoTextScanStatsDto, started_at: &Instant) -> bool {
@@ -5324,7 +6589,13 @@ impl AppController {
         );
     }
 
-    fn lexical_symbol_hits(
+    /// Resolve DB/index-backed symbol candidates for read commands.
+    ///
+    /// This intentionally bypasses mandatory sidecar product search so symbol,
+    /// snippet, trail, and graph-query target resolution can work from an
+    /// already-open indexed store. Product search and packet evidence must use
+    /// the sidecar-primary search paths instead.
+    pub fn resolve_indexed_symbol_candidates(
         &self,
         query: &str,
         max_results: usize,
@@ -5403,8 +6674,9 @@ impl AppController {
             s.project_root = Some(root);
             s.storage_path = Some(storage_path);
             s.node_names.clear();
-            s.search_engine = None;
+            clear_search_engine(&mut s);
         }
+        self.sidecar_query_cache.lock().clear();
 
         Ok(summary)
     }
@@ -5425,8 +6697,9 @@ impl AppController {
             s.project_root = Some(root);
             s.storage_path = Some(storage_path);
             s.node_names = node_names;
-            s.search_engine = Some(engine);
+            publish_search_engine(&mut s, engine);
         }
+        self.sidecar_query_cache.lock().clear();
 
         let _ = self.events_tx.send(AppEventPayload::StatusUpdate {
             message: "Project opened.".to_string(),
@@ -5804,6 +7077,7 @@ impl AppController {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_search_plan_subqueries(
         &self,
         storage: &Storage,
@@ -5829,17 +7103,19 @@ impl AppController {
                 )
             });
             if uses_indexed {
-                let (mut scored_hits, _) = self.search_hybrid_scored_inner(
+                let subquery_limit =
+                    search_plan_subquery_candidate_limit(subquery, limit_per_source);
+                let mut scored_hits = self.search_hybrid_scored(
                     SearchRequest {
                         query: subquery.query.clone(),
                         repo_text: SearchRepoTextMode::Off,
-                        limit_per_source: limit_per_source as u32,
+                        limit_per_source: subquery_limit as u32,
                         expand_search_plan: false,
                         hybrid_weights: hybrid_weights.clone(),
                         hybrid_limits: hybrid_limits.clone(),
                     },
                     None,
-                    limit_per_source,
+                    subquery_limit,
                     hybrid_weights.clone(),
                 )?;
                 let mut suggestions = did_you_mean_suggestions(&scored_hits);
@@ -5870,8 +7146,8 @@ impl AppController {
                     )
                 });
                 dedupe_inexact_search_hits_by_display_key(&subquery.query, &mut hits);
-                hits.truncate(limit_per_source);
-                suggestions.truncate(limit_per_source);
+                hits.truncate(subquery_limit);
+                suggestions.truncate(subquery_limit);
                 annotate_search_hit_match_quality(&subquery.query, &mut hits);
                 annotate_search_hit_match_quality(&subquery.query, &mut suggestions);
                 evidence
@@ -5880,7 +7156,7 @@ impl AppController {
                         subquery,
                         &hits,
                         &suggestions,
-                        limit_per_source as u32,
+                        subquery_limit as u32,
                         semantic_ready,
                     ));
                 merge_search_hits_by_node_id(&mut evidence.indexed_symbol_hits, hits);
@@ -5888,11 +7164,13 @@ impl AppController {
             }
 
             if subquery.channels.contains(&SearchPlanChannelDto::RepoText) {
+                let repo_text_limit =
+                    search_plan_subquery_candidate_limit(subquery, limit_per_source);
                 let scan = Self::collect_repo_text_hits(
                     storage,
                     project_root.as_deref(),
                     &subquery.query,
-                    limit_per_source,
+                    repo_text_limit,
                     &seen_repo_text_ids,
                 )?;
                 let mut hits = scan.hits;
@@ -5906,9 +7184,9 @@ impl AppController {
                     .push(SearchPlanCandidateWindowDto {
                         channel: SearchPlanChannelDto::RepoText,
                         subquery: subquery.query.clone(),
-                        limit: limit_per_source as u32,
+                        limit: repo_text_limit as u32,
                         returned_count: clamp_usize_to_u32(hits.len()),
-                        truncated: hits.len() >= limit_per_source,
+                        truncated: hits.len() >= repo_text_limit,
                         score_reasons: vec![
                             "executed repo-text retrieval for this planned subquery; hits require promotion or source reads"
                                 .to_string(),
@@ -5974,6 +7252,7 @@ impl AppController {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_search_plan(
         &self,
         storage: &Storage,
@@ -6074,6 +7353,7 @@ impl AppController {
                 &anchor_groups,
                 &plan_suggestions,
                 &plan_indexed_hits,
+                &plan_repo_text_hits,
             ),
             next_actions,
             source_truth_checks,
@@ -6081,8 +7361,6 @@ impl AppController {
         Ok(Some(SearchPlanBuild {
             plan,
             indexed_symbol_hits: executed.indexed_symbol_hits,
-            repo_text_hits: executed.repo_text_hits,
-            suggestions: executed.suggestions,
         }))
     }
 
@@ -6210,109 +7488,96 @@ impl AppController {
         self.ensure_consistent_read_state("Search")?;
         let original_query = req.query.clone();
         let intent_query = parse_search_intent_query(&original_query);
-        let query = intent_query.effective_query.clone();
         let limit_per_source = req.limit_per_source.clamp(1, 50) as usize;
         let repo_text_mode = req.repo_text;
-        let (mut scored_symbol_hits, retrieval) = self.search_hybrid_scored_inner(
-            SearchRequest {
-                query: query.clone(),
-                repo_text: SearchRepoTextMode::Off,
-                limit_per_source: req.limit_per_source,
-                expand_search_plan: false,
-                hybrid_weights: req.hybrid_weights.clone(),
-                hybrid_limits: req.hybrid_limits.clone(),
-            },
-            None,
+        self.search_results_sidecar_primary(
+            original_query,
+            intent_query,
             limit_per_source,
+            repo_text_mode,
+            req.expand_search_plan,
             req.hybrid_weights.clone(),
-        )?;
-        let mut suggestions = did_you_mean_suggestions(&scored_symbol_hits);
-        let mut indexed_symbol_hits = scored_symbol_hits
-            .drain(..)
-            .map(|scored| scored.hit)
-            .collect::<Vec<_>>();
-        let storage = self.open_storage()?;
+            req.hybrid_limits.clone(),
+        )
+    }
 
-        if should_expand_symbol_query(&query, indexed_symbol_hits.len()) {
-            let expanded_hits = self.expanded_symbol_hits(&storage, &query)?;
-            merge_search_hits_by_node_id(&mut indexed_symbol_hits, expanded_hits);
+    #[allow(clippy::too_many_arguments)]
+    fn search_results_sidecar_primary(
+        &self,
+        original_query: String,
+        intent_query: SearchIntentQuery,
+        limit_per_source: usize,
+        repo_text_mode: SearchRepoTextMode,
+        expand_search_plan: bool,
+        hybrid_weights: Option<AgentHybridWeightsDto>,
+        hybrid_limits: Option<SearchHybridLimitsDto>,
+    ) -> Result<SearchResultsDto, ApiError> {
+        if !agent::retrieval_primary::sidecar_retrieval_primary_enabled(self) {
+            let reason = agent::retrieval_primary::sidecar_retrieval_unavailable_reason(self)
+                .unwrap_or_else(|| {
+                    "sidecar retrieval primary is mandatory; legacy search is disabled".to_string()
+                });
+            return Err(ApiError::invalid_argument(reason));
         }
 
-        apply_search_intent_filters(&mut suggestions, &intent_query.filters);
-        apply_search_intent_filters(&mut indexed_symbol_hits, &intent_query.filters);
+        let query = intent_query.effective_query.clone();
+        let query_result = agent::retrieval_primary::run_sidecar_query(self, &query, None)
+            .map_err(|error| {
+                ApiError::invalid_argument(format!("sidecar search failed: {error}"))
+            })?;
+        let mut indexed_symbol_hits =
+            agent::retrieval_primary::resolve_sidecar_candidates_to_search_hits(
+                self,
+                &query_result.hits,
+                limit_per_source,
+            )
+            .unwrap_or_default();
+        if let Some(reason) = agent::retrieval_primary::sidecar_result_rejection_reason(
+            &query_result,
+            &indexed_symbol_hits,
+        ) {
+            let diagnostic = agent::retrieval_primary::sidecar_rejection_diagnostic(
+                self,
+                &query_result,
+                &indexed_symbol_hits,
+                5,
+            );
+            return Err(ApiError::invalid_argument(format!(
+                "sidecar search rejected query: {reason}; {diagnostic}"
+            )));
+        }
+        let candidate_count = query_result.hits.len();
+        let resolved_hit_count = indexed_symbol_hits.len();
+        let initial_sidecar_hits = indexed_symbol_hits.clone();
 
+        apply_search_intent_filters(&mut indexed_symbol_hits, &intent_query.filters);
         let project_root = self.require_project_root().ok();
         indexed_symbol_hits.sort_by(|left, right| {
             compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
         });
         dedupe_inexact_search_hits_by_display_key(&query, &mut indexed_symbol_hits);
         indexed_symbol_hits.truncate(limit_per_source);
-        let mut used_repo_explanation_overview = false;
-        if Self::is_repo_explanation_search_query(&query)
-            && let Ok(snapshot) = self.grounding_snapshot(GroundingBudgetDto::Balanced)
-        {
-            let mut overview_hits =
-                grounding::grounding_explanation_search_hits(&snapshot, limit_per_source);
-            apply_search_intent_filters(&mut overview_hits, &intent_query.filters);
-            if !overview_hits.is_empty() {
-                if query_has_symbol_or_literal_signal(&query) {
-                    merge_search_hits_by_node_id(&mut suggestions, overview_hits);
-                    suggestions.sort_by(|left, right| {
-                        compare_search_hits_with_project_root(
-                            project_root.as_deref(),
-                            &query,
-                            left,
-                            right,
-                        )
-                    });
-                    suggestions.truncate(limit_per_source);
-                } else {
-                    used_repo_explanation_overview = true;
-                    suggestions = overview_hits.clone();
-                    indexed_symbol_hits = overview_hits;
-                }
-            }
-        }
+        annotate_search_hit_match_quality(&query, &mut indexed_symbol_hits);
 
-        let repo_text_fallback_reason = if repo_text_mode == SearchRepoTextMode::Auto {
-            repo_text_auto_fallback_reason(&query, &indexed_symbol_hits)
-        } else {
-            None
-        };
-        let repo_text_enabled =
-            Self::repo_text_enabled_for_mode(repo_text_mode, &query, &indexed_symbol_hits)
-                && !used_repo_explanation_overview;
-        let indexed_hit_ids = indexed_symbol_hits
-            .iter()
-            .map(|hit| hit.node_id.clone())
-            .collect::<HashSet<_>>();
-        let (mut repo_text_hits, repo_text_stats) = if repo_text_enabled {
-            let scan = Self::collect_repo_text_hits(
-                &storage,
-                self.require_project_root().ok().as_deref(),
-                &query,
-                limit_per_source,
-                &indexed_hit_ids,
-            )?;
-            let mut hits = scan.hits;
-            apply_search_intent_filters(&mut hits, &intent_query.filters);
-            (hits, Some(scan.stats))
-        } else {
-            (Vec::new(), None)
-        };
+        let storage = self.open_storage()?;
+        let retrieval = retrieval_state_from_storage(&storage)?;
         let freshness = self.index_freshness().ok();
+        let mut repo_text_hits = Vec::new();
+        let suggestions = Vec::new();
         let query_assessment = search_query_assessment(
             &query,
             &indexed_symbol_hits,
             &repo_text_hits,
             repo_text_mode,
-            repo_text_enabled,
-            repo_text_fallback_reason,
+            false,
+            None,
         );
+        let indexed_hit_ids = indexed_symbol_hits
+            .iter()
+            .map(|hit| hit.node_id.clone())
+            .collect::<HashSet<_>>();
         let mut search_plan_anchor_rank = HashMap::<NodeId, usize>::new();
-        let search_plan = if used_repo_explanation_overview || !req.expand_search_plan {
-            None
-        } else {
+        let search_plan = if expand_search_plan {
             match self.build_search_plan(
                 &storage,
                 &original_query,
@@ -6325,9 +7590,9 @@ impl AppController {
                 limit_per_source as u32,
                 &intent_query.filters,
                 &indexed_hit_ids,
-                repo_text_enabled,
-                req.hybrid_weights.clone(),
-                req.hybrid_limits.clone(),
+                false,
+                hybrid_weights,
+                hybrid_limits,
             )? {
                 Some(plan_build) => {
                     for (rank, group) in plan_build.plan.anchor_groups.iter().enumerate() {
@@ -6345,12 +7610,12 @@ impl AppController {
                         &mut indexed_symbol_hits,
                         plan_build.indexed_symbol_hits,
                     );
-                    merge_search_hits_by_node_id(&mut repo_text_hits, plan_build.repo_text_hits);
-                    merge_search_hits_by_node_id(&mut suggestions, plan_build.suggestions);
                     Some(plan_build.plan)
                 }
                 None => None,
             }
+        } else {
+            None
         };
         indexed_symbol_hits.sort_by(|left, right| {
             let anchor_order = match (
@@ -6367,32 +7632,40 @@ impl AppController {
             })
         });
         dedupe_inexact_search_hits_by_display_key(&query, &mut indexed_symbol_hits);
+        let indexed_symbol_candidates = indexed_symbol_hits.clone();
+        apply_architecture_cross_source_coverage(
+            &query,
+            &mut indexed_symbol_hits,
+            &mut repo_text_hits,
+            &indexed_symbol_candidates,
+            &[],
+            limit_per_source,
+        );
         indexed_symbol_hits.truncate(limit_per_source);
-        repo_text_hits.sort_by(|left, right| {
-            compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
-        });
-        repo_text_hits.truncate(limit_per_source);
-        suggestions.sort_by(|left, right| {
-            compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
-        });
-        suggestions.truncate(limit_per_source);
-        annotate_search_hit_match_quality(&query, &mut suggestions);
         annotate_search_hit_match_quality(&query, &mut indexed_symbol_hits);
-        annotate_search_hit_match_quality(&query, &mut repo_text_hits);
-        let mut hits = Vec::with_capacity(indexed_symbol_hits.len() + repo_text_hits.len());
-        hits.extend(indexed_symbol_hits.iter().cloned());
-        hits.extend(repo_text_hits.iter().cloned());
+        let hits = indexed_symbol_hits.clone();
+        let retrieval_shadow = Some(
+            agent::retrieval_primary::shadow_from_query_result_with_candidate_admission_diagnostics(
+                self,
+                query_result.clone(),
+                candidate_count,
+                resolved_hit_count,
+                &initial_sidecar_hits,
+                &hits,
+            ),
+        );
 
         Ok(SearchResultsDto {
             query: original_query,
             retrieval,
+            retrieval_shadow,
             freshness,
             limit_per_source: limit_per_source as u32,
             repo_text_mode,
-            repo_text_enabled,
+            repo_text_enabled: false,
             query_assessment: Some(query_assessment),
             search_plan,
-            repo_text_stats,
+            repo_text_stats: None,
             suggestions,
             indexed_symbol_hits,
             repo_text_hits,
@@ -6902,6 +8175,7 @@ impl AppController {
         })
     }
 
+    #[cfg(test)]
     fn is_repo_explanation_search_query(query: &str) -> bool {
         let lower = query.to_ascii_lowercase();
         let subject =
@@ -6957,26 +8231,40 @@ impl AppController {
     }
 
     pub(crate) fn index_freshness(&self) -> Result<IndexFreshnessDto, ApiError> {
+        let ttl = Duration::from_secs(index_freshness_cache_ttl_secs());
+        {
+            let state = self.state.lock();
+            if let Some(cached) = state.index_freshness_cache.as_ref()
+                && cached.cached_at.elapsed() < ttl
+            {
+                return Ok(cached.value.clone());
+            }
+        }
+
         let root = self.require_project_root()?;
         let storage = self.open_storage()?;
         let workspace = Workspace::open(root.clone())
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
-        Ok(index_freshness_from_storage(&root, &workspace, &storage))
+        let freshness = index_freshness_from_storage(&root, &workspace, &storage);
+        let mut state = self.state.lock();
+        state.index_freshness_cache = Some(CachedIndexFreshness {
+            value: freshness.clone(),
+            cached_at: Instant::now(),
+        });
+        Ok(freshness)
     }
 
     fn search_hybrid_results(
         &self,
-        req: SearchRequest,
-        focus_node_id: Option<NodeId>,
+        mut req: SearchRequest,
+        _focus_node_id: Option<NodeId>,
         max_results: usize,
-        request_weights: Option<AgentHybridWeightsDto>,
+        _request_weights: Option<AgentHybridWeightsDto>,
     ) -> Result<(Vec<SearchHit>, RetrievalStateDto), ApiError> {
-        let (scored_hits, retrieval) =
-            self.search_hybrid_scored_inner(req, focus_node_id, max_results, request_weights)?;
-        Ok((
-            scored_hits.into_iter().map(|scored| scored.hit).collect(),
-            retrieval,
-        ))
+        req.limit_per_source = max_results.clamp(1, 50) as u32;
+        req.expand_search_plan = false;
+        let results = self.search_results(req)?;
+        Ok((results.hits, results.retrieval))
     }
 
     pub fn search_hybrid(
@@ -7002,68 +8290,34 @@ impl AppController {
         max_results: usize,
         request_weights: Option<AgentHybridWeightsDto>,
     ) -> Result<Vec<HybridSearchScoredHit>, ApiError> {
-        Ok(self
-            .search_hybrid_scored_inner(req, focus_node_id, max_results, request_weights)?
-            .0)
+        let (hits, _) =
+            self.search_hybrid_results(req, focus_node_id, max_results, request_weights)?;
+        Ok(hits
+            .into_iter()
+            .map(|hit| HybridSearchScoredHit {
+                lexical_score: hit.score,
+                semantic_score: hit
+                    .score_breakdown
+                    .as_ref()
+                    .map(|scores| scores.semantic)
+                    .unwrap_or(0.0),
+                graph_score: hit
+                    .score_breakdown
+                    .as_ref()
+                    .map(|scores| scores.graph)
+                    .unwrap_or(0.0),
+                total_score: hit
+                    .score_breakdown
+                    .as_ref()
+                    .map(|scores| scores.total)
+                    .unwrap_or(hit.score),
+                hit,
+            })
+            .collect())
     }
 
-    pub(crate) fn search_symbolic_packet_anchor_batch(
-        &self,
-        queries: &[String],
-        max_results: usize,
-    ) -> Result<Vec<(String, Vec<SearchHit>)>, ApiError> {
-        self.ensure_search_state()?;
-        let storage = self.open_storage()?;
-        let requested_max_results = max_results.clamp(1, 50);
-        let project_root = self.require_project_root().ok();
-        let (symbolic_by_query, node_names) = {
-            let mut s = self.state.lock();
-            let engine = s.search_engine.as_mut().ok_or_else(|| {
-                ApiError::invalid_argument("Search engine not initialized. Open a project first.")
-            })?;
-            (
-                queries
-                    .iter()
-                    .map(|query| {
-                        (
-                            query.clone(),
-                            lexical_hybrid_hits(engine, query, &HashMap::new()),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-                s.node_names.clone(),
-            )
-        };
-
-        let mut results = Vec::with_capacity(symbolic_by_query.len());
-        for (query, symbolic) in symbolic_by_query {
-            let mut hits = Vec::with_capacity(symbolic.len());
-            for scored in symbolic {
-                if let Some(mut hit) = Self::build_search_hit(
-                    &storage,
-                    &node_names,
-                    scored.node_id,
-                    scored.total_score,
-                ) {
-                    hit.score_breakdown = Some(RetrievalScoreBreakdownDto {
-                        lexical: scored.lexical_score,
-                        semantic: 0.0,
-                        graph: scored.graph_score,
-                        total: scored.total_score,
-                    });
-                    hits.push(hit);
-                }
-            }
-            hits.sort_by(|left, right| {
-                compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
-            });
-            annotate_search_hit_match_quality(&query, &mut hits);
-            hits.truncate(requested_max_results);
-            results.push((query, hits));
-        }
-        Ok(results)
-    }
-
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn search_hybrid_scored_inner(
         &self,
         req: SearchRequest,
@@ -7073,10 +8327,25 @@ impl AppController {
     ) -> Result<(Vec<HybridSearchScoredHit>, RetrievalStateDto), ApiError> {
         self.ensure_search_state()?;
         let storage = self.open_storage()?;
-        let storage_retrieval = retrieval_state_from_storage(&storage)?;
+        let semantic_disabled = semantic_disabled_by_request_weights(request_weights.as_ref());
+        let storage_retrieval = if semantic_disabled {
+            None
+        } else {
+            Some(retrieval_state_from_storage(&storage)?)
+        };
         let mut graph_boosts = HashMap::<codestory_contracts::graph::NodeId, f32>::new();
         let requested_max_results = max_results.clamp(1, 50);
         let prefer_primary_sources = !query_mentions_non_primary_source(&req.query);
+        let use_exact_symbol_lexical_fast_path =
+            exact_symbol_lexical_fast_path(&req, request_weights.as_ref());
+        let hybrid_config = hybrid_search_config_for_request(
+            &req,
+            requested_max_results,
+            request_weights.clone(),
+            prefer_primary_sources,
+        );
+        let exact_symbol_merge_queries =
+            crate::search::lexical::exact_symbol_merged_lexical_queries(&req.query).len();
 
         let focus_core_id = match focus_node_id {
             Some(value) => Some(value.to_core()?),
@@ -7102,9 +8371,15 @@ impl AppController {
             let engine = s.search_engine.as_mut().ok_or_else(|| {
                 ApiError::invalid_argument("Search engine not initialized. Open a project first.")
             })?;
-            let mut retrieval = storage_retrieval.clone();
+            let mut retrieval = storage_retrieval
+                .clone()
+                .unwrap_or_else(|| retrieval_state_from_engine(engine));
 
-            if retrieval.mode == RetrievalModeDto::Hybrid && engine.semantic_doc_count() == 0 {
+            if !semantic_disabled
+                && !use_exact_symbol_lexical_fast_path
+                && retrieval.mode == RetrievalModeDto::Hybrid
+                && engine.semantic_doc_count() == 0
+            {
                 if !engine.embedding_runtime_configured()
                     && let Err(error) = engine.set_embedding_runtime_from_env()
                 {
@@ -7115,13 +8390,26 @@ impl AppController {
                 if engine.embedding_runtime_configured() && engine.semantic_doc_count() == 0 {
                     reload_llm_docs_from_storage(&storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
                 }
+                if let Some(storage_retrieval) = storage_retrieval.as_ref() {
+                    retrieval = retrieval_state_from_engine_with_storage_contract(
+                        engine,
+                        storage_retrieval,
+                    );
+                } else {
+                    retrieval = retrieval_state_from_engine(engine);
+                }
+            } else if !semantic_disabled
+                && (engine.semantic_doc_count() > 0 || engine.embedding_runtime_configured())
+                && let Some(storage_retrieval) = storage_retrieval.as_ref()
+            {
                 retrieval =
-                    retrieval_state_from_engine_with_storage_contract(engine, &storage_retrieval);
-            } else if engine.semantic_doc_count() > 0 || engine.embedding_runtime_configured() {
-                retrieval =
-                    retrieval_state_from_engine_with_storage_contract(engine, &storage_retrieval);
+                    retrieval_state_from_engine_with_storage_contract(engine, storage_retrieval);
             }
 
+            let context_storage_retrieval = storage_retrieval
+                .clone()
+                .unwrap_or_else(|| retrieval.clone());
+            let symbol_table_size = engine.symbols().len();
             let hits = hybrid_hits_for_retrieval_state(
                 engine,
                 HybridHitsContext {
@@ -7130,9 +8418,27 @@ impl AppController {
                     requested_max_results,
                     request_weights,
                     prefer_primary_sources,
-                    storage_retrieval: &storage_retrieval,
+                    storage_retrieval: &context_storage_retrieval,
+                    use_exact_symbol_lexical_fast_path,
                 },
                 &mut retrieval,
+            );
+            s.last_hybrid_instrumentation = Some(HybridSearchInstrumentation {
+                symbol_table_size,
+                exact_symbol_merge_queries,
+                hybrid_max_results: hybrid_config.max_results,
+                hybrid_lexical_limit: hybrid_config.lexical_limit,
+                hybrid_semantic_limit: hybrid_config.semantic_limit,
+                mixed_natural_language: mixed_natural_language_query(&req.query),
+            });
+            tracing::info!(
+                symbol_table_size,
+                exact_symbol_merge_queries,
+                hybrid_max_results = hybrid_config.max_results,
+                hybrid_lexical_limit = hybrid_config.lexical_limit,
+                hybrid_semantic_limit = hybrid_config.semantic_limit,
+                mixed_nl = mixed_natural_language_query(&req.query),
+                "hybrid_search_instrumentation"
             );
 
             (hits, s.node_names.clone(), retrieval)
@@ -7173,7 +8479,7 @@ impl AppController {
                     .iter()
                     .filter(|scored| !is_non_primary_source_hit(&scored.hit))
                     .count();
-                if primary_count >= requested_max_results {
+                if primary_count >= primary_source_retention_threshold(requested_max_results) {
                     out.retain(|scored| !is_non_primary_source_hit(&scored.hit));
                 }
             } else {
@@ -7245,6 +8551,16 @@ impl AppController {
         agent::agent_ask(self, req)
     }
 
+    pub fn begin_packet_retrieval(&self) {
+        let _ = self;
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn take_hybrid_instrumentation(&self) -> Option<HybridSearchInstrumentation> {
+        self.state.lock().last_hybrid_instrumentation.take()
+    }
+
     pub fn agent_packet(&self, req: AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError> {
         agent::agent_packet(self, req)
     }
@@ -7255,6 +8571,10 @@ impl AppController {
 
     pub fn graph_trail(&self, req: TrailConfigDto) -> Result<GraphResponse, ApiError> {
         graph_builders::graph_trail(self, req)
+    }
+
+    pub fn graph_direct_references(&self, req: TrailConfigDto) -> Result<GraphResponse, ApiError> {
+        graph_builders::graph_direct_references(self, req)
     }
 
     pub fn graph_trail_filter_options(&self) -> Result<TrailFilterOptionsDto, ApiError> {
@@ -7562,6 +8882,14 @@ impl AppController {
         if metadata.handler.is_none() {
             metadata.handler = self.route_endpoint_handler(storage, node);
         }
+        if metadata.handler.is_some()
+            && !metadata
+                .provenance
+                .iter()
+                .any(|entry| entry == "graph:handler_edge")
+        {
+            metadata.provenance.push("graph:handler_edge".to_string());
+        }
         if metadata.source_file.is_none() {
             metadata.source_file = source_file.map(ToOwned::to_owned);
         }
@@ -7848,7 +9176,6 @@ fn index_full(
         )));
     }
     let publish_ms = clamp_u128_to_u32(publish_started.elapsed().as_millis());
-
     let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
     Ok(IndexingRunSummary {
         phase_timings: IndexingPhaseTimings {
@@ -8160,7 +9487,8 @@ fn refresh_caches(
             let semantic_stats = result.semantic_stats;
             let search_stats = result.search_stats;
             s.node_names = result.node_names;
-            s.search_engine = Some(result.engine);
+            publish_search_engine(&mut s, result.engine);
+            controller.sidecar_query_cache.lock().clear();
             s.is_indexing = false;
             Ok(CacheRefreshStats {
                 search_stats,
@@ -8176,7 +9504,8 @@ fn refresh_caches(
                 error.message
             );
             s.node_names.clear();
-            s.search_engine = None;
+            clear_search_engine(&mut s);
+            controller.sidecar_query_cache.lock().clear();
             s.is_indexing = false;
             Err(error)
         }
@@ -8186,6 +9515,7 @@ fn refresh_caches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::lexical::exact_symbol_merged_lexical_queries;
     use codestory_contracts::graph::{
         Edge, EdgeId, EdgeKind, Node, NodeId as CoreNodeId, NodeKind, Occurrence, OccurrenceKind,
         ResolutionCertainty, SourceLocation,
@@ -8231,6 +9561,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn assert_mandatory_sidecar_unavailable(error: &ApiError) {
+        assert_eq!(error.code, "invalid_argument");
+        assert!(
+            error
+                .message
+                .contains("sidecar retrieval primary is unavailable or degraded")
+                || error
+                    .message
+                    .contains("sidecar retrieval primary is mandatory"),
+            "expected mandatory sidecar failure, got {error:?}"
+        );
     }
 
     struct HybridTestEnv {
@@ -8574,7 +9917,7 @@ mod tests {
             semantic_doc_max_tokens_from_env(),
             SEMANTIC_DOC_DEFAULT_MAX_TOKENS
         );
-        assert!(semantic_doc_shape_contract().contains("max_tokens=384"));
+        assert!(semantic_doc_shape_contract().contains("max_tokens=128"));
     }
 
     fn pending_semantic_doc_for_test(node_id: i64, doc_text: &str) -> PendingLlmSymbolDoc {
@@ -8658,6 +10001,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _env = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
+        let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "512");
         let cases = [
             (
                 "rust",
@@ -8746,6 +10090,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _env = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
+        let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "512");
         let doc = semantic_doc_text_for_test(
             "AppController::openProjectWithStoragePath",
             Some("codestory_runtime::AppController::openProjectWithStoragePath"),
@@ -8778,6 +10123,7 @@ mod tests {
         let _lock = ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "512");
         let no_alias = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "no_alias");
         let no_alias_doc = semantic_doc_text_for_test(
             "AppController::openProjectWithStoragePath",
@@ -9027,6 +10373,104 @@ pub fn exact_symbol_anchor() {{}}
     }
 
     #[test]
+    fn sourcetrail_style_architecture_prompt_expands_flow_roles() {
+        let query = "Explain how Sourcetrail turns project/source-group configuration into indexing work, then how indexed data is accessed by the application. Cite the source files that support the path.";
+        let terms = search_plan_terms(query);
+        assert!(
+            terms
+                .dropped
+                .iter()
+                .any(|term| term.term.eq_ignore_ascii_case("cite")),
+            "citation instruction should not become a named anchor: {:?}",
+            terms.dropped
+        );
+        for expected in [
+            "BuildIndex",
+            "SourceGroup",
+            "IndexerCommand",
+            "build",
+            "index",
+            "storage",
+            "persistence",
+        ] {
+            assert!(
+                terms
+                    .extracted
+                    .iter()
+                    .any(|term| term.eq_ignore_ascii_case(expected)),
+                "expected inferred architecture term `{expected}` in {:?}",
+                terms.extracted
+            );
+        }
+
+        let intents = architecture_query_intents(query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(!intents.is_empty(), "query should have architecture intent");
+
+        let subqueries = search_plan_subqueries(query, &terms, &intents);
+        assert!(
+            !subqueries
+                .iter()
+                .any(|subquery| subquery.role == "named_anchor" && subquery.query == "Cite"),
+            "generic citation wording should not consume a named-anchor slot: {subqueries:#?}"
+        );
+        for expected_role in [
+            "build_index_entrypoint",
+            "source_group_configuration",
+            "indexing_work",
+            "storage_access_surface",
+        ] {
+            assert!(
+                subqueries
+                    .iter()
+                    .any(|subquery| subquery.role == expected_role),
+                "expected role subquery `{expected_role}` in {subqueries:#?}"
+            );
+        }
+        let typed_anchor_terms = subqueries
+            .iter()
+            .find(|subquery| subquery.role == "typed_anchor_terms")
+            .map(|subquery| subquery.query.as_str())
+            .expect("typed anchor terms");
+        for expected in ["BuildIndex", "SourceGroup", "IndexerCommand"] {
+            assert!(
+                typed_anchor_terms.contains(expected),
+                "typed anchor terms should contain `{expected}`, got `{typed_anchor_terms}`"
+            );
+        }
+    }
+
+    #[test]
+    fn event_output_architecture_prompt_expands_processor_abstraction() {
+        let query = "Explain how codex exec --json flows from the top-level CLI into the exec runtime, app-server thread and turn start requests, and JSONL event output.";
+        let terms = search_plan_terms(query);
+        assert!(
+            terms.extracted.iter().any(|term| term == "EventProcessor"),
+            "event-output architecture prompt should infer source-truth abstraction: {:?}",
+            terms.extracted
+        );
+
+        let intents = architecture_query_intents(query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(!intents.is_empty(), "query should have architecture intent");
+
+        let subqueries = search_plan_subqueries(query, &terms, &intents);
+        let typed_anchor_terms = subqueries
+            .iter()
+            .find(|subquery| subquery.role == "typed_anchor_terms")
+            .map(|subquery| subquery.query.as_str())
+            .expect("typed anchor terms");
+        assert!(
+            typed_anchor_terms.contains("EventProcessor"),
+            "typed anchor terms should include EventProcessor, got `{typed_anchor_terms}`"
+        );
+    }
+
+    #[test]
     fn multi_anchor_agent_question_prioritizes_named_anchor_subquery_terms() {
         let query = "Explain how ProjectAlpha turns configuration into processing work, then how processed data is accessed by the application. Anchor the answer around ConfigGroup, WorkerRunner, and DataAccess.";
         let intents = architecture_query_intents(query)
@@ -9067,8 +10511,66 @@ pub fn exact_symbol_anchor() {{}}
     }
 
     #[test]
+    fn search_plan_still_runs_for_seed_anchor_drill_queries_with_exact_hits() {
+        let query = "Explain how a full indexing run moves through the runtime. Seed anchors: run_index, RuntimeContext::ensure_open_from_summary, WorkspaceIndexer::run";
+        let intents = architecture_query_intents(query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(!intents.is_empty(), "query should have architecture intent");
+
+        assert!(
+            search_plan_eligible(query, 3, &intents),
+            "drill seed-anchor queries need a plan even when the anchors produce exact symbol hits"
+        );
+
+        let same_query_without_seed_anchors = "Explain how run_index RuntimeContext::ensure_open_from_summary WorkspaceIndexer::run moves through the runtime.";
+        assert!(
+            !search_plan_eligible(same_query_without_seed_anchors, 3, &intents),
+            "ordinary exact-symbol queries should keep the exact-hit suppression"
+        );
+    }
+
+    #[test]
+    fn broad_explain_how_search_plan_survives_generic_exact_hits() {
+        let query = "Explain how a full indexing run moves from the CLI into runtime orchestration, file discovery, symbol extraction, persistence, and search or snapshot refresh.";
+        let intents = architecture_query_intents(query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(!intents.is_empty(), "query should have architecture intent");
+
+        assert!(
+            search_plan_eligible(query, 7, &intents),
+            "generic exact hits such as CLI should not suppress broad architecture search plans"
+        );
+        let terms = search_plan_terms(query);
+        let roles = search_plan_subqueries(query, &terms, &intents)
+            .into_iter()
+            .map(|subquery| subquery.role)
+            .collect::<Vec<_>>();
+        for expected in [
+            "workspace_discovery",
+            "symbol_extraction",
+            "persistence_surface",
+        ] {
+            assert!(
+                roles.iter().any(|role| role == expected),
+                "broad explain-how prompt should expand architecture role `{expected}`: {roles:#?}"
+            );
+        }
+
+        let ordinary_exact_query =
+            "Explain how run_index RuntimeContext::ensure_open_from_summary moves through runtime.";
+        assert!(
+            !search_plan_eligible(ordinary_exact_query, 2, &intents),
+            "ordinary exact-symbol explanations should still stay exact-first unless they name enough architecture surfaces"
+        );
+    }
+
+    #[test]
     fn search_plan_preserves_seed_anchor_line_exactly() {
-        let query = "Explain how a full indexing run moves through the runtime. Seed anchors: run_index, IndexService::run_indexing_blocking, WorkspaceIndexer::run";
+        let query = "Explain how a full indexing run moves through the runtime. Seed anchors: run_index, run_index_once, RuntimeContext::ensure_open_from_summary, IndexService::run_indexing_blocking, AppController::run_indexing_blocking_inner, index_incremental, WorkspaceManifest::build_execution_plan, WorkspaceIndexer::run, WorkspaceIndexer::flush_projection_batch";
         let intents = architecture_query_intents(query)
             .into_iter()
             .map(|intent| intent.label().to_string())
@@ -9079,8 +10581,14 @@ pub fn exact_symbol_anchor() {{}}
         let subqueries = search_plan_subqueries(query, &terms, &intents);
         for expected in [
             "run_index",
+            "run_index_once",
+            "RuntimeContext::ensure_open_from_summary",
             "IndexService::run_indexing_blocking",
+            "AppController::run_indexing_blocking_inner",
+            "index_incremental",
+            "WorkspaceManifest::build_execution_plan",
             "WorkspaceIndexer::run",
+            "WorkspaceIndexer::flush_projection_batch",
         ] {
             assert!(
                 subqueries
@@ -9112,6 +10620,173 @@ pub fn exact_symbol_anchor() {{}}
         }
     }
 
+    #[test]
+    fn payload_content_flow_prompt_expands_source_truth_anchors() {
+        let query = "Explain how Root & Runtime public writing and social surfaces connect through Payload collections, post rendering, comment auth/submission, RSS, and the Elsewhere feed. Cite the source files that support the path.";
+        let terms = search_plan_terms(query);
+        for noisy in ["root", "runtime"] {
+            assert!(
+                !terms
+                    .extracted
+                    .iter()
+                    .any(|term| term.eq_ignore_ascii_case(noisy)),
+                "brand phrase term `{noisy}` should not dominate Payload content-flow search: {:?}",
+                terms.extracted
+            );
+            assert!(
+                terms
+                    .dropped
+                    .iter()
+                    .any(|term| term.term.eq_ignore_ascii_case(noisy)
+                        && term.reason == "brand_phrase_in_content_flow"),
+                "brand phrase term `{noisy}` should be explained as dropped: {:?}",
+                terms.dropped
+            );
+        }
+        for expected in [
+            "content config",
+            "collection config",
+            "Posts",
+            "Comments",
+            "social entries",
+            "post page",
+            "content client",
+            "comment submission",
+            "comment auth",
+            "feed",
+        ] {
+            assert!(
+                terms
+                    .extracted
+                    .iter()
+                    .any(|term| term.eq_ignore_ascii_case(expected)),
+                "expected Payload content-flow term `{expected}` in {:?}",
+                terms.extracted
+            );
+        }
+
+        let intents = architecture_query_intents(query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(!intents.is_empty(), "query should have architecture intent");
+
+        let subqueries = search_plan_subqueries(query, &terms, &intents);
+        let typed_anchor_terms = subqueries
+            .iter()
+            .find(|subquery| subquery.role == "typed_anchor_terms")
+            .map(|subquery| subquery.query.as_str())
+            .expect("typed anchor terms");
+        for expected in ["Posts", "Comments", "feed"] {
+            assert!(
+                typed_anchor_terms.contains(expected),
+                "typed anchor terms should include `{expected}`, got `{typed_anchor_terms}`"
+            );
+        }
+        assert!(
+            subqueries.iter().any(|subquery| {
+                subquery.role == "content_surface"
+                    && subquery.query.to_ascii_lowercase().contains("comments")
+            }),
+            "content role subquery should preserve comment wording: {subqueries:#?}"
+        );
+        for expected_role in [
+            "collection_config_surface",
+            "comment_submission_surface",
+            "public_feed_surface",
+        ] {
+            assert!(
+                subqueries
+                    .iter()
+                    .any(|subquery| subquery.role == expected_role),
+                "expected role subquery `{expected_role}` in {subqueries:#?}"
+            );
+        }
+        let comment_role_query = subqueries
+            .iter()
+            .find(|subquery| subquery.role == "comment_submission_surface")
+            .map(|subquery| subquery.query.to_ascii_lowercase())
+            .expect("comment submission role query");
+        for expected in ["comment", "auth", "submission"] {
+            assert!(
+                comment_role_query.contains(expected),
+                "comment role query should contain `{expected}`, got `{comment_role_query}`"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_exec_json_prompt_expands_source_truth_anchors() {
+        let query = "Explain how `codex exec --json` flows from the top-level CLI into the exec runtime, app-server thread and turn start requests, and JSONL event output. Cite the source files that support the path.";
+        let terms = search_plan_terms(query);
+        for expected in [
+            "EventProcessor",
+            "exec cli",
+            "exec runtime",
+            "exec session",
+            "event processor",
+            "event output",
+            "thread start",
+            "turn start",
+        ] {
+            assert!(
+                terms
+                    .extracted
+                    .iter()
+                    .any(|term| term.eq_ignore_ascii_case(expected)),
+                "expected Codex exec-flow term `{expected}` in {:?}",
+                terms.extracted
+            );
+        }
+
+        let intents = architecture_query_intents(query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(!intents.is_empty(), "query should have architecture intent");
+
+        let subqueries = search_plan_subqueries(query, &terms, &intents);
+        let typed_anchor_terms = subqueries
+            .iter()
+            .find(|subquery| subquery.role == "typed_anchor_terms")
+            .map(|subquery| subquery.query.as_str())
+            .expect("typed anchor terms");
+        assert!(
+            typed_anchor_terms.contains("EventProcessor"),
+            "typed anchor terms should include EventProcessor, got `{typed_anchor_terms}`"
+        );
+        for expected_role in ["exec_cli_surface", "exec_event_output_surface"] {
+            assert!(
+                subqueries
+                    .iter()
+                    .any(|subquery| subquery.role == expected_role),
+                "expected role subquery `{expected_role}` in {subqueries:#?}"
+            );
+        }
+        let exec_cli_query = subqueries
+            .iter()
+            .find(|subquery| subquery.role == "exec_cli_surface")
+            .map(|subquery| subquery.query.to_ascii_lowercase())
+            .expect("exec CLI role query");
+        for expected in ["exec", "cli", "runtime"] {
+            assert!(
+                exec_cli_query.contains(expected),
+                "exec CLI role query should contain `{expected}`, got `{exec_cli_query}`"
+            );
+        }
+        let event_output_query = subqueries
+            .iter()
+            .find(|subquery| subquery.role == "exec_event_output_surface")
+            .map(|subquery| subquery.query.to_ascii_lowercase())
+            .expect("event output role query");
+        for expected in ["event", "output", "processor"] {
+            assert!(
+                event_output_query.contains(expected),
+                "event-output role query should contain `{expected}`, got `{event_output_query}`"
+            );
+        }
+    }
+
     fn search_plan_test_hit(
         id: &str,
         display_name: &str,
@@ -9132,6 +10807,950 @@ pub fn exact_symbol_anchor() {{}}
             resolvable,
             score_breakdown: None,
         }
+    }
+
+    #[test]
+    fn architecture_repo_text_window_preserves_coverage_surfaces() {
+        let query = "Explain how a full indexing run moves from the CLI into runtime orchestration, file discovery, symbol extraction, persistence, and search or snapshot refresh.";
+        let mut hits = vec![
+            search_plan_test_hit(
+                "runtime-lib",
+                "crates/codestory-runtime/src/lib.rs",
+                Path::new("crates/codestory-runtime/src/lib.rs"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "runtime-agent",
+                "crates/codestory-runtime/src/agent/orchestrator.rs",
+                Path::new("crates/codestory-runtime/src/agent/orchestrator.rs"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "cli-runtime",
+                "crates/codestory-cli/src/runtime.rs",
+                Path::new("crates/codestory-cli/src/runtime.rs"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "runtime-semantic",
+                "crates/codestory-runtime/src/semantic_doc_text.rs",
+                Path::new("crates/codestory-runtime/src/semantic_doc_text.rs"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "runtime-symbol",
+                "crates/codestory-runtime/src/symbol_query.rs",
+                Path::new("crates/codestory-runtime/src/symbol_query.rs"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "runtime-search",
+                "crates/codestory-runtime/src/search/engine.rs",
+                Path::new("crates/codestory-runtime/src/search/engine.rs"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "runtime-search-runtime",
+                "crates/codestory-runtime/src/search_runtime.rs",
+                Path::new("crates/codestory-runtime/src/search_runtime.rs"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "runtime-services",
+                "crates/codestory-runtime/src/services.rs",
+                Path::new("crates/codestory-runtime/src/services.rs"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "cli-args",
+                "crates/codestory-cli/src/args.rs",
+                Path::new("crates/codestory-cli/src/args.rs"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "runtime-browser",
+                "crates/codestory-runtime/src/browser.rs",
+                Path::new("crates/codestory-runtime/src/browser.rs"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "indexer-lib",
+                "crates/codestory-indexer/src/lib.rs",
+                Path::new("crates/codestory-indexer/src/lib.rs"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "storage-impl",
+                "crates/codestory-store/src/storage_impl/mod.rs",
+                Path::new("crates/codestory-store/src/storage_impl/mod.rs"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+        ];
+
+        truncate_repo_text_hits_for_query(query, &mut hits, 10);
+        let paths = hits
+            .iter()
+            .filter_map(|hit| hit.file_path.as_deref())
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&"crates/codestory-runtime/src/lib.rs"));
+        assert!(paths.contains(&"crates/codestory-cli/src/runtime.rs"));
+        assert!(paths.contains(&"crates/codestory-runtime/src/services.rs"));
+        assert!(paths.contains(&"crates/codestory-indexer/src/lib.rs"));
+        assert!(paths.contains(&"crates/codestory-store/src/storage_impl/mod.rs"));
+        assert_eq!(paths.len(), 10);
+    }
+
+    #[test]
+    fn architecture_repo_text_window_preserves_non_crate_source_surfaces() {
+        let query = "Explain how Sourcetrail turns project/source-group configuration into indexing work, then how indexed data is accessed by the application.";
+        let mut hits = vec![
+            search_plan_test_hit(
+                "custom-command",
+                "src/lib/project/SourceGroupCustomCommand.cpp",
+                Path::new("src/lib/project/SourceGroupCustomCommand.cpp"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "wizard-data",
+                "src/lib_gui/qt/project_wizard/content/QtProjectWizardContentSourceGroupData.cpp",
+                Path::new(
+                    "src/lib_gui/qt/project_wizard/content/QtProjectWizardContentSourceGroupData.cpp",
+                ),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "wizard-info",
+                "src/lib_gui/qt/project_wizard/content/QtProjectWizardContentSourceGroupInfoText.cpp",
+                Path::new(
+                    "src/lib_gui/qt/project_wizard/content/QtProjectWizardContentSourceGroupInfoText.cpp",
+                ),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "factory",
+                "src/lib/project/SourceGroupFactory.cpp",
+                Path::new("src/lib/project/SourceGroupFactory.cpp"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "factory-custom",
+                "src/lib/project/SourceGroupFactoryModuleCustom.cpp",
+                Path::new("src/lib/project/SourceGroupFactoryModuleCustom.cpp"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "python-empty",
+                "src/lib_python/project/SourceGroupPythonEmpty.cpp",
+                Path::new("src/lib_python/project/SourceGroupPythonEmpty.cpp"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "factory-cxx",
+                "src/lib_cxx/project/SourceGroupFactoryModuleCxx.cpp",
+                Path::new("src/lib_cxx/project/SourceGroupFactoryModuleCxx.cpp"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "wizard-data-h",
+                "src/lib_gui/qt/project_wizard/content/QtProjectWizardContentSourceGroupData.h",
+                Path::new(
+                    "src/lib_gui/qt/project_wizard/content/QtProjectWizardContentSourceGroupData.h",
+                ),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "wizard-info-h",
+                "src/lib_gui/qt/project_wizard/content/QtProjectWizardContentSourceGroupInfoText.h",
+                Path::new(
+                    "src/lib_gui/qt/project_wizard/content/QtProjectWizardContentSourceGroupInfoText.h",
+                ),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "factory-java",
+                "src/lib_java/project/SourceGroupFactoryModuleJava.cpp",
+                Path::new("src/lib_java/project/SourceGroupFactoryModuleJava.cpp"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "cdb",
+                "src/lib_cxx/project/SourceGroupCxxCdb.cpp",
+                Path::new("src/lib_cxx/project/SourceGroupCxxCdb.cpp"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "storage-access",
+                "src/lib/data/storage/StorageAccess.h",
+                Path::new("src/lib/data/storage/StorageAccess.h"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "storage-proxy",
+                "src/lib/data/storage/StorageAccessProxy.cpp",
+                Path::new("src/lib/data/storage/StorageAccessProxy.cpp"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+        ];
+
+        truncate_repo_text_hits_for_query(query, &mut hits, 10);
+        let paths = hits
+            .iter()
+            .filter_map(|hit| hit.file_path.as_deref())
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&"src/lib_cxx/project/SourceGroupCxxCdb.cpp"));
+        assert!(paths.contains(&"src/lib/data/storage/StorageAccess.h"));
+        assert!(paths.contains(&"src/lib/data/storage/StorageAccessProxy.cpp"));
+        assert_eq!(paths.len(), 10);
+    }
+
+    #[test]
+    fn architecture_cross_source_coverage_promotes_concrete_role_representatives() {
+        let query = "Explain how Sourcetrail turns project/source-group configuration into indexing work, then how indexed data is accessed by the application.";
+        let mut indexed_hits = vec![
+            search_plan_test_hit(
+                "persistent-h",
+                "StorageAccess",
+                Path::new("src/lib/data/storage/PersistentStorage.h"),
+                17,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+            search_plan_test_hit(
+                "generic-indexer",
+                "Indexer",
+                Path::new("src/lib/data/indexer/Indexer.h"),
+                1,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+            search_plan_test_hit(
+                "persistent-cpp",
+                "PersistentStorage::PersistentStorage",
+                Path::new("src/lib/data/storage/PersistentStorage.cpp"),
+                32,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+            search_plan_test_hit(
+                "project",
+                "Project::isIndexing",
+                Path::new("src/lib/project/Project.cpp"),
+                92,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+        ];
+        for index in 0..6 {
+            indexed_hits.push(search_plan_test_hit(
+                &format!("generic-indexer-{index}"),
+                "Indexer",
+                Path::new(&format!("src/lib/data/indexer/Indexer{index}.h")),
+                1,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ));
+        }
+        let mut indexed_candidates = indexed_hits.clone();
+        indexed_candidates.push(search_plan_test_hit(
+            "storage-access-h",
+            "StorageAccess::~StorageAccess",
+            Path::new("src/lib/data/storage/StorageAccess.h"),
+            36,
+            SearchHitOrigin::IndexedSymbol,
+            true,
+        ));
+
+        let mut repo_text_hits = vec![search_plan_test_hit(
+            "cdb-h",
+            "src/lib_cxx/project/SourceGroupCxxCdb.h",
+            Path::new("src/lib_cxx/project/SourceGroupCxxCdb.h"),
+            1,
+            SearchHitOrigin::TextMatch,
+            false,
+        )];
+        for index in 0..9 {
+            repo_text_hits.push(search_plan_test_hit(
+                &format!("wizard-{index}"),
+                "src/lib_gui/qt/project_wizard/content/QtProjectWizardContentSourceGroupData.cpp",
+                Path::new(&format!(
+                    "src/lib_gui/qt/project_wizard/content/QtProjectWizardContentSourceGroupData{index}.cpp"
+                )),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ));
+        }
+        let mut repo_text_candidates = repo_text_hits.clone();
+        repo_text_candidates.push(search_plan_test_hit(
+            "indexer-java",
+            "src/lib_java/data/indexer/IndexerJava.cpp",
+            Path::new("src/lib_java/data/indexer/IndexerJava.cpp"),
+            15,
+            SearchHitOrigin::TextMatch,
+            false,
+        ));
+
+        apply_architecture_cross_source_coverage(
+            query,
+            &mut indexed_hits,
+            &mut repo_text_hits,
+            &indexed_candidates,
+            &repo_text_candidates,
+            10,
+        );
+
+        let indexed_paths = indexed_hits
+            .iter()
+            .filter_map(|hit| hit.file_path.as_deref())
+            .collect::<Vec<_>>();
+        let repo_text_paths = repo_text_hits
+            .iter()
+            .filter_map(|hit| hit.file_path.as_deref())
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "src/lib/project/Project.cpp",
+            "src/lib/data/storage/PersistentStorage.cpp",
+            "src/lib/data/storage/PersistentStorage.h",
+            "src/lib/data/storage/StorageAccess.h",
+        ] {
+            assert!(
+                indexed_paths.contains(&expected),
+                "expected indexed path `{expected}` in {indexed_paths:#?}"
+            );
+        }
+        for expected in [
+            "src/lib_cxx/project/SourceGroupCxxCdb.h",
+            "src/lib_java/data/indexer/IndexerJava.cpp",
+        ] {
+            assert!(
+                repo_text_paths.contains(&expected),
+                "expected repo-text path `{expected}` in {repo_text_paths:#?}"
+            );
+        }
+        assert_eq!(indexed_hits.len(), 10);
+        assert_eq!(repo_text_hits.len(), 10);
+    }
+
+    #[test]
+    fn architecture_cross_source_coverage_uses_replacement_budget_for_actual_admissions() {
+        let query = "Explain how Sourcetrail turns project/source-group configuration into indexing work, then how indexed data is accessed by the application.";
+        let mut indexed_hits = Vec::new();
+        let indexed_candidates = Vec::new();
+        let mut repo_text_hits = (0..10)
+            .map(|index| {
+                search_plan_test_hit(
+                    &format!("generic-source-group-{index}"),
+                    &format!("src/lib/project/SourceGroupGeneric{index}.cpp"),
+                    Path::new(&format!("src/lib/project/SourceGroupGeneric{index}.cpp")),
+                    1,
+                    SearchHitOrigin::TextMatch,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut repo_text_candidates = repo_text_hits.clone();
+        for (id, path) in [
+            (
+                "source-group-cdb-h",
+                "src/lib_cxx/project/SourceGroupCxxCdb.h",
+            ),
+            (
+                "source-group-cdb-cpp",
+                "src/lib_cxx/project/SourceGroupCxxCdb.cpp",
+            ),
+            (
+                "indexer-command-cxx-cpp",
+                "src/lib_cxx/data/indexer/IndexerCommandCxx.cpp",
+            ),
+            (
+                "indexer-command-cxx-h",
+                "src/lib_cxx/data/indexer/IndexerCommandCxx.h",
+            ),
+            ("indexer-java", "src/lib_java/data/indexer/IndexerJava.cpp"),
+            (
+                "storage-proxy",
+                "src/lib/data/storage/StorageAccessProxy.cpp",
+            ),
+        ] {
+            repo_text_candidates.push(search_plan_test_hit(
+                id,
+                path,
+                Path::new(path),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ));
+        }
+
+        apply_architecture_cross_source_coverage(
+            query,
+            &mut indexed_hits,
+            &mut repo_text_hits,
+            &indexed_candidates,
+            &repo_text_candidates,
+            10,
+        );
+
+        let repo_text_paths = repo_text_hits
+            .iter()
+            .filter_map(|hit| hit.file_path.as_deref())
+            .collect::<Vec<_>>();
+        for expected in [
+            "src/lib_cxx/project/SourceGroupCxxCdb.cpp",
+            "src/lib_java/data/indexer/IndexerJava.cpp",
+            "src/lib/data/storage/StorageAccessProxy.cpp",
+        ] {
+            assert!(
+                repo_text_paths.contains(&expected),
+                "expected high-coverage late candidate `{expected}` in {repo_text_paths:#?}"
+            );
+        }
+        assert_eq!(repo_text_paths.len(), 10);
+    }
+
+    #[test]
+    fn search_plan_rejected_hits_exposes_repo_text_coverage_candidates() {
+        let chosen = search_plan_test_hit(
+            "project",
+            "Project::isIndexing",
+            Path::new("src/lib/project/Project.cpp"),
+            92,
+            SearchHitOrigin::IndexedSymbol,
+            true,
+        );
+        let anchor_groups = vec![SearchPlanAnchorGroupDto {
+            anchor: "Project::isIndexing".to_string(),
+            chosen_symbol: Some(chosen),
+            supporting_hits: Vec::new(),
+            promotion_status: SearchPlanPromotionStatusDto::TypedAnchor,
+            promotion_method: None,
+            caller_count: 0,
+            definition_only: false,
+            no_visible_callers: false,
+            confidence: "high".to_string(),
+            reasons: Vec::new(),
+        }];
+        let indexed_hits = vec![search_plan_test_hit(
+            "storage-access",
+            "StorageAccess::~StorageAccess",
+            Path::new("src/lib/data/storage/StorageAccess.h"),
+            36,
+            SearchHitOrigin::IndexedSymbol,
+            true,
+        )];
+        let repo_text_hits = vec![search_plan_test_hit(
+            "source-group-cdb",
+            "src/lib_cxx/project/SourceGroupCxxCdb.cpp",
+            Path::new("src/lib_cxx/project/SourceGroupCxxCdb.cpp"),
+            1,
+            SearchHitOrigin::TextMatch,
+            false,
+        )];
+
+        let rejected =
+            search_plan_rejected_hits(&anchor_groups, &[], &indexed_hits, &repo_text_hits);
+
+        let repo_text = rejected
+            .iter()
+            .find(|hit| hit.origin == SearchHitOrigin::TextMatch)
+            .expect("repo-text rejected hit should be retained for diagnostics");
+        assert_eq!(
+            repo_text.file_path.as_deref(),
+            Some("src/lib_cxx/project/SourceGroupCxxCdb.cpp")
+        );
+        assert!(
+            repo_text.reason.contains("source=repo_text")
+                && repo_text
+                    .reason
+                    .contains("coverage_key=source_group:configuration:impl")
+                && repo_text.reason.contains("coverage_score=10"),
+            "repo-text rejection reason should include coverage provenance: {repo_text:#?}"
+        );
+    }
+
+    #[test]
+    fn architecture_coverage_promotes_exec_flow_source_surfaces() {
+        let expected = [
+            (
+                "codex-rs/cli/src/main.rs",
+                "cli:top_level_entrypoint:impl",
+                8,
+            ),
+            (
+                "codex-rs/exec/src/main.rs",
+                "exec:binary_entrypoint:impl",
+                9,
+            ),
+            ("codex-rs/exec/src/cli.rs", "exec:cli_options:impl", 10),
+            ("codex-rs/exec/src/lib.rs", "exec:runtime:impl", 9),
+            ("codex-rs/exec/src/exec_events.rs", "exec:events:impl", 9),
+            (
+                "codex-rs/exec/src/event_processor_with_jsonl_output.rs",
+                "exec:jsonl_event_processor:impl",
+                9,
+            ),
+            (
+                "codex-rs/exec/src/event_processor.rs",
+                "exec:event_processor:impl",
+                8,
+            ),
+        ];
+
+        for (path, expected_key, expected_score) in expected {
+            let hit = search_plan_test_hit(
+                path,
+                path,
+                Path::new(path),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            );
+            let coverage = architecture_coverage_for_hit(&hit)
+                .unwrap_or_else(|| panic!("expected coverage for {path}"));
+            assert_eq!(coverage.key, expected_key);
+            assert_eq!(coverage.score, expected_score);
+        }
+    }
+
+    #[test]
+    fn architecture_coverage_promotes_payload_content_flow_surfaces() {
+        let expected = [
+            ("src/payload.config.ts", "payload:config:impl", 9),
+            (
+                "src/collections/Posts.ts",
+                "payload:posts_collection:impl",
+                10,
+            ),
+            (
+                "src/collections/Comments.ts",
+                "payload:comments_collection:impl",
+                10,
+            ),
+            (
+                "src/app/(frontend)/posts/[slug]/comments/route.ts",
+                "comments:submission_route:impl",
+                10,
+            ),
+            ("src/app/feed.xml/route.ts", "feed:rss_route:impl", 10),
+            ("src/lib/payload.ts", "payload:client:impl", 10),
+            (
+                "src/lib/content-data/post-content.ts",
+                "content:post_data:impl",
+                10,
+            ),
+            (
+                "src/lib/content-data/comment-content.ts",
+                "content:comment_data:impl",
+                10,
+            ),
+        ];
+
+        for (path, expected_key, expected_score) in expected {
+            let hit = search_plan_test_hit(
+                path,
+                path,
+                Path::new(path),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            );
+            let coverage = architecture_coverage_for_hit(&hit)
+                .unwrap_or_else(|| panic!("expected coverage for {path}"));
+            assert_eq!(coverage.key, expected_key);
+            assert_eq!(coverage.score, expected_score);
+        }
+    }
+
+    #[test]
+    fn architecture_cross_source_coverage_admits_late_payload_content_surfaces() {
+        let query = "Explain how Root & Runtime public writing and social surfaces connect through Payload collections, post rendering, comment auth/submission, RSS, and the Elsewhere feed.";
+        let mut indexed_hits = Vec::new();
+        let indexed_candidates = Vec::new();
+        let mut repo_text_hits = (0..10)
+            .map(|index| {
+                search_plan_test_hit(
+                    &format!("generic-payload-{index}"),
+                    &format!("src/app/(payload)/admin/importMap{index}.js"),
+                    Path::new(&format!("src/app/(payload)/admin/importMap{index}.js")),
+                    1,
+                    SearchHitOrigin::TextMatch,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut repo_text_candidates = repo_text_hits.clone();
+        for path in [
+            "src/collections/Posts.ts",
+            "src/collections/Comments.ts",
+            "src/app/(frontend)/posts/[slug]/comments/route.ts",
+            "src/app/feed.xml/route.ts",
+            "src/lib/payload.ts",
+            "src/lib/content-data/post-content.ts",
+            "src/lib/content-data/comment-content.ts",
+        ] {
+            repo_text_candidates.push(search_plan_test_hit(
+                path,
+                path,
+                Path::new(path),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ));
+        }
+
+        apply_architecture_cross_source_coverage(
+            query,
+            &mut indexed_hits,
+            &mut repo_text_hits,
+            &indexed_candidates,
+            &repo_text_candidates,
+            10,
+        );
+
+        let repo_text_paths = repo_text_hits
+            .iter()
+            .filter_map(|hit| hit.file_path.as_deref())
+            .collect::<Vec<_>>();
+        for expected in [
+            "src/collections/Posts.ts",
+            "src/collections/Comments.ts",
+            "src/app/(frontend)/posts/[slug]/comments/route.ts",
+            "src/app/feed.xml/route.ts",
+            "src/lib/payload.ts",
+            "src/lib/content-data/post-content.ts",
+            "src/lib/content-data/comment-content.ts",
+        ] {
+            assert!(
+                repo_text_paths.contains(&expected),
+                "expected late Payload content surface `{expected}` in {repo_text_paths:#?}"
+            );
+        }
+        assert_eq!(repo_text_paths.len(), 10);
+    }
+
+    #[test]
+    fn architecture_cross_source_coverage_admits_late_exec_flow_surfaces() {
+        let query = "Explain how codex exec --json flows from the top-level CLI into the exec runtime and JSONL event output.";
+        let mut indexed_hits = vec![search_plan_test_hit(
+            "exec-cli",
+            "Cli",
+            Path::new("codex-rs/exec/src/cli.rs"),
+            14,
+            SearchHitOrigin::IndexedSymbol,
+            true,
+        )];
+        for index in 0..9 {
+            indexed_hits.push(search_plan_test_hit(
+                &format!("generic-cli-{index}"),
+                "Cli",
+                Path::new(&format!("codex-rs/generic-{index}/src/cli.rs")),
+                1,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ));
+        }
+        let indexed_candidates = indexed_hits.clone();
+
+        let mut repo_text_hits = vec![search_plan_test_hit(
+            "exec-events",
+            "codex-rs/exec/src/exec_events.rs",
+            Path::new("codex-rs/exec/src/exec_events.rs"),
+            8,
+            SearchHitOrigin::TextMatch,
+            false,
+        )];
+        for index in 0..9 {
+            repo_text_hits.push(search_plan_test_hit(
+                &format!("generic-client-{index}"),
+                &format!("codex-rs/generic-{index}/src/client.rs"),
+                Path::new(&format!("codex-rs/generic-{index}/src/client.rs")),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ));
+        }
+        let mut repo_text_candidates = repo_text_hits.clone();
+        for path in [
+            "codex-rs/cli/src/main.rs",
+            "codex-rs/exec/src/main.rs",
+            "codex-rs/exec/src/lib.rs",
+        ] {
+            repo_text_candidates.push(search_plan_test_hit(
+                path,
+                path,
+                Path::new(path),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ));
+        }
+
+        apply_architecture_cross_source_coverage(
+            query,
+            &mut indexed_hits,
+            &mut repo_text_hits,
+            &indexed_candidates,
+            &repo_text_candidates,
+            10,
+        );
+
+        let repo_text_paths = repo_text_hits
+            .iter()
+            .filter_map(|hit| hit.file_path.as_deref())
+            .collect::<Vec<_>>();
+        for expected in [
+            "codex-rs/exec/src/exec_events.rs",
+            "codex-rs/cli/src/main.rs",
+            "codex-rs/exec/src/main.rs",
+            "codex-rs/exec/src/lib.rs",
+        ] {
+            assert!(
+                repo_text_paths.contains(&expected),
+                "expected exec-flow surface `{expected}` in {repo_text_paths:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn architecture_cross_source_coverage_admits_late_indexed_exec_flow_surfaces() {
+        let query = "Explain how codex exec --json flows from the top-level CLI into the exec runtime and JSONL event output.";
+        let mut indexed_hits = vec![
+            search_plan_test_hit(
+                "cli-main",
+                "Subcommand::Exec",
+                Path::new("codex-rs/cli/src/main.rs"),
+                120,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+            search_plan_test_hit(
+                "exec-lib",
+                "run_exec_session",
+                Path::new("codex-rs/exec/src/lib.rs"),
+                1,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+        ];
+        for index in 0..8 {
+            indexed_hits.push(search_plan_test_hit(
+                &format!("app-server-noise-{index}"),
+                "CommandExec",
+                Path::new(&format!(
+                    "codex-rs/app-server-protocol/src/protocol/v2/noise_{index}.rs"
+                )),
+                1,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ));
+        }
+        let mut indexed_candidates = indexed_hits.clone();
+        for (id, name, path) in [
+            ("exec-cli", "Cli", "codex-rs/exec/src/cli.rs"),
+            ("exec-main", "clap::Parser", "codex-rs/exec/src/main.rs"),
+            (
+                "exec-jsonl",
+                "EventProcessorWithJsonOutput::emit",
+                "codex-rs/exec/src/event_processor_with_jsonl_output.rs",
+            ),
+            (
+                "exec-events",
+                "codex_protocol::models::WebSearchAction",
+                "codex-rs/exec/src/exec_events.rs",
+            ),
+        ] {
+            indexed_candidates.push(search_plan_test_hit(
+                id,
+                name,
+                Path::new(path),
+                1,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ));
+        }
+        let mut repo_text_hits = Vec::new();
+
+        apply_architecture_cross_source_coverage(
+            query,
+            &mut indexed_hits,
+            &mut repo_text_hits,
+            &indexed_candidates,
+            &[],
+            10,
+        );
+
+        let indexed_paths = indexed_hits
+            .iter()
+            .filter_map(|hit| hit.file_path.as_deref())
+            .collect::<Vec<_>>();
+        for expected in [
+            "codex-rs/exec/src/cli.rs",
+            "codex-rs/exec/src/main.rs",
+            "codex-rs/exec/src/event_processor_with_jsonl_output.rs",
+            "codex-rs/exec/src/exec_events.rs",
+        ] {
+            assert!(
+                indexed_paths.contains(&expected),
+                "expected late indexed exec-flow surface `{expected}` in {indexed_paths:#?}"
+            );
+        }
+        assert_eq!(indexed_paths.len(), 10);
+    }
+
+    #[test]
+    fn repo_text_window_does_not_diversify_non_architecture_queries() {
+        let mut hits = vec![
+            search_plan_test_hit(
+                "first",
+                "first",
+                Path::new("crates/codestory-runtime/src/lib.rs"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "second",
+                "second",
+                Path::new("crates/codestory-indexer/src/lib.rs"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+            search_plan_test_hit(
+                "third",
+                "third",
+                Path::new("crates/codestory-store/src/storage_impl/mod.rs"),
+                1,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+        ];
+
+        truncate_repo_text_hits_for_query("run_index", &mut hits, 2);
+
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.node_id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+    }
+
+    #[test]
+    fn search_plan_anchor_groups_keep_diverse_names_before_truncation() {
+        let temp = tempdir().expect("create temp dir");
+        let source_path = temp.path().join("src").join("flow.rs");
+        fs::create_dir_all(source_path.parent().expect("src parent")).expect("create src");
+        fs::write(&source_path, "fn placeholder() {}\n").expect("write source");
+        let mut hits = (0..10)
+            .map(|index| {
+                search_plan_test_hit(
+                    &format!("cli-{index}"),
+                    "cli",
+                    &source_path,
+                    index + 1,
+                    SearchHitOrigin::IndexedSymbol,
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        hits.push(search_plan_test_hit(
+            "workspace",
+            "WorkspaceManifest::build_execution_plan",
+            &source_path,
+            20,
+            SearchHitOrigin::IndexedSymbol,
+            true,
+        ));
+        hits.push(search_plan_test_hit(
+            "indexer",
+            "WorkspaceIndexer::run",
+            &source_path,
+            21,
+            SearchHitOrigin::IndexedSymbol,
+            true,
+        ));
+
+        let terms = search_plan_terms(
+            "Explain how the CLI runtime workspace indexer store and search flow fits together.",
+        );
+        let groups = search_plan_anchor_groups(
+            "Explain how the CLI runtime workspace indexer store and search flow fits together.",
+            &terms,
+            &hits,
+            &[],
+            &[],
+            &HashMap::new(),
+        );
+        let anchors = groups
+            .iter()
+            .map(|group| group.anchor.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            anchors
+                .iter()
+                .any(|anchor| anchor.contains("WorkspaceManifest")),
+            "duplicate cli anchors should not crowd out workspace anchor: {anchors:#?}"
+        );
+        assert!(
+            anchors
+                .iter()
+                .any(|anchor| anchor.contains("WorkspaceIndexer")),
+            "duplicate cli anchors should not crowd out indexer anchor: {anchors:#?}"
+        );
     }
 
     #[test]
@@ -9477,7 +12096,174 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn search_ranks_exact_type_before_members_and_omits_unknown_hits() {
+    fn build_search_hit_adjusts_route_scores_by_extraction_provenance() {
+        fn route_canonical_id(extraction: &str) -> String {
+            format!(
+                "route_endpoint:{}",
+                serde_json::json!({
+                    "kind": "framework_route",
+                    "framework": "express",
+                    "method": "GET",
+                    "path": "/api/users",
+                    "provenance": [format!("extraction:{extraction}")],
+                })
+            )
+        }
+
+        let mut storage = Storage::new_in_memory().expect("storage");
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: CoreNodeId(20),
+                    kind: NodeKind::FILE,
+                    serialized_name: "src/routes.ts".to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(22),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "GET /api/users".to_string(),
+                    file_node_id: Some(CoreNodeId(20)),
+                    canonical_id: Some(route_canonical_id("ast_indexed")),
+                    start_line: Some(3),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(23),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "GET /api/users".to_string(),
+                    file_node_id: Some(CoreNodeId(20)),
+                    canonical_id: Some(route_canonical_id("text_only")),
+                    start_line: Some(3),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(24),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "plain_handler".to_string(),
+                    file_node_id: Some(CoreNodeId(20)),
+                    start_line: Some(8),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert route nodes");
+        let node_names = HashMap::from([
+            (CoreNodeId(22), "GET /api/users".to_string()),
+            (CoreNodeId(23), "GET /api/users".to_string()),
+            (CoreNodeId(24), "plain_handler".to_string()),
+        ]);
+
+        let ast = AppController::build_search_hit(&storage, &node_names, CoreNodeId(22), 1.0)
+            .expect("ast route hit");
+        let text_only = AppController::build_search_hit(&storage, &node_names, CoreNodeId(23), 1.0)
+            .expect("text-only route hit");
+        let normal = AppController::build_search_hit(&storage, &node_names, CoreNodeId(24), 1.0)
+            .expect("normal hit");
+
+        assert!(
+            ast.score > text_only.score,
+            "AST-indexed route evidence should outrank otherwise equivalent text-only route guesses"
+        );
+        assert!(ast.score > normal.score);
+        assert!(text_only.score < normal.score);
+        assert_eq!(normal.score, 1.0);
+
+        let mut hits = [text_only, ast.clone()];
+        hits.sort_by(|left, right| compare_search_hits("/api/users", left, right));
+        assert_eq!(hits.first().map(|hit| &hit.node_id), Some(&ast.node_id));
+    }
+
+    #[test]
+    fn build_search_state_scopes_projection_rebuild_to_touched_files() {
+        let mut storage = Storage::new_in_memory().expect("storage");
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: CoreNodeId(900),
+                    kind: NodeKind::FILE,
+                    serialized_name: "src/changed.rs".to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(901),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "old_name".to_string(),
+                    qualified_name: Some("pkg::old_name".to_string()),
+                    file_node_id: Some(CoreNodeId(900)),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(910),
+                    kind: NodeKind::FILE,
+                    serialized_name: "src/untouched.rs".to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(911),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "untouched".to_string(),
+                    qualified_name: Some("pkg::untouched".to_string()),
+                    file_node_id: Some(CoreNodeId(910)),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert nodes");
+        storage
+            .rebuild_search_symbol_projection_from_node_table()
+            .expect("full projection");
+
+        storage
+            .insert_nodes_batch(&[Node {
+                id: CoreNodeId(901),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "renamed".to_string(),
+                qualified_name: Some("pkg::renamed".to_string()),
+                file_node_id: Some(CoreNodeId(900)),
+                ..Default::default()
+            }])
+            .expect("update changed node");
+        storage
+            .upsert_search_symbol_projection_batch(&[SearchSymbolProjection {
+                node_id: CoreNodeId(911),
+                display_name: "stale_other_file".to_string(),
+            }])
+            .expect("seed untouched stale projection");
+
+        let nodes = storage.get_nodes().expect("nodes");
+        let touched = HashSet::from([CoreNodeId(900)]);
+        build_search_state(
+            &mut storage,
+            None,
+            nodes,
+            Some(&touched),
+            SemanticProjectionMode::SkipPersistence,
+            false,
+        )
+        .expect("scoped search state");
+
+        let projection = storage
+            .get_search_symbol_projection_batch_after(None, 10)
+            .expect("projection");
+        let names_by_id: HashMap<_, _> = projection
+            .into_iter()
+            .map(|entry| (entry.node_id, entry.display_name))
+            .collect();
+        assert_eq!(
+            names_by_id.get(&CoreNodeId(900)).map(String::as_str),
+            Some("src/changed.rs")
+        );
+        assert_eq!(
+            names_by_id.get(&CoreNodeId(901)).map(String::as_str),
+            Some("pkg::renamed")
+        );
+        assert_eq!(
+            names_by_id.get(&CoreNodeId(911)).map(String::as_str),
+            Some("stale_other_file")
+        );
+    }
+
+    #[test]
+    fn search_requires_full_sidecars_for_exact_type_queries() {
         let temp = tempdir().expect("create temp dir");
         let db_path = temp.path().join("codestory.db");
 
@@ -9530,7 +12316,7 @@ fn build_llm_symbol_doc_text() -> String {
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
 
-        let hits = controller
+        let error = controller
             .search(SearchRequest {
                 query: "AppController".to_string(),
                 repo_text: SearchRepoTextMode::Off,
@@ -9539,16 +12325,8 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
-            .expect("search");
-
-        assert_eq!(
-            hits.first().map(|hit| hit.display_name.as_str()),
-            Some("AppController")
-        );
-        assert!(
-            hits.iter()
-                .all(|hit| hit.kind != codestory_contracts::api::NodeKind::UNKNOWN)
-        );
+            .expect_err("search should require full sidecars");
+        assert_mandatory_sidecar_unavailable(&error);
     }
 
     #[test]
@@ -9585,7 +12363,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn search_prefers_real_tictactoe_definitions_for_check_winner_and_min_max() {
+    fn search_prefers_full_sidecars_for_tictactoe_queries() {
         let _lock = ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -9601,11 +12379,8 @@ fn build_llm_symbol_doc_text() -> String {
             .run_indexing_blocking(IndexMode::Full)
             .expect("index fixtures");
 
-        for (query, expected_kind) in [
-            ("check_winner", codestory_contracts::api::NodeKind::FUNCTION),
-            ("min_max", codestory_contracts::api::NodeKind::FUNCTION),
-        ] {
-            let hits = controller
+        for query in ["check_winner", "min_max"] {
+            let error = controller
                 .search(SearchRequest {
                     query: query.to_string(),
                     repo_text: SearchRepoTextMode::Off,
@@ -9614,18 +12389,13 @@ fn build_llm_symbol_doc_text() -> String {
                     hybrid_weights: None,
                     hybrid_limits: None,
                 })
-                .expect("search fixtures");
-            let first = hits.first().expect("at least one hit");
-            assert_eq!(
-                first.kind, expected_kind,
-                "expected real definition to outrank loose matches for {query}"
-            );
-            assert_eq!(terminal_symbol_segment(&first.display_name), query);
+                .expect_err("search fixtures should require full sidecars");
+            assert_mandatory_sidecar_unavailable(&error);
         }
     }
 
     #[test]
-    fn repo_explanation_search_preserves_symbol_like_indexed_hits() {
+    fn repo_explanation_search_requires_full_sidecar_retrieval() {
         let _lock = ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -9641,7 +12411,7 @@ fn build_llm_symbol_doc_text() -> String {
             .run_indexing_blocking(IndexMode::Full)
             .expect("index fixtures");
 
-        let generic_results = controller
+        let generic_error = controller
             .search_results(SearchRequest {
                 query: "Explain how this repo fits together".to_string(),
                 repo_text: SearchRepoTextMode::Off,
@@ -9650,22 +12420,10 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
-            .expect("generic repo explanation search");
-        assert!(
-            !generic_results.indexed_symbol_hits.is_empty(),
-            "generic repo-explanation prompts should still use grounding overview hits"
-        );
-        assert_eq!(
-            generic_results.indexed_symbol_hits.len(),
-            generic_results.suggestions.len(),
-            "generic repo-explanation replacement should mirror overview suggestions"
-        );
-        assert!(
-            generic_results.search_plan.is_none(),
-            "generic repo-overview replacement should not add search-plan anchors: {generic_results:?}"
-        );
+            .expect_err("generic repo explanation search should require full sidecars");
+        assert_mandatory_sidecar_unavailable(&generic_error);
 
-        let results = controller
+        let symbol_error = controller
             .search_results(SearchRequest {
                 query: "Explain how check_winner fits in this repo".to_string(),
                 repo_text: SearchRepoTextMode::Off,
@@ -9674,23 +12432,12 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
-            .expect("search fixtures");
-
-        assert!(
-            results
-                .indexed_symbol_hits
-                .iter()
-                .any(|hit| terminal_symbol_segment(&hit.display_name) == "check_winner"),
-            "symbol-like repo-explanation prompts should preserve indexed hits: {results:?}"
-        );
-        assert!(
-            !results.suggestions.is_empty(),
-            "symbol-like repo-explanation prompts should keep overview hits as suggestions: {results:?}"
-        );
+            .expect_err("symbol-like repo explanation search should require full sidecars");
+        assert_mandatory_sidecar_unavailable(&symbol_error);
     }
 
     #[test]
-    fn search_expands_natural_language_queries() {
+    fn search_rejects_natural_language_queries_without_full_sidecars() {
         let temp = tempdir().expect("create temp dir");
         let db_path = temp.path().join("codestory.db");
 
@@ -9729,7 +12476,7 @@ fn build_llm_symbol_doc_text() -> String {
 
         let broad_query =
             "Explain how the full-index path flows through runtime workspace indexer and store";
-        let results_without_plan = controller
+        let error_without_plan = controller
             .search_results(SearchRequest {
                 query: broad_query.to_string(),
                 repo_text: SearchRepoTextMode::Off,
@@ -9738,18 +12485,10 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
-            .expect("search with natural language");
+            .expect_err("natural language search should require full sidecars");
+        assert_mandatory_sidecar_unavailable(&error_without_plan);
 
-        assert!(
-            !results_without_plan.indexed_symbol_hits.is_empty(),
-            "Expected term extraction fallback to find symbol matches"
-        );
-        assert!(
-            results_without_plan.search_plan.is_none(),
-            "search should not build Search Plan work unless requested: {results_without_plan:?}"
-        );
-
-        let results_with_plan = controller
+        let error_with_plan = controller
             .search_results(SearchRequest {
                 query: broad_query.to_string(),
                 repo_text: SearchRepoTextMode::Off,
@@ -9758,11 +12497,8 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
-            .expect("search with natural language and search plan");
-        assert!(
-            results_with_plan.search_plan.is_some(),
-            "search should build Search Plan only when requested: {results_with_plan:?}"
-        );
+            .expect_err("natural language search plan should require full sidecars");
+        assert_mandatory_sidecar_unavailable(&error_with_plan);
     }
 
     #[test]
@@ -9786,7 +12522,7 @@ fn build_llm_symbol_doc_text() -> String {
         )
         .expect("build search state");
         let node_names = result.node_names;
-        let mut engine = result.engine;
+        let engine = result.engine;
         assert_eq!(
             node_names.get(&CoreNodeId(1)).map(String::as_str),
             Some("pkg.mod.short_name")
@@ -10167,7 +12903,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn search_results_group_runtime_owned_repo_text_hits() {
+    fn search_results_ignores_repo_text_hits_without_full_sidecars() {
         let temp = tempdir().expect("temp dir");
         let storage_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(storage_path.parent().expect("db parent")).expect("create db dir");
@@ -10190,6 +12926,7 @@ fn build_llm_symbol_doc_text() -> String {
                     indexed: true,
                     complete: true,
                     line_count: 2,
+                    file_role: codestory_store::FileRole::Source,
                 })
                 .expect("insert file");
             storage
@@ -10217,7 +12954,7 @@ fn build_llm_symbol_doc_text() -> String {
             .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
             .expect("open project");
 
-        let results = controller
+        let error = controller
             .search_results(SearchRequest {
                 query: "how does alpha work".to_string(),
                 repo_text: SearchRepoTextMode::On,
@@ -10226,23 +12963,12 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
-            .expect("search results");
-
-        assert!(results.repo_text_enabled);
-        assert!(!results.indexed_symbol_hits.is_empty());
-        assert!(!results.repo_text_hits.is_empty());
-        assert_eq!(
-            results.hits.len(),
-            results.indexed_symbol_hits.len() + results.repo_text_hits.len()
-        );
-        assert_eq!(
-            results.repo_text_hits[0].origin,
-            codestory_contracts::api::SearchHitOrigin::TextMatch
-        );
+            .expect_err("repo-text search should still require full sidecars");
+        assert_mandatory_sidecar_unavailable(&error);
     }
 
     #[test]
-    fn repo_text_auto_fallback_runs_for_missing_concrete_anchor() {
+    fn repo_text_auto_fallback_is_not_product_search_without_full_sidecars() {
         let temp = tempdir().expect("temp dir");
         let storage_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(storage_path.parent().expect("db parent")).expect("create db dir");
@@ -10267,6 +12993,7 @@ fn build_llm_symbol_doc_text() -> String {
                     indexed: true,
                     complete: true,
                     line_count: 1,
+                    file_role: codestory_store::FileRole::Source,
                 })
                 .expect("insert source file");
             storage
@@ -10278,6 +13005,7 @@ fn build_llm_symbol_doc_text() -> String {
                     indexed: true,
                     complete: true,
                     line_count: 1,
+                    file_role: codestory_store::FileRole::Source,
                 })
                 .expect("insert readme file");
             storage
@@ -10305,7 +13033,7 @@ fn build_llm_symbol_doc_text() -> String {
             .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
             .expect("open project");
 
-        let results = controller
+        let error = controller
             .search_results(SearchRequest {
                 query: "GlobalResourceListView".to_string(),
                 repo_text: SearchRepoTextMode::Auto,
@@ -10314,20 +13042,8 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
-            .expect("search results");
-
-        assert!(results.repo_text_enabled);
-        assert!(!results.repo_text_hits.is_empty());
-        let assessment = results.query_assessment.expect("query assessment");
-        assert_eq!(assessment.exact_symbol_hit_count, 0);
-        assert!(assessment.stale_or_missing_anchor);
-        assert!(
-            assessment
-                .repo_text_fallback_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("no indexed symbol")
-                    || reason.contains("no exact indexed symbol"))
-        );
+            .expect_err("repo-text auto fallback should require full sidecars");
+        assert_mandatory_sidecar_unavailable(&error);
     }
 
     #[test]
@@ -10363,6 +13079,7 @@ fn build_llm_symbol_doc_text() -> String {
                         indexed: true,
                         complete: true,
                         line_count: 1,
+                        file_role: codestory_store::FileRole::Source,
                     })
                     .expect("insert file");
             }
@@ -10427,6 +13144,7 @@ fn build_llm_symbol_doc_text() -> String {
                         indexed: true,
                         complete: true,
                         line_count: 2,
+                        file_role: codestory_store::FileRole::Source,
                     })
                     .expect("insert file");
             }
@@ -10471,6 +13189,7 @@ fn build_llm_symbol_doc_text() -> String {
                     indexed: true,
                     complete: true,
                     line_count: 1,
+                    file_role: codestory_store::FileRole::Source,
                 })
                 .expect("insert file");
         }
@@ -10515,6 +13234,7 @@ fn build_llm_symbol_doc_text() -> String {
                         indexed: true,
                         complete: true,
                         line_count: 1,
+                        file_role: codestory_store::FileRole::Source,
                     })
                     .expect("insert file");
             }
@@ -10598,6 +13318,7 @@ fn build_llm_symbol_doc_text() -> String {
                     indexed: true,
                     complete: true,
                     line_count: 1,
+                    file_role: codestory_store::FileRole::Source,
                 })
                 .expect("insert file");
         }
@@ -10818,6 +13539,40 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn embedded_exact_symbol_terms_count_and_annotate_exact_hits() {
+        let mut hit = SearchHit {
+            node_id: NodeId("search-hybrid".to_string()),
+            display_name: "SearchEngine::search_hybrid_with_scores".to_string(),
+            kind: codestory_contracts::api::NodeKind::METHOD,
+            file_path: Some("src/search/engine.rs".to_string()),
+            line: Some(1769),
+            score: 0.25,
+            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
+            resolvable: true,
+            score_breakdown: None,
+        };
+        let query = "exact symbol first semantic ranking search_hybrid_with_scores";
+
+        assert_eq!(exact_symbol_hit_count(query, std::slice::from_ref(&hit)), 1);
+
+        annotate_search_hit_match_quality(query, std::slice::from_mut(&mut hit));
+
+        assert_eq!(
+            hit.match_quality,
+            Some(codestory_contracts::api::SearchMatchQualityDto::NormalizedExact)
+        );
+    }
+
+    #[test]
+    fn primary_source_retention_keeps_short_precise_windows() {
+        assert_eq!(primary_source_retention_threshold(1), 1);
+        assert_eq!(primary_source_retention_threshold(3), 3);
+        assert_eq!(primary_source_retention_threshold(10), 3);
+        assert_eq!(primary_source_retention_threshold(50), 3);
+    }
+
+    #[test]
     fn inexact_search_results_deduplicate_repeated_display_keys() {
         let mut hits = vec![
             SearchHit {
@@ -10930,6 +13685,238 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn exact_symbol_fast_path_is_conservative() {
+        let req = |query: &str,
+                   hybrid_weights: Option<AgentHybridWeightsDto>,
+                   hybrid_limits: Option<SearchHybridLimitsDto>| SearchRequest {
+            query: query.to_string(),
+            repo_text: SearchRepoTextMode::Off,
+            limit_per_source: 10,
+            expand_search_plan: false,
+            hybrid_weights,
+            hybrid_limits,
+        };
+
+        assert!(exact_symbol_lexical_fast_path(
+            &req("Workbench", None, None),
+            None
+        ));
+        assert!(exact_symbol_lexical_fast_path(
+            &req("Subcommand::Exec", None, None),
+            None
+        ));
+        assert!(exact_symbol_lexical_fast_path(
+            &req("check_winner", None, None),
+            None
+        ));
+        assert!(!exact_symbol_lexical_fast_path(
+            &req("authorization", None, None),
+            None
+        ));
+        assert!(!exact_symbol_lexical_fast_path(
+            &req("how ExtensionService starts", None, None),
+            None
+        ));
+        assert!(!exact_symbol_lexical_fast_path(
+            &req(
+                "Workbench",
+                None,
+                Some(SearchHybridLimitsDto {
+                    lexical: None,
+                    semantic: Some(20),
+                }),
+            ),
+            None
+        ));
+
+        let weights = AgentHybridWeightsDto {
+            lexical: Some(0.25),
+            semantic: Some(0.75),
+            graph: None,
+        };
+        assert!(!exact_symbol_lexical_fast_path(
+            &req("Workbench", Some(weights.clone()), None),
+            Some(&weights)
+        ));
+    }
+
+    #[test]
+    fn exact_symbol_merged_lexical_queries_dedupe_exact_anchor_scan() {
+        assert_eq!(
+            exact_symbol_merged_lexical_queries("Workbench"),
+            vec!["Workbench".to_string()]
+        );
+        assert_eq!(
+            exact_symbol_merged_lexical_queries("Subcommand::Exec"),
+            vec!["Subcommand::Exec".to_string(), "Exec".to_string()]
+        );
+        assert_eq!(
+            exact_symbol_merged_lexical_queries("how ExtensionHostManager starts"),
+            vec!["how ExtensionHostManager starts".to_string()]
+        );
+    }
+
+    #[test]
+    fn mixed_natural_language_query_detects_embedded_symbol_prompts() {
+        assert!(mixed_natural_language_query(
+            "how ExtensionHostManager starts"
+        ));
+        assert!(!mixed_natural_language_query("Workbench"));
+        assert!(!mixed_natural_language_query("Subcommand::Exec"));
+    }
+
+    #[test]
+    fn hybrid_search_config_skips_exact_symbol_escalation_for_mixed_nl() {
+        let req = SearchRequest {
+            query: "how ExtensionHostManager starts".to_string(),
+            repo_text: SearchRepoTextMode::Off,
+            limit_per_source: 10,
+            expand_search_plan: false,
+            hybrid_weights: None,
+            hybrid_limits: None,
+        };
+        let config = hybrid_search_config_for_request(&req, 10, None, true);
+        assert_eq!(config.max_results, 10);
+    }
+
+    #[test]
+    fn exact_symbol_fast_path_returns_lexical_hits_without_semantic_fallback() {
+        let mut engine = SearchEngine::new(None).expect("search engine");
+        engine
+            .index_nodes(vec![(CoreNodeId(1), "Workbench".to_string())])
+            .expect("index nodes");
+        let req = SearchRequest {
+            query: "Workbench".to_string(),
+            repo_text: SearchRepoTextMode::Off,
+            limit_per_source: 10,
+            expand_search_plan: false,
+            hybrid_weights: None,
+            hybrid_limits: None,
+        };
+        let storage_retrieval = RetrievalStateDto {
+            mode: RetrievalModeDto::Hybrid,
+            hybrid_configured: true,
+            semantic_ready: true,
+            semantic_mode: SemanticModeDto::Enabled,
+            semantic_doc_count: 170_000,
+            embedding_model: Some("test-model".to_string()),
+            current_embedding: None,
+            stored_embedding: None,
+            fallback_reason: None,
+            fallback_message: None,
+        };
+        let graph_boosts = HashMap::new();
+        let mut retrieval = storage_retrieval.clone();
+        let use_exact_symbol_lexical_fast_path = exact_symbol_lexical_fast_path(&req, None);
+
+        let hits = hybrid_hits_for_retrieval_state(
+            &mut engine,
+            HybridHitsContext {
+                req: &req,
+                graph_boosts: &graph_boosts,
+                requested_max_results: 10,
+                request_weights: None,
+                prefer_primary_sources: true,
+                storage_retrieval: &storage_retrieval,
+                use_exact_symbol_lexical_fast_path,
+            },
+            &mut retrieval,
+        );
+
+        assert!(use_exact_symbol_lexical_fast_path);
+        assert_eq!(hits.first().map(|hit| hit.node_id), Some(CoreNodeId(1)));
+        assert_eq!(hits[0].semantic_score, 0.0);
+        assert_eq!(retrieval.fallback_reason, None);
+        assert_eq!(retrieval.fallback_message, None);
+    }
+
+    #[test]
+    fn zero_semantic_request_weights_use_lexical_hits_without_semantic_fallback() {
+        let mut engine = SearchEngine::new(None).expect("search engine");
+        engine
+            .index_nodes(vec![(CoreNodeId(1), "ExtensionHostManager".to_string())])
+            .expect("index nodes");
+        let req = SearchRequest {
+            query: "ExtensionHostManager".to_string(),
+            repo_text: SearchRepoTextMode::Off,
+            limit_per_source: 10,
+            expand_search_plan: false,
+            hybrid_weights: None,
+            hybrid_limits: None,
+        };
+        let storage_retrieval = RetrievalStateDto {
+            mode: RetrievalModeDto::Hybrid,
+            hybrid_configured: true,
+            semantic_ready: true,
+            semantic_mode: SemanticModeDto::Enabled,
+            semantic_doc_count: 170_000,
+            embedding_model: Some("test-model".to_string()),
+            current_embedding: None,
+            stored_embedding: None,
+            fallback_reason: None,
+            fallback_message: None,
+        };
+        let graph_boosts = HashMap::new();
+        let mut retrieval = storage_retrieval.clone();
+        let request_weights = AgentHybridWeightsDto {
+            lexical: Some(1.0),
+            semantic: Some(0.0),
+            graph: Some(0.0),
+        };
+
+        let hits = hybrid_hits_for_retrieval_state(
+            &mut engine,
+            HybridHitsContext {
+                req: &req,
+                graph_boosts: &graph_boosts,
+                requested_max_results: 10,
+                request_weights: Some(request_weights),
+                prefer_primary_sources: true,
+                storage_retrieval: &storage_retrieval,
+                use_exact_symbol_lexical_fast_path: false,
+            },
+            &mut retrieval,
+        );
+
+        assert_eq!(hits.first().map(|hit| hit.node_id), Some(CoreNodeId(1)));
+        assert_eq!(hits[0].semantic_score, 0.0);
+        assert_eq!(retrieval.fallback_reason, None);
+        assert_eq!(retrieval.fallback_message, None);
+    }
+
+    #[test]
+    fn exact_symbol_merged_lexical_hits_include_terminal_symbol_matches() {
+        let mut engine = SearchEngine::new(None).expect("search engine");
+        engine
+            .index_nodes(vec![
+                (CoreNodeId(1), "exec_events::ThreadEvent".to_string()),
+                (CoreNodeId(2), "ThreadEvent".to_string()),
+                (
+                    CoreNodeId(3),
+                    "crate::exec_events::ThreadEvent (import)".to_string(),
+                ),
+            ])
+            .expect("index nodes");
+
+        let hits = exact_symbol_merged_lexical_hybrid_hits(
+            &engine,
+            "exec_events::ThreadEvent",
+            &HashMap::new(),
+        );
+        let ids = hits.iter().map(|hit| hit.node_id).collect::<Vec<_>>();
+
+        assert!(
+            ids.contains(&CoreNodeId(2)),
+            "terminal exact symbol should be admitted beside qualified aliases: {ids:?}"
+        );
+        assert_eq!(
+            ids.iter().filter(|id| **id == CoreNodeId(2)).count(),
+            1,
+            "exact-symbol merging should preserve node uniqueness: {ids:?}"
+        );
+    }
+
+    #[test]
     fn full_index_rebuilds_semantic_docs_when_source_text_changes() {
         let _env = hybrid_test_env();
         let workspace = tempdir().expect("workspace dir");
@@ -10992,7 +13979,8 @@ fn build_llm_symbol_doc_text() -> String {
             state
                 .node_names
                 .insert(CoreNodeId(999), "stale_symbol".to_string());
-            state.search_engine = Some(SearchEngine::new(None).expect("search engine"));
+            let engine = SearchEngine::new(None).expect("search engine");
+            publish_search_engine(&mut state, engine);
         }
 
         let error = controller
@@ -11046,7 +14034,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn search_lazily_initializes_search_state_after_summary_open() {
+    fn search_after_summary_open_stays_sidecar_primary_without_runtime_refresh() {
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
         let controller = AppController::new();
@@ -11058,7 +14046,7 @@ fn build_llm_symbol_doc_text() -> String {
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("index without runtime refresh");
 
-        let hits = controller
+        let error = controller
             .search(SearchRequest {
                 query: "check_winner".to_string(),
                 repo_text: SearchRepoTextMode::Off,
@@ -11067,15 +14055,12 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_weights: None,
                 hybrid_limits: None,
             })
-            .expect("lazy search should succeed");
+            .expect_err("search should require full sidecars after summary open");
 
-        assert!(
-            !hits.is_empty(),
-            "expected search to return indexed symbols"
-        );
+        assert_mandatory_sidecar_unavailable(&error);
         let state = controller.state.lock();
-        assert!(state.search_engine.is_some());
-        assert!(!state.node_names.is_empty());
+        assert!(state.search_engine.is_none());
+        assert!(state.node_names.is_empty());
     }
 
     #[test]
@@ -11457,6 +14442,133 @@ fn build_llm_symbol_doc_text() -> String {
             graph.canonical_layout.is_some(),
             "Expected canonical_layout on trail response"
         );
+    }
+
+    #[test]
+    fn graph_direct_references_returns_filtered_direct_incoming_edges() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("codestory.db");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(10),
+                        kind: NodeKind::FILE,
+                        serialized_name: "src/lib.rs".to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(11),
+                        kind: NodeKind::FILE,
+                        serialized_name: "tests/lib_test.rs".to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(1),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "target".to_string(),
+                        file_node_id: Some(CoreNodeId(10)),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(2),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "prod_caller".to_string(),
+                        file_node_id: Some(CoreNodeId(10)),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(3),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "test_caller".to_string(),
+                        file_node_id: Some(CoreNodeId(11)),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(4),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "uncertain_caller".to_string(),
+                        file_node_id: Some(CoreNodeId(10)),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert nodes");
+            storage
+                .insert_edges_batch(&[
+                    Edge {
+                        id: EdgeId(21),
+                        source: CoreNodeId(2),
+                        target: CoreNodeId(1),
+                        kind: EdgeKind::CALL,
+                        file_node_id: Some(CoreNodeId(10)),
+                        certainty: Some(ResolutionCertainty::Certain),
+                        confidence: Some(0.95),
+                        ..Default::default()
+                    },
+                    Edge {
+                        id: EdgeId(22),
+                        source: CoreNodeId(3),
+                        target: CoreNodeId(1),
+                        kind: EdgeKind::CALL,
+                        file_node_id: Some(CoreNodeId(11)),
+                        certainty: Some(ResolutionCertainty::Certain),
+                        confidence: Some(0.95),
+                        ..Default::default()
+                    },
+                    Edge {
+                        id: EdgeId(23),
+                        source: CoreNodeId(4),
+                        target: CoreNodeId(1),
+                        kind: EdgeKind::CALL,
+                        file_node_id: Some(CoreNodeId(10)),
+                        certainty: Some(ResolutionCertainty::Uncertain),
+                        confidence: Some(0.4),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert edges");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: temp.path().to_string_lossy().to_string(),
+            })
+            .expect("open project");
+
+        let graph = controller
+            .graph_direct_references(TrailConfigDto {
+                root_id: codestory_contracts::api::NodeId("1".to_string()),
+                mode: codestory_contracts::api::TrailMode::AllReferencing,
+                target_id: None,
+                depth: 0,
+                direction: codestory_contracts::api::TrailDirection::Incoming,
+                caller_scope: codestory_contracts::api::TrailCallerScope::ProductionOnly,
+                edge_filter: vec![],
+                show_utility_calls: false,
+                hide_speculative: true,
+                story: false,
+                node_filter: vec![],
+                max_nodes: 10,
+                layout_direction: codestory_contracts::api::LayoutDirection::Horizontal,
+            })
+            .expect("load direct references");
+
+        let edge_sources = graph
+            .edges
+            .iter()
+            .map(|edge| edge.source.0.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(edge_sources, vec!["2"]);
+        let node_ids = graph
+            .nodes
+            .iter()
+            .map(|node| node.id.0.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(node_ids, vec!["1", "2"]);
+        assert!(graph.canonical_layout.is_none());
     }
 
     #[test]

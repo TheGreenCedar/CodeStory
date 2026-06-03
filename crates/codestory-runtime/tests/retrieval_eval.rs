@@ -9,6 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 use tempfile::{TempDir, tempdir};
 
 static HYBRID_EVAL_ENV_LOCK: Mutex<()> = Mutex::new(());
+const FULL_RETRIEVAL_EVAL_TESTS_ENV: &str = "CODESTORY_RETRIEVAL_EVAL_FULL_TESTS";
 
 struct EnvGuard {
     key: &'static str,
@@ -51,18 +52,25 @@ fn restore_env_value(key: &'static str, previous: Option<&str>) {
     }
 }
 
-fn hybrid_eval_env() -> HybridEvalEnv {
+fn hybrid_eval_env(hash_embeddings: bool) -> HybridEvalEnv {
     let lock = HYBRID_EVAL_ENV_LOCK
         .lock()
-        .expect("hybrid eval env lock poisoned");
-    let guards = vec![
-        EnvGuard::set("CODESTORY_HYBRID_RETRIEVAL_ENABLED", "true"),
-        EnvGuard::set("CODESTORY_EMBED_RUNTIME_MODE", "hash"),
-    ];
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guards = vec![EnvGuard::set("CODESTORY_HYBRID_RETRIEVAL_ENABLED", "true")];
+    if hash_embeddings {
+        guards.push(EnvGuard::set("CODESTORY_EMBED_RUNTIME_MODE", "hash"));
+    }
     HybridEvalEnv {
         guards: Some(guards),
         _lock: lock,
     }
+}
+
+fn env_flag(key: &str) -> bool {
+    matches!(
+        std::env::var(key).ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
 }
 
 fn write_retrieval_fixture(root: &Path) {
@@ -107,10 +115,68 @@ fn indexed_controller() -> (AppController, TempDir, TempDir) {
     (controller, workspace, storage)
 }
 
+fn full_retrieval_eval_fixture() -> (HybridEvalEnv, AppController, TempDir, TempDir) {
+    if !env_flag(FULL_RETRIEVAL_EVAL_TESTS_ENV) {
+        panic!(
+            "blocked full-retrieval eval contract: set {FULL_RETRIEVAL_EVAL_TESTS_ENV}=1 after preparing real sidecars"
+        );
+    }
+    let env = hybrid_eval_env(false);
+    let (controller, workspace, storage) = indexed_controller();
+    codestory_retrieval::finalize_index(workspace.path(), &storage.path().join("codestory.db"))
+        .expect("finalize sidecar retrieval index");
+    let status = codestory_retrieval::strict_sidecar_status(
+        workspace.path(),
+        Some(&storage.path().join("codestory.db")),
+    )
+    .expect("strict sidecar status after retrieval index");
+    assert_eq!(
+        status.retrieval_mode, "full",
+        "full-retrieval eval fixture must reach retrieval_mode=full"
+    );
+    (env, controller, workspace, storage)
+}
+
 #[test]
-fn retrieval_eval_exact_symbol_queries_prefer_exact_symbol_hits() {
-    let _env = hybrid_eval_env();
+fn retrieval_eval_search_fails_closed_without_full_retrieval_sidecars() {
+    let _env = hybrid_eval_env(true);
     let (controller, _workspace, _storage) = indexed_controller();
+
+    let error = controller
+        .search_hybrid(
+            SearchRequest {
+                query: "exact_symbol_anchor".to_string(),
+                repo_text: codestory_contracts::api::SearchRepoTextMode::Off,
+                limit_per_source: 5,
+                expand_search_plan: false,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            },
+            None,
+            Some(5),
+            None,
+        )
+        .expect_err("plain indexing must not satisfy full sidecar retrieval search");
+
+    assert_eq!(error.code, "invalid_argument");
+    assert!(
+        error
+            .message
+            .contains("sidecar retrieval primary is unavailable or degraded"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("expected mode=full"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+#[ignore = "live full-sidecar success contract; set CODESTORY_RETRIEVAL_EVAL_FULL_TESTS=1 after preparing real sidecars"]
+fn retrieval_eval_exact_symbol_queries_prefer_exact_symbol_hits() {
+    let (_env, controller, _workspace, _storage) = full_retrieval_eval_fixture();
 
     let hits = controller
         .search_hybrid(
@@ -134,9 +200,35 @@ fn retrieval_eval_exact_symbol_queries_prefer_exact_symbol_hits() {
 }
 
 #[test]
+#[ignore = "live full-sidecar success contract; set CODESTORY_RETRIEVAL_EVAL_FULL_TESTS=1 after preparing real sidecars"]
+fn retrieval_eval_embedded_exact_symbol_terms_prefer_exact_symbol_hits() {
+    let (_env, controller, _workspace, _storage) = full_retrieval_eval_fixture();
+
+    let hits = controller
+        .search_hybrid(
+            SearchRequest {
+                query: "compressed grounding summary exact_symbol_anchor".to_string(),
+                repo_text: codestory_contracts::api::SearchRepoTextMode::Off,
+                limit_per_source: 5,
+                expand_search_plan: false,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            },
+            None,
+            Some(5),
+            None,
+        )
+        .expect("search embedded exact symbol");
+
+    let top = hits.first().expect("top hit");
+    assert_eq!(top.display_name, "exact_symbol_anchor");
+    assert!(top.resolvable);
+}
+
+#[test]
+#[ignore = "live full-sidecar success contract; set CODESTORY_RETRIEVAL_EVAL_FULL_TESTS=1 after preparing real sidecars"]
 fn retrieval_eval_natural_language_queries_hit_semantic_symbol_docs() {
-    let _env = hybrid_eval_env();
-    let (controller, _workspace, _storage) = indexed_controller();
+    let (_env, controller, _workspace, _storage) = full_retrieval_eval_fixture();
 
     let hits = controller
         .search_hybrid(
@@ -159,9 +251,9 @@ fn retrieval_eval_natural_language_queries_hit_semantic_symbol_docs() {
 }
 
 #[test]
+#[ignore = "live full-sidecar success contract; set CODESTORY_RETRIEVAL_EVAL_FULL_TESTS=1 after preparing real sidecars"]
 fn retrieval_eval_grounding_snapshot_reports_hybrid_state() {
-    let _env = hybrid_eval_env();
-    let (controller, _workspace, _storage) = indexed_controller();
+    let (_env, controller, _workspace, _storage) = full_retrieval_eval_fixture();
 
     let snapshot = controller
         .grounding_snapshot(GroundingBudgetDto::Balanced)
@@ -180,9 +272,9 @@ fn retrieval_eval_grounding_snapshot_reports_hybrid_state() {
 }
 
 #[test]
+#[ignore = "live full-sidecar success contract; set CODESTORY_RETRIEVAL_EVAL_FULL_TESTS=1 after preparing real sidecars"]
 fn retrieval_eval_trail_context_keeps_grounded_neighbors() {
-    let _env = hybrid_eval_env();
-    let (controller, _workspace, _storage) = indexed_controller();
+    let (_env, controller, _workspace, _storage) = full_retrieval_eval_fixture();
     let focus = controller
         .search_hybrid(
             SearchRequest {

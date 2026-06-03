@@ -1,7 +1,7 @@
 use codestory_contracts::api::{
     AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalStepDto,
     AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, AgentRetrievalSummaryFieldDto,
-    AgentRetrievalTraceDto,
+    AgentRetrievalTraceDto, RetrievalShadowDto,
 };
 use std::time::Instant;
 
@@ -10,6 +10,7 @@ pub(crate) struct TraceRecorder {
     steps: Vec<AgentRetrievalStepDto>,
     annotations: Vec<String>,
     sla_target_ms: Option<u32>,
+    retrieval_shadow: Option<RetrievalShadowDto>,
 }
 
 pub(crate) struct StepToken {
@@ -35,7 +36,12 @@ impl TraceRecorder {
             steps: Vec::new(),
             annotations: Vec::new(),
             sla_target_ms,
+            retrieval_shadow: None,
         }
+    }
+
+    pub(crate) fn set_retrieval_shadow(&mut self, shadow: RetrievalShadowDto) {
+        self.retrieval_shadow = Some(shadow);
     }
 
     pub(crate) fn start_step(
@@ -118,8 +124,11 @@ impl TraceRecorder {
             total_latency_ms,
             sla_target_ms: self.sla_target_ms,
             sla_missed,
+            semantic_fallback_count: 0,
+            semantic_fallbacks: Vec::new(),
             annotations: self.annotations,
             steps: self.steps,
+            retrieval_shadow: self.retrieval_shadow,
         }
     }
 
@@ -130,7 +139,11 @@ impl TraceRecorder {
         output: Vec<AgentRetrievalSummaryFieldDto>,
         message: Option<String>,
     ) {
-        let duration_ms = token.started_at.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        let duration_ms = if status == AgentRetrievalStepStatusDto::Skipped {
+            0
+        } else {
+            token.started_at.elapsed().as_millis().min(u32::MAX as u128) as u32
+        };
         self.steps.push(AgentRetrievalStepDto {
             kind: token.kind,
             status,

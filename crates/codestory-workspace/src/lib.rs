@@ -18,6 +18,22 @@ pub enum Language {
     Rust,
     JavaScript,
     TypeScript,
+    Go,
+    Ruby,
+    Php,
+    CSharp,
+    Kotlin,
+    Swift,
+    Dart,
+    Lua,
+    Sql,
+    Html,
+    Css,
+    Bash,
+    PowerShell,
+    Svelte,
+    Vue,
+    Astro,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -598,15 +614,34 @@ fn matches_source_group_language(path: &Path, language: &Language) -> bool {
         (&Language::Rust, Some("rs"))
             | (&Language::Python, Some("py" | "pyi"))
             | (&Language::Java, Some("java"))
-            | (&Language::JavaScript, Some("js" | "jsx" | "mjs" | "cjs"))
+            | (
+                &Language::JavaScript,
+                Some("js" | "jsx" | "mjs" | "cjs" | "svelte" | "vue" | "astro")
+            )
             | (
                 &Language::TypeScript,
-                Some("ts" | "tsx" | "mts" | "cts" | "svelte")
+                Some("ts" | "tsx" | "mts" | "cts" | "svelte" | "vue" | "astro")
             )
             | (
                 &Language::Cxx,
                 Some("c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx")
             )
+            | (&Language::Go, Some("go"))
+            | (&Language::Ruby, Some("rb"))
+            | (&Language::Php, Some("php"))
+            | (&Language::CSharp, Some("cs" | "cshtml"))
+            | (&Language::Kotlin, Some("kt" | "kts"))
+            | (&Language::Swift, Some("swift"))
+            | (&Language::Dart, Some("dart"))
+            | (&Language::Lua, Some("lua"))
+            | (&Language::Sql, Some("sql"))
+            | (&Language::Html, Some("html" | "htm"))
+            | (&Language::Css, Some("css" | "scss" | "sass" | "less"))
+            | (&Language::Bash, Some("sh" | "bash"))
+            | (&Language::PowerShell, Some("ps1" | "psm1"))
+            | (&Language::Svelte, Some("svelte"))
+            | (&Language::Vue, Some("vue"))
+            | (&Language::Astro, Some("astro"))
     )
 }
 
