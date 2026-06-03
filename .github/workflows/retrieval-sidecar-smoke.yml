@@ -1,0 +1,100 @@
+# Windows retrieval manifest-missing shape smoke.
+# Contract: docs/contributors/retrieval-sidecar-smoke-ci.md
+
+name: retrieval-sidecar-smoke
+
+on:
+  pull_request:
+    paths:
+      - crates/codestory-retrieval/**
+      - crates/codestory-contracts/**
+      - crates/codestory-store/Cargo.toml
+      - crates/codestory-store/src/**
+      - crates/codestory-cli/src/retrieval.rs
+      - crates/codestory-cli/src/main.rs
+      - crates/codestory-cli/src/args.rs
+      - crates/codestory-cli/src/runtime.rs
+      - crates/codestory-cli/src/stdio_*.rs
+      - crates/codestory-cli/tests/search_json_output.rs
+      - crates/codestory-cli/tests/stdio_protocol_contracts.rs
+      - crates/codestory-runtime/src/**
+      - crates/codestory-indexer/Cargo.toml
+      - crates/codestory-indexer/src/lib.rs
+      - crates/codestory-runtime/tests/retrieval_generalization_guard.rs
+      - scripts/lint-retrieval-generalization.mjs
+      - scripts/**retrieval**
+      - docs/ops/retrieval-sidecars.md
+      - docs/contributors/retrieval-sidecar-smoke-ci.md
+      - docs/architecture/retrieval-*.md
+      - docs/testing/retrieval-architecture.md
+      - docker/retrieval-compose.yml
+      - .github/workflows/retrieval-sidecar-smoke.yml
+  workflow_dispatch:
+
+jobs:
+  windows-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Generalization lint (production paths)
+        run: node scripts/lint-retrieval-generalization.mjs
+
+      - name: Build release CLI
+        run: cargo build --release -p codestory-cli
+
+      - name: Retrieval manifest-missing shape check
+        shell: pwsh
+        run: |
+          $cli = ".\target\release\codestory-cli.exe"
+          & $cli retrieval bootstrap --project . --skip-compose --wait-secs 0
+          if ($LASTEXITCODE -ne 0) {
+            throw "retrieval bootstrap failed with exit code $LASTEXITCODE"
+          }
+
+          $statusJson = & $cli retrieval status --project .
+          if ($LASTEXITCODE -ne 0) {
+            throw "retrieval status failed with exit code $LASTEXITCODE"
+          }
+
+          $statusText = ($statusJson | Out-String).Trim()
+          Write-Host $statusText
+
+          $status = $statusText | ConvertFrom-Json
+          $actualMode = if ($status.retrieval_mode) { $status.retrieval_mode } else { "<missing>" }
+          $degradedReason = if ($status.degraded_reason) { $status.degraded_reason } else { "<none>" }
+
+          if ($degradedReason -ne "retrieval_manifest_missing") {
+            Write-Host "retrieval status JSON:"
+            Write-Host $statusText
+            throw "retrieval-sidecar-smoke expected manifest-missing shape before indexing; actual mode='$actualMode'; degraded reason='$degradedReason'"
+          }
+
+          if ($actualMode -eq "full") {
+            Write-Host "retrieval status JSON:"
+            Write-Host $statusText
+            throw "manifest-missing shape check must not report full mode before retrieval index"
+          }
+
+      - name: Runtime library contract tests
+        run: cargo test -p codestory-runtime --lib
+
+      - name: Retrieval generalization guard (Rust)
+        run: cargo test -p codestory-runtime --test retrieval_generalization_guard
+
+      - name: Stdio protocol contract tests
+        run: cargo test -p codestory-cli --test stdio_protocol_contracts
+
+      - name: CLI search JSON fail-closed contract tests
+        run: cargo test -p codestory-cli --test search_json_output
+
+      - name: Retrieval crate unit tests
+        run: cargo test -p codestory-retrieval

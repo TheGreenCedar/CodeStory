@@ -26,7 +26,7 @@ Before proposing an optimization, record:
 | --- | --- |
 | Command | Exact command line, including `--project`, `--refresh`, `--format`, and relevant environment variables. |
 | Commit | Current commit or working-tree label. If the tree is dirty, say so. |
-| Cache state | Cold cache, warm cache, incremental refresh, lexical-only, hash semantic, managed ONNX, or external embedding backend. |
+| Cache state | Cold cache, warm cache, incremental refresh, full sidecar, lexical-only diagnostic, hash semantic diagnostic, ONNX diagnostic, or external embedding backend. |
 | Sample size | Number of runs and whether the first run was discarded. |
 | Headline metric | Index seconds, graph phase seconds, semantic phase seconds, per-command seconds, p95/max latency, or benchmark score. |
 | Dominant cost | Measured cost center: graph phase, semantic phase, store reads/writes, repo-text scan, source reads, graph traversal, search scoring, CLI rendering, lock contention, or memory pressure. |
@@ -41,6 +41,9 @@ cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture s
 cargo test -p codestory-runtime --test retrieval_eval
 cargo check -p codestory-bench --benches
 ```
+
+`retrieval_eval` needs `CODESTORY_RETRIEVAL_EVAL_FULL_TESTS=1` for full sidecar quality assertions;
+without it, the suite checks that non-full retrieval fails closed.
 
 Use Criterion benches from `crates/codestory-bench` only when the measured hot
 path is narrower than the repo-scale e2e test can explain.

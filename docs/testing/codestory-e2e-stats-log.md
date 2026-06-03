@@ -35,6 +35,23 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-05-24 | 7c891af+wt | pass, review remediation e2e | 11.10 | 0.29 | 1.29 | 0.86 | 0.25 | 0.23 | 56,272 | 47,628 | 149 | 0 | 7,501 | true |
 | 2026-05-24 | 663c257+wt | pass, review findings remediation | 12.30 | 0.24 | 1.04 | 0.65 | 0.24 | 0.21 | 56,362 | 47,659 | 149 | 0 | 7,530 | true |
 | 2026-05-24 | 3c62f1e+wt | pass, remove spec docs publish gate | 11.39 | 0.23 | 1.06 | 0.66 | 0.21 | 0.19 | 56,531 | 47,806 | 149 | 0 | 7,566 | true |
+| 2026-05-25 | cba6cfe+wt | pass, packet planner local-real A/B checkpoint | 11.61 | 0.21 | 1.06 | 0.63 | 0.19 | 0.17 | 58,659 | 49,707 | 150 | 0 | 7,827 | true |
+| 2026-05-25 | 49cd906+wt | pass, vscode packet holdout checkpoint | 11.88 | 0.28 | 1.30 | 0.77 | 0.21 | 0.18 | 58,726 | 49,773 | 150 | 0 | 7,834 | true |
+| 2026-05-25 | 73fc42a+wt | pass, vscode cache freshness fix; drill manifest skipped | 11.00 | 0.21 | 1.08 | 0.68 | 0.19 | 0.19 | 58,782 | 49,824 | 150 | 0 | 7,847 | true |
+| 2026-05-25 | 5aad799+wt | pass, projection cleanup FK fix; drill manifest skipped | 11.59 | 0.22 | 1.03 | 0.69 | 0.19 | 0.18 | 58,799 | 49,843 | 150 | 0 | 7,851 | true |
+| 2026-05-25 | a6416ad+wt | pass, rust receiver chain drill bridge pass | 14.81 | 0.25 | 0.98 | 0.47 | 0.23 | 0.20 | 59,456 | 50,381 | 150 | 0 | 7,915 | true |
+| 2026-05-25 | 765fe4b+wt | pass, owner-alias drill evidence and jobs coverage | 14.79 | 0.25 | 0.96 | 0.44 | 0.33 | 0.21 | 59,531 | 50,444 | 150 | 0 | 7,927 | true |
+| 2026-05-25 | bce041a+wt | fail, drill search_plan missing before seed-anchor repair; targeted seed-anchor search repro passed after repair | 15.72 | 0.24 | 0.95 | 0.44 | 0.21 | 0.22 | 59,917 | 50,781 | 150 | 0 | 8,008 | true |
+| 2026-06-01 | 7c4143f6+wt | pass, mandatory sidecar real-embedding e2e plus real drill manifest | 675.82 | 0.38 | 1.43 | 0.63 | 0.35 | 0.43 | 77,912 | 65,529 | 229 | 0 | 10,668 | true |
+| 2026-06-01 | 2deff76e+wt | fail, release e2e stats ok; real drill manifest env missing | 685.56 | 0.34 | 1.29 | 0.54 | 0.32 | 0.31 | 78,795 | 66,280 | 229 | 0 | 10,771 | true |
+| 2026-06-02 | 72d4ea4c+wt | pass, review remediation sidecar e2e; retrieval index 16.34s; drill manifest skipped | 746.30 | 0.31 | 1.14 | 0.46 | 0.24 | 0.22 | 78,247 | 66,075 | 217 | 0 | 10,787 | true |
+| 2026-06-02 | 8f625b5e+wt | fail, release e2e stats ok; real drill manifest env missing; retrieval_index_seconds 18.15 | 1190.65 | 0.48 | 1.38 | 0.53 | 0.28 | 0.32 | 78,212 | 66,040 | 217 | 0 | 10,814 | true |
+| 2026-06-02 | de6436a3+wt | pass, round 3 sidecar contract e2e; optional real drill manifest skipped; retrieval_index_seconds 18.13 | 929.37 | 0.31 | 1.48 | 0.52 | 0.30 | 0.25 | 78,159 | 65,970 | 217 | 0 | 10,806 | true |
+| 2026-06-02 | dbba955b+wt | pass, round 4 sidecar contract e2e; optional real drill manifest skipped; retrieval_index_seconds 16.02 | 874.56 | 0.29 | 1.15 | 0.46 | 0.26 | 0.24 | 78,203 | 66,005 | 217 | 0 | 10,814 | true |
+| 2026-06-02 | 3c3012af+wt | pass, round 6 sidecar cache/status e2e; optional real drill manifest skipped; retrieval_index_seconds 20.58; retrieval_mode full | 890.52 | 0.34 | 1.91 | 0.63 | 0.31 | 0.29 | 78,376 | 66,156 | 217 | 0 | 10,836 | true |
+| 2026-06-02 | 4c616548+wt | blocked, round 7 release e2e index phase did not complete; stopped child after 1075.05s with no stdout/stderr; failed command `index --refresh full --format json`; retrieval_index_seconds n/a; retrieval_mode n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
+| 2026-06-02 | 25751a39+wt | fail, round 8 release e2e stats ok; real drill manifest env missing fail-closed; retrieval_index_seconds 17.73; retrieval_status_seconds 0.46; retrieval_mode full | 720.80 | 0.31 | 1.54 | 0.52 | 0.26 | 0.26 | 78,478 | 66,235 | 217 | 0 | 10,839 | true |
+| 2026-06-02 | a23770f+wt | pass, round 9 stats-only release e2e; real drill intentionally skipped with CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1; not real-drill release evidence; retrieval_index_seconds 18.35; retrieval_status_seconds 0.56; retrieval_mode full | 711.31 | 0.32 | 1.77 | 0.59 | 0.32 | 0.27 | 78,582 | 66,332 | 217 | 0 | 10,847 | true |
 
 ## Phase Metrics
 
@@ -64,3 +81,21 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-05-24 | 7db7fb1+wt | post-rebase benchmark/packet integration E2E | 18.04 | 5.38 | 1.69 | 0 | 7,466 | 0 |
 | 2026-05-24 | 7c891af+wt | review remediation E2E | 11.10 | 5.12 | 0.79 | 0 | 7,501 | 0 |
 | 2026-05-24 | 3c62f1e+wt | remove spec docs publish gate E2E | 11.39 | 5.14 | 0.70 | 0 | 7,566 | 0 |
+| 2026-05-25 | cba6cfe+wt | packet planner local-real A/B checkpoint E2E | 11.61 | 4.99 | 0.80 | 0 | 7,827 | 0 |
+| 2026-05-25 | 49cd906+wt | vscode packet holdout checkpoint E2E | 11.88 | 5.27 | 0.81 | 0 | 7,834 | 0 |
+| 2026-05-25 | 73fc42a+wt | vscode cache freshness fix E2E | 11.00 | 5.20 | 0.94 | 0 | 7,847 | 0 |
+| 2026-05-25 | 5aad799+wt | projection cleanup FK fix E2E | 11.59 | 5.26 | 1.18 | 0 | 7,851 | 0 |
+| 2026-05-25 | a6416ad+wt | rust receiver chain drill bridge E2E | 14.81 | 7.47 | 1.61 | 0 | 7,915 | 0 |
+| 2026-05-25 | 765fe4b+wt | owner-alias drill evidence and jobs coverage E2E | 14.79 | 7.79 | 0.93 | 0 | 7,927 | 0 |
+| 2026-05-25 | bce041a+wt | semantic role-awareness E2E release half; drill half failed before seed-anchor repair | 15.72 | 7.94 | 0.98 | 0 | 8,008 | 0 |
+| 2026-06-01 | 7c4143f6+wt | mandatory sidecar real-embedding e2e with real drill manifest | 675.82 | 9.19 | 643.68 | 0 | 10,668 | 0 |
+| 2026-06-01 | 2deff76e+wt | segment 70 stage probes release e2e; drill manifest env missing | 685.56 | 8.61 | 654.37 | 0 | 10,771 | 0 |
+| 2026-06-02 | 72d4ea4c+wt | review remediation sidecar e2e; retrieval index 16.34s; drill manifest skipped | 746.30 | 10.40 | 727.80 | 0 | 10,787 | 0 |
+| 2026-06-02 | 8f625b5e+wt | review remediation stats pass; drill failed CODESTORY_REAL_REPO_DRILL_CASES missing; retrieval_index_seconds 18.15 | 1190.65 | 9.77 | 1172.38 | 0 | 10,814 | 0 |
+| 2026-06-02 | de6436a3+wt | round 3 sidecar contract e2e; optional real drill manifest skipped; retrieval_index_seconds 18.13 | 929.37 | 11.74 | 906.29 | 0 | 10,806 | 0 |
+| 2026-06-02 | dbba955b+wt | round 4 sidecar contract e2e; optional real drill manifest skipped; retrieval_index_seconds 16.02 | 874.56 | 11.09 | 854.21 | 0 | 10,814 | 0 |
+| 2026-06-02 | b582a9bb+wt | round 5 sidecar contract e2e; optional real drill manifest skipped; retrieval_index_seconds 19.75; retrieval_mode full | 917.01 | 10.30 | 897.84 | 0 | 10,826 | 0 |
+| 2026-06-02 | 3c3012af+wt | round 6 sidecar cache/status e2e; optional real drill manifest skipped; retrieval_index_seconds 20.58; retrieval_mode full | 890.52 | 12.95 | 866.79 | 0 | 10,836 | 0 |
+| 2026-06-02 | 4c616548+wt | round 7 blocked before phase metrics; release index child stopped after 1075.05s with no stdout/stderr; retrieval_index_seconds n/a; retrieval_mode n/a | n/a | n/a | n/a | n/a | n/a | n/a |
+| 2026-06-02 | 25751a39+wt | round 8 release e2e stats ok; real drill manifest env missing fail-closed; retrieval_index_seconds 17.73; retrieval_status_seconds 0.46; retrieval_mode full | 720.80 | 10.27 | 702.18 | 0 | 10,839 | 0 |
+| 2026-06-02 | a23770f+wt | round 9 stats-only release e2e; real drill intentionally skipped with CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1; not real-drill release evidence; retrieval_index_seconds 18.35; retrieval_mode full | 711.31 | 11.08 | 691.07 | 0 | 10,847 | 0 |

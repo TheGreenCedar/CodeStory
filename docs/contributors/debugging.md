@@ -83,20 +83,25 @@ Check:
 - whether the symbol exists in store-backed search docs
 - whether runtime rebuilt its search state after indexing
 - what retrieval mode `index`, `ground`, or `search` reported for the current run
-- whether semantic retrieval is disabled, ONNX model/tokenizer paths are missing, a legacy llama.cpp endpoint is unreachable, or semantic docs are missing
+- whether semantic retrieval is disabled, ONNX model/tokenizer paths are missing, sidecars are not full, or semantic docs are missing
 - whether `CODESTORY_HYBRID_RETRIEVAL_ENABLED`, `CODESTORY_SEMANTIC_DOC_SCOPE`, `CODESTORY_EMBED_RUNTIME_MODE`, `CODESTORY_EMBED_BACKEND`, or the `CODESTORY_EMBED_ONNX_*` paths changed between runs
 - whether graph-based boosts are overwhelming lexical matches
 
 Recovery order:
 
 1. Confirm whether the miss is in `indexed_symbol_hits`, `repo_text_hits`, or both.
-2. Confirm the reported retrieval mode and fallback reason before touching search ranking code.
-3. If `doctor` reports `missing_managed_assets`, run `codestory-cli setup embeddings --project .` before reindexing. Managed setup installs ONNX assets and should not start a server.
-4. For lightweight local-dev semantic checks, set `CODESTORY_EMBED_RUNTIME_MODE=hash`.
-5. For external legacy real local model assets, set `CODESTORY_EMBED_BACKEND=llamacpp`, start `llama-server --embedding`, and set `CODESTORY_EMBED_LLAMACPP_URL` if it is not on the default endpoint.
-6. If the current machine should stay lexical only, set `CODESTORY_HYBRID_RETRIEVAL_ENABLED=false` and verify the fallback messaging instead of treating it as a runtime regression.
-7. Rebuild once with `index --refresh full`.
-8. If semantic retrieval is still the only failing part, inspect the reported fallback reason before touching lexical ranking or CLI rendering.
+2. Confirm the reported retrieval mode and degraded-state reason before touching search ranking code.
+3. For product sidecar evidence, run `codestory-cli retrieval bootstrap --project .`, set
+   `CODESTORY_EMBED_BACKEND=llamacpp`, and point `CODESTORY_EMBED_LLAMACPP_URL` at the local
+   bge-base-en-v1.5 llama.cpp `/v1/embeddings` endpoint before reindexing.
+4. Rebuild once with `codestory-cli index --project . --refresh full`, then
+   `codestory-cli retrieval index --project . --refresh full`.
+5. Require `codestory-cli retrieval status --project . --format json` to report
+   `retrieval_mode: "full"` before trusting packet/search evidence.
+6. If `doctor` reports `missing_managed_assets`, use `codestory-cli setup embeddings --project .`
+   only for managed ONNX/local semantic diagnostics. Managed setup installs ONNX assets and should
+   not start a server or create the product retrieval manifest.
+7. If semantic retrieval is still the only failing part, inspect the reported degraded-state reason before touching lexical ranking or CLI rendering.
 
 ## If Cold Indexing Is Slow
 
@@ -121,16 +126,19 @@ Check:
 - whether `CODESTORY_SEMANTIC_DOC_SCOPE=all` is forcing the broad all-symbol semantic set
 - whether `CODESTORY_SEMANTIC_DOC_ALIAS_MODE` was changed from the profiled default of `alias_variant`
 - whether `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` was changed from the profiled default of `128`
-- whether managed ONNX embeddings are installed according to `doctor`
-- whether `CODESTORY_EMBED_ONNX_PROVIDER` is `directml`, `cpu`, or `auto`, whether managed setup is using the pooled ONNX graph, and whether `CODESTORY_EMBED_ONNX_BATCH_TOKENS` is too large for the active output tensor shape
-- whether a legacy `CODESTORY_EMBED_BACKEND=llamacpp` comparison is pointing at a real `llama-server --embedding` endpoint before trusting GGUF speed claims
+- whether mandatory sidecars report `retrieval_mode=full` according to `doctor`
+  and `retrieval status`
+- whether `CODESTORY_EMBED_BACKEND=llamacpp` and the local
+  `CODESTORY_EMBED_LLAMACPP_URL` endpoint match the manifest embedding backend
+- whether an ONNX, hash, or other diagnostic comparison is clearly labeled and
+  excluded from agent-facing sidecar evidence
 
 Recovery order:
 
 1. Run one measured cold E2E and append the headline numbers to `docs/testing/codestory-e2e-stats-log.md`.
 2. Compare semantic embedded/reused counts before changing graph code.
 3. For reuse regressions, inspect semantic doc version, generated text hash, embedding model, and embedding dimension.
-4. For cold-only regressions, inspect durable semantic scope, length-bucket ordering, embedding batch size, ONNX provider, and ORT CPU thread settings.
+4. For cold-only regressions, inspect durable semantic scope, length-bucket ordering, embedding batch size, sidecar health, and local embedding endpoint latency.
 5. For backend experiments, first verify the runtime is using the backend under test, then rerun the speed and quality comparisons documented in `docs/testing/embedding-backend-benchmarks.md`.
 
 ## If Grounding Is Wrong
