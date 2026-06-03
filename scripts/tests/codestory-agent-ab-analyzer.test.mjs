@@ -13,12 +13,19 @@ import {
   isPathInside,
   loadTaskForResult,
   loadTasks,
+  parseArgs as parseBenchmarkArgs,
   parseJsonLines,
+  packetComposition,
+  packetLatencyTelemetry,
   packetFirstCommandForPrompt,
+  packetRuntimePublishableBlockers,
   publicCoreCorpusAudit,
   repoProvenanceBlockers,
   resolveCodeStoryCli,
   scoreQuality,
+  summarizePacketRuntimeRuns,
+  buildQualityDebugPayload,
+  qualityFailureReasons,
   taskSnapshotForResult,
 } from "../codestory-agent-ab-benchmark.mjs";
 
@@ -26,6 +33,94 @@ const RUNTIME_SERVICE_FILE = "crates/codestory-runtime/src/services.rs";
 const RUN_INDEX_SYMBOL = "IndexService::run_indexing_blocking";
 const RUNTIME_REFRESH_CLAIM =
   "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases.";
+
+test("parses packet-runtime benchmark run id", () => {
+  const opts = parseBenchmarkArgs([
+    "--packet-runtime",
+    "--task-suite",
+    "local-real",
+    "--benchmark-run-id",
+    "segment 43/v2",
+  ]);
+
+  assert.equal(opts.packetRuntime, true);
+  assert.equal(opts.benchmarkRunId, "segment-43-v2");
+  assert.equal(opts.prepareCodestoryCache, true);
+  assert.throws(
+    () =>
+      parseBenchmarkArgs([
+        "--packet-runtime",
+        "--task-suite",
+        "local-real",
+        "--no-prepare-codestory-cache",
+      ]),
+    /sidecar preparation is mandatory/,
+  );
+});
+
+test("packet latency telemetry preserves retrieval shadow cache diagnostics", () => {
+  const packet = {
+    answer: {
+      freshness: { duration_ms: 12 },
+      retrieval_trace: {
+        total_latency_ms: 40,
+        sla_target_ms: 500,
+        sla_missed: false,
+        steps: [{ kind: "search", status: "success", duration_ms: 25, message: "ok" }],
+      },
+    },
+    benchmark_trace: {
+      retrieval_trace: {
+        retrieval_shadow: {
+          retrieval_mode: "full",
+          retrieval_total_ms: 7,
+          cache_hit: true,
+          stage_timings: [
+            { stage: "stage1_zoekt_lexical", elapsed_ms: 2, cache_hit: false },
+            { stage: "stage2_semantic_vector", elapsed_ms: 1, cache_hit: true },
+          ],
+          candidate_count: 4,
+          resolved_hit_count: 3,
+          unresolved_candidate_count: 1,
+        },
+      },
+    },
+  };
+
+  const telemetry = packetLatencyTelemetry(packet, 80);
+  assert.equal(telemetry.retrieval_shadow.cache_hit, true);
+  assert.equal(telemetry.retrieval_shadow.cache_hit_stage_count, 1);
+  assert.deepEqual(telemetry.retrieval_shadow.cache_hit_stages, ["stage2_semantic_vector"]);
+
+  const summary = summarizePacketRuntimeRuns([
+    {
+      repo: "fixture",
+      task_id: "cache",
+      mode: "warm_stdio_packet",
+      status: "pass",
+      wall_ms: 80,
+      warm_stdio_packet_cache_hit: true,
+      packet_latency: telemetry,
+    },
+  ]);
+  assert.equal(summary[0].warm_stdio_packet_cache_hit_runs, 1);
+  assert.equal(summary[0].retrieval_shadow_cache_hit_runs, 1);
+  assert.equal(summary[0].retrieval_shadow_stage_cache_hit_runs, 1);
+
+  const debug = buildQualityDebugPayload([
+    {
+      repo: "fixture",
+      task_id: "cache",
+      mode: "warm_stdio_packet",
+      status: "pass",
+      warm_stdio_packet_cache_hit: true,
+      packet_latency: telemetry,
+    },
+  ]);
+  assert.equal(debug.rows[0].warm_stdio_packet_cache_hit, true);
+  assert.equal(debug.rows[0].retrieval.cache_hit, true);
+  assert.equal(debug.rows[0].retrieval.cache_hit_stage_count, 1);
+});
 
 function commandEvent(id, type, command, aggregatedOutput = "", exitCode = 0) {
   return {
@@ -203,6 +298,29 @@ test("Windows Codex runner args reject cmd metacharacters", () => {
   );
 });
 
+test("holdout-retrieval suite loads three OSS manifests", async () => {
+  const tasks = await loadTasks({
+    taskSuite: "holdout-retrieval",
+    taskManifest: null,
+    taskIds: null,
+    materializeRepos: true,
+    repoCacheDir: path.join("target", "agent-benchmark", "repos"),
+  });
+
+  assert.equal(tasks.length, 3);
+  assert.deepEqual(
+    tasks.map((task) => task.id).sort(),
+    ["axios-request-dispatch", "redis-server-event-loop", "ripgrep-search-pipeline"],
+  );
+  for (const task of tasks) {
+    assert.equal(task.suite, "holdout-retrieval");
+    assert.equal(task.task_class, "architecture_explanation");
+    assert.ok(task.repo_metadata?.url);
+    assert.ok(task.repo_metadata?.ref);
+    assert.notEqual(task.repo_metadata.ref, "local");
+  }
+});
+
 test("public-core corpus keeps publishable coverage locked", async () => {
   const tasks = await loadTasks({
     taskSuite: "public-core",
@@ -275,6 +393,7 @@ test("analyzes transcript command friction and scores manifest anchors", () => {
     id: "fixture",
     task_class: "architecture_explanation",
     expected_files: ["crates/codestory-cli/src/main.rs"],
+    expected_verification_files: ["crates/codestory-cli/tests/onboarding_contracts.rs"],
     expected_symbols: ["RuntimeContext::ensure_open", "MissingSymbol"],
     expected_claims: ["Full indexing starts"],
     forbidden_claims: ["remote service is required"],
@@ -292,6 +411,10 @@ test("analyzes transcript command friction and scores manifest anchors", () => {
   assert.equal(quality.expected_files.recall, 1);
   assert.equal(quality.expected_symbols.recall, 0.5);
   assert.deepEqual(quality.missed_anchors.symbols, ["MissingSymbol"]);
+  assert.equal(quality.expected_verification_files.recall, 0);
+  assert.deepEqual(quality.missed_anchors.verification_files, [
+    "crates/codestory-cli/tests/onboarding_contracts.rs",
+  ]);
   assert.equal(quality.citation_coverage.recall, 1);
 });
 
@@ -451,6 +574,136 @@ test("quality scoring does not promote transcript-only expected anchors", () => 
   assert.equal(quality.expected_symbols.recall, 0);
 });
 
+test("packet composition separates citations, answer surfaces, and structured-only paths", () => {
+  const composition = packetComposition(
+    {
+      answer: {
+        summary: "The storage flow also mentions src/lib/data/storage/StorageAccessProxy.cpp.",
+        sections: [
+          {
+            title: "Indexing",
+            blocks: [
+              {
+                markdown: "Project::buildIndex creates indexing work.",
+              },
+            ],
+          },
+        ],
+        citations: [
+          {
+            display_name: "Project::buildIndex",
+            file_path: "src/lib/project/Project.cpp",
+            line: 42,
+          },
+        ],
+      },
+      sufficiency: {
+        avoid_opening: ["src/lib/data/storage/PersistentStorage.cpp"],
+        covered_claims: [
+          {
+            claim: "Hidden trace source mentions src/lib_cxx/project/SourceGroupCxxCdb.cpp.",
+          },
+        ],
+      },
+    },
+    {
+      expected_files: [
+        "src/lib/project/Project.cpp",
+        "src/lib/data/storage/PersistentStorage.cpp",
+        "src/lib/data/storage/StorageAccessProxy.cpp",
+        "src/lib_cxx/project/SourceGroupCxxCdb.cpp",
+        "src/lib_java/data/indexer/IndexerJava.cpp",
+      ],
+      expected_verification_files: ["test/lib/project/ProjectTest.cpp"],
+    },
+  );
+
+  assert.equal(composition.expected_file_count, 5);
+  assert.equal(composition.expected_verification_file_count, 1);
+  assert.equal(composition.cited_file_count, 1);
+  assert.equal(composition.citation_backed_file_count, 2);
+  assert.equal(composition.answer_surface_file_count, 3);
+  assert.equal(composition.structured_file_count, 4);
+  assert.equal(composition.citation_recall, 1 / 5);
+  assert.equal(composition.citation_backed_recall, 2 / 5);
+  assert.equal(composition.answer_surface_recall, 3 / 5);
+  assert.equal(composition.structured_file_recall, 4 / 5);
+  assert.ok(Math.abs(composition.composition_score - (1 + 0.9 + 0.25) / 5) < 1e-9);
+  assert.deepEqual(
+    composition.files.map((file) => [file.expected_file, file.packet_boundary]),
+    [
+      ["src/lib/project/Project.cpp", "cited_in_answer"],
+      ["src/lib/data/storage/PersistentStorage.cpp", "listed_in_avoid_opening"],
+      ["src/lib/data/storage/StorageAccessProxy.cpp", "mentioned_in_answer_text"],
+      ["src/lib_cxx/project/SourceGroupCxxCdb.cpp", "present_only_in_structured_json"],
+      ["src/lib_java/data/indexer/IndexerJava.cpp", "absent_from_packet"],
+    ],
+  );
+  assert.deepEqual(
+    composition.verification_files.map((file) => [file.expected_file, file.packet_boundary]),
+    [["test/lib/project/ProjectTest.cpp", "absent_from_packet"]],
+  );
+  assert.equal(composition.verification_summary.structured_file_recall, 0);
+});
+
+const LOCAL_REAL_COMPACT_BUDGET_TASKS = [
+  {
+    repo: "vscode",
+    task_id: "vscode-workbench-extension-host",
+    expected_files: [
+      "src/vs/workbench/browser/workbench.ts",
+      "src/vs/workbench/services/extensions/browser/extensionService.ts",
+      "src/vs/workbench/services/extensions/common/extensionHostManager.ts",
+      "src/vs/workbench/api/common/extHostExtensionService.ts",
+      "src/vs/workbench/api/common/extHostCommands.ts",
+    ],
+  },
+  {
+    repo: "codex",
+    task_id: "codex-exec-json-flow",
+    expected_files: [
+      "codex-rs/cli/src/main.rs",
+      "codex-rs/exec/src/lib.rs",
+      "codex-rs/exec/src/event_processor.rs",
+      "codex-rs/exec/src/event_processor_with_jsonl_output.rs",
+      "codex-rs/exec/src/exec_events.rs",
+    ],
+  },
+  {
+    repo: "sourcetrail",
+    task_id: "sourcetrail-indexing-to-storage",
+    expected_files: [
+      "src/lib/project/Project.cpp",
+      "src/lib_cxx/project/SourceGroupCxxCdb.cpp",
+      "src/lib_cxx/project/SourceGroupCxxCdb.h",
+      "src/lib/data/storage/StorageAccess.h",
+      "src/lib/data/storage/PersistentStorage.cpp",
+    ],
+  },
+];
+
+for (const task of LOCAL_REAL_COMPACT_BUDGET_TASKS) {
+  test(`compact-budget packet composition rewards citation-backed recall for ${task.repo}/${task.task_id}`, () => {
+    const citedPath = task.expected_files[0];
+    const composition = packetComposition(
+      {
+        answer: {
+          summary: `Cited ${citedPath} and mentioned another path only in prose.`,
+          citations: [{ display_name: "Anchor", file_path: citedPath, line: 1 }],
+        },
+        sufficiency: { avoid_opening: [], covered_claims: [] },
+      },
+      { expected_files: task.expected_files },
+    );
+
+    assert.equal(composition.cited_file_count, 1);
+    assert.equal(composition.citation_backed_file_count, 1);
+    assert.equal(composition.answer_text_file_count, 0);
+    assert.equal(composition.citation_backed_recall, composition.citation_recall);
+    assert.ok(composition.composition_score >= composition.citation_recall);
+  });
+}
+
 test("scores forbidden claims with the same fuzzy matcher as expected claims", () => {
   const task = runtimeQualityTask("forbidden-claim-fixture", {
     min_expected_file_recall: 0,
@@ -470,6 +723,129 @@ test("scores forbidden claims with the same fuzzy matcher as expected claims", (
   assert.equal(quality.forbidden_claims.found, 1);
   assert.equal(quality.pass, false);
 });
+
+test("forbidden claim scoring requires negative polarity terms", () => {
+  const task = runtimeQualityTask("forbidden-negation-fixture", {
+    min_expected_file_recall: 0,
+    min_expected_symbol_recall: 0,
+    min_expected_claim_recall: 0,
+    min_citation_coverage: 0,
+    min_expected_anchor_recall: 0,
+    max_forbidden_claims: 0,
+  });
+  task.forbidden_claims = [
+    "ThreadStartParams and TurnStartParams are only used by the interactive TUI, not by codex exec.",
+  ];
+
+  const quality = scoreQuality(
+    [
+      agentMessageEvent(
+        "codex exec sends ThreadStartParams and TurnStartParams through thread/start and turn/start, while the TUI has a separate helper.",
+      ),
+    ],
+    task,
+  );
+
+  assert.equal(quality.forbidden_claims.found, 0);
+  assert.equal(quality.pass, true);
+});
+
+test("forbidden claim scoring does not combine unrelated storage sentences", () => {
+  const task = runtimeQualityTask("forbidden-storage-fixture", {
+    min_expected_file_recall: 0,
+    min_expected_symbol_recall: 0,
+    min_expected_claim_recall: 0,
+    min_citation_coverage: 0,
+    min_expected_anchor_recall: 0,
+    max_forbidden_claims: 0,
+  });
+  task.forbidden_claims = ["StorageAccessProxy is the persistent SQLite storage implementation."];
+
+  const quality = scoreQuality(
+    [
+      agentMessageEvent(
+        "StorageAccessProxy forwards storage calls to the active storage subject. PersistentStorage is the concrete persistent implementation behind the storage access contract.",
+      ),
+    ],
+    task,
+  );
+
+  assert.equal(quality.forbidden_claims.found, 0);
+  assert.equal(quality.pass, true);
+});
+
+function pinnedRepoProvenance() {
+  return {
+    manifest_overridden_by_builtin: false,
+    configured: { ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7" },
+    manifest: { ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7" },
+    git_head: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+    git_dirty: false,
+  };
+}
+
+function localCacheProvenance(overrides = {}) {
+  return {
+    doctor_status: "pass",
+    storage_path: "C:/Users/alber/AppData/Local/codestory/cache/codestory.db",
+    cache_policy: "prepared-sidecar-cache-read-only",
+    retrieval_mode: "full",
+    sidecar_generation: "proj-current",
+    manifest_embedding_backend: "llamacpp:bge-base-en-v1.5",
+    semantic_backend: "onnx",
+    local_only: true,
+    locality_kind: "local_model_files",
+    indexed: true,
+    freshness_status: "fresh",
+    semantic_ready: true,
+    indexing_in_timed_run: false,
+    ...overrides,
+  };
+}
+
+function publishableWithCodeStoryResult(overrides = {}) {
+  return {
+    repo: "codestory",
+    task_id: "codestory-indexing-flow",
+    arm: "with_codestory",
+    repeat: 1,
+    status: "pass",
+    usage: { total_tokens: 100 },
+    packet_first_required: true,
+    packet_first_pass: true,
+    quality: { pass: true },
+    transcript_analysis: {
+      ordinary_source_reads_after_first_packet: 0,
+    },
+    repo_provenance: pinnedRepoProvenance(),
+    codestory_cache_provenance: localCacheProvenance(),
+    ...overrides,
+  };
+}
+
+function publishablePacketRuntimeResult(overrides = {}) {
+  return {
+    repo: "codestory",
+    task_id: "codestory-indexing-flow",
+    mode: "cold",
+    repeat: 1,
+    status: "pass",
+    quality: { pass: true },
+    sufficiency: {
+      status: "sufficient",
+      sufficient_quality_mismatch: false,
+    },
+    packet_latency: {
+      sla_missed: false,
+      retrieval_shadow: {
+        retrieval_mode: "full",
+      },
+    },
+    repo_provenance: pinnedRepoProvenance(),
+    codestory_cache_provenance: localCacheProvenance(),
+    ...overrides,
+  };
+}
 
 test("publishable gate blocks avoidable source reads after packet", () => {
   const blockers = agentPublishableBlockers(
@@ -581,33 +957,95 @@ test("publishable provenance requires pinned clean manifest checkout", () => {
 test("publishable gate requires CodeStory cache provenance for CodeStory arm", () => {
   const blockers = agentPublishableBlockers(
     [
-      {
-        repo: "codestory",
-        task_id: "codestory-indexing-flow",
-        arm: "with_codestory",
-        repeat: 1,
-        status: "pass",
-        usage: { total_tokens: 100 },
-        packet_first_required: true,
-        packet_first_pass: true,
-        quality: { pass: true },
-        transcript_analysis: {
-          ordinary_source_reads_after_first_packet: 0,
-        },
-        repo_provenance: {
-          manifest_overridden_by_builtin: false,
-          configured: { ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7" },
-          manifest: { ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7" },
-          git_head: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
-          git_dirty: false,
-        },
-      },
+      publishableWithCodeStoryResult({
+        codestory_cache_provenance: null,
+      }),
     ],
     { publishable: true },
   );
 
   assert.equal(blockers.length, 1);
   assert.match(blockers[0].reasons.join("\n"), /missing CodeStory cache provenance/);
+});
+
+test("publishable gate accepts local-only CodeStory cache provenance", () => {
+  const blockers = agentPublishableBlockers(
+    [publishableWithCodeStoryResult()],
+    { publishable: true },
+  );
+
+  assert.deepEqual(blockers, []);
+});
+
+test("publishable gate requires CodeStory local-only provenance", () => {
+  const blockers = agentPublishableBlockers(
+    [
+      publishableWithCodeStoryResult({
+        codestory_cache_provenance: localCacheProvenance({
+          local_only: false,
+          locality_kind: "remote_endpoint",
+        }),
+      }),
+    ],
+    { publishable: true },
+  );
+
+  assert.equal(blockers.length, 1);
+  assert.match(blockers[0].reasons.join("\n"), /local-only guarantee is not proven/);
+});
+
+test("packet runtime publishable gate requires sufficient packets and telemetry", () => {
+  assert.deepEqual(
+    packetRuntimePublishableBlockers([publishablePacketRuntimeResult()], { publishable: true }),
+    [],
+  );
+
+  const blockers = packetRuntimePublishableBlockers(
+    [
+      publishablePacketRuntimeResult({ sufficiency: null }),
+      publishablePacketRuntimeResult({
+        sufficiency: { status: "partial", sufficient_quality_mismatch: false },
+      }),
+      publishablePacketRuntimeResult({ packet_latency: null }),
+    ],
+    { publishable: true },
+  );
+
+  assert.equal(blockers.length, 3);
+  assert.match(blockers[0].reasons.join("\n"), /missing packet sufficiency telemetry/);
+  assert.match(blockers[1].reasons.join("\n"), /packet sufficiency status=partial; expected sufficient/);
+  assert.match(blockers[2].reasons.join("\n"), /missing packet latency telemetry/);
+});
+
+test("packet runtime publishable gate requires SLA pass and full retrieval shadow", () => {
+  const blockers = packetRuntimePublishableBlockers(
+    [
+      publishablePacketRuntimeResult({
+        packet_latency: {
+          sla_missed: true,
+          retrieval_shadow: { retrieval_mode: "full" },
+        },
+      }),
+      publishablePacketRuntimeResult({
+        packet_latency: {
+          sla_missed: false,
+          retrieval_shadow: null,
+        },
+      }),
+      publishablePacketRuntimeResult({
+        packet_latency: {
+          sla_missed: false,
+          retrieval_shadow: { retrieval_mode: "degraded" },
+        },
+      }),
+    ],
+    { publishable: true },
+  );
+
+  assert.equal(blockers.length, 3);
+  assert.match(blockers[0].reasons.join("\n"), /packet retrieval SLA missed=true; expected false/);
+  assert.match(blockers[1].reasons.join("\n"), /missing retrieval shadow telemetry/);
+  assert.match(blockers[2].reasons.join("\n"), /packet retrieval shadow mode=degraded; expected full/);
 });
 
 test("reanalysis uses the run-time task snapshot before current manifest contents", async () => {
@@ -645,4 +1083,41 @@ test("reanalysis uses the run-time task snapshot before current manifest content
       assert.deepEqual(loaded.expected_claims, ["The snapshot claim is immutable."]);
     },
   );
+});
+
+test("qualityFailureReasons lists recall misses", () => {
+  const reasons = qualityFailureReasons({
+    pass: false,
+    thresholds: { expected_file_recall: 0.8 },
+    expected_anchors: { recall: 1 },
+    expected_files: { recall: 0.2 },
+    expected_symbols: { recall: 1 },
+    expected_claims: { recall: 1 },
+    citation_coverage: { recall: 1 },
+    forbidden_claims: { found: 0 },
+  });
+  assert.ok(reasons.includes("expected_file_recall_low"));
+});
+
+test("buildQualityDebugPayload aggregates failure counts", () => {
+  const payload = buildQualityDebugPayload([
+    {
+      repo: "ripgrep",
+      task_id: "ripgrep-search-pipeline",
+      mode: "cold-cli",
+      status: "pass",
+      quality: {
+        pass: false,
+        thresholds: {},
+        expected_anchors: { recall: 0.5 },
+        expected_files: { recall: 0.5 },
+        expected_symbols: { recall: 0.5 },
+        expected_claims: { recall: 0.5 },
+        citation_coverage: { recall: 0.5 },
+        forbidden_claims: { found: 0 },
+      },
+    },
+  ]);
+  assert.equal(payload.summary.quality_fail_runs, 1);
+  assert.ok(Object.keys(payload.summary.failure_reason_counts).length > 0);
 });

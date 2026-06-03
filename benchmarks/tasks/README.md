@@ -13,7 +13,13 @@ Each manifest should include:
 - `repo`: public repository metadata and optional setup notes.
 - `prompt`: the task text to run.
 - `expected_files`: repository-relative files that should be cited or used.
+- `expected_verification_files`: optional test, benchmark, or verification
+  files that are useful secondary evidence but should not count against primary
+  source recall unless the prompt asks for verification.
 - `expected_symbols`: stable symbols that should be found when applicable.
+  Symbol entries may include an optional `query` when the canonical symbol name
+  is intentionally ambiguous without task context; scoring still checks the
+  `name` and `path`.
 - `expected_claims`: claims a correct answer should make.
 - `forbidden_claims`: claims that should fail quality scoring when present.
 - `quality_thresholds`: pass/fail thresholds for files, symbols, claims,
@@ -56,3 +62,85 @@ the harness does not run arbitrary setup commands.
 Direct packet runtime rows are available with `--packet-runtime`. They compare
 cold CLI packet calls with warm `serve --stdio` packet calls while reusing the
 same expected-anchor quality gates.
+
+## Local Real-Repo Corpus
+
+The `local-real` suite targets sibling checkouts under the parent directory of
+this CodeStory repo. It is meant for exploratory A/B runs against the user's
+real local workspaces before promotion-grade public rows exist.
+
+Current slots:
+
+- `codestory`: this repo.
+- `sourcetrail`: `../Sourcetrail`.
+- `codex`: `../codex`.
+- `vscode`: `../vscode`; currently verified against pinned commit
+  `20ed2bc21d4d73a029b52d3ee6db382ee85c3cca` when that checkout is present.
+
+Local-real rows are not public savings claims by themselves. They must be
+repeated, quality-gated, tied to clean pinned checkouts, and compared against
+the no-CodeStory arm before they support promotion language.
+
+For CodeStory-assisted rows, use `--prepare-codestory-cache` unless the intent is
+explicitly to measure degraded cache behavior. This refreshes stale or
+semantic-empty local caches before the timed agent run and records the index
+cost as setup evidence, so cache-reuse savings are not confused with indexing
+cost.
+
+## Holdout retrieval
+
+The `holdout-retrieval` suite measures **generalization** on pinned public OSS
+libraries. It is required for sidecar retrieval promotion (pass at least 2/3 repos)
+and must **not** be used to tune planner or ranker heuristics.
+
+| Repo key | Upstream | Pin |
+|----------|----------|-----|
+| `ripgrep` | [BurntSushi/ripgrep](https://github.com/BurntSushi/ripgrep) | `14.1.0` |
+| `axios` | [axios/axios](https://github.com/axios/axios) | `v1.6.8` |
+| `redis` | [redis/redis](https://github.com/redis/redis) | `7.2.4` |
+
+Manifests live under `benchmarks/tasks/holdout-retrieval/`. Each task uses
+`task_class: architecture_explanation` and records immutable `repo.ref` values.
+
+### Materializing repos
+
+Holdout repos are cloned only under `target/agent-benchmark/repos/` (under
+`target/`, so they stay out of version control). No sibling checkout is required.
+
+Prefetch all three holdout checkouts:
+
+```powershell
+node scripts/fetch-holdout-repos.mjs
+```
+
+Or use the benchmark harness directly:
+
+```powershell
+node scripts/codestory-agent-ab-benchmark.mjs `
+  --list --task-suite holdout-retrieval --materialize-repos
+```
+
+Optional `--repo-cache-dir <path>` overrides the default cache directory on both
+commands.
+
+### Smoke run (packet runtime)
+
+```powershell
+node scripts/codestory-agent-ab-benchmark.mjs `
+  --packet-runtime --packet-runtime-mode cold-cli `
+  --task-suite holdout-retrieval --materialize-repos `
+  --repeats 1 --out-dir target/agent-benchmark/holdout-retrieval-smoke `
+  --codestory-cli target/release/codestory-cli.exe --timeout-ms 180000
+```
+
+Build `codestory-cli` in release mode before the smoke run. `redis` is L-tier and
+may exceed the default timeout on cold index; increase `--timeout-ms` when needed.
+
+### Forbidden tuning policy
+
+- Do **not** add repo-name, path, or display-name literals for `ripgrep`, `axios`,
+  or `redis` in v2 planner or ranker code.
+- Do **not** iterate KPI fixes against holdout manifests; use `local-real` for
+  in-scope tuning and treat holdout rows as promotion-only evidence.
+- Legacy sibling apps (`freelancer`, `traderotate`) are removed from default
+  benchmark repos; use this suite instead for generalization gates.

@@ -1,0 +1,104 @@
+{
+  "$schema": "../manifest.schema.json",
+  "id": "vscode-workbench-extension-host",
+  "version": 1,
+  "suite": "local-real",
+  "task_class": "architecture_explanation",
+  "repo": {
+    "name": "vscode",
+    "url": "https://github.com/microsoft/vscode.git",
+    "ref": "20ed2bc21d4d73a029b52d3ee6db382ee85c3cca",
+    "workspace_root": ".",
+    "languages": [
+      "TypeScript"
+    ],
+    "setup": [
+      "No dependency setup is required for read-only benchmark inspection."
+    ]
+  },
+  "prompt": "Explain how VS Code workbench startup reaches extension host activation and command execution. Cite the source files that support the path.",
+  "expected_files": [
+    "src/vs/workbench/browser/workbench.ts",
+    "src/vs/workbench/services/extensions/browser/extensionService.ts",
+    "src/vs/workbench/services/extensions/common/extensionHostManager.ts",
+    "src/vs/workbench/api/common/extHostExtensionService.ts",
+    "src/vs/workbench/api/common/extHostCommands.ts"
+  ],
+  "expected_symbols": [
+    {
+      "name": "Workbench",
+      "path": "src/vs/workbench/browser/workbench.ts",
+      "kind": "class",
+      "why": "Workbench startup owner."
+    },
+    {
+      "name": "ExtensionService",
+      "path": "src/vs/workbench/services/extensions/browser/extensionService.ts",
+      "kind": "class",
+      "why": "Coordinates extension scanning, activation, and host management."
+    },
+    {
+      "name": "ExtensionHostManager",
+      "path": "src/vs/workbench/services/extensions/common/extensionHostManager.ts",
+      "kind": "class",
+      "why": "Manages extension host lifecycle."
+    },
+    {
+      "name": "AbstractExtHostExtensionService",
+      "path": "src/vs/workbench/api/common/extHostExtensionService.ts",
+      "kind": "class",
+      "why": "Extension-host-side activation service."
+    },
+    {
+      "name": "ExtHostCommands",
+      "path": "src/vs/workbench/api/common/extHostCommands.ts",
+      "kind": "class",
+      "why": "Extension-host-side command registration and execution surface."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "Workbench startup creates and initializes services before extensions can activate."
+    },
+    {
+      "text": "ExtensionService coordinates extension lifecycle and communicates with extension host managers."
+    },
+    {
+      "text": "ExtensionHostManager owns extension host lifecycle and messaging boundaries."
+    },
+    {
+      "text": "AbstractExtHostExtensionService handles extension activation inside the extension host."
+    },
+    {
+      "text": "ExtHostCommands owns extension-host command registration and execution behavior."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "The renderer directly executes extension code without an extension host boundary.",
+      "severity": "critical"
+    },
+    {
+      "text": "VS Code command execution is unrelated to extension activation.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.75,
+    "min_expected_file_recall": 0.75,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.8,
+    "min_citation_coverage": 0.75,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "local",
+    "typescript",
+    "workbench",
+    "extension-host",
+    "holdout"
+  ],
+  "notes": [
+    "Local-real holdout manifest for the cloned ../vscode checkout at 20ed2bc21d4d73a029b52d3ee6db382ee85c3cca. Keep rows exploratory unless repeated with clean pinned provenance."
+  ]
+}

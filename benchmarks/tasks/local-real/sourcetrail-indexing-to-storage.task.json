@@ -1,0 +1,131 @@
+{
+  "$schema": "../manifest.schema.json",
+  "id": "sourcetrail-indexing-to-storage",
+  "version": 1,
+  "suite": "local-real",
+  "task_class": "architecture_explanation",
+  "repo": {
+    "name": "sourcetrail",
+    "url": "https://github.com/CoatiSoftware/Sourcetrail.git",
+    "ref": "4b1b0e4fd19c4af235fef12b0564c05348f5f6d3",
+    "workspace_root": ".",
+    "languages": [
+      "C++",
+      "Java"
+    ],
+    "setup": [
+      "No dependency setup is required for read-only benchmark inspection."
+    ]
+  },
+  "prompt": "Explain how Sourcetrail turns project/source-group configuration into indexing work, then how indexed data is accessed by the application. Cite the source files that support the path.",
+  "expected_files": [
+    "src/lib/project/Project.cpp",
+    "src/lib_cxx/project/SourceGroupCxxCdb.cpp",
+    "src/lib_cxx/project/SourceGroupCxxCdb.h",
+    "src/lib_cxx/data/indexer/IndexerCommandCxx.h",
+    "src/lib_java/data/indexer/IndexerJava.cpp",
+    "src/lib/data/storage/StorageAccess.h",
+    "src/lib/data/storage/StorageAccessProxy.cpp",
+    "src/lib/data/storage/PersistentStorage.cpp",
+    "src/lib/data/storage/PersistentStorage.h"
+  ],
+  "expected_symbols": [
+    {
+      "name": "Project::buildIndex",
+      "path": "src/lib/project/Project.cpp",
+      "kind": "method",
+      "why": "Builds the indexing task pipeline for project source groups."
+    },
+    {
+      "name": "TaskFillIndexerCommandsQueue",
+      "path": "src/lib/data/indexer/TaskFillIndexerCommandQueue.h",
+      "kind": "class",
+      "why": "Defines the task that queues indexer commands during the project build-index task flow; Project::buildIndex covers the callsite."
+    },
+    {
+      "name": "SourceGroupCxxCdb",
+      "path": "src/lib_cxx/project/SourceGroupCxxCdb.cpp",
+      "kind": "class",
+      "why": "Loads compile database input and creates C/C++ indexer commands."
+    },
+    {
+      "name": "IndexerCommandCxx",
+      "path": "src/lib_cxx/data/indexer/IndexerCommandCxx.h",
+      "kind": "class",
+      "why": "Represents C/C++ indexer command work emitted by C++ source groups."
+    },
+    {
+      "name": "IndexerJava",
+      "path": "src/lib_java/data/indexer/IndexerJava.cpp",
+      "kind": "class",
+      "why": "Executes Java indexing through the Java parser."
+    },
+    {
+      "name": "StorageAccess",
+      "path": "src/lib/data/storage/StorageAccess.h",
+      "kind": "interface",
+      "why": "Application-facing storage access contract."
+    },
+    {
+      "name": "StorageAccessProxy",
+      "path": "src/lib/data/storage/StorageAccessProxy.cpp",
+      "kind": "class",
+      "why": "Delegates storage calls to the active storage subject."
+    },
+    {
+      "name": "PersistentStorage",
+      "path": "src/lib/data/storage/PersistentStorage.cpp",
+      "kind": "class",
+      "why": "Concrete persistent implementation of storage access."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "Project::buildIndex builds a per-source-group indexing task pipeline before merge and injection work."
+    },
+    {
+      "text": "SourceGroupCxxCdb reads compile database input and emits IndexerCommandCxx work for C and C++ files."
+    },
+    {
+      "text": "IndexerJava delegates Java command execution into JavaParser build-index behavior."
+    },
+    {
+      "text": "StorageAccess is the application-facing storage contract and PersistentStorage implements it."
+    },
+    {
+      "text": "StorageAccessProxy forwards storage calls to the active storage subject rather than owning persistence itself."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "Sourcetrail only indexes Java and does not have a C/C++ compile database source-group path.",
+      "severity": "critical"
+    },
+    {
+      "text": "StorageAccessProxy is the persistent SQLite storage implementation.",
+      "severity": "major"
+    },
+    {
+      "text": "Project::buildIndex directly parses source files instead of building indexing tasks.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.75,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.8,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "local",
+    "cxx",
+    "java",
+    "indexing",
+    "storage"
+  ],
+  "notes": [
+    "Local-real task for the user-requested sibling checkout. This is not public promotion evidence unless rerun against a pinned clean checkout with repeated paired rows."
+  ]
+}

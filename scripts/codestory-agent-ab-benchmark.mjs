@@ -8,6 +8,18 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 
+import {
+  buildPacketQualityDeltas,
+  discoverPreviousPacketSummary,
+} from "./codestory-agent-value-score.mjs";
+import {
+  benchmarkChildEnv,
+  retrievalContractSummary,
+  retrievalEnv as benchmarkRetrievalEnv,
+  shouldPrepareRetrievalIndex,
+  unsupportedSidecarContractRequests,
+} from "./codestory-benchmark-contract.mjs";
+
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
 const siblingRoot = path.resolve(repoRoot, "..");
@@ -38,20 +50,34 @@ const PUBLIC_REPOS = {
 };
 
 const LOCAL_REPOS = {
-  freelancer: {
-    path: path.join(siblingRoot, "freelancer"),
+  sourcetrail: {
+    path: path.join(siblingRoot, "Sourcetrail"),
+    url: "https://github.com/CoatiSoftware/Sourcetrail.git",
+    ref: "4b1b0e4fd19c4af235fef12b0564c05348f5f6d3",
+    languages: ["C++", "Java"],
     prompt:
-      "Explain how lead, client, and project persistence flows through commands, repositories, and domain types.",
+      "Explain how project/source-group configuration becomes indexing work, then how indexed data is accessed by the application.",
+  },
+  codex: {
+    path: path.join(siblingRoot, "codex"),
+    url: "https://github.com/openai/codex.git",
+    ref: "9f42c89c0112771dc29100a6f3fc904049b2655f",
+    languages: ["Rust", "TypeScript"],
+    prompt:
+      "Explain how `codex exec` flows from the top-level CLI into the exec runtime, app-server turn start, and JSONL event output.",
+  },
+  vscode: {
+    path: path.join(siblingRoot, "vscode"),
+    url: "https://github.com/microsoft/vscode.git",
+    ref: "local",
+    languages: ["TypeScript"],
+    prompt:
+      "Explain how VS Code workbench startup reaches extension host activation and command execution.",
   },
   rootandruntime: {
     path: path.join(siblingRoot, "rootandruntime"),
     prompt:
       "Explain how public writing and social surfaces connect to Payload collections, comment auth, and the elsewhere feed.",
-  },
-  traderotate: {
-    path: path.join(siblingRoot, "traderotate"),
-    prompt:
-      "Explain how runtime config, wallet context, executor setup, and the hunt loop connect.",
   },
 };
 
@@ -61,7 +87,7 @@ const ARMS = {
   without_codestory:
     "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal repository exploration only.",
   with_codestory:
-    "Use CodeStory grounding first if available. If CODESTORY_CLI is set, use that executable; otherwise try codestory-cli on PATH. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. If packet status is sufficient and follow_up_commands is empty, answer from the packet; budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations and sufficiency.avoid_opening, not only the paths mentioned in your prose. Use search, context, trail, or snippet only for named gaps. Run index only if the cache is missing and writes are allowed. If CodeStory is unavailable, say so explicitly and continue.",
+    "Use CodeStory grounding first. If CODESTORY_CLI is set, use that executable; otherwise use codestory-cli on PATH. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run only the listed follow_up_commands in order and prefer targeted `search --why` commands before escalating packet budget. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations and sufficiency.avoid_opening, not only the paths mentioned in your prose. Use search, context, trail, or snippet only for named gaps. The prepared full sidecar cache is mandatory; if CodeStory or its sidecars are unavailable, fail the run instead of continuing with ordinary exploration.",
 };
 
 function usage() {
@@ -69,8 +95,8 @@ function usage() {
   node scripts/codestory-agent-ab-benchmark.mjs --list
   node scripts/codestory-agent-ab-benchmark.mjs --self-test
   node scripts/codestory-agent-ab-benchmark.mjs --reanalyze-dir target/agent-benchmark/<run-dir>
-  node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite public-core [--materialize-repos] [--repeats n]
-  node scripts/codestory-agent-ab-benchmark.mjs [--quick] [--repos names] [--arms names] [--task-suite name] [--task-ids ids] [--task-manifest path] [--include-local-repos] [--repeats n] [--runner codex] [--model model] [--sandbox mode] [--out-dir path] [--timeout-ms ms] [--allow-failures] [--publishable]
+  node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite <suite> [--materialize-repos] [--repeats n]
+  node scripts/codestory-agent-ab-benchmark.mjs [--quick] [--repos names] [--arms names] [--task-suite name] [--task-ids ids] [--task-manifest path] [--include-local-repos] [--repeats n] [--runner codex] [--model model] [--sandbox mode] [--out-dir path] [--timeout-ms ms] [--prepare-codestory-cache] [--allow-failures] [--publishable]
 
 Options:
   --list          Print configured benchmark repositories or selected manifest tasks and exit.
@@ -79,7 +105,7 @@ Options:
   --quick         Default to repo=codestory and repeats=1 unless explicitly set.
   --repos         Comma-separated repo names. Public: ${Object.keys(PUBLIC_REPOS).join(", ")}. Local optional: ${Object.keys(LOCAL_REPOS).join(", ")}
   --arms          Comma-separated A/B arms. Default: ${Object.keys(ARMS).join(", ")}.
-  --task-suite    Task suite folder under benchmarks/tasks, such as public-core.
+  --task-suite    Task suite folder under benchmarks/tasks, such as public-core or holdout-retrieval.
   --task-ids      Comma-separated manifest task ids to include after suite/path loading.
   --task-manifest Task manifest JSON file or directory. When set, tasks drive repos and prompts.
   --materialize-repos
@@ -91,6 +117,8 @@ Options:
   --packet-runtime-mode
                   cold-cli, warm-stdio, or both. Default: both.
   --codestory-cli Path to codestory-cli for packet runtime mode. Default: CODESTORY_CLI, release binary, then PATH.
+  --benchmark-run-id
+                  Coherent benchmark run id to stamp packet-runtime artifacts.
   --include-local-repos
                   Include local sibling repos in the default non-quick run.
   --repeats       Repeats per repo/arm. Default: 3, or 1 with --quick.
@@ -99,10 +127,22 @@ Options:
   --sandbox       Codex sandbox mode. Default: workspace-write.
   --out-dir       Output directory. Default: target/agent-benchmark/<timestamp>.
   --timeout-ms    Timeout per runner invocation. Default: 600000.
+  --prepare-codestory-cache
+                  Before timed with-CodeStory runs, refresh stale or semantic-empty local caches and record indexing cost separately.
+                  Packet-runtime mode enables this by default because sidecar-primary packets require prepared local indexes.
+  --no-prepare-codestory-cache
+                  Unsupported; sidecar preparation is mandatory.
+  --prepare-codestory-timeout-ms
+                  Timeout for each pre-run CodeStory index refresh. Default: 1800000.
   --max-source-reads-after-packet
                   Publishable with-CodeStory runs fail above this post-packet ordinary source-read count. Default: 0.
   --allow-failures Exit 0 even when a run fails. Intended only for exploratory dry runs.
   --publishable   Fail unless every run succeeds and reports token usage.
+
+Environment (parity / promotion — see docs/testing/retrieval-architecture.md):
+  CODESTORY_RETRIEVAL unset|1 Sidecar-primary packet retrieval (benchmark default)
+  CODESTORY_RETRIEVAL=0       Unsupported; sidecar retrieval is mandatory
+  CODESTORY_EVAL_PROBES=1        Explicit diagnostic only; product benchmark runs do not inject it
 `);
 }
 
@@ -126,6 +166,7 @@ function parseArgs(argv) {
     packetRuntime: false,
     packetRuntimeMode: "both",
     codestoryCli: process.env.CODESTORY_CLI || null,
+    benchmarkRunId: null,
     includeLocalRepos: false,
     repeats: null,
     runner: "codex",
@@ -133,6 +174,9 @@ function parseArgs(argv) {
     sandbox: "workspace-write",
     outDir: null,
     timeoutMs: 600000,
+    prepareCodestoryCache: null,
+    prepareCodestoryTimeoutMs: 1_800_000,
+    cachePreparationByRepo: null,
     maxSourceReadsAfterPacket: 0,
     allowFailures: false,
     publishable: false,
@@ -232,8 +276,24 @@ function parseArgs(argv) {
       opts.outDir = argv[++i];
       continue;
     }
+    if (arg === "--benchmark-run-id") {
+      opts.benchmarkRunId = argv[++i];
+      continue;
+    }
     if (arg === "--timeout-ms") {
       opts.timeoutMs = Number.parseInt(argv[++i], 10);
+      continue;
+    }
+    if (arg === "--prepare-codestory-cache") {
+      opts.prepareCodestoryCache = true;
+      continue;
+    }
+    if (arg === "--no-prepare-codestory-cache") {
+      throw new Error("--no-prepare-codestory-cache is unsupported; sidecar preparation is mandatory");
+      continue;
+    }
+    if (arg === "--prepare-codestory-timeout-ms") {
+      opts.prepareCodestoryTimeoutMs = Number.parseInt(argv[++i], 10);
       continue;
     }
     if (arg === "--max-source-reads-after-packet") {
@@ -267,17 +327,26 @@ function parseArgs(argv) {
   if (!opts.repeats) {
     opts.repeats = opts.quick ? 1 : 3;
   }
+  if (opts.prepareCodestoryCache == null) {
+    opts.prepareCodestoryCache = opts.packetRuntime || opts.arms.includes("with_codestory");
+  }
   if (!Number.isInteger(opts.repeats) || opts.repeats < 1) {
     throw new Error("--repeats must be a positive integer");
   }
   if (!Number.isInteger(opts.timeoutMs) || opts.timeoutMs < 1000) {
     throw new Error("--timeout-ms must be an integer >= 1000");
   }
+  if (!Number.isInteger(opts.prepareCodestoryTimeoutMs) || opts.prepareCodestoryTimeoutMs < 1000) {
+    throw new Error("--prepare-codestory-timeout-ms must be an integer >= 1000");
+  }
   if (!["read-only", "workspace-write", "danger-full-access"].includes(opts.sandbox)) {
     throw new Error("--sandbox must be one of: read-only, workspace-write, danger-full-access");
   }
   if (!["cold-cli", "warm-stdio", "both"].includes(opts.packetRuntimeMode)) {
     throw new Error("--packet-runtime-mode must be one of: cold-cli, warm-stdio, both");
+  }
+  if (opts.benchmarkRunId != null) {
+    opts.benchmarkRunId = sanitizeBenchmarkRunId(opts.benchmarkRunId);
   }
   if (!Number.isInteger(opts.maxSourceReadsAfterPacket) || opts.maxSourceReadsAfterPacket < 0) {
     throw new Error("--max-source-reads-after-packet must be a non-negative integer");
@@ -291,6 +360,21 @@ function parseArgs(argv) {
     }
   }
   return opts;
+}
+
+function sanitizeBenchmarkRunId(value) {
+  const cleaned = String(value ?? "")
+    .trim()
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!cleaned) {
+    throw new Error("--benchmark-run-id must contain at least one filesystem-safe character");
+  }
+  return cleaned;
+}
+
+function retrievalEnv() {
+  return benchmarkRetrievalEnv(benchmarkChildEnv(process.env));
 }
 
 function runnerCommand(opts, repoPath, prompt) {
@@ -509,6 +593,9 @@ function normalizeManifestTask(filePath, raw, opts = {}) {
     throw new Error(`Task manifest is missing prompt: ${filePath}`);
   }
   const expectedFiles = textAnchorList(raw.expected_files ?? raw.expectedFiles);
+  const expectedVerificationFiles = textAnchorList(
+    raw.expected_verification_files ?? raw.expectedVerificationFiles,
+  );
   const expectedSymbols = textAnchorList(raw.expected_symbols ?? raw.expectedSymbols);
   const expectedClaims = textAnchorList(raw.expected_claims ?? raw.expectedClaims);
   const qualityThresholds = raw.quality_thresholds ?? raw.qualityThresholds;
@@ -534,6 +621,7 @@ function normalizeManifestTask(filePath, raw, opts = {}) {
     task_class: taskClass,
     prompt,
     expected_files: expectedFiles,
+    expected_verification_files: expectedVerificationFiles,
     expected_symbols: expectedSymbols,
     expected_claims: expectedClaims,
     forbidden_claims: textAnchorList(raw.forbidden_claims ?? raw.forbiddenClaims),
@@ -556,6 +644,7 @@ function taskSnapshotForResult(task) {
       task_class: task.task_class,
       prompt: task.prompt,
       expected_files: task.expected_files ?? [],
+      expected_verification_files: task.expected_verification_files ?? [],
       expected_symbols: task.expected_symbols ?? [],
       expected_claims: task.expected_claims ?? [],
       forbidden_claims: task.forbidden_claims ?? [],
@@ -695,6 +784,7 @@ function validatePublishableShape(opts, tasks) {
       blockers.push(`public-core needs at least 3 tasks per class; underfilled: ${audit.underfilled_classes.join(", ")}`);
     }
   }
+  blockers.push(...unsupportedSidecarContractRequests(process.env));
   if (blockers.length) {
     throw new Error(`Publishable benchmark shape is incomplete:\n- ${blockers.join("\n- ")}`);
   }
@@ -866,6 +956,11 @@ ${packetFirstCommand}
 
 Run that answer packet before any repository search, direct source read, git command, CodeStory primitive, or help/probe command. The benchmark treats help/probe commands such as \`--help\` as not packet-first.`
     : "";
+  const stopContractBlock =
+    armName === "with_codestory"
+      ? `
+If the packet reports \`sufficiency.status: "sufficient"\` with no \`sufficiency.follow_up_commands\`, do not run ordinary source reads, \`rg\`, \`grep\`, \`git show\`, or file-open commands afterward. Those commands count as benchmark overhead unless the packet names a concrete unresolved gap.`
+      : "";
   return `You are running a controlled CodeStory benchmark.
 
 Repository: ${repoName}
@@ -875,6 +970,7 @@ Task: ${taskPrompt}
 Arm: ${armName}
 Instruction: ${ARMS[armName]}
 ${packetFirstBlock}
+${stopContractBlock}
 
 Return a concise answer with the files, symbols, and commands that support your explanation.
 Do not edit source files. Use read-only inspection commands only, except CodeStory may write its cache if needed.`;
@@ -1026,7 +1122,14 @@ function normalizePathLike(value) {
     .replace(/^['"]|['"]$/g, "")
     .replace(/\\/g, "/")
     .replace(/\/+/g, "/")
+    .replace(/^\?\/(?=[A-Za-z]:\/)/, "")
     .replace(/^\.?\//, "");
+}
+
+function pathMatchesLike(actual, expected) {
+  const left = normalizePathLike(actual).toLowerCase();
+  const right = normalizePathLike(expected).toLowerCase();
+  return left === right || left.endsWith(`/${right}`);
 }
 
 function isLikelySourcePath(value) {
@@ -1345,12 +1448,45 @@ function claimMatched(haystack, claim) {
   return matched >= Math.min(4, expectedTokens.length) && ratio >= 0.65;
 }
 
-function scoreClaimSet(claims, haystack) {
+const FORBIDDEN_POLARITY_TERMS = new Set([
+  "after",
+  "bypass",
+  "bypasses",
+  "bypassed",
+  "converting",
+  "direct",
+  "directly",
+  "instead",
+  "never",
+  "not",
+  "only",
+  "without",
+]);
+
+function claimPolarityTokens(claim) {
+  return claimTokens(claim).filter((token) => FORBIDDEN_POLARITY_TERMS.has(token));
+}
+
+function forbiddenClaimMatched(haystack, claim) {
+  if (!claimMatched(haystack, claim)) {
+    return false;
+  }
+  const polarityTokens = claimPolarityTokens(claim);
+  if (!polarityTokens.length) {
+    const haystackTokens = new Set(claimTokens(haystack));
+    return claimTokens(claim).every((token) => claimTokenMatched(token, haystackTokens));
+  }
+  const haystackTokens = new Set(claimTokens(haystack));
+  return polarityTokens.every((token) => claimTokenMatched(token, haystackTokens));
+}
+
+function scoreClaimSet(claims, haystack, opts = {}) {
   const expected = [...new Set((claims ?? []).map(String).map((value) => value.trim()).filter(Boolean))];
   const found = [];
   const missed = [];
   for (const claim of expected) {
-    if (claimMatched(haystack, claim)) {
+    const matched = opts.forbidden ? forbiddenClaimMatched(haystack, claim) : claimMatched(haystack, claim);
+    if (matched) {
       found.push(claim);
     } else {
       missed.push(claim);
@@ -1421,7 +1557,8 @@ function scoreQualityFromText(finalAnswer, transcript, task) {
   const symbols = scoreAnchorSet(task.expected_symbols, finalAnswer);
   const claims = scoreClaimSet(task.expected_claims, finalAnswer);
   const citations = scoreAnchorSet(task.expected_files, finalAnswer);
-  const forbidden = scoreClaimSet(task.forbidden_claims, finalAnswer);
+  const verificationFiles = scoreAnchorSet(task.expected_verification_files ?? [], finalAnswer);
+  const forbidden = scoreClaimSet(task.forbidden_claims, finalAnswer, { forbidden: true });
   const allAnchors = aggregateQualityAnchors(files, symbols, claims);
   const observedAnchors = aggregateQualityAnchors(observedFiles, observedSymbols, claims);
   const thresholds = task.quality_thresholds ?? {};
@@ -1454,6 +1591,7 @@ function scoreQualityFromText(finalAnswer, transcript, task) {
     },
     expected_anchors: allAnchors,
     expected_files: files,
+    expected_verification_files: verificationFiles,
     expected_symbols: symbols,
     observed_anchors: observedAnchors,
     observed_files: observedFiles,
@@ -1472,6 +1610,7 @@ function scoreQualityFromText(finalAnswer, transcript, task) {
     },
     missed_anchors: {
       files: files.missed_anchors,
+      verification_files: verificationFiles.missed_anchors,
       symbols: symbols.missed_anchors,
       claims: claims.missed_anchors,
     },
@@ -1595,7 +1734,7 @@ async function runOne(opts, run, outDir) {
   const repoConfig = ALL_REPOS[run.repo];
   const prompt = composePrompt(run.repo, repoConfig, run.arm, run.task);
   const { command, args, stdin, killProcessTree } = runnerCommand(opts, repoConfig.path, prompt);
-  const env = { ...process.env };
+  const env = run.arm === "with_codestory" ? benchmarkChildEnv(process.env) : { ...process.env };
   if (run.arm === "with_codestory") {
     env.CODESTORY_CLI = path.resolve(resolveCodeStoryCli(opts));
   }
@@ -1635,6 +1774,8 @@ async function runOne(opts, run, outDir) {
     ? await codestoryCacheProvenance(opts, repoConfig, {
         codestory_index_commands_observed: analysis.codestory_index_commands_observed,
         indexing_in_timed_run: analysis.codestory_index_commands_observed > 0,
+        cache_prepared: opts.cachePreparationByRepo?.has(run.repo) ?? false,
+        cache_preparation: opts.cachePreparationByRepo?.get(run.repo) ?? null,
         transport_mode: "agent_runner",
       })
     : null;
@@ -1714,6 +1855,223 @@ async function repoProvenance(config) {
   };
 }
 
+function trimTail(text, maxChars = 4000) {
+  const value = String(text ?? "");
+  return value.length <= maxChars ? value : value.slice(value.length - maxChars);
+}
+
+function doctorSnapshotFromOutput(result, output, parseError, wallMs) {
+  const retrieval = output?.retrieval ?? null;
+  const locality = semanticRuntimeLocality(output);
+  return {
+    status: result.status === "pass" && !parseError ? "pass" : result.status,
+    exit_code: result.exitCode,
+    timed_out: Boolean(result.timedOut),
+    error: result.error ?? parseError ?? null,
+    wall_ms: wallMs,
+    project: output?.project ?? null,
+    storage_path: output?.storage_path ?? null,
+    indexed: output?.indexed ?? null,
+    freshness_status: output?.freshness?.status ?? null,
+    changed_file_count: output?.freshness?.changed_file_count ?? null,
+    new_file_count: output?.freshness?.new_file_count ?? null,
+    removed_file_count: output?.freshness?.removed_file_count ?? null,
+    semantic_ready: retrieval?.semantic_ready ?? null,
+    semantic_backend: semanticBackendName(retrieval),
+    semantic_doc_count: retrieval?.semantic_doc_count ?? null,
+    embedding_model: retrieval?.embedding_model ?? retrieval?.current_embedding?.model_id ?? null,
+    local_only: locality.local_only,
+    locality_kind: locality.locality_kind,
+    locality_evidence: locality.locality_evidence,
+    stats: output?.stats ?? null,
+    stdout_tail: result.status === "pass" ? null : trimTail(result.stdout),
+    stderr_tail: result.status === "pass" ? null : trimTail(result.stderr),
+  };
+}
+
+function retrievalStatusSnapshotFromOutput(result, output, parseError, wallMs) {
+  return {
+    status: result.status === "pass" && !parseError ? "pass" : result.status,
+    exit_code: result.exitCode,
+    timed_out: Boolean(result.timedOut),
+    error: result.error ?? parseError ?? null,
+    wall_ms: wallMs,
+    retrieval_mode: output?.retrieval_mode ?? null,
+    degraded_reason: output?.degraded_reason ?? null,
+    manifest_embedding_backend: output?.manifest?.embedding_backend ?? null,
+    manifest_embedding_dim: output?.manifest?.embedding_dim ?? null,
+    sidecar_generation: output?.manifest?.sidecar_generation ?? null,
+    qdrant_collection: output?.manifest?.qdrant_collection ?? null,
+    zoekt_capabilities: output?.zoekt?.capabilities ?? null,
+    qdrant_capabilities: output?.qdrant?.capabilities ?? null,
+    scip_capabilities: output?.scip?.capabilities ?? null,
+    stdout_tail: result.status === "pass" ? null : trimTail(result.stdout),
+    stderr_tail: result.status === "pass" ? null : trimTail(result.stderr),
+  };
+}
+
+async function codestoryDoctorSnapshot(codestoryCli, project, timeoutMs) {
+  const started = performance.now();
+  const result = await runProcess(
+    codestoryCli,
+    ["doctor", "--project", project, "--format", "json"],
+    { timeoutMs, env: benchmarkChildEnv(process.env) },
+  );
+  const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
+  let output = null;
+  let parseError = null;
+  if (result.status === "pass") {
+    try {
+      output = JSON.parse(result.stdout);
+    } catch (error) {
+      parseError = error.message;
+    }
+  }
+  return doctorSnapshotFromOutput(result, output, parseError, wallMs);
+}
+
+async function codestoryRetrievalStatusSnapshot(codestoryCli, project, timeoutMs) {
+  const started = performance.now();
+  const result = await runProcess(
+    codestoryCli,
+    ["retrieval", "status", "--project", project, "--format", "json"],
+    { timeoutMs, env: benchmarkChildEnv(process.env) },
+  );
+  const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
+  let output = null;
+  let parseError = null;
+  if (result.status === "pass") {
+    try {
+      output = JSON.parse(result.stdout);
+    } catch (error) {
+      parseError = error.message;
+    }
+  }
+  return retrievalStatusSnapshotFromOutput(result, output, parseError, wallMs);
+}
+
+function cacheNeedsPreparation(snapshot) {
+  if (snapshot.status !== "pass") {
+    return true;
+  }
+  if (snapshot.indexed !== true) {
+    return true;
+  }
+  if (snapshot.freshness_status !== "fresh") {
+    return true;
+  }
+  return snapshot.semantic_ready !== true;
+}
+
+function cachePreparationAction(snapshot) {
+  return cacheNeedsPreparation(snapshot) ? "retrieval-index-auto" : "already-ready";
+}
+
+function compactCachePreparation(preparation) {
+  if (!preparation) {
+    return null;
+  }
+  return {
+    repo: preparation.repo,
+    action: preparation.action,
+    index_status: preparation.index_status ?? null,
+    index_exit_code: preparation.index_exit_code ?? null,
+    index_wall_ms: preparation.index_wall_ms ?? null,
+    retrieval_contract: preparation.retrieval_contract ?? null,
+    retrieval_index_status: preparation.retrieval_index_status ?? null,
+    retrieval_index_exit_code: preparation.retrieval_index_exit_code ?? null,
+    retrieval_index_wall_ms: preparation.retrieval_index_wall_ms ?? null,
+    retrieval_mode: preparation.retrieval_status?.retrieval_mode ?? null,
+    retrieval_degraded_reason: preparation.retrieval_status?.degraded_reason ?? null,
+    sidecar_generation: preparation.retrieval_status?.sidecar_generation ?? null,
+    manifest_embedding_backend: preparation.retrieval_status?.manifest_embedding_backend ?? null,
+    before_freshness_status: preparation.before?.freshness_status ?? null,
+    after_freshness_status: preparation.after?.freshness_status ?? null,
+    before_semantic_ready: preparation.before?.semantic_ready ?? null,
+    after_semantic_ready: preparation.after?.semantic_ready ?? null,
+    before_semantic_doc_count: preparation.before?.semantic_doc_count ?? null,
+    after_semantic_doc_count: preparation.after?.semantic_doc_count ?? null,
+  };
+}
+
+async function prepareCodeStoryCaches(opts, tasks) {
+  if (!opts.arms.includes("with_codestory")) {
+    return [];
+  }
+  const repoNames = [...new Set(tasks.map((task) => task.repo))];
+  const codestoryCli = resolveCodeStoryCli(opts);
+  const preparations = [];
+  for (const repo of repoNames) {
+    const config = ALL_REPOS[repo];
+    if (!config || !existsSync(config.path)) {
+      preparations.push({
+        repo,
+        project: config?.path ?? null,
+        action: "skipped-missing-repo",
+      });
+      continue;
+    }
+
+    console.log(`preparing CodeStory cache for ${repo}`);
+    const before = await codestoryDoctorSnapshot(codestoryCli, config.path, 60_000);
+    const preparation = {
+      repo,
+      project: config.path,
+      codestory_cli: path.resolve(codestoryCli),
+      action: cachePreparationAction(before),
+      before,
+      index_status: null,
+      index_exit_code: null,
+      index_wall_ms: 0,
+      index_stdout_tail: null,
+      index_stderr_tail: null,
+      retrieval_status: null,
+      retrieval_index_stdout_tail: null,
+      retrieval_index_stderr_tail: null,
+      after: before,
+    };
+
+    preparation.retrieval_contract = retrievalContractSummary(benchmarkChildEnv(process.env));
+    if (shouldPrepareRetrievalIndex(process.env)) {
+      const retrievalStarted = performance.now();
+      const retrievalIndex = await runProcess(
+        codestoryCli,
+        ["retrieval", "index", "--project", config.path, "--refresh", "auto"],
+        {
+          env: benchmarkChildEnv(process.env),
+          timeoutMs: opts.prepareCodestoryTimeoutMs,
+          timeoutMessage: `retrieval index timed out after ${opts.prepareCodestoryTimeoutMs}ms.`,
+        },
+      );
+      preparation.retrieval_index_status = retrievalIndex.status;
+      preparation.retrieval_index_exit_code = retrievalIndex.exitCode;
+      preparation.retrieval_index_wall_ms =
+        Math.round((performance.now() - retrievalStarted) * 1000) / 1000;
+      preparation.retrieval_index_stdout_tail = trimTail(retrievalIndex.stdout);
+      preparation.retrieval_index_stderr_tail = trimTail(retrievalIndex.stderr);
+      if (retrievalIndex.status !== "pass") {
+        throw new Error(
+          `mandatory retrieval index failed for ${repo}: ${trimTail(retrievalIndex.stderr || retrievalIndex.stdout)}`,
+        );
+      }
+      preparation.after = await codestoryDoctorSnapshot(codestoryCli, config.path, 60_000);
+      preparation.retrieval_status = await codestoryRetrievalStatusSnapshot(
+        codestoryCli,
+        config.path,
+        60_000,
+      );
+      if (preparation.retrieval_status.retrieval_mode !== "full") {
+        throw new Error(
+          `mandatory retrieval index for ${repo} did not reach full mode: ${preparation.retrieval_status.retrieval_mode ?? "unknown"} ${preparation.retrieval_status.degraded_reason ?? ""}`.trim(),
+        );
+      }
+    }
+
+    preparations.push(preparation);
+  }
+  return preparations;
+}
+
 function semanticBackendName(retrieval) {
   if (!retrieval || typeof retrieval !== "object") {
     return "unknown";
@@ -1725,10 +2083,82 @@ function semanticBackendName(retrieval) {
   );
 }
 
+function doctorEnvironmentValue(output, name) {
+  const row = (output?.environment ?? []).find((item) => item?.name === name);
+  if (!row || row.status !== "ok") {
+    return null;
+  }
+  const match = String(row.message ?? "").match(/`([^`]*)`/);
+  return match ? match[1] : null;
+}
+
+function isLoopbackUrl(value) {
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    return (
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "::1" ||
+      hostname.endsWith(".localhost")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function semanticRuntimeLocality(output) {
+  const retrieval = output?.retrieval ?? {};
+  const backend = semanticBackendName(retrieval);
+  if (backend === "symbolic-only") {
+    return {
+      local_only: true,
+      locality_kind: "no_semantic_runtime",
+      locality_evidence: "semantic retrieval unavailable; no embedding runtime was used",
+    };
+  }
+  if (backend === "onnx") {
+    return {
+      local_only: true,
+      locality_kind: "local_model_files",
+      locality_evidence: "semantic backend is onnx",
+    };
+  }
+  if (backend === "llamacpp") {
+    const endpoint = doctorEnvironmentValue(output, "CODESTORY_EMBED_LLAMACPP_URL");
+    if (!endpoint) {
+      return {
+        local_only: null,
+        locality_kind: "unknown_llamacpp_endpoint",
+        locality_evidence: "llama.cpp backend did not expose a configured endpoint",
+      };
+    }
+    const loopback = isLoopbackUrl(endpoint);
+    return {
+      local_only: loopback,
+      locality_kind: loopback ? "loopback_endpoint" : "remote_endpoint",
+      locality_evidence: "semantic backend is llama.cpp",
+    };
+  }
+  if (backend === "hash" || backend === "lexical") {
+    return {
+      local_only: true,
+      locality_kind: "local_deterministic_backend",
+      locality_evidence: `semantic backend is ${backend}`,
+    };
+  }
+  return {
+    local_only: null,
+    locality_kind: "unknown_backend",
+    locality_evidence: `semantic backend is ${backend}`,
+  };
+}
+
 function cachePolicyForRun(observations = {}) {
-  return observations.indexing_in_timed_run
-    ? "timed-run-indexed-cache"
-    : "existing-cache-read-only";
+  if (observations.indexing_in_timed_run) {
+    return "timed-run-indexed-cache";
+  }
+  return observations.cache_prepared ? "prepared-sidecar-cache-read-only" : "unprepared-cache-blocked";
 }
 
 async function codestoryCacheProvenance(opts, config, observations = {}) {
@@ -1747,38 +2177,42 @@ async function codestoryCacheProvenance(opts, config, observations = {}) {
     };
   }
 
-  const doctor = await runProcess(
+  const doctor = await codestoryDoctorSnapshot(
     codestoryCli,
-    ["doctor", "--project", config.path, "--format", "json"],
-    { timeoutMs: Math.min(opts.timeoutMs ?? 600_000, 60_000) },
+    config.path,
+    Math.min(opts.timeoutMs ?? 600_000, 60_000),
   );
-  let output = null;
-  let parseError = null;
-  if (doctor.status === "pass") {
-    try {
-      output = JSON.parse(doctor.stdout);
-    } catch (error) {
-      parseError = error.message;
-    }
-  }
-  const retrieval = output?.retrieval ?? null;
+  const retrievalStatus = observations.cache_preparation?.retrieval_status ??
+    await codestoryRetrievalStatusSnapshot(
+      codestoryCli,
+      config.path,
+      Math.min(opts.timeoutMs ?? 600_000, 60_000),
+    );
   return {
     codestory_cli: path.resolve(codestoryCli),
-    project: output?.project ?? config.path,
-    storage_path: output?.storage_path ?? null,
-    indexed: output?.indexed ?? null,
-    freshness_status: output?.freshness?.status ?? null,
-    semantic_ready: retrieval?.semantic_ready ?? null,
-    semantic_backend: semanticBackendName(retrieval),
-    semantic_doc_count: retrieval?.semantic_doc_count ?? null,
-    embedding_model: retrieval?.embedding_model ?? retrieval?.current_embedding?.model_id ?? null,
+    project: doctor.project ?? config.path,
+    storage_path: doctor.storage_path ?? null,
+    indexed: doctor.indexed ?? null,
+    freshness_status: doctor.freshness_status ?? null,
+    semantic_ready: doctor.semantic_ready ?? null,
+    semantic_backend: doctor.semantic_backend ?? null,
+    semantic_doc_count: doctor.semantic_doc_count ?? null,
+    embedding_model: doctor.embedding_model ?? null,
+    local_only: doctor.local_only ?? null,
+    locality_kind: doctor.locality_kind ?? null,
+    locality_evidence: doctor.locality_evidence ?? null,
     cache_policy: cachePolicyForRun(observations),
     indexing_in_timed_run: observations.indexing_in_timed_run ?? null,
     codestory_index_commands_observed: observations.codestory_index_commands_observed ?? null,
+    cache_preparation: compactCachePreparation(observations.cache_preparation),
     transport_mode: observations.transport_mode ?? null,
-    doctor_status: doctor.status === "pass" && !parseError ? "pass" : "fail",
-    doctor_exit_code: doctor.exitCode,
-    doctor_error: doctor.error ?? parseError,
+    retrieval_status: retrievalStatus,
+    retrieval_mode: retrievalStatus.retrieval_mode ?? null,
+    sidecar_generation: retrievalStatus.sidecar_generation ?? null,
+    manifest_embedding_backend: retrievalStatus.manifest_embedding_backend ?? null,
+    doctor_status: doctor.status,
+    doctor_exit_code: doctor.exit_code,
+    doctor_error: doctor.error,
   };
 }
 
@@ -1834,6 +2268,8 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
       ? await codestoryCacheProvenance(opts, repoConfig, {
           codestory_index_commands_observed: analysis.codestory_index_commands_observed,
           indexing_in_timed_run: analysis.codestory_index_commands_observed > 0,
+          cache_prepared: opts.cachePreparationByRepo?.has(result.repo) ?? false,
+          cache_preparation: opts.cachePreparationByRepo?.get(result.repo) ?? null,
           transport_mode: "agent_runner",
         })
       : null
@@ -1938,7 +2374,33 @@ function packetPayloadText(packet) {
   if (!packet || typeof packet !== "object") {
     return String(packet ?? "");
   }
-  const chunks = [JSON.stringify(packet)];
+  const chunks = [];
+  chunks.push(packetAnswerText(packet));
+  for (const citation of packet.answer?.citations ?? []) {
+    chunks.push(
+      [
+        citation.display_name,
+        citation.file_path,
+        citation.line == null ? null : String(citation.line),
+      ]
+        .filter(Boolean)
+        .join(" "),
+    );
+  }
+  for (const claim of packet.sufficiency?.covered_claims ?? []) {
+    chunks.push(claim.claim);
+  }
+  for (const path of packet.sufficiency?.avoid_opening ?? []) {
+    chunks.push(path);
+  }
+  return chunks.filter(Boolean).join("\n");
+}
+
+function packetAnswerText(packet) {
+  if (!packet || typeof packet !== "object") {
+    return String(packet ?? "");
+  }
+  const chunks = [];
   if (packet.answer?.summary) {
     chunks.push(packet.answer.summary);
   }
@@ -1955,8 +2417,223 @@ function packetPayloadText(packet) {
   return chunks.join("\n");
 }
 
+function packetComposition(packet, task) {
+  if (!packet || typeof packet !== "object" || !task) {
+    return null;
+  }
+  const expectedFiles = [
+    ...new Set((task.expected_files ?? []).map(String).map((value) => value.trim()).filter(Boolean)),
+  ];
+  const expectedVerificationFiles = [
+    ...new Set(
+      (task.expected_verification_files ?? []).map(String).map((value) => value.trim()).filter(Boolean),
+    ),
+  ];
+  const citationPaths = (packet.answer?.citations ?? [])
+    .map((citation, index) => ({
+      source: "answer.citations",
+      path: citation.file_path,
+      rank: index + 1,
+      display_name: citation.display_name ?? null,
+      line: citation.line ?? null,
+    }))
+    .filter((entry) => entry.path);
+  const avoidOpeningPaths = (packet.sufficiency?.avoid_opening ?? [])
+    .map((pathValue, index) => ({
+      source: "sufficiency.avoid_opening",
+      path: pathValue,
+      rank: index + 1,
+      display_name: null,
+      line: null,
+    }))
+    .filter((entry) => entry.path);
+  const answerText = packetAnswerText(packet);
+  const structuredJson = JSON.stringify(packet);
+  const files = expectedFiles.map((expectedFile) => {
+    const citationSurfaces = pathSurfacesForExpected(citationPaths, expectedFile);
+    const avoidOpeningSurfaces = pathSurfacesForExpected(avoidOpeningPaths, expectedFile);
+    const answerTextMentioned = anchorMatched(answerText, expectedFile);
+    const structuredJsonMentioned = anchorMatched(structuredJson, expectedFile);
+    const citationBackedFound =
+      citationSurfaces.length > 0 || avoidOpeningSurfaces.length > 0;
+    const answerSurfaceFound = citationBackedFound || answerTextMentioned;
+    const structuredFound = answerSurfaceFound || structuredJsonMentioned;
+    return {
+      expected_file: expectedFile,
+      packet_boundary: packetLossBoundary({
+        cited: citationSurfaces.length > 0,
+        avoidOpening: avoidOpeningSurfaces.length > 0,
+        answerTextMentioned,
+        structuredJsonMentioned,
+      }),
+      citation_backed_found: citationBackedFound,
+      answer_surface_found: answerSurfaceFound,
+      structured_found: structuredFound,
+      cited: citationSurfaces.length > 0,
+      avoid_opening: avoidOpeningSurfaces.length > 0,
+      answer_text_mentioned: answerTextMentioned,
+      structured_json_mentioned: structuredJsonMentioned,
+      surfaces: [
+        ...citationSurfaces,
+        ...avoidOpeningSurfaces,
+        ...(answerTextMentioned
+          ? [{ source: "answer.text", path: expectedFile, rank: null, display_name: null, line: null }]
+          : []),
+        ...(structuredJsonMentioned && !answerSurfaceFound
+          ? [{ source: "packet.structured_json", path: expectedFile, rank: null, display_name: null, line: null }]
+          : []),
+      ],
+    };
+  });
+  const summary = summarizePacketComposition(files);
+  const verificationFiles = expectedVerificationFiles.map((expectedFile) =>
+    packetFileComposition(packet, expectedFile, {
+      citationPaths,
+      avoidOpeningPaths,
+      answerText,
+      structuredJson,
+    }),
+  );
+  const verificationSummary = summarizePacketComposition(verificationFiles);
+  return {
+    expected_file_count: expectedFiles.length,
+    ...summary,
+    files,
+    expected_verification_file_count: expectedVerificationFiles.length,
+    verification_summary: verificationSummary,
+    verification_files: verificationFiles,
+  };
+}
+
+function packetFileComposition(
+  packet,
+  expectedFile,
+  { citationPaths, avoidOpeningPaths, answerText, structuredJson },
+) {
+  const citationSurfaces = pathSurfacesForExpected(citationPaths, expectedFile);
+  const avoidOpeningSurfaces = pathSurfacesForExpected(avoidOpeningPaths, expectedFile);
+  const answerTextMentioned = anchorMatched(answerText, expectedFile);
+  const structuredJsonMentioned = anchorMatched(structuredJson, expectedFile);
+  const citationBackedFound =
+    citationSurfaces.length > 0 || avoidOpeningSurfaces.length > 0;
+  const answerSurfaceFound = citationBackedFound || answerTextMentioned;
+  const structuredFound = answerSurfaceFound || structuredJsonMentioned;
+  return {
+    expected_file: expectedFile,
+    packet_boundary: packetLossBoundary({
+      cited: citationSurfaces.length > 0,
+      avoidOpening: avoidOpeningSurfaces.length > 0,
+      answerTextMentioned,
+      structuredJsonMentioned,
+    }),
+    citation_backed_found: citationBackedFound,
+    answer_surface_found: answerSurfaceFound,
+    structured_found: structuredFound,
+    cited: citationSurfaces.length > 0,
+    avoid_opening: avoidOpeningSurfaces.length > 0,
+    answer_text_mentioned: answerTextMentioned,
+    structured_json_mentioned: structuredJsonMentioned,
+    surfaces: [
+      ...citationSurfaces,
+      ...avoidOpeningSurfaces,
+      ...(answerTextMentioned
+        ? [{ source: "answer.text", path: expectedFile, rank: null, display_name: null, line: null }]
+        : []),
+      ...(structuredJsonMentioned && !answerSurfaceFound
+        ? [{ source: "packet.structured_json", path: expectedFile, rank: null, display_name: null, line: null }]
+        : []),
+    ],
+  };
+}
+
+function pathSurfacesForExpected(paths, expectedFile) {
+  return paths
+    .filter((entry) => pathMatchesLike(entry.path, expectedFile))
+    .map((entry) => ({
+      source: entry.source,
+      path: normalizePathLike(entry.path),
+      rank: entry.rank,
+      display_name: entry.display_name,
+      line: entry.line,
+    }));
+}
+
+function packetLossBoundary({ cited, avoidOpening, answerTextMentioned, structuredJsonMentioned }) {
+  if (cited) {
+    return "cited_in_answer";
+  }
+  if (avoidOpening) {
+    return "listed_in_avoid_opening";
+  }
+  if (answerTextMentioned) {
+    return "mentioned_in_answer_text";
+  }
+  if (structuredJsonMentioned) {
+    return "present_only_in_structured_json";
+  }
+  return "absent_from_packet";
+}
+
+const PACKET_COMPOSITION_WEIGHTS = {
+  cited: 1,
+  avoid_opening: 0.9,
+  answer_text_only: 0.25,
+};
+
+function packetCompositionFileScore(file) {
+  if (file.cited) {
+    return PACKET_COMPOSITION_WEIGHTS.cited;
+  }
+  if (file.avoid_opening) {
+    return PACKET_COMPOSITION_WEIGHTS.avoid_opening;
+  }
+  if (file.answer_text_mentioned && !file.citation_backed_found) {
+    return PACKET_COMPOSITION_WEIGHTS.answer_text_only;
+  }
+  return 0;
+}
+
+function summarizePacketComposition(files) {
+  const expected = files.length;
+  const cited = files.filter((file) => file.cited).length;
+  const avoidOpening = files.filter((file) => file.avoid_opening).length;
+  const answerText = files.filter(
+    (file) => file.answer_text_mentioned && !file.citation_backed_found,
+  ).length;
+  const citationBacked = files.filter((file) => file.citation_backed_found).length;
+  const answerSurface = files.filter((file) => file.answer_surface_found).length;
+  const structured = files.filter((file) => file.structured_found).length;
+  const compositionScore = expected
+    ? files.reduce((sum, file) => sum + packetCompositionFileScore(file), 0) / expected
+    : null;
+  const boundaryCounts = {};
+  for (const file of files) {
+    boundaryCounts[file.packet_boundary] = (boundaryCounts[file.packet_boundary] ?? 0) + 1;
+  }
+  return {
+    cited_file_count: cited,
+    avoid_opening_file_count: avoidOpening,
+    answer_text_file_count: answerText,
+    citation_backed_file_count: citationBacked,
+    answer_surface_file_count: answerSurface,
+    structured_file_count: structured,
+    absent_file_count: expected - structured,
+    citation_recall: expected ? cited / expected : null,
+    citation_backed_recall: expected ? citationBacked / expected : null,
+    answer_surface_recall: expected ? answerSurface / expected : null,
+    structured_file_recall: expected ? structured / expected : null,
+    composition_score: compositionScore,
+    boundary_counts: boundaryCounts,
+  };
+}
+
 function jsonByteLength(value) {
   return Buffer.byteLength(JSON.stringify(value ?? null), "utf8");
+}
+
+function finiteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 function packetShape(packet) {
@@ -1993,6 +2670,64 @@ function packetSufficiencyTelemetry(packet, quality) {
   };
 }
 
+function packetRetrievalShadowTelemetry(shadow) {
+  if (!shadow || typeof shadow !== "object") {
+    return null;
+  }
+  const stages = Array.isArray(shadow.stage_timings) ? shadow.stage_timings : [];
+  const cacheHitStages = stages.filter((stage) => stage?.cache_hit === true);
+  return {
+    retrieval_mode: shadow.retrieval_mode ?? null,
+    degraded_reason: shadow.degraded_reason ?? null,
+    retrieval_total_ms: finiteNumber(shadow.retrieval_total_ms),
+    total_budget_ms: finiteNumber(shadow.total_budget_ms),
+    cancel_reason: shadow.cancel_reason ?? null,
+    cache_hit: shadow.cache_hit === true,
+    stage_count: stages.length,
+    cache_hit_stage_count: cacheHitStages.length,
+    cache_hit_stages: cacheHitStages
+      .map((stage) => String(stage?.stage ?? "").trim())
+      .filter(Boolean),
+    candidate_count: finiteNumber(shadow.candidate_count),
+    resolved_hit_count: finiteNumber(shadow.resolved_hit_count),
+    unresolved_candidate_count: finiteNumber(shadow.unresolved_candidate_count),
+    error: shadow.error ?? null,
+  };
+}
+
+function packetLatencyTelemetry(packet, wallMs) {
+  if (!packet || typeof packet !== "object") {
+    return null;
+  }
+  const retrievalTrace = packet.answer?.retrieval_trace ?? null;
+  const benchmarkRetrievalTrace = packet.benchmark_trace?.retrieval_trace ?? null;
+  const retrievalShadow = packetRetrievalShadowTelemetry(
+    benchmarkRetrievalTrace?.retrieval_shadow ?? retrievalTrace?.retrieval_shadow ?? null,
+  );
+  const freshness = packet.answer?.freshness ?? null;
+  const steps = Array.isArray(retrievalTrace?.steps) ? retrievalTrace.steps : [];
+  const topStep = [...steps].sort((left, right) => (right.duration_ms ?? 0) - (left.duration_ms ?? 0))[0] ?? null;
+  const retrievalTotalMs = finiteNumber(retrievalTrace?.total_latency_ms);
+  const freshnessMs = finiteNumber(freshness?.duration_ms);
+  const unaccountedMs =
+    Number.isFinite(wallMs) && Number.isFinite(retrievalTotalMs) && Number.isFinite(freshnessMs)
+      ? Math.max(0, wallMs - retrievalTotalMs - freshnessMs)
+      : null;
+  return {
+    freshness_ms: Number.isFinite(freshnessMs) ? freshnessMs : null,
+    retrieval_total_ms: Number.isFinite(retrievalTotalMs) ? retrievalTotalMs : null,
+    sla_target_ms: finiteNumber(retrievalTrace?.sla_target_ms),
+    sla_missed: retrievalTrace?.sla_missed ?? null,
+    unaccounted_ms: unaccountedMs,
+    top_step_kind: topStep?.kind ?? null,
+    top_step_status: topStep?.status ?? null,
+    top_step_duration_ms: finiteNumber(topStep?.duration_ms),
+    top_step_message: topStep?.message ?? null,
+    retrieval_step_count: steps.length,
+    retrieval_shadow: retrievalShadow,
+  };
+}
+
 async function runColdPacketRuntime(opts, task, repeat, outDir) {
   const repoConfig = ALL_REPOS[task.repo];
   const codestoryCli = resolveCodeStoryCli(opts);
@@ -2017,7 +2752,10 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
     args.push("--task-class", task.task_class.replace(/_/g, "-"));
   }
   const started = performance.now();
-  const result = await runProcess(codestoryCli, args, { timeoutMs: opts.timeoutMs });
+  const result = await runProcess(codestoryCli, args, {
+    env: benchmarkChildEnv(process.env),
+    timeoutMs: opts.timeoutMs,
+  });
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
   let packet = null;
   let parseError = null;
@@ -2033,6 +2771,8 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
     : null;
   const shape = packetShape(packet);
   const sufficiency = packetSufficiencyTelemetry(packet, quality);
+  const latency = packetLatencyTelemetry(packet, wallMs);
+  const composition = packetComposition(packet, task);
   const runId = benchmarkRunId([task.repo, task.id, "cold-cli-packet", String(repeat).padStart(2, "0")]);
   await writeFile(path.join(outDir, `${runId}.stdout.json`), result.stdout, "utf8");
   await writeFile(path.join(outDir, `${runId}.stderr.txt`), result.stderr, "utf8");
@@ -2052,6 +2792,8 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
     wall_ms: wallMs,
     response_bytes: Buffer.byteLength(result.stdout, "utf8"),
     packet_shape: shape,
+    packet_latency: latency,
+    packet_composition: composition,
     sufficiency,
     quality,
   };
@@ -2059,7 +2801,7 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
 
 function createStdioClient(command, args, opts) {
   const child = spawn(command, args, {
-    env: process.env,
+    env: benchmarkChildEnv(process.env),
     shell: false,
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
@@ -2159,6 +2901,7 @@ async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
     opts,
   );
   const rows = [];
+  const previousPacketByTask = new Map();
   try {
     await client.request({
       jsonrpc: "2.0",
@@ -2186,11 +2929,24 @@ async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
         const response = JSON.parse(responseLine);
         const packet = response.result?.structuredContent ?? null;
         const isError = response.result?.isError === true || response.error;
+        const packetFingerprint = packet && !isError ? JSON.stringify(packet) : null;
+        const previousPacket = packetFingerprint ? previousPacketByTask.get(task.id) : null;
+        const warmStdioPacketCacheHit =
+          packetFingerprint != null && previousPacket?.fingerprint === packetFingerprint;
+        if (packetFingerprint) {
+          previousPacketByTask.set(task.id, {
+            fingerprint: packetFingerprint,
+            repeat,
+            wallMs,
+          });
+        }
         const quality = packet && !isError
           ? scoreQualityFromText(packetPayloadText(packet), JSON.stringify(packet), task)
           : null;
         const shape = packetShape(packet);
         const sufficiency = packetSufficiencyTelemetry(packet, quality);
+        const latency = packetLatencyTelemetry(packet, wallMs);
+        const composition = packetComposition(packet, task);
         const runId = benchmarkRunId([task.repo, task.id, "warm-stdio-packet", String(repeat).padStart(2, "0")]);
         await writeFile(path.join(outDir, `${runId}.response.json`), `${JSON.stringify(response, null, 2)}\n`, "utf8");
         rows.push({
@@ -2208,7 +2964,12 @@ async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
           error: response.error?.message ?? (isError ? response.result?.content?.[0]?.text : null),
           wall_ms: wallMs,
           response_bytes: Buffer.byteLength(responseLine, "utf8"),
+          warm_stdio_packet_cache_hit: warmStdioPacketCacheHit,
+          warm_stdio_packet_cache_reference_repeat: warmStdioPacketCacheHit ? previousPacket.repeat : null,
+          warm_stdio_packet_cache_reference_wall_ms: warmStdioPacketCacheHit ? previousPacket.wallMs : null,
           packet_shape: shape,
+          packet_latency: latency,
+          packet_composition: composition,
           sufficiency,
           quality,
         });
@@ -2238,6 +2999,16 @@ function summarizePacketRuntimeRuns(results) {
     const qualityRows = successful.filter((row) => row.quality);
     const sufficiencyRows = successful.filter((row) => row.sufficiency);
     const shapeRows = successful.filter((row) => row.packet_shape);
+    const latencyRows = successful.filter((row) => row.packet_latency);
+    const shadowRows = latencyRows
+      .map((row) => row.packet_latency?.retrieval_shadow)
+      .filter((shadow) => shadow && typeof shadow === "object");
+    const compositionRows = successful.filter((row) => row.packet_composition);
+    const topLatencyRow = latencyRows
+      .filter((row) => Number.isFinite(Number(row.packet_latency?.top_step_duration_ms)))
+      .sort((left, right) =>
+        Number(right.packet_latency.top_step_duration_ms) - Number(left.packet_latency.top_step_duration_ms)
+      )[0];
     const sufficiencyStatusCounts = {};
     for (const row of sufficiencyRows) {
       const status = row.sufficiency.status ?? "unknown";
@@ -2257,10 +3028,25 @@ function summarizePacketRuntimeRuns(results) {
       median_packet_bytes: median(shapeRows.map((row) => row.packet_shape?.packet_bytes)),
       median_packet_graph_bytes: median(shapeRows.map((row) => row.packet_shape?.graph_bytes)),
       median_budget_used_output_bytes: median(shapeRows.map((row) => row.packet_shape?.budget_used_output_bytes)),
+      median_packet_freshness_ms: median(latencyRows.map((row) => row.packet_latency?.freshness_ms)),
+      median_packet_retrieval_total_ms: median(latencyRows.map((row) => row.packet_latency?.retrieval_total_ms)),
+      median_packet_unaccounted_ms: median(latencyRows.map((row) => row.packet_latency?.unaccounted_ms)),
+      packet_sla_missed_runs: latencyRows.filter((row) => row.packet_latency?.sla_missed === true).length,
+      warm_stdio_packet_cache_hit_runs: successful.filter((row) => row.warm_stdio_packet_cache_hit === true).length,
+      retrieval_shadow_cache_hit_runs: shadowRows.filter((shadow) => shadow.cache_hit === true).length,
+      retrieval_shadow_stage_cache_hit_runs: shadowRows.filter((shadow) => Number(shadow.cache_hit_stage_count) > 0).length,
+      median_retrieval_shadow_cache_hit_stage_count: median(shadowRows.map((shadow) => shadow.cache_hit_stage_count)),
+      packet_top_latency_step_kind: topLatencyRow?.packet_latency?.top_step_kind ?? null,
+      packet_top_latency_step_status: topLatencyRow?.packet_latency?.top_step_status ?? null,
+      median_packet_top_step_ms: median(latencyRows.map((row) => row.packet_latency?.top_step_duration_ms)),
       median_avoid_opening_count: median(sufficiencyRows.map((row) => row.sufficiency?.avoid_opening_count)),
       median_follow_up_commands_count: median(sufficiencyRows.map((row) => row.sufficiency?.follow_up_commands_count)),
       median_expected_file_recall: median(qualityRows.map((row) => row.quality?.expected_files?.recall)),
+      median_expected_claim_recall: median(qualityRows.map((row) => row.quality?.expected_claims?.recall)),
       median_citation_coverage: median(qualityRows.map((row) => row.quality?.citation_coverage?.recall)),
+      median_packet_citation_recall: median(compositionRows.map((row) => row.packet_composition?.citation_recall)),
+      median_packet_answer_surface_recall: median(compositionRows.map((row) => row.packet_composition?.answer_surface_recall)),
+      median_packet_structured_file_recall: median(compositionRows.map((row) => row.packet_composition?.structured_file_recall)),
     };
   });
 }
@@ -2269,8 +3055,8 @@ function packetRuntimeMarkdown(summary) {
   const lines = [
     "# Packet Runtime Benchmark",
     "",
-    "| Repo | Task | Mode | Runs | Pass | Quality Pass | Sufficiency | Suff/quality gaps | Wall ms median | Response bytes median | Packet bytes median | Graph bytes median | Avoid-open median | Follow-up median | File recall | Citation coverage |",
-    "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    "| Repo | Task | Mode | Runs | Pass | Quality Pass | Sufficiency | Suff/quality gaps | Wall ms median | Retrieval ms median | Freshness ms median | Unaccounted ms median | Top step | Top step ms median | SLA misses | Packet-cache hits | Retrieval cache-hit runs | Stage cache-hit runs | Response bytes median | Packet bytes median | Graph bytes median | Avoid-open median | Follow-up median | File recall | Citation coverage | Packet citation recall | Packet answer-surface recall | Packet structured recall |",
+    "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ];
   for (const row of summary) {
     lines.push(packetRuntimeMarkdownRow(row));
@@ -2292,6 +3078,15 @@ function packetRuntimeMarkdownRow(row) {
     sufficiency,
     formatValue(row.sufficient_quality_mismatch_runs),
     formatValue(row.median_wall_ms),
+    formatValue(row.median_packet_retrieval_total_ms),
+    formatValue(row.median_packet_freshness_ms),
+    formatValue(row.median_packet_unaccounted_ms),
+    row.packet_top_latency_step_kind ?? "",
+    formatValue(row.median_packet_top_step_ms),
+    formatValue(row.packet_sla_missed_runs),
+    formatValue(row.warm_stdio_packet_cache_hit_runs),
+    formatValue(row.retrieval_shadow_cache_hit_runs),
+    formatValue(row.retrieval_shadow_stage_cache_hit_runs),
     formatValue(row.median_response_bytes),
     formatValue(row.median_packet_bytes),
     formatValue(row.median_packet_graph_bytes),
@@ -2299,6 +3094,9 @@ function packetRuntimeMarkdownRow(row) {
     formatValue(row.median_follow_up_commands_count),
     formatPercent(row.median_expected_file_recall),
     formatPercent(row.median_citation_coverage),
+    formatPercent(row.median_packet_citation_recall),
+    formatPercent(row.median_packet_answer_surface_recall),
+    formatPercent(row.median_packet_structured_file_recall),
   ];
   return `| ${cells.join(" | ")} |`;
 }
@@ -2361,8 +3159,34 @@ function cacheProvenanceBlockers(result) {
   if (!provenance.cache_policy) {
     reasons.push("missing CodeStory cache policy");
   }
+  if (provenance.cache_policy === "unprepared-cache-blocked") {
+    reasons.push("CodeStory sidecar cache was not prepared");
+  }
+  if (provenance.retrieval_mode !== "full") {
+    reasons.push(`CodeStory retrieval mode=${provenance.retrieval_mode ?? "unknown"}; expected full`);
+  }
+  if (!provenance.sidecar_generation) {
+    reasons.push("missing CodeStory sidecar generation");
+  }
+  if (provenance.manifest_embedding_backend !== "llamacpp:bge-base-en-v1.5") {
+    reasons.push(
+      `CodeStory sidecar embedding backend=${provenance.manifest_embedding_backend ?? "unknown"}; expected llamacpp:bge-base-en-v1.5`,
+    );
+  }
   if (provenance.semantic_backend == null) {
     reasons.push("missing CodeStory semantic backend");
+  }
+  if (provenance.local_only !== true) {
+    reasons.push(`CodeStory local-only guarantee is not proven (${provenance.locality_kind ?? "unknown"})`);
+  }
+  if (provenance.indexed !== true) {
+    reasons.push("CodeStory cache is not indexed");
+  }
+  if (provenance.freshness_status !== "fresh") {
+    reasons.push(`CodeStory cache freshness=${provenance.freshness_status ?? "unknown"}`);
+  }
+  if (provenance.semantic_ready !== true) {
+    reasons.push("CodeStory semantic docs are not ready");
   }
   if (provenance.indexing_in_timed_run == null) {
     reasons.push("missing timed-run indexing provenance");
@@ -2370,8 +3194,121 @@ function cacheProvenanceBlockers(result) {
   return reasons;
 }
 
+function qualityFailureReasons(quality) {
+  if (!quality) {
+    return ["missing_quality_score"];
+  }
+  if (quality.pass) {
+    return [];
+  }
+  const reasons = [];
+  const thresholds = quality.thresholds ?? {};
+  const files = quality.expected_files ?? {};
+  const symbols = quality.expected_symbols ?? {};
+  const claims = quality.expected_claims ?? {};
+  const citations = quality.citation_coverage ?? {};
+  const anchors = quality.expected_anchors ?? {};
+  const forbidden = quality.forbidden_claims ?? {};
+
+  if (!thresholdPass(anchors.recall, thresholdValue(thresholds, "expected_anchor_recall", 0.8))) {
+    reasons.push("expected_anchor_recall_low");
+  }
+  if (!thresholdPass(files.recall, thresholdValue(thresholds, "expected_file_recall", 0.8))) {
+    reasons.push("expected_file_recall_low");
+  }
+  if (!thresholdPass(symbols.recall, thresholdValue(thresholds, "expected_symbol_recall", 0.7))) {
+    reasons.push("expected_symbol_recall_low");
+  }
+  if (!thresholdPass(claims.recall, thresholdValue(thresholds, "expected_claim_recall", 0.8))) {
+    reasons.push("expected_claim_recall_low");
+  }
+  if (!thresholdPass(citations.recall, thresholdValue(thresholds, "citation_coverage", 0.6))) {
+    reasons.push("citation_coverage_low");
+  }
+  if ((forbidden.found ?? 0) > thresholdValue(thresholds, "max_forbidden_claims", 0)) {
+    reasons.push("forbidden_claim_present");
+  }
+  if (!reasons.length) {
+    reasons.push("quality_gate_failed");
+  }
+  return reasons;
+}
+
+function extractRetrievalDiagnostics(row) {
+  const shadow = row.packet_composition?.retrieval_shadow ?? row.packet_latency?.retrieval_shadow ?? null;
+  const composition = row.packet_composition ?? null;
+  if (!shadow && !composition) {
+    return null;
+  }
+  return {
+    retrieval_mode: shadow?.retrieval_mode ?? null,
+    degraded_reason: shadow?.degraded_reason ?? null,
+    cache_hit: shadow?.cache_hit ?? null,
+    cache_hit_stage_count: shadow?.cache_hit_stage_count ?? null,
+    cache_hit_stages: shadow?.cache_hit_stages ?? null,
+    candidate_count: shadow?.candidate_count ?? null,
+    resolved_hit_count: shadow?.resolved_hit_count ?? null,
+    unavailable_mode: shadow?.retrieval_mode === "unavailable",
+    citation_recall: composition?.citation_recall ?? null,
+    answer_surface_recall: composition?.answer_surface_recall ?? null,
+    structured_file_recall: composition?.structured_file_recall ?? null,
+  };
+}
+
+function buildQualityDebugPayload(results, meta = {}) {
+  const rows = results.map((row) => {
+    const quality = row.quality ?? null;
+    const failureReasons = qualityFailureReasons(quality);
+    return {
+      repo: row.repo,
+      task_id: row.task_id,
+      mode: row.mode,
+      repeat: row.repeat ?? null,
+      status: row.status,
+      warm_stdio_packet_cache_hit: row.warm_stdio_packet_cache_hit ?? null,
+      quality_pass: quality?.pass ?? null,
+      failure_reasons: failureReasons,
+      quality_metrics: quality
+        ? {
+            expected_file_recall: quality.expected_files?.recall ?? null,
+            expected_symbol_recall: quality.expected_symbols?.recall ?? null,
+            expected_claim_recall: quality.expected_claims?.recall ?? null,
+            citation_coverage: quality.citation_coverage?.recall ?? null,
+            expected_anchor_recall: quality.expected_anchors?.recall ?? null,
+            forbidden_claims_found: quality.forbidden_claims?.found ?? null,
+          }
+        : null,
+      missed_anchors: quality?.missed_anchors ?? null,
+      retrieval: extractRetrievalDiagnostics(row),
+      sufficiency_status: row.sufficiency?.status ?? null,
+      sufficient_quality_mismatch: row.sufficiency?.sufficient_quality_mismatch ?? null,
+    };
+  });
+  const failing = rows.filter((row) => row.quality_pass === false);
+  const reasonCounts = {};
+  for (const row of failing) {
+    for (const reason of row.failure_reasons) {
+      reasonCounts[reason] = (reasonCounts[reason] ?? 0) + 1;
+    }
+  }
+  return {
+    generated_at: new Date().toISOString(),
+    scope: "packet_runtime_quality_debug",
+    ...meta,
+    rows,
+    summary: {
+      runs: rows.length,
+      quality_scored_runs: rows.filter((row) => row.quality_pass != null).length,
+      quality_pass_runs: rows.filter((row) => row.quality_pass === true).length,
+      quality_fail_runs: failing.length,
+      failure_reason_counts: reasonCounts,
+    },
+  };
+}
+
 function packetRuntimePublishableBlockers(results, opts = {}) {
   const enforceRepoProvenance = Boolean(opts.publishable || opts.enforceRepoProvenance);
+  const enforcePacketRuntimeTelemetry = Boolean(opts.publishable || opts.enforcePacketRuntimeTelemetry);
   return results
     .map((row) => {
       const reasons = [];
@@ -2385,6 +3322,27 @@ function packetRuntimePublishableBlockers(results, opts = {}) {
       }
       if (row.sufficiency?.sufficient_quality_mismatch) {
         reasons.push("packet sufficiency says sufficient but manifest quality failed");
+      }
+      if (enforcePacketRuntimeTelemetry) {
+        if (!row.sufficiency) {
+          reasons.push("missing packet sufficiency telemetry");
+        } else if (row.sufficiency.status !== "sufficient") {
+          reasons.push(`packet sufficiency status=${row.sufficiency.status ?? "unknown"}; expected sufficient`);
+        }
+        const latency = row.packet_latency;
+        if (!latency) {
+          reasons.push("missing packet latency telemetry");
+        } else {
+          if (latency.sla_missed !== false) {
+            reasons.push(`packet retrieval SLA missed=${latency.sla_missed ?? "unknown"}; expected false`);
+          }
+          const shadow = latency.retrieval_shadow;
+          if (!shadow) {
+            reasons.push("missing retrieval shadow telemetry");
+          } else if (shadow.retrieval_mode !== "full") {
+            reasons.push(`packet retrieval shadow mode=${shadow.retrieval_mode ?? "unknown"}; expected full`);
+          }
+        }
       }
       if (enforceRepoProvenance) {
         reasons.push(...repoProvenanceBlockers(row));
@@ -2406,13 +3364,118 @@ function groupTasksByRepo(tasks) {
   return byRepo;
 }
 
+function packetCompositionPayload(results) {
+  return {
+    generated_at: new Date().toISOString(),
+    scope: "packet_runtime_composition",
+    rows: results
+      .filter((row) => row.packet_composition)
+      .map((row) => ({
+        repo: row.repo,
+        task_id: row.task_id,
+        mode: row.mode,
+        repeat: row.repeat,
+        status: row.status,
+        sufficiency_status: row.sufficiency?.status ?? null,
+        composition_summary: {
+          expected_file_count: row.packet_composition.expected_file_count,
+          cited_file_count: row.packet_composition.cited_file_count,
+          avoid_opening_file_count: row.packet_composition.avoid_opening_file_count,
+          answer_text_file_count: row.packet_composition.answer_text_file_count,
+          answer_surface_file_count: row.packet_composition.answer_surface_file_count,
+          structured_file_count: row.packet_composition.structured_file_count,
+          absent_file_count: row.packet_composition.absent_file_count,
+          citation_recall: row.packet_composition.citation_recall,
+          answer_surface_recall: row.packet_composition.answer_surface_recall,
+          structured_file_recall: row.packet_composition.structured_file_recall,
+          boundary_counts: row.packet_composition.boundary_counts,
+          expected_verification_file_count: row.packet_composition.expected_verification_file_count,
+          verification_summary: row.packet_composition.verification_summary,
+        },
+        expected_files: row.packet_composition.files,
+        expected_verification_files: row.packet_composition.verification_files,
+      })),
+  };
+}
+
+function packetCompositionMarkdown(payload) {
+  const lines = [
+    "# Packet Runtime Composition",
+    "",
+    "| Repo | Task | Mode | Repeat | Status | Sufficiency | Citation recall | Answer-surface recall | Structured recall | Boundary counts |",
+    "| --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | --- |",
+  ];
+  for (const row of payload.rows) {
+    const summary = row.composition_summary ?? {};
+    const boundaryCounts = Object.entries(summary.boundary_counts ?? {})
+      .map(([boundary, count]) => `${boundary}:${count}`)
+      .join(", ");
+    lines.push(
+      `| ${row.repo} | ${row.task_id} | ${row.mode} | ${row.repeat} | ${row.status} | ${row.sufficiency_status ?? ""} | ${formatPercent(summary.citation_recall)} | ${formatPercent(summary.answer_surface_recall)} | ${formatPercent(summary.structured_file_recall)} | ${boundaryCounts} |`,
+    );
+  }
+  for (const row of payload.rows) {
+    lines.push("");
+    lines.push(`## ${row.repo} / ${row.task_id} / ${row.mode} / repeat ${row.repeat}`);
+    lines.push("");
+    lines.push("| Expected file | Boundary | Surfaces |");
+    lines.push("| --- | --- | --- |");
+    for (const file of row.expected_files ?? []) {
+      const surfaces = (file.surfaces ?? [])
+        .map((surface) =>
+          [
+            surface.source,
+            surface.rank == null ? null : `rank=${surface.rank}`,
+            surface.line == null ? null : `line=${surface.line}`,
+          ]
+            .filter(Boolean)
+            .join(" "),
+        )
+        .join("<br>");
+      lines.push(`| ${file.expected_file} | ${file.packet_boundary} | ${surfaces || ""} |`);
+    }
+    if ((row.expected_verification_files ?? []).length) {
+      lines.push("");
+      lines.push("| Expected verification file | Boundary | Surfaces |");
+      lines.push("| --- | --- | --- |");
+      for (const file of row.expected_verification_files ?? []) {
+        const surfaces = (file.surfaces ?? [])
+          .map((surface) =>
+            [
+              surface.source,
+              surface.rank == null ? null : `rank=${surface.rank}`,
+              surface.line == null ? null : `line=${surface.line}`,
+            ]
+              .filter(Boolean)
+              .join(" "),
+          )
+          .join("<br>");
+        lines.push(`| ${file.expected_file} | ${file.packet_boundary} | ${surfaces || ""} |`);
+      }
+    }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 async function runPacketRuntimeBenchmark(opts, tasks) {
   if (!tasks.length) {
     throw new Error("--packet-runtime requires --task-suite or --task-manifest");
   }
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outDir = path.resolve(opts.outDir ?? path.join(repoRoot, "target", "agent-benchmark", `packet-runtime-${timestamp}`));
+  const benchmarkId = opts.benchmarkRunId ?? path.basename(outDir);
   await mkdir(outDir, { recursive: true });
+  const cachePreparation = opts.prepareCodestoryCache
+    ? await prepareCodeStoryCaches(opts, tasks)
+    : [];
+  opts.cachePreparationByRepo = new Map(cachePreparation.map((row) => [row.repo, row]));
+  if (cachePreparation.length) {
+    await writeFile(
+      path.join(outDir, "codestory-cache-preparation.json"),
+      `${JSON.stringify(cachePreparation, null, 2)}\n`,
+      "utf8",
+    );
+  }
   const modes =
     opts.packetRuntimeMode === "both"
       ? ["cold-cli", "warm-stdio"]
@@ -2436,14 +3499,56 @@ async function runPacketRuntimeBenchmark(opts, tasks) {
   const summary = summarizePacketRuntimeRuns(results);
   const payload = {
     generated_at: new Date().toISOString(),
+    benchmark_run_id: benchmarkId,
     codestory_cli: resolveCodeStoryCli(opts),
     modes,
     repeats: opts.repeats,
     output_dir: outDir,
+    retrieval_env: retrievalEnv(),
+    retrieval_contract: retrievalContractSummary(benchmarkChildEnv(process.env)),
     summary,
   };
-  await writeFile(path.join(outDir, "packet-runtime-summary.json"), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  const packetRuntimeSummaryPath = path.join(outDir, "packet-runtime-summary.json");
+  await writeFile(packetRuntimeSummaryPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
   await writeFile(path.join(outDir, "packet-runtime-summary.md"), packetRuntimeMarkdown(summary), "utf8");
+  const baselinePacketSummaryPath = discoverPreviousPacketSummary(packetRuntimeSummaryPath, repoRoot);
+  const baselinePacketSummary = baselinePacketSummaryPath
+    ? JSON.parse(await readFile(baselinePacketSummaryPath, "utf8"))
+    : null;
+  const packetQualityDeltas = buildPacketQualityDeltas(
+    summary,
+    Array.isArray(baselinePacketSummary?.summary) ? baselinePacketSummary.summary : [],
+    {
+      currentPath: packetRuntimeSummaryPath,
+      baselinePath: baselinePacketSummaryPath,
+    },
+  );
+  const packetQualityDeltasPath = path.join(outDir, "packet-quality-deltas.json");
+  await writeFile(packetQualityDeltasPath, `${JSON.stringify(packetQualityDeltas, null, 2)}\n`, "utf8");
+  console.log(`ARTIFACT packet_quality_deltas=${packetQualityDeltasPath}`);
+  const qualityDebug = buildQualityDebugPayload(results, {
+    output_dir: outDir,
+    benchmark_run_id: benchmarkId,
+    codestory_cli: resolveCodeStoryCli(opts),
+    modes,
+    repeats: opts.repeats,
+  });
+  const qualityDebugPath = path.join(outDir, "quality-debug.json");
+  await writeFile(qualityDebugPath, `${JSON.stringify(qualityDebug, null, 2)}\n`, "utf8");
+  console.log(`ARTIFACT quality_debug=${qualityDebugPath}`);
+  const compositionPayload = packetCompositionPayload(results);
+  if (compositionPayload.rows.length) {
+    await writeFile(
+      path.join(outDir, "packet-composition.json"),
+      `${JSON.stringify(compositionPayload, null, 2)}\n`,
+      "utf8",
+    );
+    await writeFile(
+      path.join(outDir, "packet-composition.md"),
+      packetCompositionMarkdown(compositionPayload),
+      "utf8",
+    );
+  }
 
   const blockers = packetRuntimePublishableBlockers(results, opts);
   if (opts.publishable && blockers.length) {
@@ -2534,10 +3639,35 @@ function summarizeRuns(results) {
       median_citation_coverage: median(
         qualityRows.map((row) => row.quality?.citation_coverage?.recall),
       ),
+      median_repository_context_output_chars: median(
+        successful.map((row) => repositoryContextOutputChars(row.transcript_analysis)),
+      ),
+      median_useful_anchor_hits_per_10k_context_chars: median(
+        qualityRows.map((row) => usefulAnchorHitsPer10kContextChars(row)),
+      ),
       median_command_categories: categoryMedians,
     });
   }
   return summaries;
+}
+
+function repositoryContextOutputChars(analysis) {
+  const byCategory = analysis?.output_chars_by_category ?? {};
+  return (
+    (byCategory.codestory_cli ?? 0) +
+    (byCategory.shell_search ?? 0) +
+    (byCategory.direct_file_read ?? 0) +
+    (byCategory.git ?? 0)
+  );
+}
+
+function usefulAnchorHitsPer10kContextChars(row) {
+  const hits = row.quality?.expected_anchors?.found;
+  if (hits == null) {
+    return null;
+  }
+  const contextChars = repositoryContextOutputChars(row.transcript_analysis);
+  return hits / Math.max(1, contextChars / 10_000);
 }
 
 function agentPublishableBlockers(results, opts = {}) {
@@ -2589,8 +3719,8 @@ function markdownSummary(summary, opts) {
     `Sandbox: \`${opts.sandbox}\``,
     `Host: \`${os.hostname()}\``,
     "",
-    "| Repo | Task | Arm | Runs | Success | Packet first | Quality pass | Median wall ms | Median tokens | Median cost USD | Median tool calls | Source reads | After CodeStory | After Packet | File recall | Citation coverage |",
-    "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    "| Repo | Task | Arm | Runs | Success | Packet first | Quality pass | Median wall ms | Median tokens | Median cost USD | Median tool calls | Source reads | After CodeStory | After Packet | File recall | Citation coverage | Context chars | Useful anchors / 10k context chars |",
+    "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ];
   for (const row of summary) {
     lines.push(markdownSummaryRow(row));
@@ -2622,6 +3752,8 @@ function markdownSummaryRow(row) {
     formatValue(row.median_source_reads_after_packet),
     formatPercent(row.median_expected_file_recall),
     formatPercent(row.median_citation_coverage),
+    formatValue(row.median_repository_context_output_chars),
+    formatValue(row.median_useful_anchor_hits_per_10k_context_chars),
   ];
   return `| ${cells.join(" | ")} |`;
 }
@@ -2771,6 +3903,24 @@ function runSelfTest() {
     }),
     [null, false, true, "fail"],
   );
+  assert.equal(
+    cachePreparationAction({
+      status: "pass",
+      indexed: true,
+      freshness_status: "stale",
+      semantic_ready: false,
+    }),
+    "retrieval-index-auto",
+  );
+  assert.equal(
+    cachePreparationAction({
+      status: "pass",
+      indexed: true,
+      freshness_status: "fresh",
+      semantic_ready: true,
+    }),
+    "already-ready",
+  );
 
   console.log("self-test passed");
 }
@@ -2845,11 +3995,22 @@ async function main() {
     }
   }
 
+  const plannedRuns = planAgentRuns(opts, tasks);
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outDir = path.resolve(opts.outDir ?? path.join(repoRoot, "target", "agent-benchmark", timestamp));
   await mkdir(outDir, { recursive: true });
+  const cachePreparation = opts.prepareCodestoryCache
+    ? await prepareCodeStoryCaches(opts, tasks)
+    : [];
+  opts.cachePreparationByRepo = new Map(cachePreparation.map((row) => [row.repo, row]));
+  if (cachePreparation.length) {
+    await writeFile(
+      path.join(outDir, "codestory-cache-preparation.json"),
+      `${JSON.stringify(cachePreparation, null, 2)}\n`,
+      "utf8",
+    );
+  }
 
-  const plannedRuns = planAgentRuns(opts, tasks);
   const results = [];
   for (const run of plannedRuns) {
     console.log(`running ${run.repo} ${run.arm} repeat ${run.repeat}/${opts.repeats}`);
@@ -2868,6 +4029,8 @@ async function main() {
     task_suite: opts.taskSuite,
     task_ids: opts.taskIds,
     task_manifest: opts.taskManifest,
+    prepare_codestory_cache: opts.prepareCodestoryCache,
+    cache_preparation: cachePreparation,
     tasks: tasks.map((task) => ({
       id: task.id,
       repo: task.repo,
@@ -2881,6 +4044,8 @@ async function main() {
     timeout_ms: opts.timeoutMs,
     sandbox: opts.sandbox,
     output_dir: outDir,
+    retrieval_env: retrievalEnv(),
+    retrieval_contract: retrievalContractSummary(benchmarkChildEnv(process.env)),
     summary,
   };
   await writeFile(path.join(outDir, "summary.json"), `${JSON.stringify(summaryPayload, null, 2)}\n`, "utf8");
@@ -2918,18 +4083,29 @@ export {
   agentPublishableBlockers,
   assertSafeWindowsCmdArgs,
   benchmarkRunId,
+  buildPacketQualityDeltas,
+  buildQualityDebugPayload,
+  qualityFailureReasons,
   commandCategory,
   extractCommandExecutions,
   isPathInside,
   loadTaskForResult,
   loadTasks,
+  materializeRepos,
+  parseArgs,
   parseJsonLines,
+  packetComposition,
+  packetLatencyTelemetry,
+  packetRuntimePublishableBlockers,
+  PACKET_COMPOSITION_WEIGHTS,
+  packetCompositionFileScore,
   packetFirstCommandForPrompt,
   publicCoreCorpusAudit,
   repoProvenanceBlockers,
   repoConfigFromManifest,
   resolveCodeStoryCli,
   scoreQuality,
+  summarizePacketRuntimeRuns,
   taskSnapshotForResult,
 };
 

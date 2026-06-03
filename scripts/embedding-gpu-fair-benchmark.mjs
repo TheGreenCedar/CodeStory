@@ -569,14 +569,15 @@ const queries = [
   },
   {
     id: "holdout-stdio-tool-router",
-    query: "dispatch JSON stdio tool calls to search symbol trail snippet and ask handlers",
+    query: "dispatch JSON stdio tool calls to packet search symbol trail snippet and context handlers",
     expect: [
       "handle_stdio_tool_call",
+      "handle_stdio_packet",
       "handle_stdio_search",
       "handle_stdio_symbol",
       "handle_stdio_trail",
       "handle_stdio_snippet",
-      "handle_stdio_ask",
+      "handle_stdio_context",
     ],
     bucket: "holdout-adversarial",
   },
@@ -605,14 +606,14 @@ const queries = [
   },
   {
     id: "holdout-agent-term-planner",
-    query: "ask a local agent to suggest extra search terms when retrieval needs a planner",
-    expect: ["build_term_planner_prompt", "should_use_agent_term_planner"],
+    query: "build packet search plans and concrete symbol probe queries from a broad task prompt",
+    expect: ["build_packet_plan", "packet_symbol_probe_queries", "infer_packet_task_class"],
     bucket: "holdout-adversarial",
   },
   {
     id: "holdout-agent-prompt-builder",
-    query: "build the constrained prompt sent to a local code assistant using indexed context only",
-    expect: ["build_local_agent_prompt"],
+    query: "augment a packet retrieval prompt with planned CodeStory queries for compact broad task grounding",
+    expect: ["packet_retrieval_prompt", "packet_compact_retrieval_prompt_lines"],
     bucket: "holdout-adversarial",
   },
   {
@@ -764,9 +765,9 @@ const queries = [
     bucket: "holdout-adversarial",
   },
   {
-    id: "holdout-ask-artifact-bundle",
-    query: "write agent ask bundle artifacts with a sanitized filename",
-    expect: ["write_ask_bundle", "sanitize_artifact_name"],
+    id: "holdout-context-artifact-bundle",
+    query: "write context bundle artifacts and sanitize generated artifact filenames",
+    expect: ["write_context_bundle", "sanitize_artifact_name"],
     bucket: "holdout-adversarial",
   },
   {

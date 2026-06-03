@@ -1,0 +1,104 @@
+{
+  "$schema": "../manifest.schema.json",
+  "id": "axios-request-dispatch",
+  "version": 1,
+  "suite": "holdout-retrieval",
+  "task_class": "architecture_explanation",
+  "repo": {
+    "name": "axios",
+    "url": "https://github.com/axios/axios.git",
+    "ref": "v1.6.8",
+    "workspace_root": ".",
+    "languages": [
+      "JavaScript",
+      "TypeScript"
+    ],
+    "setup": [
+      "npm install"
+    ]
+  },
+  "prompt": "Explain how the default axios instance is created and how an HTTP request flows through interceptors, dispatchRequest, and the transport adapter. Cite the source files that support the path.",
+  "expected_files": [
+    "lib/axios.js",
+    "lib/core/Axios.js",
+    "lib/core/dispatchRequest.js",
+    "lib/core/InterceptorManager.js",
+    "lib/adapters/adapters.js"
+  ],
+  "expected_symbols": [
+    {
+      "name": "createInstance",
+      "path": "lib/axios.js",
+      "kind": "function",
+      "why": "Factory that binds Axios methods onto the callable instance."
+    },
+    {
+      "name": "Axios",
+      "path": "lib/core/Axios.js",
+      "kind": "class",
+      "why": "Owns defaults and request/response interceptor managers."
+    },
+    {
+      "name": "Axios.prototype.request",
+      "path": "lib/core/Axios.js",
+      "kind": "method",
+      "why": "Merges config and runs the interceptor chain ending in dispatchRequest."
+    },
+    {
+      "name": "dispatchRequest",
+      "path": "lib/core/dispatchRequest.js",
+      "kind": "function",
+      "why": "Transforms data, selects an adapter, and settles the response."
+    },
+    {
+      "name": "InterceptorManager",
+      "path": "lib/core/InterceptorManager.js",
+      "kind": "class",
+      "why": "Registers fulfilled/rejected handlers for request and response chains."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "createInstance wraps an Axios context and exposes verb helpers bound to request."
+    },
+    {
+      "text": "Axios.request merges defaults, runs request interceptors, then calls dispatchRequest."
+    },
+    {
+      "text": "dispatchRequest transforms the body/headers and invokes the configured adapter."
+    },
+    {
+      "text": "InterceptorManager stores interceptor pairs used by the promise chain in request."
+    },
+    {
+      "text": "adapters.js selects xhr or http transport based on environment capabilities."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "axios sends HTTP requests directly from createInstance without an Axios request chain.",
+      "severity": "critical"
+    },
+    {
+      "text": "Interceptors run only after the transport adapter returns a response.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.7,
+    "min_expected_symbol_recall": 0.65,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.7,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "holdout",
+    "javascript",
+    "http",
+    "generalization"
+  ],
+  "notes": [
+    "Generalization holdout for sidecar retrieval. Do not tune planner or ranker heuristics against this manifest."
+  ]
+}

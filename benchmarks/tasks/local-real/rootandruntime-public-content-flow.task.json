@@ -1,0 +1,148 @@
+{
+  "$schema": "../manifest.schema.json",
+  "id": "rootandruntime-public-content-flow",
+  "version": 1,
+  "suite": "local-real",
+  "task_class": "architecture_explanation",
+  "repo": {
+    "name": "rootandruntime",
+    "url": "file:///C:/Users/alber/source/repos/rootandruntime",
+    "ref": "44d46071a8783db0b44e4b7d7e1521b0dbb9fe65",
+    "workspace_root": ".",
+    "languages": [
+      "TypeScript",
+      "React"
+    ],
+    "setup": [
+      "No dependency setup is required for read-only benchmark inspection."
+    ]
+  },
+  "prompt": "Explain how Root & Runtime public writing and social surfaces connect through Payload collections, post rendering, comment auth/submission, RSS, and the Elsewhere feed. Cite the source files that support the path.",
+  "expected_files": [
+    "src/payload.config.ts",
+    "src/collections/Posts.ts",
+    "src/collections/Comments.ts",
+    "src/collections/SocialEntries.ts",
+    "src/app/(frontend)/posts/[slug]/page.tsx",
+    "src/app/(frontend)/posts/[slug]/comments/route.ts",
+    "src/app/feed.xml/route.ts",
+    "src/lib/payload.ts",
+    "src/lib/comment-auth.ts",
+    "src/lib/comment-submission-guard.ts",
+    "src/lib/content-data/post-content.ts",
+    "src/lib/content-data/comment-content.ts",
+    "src/lib/content-data/social-entry-content.ts"
+  ],
+  "expected_symbols": [
+    {
+      "name": "buildConfig",
+      "path": "src/payload.config.ts",
+      "kind": "function call",
+      "why": "Registers the Payload collections, globals, editor, database adapter, and storage plugin."
+    },
+    {
+      "name": "Posts",
+      "path": "src/collections/Posts.ts",
+      "kind": "collection config",
+      "why": "Defines the posts collection, publishing metadata, categories, authors, drafts, and revalidation hooks."
+    },
+    {
+      "name": "Comments",
+      "path": "src/collections/Comments.ts",
+      "kind": "collection config",
+      "why": "Defines moderated comment storage, post relationship, author fields, commenter auth metadata, and editorial access."
+    },
+    {
+      "name": "SocialEntries",
+      "path": "src/collections/SocialEntries.ts",
+      "kind": "collection config",
+      "why": "Defines stored Reddit/Instagram entries, hidden/pinned moderation, overrides, and social-entry revalidation hooks."
+    },
+    {
+      "name": "PostPage",
+      "path": "src/app/(frontend)/posts/[slug]/page.tsx",
+      "kind": "React server component",
+      "why": "Renders a published post with related posts, approved comments, structured data, and comment UI."
+    },
+    {
+      "name": "POST",
+      "path": "src/app/(frontend)/posts/[slug]/comments/route.ts",
+      "kind": "route handler",
+      "why": "Validates and persists public comment submissions through Payload."
+    },
+    {
+      "name": "getCommentAuthContextFromHeaders",
+      "path": "src/lib/comment-auth.ts",
+      "kind": "function",
+      "why": "Resolves optional Better Auth session context for authenticated commenters."
+    },
+    {
+      "name": "getLatestSocialEntries",
+      "path": "src/lib/content-data/social-entry-content.ts",
+      "kind": "function",
+      "why": "Reads stored social entries from Payload and returns public Elsewhere feed items."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "Payload is configured in src/payload.config.ts with Users, Media, Categories, Posts, Pages, Comments, and SocialEntries collections."
+    },
+    {
+      "text": "The Posts collection owns published writing metadata such as slugs, excerpts, authors, categories, hero media, drafts, and publishedAt."
+    },
+    {
+      "text": "The post page loads a post by slug, approved comments, related posts, and site settings before rendering RichTextRenderer and PostComments."
+    },
+    {
+      "text": "The comment POST route validates origin, honeypot, draft validity, timing, and rate limits before creating a pending comment in Payload."
+    },
+    {
+      "text": "Comment auth is optional: getCommentAuthContextFromHeaders returns a Better Auth session when configured, and guest comments still work when it is absent."
+    },
+    {
+      "text": "The feed.xml route reads published posts and site settings, then renders RSS item XML for each post."
+    },
+    {
+      "text": "SocialEntries stores moderated Reddit and Instagram entries with hidden/pinned flags, overrides, media payloads, and source metadata."
+    },
+    {
+      "text": "getLatestSocialEntries reads social-entries from Payload, merges pinned and recent entries, filters hidden entries, and maps them into Elsewhere feed items."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "The public homepage fetches Reddit and Instagram live during render instead of reading stored Payload social entries.",
+      "severity": "major"
+    },
+    {
+      "text": "Public comments are immediately approved and bypass moderation.",
+      "severity": "critical"
+    },
+    {
+      "text": "Comment auth is required for all readers before guest comments can be submitted.",
+      "severity": "major"
+    },
+    {
+      "text": "RSS output is generated from SocialEntries instead of published posts.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.75,
+    "min_expected_file_recall": 0.75,
+    "min_expected_symbol_recall": 0.7,
+    "min_expected_claim_recall": 0.8,
+    "min_citation_coverage": 0.75,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "local",
+    "typescript",
+    "nextjs",
+    "payload",
+    "holdout"
+  ],
+  "notes": [
+    "Local-real holdout task added after the Codex, Sourcetrail, and VS Code loops. Treat as promotion scaffolding until packet-runtime and live A/B rows are repeated against clean pinned checkout/cache provenance."
+  ]
+}
