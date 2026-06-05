@@ -52,6 +52,7 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-06-02 | 4c616548+wt | blocked, round 7 release e2e index phase did not complete; stopped child after 1075.05s with no stdout/stderr; failed command `index --refresh full --format json`; retrieval_index_seconds n/a; retrieval_mode n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
 | 2026-06-02 | 25751a39+wt | fail, round 8 release e2e stats ok; real drill manifest env missing fail-closed; retrieval_index_seconds 17.73; retrieval_status_seconds 0.46; retrieval_mode full | 720.80 | 0.31 | 1.54 | 0.52 | 0.26 | 0.26 | 78,478 | 66,235 | 217 | 0 | 10,839 | true |
 | 2026-06-02 | a23770f+wt | pass, round 9 stats-only release e2e; real drill intentionally skipped with CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1; not real-drill release evidence; retrieval_index_seconds 18.35; retrieval_status_seconds 0.56; retrieval_mode full | 711.31 | 0.32 | 1.77 | 0.59 | 0.32 | 0.27 | 78,582 | 66,332 | 217 | 0 | 10,847 | true |
+| 2026-06-05 | 42089cc5+wt | pass, stats-only retrieval rollout proof guidance plus strict sidecar markdown freshness fix; real drill intentionally skipped with CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1; retrieval_index_seconds 21.57; retrieval_status_seconds 0.96; retrieval_mode full | 981.56 | 0.50 | 2.94 | 0.54 | 0.34 | 0.26 | 79,028 | 66,731 | 217 | 0 | 10,881 | true |
 
 ## Phase Metrics
 
@@ -99,3 +100,4 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-06-02 | 4c616548+wt | round 7 blocked before phase metrics; release index child stopped after 1075.05s with no stdout/stderr; retrieval_index_seconds n/a; retrieval_mode n/a | n/a | n/a | n/a | n/a | n/a | n/a |
 | 2026-06-02 | 25751a39+wt | round 8 release e2e stats ok; real drill manifest env missing fail-closed; retrieval_index_seconds 17.73; retrieval_status_seconds 0.46; retrieval_mode full | 720.80 | 10.27 | 702.18 | 0 | 10,839 | 0 |
 | 2026-06-02 | a23770f+wt | round 9 stats-only release e2e; real drill intentionally skipped with CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1; not real-drill release evidence; retrieval_index_seconds 18.35; retrieval_mode full | 711.31 | 11.08 | 691.07 | 0 | 10,847 | 0 |
+| 2026-06-05 | 42089cc5+wt | stats-only retrieval rollout proof guidance plus strict sidecar markdown freshness fix; real drill intentionally skipped with CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1; retrieval_index_seconds 21.57; retrieval_mode full | 981.56 | 9.67 | 963.51 | 0 | 10,881 | 0 |
