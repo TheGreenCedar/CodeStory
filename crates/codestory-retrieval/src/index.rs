@@ -40,11 +40,11 @@ pub struct ProjectQdrantRepairOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SidecarInputFingerprint {
-    hash: String,
-    projection_count: i64,
-    lexical_file_count: u32,
-    lexical_hash: String,
+pub(crate) struct SidecarInputFingerprint {
+    pub(crate) hash: String,
+    pub(crate) projection_count: i64,
+    pub(crate) lexical_file_count: u32,
+    pub(crate) lexical_hash: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -660,7 +660,7 @@ fn persist_finalized_manifest(
     })
 }
 
-fn compute_sidecar_input_fingerprint(
+pub(crate) fn compute_sidecar_input_fingerprint(
     storage: &Store,
     project_root: &Path,
     project_id: &str,

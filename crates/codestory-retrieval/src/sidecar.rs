@@ -1,7 +1,10 @@
 use crate::config::SidecarLayout;
-use crate::generation::manifest_unavailable_reason;
+use crate::generation::{
+    SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, manifest_has_current_sidecar_contract,
+    manifest_staleness_reason, manifest_unavailable_reason,
+};
 use crate::health::{RetrievalStatusReport, probe_sidecar_health};
-use crate::index::project_id_for_root;
+use crate::index::{compute_sidecar_input_fingerprint, project_id_for_root};
 use anyhow::{Context, Result};
 use codestory_store::Store;
 use codestory_workspace::{RefreshInputs, StoredFileState, WorkspaceManifest};
@@ -72,8 +75,9 @@ fn sidecar_status_inner(
             .context("load retrieval manifest")?;
         if strict
             && let Some(manifest) = manifest.as_ref()
-            && let Some(reason) = strict_readiness_unavailable_reason(project_root, &storage)
-                .context("check strict sidecar readiness")?
+            && let Some(reason) =
+                strict_readiness_unavailable_reason(project_root, &storage, &project_id, manifest)
+                    .context("check strict sidecar readiness")?
         {
             return Ok(crate::health::unavailable_status_report(
                 format!("sidecar_manifest_stale: {reason}"),
@@ -99,7 +103,16 @@ pub(crate) fn validate_strict_sidecar_readiness(
     project_root: &Path,
     storage: &Store,
 ) -> Result<()> {
-    if let Some(reason) = strict_readiness_unavailable_reason(project_root, storage)? {
+    let project_id = project_id_for_root(project_root);
+    let Some(manifest) = storage
+        .get_retrieval_index_manifest(&project_id)
+        .context("load retrieval manifest for strict readiness")?
+    else {
+        return Ok(());
+    };
+    if let Some(reason) =
+        strict_readiness_unavailable_reason(project_root, storage, &project_id, &manifest)?
+    {
         anyhow::bail!("sidecar_manifest_stale: {reason}");
     }
     Ok(())
@@ -108,7 +121,35 @@ pub(crate) fn validate_strict_sidecar_readiness(
 fn strict_readiness_unavailable_reason(
     project_root: &Path,
     storage: &Store,
+    project_id: &str,
+    manifest: &codestory_store::RetrievalIndexManifest,
 ) -> Result<Option<String>> {
+    if !manifest_has_current_sidecar_contract(project_id, manifest) {
+        return Ok(None);
+    }
+    if let Some(reason) = manifest_staleness_reason(storage, manifest)
+        && manifest_contract_drift_should_win(&reason)
+    {
+        return Ok(None);
+    }
+
+    let embedding_backend = crate::embeddings::embedding_runtime_id();
+    let embedding_dim = i32::try_from(crate::embeddings::qdrant_vector_dim())
+        .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
+    let current_input = compute_sidecar_input_fingerprint(
+        storage,
+        project_root,
+        project_id,
+        &embedding_backend,
+        embedding_dim,
+    )
+    .context("compute strict sidecar input fingerprint")?;
+    if manifest.sidecar_input_hash.as_deref() == Some(current_input.hash.as_str())
+        && manifest.projection_count == Some(current_input.projection_count)
+    {
+        return Ok(None);
+    }
+
     let workspace = WorkspaceManifest::open(project_root.to_path_buf())
         .context("open workspace manifest for strict sidecar readiness")?;
     let files = storage.files().get_files().context("load indexed files")?;
@@ -127,7 +168,11 @@ fn strict_readiness_unavailable_reason(
     let plan = workspace
         .build_execution_plan(&refresh_inputs)
         .context("build strict sidecar freshness plan")?;
-    if let Some(path) = plan.files_to_index.first() {
+    if let Some(path) = plan
+        .files_to_index
+        .iter()
+        .find(|path| graph_indexed_source_path(path))
+    {
         return Ok(Some(format!(
             "indexable_file_added_or_changed_after_sidecar_manifest: {}",
             path.display()
@@ -138,7 +183,63 @@ fn strict_readiness_unavailable_reason(
             "indexed_file_removed_after_sidecar_manifest: file_id={file_id}"
         )));
     }
-    Ok(None)
+    Ok(Some(format!(
+        "sidecar_input_hash_changed: manifest={} current={}; projection_count manifest={} current={}",
+        manifest
+            .sidecar_input_hash
+            .as_deref()
+            .unwrap_or("<missing>"),
+        current_input.hash,
+        manifest
+            .projection_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "<missing>".into()),
+        current_input.projection_count
+    )))
+}
+
+fn graph_indexed_source_path(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+    matches!(
+        extension.as_deref(),
+        Some(
+            "rs" | "py"
+                | "pyi"
+                | "java"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "svelte"
+                | "vue"
+                | "astro"
+                | "ts"
+                | "tsx"
+                | "mts"
+                | "cts"
+                | "c"
+                | "cc"
+                | "cpp"
+                | "cxx"
+                | "h"
+                | "hh"
+                | "hpp"
+                | "hxx"
+                | "go"
+                | "rb"
+                | "php"
+                | "cs"
+        )
+    )
+}
+
+fn manifest_contract_drift_should_win(reason: &str) -> bool {
+    reason.contains("sidecar_embedding_backend_changed")
+        || reason.contains("sidecar_embedding_dim_changed")
+        || reason == SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED
 }
 
 #[cfg(test)]
@@ -147,6 +248,7 @@ mod tests {
     use crate::generation::{
         SIDECAR_SCHEMA_VERSION, sidecar_generation_id, sidecar_qdrant_collection,
     };
+    use crate::index::compute_sidecar_input_fingerprint;
     use codestory_store::{FileInfo, FileRole};
     use tempfile::TempDir;
 
@@ -400,6 +502,71 @@ mod tests {
                 .unwrap_or_default()
                 .contains("indexable_file_added_or_changed_after_sidecar_manifest"),
             "new indexable file should make strict status fail closed: {report:?}"
+        );
+    }
+
+    #[test]
+    fn strict_readiness_accepts_markdown_covered_by_sidecar_fingerprint() {
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let source_path = project.path().join("src").join("lib.rs");
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, "pub fn indexed() {}\n").expect("write source");
+        std::fs::write(project.path().join("AGENTS.md"), "# Agent guidance\n")
+            .expect("write markdown");
+        let indexed_mtime = live_mtime_millis(&source_path);
+        let project_id = project_id_for_root(project.path());
+
+        let mut storage = Store::open(&storage_path).expect("open db");
+        storage
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path.clone(),
+                language: "rust".into(),
+                modification_time: indexed_mtime,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            })
+            .expect("insert indexed file");
+        let input = compute_sidecar_input_fingerprint(
+            &storage,
+            project.path(),
+            &project_id,
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+        )
+        .expect("sidecar input");
+        storage
+            .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
+                project_id: project_id.clone(),
+                zoekt_version: "zoekt-real-v1".into(),
+                qdrant_collection: sidecar_qdrant_collection(&project_id, &input.hash),
+                scip_revision: Some("graph-test".into()),
+                built_at_epoch_ms: indexed_mtime,
+                disk_bytes: None,
+                degraded_modes_json: "[]".into(),
+                embedding_backend: Some(crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into()),
+                embedding_dim: Some(768),
+                sidecar_schema_version: Some(SIDECAR_SCHEMA_VERSION),
+                sidecar_input_hash: Some(input.hash.clone()),
+                sidecar_generation: Some(sidecar_generation_id(&project_id, &input.hash)),
+                projection_count: Some(input.projection_count),
+            })
+            .expect("manifest");
+
+        validate_strict_sidecar_readiness(project.path(), &storage)
+            .expect("markdown already covered by sidecar input should not look stale");
+
+        std::fs::write(project.path().join("README.md"), "# New docs\n").expect("write new docs");
+        let stale = validate_strict_sidecar_readiness(project.path(), &storage)
+            .expect_err("new sidecar-only docs should stale the manifest");
+        assert!(
+            stale.to_string().contains("sidecar_input_hash_changed"),
+            "docs-only sidecar drift should report input-hash drift, got: {stale:?}"
         );
     }
 

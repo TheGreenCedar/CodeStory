@@ -18,17 +18,20 @@ checkout is only the tool artifact unless the user is editing CodeStory itself.
 3. Use `doctor` when cache, freshness, or retrieval health matters; use
    `index --refresh full` for first runs or historical indexing failures, and
    incremental refreshes during normal edit loops.
-4. Start broad repo, product, architecture, review, and planning questions with
+4. For retrieval rollout, sidecar, runtime, CLI, benchmark, or smoke-CI work,
+   choose the proof layer from `references/retrieval-rollout.md` before running
+   broad or expensive verification.
+5. Start broad repo, product, architecture, review, and planning questions with
    `packet`. Start exact target discovery with `search --why`.
-5. Use `context` only after selecting one concrete target by id, query, or
+6. Use `context` only after selecting one concrete target by id, query, or
    bookmark. Do not pass broad natural-language questions directly to `context`.
-6. Use `symbol`, `trail --story --hide-speculative`, `snippet`, and `explore`
+7. Use `symbol`, `trail --story --hide-speculative`, `snippet`, and `explore`
    for source-backed detail around a selected target.
-7. Use `files` before claiming language/path coverage, and `affected` before
+8. Use `files` before claiming language/path coverage, and `affected` before
    choosing regression tests from changed files.
-8. Use `drill` or `drill-suite` for repeatable answer-quality checks that need
+9. Use `drill` or `drill-suite` for repeatable answer-quality checks that need
    source-truth verification artifacts.
-9. Keep ordinary grounding CLI-first. Use `serve --stdio` only for warm
+10. Keep ordinary grounding CLI-first. Use `serve --stdio` only for warm
    transport, protocol, or stdio integration work.
 
 ## Evidence Rules
@@ -95,4 +98,5 @@ Detailed argument tables, output examples, and usage patterns for each command:
 - [affected](references/affected.md) - Changed-file impact analysis
 - [bookmark](references/bookmark.md) - Save reusable investigation focus nodes
 - [setup](references/setup.md) - Managed embedding setup
+- [retrieval-rollout](references/retrieval-rollout.md) - Proof table for retrieval rollout layers, sidecar repair, benchmark gates, and CI smoke triage
 - [serve](references/serve.md) - Local integration surface outside the normal CLI-navigation docs/spec workflow
