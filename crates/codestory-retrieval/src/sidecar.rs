@@ -79,24 +79,40 @@ fn sidecar_status_inner(
                 strict_readiness_unavailable_reason(project_root, &storage, &project_id, manifest)
                     .context("check strict sidecar readiness")?
         {
-            return Ok(crate::health::unavailable_status_report(
-                format!("sidecar_manifest_stale: {reason}"),
-                Some(manifest.clone()),
+            return Ok(enrich_status_with_semantic_doc_stats(
+                crate::health::unavailable_status_report(
+                    format!("sidecar_manifest_stale: {reason}"),
+                    Some(manifest.clone()),
+                ),
+                &storage,
             ));
         }
         if let Some(manifest) = manifest.as_ref()
             && let Some(reason) = manifest_unavailable_reason(&project_id, &storage, manifest)
         {
-            return Ok(crate::health::unavailable_status_report(
-                reason,
-                Some(manifest.clone()),
+            return Ok(enrich_status_with_semantic_doc_stats(
+                crate::health::unavailable_status_report(reason, Some(manifest.clone())),
+                &storage,
             ));
         }
-        manifest
+        let report = probe_sidecar_health(&layout, &project_id, manifest);
+        return Ok(enrich_status_with_semantic_doc_stats(report, &storage));
     } else {
         None
     };
     Ok(probe_sidecar_health(&layout, &project_id, manifest))
+}
+
+fn enrich_status_with_semantic_doc_stats(
+    mut report: RetrievalStatusReport,
+    storage: &Store,
+) -> RetrievalStatusReport {
+    if let Ok(stats) = storage.get_llm_symbol_doc_stats() {
+        report.stored_doc_vector_producer_backend = stats.embedding_backend;
+        report.stored_doc_vector_dim = stats.embedding_dim;
+        report.stored_doc_vector_mixed_backends = Some(stats.mixed_embedding_backends);
+    }
+    report
 }
 
 pub(crate) fn validate_strict_sidecar_readiness(

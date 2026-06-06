@@ -519,7 +519,7 @@ fn run_context(cmd: ContextCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "context")?;
     preflight_output_file(cmd.output_file.as_deref())?;
     ensure_no_context_hybrid_overrides(&cmd)?;
-    let runtime = RuntimeContext::new(&cmd.project)?;
+    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "context")?;
 
@@ -566,7 +566,7 @@ fn run_context(cmd: ContextCommand) -> Result<()> {
 fn run_packet(cmd: PacketCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "packet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let runtime = RuntimeContext::new(&cmd.project)?;
+    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "packet")?;
 
@@ -1044,7 +1044,7 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "search")?;
     preflight_output_file(cmd.output_file.as_deref())?;
     ensure_no_search_hybrid_overrides(&cmd)?;
-    let runtime = RuntimeContext::new(&cmd.project)?;
+    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "search")?;
     let search_results = runtime

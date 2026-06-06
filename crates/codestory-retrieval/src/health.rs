@@ -40,6 +40,17 @@ pub struct RetrievalStatusReport {
     pub retrieval_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
+    pub query_embedding_backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_vector_embedding_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_vector_embedding_dim: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_doc_vector_producer_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_doc_vector_dim: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_doc_vector_mixed_backends: Option<bool>,
     pub zoekt: ComponentHealth,
     pub qdrant: ComponentHealth,
     pub scip: ComponentHealth,
@@ -73,9 +84,21 @@ pub fn unavailable_status_report(
     manifest: Option<codestory_store::RetrievalIndexManifest>,
 ) -> RetrievalStatusReport {
     let reason = reason.into();
+    let manifest_vector_embedding_backend = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.embedding_backend.clone());
+    let manifest_vector_embedding_dim = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.embedding_dim);
     RetrievalStatusReport {
         retrieval_mode: "unavailable".into(),
         degraded_reason: Some(reason.clone()),
+        query_embedding_backend: crate::embeddings::embedding_runtime_id(),
+        manifest_vector_embedding_backend,
+        manifest_vector_embedding_dim,
+        stored_doc_vector_producer_backend: None,
+        stored_doc_vector_dim: None,
+        stored_doc_vector_mixed_backends: None,
         zoekt: unavailable_component("zoekt", &reason),
         qdrant: unavailable_component("qdrant", &reason),
         scip: unavailable_component("scip", &reason),
@@ -316,6 +339,12 @@ pub fn probe_sidecar_health(
     RetrievalStatusReport {
         retrieval_mode: mode.as_str().into(),
         degraded_reason,
+        query_embedding_backend: current_embedding_backend,
+        manifest_vector_embedding_backend: manifest.embedding_backend.clone(),
+        manifest_vector_embedding_dim: manifest.embedding_dim,
+        stored_doc_vector_producer_backend: None,
+        stored_doc_vector_dim: None,
+        stored_doc_vector_mixed_backends: None,
         zoekt,
         qdrant,
         scip,

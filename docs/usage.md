@@ -186,24 +186,39 @@ project is usable only when the local Zoekt, Qdrant, and SCIP sidecars report
 `retrieval_mode=full`; missing sidecars, stale manifests, or embedding-contract
 drift fail closed instead of falling back to an older local search path.
 
-Product sidecar setup:
+Basic local index:
 
 ```powershell
-codestory-cli retrieval bootstrap --project <target-workspace>
+codestory-cli doctor --project <target-workspace>
+codestory-cli index --project <target-workspace> --refresh full
+codestory-cli ground --project <target-workspace> --why
+```
+
+That lane builds and reads the local SQLite cache. It does not start sidecars,
+write the retrieval manifest, or prove packet/search readiness.
+
+Product sidecar setup for agent-facing packet/search:
+
+```powershell
+node scripts/setup-retrieval-env.mjs --fetch-embed-model
+$env:CODESTORY_EMBED_MODEL_DIR = (Resolve-Path .\target\retrieval-models).Path
 $env:CODESTORY_EMBED_BACKEND = "llamacpp"
 $env:CODESTORY_EMBED_LLAMACPP_URL = "http://127.0.0.1:8080/v1/embeddings"
+cargo retrieval-setup
+
 codestory-cli index --project <target-workspace> --refresh full
 codestory-cli retrieval index --project <target-workspace> --refresh full
 codestory-cli retrieval status --project <target-workspace> --format json
 codestory-cli doctor --project <target-workspace>
 ```
 
-Plain `codestory-cli index` builds the core SQLite code index. It does not
-generate or prove sidecar readiness. Run `codestory-cli retrieval index` only
-after the local sidecar services, llama.cpp embedding endpoint, and
-`bge-base-en-v1.5` model configuration are ready, then require `retrieval
-status --format json` to report `retrieval_mode: "full"` before trusting
-agent-facing packet/search evidence.
+Run `codestory-cli retrieval index` only after the local sidecar services,
+llama.cpp embedding endpoint, and `bge-base-en-v1.5` model configuration are
+ready, then require `retrieval status --format json` to report
+`retrieval_mode: "full"` before trusting agent-facing packet/search evidence.
+The status JSON also reports `query_embedding_backend`,
+`manifest_vector_embedding_backend`, and `stored_doc_vector_producer_backend`
+so backend drift is visible.
 
 Legacy managed embedding setup is local semantic/diagnostic only:
 
@@ -213,7 +228,9 @@ codestory-cli setup embeddings --project <target-workspace>
 ```
 
 Those commands install managed ONNX assets. They do not start llama.cpp, create
-the retrieval manifest, or prove product sidecar readiness.
+the retrieval manifest, or prove product sidecar readiness. Retrieval sidecar
+commands do not silently switch to ONNX mode just because managed assets are
+installed; unset retrieval backend means the product llama.cpp sidecar contract.
 
 Useful environment knobs:
 
