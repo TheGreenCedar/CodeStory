@@ -3683,34 +3683,20 @@ fn summarize_symbol_doc(
 
     let body = serde_json::to_string(&request)
         .map_err(|e| ApiError::internal(format!("Failed to build summary request: {e}")))?;
-    let mut command = std::process::Command::new("curl");
-    command
-        .arg("-sS")
-        .arg("-X")
-        .arg("POST")
-        .arg(endpoint)
-        .arg("-H")
-        .arg("Content-Type: application/json");
+    let mut request = ureq::post(endpoint)
+        .timeout(summary_endpoint_timeout())
+        .set("Content-Type", "application/json");
     if let Ok(api_key) = std::env::var("CODESTORY_SUMMARY_API_KEY")
         && !api_key.trim().is_empty()
     {
-        command
-            .arg("-H")
-            .arg(format!("Authorization: Bearer {}", api_key.trim()));
+        request = request.set("Authorization", &format!("Bearer {}", api_key.trim()));
     }
-    let output = command.arg("-d").arg(body).output().map_err(|e| {
-        ApiError::internal(format!(
-            "Failed to invoke curl for CODESTORY_SUMMARY_ENDPOINT: {e}"
-        ))
-    })?;
-    if !output.status.success() {
-        return Err(ApiError::internal(format!(
-            "Summary endpoint failed with status {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout)
+    let response_body = request
+        .send_string(&body)
+        .map_err(summary_endpoint_http_error)?
+        .into_string()
+        .map_err(|e| ApiError::internal(format!("Summary endpoint response failed: {e}")))?;
+    let response: serde_json::Value = serde_json::from_str(&response_body)
         .map_err(|e| ApiError::internal(format!("Summary endpoint returned invalid JSON: {e}")))?;
     let summary = response
         .pointer("/choices/0/message/content")
@@ -3728,6 +3714,41 @@ fn summarize_symbol_doc(
             )
         })?;
     Ok(summary.lines().next().unwrap_or(summary).trim().to_string())
+}
+
+fn summary_endpoint_timeout() -> Duration {
+    let seconds = std::env::var("CODESTORY_SUMMARY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| (1..=300).contains(seconds))
+        .unwrap_or(30);
+    Duration::from_secs(seconds)
+}
+
+fn summary_endpoint_http_error(error: ureq::Error) -> ApiError {
+    match error {
+        ureq::Error::Status(status, response) => {
+            let body = response
+                .into_string()
+                .unwrap_or_else(|read_error| format!("failed to read error body: {read_error}"));
+            ApiError::internal(format!(
+                "Summary endpoint failed with status {status}: {}",
+                truncate_error_body(&body)
+            ))
+        }
+        ureq::Error::Transport(error) => {
+            ApiError::internal(format!("Summary endpoint request failed: {error}"))
+        }
+    }
+}
+
+fn truncate_error_body(body: &str) -> String {
+    const MAX_ERROR_BODY_CHARS: usize = 2_048;
+    let mut truncated = body.chars().take(MAX_ERROR_BODY_CHARS).collect::<String>();
+    if body.chars().count() > MAX_ERROR_BODY_CHARS {
+        truncated.push_str("...");
+    }
+    truncated
 }
 
 fn local_symbol_summary(doc: &LlmSymbolDoc) -> String {

@@ -18,9 +18,18 @@ refresh an existing cache in place, or `full` after a cache reset, schema change
 failure.";
 const DRILL_REFRESH_HELP: &str = "Drill defaults to `full` so each report is mechanically fresh. Use `none` only after a \
 fresh index, or `incremental` to refresh an existing cache in place.";
+const CLI_LONG_ABOUT: &str = "\
+CodeStory turns a local repository into auditable grounding evidence.
+
+Common lanes:
+  New repo:      codestory-cli index --project <repo> --refresh full
+  Broad question: codestory-cli packet --project <repo> \"How does this system work?\"
+  Exact target:  codestory-cli context --project <repo> --query <symbol-or-file>
+
+For agent-facing packet/search evidence, first run retrieval bootstrap + retrieval index and require retrieval status to report retrieval_mode=full.";
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Skill-first repo grounding runtime", long_about = None)]
+#[command(author, version, about = "Skill-first repo grounding runtime", long_about = CLI_LONG_ABOUT)]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Command,

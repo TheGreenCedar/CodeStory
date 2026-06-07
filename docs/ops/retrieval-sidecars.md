@@ -33,6 +33,24 @@ SCIP sidecar artifacts, then use `codestory-cli retrieval status --project
 <repo> --format json` to verify `retrieval_mode: "full"` before using
 agent-facing packet/search evidence.
 
+First-run evidence path:
+
+```powershell
+node scripts/setup-retrieval-env.mjs --fetch-embed-model
+$env:CODESTORY_EMBED_MODEL_DIR = (Resolve-Path .\target\retrieval-models).Path
+$env:CODESTORY_EMBED_BACKEND = "llamacpp"
+$env:CODESTORY_EMBED_LLAMACPP_URL = "http://127.0.0.1:8080/v1/embeddings"
+cargo retrieval-setup
+.\target\release\codestory-cli.exe index --project <repo> --refresh full
+.\target\release\codestory-cli.exe retrieval index --project <repo> --refresh full
+.\target\release\codestory-cli.exe retrieval status --project <repo> --format json
+```
+
+`retrieval status` must show `retrieval_mode: "full"`. Its JSON backend fields
+distinguish the active query backend (`query_embedding_backend`), manifest
+vector contract (`manifest_vector_embedding_backend`), and stored semantic-doc
+producer (`stored_doc_vector_producer_backend`).
+
 Status after bootstrap:
 
 ```sh
@@ -212,15 +230,17 @@ semantic state, and SCIP graph artifacts. `CODESTORY_RETRIEVAL=0` is unsupported
 
 ### Real embeddings (bge-base-en-v1.5 + llama.cpp)
 
-Promotion uses **768-d** vectors. Qdrant document vectors come from stored semantic docs produced by
-the managed local embedding runtime. Query vectors still come from the local llama.cpp sidecar so
-retrieval remains sidecar-backed and can smoke-test the live collection. Hash projection is
-diagnostic only and never produces `retrieval_mode=full`.
+Promotion uses **768-d** vectors. Qdrant document vectors come from stored
+semantic docs with product-compatible vector metadata. Query vectors come from
+the local llama.cpp sidecar so retrieval remains sidecar-backed and can
+smoke-test the live collection. With real vectors enabled, an unset retrieval
+backend means this product llama.cpp contract; explicit ONNX or hash modes are
+diagnostic only and never produce `retrieval_mode=full`.
 
 1. Download GGUF (once): `node scripts/setup-retrieval-env.mjs --fetch-embed-model`
 2. Export (see [`docker/retrieval.env.example`](../../docker/retrieval.env.example)):
    - `CODESTORY_EMBED_MODEL_DIR=<repo>/target/retrieval-models`
-   - `CODESTORY_EMBED_BACKEND=llamacpp`
+   - `CODESTORY_EMBED_BACKEND=llamacpp` (recommended explicit product mode; unset is also product mode for retrieval commands)
    - `CODESTORY_EMBED_LLAMACPP_URL=http://127.0.0.1:8080/v1/embeddings`
 3. `cargo retrieval-setup` (starts Qdrant, Zoekt webserver, `codestory-embed` on `:8080`)
 4. Dim smoke: `curl -s http://127.0.0.1:8080/v1/embeddings -H "Content-Type: application/json" -d "{\"input\":[\"function\"]}"` → embedding length **768**

@@ -34,18 +34,36 @@ cargo build --release -p codestory-cli
 $CodeStoryCli = ".\target\release\codestory-cli.exe"
 $TargetWorkspace = "C:\path\to\repo"
 
-cargo retrieval-setup
 & $CodeStoryCli doctor --project $TargetWorkspace
 & $CodeStoryCli setup embeddings --project $TargetWorkspace --dry-run --format json
 & $CodeStoryCli index --project $TargetWorkspace --refresh full
-& $CodeStoryCli retrieval index --project $TargetWorkspace --refresh auto
 & $CodeStoryCli ground --project $TargetWorkspace --why
 ```
 
-Current packet/search evidence requires the local Zoekt, Qdrant, SCIP, and
-llama.cpp embedding sidecars to reach `retrieval_mode=full`; missing assets,
-stale manifests, disabled sidecars, or diagnostic embedding modes are setup
-failures to fix before trusting agent context.
+That basic path builds the local SQLite index and is enough for health, file,
+symbol, trail, snippet, and orientation checks. The managed embedding dry-run is
+a local semantic setup check; it does not prove sidecar readiness.
+
+Agent-facing `packet` and `search` evidence has one extra readiness contract:
+local Zoekt, Qdrant, SCIP, and llama.cpp embedding sidecars must report
+`retrieval_mode=full`.
+
+```powershell
+node scripts/setup-retrieval-env.mjs --fetch-embed-model
+$env:CODESTORY_EMBED_MODEL_DIR = (Resolve-Path .\target\retrieval-models).Path
+$env:CODESTORY_EMBED_BACKEND = "llamacpp"
+$env:CODESTORY_EMBED_LLAMACPP_URL = "http://127.0.0.1:8080/v1/embeddings"
+
+cargo retrieval-setup
+& $CodeStoryCli index --project $TargetWorkspace --refresh full
+& $CodeStoryCli retrieval index --project $TargetWorkspace --refresh full
+& $CodeStoryCli retrieval status --project $TargetWorkspace --format json
+& $CodeStoryCli doctor --project $TargetWorkspace
+```
+
+Missing sidecars, stale manifests, disabled sidecars, mixed stored-doc vector
+contracts, or diagnostic embedding modes are setup failures to fix before
+trusting packet/search context.
 
 After that first index, use narrower commands instead of asking the agent to
 start over:

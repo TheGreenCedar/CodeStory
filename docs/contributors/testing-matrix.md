@@ -96,6 +96,19 @@ evidence.
 
 Append the emitted headline metrics to `docs/testing/codestory-e2e-stats-log.md`. Include graph seconds, semantic seconds, semantic docs reused, semantic docs embedded, total index seconds, `retrieval_index_seconds`, `retrieval_status_seconds`, and whether `sidecar_status_after_retrieval_index` plus `search.sidecar_shadow_retrieval_mode` were `full`.
 
+Release-readiness evidence is tiered:
+
+| Evidence tier | Required proof | Release meaning |
+| --- | --- | --- |
+| Stats-only | `codestory_repo_e2e_stats` completed with `CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1` or without prepared full sidecars | Useful local regression signal only; not release proof for packet/search readiness. |
+| Full sidecar | Local Zoekt, Qdrant, SCIP, and llama.cpp are running; `retrieval index --refresh full` succeeds; `retrieval status --format json` reports `retrieval_mode: "full"` plus product backend fields | Required before claiming agent-facing packet/search readiness on the current workspace. |
+| Real-repo drill | `CODESTORY_REAL_REPO_DRILL_CASES` points at prepared manifests and the drill cases run without skip allowances | Required before claiming the release was exercised beyond the CodeStory checkout. |
+| Promotion-grade benchmark | Baseline and candidate benchmark rows are captured with sidecar status, search shadow mode, and no-regression threshold | Required for performance or retrieval-quality promotion claims. |
+
+When logging release evidence, state the highest tier reached and the exact
+skip env vars used. A stats-only row must not be described as full sidecar or
+real-repo drill evidence.
+
 For the current repo-scale baseline, use the latest row in
 [`codestory-e2e-stats-log.md`](../testing/codestory-e2e-stats-log.md). Older
 rows, including the 2026-04-18 durable-scope measurements, are historical

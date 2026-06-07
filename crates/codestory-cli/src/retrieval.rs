@@ -94,7 +94,7 @@ fn run_retrieval_query(cmd: RetrievalQueryCommand) -> Result<()> {
 
 fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
     preflight_output(cmd.output_file.as_deref())?;
-    let runtime = RuntimeContext::new(&cmd.project)?;
+    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let summary = runtime.open_project_summary()?;
     let refresh_mode = resolve_refresh_request(cmd.refresh, &summary);
     run_retrieval_index_refresh(&runtime, cmd.refresh, refresh_mode)?;
@@ -326,23 +326,24 @@ fn emit_retrieval_status(
     report: &RetrievalStatusReport,
     output_file: Option<&std::path::Path>,
 ) -> Result<()> {
-    let embedding_backend = codestory_retrieval::embedding_backend_label();
-    let manifest_embedding = report
-        .manifest
-        .as_ref()
-        .map(|manifest| {
-            format!(
-                "embedding_backend={:?} embedding_dim={:?}",
-                manifest.embedding_backend, manifest.embedding_dim
-            )
-        })
-        .unwrap_or_else(|| "manifest=none".into());
+    let manifest_vector_backend = report
+        .manifest_vector_embedding_backend
+        .as_deref()
+        .unwrap_or("<none>");
+    let stored_doc_backend = report
+        .stored_doc_vector_producer_backend
+        .as_deref()
+        .unwrap_or("<none>");
     let markdown = format!(
-        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- active_embedding_backend: `{}`\n- manifest: {}\n- zoekt: {:?} ({:?}) capabilities: lexical={}\n- qdrant: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
+        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n- zoekt: {:?} ({:?}) capabilities: lexical={}\n- qdrant: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
         report.retrieval_mode,
         report.degraded_reason,
-        embedding_backend,
-        manifest_embedding,
+        report.query_embedding_backend,
+        manifest_vector_backend,
+        report.manifest_vector_embedding_dim,
+        stored_doc_backend,
+        report.stored_doc_vector_dim,
+        report.stored_doc_vector_mixed_backends,
         report.zoekt.status,
         report.zoekt.detail,
         report.zoekt.capabilities.lexical,
