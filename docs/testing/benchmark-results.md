@@ -79,6 +79,18 @@ The 2026-05-25 `drill-suite` rows are also non-promotional. They are designed to
 find grounding failures before an agent A/B run, and the current CodeStory case
 still falls back to source-truth-only evidence for `27/55` bridge pairs.
 
+## Proof Tier Ladder
+
+Use the highest tier actually reached when describing a row. Do not promote a
+lower tier into a broader claim just because the command exited successfully.
+
+| Proof tier | Required evidence | Can claim | Cannot claim |
+| --- | --- | --- | --- |
+| Stats-only local regression signal | `codestory_repo_e2e_stats` completed with skip allowances or without prepared full sidecars. | Local timing, indexing, and cache-shape regression signal for the current checkout. | Full sidecar readiness, agent packet/search readiness, real-repo release coverage, or performance promotion. |
+| Full sidecar readiness proof | Zoekt, Qdrant, SCIP, and llama.cpp are running; `retrieval index --refresh full` succeeds; `retrieval status --format json` reports `retrieval_mode: "full"` and product backend fields. | Agent-facing packet/search readiness for the verified workspace and cache state. | General quality, cross-repo coverage, or benchmark savings. |
+| Real-repo drill proof | Prepared real-repo drill manifests run without skip allowances and produce expected evidence packets, source-truth checks, and verdicts. | The release path was exercised beyond the CodeStory checkout on the named drill cases. | Generalized agent savings or promotion-grade performance. |
+| Promotion-grade benchmark proof | Controlled baseline and candidate benchmark rows use pinned refs, comparable cache state, sidecar status, answer-level quality gates, and no-regression thresholds. | Cautious performance or retrieval-quality promotion for the measured scope. | Universal savings, untested repos, or environments outside the recorded setup. |
+
 ## Promotion Rules
 
 - Use the same project, cache state, semantic backend, command flags, runner,

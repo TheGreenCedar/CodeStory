@@ -13,6 +13,8 @@ struct RepoE2eStats {
     cache_dir: String,
     storage_path: String,
     search_dir: String,
+    proof_tier: String,
+    warnings: Vec<String>,
     embed_batch_size: u32,
     search_dir_unchanged: bool,
     index_seconds: f64,
@@ -91,6 +93,37 @@ struct SnippetStats {
     snippet_lines: usize,
 }
 
+const PROOF_TIER_STATS_ONLY: &str = "stats_only";
+const PROOF_TIER_FULL_SIDECAR: &str = "full_sidecar";
+const INDEX_SECONDS_WARNING_THRESHOLD: f64 = 600.0;
+const SEMANTIC_PHASE_SECONDS_WARNING_THRESHOLD: f64 = 500.0;
+
+fn release_readiness_proof_tier(
+    sidecar_status_after_retrieval_index: &str,
+    search_shadow_sidecar_mode: &str,
+) -> &'static str {
+    if sidecar_status_after_retrieval_index == "full" && search_shadow_sidecar_mode == "full" {
+        PROOF_TIER_FULL_SIDECAR
+    } else {
+        PROOF_TIER_STATS_ONLY
+    }
+}
+
+fn release_readiness_warnings(index_seconds: f64, semantic_phase_seconds: f64) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if index_seconds > INDEX_SECONDS_WARNING_THRESHOLD {
+        warnings.push(format!(
+            "index_seconds exceeded {INDEX_SECONDS_WARNING_THRESHOLD:.0}s release-readiness warning threshold: {index_seconds:.2}s"
+        ));
+    }
+    if semantic_phase_seconds > SEMANTIC_PHASE_SECONDS_WARNING_THRESHOLD {
+        warnings.push(format!(
+            "semantic_phase_seconds exceeded {SEMANTIC_PHASE_SECONDS_WARNING_THRESHOLD:.0}s release-readiness warning threshold: {semantic_phase_seconds:.2}s"
+        ));
+    }
+    warnings
+}
+
 #[derive(Debug)]
 struct DrillRepoCase {
     name: String,
@@ -110,6 +143,45 @@ struct DrillRepoCaseConfig {
     project: PathBuf,
     question: String,
     anchors: Vec<String>,
+}
+
+#[test]
+fn release_readiness_proof_tier_requires_full_sidecar_evidence() {
+    assert_eq!(
+        release_readiness_proof_tier("full", "full"),
+        PROOF_TIER_FULL_SIDECAR
+    );
+    assert_eq!(
+        release_readiness_proof_tier("full", "degraded"),
+        PROOF_TIER_STATS_ONLY
+    );
+    assert_eq!(
+        release_readiness_proof_tier("unavailable", "full"),
+        PROOF_TIER_STATS_ONLY
+    );
+}
+
+#[test]
+fn release_readiness_proof_tier_does_not_claim_drill_or_promotion() {
+    let proof_tier = release_readiness_proof_tier("full", "full");
+
+    assert_eq!(proof_tier, PROOF_TIER_FULL_SIDECAR);
+    assert_ne!(proof_tier, "real_repo_drill");
+    assert_ne!(proof_tier, "promotion_grade");
+}
+
+#[test]
+fn release_readiness_warnings_only_emit_above_thresholds() {
+    assert!(release_readiness_warnings(600.0, 500.0).is_empty());
+
+    assert_eq!(
+        release_readiness_warnings(600.01, 500.01),
+        vec![
+            "index_seconds exceeded 600s release-readiness warning threshold: 600.01s".to_string(),
+            "semantic_phase_seconds exceeded 500s release-readiness warning threshold: 500.01s"
+                .to_string(),
+        ]
+    );
 }
 
 fn repo_root() -> PathBuf {
@@ -460,17 +532,28 @@ fn codestory_repo_release_e2e_emits_stats() {
             + optional_u64_field(&index_json, &["phase_timings", "semantic_db_upsert_ms"])
             + optional_u64_field(&index_json, &["phase_timings", "semantic_reload_ms"])
             + optional_u64_field(&index_json, &["phase_timings", "semantic_prune_ms"]);
+    let semantic_phase_seconds = semantic_phase_ms as f64 / 1000.0;
+    let search_sidecar_shadow_retrieval_mode =
+        string_field(&search_json, &["retrieval_shadow", "retrieval_mode"]).to_string();
+    let proof_tier = release_readiness_proof_tier(
+        sidecar_retrieval_mode.as_str(),
+        search_sidecar_shadow_retrieval_mode.as_str(),
+    )
+    .to_string();
+    let warnings = release_readiness_warnings(index_seconds, semantic_phase_seconds);
 
     let stats = RepoE2eStats {
         project_root: project_root.display().to_string(),
         cache_dir: cache_dir.path().display().to_string(),
         storage_path: storage_path.display().to_string(),
         search_dir: search_dir.display().to_string(),
+        proof_tier,
+        warnings,
         embed_batch_size: 128,
         search_dir_unchanged,
         index_seconds,
         graph_phase_seconds: graph_phase_ms as f64 / 1000.0,
-        semantic_phase_seconds: semantic_phase_ms as f64 / 1000.0,
+        semantic_phase_seconds,
         semantic_docs_reused: optional_u64_field(
             &index_json,
             &["phase_timings", "semantic_docs_reused"],
@@ -514,11 +597,7 @@ fn codestory_repo_release_e2e_emits_stats() {
         },
         search: SearchStats {
             query: string_field(&search_json, &["query"]).to_string(),
-            sidecar_shadow_retrieval_mode: string_field(
-                &search_json,
-                &["retrieval_shadow", "retrieval_mode"],
-            )
-            .to_string(),
+            sidecar_shadow_retrieval_mode: search_sidecar_shadow_retrieval_mode,
             legacy_search_retrieval_mode: string_field(&search_json, &["retrieval", "mode"])
                 .to_string(),
             semantic_doc_count: u64_field(&search_json, &["retrieval", "semantic_doc_count"]),
@@ -561,6 +640,10 @@ fn codestory_repo_release_e2e_emits_stats() {
     assert_eq!(
         stats.index.sidecar_status_after_retrieval_index, "full",
         "retrieval status after retrieval index should be full before trusting index/ground/search evidence"
+    );
+    assert_eq!(
+        stats.proof_tier, PROOF_TIER_FULL_SIDECAR,
+        "repo e2e stats harness proves full sidecar evidence but does not run real-repo drill cases"
     );
     assert_eq!(
         stats.ground.sidecar_status_after_retrieval_index, "full",

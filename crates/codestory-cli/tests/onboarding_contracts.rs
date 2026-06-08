@@ -86,10 +86,86 @@ fn assert_public_doc_avoids_agent_specific_framing(file: &Path, contents: &str) 
     }
 }
 
+fn extract_inline_toml_string_array(manifest: &str, key: &str) -> Vec<String> {
+    let prefix = format!("{key} = [");
+    let line = manifest
+        .lines()
+        .find(|line| line.trim_start().starts_with(&prefix))
+        .unwrap_or_else(|| panic!("manifest should contain inline array `{key}`"));
+    let values = line
+        .trim()
+        .strip_prefix(&prefix)
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or_else(|| panic!("manifest should use inline string array for `{key}`"));
+
+    values
+        .split(',')
+        .map(|value| value.trim().trim_matches('"').to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+#[test]
+fn cli_package_metadata_is_adoption_ready() {
+    let root = repo_root();
+    let manifest_path = root.join("crates/codestory-cli/Cargo.toml");
+    let manifest = fs::read_to_string(&manifest_path).expect("CLI manifest should exist");
+
+    for required in [
+        "description = \"Local repository evidence and grounding CLI for source-backed coding workflows.\"",
+        "license = \"Apache-2.0\"",
+        "repository = \"https://github.com/TheGreenCedar/CodeStory.git\"",
+        "readme = \"../../README.md\"",
+    ] {
+        assert!(
+            manifest.contains(required),
+            "CLI package metadata should include `{required}`"
+        );
+    }
+
+    let readme_from_manifest = manifest_path
+        .parent()
+        .expect("CLI manifest should have parent")
+        .join("../../README.md");
+    assert_eq!(
+        fs::canonicalize(readme_from_manifest).expect("manifest readme path should resolve"),
+        fs::canonicalize(root.join("README.md")).expect("repo README should resolve"),
+        "CLI package readme should point at the repository README"
+    );
+
+    let keywords = extract_inline_toml_string_array(&manifest, "keywords");
+    assert_eq!(
+        keywords,
+        vec!["code-search", "grounding", "cli", "agents"],
+        "keywords should stay conservative and adoption-oriented"
+    );
+    assert!(
+        keywords.len() <= 5,
+        "crates.io accepts at most five package keywords"
+    );
+    for keyword in keywords {
+        assert!(
+            keyword.len() <= 20
+                && keyword
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'),
+            "keyword should stay crates.io-compatible: {keyword}"
+        );
+    }
+
+    let categories = extract_inline_toml_string_array(&manifest, "categories");
+    assert_eq!(
+        categories,
+        vec!["command-line-utilities", "development-tools"],
+        "categories should stay accurate and crates.io-compatible"
+    );
+}
+
 #[test]
 fn readme_keeps_customer_first_onboarding() {
     let root = repo_root();
     let readme = fs::read_to_string(root.join("README.md")).expect("README should exist");
+    assert!(readme.contains("Public Promise"));
     assert!(readme.contains("Try It On A Repo"));
     assert!(readme.contains("What It Builds"));
     assert!(readme.contains("Local codebase grounding for coding agents"));
@@ -97,6 +173,14 @@ fn readme_keeps_customer_first_onboarding() {
     assert!(readme.contains("Core Flow"));
     assert!(readme.contains("Hack On CodeStory"));
     assert!(readme.contains("A good CodeStory-backed answer should name"));
+    assert!(readme.contains("local evidence layer for repositories"));
+    assert!(readme.contains("explicit commands"));
+    assert!(readme.contains("source-backed answers"));
+    assert!(readme.contains("per-project SQLite cache is separate"));
+    assert!(readme.contains("local retrieval sidecars"));
+    assert!(readme.contains("does not by itself prove sidecar readiness"));
+    assert!(readme.contains("environment- and repository-specific evidence"));
+    assert!(readme.contains("instead of promising universal speedups or savings"));
     assert!(readme.contains("benchmark history"));
     assert!(readme.contains("checked with `doctor`"));
     assert!(readme.contains(".agents/skills/codestory-grounding/SKILL.md"));
@@ -237,6 +321,69 @@ fn usage_doc_keeps_agent_contract_terms_out_of_operator_flow() {
             "operator usage doc should not expose agent-internal contract term {blocked}"
         );
     }
+}
+
+#[test]
+fn usage_doc_names_two_readiness_tracks_and_predictable_output_modes() {
+    let root = repo_root();
+    let usage = fs::read_to_string(root.join("docs/usage.md")).expect("usage doc should exist");
+
+    assert!(usage.contains("## Readiness Tracks"));
+    assert!(usage.contains("### Local navigation/cache readiness"));
+    assert!(usage.contains("### Agent packet/search sidecar readiness"));
+    assert!(usage.contains("`local_navigation`"));
+    assert!(usage.contains("`agent_packet_search`"));
+    assert!(usage.contains("`retrieval_mode: \"full\"`"));
+    assert!(usage.contains("## Predictable Output Modes"));
+    assert!(usage.contains("Most commands default to Markdown"));
+    assert!(
+        usage.contains("Use `--format json` when automation needs the complete structured result")
+    );
+    assert!(usage.contains("Use `--output-file <PATH>`"));
+    assert!(usage.contains("The parent directory must already exist"));
+    assert!(usage.contains("`explore` opens the terminal UI by default"));
+    assert!(usage.contains("Use `--no-tui`"));
+    assert!(
+        usage
+            .find("## Readiness Tracks")
+            .expect("readiness heading")
+            < usage
+                .find("## Retrieval Defaults")
+                .expect("retrieval defaults heading"),
+        "usage should introduce readiness tracks before retrieval defaults"
+    );
+}
+
+#[test]
+fn benchmark_docs_show_proof_tier_ladder() {
+    let root = repo_root();
+    let benchmark_scorecard = fs::read_to_string(root.join("docs/testing/benchmark-results.md"))
+        .expect("benchmark scorecard should exist");
+
+    assert!(benchmark_scorecard.contains("## Proof Tier Ladder"));
+    for tier in [
+        "Stats-only local regression signal",
+        "Full sidecar readiness proof",
+        "Real-repo drill proof",
+        "Promotion-grade benchmark proof",
+    ] {
+        assert!(
+            benchmark_scorecard.contains(tier),
+            "benchmark scorecard should explain proof tier {tier}"
+        );
+    }
+    assert!(benchmark_scorecard.contains("Full sidecar readiness, agent packet/search readiness"));
+    assert!(benchmark_scorecard.contains("`retrieval_mode: \"full\"`"));
+    assert!(benchmark_scorecard.contains("Generalized agent savings"));
+    assert!(
+        benchmark_scorecard
+            .find("## Proof Tier Ladder")
+            .expect("proof tier ladder")
+            < benchmark_scorecard
+                .find("## Promotion Rules")
+                .expect("promotion rules"),
+        "proof tier ladder should frame promotion rules"
+    );
 }
 
 #[test]

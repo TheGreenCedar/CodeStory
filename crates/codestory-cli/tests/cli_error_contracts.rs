@@ -272,6 +272,10 @@ fn top_level_help_names_command_purposes() {
         ("doctor", "Check cache, index, and retrieval health."),
         ("setup", "Install or check local setup assets."),
         ("symbol", "Inspect a symbol by query or id."),
+        (
+            "explore",
+            "Open the terminal explorer or print an exploration packet.",
+        ),
     ] {
         assert!(
             help_text

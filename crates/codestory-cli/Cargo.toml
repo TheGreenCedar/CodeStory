@@ -1,7 +1,13 @@
 [package]
 name = "codestory-cli"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
+description = "Local repository evidence and grounding CLI for source-backed coding workflows."
+license = "Apache-2.0"
+repository = "https://github.com/TheGreenCedar/CodeStory.git"
+readme = "../../README.md"
+keywords = ["code-search", "grounding", "cli", "agents"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 codestory-contracts = { workspace = true }

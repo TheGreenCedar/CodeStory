@@ -139,6 +139,7 @@ pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
         && !cmd.no_tui
         && std::io::stdout().is_terminal()
     {
+        eprintln!("Opening interactive explore TUI; use --no-tui for plain markdown.");
         return run_explore_tui(&render_context);
     }
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
@@ -1586,6 +1587,23 @@ impl ExploreTuiState {
     }
 }
 
+fn explore_tui_nav_label(
+    pane_label: &str,
+    pane_index: usize,
+    pane_count: usize,
+    selected: bool,
+) -> String {
+    let marker = if selected { ">" } else { " " };
+    format!("{marker} {pane_label} [{}/{}]", pane_index + 1, pane_count)
+}
+
+fn explore_tui_footer_lines() -> [&'static str; 2] {
+    [
+        "Tab/Shift-Tab panes  Up/Down or j/k scroll  PgUp/PgDn page",
+        "Home top  Esc/Ctrl+C/q quit",
+    ]
+}
+
 pub(crate) fn explore_tui_action(key: crossterm::event::KeyEvent) -> ExploreTuiAction {
     use crossterm::event::{KeyCode, KeyModifiers};
     match key.code {
@@ -1644,7 +1662,7 @@ fn run_explore_tui(context: &ExploreRenderContext<'_>) -> Result<()> {
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Min(1),
-                    Constraint::Length(1),
+                    Constraint::Length(2),
                 ])
                 .split(area);
             let body = Layout::default()
@@ -1672,6 +1690,8 @@ fn run_explore_tui(context: &ExploreRenderContext<'_>) -> Result<()> {
                 .iter()
                 .enumerate()
                 .map(|(idx, pane)| {
+                    let label =
+                        explore_tui_nav_label(pane.label, idx, panes.len(), idx == state.selected);
                     let style = if idx == state.selected {
                         Style::default()
                             .fg(Color::Cyan)
@@ -1679,7 +1699,7 @@ fn run_explore_tui(context: &ExploreRenderContext<'_>) -> Result<()> {
                     } else {
                         Style::default()
                     };
-                    ListItem::new(Line::from(Span::styled(pane.label, style)))
+                    ListItem::new(Line::from(Span::styled(label, style)))
                 })
                 .collect::<Vec<_>>();
             frame.render_widget(
@@ -1692,14 +1712,19 @@ fn run_explore_tui(context: &ExploreRenderContext<'_>) -> Result<()> {
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title(panes[state.selected].label),
+                            .title(explore_tui_nav_label(
+                                panes[state.selected].label,
+                                state.selected,
+                                panes.len(),
+                                true,
+                            )),
                     )
                     .wrap(Wrap { trim: false })
                     .scroll((state.scroll[state.selected], 0)),
                 body[1],
             );
             frame.render_widget(
-                Paragraph::new("Tab/Shift-Tab pane  Up/Down scroll  Home top  q quit"),
+                Paragraph::new(explore_tui_footer_lines().join("\n")),
                 shell[2],
             );
         })?;
@@ -1713,4 +1738,47 @@ fn run_explore_tui(context: &ExploreRenderContext<'_>) -> Result<()> {
     }
     terminal.show_cursor()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn explore_tui_nav_label() {
+        assert_eq!(
+            super::explore_tui_nav_label("Status", 0, 6, true),
+            "> Status [1/6]"
+        );
+        assert_eq!(
+            super::explore_tui_nav_label("Status", 0, 6, false),
+            "  Status [1/6]"
+        );
+        assert_eq!(
+            super::explore_tui_nav_label("Trail", 5, 6, false),
+            "  Trail [6/6]"
+        );
+    }
+
+    #[test]
+    fn explore_tui_footer_text() {
+        let lines = super::explore_tui_footer_lines();
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            assert!(line.len() <= 80, "footer line exceeds 80 columns: {line}");
+        }
+
+        let footer = lines.join("\n");
+        for control in [
+            "Tab",
+            "Shift-Tab",
+            "Up/Down",
+            "j/k",
+            "PgUp/PgDn",
+            "Home",
+            "Esc",
+            "Ctrl+C",
+            "q",
+        ] {
+            assert!(footer.contains(control), "footer missing {control}");
+        }
+    }
 }
