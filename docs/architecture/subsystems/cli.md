@@ -38,7 +38,7 @@ index path when embedding assets are available.
 
 ## Configuration Files
 
-The CLI loads optional `.codestory.toml` defaults from the user home directory and then from the selected project root. Project config overrides home config. Explicit environment variables override both config files because config values are only applied when the matching runtime env var is absent.
+The CLI loads optional `.codestory.toml` defaults from the user home directory and then from the selected project root. Project config may override home config for project-safe preferences. Cache roots, network endpoints, credentials, and source-text egress settings must come from trusted user config, explicit environment variables, or CLI options; project files cannot set `cache_dir`, `summary_endpoint`, or embedding endpoint fields unless `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG=1` is set deliberately for that run. Explicit environment variables override both config files because config values are only applied when the matching runtime env var is absent.
 
 Embedding config keys map to the runtime env names:
 
