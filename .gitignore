@@ -30,6 +30,7 @@ models/
 # Local scratch output
 check_output*.txt
 check_tests_output*.txt
+.worktrees/
 
 # Node tooling (if used locally)
 node_modules/
