@@ -38,6 +38,7 @@ mod http_transport;
 mod managed_embeddings;
 mod output;
 mod query_resolution;
+mod report;
 mod retrieval;
 mod runtime;
 mod stdio_catalog;
@@ -178,6 +179,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Index(cmd) => run_index(cmd),
         Command::Ground(cmd) => run_ground(cmd),
+        Command::Report(cmd) => report::run_report(cmd),
         Command::Context(cmd) => run_context(cmd),
         Command::Packet(cmd) => run_packet(cmd),
         Command::Doctor(cmd) => run_doctor(cmd),

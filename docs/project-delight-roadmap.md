@@ -17,6 +17,10 @@ These capabilities are represented in the current CLI/runtime surface:
 - `index` builds graph state, snapshots, lexical search state, and semantic docs
   in the local cache.
 - `ground --why` gives broad repo orientation with retrieval and coverage notes.
+- `report` emits a derived Markdown repo report or JSON graph export from the
+  current SQLite store, including hotspots, entry points, bridge nodes,
+  suggested follow-up queries, generation metadata, source locations, and
+  confidence/certainty when available.
 - `search --why` exposes candidate results and retrieval explanations.
 - `symbol`, `trail`, `snippet`, and `explore` support focused navigation around
   concrete targets.
@@ -74,7 +78,9 @@ to trust and harder to misuse:
 ## Later
 
 - Saved query presets for repeated investigations.
-- Shareable result bundles that pair Markdown summaries with machine JSON.
+- Sharper shareable result bundles that pair Markdown summaries with machine
+  JSON across targeted workflows, beyond the current repo-level `report`
+  artifact.
 - Better typo and low-confidence query suggestions.
 - A separate web UI only after the browser surface gate has current evidence.
 

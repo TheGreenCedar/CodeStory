@@ -89,11 +89,18 @@ described as agent packet/search readiness.
 codestory-cli doctor --project <target-workspace>
 codestory-cli index --project <target-workspace> --refresh full
 codestory-cli ground --project <target-workspace> --why
+codestory-cli report --project <target-workspace> --output-file out/codestory-report.md
+codestory-cli report --project <target-workspace> --format json --output-file out/codestory-graph.json
 ```
 
 Use this when the repository is new to the agent. `doctor` tells you whether the
 cache and retrieval state are usable. `ground --why` gives broad orientation and
-reports limited coverage or gaps.
+reports limited coverage or gaps. `report` reads the current SQLite store
+without refreshing it and emits generated artifacts: Markdown for repo summary,
+hotspots, entry points, bridge/high-connectivity nodes, and next queries; JSON
+for automation that needs nodes, edges, confidence/certainty, source locations,
+and generation metadata. Treat both files as outputs to regenerate, not
+source-of-truth state.
 
 ### I need evidence for a broad question
 
@@ -160,6 +167,9 @@ and retrieval state.
   semantic docs.
 - `ground`: broad repo-level orientation snapshot; `--why` explains retrieval
   mode, coverage, gaps, and next commands.
+- `report`: derived Markdown repo report or JSON graph export from the current
+  SQLite store; use `--output-file` to keep artifacts separate from terminal
+  logs.
 - `packet`: bounded broad-task evidence packet with citations, budget usage,
   gaps, and follow-up commands.
 - `search`: candidate discovery for symbols, files, literals, API paths,
