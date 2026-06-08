@@ -155,7 +155,12 @@ pub fn build_report(
     let project_root = project_root.as_ref();
     let storage_path = storage_path.as_ref();
     let source = load_report_source(storage_path)?;
-    Ok(build_report_from_source(project_root, &source, limit))
+    Ok(build_report_from_source(
+        project_root,
+        storage_path,
+        &source,
+        limit,
+    ))
 }
 
 pub fn build_report_export(
@@ -166,7 +171,7 @@ pub fn build_report_export(
     let project_root = project_root.as_ref();
     let storage_path = storage_path.as_ref();
     let source = load_report_source(storage_path)?;
-    let report = build_report_from_source(project_root, &source, limit);
+    let report = build_report_from_source(project_root, storage_path, &source, limit);
     let graph = GraphExport {
         nodes: source
             .nodes
@@ -216,6 +221,7 @@ fn load_report_source(storage_path: &Path) -> Result<ReportSource> {
 
 fn build_report_from_source(
     project_root: &Path,
+    storage_path: &Path,
     source: &ReportSource,
     limit: usize,
 ) -> RepoReport {
