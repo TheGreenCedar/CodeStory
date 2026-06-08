@@ -178,6 +178,8 @@ and retrieval state.
 - `drill`: write a deterministic investigation report for selected anchors.
 - `setup embeddings`: install managed local embedding assets.
 - `serve --stdio`: persistent local read surface for repeated agent queries.
+  Use `get_node`, `neighbors`, `shortest_path`, or `query_subgraph` for cheap
+  graph probes from known node ids before asking for a broad `packet`.
 - `generate-completions`: emit shell completions from the command model.
 
 ## Index Options
