@@ -31,11 +31,14 @@ These capabilities are represented in the current CLI/runtime surface:
 The highest-value improvements are still about making the evidence loop easier
 to trust and harder to misuse:
 
-1. **Make target-context packets sharper**
-   - Improve `context` so it gathers the right neighborhood around one target
-     with fewer manual hops.
-   - Keep it target-first; broad open-ended questions belong in `packet` or a
-     `drill`/`drill-suite` run that records source-truth verification.
+1. **Make reliability and readiness hard to misread**
+   - Keep tightening `doctor` so it separates local cache/navigation readiness
+     from agent-facing packet/search sidecar readiness.
+   - Keep recovery commands focused on the failing layer: stale local index,
+     managed embedding assets, sidecar manifest, sidecar process, or backend
+     contract drift.
+   - Preserve fail-closed behavior for sidecar packet/search and make stale
+     index repair obvious before answer-quality work starts.
 
 2. **Make answer-quality gates harder to bypass**
    - Treat source-truth correction counts as product evidence, not test noise.
@@ -45,22 +48,28 @@ to trust and harder to misuse:
      degraded until claim classifications prove no misleading or unsupported
      claims remain.
 
-3. **Make retrieval explanations more useful**
+3. **Make target-context packets sharper**
+   - Improve `context` so it gathers the right neighborhood around one target
+     with fewer manual hops.
+   - Keep it target-first; broad open-ended questions belong in `packet` or a
+     `drill`/`drill-suite` run that records source-truth verification.
+
+4. **Make retrieval explanations more useful**
    - Keep improving `--why` output for lexical, semantic, graph, fallback, and
      freshness signals.
    - The goal is to show why a result appeared and when not to trust it.
 
-4. **Improve repository navigation**
+5. **Improve repository navigation**
    - Keep hardening `explore`, definition, references, symbol browsing, trails,
      and snippets before adding a separate web UI.
    - A new surface should be added only when it solves a workflow that the
      current surfaces do not.
 
-5. **Simplify setup**
-   - Managed embeddings, profile selection, and fail-closed diagnostics should
-     make first use clear.
-   - If the model path, backend, or doc shape is stale, `doctor` should say so
-     plainly.
+6. **Polish setup without blurring readiness tracks**
+   - Managed embeddings, profile selection, sidecar setup, and fail-closed
+     diagnostics should make first use clear.
+   - If the model path, backend, manifest, sidecar mode, or doc shape is stale,
+     `doctor` should say so plainly.
 
 ## Later
 

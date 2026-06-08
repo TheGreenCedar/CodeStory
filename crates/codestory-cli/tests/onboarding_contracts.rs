@@ -240,6 +240,69 @@ fn usage_doc_keeps_agent_contract_terms_out_of_operator_flow() {
 }
 
 #[test]
+fn usage_doc_names_two_readiness_tracks_and_predictable_output_modes() {
+    let root = repo_root();
+    let usage = fs::read_to_string(root.join("docs/usage.md")).expect("usage doc should exist");
+
+    assert!(usage.contains("## Readiness Tracks"));
+    assert!(usage.contains("### Local navigation/cache readiness"));
+    assert!(usage.contains("### Agent packet/search sidecar readiness"));
+    assert!(usage.contains("`local_navigation`"));
+    assert!(usage.contains("`agent_packet_search`"));
+    assert!(usage.contains("`retrieval_mode: \"full\"`"));
+    assert!(usage.contains("## Predictable Output Modes"));
+    assert!(usage.contains("Most commands default to Markdown"));
+    assert!(
+        usage.contains("Use `--format json` when automation needs the complete structured result")
+    );
+    assert!(usage.contains("Use `--output-file <PATH>`"));
+    assert!(usage.contains("The parent directory must already exist"));
+    assert!(usage.contains("`explore` opens the terminal UI by default"));
+    assert!(usage.contains("Use `--no-tui`"));
+    assert!(
+        usage
+            .find("## Readiness Tracks")
+            .expect("readiness heading")
+            < usage
+                .find("## Retrieval Defaults")
+                .expect("retrieval defaults heading"),
+        "usage should introduce readiness tracks before retrieval defaults"
+    );
+}
+
+#[test]
+fn benchmark_docs_show_proof_tier_ladder() {
+    let root = repo_root();
+    let benchmark_scorecard = fs::read_to_string(root.join("docs/testing/benchmark-results.md"))
+        .expect("benchmark scorecard should exist");
+
+    assert!(benchmark_scorecard.contains("## Proof Tier Ladder"));
+    for tier in [
+        "Stats-only local regression signal",
+        "Full sidecar readiness proof",
+        "Real-repo drill proof",
+        "Promotion-grade benchmark proof",
+    ] {
+        assert!(
+            benchmark_scorecard.contains(tier),
+            "benchmark scorecard should explain proof tier {tier}"
+        );
+    }
+    assert!(benchmark_scorecard.contains("Full sidecar readiness, agent packet/search readiness"));
+    assert!(benchmark_scorecard.contains("`retrieval_mode: \"full\"`"));
+    assert!(benchmark_scorecard.contains("Generalized agent savings"));
+    assert!(
+        benchmark_scorecard
+            .find("## Proof Tier Ladder")
+            .expect("proof tier ladder")
+            < benchmark_scorecard
+                .find("## Promotion Rules")
+                .expect("promotion rules"),
+        "proof tier ladder should frame promotion rules"
+    );
+}
+
+#[test]
 fn markdown_links_resolve_to_existing_local_files() {
     let root = repo_root();
     let mut markdown_files = vec![root.join("README.md")];

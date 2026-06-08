@@ -53,6 +53,33 @@ $TargetWorkspace = "C:\path\to\repo"
 & $CodeStoryCli ground --project $TargetWorkspace --why
 ```
 
+## Readiness Tracks
+
+CodeStory has two readiness tracks. Keep them separate when deciding whether an
+agent can rely on packet/search output.
+
+### Local navigation/cache readiness
+
+This lane is for local browsing and source navigation. It uses the project
+SQLite cache built by `index` and read by commands such as `ground`, `symbol`,
+`trail`, `snippet`, `explore`, `context`, `files`, and `affected`.
+
+`doctor` may report this lane as `local_navigation`. A healthy local navigation
+lane means the cache can support graph and source navigation. It does not prove
+that sidecar packet/search is ready.
+
+### Agent packet/search sidecar readiness
+
+This lane is for agent-facing `packet` and `search` evidence. It requires the
+sidecar retrieval stack to be built and healthy: Zoekt lexical shards, Qdrant
+semantic vectors, SCIP graph artifacts, the llama.cpp query embedding endpoint,
+and a current retrieval manifest.
+
+`doctor` may report this lane as `agent_packet_search`. Treat this lane as
+ready only when sidecar status reports `retrieval_mode: "full"`. Missing,
+stale, stubbed, hash-vector, or non-product sidecar state is diagnostic only and
+must not be described as packet/search readiness.
+
 ## Common Workflows
 
 ### I need a repo overview
@@ -178,6 +205,25 @@ Refresh modes:
 Read commands default to `--refresh none`. Use `--refresh incremental` when a
 read should refresh an existing cache first, and `--refresh full` after a cache
 reset, schema change, or suspected stale-state incident.
+
+## Predictable Output Modes
+
+Most commands default to Markdown because the normal operator path is human
+review. Use `--format markdown` when the output will be read directly in a
+terminal, pasted into a report, or inspected during recovery.
+
+Use `--format json` when automation needs the complete structured result,
+including fields that Markdown may summarize. JSON is the safer choice for
+tests, scripts, status gates, and any workflow that must compare exact values
+such as `retrieval_mode`, cache paths, or timing fields.
+
+Use `--output-file <PATH>` when a command produces an artifact that should be
+kept separate from terminal logs. The parent directory must already exist.
+Treat the file as the durable result and stdout/stderr as command status.
+
+`explore` opens the terminal UI by default when a TUI is available. Use `--no-tui`
+for predictable command output in agent runs, tests, non-interactive terminals,
+and CI logs.
 
 ## Retrieval Defaults
 

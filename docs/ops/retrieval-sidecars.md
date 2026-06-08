@@ -3,6 +3,13 @@
 Local Zoekt, Qdrant, and SCIP indexer processes for sidecar packet retrieval. Data directories
 live under the CodeStory user cache; ports are fixed for local dev and CI smoke.
 
+This runbook covers the `agent_packet_search` readiness lane. Sidecar readiness
+is required before agent-facing `packet` and `search` output can be trusted.
+Local SQLite navigation is a separate `local_navigation` lane: `codestory-cli
+index`, `ground`, `symbol`, `trail`, `snippet`, `explore`, `context`, `files`,
+and `affected` can be useful with a healthy local cache, but that cache alone
+does not prove packet/search sidecar readiness.
+
 **Design reference:** [`retrieval-design.md`](../architecture/retrieval-design.md)
 (sidecar pins, degraded modes, preflight).
 
@@ -26,8 +33,9 @@ From the CodeStory repository root (Windows, macOS, Linux):
 cargo retrieval-setup
 ```
 
-Plain `codestory-cli index` builds the core SQLite code index only. It does not
-generate sidecar artifacts or prove retrieval readiness. Use
+Plain `codestory-cli index` builds the core SQLite code index only. It can make
+the local navigation lane usable, but it does not generate sidecar artifacts or
+prove agent packet/search readiness. Use
 `codestory-cli retrieval index --project <repo>` to generate Zoekt, Qdrant, and
 SCIP sidecar artifacts, then use `codestory-cli retrieval status --project
 <repo> --format json` to verify `retrieval_mode: "full"` before using
@@ -219,6 +227,9 @@ Historical compose-profile overrides and hash-vector modes are rejected by produ
 paths. Stubbed, hash-vector, or partial sidecars report a non-`full` mode and fail closed for agent-facing packet/search
 paths. Sidecar-primary packet runs require a project-scoped lexical shard, live llama.cpp
 semantic state, and SCIP graph artifacts. `CODESTORY_RETRIEVAL=0` is unsupported.
+Managed `setup embeddings` output is not a substitute for this lane: it may
+install local semantic assets, but it does not start llama.cpp, build the
+retrieval manifest, or make `retrieval status` report `full`.
 
 **Phase 2 (shipped in crate):**
 
