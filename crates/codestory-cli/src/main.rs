@@ -383,7 +383,12 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
         retrieval,
         phase_timings: opened.phase_timings.as_ref(),
         summary_generation: summary_generation.as_ref(),
-        next_commands: index_next_commands(&opened.summary.root, Some(retrieval), sidecar_is_full),
+        next_commands: index_next_commands(
+            &opened.summary.root,
+            Some(retrieval),
+            opened.summary.freshness.as_ref(),
+            sidecar_is_full,
+        ),
     };
 
     let markdown = render_index_markdown(&output);
@@ -7929,7 +7934,12 @@ fn build_doctor_output(
         retrieval,
         freshness: summary.freshness.clone(),
         checks,
-        next_commands: index_next_commands(&project, summary.retrieval.as_ref(), sidecar_is_full),
+        next_commands: index_next_commands(
+            &project,
+            summary.retrieval.as_ref(),
+            summary.freshness.as_ref(),
+            sidecar_is_full,
+        ),
         environment,
     }
 }
@@ -8258,10 +8268,34 @@ fn doctor_sidecar_check(sidecar: &DoctorSidecarStatusOutput) -> DoctorCheckOutpu
 fn index_next_commands(
     project: &str,
     retrieval: Option<&codestory_contracts::api::RetrievalStateDto>,
+    freshness: Option<&IndexFreshnessDto>,
     sidecar_is_full: bool,
 ) -> Vec<String> {
     let project = quote_command_path(std::path::Path::new(project));
     let mut commands = Vec::new();
+    if let Some(freshness) = freshness {
+        match freshness.status {
+            IndexFreshnessStatusDto::Stale => {
+                commands.push(format!(
+                    "codestory-cli index --project {project} --refresh incremental"
+                ));
+                commands.push(format!(
+                    "codestory-cli doctor --project {project} --format markdown"
+                ));
+                return commands;
+            }
+            IndexFreshnessStatusDto::NotChecked => {
+                commands.push(format!(
+                    "codestory-cli index --project {project} --refresh full"
+                ));
+                commands.push(format!(
+                    "codestory-cli doctor --project {project} --format markdown"
+                ));
+                return commands;
+            }
+            IndexFreshnessStatusDto::Fresh => {}
+        }
+    }
     if !sidecar_is_full {
         commands.push(format!(
             "codestory-cli retrieval status --project {project}"
@@ -8272,6 +8306,7 @@ fn index_next_commands(
         commands.push(format!(
             "codestory-cli doctor --project {project} --format markdown"
         ));
+        return commands;
     }
     if let Some(retrieval) = retrieval.filter(|state| !state.semantic_ready)
         && retrieval.fallback_reason == Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime)
@@ -9383,6 +9418,38 @@ mod tests {
             packet_task_class_label(PacketTaskClassDto::BugLocalization),
             "bug_localization"
         );
+    }
+
+    #[test]
+    fn index_next_commands_stop_at_check_index_when_freshness_not_checked() {
+        let freshness = IndexFreshnessDto {
+            status: IndexFreshnessStatusDto::NotChecked,
+            changed_file_count: 0,
+            new_file_count: 0,
+            removed_file_count: 0,
+            checked_file_count: 0,
+            indexed_file_count: 1,
+            duration_ms: 0,
+            reason: Some("bounded inventory overflow".to_string()),
+            samples: Vec::new(),
+        };
+
+        let commands = index_next_commands("C:/repo", None, Some(&freshness), true);
+        let joined = commands.join("\n");
+
+        assert!(
+            joined.contains("codestory-cli index")
+                && joined.contains("--refresh full")
+                && joined.contains("codestory-cli doctor")
+                && joined.contains("--format markdown"),
+            "not-checked freshness should recommend index verification before proof commands: {joined}"
+        );
+        for blocked in ["ground", "search", "context"] {
+            assert!(
+                !joined.contains(&format!("codestory-cli {blocked} ")),
+                "not-checked freshness should stop before `{blocked}` proof/navigation commands: {joined}"
+            );
+        }
     }
 
     #[test]
