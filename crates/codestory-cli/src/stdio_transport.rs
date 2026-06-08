@@ -964,12 +964,11 @@ fn handle_stdio_get_node(
                 .map_err(map_api_error)
                 .map(|node| {
                     let file_refs = stdio_node_file_refs(&node);
-                    let resolution =
-                        serde_json::to_value(build_query_resolution_output(
-                            &runtime.project_root,
-                            &target,
-                        ))
-                        .unwrap_or(serde_json::Value::Null);
+                    let resolution = serde_json::to_value(build_query_resolution_output(
+                        &runtime.project_root,
+                        &target,
+                    ))
+                    .unwrap_or(serde_json::Value::Null);
                     serde_json::json!({
                         "resolution": resolution,
                         "node": node,
@@ -1011,12 +1010,11 @@ fn handle_stdio_neighbors(
                 .trail_context(config)
                 .map_err(map_api_error)
                 .map(|context| {
-                    let resolution =
-                        serde_json::to_value(build_query_resolution_output(
-                            &runtime.project_root,
-                            &target,
-                        ))
-                        .unwrap_or(serde_json::Value::Null);
+                    let resolution = serde_json::to_value(build_query_resolution_output(
+                        &runtime.project_root,
+                        &target,
+                    ))
+                    .unwrap_or(serde_json::Value::Null);
                     stdio_graph_tool_output(
                         resolution,
                         context.trail,
@@ -1248,10 +1246,7 @@ fn stdio_graph_u32_arg(
         .unwrap_or(default)
 }
 
-fn stdio_graph_string_arg<'a>(
-    request: &'a serde_json::Value,
-    name: &str,
-) -> Option<&'a str> {
+fn stdio_graph_string_arg<'a>(request: &'a serde_json::Value, name: &str) -> Option<&'a str> {
     request
         .pointer(&format!("/params/arguments/{name}"))
         .and_then(|value| value.as_str())

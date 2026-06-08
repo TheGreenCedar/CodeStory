@@ -3084,8 +3084,7 @@ pub(crate) fn render_trail_dot(_project_root: &Path, context: &TrailContextDto) 
     }
     for edge in &context.trail.edges {
         let edge_kind = format!("{:?}", edge.kind).to_lowercase();
-        let (marker, certainty) =
-            render_trail_edge_notation(&edge_kind, edge.certainty.as_deref());
+        let (marker, certainty) = render_trail_edge_notation(&edge_kind, edge.certainty.as_deref());
         let label = format!("{marker}{certainty}");
         let _ = writeln!(
             dot,

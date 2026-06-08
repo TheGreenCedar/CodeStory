@@ -730,9 +730,7 @@ fn packet_operator_next_action(packet: &AgentPacketDto) -> &str {
         .follow_up_commands
         .first()
         .map(String::as_str)
-        .unwrap_or(
-            "Inspect cited source before relying on claims not covered by packet citations.",
-        )
+        .unwrap_or("Inspect cited source before relying on claims not covered by packet citations.")
 }
 
 fn packet_budget_mode_label(mode: PacketBudgetModeDto) -> &'static str {

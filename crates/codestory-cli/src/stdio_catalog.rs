@@ -630,13 +630,24 @@ static GRAPH_TOOL_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::object("node", "Node details DTO.").nullable(),
         SchemaProperty::object("graph", "Graph response DTO.").nullable(),
         SchemaProperty::string("certainty", "Overall certainty note."),
-        SchemaProperty::array("file_refs", "Stable project-relative file references.", &GENERIC_OBJECT_SCHEMA),
+        SchemaProperty::array(
+            "file_refs",
+            "Stable project-relative file references.",
+            &GENERIC_OBJECT_SCHEMA,
+        ),
         SchemaProperty::object("limits", "Applied bounds for this graph primitive."),
         SchemaProperty::integer("node_count", "Returned node count."),
         SchemaProperty::integer("edge_count", "Returned edge count."),
         SchemaProperty::boolean("truncated", "Whether the graph result was truncated."),
     ],
-    &["certainty", "file_refs", "limits", "node_count", "edge_count", "truncated"],
+    &[
+        "certainty",
+        "file_refs",
+        "limits",
+        "node_count",
+        "edge_count",
+        "truncated",
+    ],
 );
 
 static SNIPPET_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(

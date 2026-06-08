@@ -524,11 +524,7 @@ embedding_model_id = "project/model-id"
 
     #[test]
     fn project_config_rejects_embedding_endpoint_without_trusted_opt_in() -> Result<()> {
-        let _env = EnvRestore::capture(&[
-            "USERPROFILE",
-            "HOME",
-            PROJECT_NETWORK_CONFIG_OPT_IN_ENV,
-        ]);
+        let _env = EnvRestore::capture(&["USERPROFILE", "HOME", PROJECT_NETWORK_CONFIG_OPT_IN_ENV]);
         clear_env(&["USERPROFILE", "HOME", PROJECT_NETWORK_CONFIG_OPT_IN_ENV]);
 
         let project = tempdir()?;
@@ -580,11 +576,7 @@ embedding_model_id = "project/model-id"
 
     #[test]
     fn home_config_can_set_cache_dir_and_summary_endpoint() -> Result<()> {
-        let _env = EnvRestore::capture(&[
-            "USERPROFILE",
-            "HOME",
-            "CODESTORY_SUMMARY_ENDPOINT",
-        ]);
+        let _env = EnvRestore::capture(&["USERPROFILE", "HOME", "CODESTORY_SUMMARY_ENDPOINT"]);
         clear_env(&["HOME", "CODESTORY_SUMMARY_ENDPOINT"]);
 
         let home = tempdir()?;
@@ -602,7 +594,10 @@ summary_endpoint = "https://example.invalid/v1/chat/completions"
 
         let config = load_config(project.path())?;
 
-        assert_eq!(config.cache_dir.as_deref(), Some(Path::new("C:/trusted-cache")));
+        assert_eq!(
+            config.cache_dir.as_deref(),
+            Some(Path::new("C:/trusted-cache"))
+        );
         assert_eq!(
             config.summary_endpoint.as_deref(),
             Some("https://example.invalid/v1/chat/completions")

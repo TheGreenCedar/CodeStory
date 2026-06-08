@@ -401,7 +401,9 @@ fn graph_export_edge(edge: &Edge, nodes_by_id: &HashMap<NodeId, Node>) -> GraphE
         effective_target: edge.effective_target().0,
         kind: edge_kind_label(edge.kind),
         confidence: edge.confidence,
-        certainty: edge.certainty.map(|certainty| certainty.as_str().to_string()),
+        certainty: edge
+            .certainty
+            .map(|certainty| certainty.as_str().to_string()),
         callsite_identity: edge.callsite_identity.clone(),
         candidate_targets: edge
             .candidate_targets
@@ -423,7 +425,13 @@ fn source_location_for_node(
             .and_then(|id| nodes_by_id.get(&id))
             .map(node_display_name)
     };
-    source_location(file, node.start_line, node.start_col, node.end_line, node.end_col)
+    source_location(
+        file,
+        node.start_line,
+        node.start_col,
+        node.end_line,
+        node.end_col,
+    )
 }
 
 fn source_location_for_edge(
@@ -466,14 +474,16 @@ fn node_display_name(node: &Node) -> String {
 
 fn looks_like_entry_point(node: &Node) -> bool {
     let name = node_display_name(node).to_ascii_lowercase();
-    matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MODULE)
-        && (name == "main"
-            || name.ends_with("::main")
-            || name.ends_with(".main")
-            || name.contains("run")
-            || name.contains("start")
-            || name.contains("serve")
-            || name.contains("index"))
+    matches!(
+        node.kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MODULE
+    ) && (name == "main"
+        || name.ends_with("::main")
+        || name.ends_with(".main")
+        || name.contains("run")
+        || name.contains("start")
+        || name.contains("serve")
+        || name.contains("index"))
 }
 
 fn node_kind_counts(nodes: &[Node]) -> BTreeMap<String, usize> {

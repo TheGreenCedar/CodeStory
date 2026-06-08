@@ -116,10 +116,7 @@ fn append_node_section(
         let _ = writeln!(markdown);
         return;
     }
-    let _ = writeln!(
-        markdown,
-        "| Node | Kind | In | Out | Total | Source |"
-    );
+    let _ = writeln!(markdown, "| Node | Kind | In | Out | Total | Source |");
     let _ = writeln!(markdown, "| --- | --- | ---: | ---: | ---: | --- |");
     for node in nodes {
         let _ = writeln!(
