@@ -174,6 +174,25 @@ fn check_with_name<'a>(doctor: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("doctor check `{name}` missing: {doctor:#}"))
 }
 
+fn doctor_next_commands(doctor: &Value) -> Vec<&str> {
+    doctor["next_commands"]
+        .as_array()
+        .expect("doctor next commands")
+        .iter()
+        .map(|command| command.as_str().expect("next command string"))
+        .collect()
+}
+
+fn assert_no_agent_proof_commands(commands: &[&str], context: &str) {
+    let joined = commands.join("\n");
+    for blocked in ["packet", "ground", "search", "context"] {
+        assert!(
+            !joined.contains(&format!("codestory-cli {blocked} ")),
+            "{context} should stop before `{blocked}` proof/navigation commands: {joined}"
+        );
+    }
+}
+
 fn clean_test_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
@@ -578,6 +597,140 @@ fn new_openapi_with_late_paths_marks_freshness_stale() {
         ),
         Some(1),
         "new OpenAPI schema with late paths should be counted as new: {freshness:#}"
+    );
+}
+
+#[test]
+fn doctor_next_commands_stop_at_index_repair_when_inventory_is_stale() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+
+    fs::write(
+        workspace.path().join("late-openapi.yaml"),
+        "openapi: 3.1.0\ninfo:\n  title: Late Paths\n  version: 1.0.0\npaths:\n  /api/late:\n    get:\n      operationId: getLate\n",
+    )
+    .expect("write late OpenAPI fixture");
+
+    let doctor = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["doctor", "--format", "json"],
+    );
+    let freshness = find_index_freshness(&doctor)
+        .unwrap_or_else(|| panic!("doctor should include index freshness: {doctor:#}"));
+    assert_eq!(
+        freshness["status"], "stale",
+        "doctor should report stale freshness before recommending repair: {doctor:#}"
+    );
+
+    let next_commands = doctor_next_commands(&doctor);
+    let joined = next_commands.join("\n");
+    assert!(
+        joined.contains("codestory-cli index")
+            && joined.contains("--refresh incremental")
+            && joined.contains("codestory-cli doctor")
+            && joined.contains("--format markdown"),
+        "stale doctor should recommend index repair then doctor recheck: {doctor:#}"
+    );
+    assert!(
+        !joined.contains("retrieval status") && !joined.contains("retrieval index"),
+        "stale doctor should stop before retrieval repair commands: {doctor:#}"
+    );
+    assert_no_agent_proof_commands(&next_commands, "stale doctor");
+
+    let markdown = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &["doctor", "--format", "markdown"],
+    );
+    assert!(
+        markdown.status.success(),
+        "doctor markdown failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&markdown.stdout),
+        String::from_utf8_lossy(&markdown.stderr)
+    );
+    let markdown = String::from_utf8_lossy(&markdown.stdout);
+    assert!(
+        markdown
+            .contains("readiness: local_navigation=repair_index agent_packet_search=repair_index"),
+        "doctor markdown should show split readiness with index repair first:\n{markdown}"
+    );
+}
+
+#[test]
+fn doctor_next_commands_stop_at_retrieval_repair_when_sidecar_is_not_full() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    let index = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    let index_next_commands = doctor_next_commands(&index);
+    let index_next_commands_joined = index_next_commands.join("\n");
+    assert!(
+        index_next_commands_joined.contains("codestory-cli retrieval status")
+            && index_next_commands_joined.contains("codestory-cli retrieval index"),
+        "index output should recommend sidecar repair when sidecar retrieval is not full: {index:#}"
+    );
+    assert_no_agent_proof_commands(&index_next_commands, "index output");
+
+    let doctor = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["doctor", "--format", "json"],
+    );
+    let freshness = find_index_freshness(&doctor)
+        .unwrap_or_else(|| panic!("doctor should include index freshness: {doctor:#}"));
+    assert_ne!(
+        freshness["status"], "stale",
+        "sidecar repair test needs fresh enough inventory: {doctor:#}"
+    );
+    assert_ne!(
+        doctor["retrieval_mode"], "full",
+        "sidecar repair test needs mandatory sidecar retrieval to be not full: {doctor:#}"
+    );
+
+    let next_commands = doctor_next_commands(&doctor);
+    let joined = next_commands.join("\n");
+    assert!(
+        joined.contains("codestory-cli retrieval status")
+            && joined.contains("codestory-cli retrieval index")
+            && joined.contains("--refresh full")
+            && joined.contains("codestory-cli doctor")
+            && joined.contains("--format markdown"),
+        "doctor should recommend retrieval repair before packet/search: {doctor:#}"
+    );
+    assert!(
+        !joined.contains("codestory-cli index "),
+        "fresh doctor should not send users back to index repair: {doctor:#}"
+    );
+    assert_no_agent_proof_commands(&next_commands, "sidecar doctor");
+
+    let markdown = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &["doctor", "--format", "markdown"],
+    );
+    assert!(
+        markdown.status.success(),
+        "doctor markdown failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&markdown.stdout),
+        String::from_utf8_lossy(&markdown.stderr)
+    );
+    let markdown = String::from_utf8_lossy(&markdown.stdout);
+    assert!(
+        markdown.contains("readiness: local_navigation=ready agent_packet_search=repair_retrieval"),
+        "doctor markdown should show split readiness with retrieval repair for agent use:\n{markdown}"
     );
 }
 

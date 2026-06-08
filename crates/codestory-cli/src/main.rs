@@ -250,6 +250,14 @@ fn quote_command_value(value: &str) -> String {
     quote_powershell_single_quoted_value(value)
 }
 
+fn quote_command_argument_value(value: &str) -> String {
+    if command_value_needs_single_quotes(value) {
+        quote_command_value(value)
+    } else {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    }
+}
+
 fn command_value_needs_single_quotes(value: &str) -> bool {
     value.chars().any(|ch| matches!(ch, '$' | '`' | '\'' | '"'))
 }
@@ -383,7 +391,12 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
         retrieval,
         phase_timings: opened.phase_timings.as_ref(),
         summary_generation: summary_generation.as_ref(),
-        next_commands: index_next_commands(&opened.summary.root, Some(retrieval), sidecar_is_full),
+        next_commands: index_next_commands(
+            &opened.summary.root,
+            Some(retrieval),
+            opened.summary.freshness.as_ref(),
+            sidecar_is_full,
+        ),
     };
 
     let markdown = render_index_markdown(&output);
@@ -7677,6 +7690,8 @@ struct CliErrorBody {
     next_commands: Vec<String>,
 }
 
+const CLI_ERROR_MARKDOWN_ALTERNATIVE_LIMIT: usize = 10;
+
 fn resolve_target_or_emit_ambiguity(
     runtime: &RuntimeContext,
     target: args::TargetSelection,
@@ -7708,17 +7723,36 @@ fn render_cli_error_markdown(output: &CliErrorOutput) -> String {
     let _ = writeln!(markdown, "# Command Error");
     let _ = writeln!(markdown, "code: {}", output.error.code);
     let _ = writeln!(markdown, "failed_layer: {}", output.error.failed_layer);
-    let _ = writeln!(markdown, "message: {}", output.error.message);
+    let _ = writeln!(markdown, "message: {}", cli_error_markdown_message(output));
     let _ = writeln!(markdown, "query: `{}`", output.error.query);
     if let Some(file_filter) = output.error.file_filter.as_deref() {
         let _ = writeln!(markdown, "file_filter: `{file_filter}`");
+    }
+    if !output.error.next_commands.is_empty() {
+        let _ = writeln!(markdown, "next_commands:");
+        for command in &output.error.next_commands {
+            let _ = writeln!(markdown, "- `{command}`");
+        }
     }
     let _ = writeln!(
         markdown,
         "alternatives: {}",
         output.error.alternatives.len()
     );
-    for alternative in &output.error.alternatives {
+    if output.error.alternatives.len() > CLI_ERROR_MARKDOWN_ALTERNATIVE_LIMIT {
+        let _ = writeln!(
+            markdown,
+            "showing: {} of {}; use `--format json` or `search` to inspect all alternatives",
+            CLI_ERROR_MARKDOWN_ALTERNATIVE_LIMIT,
+            output.error.alternatives.len()
+        );
+    }
+    for alternative in output
+        .error
+        .alternatives
+        .iter()
+        .take(CLI_ERROR_MARKDOWN_ALTERNATIVE_LIMIT)
+    {
         let location = alternative
             .file_path
             .as_deref()
@@ -7753,13 +7787,20 @@ fn render_cli_error_markdown(output: &CliErrorOutput) -> String {
             let _ = writeln!(markdown, "- {note}");
         }
     }
-    if !output.error.next_commands.is_empty() {
-        let _ = writeln!(markdown, "next_commands:");
-        for command in &output.error.next_commands {
-            let _ = writeln!(markdown, "- `{command}`");
-        }
-    }
     markdown
+}
+
+fn cli_error_markdown_message(output: &CliErrorOutput) -> &str {
+    if output.error.code == "ambiguous_target" {
+        output
+            .error
+            .message
+            .lines()
+            .next()
+            .unwrap_or(&output.error.message)
+    } else {
+        &output.error.message
+    }
 }
 
 fn build_ambiguous_target_error_output(
@@ -7774,16 +7815,16 @@ fn build_ambiguous_target_error_output(
             build_numbered_search_hit_output(project_root, hit, Some(&ambiguous.query), index + 1)
         })
         .collect::<Vec<_>>();
-    let quoted_query = ambiguous.query.replace('"', "\\\"");
     let project = quote_command_path(project_root);
     let file_clause = ambiguous
         .file_filter
         .as_deref()
-        .map(|file_filter| format!(" --file \"{}\"", file_filter.replace('"', "\\\"")))
+        .map(|file_filter| format!(" --file {}", quote_command_argument_value(file_filter)))
         .unwrap_or_default();
     let mut next_commands = vec![format!(
-        "codestory-cli symbol --project {project} --query \"{}\"{} --choose 1",
-        quoted_query, file_clause
+        "codestory-cli symbol --project {project} --query {}{} --choose 1",
+        quote_command_argument_value(&ambiguous.query),
+        file_clause
     )];
     if let Some(first) = ambiguous.alternatives.first() {
         next_commands.push(format!(
@@ -7792,9 +7833,9 @@ fn build_ambiguous_target_error_output(
         ));
         if let Some(path) = first.file_path.as_deref() {
             next_commands.push(format!(
-                "codestory-cli symbol --project {project} --query \"{}\" --file {}",
-                quoted_query,
-                quote_command_value(&crate::display::relative_path(project_root, path))
+                "codestory-cli symbol --project {project} --query {} --file {}",
+                quote_command_argument_value(&ambiguous.query),
+                quote_command_argument_value(&crate::display::relative_path(project_root, path))
             ));
         }
     }
@@ -7816,7 +7857,8 @@ fn build_ambiguous_target_error_output(
                     ambiguous.query
                 ),
                 format!(
-                    "search: inspect alternatives with `codestory-cli search --project {project} --query`, then rerun this command with --choose, --id, or --file"
+                    "search: inspect alternatives with `codestory-cli search --project {project} --query {}`, then rerun this command with --choose, --id, or --file",
+                    quote_command_argument_value(&ambiguous.query)
                 ),
             ],
             next_commands,
@@ -7929,7 +7971,12 @@ fn build_doctor_output(
         retrieval,
         freshness: summary.freshness.clone(),
         checks,
-        next_commands: index_next_commands(&project, summary.retrieval.as_ref(), sidecar_is_full),
+        next_commands: index_next_commands(
+            &project,
+            summary.retrieval.as_ref(),
+            summary.freshness.as_ref(),
+            sidecar_is_full,
+        ),
         environment,
     }
 }
@@ -8258,10 +8305,34 @@ fn doctor_sidecar_check(sidecar: &DoctorSidecarStatusOutput) -> DoctorCheckOutpu
 fn index_next_commands(
     project: &str,
     retrieval: Option<&codestory_contracts::api::RetrievalStateDto>,
+    freshness: Option<&IndexFreshnessDto>,
     sidecar_is_full: bool,
 ) -> Vec<String> {
     let project = quote_command_path(std::path::Path::new(project));
     let mut commands = Vec::new();
+    if let Some(freshness) = freshness {
+        match freshness.status {
+            IndexFreshnessStatusDto::Stale => {
+                commands.push(format!(
+                    "codestory-cli index --project {project} --refresh incremental"
+                ));
+                commands.push(format!(
+                    "codestory-cli doctor --project {project} --format markdown"
+                ));
+                return commands;
+            }
+            IndexFreshnessStatusDto::NotChecked => {
+                commands.push(format!(
+                    "codestory-cli index --project {project} --refresh full"
+                ));
+                commands.push(format!(
+                    "codestory-cli doctor --project {project} --format markdown"
+                ));
+                return commands;
+            }
+            IndexFreshnessStatusDto::Fresh => {}
+        }
+    }
     if !sidecar_is_full {
         commands.push(format!(
             "codestory-cli retrieval status --project {project}"
@@ -8272,6 +8343,7 @@ fn index_next_commands(
         commands.push(format!(
             "codestory-cli doctor --project {project} --format markdown"
         ));
+        return commands;
     }
     if let Some(retrieval) = retrieval.filter(|state| !state.semantic_ready)
         && retrieval.fallback_reason == Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime)
@@ -9383,6 +9455,38 @@ mod tests {
             packet_task_class_label(PacketTaskClassDto::BugLocalization),
             "bug_localization"
         );
+    }
+
+    #[test]
+    fn index_next_commands_stop_at_check_index_when_freshness_not_checked() {
+        let freshness = IndexFreshnessDto {
+            status: IndexFreshnessStatusDto::NotChecked,
+            changed_file_count: 0,
+            new_file_count: 0,
+            removed_file_count: 0,
+            checked_file_count: 0,
+            indexed_file_count: 1,
+            duration_ms: 0,
+            reason: Some("bounded inventory overflow".to_string()),
+            samples: Vec::new(),
+        };
+
+        let commands = index_next_commands("C:/repo", None, Some(&freshness), true);
+        let joined = commands.join("\n");
+
+        assert!(
+            joined.contains("codestory-cli index")
+                && joined.contains("--refresh full")
+                && joined.contains("codestory-cli doctor")
+                && joined.contains("--format markdown"),
+            "not-checked freshness should recommend index verification before proof commands: {joined}"
+        );
+        for blocked in ["ground", "search", "context"] {
+            assert!(
+                !joined.contains(&format!("codestory-cli {blocked} ")),
+                "not-checked freshness should stop before `{blocked}` proof/navigation commands: {joined}"
+            );
+        }
     }
 
     #[test]

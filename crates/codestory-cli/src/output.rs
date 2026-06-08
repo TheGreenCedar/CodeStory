@@ -3,11 +3,12 @@ use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentRetrievalPolicyModeDto,
     AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
     AgentRetrievalStepStatusDto, ClaimReadinessDto, EvidenceTypeDto, GraphArtifactDto,
-    GroundingSnapshotDto, IndexingPhaseTimings, NodeDetailsDto, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, SearchHit, SearchHitOrigin,
-    SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
-    SearchPlanBridgeStatusDto, SearchPlanChannelDto, SearchPlanDto, SearchPlanPromotionStatusDto,
-    SnippetContextDto, SymbolContextDto, TrailContextDto, TrailStoryDto,
+    GroundingSnapshotDto, IndexFreshnessStatusDto, IndexingPhaseTimings, NodeDetailsDto,
+    RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto,
+    SearchHit, SearchHitOrigin, SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto,
+    SearchPlanBridgeEvidenceKindDto, SearchPlanBridgeStatusDto, SearchPlanChannelDto,
+    SearchPlanDto, SearchPlanPromotionStatusDto, SnippetContextDto, SymbolContextDto,
+    TrailContextDto, TrailStoryDto,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -566,8 +567,8 @@ pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput)
         append_search_plan(&mut markdown, project_root, plan);
     }
     if output.explain {
-        append_search_sidecar_diagnostics(&mut markdown, output);
         append_search_evidence_packet(&mut markdown, project_root, output);
+        append_search_sidecar_diagnostics(&mut markdown, output);
     }
     if !output.suggestions.is_empty() {
         let _ = writeln!(markdown, "did_you_mean:");
@@ -1960,6 +1961,12 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
         output.retrieval_mode,
         output.degraded_reason.as_deref().unwrap_or("none")
     );
+    let _ = writeln!(
+        markdown,
+        "readiness: local_navigation={} agent_packet_search={}",
+        doctor_local_navigation_readiness(output),
+        doctor_agent_packet_search_readiness(output)
+    );
     if let Some(retrieval) = output.retrieval.as_ref() {
         let _ = writeln!(
             markdown,
@@ -2005,6 +2012,33 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
         }
     }
     markdown
+}
+
+fn doctor_local_navigation_readiness(output: &DoctorOutput) -> &'static str {
+    if !output.indexed
+        || output
+            .freshness
+            .as_ref()
+            .is_some_and(|freshness| freshness.status == IndexFreshnessStatusDto::Stale)
+    {
+        return "repair_index";
+    }
+    "ready"
+}
+
+fn doctor_agent_packet_search_readiness(output: &DoctorOutput) -> &'static str {
+    if !output.indexed {
+        return "repair_index";
+    }
+    match output.freshness.as_ref().map(|freshness| freshness.status) {
+        Some(IndexFreshnessStatusDto::Stale) => return "repair_index",
+        Some(IndexFreshnessStatusDto::NotChecked) => return "check_index",
+        Some(IndexFreshnessStatusDto::Fresh) | None => {}
+    }
+    if output.retrieval_mode != "full" {
+        return "repair_retrieval";
+    }
+    "ready"
 }
 
 pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
@@ -3379,10 +3413,10 @@ mod tests {
         AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, AgentRetrievalTraceDto, EdgeId,
         EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse, GroundingBudgetDto,
         GroundingCoverageDto, GroundingFileDigestDto, GroundingSnapshotDto,
-        GroundingSymbolDigestDto, NodeDetailsDto, NodeId, NodeKind, RetrievalFallbackReasonDto,
-        RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, SearchHitOrigin,
-        SearchPlanNextActionDto, SemanticModeDto, StorageStatsDto, TrailContextDto, TrailStoryDto,
-        TrailStoryStepDto,
+        GroundingSymbolDigestDto, IndexFreshnessDto, NodeDetailsDto, NodeId, NodeKind,
+        RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto,
+        RetrievalShadowDto, RetrievalStateDto, SearchHitOrigin, SearchPlanNextActionDto,
+        SemanticModeDto, StorageStatsDto, TrailContextDto, TrailStoryDto, TrailStoryStepDto,
     };
     use serde_json::json;
     use std::path::Path;
@@ -3450,6 +3484,28 @@ mod tests {
         }
     }
 
+    fn sample_doctor_output() -> DoctorOutput {
+        DoctorOutput {
+            project: "C:/repo".to_string(),
+            storage_path: "C:/cache/codestory.db".to_string(),
+            indexed: true,
+            stats: sample_storage_stats(),
+            retrieval_mode: "full".to_string(),
+            degraded_reason: None,
+            sidecar_retrieval: crate::args::DoctorSidecarStatusOutput {
+                retrieval_mode: "full".to_string(),
+                degraded_reason: None,
+                manifest_generation: None,
+                manifest_input_hash: None,
+            },
+            retrieval: None,
+            freshness: None,
+            checks: Vec::new(),
+            next_commands: Vec::new(),
+            environment: Vec::new(),
+        }
+    }
+
     fn sample_node_details(id: &str, display_name: &str) -> NodeDetailsDto {
         NodeDetailsDto {
             id: NodeId(id.to_string()),
@@ -3466,6 +3522,29 @@ mod tests {
             member_access: None,
             route_endpoint: None,
         }
+    }
+
+    #[test]
+    fn doctor_markdown_marks_agent_readiness_check_index_when_freshness_not_checked() {
+        let mut output = sample_doctor_output();
+        output.freshness = Some(IndexFreshnessDto {
+            status: IndexFreshnessStatusDto::NotChecked,
+            changed_file_count: 0,
+            new_file_count: 0,
+            removed_file_count: 0,
+            checked_file_count: 0,
+            indexed_file_count: 1,
+            duration_ms: 0,
+            reason: Some("bounded inventory overflow".to_string()),
+            samples: Vec::new(),
+        });
+
+        let markdown = render_doctor_markdown(&output);
+
+        assert!(
+            markdown.contains("readiness: local_navigation=ready agent_packet_search=check_index"),
+            "doctor markdown must not report agent packet/search ready when freshness was not checked:\n{markdown}"
+        );
     }
 
     fn sample_graph_node(id: &str, label: &str) -> GraphNodeDto {
@@ -3918,6 +3997,56 @@ mod tests {
             !markdown.contains("why:"),
             "search --why should not duplicate packet evidence as legacy per-hit why lines:\n{markdown}"
         );
+    }
+
+    #[test]
+    fn search_why_markdown_puts_evidence_before_diagnostics() {
+        let output = crate::args::SearchOutput {
+            query: "packet output".to_string(),
+            retrieval: sample_retrieval(),
+            retrieval_shadow: Some(RetrievalShadowDto {
+                retrieval_mode: "full".to_string(),
+                degraded_reason: None,
+                retrieval_total_ms: 12,
+                total_budget_ms: Some(500),
+                cancel_reason: None,
+                cache_hit: true,
+                stage_timings: Vec::new(),
+                candidates: Vec::new(),
+                would_rank: Vec::new(),
+                error: None,
+                candidate_count: 1,
+                resolved_hit_count: 1,
+                unresolved_candidate_count: 0,
+                candidate_resolution_counts: Vec::new(),
+            }),
+            freshness: None,
+            limit_per_source: 1,
+            repo_text_mode: crate::args::RepoTextMode::Auto,
+            repo_text_enabled: true,
+            query_assessment: Some(codestory_contracts::api::SearchQueryAssessmentDto {
+                exact_symbol_hit_count: 1,
+                weak_top_hit: false,
+                stale_or_missing_anchor: false,
+                repo_text_fallback_reason: None,
+                recommended_next_action: Some(
+                    "Open the exact indexed hit with symbol, trail, and snippet before answering."
+                        .to_string(),
+                ),
+            }),
+            search_plan: None,
+            explain: true,
+            query_hints: Vec::new(),
+            suggestions: Vec::new(),
+            indexed_symbol_hits: vec![sample_search_hit()],
+            repo_text_hits: Vec::new(),
+            repo_text_stats: None,
+        };
+
+        let markdown = render_search_markdown(Path::new("C:/repo"), &output);
+
+        assert_order(&markdown, "short_finding:", "Sidecar diagnostics:");
+        assert_order(&markdown, "citations:", "Sidecar diagnostics:");
     }
 
     #[test]

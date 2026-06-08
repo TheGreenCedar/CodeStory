@@ -37,25 +37,45 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
+    #[command(about = "Build or refresh the repository index.")]
     Index(IndexCommand),
+    #[command(about = "Summarize indexed repository context.")]
     Ground(GroundCommand),
+    #[command(about = "Gather evidence for one concrete target.")]
     Context(ContextCommand),
+    #[command(about = "Answer a broad repository question with evidence.")]
     Packet(PacketCommand),
+    #[command(about = "Check cache, index, and retrieval health.")]
     Doctor(DoctorCommand),
+    #[command(about = "Install or check local setup assets.")]
     Setup(SetupCommand),
+    #[command(about = "Find symbols and repo text evidence.")]
     Search(SearchCommand),
+    #[command(about = "Run a repeatable grounding quality check.")]
     Drill(DrillCommand),
+    #[command(about = "Run a drill manifest across repositories.")]
     DrillSuite(DrillSuiteCommand),
+    #[command(about = "Inspect a symbol by query or id.")]
     Symbol(SymbolCommand),
+    #[command(about = "Trace calls, refs, and related symbols.")]
     Trail(TrailCommand),
+    #[command(about = "Show source around a symbol.")]
     Snippet(SnippetCommand),
+    #[command(about = "Run structured graph queries.")]
     Query(QueryCommand),
+    #[command(about = "Explore a target without the TUI.")]
     Explore(ExploreCommand),
+    #[command(about = "List indexed files and coverage.")]
     Files(FilesCommand),
+    #[command(about = "Explain impact from changed files.")]
     Affected(AffectedCommand),
+    #[command(about = "Save and reuse investigation targets.")]
     Bookmark(BookmarkCommand),
+    #[command(about = "Start the local integration surface.")]
     Serve(ServeCommand),
+    #[command(about = "Generate shell completions.")]
     GenerateCompletions(GenerateCompletionsCommand),
+    #[command(about = "Manage retrieval sidecar data.")]
     Retrieval(RetrievalCommand),
 }
 
