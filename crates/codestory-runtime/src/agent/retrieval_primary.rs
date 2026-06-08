@@ -161,6 +161,7 @@ fn sidecar_retrieval_recovery_commands(project: &str) -> Vec<String> {
     vec![
         format!("codestory-cli index --project {project} --refresh full"),
         format!("codestory-cli retrieval bootstrap --project {project} --format json"),
+        format!("codestory-cli retrieval index --project {project} --refresh full"),
         format!("codestory-cli doctor --project {project} --format markdown"),
     ]
 }
