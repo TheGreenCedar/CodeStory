@@ -1,6 +1,6 @@
 # CLI Subsystem
 
-`codestory-cli` is the thin adapter for indexing, grounding reads, DB-first context packets, graph-query helpers, local exploration, health checks, and lightweight serving.
+`codestory-cli` is the thin adapter for indexing, grounding reads, DB-first target context packets, graph-query helpers, local exploration, health checks, and lightweight serving.
 
 ## Ownership
 
@@ -82,7 +82,7 @@ rather than the general CLI architecture page.
 
 `query` is intentionally small. It parses source operations (`search`, `symbol`, `trail`) followed by stream refinements (`filter`, `limit`) and rejects malformed or unknown named arguments rather than silently ignoring typos.
 
-`context` is the higher-level retrieval packet. It resolves one concrete target from `--id`, `--query`, or `--bookmark`, delegates to `codestory-runtime` retrieval orchestration, includes citations and retrieval traces, and always uses DB-first synthesis. It is not a natural-language question-answering surface. `--bundle <DIR>` writes Markdown, JSON, and Mermaid artifacts for handoff.
+`context` is target context: DB-first evidence for one concrete target. It resolves that target from `--id`, `--query`, or `--bookmark`, delegates to `codestory-runtime` retrieval orchestration, includes citations and retrieval traces, and always uses DB-first synthesis. It is not a natural-language question-answering surface and is not a replacement for broad `packet`, `search`, or `drill` questions. `--bundle <DIR>` writes Markdown, JSON, and Mermaid artifacts for handoff.
 
 `doctor` is a read-only health report for project path resolution, cache presence, index counts, retrieval state, managed embedding setup, relevant embedding environment variables, and next commands. It should stay diagnostic; it should not mutate caches or fetch model assets. `setup embeddings` is the explicit mutating path for installing pinned ONNX Runtime BGE-base assets in the user cache. Managed setup does not launch or retain an embedding server.
 

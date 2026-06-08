@@ -60,7 +60,8 @@ High-signal environment toggles:
 
 Use other embedding, alias, batch-size, tokenizer, provider, hash, ONNX, and
 summary tuning variables only for focused diagnostics or historical comparisons.
-Agent-facing retrieval requires full sidecar readiness.
+Agent packet/search readiness requires retrieval status to report
+`retrieval_mode=full`.
 
 ## Output
 
@@ -68,7 +69,7 @@ Markdown returns a compact index summary. JSON exposes the same data for tools:
 
 - project and storage path
 - refresh mode and discovered file/error counts
-- retrieval readiness and semantic doc counts
+- local navigation readiness notes and semantic doc counts
 - parse, flush, resolve, cleanup, cache, and semantic timing buckets
 - resolution counters and semantic reuse/embed/prune counts
 
