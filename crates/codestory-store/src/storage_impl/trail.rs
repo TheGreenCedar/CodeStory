@@ -64,7 +64,7 @@ pub(super) fn get_trail_bfs(
                 result.truncated = true;
                 break;
             }
-            let edge_fetch = get_edges_for_node(
+            let edge_fetch = get_edges_for_node_limited(
                 storage,
                 current_id,
                 &direction,
@@ -192,7 +192,7 @@ pub(super) fn get_trail_to_target(
         let Some(&d_cur) = dist_from_root.get(&current) else {
             break;
         };
-        let edge_fetch = get_edges_for_node(
+        let edge_fetch = get_edges_for_node_limited(
             storage,
             current,
             &TrailDirection::Outgoing,
@@ -295,7 +295,7 @@ pub(super) fn get_trail_to_target(
         let Some(&d_root) = dist_from_root.get(id) else {
             continue;
         };
-        let edge_fetch = get_edges_for_node(
+        let edge_fetch = get_edges_for_node_limited(
             storage,
             *id,
             &TrailDirection::Outgoing,
@@ -365,7 +365,7 @@ fn bfs_distances(
             continue;
         }
 
-        let edge_fetch = get_edges_for_node(
+        let edge_fetch = get_edges_for_node_limited(
             storage,
             current_id,
             &direction,
@@ -415,7 +415,7 @@ fn bfs_distances_to_target_through_root_reachable(
             continue;
         }
 
-        let edge_fetch = get_edges_for_node(
+        let edge_fetch = get_edges_for_node_limited(
             storage,
             current_id,
             &TrailDirection::Incoming,
@@ -452,7 +452,7 @@ fn bfs_distances_to_target_through_root_reachable(
     Ok((dist, truncated))
 }
 
-fn get_edges_for_node(
+fn get_edges_for_node_limited(
     storage: &Storage,
     node_id: NodeId,
     direction: &TrailDirection,
@@ -530,6 +530,26 @@ fn get_edges_for_node(
     Ok(EdgeFetchResult { edges, truncated })
 }
 
+pub(super) fn get_edges_for_node(
+    storage: &Storage,
+    node_id: NodeId,
+    direction: &TrailDirection,
+    edge_filter: &[EdgeKind],
+    caller_scope: TrailCallerScope,
+    show_utility_calls: bool,
+) -> Result<Vec<Edge>, StorageError> {
+    get_edges_for_node_limited(
+        storage,
+        node_id,
+        direction,
+        edge_filter,
+        caller_scope,
+        show_utility_calls,
+        None,
+    )
+    .map(|result| result.edges)
+}
+
 pub(super) fn get_edges_for_node_id(
     storage: &Storage,
     node_id: NodeId,
@@ -541,9 +561,7 @@ pub(super) fn get_edges_for_node_id(
         &[],
         TrailCallerScope::IncludeTestsAndBenches,
         true,
-        None,
     )
-    .map(|result| result.edges)
 }
 
 fn push_unique(selected: &mut Vec<NodeId>, selected_set: &mut HashSet<NodeId>, id: NodeId) {
