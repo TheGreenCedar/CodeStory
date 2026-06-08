@@ -4673,14 +4673,12 @@ fn llm_symbol_doc_hash(doc_text: &str) -> String {
     format!("{hash:016x}")
 }
 
-fn llm_symbol_doc_can_reuse(
+fn llm_symbol_doc_contract_matches(
     existing_doc: &LlmSymbolDocReuseMetadata,
-    doc_hash: &str,
     embedding_contract: &EmbeddingProfileContractDto,
     model_id: &str,
 ) -> bool {
     existing_doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
-        && existing_doc.doc_hash == doc_hash
         && existing_doc.embedding_profile.as_deref() == Some(embedding_contract.profile.as_str())
         && existing_doc.embedding_model == model_id
         && existing_doc.embedding_backend.as_deref() == Some(embedding_contract.backend.as_str())
@@ -4689,6 +4687,16 @@ fn llm_symbol_doc_can_reuse(
             .map(|dimension| existing_doc.embedding_dim == dimension)
             .unwrap_or(existing_doc.embedding_dim > 0)
         && existing_doc.doc_shape.as_deref() == Some(embedding_contract.doc_shape.as_str())
+}
+
+fn llm_symbol_doc_can_reuse(
+    existing_doc: &LlmSymbolDocReuseMetadata,
+    doc_hash: &str,
+    embedding_contract: &EmbeddingProfileContractDto,
+    model_id: &str,
+) -> bool {
+    existing_doc.doc_hash == doc_hash
+        && llm_symbol_doc_contract_matches(existing_doc, embedding_contract, model_id)
 }
 
 fn sort_pending_llm_symbol_docs_for_embedding_batches(docs: &mut [PendingLlmSymbolDoc]) {
@@ -4835,7 +4843,22 @@ fn sync_llm_symbol_projection(
         .map(|doc| (doc.node_id, doc))
         .collect::<HashMap<_, _>>();
 
-    if let Some(scope) = llm_refresh_file_scope
+    let expand_semantic_scope_for_contract_repair = llm_refresh_file_scope.is_some()
+        && existing_docs.values().any(|existing_doc| {
+            !llm_symbol_doc_contract_matches(existing_doc, &embedding_contract, &model_id)
+        });
+    if expand_semantic_scope_for_contract_repair {
+        tracing::warn!(
+            "Stored semantic-doc contract differs from current embedding contract; expanding incremental semantic sync to rebuild all semantic docs"
+        );
+    }
+    let effective_llm_refresh_file_scope = if expand_semantic_scope_for_contract_repair {
+        None
+    } else {
+        llm_refresh_file_scope
+    };
+
+    if let Some(scope) = effective_llm_refresh_file_scope
         && scope.is_empty()
     {
         if hydrate_semantic_docs {
@@ -4858,7 +4881,7 @@ fn sync_llm_symbol_projection(
         .iter()
         .filter(|node| llm_indexable_kind(node.kind))
         .filter(|node| {
-            llm_refresh_file_scope
+            effective_llm_refresh_file_scope
                 .map(|scope| {
                     node.file_node_id
                         .map(|file_node_id| scope.contains(&file_node_id))
@@ -4959,7 +4982,7 @@ fn sync_llm_symbol_projection(
     }
 
     let prune_started = Instant::now();
-    let stale_docs = if let Some(scope) = llm_refresh_file_scope {
+    let stale_docs = if let Some(scope) = effective_llm_refresh_file_scope {
         let file_node_ids = scope.iter().copied().collect::<Vec<_>>();
         storage
             .delete_llm_symbol_docs_for_files_except_node_ids(&file_node_ids, &seen_node_ids)
@@ -12851,6 +12874,72 @@ fn build_llm_symbol_doc_text() -> String {
             docs.iter()
                 .any(|doc| doc.display_name.contains("codestory_added_move_hint")),
             "incremental semantic docs should include the new symbol"
+        );
+    }
+
+    #[test]
+    fn incremental_refresh_rebuilds_all_semantic_docs_when_embedding_contract_changes() {
+        let mut env = hybrid_test_env();
+        env.push(EnvGuard::set(EMBEDDING_EXPECTED_DIM_ENV, "128"));
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("initial full index");
+
+        let before_docs = Storage::open(&storage_path)
+            .expect("open storage before drift")
+            .get_all_llm_symbol_docs()
+            .expect("semantic docs before drift");
+        assert!(
+            !before_docs.is_empty(),
+            "fixture should persist semantic docs"
+        );
+        assert!(
+            before_docs
+                .iter()
+                .all(|doc| doc.embedding_dim == 128 && doc.embedding.len() == 128),
+            "initial docs should use the first embedding contract"
+        );
+
+        env.push(EnvGuard::set(EMBEDDING_EXPECTED_DIM_ENV, "384"));
+        let rust_fixture = workspace.path().join("rust_tictactoe.rs");
+        let mut source = fs::read_to_string(&rust_fixture).expect("read rust fixture");
+        source.push_str("\nfn codestory_contract_drift_added_hint() -> i32 { 7 }\n");
+        fs::write(&rust_fixture, source).expect("write changed rust fixture");
+
+        let incremental_timings = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental index after contract drift");
+        assert!(
+            incremental_timings.semantic_docs_embedded.unwrap_or(0)
+                >= clamp_usize_to_u32(before_docs.len()),
+            "contract drift should expand incremental semantic sync beyond the touched file"
+        );
+
+        let repaired_docs = Storage::open(&storage_path)
+            .expect("open storage after drift repair")
+            .get_all_llm_symbol_docs()
+            .expect("semantic docs after drift repair");
+        assert!(
+            repaired_docs
+                .iter()
+                .all(|doc| doc.embedding_dim == 384 && doc.embedding.len() == 384),
+            "incremental repair should leave all stored semantic docs on the current contract"
+        );
+        assert!(
+            repaired_docs.iter().any(|doc| doc
+                .display_name
+                .contains("codestory_contract_drift_added_hint")),
+            "incremental repair should still include symbols from the touched file"
         );
     }
 
