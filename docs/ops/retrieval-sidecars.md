@@ -179,6 +179,12 @@ older search response shapes are treated as contract drift. Exact symbol queries
 exact sidecar evidence first: once SCIP or lexical stages produce an exact symbol anchor, semantic
 and graph expansion lanes are skipped for that query instead of letting broad semantic evidence
 displace the exact hit.
+For mixed symbol-plus-explanation prompts, the semantic stage may send Qdrant a path allowlist from
+the already-found Zoekt/SCIP candidates. This mirrors filtered dense retrieval: when the allowlist
+returns enough semantic hits, CodeStory avoids a full vector scan; when it underfills or fails,
+CodeStory automatically runs the unfiltered Qdrant stage and records `full_fallback=true` in the
+stage trace. This is not an indexing shortcut: the sidecar manifest still needs the complete
+product-compatible semantic doc count before `retrieval_mode` can be `full`.
 
 Before Compose starts, bootstrap repairs Qdrant storage:
 

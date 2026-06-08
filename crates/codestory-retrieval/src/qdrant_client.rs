@@ -190,16 +190,25 @@ impl QdrantClient {
         query: &str,
         limit: usize,
     ) -> Result<Vec<super::CandidateHit>> {
+        self.search_scoped(collection, query, limit, &[])
+    }
+
+    /// Semantic search scoped to payload paths. The path allowlist is a query-time filter,
+    /// not a sidecar completeness shortcut; callers must fall back to unfiltered search when
+    /// the scoped pass cannot satisfy recall.
+    pub fn search_scoped(
+        &self,
+        collection: &str,
+        query: &str,
+        limit: usize,
+        allow_paths: &[String],
+    ) -> Result<Vec<super::CandidateHit>> {
         if !qdrant_enabled() {
             bail!("qdrant sidecar is mandatory; CODESTORY_QDRANT_ENABLED=false is unsupported");
         }
         let url = format!("{}/collections/{collection}/points/query", self.base_url);
         let vector = query_vector(query)?;
-        let body = serde_json::json!({
-            "query": vector,
-            "limit": limit,
-            "with_payload": true,
-        });
+        let body = qdrant_query_body(vector, limit, allow_paths);
         let payload = serde_json::to_string(&body).context("serialize qdrant search body")?;
         match ureq::post(&url)
             .timeout(self.timeout)
@@ -408,6 +417,32 @@ impl QdrantClient {
     }
 }
 
+fn qdrant_query_body(vector: Vec<f32>, limit: usize, allow_paths: &[String]) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "query": vector,
+        "limit": limit,
+        "with_payload": true,
+    });
+    if !allow_paths.is_empty()
+        && let Some(map) = body.as_object_mut()
+    {
+        map.insert(
+            "filter".to_string(),
+            serde_json::json!({
+                "must": [
+                    {
+                        "key": "path",
+                        "match": {
+                            "any": allow_paths,
+                        }
+                    }
+                ]
+            }),
+        );
+    }
+    body
+}
+
 fn parse_collection_names(body: &str) -> Result<Vec<String>> {
     let parsed: serde_json::Value =
         serde_json::from_str(body).context("parse qdrant collections response json")?;
@@ -610,6 +645,22 @@ mod tests {
         assert_eq!(hits[0].symbol_name.as_deref(), Some("handle_request"));
         assert_eq!(hits[0].source, CandidateSource::Qdrant);
         assert_eq!(hits[0].file_role, Some(FileRole::Source));
+    }
+
+    #[test]
+    fn qdrant_query_body_adds_path_allowlist_filter() {
+        let body = qdrant_query_body(
+            vec![0.1, 0.2],
+            8,
+            &["src/router.rs".to_string(), "src/app.rs".to_string()],
+        );
+
+        assert_eq!(body["limit"], 8);
+        assert_eq!(body["with_payload"], true);
+        assert_eq!(
+            body["filter"]["must"][0]["match"]["any"],
+            serde_json::json!(["src/router.rs", "src/app.rs"])
+        );
     }
 
     #[test]

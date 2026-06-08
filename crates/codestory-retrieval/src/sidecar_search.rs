@@ -5,10 +5,25 @@ use crate::scip_client::ScipClient;
 use crate::zoekt_client::ZoektClient;
 use anyhow::Result;
 use codestory_store::RetrievalIndexManifest;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SemanticSearchScope {
+    pub allow_paths: Vec<String>,
+}
+
 /// Sidecar search surface used by the executor (mockable in unit tests).
 pub trait SidecarSearch: Send + Sync {
     fn zoekt_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
     fn qdrant_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
+    fn qdrant_search_scoped(
+        &self,
+        query: &str,
+        limit: usize,
+        scope: &SemanticSearchScope,
+    ) -> Result<Vec<CandidateHit>> {
+        let _ = scope;
+        self.qdrant_search(query, limit)
+    }
     fn scip_anchor(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
     fn scip_expand(&self, anchors: &[CandidateHit], limit: usize) -> Result<Vec<CandidateHit>>;
 }
@@ -70,6 +85,16 @@ impl SidecarSearch for LiveSidecarSearch {
         self.qdrant.search(&self.qdrant_collection, query, limit)
     }
 
+    fn qdrant_search_scoped(
+        &self,
+        query: &str,
+        limit: usize,
+        scope: &SemanticSearchScope,
+    ) -> Result<Vec<CandidateHit>> {
+        self.qdrant
+            .search_scoped(&self.qdrant_collection, query, limit, &scope.allow_paths)
+    }
+
     fn scip_anchor(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
         ScipClient::anchor_search(&self.layout, &self.sidecar_generation, query, limit)
     }
@@ -89,6 +114,9 @@ pub mod mock {
     pub struct MockSidecarSearch {
         pub zoekt: Mutex<HashMap<String, Vec<CandidateHit>>>,
         pub qdrant: Mutex<HashMap<String, Vec<CandidateHit>>>,
+        pub qdrant_scoped: Mutex<HashMap<String, Vec<CandidateHit>>>,
+        pub qdrant_full_calls: Mutex<usize>,
+        pub qdrant_scoped_calls: Mutex<Vec<SemanticSearchScope>>,
         pub scip_anchor: Mutex<HashMap<String, Vec<CandidateHit>>>,
         pub scip_expand: Mutex<Vec<CandidateHit>>,
     }
@@ -120,12 +148,36 @@ pub mod mock {
         }
 
         fn qdrant_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
+            *self.qdrant_full_calls.lock().expect("full call lock") += 1;
             Ok(self
                 .qdrant
                 .lock()
                 .expect("qdrant lock")
                 .get(query)
                 .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .take(limit)
+                .collect())
+        }
+
+        fn qdrant_search_scoped(
+            &self,
+            query: &str,
+            limit: usize,
+            scope: &SemanticSearchScope,
+        ) -> Result<Vec<CandidateHit>> {
+            self.qdrant_scoped_calls
+                .lock()
+                .expect("scoped call lock")
+                .push(scope.clone());
+            Ok(self
+                .qdrant_scoped
+                .lock()
+                .expect("qdrant scoped lock")
+                .get(query)
+                .cloned()
+                .or_else(|| self.qdrant.lock().expect("qdrant lock").get(query).cloned())
                 .unwrap_or_default()
                 .into_iter()
                 .take(limit)

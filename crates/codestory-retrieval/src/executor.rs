@@ -1,16 +1,16 @@
 use crate::cache::{RetrievalCache, RetrievalCacheKey};
-use crate::candidate::CandidateHit;
+use crate::candidate::{CandidateHit, CandidateSource};
 use crate::health::probe_sidecar_health;
 use crate::index::query_fingerprint;
 use crate::mode::{RetrievalDegradedMode, derive_degraded_mode};
 use crate::planner::{PlannedStage, RetrievalStageKind};
-use crate::query_features::{QueryFeatures, classify_query};
+use crate::query_features::{QueryFeatures, QueryShape, classify_query};
 use crate::ranker::rank_candidates;
-use crate::sidecar_search::SidecarSearch;
+use crate::sidecar_search::{SemanticSearchScope, SidecarSearch};
 use anyhow::{Result, bail};
 use codestory_store::RetrievalIndexManifest;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,11 +30,26 @@ pub struct StageTrace {
     pub degraded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stub_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_scope: Option<SemanticScopeTrace>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticScopeTrace {
+    pub mode: String,
+    pub allowlist_size: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub full_fallback: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
 }
+
+const SEMANTIC_SCOPE_MAX_ALLOWLIST_PATHS: usize = 96;
+const SEMANTIC_SCOPE_MIN_SUCCESS_HITS: usize = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryTrace {
@@ -171,19 +186,101 @@ impl<'a> QueryExecutor<'a> {
         stage: &PlannedStage,
         features: &QueryFeatures,
         anchors: &[CandidateHit],
-    ) -> Result<Vec<CandidateHit>> {
+    ) -> Result<StageRunOutput> {
         let query = &features.raw_query;
-        match stage.kind {
-            RetrievalStageKind::Stage0ScipAnchor => self.sidecars.scip_anchor(query, stage.top_k),
+        let hits = match stage.kind {
+            RetrievalStageKind::Stage0ScipAnchor => {
+                self.sidecars.scip_anchor(query, stage.top_k)?
+            }
             RetrievalStageKind::Stage1ZoektLexical => {
-                self.sidecars.zoekt_search(query, stage.top_k)
+                self.sidecars.zoekt_search(query, stage.top_k)?
             }
             RetrievalStageKind::Stage1bQdrantSemantic => {
-                self.sidecars.qdrant_search(query, stage.top_k)
+                return self.run_qdrant_semantic_stage(stage, features, anchors);
             }
-            RetrievalStageKind::Stage2ScipExpand => self.sidecars.scip_expand(anchors, stage.top_k),
+            RetrievalStageKind::Stage2ScipExpand => {
+                self.sidecars.scip_expand(anchors, stage.top_k)?
+            }
             RetrievalStageKind::Stage3RepoTextFallback => {
                 bail!("repo-text diagnostic stage is unsupported in mandatory sidecar retrieval")
+            }
+        };
+        Ok(StageRunOutput {
+            hits,
+            semantic_scope: None,
+        })
+    }
+
+    fn run_qdrant_semantic_stage(
+        &self,
+        stage: &PlannedStage,
+        features: &QueryFeatures,
+        anchors: &[CandidateHit],
+    ) -> Result<StageRunOutput> {
+        let Some(scope) = semantic_candidate_scope(features, anchors) else {
+            return Ok(StageRunOutput {
+                hits: self
+                    .sidecars
+                    .qdrant_search(&features.raw_query, stage.top_k)?,
+                semantic_scope: Some(SemanticScopeTrace {
+                    mode: "full".into(),
+                    allowlist_size: 0,
+                    full_fallback: false,
+                    fallback_reason: None,
+                }),
+            });
+        };
+
+        let allowlist_size = scope.allow_paths.len();
+        match self
+            .sidecars
+            .qdrant_search_scoped(&features.raw_query, stage.top_k, &scope)
+        {
+            Ok(scoped_hits)
+                if scoped_hits.len()
+                    >= scoped_semantic_success_floor(stage.top_k, allowlist_size) =>
+            {
+                Ok(StageRunOutput {
+                    hits: scoped_hits,
+                    semantic_scope: Some(SemanticScopeTrace {
+                        mode: "candidate_allowlist".into(),
+                        allowlist_size,
+                        full_fallback: false,
+                        fallback_reason: None,
+                    }),
+                })
+            }
+            Ok(scoped_hits) => {
+                let mut hits = scoped_hits;
+                let fallback = self
+                    .sidecars
+                    .qdrant_search(&features.raw_query, stage.top_k)?;
+                merge_candidates(&mut hits, fallback);
+                Ok(StageRunOutput {
+                    hits,
+                    semantic_scope: Some(SemanticScopeTrace {
+                        mode: "candidate_allowlist".into(),
+                        allowlist_size,
+                        full_fallback: true,
+                        fallback_reason: Some("allowlist_underfilled".into()),
+                    }),
+                })
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "scoped qdrant semantic search failed; falling back to full semantic search: {error}"
+                );
+                Ok(StageRunOutput {
+                    hits: self
+                        .sidecars
+                        .qdrant_search(&features.raw_query, stage.top_k)?,
+                    semantic_scope: Some(SemanticScopeTrace {
+                        mode: "candidate_allowlist".into(),
+                        allowlist_size,
+                        full_fallback: true,
+                        fallback_reason: Some("allowlist_query_failed".into()),
+                    }),
+                })
             }
         }
     }
@@ -212,18 +309,19 @@ impl<'a> QueryExecutor<'a> {
                     0,
                     0,
                     0.0,
-                    Some("exact_symbol_anchor".into()),
-                    false,
-                    None,
+                    StageTraceMeta {
+                        cancel_reason: Some("exact_symbol_anchor".into()),
+                        ..Default::default()
+                    },
                 ));
                 continue;
             }
 
             let stage_started = Instant::now();
             let before_score = candidate_mass(candidates);
-            let stage_hits = self.run_stage(stage, features, candidates)?;
-            let (stub_reason, stage_degraded) = stage_stub_metadata(&stage_hits);
-            let added = merge_candidates(candidates, stage_hits);
+            let stage_output = self.run_stage(stage, features, candidates)?;
+            let (stub_reason, stage_degraded) = stage_stub_metadata(&stage_output.hits);
+            let added = merge_candidates(candidates, stage_output.hits);
             let after_score = candidate_mass(candidates);
             let marginal_gain = if before_score <= 0.0 {
                 after_score
@@ -236,9 +334,12 @@ impl<'a> QueryExecutor<'a> {
                 stage_started.elapsed().as_millis() as u64,
                 added,
                 marginal_gain,
-                None,
-                stage_degraded,
-                stub_reason,
+                StageTraceMeta {
+                    degraded: stage_degraded,
+                    stub_reason,
+                    semantic_scope: stage_output.semantic_scope,
+                    ..Default::default()
+                },
             ));
 
             if let Some(threshold) = options.stop_marginal_gain_threshold {
@@ -256,6 +357,11 @@ impl<'a> QueryExecutor<'a> {
     }
 }
 
+struct StageRunOutput {
+    hits: Vec<CandidateHit>,
+    semantic_scope: Option<SemanticScopeTrace>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct StageSequenceOptions {
     stop_marginal_gain_threshold: Option<f32>,
@@ -267,9 +373,7 @@ fn stage_trace(
     elapsed_ms: u64,
     candidates_added: usize,
     marginal_gain: f32,
-    cancel_reason: Option<String>,
-    degraded: bool,
-    stub_reason: Option<String>,
+    meta: StageTraceMeta,
 ) -> StageTrace {
     StageTrace {
         stage: stage.kind,
@@ -277,11 +381,66 @@ fn stage_trace(
         elapsed_ms,
         candidates_added,
         marginal_gain,
-        cancel_reason,
+        cancel_reason: meta.cancel_reason,
         cache_hit: false,
-        degraded,
-        stub_reason,
+        degraded: meta.degraded,
+        stub_reason: meta.stub_reason,
+        semantic_scope: meta.semantic_scope,
     }
+}
+
+#[derive(Default)]
+struct StageTraceMeta {
+    cancel_reason: Option<String>,
+    degraded: bool,
+    stub_reason: Option<String>,
+    semantic_scope: Option<SemanticScopeTrace>,
+}
+
+fn semantic_candidate_scope(
+    features: &QueryFeatures,
+    candidates: &[CandidateHit],
+) -> Option<SemanticSearchScope> {
+    if !matches!(features.shape, QueryShape::Mixed | QueryShape::SymbolLike) {
+        return None;
+    }
+
+    let mut seen = HashSet::new();
+    let mut allow_paths = Vec::new();
+    for candidate in candidates {
+        if matches!(
+            candidate.source,
+            CandidateSource::Qdrant | CandidateSource::Legacy
+        ) || crate::candidate::is_phantom_sidecar_hit(candidate)
+        {
+            continue;
+        }
+        let Some(path) = normalize_allowlist_path(&candidate.file_path) else {
+            continue;
+        };
+        if seen.insert(path.clone()) {
+            allow_paths.push(path);
+            if allow_paths.len() > SEMANTIC_SCOPE_MAX_ALLOWLIST_PATHS {
+                return None;
+            }
+        }
+    }
+
+    (!allow_paths.is_empty()).then_some(SemanticSearchScope { allow_paths })
+}
+
+fn normalize_allowlist_path(path: &str) -> Option<String> {
+    let normalized = path.trim().replace('\\', "/");
+    if normalized.is_empty() || normalized.contains(':') {
+        return None;
+    }
+    Some(normalized.trim_start_matches("./").to_string())
+}
+
+fn scoped_semantic_success_floor(stage_top_k: usize, allowlist_size: usize) -> usize {
+    stage_top_k
+        .min(allowlist_size)
+        .clamp(1, SEMANTIC_SCOPE_MIN_SUCCESS_HITS)
 }
 
 fn should_skip_after_exact_symbol_anchor(
@@ -309,7 +468,7 @@ fn should_skip_after_exact_symbol_anchor(
 fn candidate_is_exact_symbol_anchor(query: &str, candidate: &CandidateHit) -> bool {
     if matches!(
         candidate.source,
-        crate::candidate::CandidateSource::Qdrant | crate::candidate::CandidateSource::Legacy
+        CandidateSource::Qdrant | CandidateSource::Legacy
     ) {
         return false;
     }
@@ -447,6 +606,7 @@ mod tests {
             )])),
             scip_anchor: Mutex::new(HashMap::new()),
             scip_expand: Mutex::new(Vec::new()),
+            ..Default::default()
         };
         let mut cache = RetrievalCache::new();
         let mut executor = QueryExecutor {
@@ -677,6 +837,128 @@ mod tests {
                 .any(|hit| hit.file_path == "src/semantic.rs"),
             "expected semantic hit after empty lexical stages: {:?}",
             result.hits
+        );
+    }
+
+    #[test]
+    fn executor_scopes_semantic_search_to_lexical_candidates_for_mixed_queries() {
+        let query = "Explain how StartupFlow handles requests";
+        let mock = MockSidecarSearch {
+            zoekt: Mutex::new(HashMap::from([(
+                query.into(),
+                vec![CandidateHit::with_source(
+                    "src/startup.rs",
+                    Some("StartupFlow".into()),
+                    0.9,
+                    CandidateSource::Zoekt,
+                )],
+            )])),
+            qdrant_scoped: Mutex::new(HashMap::from([(
+                query.into(),
+                vec![CandidateHit::with_source(
+                    "src/startup.rs",
+                    Some("StartupFlow".into()),
+                    0.88,
+                    CandidateSource::Qdrant,
+                )],
+            )])),
+            ..Default::default()
+        };
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: &mock,
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: HashMap::new(),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+
+        let result = executor.execute(query, Some(800)).expect("query");
+
+        assert_eq!(
+            *mock.qdrant_full_calls.lock().expect("full call lock"),
+            0,
+            "scoped semantic hit should avoid full Qdrant scan"
+        );
+        let scoped_calls = mock.qdrant_scoped_calls.lock().expect("scoped call lock");
+        assert_eq!(scoped_calls.len(), 1);
+        assert_eq!(scoped_calls[0].allow_paths, vec!["src/startup.rs"]);
+        let qdrant_trace = result
+            .trace
+            .stages
+            .iter()
+            .find(|stage| stage.stage == RetrievalStageKind::Stage1bQdrantSemantic)
+            .expect("qdrant stage");
+        assert_eq!(
+            qdrant_trace
+                .semantic_scope
+                .as_ref()
+                .map(|scope| scope.full_fallback),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn executor_falls_back_to_full_semantic_when_allowlist_underfills() {
+        let query = "Explain how StartupFlow handles requests";
+        let mock = MockSidecarSearch {
+            zoekt: Mutex::new(HashMap::from([(
+                query.into(),
+                vec![CandidateHit::with_source(
+                    "src/startup.rs",
+                    Some("StartupFlow".into()),
+                    0.9,
+                    CandidateSource::Zoekt,
+                )],
+            )])),
+            qdrant_scoped: Mutex::new(HashMap::from([(query.into(), Vec::new())])),
+            qdrant: Mutex::new(HashMap::from([(
+                query.into(),
+                vec![CandidateHit::with_source(
+                    "src/request_dispatch.rs",
+                    Some("RequestDispatch".into()),
+                    0.93,
+                    CandidateSource::Qdrant,
+                )],
+            )])),
+            ..Default::default()
+        };
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: &mock,
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: HashMap::new(),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+
+        let result = executor.execute(query, Some(800)).expect("query");
+
+        assert_eq!(*mock.qdrant_full_calls.lock().expect("full call lock"), 1);
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| hit.file_path == "src/request_dispatch.rs"),
+            "full semantic fallback must preserve recall: {:?}",
+            result.hits
+        );
+        let qdrant_trace = result
+            .trace
+            .stages
+            .iter()
+            .find(|stage| stage.stage == RetrievalStageKind::Stage1bQdrantSemantic)
+            .expect("qdrant stage");
+        let semantic_scope = qdrant_trace
+            .semantic_scope
+            .as_ref()
+            .expect("semantic scope trace");
+        assert!(semantic_scope.full_fallback);
+        assert_eq!(
+            semantic_scope.fallback_reason.as_deref(),
+            Some("allowlist_underfilled")
         );
     }
 

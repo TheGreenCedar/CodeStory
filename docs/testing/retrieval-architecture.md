@@ -153,6 +153,11 @@ cargo test -p codestory-runtime
 node --test scripts/tests/codestory-agent-ab-analyzer.test.mjs
 ```
 
+`cargo test -p codestory-retrieval` includes the scoped semantic behavior gate:
+mixed queries with strong lexical/graph candidates use a Qdrant path allowlist,
+while underfilled allowlists fall back to the full semantic stage. Those tests
+are the minimum guard against turning selective search into a silent recall cap.
+
 ---
 
 ## Promotion checklist

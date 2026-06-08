@@ -66,6 +66,12 @@ component and persists the manifest only after the full stack is healthy.
 - Exact symbol and path evidence remains the precision floor.
 - Semantic and graph evidence can expand or rank candidates, but cannot replace
   a missing exact sidecar contract.
+- Mixed or symbol-shaped queries may run Qdrant semantic search with a
+  candidate-path allowlist derived from prior Zoekt/SCIP evidence. This is a
+  query-time resource optimization only: it never changes the sidecar
+  projection count, never marks a partial semantic corpus as `full`, and must
+  fall back to an unfiltered Qdrant search when the scoped pass underfills or
+  errors.
 - Broad prompt retrieval should let lexical/source evidence compete with
   semantic evidence and should downrank tests, generated files, benchmarks, and
   vendor paths unless the query explicitly asks for those roles.
