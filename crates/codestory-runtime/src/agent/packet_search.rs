@@ -2,7 +2,7 @@
 
 use crate::agent::retrieval_primary::{
     packet_batch_should_use_sidecar, search_sidecar_packet_batch,
-    sidecar_retrieval_unavailable_reason,
+    sidecar_retrieval_unavailable_error, sidecar_retrieval_unavailable_reason,
 };
 use crate::{AppController, HybridSearchScoredHit};
 use codestory_contracts::api::{
@@ -42,16 +42,20 @@ impl AppController {
                         "sidecar retrieval packet lexical batch unavailable; fail-closed: {}",
                         error.message
                     );
-                    return Err(ApiError::invalid_argument(format!(
-                        "sidecar retrieval packet lexical batch unavailable: {}; sidecar retrieval is mandatory",
-                        error.message
-                    )));
+                    return Err(sidecar_retrieval_unavailable_error(
+                        self,
+                        format!(
+                            "sidecar retrieval packet lexical batch unavailable: {}; sidecar retrieval is mandatory",
+                            error.message
+                        ),
+                    ));
                 }
             }
         } else if let Some(reason) = sidecar_retrieval_unavailable_reason(self) {
-            return Err(ApiError::invalid_argument(reason));
+            return Err(sidecar_retrieval_unavailable_error(self, reason));
         }
-        Err(ApiError::invalid_argument(
+        Err(sidecar_retrieval_unavailable_error(
+            self,
             "sidecar retrieval primary is mandatory for packet lexical batch",
         ))
     }
@@ -99,16 +103,20 @@ impl AppController {
                         "sidecar retrieval packet semantic batch unavailable; fail-closed: {}",
                         error.message
                     );
-                    return Err(ApiError::invalid_argument(format!(
-                        "sidecar retrieval packet semantic batch unavailable: {}; sidecar retrieval is mandatory",
-                        error.message
-                    )));
+                    return Err(sidecar_retrieval_unavailable_error(
+                        self,
+                        format!(
+                            "sidecar retrieval packet semantic batch unavailable: {}; sidecar retrieval is mandatory",
+                            error.message
+                        ),
+                    ));
                 }
             }
         } else if let Some(reason) = sidecar_retrieval_unavailable_reason(self) {
-            return Err(ApiError::invalid_argument(reason));
+            return Err(sidecar_retrieval_unavailable_error(self, reason));
         }
-        Err(ApiError::invalid_argument(
+        Err(sidecar_retrieval_unavailable_error(
+            self,
             "sidecar retrieval primary is mandatory for packet semantic batch",
         ))
     }
@@ -123,9 +131,10 @@ impl AppController {
         if packet_batch_should_use_sidecar(self) {
             return Ok(());
         } else if let Some(reason) = sidecar_retrieval_unavailable_reason(self) {
-            return Err(ApiError::invalid_argument(reason));
+            return Err(sidecar_retrieval_unavailable_error(self, reason));
         }
-        Err(ApiError::invalid_argument(
+        Err(sidecar_retrieval_unavailable_error(
+            self,
             "sidecar retrieval primary is mandatory for packet subquery warmup",
         ))
     }
@@ -149,6 +158,13 @@ mod tests {
                 .contains("sidecar retrieval primary requires an open project"),
             "warmup should report the mandatory sidecar gate, got: {}",
             error.message
+        );
+        assert_eq!(error.code, "retrieval_unavailable");
+        let details = error.details.expect("retrieval error details");
+        assert_eq!(details.failed_layer.as_deref(), Some("retrieval_sidecar"));
+        assert!(
+            !details.next_commands.is_empty(),
+            "warmup should include recovery commands"
         );
     }
 }

@@ -24,7 +24,8 @@ use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
     RETRIEVAL_VERSION_SIDECAR, SidecarPrimarySearchOutcome, maybe_log_rollback_after_packet,
     maybe_run_retrieval_shadow, sidecar_retrieval_blocks_nucleo_supplement,
-    sidecar_retrieval_primary_enabled, try_sidecar_primary_search,
+    sidecar_retrieval_primary_enabled, sidecar_retrieval_unavailable_error,
+    try_sidecar_primary_search,
 };
 use crate::agent::trace::{TraceRecorder, field};
 use crate::agent::trace_export;
@@ -4647,18 +4648,20 @@ fn execute_retrieval(
             trace.annotate(format!(
                 "retrieval_sidecar_primary rejected=true fail_closed=true reason={reason}"
             ));
-            return Err(ApiError::invalid_argument(format!(
-                "sidecar retrieval primary rejected query: {reason}"
-            )));
+            return Err(sidecar_retrieval_unavailable_error(
+                controller,
+                format!("sidecar retrieval primary rejected query: {reason}"),
+            ));
         }
         Some(SidecarPrimarySearchOutcome::Unavailable { reason }) => {
             trace.annotate(format!(
                 "retrieval_sidecar_primary unavailable=true fail_closed=true reason={reason}"
             ));
-            return Err(ApiError::invalid_argument(reason));
+            return Err(sidecar_retrieval_unavailable_error(controller, reason));
         }
         None => {
-            return Err(ApiError::invalid_argument(
+            return Err(sidecar_retrieval_unavailable_error(
+                controller,
                 "sidecar retrieval primary is mandatory; non-sidecar initial search is disabled",
             ));
         }

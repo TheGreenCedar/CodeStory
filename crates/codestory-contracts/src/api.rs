@@ -45,7 +45,7 @@ pub use dto::{
     UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WorkspaceMemberIndexDto,
     WriteFileDataUrlRequest, WriteFileResponse, WriteFileTextRequest,
 };
-pub use errors::ApiError;
+pub use errors::{ApiError, ApiErrorDetails};
 pub use events::{AppEventPayload, IndexingPhaseTimings};
 pub use ids::{EdgeId, NodeId};
 pub use types::{

@@ -140,6 +140,36 @@ pub(crate) fn sidecar_retrieval_unavailable_reason(controller: &AppController) -
     ))
 }
 
+pub(crate) fn sidecar_retrieval_unavailable_error(
+    controller: &AppController,
+    reason: impl Into<String>,
+) -> ApiError {
+    let project = controller
+        .require_project_root()
+        .ok()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| "<project>".to_string());
+    ApiError::retrieval_unavailable(
+        reason,
+        project.clone(),
+        sidecar_retrieval_recovery_commands(&project),
+    )
+}
+
+fn sidecar_retrieval_recovery_commands(project: &str) -> Vec<String> {
+    let project = quote_cli_arg(project);
+    vec![
+        format!("codestory-cli index --project {project} --refresh full"),
+        format!("codestory-cli retrieval bootstrap --project {project} --format json"),
+        format!("codestory-cli retrieval index --project {project} --refresh full"),
+        format!("codestory-cli doctor --project {project} --format markdown"),
+    ]
+}
+
+fn quote_cli_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 pub(crate) fn shadow_retrieval_enabled() -> bool {
     if let Some(env) = unsupported_deprecated_env() {
         tracing::error!(
@@ -398,7 +428,10 @@ fn search_sidecar_packet_batch_inner(
     for (query, max_results) in queries {
         let query_result = run_sidecar_query(controller, query, Some(per_query_budget as u32))
             .map_err(|error| {
-                ApiError::invalid_argument(format!("sidecar retrieval batch query failed: {error}"))
+                sidecar_retrieval_unavailable_error(
+                    controller,
+                    format!("sidecar retrieval batch query failed: {error}"),
+                )
             })?;
         let max_results = (*max_results).clamp(1, 50);
         let resolved_hits =
@@ -407,9 +440,12 @@ fn search_sidecar_packet_batch_inner(
         if let Some(reason) = sidecar_packet_batch_rejection_reason(&query_result, &resolved_hits) {
             let diagnostic =
                 sidecar_rejection_diagnostic(controller, &query_result, &resolved_hits, 5);
-            return Err(ApiError::invalid_argument(format!(
-                "sidecar retrieval rejected packet batch query `{query}`: {reason}; {diagnostic}"
-            )));
+            return Err(sidecar_retrieval_unavailable_error(
+                controller,
+                format!(
+                    "sidecar retrieval rejected packet batch query `{query}`: {reason}; {diagnostic}"
+                ),
+            ));
         }
         results.push((query.clone(), resolved_hits));
     }
@@ -1459,6 +1495,22 @@ mod tests {
         assert_eq!(sidecar_budget_ms(Some(400)), 400);
         assert_eq!(sidecar_budget_ms(Some(5_000)), DEFAULT_SIDECAR_BUDGET_MS);
         assert_eq!(sidecar_budget_ms(None), DEFAULT_SIDECAR_BUDGET_MS);
+    }
+
+    #[test]
+    fn recovery_commands_quote_powershell_sensitive_project_paths() {
+        let commands = sidecar_retrieval_recovery_commands(r"C:\tmp\cost$cache`tick's repo");
+
+        assert_eq!(
+            commands[0],
+            r"codestory-cli index --project 'C:\tmp\cost$cache`tick''s repo' --refresh full"
+        );
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.contains(r"--project 'C:\tmp\cost$cache`tick''s repo'")),
+            "all recovery commands should quote the project path literally: {commands:?}"
+        );
     }
 
     #[test]

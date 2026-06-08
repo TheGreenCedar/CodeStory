@@ -272,7 +272,7 @@ fn try_ask_browser_with_profile(
 }
 
 fn assert_mandatory_sidecar_unavailable(error: &ApiError) {
-    assert_eq!(error.code, "invalid_argument");
+    assert_eq!(error.code, "retrieval_unavailable");
     assert!(
         error
             .message
@@ -282,6 +282,31 @@ fn assert_mandatory_sidecar_unavailable(error: &ApiError) {
     assert!(
         error.message.contains("expected mode=full"),
         "error should name the full-mode requirement: {error:?}"
+    );
+    let details = error.details.as_ref().expect("retrieval error details");
+    assert_eq!(details.failed_layer.as_deref(), Some("retrieval_sidecar"));
+    assert!(
+        details
+            .next_commands
+            .iter()
+            .any(|command| command.contains("codestory-cli index")
+                && command.contains("--refresh full")),
+        "retrieval error should include index recovery command: {error:?}"
+    );
+    assert!(
+        details
+            .next_commands
+            .iter()
+            .any(|command| command.contains("codestory-cli retrieval bootstrap")),
+        "retrieval error should include bootstrap recovery command: {error:?}"
+    );
+    assert!(
+        details
+            .next_commands
+            .iter()
+            .any(|command| command.contains("codestory-cli retrieval index")
+                && command.contains("--refresh full")),
+        "retrieval error should include sidecar index recovery command: {error:?}"
     );
 }
 

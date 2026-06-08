@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::{
     AgentAskRequest, AgentPacketRequestDto, AgentResponseModeDto, AgentRetrievalPresetDto,
-    AgentRetrievalProfileSelectionDto, GroundingBudgetDto, ListChildrenSymbolsRequest,
+    AgentRetrievalProfileSelectionDto, ApiError, GroundingBudgetDto, ListChildrenSymbolsRequest,
     ListRootSymbolsRequest, NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto,
     SearchRepoTextMode, SearchRequest, TrailDirection,
 };
@@ -494,7 +494,7 @@ fn handle_stdio_packet(
             latency_budget_ms,
         })
         .map(|packet| serde_json::json!({"result": packet}))
-        .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}));
+        .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}));
     if response.get("result").is_some() {
         state.packet_cache.insert(cache_key, response.clone());
     }
@@ -819,7 +819,7 @@ fn handle_stdio_search(
             hybrid_limits: None,
         })
         .map(|result| serde_json::json!({"result": enrich_stdio_search_result(result)}))
-        .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}));
+        .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}));
     if response.get("result").is_some() {
         state.search_cache.insert(cache_key, response.clone());
     }
@@ -1057,7 +1057,12 @@ fn handle_stdio_context(
             ));
             serde_json::json!({"result": context_packet_json(&result)})
         })
-        .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))
+        .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
+}
+
+fn stdio_api_error_value(error: ApiError) -> serde_json::Value {
+    serde_json::to_value(error.clone())
+        .unwrap_or_else(|_| serde_json::json!({"message": map_api_error(error).to_string()}))
 }
 
 fn stdio_context_target(
