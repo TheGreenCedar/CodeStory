@@ -715,9 +715,13 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
         vec![
             "context",
             "definition",
+            "get_node",
+            "neighbors",
             "packet",
+            "query_subgraph",
             "references",
             "search",
+            "shortest_path",
             "snippet",
             "symbol",
             "symbols",
