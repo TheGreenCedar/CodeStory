@@ -215,6 +215,16 @@ Most commands default to Markdown because the normal operator path is human
 review. Use `--format markdown` when the output will be read directly in a
 terminal, pasted into a report, or inspected during recovery.
 
+Agent-facing Markdown starts with an operator header when the command has enough
+status evidence to do so: `Status`, `Trust`, `Next Action`, and `Proof Tier`
+come before dense citations, diagnostics, or graph details. This is the default
+shape for `doctor`, `ground --why`, `search --why`, `packet`, and `context`.
+
+`search --why` keeps provenance compact by default. Use
+`search --why --plan-details` only when you need the full broad-query search
+plan, including subqueries, candidate windows, bridge evidence, rejected
+candidates, and source-truth checks.
+
 Use `--format json` when automation needs the complete structured result,
 including fields that Markdown may summarize. JSON is the safer choice for
 tests, scripts, status gates, and any workflow that must compare exact values

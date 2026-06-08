@@ -557,6 +557,7 @@ fn broad_search_json_and_markdown_expose_search_plan() {
             "--repo-text",
             "on",
             "--why",
+            "--plan-details",
             "--format",
             "json",
             "--refresh",
@@ -751,6 +752,7 @@ fn broad_search_json_and_markdown_expose_search_plan() {
             "--repo-text",
             "on",
             "--why",
+            "--plan-details",
             "--format",
             "markdown",
             "--refresh",
@@ -782,7 +784,7 @@ fn broad_search_json_and_markdown_expose_search_plan() {
 
 #[test]
 #[ignore = "live full-sidecar contract; requires finalized sidecar search-plan evidence"]
-fn broad_search_json_without_why_does_not_emit_search_plan() {
+fn broad_search_json_without_plan_details_does_not_emit_search_plan() {
     let workspace = tempdir().expect("workspace dir");
     write_search_quality_fixture(workspace.path());
 
@@ -804,6 +806,7 @@ fn broad_search_json_without_why_does_not_emit_search_plan() {
             "how full indexing supports search trail and snippet commands",
             "--repo-text",
             "on",
+            "--why",
             "--format",
             "json",
             "--refresh",
@@ -818,7 +821,7 @@ fn broad_search_json_without_why_does_not_emit_search_plan() {
     let json: Value = serde_json::from_slice(&search.stdout).expect("parse search json");
     assert!(
         json["search_plan"].is_null(),
-        "search should not emit Search Plan unless --why requested: {json:#}"
+        "search should not emit Search Plan unless --why --plan-details is requested: {json:#}"
     );
 }
 
@@ -848,6 +851,7 @@ fn search_plan_honors_repo_text_off() {
             "--repo-text",
             "off",
             "--why",
+            "--plan-details",
             "--format",
             "json",
             "--refresh",
@@ -1771,6 +1775,7 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
         ];
         if query.starts_with("how ") {
             args.push("--why");
+            args.push("--plan-details");
         }
         let search = run_cli(workspace.path(), &args);
         latency_ms.push(started.elapsed().as_millis() as u64);

@@ -362,6 +362,40 @@ fn append_next_commands(markdown: &mut String, commands: &[String]) {
     }
 }
 
+fn append_operator_header(
+    markdown: &mut String,
+    status: &str,
+    trust: &str,
+    next_action: &str,
+    proof_tier: &str,
+) {
+    let _ = writeln!(markdown, "## Status");
+    let _ = writeln!(markdown, "status: {status}");
+    let _ = writeln!(markdown, "## Trust");
+    let _ = writeln!(markdown, "trust: {trust}");
+    let _ = writeln!(markdown, "## Next Action");
+    let _ = writeln!(markdown, "next_action: {next_action}");
+    let _ = writeln!(markdown, "## Proof Tier");
+    let _ = writeln!(markdown, "proof_tier: {proof_tier}");
+}
+
+fn operator_status_from_confidence(confidence: &str) -> &'static str {
+    match confidence {
+        "high" => "ready",
+        "medium" => "review",
+        "low" => "needs_source_check",
+        _ => "review",
+    }
+}
+
+fn operator_trust_line(confidence: &str, reasons: &[String]) -> String {
+    let reason = reasons
+        .first()
+        .map(String::as_str)
+        .unwrap_or("no limiting evidence was reported");
+    format!("{confidence} - {reason}")
+}
+
 pub(crate) fn render_index_dry_run_markdown(output: &IndexDryRunOutput<'_>) -> String {
     let dry_run = output.dry_run;
     let mut markdown = String::new();
@@ -443,6 +477,26 @@ pub(crate) fn render_ground_markdown(
 ) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Grounding Snapshot");
+    if explain {
+        let (confidence, reasons) = ground_confidence(snapshot);
+        let next_action = snapshot
+            .recommended_queries
+            .first()
+            .cloned()
+            .unwrap_or_else(|| {
+                format!(
+                    "codestory-cli ground --project {} --why",
+                    quoted_cli_arg(&clean_path_string(&project_root.to_string_lossy()))
+                )
+            });
+        append_operator_header(
+            &mut markdown,
+            operator_status_from_confidence(confidence),
+            &operator_trust_line(confidence, &reasons),
+            &next_action,
+            "grounding_snapshot",
+        );
+    }
     let _ = writeln!(markdown, "root: `{}`", clean_path_string(&snapshot.root));
     let _ = writeln!(markdown, "budget: `{}`", format_budget(snapshot.budget));
     let _ = writeln!(
@@ -534,6 +588,17 @@ pub(crate) fn render_ground_markdown(
 pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Search");
+    if output.explain {
+        let (confidence, reasons) = search_confidence(output);
+        let next_action = search_operator_next_action(project_root, output);
+        append_operator_header(
+            &mut markdown,
+            operator_status_from_confidence(confidence),
+            &operator_trust_line(confidence, &reasons),
+            &next_action,
+            search_operator_proof_tier(output),
+        );
+    }
     let _ = writeln!(markdown, "query: `{}`", output.query);
     let _ = writeln!(
         markdown,
@@ -561,14 +626,12 @@ pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput)
     if let Some(assessment) = output.query_assessment.as_ref() {
         append_query_assessment(&mut markdown, assessment);
     }
-    if output.explain
-        && let Some(plan) = output.search_plan.as_ref()
-    {
-        append_search_plan(&mut markdown, project_root, plan);
-    }
     if output.explain {
         append_search_evidence_packet(&mut markdown, project_root, output);
         append_search_sidecar_diagnostics(&mut markdown, output);
+        if let Some(plan) = output.search_plan.as_ref() {
+            append_search_plan(&mut markdown, project_root, plan);
+        }
     }
     if !output.suggestions.is_empty() {
         let _ = writeln!(markdown, "did_you_mean:");
@@ -611,6 +674,50 @@ pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput)
         }
     }
     markdown
+}
+
+fn search_operator_next_action(project_root: &Path, output: &SearchOutput) -> String {
+    if let Some(action) = output
+        .query_assessment
+        .as_ref()
+        .and_then(|assessment| assessment.recommended_next_action.as_deref())
+    {
+        return action.to_string();
+    }
+    if let Some(hint) = output.query_hints.first() {
+        return hint.clone();
+    }
+    if let Some(hit) = output
+        .indexed_symbol_hits
+        .iter()
+        .chain(output.repo_text_hits.iter())
+        .find(|hit| hit.resolvable)
+    {
+        return format!(
+            "codestory-cli context --project {} --id {}",
+            quoted_project_arg(project_root),
+            hit.node_id
+        );
+    }
+    format!(
+        "codestory-cli search --project {} --query {} --why",
+        quoted_project_arg(project_root),
+        quoted_cli_arg(&output.query)
+    )
+}
+
+fn search_operator_proof_tier(output: &SearchOutput) -> &'static str {
+    if output
+        .retrieval_shadow
+        .as_ref()
+        .is_some_and(|shadow| shadow.retrieval_mode == "full")
+    {
+        "full_sidecar_search"
+    } else if output.retrieval.semantic_ready {
+        "local_hybrid_search"
+    } else {
+        "symbolic_or_degraded_search"
+    }
 }
 
 fn append_search_hit_why(markdown: &mut String, hit: &SearchHitOutput) {
@@ -1831,6 +1938,14 @@ fn quoted_cli_arg(value: &str) -> String {
 pub(crate) fn render_context_markdown(project_root: &Path, answer: &AgentAnswerDto) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Context");
+    let (confidence, reasons) = agent_confidence(answer);
+    append_operator_header(
+        &mut markdown,
+        operator_status_from_confidence(confidence),
+        &operator_trust_line(confidence, &reasons),
+        context_operator_next_action(answer),
+        "context_packet",
+    );
     let _ = writeln!(markdown, "target: `{}`", answer.prompt.replace('\n', " "));
     let _ = writeln!(markdown, "summary: {}", answer.summary);
     let _ = writeln!(
@@ -1884,6 +1999,21 @@ pub(crate) fn render_context_markdown(project_root: &Path, answer: &AgentAnswerD
         }
     }
     markdown
+}
+
+fn context_operator_next_action(answer: &AgentAnswerDto) -> &'static str {
+    if answer.citations.is_empty() {
+        "Run search --why for a concrete symbol or file before answering."
+    } else if answer
+        .retrieval_trace
+        .steps
+        .iter()
+        .any(|step| step.status != AgentRetrievalStepStatusDto::Ok)
+    {
+        "Read gaps_uncertainty before relying on the cited context."
+    } else {
+        "Use the cited context below; inspect source for any claim not covered by citations."
+    }
 }
 
 pub(crate) fn context_packet_json(answer: &AgentAnswerDto) -> Value {
@@ -1945,6 +2075,13 @@ fn agent_answer_mode_label(_answer: &AgentAnswerDto) -> &'static str {
 pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Doctor");
+    append_operator_header(
+        &mut markdown,
+        doctor_operator_status(output),
+        &doctor_operator_trust(output),
+        doctor_operator_next_action(output),
+        "environment_and_cache_health",
+    );
     let _ = writeln!(markdown, "project: `{}`", output.project);
     let _ = writeln!(markdown, "storage: `{}`", output.storage_path);
     let _ = writeln!(
@@ -2012,6 +2149,36 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
         }
     }
     markdown
+}
+
+fn doctor_operator_status(output: &DoctorOutput) -> &'static str {
+    if output.checks.iter().any(|check| check.status == "error") {
+        "blocked"
+    } else if doctor_agent_packet_search_readiness(output) != "ready"
+        || output.checks.iter().any(|check| check.status == "warn")
+    {
+        "needs_attention"
+    } else {
+        "ready"
+    }
+}
+
+fn doctor_operator_trust(output: &DoctorOutput) -> String {
+    format!(
+        "local_navigation={} agent_packet_search={} sidecar_mode={} degraded_reason={}",
+        doctor_local_navigation_readiness(output),
+        doctor_agent_packet_search_readiness(output),
+        output.retrieval_mode,
+        output.degraded_reason.as_deref().unwrap_or("none")
+    )
+}
+
+fn doctor_operator_next_action(output: &DoctorOutput) -> &str {
+    output
+        .next_commands
+        .first()
+        .map(String::as_str)
+        .unwrap_or("Review checks below; no repair command was emitted.")
 }
 
 fn doctor_local_navigation_readiness(output: &DoctorOutput) -> &'static str {
@@ -2671,6 +2838,7 @@ pub(crate) fn render_trail_markdown(
         context.trail.edges.len(),
         context.trail.truncated
     );
+    append_trail_legend(&mut markdown);
 
     let labels = context
         .trail
@@ -2736,6 +2904,7 @@ pub(crate) fn render_trail_story_markdown(
     );
     let _ = writeln!(markdown, "summary: {}", story.summary);
     append_trail_edge_summary(&mut markdown, context);
+    append_trail_legend(&mut markdown);
 
     append_story_list(&mut markdown, "## Entry Points", &story.entry_points);
 
@@ -2873,10 +3042,37 @@ fn append_story_list(markdown: &mut String, title: &str, items: &[String]) {
     }
 }
 
+fn append_trail_legend(markdown: &mut String) {
+    let _ = writeln!(markdown, "legend:");
+    for line in trail_legend_lines() {
+        let _ = writeln!(markdown, "- {line}");
+    }
+}
+
+fn trail_legend_lines() -> [&'static str; 4] {
+    [
+        "`-kind->` certain or definite edge",
+        "`~kind~>` probable edge",
+        "`?kind?>` uncertain or speculative edge",
+        "`[unresolved]` missing certainty metadata",
+    ]
+}
+
 pub(crate) fn render_trail_dot(_project_root: &Path, context: &TrailContextDto) -> String {
     let mut dot = String::new();
     let _ = writeln!(dot, "digraph codestory_trail {{");
     let _ = writeln!(dot, "  rankdir=LR;");
+    let _ = writeln!(dot, "  subgraph cluster_legend {{");
+    let _ = writeln!(dot, "    label=\"Legend\";");
+    for (index, line) in trail_legend_lines().iter().enumerate() {
+        let _ = writeln!(
+            dot,
+            "    \"legend_{}\" [shape=plaintext,label=\"{}\"];",
+            index,
+            escape_dot(&line.replace('`', ""))
+        );
+    }
+    let _ = writeln!(dot, "  }}");
     for node in &context.trail.nodes {
         let _ = writeln!(
             dot,
@@ -2887,12 +3083,16 @@ pub(crate) fn render_trail_dot(_project_root: &Path, context: &TrailContextDto) 
         );
     }
     for edge in &context.trail.edges {
+        let edge_kind = format!("{:?}", edge.kind).to_lowercase();
+        let (marker, certainty) =
+            render_trail_edge_notation(&edge_kind, edge.certainty.as_deref());
+        let label = format!("{marker}{certainty}");
         let _ = writeln!(
             dot,
             "  \"{}\" -> \"{}\" [label=\"{}\"];",
             escape_dot(&edge.source.0),
             escape_dot(&edge.target.0),
-            escape_dot(&format!("{:?}", edge.kind).to_lowercase())
+            escape_dot(&label)
         );
     }
     let _ = writeln!(dot, "}}");
@@ -3429,7 +3629,15 @@ mod tests {
         if !intro_labels.iter().any(|label| lower.contains(label)) {
             missing.push(format!("one of {intro_labels:?}"));
         }
-        for required in ["confidence:", "what_was_checked:", "gaps_uncertainty:"] {
+        for required in [
+            "## status",
+            "## trust",
+            "## next action",
+            "## proof tier",
+            "confidence:",
+            "what_was_checked:",
+            "gaps_uncertainty:",
+        ] {
             if !lower.contains(required) {
                 missing.push(required.to_string());
             }
@@ -3541,6 +3749,10 @@ mod tests {
 
         let markdown = render_doctor_markdown(&output);
 
+        assert!(markdown.contains("## Status"), "{markdown}");
+        assert!(markdown.contains("## Trust"), "{markdown}");
+        assert!(markdown.contains("## Next Action"), "{markdown}");
+        assert!(markdown.contains("## Proof Tier"), "{markdown}");
         assert!(
             markdown.contains("readiness: local_navigation=ready agent_packet_search=check_index"),
             "doctor markdown must not report agent packet/search ready when freshness was not checked:\n{markdown}"
@@ -4459,6 +4671,11 @@ summary: Story trail around `handle_request` found 6 nodes and 5 edges; mode=nei
 edge_summary:
 - kinds: call=5
 - certainty: certain=3 probable=1 uncertain=1
+legend:
+- `-kind->` certain or definite edge
+- `~kind~>` probable edge
+- `?kind?>` uncertain or speculative edge
+- `[unresolved]` missing certainty metadata
 
 ## Entry Points
 - focus: handle_request [function] `src/request.rs`
@@ -4639,7 +4856,8 @@ edge_summary:
 
         let dot = render_trail_dot(Path::new("C:/repo"), &context);
 
+        assert!(dot.contains("label=\"Legend\";"));
         assert!(dot.contains("\"a\" [label=\"A\\n[function]\"];"));
-        assert!(dot.contains("\"a\" -> \"b\" [label=\"call\"];"));
+        assert!(dot.contains("\"a\" -> \"b\" [label=\"-call-> [unresolved]\"];"));
     }
 }

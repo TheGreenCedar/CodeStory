@@ -604,6 +604,12 @@ pub(crate) struct SearchCommand {
     )]
     pub(crate) why: bool,
     #[arg(
+        long = "plan-details",
+        requires = "why",
+        help = "Include the full search plan in --why output. By default --why keeps provenance compact."
+    )]
+    pub(crate) plan_details: bool,
+    #[arg(
         long = "hybrid-lexical",
         value_name = "WEIGHT",
         hide = true,
