@@ -1,6 +1,9 @@
 # CodeStory Delight and Speed Roadmap Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Historical planning artifact:** This file records the plan that produced PR
+> #23. Checkbox state reflects the original task breakdown, not current
+> implementation status. Use the PR diff and review notes as the as-built source
+> of truth.
 
 **Goal:** Turn the multi-angle review into independently shippable CodeStory improvements that make the product clearer, more delightful, and materially faster.
 
@@ -263,18 +266,17 @@ Add a Clap flag whose name makes the behavior obvious:
 
 ```rust
 #[arg(
-    long = "why-detail",
-    default_value = "compact",
-    value_parser = ["compact", "full"],
-    help = "Control search explanation detail when --why is enabled."
+    long = "plan-details",
+    requires = "why",
+    help = "Include the full search plan in --why output. By default --why keeps provenance compact."
 )]
-pub(crate) why_detail: String,
+pub(crate) plan_details: bool,
 ```
 
 Expected behavior:
 
 - `--why` keeps compact headings, top channels, freshness, degraded reason, and next command.
-- `--why --why-detail full` includes subqueries, windows, bridges, rejected candidates, promotions, and full next-action detail.
+- `--why --plan-details` includes subqueries, windows, bridges, rejected candidates, promotions, and full next-action detail.
 
 - [ ] **Step 4: Update trail graph rendering legend**
 
@@ -393,8 +395,8 @@ git commit -m "prepare semantic indexing fast path"
 Use a command shape that mirrors existing output conventions:
 
 ```text
-codestory-cli report --project <repo> --format markdown --output codestory-report.md
-codestory-cli report --project <repo> --format json --output codestory-graph.json
+codestory-cli report --project <repo> --format markdown --output-file codestory-report.md
+codestory-cli report --project <repo> --format json --output-file codestory-graph.json
 ```
 
 - [ ] **Step 2: Add report DTOs before rendering**
@@ -404,7 +406,7 @@ Create internal DTOs rather than rendering directly from store rows:
 ```rust
 pub(crate) struct RepoReport {
     pub(crate) project_root: PathBuf,
-    pub(crate) generated_at: String,
+    pub(crate) metadata: ReportGenerationMetadata,
     pub(crate) node_count: usize,
     pub(crate) edge_count: usize,
     pub(crate) hotspots: Vec<ReportHotspot>,
@@ -431,7 +433,7 @@ Defer Leiden/community detection until the first report/export slice is shippabl
 Use a tiny fixture repo already available in CLI tests or create a focused fixture under the existing test pattern. Assert:
 
 - Markdown contains project summary, hotspots, and suggested queries.
-- JSON contains `generated_at`, `nodes`, `edges`, and `metadata`.
+- JSON contains `metadata.generated_at_epoch_ms`, `nodes`, `edges`, and `metadata`.
 - Output file parent must already exist, matching existing `--output-file` behavior.
 
 - [ ] **Step 5: Run focused report tests during implementation**
@@ -464,10 +466,10 @@ git commit -m "add codestory report export"
 Add simple, bounded tools:
 
 ```text
-codestory.get_node
-codestory.neighbors
-codestory.shortest_path
-codestory.query_subgraph
+get_node
+neighbors
+shortest_path
+query_subgraph
 ```
 
 - [ ] **Step 2: Keep response contracts narrow**
@@ -535,7 +537,7 @@ Trusted user config, environment variables, or explicit CLI flags must set cache
 
 - [ ] **Step 2: Fail closed on project network endpoints**
 
-If `.codestory.toml` contains a summary or embedding endpoint, reject it unless an explicit trusted opt-in exists.
+If `.codestory.toml` contains a summary endpoint, summary model, or embedding endpoint, reject it unless an explicit trusted opt-in exists.
 
 Suggested opt-in name:
 

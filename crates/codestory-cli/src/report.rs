@@ -17,16 +17,32 @@ pub(crate) fn run_report(cmd: ReportCommand) -> Result<()> {
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let opened = runtime.ensure_open(crate::args::RefreshMode::None)?;
     ensure_index_ready(&opened, "report")?;
-    let output = codestory_runtime::graph_analysis::build_report_export(
-        &runtime.project_root,
-        &runtime.storage_path,
-        cmd.limit,
-    )?;
-    let markdown = render_report_markdown(&output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    match cmd.format {
+        OutputFormat::Markdown => {
+            let output = codestory_runtime::graph_analysis::build_report(
+                &runtime.project_root,
+                &runtime.storage_path,
+                cmd.limit,
+            )?;
+            let markdown = render_report_markdown(&output);
+            emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+        }
+        OutputFormat::Json => {
+            let output = codestory_runtime::graph_analysis::build_report_export(
+                &runtime.project_root,
+                &runtime.storage_path,
+                cmd.limit,
+            )?;
+            let markdown = render_report_markdown(&output.report);
+            emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+        }
+        OutputFormat::Dot => {
+            bail!("--format dot is only supported by `trail`; use markdown or json")
+        }
+    }
 }
 
-fn render_report_markdown(output: &codestory_runtime::graph_analysis::RepoReportExport) -> String {
+fn render_report_markdown(output: &codestory_runtime::graph_analysis::RepoReport) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# CodeStory Repo Report");
     let _ = writeln!(
@@ -62,15 +78,12 @@ fn render_report_markdown(output: &codestory_runtime::graph_analysis::RepoReport
     append_follow_ups(&mut markdown, output);
     let _ = writeln!(
         markdown,
-        "JSON graph export: rerun with `--format json` to get nodes, edges, confidence/certainty, source locations, and generation metadata."
+        "JSON graph export: rerun with `--format json` to get the full current graph, including nodes, edges, confidence/certainty, source locations, and generation metadata."
     );
     markdown
 }
 
-fn append_summary(
-    markdown: &mut String,
-    output: &codestory_runtime::graph_analysis::RepoReportExport,
-) {
+fn append_summary(markdown: &mut String, output: &codestory_runtime::graph_analysis::RepoReport) {
     let summary = &output.summary;
     let _ = writeln!(markdown, "## Repo Summary");
     let _ = writeln!(
@@ -135,7 +148,7 @@ fn append_node_section(
 
 fn append_follow_ups(
     markdown: &mut String,
-    output: &codestory_runtime::graph_analysis::RepoReportExport,
+    output: &codestory_runtime::graph_analysis::RepoReport,
 ) {
     let _ = writeln!(markdown, "## Suggested Follow-up Queries");
     if output.follow_up_queries.is_empty() {

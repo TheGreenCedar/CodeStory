@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use codestory_contracts::api::{EdgeId as ApiEdgeId, NodeId as ApiNodeId};
 use codestory_contracts::graph::{Edge, EdgeKind, Node, NodeId, NodeKind};
 use codestory_store::Store;
 use serde::Serialize;
@@ -9,13 +10,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_REPORT_LIMIT: usize = 10;
 
 #[derive(Debug, Clone, Serialize)]
-pub struct RepoReportExport {
+pub struct RepoReport {
     pub metadata: ReportGenerationMetadata,
     pub summary: RepoReportSummary,
     pub hotspots: Vec<ReportNodeSummary>,
     pub entry_points: Vec<ReportNodeSummary>,
     pub bridge_nodes: Vec<ReportNodeSummary>,
     pub follow_up_queries: Vec<ReportFollowUpQuery>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RepoReportExport {
+    #[serde(flatten)]
+    pub report: RepoReport,
     pub graph: GraphExport,
 }
 
@@ -44,7 +51,7 @@ pub struct RepoReportSummary {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReportNodeSummary {
-    pub id: i64,
+    pub id: ApiNodeId,
     pub name: String,
     pub kind: String,
     pub incoming_edges: usize,
@@ -69,7 +76,7 @@ pub struct GraphExport {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GraphExportNode {
-    pub id: i64,
+    pub id: ApiNodeId,
     pub name: String,
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -77,18 +84,18 @@ pub struct GraphExportNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub file_node_id: Option<i64>,
+    pub file_node_id: Option<ApiNodeId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_location: Option<SourceLocation>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GraphExportEdge {
-    pub id: i64,
-    pub source: i64,
-    pub target: i64,
-    pub effective_source: i64,
-    pub effective_target: i64,
+    pub id: ApiEdgeId,
+    pub source: ApiNodeId,
+    pub target: ApiNodeId,
+    pub effective_source: ApiNodeId,
+    pub effective_target: ApiNodeId,
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f32>,
@@ -97,7 +104,7 @@ pub struct GraphExportEdge {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callsite_identity: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub candidate_targets: Vec<i64>,
+    pub candidate_targets: Vec<ApiNodeId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_location: Option<SourceLocation>,
 }
@@ -132,6 +139,25 @@ impl NodeDegree {
     }
 }
 
+struct ReportSource {
+    stats: codestory_store::StorageStats,
+    nodes: Vec<Node>,
+    edges: Vec<Edge>,
+    nodes_by_id: HashMap<NodeId, Node>,
+    degrees: HashMap<NodeId, NodeDegree>,
+}
+
+pub fn build_report(
+    project_root: impl AsRef<Path>,
+    storage_path: impl AsRef<Path>,
+    limit: usize,
+) -> Result<RepoReport> {
+    let project_root = project_root.as_ref();
+    let storage_path = storage_path.as_ref();
+    let source = load_report_source(storage_path)?;
+    Ok(build_report_from_source(project_root, &source, limit))
+}
+
 pub fn build_report_export(
     project_root: impl AsRef<Path>,
     storage_path: impl AsRef<Path>,
@@ -139,6 +165,25 @@ pub fn build_report_export(
 ) -> Result<RepoReportExport> {
     let project_root = project_root.as_ref();
     let storage_path = storage_path.as_ref();
+    let source = load_report_source(storage_path)?;
+    let report = build_report_from_source(project_root, &source, limit);
+    let graph = GraphExport {
+        nodes: source
+            .nodes
+            .iter()
+            .map(|node| graph_export_node(node, &source.nodes_by_id))
+            .collect(),
+        edges: source
+            .edges
+            .iter()
+            .map(|edge| graph_export_edge(edge, &source.nodes_by_id))
+            .collect(),
+    };
+
+    Ok(RepoReportExport { report, graph })
+}
+
+fn load_report_source(storage_path: &Path) -> Result<ReportSource> {
     let storage = Store::open(storage_path).with_context(|| {
         format!(
             "Failed to open CodeStory store at {}",
@@ -155,40 +200,44 @@ pub fn build_report_export(
         .get_edges()
         .context("Failed to query CodeStory graph edges")?;
 
-    let limit = limit.max(1);
     let nodes_by_id = nodes
         .iter()
         .map(|node| (node.id, node.clone()))
         .collect::<HashMap<_, _>>();
     let degrees = degree_map(&edges);
+    Ok(ReportSource {
+        stats,
+        nodes,
+        edges,
+        nodes_by_id,
+        degrees,
+    })
+}
+
+fn build_report_from_source(
+    project_root: &Path,
+    source: &ReportSource,
+    limit: usize,
+) -> RepoReport {
+    let limit = limit.max(1);
     let summary = RepoReportSummary {
-        node_count: stats.node_count,
-        edge_count: stats.edge_count,
-        file_count: stats.file_count,
-        error_count: stats.error_count,
-        exported_node_count: nodes.len(),
-        exported_edge_count: edges.len(),
-        node_kinds: node_kind_counts(&nodes),
-        edge_kinds: edge_kind_counts(&edges),
+        node_count: source.stats.node_count,
+        edge_count: source.stats.edge_count,
+        file_count: source.stats.file_count,
+        error_count: source.stats.error_count,
+        exported_node_count: source.nodes.len(),
+        exported_edge_count: source.edges.len(),
+        node_kinds: node_kind_counts(&source.nodes),
+        edge_kinds: edge_kind_counts(&source.edges),
     };
 
-    let hotspots = top_hotspots(&nodes, &nodes_by_id, &degrees, limit);
-    let entry_points = top_entry_points(&nodes, &nodes_by_id, &degrees, limit);
-    let bridge_nodes = top_bridge_nodes(&nodes, &nodes_by_id, &degrees, limit);
+    let hotspots = top_hotspots(&source.nodes, &source.nodes_by_id, &source.degrees, limit);
+    let entry_points = top_entry_points(&source.nodes, &source.nodes_by_id, &source.degrees, limit);
+    let bridge_nodes = top_bridge_nodes(&source.nodes, &source.nodes_by_id, &source.degrees, limit);
     let follow_up_queries =
         follow_up_queries(project_root, &entry_points, &bridge_nodes, &hotspots, limit);
-    let graph = GraphExport {
-        nodes: nodes
-            .iter()
-            .map(|node| graph_export_node(node, &nodes_by_id))
-            .collect(),
-        edges: edges
-            .iter()
-            .map(|edge| graph_export_edge(edge, &nodes_by_id))
-            .collect(),
-    };
 
-    Ok(RepoReportExport {
+    RepoReport {
         metadata: ReportGenerationMetadata {
             format_version: 1,
             artifact_role: "derived_output".to_string(),
@@ -203,8 +252,7 @@ pub fn build_report_export(
         entry_points,
         bridge_nodes,
         follow_up_queries,
-        graph,
-    })
+    }
 }
 
 fn degree_map(edges: &[Edge]) -> HashMap<NodeId, NodeDegree> {
@@ -344,12 +392,12 @@ fn push_follow_ups(
     project_root: &Path,
     reason: &str,
     nodes: &[ReportNodeSummary],
-    seen: &mut HashSet<i64>,
+    seen: &mut HashSet<String>,
     queries: &mut Vec<ReportFollowUpQuery>,
     limit: usize,
 ) {
     for node in nodes {
-        if queries.len() >= limit || !seen.insert(node.id) {
+        if queries.len() >= limit || !seen.insert(node.id.0.clone()) {
             continue;
         }
         queries.push(ReportFollowUpQuery {
@@ -358,7 +406,7 @@ fn push_follow_ups(
             command: format!(
                 "codestory-cli trail --project {} --id {} --story --hide-speculative",
                 shell_quote_path(project_root),
-                node.id
+                node.id.0
             ),
         });
     }
@@ -370,7 +418,7 @@ fn report_node_summary(
     degree: NodeDegree,
 ) -> ReportNodeSummary {
     ReportNodeSummary {
-        id: node.id.0,
+        id: ApiNodeId::from(node.id),
         name: node_display_name(node),
         kind: node_kind_label(node.kind),
         incoming_edges: degree.incoming,
@@ -382,23 +430,23 @@ fn report_node_summary(
 
 fn graph_export_node(node: &Node, nodes_by_id: &HashMap<NodeId, Node>) -> GraphExportNode {
     GraphExportNode {
-        id: node.id.0,
+        id: ApiNodeId::from(node.id),
         name: node_display_name(node),
         kind: node_kind_label(node.kind),
         qualified_name: node.qualified_name.clone(),
         canonical_id: node.canonical_id.clone(),
-        file_node_id: node.file_node_id.map(|id| id.0),
+        file_node_id: node.file_node_id.map(ApiNodeId::from),
         source_location: source_location_for_node(node, nodes_by_id),
     }
 }
 
 fn graph_export_edge(edge: &Edge, nodes_by_id: &HashMap<NodeId, Node>) -> GraphExportEdge {
     GraphExportEdge {
-        id: edge.id.0,
-        source: edge.source.0,
-        target: edge.target.0,
-        effective_source: edge.effective_source().0,
-        effective_target: edge.effective_target().0,
+        id: ApiEdgeId::from(edge.id),
+        source: ApiNodeId::from(edge.source),
+        target: ApiNodeId::from(edge.target),
+        effective_source: ApiNodeId::from(edge.effective_source()),
+        effective_target: ApiNodeId::from(edge.effective_target()),
         kind: edge_kind_label(edge.kind),
         confidence: edge.confidence,
         certainty: edge
@@ -408,7 +456,8 @@ fn graph_export_edge(edge: &Edge, nodes_by_id: &HashMap<NodeId, Node>) -> GraphE
         candidate_targets: edge
             .candidate_targets
             .iter()
-            .map(|candidate| candidate.0)
+            .copied()
+            .map(ApiNodeId::from)
             .collect(),
         source_location: source_location_for_edge(edge, nodes_by_id),
     }
@@ -519,9 +568,5 @@ fn generated_at_epoch_ms() -> u128 {
 
 fn shell_quote_path(path: &Path) -> String {
     let raw = path.to_string_lossy().replace('\\', "/");
-    if raw.contains(' ') {
-        format!("\"{}\"", raw.replace('"', "\\\""))
-    } else {
-        raw
-    }
+    format!("'{}'", raw.replace('\'', "''"))
 }

@@ -59,7 +59,7 @@ lexical index, and DB-backed navigation commands are usable for health, file,
 symbol, trail, snippet, context, orientation checks, and derived report/export
 artifacts.
 `report` reads the current SQLite store and writes generated artifacts; the
-Markdown report and JSON graph export are not source-of-truth state. The managed
+Markdown report and full JSON graph export are not source-of-truth state. The managed
 embedding dry-run is a local semantic setup check; it does not prove agent
 packet/search readiness.
 

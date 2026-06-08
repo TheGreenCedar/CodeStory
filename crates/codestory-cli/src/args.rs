@@ -301,7 +301,7 @@ pub(crate) struct ReportCommand {
         value_name = "N",
         value_parser = parse_positive_usize,
         default_value_t = 10,
-        help = "Maximum number of hotspots, entry points, bridges, and follow-up queries to include in the report sections."
+        help = "Maximum number of hotspots, entry points, bridges, and follow-up queries to include in report sections. JSON graph export still includes the full graph."
     )]
     pub(crate) limit: usize,
 }

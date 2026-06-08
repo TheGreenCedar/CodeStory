@@ -6,6 +6,12 @@ struct BfsTraversalOptions<'a> {
     show_utility_calls: bool,
     max_depth: u32,
     max_nodes: usize,
+    max_edges_per_node: usize,
+}
+
+struct EdgeFetchResult {
+    edges: Vec<Edge>,
+    truncated: bool,
 }
 
 pub(super) fn get_trail(
@@ -53,16 +59,25 @@ pub(super) fn get_trail_bfs(
         }
 
         if depth < max_depth {
-            let edges = get_edges_for_node(
+            let remaining_edges = max_edges.saturating_sub(result.edges.len());
+            if remaining_edges == 0 {
+                result.truncated = true;
+                break;
+            }
+            let edge_fetch = get_edges_for_node(
                 storage,
                 current_id,
                 &direction,
                 &config.edge_filter,
                 config.caller_scope,
                 config.show_utility_calls,
+                Some(remaining_edges),
             )?;
+            if edge_fetch.truncated {
+                result.truncated = true;
+            }
 
-            for edge in edges {
+            for edge in edge_fetch.edges {
                 if result.edges.len() >= max_edges {
                     result.truncated = true;
                     break;
@@ -126,6 +141,7 @@ pub(super) fn get_trail_to_target(
         show_utility_calls: config.show_utility_calls,
         max_depth,
         max_nodes: bfs_cap,
+        max_edges_per_node: config.max_nodes.saturating_mul(3).max(128),
     };
 
     let (dist_from_root, truncated_from_root) = bfs_distances(
@@ -171,21 +187,26 @@ pub(super) fn get_trail_to_target(
 
     let mut path_nodes: Vec<NodeId> = vec![config.root_id];
     let mut current = config.root_id;
+    let mut path_reconstruction_truncated = false;
     while current != target_id {
         let Some(&d_cur) = dist_from_root.get(&current) else {
             break;
         };
-        let edges = get_edges_for_node(
+        let edge_fetch = get_edges_for_node(
             storage,
             current,
             &TrailDirection::Outgoing,
             &config.edge_filter,
             config.caller_scope,
             config.show_utility_calls,
+            Some(traversal_options.max_edges_per_node),
         )?;
+        if edge_fetch.truncated {
+            path_reconstruction_truncated = true;
+        }
         let mut best_next: Option<NodeId> = None;
         let mut best_key: Option<(u32, i64)> = None;
-        for edge in edges {
+        for edge in edge_fetch.edges {
             let (src, dst) = edge.effective_endpoints();
             if src != current {
                 continue;
@@ -247,6 +268,7 @@ pub(super) fn get_trail_to_target(
 
     let truncated = truncated_from_root
         || truncated_to_target
+        || path_reconstruction_truncated
         || included.len() > config.max_nodes
         || selected.len() < included.len();
     let mut result = TrailResult {
@@ -273,15 +295,19 @@ pub(super) fn get_trail_to_target(
         let Some(&d_root) = dist_from_root.get(id) else {
             continue;
         };
-        let edges = get_edges_for_node(
+        let edge_fetch = get_edges_for_node(
             storage,
             *id,
             &TrailDirection::Outgoing,
             &config.edge_filter,
             config.caller_scope,
             config.show_utility_calls,
+            Some(traversal_options.max_edges_per_node),
         )?;
-        for edge in edges {
+        if edge_fetch.truncated {
+            result.truncated = true;
+        }
+        for edge in edge_fetch.edges {
             let (src, dst) = edge.effective_endpoints();
             if src != *id || !selected_set.contains(&dst) {
                 continue;
@@ -339,15 +365,19 @@ fn bfs_distances(
             continue;
         }
 
-        let edges = get_edges_for_node(
+        let edge_fetch = get_edges_for_node(
             storage,
             current_id,
             &direction,
             options.edge_filter,
             options.caller_scope,
             options.show_utility_calls,
+            Some(options.max_edges_per_node),
         )?;
-        for edge in edges {
+        if edge_fetch.truncated {
+            truncated = true;
+        }
+        for edge in edge_fetch.edges {
             let Some(neighbor_id) = super::neighbor_for_direction(current_id, direction, &edge)
             else {
                 continue;
@@ -385,15 +415,19 @@ fn bfs_distances_to_target_through_root_reachable(
             continue;
         }
 
-        let edges = get_edges_for_node(
+        let edge_fetch = get_edges_for_node(
             storage,
             current_id,
             &TrailDirection::Incoming,
             options.edge_filter,
             options.caller_scope,
             options.show_utility_calls,
+            Some(options.max_edges_per_node),
         )?;
-        for edge in edges {
+        if edge_fetch.truncated {
+            truncated = true;
+        }
+        for edge in edge_fetch.edges {
             let Some(neighbor_id) =
                 super::neighbor_for_direction(current_id, TrailDirection::Incoming, &edge)
             else {
@@ -418,14 +452,15 @@ fn bfs_distances_to_target_through_root_reachable(
     Ok((dist, truncated))
 }
 
-pub(super) fn get_edges_for_node(
+fn get_edges_for_node(
     storage: &Storage,
     node_id: NodeId,
     direction: &TrailDirection,
     edge_filter: &[EdgeKind],
     caller_scope: TrailCallerScope,
     show_utility_calls: bool,
-) -> Result<Vec<Edge>, StorageError> {
+    edge_budget: Option<usize>,
+) -> Result<EdgeFetchResult, StorageError> {
     let where_clause = match direction {
         TrailDirection::Outgoing => "e.source_node_id = ?1 OR e.resolved_source_node_id = ?1",
         TrailDirection::Incoming => "e.target_node_id = ?1 OR e.resolved_target_node_id = ?1",
@@ -437,9 +472,16 @@ pub(super) fn get_edges_for_node(
         "{} WHERE {where_clause} ORDER BY e.id",
         super::EDGE_SELECT_BASE
     );
+    if edge_budget == Some(0) {
+        return Ok(EdgeFetchResult {
+            edges: Vec::new(),
+            truncated: true,
+        });
+    }
 
     let mut stmt = storage.conn.prepare(&query)?;
     let mut edges = Vec::new();
+    let mut truncated = false;
     let mut rows = stmt.query(params![node_id.0])?;
 
     while let Some(row) = rows.next()? {
@@ -479,9 +521,13 @@ pub(super) fn get_edges_for_node(
         };
         if matches_node {
             edges.push(edge);
+            if edge_budget.is_some_and(|budget| edges.len() >= budget) {
+                truncated = true;
+                break;
+            }
         }
     }
-    Ok(edges)
+    Ok(EdgeFetchResult { edges, truncated })
 }
 
 pub(super) fn get_edges_for_node_id(
@@ -495,7 +541,9 @@ pub(super) fn get_edges_for_node_id(
         &[],
         TrailCallerScope::IncludeTestsAndBenches,
         true,
+        None,
     )
+    .map(|result| result.edges)
 }
 
 fn push_unique(selected: &mut Vec<NodeId>, selected_set: &mut HashSet<NodeId>, id: NodeId) {

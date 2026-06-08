@@ -38,7 +38,7 @@ index path when embedding assets are available.
 
 ## Configuration Files
 
-The CLI loads optional `.codestory.toml` defaults from the user home directory and then from the selected project root. Project config may override home config for project-safe preferences. Cache roots, network endpoints, credentials, and source-text egress settings must come from trusted user config, explicit environment variables, or CLI options; project files cannot set `cache_dir`, `summary_endpoint`, or embedding endpoint fields unless `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG=1` is set deliberately for that run. Explicit environment variables override both config files because config values are only applied when the matching runtime env var is absent.
+The CLI loads optional `.codestory.toml` defaults from the user home directory and then from the selected project root. Project config may override home config for project-safe preferences. Cache roots, network endpoints, model selectors for source-egress calls, credentials, and source-text egress settings must come from trusted user config, explicit environment variables, or CLI options; project files cannot set `cache_dir`, `summary_endpoint`, `summary_model`, or embedding endpoint fields unless `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG=1` is set deliberately for that run. Explicit environment variables override both config files because config values are only applied when the matching runtime env var is absent.
 
 Embedding config keys map to the runtime env names:
 
@@ -47,6 +47,7 @@ Embedding config keys map to the runtime env names:
 | `embedding_profile` | `CODESTORY_EMBED_PROFILE` | Selects a built-in profile such as `bge-base-en-v1.5`, `bge-small-en-v1.5`, or `custom`. |
 | `embedding_model_id` | `CODESTORY_EMBED_MODEL_ID` | Overrides the resolved model id for the selected profile. |
 | `embedding_model` | `CODESTORY_EMBED_MODEL_ID` | Deprecated alias for `embedding_model_id`; prefer the explicit key in new config. |
+| `embedding_endpoint` | `CODESTORY_EMBED_LLAMACPP_URL` | Trusted-only endpoint for the product llama.cpp embedding sidecar. |
 
 The CLI should not set stale embedding env aliases that the runtime does not read.
 
@@ -71,9 +72,11 @@ the caller requests a refresh.
 
 `search --query` accepts field-qualified filters such as `kind:function`,
 `path:routes.ts`, `name:listUsers`, and `lang:typescript` for narrowing
-candidate sets without hiding the original query text. Broad architecture-style
-`search` responses may include a Search Plan when `--why` is requested. Treat
-that as discovery evidence and next-command guidance, not final answer prose.
+candidate sets without hiding the original query text. `search --why` keeps
+operator provenance compact by default; broad architecture-style `search`
+responses include the full Search Plan only when `--plan-details` is also
+requested. Treat that plan as discovery evidence and next-command guidance, not
+final answer prose.
 
 `drill` is the exception to the default refresh posture: it defaults to
 `--refresh full` so generated report bundles are mechanically fresh. Its

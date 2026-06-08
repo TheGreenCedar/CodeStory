@@ -98,9 +98,10 @@ cache and retrieval state are usable. `ground --why` gives broad orientation and
 reports limited coverage or gaps. `report` reads the current SQLite store
 without refreshing it and emits generated artifacts: Markdown for repo summary,
 hotspots, entry points, bridge/high-connectivity nodes, and next queries; JSON
-for automation that needs nodes, edges, confidence/certainty, source locations,
-and generation metadata. Treat both files as outputs to regenerate, not
-source-of-truth state.
+for automation that needs the full current graph, including nodes, edges,
+confidence/certainty, source locations, and generation metadata. `--limit`
+bounds the Markdown report sections, not the full JSON graph export. Treat both
+files as outputs to regenerate, not source-of-truth state.
 
 ### I need evidence for a broad question
 
@@ -365,12 +366,13 @@ embedding_model_id = "BAAI/bge-base-en-v1.5-local"
 hybrid_retrieval_enabled = true
 ```
 
-Project `.codestory.toml` files are not trusted to choose cache roots or
-network/source-egress settings. Put `cache_dir` in the user home
-`.codestory.toml` or pass `--cache-dir`. Put summary or embedding endpoints in
-trusted environment variables such as `CODESTORY_SUMMARY_ENDPOINT` or
-`CODESTORY_EMBED_LLAMACPP_URL`; a project file containing `summary_endpoint` or
-`embedding_endpoint` is rejected unless
+Project `.codestory.toml` files are not trusted to choose cache roots,
+network/source-egress settings, or model selectors for source-egress calls. Put
+`cache_dir` in the user home `.codestory.toml` or pass `--cache-dir`. Put
+summary endpoints/models or embedding endpoints in trusted environment
+variables such as `CODESTORY_SUMMARY_ENDPOINT`, `CODESTORY_SUMMARY_MODEL`, or
+`CODESTORY_EMBED_LLAMACPP_URL`; a project file containing `summary_endpoint`,
+`summary_model`, or `embedding_endpoint` is rejected unless
 `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG=1` is set deliberately for that run.
 
 `semantic_doc_scope` is intentionally omitted above because durable semantic
