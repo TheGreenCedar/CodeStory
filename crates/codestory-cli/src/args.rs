@@ -41,6 +41,8 @@ pub(crate) enum Command {
     Index(IndexCommand),
     #[command(about = "Summarize indexed repository context.")]
     Ground(GroundCommand),
+    #[command(about = "Generate a repo report or machine graph export from the current store.")]
+    Report(ReportCommand),
     #[command(about = "Gather evidence for one concrete target.")]
     Context(ContextCommand),
     #[command(about = "Answer a broad repository question with evidence.")]
@@ -280,6 +282,28 @@ pub(crate) struct GroundCommand {
         help = "Explain retrieval mode, coverage, and query hints in the Markdown output."
     )]
     pub(crate) why: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ReportCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write the generated report/export artifact to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = parse_positive_usize,
+        default_value_t = 10,
+        help = "Maximum number of hotspots, entry points, bridges, and follow-up queries to include in the report sections."
+    )]
+    pub(crate) limit: usize,
 }
 
 #[derive(Args, Debug)]

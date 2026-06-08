@@ -52,6 +52,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod agent;
 pub use agent::packet_step_trace_json;
 mod browser;
+pub mod graph_analysis;
 mod graph_builders;
 mod graph_canonical;
 mod grounding;

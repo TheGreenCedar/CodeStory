@@ -49,11 +49,16 @@ $TargetWorkspace = "C:\path\to\repo"
 & $CodeStoryCli setup embeddings --project $TargetWorkspace --dry-run --format json
 & $CodeStoryCli index --project $TargetWorkspace --refresh full
 & $CodeStoryCli ground --project $TargetWorkspace --why
+& $CodeStoryCli report --project $TargetWorkspace --output-file .\codestory-report.md
+& $CodeStoryCli report --project $TargetWorkspace --format json --output-file .\codestory-graph.json
 ```
 
 That basic path builds the local SQLite index and is enough for health, file,
-symbol, trail, snippet, and orientation checks. The managed embedding dry-run is
-a local semantic setup check; it does not prove sidecar readiness.
+symbol, trail, snippet, orientation checks, and derived report/export artifacts.
+`report` reads the current SQLite store and writes generated artifacts; the
+Markdown report and JSON graph export are not source-of-truth state. The managed
+embedding dry-run is a local semantic setup check; it does not prove sidecar
+readiness.
 
 Agent-facing `packet` and `search` evidence has one extra readiness contract:
 local Zoekt, Qdrant, SCIP, and llama.cpp embedding sidecars must report
@@ -145,6 +150,7 @@ The skill package lives at
 | Health and cache readiness | `codestory-cli doctor --project <target-workspace>` |
 | Build or refresh an index | `codestory-cli index --project <target-workspace> --refresh full` |
 | Broad orientation | `codestory-cli ground --project <target-workspace> --why` |
+| Repo report / graph export | `codestory-cli report --project <target-workspace> --format markdown` |
 | Broad task evidence | `codestory-cli packet --project <target-workspace> --question "<task>" --budget compact` |
 | Candidate discovery | `codestory-cli search --project <target-workspace> --query "<term>" --why` |
 | Exact symbol evidence | `codestory-cli symbol --project <target-workspace> --id <node-id>` |
