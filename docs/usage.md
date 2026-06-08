@@ -333,7 +333,7 @@ Use `codestory_project.json` when one project needs explicit source groups:
 
 Team or user defaults can live in `.codestory.toml` at the project root or in
 the user home directory. The home file loads first, the project file overrides
-it, and explicit environment variables still win.
+it for project-safe preferences, and explicit environment variables still win.
 
 Example:
 
@@ -342,6 +342,14 @@ embedding_profile = "bge-base-en-v1.5"
 embedding_model_id = "BAAI/bge-base-en-v1.5-local"
 hybrid_retrieval_enabled = true
 ```
+
+Project `.codestory.toml` files are not trusted to choose cache roots or
+network/source-egress settings. Put `cache_dir` in the user home
+`.codestory.toml` or pass `--cache-dir`. Put summary or embedding endpoints in
+trusted environment variables such as `CODESTORY_SUMMARY_ENDPOINT` or
+`CODESTORY_EMBED_LLAMACPP_URL`; a project file containing `summary_endpoint` or
+`embedding_endpoint` is rejected unless
+`CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG=1` is set deliberately for that run.
 
 `semantic_doc_scope` is intentionally omitted above because durable semantic
 docs are the default. Set it only when opting into the broader all-symbol scope;
