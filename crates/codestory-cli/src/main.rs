@@ -38,6 +38,7 @@ mod http_transport;
 mod managed_embeddings;
 mod output;
 mod query_resolution;
+mod report;
 mod retrieval;
 mod runtime;
 mod stdio_catalog;
@@ -178,6 +179,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Index(cmd) => run_index(cmd),
         Command::Ground(cmd) => run_ground(cmd),
+        Command::Report(cmd) => report::run_report(cmd),
         Command::Context(cmd) => run_context(cmd),
         Command::Packet(cmd) => run_packet(cmd),
         Command::Doctor(cmd) => run_doctor(cmd),
@@ -604,6 +606,7 @@ fn run_packet(cmd: PacketCommand) -> Result<()> {
 fn render_packet_markdown(project_root: &std::path::Path, packet: &AgentPacketDto) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Packet");
+    append_packet_operator_header(&mut markdown, packet);
     let _ = writeln!(
         markdown,
         "question: `{}`",
@@ -678,6 +681,56 @@ fn render_packet_markdown(project_root: &std::path::Path, packet: &AgentPacketDt
     markdown.push('\n');
     markdown.push_str(&render_context_markdown(project_root, &packet.answer));
     markdown
+}
+
+fn append_packet_operator_header(markdown: &mut String, packet: &AgentPacketDto) {
+    let _ = writeln!(markdown, "## Status");
+    let _ = writeln!(
+        markdown,
+        "status: {}",
+        packet_operator_status(packet.sufficiency.status)
+    );
+    let _ = writeln!(markdown, "## Trust");
+    let _ = writeln!(
+        markdown,
+        "trust: sufficiency={} budget_truncated={} omitted_sections={}",
+        packet_sufficiency_label(packet.sufficiency.status),
+        packet.budget.truncated,
+        packet_budget_omitted_sections(packet)
+    );
+    let _ = writeln!(markdown, "## Next Action");
+    let _ = writeln!(
+        markdown,
+        "next_action: {}",
+        packet_operator_next_action(packet)
+    );
+    let _ = writeln!(markdown, "## Proof Tier");
+    let _ = writeln!(markdown, "proof_tier: packet_evidence");
+}
+
+fn packet_operator_status(status: PacketSufficiencyStatusDto) -> &'static str {
+    match status {
+        PacketSufficiencyStatusDto::Sufficient => "ready",
+        PacketSufficiencyStatusDto::Partial => "needs_attention",
+        PacketSufficiencyStatusDto::Insufficient => "blocked",
+    }
+}
+
+fn packet_budget_omitted_sections(packet: &AgentPacketDto) -> String {
+    if packet.budget.omitted_sections.is_empty() {
+        "none".to_string()
+    } else {
+        packet.budget.omitted_sections.join(",")
+    }
+}
+
+fn packet_operator_next_action(packet: &AgentPacketDto) -> &str {
+    packet
+        .sufficiency
+        .follow_up_commands
+        .first()
+        .map(String::as_str)
+        .unwrap_or("Inspect cited source before relying on claims not covered by packet citations.")
 }
 
 fn packet_budget_mode_label(mode: PacketBudgetModeDto) -> &'static str {
@@ -1101,7 +1154,7 @@ fn search_request_from_command(cmd: &SearchCommand) -> SearchRequest {
         query: cmd.query.clone(),
         repo_text: to_api_repo_text_mode(cmd.repo_text),
         limit_per_source: cmd.limit.clamp(1, 50),
-        expand_search_plan: cmd.why,
+        expand_search_plan: cmd.why && cmd.plan_details,
         hybrid_weights: hybrid_weights(cmd.hybrid_lexical, cmd.hybrid_semantic, cmd.hybrid_graph),
         hybrid_limits: hybrid_limits(cmd.hybrid_lexical_limit, cmd.hybrid_semantic_limit),
     }

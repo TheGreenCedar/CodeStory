@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::{
     AgentAskRequest, AgentPacketRequestDto, AgentResponseModeDto, AgentRetrievalPresetDto,
-    AgentRetrievalProfileSelectionDto, ApiError, GroundingBudgetDto, ListChildrenSymbolsRequest,
-    ListRootSymbolsRequest, NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto,
-    SearchRepoTextMode, SearchRequest, TrailDirection,
+    AgentRetrievalProfileSelectionDto, ApiError, GraphResponse, GroundingBudgetDto,
+    ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId,
+    NodeKind, PacketBudgetModeDto, PacketTaskClassDto, SearchRepoTextMode, SearchRequest,
+    TrailCallerScope, TrailDirection, TrailMode,
 };
 use codestory_retrieval::SidecarLayout;
 use std::io::{BufRead, Write};
@@ -434,6 +435,10 @@ fn handle_stdio_tool_call(
         "search" => handle_stdio_search(runtime, state, request, query),
         "symbol" => handle_stdio_symbol(runtime, request),
         "trail" => handle_stdio_trail(runtime, request),
+        "get_node" => handle_stdio_get_node(runtime, request),
+        "neighbors" => handle_stdio_neighbors(runtime, request, "neighbors", 1, 50),
+        "shortest_path" => handle_stdio_shortest_path(runtime, request),
+        "query_subgraph" => handle_stdio_neighbors(runtime, request, "query_subgraph", 2, 80),
         "definition" => handle_stdio_definition(runtime, request),
         "references" => handle_stdio_references(runtime, request),
         "symbols" => handle_stdio_symbols(runtime, request),
@@ -945,6 +950,154 @@ fn handle_stdio_definition(
         )
 }
 
+fn handle_stdio_get_node(
+    runtime: &RuntimeContext,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    resolve_target(runtime, stdio_target_selection(request), None)
+        .and_then(|target| {
+            runtime
+                .browser
+                .node_details(NodeDetailsRequest {
+                    id: target.selected.node_id.clone(),
+                })
+                .map_err(map_api_error)
+                .map(|node| {
+                    let file_refs = stdio_node_file_refs(&node);
+                    let resolution = serde_json::to_value(build_query_resolution_output(
+                        &runtime.project_root,
+                        &target,
+                    ))
+                    .unwrap_or(serde_json::Value::Null);
+                    serde_json::json!({
+                        "resolution": resolution,
+                        "node": node,
+                        "certainty": "certain",
+                        "file_refs": file_refs,
+                        "limits": {
+                            "max_nodes": 1,
+                            "max_edges": 0
+                        },
+                        "node_count": 1,
+                        "edge_count": 0,
+                        "truncated": false
+                    })
+                })
+        })
+        .map(|result| serde_json::json!({"result": result}))
+        .unwrap_or_else(
+            |error| serde_json::json!({"error": stdio_legacy_error_value(runtime, &error)}),
+        )
+}
+
+fn handle_stdio_neighbors(
+    runtime: &RuntimeContext,
+    request: &serde_json::Value,
+    tool_name: &str,
+    default_depth: u32,
+    default_max_nodes: u32,
+) -> serde_json::Value {
+    let direction = stdio_graph_direction(request);
+    let depth = stdio_graph_u32_arg(request, "depth", default_depth, 0, 3);
+    let max_nodes = stdio_graph_u32_arg(request, "max_nodes", default_max_nodes, 1, 120);
+    resolve_target(runtime, stdio_target_selection(request), None)
+        .and_then(|target| {
+            let mut config =
+                browser_trail_config(target.selected.node_id.clone(), depth, direction, false);
+            config.max_nodes = max_nodes;
+            runtime
+                .browser
+                .trail_context(config)
+                .map_err(map_api_error)
+                .map(|context| {
+                    let resolution = serde_json::to_value(build_query_resolution_output(
+                        &runtime.project_root,
+                        &target,
+                    ))
+                    .unwrap_or(serde_json::Value::Null);
+                    stdio_graph_tool_output(
+                        resolution,
+                        context.trail,
+                        serde_json::json!({
+                            "tool": tool_name,
+                            "direction": stdio_graph_direction_label(direction),
+                            "depth": depth,
+                            "max_nodes": max_nodes,
+                            "max_edges": max_nodes.saturating_mul(3).max(128)
+                        }),
+                    )
+                })
+        })
+        .map(|result| serde_json::json!({"result": result}))
+        .unwrap_or_else(
+            |error| serde_json::json!({"error": stdio_legacy_error_value(runtime, &error)}),
+        )
+}
+
+fn handle_stdio_shortest_path(
+    runtime: &RuntimeContext,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(from_id) = stdio_graph_string_arg(request, "from_id") else {
+        return serde_json::json!({"error": "shortest_path.from_id is required"});
+    };
+    let Some(to_id) = stdio_graph_string_arg(request, "to_id") else {
+        return serde_json::json!({"error": "shortest_path.to_id is required"});
+    };
+    let max_depth = stdio_graph_u32_arg(request, "max_depth", 6, 1, 10);
+    let max_nodes = stdio_graph_u32_arg(request, "max_nodes", 80, 2, 120);
+    let from = NodeId(from_id.to_string());
+    let to = NodeId(to_id.to_string());
+    if let Err(error) = runtime
+        .browser
+        .node_details(NodeDetailsRequest { id: from.clone() })
+    {
+        return serde_json::json!({"error": stdio_api_error_value(error)});
+    }
+    if let Err(error) = runtime
+        .browser
+        .node_details(NodeDetailsRequest { id: to.clone() })
+    {
+        return serde_json::json!({"error": stdio_api_error_value(error)});
+    }
+    runtime
+        .browser
+        .trail_context(codestory_contracts::api::TrailConfigDto {
+            root_id: from.clone(),
+            mode: TrailMode::ToTargetSymbol,
+            target_id: Some(to.clone()),
+            depth: max_depth,
+            direction: TrailDirection::Outgoing,
+            caller_scope: TrailCallerScope::ProductionOnly,
+            edge_filter: Vec::new(),
+            show_utility_calls: false,
+            hide_speculative: false,
+            story: false,
+            node_filter: Vec::new(),
+            max_nodes,
+            layout_direction: codestory_contracts::api::LayoutDirection::Horizontal,
+        })
+        .map(|context| {
+            let mut output = stdio_graph_tool_output(
+                serde_json::Value::Null,
+                context.trail,
+                serde_json::json!({
+                    "tool": "shortest_path",
+                    "direction": "outgoing",
+                    "max_depth": max_depth,
+                    "max_nodes": max_nodes,
+                    "max_edges": max_nodes.saturating_mul(3).max(128)
+                }),
+            );
+            if let Some(object) = output.as_object_mut() {
+                object.insert("from_id".to_string(), serde_json::json!(from.0.as_str()));
+                object.insert("to_id".to_string(), serde_json::json!(to.0.as_str()));
+            }
+            serde_json::json!({"result": output})
+        })
+        .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
+}
+
 fn handle_stdio_references(
     runtime: &RuntimeContext,
     request: &serde_json::Value,
@@ -1058,6 +1211,101 @@ fn handle_stdio_context(
             serde_json::json!({"result": context_packet_json(&result)})
         })
         .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
+}
+
+fn stdio_graph_direction(request: &serde_json::Value) -> TrailDirection {
+    match request
+        .pointer("/params/arguments/direction")
+        .and_then(|value| value.as_str())
+    {
+        Some("incoming") => TrailDirection::Incoming,
+        Some("outgoing") => TrailDirection::Outgoing,
+        _ => TrailDirection::Both,
+    }
+}
+
+fn stdio_graph_direction_label(direction: TrailDirection) -> &'static str {
+    match direction {
+        TrailDirection::Incoming => "incoming",
+        TrailDirection::Outgoing => "outgoing",
+        TrailDirection::Both => "both",
+    }
+}
+
+fn stdio_graph_u32_arg(
+    request: &serde_json::Value,
+    name: &str,
+    default: u32,
+    min: u32,
+    max: u32,
+) -> u32 {
+    request
+        .pointer(&format!("/params/arguments/{name}"))
+        .and_then(|value| value.as_u64())
+        .map(|value| value.clamp(min as u64, max as u64) as u32)
+        .unwrap_or(default)
+}
+
+fn stdio_graph_string_arg<'a>(request: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+    request
+        .pointer(&format!("/params/arguments/{name}"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn stdio_graph_tool_output(
+    resolution: serde_json::Value,
+    graph: GraphResponse,
+    limits: serde_json::Value,
+) -> serde_json::Value {
+    let file_refs = stdio_graph_file_refs(&graph);
+    let node_count = graph.nodes.len();
+    let edge_count = graph.edges.len();
+    let truncated = graph.truncated;
+    serde_json::json!({
+        "resolution": resolution,
+        "graph": graph,
+        "certainty": "mixed; inspect graph.edges[].certainty and graph.edges[].confidence",
+        "file_refs": file_refs,
+        "limits": limits,
+        "node_count": node_count,
+        "edge_count": edge_count,
+        "truncated": truncated,
+    })
+}
+
+fn stdio_node_file_refs(node: &NodeDetailsDto) -> serde_json::Value {
+    match node.file_path.as_deref() {
+        Some(path) => serde_json::json!([
+            {
+                "node_id": node.id.0.as_str(),
+                "file_path": path,
+                "line": node.start_line
+            }
+        ]),
+        None => serde_json::json!([]),
+    }
+}
+
+fn stdio_graph_file_refs(graph: &GraphResponse) -> serde_json::Value {
+    let mut seen = std::collections::HashSet::<(&str, Option<u32>)>::new();
+    let refs = graph
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let path = node.file_path.as_deref()?;
+            if !seen.insert((path, None)) {
+                return None;
+            }
+            Some(serde_json::json!({
+                "node_id": node.id.0.as_str(),
+                "file_path": path,
+                "line": null
+            }))
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!(refs)
 }
 
 fn stdio_api_error_value(error: ApiError) -> serde_json::Value {

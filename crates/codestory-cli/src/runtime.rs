@@ -711,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn project_config_cache_dir_does_not_select_managed_executable_root() {
+    fn project_config_cache_dir_is_rejected_before_runtime_paths() {
         let _env_lock = crate::config::config_env_test_lock();
         let temp = tempdir().expect("temp dir");
         let project = temp.path().join("repo");
@@ -723,23 +723,17 @@ mod tests {
         )
         .expect("write project config");
 
-        let context = RuntimeContext::new_inspect_only(&ProjectArgs {
+        let err = match RuntimeContext::new_inspect_only(&ProjectArgs {
             project,
             cache_dir: None,
-        })
-        .expect("runtime context");
+        }) {
+            Ok(_) => panic!("repo-controlled cache_dir should fail closed"),
+            Err(err) => err,
+        };
 
-        assert_eq!(context.storage_path, config_cache.join("codestory.db"));
-        assert_eq!(
-            context.managed_embeddings_root,
-            crate::managed_embeddings::managed_root(None).expect("global managed root"),
-            "repo-controlled config cache_dir should not influence managed executable asset root"
-        );
-        assert_ne!(
-            context.managed_embeddings_root,
-            config_cache.join("managed-embeddings"),
-            "repo-controlled config cache_dir must not choose executable managed asset root"
-        );
+        let message = format!("{err:#}");
+        assert!(message.contains("project config field `cache_dir` is not trusted"));
+        assert!(message.contains("--cache-dir"));
     }
 
     #[test]

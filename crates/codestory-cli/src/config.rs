@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+const PROJECT_NETWORK_CONFIG_OPT_IN_ENV: &str = "CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG";
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct CliConfig {
     pub(crate) cache_dir: Option<PathBuf>,
@@ -9,11 +11,18 @@ pub(crate) struct CliConfig {
     pub(crate) embedding_model_id: Option<String>,
     #[serde(default)]
     pub(crate) embedding_model: Option<String>,
+    pub(crate) embedding_endpoint: Option<String>,
     pub(crate) hybrid_retrieval_enabled: Option<bool>,
     pub(crate) semantic_doc_scope: Option<String>,
     pub(crate) semantic_doc_alias_mode: Option<String>,
     pub(crate) summary_endpoint: Option<String>,
     pub(crate) summary_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigSource {
+    TrustedUser,
+    Project,
 }
 
 pub(crate) fn load_config(project_root: &Path) -> Result<CliConfig> {
@@ -22,19 +31,28 @@ pub(crate) fn load_config(project_root: &Path) -> Result<CliConfig> {
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
     {
-        merge_config_file(&mut config, &home.join(".codestory.toml"))?;
+        merge_config_file(
+            &mut config,
+            &home.join(".codestory.toml"),
+            ConfigSource::TrustedUser,
+        )?;
     }
-    merge_config_file(&mut config, &project_root.join(".codestory.toml"))?;
+    merge_config_file(
+        &mut config,
+        &project_root.join(".codestory.toml"),
+        ConfigSource::Project,
+    )?;
     apply_env_defaults(&config);
     Ok(config)
 }
 
-fn merge_config_file(config: &mut CliConfig, path: &Path) -> Result<()> {
+fn merge_config_file(config: &mut CliConfig, path: &Path, source: ConfigSource) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config {}", path.display()))?;
+    validate_config_trust_boundary(&raw, source, path)?;
     let file_config: CliConfig = toml::from_str(&raw)
         .with_context(|| format!("Failed to parse config {}", path.display()))?;
     if file_config.cache_dir.is_some() {
@@ -47,6 +65,9 @@ fn merge_config_file(config: &mut CliConfig, path: &Path) -> Result<()> {
         config.embedding_model_id = file_config
             .embedding_model_id
             .or(file_config.embedding_model);
+    }
+    if file_config.embedding_endpoint.is_some() {
+        config.embedding_endpoint = file_config.embedding_endpoint;
     }
     if file_config.hybrid_retrieval_enabled.is_some() {
         config.hybrid_retrieval_enabled = file_config.hybrid_retrieval_enabled;
@@ -66,6 +87,36 @@ fn merge_config_file(config: &mut CliConfig, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_config_trust_boundary(raw: &str, source: ConfigSource, path: &Path) -> Result<()> {
+    if source != ConfigSource::Project {
+        return Ok(());
+    }
+    let value: toml::Value = toml::from_str(raw)
+        .with_context(|| format!("Failed to parse config {}", path.display()))?;
+    let Some(table) = value.as_table() else {
+        return Ok(());
+    };
+    if table.contains_key("cache_dir") {
+        anyhow::bail!(
+            "project config field `cache_dir` is not trusted; set it in the user home .codestory.toml or pass --cache-dir instead"
+        );
+    }
+    for field in ["summary_endpoint", "summary_model", "embedding_endpoint"] {
+        if table.contains_key(field) && !project_network_config_allowed() {
+            anyhow::bail!(
+                "project config field `{field}` is not trusted; set CODESTORY_SUMMARY_ENDPOINT, CODESTORY_SUMMARY_MODEL, CODESTORY_EMBED_LLAMACPP_URL, or pass a trusted CLI option instead"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn project_network_config_allowed() -> bool {
+    std::env::var(PROJECT_NETWORK_CONFIG_OPT_IN_ENV)
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
 fn apply_env_defaults(config: &CliConfig) {
     set_env_if_absent(
         "CODESTORY_EMBED_PROFILE",
@@ -74,6 +125,10 @@ fn apply_env_defaults(config: &CliConfig) {
     set_env_if_absent(
         "CODESTORY_EMBED_MODEL_ID",
         config.embedding_model_id.as_deref(),
+    );
+    set_env_if_absent(
+        "CODESTORY_EMBED_LLAMACPP_URL",
+        config.embedding_endpoint.as_deref(),
     );
     set_env_if_absent(
         "CODESTORY_HYBRID_RETRIEVAL_ENABLED",
@@ -420,6 +475,234 @@ embedding_model_id = "project/model-id"
             Ok("project/legacy-model-id")
         );
         assert!(std::env::var_os("CODESTORY_EMBEDDING_MODEL").is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn project_config_rejects_cache_dir() -> Result<()> {
+        let _env = EnvRestore::capture(&["USERPROFILE", "HOME"]);
+        clear_env(&["USERPROFILE", "HOME"]);
+
+        let project = tempdir()?;
+        std::fs::write(
+            project.path().join(".codestory.toml"),
+            r#"cache_dir = "C:/repo-controlled-cache""#,
+        )?;
+
+        let err = load_config(project.path()).expect_err("project cache_dir should fail closed");
+        let message = format!("{err:#}");
+        assert!(message.contains("project config field `cache_dir` is not trusted"));
+        assert!(message.contains("user home .codestory.toml"));
+        assert!(message.contains("--cache-dir"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn project_config_rejects_summary_endpoint_without_trusted_opt_in() -> Result<()> {
+        let _env = EnvRestore::capture(&[
+            "USERPROFILE",
+            "HOME",
+            PROJECT_NETWORK_CONFIG_OPT_IN_ENV,
+            "CODESTORY_SUMMARY_ENDPOINT",
+        ]);
+        clear_env(&[
+            "USERPROFILE",
+            "HOME",
+            PROJECT_NETWORK_CONFIG_OPT_IN_ENV,
+            "CODESTORY_SUMMARY_ENDPOINT",
+        ]);
+
+        let project = tempdir()?;
+        std::fs::write(
+            project.path().join(".codestory.toml"),
+            r#"summary_endpoint = "https://example.invalid/v1/chat/completions""#,
+        )?;
+
+        let err = load_config(project.path()).expect_err("project summary endpoint should fail");
+        let message = format!("{err:#}");
+        assert!(message.contains("project config field `summary_endpoint` is not trusted"));
+        assert!(message.contains("CODESTORY_SUMMARY_ENDPOINT"));
+        assert!(message.contains("trusted CLI option"));
+        assert!(std::env::var_os("CODESTORY_SUMMARY_ENDPOINT").is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn project_config_rejects_summary_model_without_trusted_opt_in() -> Result<()> {
+        let _env = EnvRestore::capture(&[
+            "USERPROFILE",
+            "HOME",
+            PROJECT_NETWORK_CONFIG_OPT_IN_ENV,
+            "CODESTORY_SUMMARY_MODEL",
+        ]);
+        clear_env(&[
+            "USERPROFILE",
+            "HOME",
+            PROJECT_NETWORK_CONFIG_OPT_IN_ENV,
+            "CODESTORY_SUMMARY_MODEL",
+        ]);
+
+        let project = tempdir()?;
+        std::fs::write(
+            project.path().join(".codestory.toml"),
+            r#"summary_model = "expensive/repo-selected-model""#,
+        )?;
+
+        let err = load_config(project.path()).expect_err("project summary model should fail");
+        let message = format!("{err:#}");
+        assert!(message.contains("project config field `summary_model` is not trusted"));
+        assert!(message.contains("CODESTORY_SUMMARY_MODEL"));
+        assert!(std::env::var_os("CODESTORY_SUMMARY_MODEL").is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn project_config_rejects_embedding_endpoint_without_trusted_opt_in() -> Result<()> {
+        let _env = EnvRestore::capture(&["USERPROFILE", "HOME", PROJECT_NETWORK_CONFIG_OPT_IN_ENV]);
+        clear_env(&["USERPROFILE", "HOME", PROJECT_NETWORK_CONFIG_OPT_IN_ENV]);
+
+        let project = tempdir()?;
+        std::fs::write(
+            project.path().join(".codestory.toml"),
+            r#"embedding_endpoint = "http://127.0.0.1:8080/v1/embeddings""#,
+        )?;
+
+        let err = load_config(project.path()).expect_err("project embedding endpoint should fail");
+        let message = format!("{err:#}");
+        assert!(message.contains("project config field `embedding_endpoint` is not trusted"));
+        assert!(message.contains("CODESTORY_EMBED_LLAMACPP_URL"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_opt_in_allows_project_summary_endpoint() -> Result<()> {
+        let _env = EnvRestore::capture(&[
+            "USERPROFILE",
+            "HOME",
+            PROJECT_NETWORK_CONFIG_OPT_IN_ENV,
+            "CODESTORY_SUMMARY_ENDPOINT",
+        ]);
+        clear_env(&["USERPROFILE", "HOME", "CODESTORY_SUMMARY_ENDPOINT"]);
+        unsafe {
+            std::env::set_var(PROJECT_NETWORK_CONFIG_OPT_IN_ENV, "1");
+        }
+
+        let project = tempdir()?;
+        std::fs::write(
+            project.path().join(".codestory.toml"),
+            r#"summary_endpoint = "https://example.invalid/v1/chat/completions""#,
+        )?;
+
+        let config = load_config(project.path())?;
+
+        assert_eq!(
+            config.summary_endpoint.as_deref(),
+            Some("https://example.invalid/v1/chat/completions")
+        );
+        assert_eq!(
+            std::env::var("CODESTORY_SUMMARY_ENDPOINT").as_deref(),
+            Ok("https://example.invalid/v1/chat/completions")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_opt_in_allows_project_embedding_endpoint() -> Result<()> {
+        let _env = EnvRestore::capture(&[
+            "USERPROFILE",
+            "HOME",
+            PROJECT_NETWORK_CONFIG_OPT_IN_ENV,
+            "CODESTORY_EMBED_LLAMACPP_URL",
+        ]);
+        clear_env(&["USERPROFILE", "HOME", "CODESTORY_EMBED_LLAMACPP_URL"]);
+        unsafe {
+            std::env::set_var(PROJECT_NETWORK_CONFIG_OPT_IN_ENV, "1");
+        }
+
+        let project = tempdir()?;
+        std::fs::write(
+            project.path().join(".codestory.toml"),
+            r#"embedding_endpoint = "http://127.0.0.1:8080/v1/embeddings""#,
+        )?;
+
+        let config = load_config(project.path())?;
+
+        assert_eq!(
+            config.embedding_endpoint.as_deref(),
+            Some("http://127.0.0.1:8080/v1/embeddings")
+        );
+        assert_eq!(
+            std::env::var("CODESTORY_EMBED_LLAMACPP_URL").as_deref(),
+            Ok("http://127.0.0.1:8080/v1/embeddings")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn home_config_can_set_cache_dir_and_network_defaults() -> Result<()> {
+        let _env = EnvRestore::capture(&[
+            "USERPROFILE",
+            "HOME",
+            "CODESTORY_SUMMARY_ENDPOINT",
+            "CODESTORY_SUMMARY_MODEL",
+            "CODESTORY_EMBED_LLAMACPP_URL",
+        ]);
+        clear_env(&[
+            "HOME",
+            "CODESTORY_SUMMARY_ENDPOINT",
+            "CODESTORY_SUMMARY_MODEL",
+            "CODESTORY_EMBED_LLAMACPP_URL",
+        ]);
+
+        let home = tempdir()?;
+        let project = tempdir()?;
+        unsafe {
+            std::env::set_var("USERPROFILE", home.path());
+        }
+        std::fs::write(
+            home.path().join(".codestory.toml"),
+            r#"
+cache_dir = "C:/trusted-cache"
+summary_endpoint = "https://example.invalid/v1/chat/completions"
+summary_model = "trusted/model"
+embedding_endpoint = "http://127.0.0.1:8080/v1/embeddings"
+"#,
+        )?;
+
+        let config = load_config(project.path())?;
+
+        assert_eq!(
+            config.cache_dir.as_deref(),
+            Some(Path::new("C:/trusted-cache"))
+        );
+        assert_eq!(
+            config.summary_endpoint.as_deref(),
+            Some("https://example.invalid/v1/chat/completions")
+        );
+        assert_eq!(config.summary_model.as_deref(), Some("trusted/model"));
+        assert_eq!(
+            config.embedding_endpoint.as_deref(),
+            Some("http://127.0.0.1:8080/v1/embeddings")
+        );
+        assert_eq!(
+            std::env::var("CODESTORY_SUMMARY_ENDPOINT").as_deref(),
+            Ok("https://example.invalid/v1/chat/completions")
+        );
+        assert_eq!(
+            std::env::var("CODESTORY_SUMMARY_MODEL").as_deref(),
+            Ok("trusted/model")
+        );
+        assert_eq!(
+            std::env::var("CODESTORY_EMBED_LLAMACPP_URL").as_deref(),
+            Ok("http://127.0.0.1:8080/v1/embeddings")
+        );
 
         Ok(())
     }

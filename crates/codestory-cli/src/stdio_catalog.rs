@@ -623,6 +623,33 @@ static TRAIL_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(
     &["focus", "trail"],
 );
 
+static GRAPH_TOOL_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Bounded CodeStory graph primitive output.",
+    &[
+        SchemaProperty::object("resolution", "Optional query resolution metadata.").nullable(),
+        SchemaProperty::object("node", "Node details DTO.").nullable(),
+        SchemaProperty::object("graph", "Graph response DTO.").nullable(),
+        SchemaProperty::string("certainty", "Overall certainty note."),
+        SchemaProperty::array(
+            "file_refs",
+            "Stable project-relative file references.",
+            &GENERIC_OBJECT_SCHEMA,
+        ),
+        SchemaProperty::object("limits", "Applied bounds for this graph primitive."),
+        SchemaProperty::integer("node_count", "Returned node count."),
+        SchemaProperty::integer("edge_count", "Returned edge count."),
+        SchemaProperty::boolean("truncated", "Whether the graph result was truncated."),
+    ],
+    &[
+        "certainty",
+        "file_refs",
+        "limits",
+        "node_count",
+        "edge_count",
+        "truncated",
+    ],
+);
+
 static SNIPPET_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(
     "CodeStory snippet context DTO.",
     &[
@@ -806,6 +833,84 @@ static TARGET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
 )
 .with_any_of_required(&[&["query"], &["id"]]);
 
+static GRAPH_TARGET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Resolve a single indexed graph node by stable id or query.",
+    &[
+        SchemaProperty::string("query", "Symbol query.").with_min_length(1),
+        SchemaProperty::string("id", "Stable node id.").with_min_length(1),
+        SchemaProperty::integer(
+            "choose",
+            "Resolve by the 1-based alternative number from an ambiguity error.",
+        )
+        .with_bounds(1, 50),
+    ],
+    &[],
+)
+.with_any_of_required(&[&["query"], &["id"]]);
+
+static GRAPH_NEIGHBORS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Return a bounded graph neighborhood around one node.",
+    &[
+        SchemaProperty::string("query", "Symbol query.").with_min_length(1),
+        SchemaProperty::string("id", "Stable node id.").with_min_length(1),
+        SchemaProperty::integer(
+            "choose",
+            "Resolve by the 1-based alternative number from an ambiguity error.",
+        )
+        .with_bounds(1, 50),
+        SchemaProperty::string("direction", "Graph direction.")
+            .with_enum(&["incoming", "outgoing", "both"])
+            .with_default(ValueLiteral::String("both")),
+        SchemaProperty::integer("depth", "Graph depth.")
+            .with_default(ValueLiteral::Integer(1))
+            .with_bounds(0, 3),
+        SchemaProperty::integer("max_nodes", "Maximum graph nodes returned.")
+            .with_default(ValueLiteral::Integer(50))
+            .with_bounds(1, 120),
+    ],
+    &[],
+)
+.with_any_of_required(&[&["query"], &["id"]]);
+
+static SHORTEST_PATH_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Return a bounded forward path graph between two stable node ids.",
+    &[
+        SchemaProperty::string("from_id", "Stable source node id.").with_min_length(1),
+        SchemaProperty::string("to_id", "Stable target node id.").with_min_length(1),
+        SchemaProperty::integer("max_depth", "Maximum path depth.")
+            .with_default(ValueLiteral::Integer(6))
+            .with_bounds(1, 10),
+        SchemaProperty::integer("max_nodes", "Maximum graph nodes returned.")
+            .with_default(ValueLiteral::Integer(80))
+            .with_bounds(2, 120),
+    ],
+    &["from_id", "to_id"],
+);
+
+static QUERY_SUBGRAPH_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Return a bounded graph subgraph around one resolved node.",
+    &[
+        SchemaProperty::string("query", "Symbol query.").with_min_length(1),
+        SchemaProperty::string("id", "Stable node id.").with_min_length(1),
+        SchemaProperty::integer(
+            "choose",
+            "Resolve by the 1-based alternative number from an ambiguity error.",
+        )
+        .with_bounds(1, 50),
+        SchemaProperty::string("direction", "Graph direction.")
+            .with_enum(&["incoming", "outgoing", "both"])
+            .with_default(ValueLiteral::String("both")),
+        SchemaProperty::integer("depth", "Graph depth.")
+            .with_default(ValueLiteral::Integer(2))
+            .with_bounds(0, 3),
+        SchemaProperty::integer("max_nodes", "Maximum graph nodes returned.")
+            .with_default(ValueLiteral::Integer(80))
+            .with_bounds(1, 120),
+    ],
+    &[],
+)
+.with_any_of_required(&[&["query"], &["id"]]);
+
 static SYMBOLS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Browse root symbols or children for a parent id.",
     &[
@@ -894,6 +999,34 @@ static TOOLS: &[ToolSpec] = &[
         description: "Return a graph trail around a symbol.",
         input_schema: TRAIL_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(TRAIL_CONTEXT_SCHEMA)),
+        safety: SafetyMetadata::read_only(),
+    },
+    ToolSpec {
+        name: "get_node",
+        description: "Return one stable graph node with file refs before requesting a packet.",
+        input_schema: GRAPH_TARGET_INPUT_SCHEMA,
+        output_schema: Some(SchemaSpec::Object(GRAPH_TOOL_OUTPUT_SCHEMA)),
+        safety: SafetyMetadata::read_only(),
+    },
+    ToolSpec {
+        name: "neighbors",
+        description: "Return a bounded graph neighborhood around one node.",
+        input_schema: GRAPH_NEIGHBORS_INPUT_SCHEMA,
+        output_schema: Some(SchemaSpec::Object(GRAPH_TOOL_OUTPUT_SCHEMA)),
+        safety: SafetyMetadata::read_only(),
+    },
+    ToolSpec {
+        name: "shortest_path",
+        description: "Return a bounded forward path graph between two node ids.",
+        input_schema: SHORTEST_PATH_INPUT_SCHEMA,
+        output_schema: Some(SchemaSpec::Object(GRAPH_TOOL_OUTPUT_SCHEMA)),
+        safety: SafetyMetadata::read_only(),
+    },
+    ToolSpec {
+        name: "query_subgraph",
+        description: "Return a bounded subgraph around one resolved node; packet remains the broad task tool.",
+        input_schema: QUERY_SUBGRAPH_INPUT_SCHEMA,
+        output_schema: Some(SchemaSpec::Object(GRAPH_TOOL_OUTPUT_SCHEMA)),
         safety: SafetyMetadata::read_only(),
     },
     ToolSpec {

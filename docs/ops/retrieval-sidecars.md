@@ -401,6 +401,15 @@ Traces must include `retrieval_mode` and `degraded_reason`.
 | `CODESTORY_RETRIEVAL_PRUNE_ON_SCAN_ERROR` | `1` allows retention deletes despite protection-scan errors (default off; fail-closed prune) |
 | `CODESTORY_EVAL_PROBES` | Test-only benchmark probe catalog switch; production runtime ignores this env var |
 
+Keep endpoint and cache-root settings out of project `.codestory.toml` files.
+Project config may describe indexing and semantic-document preferences, but
+`cache_dir`, `summary_endpoint`, `summary_model`, and embedding endpoint fields
+are trust boundaries. Use trusted user config, explicit CLI flags such as
+`--cache-dir`, or environment variables such as `CODESTORY_SUMMARY_ENDPOINT`,
+`CODESTORY_SUMMARY_MODEL`, and `CODESTORY_EMBED_LLAMACPP_URL`. Set
+`CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG=1` only when intentionally allowing a
+project file to provide network endpoints for that run.
+
 ---
 
 ## Related docs

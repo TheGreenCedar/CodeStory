@@ -51,6 +51,8 @@ pub const LLAMACPP_REQUEST_COUNT_ENV: &str = "CODESTORY_EMBED_LLAMACPP_REQUEST_C
 pub const STORED_VECTOR_ENCODING_ENV: &str = "CODESTORY_STORED_VECTOR_ENCODING";
 pub const SYMBOL_FULL_TEXT_INDEX_ENV: &str = "CODESTORY_SYMBOL_FULL_TEXT_INDEX";
 const DEFAULT_LLAMACPP_EMBEDDINGS_URL: &str = "http://127.0.0.1:8080/v1/embeddings";
+const DEFAULT_LLAMACPP_REQUEST_COUNT: usize = 1;
+const MAX_LLAMACPP_REQUEST_COUNT: usize = 16;
 const DEFAULT_ONNX_BATCH_TOKENS: usize = 32_768;
 #[cfg(test)]
 const SEMANTIC_QUANTIZED_RESCORE_MULTIPLIER: usize = 4;
@@ -107,6 +109,23 @@ fn symbol_full_text_index_enabled_from_env() -> bool {
 fn embedding_parallel_chunk_size(text_count: usize, worker_count: usize) -> usize {
     let workers = worker_count.max(1).min(text_count.max(1));
     text_count.max(1).div_ceil(workers).max(1)
+}
+
+fn llamacpp_request_count_from_env() -> usize {
+    let Ok(raw) = std::env::var(LLAMACPP_REQUEST_COUNT_ENV) else {
+        return DEFAULT_LLAMACPP_REQUEST_COUNT;
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "auto" | "available_parallelism") {
+        return std::thread::available_parallelism()
+            .map(|workers| workers.get())
+            .unwrap_or(DEFAULT_LLAMACPP_REQUEST_COUNT)
+            .clamp(1, MAX_LLAMACPP_REQUEST_COUNT);
+    }
+    normalized
+        .parse::<usize>()
+        .map(|value| value.clamp(1, MAX_LLAMACPP_REQUEST_COUNT))
+        .unwrap_or(DEFAULT_LLAMACPP_REQUEST_COUNT)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1442,7 +1461,7 @@ impl EmbeddingRuntime {
                     profile,
                     backend: EmbeddingBackend::LlamaCpp(Arc::new(LlamaCppEmbeddingRuntime {
                         endpoint,
-                        request_count: env_usize(LLAMACPP_REQUEST_COUNT_ENV, 1, 16).unwrap_or(1),
+                        request_count: llamacpp_request_count_from_env(),
                     })),
                 })
             }

@@ -23,6 +23,8 @@ fail-closed states.
 | `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
 | `--format` | enum | `markdown` | Output format: `markdown` or `json` |
 | `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
+| `--why` | boolean | `false` | Include compact ranking, uncertainty, and next-action evidence |
+| `--plan-details` | boolean | `false` | With `--why`, include the full Search Plan in Markdown and JSON |
 | `--hybrid-*` | n/a | unsupported | Hybrid tuning overrides are rejected under mandatory sidecar search because ignored weights would be misleading |
 
 ## Query Behavior
@@ -37,10 +39,11 @@ fail-closed states.
   in `auto` mode. Treat this as an uncertainty signal, not as successful graph
   grounding.
 - When hybrid retrieval finds strong semantic matches but no lexical match, Markdown and JSON output include `did_you_mean` suggestions.
-- Broad architecture-style queries can include `search_plan`. The plan reports
-  extracted and dropped terms, bounded subqueries, candidate windows, anchor
-  groups, repo-text promotion status, bridge evidence, next commands, and
-  source-truth checks. It is a discovery plan, not final answer prose.
+- Broad architecture-style queries can include `search_plan` when `--why
+  --plan-details` is set. The plan reports extracted and dropped terms, bounded
+  subqueries, candidate windows, anchor groups, repo-text promotion status,
+  bridge evidence, next commands, and source-truth checks. It is a discovery
+  plan, not final answer prose.
 - Ranking boosts exact and terminal symbol names, CamelCase initials, compound terms, and path co-location. Test, fixture, vendor, and external hits are dampened unless the query asks for them.
 - Import/re-export-looking exact hits are ranked below definition-looking hits when source-line evidence is available.
 - Repo-text evidence remains explicit navigation evidence. Treat repo-text hits
@@ -64,11 +67,13 @@ Each hit includes: node ID, display name, kind, file path, line number, relevanc
 
 Search output also includes `query_assessment` with exact symbol hit count, weak-hit/stale-anchor flags, any repo-text diagnostic reason, and a recommended next action. Use it to avoid treating weak semantic suggestions as proof of an exact anchor.
 
-For broad architecture queries, JSON may include `search_plan`; Markdown renders
-it when `--why` is set. Prefer `typed_anchor` and `promoted` plan groups as
-follow-up anchors. Treat `ambiguous` and `needs_source_read` groups as uncertain
-until direct source verification. Use the plan's next commands to continue with
-`symbol`, `trail`, `snippet`, or `explore`.
+For broad architecture queries, compact `--why` output omits the full Search
+Plan by default. Use `search --why --plan-details` when you need JSON
+`search_plan` or the Markdown Search Plan section. Prefer `typed_anchor` and
+`promoted` plan groups as follow-up anchors. Treat `ambiguous` and
+`needs_source_read` groups as uncertain until direct source verification. Use
+the plan's next commands to continue with `symbol`, `trail`, `snippet`, or
+`explore`.
 
 When a name appears more than once, prefer typed symbol hits such as `[function]`, `[struct]`, `[field]`, or `[file]` over `[unknown]` hits when you are verifying symbol surfacing. `[unknown]` results are often usage-like callsite or reference nodes, not the canonical definition.
 

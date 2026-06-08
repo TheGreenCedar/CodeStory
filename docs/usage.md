@@ -58,27 +58,28 @@ $TargetWorkspace = "C:\path\to\repo"
 CodeStory has two readiness tracks. Keep them separate when deciding whether an
 agent can rely on packet/search output.
 
-### Local navigation/cache readiness
+### Local navigation readiness
 
 This lane is for local browsing and source navigation. It uses the project
 SQLite cache built by `index` and read by commands such as `ground`, `symbol`,
 `trail`, `snippet`, `explore`, `context`, `files`, and `affected`.
 
-`doctor` may report this lane as `local_navigation`. A healthy local navigation
-lane means the cache can support graph and source navigation. It does not prove
-that sidecar packet/search is ready.
+`doctor` may report this lane as `local_navigation`. Local navigation readiness
+means the local cache, graph, lexical index, and DB-backed navigation commands
+are usable. It does not prove agent packet/search readiness.
 
-### Agent packet/search sidecar readiness
+### Agent packet/search readiness
 
 This lane is for agent-facing `packet` and `search` evidence. It requires the
 sidecar retrieval stack to be built and healthy: Zoekt lexical shards, Qdrant
 semantic vectors, SCIP graph artifacts, the llama.cpp query embedding endpoint,
 and a current retrieval manifest.
 
-`doctor` may report this lane as `agent_packet_search`. Treat this lane as
-ready only when sidecar status reports `retrieval_mode: "full"`. Missing,
-stale, stubbed, hash-vector, or non-product sidecar state is diagnostic only and
-must not be described as packet/search readiness.
+`doctor` may report this lane as `agent_packet_search`. Agent packet/search
+readiness means sidecar packet/search evidence is trustworthy only when
+retrieval status reports `retrieval_mode: "full"`. Missing, stale, stubbed,
+hash-vector, or non-product sidecar state is diagnostic only and must not be
+described as agent packet/search readiness.
 
 ## Common Workflows
 
@@ -88,11 +89,19 @@ must not be described as packet/search readiness.
 codestory-cli doctor --project <target-workspace>
 codestory-cli index --project <target-workspace> --refresh full
 codestory-cli ground --project <target-workspace> --why
+codestory-cli report --project <target-workspace> --output-file out/codestory-report.md
+codestory-cli report --project <target-workspace> --format json --output-file out/codestory-graph.json
 ```
 
 Use this when the repository is new to the agent. `doctor` tells you whether the
 cache and retrieval state are usable. `ground --why` gives broad orientation and
-reports limited coverage or gaps.
+reports limited coverage or gaps. `report` reads the current SQLite store
+without refreshing it and emits generated artifacts: Markdown for repo summary,
+hotspots, entry points, bridge/high-connectivity nodes, and next queries; JSON
+for automation that needs the full current graph, including nodes, edges,
+confidence/certainty, source locations, and generation metadata. `--limit`
+bounds the Markdown report sections, not the full JSON graph export. Treat both
+files as outputs to regenerate, not source-of-truth state.
 
 ### I need evidence for a broad question
 
@@ -121,7 +130,9 @@ and source. Use `context` when you want a bundled handoff around that target:
 codestory-cli context --project <target-workspace> --id <node-id> --bundle out/context-name
 ```
 
-`context` is target-first. It is not an open chat endpoint.
+Target context is DB-first evidence for one concrete target. `context` is
+target-first; it is not an open chat endpoint and is not a replacement for broad
+`packet`, `search`, or `drill` questions.
 
 ### I changed files and need likely impact
 
@@ -157,6 +168,9 @@ and retrieval state.
   semantic docs.
 - `ground`: broad repo-level orientation snapshot; `--why` explains retrieval
   mode, coverage, gaps, and next commands.
+- `report`: derived Markdown repo report or JSON graph export from the current
+  SQLite store; use `--output-file` to keep artifacts separate from terminal
+  logs.
 - `packet`: bounded broad-task evidence packet with citations, budget usage,
   gaps, and follow-up commands.
 - `search`: candidate discovery for symbols, files, literals, API paths,
@@ -175,6 +189,8 @@ and retrieval state.
 - `drill`: write a deterministic investigation report for selected anchors.
 - `setup embeddings`: install managed local embedding assets.
 - `serve --stdio`: persistent local read surface for repeated agent queries.
+  Use `get_node`, `neighbors`, `shortest_path`, or `query_subgraph` for cheap
+  graph probes from known node ids before asking for a broad `packet`.
 - `generate-completions`: emit shell completions from the command model.
 
 ## Index Options
@@ -212,6 +228,16 @@ Most commands default to Markdown because the normal operator path is human
 review. Use `--format markdown` when the output will be read directly in a
 terminal, pasted into a report, or inspected during recovery.
 
+Agent-facing Markdown starts with an operator header when the command has enough
+status evidence to do so: `Status`, `Trust`, `Next Action`, and `Proof Tier`
+come before dense citations, diagnostics, or graph details. This is the default
+shape for `doctor`, `ground --why`, `search --why`, `packet`, and `context`.
+
+`search --why` keeps provenance compact by default. Use
+`search --why --plan-details` only when you need the full broad-query search
+plan, including subqueries, candidate windows, bridge evidence, rejected
+candidates, and source-truth checks.
+
 Use `--format json` when automation needs the complete structured result,
 including fields that Markdown may summarize. JSON is the safer choice for
 tests, scripts, status gates, and any workflow that must compare exact values
@@ -227,10 +253,11 @@ and CI logs.
 
 ## Retrieval Defaults
 
-Sidecar retrieval is mandatory for agent-facing packet/search workflows. A
-project is usable only when the local Zoekt, Qdrant, and SCIP sidecars report
-`retrieval_mode=full`; missing sidecars, stale manifests, or embedding-contract
-drift fail closed instead of falling back to an older local search path.
+Sidecar retrieval is mandatory for agent-facing packet/search workflows. Agent
+packet/search readiness means sidecar packet/search evidence is trustworthy only
+when retrieval status reports `retrieval_mode=full`; missing sidecars, stale
+manifests, or embedding-contract drift fail closed instead of falling back to an
+older local search path.
 
 Basic local index:
 
@@ -241,7 +268,7 @@ codestory-cli ground --project <target-workspace> --why
 ```
 
 That lane builds and reads the local SQLite cache. It does not start sidecars,
-write the retrieval manifest, or prove packet/search readiness.
+write the retrieval manifest, or prove agent packet/search readiness.
 
 Product sidecar setup for agent-facing packet/search:
 
@@ -274,7 +301,7 @@ codestory-cli setup embeddings --project <target-workspace>
 ```
 
 Those commands install managed ONNX assets. They do not start llama.cpp, create
-the retrieval manifest, or prove product sidecar readiness. Retrieval sidecar
+the retrieval manifest, or prove agent packet/search readiness. Retrieval sidecar
 commands do not silently switch to ONNX mode just because managed assets are
 installed; unset retrieval backend means the product llama.cpp sidecar contract.
 
@@ -289,7 +316,7 @@ Useful environment knobs:
 
 Hash embeddings, ONNX-only experiments, lexical-only switches, and non-sidecar
 embedding paths are diagnostic or historical comparison modes only.
-Agent-facing packet/search evidence requires repaired sidecars and
+Agent packet/search readiness requires repaired sidecars and
 `retrieval_mode=full`.
 
 `index`, `ground`, `search`, `context`, and `doctor` report retrieval mode and
@@ -306,9 +333,30 @@ root for monorepo sessions:
 }
 ```
 
+Use `codestory_project.json` when one project needs explicit source groups:
+
+```json
+{
+  "name": "api",
+  "version": 1,
+  "source_groups": [
+    {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "language": "TypeScript",
+      "standard": "Default",
+      "source_paths": ["src/"],
+      "exclude_patterns": ["**/node_modules/**", "**/dist/**"],
+      "include_paths": [],
+      "defines": {},
+      "language_specific": "Other"
+    }
+  ]
+}
+```
+
 Team or user defaults can live in `.codestory.toml` at the project root or in
 the user home directory. The home file loads first, the project file overrides
-it, and explicit environment variables still win.
+it for project-safe preferences, and explicit environment variables still win.
 
 Example:
 
@@ -317,6 +365,15 @@ embedding_profile = "bge-base-en-v1.5"
 embedding_model_id = "BAAI/bge-base-en-v1.5-local"
 hybrid_retrieval_enabled = true
 ```
+
+Project `.codestory.toml` files are not trusted to choose cache roots,
+network/source-egress settings, or model selectors for source-egress calls. Put
+`cache_dir` in the user home `.codestory.toml` or pass `--cache-dir`. Put
+summary endpoints/models or embedding endpoints in trusted environment
+variables such as `CODESTORY_SUMMARY_ENDPOINT`, `CODESTORY_SUMMARY_MODEL`, or
+`CODESTORY_EMBED_LLAMACPP_URL`; a project file containing `summary_endpoint`,
+`summary_model`, or `embedding_endpoint` is rejected unless
+`CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG=1` is set deliberately for that run.
 
 `semantic_doc_scope` is intentionally omitted above because durable semantic
 docs are the default. Set it only when opting into the broader all-symbol scope;

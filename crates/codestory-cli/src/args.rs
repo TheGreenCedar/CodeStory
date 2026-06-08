@@ -23,10 +23,10 @@ CodeStory turns a local repository into auditable grounding evidence.
 
 Common lanes:
   New repo:      codestory-cli index --project <repo> --refresh full
-  Broad question: codestory-cli packet --project <repo> \"How does this system work?\"
+  Broad question: codestory-cli packet --project <repo> --question \"How does this system work?\"
   Exact target:  codestory-cli context --project <repo> --query <symbol-or-file>
 
-For agent-facing packet/search evidence, first run retrieval bootstrap + retrieval index and require retrieval status to report retrieval_mode=full.";
+For agent packet/search readiness, first run retrieval bootstrap + retrieval index and require retrieval status to report retrieval_mode=full.";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Skill-first repo grounding runtime", long_about = CLI_LONG_ABOUT)]
@@ -41,6 +41,8 @@ pub(crate) enum Command {
     Index(IndexCommand),
     #[command(about = "Summarize indexed repository context.")]
     Ground(GroundCommand),
+    #[command(about = "Generate a repo report or machine graph export from the current store.")]
+    Report(ReportCommand),
     #[command(about = "Gather evidence for one concrete target.")]
     Context(ContextCommand),
     #[command(about = "Answer a broad repository question with evidence.")]
@@ -280,6 +282,28 @@ pub(crate) struct GroundCommand {
         help = "Explain retrieval mode, coverage, and query hints in the Markdown output."
     )]
     pub(crate) why: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ReportCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write the generated report/export artifact to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = parse_positive_usize,
+        default_value_t = 10,
+        help = "Maximum number of hotspots, entry points, bridges, and follow-up queries to include in report sections. JSON graph export still includes the full graph."
+    )]
+    pub(crate) limit: usize,
 }
 
 #[derive(Args, Debug)]
@@ -603,6 +627,12 @@ pub(crate) struct SearchCommand {
         help = "Show compact ranking, uncertainty, and next-action explanations for each result."
     )]
     pub(crate) why: bool,
+    #[arg(
+        long = "plan-details",
+        requires = "why",
+        help = "Include the full search plan in --why output. By default --why keeps provenance compact."
+    )]
+    pub(crate) plan_details: bool,
     #[arg(
         long = "hybrid-lexical",
         value_name = "WEIGHT",
