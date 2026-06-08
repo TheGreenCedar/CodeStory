@@ -4654,6 +4654,93 @@ struct BuiltLlmSymbolDoc {
     reusable: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticVectorReuseContractKey {
+    backend: String,
+    profile: String,
+    model_id: String,
+    dimension: u32,
+    doc_shape: String,
+}
+
+impl SemanticVectorReuseContractKey {
+    fn from_existing(existing_doc: &LlmSymbolDocReuseMetadata) -> Option<Self> {
+        if existing_doc.doc_version != LLM_SYMBOL_DOC_SCHEMA_VERSION
+            || existing_doc.embedding_dim == 0
+        {
+            return None;
+        }
+        Some(Self {
+            backend: existing_doc.embedding_backend.clone()?,
+            profile: existing_doc.embedding_profile.clone()?,
+            model_id: existing_doc.embedding_model.clone(),
+            dimension: existing_doc.embedding_dim,
+            doc_shape: existing_doc.doc_shape.clone()?,
+        })
+    }
+
+    fn current(embedding_contract: &EmbeddingProfileContractDto, dimension: u32) -> Self {
+        Self {
+            backend: embedding_contract.backend.clone(),
+            profile: embedding_contract.profile.clone(),
+            model_id: embedding_contract.cache_key.clone(),
+            dimension,
+            doc_shape: embedding_contract.doc_shape.clone(),
+        }
+    }
+
+    fn matches_current_without_known_dimension(
+        &self,
+        embedding_contract: &EmbeddingProfileContractDto,
+    ) -> bool {
+        self.backend.as_str() == embedding_contract.backend.as_str()
+            && self.profile.as_str() == embedding_contract.profile.as_str()
+            && self.model_id.as_str() == embedding_contract.cache_key.as_str()
+            && self.dimension > 0
+            && self.doc_shape.as_str() == embedding_contract.doc_shape.as_str()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticVectorReuseKey {
+    contract: SemanticVectorReuseContractKey,
+    doc_hash: String,
+}
+
+impl SemanticVectorReuseKey {
+    fn from_existing(existing_doc: &LlmSymbolDocReuseMetadata) -> Option<Self> {
+        if existing_doc.doc_hash.is_empty() {
+            return None;
+        }
+        Some(Self {
+            contract: SemanticVectorReuseContractKey::from_existing(existing_doc)?,
+            doc_hash: existing_doc.doc_hash.clone(),
+        })
+    }
+
+    fn current(
+        doc_hash: &str,
+        embedding_contract: &EmbeddingProfileContractDto,
+        dimension: u32,
+    ) -> Self {
+        Self {
+            contract: SemanticVectorReuseContractKey::current(embedding_contract, dimension),
+            doc_hash: doc_hash.to_string(),
+        }
+    }
+
+    fn matches_current_without_known_dimension(
+        &self,
+        doc_hash: &str,
+        embedding_contract: &EmbeddingProfileContractDto,
+    ) -> bool {
+        self.doc_hash == doc_hash
+            && self
+                .contract
+                .matches_current_without_known_dimension(embedding_contract)
+    }
+}
+
 fn llm_symbol_doc_hash(doc_text: &str) -> String {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
@@ -4676,27 +4763,30 @@ fn llm_symbol_doc_hash(doc_text: &str) -> String {
 fn llm_symbol_doc_contract_matches(
     existing_doc: &LlmSymbolDocReuseMetadata,
     embedding_contract: &EmbeddingProfileContractDto,
-    model_id: &str,
 ) -> bool {
-    existing_doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
-        && existing_doc.embedding_profile.as_deref() == Some(embedding_contract.profile.as_str())
-        && existing_doc.embedding_model == model_id
-        && existing_doc.embedding_backend.as_deref() == Some(embedding_contract.backend.as_str())
-        && embedding_contract
-            .dimension
-            .map(|dimension| existing_doc.embedding_dim == dimension)
-            .unwrap_or(existing_doc.embedding_dim > 0)
-        && existing_doc.doc_shape.as_deref() == Some(embedding_contract.doc_shape.as_str())
+    let Some(existing_key) = SemanticVectorReuseContractKey::from_existing(existing_doc) else {
+        return false;
+    };
+    if let Some(dimension) = embedding_contract.dimension {
+        return existing_key
+            == SemanticVectorReuseContractKey::current(embedding_contract, dimension);
+    }
+    existing_key.matches_current_without_known_dimension(embedding_contract)
 }
 
 fn llm_symbol_doc_can_reuse(
     existing_doc: &LlmSymbolDocReuseMetadata,
     doc_hash: &str,
     embedding_contract: &EmbeddingProfileContractDto,
-    model_id: &str,
 ) -> bool {
-    existing_doc.doc_hash == doc_hash
-        && llm_symbol_doc_contract_matches(existing_doc, embedding_contract, model_id)
+    let Some(existing_key) = SemanticVectorReuseKey::from_existing(existing_doc) else {
+        return false;
+    };
+    if let Some(dimension) = embedding_contract.dimension {
+        return existing_key
+            == SemanticVectorReuseKey::current(doc_hash, embedding_contract, dimension);
+    }
+    existing_key.matches_current_without_known_dimension(doc_hash, embedding_contract)
 }
 
 fn sort_pending_llm_symbol_docs_for_embedding_batches(docs: &mut [PendingLlmSymbolDoc]) {
@@ -4833,7 +4923,6 @@ fn sync_llm_symbol_projection(
             "Failed to resolve current embedding profile contract after configuring runtime",
         )
     })?;
-    let model_id = embedding_contract.cache_key.clone();
     let updated_at_epoch_ms = current_epoch_ms();
 
     let existing_docs = storage
@@ -4845,7 +4934,7 @@ fn sync_llm_symbol_projection(
 
     let expand_semantic_scope_for_contract_repair = llm_refresh_file_scope.is_some()
         && existing_docs.values().any(|existing_doc| {
-            !llm_symbol_doc_contract_matches(existing_doc, &embedding_contract, &model_id)
+            !llm_symbol_doc_contract_matches(existing_doc, &embedding_contract)
         });
     if expand_semantic_scope_for_contract_repair {
         tracing::warn!(
@@ -4916,12 +5005,7 @@ fn sync_llm_symbol_projection(
                 );
                 let doc_hash = llm_symbol_doc_hash(&doc_text);
                 let reusable = existing_docs.get(&node.id).is_some_and(|existing_doc| {
-                    llm_symbol_doc_can_reuse(
-                        existing_doc,
-                        &doc_hash,
-                        &embedding_contract,
-                        &model_id,
-                    )
+                    llm_symbol_doc_can_reuse(existing_doc, &doc_hash, &embedding_contract)
                 });
 
                 BuiltLlmSymbolDoc {
