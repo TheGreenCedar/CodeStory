@@ -91,23 +91,40 @@ cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocap
 
 The real-repo drill portion fails closed unless `CODESTORY_REAL_REPO_DRILL_CASES`
 points at a prepared manifest. Use `CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1`
-only for intentional local stats-only rows; those rows are not real-drill release
-evidence.
+only to make that separate drill skip explicit during local release-evidence
+collection. A skipped drill means the release evidence is not real-repo drill
+proof; it does not rename the `proof_tier` emitted by the stats JSON.
 
-Append the emitted headline metrics to `docs/testing/codestory-e2e-stats-log.md`. Include graph seconds, semantic seconds, semantic docs reused, semantic docs embedded, total index seconds, `retrieval_index_seconds`, `retrieval_status_seconds`, and whether `sidecar_status_after_retrieval_index` plus `search.sidecar_shadow_retrieval_mode` were `full`.
+Append the emitted headline metrics to `docs/testing/codestory-e2e-stats-log.md`. Include graph seconds, semantic seconds, semantic docs reused, semantic docs embedded, total index seconds, `retrieval_index_seconds`, `retrieval_status_seconds`, `proof_tier`, any `warnings`, and whether `sidecar_status_after_retrieval_index` plus `search.sidecar_shadow_retrieval_mode` were `full`.
 
 Release-readiness evidence is tiered:
 
 | Evidence tier | Required proof | Release meaning |
 | --- | --- | --- |
-| Stats-only | `codestory_repo_e2e_stats` completed with `CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1` or without prepared full sidecars | Useful local regression signal only; not release proof for packet/search readiness. |
-| Full sidecar | Local Zoekt, Qdrant, SCIP, and llama.cpp are running; `retrieval index --refresh full` succeeds; `retrieval status --format json` reports `retrieval_mode: "full"` plus product backend fields | Required before claiming agent-facing packet/search readiness on the current workspace. |
+| Stats-only / degraded sidecar | Diagnostic timing or contract evidence without prepared full sidecars, or stats output whose `proof_tier` is `stats_only` | Useful local regression signal only; not release proof for packet/search readiness. The current passing `codestory_repo_release_e2e_emits_stats` harness asserts full sidecar status instead of completing as a passing no-full-sidecar row. |
+| Full sidecar | `codestory_repo_release_e2e_emits_stats` emits `proof_tier: "full_sidecar"` after local Zoekt, Qdrant, SCIP, and llama.cpp are running; `retrieval index --refresh full` succeeds; `retrieval status --format json` reports `retrieval_mode: "full"`; and search shadow mode is `full` | Required before claiming agent-facing packet/search readiness on the current workspace. This is the normal tier for a passing stats JSON object from the release e2e stats harness. |
 | Real-repo drill | `CODESTORY_REAL_REPO_DRILL_CASES` points at prepared manifests and the drill cases run without skip allowances | Required before claiming the release was exercised beyond the CodeStory checkout. |
 | Promotion-grade benchmark | Baseline and candidate benchmark rows are captured with sidecar status, search shadow mode, and no-regression threshold | Required for performance or retrieval-quality promotion claims. |
 
 When logging release evidence, state the highest tier reached and the exact
-skip env vars used. A stats-only row must not be described as full sidecar or
-real-repo drill evidence.
+skip env vars used. The stats JSON reports `proof_tier` as the highest tier
+proven by that stats object. If `CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1`
+was used, record that the real-repo drill was intentionally skipped, but preserve
+the stats JSON tier exactly; for example, a passing full-sidecar stats object
+remains `full_sidecar`, not `stats_only`. Warning-free full-sidecar stats must
+not be promoted to real-repo drill or promotion-grade evidence by themselves.
+
+The stats JSON also reports `warnings` for performance thresholds that should
+stay visible in logged evidence:
+
+| Warning | Threshold |
+| --- | --- |
+| Total index time | `index_seconds > 600` |
+| Semantic phase time | `semantic_phase_seconds > 500` |
+
+Preserve those warning strings when copying the run into release evidence. An
+empty `warnings` array only means the measured run stayed under these warning
+thresholds; it does not raise the proof tier.
 
 For the current repo-scale baseline, use the latest row in
 [`codestory-e2e-stats-log.md`](../testing/codestory-e2e-stats-log.md). Older
