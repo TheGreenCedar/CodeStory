@@ -7561,13 +7561,18 @@ impl AppController {
                 .unwrap_or_else(|| {
                     "sidecar retrieval primary is mandatory; legacy search is disabled".to_string()
                 });
-            return Err(ApiError::invalid_argument(reason));
+            return Err(
+                agent::retrieval_primary::sidecar_retrieval_unavailable_error(self, reason),
+            );
         }
 
         let query = intent_query.effective_query.clone();
         let query_result = agent::retrieval_primary::run_sidecar_query(self, &query, None)
             .map_err(|error| {
-                ApiError::invalid_argument(format!("sidecar search failed: {error}"))
+                agent::retrieval_primary::sidecar_retrieval_unavailable_error(
+                    self,
+                    format!("sidecar search failed: {error}"),
+                )
             })?;
         let mut indexed_symbol_hits =
             agent::retrieval_primary::resolve_sidecar_candidates_to_search_hits(
@@ -7586,9 +7591,12 @@ impl AppController {
                 &indexed_symbol_hits,
                 5,
             );
-            return Err(ApiError::invalid_argument(format!(
-                "sidecar search rejected query: {reason}; {diagnostic}"
-            )));
+            return Err(
+                agent::retrieval_primary::sidecar_retrieval_unavailable_error(
+                    self,
+                    format!("sidecar search rejected query: {reason}; {diagnostic}"),
+                ),
+            );
         }
         let candidate_count = query_result.hits.len();
         let resolved_hit_count = indexed_symbol_hits.len();
@@ -9608,7 +9616,7 @@ mod tests {
     }
 
     fn assert_mandatory_sidecar_unavailable(error: &ApiError) {
-        assert_eq!(error.code, "invalid_argument");
+        assert_eq!(error.code, "retrieval_unavailable");
         assert!(
             error
                 .message
@@ -9617,6 +9625,12 @@ mod tests {
                     .message
                     .contains("sidecar retrieval primary is mandatory"),
             "expected mandatory sidecar failure, got {error:?}"
+        );
+        let details = error.details.as_ref().expect("retrieval error details");
+        assert_eq!(details.failed_layer.as_deref(), Some("retrieval_sidecar"));
+        assert!(
+            !details.next_commands.is_empty(),
+            "retrieval error should include repair commands: {error:?}"
         );
     }
 

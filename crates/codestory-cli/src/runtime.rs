@@ -448,7 +448,20 @@ pub(crate) fn ensure_index_ready(opened: &OpenedProject, subcommand: &str) -> Re
 }
 
 pub(crate) fn map_api_error(error: ApiError) -> anyhow::Error {
-    anyhow!("{}: {}", error.code, error.message)
+    let mut message = format!("{}: {}", error.code, error.message);
+    if let Some(next_commands) = api_error_next_commands(&error) {
+        message.push_str("\n\nNext commands:");
+        for command in next_commands {
+            message.push_str("\n  ");
+            message.push_str(&command);
+        }
+    }
+    anyhow!(message)
+}
+
+fn api_error_next_commands(error: &ApiError) -> Option<Vec<String>> {
+    let commands = &error.details.as_ref()?.next_commands;
+    (!commands.is_empty()).then_some(commands.clone())
 }
 
 pub(crate) fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {

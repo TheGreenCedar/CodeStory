@@ -279,9 +279,18 @@ fn search_json_fails_closed_without_full_sidecars() {
     );
     let stderr = String::from_utf8_lossy(&search.stderr);
     assert!(
-        stderr.contains("sidecar retrieval primary is unavailable or degraded")
-            && stderr.contains("expected mode=full"),
+        stderr.contains(
+            "retrieval_unavailable: sidecar retrieval primary is unavailable or degraded"
+        ) && stderr.contains("expected mode=full"),
         "search should report mandatory sidecar full-mode boundary: {stderr}"
+    );
+    assert!(
+        stderr.contains("Next commands:")
+            && stderr.contains("codestory-cli index")
+            && stderr.contains("--refresh full")
+            && stderr.contains("codestory-cli retrieval bootstrap")
+            && stderr.contains("codestory-cli doctor"),
+        "search should include retrieval repair commands: {stderr}"
     );
 }
 

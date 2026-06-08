@@ -1633,6 +1633,11 @@ fn search_tool_fails_closed_without_full_retrieval_sidecars() {
     );
 
     let error = assert_tool_error(&response, json!("search-requires-full-retrieval"));
+    assert_eq!(
+        error.pointer("/code").and_then(Value::as_str),
+        Some("retrieval_unavailable"),
+        "stdio search should preserve typed retrieval failure code: {response}"
+    );
     let message = error
         .pointer("/message")
         .and_then(Value::as_str)
@@ -1641,6 +1646,33 @@ fn search_tool_fails_closed_without_full_retrieval_sidecars() {
         message.contains("sidecar retrieval primary is unavailable or degraded")
             && message.contains("expected mode=full"),
         "stdio search should fail closed when the fixture has only a plain index: {response}"
+    );
+    let details = error
+        .pointer("/details")
+        .unwrap_or_else(|| panic!("stdio search error should include details: {response}"));
+    assert_eq!(details["failed_layer"], json!("retrieval_sidecar"));
+    let expected_project = fs::canonicalize(fixture.workspace.path()).expect("canonical project");
+    assert_eq!(
+        details["project"].as_str(),
+        Some(expected_project.to_str().expect("workspace path")),
+        "stdio search error should include the current project path: {response}"
+    );
+    let next_commands = details["next_commands"]
+        .as_array()
+        .unwrap_or_else(|| panic!("stdio search error should include next_commands: {response}"));
+    assert!(
+        next_commands
+            .iter()
+            .any(|command| command.as_str().is_some_and(|text| text
+                .contains("codestory-cli index")
+                && text.contains("--refresh full"))),
+        "stdio search error should include index repair command: {response}"
+    );
+    assert!(
+        next_commands.iter().any(|command| command
+            .as_str()
+            .is_some_and(|text| text.contains("codestory-cli retrieval bootstrap"))),
+        "stdio search error should include sidecar bootstrap repair command: {response}"
     );
 }
 
