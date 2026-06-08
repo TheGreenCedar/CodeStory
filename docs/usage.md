@@ -58,27 +58,28 @@ $TargetWorkspace = "C:\path\to\repo"
 CodeStory has two readiness tracks. Keep them separate when deciding whether an
 agent can rely on packet/search output.
 
-### Local navigation/cache readiness
+### Local navigation readiness
 
 This lane is for local browsing and source navigation. It uses the project
 SQLite cache built by `index` and read by commands such as `ground`, `symbol`,
 `trail`, `snippet`, `explore`, `context`, `files`, and `affected`.
 
-`doctor` may report this lane as `local_navigation`. A healthy local navigation
-lane means the cache can support graph and source navigation. It does not prove
-that sidecar packet/search is ready.
+`doctor` may report this lane as `local_navigation`. Local navigation readiness
+means the local cache, graph, lexical index, and DB-backed navigation commands
+are usable. It does not prove agent packet/search readiness.
 
-### Agent packet/search sidecar readiness
+### Agent packet/search readiness
 
 This lane is for agent-facing `packet` and `search` evidence. It requires the
 sidecar retrieval stack to be built and healthy: Zoekt lexical shards, Qdrant
 semantic vectors, SCIP graph artifacts, the llama.cpp query embedding endpoint,
 and a current retrieval manifest.
 
-`doctor` may report this lane as `agent_packet_search`. Treat this lane as
-ready only when sidecar status reports `retrieval_mode: "full"`. Missing,
-stale, stubbed, hash-vector, or non-product sidecar state is diagnostic only and
-must not be described as packet/search readiness.
+`doctor` may report this lane as `agent_packet_search`. Agent packet/search
+readiness means sidecar packet/search evidence is trustworthy only when
+retrieval status reports `retrieval_mode: "full"`. Missing, stale, stubbed,
+hash-vector, or non-product sidecar state is diagnostic only and must not be
+described as agent packet/search readiness.
 
 ## Common Workflows
 
@@ -121,7 +122,9 @@ and source. Use `context` when you want a bundled handoff around that target:
 codestory-cli context --project <target-workspace> --id <node-id> --bundle out/context-name
 ```
 
-`context` is target-first. It is not an open chat endpoint.
+Target context is DB-first evidence for one concrete target. `context` is
+target-first; it is not an open chat endpoint and is not a replacement for broad
+`packet`, `search`, or `drill` questions.
 
 ### I changed files and need likely impact
 
@@ -227,10 +230,11 @@ and CI logs.
 
 ## Retrieval Defaults
 
-Sidecar retrieval is mandatory for agent-facing packet/search workflows. A
-project is usable only when the local Zoekt, Qdrant, and SCIP sidecars report
-`retrieval_mode=full`; missing sidecars, stale manifests, or embedding-contract
-drift fail closed instead of falling back to an older local search path.
+Sidecar retrieval is mandatory for agent-facing packet/search workflows. Agent
+packet/search readiness means sidecar packet/search evidence is trustworthy only
+when retrieval status reports `retrieval_mode=full`; missing sidecars, stale
+manifests, or embedding-contract drift fail closed instead of falling back to an
+older local search path.
 
 Basic local index:
 
@@ -241,7 +245,7 @@ codestory-cli ground --project <target-workspace> --why
 ```
 
 That lane builds and reads the local SQLite cache. It does not start sidecars,
-write the retrieval manifest, or prove packet/search readiness.
+write the retrieval manifest, or prove agent packet/search readiness.
 
 Product sidecar setup for agent-facing packet/search:
 
@@ -274,7 +278,7 @@ codestory-cli setup embeddings --project <target-workspace>
 ```
 
 Those commands install managed ONNX assets. They do not start llama.cpp, create
-the retrieval manifest, or prove product sidecar readiness. Retrieval sidecar
+the retrieval manifest, or prove agent packet/search readiness. Retrieval sidecar
 commands do not silently switch to ONNX mode just because managed assets are
 installed; unset retrieval backend means the product llama.cpp sidecar contract.
 
@@ -289,7 +293,7 @@ Useful environment knobs:
 
 Hash embeddings, ONNX-only experiments, lexical-only switches, and non-sidecar
 embedding paths are diagnostic or historical comparison modes only.
-Agent-facing packet/search evidence requires repaired sidecars and
+Agent packet/search readiness requires repaired sidecars and
 `retrieval_mode=full`.
 
 `index`, `ground`, `search`, `context`, and `doctor` report retrieval mode and
@@ -303,6 +307,27 @@ root for monorepo sessions:
 ```json
 {
   "members": ["backend/", "frontend/", "shared/"]
+}
+```
+
+Use `codestory_project.json` when one project needs explicit source groups:
+
+```json
+{
+  "name": "api",
+  "version": 1,
+  "source_groups": [
+    {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "language": "TypeScript",
+      "standard": "Default",
+      "source_paths": ["src/"],
+      "exclude_patterns": ["**/node_modules/**", "**/dist/**"],
+      "include_paths": [],
+      "defines": {},
+      "language_specific": "Other"
+    }
+  ]
 }
 ```
 

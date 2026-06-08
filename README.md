@@ -32,9 +32,10 @@ correctness guarantee. It gives operators and coding agents explicit commands
 for cache health, indexing, search, trails, snippets, and source-backed answers
 that name the files they used. The per-project SQLite cache is separate from
 the optional local retrieval sidecars used by packet/search workflows; a healthy
-cache does not by itself prove sidecar readiness. Benchmark notes are
-environment- and repository-specific evidence, so public claims should cite the
-checked setup instead of promising universal speedups or savings.
+local navigation readiness report does not by itself prove agent packet/search
+readiness. Benchmark notes are environment- and repository-specific evidence,
+so public claims should cite the checked setup instead of promising universal
+speedups or savings.
 
 ## Try It On A Repo
 
@@ -51,13 +52,16 @@ $TargetWorkspace = "C:\path\to\repo"
 & $CodeStoryCli ground --project $TargetWorkspace --why
 ```
 
-That basic path builds the local SQLite index and is enough for health, file,
-symbol, trail, snippet, and orientation checks. The managed embedding dry-run is
-a local semantic setup check; it does not prove sidecar readiness.
+That basic path establishes local navigation readiness: the local cache, graph,
+lexical index, and DB-backed navigation commands are usable for health, file,
+symbol, trail, snippet, context, and orientation checks. The managed embedding
+dry-run is a local semantic setup check; it does not prove agent packet/search
+readiness.
 
-Agent-facing `packet` and `search` evidence has one extra readiness contract:
-local Zoekt, Qdrant, SCIP, and llama.cpp embedding sidecars must report
-`retrieval_mode=full`.
+Agent packet/search readiness has one extra contract: sidecar packet/search
+evidence is trustworthy only when retrieval status reports `retrieval_mode=full`.
+That full mode depends on local Zoekt, Qdrant, SCIP, and llama.cpp embedding
+sidecars.
 
 ```powershell
 node scripts/setup-retrieval-env.mjs --fetch-embed-model
@@ -74,7 +78,7 @@ cargo retrieval-setup
 
 Missing sidecars, stale manifests, disabled sidecars, mixed stored-doc vector
 contracts, or diagnostic embedding modes are setup failures to fix before
-trusting packet/search context.
+trusting agent-facing packet/search evidence.
 
 After that first index, use narrower commands instead of asking the agent to
 start over:
@@ -142,7 +146,7 @@ The skill package lives at
 
 | Need | Command |
 | --- | --- |
-| Health and cache readiness | `codestory-cli doctor --project <target-workspace>` |
+| Local navigation readiness | `codestory-cli doctor --project <target-workspace>` |
 | Build or refresh an index | `codestory-cli index --project <target-workspace> --refresh full` |
 | Broad orientation | `codestory-cli ground --project <target-workspace> --why` |
 | Broad task evidence | `codestory-cli packet --project <target-workspace> --question "<task>" --budget compact` |
@@ -155,8 +159,10 @@ The skill package lives at
 | Changed-file impact | `codestory-cli affected --project <target-workspace> --format markdown` |
 | Persistent read surface | `codestory-cli serve --project <target-workspace> --stdio` |
 
-Use `packet` for broad task questions. Use `context` after you have one concrete
-target. Use `doctor` when output looks stale, incomplete, or inconsistent.
+Use `packet` for broad task questions. Target context is DB-first evidence for
+one concrete target; use `context` after search, trail, explore, or a bookmark
+has selected that target. Use `doctor` when output looks stale, incomplete, or
+inconsistent.
 
 ## What It Builds
 
