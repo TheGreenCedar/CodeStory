@@ -63,7 +63,7 @@ pub(crate) enum Command {
     Snippet(SnippetCommand),
     #[command(about = "Run structured graph queries.")]
     Query(QueryCommand),
-    #[command(about = "Explore a target without the TUI.")]
+    #[command(about = "Open the terminal explorer or print an exploration packet.")]
     Explore(ExploreCommand),
     #[command(about = "List indexed files and coverage.")]
     Files(FilesCommand),

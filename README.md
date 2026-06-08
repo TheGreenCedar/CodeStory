@@ -25,6 +25,17 @@ assets are installed. Setup can fetch the CodeStory source artifact or managed
 embedding assets; the indexed project data stays in the user cache and commands
 stay explicit about which workspace they read.
 
+## Public Promise
+
+CodeStory is a local evidence layer for repositories, not an automatic
+correctness guarantee. It gives operators and coding agents explicit commands
+for cache health, indexing, search, trails, snippets, and source-backed answers
+that name the files they used. The per-project SQLite cache is separate from
+the optional local retrieval sidecars used by packet/search workflows; a healthy
+cache does not by itself prove sidecar readiness. Benchmark notes are
+environment- and repository-specific evidence, so public claims should cite the
+checked setup instead of promising universal speedups or savings.
+
 ## Try It On A Repo
 
 From this checkout, build the CLI and point it at any repository:

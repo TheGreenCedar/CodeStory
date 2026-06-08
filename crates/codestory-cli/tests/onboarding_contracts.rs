@@ -86,10 +86,86 @@ fn assert_public_doc_avoids_agent_specific_framing(file: &Path, contents: &str) 
     }
 }
 
+fn extract_inline_toml_string_array(manifest: &str, key: &str) -> Vec<String> {
+    let prefix = format!("{key} = [");
+    let line = manifest
+        .lines()
+        .find(|line| line.trim_start().starts_with(&prefix))
+        .unwrap_or_else(|| panic!("manifest should contain inline array `{key}`"));
+    let values = line
+        .trim()
+        .strip_prefix(&prefix)
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or_else(|| panic!("manifest should use inline string array for `{key}`"));
+
+    values
+        .split(',')
+        .map(|value| value.trim().trim_matches('"').to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+#[test]
+fn cli_package_metadata_is_adoption_ready() {
+    let root = repo_root();
+    let manifest_path = root.join("crates/codestory-cli/Cargo.toml");
+    let manifest = fs::read_to_string(&manifest_path).expect("CLI manifest should exist");
+
+    for required in [
+        "description = \"Local repository evidence and grounding CLI for source-backed coding workflows.\"",
+        "license = \"Apache-2.0\"",
+        "repository = \"https://github.com/TheGreenCedar/CodeStory.git\"",
+        "readme = \"../../README.md\"",
+    ] {
+        assert!(
+            manifest.contains(required),
+            "CLI package metadata should include `{required}`"
+        );
+    }
+
+    let readme_from_manifest = manifest_path
+        .parent()
+        .expect("CLI manifest should have parent")
+        .join("../../README.md");
+    assert_eq!(
+        fs::canonicalize(readme_from_manifest).expect("manifest readme path should resolve"),
+        fs::canonicalize(root.join("README.md")).expect("repo README should resolve"),
+        "CLI package readme should point at the repository README"
+    );
+
+    let keywords = extract_inline_toml_string_array(&manifest, "keywords");
+    assert_eq!(
+        keywords,
+        vec!["code-search", "grounding", "cli", "agents"],
+        "keywords should stay conservative and adoption-oriented"
+    );
+    assert!(
+        keywords.len() <= 5,
+        "crates.io accepts at most five package keywords"
+    );
+    for keyword in keywords {
+        assert!(
+            keyword.len() <= 20
+                && keyword
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'),
+            "keyword should stay crates.io-compatible: {keyword}"
+        );
+    }
+
+    let categories = extract_inline_toml_string_array(&manifest, "categories");
+    assert_eq!(
+        categories,
+        vec!["command-line-utilities", "development-tools"],
+        "categories should stay accurate and crates.io-compatible"
+    );
+}
+
 #[test]
 fn readme_keeps_customer_first_onboarding() {
     let root = repo_root();
     let readme = fs::read_to_string(root.join("README.md")).expect("README should exist");
+    assert!(readme.contains("Public Promise"));
     assert!(readme.contains("Try It On A Repo"));
     assert!(readme.contains("What It Builds"));
     assert!(readme.contains("Local codebase grounding for coding agents"));
@@ -97,6 +173,14 @@ fn readme_keeps_customer_first_onboarding() {
     assert!(readme.contains("Core Flow"));
     assert!(readme.contains("Hack On CodeStory"));
     assert!(readme.contains("A good CodeStory-backed answer should name"));
+    assert!(readme.contains("local evidence layer for repositories"));
+    assert!(readme.contains("explicit commands"));
+    assert!(readme.contains("source-backed answers"));
+    assert!(readme.contains("per-project SQLite cache is separate"));
+    assert!(readme.contains("local retrieval sidecars"));
+    assert!(readme.contains("does not by itself prove sidecar readiness"));
+    assert!(readme.contains("environment- and repository-specific evidence"));
+    assert!(readme.contains("instead of promising universal speedups or savings"));
     assert!(readme.contains("benchmark history"));
     assert!(readme.contains("checked with `doctor`"));
     assert!(readme.contains(".agents/skills/codestory-grounding/SKILL.md"));
