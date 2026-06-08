@@ -567,8 +567,8 @@ pub(crate) fn render_search_markdown(project_root: &Path, output: &SearchOutput)
         append_search_plan(&mut markdown, project_root, plan);
     }
     if output.explain {
-        append_search_sidecar_diagnostics(&mut markdown, output);
         append_search_evidence_packet(&mut markdown, project_root, output);
+        append_search_sidecar_diagnostics(&mut markdown, output);
     }
     if !output.suggestions.is_empty() {
         let _ = writeln!(markdown, "did_you_mean:");
@@ -3415,8 +3415,8 @@ mod tests {
         GroundingCoverageDto, GroundingFileDigestDto, GroundingSnapshotDto,
         GroundingSymbolDigestDto, IndexFreshnessDto, NodeDetailsDto, NodeId, NodeKind,
         RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto,
-        RetrievalStateDto, SearchHitOrigin, SearchPlanNextActionDto, SemanticModeDto,
-        StorageStatsDto, TrailContextDto, TrailStoryDto, TrailStoryStepDto,
+        RetrievalShadowDto, RetrievalStateDto, SearchHitOrigin, SearchPlanNextActionDto,
+        SemanticModeDto, StorageStatsDto, TrailContextDto, TrailStoryDto, TrailStoryStepDto,
     };
     use serde_json::json;
     use std::path::Path;
@@ -3997,6 +3997,56 @@ mod tests {
             !markdown.contains("why:"),
             "search --why should not duplicate packet evidence as legacy per-hit why lines:\n{markdown}"
         );
+    }
+
+    #[test]
+    fn search_why_markdown_puts_evidence_before_diagnostics() {
+        let output = crate::args::SearchOutput {
+            query: "packet output".to_string(),
+            retrieval: sample_retrieval(),
+            retrieval_shadow: Some(RetrievalShadowDto {
+                retrieval_mode: "full".to_string(),
+                degraded_reason: None,
+                retrieval_total_ms: 12,
+                total_budget_ms: Some(500),
+                cancel_reason: None,
+                cache_hit: true,
+                stage_timings: Vec::new(),
+                candidates: Vec::new(),
+                would_rank: Vec::new(),
+                error: None,
+                candidate_count: 1,
+                resolved_hit_count: 1,
+                unresolved_candidate_count: 0,
+                candidate_resolution_counts: Vec::new(),
+            }),
+            freshness: None,
+            limit_per_source: 1,
+            repo_text_mode: crate::args::RepoTextMode::Auto,
+            repo_text_enabled: true,
+            query_assessment: Some(codestory_contracts::api::SearchQueryAssessmentDto {
+                exact_symbol_hit_count: 1,
+                weak_top_hit: false,
+                stale_or_missing_anchor: false,
+                repo_text_fallback_reason: None,
+                recommended_next_action: Some(
+                    "Open the exact indexed hit with symbol, trail, and snippet before answering."
+                        .to_string(),
+                ),
+            }),
+            search_plan: None,
+            explain: true,
+            query_hints: Vec::new(),
+            suggestions: Vec::new(),
+            indexed_symbol_hits: vec![sample_search_hit()],
+            repo_text_hits: Vec::new(),
+            repo_text_stats: None,
+        };
+
+        let markdown = render_search_markdown(Path::new("C:/repo"), &output);
+
+        assert_order(&markdown, "short_finding:", "Sidecar diagnostics:");
+        assert_order(&markdown, "citations:", "Sidecar diagnostics:");
     }
 
     #[test]

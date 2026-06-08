@@ -17,6 +17,8 @@ use crate::query_resolution::{
     resolution_rank_with_project_root, search_hit_matches_file_filter,
 };
 
+const HUMAN_AMBIGUOUS_ALTERNATIVE_LIMIT: usize = 10;
+
 #[derive(Debug)]
 pub(crate) struct OpenedProject {
     pub(crate) summary: ProjectSummary,
@@ -544,24 +546,8 @@ fn ambiguous_query_error(
         .map(|value| format!(" even after applying `--file {}`", clean_path_string(value)))
         .unwrap_or_default();
     message.push_str(&format!(
-        "Query `{query}` is ambiguous{scope}. Top equally ranked matches:\n"
+        "Query `{query}` is ambiguous{scope}; choose a match or pass a stable id.\n"
     ));
-    for (index, hit) in alternatives.iter().enumerate() {
-        let number = index + 1;
-        message.push_str("  ");
-        message.push_str(&number.to_string());
-        message.push_str(". ");
-        message.push_str(&format_search_hit_target(project_root, hit));
-        message.push_str(" id=`");
-        message.push_str(&hit.node_id.0);
-        message.push('`');
-        if let Some(node_ref) = node_ref(project_root, hit) {
-            message.push_str(" ref=`");
-            message.push_str(&node_ref);
-            message.push('`');
-        }
-        message.push('\n');
-    }
     message.push_str("\nNext commands:\n");
     message.push_str(&format!(
         "  codestory-cli symbol --project {} --query {}{} --choose 1\n",
@@ -595,6 +581,31 @@ fn ambiguous_query_error(
             "\nPass a more qualified symbol name, add `--file <path-fragment>`, or resolve the exact `--id` from `search` output.",
         );
     }
+    let displayed = alternatives.len().min(HUMAN_AMBIGUOUS_ALTERNATIVE_LIMIT);
+    message.push_str(&format!(
+        "\n\nTop equally ranked matches (showing {displayed} of {}):\n",
+        alternatives.len()
+    ));
+    for (index, hit) in alternatives
+        .iter()
+        .take(HUMAN_AMBIGUOUS_ALTERNATIVE_LIMIT)
+        .enumerate()
+    {
+        let number = index + 1;
+        message.push_str("  ");
+        message.push_str(&number.to_string());
+        message.push_str(". ");
+        message.push_str(&format_search_hit_target(project_root, hit));
+        message.push_str(" id=`");
+        message.push_str(&hit.node_id.0);
+        message.push('`');
+        if let Some(node_ref) = node_ref(project_root, hit) {
+            message.push_str(" ref=`");
+            message.push_str(&node_ref);
+            message.push('`');
+        }
+        message.push('\n');
+    }
     message
 }
 
@@ -613,7 +624,19 @@ fn quote_cli_path(path: &Path) -> String {
 }
 
 fn quote_cli_value(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\\\""))
+    if cli_value_needs_single_quotes(value) {
+        quote_cli_single_quoted_value(value)
+    } else {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    }
+}
+
+fn cli_value_needs_single_quotes(value: &str) -> bool {
+    value.chars().any(|ch| matches!(ch, '$' | '`' | '\'' | '"'))
+}
+
+fn quote_cli_single_quoted_value(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(test)]

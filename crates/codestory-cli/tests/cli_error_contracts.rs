@@ -45,6 +45,47 @@ pub mod beta;
     .expect("write beta.rs");
 }
 
+fn write_many_ambiguous_rust_workspace(root: &Path, count: usize) {
+    fs::create_dir_all(root.join("src")).expect("create src dir");
+    let mut lib = String::new();
+    for index in 1..=count {
+        lib.push_str(&format!("pub mod candidate_{index};\n"));
+        fs::write(
+            root.join("src").join(format!("candidate_{index}.rs")),
+            format!(
+                r#"pub fn configure() -> usize {{
+    {index}
+}}
+"#
+            ),
+        )
+        .expect("write candidate module");
+    }
+    fs::write(root.join("src").join("lib.rs"), lib).expect("write lib.rs");
+}
+
+fn write_many_ambiguous_rust_workspace_under_dir(root: &Path, dir: &str, count: usize) {
+    let source_dir = root.join("src").join(dir);
+    fs::create_dir_all(&source_dir).expect("create nested source dir");
+    let mut lib = String::new();
+    for index in 1..=count {
+        lib.push_str(&format!(
+            "#[path = \"{dir}/candidate_{index}.rs\"]\npub mod candidate_{index};\n"
+        ));
+        fs::write(
+            source_dir.join(format!("candidate_{index}.rs")),
+            format!(
+                r#"pub fn configure() -> usize {{
+    {index}
+}}
+"#
+            ),
+        )
+        .expect("write nested candidate module");
+    }
+    fs::write(root.join("src").join("lib.rs"), lib).expect("write lib.rs");
+}
+
 fn write_drill_friction_workspace(root: &Path) {
     fs::create_dir_all(root.join("src").join("collections")).expect("create collections dir");
     fs::create_dir_all(root.join("src").join("components")).expect("create components dir");
@@ -210,6 +251,35 @@ fn ambiguous_error_alternatives(json: &Value) -> &Vec<Value> {
     json.pointer("/error/alternatives")
         .and_then(Value::as_array)
         .unwrap_or_else(|| panic!("ambiguous JSON should expose /error/alternatives: {json:#}"))
+}
+
+#[test]
+fn top_level_help_names_command_purposes() {
+    let help = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+        .arg("--help")
+        .output()
+        .expect("run top-level help");
+    assert_success(&help, "codestory-cli --help failed");
+    let help_text = String::from_utf8_lossy(&help.stdout);
+
+    for (command, purpose) in [
+        ("index", "Build or refresh the repository index."),
+        ("search", "Find symbols and repo text evidence."),
+        (
+            "packet",
+            "Answer a broad repository question with evidence.",
+        ),
+        ("doctor", "Check cache, index, and retrieval health."),
+        ("setup", "Install or check local setup assets."),
+        ("symbol", "Inspect a symbol by query or id."),
+    ] {
+        assert!(
+            help_text
+                .lines()
+                .any(|line| line.trim_start().starts_with(command) && line.contains(purpose)),
+            "top-level help should show {command:?} purpose {purpose:?}, not only command names:\n{help_text}"
+        );
+    }
 }
 
 #[test]
@@ -582,6 +652,161 @@ fn ambiguous_query_lists_ranked_alternatives_and_next_steps() {
 }
 
 #[test]
+fn ambiguous_query_prioritizes_next_commands_and_caps_human_alternatives() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_many_ambiguous_rust_workspace(workspace.path(), 12);
+
+    index_workspace(workspace.path(), cache_dir.path());
+
+    let output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &["symbol", "--query", "configure", "--refresh", "none"],
+    );
+
+    assert!(
+        !output.status.success(),
+        "ambiguous query must fail before a target is selected\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let next_commands = combined
+        .find("Next commands:")
+        .unwrap_or_else(|| panic!("missing Next commands in:\n{combined}"));
+    let alternatives = combined
+        .find("Top equally ranked matches")
+        .unwrap_or_else(|| panic!("missing alternatives heading in:\n{combined}"));
+    assert!(
+        next_commands < alternatives,
+        "Next commands should precede alternatives in the human diagnostic:\n{combined}"
+    );
+    assert!(
+        combined.contains("Top equally ranked matches (showing 10 of 12):"),
+        "human diagnostic should explain the displayed cap:\n{combined}"
+    );
+    let displayed_alternatives = combined
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.contains(" id=`")
+                && trimmed
+                    .split_once('.')
+                    .is_some_and(|(number, _)| number.chars().all(|ch| ch.is_ascii_digit()))
+        })
+        .count();
+    assert_eq!(
+        displayed_alternatives, 10,
+        "human diagnostic should display at most 10 alternatives:\n{combined}"
+    );
+
+    let json_output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "symbol",
+            "--query",
+            "configure",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        !json_output.status.success(),
+        "ambiguous JSON query should fail without selecting a target"
+    );
+    let json = parse_stdout_json(&json_output);
+    assert_eq!(
+        ambiguous_error_alternatives(&json).len(),
+        12,
+        "structured ambiguity JSON should keep every tied alternative: {json:#}"
+    );
+}
+
+#[test]
+fn ambiguous_query_quotes_shell_sensitive_file_filters_in_next_commands() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_many_ambiguous_rust_workspace_under_dir(workspace.path(), "$hidden path", 2);
+    index_workspace(workspace.path(), cache_dir.path());
+
+    let output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "symbol",
+            "--query",
+            "configure",
+            "--file",
+            "$hidden path",
+            "--refresh",
+            "none",
+        ],
+    );
+
+    assert!(
+        !output.status.success(),
+        "filtered ambiguous query should fail before selecting a target\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("--file '$hidden path'"),
+        "human diagnostic should single-quote shell-sensitive file filters:\n{combined}"
+    );
+    assert!(
+        !combined.contains("--file \"$hidden path\""),
+        "human diagnostic should not double-quote shell-sensitive file filters:\n{combined}"
+    );
+
+    let json_output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "symbol",
+            "--query",
+            "configure",
+            "--file",
+            "$hidden path",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        !json_output.status.success(),
+        "filtered ambiguous JSON query should fail before selecting a target"
+    );
+    let json = parse_stdout_json(&json_output);
+    assert_eq!(
+        ambiguous_error_alternatives(&json).len(),
+        2,
+        "filtered ambiguity JSON should keep every tied alternative: {json:#}"
+    );
+    assert!(
+        json.pointer("/error/next_commands")
+            .and_then(Value::as_array)
+            .is_some_and(|commands| commands.iter().any(|command| command
+                .as_str()
+                .is_some_and(|value| value.contains("--file '$hidden path'")))),
+        "structured next commands should single-quote shell-sensitive file filters: {json:#}"
+    );
+}
+
+#[test]
 fn ambiguous_symbol_json_includes_numbered_alternatives_with_stable_refs() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
@@ -634,6 +859,14 @@ fn ambiguous_symbol_json_includes_numbered_alternatives_with_stable_refs() {
                 .iter()
                 .all(|note| !note.as_str().unwrap_or_default().contains("search --file"))),
         "ambiguous JSON should not imply `search --file` exists: {json:#}"
+    );
+    assert!(
+        json.pointer("/error/layer_notes")
+            .and_then(Value::as_array)
+            .is_some_and(|notes| notes.iter().any(|note| note
+                .as_str()
+                .is_some_and(|note| note.contains("--query \"configure\"")))),
+        "ambiguous JSON layer note should include the searched query when it names search: {json:#}"
     );
     assert!(
         json.pointer("/resolution/resolved").is_none(),
@@ -722,7 +955,7 @@ fn ambiguous_symbol_json_includes_numbered_alternatives_with_stable_refs() {
 fn ambiguous_query_writes_output_file_even_on_failure() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
-    write_ambiguous_rust_workspace(workspace.path());
+    write_many_ambiguous_rust_workspace(workspace.path(), 12);
     index_workspace(workspace.path(), cache_dir.path());
     let output_file = cache_dir.path().join("ambiguous-snippet.md");
 
@@ -750,7 +983,68 @@ fn ambiguous_query_writes_output_file_even_on_failure() {
         diagnostic.contains("code: ambiguous_target"),
         "{diagnostic}"
     );
-    assert!(diagnostic.contains("alternatives:"), "{diagnostic}");
+    assert!(diagnostic.contains("alternatives: 12"), "{diagnostic}");
+    assert!(
+        diagnostic.contains(
+            "showing: 10 of 12; use `--format json` or `search` to inspect all alternatives"
+        ),
+        "{diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("Top equally ranked matches"),
+        "markdown output-file diagnostics should not duplicate the embedded human alternatives from the message:\n{diagnostic}"
+    );
+    let next_commands = diagnostic
+        .find("next_commands:")
+        .unwrap_or_else(|| panic!("missing next_commands in:\n{diagnostic}"));
+    let alternatives = diagnostic
+        .find("alternatives: 12")
+        .unwrap_or_else(|| panic!("missing alternatives heading in:\n{diagnostic}"));
+    assert!(
+        next_commands < alternatives,
+        "markdown output-file diagnostics should put next commands before alternatives:\n{diagnostic}"
+    );
+    let visible_alternative_rows = diagnostic
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            let numbered_runtime_row = trimmed.contains(" id=`")
+                && trimmed
+                    .split_once('.')
+                    .is_some_and(|(number, _)| number.chars().all(|ch| ch.is_ascii_digit()));
+            let structured_markdown_row =
+                trimmed.starts_with("- [") && trimmed.contains("configure");
+            numbered_runtime_row || structured_markdown_row
+        })
+        .count();
+    assert_eq!(
+        visible_alternative_rows, 10,
+        "markdown output-file diagnostics should render exactly one capped alternatives section:\n{diagnostic}"
+    );
+
+    let json_output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "snippet",
+            "--query",
+            "configure",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        !json_output.status.success(),
+        "ambiguous JSON snippet should fail without selecting a target"
+    );
+    let json = parse_stdout_json(&json_output);
+    assert_eq!(
+        ambiguous_error_alternatives(&json).len(),
+        12,
+        "structured ambiguity JSON should keep every tied alternative: {json:#}"
+    );
 }
 
 #[test]
