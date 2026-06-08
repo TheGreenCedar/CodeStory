@@ -378,6 +378,51 @@ mod tests {
     }
 
     #[test]
+    fn manifest_staleness_rejects_staged_repair_dimension_drift() {
+        let project = TempDir::new().expect("project");
+        let storage_path = project.path().join("codestory.db");
+        let mut storage = Store::open(&storage_path).expect("open store");
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: NodeId(1),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "repaired_touched_file".into(),
+                    ..Default::default()
+                },
+                Node {
+                    id: NodeId(2),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "stale_untouched_file".into(),
+                    ..Default::default()
+                },
+            ])
+            .expect("nodes");
+        storage
+            .upsert_llm_symbol_docs_batch(&[
+                semantic_doc(1, "semantic_doc_version=4;scope=durable_symbols"),
+                LlmSymbolDoc {
+                    embedding_dim: 128,
+                    embedding: vec![0.0; 128],
+                    ..semantic_doc(2, "semantic_doc_version=4;scope=durable_symbols")
+                },
+            ])
+            .expect("docs");
+        let mut manifest = manifest("proj", "deadbeefcafebabe1234");
+        manifest.embedding_backend = Some(crate::embeddings::embedding_runtime_id());
+        manifest.embedding_dim = Some(crate::embeddings::qdrant_vector_dim() as i32);
+        manifest.projection_count = Some(2);
+
+        let reason = manifest_staleness_reason(&storage, &manifest)
+            .expect("staged dimension repair should stale");
+
+        assert_eq!(
+            reason,
+            "sidecar_semantic_doc_count_changed: manifest=2 current=1"
+        );
+    }
+
+    #[test]
     fn manifest_staleness_counts_only_sidecar_eligible_semantic_docs() {
         let project = TempDir::new().expect("project");
         let storage_path = project.path().join("codestory.db");

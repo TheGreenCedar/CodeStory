@@ -712,6 +712,7 @@ pub struct LlmSymbolDoc {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LlmSymbolDocReuseMetadata {
     pub node_id: NodeId,
+    pub file_node_id: Option<NodeId>,
     pub doc_version: u32,
     pub doc_hash: String,
     pub embedding_profile: Option<String>,
@@ -3053,6 +3054,7 @@ impl Storage {
         let mut stmt = self.conn.prepare(
             "SELECT
                 node_id,
+                file_node_id,
                 doc_version,
                 doc_hash,
                 embedding_profile,
@@ -3066,17 +3068,18 @@ impl Storage {
         let mut rows = stmt.query([])?;
         let mut docs = Vec::new();
         while let Some(row) = rows.next()? {
-            let doc_version: i64 = row.get(1)?;
-            let embedding_dim: i64 = row.get(6)?;
+            let doc_version: i64 = row.get(2)?;
+            let embedding_dim: i64 = row.get(7)?;
             docs.push(LlmSymbolDocReuseMetadata {
                 node_id: NodeId(row.get(0)?),
+                file_node_id: row.get::<_, Option<i64>>(1)?.map(NodeId),
                 doc_version: doc_version.max(0).min(u32::MAX as i64) as u32,
-                doc_hash: row.get(2)?,
-                embedding_profile: row.get(3)?,
-                embedding_model: row.get(4)?,
-                embedding_backend: row.get(5)?,
+                doc_hash: row.get(3)?,
+                embedding_profile: row.get(4)?,
+                embedding_model: row.get(5)?,
+                embedding_backend: row.get(6)?,
                 embedding_dim: embedding_dim.max(0).min(u32::MAX as i64) as u32,
-                doc_shape: row.get(7)?,
+                doc_shape: row.get(8)?,
             });
         }
         Ok(docs)

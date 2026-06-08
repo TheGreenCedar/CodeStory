@@ -42,6 +42,7 @@ Important tuning surfaces:
 - `CODESTORY_SEMANTIC_DOC_SCOPE`: default durable symbols; use `all` for the older broad symbol set
 - `CODESTORY_SEMANTIC_DOC_ALIAS_MODE`: default `alias_variant`; use `no_alias` for baseline research rows or `current_alias` for the older full alias text
 - `CODESTORY_SEMANTIC_DOC_MAX_TOKENS`: generated semantic-doc token budget.
+- `CODESTORY_SEMANTIC_DOC_FOREGROUND_LIMIT`: optional foreground cap for newly embedded semantic docs. Reusable current docs still load; docs beyond the cap are left as semantic debt instead of being embedded during that index pass.
 - `CODESTORY_EMBED_BACKEND`: product sidecar indexing requires `llamacpp`.
 - `CODESTORY_EMBED_LLAMACPP_URL`: local OpenAI-compatible llama.cpp embedding endpoint for `CODESTORY_EMBED_BACKEND=llamacpp`.
 - `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT`: local llama.cpp request concurrency, clamped from `1` to `16`.
@@ -60,6 +61,25 @@ then writes generation-bound sidecar artifacts and manifest metadata. Missing
 or non-product embedding state fails closed for agent-facing retrieval.
 
 Timing fields for this path are in `IndexingPhaseTimings`: `search_projection_rebuild_ms`, `search_symbol_index_ms`, `runtime_cache_publish_ms`, `semantic_doc_build_ms`, `semantic_embedding_ms`, `semantic_db_upsert_ms`, `semantic_reload_ms`, `semantic_prune_ms`, `semantic_docs_reused`, `semantic_docs_embedded`, `semantic_docs_pending`, and `semantic_docs_stale`.
+
+Embedding contract repair is intentionally asymmetric. Full refresh is the
+contract-repair path for the whole semantic corpus. Incremental refresh keeps
+semantic sync scoped to touched files even when the stored embedding contract
+differs from the current runtime contract; touched-file docs are rebuilt, while
+untouched docs remain stale and are reported through `semantic_docs_stale`.
+Mixed stored semantic-doc contracts keep sidecar manifests stale/fail-closed
+until a full refresh plus `retrieval index` repairs the corpus and writes fresh
+sidecar artifacts.
+
+Lazy foreground embedding is opt-in through
+`CODESTORY_SEMANTIC_DOC_FOREGROUND_LIMIT`. This mode keeps graph and lexical
+indexing complete, reuses current semantic docs when possible, embeds only the
+first capped set of missing or stale semantic docs, and reports the remaining
+debt through `semantic_docs_pending > semantic_docs_embedded` plus
+`semantic_docs_stale`. Deferred docs are not retained as stale vectors in the
+store, so sidecar manifests continue to fail closed on count or contract drift
+until a full uncapped repair and `retrieval index` rebuild the semantic
+artifacts.
 
 ## Failure Signatures
 

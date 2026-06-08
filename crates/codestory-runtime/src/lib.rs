@@ -3776,6 +3776,7 @@ const SEMANTIC_DOC_SCOPE_ENV: &str = "CODESTORY_SEMANTIC_DOC_SCOPE";
 const SEMANTIC_DOC_ALIAS_MODE_ENV: &str = "CODESTORY_SEMANTIC_DOC_ALIAS_MODE";
 const SEMANTIC_DOC_MAX_TOKENS_ENV: &str = "CODESTORY_SEMANTIC_DOC_MAX_TOKENS";
 const SEMANTIC_DOC_DEFAULT_MAX_TOKENS: usize = 128;
+const SEMANTIC_DOC_FOREGROUND_LIMIT_ENV: &str = "CODESTORY_SEMANTIC_DOC_FOREGROUND_LIMIT";
 const SEMANTIC_STREAM_PENDING_DOCS_ENV: &str = "CODESTORY_SEMANTIC_STREAM_PENDING_DOCS";
 const SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV: &str =
     "CODESTORY_SEMANTIC_STREAM_SORT_WINDOW_BATCHES";
@@ -4172,6 +4173,20 @@ fn semantic_doc_max_tokens_from_env() -> usize {
         .filter(|value| *value > 0)
         .map(|value| value.clamp(16, 8_192))
         .unwrap_or(SEMANTIC_DOC_DEFAULT_MAX_TOKENS)
+}
+
+fn semantic_doc_foreground_limit_from_env() -> Option<usize> {
+    let value = std::env::var(SEMANTIC_DOC_FOREGROUND_LIMIT_ENV).ok()?;
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty()
+        || matches!(
+            normalized.as_str(),
+            "all" | "full" | "none" | "off" | "unlimited"
+        )
+    {
+        return None;
+    }
+    normalized.parse::<usize>().ok()
 }
 
 fn stream_pending_llm_symbol_docs_from_env() -> bool {
@@ -4933,24 +4948,37 @@ fn sync_llm_symbol_projection(
         .map(|doc| (doc.node_id, doc))
         .collect::<HashMap<_, _>>();
 
-    let expand_semantic_scope_for_contract_repair = llm_refresh_file_scope.is_some()
-        && existing_docs.values().any(|existing_doc| {
-            !llm_symbol_doc_contract_matches(existing_doc, &embedding_contract)
-        });
-    if expand_semantic_scope_for_contract_repair {
+    let contract_stale_doc_count = existing_docs
+        .values()
+        .filter(|existing_doc| !llm_symbol_doc_contract_matches(existing_doc, &embedding_contract))
+        .count();
+    let scoped_contract_stale_docs = llm_refresh_file_scope
+        .map(|scope| {
+            existing_docs
+                .values()
+                .filter(|existing_doc| {
+                    !llm_symbol_doc_contract_matches(existing_doc, &embedding_contract)
+                        && existing_doc
+                            .file_node_id
+                            .map(|file_node_id| !scope.contains(&file_node_id))
+                            .unwrap_or(true)
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    if llm_refresh_file_scope.is_some() && contract_stale_doc_count > 0 {
         tracing::warn!(
-            "Stored semantic-doc contract differs from current embedding contract; expanding incremental semantic sync to rebuild all semantic docs"
+            contract_stale_doc_count,
+            scoped_contract_stale_docs,
+            "Stored semantic-doc contract differs from current embedding contract; repairing touched semantic docs only during incremental sync. Full refresh is required to repair untouched semantic docs."
         );
     }
-    let effective_llm_refresh_file_scope = if expand_semantic_scope_for_contract_repair {
-        None
-    } else {
-        llm_refresh_file_scope
-    };
+    let effective_llm_refresh_file_scope = llm_refresh_file_scope;
 
     if let Some(scope) = effective_llm_refresh_file_scope
         && scope.is_empty()
     {
+        stats.docs_stale = clamp_usize_to_u32(scoped_contract_stale_docs);
         if hydrate_semantic_docs {
             let reload_started = Instant::now();
             reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
@@ -4960,12 +4988,21 @@ fn sync_llm_symbol_projection(
     }
 
     let embed_batch_size = llm_doc_embed_batch_size();
+    let foreground_doc_limit = semantic_doc_foreground_limit_from_env();
     let stream_pending_docs = stream_pending_llm_symbol_docs_from_env();
     let stream_sort_window_batches = semantic_stream_sort_window_batches_from_env();
     let stream_sort_window_size = embed_batch_size.saturating_mul(stream_sort_window_batches);
     tracing::debug!(embed_batch_size, "Using semantic doc embedding batch size");
+    if let Some(foreground_doc_limit) = foreground_doc_limit {
+        tracing::debug!(
+            foreground_doc_limit,
+            "Using semantic doc foreground embedding limit"
+        );
+    }
     let mut pending_docs = Vec::<PendingLlmSymbolDoc>::new();
     let mut seen_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
+    let mut foreground_docs_selected = 0_usize;
+    let mut deferred_missing_docs = 0_usize;
     let mut doc_build_ns = 0_u128;
     let semantic_nodes = nodes
         .iter()
@@ -5028,13 +5065,21 @@ fn sync_llm_symbol_projection(
         doc_build_ns = doc_build_ns.saturating_add(doc_build_started.elapsed().as_nanos());
 
         for built_doc in built_docs {
-            seen_node_ids.push(built_doc.pending.node_id);
             if built_doc.reusable {
+                seen_node_ids.push(built_doc.pending.node_id);
                 stats.docs_reused = stats.docs_reused.saturating_add(1);
                 continue;
             }
 
             stats.docs_pending = stats.docs_pending.saturating_add(1);
+            if foreground_doc_limit.is_some_and(|limit| foreground_docs_selected >= limit) {
+                if !existing_docs.contains_key(&built_doc.pending.node_id) {
+                    deferred_missing_docs = deferred_missing_docs.saturating_add(1);
+                }
+                continue;
+            }
+            foreground_docs_selected = foreground_docs_selected.saturating_add(1);
+            seen_node_ids.push(built_doc.pending.node_id);
             pending_docs.push(built_doc.pending);
         }
 
@@ -5078,7 +5123,9 @@ fn sync_llm_symbol_projection(
             .map_err(|e| ApiError::internal(format!("Failed to prune stale LLM docs: {e}")))?
     };
     stats.prune_ms = clamp_u128_to_u32(prune_started.elapsed().as_millis());
-    stats.docs_stale = clamp_usize_to_u32(stale_docs);
+    stats.docs_stale = clamp_usize_to_u32(stale_docs)
+        .saturating_add(clamp_usize_to_u32(scoped_contract_stale_docs))
+        .saturating_add(clamp_usize_to_u32(deferred_missing_docs));
 
     if hydrate_semantic_docs {
         let reload_started = Instant::now();
@@ -9749,6 +9796,7 @@ mod tests {
                 EnvGuard::remove(SEMANTIC_DOC_SCOPE_ENV),
                 EnvGuard::remove(SEMANTIC_DOC_ALIAS_MODE_ENV),
                 EnvGuard::remove(SEMANTIC_DOC_MAX_TOKENS_ENV),
+                EnvGuard::remove(SEMANTIC_DOC_FOREGROUND_LIMIT_ENV),
                 EnvGuard::remove(SEMANTIC_STREAM_PENDING_DOCS_ENV),
                 EnvGuard::remove(SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV),
             ],
@@ -10067,6 +10115,24 @@ mod tests {
             SEMANTIC_DOC_DEFAULT_MAX_TOKENS
         );
         assert!(semantic_doc_shape_contract().contains("max_tokens=128"));
+    }
+
+    #[test]
+    fn semantic_doc_foreground_limit_defaults_to_unlimited_and_accepts_zero() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvGuard::remove(SEMANTIC_DOC_FOREGROUND_LIMIT_ENV);
+        assert_eq!(semantic_doc_foreground_limit_from_env(), None);
+
+        let _env = EnvGuard::set(SEMANTIC_DOC_FOREGROUND_LIMIT_ENV, "2");
+        assert_eq!(semantic_doc_foreground_limit_from_env(), Some(2));
+
+        let _env = EnvGuard::set(SEMANTIC_DOC_FOREGROUND_LIMIT_ENV, "0");
+        assert_eq!(semantic_doc_foreground_limit_from_env(), Some(0));
+
+        let _env = EnvGuard::set(SEMANTIC_DOC_FOREGROUND_LIMIT_ENV, "unlimited");
+        assert_eq!(semantic_doc_foreground_limit_from_env(), None);
     }
 
     fn pending_semantic_doc_for_test(node_id: i64, doc_text: &str) -> PendingLlmSymbolDoc {
@@ -12813,6 +12879,99 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn semantic_foreground_limit_defers_unembedded_docs() {
+        let mut env = hybrid_test_env();
+        env.push(EnvGuard::set(SEMANTIC_DOC_FOREGROUND_LIMIT_ENV, "2"));
+        let mut storage = Storage::new_in_memory().expect("storage");
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: CoreNodeId(1),
+                    kind: NodeKind::FILE,
+                    serialized_name: "src/lib.rs".to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(10),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "alpha".to_string(),
+                    qualified_name: Some("pkg::alpha".to_string()),
+                    file_node_id: Some(CoreNodeId(1)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(11),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "beta".to_string(),
+                    qualified_name: Some("pkg::beta".to_string()),
+                    file_node_id: Some(CoreNodeId(1)),
+                    start_line: Some(5),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(12),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "gamma".to_string(),
+                    qualified_name: Some("pkg::gamma".to_string()),
+                    file_node_id: Some(CoreNodeId(1)),
+                    start_line: Some(9),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(13),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "delta".to_string(),
+                    qualified_name: Some("pkg::delta".to_string()),
+                    file_node_id: Some(CoreNodeId(1)),
+                    start_line: Some(13),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert nodes");
+
+        let nodes = storage.get_nodes().expect("nodes");
+        let result = build_search_state(
+            &mut storage,
+            None,
+            nodes,
+            None,
+            SemanticProjectionMode::PersistBackedDocs,
+            false,
+        )
+        .expect("build capped semantic state");
+
+        let docs = storage
+            .get_all_llm_symbol_docs()
+            .expect("stored semantic docs");
+        println!(
+            "METRIC foreground_limit_pending_docs={}",
+            result.semantic_stats.docs_pending
+        );
+        println!(
+            "METRIC foreground_limit_embedded_docs={}",
+            result.semantic_stats.docs_embedded
+        );
+        println!(
+            "METRIC foreground_limit_stale_docs={}",
+            result.semantic_stats.docs_stale
+        );
+        println!("METRIC foreground_limit_stored_docs={}", docs.len());
+
+        assert_eq!(result.semantic_stats.docs_pending, 4);
+        assert_eq!(result.semantic_stats.docs_embedded, 2);
+        assert_eq!(result.semantic_stats.docs_stale, 2);
+        assert_eq!(docs.len(), 2);
+        assert!(
+            docs.iter().all(
+                |doc| doc.embedding_profile.as_deref() == Some("bge-small-en-v1.5")
+                    && doc.embedding_backend.as_deref() == Some("hash")
+            ),
+            "foreground docs should still use the current semantic contract"
+        );
+    }
+
+    #[test]
     fn full_refresh_repairs_reused_semantic_docs_missing_contract_metadata() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
@@ -12977,7 +13136,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn incremental_refresh_rebuilds_all_semantic_docs_when_embedding_contract_changes() {
+    fn incremental_refresh_repairs_touched_file_semantic_docs_when_embedding_contract_changes() {
         let mut env = hybrid_test_env();
         env.push(EnvGuard::set(EMBEDDING_EXPECTED_DIM_ENV, "128"));
         let workspace = copy_tictactoe_workspace();
@@ -13018,21 +13177,58 @@ fn build_llm_symbol_doc_text() -> String {
         let incremental_timings = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
             .expect("incremental index after contract drift");
-        assert!(
+        println!("METRIC contract_drift_before_docs={}", before_docs.len());
+        println!(
+            "METRIC contract_drift_embedded_docs={}",
             incremental_timings.semantic_docs_embedded.unwrap_or(0)
-                >= clamp_usize_to_u32(before_docs.len()),
-            "contract drift should expand incremental semantic sync beyond the touched file"
+        );
+        println!(
+            "METRIC contract_drift_stale_docs={}",
+            incremental_timings.semantic_docs_stale.unwrap_or(0)
+        );
+        assert!(
+            incremental_timings.semantic_docs_embedded.unwrap_or(0) > 0,
+            "changed-file docs should be embedded against the current contract"
+        );
+        assert!(
+            incremental_timings
+                .semantic_docs_embedded
+                .unwrap_or(u32::MAX)
+                < clamp_usize_to_u32(before_docs.len()),
+            "contract drift should not expand incremental semantic sync beyond the touched file"
+        );
+        assert!(
+            incremental_timings.semantic_docs_stale.unwrap_or(0) > 0,
+            "incremental repair should report untouched semantic docs that remain on the stale contract"
         );
 
         let repaired_docs = Storage::open(&storage_path)
             .expect("open storage after drift repair")
             .get_all_llm_symbol_docs()
             .expect("semantic docs after drift repair");
+        let rust_docs = repaired_docs
+            .iter()
+            .filter(|doc| {
+                doc.file_path
+                    .as_deref()
+                    .is_some_and(|path| path.contains("rust_tictactoe.rs"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !rust_docs.is_empty(),
+            "fixture should have Rust semantic docs"
+        );
+        assert!(
+            rust_docs
+                .iter()
+                .all(|doc| doc.embedding_dim == 384 && doc.embedding.len() == 384),
+            "incremental repair should leave touched-file semantic docs on the current contract"
+        );
         assert!(
             repaired_docs
                 .iter()
-                .all(|doc| doc.embedding_dim == 384 && doc.embedding.len() == 384),
-            "incremental repair should leave all stored semantic docs on the current contract"
+                .any(|doc| doc.embedding_dim == 128 && doc.embedding.len() == 128),
+            "untouched semantic docs should remain staged for full-refresh contract repair"
         );
         assert!(
             repaired_docs.iter().any(|doc| doc
