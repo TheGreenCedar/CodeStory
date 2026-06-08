@@ -32,6 +32,26 @@ Before proposing an optimization, record:
 | Dominant cost | Measured cost center: graph phase, semantic phase, store reads/writes, repo-text scan, source reads, graph traversal, search scoring, CLI rendering, lock contention, or memory pressure. |
 | Quality guard | Search recall/MRR, expected anchors, route coverage status, semantic-doc reuse, or output-golden checks that must not regress. |
 
+For `index` changes, split the comparison into graph and semantic subphases
+before drawing conclusions:
+
+| Phase field | Use |
+| --- | --- |
+| Graph phase | File discovery, parse/extract, graph writes, and snapshot/store refresh. |
+| Search projection | Search projection rebuild and symbol-index write time. |
+| Semantic doc build | Semantic document text construction, file text cache, and graph-context shaping. |
+| Semantic embedding | Embedding backend wall time, batch/request shape, and request concurrency setting. |
+| Semantic persistence | Semantic-doc upsert, reload, prune, reuse, pending, embedded, and stale counts. |
+
+For llama.cpp, the default request count remains serial. Compare explicit
+`CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT=<n>` values or the opt-in
+`CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT=auto` path only after the baseline
+shows embedding backend saturation rather than graph/store contention.
+
+Do not collapse these into one "index got faster/slower" claim unless the
+repo-scale e2e row shows the same project, cache state, semantic backend, and
+command flags before and after.
+
 Prefer existing gates before adding a new harness:
 
 ```powershell
@@ -62,6 +82,15 @@ For every accepted performance change, record:
 Append repo-scale timing rows to
 [codestory-e2e-stats-log.md](codestory-e2e-stats-log.md) when default indexing,
 semantic-doc persistence, embedding reuse, or cold-start behavior changes.
+Before/after rows in that log require a serialized full ignored e2e run. If the
+branch cannot run it yet, leave the log unchanged and put this exact deferred
+verification plan in the PR or final notes:
+
+```powershell
+cargo build --release -p codestory-cli
+cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
+```
+
 For the CLI navigation branch baseline, see
 [cli-navigation-next-wave-performance-review.md](cli-navigation-next-wave-performance-review.md).
 
