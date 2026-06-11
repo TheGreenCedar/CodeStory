@@ -199,6 +199,8 @@ async function withManifestFile(manifest, callback) {
 
 test("categorizes commands without treating source paths as cli invocations", () => {
   assert.equal(commandCategory("& $env:CODESTORY_CLI packet --project . --question flow"), "codestory_cli");
+  assert.equal(commandCategory('"${CODESTORY_CLI:-codestory-cli}" packet --project . --question flow'), "codestory_cli");
+  assert.equal(commandCategory('"$CODESTORY_CLI" index --project . --refresh full'), "codestory_cli");
   assert.equal(commandCategory('& "C:\\tools\\codestory-cli.exe" packet --project . --question flow'), "codestory_cli");
   assert.equal(
     commandCategory(
@@ -260,19 +262,34 @@ test("rejects manifest repo and workspace paths outside the cache", async () => 
   );
 });
 
-test("packet-first command renders manifest text as PowerShell literals", () => {
-  const command = packetFirstCommandForPrompt(
+test("packet-first command renders manifest text for host shells", () => {
+  const windowsCommand = packetFirstCommandForPrompt(
     "Inspect $env:SECRET and $(Get-ChildItem), then read John's file.\nNext line.",
     { task_class: "bug_localization" },
+    "win32",
   );
 
   assert.match(
-    command,
+    windowsCommand,
     /--question 'Inspect \$env:SECRET and \$\(Get-ChildItem\), then read John''s file\. Next line\.'/,
   );
-  assert.match(command, /--task-class 'bug-localization'/);
+  assert.match(windowsCommand, /--task-class 'bug-localization'/);
+
+  const unixCommand = packetFirstCommandForPrompt(
+    "Inspect $env:SECRET and $(Get-ChildItem), then read John's file.\nNext line.",
+    { task_class: "bug_localization" },
+    "linux",
+  );
+
+  assert.ok(unixCommand.startsWith('"${CODESTORY_CLI:-codestory-cli}" packet '));
+  assert.ok(
+    unixCommand.includes(
+      "--question 'Inspect $env:SECRET and $(Get-ChildItem), then read John'\\''s file. Next line.'",
+    ),
+  );
+  assert.match(unixCommand, /--task-class 'bug-localization'/);
   assert.throws(
-    () => packetFirstCommandForPrompt("Explain the task.", { task_class: "bug_localization; Remove-Item ." }),
+    () => packetFirstCommandForPrompt("Explain the task.", { task_class: "bug_localization; Remove-Item ." }, "linux"),
     /task_class/,
   );
 });

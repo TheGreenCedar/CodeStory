@@ -38,6 +38,7 @@ mod http_transport;
 mod managed_embeddings;
 mod output;
 mod query_resolution;
+mod readiness;
 mod report;
 mod retrieval;
 mod runtime;
@@ -63,9 +64,10 @@ use args::{
     DrillSummaryVerdictOutput, DrillVerificationChecklistItemOutput, FilesCommand,
     GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput, IndexOutput,
     PacketCommand, ProjectArgs, QueryCommand, QueryOutput, QueryResolutionOutput,
-    QuerySelectorOutput, RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput, ServeCommand,
-    SetupAction, SetupCommand, SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput,
-    TrailCommand, TrailJsonOutput, VerificationTargetOutput, build_trail_request,
+    QuerySelectorOutput, ReadyCommand, ReadyOutput, RepoTextMode, SearchCommand, SearchHitOutput,
+    SearchOutput, ServeCommand, SetupAction, SetupCommand, SnippetCommand, SnippetJsonOutput,
+    SymbolCommand, SymbolJsonOutput, TrailCommand, TrailJsonOutput, VerificationTargetOutput,
+    build_trail_request,
 };
 #[cfg(test)]
 use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
@@ -75,9 +77,10 @@ use output::{
     context_packet_json, emit, emit_text, render_agent_citation, render_context_markdown,
     render_doctor_markdown, render_drill_markdown, render_ground_markdown,
     render_index_dry_run_markdown, render_index_markdown, render_query_markdown,
-    render_search_hit_output, render_search_markdown, render_snippet_markdown,
-    render_symbol_markdown, render_symbol_mermaid, render_trail_dot, render_trail_markdown,
-    render_trail_mermaid, render_trail_story_markdown, validate_output_file_parent,
+    render_ready_markdown, render_search_hit_output, render_search_markdown,
+    render_snippet_markdown, render_symbol_markdown, render_symbol_mermaid, render_trail_dot,
+    render_trail_markdown, render_trail_mermaid, render_trail_story_markdown,
+    validate_output_file_parent,
 };
 use runtime::{
     AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
@@ -183,6 +186,7 @@ fn main() -> Result<()> {
         Command::Context(cmd) => run_context(cmd),
         Command::Packet(cmd) => run_packet(cmd),
         Command::Doctor(cmd) => run_doctor(cmd),
+        Command::Ready(cmd) => run_ready(cmd),
         Command::Setup(cmd) => run_setup(cmd),
         Command::Search(cmd) => run_search(cmd),
         Command::Drill(cmd) => run_drill(cmd),
@@ -240,32 +244,15 @@ fn setup_embeddings_next_commands(
 }
 
 fn quote_command_path(path: &std::path::Path) -> String {
-    let value = display::clean_path_string(&path.to_string_lossy());
-    if command_value_needs_single_quotes(&value) {
-        quote_powershell_single_quoted_value(&value)
-    } else {
-        format!("\"{}\"", value.replace('"', "\\\""))
-    }
+    display::quote_command_path(path)
 }
 
 fn quote_command_value(value: &str) -> String {
-    quote_powershell_single_quoted_value(value)
+    display::quote_command_value(value)
 }
 
 fn quote_command_argument_value(value: &str) -> String {
-    if command_value_needs_single_quotes(value) {
-        quote_command_value(value)
-    } else {
-        format!("\"{}\"", value.replace('"', "\\\""))
-    }
-}
-
-fn command_value_needs_single_quotes(value: &str) -> bool {
-    value.chars().any(|ch| matches!(ch, '$' | '`' | '\'' | '"'))
-}
-
-fn quote_powershell_single_quoted_value(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    display::quote_command_argument_value(value)
 }
 
 fn run_index(cmd: IndexCommand) -> Result<()> {
@@ -379,12 +366,14 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
         .context("Open project summary did not include retrieval state")?;
     let refresh_label = refresh_label(cmd.refresh, opened.refresh_mode);
     let storage_path = runtime.storage_path.to_string_lossy().to_string();
-    let sidecar_is_full = codestory_retrieval::strict_sidecar_status(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-    )
-    .map(|status| status.retrieval_mode == "full")
-    .unwrap_or(false);
+    let sidecar_retrieval = doctor_sidecar_status(&runtime);
+    let readiness = build_summary_readiness(
+        &opened.summary.root,
+        &opened.summary.stats,
+        opened.summary.freshness.as_ref(),
+        &sidecar_retrieval,
+    );
+    let next_commands = readiness::compatibility_next_commands(&readiness);
     let output = IndexOutput {
         project: &opened.summary.root,
         storage_path: &storage_path,
@@ -393,12 +382,8 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
         retrieval,
         phase_timings: opened.phase_timings.as_ref(),
         summary_generation: summary_generation.as_ref(),
-        next_commands: index_next_commands(
-            &opened.summary.root,
-            Some(retrieval),
-            opened.summary.freshness.as_ref(),
-            sidecar_is_full,
-        ),
+        readiness,
+        next_commands,
     };
 
     let markdown = render_index_markdown(&output);
@@ -1103,6 +1088,27 @@ fn run_doctor(cmd: DoctorCommand) -> Result<()> {
     let summary = runtime.open_project_summary()?;
     let output = build_doctor_output(&runtime, &summary);
     let markdown = render_doctor_markdown(&output);
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn run_ready(cmd: ReadyCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "ready")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
+    let summary = runtime.open_project_summary()?;
+    let sidecar = doctor_sidecar_status(&runtime);
+    let mut verdicts = build_summary_readiness(
+        &summary.root,
+        &summary.stats,
+        summary.freshness.as_ref(),
+        &sidecar,
+    );
+    if let Some(goal) = cmd.goal {
+        let goal = goal.as_dto();
+        verdicts.retain(|verdict| verdict.goal == goal);
+    }
+    let output = ReadyOutput { verdicts };
+    let markdown = render_ready_markdown(&output);
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
@@ -8205,7 +8211,13 @@ fn build_doctor_output(
     let storage_path = display::clean_path_string(&runtime.storage_path.to_string_lossy());
     let storage_exists = runtime.storage_path.exists();
     let sidecar_retrieval = doctor_sidecar_status(runtime);
-    let sidecar_is_full = sidecar_retrieval.retrieval_mode == "full";
+    let readiness = build_summary_readiness(
+        &project,
+        &summary.stats,
+        summary.freshness.as_ref(),
+        &sidecar_retrieval,
+    );
+    let next_commands = readiness::compatibility_next_commands(&readiness);
     let mut checks = Vec::new();
     checks.push(doctor_check(
         "project",
@@ -8294,14 +8306,35 @@ fn build_doctor_output(
         sidecar_retrieval,
         retrieval,
         freshness: summary.freshness.clone(),
+        readiness,
         checks,
-        next_commands: index_next_commands(
-            &project,
-            summary.retrieval.as_ref(),
-            summary.freshness.as_ref(),
-            sidecar_is_full,
-        ),
+        next_commands,
         environment,
+    }
+}
+
+fn build_summary_readiness(
+    project: &str,
+    stats: &codestory_contracts::api::StorageStatsDto,
+    freshness: Option<&IndexFreshnessDto>,
+    sidecar: &DoctorSidecarStatusOutput,
+) -> Vec<codestory_contracts::api::ReadinessVerdictDto> {
+    readiness::build_readiness_verdicts(readiness::ReadinessInputs {
+        project,
+        stats,
+        freshness,
+        sidecar: Some(readiness_sidecar_input(sidecar)),
+    })
+}
+
+fn readiness_sidecar_input(
+    sidecar: &DoctorSidecarStatusOutput,
+) -> readiness::ReadinessSidecarInput<'_> {
+    readiness::ReadinessSidecarInput {
+        retrieval_mode: sidecar.retrieval_mode.as_str(),
+        degraded_reason: sidecar.degraded_reason.as_deref(),
+        manifest_generation: sidecar.manifest_generation.as_deref(),
+        manifest_input_hash: sidecar.manifest_input_hash.as_deref(),
     }
 }
 
@@ -8626,6 +8659,7 @@ fn doctor_sidecar_check(sidecar: &DoctorSidecarStatusOutput) -> DoctorCheckOutpu
     )
 }
 
+#[cfg(test)]
 fn index_next_commands(
     project: &str,
     retrieval: Option<&codestory_contracts::api::RetrievalStateDto>,
@@ -10923,6 +10957,7 @@ mod tests {
             retrieval: &retrieval,
             phase_timings: Some(&timings),
             summary_generation: None,
+            readiness: Vec::new(),
             next_commands: Vec::new(),
         };
 
@@ -11665,9 +11700,15 @@ mod tests {
 
     #[test]
     fn command_quoting_single_quotes_shell_sensitive_values() {
+        #[cfg(windows)]
         assert_eq!(
             quote_command_value("Inspect $env:SECRET and $(Get-ChildItem) and 'literal'"),
             "'Inspect $env:SECRET and $(Get-ChildItem) and ''literal'''"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            quote_command_value("Inspect $env:SECRET and $(Get-ChildItem) and 'literal'"),
+            r"'Inspect $env:SECRET and $(Get-ChildItem) and '\''literal'\'''"
         );
         assert_eq!(
             quote_command_path(Path::new("C:/repo/$hidden")),

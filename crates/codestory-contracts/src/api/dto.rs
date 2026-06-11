@@ -233,6 +233,60 @@ pub struct IndexFreshnessDto {
     pub samples: Vec<IndexFreshnessSampleDto>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessGoalDto {
+    LocalNavigation,
+    AgentPacketSearch,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessStatusDto {
+    Ready,
+    RepairIndex,
+    CheckIndex,
+    RepairRetrieval,
+    CacheBusy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct ReadinessIndexSnapshotDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<IndexFreshnessStatusDto>,
+    pub changed_file_count: u32,
+    pub new_file_count: u32,
+    pub removed_file_count: u32,
+    pub checked_file_count: u32,
+    pub indexed_file_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct ReadinessSidecarSnapshotDto {
+    pub retrieval_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_input_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct ReadinessVerdictDto {
+    pub goal: ReadinessGoalDto,
+    pub status: ReadinessStatusDto,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub minimum_next: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub full_repair: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<ReadinessIndexSnapshotDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar: Option<ReadinessSidecarSnapshotDto>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchHit {
     pub node_id: NodeId,

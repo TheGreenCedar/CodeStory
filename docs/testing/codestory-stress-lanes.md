@@ -7,20 +7,20 @@ metrics exist. They are promotion scouts, not product proof by themselves.
 
 Default smoke scale builds a 1k-file synthetic repo:
 
-```powershell
+```sh
 cargo bench -p codestory-bench --bench browser_stress
 ```
 
 Larger scales are opt-in:
 
-```powershell
-$env:CODESTORY_STRESS_SCALE = "large" # 1k + 10k
-$env:CODESTORY_ALLOW_HEAVY_STRESS = "1"
+```sh
+export CODESTORY_STRESS_SCALE=large # 1k + 10k
+export CODESTORY_ALLOW_HEAVY_STRESS=1
 cargo bench -p codestory-bench --bench browser_stress
 
-$env:CODESTORY_STRESS_SCALE = "full" # 1k + 10k + 100k
-$env:CODESTORY_ALLOW_HEAVY_STRESS = "1"
-$env:CODESTORY_ALLOW_100K_STRESS = "1"
+export CODESTORY_STRESS_SCALE=full # 1k + 10k + 100k
+export CODESTORY_ALLOW_HEAVY_STRESS=1
+export CODESTORY_ALLOW_100K_STRESS=1
 cargo bench -p codestory-bench --bench browser_stress
 ```
 

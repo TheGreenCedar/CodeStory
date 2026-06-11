@@ -193,15 +193,15 @@ Check:
 
 Use this when you need to wipe state instead of debugging a clearly broken cache:
 
-```powershell
-.\target\release\codestory-cli.exe index --project . --refresh full
+```sh
+./target/release/codestory-cli index --project . --refresh full
 ```
 
 If the cache directory itself needs to go:
 
-```powershell
-Remove-Item -LiteralPath <cache-dir> -Recurse -Force
-.\target\release\codestory-cli.exe index --project . --refresh full
+```sh
+mv <cache-dir> <cache-dir>.bak
+./target/release/codestory-cli index --project . --refresh full
 ```
 
 Keep the work serialized. Running multiple cargo or CLI indexing commands at once can hide the real failure behind lock contention and avoidable memory pressure.

@@ -53,12 +53,14 @@ struct RepoE2eStats {
     symbol_seconds: f64,
     trail_seconds: f64,
     snippet_seconds: f64,
+    report_seconds: f64,
     index: IndexStats,
     ground: GroundStats,
     search: SearchStats,
     symbol: SymbolStats,
     trail: TrailStats,
     snippet: SnippetStats,
+    report: ReportStats,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,6 +126,15 @@ struct SnippetStats {
     path: String,
     line: u64,
     snippet_lines: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ReportStats {
+    markdown_seconds: f64,
+    json_seconds: f64,
+    markdown_bytes: u64,
+    json_graph_nodes: usize,
+    json_graph_edges: usize,
 }
 
 const PROOF_TIER_STATS_ONLY: &str = "stats_only";
@@ -248,6 +259,19 @@ fn run_cli_json(
     cache_dir: &Path,
     args: &[String],
 ) -> (f64, Value) {
+    let (seconds, stdout) = run_cli_output(binary, project_root, cache_dir, args);
+    (
+        seconds,
+        serde_json::from_slice(&stdout).expect("parse json output"),
+    )
+}
+
+fn run_cli_output(
+    binary: &Path,
+    project_root: &Path,
+    cache_dir: &Path,
+    args: &[String],
+) -> (f64, Vec<u8>) {
     let started = Instant::now();
     let output = Command::new(binary)
         .current_dir(project_root)
@@ -269,10 +293,7 @@ fn run_cli_json(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    (
-        seconds,
-        serde_json::from_slice(&output.stdout).expect("parse json output"),
-    )
+    (seconds, output.stdout)
 }
 
 fn json_path<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
@@ -572,6 +593,32 @@ fn codestory_repo_release_e2e_emits_stats() {
         ],
     );
 
+    let (report_markdown_seconds, report_markdown_stdout) = run_cli_output(
+        &binary,
+        project_root.as_path(),
+        cache_dir.path(),
+        &[
+            "report".to_string(),
+            "--limit".to_string(),
+            "8".to_string(),
+            "--format".to_string(),
+            "markdown".to_string(),
+        ],
+    );
+    let (report_json_seconds, report_json) = run_cli_json(
+        &binary,
+        project_root.as_path(),
+        cache_dir.path(),
+        &[
+            "report".to_string(),
+            "--limit".to_string(),
+            "8".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ],
+    );
+    let report_seconds = report_markdown_seconds + report_json_seconds;
+
     let search_dir_after = fs::metadata(&search_dir)
         .expect("search dir metadata after reads")
         .modified()
@@ -751,6 +798,7 @@ fn codestory_repo_release_e2e_emits_stats() {
         symbol_seconds,
         trail_seconds,
         snippet_seconds,
+        report_seconds,
         index: IndexStats {
             node_count: u64_field(&index_json, &["summary", "stats", "node_count"]),
             edge_count: u64_field(&index_json, &["summary", "stats", "edge_count"]),
@@ -799,6 +847,13 @@ fn codestory_repo_release_e2e_emits_stats() {
             snippet_lines: string_field(&snippet_json, &["snippet", "snippet"])
                 .lines()
                 .count(),
+        },
+        report: ReportStats {
+            markdown_seconds: report_markdown_seconds,
+            json_seconds: report_json_seconds,
+            markdown_bytes: report_markdown_stdout.len() as u64,
+            json_graph_nodes: array_len(&report_json, &["graph", "nodes"]),
+            json_graph_edges: array_len(&report_json, &["graph", "edges"]),
         },
     };
 

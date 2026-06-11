@@ -43,16 +43,19 @@ agent-facing packet/search evidence.
 
 First-run evidence path:
 
-```powershell
+```sh
 node scripts/setup-retrieval-env.mjs --fetch-embed-model
-$env:CODESTORY_EMBED_MODEL_DIR = (Resolve-Path .\target\retrieval-models).Path
-$env:CODESTORY_EMBED_BACKEND = "llamacpp"
-$env:CODESTORY_EMBED_LLAMACPP_URL = "http://127.0.0.1:8080/v1/embeddings"
+export CODESTORY_EMBED_MODEL_DIR="$(pwd)/target/retrieval-models"
+export CODESTORY_EMBED_BACKEND="llamacpp"
+export CODESTORY_EMBED_LLAMACPP_URL="http://127.0.0.1:8080/v1/embeddings"
 cargo retrieval-setup
-.\target\release\codestory-cli.exe index --project <repo> --refresh full
-.\target\release\codestory-cli.exe retrieval index --project <repo> --refresh full
-.\target\release\codestory-cli.exe retrieval status --project <repo> --format json
+./target/release/codestory-cli index --project <repo> --refresh full
+./target/release/codestory-cli retrieval index --project <repo> --refresh full
+./target/release/codestory-cli retrieval status --project <repo> --format json
 ```
+
+On Windows PowerShell, use `.\target\release\codestory-cli.exe` and `$env:...`
+assignments for the same flow.
 
 `retrieval status` must show `retrieval_mode: "full"`. Its JSON backend fields
 distinguish the active query backend (`query_embedding_backend`), manifest
@@ -151,8 +154,8 @@ full refresh when finalization detects that the manifest would be unavailable im
 
 Confirm bindings with:
 
-```powershell
-.\target\release\codestory-cli.exe retrieval status --project .
+```sh
+./target/release/codestory-cli retrieval status --project .
 ```
 
 ---
@@ -161,9 +164,9 @@ Confirm bindings with:
 
 ### Bootstrap (recommended: Compose + cache dirs + wait)
 
-```powershell
+```sh
 cargo build --release -p codestory-cli
-.\target\release\codestory-cli.exe retrieval bootstrap --project .
+./target/release/codestory-cli retrieval bootstrap --project .
 ```
 
 Starts `docker/retrieval-compose.yml` when Docker is available (`qdrant/qdrant:v1.12.5`, Zoekt
@@ -205,16 +208,16 @@ While Qdrant is reachable, pruning uses HTTP `DELETE /collections/{name}`; when 
 
 ### Start sidecars (data dirs + state file only)
 
-```powershell
-.\target\release\codestory-cli.exe retrieval up
+```sh
+./target/release/codestory-cli retrieval up
 ```
 
 Does **not** start Docker. Use `retrieval bootstrap` or the setup script for automated Compose.
 
 ### Health check
 
-```powershell
-.\target\release\codestory-cli.exe retrieval status --project .
+```sh
+./target/release/codestory-cli retrieval status --project .
 ```
 
 JSON includes per-component `status`, `latency_ms`, `detail`, `capabilities` flags
@@ -270,8 +273,8 @@ Wrong model dim with `CODESTORY_EMBED_BACKEND=llamacpp` fails loudly (no hash su
 
 ### Index project
 
-```powershell
-.\target\release\codestory-cli.exe retrieval index --project . --refresh auto
+```sh
+./target/release/codestory-cli retrieval index --project . --refresh auto
 ```
 
 Runs workspace index (same as `codestory index`) then persists `retrieval_index_manifest` in
@@ -299,14 +302,14 @@ count is zero, Qdrant reuse is skipped explicitly and cannot mask stale graph/le
 
 ### Stop sidecars (state file only)
 
-```powershell
-.\target\release\codestory-cli.exe retrieval down
+```sh
+./target/release/codestory-cli retrieval down
 ```
 
 ### Standalone query (Phase 2+)
 
-```powershell
-.\target\release\codestory-cli.exe retrieval query "ExtensionService" --project .
+```sh
+./target/release/codestory-cli retrieval query "ExtensionService" --project .
 ```
 
 ---
@@ -356,8 +359,8 @@ and the ignored `retrieval_eval_*` tests with `CODESTORY_RETRIEVAL_EVAL_FULL_TES
 
 **Holdout prefetch (benchmark harness, not sidecar CLI):**
 
-```powershell
-node scripts/codestory-agent-ab-benchmark.mjs `
+```sh
+node scripts/codestory-agent-ab-benchmark.mjs \
   --list --task-suite holdout-retrieval --materialize-repos
 ```
 
@@ -367,7 +370,7 @@ Clones land in `target/agent-benchmark/repos/` (gitignored).
 
 | Symptom | Likely cause | Action |
 |---------|--------------|--------|
-| `retrieval up` port in use | stale process | `retrieval down`; check Task Manager / `docker ps` |
+| `retrieval up` port in use | stale process | `retrieval down`; check `ps`, Task Manager, or `docker ps` |
 | Zoekt unhealthy, unreachable | server not started | start Zoekt on `6070` and rebuild the project shard |
 | Qdrant unhealthy | wrong image tag / volume permissions | `docker run -p 6333:6333 qdrant/qdrant:v1.12.5` |
 | Qdrant unavailable while manifest dense-anchor count is `0` | expected graph-first policy skip | Verify Zoekt and SCIP are healthy and manifest policy/count/hash fields match; the dense stage will be skipped explicitly |

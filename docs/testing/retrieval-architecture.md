@@ -88,11 +88,11 @@ Use these when running promotion harnesses. Do not enable in normal production p
 
 **Sidecar promotion candidate (typical):**
 
-```powershell
-Remove-Item Env:CODESTORY_RETRIEVAL -ErrorAction SilentlyContinue
-Remove-Item Env:CODESTORY_EVAL_PROBES -ErrorAction SilentlyContinue
-.\target\release\codestory-cli.exe retrieval up
-.\target\release\codestory-cli.exe retrieval index --project . --refresh auto
+```sh
+unset CODESTORY_RETRIEVAL
+unset CODESTORY_EVAL_PROBES
+./target/release/codestory-cli retrieval up
+./target/release/codestory-cli retrieval index --project . --refresh auto
 ```
 
 ---
@@ -128,12 +128,12 @@ cargo run -p codestory-cli -- retrieval query "main" --project <repo-root>
 Repos: `codex`, `rootandruntime`, `sourcetrail`, `vscode` — manifests under
 `benchmarks/tasks/local-real/`.
 
-```powershell
-node scripts/codestory-agent-ab-benchmark.mjs `
-  --packet-runtime --packet-runtime-mode cold-cli `
-  --task-suite local-real --repeats 1 `
-  --out-dir target/agent-benchmark/packet-runtime-sidecar-promotion `
-  --codestory-cli target/release/codestory-cli.exe `
+```sh
+node scripts/codestory-agent-ab-benchmark.mjs \
+  --packet-runtime --packet-runtime-mode cold-cli \
+  --task-suite local-real --repeats 1 \
+  --out-dir target/agent-benchmark/packet-runtime-sidecar-promotion \
+  --codestory-cli target/release/codestory-cli \
   --timeout-ms 300000
 ```
 
@@ -143,18 +143,18 @@ before promotion language.
 
 ### holdout-retrieval (generalization)
 
-```powershell
+```sh
 node scripts/fetch-holdout-repos.mjs
 # or:
-node scripts/codestory-agent-ab-benchmark.mjs `
+node scripts/codestory-agent-ab-benchmark.mjs \
   --list --task-suite holdout-retrieval --materialize-repos
 
-node scripts/codestory-agent-ab-benchmark.mjs `
-  --packet-runtime --packet-runtime-mode cold-cli `
-  --task-suite holdout-retrieval --materialize-repos `
-  --repeats 1 `
-  --out-dir target/agent-benchmark/holdout-retrieval-smoke `
-  --codestory-cli target/release/codestory-cli.exe `
+node scripts/codestory-agent-ab-benchmark.mjs \
+  --packet-runtime --packet-runtime-mode cold-cli \
+  --task-suite holdout-retrieval --materialize-repos \
+  --repeats 1 \
+  --out-dir target/agent-benchmark/holdout-retrieval-smoke \
+  --codestory-cli target/release/codestory-cli \
   --timeout-ms 180000
 ```
 
@@ -163,7 +163,7 @@ repo-name/path literals or tune planner/ranker heuristics against holdout rows.
 
 ## Fast CI-style checks (automated in Phase 6)
 
-```powershell
+```sh
 cargo test -p codestory-runtime --test retrieval_generalization_guard
 node --test scripts/tests/codestory-agent-ab-analyzer.test.mjs
 cargo test -p codestory-cli --test onboarding_contracts
@@ -171,7 +171,7 @@ cargo test -p codestory-cli --test onboarding_contracts
 
 Optional broader lane:
 
-```powershell
+```sh
 cargo test -p codestory-retrieval
 cargo test -p codestory-runtime
 node --test scripts/tests/codestory-agent-ab-analyzer.test.mjs
@@ -237,7 +237,7 @@ After promotion runs, verify rollback warnings:
 
 **One-shot operator drill (after each promotion run):**
 
-```powershell
+```sh
 cargo test -p codestory-runtime retrieval_rollback::tests::rollback_drill_warns_without_setting_legacy_env -- --nocapture
 ```
 

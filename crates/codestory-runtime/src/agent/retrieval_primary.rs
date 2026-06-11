@@ -161,13 +161,41 @@ fn sidecar_retrieval_recovery_commands(project: &str) -> Vec<String> {
     vec![
         format!("codestory-cli index --project {project} --refresh full"),
         format!("codestory-cli retrieval bootstrap --project {project} --format json"),
-        format!("codestory-cli retrieval index --project {project} --refresh full"),
+        format!("codestory-cli retrieval index --project {project} --refresh full --format json"),
         format!("codestory-cli doctor --project {project} --format markdown"),
     ]
 }
 
 fn quote_cli_arg(value: &str) -> String {
+    let normalized = clean_cli_path(value);
+    if normalized
+        .chars()
+        .any(|ch| matches!(ch, '$' | '`' | '\'' | '"'))
+    {
+        quote_shell_single_quoted_arg(&normalized)
+    } else {
+        format!("\"{}\"", normalized.replace('"', "\\\""))
+    }
+}
+
+#[cfg(windows)]
+fn quote_shell_single_quoted_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn quote_shell_single_quoted_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn clean_cli_path(value: &str) -> String {
+    let mut path = value.replace('\\', "/");
+    if let Some(stripped) = path.strip_prefix("//?/UNC/") {
+        path = format!("//{stripped}");
+    } else if path.starts_with("//?/") {
+        path = path[4..].to_string();
+    }
+    path
 }
 
 pub(crate) fn shadow_retrieval_enabled() -> bool {
@@ -1521,17 +1549,22 @@ mod tests {
     }
 
     #[test]
-    fn recovery_commands_quote_powershell_sensitive_project_paths() {
+    fn recovery_commands_quote_shell_sensitive_project_paths() {
         let commands = sidecar_retrieval_recovery_commands(r"C:\tmp\cost$cache`tick's repo");
+
+        #[cfg(windows)]
+        let expected_project = r"'C:/tmp/cost$cache`tick''s repo'";
+        #[cfg(not(windows))]
+        let expected_project = r"'C:/tmp/cost$cache`tick'\''s repo'";
 
         assert_eq!(
             commands[0],
-            r"codestory-cli index --project 'C:\tmp\cost$cache`tick''s repo' --refresh full"
+            format!("codestory-cli index --project {expected_project} --refresh full")
         );
         assert!(
             commands
                 .iter()
-                .all(|command| command.contains(r"--project 'C:\tmp\cost$cache`tick''s repo'")),
+                .all(|command| command.contains(&format!("--project {expected_project}"))),
             "all recovery commands should quote the project path literally: {commands:?}"
         );
     }

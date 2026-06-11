@@ -187,7 +187,9 @@ fn readme_keeps_customer_first_onboarding() {
     assert!(readme.contains("docs/usage.md"));
     assert!(readme.contains("docs/concepts/how-codestory-works.md"));
     assert!(readme.contains("docs/testing/benchmark-results.md"));
-    assert!(readme.contains("setup embeddings --project $TargetWorkspace --dry-run --format json"));
+    assert!(readme.contains(
+        r#""$CODESTORY_CLI" setup embeddings --project "$TARGET_WORKSPACE" --dry-run --format json"#
+    ));
     assert!(readme.contains("serve --stdio"));
     assert!(readme.contains("docs/architecture/overview.md"));
     assert!(readme.contains("docs/contributors/debugging.md"));
@@ -254,7 +256,9 @@ fn docs_drift_contracts_keep_living_sources_explicit() {
         .expect("benchmark scorecard should exist");
 
     assert!(
-        readme.contains("setup embeddings --project $TargetWorkspace --dry-run --format json"),
+        readme.contains(
+            r#""$CODESTORY_CLI" setup embeddings --project "$TARGET_WORKSPACE" --dry-run --format json"#
+        ),
         "README quickstart should show first-run semantic setup dry-run"
     );
     assert!(

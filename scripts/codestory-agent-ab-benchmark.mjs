@@ -950,7 +950,7 @@ Task class: ${task.task_class ?? "unspecified"}`
   const packetFirstBlock = packetFirstCommand
     ? `
 Required first repository-context command:
-\`\`\`powershell
+\`\`\`${packetFirstCommandFenceLanguage()}
 ${packetFirstCommand}
 \`\`\`
 
@@ -976,16 +976,27 @@ Return a concise answer with the files, symbols, and commands that support your 
 Do not edit source files. Use read-only inspection commands only, except CodeStory may write its cache if needed.`;
 }
 
-function packetFirstCommandForPrompt(taskPrompt, task = null) {
-  const question = String(taskPrompt).replace(/\r?\n/g, " ");
-  const taskClass = task?.task_class
-    ? ` --task-class ${powershellSingleQuoted(validatePacketTaskClass("benchmark task", task.task_class).replace(/_/g, "-"))}`
-    : "";
-  return `& $env:CODESTORY_CLI packet --project . --question ${powershellSingleQuoted(question)}${taskClass} --budget compact --format json`;
+function packetFirstCommandFenceLanguage(platform = process.platform) {
+  return platform === "win32" ? "powershell" : "sh";
 }
 
-function powershellSingleQuoted(value) {
-  return `'${String(value).replace(/'/g, "''")}'`;
+function packetFirstCommandForPrompt(taskPrompt, task = null, platform = process.platform) {
+  const question = String(taskPrompt).replace(/\r?\n/g, " ");
+  const taskClass = task?.task_class
+    ? ` --task-class ${shellSingleQuoted(validatePacketTaskClass("benchmark task", task.task_class).replace(/_/g, "-"), platform)}`
+    : "";
+  if (platform === "win32") {
+    return `& $env:CODESTORY_CLI packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget compact --format json`;
+  }
+  return `"\${CODESTORY_CLI:-codestory-cli}" packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget compact --format json`;
+}
+
+function shellSingleQuoted(value, platform = process.platform) {
+  const text = String(value);
+  if (platform === "win32") {
+    return `'${text.replace(/'/g, "''")}'`;
+  }
+  return `'${text.replace(/'/g, "'\\''")}'`;
 }
 
 function artifactNamePart(value) {
@@ -1050,6 +1061,11 @@ function commandCategory(command) {
     new RegExp(`^\\s*${codestoryExecutablePath}`, "i").test(shellText) ||
     new RegExp(`[;&|]\\s*${codestoryExecutablePath}`, "i").test(shellText) ||
     /&\s*\$env:CODESTORY_CLI\s+/i.test(shellText) ||
+    new RegExp(
+      `(?:^|[;&|]\\s*)["']?\\$\\{CODESTORY_CLI:-codestory-cli\\}["']?\\s+${codestoryCommands}`,
+      "i",
+    ).test(shellText) ||
+    new RegExp(`(?:^|[;&|]\\s*)["']?\\$CODESTORY_CLI["']?\\s+${codestoryCommands}`, "i").test(shellText) ||
     new RegExp(`&\\s*\\$[a-z_][a-z0-9_]*\\s+${codestoryCommands}`, "i").test(shellText)
   ) {
     return "codestory_cli";
@@ -1084,6 +1100,8 @@ function isCodestoryPacketCommand(command) {
     new RegExp(`^\\s*${packetExecutablePath}`, "i").test(shellText) ||
     new RegExp(`[;&|]\\s*${packetExecutablePath}`, "i").test(shellText) ||
     /&\s*\$env:CODESTORY_CLI\s+packet\b/i.test(shellText) ||
+    /(?:^|[;&|]\s*)["']?\$\{CODESTORY_CLI:-codestory-cli\}["']?\s+packet\b/i.test(shellText) ||
+    /(?:^|[;&|]\s*)["']?\$CODESTORY_CLI["']?\s+packet\b/i.test(shellText) ||
     /&\s*\$[a-z_][a-z0-9_]*\s+packet\b/i.test(shellText)
   );
 }
@@ -1097,6 +1115,8 @@ function isCodestoryIndexCommand(command) {
     new RegExp(`^\\s*${indexExecutablePath}`, "i").test(shellText) ||
     new RegExp(`[;&|]\\s*${indexExecutablePath}`, "i").test(shellText) ||
     /&\s*\$env:CODESTORY_CLI\s+index\b/i.test(shellText) ||
+    /(?:^|[;&|]\s*)["']?\$\{CODESTORY_CLI:-codestory-cli\}["']?\s+index\b/i.test(shellText) ||
+    /(?:^|[;&|]\s*)["']?\$CODESTORY_CLI["']?\s+index\b/i.test(shellText) ||
     /&\s*\$[a-z_][a-z0-9_]*\s+index\b/i.test(shellText)
   );
 }

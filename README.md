@@ -41,18 +41,22 @@ checked setup instead of promising universal speedups or savings.
 
 From this checkout, build the CLI and point it at any repository:
 
-```powershell
+```sh
 cargo build --release -p codestory-cli
-$CodeStoryCli = ".\target\release\codestory-cli.exe"
-$TargetWorkspace = "C:\path\to\repo"
+CODESTORY_CLI="./target/release/codestory-cli"
+TARGET_WORKSPACE="/path/to/repo"
 
-& $CodeStoryCli doctor --project $TargetWorkspace
-& $CodeStoryCli setup embeddings --project $TargetWorkspace --dry-run --format json
-& $CodeStoryCli index --project $TargetWorkspace --refresh full
-& $CodeStoryCli ground --project $TargetWorkspace --why
-& $CodeStoryCli report --project $TargetWorkspace --output-file .\codestory-report.md
-& $CodeStoryCli report --project $TargetWorkspace --format json --output-file .\codestory-graph.json
+"$CODESTORY_CLI" doctor --project "$TARGET_WORKSPACE"
+"$CODESTORY_CLI" setup embeddings --project "$TARGET_WORKSPACE" --dry-run --format json
+"$CODESTORY_CLI" index --project "$TARGET_WORKSPACE" --refresh full
+"$CODESTORY_CLI" ground --project "$TARGET_WORKSPACE" --why
+"$CODESTORY_CLI" report --project "$TARGET_WORKSPACE" --output-file codestory-report.md
+"$CODESTORY_CLI" report --project "$TARGET_WORKSPACE" --format json --output-file codestory-graph.json
 ```
+
+On Windows PowerShell, use `.\target\release\codestory-cli.exe`, environment
+assignments such as `$env:NAME = "value"`, and normal Windows paths such as
+`C:\path\to\repo`.
 
 That basic path establishes local navigation readiness: the local cache, graph,
 lexical index, and DB-backed navigation commands are usable for health, file,
@@ -68,17 +72,17 @@ evidence is trustworthy only when retrieval status reports `retrieval_mode=full`
 That full mode depends on local Zoekt, Qdrant, SCIP, and llama.cpp embedding
 sidecars.
 
-```powershell
+```sh
 node scripts/setup-retrieval-env.mjs --fetch-embed-model
-$env:CODESTORY_EMBED_MODEL_DIR = (Resolve-Path .\target\retrieval-models).Path
-$env:CODESTORY_EMBED_BACKEND = "llamacpp"
-$env:CODESTORY_EMBED_LLAMACPP_URL = "http://127.0.0.1:8080/v1/embeddings"
+export CODESTORY_EMBED_MODEL_DIR="$(pwd)/target/retrieval-models"
+export CODESTORY_EMBED_BACKEND="llamacpp"
+export CODESTORY_EMBED_LLAMACPP_URL="http://127.0.0.1:8080/v1/embeddings"
 
 cargo retrieval-setup
-& $CodeStoryCli index --project $TargetWorkspace --refresh full
-& $CodeStoryCli retrieval index --project $TargetWorkspace --refresh full
-& $CodeStoryCli retrieval status --project $TargetWorkspace --format json
-& $CodeStoryCli doctor --project $TargetWorkspace
+"$CODESTORY_CLI" index --project "$TARGET_WORKSPACE" --refresh full
+"$CODESTORY_CLI" retrieval index --project "$TARGET_WORKSPACE" --refresh full
+"$CODESTORY_CLI" retrieval status --project "$TARGET_WORKSPACE" --format json
+"$CODESTORY_CLI" doctor --project "$TARGET_WORKSPACE"
 ```
 
 Missing sidecars, stale manifests, disabled sidecars, mixed stored-doc vector
@@ -88,10 +92,10 @@ trusting agent-facing packet/search evidence.
 After that first index, use narrower commands instead of asking the agent to
 start over:
 
-```powershell
-& $CodeStoryCli search --project $TargetWorkspace --query "request routing" --why
-& $CodeStoryCli trail --project $TargetWorkspace --id <node-id> --story --hide-speculative
-& $CodeStoryCli snippet --project $TargetWorkspace --id <node-id> --context 40
+```sh
+"$CODESTORY_CLI" search --project "$TARGET_WORKSPACE" --query "request routing" --why
+"$CODESTORY_CLI" trail --project "$TARGET_WORKSPACE" --id <node-id> --story --hide-speculative
+"$CODESTORY_CLI" snippet --project "$TARGET_WORKSPACE" --id <node-id> --context 40
 ```
 
 A good CodeStory-backed answer should name the source files it used, say when
@@ -128,17 +132,20 @@ Details: [docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md).
 Use this path when CodeStory should be installed once as a grounding skill and
 then pointed at whatever repository an agent is working on.
 
+```sh
+SkillHome="<agent-global-skill-directory>"
+mkdir -p "$SkillHome"
+cp -R ./.agents/skills/codestory-grounding "$SkillHome/codestory-grounding"
+bash "$SkillHome/codestory-grounding/scripts/setup.sh"
+```
+
+On Windows PowerShell:
+
 ```powershell
 $SkillHome = "<agent-global-skill-directory>"
 New-Item -ItemType Directory -Force -Path $SkillHome | Out-Null
 Copy-Item -Recurse -Force .\.agents\skills\codestory-grounding "$SkillHome\codestory-grounding"
 & "$SkillHome\codestory-grounding\scripts\setup.ps1"
-```
-
-On Unix-like systems:
-
-```sh
-bash "<agent-global-skill-directory>/codestory-grounding/scripts/setup.sh"
 ```
 
 The setup script prints `CODESTORY_CLI=<path>`. Persist that path if your agent

@@ -6,15 +6,15 @@ Scope: transcript analysis and manifest-backed quality scoring for
 The harness exposes pure analyzer/scorer functions and keeps a built-in
 fixture smoke test:
 
-```powershell
-node .\scripts\codestory-agent-ab-benchmark.mjs --self-test
+```sh
+node ./scripts/codestory-agent-ab-benchmark.mjs --self-test
 ```
 
 The focused Node fixture lives at
 `scripts/tests/codestory-agent-ab-analyzer.test.mjs`:
 
-```powershell
-node --test .\scripts\tests\codestory-agent-ab-analyzer.test.mjs
+```sh
+node --test ./scripts/tests/codestory-agent-ab-analyzer.test.mjs
 ```
 
 The fixture verifies:
@@ -37,7 +37,7 @@ For source-truth recall, `drill` now feeds the broad question search and bounded
 supplemental searches into the verification target list. Treat those targets as
 candidate files for verification, not as final answer support.
 
-Keep `node .\scripts\codestory-agent-ab-benchmark.mjs --list` as the cheapest
+Keep `node ./scripts/codestory-agent-ab-benchmark.mjs --list` as the cheapest
 configuration smoke check.
 
 Do not make public savings claims from these fixtures. They only prove parser

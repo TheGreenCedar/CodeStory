@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use codestory_contracts::api::{EdgeId as ApiEdgeId, NodeId as ApiNodeId};
+use codestory_contracts::api::{
+    EdgeId as ApiEdgeId, IndexFreshnessDto, NodeId as ApiNodeId, ReadinessVerdictDto,
+};
 use codestory_contracts::graph::{Edge, EdgeKind, Node, NodeId, NodeKind};
 use codestory_store::Store;
 use serde::Serialize;
@@ -35,6 +37,26 @@ pub struct ReportGenerationMetadata {
     pub storage_path: String,
     pub generated_at_epoch_ms: u128,
     pub note: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<RepoReportHandoff>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RepoReportHandoff {
+    pub readiness: Vec<ReadinessVerdictDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<IndexFreshnessDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sidecar_retrieval_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
+    pub trust_caveat: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_entry_point: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_risk: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -252,6 +274,7 @@ fn build_report_from_source(
             storage_path: storage_path.to_string_lossy().to_string(),
             generated_at_epoch_ms: generated_at_epoch_ms(),
             note: "Report/export artifacts are generated from the current SQLite store and are not source-of-truth state.".to_string(),
+            handoff: None,
         },
         summary,
         hotspots,

@@ -635,8 +635,7 @@ fn doctor_next_commands_stop_at_index_repair_when_inventory_is_stale() {
     assert!(
         joined.contains("codestory-cli index")
             && joined.contains("--refresh incremental")
-            && joined.contains("codestory-cli doctor")
-            && joined.contains("--format markdown"),
+            && joined.contains("codestory-cli doctor"),
         "stale doctor should recommend index repair then doctor recheck: {doctor:#}"
     );
     assert!(
@@ -706,8 +705,7 @@ fn doctor_next_commands_stop_at_retrieval_repair_when_sidecar_is_not_full() {
         joined.contains("codestory-cli retrieval status")
             && joined.contains("codestory-cli retrieval index")
             && joined.contains("--refresh full")
-            && joined.contains("codestory-cli doctor")
-            && joined.contains("--format markdown"),
+            && joined.contains("codestory-cli doctor"),
         "doctor should recommend retrieval repair before packet/search: {doctor:#}"
     );
     assert!(

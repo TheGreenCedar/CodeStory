@@ -4,7 +4,7 @@
 
 Run these from the repo root:
 
-```powershell
+```sh
 cargo fmt --check
 cargo check
 cargo test -p codestory-cli
@@ -19,14 +19,16 @@ If you touch runtime search, grounding, or repo-scale indexing behavior, check t
 
 After the basic cargo checks, verify the shipped CLI flow with the built binary instead of `cargo run`:
 
-```powershell
+```sh
 cargo build --release -p codestory-cli
-.\target\release\codestory-cli.exe setup embeddings --project . --dry-run
-.\target\release\codestory-cli.exe index --project . --refresh auto
-.\target\release\codestory-cli.exe search --project . --query WorkspaceIndexer --why
-.\target\release\codestory-cli.exe context --project . --query WorkspaceIndexer
-.\target\release\codestory-cli.exe doctor --project .
+./target/release/codestory-cli setup embeddings --project . --dry-run
+./target/release/codestory-cli index --project . --refresh auto
+./target/release/codestory-cli search --project . --query WorkspaceIndexer --why
+./target/release/codestory-cli context --project . --query WorkspaceIndexer
+./target/release/codestory-cli doctor --project .
 ```
+
+On Windows PowerShell, use `.\target\release\codestory-cli.exe`.
 
 Read commands default to `--refresh none`. If a read command says the cache is empty, either run `index --refresh full` first or rerun the read command with an explicit refresh mode.
 

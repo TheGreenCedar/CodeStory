@@ -1,6 +1,8 @@
 # Testing Matrix
 
 Run Cargo verifications serially in this repo. The workspace shares build locks.
+Examples use POSIX shell syntax. On Windows PowerShell, use environment
+assignments such as `$env:NAME = "value"`.
 
 ```mermaid
 flowchart TD
@@ -24,7 +26,7 @@ flowchart TD
 
 ## Whole Workspace
 
-```powershell
+```sh
 cargo fmt --check
 cargo check
 cargo test
@@ -37,7 +39,7 @@ These are the default checks for any contributor change.
 
 If you only changed `README.md` or `docs/**`, use the smallest credible lane:
 
-```powershell
+```sh
 cargo fmt --check
 cargo test -p codestory-cli --test onboarding_contracts
 ```
@@ -46,7 +48,7 @@ Only escalate to broader cargo checks if the doc change depends on new code beha
 
 ## Indexer And Graph Fidelity
 
-```powershell
+```sh
 cargo test -p codestory-indexer --test fidelity_regression
 cargo test -p codestory-indexer --test tictactoe_language_coverage
 cargo test -p codestory-indexer --test integration
@@ -57,13 +59,13 @@ Use the full test binaries above instead of filtered `cargo test` invocations.
 
 ## Store Changes
 
-```powershell
+```sh
 cargo test -p codestory-store
 ```
 
 ## Runtime Changes
 
-```powershell
+```sh
 cargo test -p codestory-runtime
 cargo test -p codestory-runtime --test retrieval_eval
 ```
@@ -75,8 +77,8 @@ The repo-scale runtime integration test is ignored by default because it indexes
 `codestory` workspace and can exhaust memory on developer machines.
 Only run it as an explicit heavy lane:
 
-```powershell
-$env:CODESTORY_RUN_REPO_SCALE_TEST = "1"
+```sh
+export CODESTORY_RUN_REPO_SCALE_TEST=1
 cargo test -p codestory-runtime --test integration test_repo_scale_call_resolution -- --ignored --nocapture
 ```
 
@@ -85,7 +87,7 @@ cargo test -p codestory-runtime --test integration test_repo_scale_call_resoluti
 Run this lane when default `index` behavior, symbol-doc persistence, dense-anchor
 persistence/reuse, embedding reuse, or cold-start performance changes:
 
-```powershell
+```sh
 cargo build --release -p codestory-cli
 cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
 ```
@@ -96,7 +98,7 @@ only to make that separate drill skip explicit during local release-evidence
 collection. A skipped drill means the release evidence is not real-repo drill
 proof; it does not rename the `proof_tier` emitted by the stats JSON.
 
-Append the emitted headline metrics to `docs/testing/codestory-e2e-stats-log.md`. Include graph seconds, semantic seconds, symbol docs written, dense docs skipped, dense reason counts, dense docs reused, dense docs embedded, total index seconds, `retrieval_index_seconds`, `retrieval_status_seconds`, `proof_tier`, any `warnings`, and whether `sidecar_status_after_retrieval_index` plus `search.sidecar_shadow_retrieval_mode` were `full`.
+Append the emitted headline metrics to `docs/testing/codestory-e2e-stats-log.md`. Include graph seconds, semantic seconds, symbol docs written, dense docs skipped, dense reason counts, dense docs reused, dense docs embedded, total index seconds, `repeat_full_refresh_seconds`, `retrieval_index_seconds`, `retrieval_status_seconds`, `report_seconds`, `proof_tier`, any `warnings`, and whether `sidecar_status_after_retrieval_index` plus `search.sidecar_shadow_retrieval_mode` were `full`.
 
 Release-readiness evidence is tiered:
 
@@ -135,7 +137,7 @@ examples only; do not copy them into current performance claims.
 
 ## CLI Boundary And Output Changes
 
-```powershell
+```sh
 cargo test -p codestory-cli
 ```
 
@@ -143,7 +145,7 @@ Prefer this lane before `cargo test` for the whole workspace when the change is 
 
 Runtime-backed CLI fixture flows are a separate heavier lane:
 
-```powershell
+```sh
 cargo test -p codestory-cli --test runtime_backed_flows -- --ignored
 ```
 
@@ -151,7 +153,7 @@ Run that lane only when the change crosses CLI and runtime behavior together, su
 
 ## Bench Surface Checks
 
-```powershell
+```sh
 node scripts/semantic-doc-leakage-check.mjs
 cargo check -p codestory-bench --benches
 ```
@@ -176,17 +178,17 @@ and decision current in the matrix instead of adding raw run transcripts.
 
 For indexing performance work, run the full bench when practical:
 
-```powershell
+```sh
 cargo bench -p codestory-bench --bench indexing
 ```
 
 For browser-scale stress work, start with the smoke lane and only opt into
 larger synthetic repos when the machine and change justify it:
 
-```powershell
+```sh
 cargo bench -p codestory-bench --bench browser_stress
-$env:CODESTORY_STRESS_SCALE = "large" # 1k + 10k
-$env:CODESTORY_ALLOW_HEAVY_STRESS = "1"
+export CODESTORY_STRESS_SCALE=large # 1k + 10k
+export CODESTORY_ALLOW_HEAVY_STRESS=1
 cargo bench -p codestory-bench --bench browser_stress
 ```
 
