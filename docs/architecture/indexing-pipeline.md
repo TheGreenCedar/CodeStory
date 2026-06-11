@@ -46,7 +46,7 @@ That split is intentional: the runtime orchestrates the run, the indexer perform
 ```mermaid
 flowchart TD
     plan["Refresh plan from codestory-workspace"] --> prep["Normalize paths and load compile_commands metadata"]
-    prep --> supported{"Supported language?"}
+    prep --> supported{"Parser-backed or structural support path?"}
     supported -->|"No"| skip["Skip file with no parse work"]
     supported -->|"Yes"| cache{"Artifact cache hit?"}
     cache -->|"Yes"| reuse["Reuse cached intermediate artifacts or refresh file metadata"]
@@ -105,7 +105,8 @@ Files that disappeared from discovery are collected into `files_to_remove`.
 - it seeds the symbol table from existing stored node kinds for incremental runs
 - it chunks `files_to_index` using batch settings
 - it loads parsed compilation metadata from `compile_commands.json` when available
-- it picks a language configuration for each file and skips unsupported files before any parse work
+- it picks a parser-backed language configuration or structural collector for
+  each file and skips unsupported files before any parse work
 
 Compilation metadata matters mostly for native-language parsing and is part of the artifact-cache key, so changes to compiler flags or include paths can invalidate cached artifacts.
 
@@ -232,7 +233,11 @@ Keep measured repo-scale timings in [codestory-e2e-stats-log.md](../testing/code
 
 ### When files are skipped
 
-The indexer skips files before parsing when it cannot select a supported language configuration for the path plus compilation metadata.
+The indexer skips files before parsing when it cannot select a parser-backed
+language configuration or structural collector for the path plus compilation
+metadata. See [language-support.md](language-support.md) for the distinction
+between parser-backed graph support, structural collectors, beta fidelity, and
+parser-compatibility-only candidates.
 
 ### How `compile_commands.json` participates
 

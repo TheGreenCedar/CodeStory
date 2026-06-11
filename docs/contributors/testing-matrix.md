@@ -56,6 +56,9 @@ cargo test -p codestory-indexer --test integration
 
 Run these whenever the change affects parsing, extraction, semantic resolution, or graph fidelity.
 Use the full test binaries above instead of filtered `cargo test` invocations.
+Use [language-support.md](../architecture/language-support.md) when deciding
+whether a language claim is fidelity-gated, beta fidelity, structural only, or
+parser compatibility only.
 
 ## Store Changes
 

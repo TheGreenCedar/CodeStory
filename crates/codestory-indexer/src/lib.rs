@@ -130,6 +130,29 @@ pub struct LanguageConfig {
     ruleset: LanguageRuleset,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanguageSupportMode {
+    ParserBackedGraph,
+    StructuralCollector,
+    ParserCompatibilityOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanguageEvidenceTier {
+    GraphFidelity,
+    BasicFidelity,
+    StructuralOnly,
+    ParserCompatibilityOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanguageSupportProfile {
+    pub language_name: &'static str,
+    pub support_mode: LanguageSupportMode,
+    pub evidence_tier: LanguageEvidenceTier,
+    pub claim_label: &'static str,
+}
+
 struct CompiledLanguageRules {
     graph_file: GraphFile,
     tags_query: Option<Query>,
@@ -8643,9 +8666,29 @@ fn is_api_endpoint_call_context(line: &str, literal_col: u32) -> bool {
 
     let methods = ["delete", "patch", "post", "put", "head", "options", "get"];
     methods.iter().any(|method| {
-        compact_before.ends_with(&format!(".{method}("))
-            || compact_before.ends_with(&format!("::{method}("))
+        let dot_call = format!(".{method}(");
+        let path_call = format!("::{method}(");
+        (compact_before.ends_with(&dot_call) || compact_before.ends_with(&path_call))
+            && !is_server_route_registration_context(&compact_before, method)
     })
+}
+
+fn is_server_route_registration_context(compact_before: &str, method: &str) -> bool {
+    let route_call = format!(".{method}(");
+    let Some(receiver) = compact_before.strip_suffix(&route_call) else {
+        return false;
+    };
+    let receiver = receiver
+        .rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'))
+        .next()
+        .unwrap_or(receiver)
+        .rsplit('.')
+        .next()
+        .unwrap_or(receiver);
+    matches!(
+        receiver,
+        "app" | "router" | "route" | "server" | "fastify" | "hono"
+    )
 }
 
 fn has_line_comment_before_literal(value: &str) -> bool {
@@ -9298,8 +9341,100 @@ pub fn index_file(
     })
 }
 
+fn normalize_extension(ext: &str) -> String {
+    ext.trim().trim_start_matches('.').to_ascii_lowercase()
+}
+
+pub fn language_support_profile_for_ext(ext: &str) -> Option<LanguageSupportProfile> {
+    let ext = normalize_extension(ext);
+    match ext.as_str() {
+        "py" | "pyi" => Some(parser_graph_fidelity_profile("python")),
+        "java" => Some(parser_graph_fidelity_profile("java")),
+        "rs" => Some(parser_graph_fidelity_profile("rust")),
+        "js" | "jsx" | "mjs" | "cjs" => Some(parser_graph_fidelity_profile("javascript")),
+        "ts" | "tsx" | "mts" | "cts" => Some(parser_graph_fidelity_profile("typescript")),
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(parser_graph_fidelity_profile("cpp")),
+        "c" | "h" => Some(parser_graph_fidelity_profile("c")),
+        "go" => Some(parser_basic_fidelity_profile("go")),
+        "rb" => Some(parser_basic_fidelity_profile("ruby")),
+        "php" => Some(parser_basic_fidelity_profile("php")),
+        "cs" => Some(parser_basic_fidelity_profile("csharp")),
+        "html" | "htm" => Some(structural_profile("html")),
+        "css" => Some(structural_profile("css")),
+        "sql" => Some(structural_profile("sql")),
+        "kt" | "kts" => Some(parser_compatibility_profile("kotlin")),
+        "swift" => Some(parser_compatibility_profile("swift")),
+        "dart" => Some(parser_compatibility_profile("dart")),
+        "sh" | "bash" => Some(parser_compatibility_profile("bash")),
+        _ => None,
+    }
+}
+
+pub fn language_support_profile_for_language_name(
+    language_name: &str,
+) -> Option<LanguageSupportProfile> {
+    let language_name = language_name.trim().to_ascii_lowercase();
+    match language_name.as_str() {
+        "python" => Some(parser_graph_fidelity_profile("python")),
+        "java" => Some(parser_graph_fidelity_profile("java")),
+        "rust" => Some(parser_graph_fidelity_profile("rust")),
+        "javascript" => Some(parser_graph_fidelity_profile("javascript")),
+        "typescript" => Some(parser_graph_fidelity_profile("typescript")),
+        "cpp" => Some(parser_graph_fidelity_profile("cpp")),
+        "c" => Some(parser_graph_fidelity_profile("c")),
+        "go" => Some(parser_basic_fidelity_profile("go")),
+        "ruby" => Some(parser_basic_fidelity_profile("ruby")),
+        "php" => Some(parser_basic_fidelity_profile("php")),
+        "csharp" => Some(parser_basic_fidelity_profile("csharp")),
+        "html" => Some(structural_profile("html")),
+        "css" => Some(structural_profile("css")),
+        "sql" => Some(structural_profile("sql")),
+        "kotlin" => Some(parser_compatibility_profile("kotlin")),
+        "swift" => Some(parser_compatibility_profile("swift")),
+        "dart" => Some(parser_compatibility_profile("dart")),
+        "bash" => Some(parser_compatibility_profile("bash")),
+        _ => None,
+    }
+}
+
+fn parser_graph_fidelity_profile(language_name: &'static str) -> LanguageSupportProfile {
+    LanguageSupportProfile {
+        language_name,
+        support_mode: LanguageSupportMode::ParserBackedGraph,
+        evidence_tier: LanguageEvidenceTier::GraphFidelity,
+        claim_label: "parser-backed graph, fidelity-gated",
+    }
+}
+
+fn parser_basic_fidelity_profile(language_name: &'static str) -> LanguageSupportProfile {
+    LanguageSupportProfile {
+        language_name,
+        support_mode: LanguageSupportMode::ParserBackedGraph,
+        evidence_tier: LanguageEvidenceTier::BasicFidelity,
+        claim_label: "parser-backed graph, beta fidelity",
+    }
+}
+
+fn structural_profile(language_name: &'static str) -> LanguageSupportProfile {
+    LanguageSupportProfile {
+        language_name,
+        support_mode: LanguageSupportMode::StructuralCollector,
+        evidence_tier: LanguageEvidenceTier::StructuralOnly,
+        claim_label: "structural collector only",
+    }
+}
+
+fn parser_compatibility_profile(language_name: &'static str) -> LanguageSupportProfile {
+    LanguageSupportProfile {
+        language_name,
+        support_mode: LanguageSupportMode::ParserCompatibilityOnly,
+        evidence_tier: LanguageEvidenceTier::ParserCompatibilityOnly,
+        claim_label: "parser compatibility only",
+    }
+}
+
 pub fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
-    let ext = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    let ext = normalize_extension(ext);
     match ext.as_str() {
         // Keep this extension map aligned with the top-level live rule registry.
         "py" | "pyi" => Some(make_language_config(
@@ -11288,6 +11423,43 @@ class Test {
         let tsx = get_language_for_ext("tsx").expect("tsx config");
         assert_eq!(tsx.graph_query, TSX_GRAPH_QUERY);
         assert_eq!(tsx.tags_query, Some(TSX_TAGS_QUERY));
+    }
+
+    #[test]
+    fn test_language_support_profiles_separate_claim_tiers() {
+        let tier_a = language_support_profile_for_ext("rs").expect("rust profile");
+        assert_eq!(tier_a.support_mode, LanguageSupportMode::ParserBackedGraph);
+        assert_eq!(tier_a.evidence_tier, LanguageEvidenceTier::GraphFidelity);
+        assert_eq!(tier_a.claim_label, "parser-backed graph, fidelity-gated");
+
+        let tier_b = language_support_profile_for_ext("go").expect("go profile");
+        assert_eq!(tier_b.support_mode, LanguageSupportMode::ParserBackedGraph);
+        assert_eq!(tier_b.evidence_tier, LanguageEvidenceTier::BasicFidelity);
+        assert_eq!(tier_b.claim_label, "parser-backed graph, beta fidelity");
+
+        let structural = language_support_profile_for_ext("html").expect("html profile");
+        assert_eq!(
+            structural.support_mode,
+            LanguageSupportMode::StructuralCollector
+        );
+        assert_eq!(
+            structural.evidence_tier,
+            LanguageEvidenceTier::StructuralOnly
+        );
+
+        let future = language_support_profile_for_ext("swift").expect("swift profile");
+        assert_eq!(
+            future.support_mode,
+            LanguageSupportMode::ParserCompatibilityOnly
+        );
+        assert_eq!(
+            future.evidence_tier,
+            LanguageEvidenceTier::ParserCompatibilityOnly
+        );
+        assert!(
+            get_language_for_ext("swift").is_none(),
+            "parser-compatibility-only languages must not route into live parser-backed indexing"
+        );
     }
 
     #[test]

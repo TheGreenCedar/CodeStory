@@ -1,4 +1,8 @@
-# Retrieval parser compatibility matrix (ws-a-parser-compat)
+# Retrieval Parser Compatibility Matrix (ws-a-parser-compat)
+
+This page is a parser-version compatibility record, not the language support
+contract. For runtime support tiers and safe public claims, use
+[language-support.md](language-support.md).
 
 This records Step 2 parser compatibility decisions from `retrieval-language-support_038d3ae9.plan.md` against the workspace policy:
 

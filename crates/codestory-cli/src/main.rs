@@ -7680,10 +7680,23 @@ fn render_files_summary(markdown: &mut String, output: &codestory_contracts::api
             .summary
             .language_counts
             .iter()
-            .map(|entry| format!("{}={}", entry.language, entry.file_count))
+            .map(|entry| {
+                format!(
+                    "{}={} [{}; {}]",
+                    entry.language, entry.file_count, entry.support_mode, entry.evidence_tier
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let _ = writeln!(markdown, "- languages: {languages}");
+        let claim_labels = output
+            .summary
+            .language_counts
+            .iter()
+            .map(|entry| format!("{}={}", entry.language, entry.claim_label))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(markdown, "- language_support_claims: {claim_labels}");
     }
     for note in &output.summary.coverage_notes {
         let _ = writeln!(markdown, "- coverage: {note}");

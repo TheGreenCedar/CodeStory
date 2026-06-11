@@ -49,7 +49,7 @@ type SameFileCacheKey = (i64, String, String);
 type SameModuleCacheKey = (String, String, String);
 type NameCacheKey = (String, String);
 type RelativeImportCacheKey = (String, String, String, String);
-const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 4;
+pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SemanticResolutionRequestKey {

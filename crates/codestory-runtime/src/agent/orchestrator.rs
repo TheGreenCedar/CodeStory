@@ -4917,68 +4917,9 @@ fn packet_missing_sufficiency_probe_queries(
 fn packet_probe_query_is_covered(
     query: &str,
     answer: &AgentAnswerDto,
-    supported_claims: &[PacketClaimDto],
+    _supported_claims: &[PacketClaimDto],
 ) -> bool {
     packet_probe_query_is_cited(query, answer)
-        || packet_probe_query_is_covered_by_role(query, answer)
-        || packet_probe_query_is_covered_by_claim(query, supported_claims)
-}
-
-fn packet_probe_query_is_covered_by_role(query: &str, answer: &AgentAnswerDto) -> bool {
-    let normalized_query = normalize_identifier(query);
-    if normalized_query.is_empty() {
-        return false;
-    }
-    answer.citations.iter().any(|citation| {
-        packet_evidence_role(citation)
-            .map(normalize_identifier)
-            .is_some_and(|role| {
-                normalized_query == role
-                    || normalized_query.contains(&role)
-                    || role.contains(&normalized_query)
-            })
-    })
-}
-
-fn packet_probe_query_is_covered_by_claim(
-    query: &str,
-    supported_claims: &[PacketClaimDto],
-) -> bool {
-    let tokens = packet_probe_claim_coverage_tokens(query);
-    if tokens.is_empty() {
-        return false;
-    }
-    supported_claims.iter().any(|claim| {
-        let normalized_claim = normalize_identifier(&claim.claim);
-        let matched = tokens
-            .iter()
-            .filter(|token| normalized_claim.contains(token.as_str()))
-            .count();
-        if tokens.len() <= 2 {
-            matched == tokens.len()
-        } else {
-            matched >= 2 && matched.saturating_mul(5) >= tokens.len().saturating_mul(3)
-        }
-    })
-}
-
-fn packet_probe_claim_coverage_tokens(query: &str) -> Vec<String> {
-    packet_probe_match_tokens(query)
-        .into_iter()
-        .filter(|token| {
-            !matches!(
-                token.as_str(),
-                "components"
-                    | "driver"
-                    | "flow"
-                    | "flows"
-                    | "high"
-                    | "level"
-                    | "pipeline"
-                    | "result"
-            )
-        })
-        .collect()
 }
 
 fn packet_sufficiency_required_probe_queries(

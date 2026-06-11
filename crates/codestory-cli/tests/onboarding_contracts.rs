@@ -186,6 +186,7 @@ fn readme_keeps_customer_first_onboarding() {
     assert!(readme.contains(".agents/skills/codestory-grounding/SKILL.md"));
     assert!(readme.contains("docs/usage.md"));
     assert!(readme.contains("docs/concepts/how-codestory-works.md"));
+    assert!(readme.contains("docs/architecture/language-support.md"));
     assert!(readme.contains("docs/testing/benchmark-results.md"));
     assert!(readme.contains(
         r#""$CODESTORY_CLI" setup embeddings --project "$TARGET_WORKSPACE" --dry-run --format json"#
@@ -205,6 +206,7 @@ fn readme_keeps_customer_first_onboarding() {
         "docs/concepts/how-codestory-works.md",
         "docs/architecture/overview.md",
         "docs/architecture/runtime-execution-path.md",
+        "docs/architecture/language-support.md",
         "docs/architecture/subsystems/contracts.md",
         "docs/architecture/subsystems/workspace.md",
         "docs/architecture/subsystems/indexer.md",
@@ -252,6 +254,8 @@ fn docs_drift_contracts_keep_living_sources_explicit() {
     let usage = fs::read_to_string(root.join("docs/usage.md")).expect("usage doc should exist");
     let testing_matrix = fs::read_to_string(root.join("docs/contributors/testing-matrix.md"))
         .expect("testing matrix should exist");
+    let language_support = fs::read_to_string(root.join("docs/architecture/language-support.md"))
+        .expect("language support doc should exist");
     let benchmark_scorecard = fs::read_to_string(root.join("docs/testing/benchmark-results.md"))
         .expect("benchmark scorecard should exist");
 
@@ -287,9 +291,33 @@ fn docs_drift_contracts_keep_living_sources_explicit() {
             && benchmark_scorecard.contains("codestory-e2e-stats-log.md"),
         "benchmark scorecard should link detailed history and living timing logs"
     );
+    for required in [
+        "parser-backed graph",
+        "fidelity-gated",
+        "beta fidelity",
+        "structural collector",
+        "parser compatibility only",
+        "Go, Ruby, PHP, C#",
+        "Kotlin, Swift, Dart, Bash",
+        "language_support_profile_for_ext",
+        "language_support_profile_for_language_name",
+    ] {
+        assert!(
+            language_support.contains(required),
+            "language support doc should preserve support-claim term `{required}`"
+        );
+    }
+    assert!(
+        testing_matrix.contains("../architecture/language-support.md"),
+        "testing matrix should link the language support claim contract"
+    );
     assert!(
         root.join("docs/testing/benchmark-ledger.md").exists(),
         "benchmark ledger should preserve detailed historical rows"
+    );
+    assert!(
+        root.join("docs/review-action-plan.md").exists(),
+        "review action plan should preserve the external review remediation trail"
     );
 }
 

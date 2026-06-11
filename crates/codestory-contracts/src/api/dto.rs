@@ -562,6 +562,9 @@ pub struct IndexedFileDto {
 pub struct IndexedFileLanguageCountDto {
     pub language: String,
     pub file_count: u32,
+    pub support_mode: String,
+    pub evidence_tier: String,
+    pub claim_label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

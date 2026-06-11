@@ -192,6 +192,19 @@ flowchart LR
 CodeStory builds a local evidence layer so agents can request grounded context
 instead of relying on ad hoc file reads.
 
+## Language Support Claims
+
+CodeStory separates parser-backed graph indexing, regression-tested accuracy,
+structural extraction, framework route coverage, and agent packet/search
+readiness. The current contract is documented in
+[docs/architecture/language-support.md](docs/architecture/language-support.md).
+
+In short: Python, Java, Rust, JavaScript, TypeScript/TSX, C++, and C are
+fidelity-gated parser-backed graph languages; Go, Ruby, PHP, and C# are
+parser-backed beta languages with basic fidelity coverage; HTML, CSS, and SQL
+use structural collectors; Kotlin, Swift, Dart, and Bash are parser
+compatibility candidates only.
+
 For the system model, start with
 [docs/concepts/how-codestory-works.md](docs/concepts/how-codestory-works.md),
 then [docs/architecture/overview.md](docs/architecture/overview.md).
@@ -222,6 +235,7 @@ workspace shares build locks.
 - [docs/contributors/debugging.md](docs/contributors/debugging.md)
 - [docs/contributors/testing-matrix.md](docs/contributors/testing-matrix.md)
 - [docs/architecture/runtime-execution-path.md](docs/architecture/runtime-execution-path.md)
+- [docs/architecture/language-support.md](docs/architecture/language-support.md)
 - [docs/architecture/subsystems/contracts.md](docs/architecture/subsystems/contracts.md)
 - [docs/architecture/subsystems/workspace.md](docs/architecture/subsystems/workspace.md)
 - [docs/architecture/subsystems/indexer.md](docs/architecture/subsystems/indexer.md)

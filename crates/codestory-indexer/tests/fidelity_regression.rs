@@ -13,6 +13,10 @@ const JAVA_SOURCE: &str = include_str!("fixtures/fidelity_lab/java_fidelity_lab.
 const CPP_SOURCE: &str = include_str!("fixtures/fidelity_lab/cpp_fidelity_lab.cpp");
 const C_SOURCE: &str = include_str!("fixtures/fidelity_lab/c_fidelity_lab.c");
 const RUST_SOURCE: &str = include_str!("fixtures/fidelity_lab/rust_fidelity_lab.rs");
+const GO_SOURCE: &str = include_str!("fixtures/fidelity_lab/go_fidelity_lab.go");
+const RUBY_SOURCE: &str = include_str!("fixtures/fidelity_lab/ruby_fidelity_lab.rb");
+const PHP_SOURCE: &str = include_str!("fixtures/fidelity_lab/php_fidelity_lab.php");
+const CSHARP_SOURCE: &str = include_str!("fixtures/fidelity_lab/csharp_fidelity_lab.cs");
 
 type ResolvedOwnerExpectation = (&'static str, &'static str, &'static str);
 type ResolvedNameExpectation = (&'static str, &'static str);
@@ -103,6 +107,54 @@ const RUST_SYMBOLS: &[&str] = &[
     "run_async",
     "orchestrate_rust",
 ];
+const GO_SYMBOLS: &[&str] = &[
+    "Notifier",
+    "ConsoleNotifier",
+    "Repository",
+    "Event",
+    "Workflow",
+    "Notify",
+    "Save",
+    "Run",
+    "decorate",
+    "orchestrateGo",
+];
+const RUBY_SYMBOLS: &[&str] = &[
+    "Notifier",
+    "ConsoleNotifier",
+    "Repository",
+    "Workflow",
+    "notify",
+    "save",
+    "run",
+    "decorate",
+    "orchestrate_ruby",
+];
+const PHP_SYMBOLS: &[&str] = &[
+    "Notifier",
+    "ConsoleNotifier",
+    "Repository",
+    "Event",
+    "Workflow",
+    "notify",
+    "save",
+    "run",
+    "decorate",
+    "orchestrate_php",
+];
+const CSHARP_SYMBOLS: &[&str] = &[
+    "INotifier",
+    "ConsoleNotifier",
+    "Repository",
+    "Event",
+    "Workflow",
+    "Program",
+    "Notify",
+    "Save",
+    "Run",
+    "Decorate",
+    "Main",
+];
 
 const PYTHON_CALLS: &[&str] = &["notify", "save", "decorate", "run"];
 const TYPESCRIPT_CALLS: &[&str] = &["identity", "notify", "save", "decorate", "run"];
@@ -111,6 +163,10 @@ const JAVA_CALLS: &[&str] = &["identity", "notifyEvent", "save", "decorate", "ru
 const CPP_CALLS: &[&str] = &["identity", "notifyEvent", "save", "decorate", "run"];
 const C_CALLS: &[&str] = &["repository_track", "workflow_run"];
 const RUST_CALLS: &[&str] = &["identity", "notify", "save", "decorate", "run"];
+const GO_CALLS: &[&str] = &["Notify", "Save", "decorate", "Run"];
+const RUBY_CALLS: &[&str] = &["notify", "save", "decorate", "run"];
+const PHP_CALLS: &[&str] = &["notify", "save", "decorate", "run"];
+const CSHARP_CALLS: &[&str] = &["Notify", "Save", "Decorate", "Run"];
 
 const PYTHON_IMPORTS: &[&str] = &[];
 const TYPESCRIPT_IMPORTS: &[&str] = &["fs", "path"];
@@ -119,6 +175,10 @@ const JAVA_IMPORTS: &[&str] = &["java.util.concurrent", "java.util.function"];
 const CPP_IMPORTS: &[&str] = &["future", "functional", "string"];
 const C_IMPORTS: &[&str] = &["stdio", "string", "stddef"];
 const RUST_IMPORTS: &[&str] = &["std::collections", "std::future"];
+const GO_IMPORTS: &[&str] = &["fmt"];
+const RUBY_IMPORTS: &[&str] = &["logger"];
+const PHP_IMPORTS: &[&str] = &["Random\\Randomizer"];
+const CSHARP_IMPORTS: &[&str] = &["System"];
 
 const PYTHON_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[];
 const TYPESCRIPT_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] =
@@ -135,6 +195,10 @@ const CPP_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[
 const C_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[];
 const RUST_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] =
     &[("run", "Notifier", "notify"), ("run", "Repository", "save")];
+const GO_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[];
+const RUBY_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[];
+const PHP_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[];
+const CSHARP_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[];
 
 const EMPTY_RESOLVED_NAMES: &[ResolvedNameExpectation] = &[];
 
@@ -236,6 +300,62 @@ fn fidelity_cases() -> Vec<FidelityCase> {
             required_import_fragments: RUST_IMPORTS,
             min_resolved_calls: 2,
             expected_resolved_owners: RUST_RESOLVED_OWNERS,
+            expected_resolved_names: EMPTY_RESOLVED_NAMES,
+        },
+        FidelityCase {
+            language: "go",
+            filename: "fidelity.go",
+            source: GO_SOURCE,
+            min_nodes: 12,
+            min_call_edges: 4,
+            min_import_edges: 1,
+            required_symbols: GO_SYMBOLS,
+            required_call_targets: GO_CALLS,
+            required_import_fragments: GO_IMPORTS,
+            min_resolved_calls: 0,
+            expected_resolved_owners: GO_RESOLVED_OWNERS,
+            expected_resolved_names: EMPTY_RESOLVED_NAMES,
+        },
+        FidelityCase {
+            language: "ruby",
+            filename: "fidelity.rb",
+            source: RUBY_SOURCE,
+            min_nodes: 12,
+            min_call_edges: 4,
+            min_import_edges: 1,
+            required_symbols: RUBY_SYMBOLS,
+            required_call_targets: RUBY_CALLS,
+            required_import_fragments: RUBY_IMPORTS,
+            min_resolved_calls: 0,
+            expected_resolved_owners: RUBY_RESOLVED_OWNERS,
+            expected_resolved_names: EMPTY_RESOLVED_NAMES,
+        },
+        FidelityCase {
+            language: "php",
+            filename: "fidelity.php",
+            source: PHP_SOURCE,
+            min_nodes: 12,
+            min_call_edges: 4,
+            min_import_edges: 1,
+            required_symbols: PHP_SYMBOLS,
+            required_call_targets: PHP_CALLS,
+            required_import_fragments: PHP_IMPORTS,
+            min_resolved_calls: 0,
+            expected_resolved_owners: PHP_RESOLVED_OWNERS,
+            expected_resolved_names: EMPTY_RESOLVED_NAMES,
+        },
+        FidelityCase {
+            language: "csharp",
+            filename: "fidelity.cs",
+            source: CSHARP_SOURCE,
+            min_nodes: 12,
+            min_call_edges: 4,
+            min_import_edges: 1,
+            required_symbols: CSHARP_SYMBOLS,
+            required_call_targets: CSHARP_CALLS,
+            required_import_fragments: CSHARP_IMPORTS,
+            min_resolved_calls: 0,
+            expected_resolved_owners: CSHARP_RESOLVED_OWNERS,
             expected_resolved_names: EMPTY_RESOLVED_NAMES,
         },
     ]

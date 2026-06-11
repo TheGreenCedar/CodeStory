@@ -31,6 +31,9 @@ use codestory_contracts::events::{Event, EventBus};
 use codestory_contracts::graph::{AccessKind, Edge as GraphEdge, Node as GraphNode};
 use codestory_indexer::IncrementalIndexingStats;
 use codestory_indexer::WorkspaceIndexer as V2WorkspaceIndexer;
+use codestory_indexer::{
+    LanguageEvidenceTier, LanguageSupportMode, language_support_profile_for_language_name,
+};
 use codestory_store::{
     FileInfo, GroundingEdgeKindCount, GroundingNodeRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata,
     LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSearchDoc,
@@ -683,6 +686,43 @@ fn framework_route_coverage_dto(entry: &FrameworkRouteCoverageEntry) -> Framewor
             .map(|value| value.to_string())
             .collect(),
         promotable: entry.promotable,
+    }
+}
+
+struct LanguageSupportSummary {
+    support_mode: String,
+    evidence_tier: String,
+    claim_label: String,
+}
+
+fn language_support_summary_for_language(language: &str) -> LanguageSupportSummary {
+    language_support_profile_for_language_name(language)
+        .map(|profile| LanguageSupportSummary {
+            support_mode: language_support_mode_label(profile.support_mode).to_string(),
+            evidence_tier: language_evidence_tier_label(profile.evidence_tier).to_string(),
+            claim_label: profile.claim_label.to_string(),
+        })
+        .unwrap_or_else(|| LanguageSupportSummary {
+            support_mode: "unknown".to_string(),
+            evidence_tier: "unknown".to_string(),
+            claim_label: "no support claim recorded".to_string(),
+        })
+}
+
+fn language_support_mode_label(mode: LanguageSupportMode) -> &'static str {
+    match mode {
+        LanguageSupportMode::ParserBackedGraph => "parser_backed_graph",
+        LanguageSupportMode::StructuralCollector => "structural_collector",
+        LanguageSupportMode::ParserCompatibilityOnly => "parser_compatibility_only",
+    }
+}
+
+fn language_evidence_tier_label(tier: LanguageEvidenceTier) -> &'static str {
+    match tier {
+        LanguageEvidenceTier::GraphFidelity => "graph_fidelity",
+        LanguageEvidenceTier::BasicFidelity => "basic_fidelity",
+        LanguageEvidenceTier::StructuralOnly => "structural_only",
+        LanguageEvidenceTier::ParserCompatibilityOnly => "parser_compatibility_only",
     }
 }
 
@@ -8543,9 +8583,15 @@ impl AppController {
         }
         let language_counts = language_counts
             .into_iter()
-            .map(|(language, file_count)| IndexedFileLanguageCountDto {
-                language,
-                file_count,
+            .map(|(language, file_count)| {
+                let support = language_support_summary_for_language(&language);
+                IndexedFileLanguageCountDto {
+                    language,
+                    file_count,
+                    support_mode: support.support_mode,
+                    evidence_tier: support.evidence_tier,
+                    claim_label: support.claim_label,
+                }
             })
             .collect::<Vec<_>>();
         let file_count = language_counts
