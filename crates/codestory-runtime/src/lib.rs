@@ -4963,7 +4963,24 @@ fn semantic_file_is_entrypoint(path: Option<&str>, display_name: &str) -> bool {
         return true;
     }
     semantic_path_is_entrypoint_file(path)
-        && matches!(name.as_str(), "run" | "start" | "handler" | "app")
+        && matches!(
+            name.as_str(),
+            "__main__"
+                | "app"
+                | "application"
+                | "asgi"
+                | "function"
+                | "handler"
+                | "index"
+                | "program"
+                | "route"
+                | "routes"
+                | "run"
+                | "server"
+                | "start"
+                | "startup"
+                | "wsgi"
+        )
 }
 
 fn semantic_path_is_entrypoint_file(path: Option<&str>) -> bool {
@@ -4971,13 +4988,49 @@ fn semantic_path_is_entrypoint_file(path: Option<&str>) -> bool {
         return false;
     };
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    normalized.ends_with("/main.rs")
-        || normalized.ends_with("/app.ts")
-        || normalized.ends_with("/app.tsx")
-        || normalized.ends_with("/index.ts")
-        || normalized.ends_with("/index.tsx")
-        || normalized.ends_with("/route.ts")
-        || normalized.ends_with("/route.tsx")
+    [
+        "/main.rs",
+        "/main.c",
+        "/main.cc",
+        "/main.cpp",
+        "/main.cxx",
+        "/main.go",
+        "/main.java",
+        "/main.py",
+        "/app.js",
+        "/app.jsx",
+        "/app.py",
+        "/app.rb",
+        "/app.ts",
+        "/app.tsx",
+        "/application.java",
+        "/asgi.py",
+        "/config.ru",
+        "/index.js",
+        "/index.jsx",
+        "/index.php",
+        "/index.rb",
+        "/index.ts",
+        "/index.tsx",
+        "/program.cs",
+        "/route.js",
+        "/route.jsx",
+        "/route.ts",
+        "/route.tsx",
+        "/server.js",
+        "/server.jsx",
+        "/server.py",
+        "/server.rb",
+        "/server.ts",
+        "/server.tsx",
+        "/startup.cs",
+        "/wsgi.py",
+    ]
+    .iter()
+    .any(|suffix| normalized.ends_with(suffix))
+        || (normalized.contains("/cmd/") && normalized.ends_with("/main.go"))
+        || (normalized.contains("/src/main/java/") && normalized.ends_with("application.java"))
+        || (normalized.contains("/src/main/kotlin/") && normalized.ends_with("application.kt"))
 }
 
 fn semantic_file_is_public_surface(path: Option<&str>) -> bool {
@@ -4988,10 +5041,32 @@ fn semantic_file_is_public_surface(path: Option<&str>) -> bool {
     normalized.ends_with("/lib.rs")
         || normalized.ends_with("/mod.rs")
         || normalized.ends_with("/public.rs")
+        || normalized.ends_with("/__init__.py")
+        || normalized.ends_with("/index.js")
+        || normalized.ends_with("/index.jsx")
+        || normalized.ends_with("/index.php")
+        || normalized.ends_with("/index.rb")
+        || normalized.ends_with("/index.ts")
+        || normalized.ends_with("/index.tsx")
+        || normalized.ends_with("/package.json")
+        || normalized.starts_with("api/")
         || normalized.contains("/api/")
+        || normalized.starts_with("apps/")
+        || normalized.contains("/apps/")
+        || normalized.starts_with("include/")
+        || normalized.contains("/include/")
+        || normalized.starts_with("pkg/")
+        || normalized.contains("/pkg/")
+        || normalized.starts_with("public/")
+        || normalized.contains("/public/")
+        || normalized.starts_with("routes/")
         || normalized.contains("/routes/")
+        || normalized.starts_with("controllers/")
         || normalized.contains("/controllers/")
+        || normalized.starts_with("components/")
         || normalized.contains("/components/")
+        || normalized.contains("/src/main/java/")
+        || normalized.contains("/src/main/kotlin/")
 }
 
 fn dense_anchor_public_kind(kind: codestory_contracts::graph::NodeKind) -> bool {
@@ -10857,6 +10932,83 @@ mod tests {
             ),
             Some(DenseAnchorReason::DocumentedNontrivial)
         );
+    }
+
+    #[test]
+    fn dense_policy_classifies_cross_language_entrypoints_and_surfaces() {
+        let python_app = semantic_policy_node(21, NodeKind::FUNCTION, "app", 1);
+        let go_command = semantic_policy_node(22, NodeKind::FUNCTION, "run", 1);
+        let csharp_program = semantic_policy_node(23, NodeKind::CLASS, "Program", 1);
+        let java_application = semantic_policy_node(24, NodeKind::CLASS, "Application", 1);
+        let c_header_api = semantic_policy_node(25, NodeKind::STRUCT, "ClientApi", 1);
+        let python_package_api = semantic_policy_node(26, NodeKind::CLASS, "PackageClient", 1);
+        let mut context = SemanticDocGraphContext::default();
+        context
+            .file_paths
+            .insert(python_app.id, "service/app.py".to_string());
+        context
+            .file_paths
+            .insert(go_command.id, "cmd/server/main.go".to_string());
+        context
+            .file_paths
+            .insert(csharp_program.id, "src/Program.cs".to_string());
+        context.file_paths.insert(
+            java_application.id,
+            "src/main/java/com/acme/Application.java".to_string(),
+        );
+        context
+            .file_paths
+            .insert(c_header_api.id, "include/acme/client_api.hpp".to_string());
+        context.file_paths.insert(
+            python_package_api.id,
+            "packages/acme_sdk/__init__.py".to_string(),
+        );
+
+        for (node, display_name, file_path) in [
+            (&python_app, "app", "service/app.py"),
+            (&go_command, "run", "cmd/server/main.go"),
+            (&csharp_program, "Program", "src/Program.cs"),
+            (
+                &java_application,
+                "Application",
+                "src/main/java/com/acme/Application.java",
+            ),
+        ] {
+            assert_eq!(
+                dense_anchor_reason_for_node(
+                    &context,
+                    node,
+                    display_name,
+                    Some(file_path),
+                    "semantic_doc_version: 4\nsymbol: entrypoint\nkind: FUNCTION\n",
+                    Some(AccessKind::Private),
+                ),
+                Some(DenseAnchorReason::Entrypoint),
+                "{file_path} should classify as an entrypoint"
+            );
+        }
+
+        for (node, display_name, file_path) in [
+            (&c_header_api, "ClientApi", "include/acme/client_api.hpp"),
+            (
+                &python_package_api,
+                "PackageClient",
+                "packages/acme_sdk/__init__.py",
+            ),
+        ] {
+            assert_eq!(
+                dense_anchor_reason_for_node(
+                    &context,
+                    node,
+                    display_name,
+                    Some(file_path),
+                    "semantic_doc_version: 4\nsymbol: api\nkind: STRUCT\n",
+                    Some(AccessKind::Private),
+                ),
+                Some(DenseAnchorReason::PublicApi),
+                "{file_path} should classify as a public surface"
+            );
+        }
     }
 
     #[test]

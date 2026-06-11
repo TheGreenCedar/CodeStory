@@ -59,6 +59,7 @@ Keep the full emitted JSON in the test output when reviewing locally, and add th
 | 2026-06-11 | a88705f2+wt | AST-first graph_first_v1 sampled release e2e; symbol_search_docs 11,336; dense anchors 693; dense skips 10,643; semantic_embedding_ms 48.52s; retrieval_index_seconds 7.31; retrieval_mode full; repeat full refresh 21.39s with 0 embedded; peak descendant 304.93 MB at target/memory-measure/ast-first-release-e2e-v6/summary.json | 67.97 | 0.22 | 2.24 | 0.58 | 0.24 | 0.22 | 82,510 | 69,766 | 220 | 0 | 693 | true |
 | 2026-06-11 | a88705f2+wt | final AST-first graph_first_v1 sampled release e2e after drill sidecar finalizer; symbol_search_docs 11,336; dense anchors 693; dense skips 10,643; semantic_embedding_ms 48.83s; retrieval_index_seconds 6.54; retrieval_mode full; repeat full refresh 21.39s with 0 embedded; peak descendant 318.35 MB at target/memory-measure/ast-first-release-e2e-v9/summary.json | 69.18 | 0.26 | 2.38 | 0.56 | 0.24 | 0.23 | 82,528 | 69,784 | 220 | 0 | 693 | true |
 | 2026-06-11 | 376df0c8+wt | readiness/handoff and Unix compatibility release e2e; proof_tier full_sidecar; warnings none; real drill intentionally skipped with CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1; symbol_search_docs 11,505; dense anchors 708; dense skips 10,797; semantic_embedding_ms 48.89s; retrieval_index_seconds 10.95; retrieval_mode full; repeat full refresh 20.56s with 0 embedded | 68.23 | 0.22 | 2.27 | 0.54 | 0.22 | 0.20 | 83,735 | 70,803 | 222 | 0 | 708 | true |
+| 2026-06-11 | a60f078a+wt | agent-grounding rescue full e2e; proof_tier full_sidecar; warnings none; real drill manifest target/agent-benchmark/real-repo-drill-cases.json with no skip allowance; holdout packet gate final-v4 passed cold+warm; symbol_search_docs 11,543; dense anchors 708; dense skips 10,835; semantic_embedding_ms 45.17s; retrieval_index_seconds 6.50; retrieval_mode full; repeat full refresh 21.82s with 0 embedded | 66.00 | 0.22 | 2.05 | 0.53 | 0.21 | 0.20 | 84,170 | 71,161 | 222 | 0 | 708 | true |
 
 ## Repeat And Report Timing
 
@@ -69,6 +70,7 @@ Append the measurement row here when running the release harness.
 | Date | Commit | Scenario | Repeat full refresh seconds | Report seconds | Report markdown seconds | Report JSON seconds |
 | --- | --- | --- | ---: | ---: | ---: | ---: |
 | 2026-06-11 | 376df0c8+wt | readiness/handoff and Unix compatibility release e2e; proof_tier full_sidecar; real drill skipped with CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1 | 20.56 | 2.59 | 1.09 | 1.50 |
+| 2026-06-11 | a60f078a+wt | agent-grounding rescue full e2e; proof_tier full_sidecar; real drill manifest target/agent-benchmark/real-repo-drill-cases.json with no skip allowance; holdout packet gate final-v4 passed cold+warm | 21.82 | 2.56 | 1.10 | 1.46 |
 
 ## Phase Metrics
 
@@ -121,3 +123,4 @@ Append the measurement row here when running the release harness.
 | 2026-06-10 | a88705f2 | clean main baseline same-machine full-sidecar stats from detached worktree; warnings index_seconds>600 and semantic_phase_seconds>500; retrieval_index_seconds 26.44; retrieval_mode full | 1238.23 | 13.61 | 1211.82 | 0 | 11,178 | 0 |
 | 2026-06-10 | a88705f2+wt | AST-first graph_first_v1 full-sidecar stats; symbol_search_docs 11,315; dense anchors 693; dense skips 10,622; reasons public_api 643, entrypoint 5, central_graph_node 36, component_report 9; repeat full refresh 22.75s with 0 embedded | 67.34 | 13.16 | 43.98 | 0 | 693 | 0 |
 | 2026-06-11 | 376df0c8+wt | readiness/handoff and Unix compatibility release e2e; proof_tier full_sidecar; real drill skipped with CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1; symbol_search_docs 11,505; dense anchors 708; dense skips 10,797; reasons public_api 656, entrypoint 5, central_graph_node 38, component_report 9 | 68.23 | 10.11 | 49.85 | 0 | 708 | 0 |
+| 2026-06-11 | a60f078a+wt | agent-grounding rescue full e2e; proof_tier full_sidecar; real drill manifest target/agent-benchmark/real-repo-drill-cases.json with no skip allowance; symbol_search_docs 11,543; dense anchors 708; dense skips 10,835; reasons public_api 656, entrypoint 5, central_graph_node 38, component_report 9 | 66.00 | 11.25 | 45.95 | 0 | 708 | 0 |

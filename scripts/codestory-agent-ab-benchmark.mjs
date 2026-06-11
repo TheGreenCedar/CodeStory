@@ -3373,6 +3373,15 @@ function packetRuntimePublishableBlockers(results, opts = {}) {
     .filter(Boolean);
 }
 
+function packetRuntimeQualityGateRequired(opts = {}) {
+  return Boolean(opts.publishable || (opts.taskSuite === "holdout-retrieval" && !opts.allowFailures));
+}
+
+function formatPacketRuntimeBlocker(blocker) {
+  const row = blocker.result;
+  return `  ${row.repo} ${row.task_id} ${row.mode} repeat ${row.repeat}: ${blocker.reasons.join("; ")}`;
+}
+
 function groupTasksByRepo(tasks) {
   const byRepo = new Map();
   for (const task of tasks) {
@@ -3572,10 +3581,19 @@ async function runPacketRuntimeBenchmark(opts, tasks) {
 
   const blockers = packetRuntimePublishableBlockers(results, opts);
   if (opts.publishable && blockers.length) {
-    console.error("--publishable failed: packet runtime rows must pass, include passing manifest quality gates, and use pinned clean repo provenance.");
+    console.error(
+      "--publishable failed: packet runtime rows must pass, include passing manifest quality gates, and use pinned clean repo provenance.",
+    );
     for (const blocker of blockers) {
-      const row = blocker.result;
-      console.error(`  ${row.repo} ${row.task_id} ${row.mode} repeat ${row.repeat}: ${blocker.reasons.join("; ")}`);
+      console.error(formatPacketRuntimeBlocker(blocker));
+    }
+    process.exitCode = 1;
+  } else if (packetRuntimeQualityGateRequired(opts) && blockers.length) {
+    console.error(
+      "holdout-retrieval packet-runtime gate failed: every row must pass manifest quality thresholds. Use --allow-failures only for exploratory diagnostics.",
+    );
+    for (const blocker of blockers) {
+      console.error(formatPacketRuntimeBlocker(blocker));
     }
     process.exitCode = 1;
   }
@@ -3923,6 +3941,15 @@ function runSelfTest() {
     }),
     [null, false, true, "fail"],
   );
+  assert.equal(packetRuntimeQualityGateRequired({ taskSuite: "holdout-retrieval" }), true);
+  assert.equal(
+    packetRuntimeQualityGateRequired({
+      taskSuite: "holdout-retrieval",
+      allowFailures: true,
+    }),
+    false,
+  );
+  assert.equal(packetRuntimeQualityGateRequired({ taskSuite: "local-real" }), false);
   assert.equal(
     cachePreparationAction({
       status: "pass",
@@ -4117,6 +4144,7 @@ export {
   packetComposition,
   packetLatencyTelemetry,
   packetRuntimePublishableBlockers,
+  packetRuntimeQualityGateRequired,
   PACKET_COMPOSITION_WEIGHTS,
   packetCompositionFileScore,
   packetFirstCommandForPrompt,

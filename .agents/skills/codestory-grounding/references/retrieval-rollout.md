@@ -16,6 +16,24 @@ trustworthy; running retrieval alone is not enough.
 | Benchmark harness | `cargo check -p codestory-bench --benches`; the relevant Criterion bench only when it isolates the hot path; release e2e stats for real-repo timing; for AST-first retrieval, include same-run baseline/candidate rows for cold total index time, `semantic_embedding_ms`, dense doc count reduction, repeat refresh embedded-doc count, holdout MRR@10/Hit@10/exact-symbol Hit@1, packet lazy-search source reads, and peak descendant working set | New benchmark code, latency/timing claims, rollback baseline updates, dense-policy changes, or performance-sensitive retrieval/index changes | Promotion by itself; synthetic or narrow benches are scouts until real-repo evidence exists |
 | Smoke CI | `.github/workflows/retrieval-sidecar-smoke.yml` plus `docs/contributors/retrieval-sidecar-smoke-ci.md` pass criteria | PRs touching retrieval crate, runtime/stdio/search wiring, indexer retrieval hooks, retrieval docs, scripts, Docker sidecar config, or the workflow | Full sidecar readiness. CI smoke uses `--skip-compose --wait-secs 0` and proves manifest-missing fail-closed shape only |
 
+## Agent-Grounding Release Gates
+
+Use the highest completed tier as the only claim level in docs, PRs, or final
+handoffs:
+
+| Tier | Required evidence | Claim boundary |
+| --- | --- | --- |
+| CodeStory self-e2e | Generalization lint, targeted runtime/indexer tests, release CLI build, `doctor`, and repo-scale e2e stats | This branch still works on CodeStory and product Rust has no banned holdout literals |
+| Local-real drill suite | Self-e2e plus local-real packet/drill rows without skip allowances | Product tuning survived realistic local repos |
+| Holdout-retrieval drill suite | Local-real plus materialized holdout-retrieval rows, required recall/quality thresholds, and forbidden-claim checks with no skip allowances | Retrieval behavior is generalized for the public holdout suite |
+| Promotion-grade paired benchmark | Holdout plus repeated CodeStory/no-CodeStory rows, timing/cost accounting, answer-quality ledger classifications, and packet-first source-read avoidance checks | Useful-for-agents, speed, or savings claims |
+
+Packet statuses (`sufficient`, `partial`, `blocked`) describe evidence coverage
+only. Final answer quality is promoted only by `drill`/`drill-suite` ledger
+classifications. Holdout literals belong in manifests, tests, benchmark
+harnesses, or the `CODESTORY_EVAL_PROBES` eval module, not production
+planner/ranker/runtime code.
+
 ## CI Smoke Triage
 
 The Windows `retrieval-sidecar-smoke` workflow is intentionally reduced. It

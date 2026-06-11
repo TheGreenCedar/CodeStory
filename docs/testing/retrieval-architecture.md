@@ -21,7 +21,7 @@ configuration error, not a diagnostic route.
 | CLI lifecycle | `codestory-cli` `retrieval up\|down\|status\|index\|query` | Local data dirs, health JSON, standalone query |
 | Packet integration | `codestory-runtime/src/agent/retrieval_primary.rs` | Primary sidecar path, diagnostic traces, promotion warnings |
 | Nucleo policy | `codestory-runtime/src/agent/nucleo_policy.rs` | Suppresses Nucleo O(n) scan on sidecar primary; disabled sidecars are not valid product evidence |
-| Generalization lint | `scripts/lint-retrieval-generalization.mjs` | Bans repo literals in Rust production retrieval trees (CI via Rust guard test); benchmark/eval harness scripts may name holdout repos only inside their manifest/eval boundary |
+| Generalization lint | `scripts/lint-retrieval-generalization.mjs` | Bans repo literals in Rust production retrieval trees (CI via Rust guard test); benchmark/eval harness scripts and `codestory-runtime/src/agent/eval_probes.rs` may name holdout repos only inside their manifest/eval boundary |
 
 **Modes:** `full`, `no_scip`, `no_semantic`, `lexical_only`, `unavailable` — only
 `full` may serve primary packet/search results. All non-`full` modes fail closed. With
@@ -33,6 +33,25 @@ explicitly zero; otherwise Qdrant remains mandatory. See
 product corpus; `benchmarks/tasks/holdout-retrieval/` is the public
 generalization corpus. Holdout rows are promotion evidence only, not a tuning
 loop.
+
+## Proof tiers and claims
+
+Do not describe a branch as generalized or useful for agents until the matching
+proof tier has run cleanly on the current branch. Docs and PRs must state only
+the highest tier actually reached:
+
+| Tier | Proof | Claim allowed |
+|------|-------|---------------|
+| 1. CodeStory self-e2e | Generalization lint, targeted runtime/indexer tests, release CLI build, `doctor`, and repo-scale e2e stats | CodeStory still works on itself and production code has no banned holdout literals |
+| 2. Local-real drill suite | Tier 1 plus local-real packet/drill rows with no skip allowances | Product tuning survived realistic local repos |
+| 3. Holdout-retrieval drill suite | Tier 2 plus holdout-retrieval materialized repos, no skip allowances, required recall/quality thresholds, and forbidden-claim checks | Retrieval behavior is generalized enough for the public holdout suite |
+| 4. Promotion-grade paired benchmark | Tier 3 plus repeated paired CodeStory/no-CodeStory rows, quality gates, timing/cost accounting, and source-read avoidance checks | Promotion language about agent usefulness, speed, or savings |
+
+`packet` status is evidence sufficiency, not final answer quality. Only
+`drill`/`drill-suite` rows with ledger classifications can promote answer
+quality. Packet-first runs count as agent-useful only when packets marked
+`sufficient` avoid post-packet source reads, or when those reads are explicitly
+classified as source-truth follow-up rather than hidden grounding.
 
 ## Environment flags
 
@@ -160,6 +179,10 @@ node scripts/codestory-agent-ab-benchmark.mjs \
 
 Holdout failures should block promotion or trigger diagnosis; do not add
 repo-name/path literals or tune planner/ranker heuristics against holdout rows.
+The generalization lint currently fails production Rust on holdout names and
+anchors such as repository names, specific source paths, and manifest-specific
+symbols. Keep those strings in manifests, tests, benchmark harnesses, or the
+test-only eval probe module.
 
 ## Fast CI-style checks (automated in Phase 6)
 
@@ -201,7 +224,7 @@ tests in the branch. Do not infer support for languages without direct benchmark
 | Warning config | done | `docs/architecture/retrieval-rollback.json` |
 | Markdown link contract (`onboarding_contracts`) | verify | `cargo test -p codestory-cli --test onboarding_contracts` |
 | local-real cold packet + north-star SLOs | **human** | p99 retrieval, quality 3/4, wall targets |
-| holdout-retrieval 2/3 pass | **human** | Requires materialized OSS repos + index |
+| holdout-retrieval pass without skip allowances | **human** | Requires materialized OSS repos + index; no generalized claim without required recall/quality/forbidden-claim thresholds |
 | `agent_value_gap` &lt; 0.20 | **human** | Measure from a fresh coherent bundle |
 | Windows `retrieval-sidecar-smoke` CI job | fail-closed sidecar smoke | [`retrieval-sidecar-smoke-ci.md`](../contributors/retrieval-sidecar-smoke-ci.md) |
 | Ragas/Phoenix nightly eval | optional | Not configured |
@@ -222,7 +245,7 @@ tests in the branch. Do not infer support for languages without direct benchmark
 | Worst-case packet wall | ≤ 1,500 ms |
 | local-real quality pass | ≥ 3/4 repos |
 | `agent_value_gap` | &lt; 0.20 |
-| holdout generalization | 2/3 of `ripgrep`, `axios`, `redis` |
+| holdout generalization | Required manifest thresholds across the full holdout-retrieval suite |
 | Sidecar planner/ranker repo literals | 0 (lint clean) |
 
 ---

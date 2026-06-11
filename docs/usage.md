@@ -124,9 +124,11 @@ codestory-cli packet --project <target-workspace> --question "<broad task questi
 ```
 
 Use `packet` for questions like "how does routing work?" or "what owns indexing
-state?" It returns citations, gaps, and follow-up commands. If the packet says
-the evidence is incomplete, follow the named commands instead of opening
-unstructured source files directly.
+state?" It returns a `sufficient`, `partial`, or `blocked` status with
+citations, trust limits, gaps, and follow-up commands. If the packet is
+`partial` or `blocked`, follow the named source-truth commands instead of
+opening unstructured source files directly. Treat `sufficient` as evidence
+coverage, not final answer-quality proof.
 
 ### I need to understand one symbol or file
 

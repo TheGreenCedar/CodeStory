@@ -140,6 +140,10 @@ may exceed the default timeout on cold index; increase `--timeout-ms` when neede
 
 - Do **not** add repo-name, path, or display-name literals for `ripgrep`, `axios`,
   or `redis` in v2 planner or ranker code.
+- Keep holdout-specific probes and claim templates in manifests, benchmark
+  harnesses, tests, or `crates/codestory-runtime/src/agent/eval_probes.rs`
+  behind `CODESTORY_EVAL_PROBES`; do not put them in product packet/search
+  planning or ranking paths.
 - Do **not** iterate KPI fixes against holdout manifests; use `local-real` for
   in-scope tuning and treat holdout rows as promotion-only evidence.
 - Legacy sibling apps (`freelancer`, `traderotate`) are removed from default

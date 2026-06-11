@@ -1774,6 +1774,7 @@ pub struct PacketBudgetDto {
 pub enum PacketSufficiencyStatusDto {
     Sufficient,
     Partial,
+    #[serde(rename = "blocked", alias = "insufficient")]
     Insufficient,
 }
 
@@ -1949,7 +1950,7 @@ mod packet_tests {
 
     #[test]
     fn packet_sufficiency_serializes_status_as_snake_case() {
-        let value = serde_json::to_value(PacketSufficiencyDto {
+        let partial = serde_json::to_value(PacketSufficiencyDto {
             status: PacketSufficiencyStatusDto::Partial,
             covered_claims: Vec::new(),
             open_next: vec!["codestory-cli search --query runtime".to_string()],
@@ -1959,7 +1960,22 @@ mod packet_tests {
         })
         .expect("serialize");
 
-        assert_eq!(value["status"], "partial");
+        assert_eq!(partial["status"], "partial");
+
+        let blocked = serde_json::to_value(PacketSufficiencyDto {
+            status: PacketSufficiencyStatusDto::Insufficient,
+            covered_claims: Vec::new(),
+            open_next: Vec::new(),
+            avoid_opening: Vec::new(),
+            gaps: vec!["Sidecar readiness is not full.".to_string()],
+            follow_up_commands: Vec::new(),
+        })
+        .expect("serialize");
+
+        assert_eq!(blocked["status"], "blocked");
+        let legacy: PacketSufficiencyStatusDto =
+            serde_json::from_str("\"insufficient\"").expect("deserialize legacy status");
+        assert_eq!(legacy, PacketSufficiencyStatusDto::Insufficient);
     }
 
     #[test]

@@ -8637,26 +8637,14 @@ fn is_api_endpoint_call_context(line: &str, literal_col: u32) -> bool {
     }
 
     let compact_before = compact_lowercase(before_literal);
-    if compact_before.contains("fetch(") || compact_before.contains("axios(") {
+    if compact_before.contains("fetch(") {
         return true;
     }
 
     let methods = ["delete", "patch", "post", "put", "head", "options", "get"];
-    let client_receivers = [
-        "axios",
-        "requests",
-        "reqwest",
-        "http",
-        "$http",
-        "ky",
-        "got",
-        "httpclient",
-    ];
-    client_receivers.iter().any(|receiver| {
-        methods.iter().any(|method| {
-            compact_before.contains(&format!("{receiver}.{method}("))
-                || compact_before.contains(&format!("{receiver}::{method}("))
-        })
+    methods.iter().any(|method| {
+        compact_before.ends_with(&format!(".{method}("))
+            || compact_before.ends_with(&format!("::{method}("))
     })
 }
 
@@ -12836,7 +12824,7 @@ export async function loadUsers() {
 }
 
 export async function createUser() {
-    return axios.post("/api/users", {});
+    return apiClient.post("/api/users", {});
 }
 "#;
         let language_config = get_language_for_ext("ts").expect("typescript config");

@@ -743,7 +743,7 @@ fn packet_sufficiency_label(status: PacketSufficiencyStatusDto) -> &'static str 
     match status {
         PacketSufficiencyStatusDto::Sufficient => "sufficient",
         PacketSufficiencyStatusDto::Partial => "partial",
-        PacketSufficiencyStatusDto::Insufficient => "insufficient",
+        PacketSufficiencyStatusDto::Insufficient => "blocked",
     }
 }
 

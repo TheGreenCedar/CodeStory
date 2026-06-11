@@ -19,6 +19,7 @@ import {
   packetLatencyTelemetry,
   packetFirstCommandForPrompt,
   packetRuntimePublishableBlockers,
+  packetRuntimeQualityGateRequired,
   publicCoreCorpusAudit,
   repoProvenanceBlockers,
   resolveCodeStoryCli,
@@ -1063,6 +1064,21 @@ test("packet runtime publishable gate requires SLA pass and full retrieval shado
   assert.match(blockers[0].reasons.join("\n"), /packet retrieval SLA missed=true; expected false/);
   assert.match(blockers[1].reasons.join("\n"), /missing retrieval shadow telemetry/);
   assert.match(blockers[2].reasons.join("\n"), /packet retrieval shadow mode=degraded; expected full/);
+});
+
+test("holdout packet runtime requires quality gate unless failures are allowed", () => {
+  assert.equal(
+    packetRuntimeQualityGateRequired({ taskSuite: "holdout-retrieval" }),
+    true,
+  );
+  assert.equal(
+    packetRuntimeQualityGateRequired({
+      taskSuite: "holdout-retrieval",
+      allowFailures: true,
+    }),
+    false,
+  );
+  assert.equal(packetRuntimeQualityGateRequired({ taskSuite: "local-real" }), false);
 });
 
 test("reanalysis uses the run-time task snapshot before current manifest contents", async () => {
