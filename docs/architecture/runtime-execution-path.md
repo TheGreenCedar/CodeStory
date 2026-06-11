@@ -22,8 +22,8 @@ sequenceDiagram
     Runtime->>Indexer: run WorkspaceIndexer
     Indexer->>Store: flush graph, projections, search docs
     Runtime->>Store: publish staged snapshot when a full refresh completes
-    Runtime->>Search: sync lexical projection and semantic docs
-    Search->>Store: reuse, embed, upsert, reload, and prune semantic docs
+    Runtime->>Search: sync lexical projection, symbol docs, component reports, and dense anchors
+    Search->>Store: reuse, embed, upsert, reload, and prune selected dense anchors
 ```
 
 1. `codestory-cli` parses the request and builds a runtime context.
@@ -33,9 +33,9 @@ sequenceDiagram
 5. `codestory-indexer::WorkspaceIndexer` parses files, extracts graph artifacts, flushes projection batches, and runs resolution.
 6. `codestory-store` updates graph rows, occurrence rows, callable projection state, search-doc rows, and snapshot invalidation state.
 7. Runtime finalizes staged builds through `SnapshotStore` and publishes the finished snapshot when a full refresh completes.
-8. Runtime refreshes the search-symbol projection and synchronizes semantic docs before returning the index summary.
+8. Runtime refreshes the search-symbol projection, writes graph-native `symbol_search_doc` rows, writes component reports, and synchronizes selected dense anchors before returning the index summary.
 
-Default index runs do not defer semantic docs. When embedding assets are available, the returned retrieval state should have `semantic_ready = true` and a non-zero semantic doc count. If semantic assets are missing or hybrid retrieval is disabled, runtime still completes graph and lexical state and reports the degraded-state reason.
+Default index runs do not defer symbol docs. When embedding assets are available, the returned retrieval state reports the selected dense-anchor corpus for `graph_first_v1`; that corpus may be zero for graph-only projects. If embedding assets are missing, runtime still completes graph, lexical, symbol-doc, and component-report state and reports the degraded-state reason instead of pretending dense retrieval is ready.
 
 ## Search Command
 
@@ -61,13 +61,15 @@ sequenceDiagram
 2. Runtime asks `codestory-retrieval` for sidecar status before serving results.
 3. Retrieval status loads the stored retrieval manifest, applies stale-manifest checks, and reports the exact degraded reason before any healthy sidecar probe can bless an invalid manifest.
 4. `retrieval_mode = full` is the only product-serving search path. Missing, stale, partial, or non-product sidecar state fails closed with the degraded reason.
-5. Runtime executes the mandatory sidecar query, resolves returned candidates back into indexed symbols, and rejects unresolved or non-full candidate sets before returning product hits.
+5. Runtime executes the mandatory sidecar query in AST-first order: exact symbol/AST lookup, lexical source and virtual-doc search, graph expansion, then dense-anchor augmentation. It resolves returned candidates back into indexed symbols and rejects unresolved or non-full candidate sets before returning product hits.
 6. Hybrid semantic state, repo-text matches, and local lexical search are diagnostic/navigation surfaces only; they are not a product fallback for `search`.
 7. For broad architecture-style queries, runtime may assemble a Search Plan with extracted/dropped terms, bounded subqueries, candidate windows, anchor groups, bridge evidence, next commands, and source-truth checks.
 8. Runtime maps retrieval state plus resolved sidecar matches into contract DTOs and CLI renders them.
 
 When `search --why` is requested, the CLI renders compact explanations from the
 same DTO surface: sidecar origin, degraded/fail-closed state, candidate
+provenance (`exact`, `lexical_source`, `symbol_doc`, `graph_neighbor`,
+`component_report`, `dense_anchor`),
 resolution details, and the Search Plan when the broad-query planner emitted
 one. Legacy hybrid score details may appear only as diagnostic data from
 non-serving paths.

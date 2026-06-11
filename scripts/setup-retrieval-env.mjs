@@ -205,8 +205,10 @@ function printPrereqReport(opts) {
 }
 
 const BGE_GGUF = "bge-base-en-v1.5.Q8_0.gguf";
-const BGE_URL =
-  "https://huggingface.co/BAAI/bge-base-en-v1.5-GGUF/resolve/main/bge-base-en-v1.5.Q8_0.gguf";
+const BGE_URLS = [
+  "https://huggingface.co/BAAI/bge-base-en-v1.5-GGUF/resolve/main/bge-base-en-v1.5.Q8_0.gguf",
+  "https://huggingface.co/CompendiumLabs/bge-base-en-v1.5-gguf/resolve/main/bge-base-en-v1.5-q8_0.gguf",
+];
 
 function embedModelDir() {
   if (process.env.CODESTORY_EMBED_MODEL_DIR) {
@@ -223,15 +225,20 @@ async function fetchEmbedModel() {
     console.log(`Embed model already present: ${dest}`);
     return dest;
   }
-  console.log(`Downloading ${BGE_GGUF} to ${dest} ...`);
-  const response = await fetch(BGE_URL);
-  if (!response.ok) {
-    throw new Error(`Failed to download embed model: HTTP ${response.status}`);
+  let lastError = null;
+  for (const url of BGE_URLS) {
+    console.log(`Downloading ${BGE_GGUF} from ${url} to ${dest} ...`);
+    const response = await fetch(url);
+    if (!response.ok) {
+      lastError = `HTTP ${response.status} from ${url}`;
+      continue;
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    fs.writeFileSync(dest, buffer);
+    console.log(`Wrote ${dest} (${buffer.length} bytes)`);
+    return dest;
   }
-  const buffer = Buffer.from(await response.arrayBuffer());
-  fs.writeFileSync(dest, buffer);
-  console.log(`Wrote ${dest} (${buffer.length} bytes)`);
-  return dest;
+  throw new Error(`Failed to download embed model: ${lastError ?? "no URLs configured"}`);
 }
 
 async function main() {

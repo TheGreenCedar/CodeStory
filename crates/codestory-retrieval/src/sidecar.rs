@@ -75,9 +75,14 @@ fn sidecar_status_inner(
             .context("load retrieval manifest")?;
         if strict
             && let Some(manifest) = manifest.as_ref()
-            && let Some(reason) =
-                strict_readiness_unavailable_reason(project_root, &storage, &project_id, manifest)
-                    .context("check strict sidecar readiness")?
+            && let Some(reason) = strict_readiness_unavailable_reason(
+                project_root,
+                path,
+                &storage,
+                &project_id,
+                manifest,
+            )
+            .context("check strict sidecar readiness")?
         {
             return Ok(enrich_status_with_semantic_doc_stats(
                 crate::health::unavailable_status_report(
@@ -117,6 +122,7 @@ fn enrich_status_with_semantic_doc_stats(
 
 pub(crate) fn validate_strict_sidecar_readiness(
     project_root: &Path,
+    storage_path: &Path,
     storage: &Store,
 ) -> Result<()> {
     let project_id = project_id_for_root(project_root);
@@ -126,9 +132,13 @@ pub(crate) fn validate_strict_sidecar_readiness(
     else {
         return Ok(());
     };
-    if let Some(reason) =
-        strict_readiness_unavailable_reason(project_root, storage, &project_id, &manifest)?
-    {
+    if let Some(reason) = strict_readiness_unavailable_reason(
+        project_root,
+        storage_path,
+        storage,
+        &project_id,
+        &manifest,
+    )? {
         anyhow::bail!("sidecar_manifest_stale: {reason}");
     }
     Ok(())
@@ -136,6 +146,7 @@ pub(crate) fn validate_strict_sidecar_readiness(
 
 fn strict_readiness_unavailable_reason(
     project_root: &Path,
+    storage_path: &Path,
     storage: &Store,
     project_id: &str,
     manifest: &codestory_store::RetrievalIndexManifest,
@@ -154,6 +165,7 @@ fn strict_readiness_unavailable_reason(
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
     let current_input = compute_sidecar_input_fingerprint(
         storage,
+        storage_path,
         project_root,
         project_id,
         &embedding_backend,
@@ -162,6 +174,13 @@ fn strict_readiness_unavailable_reason(
     .context("compute strict sidecar input fingerprint")?;
     if manifest.sidecar_input_hash.as_deref() == Some(current_input.hash.as_str())
         && manifest.projection_count == Some(current_input.projection_count)
+        && manifest.symbol_doc_count == Some(current_input.symbol_doc_count)
+        && manifest.dense_projection_count == Some(current_input.dense_projection_count)
+        && manifest.semantic_policy_version == current_input.semantic_policy_version
+        && manifest.graph_artifact_hash.as_deref()
+            == Some(current_input.graph_artifact_hash.as_str())
+        && manifest.dense_reason_counts_json.as_deref()
+            == Some(current_input.dense_reason_counts_json.as_str())
     {
         return Ok(None);
     }
@@ -200,12 +219,22 @@ fn strict_readiness_unavailable_reason(
         )));
     }
     Ok(Some(format!(
-        "sidecar_input_hash_changed: manifest={} current={}; projection_count manifest={} current={}",
+        "sidecar_input_hash_changed: manifest={} current={}; symbol_doc_count manifest={} current={}; dense_projection_count manifest={} current={}; projection_count manifest={} current={}",
         manifest
             .sidecar_input_hash
             .as_deref()
             .unwrap_or("<missing>"),
         current_input.hash,
+        manifest
+            .symbol_doc_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "<missing>".into()),
+        current_input.symbol_doc_count,
+        manifest
+            .dense_projection_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "<missing>".into()),
+        current_input.dense_projection_count,
         manifest
             .projection_count
             .map(|count| count.to_string())
@@ -292,6 +321,13 @@ mod tests {
                     sidecar_input_hash: Some(hash.into()),
                     sidecar_generation: Some(sidecar_generation_id(&project_id, hash)),
                     projection_count: Some(10),
+                    symbol_doc_count: Some(10),
+                    dense_projection_count: Some(10),
+                    semantic_policy_version: Some(
+                        crate::generation::SEMANTIC_POLICY_VERSION.into(),
+                    ),
+                    graph_artifact_hash: Some("graph-test-hash".into()),
+                    dense_reason_counts_json: Some("{\"public_api\":10}".into()),
                 })
                 .expect("manifest");
         }
@@ -350,6 +386,13 @@ mod tests {
                     sidecar_input_hash: Some(hash.into()),
                     sidecar_generation: Some(sidecar_generation_id(&project_id, hash)),
                     projection_count: Some(0),
+                    symbol_doc_count: Some(0),
+                    dense_projection_count: Some(0),
+                    semantic_policy_version: Some(
+                        crate::generation::SEMANTIC_POLICY_VERSION.into(),
+                    ),
+                    graph_artifact_hash: Some("graph-test-hash".into()),
+                    dense_reason_counts_json: Some("{}".into()),
                 })
                 .expect("manifest");
         }
@@ -423,6 +466,13 @@ mod tests {
                     sidecar_input_hash: Some(hash.into()),
                     sidecar_generation: Some(sidecar_generation_id(&project_id, hash)),
                     projection_count: Some(0),
+                    symbol_doc_count: Some(0),
+                    dense_projection_count: Some(0),
+                    semantic_policy_version: Some(
+                        crate::generation::SEMANTIC_POLICY_VERSION.into(),
+                    ),
+                    graph_artifact_hash: Some("graph-test-hash".into()),
+                    dense_reason_counts_json: Some("{}".into()),
                 })
                 .expect("manifest");
         }
@@ -497,6 +547,13 @@ mod tests {
                     sidecar_input_hash: Some(hash.into()),
                     sidecar_generation: Some(sidecar_generation_id(&project_id, hash)),
                     projection_count: Some(0),
+                    symbol_doc_count: Some(0),
+                    dense_projection_count: Some(0),
+                    semantic_policy_version: Some(
+                        crate::generation::SEMANTIC_POLICY_VERSION.into(),
+                    ),
+                    graph_artifact_hash: Some("graph-test-hash".into()),
+                    dense_reason_counts_json: Some("{}".into()),
                 })
                 .expect("manifest");
         }
@@ -550,6 +607,7 @@ mod tests {
             .expect("insert indexed file");
         let input = compute_sidecar_input_fingerprint(
             &storage,
+            &storage_path,
             project.path(),
             &project_id,
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
@@ -571,14 +629,19 @@ mod tests {
                 sidecar_input_hash: Some(input.hash.clone()),
                 sidecar_generation: Some(sidecar_generation_id(&project_id, &input.hash)),
                 projection_count: Some(input.projection_count),
+                symbol_doc_count: Some(input.symbol_doc_count),
+                dense_projection_count: Some(input.dense_projection_count),
+                semantic_policy_version: input.semantic_policy_version.clone(),
+                graph_artifact_hash: Some(input.graph_artifact_hash.clone()),
+                dense_reason_counts_json: Some(input.dense_reason_counts_json.clone()),
             })
             .expect("manifest");
 
-        validate_strict_sidecar_readiness(project.path(), &storage)
+        validate_strict_sidecar_readiness(project.path(), &storage_path, &storage)
             .expect("markdown already covered by sidecar input should not look stale");
 
         std::fs::write(project.path().join("README.md"), "# New docs\n").expect("write new docs");
-        let stale = validate_strict_sidecar_readiness(project.path(), &storage)
+        let stale = validate_strict_sidecar_readiness(project.path(), &storage_path, &storage)
             .expect_err("new sidecar-only docs should stale the manifest");
         assert!(
             stale.to_string().contains("sidecar_input_hash_changed"),

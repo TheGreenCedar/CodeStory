@@ -14,8 +14,8 @@ These capabilities are represented in the current CLI/runtime surface:
 
 - `doctor` reports project, cache, index, retrieval, managed embedding setup, and
   next-command health.
-- `index` builds graph state, snapshots, lexical search state, and semantic docs
-  in the local cache.
+- `index` builds graph state, snapshots, lexical search state, graph-native
+  symbol docs, component reports, and selected dense anchors in the local cache.
 - `ground --why` gives broad repo orientation with retrieval and coverage notes.
 - `report` emits a derived Markdown repo report or JSON graph export from the
   current SQLite store, including hotspots, entry points, bridge nodes,

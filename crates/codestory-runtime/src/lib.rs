@@ -28,12 +28,13 @@ use codestory_contracts::api::{
     WorkspaceMemberIndexDto, WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
-use codestory_contracts::graph::{Edge as GraphEdge, Node as GraphNode};
+use codestory_contracts::graph::{AccessKind, Edge as GraphEdge, Node as GraphNode};
 use codestory_indexer::IncrementalIndexingStats;
 use codestory_indexer::WorkspaceIndexer as V2WorkspaceIndexer;
 use codestory_store::{
     FileInfo, GroundingEdgeKindCount, GroundingNodeRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata,
-    LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSummaryRecord,
+    LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSearchDoc,
+    SymbolSummaryRecord,
 };
 use codestory_workspace::{
     IndexedFileRecord, RefreshExecutionPlan, RefreshInputs, Workspace, WorkspaceInventory,
@@ -3190,6 +3191,14 @@ struct SemanticProjectionStats {
     docs_embedded: u32,
     docs_pending: u32,
     docs_stale: u32,
+    symbol_search_docs_written: u32,
+    dense_docs_skipped: u32,
+    dense_public_api: u32,
+    dense_entrypoint: u32,
+    dense_documented_nontrivial: u32,
+    dense_central_graph_node: u32,
+    dense_component_report: u32,
+    dense_unstructured_doc: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3228,6 +3237,14 @@ fn apply_semantic_projection_stats(
     timings.semantic_docs_embedded = Some(stats.docs_embedded);
     timings.semantic_docs_pending = Some(stats.docs_pending);
     timings.semantic_docs_stale = Some(stats.docs_stale);
+    timings.symbol_search_docs_written = Some(stats.symbol_search_docs_written);
+    timings.semantic_dense_docs_skipped = Some(stats.dense_docs_skipped);
+    timings.semantic_dense_public_api = Some(stats.dense_public_api);
+    timings.semantic_dense_entrypoint = Some(stats.dense_entrypoint);
+    timings.semantic_dense_documented_nontrivial = Some(stats.dense_documented_nontrivial);
+    timings.semantic_dense_central_graph_node = Some(stats.dense_central_graph_node);
+    timings.semantic_dense_component_report = Some(stats.dense_component_report);
+    timings.semantic_dense_unstructured_doc = Some(stats.dense_unstructured_doc);
 }
 
 fn apply_cache_refresh_stats(timings: &mut IndexingPhaseTimings, stats: CacheRefreshStats) {
@@ -3780,6 +3797,33 @@ const SEMANTIC_STREAM_PENDING_DOCS_ENV: &str = "CODESTORY_SEMANTIC_STREAM_PENDIN
 const SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV: &str =
     "CODESTORY_SEMANTIC_STREAM_SORT_WINDOW_BATCHES";
 const SEMANTIC_STREAM_SORT_WINDOW_BATCHES: usize = 1;
+const SEMANTIC_POLICY_VERSION: &str = "graph_first_v1";
+const SYMBOL_SEARCH_DOC_PROVENANCE: &str = "extracted";
+const DENSE_CENTRAL_LABEL_THRESHOLD: usize = 12;
+const DENSE_CENTRAL_SCORE_THRESHOLD: usize = 24;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DenseAnchorReason {
+    PublicApi,
+    Entrypoint,
+    DocumentedNontrivial,
+    CentralGraphNode,
+    ComponentReport,
+    UnstructuredDoc,
+}
+
+impl DenseAnchorReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PublicApi => "public_api",
+            Self::Entrypoint => "entrypoint",
+            Self::DocumentedNontrivial => "documented_nontrivial",
+            Self::CentralGraphNode => "central_graph_node",
+            Self::ComponentReport => "component_report",
+            Self::UnstructuredDoc => "unstructured_doc",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SemanticDocScope {
@@ -4133,6 +4177,8 @@ fn stored_semantic_docs_contract_from_stats(
         mixed_doc_versions: stats.mixed_doc_versions,
         mixed_doc_shapes: stats.mixed_doc_shapes,
         doc_shape: stats.doc_shape.clone(),
+        semantic_policy_version: stats.semantic_policy_version.clone(),
+        mixed_semantic_policy_versions: stats.mixed_semantic_policy_versions,
     }
 }
 
@@ -4525,23 +4571,15 @@ fn build_llm_symbol_doc_text(
     );
     let _ = writeln!(out, "symbol: {display_name}");
     let _ = writeln!(out, "kind: {:?}", node.kind);
-    if let Some(path) = file_path {
-        let _ = writeln!(out, "file: {path}");
-        let path_lower = path.to_ascii_lowercase();
-        if path_lower.contains("/tests/") || path_lower.contains("\\tests\\") {
-            let _ = writeln!(out, "file_role: test");
-        } else if path_lower.contains("/docs/")
-            || path_lower.contains("\\docs\\")
-            || path_lower.ends_with(".md")
-        {
-            let _ = writeln!(out, "file_role: docs");
-        }
-    }
     if let Some(line) = node.start_line {
         let _ = writeln!(out, "line: {line}");
     }
     if let Some(qualified_name) = node.qualified_name.as_deref() {
         let _ = writeln!(out, "qualified_name: {qualified_name}");
+    }
+    let (signature, comments, body) = symbol_excerpt(node, file_path, file_text_cache);
+    if !comments.is_empty() {
+        let _ = writeln!(out, "comments: {}", comments.join(" "));
     }
     if alias_mode != SemanticDocAliasMode::NoAlias {
         if let Some(language) = semantic_doc_language_from_path(file_path) {
@@ -4574,16 +4612,23 @@ fn build_llm_symbol_doc_text(
             semantic_symbol_role_aliases(node.kind)
         );
     }
-
-    let (signature, comments, body) = symbol_excerpt(node, file_path, file_text_cache);
     if !signature.is_empty() {
         let _ = writeln!(out, "signature: {}", signature.join(" "));
     }
-    if !comments.is_empty() {
-        let _ = writeln!(out, "comments: {}", comments.join(" "));
-    }
     if !body.is_empty() {
         let _ = writeln!(out, "body_summary: {}", body.join(" "));
+    }
+    if let Some(path) = file_path {
+        let _ = writeln!(out, "file: {path}");
+        let path_lower = path.to_ascii_lowercase();
+        if path_lower.contains("/tests/") || path_lower.contains("\\tests\\") {
+            let _ = writeln!(out, "file_role: test");
+        } else if path_lower.contains("/docs/")
+            || path_lower.contains("\\docs\\")
+            || path_lower.ends_with(".md")
+        {
+            let _ = writeln!(out, "file_role: docs");
+        }
     }
 
     let children = graph_context
@@ -4647,11 +4692,13 @@ struct PendingLlmSymbolDoc {
     start_line: Option<u32>,
     doc_text: String,
     doc_hash: String,
+    dense_reason: DenseAnchorReason,
 }
 
 #[derive(Debug)]
 struct BuiltLlmSymbolDoc {
-    pending: PendingLlmSymbolDoc,
+    symbol_doc: SymbolSearchDoc,
+    pending: Option<PendingLlmSymbolDoc>,
     reusable: bool,
 }
 
@@ -4662,6 +4709,7 @@ struct SemanticVectorReuseContractKey {
     model_id: String,
     dimension: u32,
     doc_shape: String,
+    semantic_policy_version: String,
 }
 
 impl SemanticVectorReuseContractKey {
@@ -4677,6 +4725,7 @@ impl SemanticVectorReuseContractKey {
             model_id: existing_doc.embedding_model.clone(),
             dimension: existing_doc.embedding_dim,
             doc_shape: existing_doc.doc_shape.clone()?,
+            semantic_policy_version: existing_doc.semantic_policy_version.clone()?,
         })
     }
 
@@ -4687,6 +4736,7 @@ impl SemanticVectorReuseContractKey {
             model_id: embedding_contract.cache_key.clone(),
             dimension,
             doc_shape: embedding_contract.doc_shape.clone(),
+            semantic_policy_version: SEMANTIC_POLICY_VERSION.to_string(),
         }
     }
 
@@ -4699,6 +4749,7 @@ impl SemanticVectorReuseContractKey {
             && self.model_id.as_str() == embedding_contract.cache_key.as_str()
             && self.dimension > 0
             && self.doc_shape.as_str() == embedding_contract.doc_shape.as_str()
+            && self.semantic_policy_version.as_str() == SEMANTIC_POLICY_VERSION
     }
 }
 
@@ -4790,6 +4841,358 @@ fn llm_symbol_doc_can_reuse(
     existing_key.matches_current_without_known_dimension(doc_hash, embedding_contract)
 }
 
+fn observe_dense_anchor_reason(stats: &mut SemanticProjectionStats, reason: DenseAnchorReason) {
+    match reason {
+        DenseAnchorReason::PublicApi => {
+            stats.dense_public_api = stats.dense_public_api.saturating_add(1);
+        }
+        DenseAnchorReason::Entrypoint => {
+            stats.dense_entrypoint = stats.dense_entrypoint.saturating_add(1);
+        }
+        DenseAnchorReason::DocumentedNontrivial => {
+            stats.dense_documented_nontrivial = stats.dense_documented_nontrivial.saturating_add(1);
+        }
+        DenseAnchorReason::CentralGraphNode => {
+            stats.dense_central_graph_node = stats.dense_central_graph_node.saturating_add(1);
+        }
+        DenseAnchorReason::ComponentReport => {
+            stats.dense_component_report = stats.dense_component_report.saturating_add(1);
+        }
+        DenseAnchorReason::UnstructuredDoc => {
+            stats.dense_unstructured_doc = stats.dense_unstructured_doc.saturating_add(1);
+        }
+    }
+}
+
+fn semantic_edge_count(edge_digests: &[String]) -> usize {
+    edge_digests
+        .iter()
+        .filter_map(|digest| digest.rsplit_once('='))
+        .filter_map(|(_, raw)| raw.parse::<usize>().ok())
+        .sum()
+}
+
+fn dense_anchor_score(graph_context: &SemanticDocGraphContext, node_id: GraphNodeId) -> usize {
+    let child_count = graph_context
+        .child_labels
+        .get(&node_id)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let related_count = graph_context
+        .referenced_labels
+        .get(&node_id)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let edge_count = graph_context
+        .edge_digests
+        .get(&node_id)
+        .map(|digests| semantic_edge_count(digests))
+        .unwrap_or(0);
+    child_count
+        .saturating_add(related_count)
+        .saturating_add(edge_count)
+}
+
+fn dense_anchor_is_central(graph_context: &SemanticDocGraphContext, node_id: GraphNodeId) -> bool {
+    let label_count = graph_context
+        .child_labels
+        .get(&node_id)
+        .map(Vec::len)
+        .unwrap_or(0)
+        .saturating_add(
+            graph_context
+                .referenced_labels
+                .get(&node_id)
+                .map(Vec::len)
+                .unwrap_or(0),
+        );
+    label_count >= DENSE_CENTRAL_LABEL_THRESHOLD
+        && dense_anchor_score(graph_context, node_id) >= DENSE_CENTRAL_SCORE_THRESHOLD
+}
+
+fn semantic_component_key_for_path(path: Option<&str>) -> Option<String> {
+    let path = path?.replace('\\', "/");
+    let parent = path
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("");
+    let parts = parent
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return None;
+    }
+    if let Some(index) = parts.iter().position(|part| *part == "crates")
+        && let Some(crate_name) = parts.get(index.saturating_add(1))
+    {
+        return Some(format!("crate:{crate_name}"));
+    }
+    if let Some(index) = parts.iter().position(|part| *part == "src") {
+        if let Some(module) = parts.get(index.saturating_add(1)) {
+            return Some(format!("module:src/{module}"));
+        }
+        return Some("module:src".into());
+    }
+    Some(format!(
+        "dir:{}",
+        parts.iter().take(2).copied().collect::<Vec<_>>().join("/")
+    ))
+}
+
+fn virtual_component_report_node_id(component_key: &str) -> GraphNodeId {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET;
+    for byte in component_key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    let value = ((hash & 0x3fff_ffff_ffff_ffff) as i64).max(1);
+    codestory_contracts::graph::NodeId(-value)
+}
+
+fn semantic_file_is_entrypoint(path: Option<&str>, display_name: &str) -> bool {
+    let name = display_name
+        .rsplit("::")
+        .next()
+        .unwrap_or(display_name)
+        .to_ascii_lowercase();
+    if name == "main" {
+        return true;
+    }
+    semantic_path_is_entrypoint_file(path)
+        && matches!(name.as_str(), "run" | "start" | "handler" | "app")
+}
+
+fn semantic_path_is_entrypoint_file(path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    normalized.ends_with("/main.rs")
+        || normalized.ends_with("/app.ts")
+        || normalized.ends_with("/app.tsx")
+        || normalized.ends_with("/index.ts")
+        || normalized.ends_with("/index.tsx")
+        || normalized.ends_with("/route.ts")
+        || normalized.ends_with("/route.tsx")
+}
+
+fn semantic_file_is_public_surface(path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    normalized.ends_with("/lib.rs")
+        || normalized.ends_with("/mod.rs")
+        || normalized.ends_with("/public.rs")
+        || normalized.contains("/api/")
+        || normalized.contains("/routes/")
+        || normalized.contains("/controllers/")
+        || normalized.contains("/components/")
+}
+
+fn dense_anchor_public_kind(kind: codestory_contracts::graph::NodeKind) -> bool {
+    matches!(
+        kind,
+        codestory_contracts::graph::NodeKind::STRUCT
+            | codestory_contracts::graph::NodeKind::CLASS
+            | codestory_contracts::graph::NodeKind::INTERFACE
+            | codestory_contracts::graph::NodeKind::ANNOTATION
+            | codestory_contracts::graph::NodeKind::UNION
+            | codestory_contracts::graph::NodeKind::ENUM
+            | codestory_contracts::graph::NodeKind::TYPEDEF
+            | codestory_contracts::graph::NodeKind::GLOBAL_VARIABLE
+            | codestory_contracts::graph::NodeKind::CONSTANT
+    )
+}
+
+fn semantic_doc_is_documented_nontrivial(doc_text: &str) -> bool {
+    if !doc_text.contains("comments:") {
+        return false;
+    }
+    doc_text
+        .lines()
+        .find_map(|line| line.strip_prefix("body_summary:"))
+        .is_some_and(|body| body.split_whitespace().count() >= 8)
+}
+
+fn dense_anchor_reason_for_node(
+    graph_context: &SemanticDocGraphContext,
+    node: &GraphNode,
+    display_name: &str,
+    file_path: Option<&str>,
+    doc_text: &str,
+    access: Option<AccessKind>,
+) -> Option<DenseAnchorReason> {
+    let file_role = file_path
+        .map(retrieval_file_role_from_path)
+        .unwrap_or(RetrievalFileRole::Source);
+    let central = dense_anchor_is_central(graph_context, node.id);
+
+    if file_role == RetrievalFileRole::Docs {
+        return Some(DenseAnchorReason::UnstructuredDoc);
+    }
+    if file_role.is_non_primary() && !central {
+        return None;
+    }
+    if semantic_file_is_entrypoint(file_path, display_name) {
+        return Some(DenseAnchorReason::Entrypoint);
+    }
+    if central {
+        return Some(DenseAnchorReason::CentralGraphNode);
+    }
+    if dense_anchor_public_kind(node.kind)
+        && (matches!(access, Some(AccessKind::Public | AccessKind::Protected))
+            || semantic_file_is_public_surface(file_path))
+    {
+        return Some(DenseAnchorReason::PublicApi);
+    }
+    if semantic_doc_is_documented_nontrivial(doc_text) {
+        return Some(DenseAnchorReason::DocumentedNontrivial);
+    }
+    None
+}
+
+fn is_retrieval_artifact_node(node: &GraphNode) -> bool {
+    node.serialized_name.starts_with("component_report:")
+        || node
+            .canonical_id
+            .as_deref()
+            .is_some_and(|canonical_id| canonical_id.starts_with("codestory:component_report:"))
+}
+
+fn build_component_report_docs(
+    graph_context: &SemanticDocGraphContext,
+    semantic_nodes: &[&GraphNode],
+    existing_docs: &HashMap<GraphNodeId, LlmSymbolDocReuseMetadata>,
+    embedding_contract: Option<&EmbeddingProfileContractDto>,
+    updated_at_epoch_ms: i64,
+) -> Vec<BuiltLlmSymbolDoc> {
+    let mut components = BTreeMap::<String, Vec<&GraphNode>>::new();
+    for node in semantic_nodes {
+        let file_path = graph_context.file_path_for_node(node);
+        let Some(component_key) = semantic_component_key_for_path(file_path) else {
+            continue;
+        };
+        components.entry(component_key).or_default().push(*node);
+    }
+
+    components
+        .into_iter()
+        .filter_map(|(component_key, mut component_nodes)| {
+            component_nodes.sort_by(|left, right| {
+                dense_anchor_score(graph_context, right.id)
+                    .cmp(&dense_anchor_score(graph_context, left.id))
+                    .then_with(|| node_display_name(left).cmp(&node_display_name(right)))
+                    .then_with(|| left.id.0.cmp(&right.id.0))
+            });
+            let god_nodes = component_nodes
+                .iter()
+                .take(8)
+                .map(|node| {
+                    let file = graph_context.file_path_for_node(node).unwrap_or("");
+                    format!(
+                        "- {} kind={:?} file={} centrality={}",
+                        node_display_name(node),
+                        node.kind,
+                        file,
+                        dense_anchor_score(graph_context, node.id)
+                    )
+                })
+                .collect::<Vec<_>>();
+            if god_nodes.is_empty() {
+                return None;
+            }
+            let mut files = component_nodes
+                .iter()
+                .filter_map(|node| graph_context.file_path_for_node(node))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            files.sort();
+            files.dedup();
+            files.truncate(12);
+
+            let mut doc_text = String::new();
+            let _ = writeln!(
+                doc_text,
+                "{LLM_SYMBOL_DOC_VERSION_PREFIX} {LLM_SYMBOL_DOC_SCHEMA_VERSION}"
+            );
+            let _ = writeln!(doc_text, "component_report: {component_key}");
+            let _ = writeln!(
+                doc_text,
+                "source_provenance: {SYMBOL_SEARCH_DOC_PROVENANCE}"
+            );
+            let _ = writeln!(doc_text, "policy_version: {SEMANTIC_POLICY_VERSION}");
+            let _ = writeln!(doc_text, "symbol_count: {}", component_nodes.len());
+            let _ = writeln!(doc_text, "file_count: {}", files.len());
+            if !files.is_empty() {
+                let _ = writeln!(doc_text, "files: {}", files.join("; "));
+            }
+            let _ = writeln!(doc_text, "god_nodes:");
+            for line in god_nodes {
+                let _ = writeln!(doc_text, "{line}");
+            }
+            doc_text = truncate_semantic_doc_text_to_token_budget(
+                &doc_text,
+                semantic_doc_max_tokens_from_env(),
+            );
+            let doc_hash = llm_symbol_doc_hash(&doc_text);
+            let node_id = virtual_component_report_node_id(&component_key);
+            let display_name = format!("component_report:{component_key}");
+            let qualified_name = Some(format!("codestory::component_report::{component_key}"));
+            let kind = codestory_contracts::graph::NodeKind::MODULE;
+            let symbol_doc = SymbolSearchDoc {
+                node_id,
+                file_node_id: None,
+                kind,
+                display_name: display_name.clone(),
+                qualified_name: qualified_name.clone(),
+                file_path: None,
+                start_line: None,
+                doc_text: doc_text.clone(),
+                doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
+                doc_hash: doc_hash.clone(),
+                policy_version: SEMANTIC_POLICY_VERSION.to_string(),
+                source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+                updated_at_epoch_ms,
+            };
+            let pending = embedding_contract.map(|embedding_contract| {
+                let dense_reason = DenseAnchorReason::ComponentReport;
+                let reusable = existing_docs.get(&node_id).is_some_and(|existing_doc| {
+                    llm_symbol_doc_can_reuse(existing_doc, &doc_hash, embedding_contract)
+                        && existing_doc.dense_reason.as_deref() == Some(dense_reason.as_str())
+                });
+                (
+                    PendingLlmSymbolDoc {
+                        node_id,
+                        file_node_id: None,
+                        kind,
+                        display_name,
+                        qualified_name,
+                        file_path: None,
+                        start_line: None,
+                        doc_text,
+                        doc_hash,
+                        dense_reason,
+                    },
+                    reusable,
+                )
+            });
+            let (pending, reusable) = pending
+                .map(|(pending, reusable)| (Some(pending), reusable))
+                .unwrap_or((None, false));
+            Some(BuiltLlmSymbolDoc {
+                symbol_doc,
+                pending,
+                reusable,
+            })
+        })
+        .collect()
+}
+
 fn sort_pending_llm_symbol_docs_for_embedding_batches(docs: &mut [PendingLlmSymbolDoc]) {
     docs.sort_by(|left, right| {
         left.doc_text
@@ -4842,6 +5245,8 @@ fn flush_pending_llm_symbol_docs(
             embedding_backend: Some(embedding_contract.backend.clone()),
             embedding_dim: embedding.len() as u32,
             doc_shape: Some(embedding_contract.doc_shape.clone()),
+            semantic_policy_version: Some(SEMANTIC_POLICY_VERSION.to_string()),
+            dense_reason: Some(doc.dense_reason.as_str().to_string()),
             embedding,
             updated_at_epoch_ms,
         })
@@ -4907,23 +5312,19 @@ fn sync_llm_symbol_projection(
         return Ok(stats);
     }
 
-    if let Err(error) = engine.set_embedding_runtime_from_env() {
-        tracing::warn!(
-            "embedding runtime unavailable ({error}); semantic ask retrieval will be unavailable until managed ONNX assets are installed with `codestory-cli setup embeddings` or embedding env points at a reachable runtime. Agent-facing retrieval must be repaired to full sidecar readiness before packet/search evidence is trusted."
-        );
-        if hydrate_semantic_docs {
-            let reload_started = Instant::now();
-            reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
-            stats.reload_ms = clamp_u128_to_u32(reload_started.elapsed().as_millis());
+    let embedding_contract = match engine.set_embedding_runtime_from_env() {
+        Ok(()) => Some(current_embedding_contract_from_env().ok_or_else(|| {
+            ApiError::internal(
+                "Failed to resolve current embedding profile contract after configuring runtime",
+            )
+        })?),
+        Err(error) => {
+            tracing::warn!(
+                "embedding runtime unavailable ({error}); graph-native symbol docs will still be refreshed, but dense anchor retrieval will be unavailable until managed ONNX assets are installed with `codestory-cli setup embeddings` or embedding env points at a reachable runtime. Agent-facing retrieval must be repaired to full sidecar readiness before packet/search evidence is trusted."
+            );
+            None
         }
-        return Ok(stats);
-    }
-
-    let embedding_contract = current_embedding_contract_from_env().ok_or_else(|| {
-        ApiError::internal(
-            "Failed to resolve current embedding profile contract after configuring runtime",
-        )
-    })?;
+    };
     let updated_at_epoch_ms = current_epoch_ms();
 
     let existing_docs = storage
@@ -4933,10 +5334,15 @@ fn sync_llm_symbol_projection(
         .map(|doc| (doc.node_id, doc))
         .collect::<HashMap<_, _>>();
 
-    let expand_semantic_scope_for_contract_repair = llm_refresh_file_scope.is_some()
-        && existing_docs.values().any(|existing_doc| {
-            !llm_symbol_doc_contract_matches(existing_doc, &embedding_contract)
-        });
+    let expand_semantic_scope_for_contract_repair =
+        if let Some(embedding_contract) = embedding_contract.as_ref() {
+            llm_refresh_file_scope.is_some()
+                && existing_docs.values().any(|existing_doc| {
+                    !llm_symbol_doc_contract_matches(existing_doc, embedding_contract)
+                })
+        } else {
+            false
+        };
     if expand_semantic_scope_for_contract_repair {
         tracing::warn!(
             "Stored semantic-doc contract differs from current embedding contract; expanding incremental semantic sync to rebuild all semantic docs"
@@ -4965,11 +5371,13 @@ fn sync_llm_symbol_projection(
     let stream_sort_window_size = embed_batch_size.saturating_mul(stream_sort_window_batches);
     tracing::debug!(embed_batch_size, "Using semantic doc embedding batch size");
     let mut pending_docs = Vec::<PendingLlmSymbolDoc>::new();
-    let mut seen_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
+    let mut seen_symbol_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
+    let mut seen_dense_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
     let mut doc_build_ns = 0_u128;
     let semantic_nodes = nodes
         .iter()
         .filter(|node| llm_indexable_kind(node.kind))
+        .filter(|node| !is_retrieval_artifact_node(node))
         .filter(|node| {
             effective_llm_refresh_file_scope
                 .map(|scope| {
@@ -4980,6 +5388,13 @@ fn sync_llm_symbol_projection(
                 .unwrap_or(true)
         })
         .collect::<Vec<_>>();
+    let semantic_node_ids = semantic_nodes
+        .iter()
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    let component_access = storage
+        .get_component_access_map_for_nodes(&semantic_node_ids)
+        .map_err(|e| ApiError::internal(format!("Failed to load symbol access metadata: {e}")))?;
     let graph_context = SemanticDocGraphContext::build(storage, &semantic_nodes, nodes)?;
     let file_cache_started = Instant::now();
     let file_text_cache = build_semantic_file_text_cache(&graph_context, &semantic_nodes);
@@ -5005,49 +5420,201 @@ fn sync_llm_symbol_projection(
                     &file_text_cache,
                 );
                 let doc_hash = llm_symbol_doc_hash(&doc_text);
-                let reusable = existing_docs.get(&node.id).is_some_and(|existing_doc| {
-                    llm_symbol_doc_can_reuse(existing_doc, &doc_hash, &embedding_contract)
-                });
+                let dense_reason = dense_anchor_reason_for_node(
+                    &graph_context,
+                    node,
+                    &display_name,
+                    file_path.as_deref(),
+                    &doc_text,
+                    component_access.get(&node.id).copied(),
+                );
+                let symbol_doc = SymbolSearchDoc {
+                    node_id: node.id,
+                    file_node_id: node.file_node_id,
+                    kind: node.kind,
+                    display_name: display_name.clone(),
+                    qualified_name: node.qualified_name.clone(),
+                    file_path: file_path.clone(),
+                    start_line: node.start_line,
+                    doc_text: doc_text.clone(),
+                    doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
+                    doc_hash: doc_hash.clone(),
+                    policy_version: SEMANTIC_POLICY_VERSION.to_string(),
+                    source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+                    updated_at_epoch_ms,
+                };
+                let pending_with_reuse =
+                    embedding_contract.as_ref().and_then(|embedding_contract| {
+                        dense_reason.map(|dense_reason| {
+                            let reusable =
+                                existing_docs.get(&node.id).is_some_and(|existing_doc| {
+                                    llm_symbol_doc_can_reuse(
+                                        existing_doc,
+                                        &doc_hash,
+                                        embedding_contract,
+                                    ) && existing_doc.dense_reason.as_deref()
+                                        == Some(dense_reason.as_str())
+                                });
+                            (
+                                PendingLlmSymbolDoc {
+                                    node_id: node.id,
+                                    file_node_id: node.file_node_id,
+                                    kind: node.kind,
+                                    display_name,
+                                    qualified_name: node.qualified_name.clone(),
+                                    file_path,
+                                    start_line: node.start_line,
+                                    doc_text,
+                                    doc_hash,
+                                    dense_reason,
+                                },
+                                reusable,
+                            )
+                        })
+                    });
+                let (pending, reusable) = pending_with_reuse
+                    .map(|(pending, reusable)| (Some(pending), reusable))
+                    .unwrap_or((None, false));
 
                 BuiltLlmSymbolDoc {
-                    pending: PendingLlmSymbolDoc {
-                        node_id: node.id,
-                        file_node_id: node.file_node_id,
-                        kind: node.kind,
-                        display_name,
-                        qualified_name: node.qualified_name.clone(),
-                        file_path,
-                        start_line: node.start_line,
-                        doc_text,
-                        doc_hash,
-                    },
+                    symbol_doc,
+                    pending,
                     reusable,
                 }
             })
             .collect::<Vec<_>>();
         doc_build_ns = doc_build_ns.saturating_add(doc_build_started.elapsed().as_nanos());
 
+        let symbol_docs = built_docs
+            .iter()
+            .map(|built_doc| built_doc.symbol_doc.clone())
+            .collect::<Vec<_>>();
+        let symbol_upsert_started = Instant::now();
+        storage
+            .upsert_symbol_search_docs_batch(&symbol_docs)
+            .map_err(|e| ApiError::internal(format!("Failed to upsert symbol search docs: {e}")))?;
+        stats.db_upsert_ms = stats.db_upsert_ms.saturating_add(clamp_u128_to_u32(
+            symbol_upsert_started.elapsed().as_millis(),
+        ));
+        stats.symbol_search_docs_written = stats
+            .symbol_search_docs_written
+            .saturating_add(clamp_usize_to_u32(symbol_docs.len()));
+
         for built_doc in built_docs {
-            seen_node_ids.push(built_doc.pending.node_id);
+            seen_symbol_node_ids.push(built_doc.symbol_doc.node_id);
+            let Some(pending_doc) = built_doc.pending else {
+                stats.dense_docs_skipped = stats.dense_docs_skipped.saturating_add(1);
+                continue;
+            };
+            seen_dense_node_ids.push(pending_doc.node_id);
+            observe_dense_anchor_reason(&mut stats, pending_doc.dense_reason);
             if built_doc.reusable {
                 stats.docs_reused = stats.docs_reused.saturating_add(1);
                 continue;
             }
 
             stats.docs_pending = stats.docs_pending.saturating_add(1);
-            pending_docs.push(built_doc.pending);
+            pending_docs.push(pending_doc);
         }
 
-        while stream_pending_docs && pending_docs.len() >= embed_batch_size {
+        while stream_pending_docs
+            && embedding_contract.is_some()
+            && pending_docs.len() >= embed_batch_size
+        {
             flush_streaming_llm_symbol_doc_window(
                 storage,
                 engine,
                 &mut pending_docs,
                 embed_batch_size,
-                &embedding_contract,
+                embedding_contract
+                    .as_ref()
+                    .expect("embedding contract exists when pending docs are flushed"),
                 updated_at_epoch_ms,
                 &mut stats,
             )?;
+        }
+    }
+
+    if effective_llm_refresh_file_scope.is_none() {
+        let report_build_started = Instant::now();
+        let built_reports = build_component_report_docs(
+            &graph_context,
+            &semantic_nodes,
+            &existing_docs,
+            embedding_contract.as_ref(),
+            updated_at_epoch_ms,
+        );
+        doc_build_ns = doc_build_ns.saturating_add(report_build_started.elapsed().as_nanos());
+        if !built_reports.is_empty() {
+            let report_symbol_docs = built_reports
+                .iter()
+                .map(|built_doc| built_doc.symbol_doc.clone())
+                .collect::<Vec<_>>();
+            let report_nodes = report_symbol_docs
+                .iter()
+                .map(|doc| GraphNode {
+                    id: doc.node_id,
+                    kind: doc.kind,
+                    serialized_name: doc.display_name.clone(),
+                    qualified_name: doc.qualified_name.clone(),
+                    canonical_id: Some(format!("codestory:{}", doc.display_name)),
+                    file_node_id: None,
+                    start_line: None,
+                    start_col: None,
+                    end_line: None,
+                    end_col: None,
+                })
+                .collect::<Vec<_>>();
+            storage
+                .upsert_retrieval_artifact_nodes_batch(&report_nodes)
+                .map_err(|e| {
+                    ApiError::internal(format!("Failed to upsert component report nodes: {e}"))
+                })?;
+            let symbol_upsert_started = Instant::now();
+            storage
+                .upsert_symbol_search_docs_batch(&report_symbol_docs)
+                .map_err(|e| {
+                    ApiError::internal(format!("Failed to upsert component report docs: {e}"))
+                })?;
+            stats.db_upsert_ms = stats.db_upsert_ms.saturating_add(clamp_u128_to_u32(
+                symbol_upsert_started.elapsed().as_millis(),
+            ));
+            stats.symbol_search_docs_written = stats
+                .symbol_search_docs_written
+                .saturating_add(clamp_usize_to_u32(report_symbol_docs.len()));
+
+            for built_doc in built_reports {
+                seen_symbol_node_ids.push(built_doc.symbol_doc.node_id);
+                let Some(pending_doc) = built_doc.pending else {
+                    stats.dense_docs_skipped = stats.dense_docs_skipped.saturating_add(1);
+                    continue;
+                };
+                seen_dense_node_ids.push(pending_doc.node_id);
+                observe_dense_anchor_reason(&mut stats, pending_doc.dense_reason);
+                if built_doc.reusable {
+                    stats.docs_reused = stats.docs_reused.saturating_add(1);
+                    continue;
+                }
+                stats.docs_pending = stats.docs_pending.saturating_add(1);
+                pending_docs.push(pending_doc);
+            }
+
+            while stream_pending_docs
+                && embedding_contract.is_some()
+                && pending_docs.len() >= embed_batch_size
+            {
+                flush_streaming_llm_symbol_doc_window(
+                    storage,
+                    engine,
+                    &mut pending_docs,
+                    embed_batch_size,
+                    embedding_contract
+                        .as_ref()
+                        .expect("embedding contract exists when pending docs are flushed"),
+                    updated_at_epoch_ms,
+                    &mut stats,
+                )?;
+            }
         }
     }
     stats.doc_build_ms = clamp_u128_to_u32(doc_build_ns / 1_000_000);
@@ -5055,30 +5622,52 @@ fn sync_llm_symbol_projection(
     if !stream_pending_docs {
         sort_pending_llm_symbol_docs_for_embedding_batches(&mut pending_docs);
     }
-    for batch in pending_docs.chunks(embed_batch_size) {
-        flush_pending_llm_symbol_docs(
-            storage,
-            engine,
-            batch,
-            &embedding_contract,
-            updated_at_epoch_ms,
-            &mut stats,
-        )?;
+    if let Some(embedding_contract) = embedding_contract.as_ref() {
+        for batch in pending_docs.chunks(embed_batch_size) {
+            flush_pending_llm_symbol_docs(
+                storage,
+                engine,
+                batch,
+                embedding_contract,
+                updated_at_epoch_ms,
+                &mut stats,
+            )?;
+        }
     }
 
     let prune_started = Instant::now();
-    let stale_docs = if let Some(scope) = effective_llm_refresh_file_scope {
+    let stale_symbol_docs = if let Some(scope) = effective_llm_refresh_file_scope {
         let file_node_ids = scope.iter().copied().collect::<Vec<_>>();
         storage
-            .delete_llm_symbol_docs_for_files_except_node_ids(&file_node_ids, &seen_node_ids)
-            .map_err(|e| ApiError::internal(format!("Failed to prune stale LLM docs: {e}")))?
+            .delete_symbol_search_docs_for_files_except_node_ids(
+                &file_node_ids,
+                &seen_symbol_node_ids,
+            )
+            .map_err(|e| ApiError::internal(format!("Failed to prune stale symbol docs: {e}")))?
     } else {
         storage
-            .prune_llm_symbol_docs_to_node_ids(&seen_node_ids)
-            .map_err(|e| ApiError::internal(format!("Failed to prune stale LLM docs: {e}")))?
+            .prune_symbol_search_docs_to_node_ids(&seen_symbol_node_ids)
+            .map_err(|e| ApiError::internal(format!("Failed to prune stale symbol docs: {e}")))?
+    };
+    let stale_dense_docs = if embedding_contract.is_some() {
+        if let Some(scope) = effective_llm_refresh_file_scope {
+            let file_node_ids = scope.iter().copied().collect::<Vec<_>>();
+            storage
+                .delete_llm_symbol_docs_for_files_except_node_ids(
+                    &file_node_ids,
+                    &seen_dense_node_ids,
+                )
+                .map_err(|e| ApiError::internal(format!("Failed to prune stale LLM docs: {e}")))?
+        } else {
+            storage
+                .prune_llm_symbol_docs_to_node_ids(&seen_dense_node_ids)
+                .map_err(|e| ApiError::internal(format!("Failed to prune stale LLM docs: {e}")))?
+        }
+    } else {
+        0
     };
     stats.prune_ms = clamp_u128_to_u32(prune_started.elapsed().as_millis());
-    stats.docs_stale = clamp_usize_to_u32(stale_docs);
+    stats.docs_stale = clamp_usize_to_u32(stale_dense_docs.saturating_add(stale_symbol_docs));
 
     if hydrate_semantic_docs {
         let reload_started = Instant::now();
@@ -8591,6 +9180,7 @@ impl AppController {
                     semantic: scored.semantic_score,
                     graph: scored.graph_score,
                     total: scored.total_score,
+                    provenance: Vec::new(),
                 });
                 out.push(HybridSearchScoredHit {
                     hit,
@@ -9286,6 +9876,31 @@ fn index_full(
         }
     };
     if can_copy_forward {
+        match staged
+            .store_mut()
+            .copy_retrieval_artifact_nodes_from(storage_path)
+        {
+            Ok(copied) => {
+                tracing::debug!(
+                    copied,
+                    "Copied retrieval artifact nodes into staged storage"
+                )
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to copy retrieval artifact nodes into staged storage: {error}"
+                )
+            }
+        }
+        match staged
+            .store_mut()
+            .copy_symbol_search_docs_from(storage_path)
+        {
+            Ok(copied) => tracing::debug!(copied, "Copied symbol docs into staged storage"),
+            Err(error) => {
+                tracing::warn!("Failed to copy symbol docs into staged storage: {error}")
+            }
+        }
         match staged.store_mut().copy_llm_symbol_docs_from(storage_path) {
             Ok(copied) => tracing::debug!(copied, "Copied semantic docs into staged storage"),
             Err(error) => {
@@ -9334,6 +9949,14 @@ fn index_full(
             semantic_docs_embedded: None,
             semantic_docs_pending: None,
             semantic_docs_stale: None,
+            symbol_search_docs_written: None,
+            semantic_dense_docs_skipped: None,
+            semantic_dense_public_api: None,
+            semantic_dense_entrypoint: None,
+            semantic_dense_documented_nontrivial: None,
+            semantic_dense_central_graph_node: None,
+            semantic_dense_component_report: None,
+            semantic_dense_unstructured_doc: None,
             deferred_indexes_ms: Some(deferred_indexes_ms),
             summary_snapshot_ms: Some(summary_snapshot_ms),
             detail_snapshot_ms: None,
@@ -9511,6 +10134,14 @@ where
             semantic_docs_embedded: None,
             semantic_docs_pending: None,
             semantic_docs_stale: None,
+            symbol_search_docs_written: None,
+            semantic_dense_docs_skipped: None,
+            semantic_dense_public_api: None,
+            semantic_dense_entrypoint: None,
+            semantic_dense_documented_nontrivial: None,
+            semantic_dense_central_graph_node: None,
+            semantic_dense_component_report: None,
+            semantic_dense_unstructured_doc: None,
             deferred_indexes_ms: None,
             summary_snapshot_ms: Some(summary_snapshot_ms),
             detail_snapshot_ms: Some(detail_snapshot_ms),
@@ -10080,7 +10711,216 @@ mod tests {
             start_line: None,
             doc_text: doc_text.to_string(),
             doc_hash: llm_symbol_doc_hash(doc_text),
+            dense_reason: DenseAnchorReason::PublicApi,
         }
+    }
+
+    fn semantic_policy_node(id: i64, kind: NodeKind, name: &str, file_id: i64) -> Node {
+        Node {
+            id: CoreNodeId(id),
+            kind,
+            serialized_name: name.to_string(),
+            qualified_name: Some(format!("pkg::{name}")),
+            file_node_id: Some(CoreNodeId(file_id)),
+            start_line: Some(1),
+            end_line: Some(3),
+            ..Default::default()
+        }
+    }
+
+    fn semantic_policy_context(path: &str, node_id: CoreNodeId) -> SemanticDocGraphContext {
+        let mut context = SemanticDocGraphContext::default();
+        context.file_paths.insert(node_id, path.to_string());
+        context
+    }
+
+    #[test]
+    fn dense_policy_skips_private_trivial_helpers() {
+        let node = semantic_policy_node(10, NodeKind::FUNCTION, "helper", 1);
+        let context = semantic_policy_context("src/internal/helper.rs", node.id);
+
+        let reason = dense_anchor_reason_for_node(
+            &context,
+            &node,
+            "helper",
+            Some("src/internal/helper.rs"),
+            "semantic_doc_version: 4\nsymbol: helper\nkind: FUNCTION\n",
+            Some(AccessKind::Private),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn dense_policy_does_not_treat_every_handler_name_as_entrypoint() {
+        let node = semantic_policy_node(14, NodeKind::FUNCTION, "handler", 1);
+        let context = semantic_policy_context("src/internal/request.rs", node.id);
+
+        let reason = dense_anchor_reason_for_node(
+            &context,
+            &node,
+            "handler",
+            Some("src/internal/request.rs"),
+            "semantic_doc_version: 4\nsymbol: handler\nkind: FUNCTION\n",
+            Some(AccessKind::Private),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn dense_policy_only_embeds_high_signal_central_nodes() {
+        let ordinary = semantic_policy_node(15, NodeKind::FUNCTION, "ordinary", 1);
+        let central = semantic_policy_node(16, NodeKind::FUNCTION, "central", 1);
+        let mut context = semantic_policy_context("src/internal/graph.rs", ordinary.id);
+        context
+            .file_paths
+            .insert(central.id, "src/internal/graph.rs".to_string());
+        context.child_labels.insert(
+            ordinary.id,
+            ["a", "b", "c", "d"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        );
+        context.referenced_labels.insert(
+            central.id,
+            (0..DENSE_CENTRAL_LABEL_THRESHOLD)
+                .map(|index| format!("ref_{index}"))
+                .collect(),
+        );
+        context
+            .edge_digests
+            .insert(central.id, vec!["CALL=24".to_string()]);
+
+        assert_eq!(
+            dense_anchor_reason_for_node(
+                &context,
+                &ordinary,
+                "ordinary",
+                Some("src/internal/graph.rs"),
+                "semantic_doc_version: 4\nsymbol: ordinary\nkind: FUNCTION\n",
+                Some(AccessKind::Private),
+            ),
+            None
+        );
+        assert_eq!(
+            dense_anchor_reason_for_node(
+                &context,
+                &central,
+                "central",
+                Some("src/internal/graph.rs"),
+                "semantic_doc_version: 4\nsymbol: central\nkind: FUNCTION\n",
+                Some(AccessKind::Private),
+            ),
+            Some(DenseAnchorReason::CentralGraphNode)
+        );
+    }
+
+    #[test]
+    fn dense_policy_classifies_public_entrypoint_and_documented_symbols() {
+        let public_node = semantic_policy_node(11, NodeKind::STRUCT, "ReportBuilder", 1);
+        let entrypoint_node = semantic_policy_node(12, NodeKind::FUNCTION, "main", 1);
+        let documented_node = semantic_policy_node(13, NodeKind::METHOD, "parse_config", 1);
+        let context = semantic_policy_context("src/lib.rs", public_node.id);
+
+        assert_eq!(
+            dense_anchor_reason_for_node(
+                &context,
+                &public_node,
+                "ReportBuilder",
+                Some("src/lib.rs"),
+                "semantic_doc_version: 4\nsymbol: ReportBuilder\nkind: STRUCT\n",
+                Some(AccessKind::Public),
+            ),
+            Some(DenseAnchorReason::PublicApi)
+        );
+        assert_eq!(
+            dense_anchor_reason_for_node(
+                &context,
+                &entrypoint_node,
+                "main",
+                Some("src/main.rs"),
+                "semantic_doc_version: 4\nsymbol: main\nkind: FUNCTION\n",
+                Some(AccessKind::Private),
+            ),
+            Some(DenseAnchorReason::Entrypoint)
+        );
+        assert_eq!(
+            dense_anchor_reason_for_node(
+                &context,
+                &documented_node,
+                "parse_config",
+                Some("src/internal/config.rs"),
+                "semantic_doc_version: 4\ncomments: parses user-visible configuration\nbody_summary: validates and normalizes the configuration before runtime startup\n",
+                Some(AccessKind::Private),
+            ),
+            Some(DenseAnchorReason::DocumentedNontrivial)
+        );
+    }
+
+    #[test]
+    fn dense_policy_does_not_embed_plain_public_callables_by_default() {
+        let node = semantic_policy_node(17, NodeKind::FUNCTION, "plain_public_function", 1);
+        let context = semantic_policy_context("src/lib.rs", node.id);
+
+        let reason = dense_anchor_reason_for_node(
+            &context,
+            &node,
+            "plain_public_function",
+            Some("src/lib.rs"),
+            "semantic_doc_version: 4\nsymbol: plain_public_function\nkind: FUNCTION\n",
+            Some(AccessKind::Public),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn dense_policy_does_not_embed_comment_only_symbols_by_default() {
+        let node = semantic_policy_node(18, NodeKind::FUNCTION, "commented_helper", 1);
+        let context = semantic_policy_context("src/internal/helper.rs", node.id);
+
+        let reason = dense_anchor_reason_for_node(
+            &context,
+            &node,
+            "commented_helper",
+            Some("src/internal/helper.rs"),
+            "semantic_doc_version: 4\ncomments: explains how helper is used by nearby code\nsignature: fn commented_helper() {}\n",
+            Some(AccessKind::Private),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn component_reports_are_extracted_dense_anchors_with_virtual_ids() {
+        let node = semantic_policy_node(20, NodeKind::FUNCTION, "central_service", 1);
+        let mut context = semantic_policy_context("crates/app/src/service.rs", node.id);
+        context
+            .edge_digests
+            .insert(node.id, vec!["CALL=9".to_string()]);
+        let reports = build_component_report_docs(
+            &context,
+            &[&node],
+            &std::collections::HashMap::new(),
+            None,
+            123,
+        );
+
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert!(report.symbol_doc.node_id.0 < 0);
+        assert_eq!(report.symbol_doc.source_provenance, "extracted");
+        assert_eq!(report.symbol_doc.policy_version, SEMANTIC_POLICY_VERSION);
+        assert!(
+            report
+                .symbol_doc
+                .doc_text
+                .contains("component_report: crate:app")
+        );
+        assert!(report.symbol_doc.doc_text.contains("god_nodes:"));
+        assert!(report.pending.is_none());
     }
 
     fn padded_char_cost(docs: &[PendingLlmSymbolDoc], batch_size: usize) -> usize {
@@ -10264,6 +11104,48 @@ mod tests {
         assert!(
             doc.contains("path_aliases: crates, codestory-runtime, codestory runtime, src, lib"),
             "method docs should expose file path aliases:\n{doc}"
+        );
+    }
+
+    #[test]
+    fn semantic_doc_text_keeps_comments_before_long_file_path() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
+        let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "128");
+        let file_path = r"\\?\C:\Users\alber\AppData\Local\Temp\codestory-search-quality-fixture-with-a-long-path\src\architecture.ts";
+        let file_text = r#"// Project source groups create indexing commands and storage access.
+export class SourceGroupCxxCdb {
+  getIndexerCommands() { return []; }
+}
+"#;
+        let node = Node {
+            id: CoreNodeId(10),
+            kind: NodeKind::CLASS,
+            serialized_name: "SourceGroupCxxCdb".to_string(),
+            qualified_name: Some("SourceGroupCxxCdb".to_string()),
+            file_node_id: Some(CoreNodeId(1)),
+            start_line: Some(2),
+            end_line: Some(4),
+            ..Default::default()
+        };
+        let mut file_text_cache = HashMap::new();
+        file_text_cache.insert(file_path.to_string(), Some(file_text.to_string()));
+
+        let doc = build_llm_symbol_doc_text(
+            &SemanticDocGraphContext::default(),
+            &node,
+            "SourceGroupCxxCdb",
+            Some(file_path),
+            &file_text_cache,
+        );
+
+        assert!(
+            doc.contains(
+                "comments: // Project source groups create indexing commands and storage access."
+            ),
+            "symbol docs should preserve nearby comments before long file paths consume the token budget:\n{doc}"
         );
     }
 
@@ -12949,16 +13831,18 @@ fn build_llm_symbol_doc_text() -> String {
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
             .expect("incremental index");
         assert!(
-            incremental_timings.semantic_docs_embedded.unwrap_or(0) > 0,
-            "new semantic docs from the touched file should be embedded"
+            incremental_timings.symbol_search_docs_written.unwrap_or(0) > 0,
+            "new symbols from the touched file should update graph-native symbol docs"
         );
-        assert!(
-            incremental_timings
-                .semantic_docs_embedded
-                .unwrap_or(u32::MAX)
-                < clamp_usize_to_u32(before_docs.len()),
-            "incremental semantic sync should not re-embed untouched files"
-        );
+        if incremental_timings.semantic_docs_embedded.unwrap_or(0) > 0 {
+            assert!(
+                incremental_timings
+                    .semantic_docs_embedded
+                    .unwrap_or(u32::MAX)
+                    < clamp_usize_to_u32(before_docs.len()),
+                "incremental dense sync should not re-embed untouched files"
+            );
+        }
         assert_eq!(
             incremental_timings.semantic_docs_stale.unwrap_or(0),
             0,
@@ -12967,12 +13851,12 @@ fn build_llm_symbol_doc_text() -> String {
 
         let docs = Storage::open(&storage_path)
             .expect("reopen storage")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs after incremental");
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("symbol docs after incremental");
         assert!(
             docs.iter()
                 .any(|doc| doc.display_name.contains("codestory_added_move_hint")),
-            "incremental semantic docs should include the new symbol"
+            "incremental symbol docs should include the new symbol"
         );
     }
 
@@ -13034,11 +13918,15 @@ fn build_llm_symbol_doc_text() -> String {
                 .all(|doc| doc.embedding_dim == 384 && doc.embedding.len() == 384),
             "incremental repair should leave all stored semantic docs on the current contract"
         );
+        let repaired_symbol_docs = Storage::open(&storage_path)
+            .expect("open storage after drift repair for symbol docs")
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("symbol docs after drift repair");
         assert!(
-            repaired_docs.iter().any(|doc| doc
+            repaired_symbol_docs.iter().any(|doc| doc
                 .display_name
                 .contains("codestory_contract_drift_added_hint")),
-            "incremental repair should still include symbols from the touched file"
+            "incremental repair should still include symbol docs from the touched file"
         );
     }
 
@@ -13669,16 +14557,37 @@ fn build_llm_symbol_doc_text() -> String {
                 .as_deref(),
             Some("model-a")
         );
+        let mut seeded_docs = storage
+            .get_all_llm_symbol_docs()
+            .expect("initial semantic docs");
+        if seeded_docs.len() == 1 {
+            let mut extra = seeded_docs[0].clone();
+            extra.node_id = CoreNodeId(3);
+            extra.display_name = "beta".to_string();
+            extra.qualified_name = Some("pkg::beta".to_string());
+            extra.dense_reason = Some("documented_nontrivial".to_string());
+            storage
+                .upsert_llm_symbol_docs_batch(&[extra])
+                .expect("seed second dense doc");
+            seeded_docs = storage
+                .get_all_llm_symbol_docs()
+                .expect("seeded semantic docs");
+        }
+        let mixed_node_id = seeded_docs
+            .last()
+            .expect("at least one semantic doc")
+            .node_id
+            .0;
 
         storage
             .get_connection()
             .execute(
                 "UPDATE llm_symbol_doc
                  SET embedding_model = CASE
-                     WHEN node_id = 2 THEN 'model-b'
+                     WHEN node_id = ?1 THEN 'model-b'
                      ELSE embedding_model
                  END",
-                [],
+                [mixed_node_id],
             )
             .expect("mark one semantic doc as mixed");
         assert_eq!(
@@ -14149,8 +15058,8 @@ fn build_llm_symbol_doc_text() -> String {
 
         let storage = Storage::open(&storage_path).expect("open storage after initial index");
         let initial_docs = storage
-            .get_all_llm_symbol_docs()
-            .expect("load initial semantic docs")
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("load initial symbol docs")
             .into_iter()
             .filter(|doc| doc.display_name == "build_snapshot_digest")
             .collect::<Vec<_>>();
@@ -14174,8 +15083,8 @@ fn build_llm_symbol_doc_text() -> String {
 
         let storage = Storage::open(&storage_path).expect("open storage after rerun");
         let updated_docs = storage
-            .get_all_llm_symbol_docs()
-            .expect("load updated semantic docs")
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("load updated symbol docs")
             .into_iter()
             .filter(|doc| doc.display_name == "build_snapshot_digest")
             .collect::<Vec<_>>();
@@ -14194,7 +15103,7 @@ fn build_llm_symbol_doc_text() -> String {
             !updated_docs
                 .iter()
                 .any(|doc| doc.doc_text.contains("initial_compressed_digest")),
-            "full index should rebuild semantic docs instead of reusing stale persisted content"
+            "full index should rebuild symbol docs instead of reusing stale persisted content"
         );
     }
 

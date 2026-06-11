@@ -1926,6 +1926,11 @@ mod tests {
             sidecar_input_hash: Some("hash-a".into()),
             sidecar_generation: Some("project-a-hash-a".into()),
             projection_count: Some(12),
+            symbol_doc_count: Some(120),
+            dense_projection_count: Some(12),
+            semantic_policy_version: Some("graph_first_v1".into()),
+            graph_artifact_hash: Some("graph-hash-a".into()),
+            dense_reason_counts_json: Some(r#"{"public_api":12}"#.into()),
         };
         let before_stale = stdio_mandatory_sidecar_fingerprint_from_status(
             codestory_retrieval::embedding_runtime_id(),

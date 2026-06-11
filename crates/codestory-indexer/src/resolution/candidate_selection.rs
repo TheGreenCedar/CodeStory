@@ -6,7 +6,16 @@ pub(super) fn compute_call_resolution(
     row: &UnresolvedEdgeRow,
     semantic_candidates: &[SemanticResolutionCandidate],
 ) -> Result<ComputedResolution> {
-    let (edge_id, file_id, caller_qualified, _, target_name, _, callsite_identity) = row;
+    let (
+        edge_id,
+        file_id,
+        caller_qualified,
+        _source_name,
+        target_name,
+        target_node_id,
+        _caller_file_path,
+        callsite_identity,
+    ) = row;
     let prepared_name = PreparedName::new(target_name.clone());
     let is_common_unqualified = is_common_unqualified_call_name(&prepared_name.original);
     let is_owner_qualified = is_owner_qualified_call_name(&prepared_name.original);
@@ -27,6 +36,20 @@ pub(super) fn compute_call_resolution(
         {
             semantic_fallback.consider(candidate.target_node_id, candidate.confidence);
         }
+    }
+
+    if selected.is_none()
+        && !is_common_unqualified
+        && candidate_index.is_import_binding_node(*target_node_id)
+    {
+        if pass.flags.store_candidates {
+            candidate_ids.push(*target_node_id);
+        }
+        selected = Some((
+            *target_node_id,
+            pass.policy.call_same_file,
+            ResolutionStrategy::CallSameFile,
+        ));
     }
 
     if selected.is_none()
@@ -142,14 +165,40 @@ fn is_owner_qualified_call_name(name: &str) -> bool {
     name.contains("::") || name.contains('.')
 }
 
+fn is_relative_import_module_name(name: &str) -> bool {
+    normalize_import_module_name(name)
+        .is_some_and(|module| module.starts_with("./") || module.starts_with("../"))
+}
+
+fn is_import_binding_name(name: &str) -> bool {
+    normalize_import_module_name(name).is_some_and(|module| {
+        !module.is_empty()
+            && !module.starts_with("./")
+            && !module.starts_with("../")
+            && !module.starts_with('/')
+            && !module.contains('/')
+    })
+}
+
 pub(super) fn compute_import_resolution(
     pass: &ResolutionPass,
     candidate_index: &CandidateIndex,
     row: &UnresolvedEdgeRow,
     semantic_candidates: &[SemanticResolutionCandidate],
 ) -> Result<ComputedResolution> {
-    let (edge_id, file_id, caller_qualified, source_name, target_name, _, _) = row;
+    let (
+        edge_id,
+        file_id,
+        caller_qualified,
+        source_name,
+        target_name,
+        _target_node_id,
+        caller_file_path,
+        _callsite_identity,
+    ) = row;
     let has_alias = import_alias_mismatch(source_name, target_name);
+    let has_relative_import_binding =
+        is_import_binding_name(source_name) && is_relative_import_module_name(target_name);
     let caller_prefix = caller_qualified.as_deref().and_then(module_prefix);
     let name_candidates = import_name_candidates(target_name, pass.flags.legacy_mode)
         .into_iter()
@@ -178,6 +227,22 @@ pub(super) fn compute_import_resolution(
     let mut same_module_selected: Option<i64> = None;
     let mut global_selected: Option<i64> = None;
     let mut fuzzy_selected: Option<i64> = None;
+    let mut relative_file_selected: Option<i64> = None;
+
+    if has_relative_import_binding {
+        let alias_name = PreparedName::new(source_name.clone());
+        relative_file_selected = candidate_index.find_relative_import_readonly(
+            caller_file_path.as_deref(),
+            target_name,
+            &alias_name.original,
+            &alias_name.ascii_lower,
+        );
+        if let Some(candidate) = relative_file_selected
+            && pass.flags.store_candidates
+        {
+            candidate_ids.push(candidate);
+        }
+    }
 
     for name in &name_candidates {
         if pass.flags.legacy_mode
@@ -250,7 +315,13 @@ pub(super) fn compute_import_resolution(
     }
 
     let mut selected: Option<(i64, f32, ResolutionStrategy)> =
-        if let Some(candidate) = same_file_selected {
+        if let Some(candidate) = relative_file_selected {
+            Some((
+                candidate,
+                ResolutionCertainty::CERTAIN_MIN,
+                ResolutionStrategy::ImportSameModule,
+            ))
+        } else if let Some(candidate) = same_file_selected {
             Some((
                 candidate,
                 pass.policy.import_same_file,
@@ -278,12 +349,15 @@ pub(super) fn compute_import_resolution(
             })
         };
 
-    if has_alias && !matches!(selected, Some((_, _, ResolutionStrategy::ImportSameFile))) {
+    if (has_alias || has_relative_import_binding)
+        && relative_file_selected.is_none()
+        && !matches!(selected, Some((_, _, ResolutionStrategy::ImportSameFile)))
+    {
         selected = None;
     }
 
     if selected.is_none()
-        && !has_alias
+        && !(has_alias || has_relative_import_binding)
         && let Some((candidate, confidence)) = semantic_fallback
     {
         selected = Some((
@@ -386,6 +460,7 @@ mod tests {
             Some(caller_qualified.to_string()),
             "caller".to_string(),
             target_name.to_string(),
+            0,
             Some("src/main.ts".to_string()),
             callsite_identity.map(str::to_string),
         )
@@ -438,6 +513,39 @@ mod tests {
             Some(ResolutionStrategy::CallSemanticFallback)
         );
         assert_eq!(computed.update.resolved_target_node_id, Some(88));
+        Ok(())
+    }
+
+    #[test]
+    fn imported_binding_call_resolves_to_exact_alias_node() -> Result<()> {
+        let row = (
+            7_i64,
+            Some(1_i64),
+            Some("pkg::core::caller".to_string()),
+            "caller".to_string(),
+            "dispatchRequest".to_string(),
+            77_i64,
+            Some("src/main.ts".to_string()),
+            Some("1:1:1:1".to_string()),
+        );
+        let mut index = CandidateIndex::default();
+        index.import_binding_node_ids.insert(77);
+        let computed = compute_call_resolution(
+            &resolution_pass(false),
+            &index,
+            &row,
+            &[SemanticResolutionCandidate {
+                target_node_id: 88,
+                confidence: 0.62,
+            }],
+        )?;
+
+        assert_eq!(computed.strategy, Some(ResolutionStrategy::CallSameFile));
+        assert_eq!(computed.update.resolved_target_node_id, Some(77));
+        assert_eq!(
+            computed.update.certainty,
+            Some(ResolutionCertainty::Certain.as_str())
+        );
         Ok(())
     }
 

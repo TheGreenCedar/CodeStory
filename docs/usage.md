@@ -58,7 +58,7 @@ $TargetWorkspace = "C:\path\to\repo"
 CodeStory has two readiness tracks. Keep them separate when deciding whether an
 agent can rely on packet/search output.
 
-### Local navigation readiness
+### Local navigation/cache readiness
 
 This lane is for local browsing and source navigation. It uses the project
 SQLite cache built by `index` and read by commands such as `ground`, `symbol`,
@@ -68,7 +68,7 @@ SQLite cache built by `index` and read by commands such as `ground`, `symbol`,
 means the local cache, graph, lexical index, and DB-backed navigation commands
 are usable. It does not prove agent packet/search readiness.
 
-### Agent packet/search readiness
+### Agent packet/search sidecar readiness
 
 This lane is for agent-facing `packet` and `search` evidence. It requires the
 sidecar retrieval stack to be built and healthy: Zoekt lexical shards, Qdrant
@@ -155,17 +155,17 @@ codestory-cli index --project <target-workspace> --refresh full
 codestory-cli doctor --project <target-workspace>
 ```
 
-If `doctor` reports stale inventory, semantic contract mismatch, missing managed
-assets, or a non-`full` retrieval mode, fix that layer before investigating
-answer quality. Treat the health report as the first source of truth for cache
-and retrieval state.
+If `doctor` reports stale inventory, dense-anchor contract mismatch, missing
+managed assets, or a non-`full` retrieval mode, fix that layer before
+investigating answer quality. Treat the health report as the first source of
+truth for cache and retrieval state.
 
 ## Core Commands
 
 - `doctor`: read-only health check for project, cache, index, retrieval, and
   environment readiness.
-- `index`: build or refresh the SQLite graph, snapshots, search state, and
-  semantic docs.
+- `index`: build or refresh the SQLite graph, snapshots, search state,
+  graph-native symbol docs, component reports, and selected dense anchors.
 - `ground`: broad repo-level orientation snapshot; `--why` explains retrieval
   mode, coverage, gaps, and next commands.
 - `report`: derived Markdown repo report or JSON graph export from the current

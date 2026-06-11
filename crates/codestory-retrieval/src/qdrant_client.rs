@@ -23,6 +23,7 @@ pub struct QdrantUpsertPoint {
     pub node_id: String,
     pub file_path: Option<String>,
     pub file_role: Option<FileRole>,
+    pub dense_reason: Option<String>,
     pub vector: Option<Vec<f32>>,
 }
 
@@ -327,6 +328,7 @@ impl QdrantClient {
                             "path": point.file_path,
                             "file_role": point.file_role.map(FileRole::as_str),
                             "symbol": point.display_name,
+                            "dense_reason": point.dense_reason,
                         }
                 }));
             }
@@ -504,13 +506,26 @@ pub fn parse_search_response(body: &str, limit: usize) -> Result<Vec<super::Cand
             .or_else(|| payload.and_then(|map| map.get("display_name")))
             .and_then(|value| value.as_str())
             .map(str::to_string);
+        let node_id = payload
+            .and_then(|map| map.get("node_id"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
         let file_role = payload
             .and_then(|map| map.get("file_role"))
             .and_then(|value| value.as_str())
             .map(FileRole::from_db_value);
+        let dense_reason = payload
+            .and_then(|map| map.get("dense_reason"))
+            .and_then(|value| value.as_str());
         let mut hit =
             CandidateHit::with_source(file_path, symbol_name, score, CandidateSource::Qdrant);
+        hit.node_id = node_id;
         hit.file_role = file_role;
+        if dense_reason == Some("component_report") {
+            hit.add_provenance("component_report");
+        } else {
+            hit.add_provenance("dense_anchor");
+        }
         hits.push(hit);
     }
     Ok(hits)
@@ -596,9 +611,11 @@ mod tests {
                     {
                         "score": 0.91,
                         "payload": {
+                            "node_id": "42",
                             "path": "src/handler.rs",
                             "symbol": "handle_request",
-                            "file_role": "source"
+                            "file_role": "source",
+                            "dense_reason": "public_api"
                         }
                     }
                 ]
@@ -607,9 +624,11 @@ mod tests {
         let hits = parse_search_response(body, 8).expect("parse");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].file_path, "src/handler.rs");
+        assert_eq!(hits[0].node_id.as_deref(), Some("42"));
         assert_eq!(hits[0].symbol_name.as_deref(), Some("handle_request"));
         assert_eq!(hits[0].source, CandidateSource::Qdrant);
         assert_eq!(hits[0].file_role, Some(FileRole::Source));
+        assert_eq!(hits[0].provenance, vec!["dense_anchor".to_string()]);
     }
 
     #[test]

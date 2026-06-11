@@ -91,7 +91,9 @@ fn file_modification_time(path: &Path) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codestory_contracts::graph::NodeKind;
+    use codestory_contracts::graph::{EdgeKind, NodeKind};
+    use codestory_store::{ProjectionBatch, Store as Storage};
+    use std::collections::HashSet;
 
     #[test]
     fn indexes_dedicated_sql_file() {
@@ -103,5 +105,66 @@ mod tests {
         let storage = index_structural_file(&path).expect("index sql");
         assert!(storage.nodes.iter().any(|n| n.kind == NodeKind::CLASS));
         assert_eq!(storage.files[0].language, "sql");
+    }
+
+    #[test]
+    fn html_inline_endpoint_calls_do_not_keep_delegated_file_edges() -> anyhow::Result<()> {
+        let html = r#"<!doctype html>
+<html>
+  <body>
+    <script>
+      axios.get('/get/server').then(function (response) {
+        return response.data;
+      });
+    </script>
+  </body>
+</html>"#;
+        let projected = index_structural_source(Path::new("examples/get/index.html"), html)?;
+        let node_ids = projected
+            .nodes
+            .iter()
+            .map(|node| node.id)
+            .collect::<HashSet<_>>();
+        for edge in &projected.edges {
+            assert!(
+                node_ids.contains(&edge.source),
+                "edge source should be present: {edge:?}"
+            );
+            assert!(
+                node_ids.contains(&edge.target),
+                "edge target should be present: {edge:?}"
+            );
+            if let Some(file_node_id) = edge.file_node_id {
+                assert!(
+                    node_ids.contains(&file_node_id),
+                    "edge file node should be present: {edge:?}"
+                );
+            }
+        }
+
+        assert!(
+            projected.edges.iter().any(|edge| {
+                edge.kind == EdgeKind::CALL
+                    && projected.nodes.iter().any(|node| {
+                        node.id == edge.target
+                            && node.canonical_id.as_deref()
+                                == Some("openapi:endpoint:GET /get/server")
+                    })
+            }),
+            "expected an inline endpoint CALL edge"
+        );
+
+        let mut storage = Storage::new_in_memory()?;
+        storage
+            .projections()
+            .flush_projection_batch(ProjectionBatch {
+                files: &projected.files,
+                nodes: &projected.nodes,
+                edges: &projected.edges,
+                occurrences: &projected.occurrences,
+                component_access: &projected.component_access,
+                callable_projection_states: &projected.callable_projection_states,
+            })?;
+        Ok(())
     }
 }

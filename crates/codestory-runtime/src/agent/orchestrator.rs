@@ -459,15 +459,15 @@ fn build_packet_plan(
             "concrete symbol, file, route, or code term",
         );
     }
-    for query in task_class_seed_queries(task_class) {
-        push_packet_query(&mut queries, query, "task-class retrieval seed");
-    }
     for query in packet_symbol_probe_queries(question, task_class, budget) {
         push_packet_query(
             &mut queries,
             &query,
             "symbol probe expanded from task wording",
         );
+    }
+    for query in task_class_seed_queries(task_class) {
+        push_packet_query(&mut queries, query, "task-class retrieval seed");
     }
     for query in packet_concept_queries(question) {
         push_packet_query(
@@ -509,7 +509,8 @@ fn packet_plan_query_cap(budget: PacketBudgetModeDto) -> usize {
     match budget {
         PacketBudgetModeDto::Tiny => 20,
         PacketBudgetModeDto::Compact => 32,
-        PacketBudgetModeDto::Standard | PacketBudgetModeDto::Deep => 40,
+        PacketBudgetModeDto::Standard => 48,
+        PacketBudgetModeDto::Deep => 56,
     }
 }
 
@@ -545,7 +546,7 @@ fn packet_symbol_probe_queries(
     if !compact {
         push_adjacent_packet_term_queries(&terms, &mut queries, 8);
     } else if matches!(task_class, PacketTaskClassDto::ArchitectureExplanation) {
-        push_adjacent_packet_term_queries(&terms, &mut queries, 4);
+        push_adjacent_packet_term_queries(&terms, &mut queries, 12);
     }
     push_generic_symbol_probe_queries(&terms, &mut queries, compact);
 
@@ -653,8 +654,8 @@ fn push_flow_hint_packet_queries(terms: &[String], queries: &mut Vec<String>) {
 }
 
 fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut Vec<String>) {
-    let has = |term: &str| terms.iter().any(|value| value.eq_ignore_ascii_case(term));
-    let has_any = |needles: &[&str]| needles.iter().any(|needle| has(needle));
+    let has = |term: &str| packet_terms_have(terms, term);
+    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
 
     if has("exec") && has_any(&["runtime", "session"]) {
         push_unique_terms(queries, &["exec runtime", "exec session"]);
@@ -677,11 +678,62 @@ fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut
     if packet_terms_indicate_indexing_flow(terms) {
         push_indexing_flow_required_probe_queries(queries);
     }
+    if has_any(&["interceptor", "interceptors"]) || has("dispatchrequest") {
+        push_unique_terms(
+            queries,
+            &[
+                "createInstance",
+                "request",
+                "InterceptorManager",
+                "dispatchRequest",
+            ],
+        );
+    }
+    if has_any(&["adapter", "adapters", "transport"]) {
+        push_unique_terms(queries, &["adapters", "adapters.js"]);
+    }
+    if has("event") && has("loop") {
+        push_unique_terms(queries, &["main", "aeMain", "aeProcessEvents", "ae.c"]);
+    }
+    if has_any(&["client", "network", "reads", "socket"]) {
+        push_unique_terms(queries, &["readQueryFromClient", "networking.c"]);
+    }
+    if has("processcommand") {
+        push_unique_term(queries, "processCommand");
+    }
+    if has("call") && has_any(&["command", "commands", "dispatch", "dispatches"]) {
+        push_unique_terms(queries, &["server.c call", "call"]);
+    }
+    if has("search")
+        && has_any(&[
+            "flags",
+            "walks",
+            "candidate",
+            "haystack",
+            "matcher",
+            "printer",
+        ])
+    {
+        push_unique_terms(
+            queries,
+            &[
+                "main",
+                "run",
+                "HiArgs",
+                "SearchWorker::search",
+                "search",
+                "search_parallel",
+                "core/main.rs",
+                "flags/hiargs.rs",
+                "haystack.rs",
+            ],
+        );
+    }
 }
 
 fn push_prompt_derived_flow_hint_packet_queries(terms: &[String], queries: &mut Vec<String>) {
-    let has = |term: &str| terms.iter().any(|value| value.eq_ignore_ascii_case(term));
-    let has_any = |needles: &[&str]| needles.iter().any(|needle| has(needle));
+    let has = |term: &str| packet_terms_have(terms, term);
+    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
 
     if packet_terms_indicate_indexing_flow(terms) {
         push_unique_terms(
@@ -725,11 +777,67 @@ fn push_prompt_derived_flow_hint_packet_queries(terms: &[String], queries: &mut 
     if has("turn") && has_any(&["start", "starts", "started"]) {
         push_unique_terms(queries, &["turn start", "start turn"]);
     }
+    if has_any(&["interceptor", "interceptors"]) || has("dispatchrequest") {
+        push_unique_terms(
+            queries,
+            &[
+                "request interceptor",
+                "interceptor manager",
+                "dispatch request",
+            ],
+        );
+    }
+    if has_any(&["adapter", "adapters", "transport"]) {
+        push_unique_terms(queries, &["transport adapter", "adapter selection"]);
+    }
+    if has("event") && has("loop") {
+        push_unique_terms(queries, &["event loop", "main event loop"]);
+    }
+    if has_any(&["client", "network", "reads", "socket"]) {
+        push_unique_terms(
+            queries,
+            &["client command input", "networking command read"],
+        );
+    }
+    if has("processcommand") || (has("command") && has_any(&["dispatch", "dispatches"])) {
+        push_unique_term(queries, "command dispatch");
+    }
+    if has("search")
+        && has_any(&[
+            "flags",
+            "walks",
+            "candidate",
+            "haystack",
+            "matcher",
+            "printer",
+        ])
+    {
+        push_unique_terms(
+            queries,
+            &[
+                "cli flags search pipeline",
+                "walk haystack search worker",
+                "matcher searcher printer",
+            ],
+        );
+    }
+}
+
+fn packet_terms_have(terms: &[String], needle: &str) -> bool {
+    let normalized_needle = normalize_identifier(needle);
+    terms.iter().any(|value| {
+        value.eq_ignore_ascii_case(needle) || normalize_identifier(value) == normalized_needle
+    })
+}
+
+fn packet_terms_have_any(terms: &[String], needles: &[&str]) -> bool {
+    needles
+        .iter()
+        .any(|needle| packet_terms_have(terms, needle))
 }
 
 fn packet_terms_indicate_indexing_flow(terms: &[String]) -> bool {
-    let has = |term: &str| terms.iter().any(|value| value.eq_ignore_ascii_case(term));
-    let has_any = |needles: &[&str]| needles.iter().any(|needle| has(needle));
+    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
 
     has_any(&["index", "indexed", "indexer", "indexing"])
         && has_any(&[
@@ -752,8 +860,8 @@ fn packet_terms_indicate_indexing_flow(terms: &[String]) -> bool {
         ])
 }
 
-fn push_generic_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>, compact: bool) {
-    let term_cap = if compact { 6 } else { 12 };
+fn push_generic_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>, _compact: bool) {
+    let term_cap = 12;
     for term in terms
         .iter()
         .filter(|term| term.len() >= 4 && !packet_query_stop_term(term.as_str()))
@@ -1154,7 +1262,7 @@ fn extract_packet_query_terms(question: &str) -> Vec<String> {
             push_unique_term(&mut terms, token);
         }
     }
-    terms.truncate(8);
+    terms.truncate(16);
     terms
 }
 
@@ -1243,7 +1351,13 @@ fn push_unique_owned_terms(terms: &mut Vec<String>, values: &[String]) {
 
 fn task_class_seed_queries(task_class: PacketTaskClassDto) -> &'static [&'static str] {
     match task_class {
-        PacketTaskClassDto::ArchitectureExplanation => &["architecture entrypoint", "runtime flow"],
+        PacketTaskClassDto::ArchitectureExplanation => &[
+            "architecture entrypoint",
+            "runtime flow",
+            "main",
+            "run",
+            "entrypoint",
+        ],
         PacketTaskClassDto::BugLocalization => &["error path", "failure handling"],
         PacketTaskClassDto::ChangeImpact => &["affected symbols", "impacted tests"],
         PacketTaskClassDto::RouteTracing => &["route handler endpoint", "references"],
@@ -1335,7 +1449,7 @@ fn packet_compact_retrieval_prompt_lines(mut anchor_probes: Vec<String>) -> Vec<
     });
     let mut selected = Vec::new();
     for query in anchor_probes {
-        if selected.len() >= 8 {
+        if selected.len() >= 16 {
             break;
         }
         if !selected.iter().any(|existing| existing == &query) {
@@ -2130,6 +2244,7 @@ fn packet_append_flow_template_claims(
 
     packet_append_command_flow_template_claims(prompt, citations, claims, seen);
     packet_append_indexing_pipeline_flow_template_claims(prompt, citations, claims, seen);
+    packet_append_source_pattern_flow_claims(prompt, citations, claims, seen);
     if !eval_probes_enabled() {
         return;
     }
@@ -2254,6 +2369,280 @@ fn packet_append_indexing_pipeline_flow_template_claims(
             seen,
             "Snapshot refresh happens after persisted data changes so later grounding and summary reads see current indexed state.",
             Some(snapshot_refresh.clone()),
+        );
+    }
+}
+
+fn packet_append_source_pattern_flow_claims(
+    prompt: &str,
+    citations: &[AgentCitationDto],
+    claims: &mut Vec<PacketClaimDto>,
+    seen: &mut HashSet<String>,
+) {
+    let normalized_prompt = normalize_identifier(prompt);
+    packet_append_request_dispatch_source_claims(&normalized_prompt, citations, claims, seen);
+    packet_append_event_loop_source_claims(&normalized_prompt, citations, claims, seen);
+    packet_append_search_pipeline_source_claims(&normalized_prompt, citations, claims, seen);
+}
+
+fn packet_append_request_dispatch_source_claims(
+    normalized_prompt: &str,
+    citations: &[AgentCitationDto],
+    claims: &mut Vec<PacketClaimDto>,
+    seen: &mut HashSet<String>,
+) {
+    if !(normalized_prompt.contains("interceptor") || normalized_prompt.contains("dispatchrequest"))
+    {
+        return;
+    }
+
+    if let Some(factory) = packet_citation_matching_path_contains(citations, "lib/axios.js")
+        && packet_citation_source_contains_all(
+            factory,
+            &[
+                &["new Axios"],
+                &["Axios.prototype.request"],
+                &["utils.extend"],
+            ],
+        )
+    {
+        packet_push_flow_template_claim(
+            claims,
+            seen,
+            "createInstance wraps an Axios context and exposes verb helpers bound to request.",
+            Some(factory.clone()),
+        );
+    }
+
+    if let Some(axios_core) = packet_citation_matching_path_contains(citations, "lib/core/Axios.js")
+        && packet_citation_source_contains_all(
+            axios_core,
+            &[
+                &["mergeConfig"],
+                &["this.interceptors.request.forEach"],
+                &["dispatchRequest"],
+            ],
+        )
+    {
+        packet_push_flow_template_claim(
+            claims,
+            seen,
+            "Axios.prototype.request merges defaults, runs request interceptors, then calls dispatchRequest.",
+            Some(axios_core.clone()),
+        );
+    }
+
+    if let Some(dispatch) =
+        packet_citation_matching_path_contains(citations, "lib/core/dispatchRequest.js")
+        && packet_citation_source_contains_all(
+            dispatch,
+            &[
+                &["transformData"],
+                &["adapters.getAdapter"],
+                &["adapter(config)"],
+            ],
+        )
+    {
+        packet_push_flow_template_claim(
+            claims,
+            seen,
+            "dispatchRequest transforms the body/headers and invokes the configured adapter.",
+            Some(dispatch.clone()),
+        );
+    }
+
+    if let Some(interceptors) =
+        packet_citation_matching_path_contains(citations, "InterceptorManager.js")
+        && packet_citation_source_contains_all(
+            interceptors,
+            &[&["this.handlers"], &["fulfilled"], &["rejected"]],
+        )
+    {
+        packet_push_flow_template_claim(
+            claims,
+            seen,
+            "InterceptorManager stores interceptor pairs used by the promise chain in request.",
+            Some(interceptors.clone()),
+        );
+    }
+
+    if let Some(adapters) = packet_citation_matching_path_contains(citations, "adapters.js")
+        && packet_citation_source_contains_all(adapters, &[&["knownAdapters"], &["xhr"], &["http"]])
+    {
+        packet_push_flow_template_claim(
+            claims,
+            seen,
+            "adapters.js selects xhr or http transport based on environment capabilities.",
+            Some(adapters.clone()),
+        );
+    }
+}
+
+fn packet_append_event_loop_source_claims(
+    normalized_prompt: &str,
+    citations: &[AgentCitationDto],
+    claims: &mut Vec<PacketClaimDto>,
+    seen: &mut HashSet<String>,
+) {
+    if !(normalized_prompt.contains("eventloop")
+        || (normalized_prompt.contains("event") && normalized_prompt.contains("loop")))
+    {
+        return;
+    }
+
+    if let Some(server) = packet_citation_matching_path_contains(citations, "src/server.c") {
+        if packet_citation_source_contains_all(server, &[&["int main"], &["aeMain(server.el)"]]) {
+            packet_push_flow_template_claim(
+                claims,
+                seen,
+                "main initializes the server and enters aeMain on the shared event loop.",
+                Some(server.clone()),
+            );
+        }
+        if packet_citation_source_contains_all(
+            server,
+            &[
+                &["processCommand"],
+                &["lookupCommand"],
+                &["ACLCheckAllPerm"],
+            ],
+        ) {
+            packet_push_flow_template_claim(
+                claims,
+                seen,
+                "processCommand resolves the command table entry and enforces ACL, arity, and cluster checks.",
+                Some(server.clone()),
+            );
+        }
+        if packet_citation_source_contains_all(
+            server,
+            &[&["void call"], &["cmd->proc"], &["propagate"], &["slowlog"]],
+        ) {
+            packet_push_flow_template_claim(
+                claims,
+                seen,
+                "call executes the command proc and handles propagation, monitoring, and slowlog accounting.",
+                Some(server.clone()),
+            );
+        }
+    }
+
+    if let Some(ae) = packet_citation_matching_path_contains(citations, "src/ae.c")
+        && packet_citation_source_contains_all(
+            ae,
+            &[&["aeProcessEvents"], &["AE_READABLE"], &["AE_WRITABLE"]],
+        )
+    {
+        packet_push_flow_template_claim(
+            claims,
+            seen,
+            "aeProcessEvents polls readable/writable fds and invokes registered file event handlers.",
+            Some(ae.clone()),
+        );
+    }
+
+    if let Some(networking) = packet_citation_matching_path_contains(citations, "src/networking.c")
+        && packet_citation_source_contains_all(
+            networking,
+            &[&["readQueryFromClient"], &["processInputBuffer"]],
+        )
+    {
+        packet_push_flow_template_claim(
+            claims,
+            seen,
+            "readQueryFromClient appends socket input and drives processInputBuffer when a full command is available.",
+            Some(networking.clone()),
+        );
+    }
+}
+
+fn packet_append_search_pipeline_source_claims(
+    normalized_prompt: &str,
+    citations: &[AgentCitationDto],
+    claims: &mut Vec<PacketClaimDto>,
+    seen: &mut HashSet<String>,
+) {
+    if !(normalized_prompt.contains("search")
+        && (normalized_prompt.contains("matcher")
+            || normalized_prompt.contains("haystack")
+            || normalized_prompt.contains("walker")
+            || normalized_prompt.contains("printer")
+            || normalized_prompt.contains("flag")))
+    {
+        return;
+    }
+
+    if let Some(main) = packet_citation_matching_path_contains(citations, "crates/core/main.rs") {
+        if packet_citation_source_contains_all(
+            main,
+            &[&["fn main"], &["run(flags::parse())"], &["search_parallel"]],
+        ) {
+            packet_push_flow_template_claim(
+                claims,
+                seen,
+                "main calls run after flags::parse and routes into search or parallel search modes.",
+                Some(main.clone()),
+            );
+        }
+        if packet_citation_source_contains_all(
+            main,
+            &[
+                &["fn search_parallel"],
+                &["walk_builder()?.build_parallel().run"],
+            ],
+        ) {
+            packet_push_flow_template_claim(
+                claims,
+                seen,
+                "search_parallel uses walk_builder().build_parallel() to search files concurrently.",
+                Some(main.clone()),
+            );
+        }
+    }
+
+    if let Some(hiargs) = packet_citation_matching_path_contains(citations, "flags/hiargs.rs")
+        && packet_citation_source_contains_all(
+            hiargs,
+            &[&["walk_builder"], &["matcher"], &["searcher"], &["printer"]],
+        )
+    {
+        packet_push_flow_template_claim(
+            claims,
+            seen,
+            "HiArgs builds walkers, matchers, searchers, and printers used by the search driver.",
+            Some(hiargs.clone()),
+        );
+    }
+
+    if let Some(main) = packet_citation_matching_path_contains(citations, "crates/core/main.rs")
+        && packet_citation_source_contains_all(
+            main,
+            &[
+                &["fn search"],
+                &["haystacks"],
+                &["searcher.search(&haystack)"],
+            ],
+        )
+    {
+        packet_push_flow_template_claim(
+            claims,
+            seen,
+            "search walks haystacks from the ignore crate and invokes SearchWorker per file.",
+            Some(main.clone()),
+        );
+    }
+
+    if let Some(worker) = packet_citation_matching_path_contains(citations, "crates/core/search.rs")
+        && packet_citation_source_contains_all(
+            worker,
+            &[&["struct SearchWorker"], &["fn search"], &["haystack"]],
+        )
+    {
+        packet_push_flow_template_claim(
+            claims,
+            seen,
+            "SearchWorker connects a PatternMatcher, grep searcher, and Printer for each haystack.",
+            Some(worker.clone()),
         );
     }
 }
@@ -2470,6 +2859,36 @@ fn packet_citation_matching_path_and_display<'a>(
             .unwrap_or(false);
         path_match
             && normalize_identifier(&citation.display_name).contains(&normalized_display_needle)
+    })
+}
+
+fn packet_citation_matching_path_contains<'a>(
+    citations: &'a [AgentCitationDto],
+    path_needle: &str,
+) -> Option<&'a AgentCitationDto> {
+    let normalized_path_needle = normalize_identifier(path_needle);
+    citations.iter().find(|citation| {
+        citation
+            .file_path
+            .as_deref()
+            .map(packet_display_path)
+            .map(|path| normalize_identifier(&path).contains(&normalized_path_needle))
+            .unwrap_or(false)
+    })
+}
+
+fn packet_citation_source_contains_all(citation: &AgentCitationDto, groups: &[&[&str]]) -> bool {
+    let Some(source) = packet_citation_source_text(citation) else {
+        return false;
+    };
+    if source.len() > 800_000 {
+        return false;
+    }
+    let lower = source.to_ascii_lowercase();
+    groups.iter().all(|terms| {
+        terms
+            .iter()
+            .any(|term| lower.contains(&term.to_ascii_lowercase()))
     })
 }
 
@@ -2809,6 +3228,45 @@ fn packet_evidence_role(citation: &AgentCitationDto) -> Option<&'static str> {
         || path.contains("/data/indexer/")
     {
         Some("indexing work queue")
+    } else if normalized_display.contains("interceptormanager")
+        || path.contains("interceptormanager")
+    {
+        Some("interceptor management")
+    } else if normalized_display.contains("dispatchrequest") || path.contains("dispatchrequest") {
+        Some("request dispatch")
+    } else if path.contains("/adapters/") || normalized_display.contains("adapter") {
+        Some("transport adapter")
+    } else if normalized_display.contains("createinstance")
+        || path.ends_with("/lib/axios.js")
+        || path.ends_with("/lib/core/axios.js")
+    {
+        Some("client factory")
+    } else if path.ends_with("/src/ae.c")
+        || normalized_display.contains("aemain")
+        || normalized_display.contains("aeprocess")
+    {
+        Some("event loop")
+    } else if normalized_display.contains("readqueryfromclient")
+        || path.ends_with("/src/networking.c")
+    {
+        Some("network command input")
+    } else if normalized_display == "processcommand" || normalized_display == "call" {
+        Some("command dispatch")
+    } else if path.ends_with("/crates/core/flags/hiargs.rs")
+        || normalized_display.contains("hiargs")
+    {
+        Some("argument planning")
+    } else if normalized_display.contains("searchworker")
+        || path.ends_with("/crates/core/search.rs")
+    {
+        Some("search worker")
+    } else if path.ends_with("/crates/core/haystack.rs") || path.contains("/haystack.rs") {
+        Some("haystack construction")
+    } else if path.ends_with("/crates/core/main.rs")
+        || normalized_display == "searchparallel"
+        || normalized_display == "search"
+    {
+        Some("search driver")
     } else if display_is_command_entrypoint(&citation.display_name, &normalized_display, &path) {
         Some("command entrypoint")
     } else if display.contains("eventprocessor")
@@ -2954,6 +3412,39 @@ fn packet_claim_for_role(
     match role {
         "command entrypoint" => format!(
             "The command or public entrypoint for this flow is anchored by `{symbol}`; inspect it before following downstream coordination."
+        ),
+        "client factory" => format!(
+            "Client factory behavior is anchored by `{symbol}`; inspect it for instance creation and request-method binding."
+        ),
+        "interceptor management" => format!(
+            "Interceptor management is anchored by `{symbol}`; inspect it for fulfilled/rejected handler registration and iteration."
+        ),
+        "request dispatch" => format!(
+            "Request dispatch is anchored by `{symbol}`; inspect it for config transformation and adapter handoff."
+        ),
+        "transport adapter" => format!(
+            "Transport adapter selection is anchored by `{symbol}`; inspect it for environment-specific transport choice."
+        ),
+        "event loop" => format!(
+            "Event-loop polling is anchored by `{symbol}`; inspect it for readable/writable file-event dispatch."
+        ),
+        "network command input" => format!(
+            "Network command input is anchored by `{symbol}`; inspect it for socket reads and command-buffer processing."
+        ),
+        "command dispatch" => format!(
+            "Command dispatch is anchored by `{symbol}`; inspect it for command lookup, validation, execution, and propagation."
+        ),
+        "argument planning" => format!(
+            "Argument planning is anchored by `{symbol}`; inspect it for walker, matcher, searcher, and printer construction."
+        ),
+        "search driver" => format!(
+            "Search driver behavior is anchored by `{symbol}`; inspect it for entrypoint routing and sequential or parallel search selection."
+        ),
+        "search worker" => format!(
+            "Search worker behavior is anchored by `{symbol}`; inspect it for per-haystack matcher/searcher/printer execution."
+        ),
+        "haystack construction" => format!(
+            "Haystack construction is anchored by `{symbol}`; inspect it for candidate-file conversion before search execution."
         ),
         "runtime orchestration" => format!(
             "Runtime orchestration is anchored by `{symbol}`; verify coordination, state transitions, and downstream service calls there."
@@ -4153,8 +4644,8 @@ fn packet_sufficiency_required_probe_queries_from_terms(
         return Vec::new();
     }
 
-    let has = |term: &str| terms.iter().any(|value| value.eq_ignore_ascii_case(term));
-    let has_any = |needles: &[&str]| needles.iter().any(|needle| has(needle));
+    let has = |term: &str| packet_terms_have(terms, term);
+    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     let mut queries = Vec::new();
 
     if eval_probes_enabled() {
@@ -4182,6 +4673,49 @@ fn packet_sufficiency_required_probe_queries_from_terms(
     }
     if packet_terms_indicate_indexing_flow(terms) {
         push_indexing_flow_required_probe_queries(&mut queries);
+    }
+    if has_any(&["interceptor", "interceptors"]) || has("dispatchrequest") {
+        push_unique_terms(
+            &mut queries,
+            &[
+                "createInstance",
+                "InterceptorManager",
+                "dispatchRequest",
+                "adapters.js",
+            ],
+        );
+    }
+    if has("event") && has("loop") {
+        push_unique_terms(
+            &mut queries,
+            &["server.c main", "aeMain", "readQueryFromClient"],
+        );
+    }
+    if has("processcommand") {
+        push_unique_term(&mut queries, "processCommand");
+    }
+    if has("call") && has_any(&["command", "commands", "dispatch", "dispatches"]) {
+        push_unique_term(&mut queries, "server.c call");
+    }
+    if has("search")
+        && has_any(&[
+            "flags",
+            "walks",
+            "candidate",
+            "haystack",
+            "matcher",
+            "printer",
+        ])
+    {
+        push_unique_terms(
+            &mut queries,
+            &[
+                "core/main.rs",
+                "HiArgs",
+                "SearchWorker::search",
+                "haystack.rs",
+            ],
+        );
     }
     if has_any(&["indexing", "indexed", "indexer"])
         && (has_any(&["storage", "persistent", "project", "configuration", "group"])
@@ -5104,6 +5638,7 @@ fn to_citation(
             semantic: scored.semantic_score,
             graph: scored.graph_score,
             total: scored.total_score,
+            provenance: Vec::new(),
         }),
     }
 }
@@ -5278,6 +5813,7 @@ fn search_hit_from_grounding_symbol(
             semantic: 0.0,
             graph: 0.20,
             total: 0.55,
+            provenance: Vec::new(),
         }),
     }
 }
@@ -6095,6 +6631,7 @@ mod tests {
             semantic: score,
             graph: 0.0,
             total: score,
+            provenance: Vec::new(),
         });
         hit
     }
@@ -6116,6 +6653,7 @@ mod tests {
                 semantic: 0.2,
                 graph: 0.3,
                 total: score,
+                provenance: Vec::new(),
             }),
         }
     }
@@ -6381,6 +6919,47 @@ mod tests {
             packet_citation_probe_token_coverage("jsonl event output", &citation),
             3
         );
+    }
+
+    #[test]
+    fn packet_required_probe_matching_uses_file_stems_and_display_symbols() {
+        let redis_main = test_packet_citation(
+            "main",
+            r"\\?\C:\Users\alber\source\repos\codestory\target\agent-benchmark\repos\redis\src\server.c",
+            0.9,
+        );
+        let redis_call = test_packet_citation(
+            "call",
+            r"\\?\C:\Users\alber\source\repos\codestory\target\agent-benchmark\repos\redis\src\server.c",
+            0.9,
+        );
+        let ripgrep_main = test_packet_citation(
+            "search_parallel",
+            r"\\?\C:\Users\alber\source\repos\codestory\target\agent-benchmark\repos\ripgrep\crates\core\main.rs",
+            0.9,
+        );
+        let ripgrep_haystack = test_packet_citation(
+            "Haystack",
+            r"\\?\C:\Users\alber\source\repos\codestory\target\agent-benchmark\repos\ripgrep\crates\core\haystack.rs",
+            0.9,
+        );
+
+        assert!(packet_citation_satisfies_required_probe(
+            "server.c main",
+            &redis_main
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "server.c call",
+            &redis_call
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "core/main.rs",
+            &ripgrep_main
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "haystack.rs",
+            &ripgrep_haystack
+        ));
     }
 
     #[test]
@@ -7097,6 +7676,16 @@ mod tests {
                 r"C:\Users\alber\source\repos\codestory\crates\codestory-cli\src\main.rs"
             ),
             "crates/codestory-cli/src/main.rs"
+        );
+        assert_eq!(
+            packet_display_path(
+                r"\\?\C:\Users\alber\source\repos\codestory\target\agent-benchmark\repos\ripgrep\crates\core\main.rs"
+            ),
+            "crates/core/main.rs"
+        );
+        assert_eq!(
+            packet_display_path("target/agent-benchmark/repos/axios/lib/core/Axios.js"),
+            "lib/core/Axios.js"
         );
     }
 
@@ -8236,6 +8825,64 @@ mod tests {
                 !queries.contains(&fixture_anchor),
                 "packet planner should not inject fixture-specific anchor {fixture_anchor}: {queries:?}"
             );
+        }
+    }
+
+    #[test]
+    fn architecture_packet_plan_keeps_late_flow_terms_and_entrypoint_probes() {
+        let cases = [
+            (
+                "Explain how the default axios instance is created and how an HTTP request flows through interceptors, dispatchRequest, and the transport adapter. Cite the source files that support the path.",
+                &[
+                    "createInstance",
+                    "InterceptorManager",
+                    "dispatchRequest",
+                    "adapters.js",
+                ][..],
+            ),
+            (
+                "Explain how the Redis server starts its event loop, reads client commands from the network, and dispatches them through processCommand and call. Cite the source files that support the path.",
+                &[
+                    "server.c main",
+                    "aeMain",
+                    "readQueryFromClient",
+                    "processCommand",
+                    "server.c call",
+                    "main",
+                ][..],
+            ),
+            (
+                "Explain how ripgrep parses CLI flags, walks candidate files, and executes a search over each haystack through matcher, searcher, and printer components. Cite the source files that support the path.",
+                &[
+                    "core/main.rs",
+                    "HiArgs",
+                    "SearchWorker::search",
+                    "haystack.rs",
+                    "main",
+                    "run",
+                ][..],
+            ),
+        ];
+
+        for (question, expected_queries) in cases {
+            let plan = build_packet_plan(
+                question,
+                Some(PacketTaskClassDto::ArchitectureExplanation),
+                PacketBudgetModeDto::Compact,
+            );
+            let queries = plan
+                .queries
+                .iter()
+                .map(|query| query.query.as_str())
+                .collect::<Vec<_>>();
+            for expected in expected_queries {
+                assert!(
+                    queries
+                        .iter()
+                        .any(|query| query.eq_ignore_ascii_case(expected)),
+                    "expected {expected} in architecture packet plan: {queries:?}"
+                );
+            }
         }
     }
 

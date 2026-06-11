@@ -83,7 +83,7 @@ Check:
 - whether the symbol exists in store-backed search docs
 - whether runtime rebuilt its search state after indexing
 - what retrieval mode `index`, `ground`, or `search` reported for the current run
-- whether semantic retrieval is disabled, ONNX model/tokenizer paths are missing, sidecars are not full, or semantic docs are missing
+- whether dense-anchor retrieval is disabled, ONNX model/tokenizer paths are missing, sidecars are not full, or symbol docs / dense anchors are missing
 - whether `CODESTORY_HYBRID_RETRIEVAL_ENABLED`, `CODESTORY_SEMANTIC_DOC_SCOPE`, `CODESTORY_EMBED_RUNTIME_MODE`, `CODESTORY_EMBED_BACKEND`, or the `CODESTORY_EMBED_ONNX_*` paths changed between runs
 - whether graph-based boosts are overwhelming lexical matches
 
@@ -109,7 +109,7 @@ Common symptoms:
 
 - `index --refresh full` is much slower on an empty cache than on a repeat full refresh
 - graph timings are small but total index time is dominated by semantic work
-- semantic docs are embedded again when they should be reused
+- unchanged dense anchors are embedded again when they should be reused
 
 Start with:
 
@@ -122,8 +122,8 @@ Start with:
 Check:
 
 - `semantic_ms.doc_build`, `semantic_ms.embedding`, `semantic_ms.db_upsert`, and `semantic_ms.reload`
-- `semantic_docs.reused`, `semantic_docs.embedded`, `semantic_docs.pending`, and `semantic_docs.stale`
-- whether `CODESTORY_SEMANTIC_DOC_SCOPE=all` is forcing the broad all-symbol semantic set
+- `symbol_search_docs_written`, `semantic_dense_docs_skipped`, dense reason counters, `semantic_docs.reused`, `semantic_docs.embedded`, `semantic_docs.pending`, and `semantic_docs.stale`
+- whether `CODESTORY_SEMANTIC_DOC_SCOPE=all` is forcing the broad all-symbol symbol-doc set
 - whether `CODESTORY_SEMANTIC_DOC_ALIAS_MODE` was changed from the profiled default of `alias_variant`
 - whether `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` was changed from the profiled default of `128`
 - whether mandatory sidecars report `retrieval_mode=full` according to `doctor`
@@ -136,9 +136,9 @@ Check:
 Recovery order:
 
 1. Run one measured cold E2E and append the headline numbers to `docs/testing/codestory-e2e-stats-log.md`.
-2. Compare semantic embedded/reused counts before changing graph code.
-3. For reuse regressions, inspect semantic doc version, generated text hash, embedding model, and embedding dimension.
-4. For cold-only regressions, inspect durable semantic scope, length-bucket ordering, embedding batch size, sidecar health, and local embedding endpoint latency.
+2. Compare symbol-doc counts, dense skipped/reason counts, and dense embedded/reused counts before changing graph code.
+3. For reuse regressions, inspect semantic doc version, generated text hash, embedding profile/backend/model/dimension, document prefix, and semantic policy version.
+4. For cold-only regressions, inspect durable symbol scope, dense-anchor policy, length-bucket ordering, embedding batch size, sidecar health, and local embedding endpoint latency.
 5. For backend experiments, first verify the runtime is using the backend under test, then rerun the speed and quality comparisons documented in `docs/testing/embedding-backend-benchmarks.md`.
 
 ## If Grounding Is Wrong

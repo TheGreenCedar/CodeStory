@@ -177,6 +177,11 @@ mod tests {
             sidecar_input_hash: Some("hash-a".into()),
             sidecar_generation: Some("abc-hash-a".into()),
             projection_count: Some(10),
+            symbol_doc_count: Some(10),
+            dense_projection_count: Some(10),
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            graph_artifact_hash: Some("graph-a".into()),
+            dense_reason_counts_json: Some("{\"public_api\":10}".into()),
         };
         let mut changed = base.clone();
         changed.qdrant_collection = "codestory_abc_hash_b".into();

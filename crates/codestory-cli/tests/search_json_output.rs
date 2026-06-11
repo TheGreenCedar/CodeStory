@@ -1718,6 +1718,22 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
         "index command failed: {}",
         String::from_utf8_lossy(&index.stderr)
     );
+    let retrieval_index = run_cli(
+        workspace.path(),
+        &[
+            "retrieval",
+            "index",
+            "--refresh",
+            "full",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        retrieval_index.status.success(),
+        "retrieval index command failed: {}",
+        String::from_utf8_lossy(&retrieval_index.stderr)
+    );
 
     let expectations = [
         ("exact_symbol_anchor", "exact_symbol_anchor", "off"),

@@ -20,12 +20,34 @@ struct RepoE2eStats {
     index_seconds: f64,
     graph_phase_seconds: f64,
     semantic_phase_seconds: f64,
+    semantic_embedding_ms: u64,
+    symbol_search_docs_written: u64,
+    semantic_dense_docs_skipped: u64,
+    semantic_dense_public_api: u64,
+    semantic_dense_entrypoint: u64,
+    semantic_dense_documented_nontrivial: u64,
+    semantic_dense_central_graph_node: u64,
+    semantic_dense_component_report: u64,
+    semantic_dense_unstructured_doc: u64,
     semantic_docs_reused: u64,
     semantic_docs_embedded: u64,
     semantic_docs_pending: u64,
     semantic_docs_stale: u64,
+    repeat_full_refresh_seconds: f64,
+    repeat_graph_phase_seconds: f64,
+    repeat_semantic_phase_seconds: f64,
+    repeat_semantic_doc_build_ms: u64,
+    repeat_semantic_embedding_ms: u64,
+    repeat_semantic_db_upsert_ms: u64,
+    repeat_semantic_reload_ms: u64,
+    repeat_semantic_prune_ms: u64,
+    repeat_semantic_docs_reused: u64,
+    repeat_semantic_docs_embedded: u64,
+    repeat_semantic_docs_pending: u64,
+    repeat_semantic_docs_stale: u64,
     retrieval_index_seconds: f64,
     retrieval_status_seconds: f64,
+    sidecar_manifest: SidecarManifestStats,
     ground_seconds: f64,
     search_seconds: f64,
     symbol_seconds: f64,
@@ -37,6 +59,17 @@ struct RepoE2eStats {
     symbol: SymbolStats,
     trail: TrailStats,
     snippet: SnippetStats,
+}
+
+#[derive(Debug, Serialize)]
+struct SidecarManifestStats {
+    symbol_doc_count: u64,
+    dense_projection_count: u64,
+    projection_count: u64,
+    semantic_policy_version: String,
+    graph_artifact_hash_present: bool,
+    dense_reason_counts_json: String,
+    dense_reason_count_total: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -300,6 +333,17 @@ fn optional_u64_field(value: &Value, path: &[&str]) -> u64 {
     current.as_u64().unwrap_or(0)
 }
 
+fn dense_reason_count_total(reason_counts_json: &str) -> u64 {
+    let value: Value =
+        serde_json::from_str(reason_counts_json).expect("dense reason counts should be json");
+    value
+        .as_object()
+        .expect("dense reason counts should be a json object")
+        .values()
+        .map(|value| value.as_u64().expect("dense reason count should be u64"))
+        .sum()
+}
+
 fn bool_field(value: &Value, path: &[&str]) -> bool {
     let current = json_path(value, path);
     current
@@ -402,6 +446,19 @@ fn codestory_repo_release_e2e_emits_stats() {
 
     let storage_path = PathBuf::from(string_field(&index_json, &["storage_path"]));
     let search_dir = search_dir_for_storage(storage_path.as_path());
+
+    let (repeat_full_refresh_seconds, repeat_index_json) = run_cli_json(
+        &binary,
+        project_root.as_path(),
+        cache_dir.path(),
+        &[
+            "index".to_string(),
+            "--refresh".to_string(),
+            "full".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ],
+    );
 
     let (retrieval_index_seconds, _retrieval_index_json) = run_cli_json(
         &binary,
@@ -526,15 +583,71 @@ fn codestory_repo_release_e2e_emits_stats() {
         + optional_u64_field(&index_json, &["phase_timings", "edge_resolution_ms"])
         + optional_u64_field(&index_json, &["phase_timings", "error_flush_ms"])
         + optional_u64_field(&index_json, &["phase_timings", "cleanup_ms"]);
+    let repeat_graph_phase_ms =
+        optional_u64_field(&repeat_index_json, &["phase_timings", "parse_index_ms"])
+            + optional_u64_field(
+                &repeat_index_json,
+                &["phase_timings", "projection_flush_ms"],
+            )
+            + optional_u64_field(&repeat_index_json, &["phase_timings", "edge_resolution_ms"])
+            + optional_u64_field(&repeat_index_json, &["phase_timings", "error_flush_ms"])
+            + optional_u64_field(&repeat_index_json, &["phase_timings", "cleanup_ms"]);
     let semantic_phase_ms =
         optional_u64_field(&index_json, &["phase_timings", "semantic_doc_build_ms"])
             + optional_u64_field(&index_json, &["phase_timings", "semantic_embedding_ms"])
             + optional_u64_field(&index_json, &["phase_timings", "semantic_db_upsert_ms"])
             + optional_u64_field(&index_json, &["phase_timings", "semantic_reload_ms"])
             + optional_u64_field(&index_json, &["phase_timings", "semantic_prune_ms"]);
+    let repeat_semantic_doc_build_ms = optional_u64_field(
+        &repeat_index_json,
+        &["phase_timings", "semantic_doc_build_ms"],
+    );
+    let repeat_semantic_embedding_ms = optional_u64_field(
+        &repeat_index_json,
+        &["phase_timings", "semantic_embedding_ms"],
+    );
+    let repeat_semantic_db_upsert_ms = optional_u64_field(
+        &repeat_index_json,
+        &["phase_timings", "semantic_db_upsert_ms"],
+    );
+    let repeat_semantic_reload_ms =
+        optional_u64_field(&repeat_index_json, &["phase_timings", "semantic_reload_ms"]);
+    let repeat_semantic_prune_ms =
+        optional_u64_field(&repeat_index_json, &["phase_timings", "semantic_prune_ms"]);
+    let repeat_semantic_phase_ms = repeat_semantic_doc_build_ms
+        + repeat_semantic_embedding_ms
+        + repeat_semantic_db_upsert_ms
+        + repeat_semantic_reload_ms
+        + repeat_semantic_prune_ms;
     let semantic_phase_seconds = semantic_phase_ms as f64 / 1000.0;
     let search_sidecar_shadow_retrieval_mode =
         string_field(&search_json, &["retrieval_shadow", "retrieval_mode"]).to_string();
+    let dense_reason_counts_json = string_field(
+        &retrieval_status_json,
+        &["manifest", "dense_reason_counts_json"],
+    )
+    .to_string();
+    let sidecar_manifest = SidecarManifestStats {
+        symbol_doc_count: u64_field(&retrieval_status_json, &["manifest", "symbol_doc_count"]),
+        dense_projection_count: u64_field(
+            &retrieval_status_json,
+            &["manifest", "dense_projection_count"],
+        ),
+        projection_count: u64_field(&retrieval_status_json, &["manifest", "projection_count"]),
+        semantic_policy_version: string_field(
+            &retrieval_status_json,
+            &["manifest", "semantic_policy_version"],
+        )
+        .to_string(),
+        graph_artifact_hash_present: !string_field(
+            &retrieval_status_json,
+            &["manifest", "graph_artifact_hash"],
+        )
+        .trim()
+        .is_empty(),
+        dense_reason_count_total: dense_reason_count_total(&dense_reason_counts_json),
+        dense_reason_counts_json,
+    };
     let proof_tier = release_readiness_proof_tier(
         sidecar_retrieval_mode.as_str(),
         search_sidecar_shadow_retrieval_mode.as_str(),
@@ -554,6 +667,42 @@ fn codestory_repo_release_e2e_emits_stats() {
         index_seconds,
         graph_phase_seconds: graph_phase_ms as f64 / 1000.0,
         semantic_phase_seconds,
+        semantic_embedding_ms: optional_u64_field(
+            &index_json,
+            &["phase_timings", "semantic_embedding_ms"],
+        ),
+        symbol_search_docs_written: optional_u64_field(
+            &index_json,
+            &["phase_timings", "symbol_search_docs_written"],
+        ),
+        semantic_dense_docs_skipped: optional_u64_field(
+            &index_json,
+            &["phase_timings", "semantic_dense_docs_skipped"],
+        ),
+        semantic_dense_public_api: optional_u64_field(
+            &index_json,
+            &["phase_timings", "semantic_dense_public_api"],
+        ),
+        semantic_dense_entrypoint: optional_u64_field(
+            &index_json,
+            &["phase_timings", "semantic_dense_entrypoint"],
+        ),
+        semantic_dense_documented_nontrivial: optional_u64_field(
+            &index_json,
+            &["phase_timings", "semantic_dense_documented_nontrivial"],
+        ),
+        semantic_dense_central_graph_node: optional_u64_field(
+            &index_json,
+            &["phase_timings", "semantic_dense_central_graph_node"],
+        ),
+        semantic_dense_component_report: optional_u64_field(
+            &index_json,
+            &["phase_timings", "semantic_dense_component_report"],
+        ),
+        semantic_dense_unstructured_doc: optional_u64_field(
+            &index_json,
+            &["phase_timings", "semantic_dense_unstructured_doc"],
+        ),
         semantic_docs_reused: optional_u64_field(
             &index_json,
             &["phase_timings", "semantic_docs_reused"],
@@ -570,8 +719,33 @@ fn codestory_repo_release_e2e_emits_stats() {
             &index_json,
             &["phase_timings", "semantic_docs_stale"],
         ),
+        repeat_full_refresh_seconds,
+        repeat_graph_phase_seconds: repeat_graph_phase_ms as f64 / 1000.0,
+        repeat_semantic_phase_seconds: repeat_semantic_phase_ms as f64 / 1000.0,
+        repeat_semantic_doc_build_ms,
+        repeat_semantic_embedding_ms,
+        repeat_semantic_db_upsert_ms,
+        repeat_semantic_reload_ms,
+        repeat_semantic_prune_ms,
+        repeat_semantic_docs_reused: optional_u64_field(
+            &repeat_index_json,
+            &["phase_timings", "semantic_docs_reused"],
+        ),
+        repeat_semantic_docs_embedded: optional_u64_field(
+            &repeat_index_json,
+            &["phase_timings", "semantic_docs_embedded"],
+        ),
+        repeat_semantic_docs_pending: optional_u64_field(
+            &repeat_index_json,
+            &["phase_timings", "semantic_docs_pending"],
+        ),
+        repeat_semantic_docs_stale: optional_u64_field(
+            &repeat_index_json,
+            &["phase_timings", "semantic_docs_stale"],
+        ),
         retrieval_index_seconds,
         retrieval_status_seconds,
+        sidecar_manifest,
         ground_seconds,
         search_seconds,
         symbol_seconds,
@@ -654,8 +828,50 @@ fn codestory_repo_release_e2e_emits_stats() {
         "search should expose full sidecar retrieval shadow"
     );
     assert!(
+        stats.sidecar_manifest.symbol_doc_count > 0,
+        "full sidecar manifest should record graph-native symbol docs"
+    );
+    assert!(
+        stats.sidecar_manifest.dense_projection_count > 0,
+        "CodeStory product run should select dense anchors"
+    );
+    assert_eq!(
+        stats.sidecar_manifest.dense_projection_count, stats.sidecar_manifest.projection_count,
+        "legacy projection_count should mirror dense_projection_count under graph_first_v1"
+    );
+    assert_eq!(
+        stats.sidecar_manifest.semantic_policy_version, "graph_first_v1",
+        "full sidecar manifest should record the active dense policy"
+    );
+    assert!(
+        stats.sidecar_manifest.graph_artifact_hash_present,
+        "full sidecar manifest should record a graph artifact hash"
+    );
+    assert_eq!(
+        stats.sidecar_manifest.dense_reason_count_total,
+        stats.sidecar_manifest.dense_projection_count,
+        "dense reason counts should account for every dense anchor"
+    );
+    assert!(
+        stats.symbol_search_docs_written > 0,
+        "index should report graph-native symbol docs written"
+    );
+    assert!(
+        stats.semantic_dense_docs_skipped > 0,
+        "AST-first policy should skip dense embeddings for recoverable code symbols"
+    );
+    assert_eq!(
+        stats.repeat_semantic_docs_embedded, 0,
+        "repeat full refresh should embed zero unchanged dense docs"
+    );
+    assert!(
+        stats.repeat_full_refresh_seconds < 25.0,
+        "repeat full refresh should stay under 25 seconds, got {:.2}s",
+        stats.repeat_full_refresh_seconds
+    );
+    assert!(
         stats.index.semantic_doc_count > 0,
-        "full repo index should populate semantic docs"
+        "full repo index should populate dense anchors"
     );
     assert!(
         stats.semantic_docs_embedded > 0,

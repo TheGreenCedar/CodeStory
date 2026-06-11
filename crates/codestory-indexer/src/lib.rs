@@ -3477,6 +3477,98 @@ fn collect_tsx_jsx_usage_edges(tree: &Tree, source: &str) -> Vec<ManualEdgeSpec>
     edges
 }
 
+fn is_javascript_like_language(language_name: &str) -> bool {
+    matches!(language_name, "javascript" | "typescript" | "tsx")
+}
+
+fn js_identifier_target_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "type_identifier" => node_source_text(node, source)
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty()),
+        "member_expression" => node
+            .child_by_field_name("property")
+            .and_then(|property| js_identifier_target_name(property, source)),
+        _ => None,
+    }
+}
+
+fn js_member_object_identifier(node: TsNode<'_>, source: &str) -> Option<String> {
+    if node.kind() != "member_expression" {
+        return None;
+    }
+    let object = node.child_by_field_name("object")?;
+    match object.kind() {
+        "identifier" => node_source_text(object, source)
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty()),
+        _ => None,
+    }
+}
+
+fn js_member_property_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    if node.kind() != "member_expression" {
+        return None;
+    }
+    node.child_by_field_name("property")
+        .and_then(|property| node_source_text(property, source))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+fn js_new_expression_constructor_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("constructor")
+        .and_then(|constructor| js_identifier_target_name(constructor, source))
+        .or_else(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find_map(|child| js_identifier_target_name(child, source))
+        })
+}
+
+fn collect_javascript_static_call_edges(tree: &Tree, source: &str) -> Vec<ManualEdgeSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        let Some(source_name) = tsx_owner_name(node, source) else {
+            return;
+        };
+        let line = Some(node.start_position().row as u32 + 1);
+        match node.kind() {
+            "new_expression" => {
+                if let Some(target_name) = js_new_expression_constructor_name(node, source) {
+                    edges.push(ManualEdgeSpec {
+                        source_name,
+                        target_name,
+                        kind: EdgeKind::CALL,
+                        line,
+                    });
+                }
+            }
+            "call_expression" => {
+                let Some(function_node) = node.child_by_field_name("function") else {
+                    return;
+                };
+                let Some(property_name) = js_member_property_name(function_node, source) else {
+                    return;
+                };
+                if !matches!(property_name.as_str(), "call" | "apply" | "bind") {
+                    return;
+                }
+                if let Some(target_name) = js_member_object_identifier(function_node, source) {
+                    edges.push(ManualEdgeSpec {
+                        source_name,
+                        target_name,
+                        kind: EdgeKind::CALL,
+                        line,
+                    });
+                }
+            }
+            _ => {}
+        }
+    });
+    edges
+}
+
 fn rust_macro_owner_name(mut node: TsNode<'_>, source: &str) -> Option<String> {
     while let Some(parent) = node.parent() {
         if parent.kind() == "function_item" {
@@ -3898,6 +3990,9 @@ fn append_manual_usage_edges(
     if is_tsx_file {
         specs.extend(collect_tsx_jsx_usage_edges(tree, source));
     }
+    if is_javascript_like_language(language_name) {
+        specs.extend(collect_javascript_static_call_edges(tree, source));
+    }
     if language_name == "rust" {
         specs.extend(collect_rust_macro_call_edges(tree, source));
     }
@@ -3923,10 +4018,17 @@ fn append_manual_usage_edges(
         };
         let target_id = match spec.kind {
             EdgeKind::CALL => unique_node_id_by_name(unique_nodes, &spec.target_name, |kind| {
-                if is_tsx_file || language_name == "python" {
+                if is_tsx_file
+                    || language_name == "python"
+                    || is_javascript_like_language(language_name)
+                {
                     matches!(
                         kind,
-                        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO | NodeKind::UNKNOWN
+                        NodeKind::CLASS
+                            | NodeKind::FUNCTION
+                            | NodeKind::METHOD
+                            | NodeKind::MACRO
+                            | NodeKind::UNKNOWN
                     )
                 } else {
                     matches!(

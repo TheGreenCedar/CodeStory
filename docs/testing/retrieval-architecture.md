@@ -1,6 +1,6 @@
 # Sidecar retrieval — architecture and promotion guide
 
-Sidecar-primary packet retrieval (Zoekt lexical, Qdrant semantic, SCIP graph) orchestrated by
+Sidecar-primary packet retrieval (Zoekt lexical, optional Qdrant dense anchors, SCIP graph) orchestrated by
 `codestory-retrieval` and integrated in `codestory-runtime`. Production packet paths use
 generic symbol/path roles; benchmark-only probe catalogs remain behind test-only eval harness hooks.
 Sidecar retrieval is mandatory for current evidence; `CODESTORY_RETRIEVAL=0` is treated as a
@@ -17,14 +17,16 @@ configuration error, not a diagnostic route.
 |-------|----------|------|
 | Sidecar clients | `crates/codestory-retrieval/` (`zoekt_client`, `qdrant_client`, `scip_client`, `health`) | HTTP probes, staged search, timeouts |
 | Planner / executor / ranker | `codestory-retrieval` (`planner`, `executor`, `ranker`, `query_features`, `mode`) | Repo-agnostic staged plan, deadlines, degraded modes |
-| Index manifest | `codestory-store` `retrieval_index_manifest` + `codestory-retrieval::index` | Version pins, sidecar input hash, generation id, and mandatory real sidecar artifact paths |
+| Index manifest | `codestory-store` `retrieval_index_manifest` + `codestory-retrieval::index` | Version pins, sidecar input hash, generation id, symbol-doc count, dense-anchor count, semantic policy version, graph artifact hash, dense reason counts, and mandatory real sidecar artifact paths |
 | CLI lifecycle | `codestory-cli` `retrieval up\|down\|status\|index\|query` | Local data dirs, health JSON, standalone query |
 | Packet integration | `codestory-runtime/src/agent/retrieval_primary.rs` | Primary sidecar path, diagnostic traces, promotion warnings |
 | Nucleo policy | `codestory-runtime/src/agent/nucleo_policy.rs` | Suppresses Nucleo O(n) scan on sidecar primary; disabled sidecars are not valid product evidence |
 | Generalization lint | `scripts/lint-retrieval-generalization.mjs` | Bans repo literals in Rust production retrieval trees (CI via Rust guard test); benchmark/eval harness scripts may name holdout repos only inside their manifest/eval boundary |
 
 **Modes:** `full`, `no_scip`, `no_semantic`, `lexical_only`, `unavailable` — only
-`full` may serve primary packet/search results. All non-`full` modes fail closed. See
+`full` may serve primary packet/search results. All non-`full` modes fail closed. With
+`graph_first_v1`, `full` can be graph/lexical-only only when the manifest dense-anchor count is
+explicitly zero; otherwise Qdrant remains mandatory. See
 [`retrieval-design.md`](../architecture/retrieval-design.md#mandatory-sidecar-mode-matrix).
 
 **Benchmark manifests:** `benchmarks/tasks/local-real/` is the realistic local
@@ -53,6 +55,28 @@ to the sidecar-primary contract.
 | `CODESTORY_ZOEKT_PORT` | `6070` | Zoekt HTTP |
 | `CODESTORY_QDRANT_HTTP_PORT` | `6333` | Qdrant HTTP |
 | `CODESTORY_QDRANT_GRPC_PORT` | `6334` | Qdrant gRPC |
+
+### AST-first policy gates
+
+`graph_first_v1` is the active semantic policy. Product code recall must come from exact
+symbol/AST lookup, lexical source and `symbol_search_doc` virtual docs, component reports, and graph
+expansion before dense anchors are used. Dense anchors are limited to deterministic reasons:
+`public_api`, `entrypoint`, `documented_nontrivial`, `central_graph_node`, `component_report`, and
+`unstructured_doc`.
+
+Promotion evidence for this lane must report:
+
+- `symbol_doc_count`
+- `dense_projection_count`
+- `semantic_policy_version`
+- `graph_artifact_hash`
+- dense reason counts
+- search-result provenance labels such as `exact`, `lexical_source`, `symbol_doc`,
+  `graph_neighbor`, `component_report`, and `dense_anchor`
+
+Zero dense anchors are valid only when the policy actually emits zero anchors and graph/lexical
+artifacts are complete. Partial dense anchors, stale policy versions, count mismatches, wrong vector
+dimensions, or stale dense reason counts are fail-closed.
 
 ### Benchmark-only flags
 
@@ -186,6 +210,12 @@ tests in the branch. Do not infer support for languages without direct benchmark
 
 | Metric | Target |
 |--------|--------|
+| Cold CodeStory product index | under 180 s |
+| Cold semantic embedding time | at least 70% lower than same-run baseline |
+| Dense embedded docs | at least 65% lower than same-run baseline |
+| Repeat full refresh | 0 unchanged dense docs embedded and under 25 s |
+| Holdout MRR@10 | no more than 1 percentage-point drop versus same-run baseline |
+| Hit@10 / exact-symbol Hit@1 | no regression |
 | Retrieval p50 | ≤ 250 ms |
 | Retrieval p90 | ≤ 600 ms |
 | Retrieval p99 | ≤ 1,000 ms |

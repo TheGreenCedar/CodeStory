@@ -649,6 +649,11 @@ mod tests {
                 sidecar_input_hash: None,
                 sidecar_generation: None,
                 projection_count: None,
+                symbol_doc_count: None,
+                dense_projection_count: None,
+                semantic_policy_version: None,
+                graph_artifact_hash: None,
+                dense_reason_counts_json: None,
             })
             .expect("upsert");
 
@@ -702,6 +707,11 @@ mod tests {
                 sidecar_input_hash: None,
                 sidecar_generation: None,
                 projection_count: None,
+                symbol_doc_count: None,
+                dense_projection_count: None,
+                semantic_policy_version: None,
+                graph_artifact_hash: None,
+                dense_reason_counts_json: None,
             })
             .expect("manifest a");
 
@@ -721,6 +731,11 @@ mod tests {
                 sidecar_input_hash: None,
                 sidecar_generation: None,
                 projection_count: None,
+                symbol_doc_count: None,
+                dense_projection_count: None,
+                semantic_policy_version: None,
+                graph_artifact_hash: None,
+                dense_reason_counts_json: None,
             })
             .expect("manifest b");
 
@@ -778,6 +793,11 @@ mod tests {
                 sidecar_input_hash: None,
                 sidecar_generation: None,
                 projection_count: None,
+                symbol_doc_count: None,
+                dense_projection_count: None,
+                semantic_policy_version: None,
+                graph_artifact_hash: None,
+                dense_reason_counts_json: None,
             })
             .expect("flat manifest");
 
@@ -800,6 +820,11 @@ mod tests {
                 sidecar_input_hash: None,
                 sidecar_generation: None,
                 projection_count: None,
+                symbol_doc_count: None,
+                dense_projection_count: None,
+                semantic_policy_version: None,
+                graph_artifact_hash: None,
+                dense_reason_counts_json: None,
             })
             .expect("hashed manifest");
 

@@ -82,7 +82,8 @@ cargo test -p codestory-runtime --test integration test_repo_scale_call_resoluti
 
 ## Repo-Scale Semantic And Cold-Start Checks
 
-Run this lane when default `index` behavior, semantic doc persistence, embedding reuse, or cold-start performance changes:
+Run this lane when default `index` behavior, symbol-doc persistence, dense-anchor
+persistence/reuse, embedding reuse, or cold-start performance changes:
 
 ```powershell
 cargo build --release -p codestory-cli
@@ -95,14 +96,14 @@ only to make that separate drill skip explicit during local release-evidence
 collection. A skipped drill means the release evidence is not real-repo drill
 proof; it does not rename the `proof_tier` emitted by the stats JSON.
 
-Append the emitted headline metrics to `docs/testing/codestory-e2e-stats-log.md`. Include graph seconds, semantic seconds, semantic docs reused, semantic docs embedded, total index seconds, `retrieval_index_seconds`, `retrieval_status_seconds`, `proof_tier`, any `warnings`, and whether `sidecar_status_after_retrieval_index` plus `search.sidecar_shadow_retrieval_mode` were `full`.
+Append the emitted headline metrics to `docs/testing/codestory-e2e-stats-log.md`. Include graph seconds, semantic seconds, symbol docs written, dense docs skipped, dense reason counts, dense docs reused, dense docs embedded, total index seconds, `retrieval_index_seconds`, `retrieval_status_seconds`, `proof_tier`, any `warnings`, and whether `sidecar_status_after_retrieval_index` plus `search.sidecar_shadow_retrieval_mode` were `full`.
 
 Release-readiness evidence is tiered:
 
 | Evidence tier | Required proof | Release meaning |
 | --- | --- | --- |
 | Stats-only / degraded sidecar | Diagnostic timing or contract evidence without prepared full sidecars, or stats output whose `proof_tier` is `stats_only` | Useful local regression signal only; not release proof for packet/search readiness. The current passing `codestory_repo_release_e2e_emits_stats` harness asserts full sidecar status instead of completing as a passing no-full-sidecar row. |
-| Full sidecar | `codestory_repo_release_e2e_emits_stats` emits `proof_tier: "full_sidecar"` after local Zoekt, Qdrant, SCIP, and llama.cpp are running; `retrieval index --refresh full` succeeds; `retrieval status --format json` reports `retrieval_mode: "full"`; and search shadow mode is `full` | Required before claiming agent-facing packet/search readiness on the current workspace. This is the normal tier for a passing stats JSON object from the release e2e stats harness. |
+| Full sidecar | `codestory_repo_release_e2e_emits_stats` emits `proof_tier: "full_sidecar"` after local Zoekt, SCIP, and required dense-anchor Qdrant/llama.cpp are prepared; `retrieval index --refresh full` succeeds; `retrieval status --format json` reports `retrieval_mode: "full"` with current symbol-doc and dense-anchor manifest fields; and search shadow mode is `full` | Required before claiming agent-facing packet/search readiness on the current workspace. This is the normal tier for a passing stats JSON object from the release e2e stats harness. |
 | Real-repo drill | `CODESTORY_REAL_REPO_DRILL_CASES` points at prepared manifests and the drill cases run without skip allowances | Required before claiming the release was exercised beyond the CodeStory checkout. |
 | Promotion-grade benchmark | Baseline and candidate benchmark rows are captured with sidecar status, search shadow mode, and no-regression threshold | Required for performance or retrieval-quality promotion claims. |
 
@@ -121,6 +122,7 @@ stay visible in logged evidence:
 | --- | --- |
 | Total index time | `index_seconds > 600` |
 | Semantic phase time | `semantic_phase_seconds > 500` |
+| AST-first cold index gate | cold CodeStory product index is not under 180s or `semantic_embedding_ms` is not at least 70% below same-run baseline |
 
 Preserve those warning strings when copying the run into release evidence. An
 empty `warnings` array only means the measured run stayed under these warning
@@ -155,14 +157,14 @@ cargo check -p codestory-bench --benches
 ```
 
 When changing embedding backends, model profiles, pooling, prefixes, batching,
-hardware-provider settings, or generated semantic-doc text, run the semantic-doc
+hardware-provider settings, generated symbol-doc text, or dense-anchor text, run the semantic-doc
 leakage check before trusting benchmark scores. It fails when production
-semantic-doc concept phrases copy or closely overlap benchmark query text. Use
+generated-doc concept phrases copy or closely overlap benchmark query text. Use
 `CODESTORY_EMBED_RESEARCH_QUERY_SPLIT=dev` for exploratory tuning and
 `CODESTORY_EMBED_RESEARCH_QUERY_SPLIT=holdout` for promotion evidence; dev-only
 rows have `promotion_eligible=false` and must not be promoted. Cache replay is
 blocked unless `CODESTORY_EMBED_RESEARCH_ALLOW_CACHE_REPLAY=1` is set, so stale
-semantic-doc caches cannot silently seed a new benchmark lane. Queries that
+generated-doc caches cannot silently seed a new benchmark lane. Queries that
 previously appeared in leaked production semantic-doc aliases are excluded by
 default; set `CODESTORY_EMBED_RESEARCH_INCLUDE_TAINTED_QUERIES=1` only when
 intentionally reproducing the invalidated historical slice. Also

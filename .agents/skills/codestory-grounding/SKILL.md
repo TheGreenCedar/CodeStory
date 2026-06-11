@@ -61,6 +61,13 @@ checkout is only the tool artifact unless the user is editing CodeStory itself.
   failed, treat product retrieval as unavailable until `retrieval_mode=full` is
   restored. Repo-text output is diagnostic only; do not use it as a substitute
   for mandatory sidecar evidence.
+- Under `graph_first_v1`, `retrieval_mode=full` means graph and lexical sidecars
+  are complete, generated `symbol_search_doc` and component-report virtual docs
+  are current, and Qdrant is complete only for selected dense anchors. A zero
+  dense-anchor manifest is valid only when reported explicitly; otherwise
+  Qdrant mismatch or unavailability is fail-closed. Search evidence should name
+  provenance such as `exact`, `lexical_source`, `symbol_doc`, `graph_neighbor`,
+  `component_report`, or `dense_anchor`.
 
 ## Command Routing
 

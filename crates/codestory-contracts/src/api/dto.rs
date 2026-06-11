@@ -190,6 +190,10 @@ pub struct StoredSemanticDocsContractDto {
     pub mixed_doc_shapes: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc_shape: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_policy_version: Option<String>,
+    #[serde(default)]
+    pub mixed_semantic_policy_versions: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -1305,6 +1309,8 @@ pub struct RetrievalScoreBreakdownDto {
     pub semantic: f32,
     pub graph: f32,
     pub total: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

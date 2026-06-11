@@ -28,6 +28,7 @@ type UnresolvedEdgeRow = (
     Option<String>,
     String,
     String,
+    i64,
     Option<String>,
     Option<String>,
 );
@@ -47,7 +48,8 @@ const SCOPED_CALLER_TABLE: &str = "resolution_scoped_caller_ids";
 type SameFileCacheKey = (i64, String, String);
 type SameModuleCacheKey = (String, String, String);
 type NameCacheKey = (String, String);
-const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 1;
+type RelativeImportCacheKey = (String, String, String, String);
+const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SemanticResolutionRequestKey {
@@ -78,6 +80,8 @@ struct ResolutionLookupCache {
 struct CandidateNode {
     id: i64,
     file_node_id: Option<i64>,
+    file_path: Option<String>,
+    normalized_file_path: Option<String>,
     serialized_name: String,
     serialized_name_ascii_lower: String,
     qualified_name: Option<String>,
@@ -87,6 +91,7 @@ struct CandidateNode {
 struct CandidateNodeSnapshot {
     id: i64,
     file_node_id: Option<i64>,
+    file_path: Option<String>,
     serialized_name: String,
     qualified_name: Option<String>,
 }
@@ -94,15 +99,20 @@ struct CandidateNodeSnapshot {
 #[derive(Default, Debug)]
 struct CandidateIndex {
     nodes: Vec<CandidateNode>,
+    relative_import_nodes: Vec<CandidateNode>,
+    import_binding_node_ids: HashSet<i64>,
     node_offset_by_id: HashMap<i64, usize>,
     exact_map: HashMap<String, Vec<usize>>,
     suffix_map_ascii_lower: HashMap<String, Vec<usize>>,
+    file_path_map: HashMap<String, Vec<usize>>,
+    relative_file_path_map: HashMap<String, Vec<usize>>,
     same_file_cache: RwLock<HashMap<SameFileCacheKey, Option<i64>>>,
     same_module_cache: RwLock<HashMap<SameModuleCacheKey, Option<i64>>>,
     global_unique_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
     global_unique_exact_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
     global_owner_alias_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
     fuzzy_cache: RwLock<HashMap<NameCacheKey, Option<i64>>>,
+    relative_import_cache: RwLock<HashMap<RelativeImportCacheKey, Option<i64>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,7 +174,11 @@ struct ResolutionSupportSnapshot {
     #[serde(default)]
     enable_semantic: bool,
     call_candidates: Vec<CandidateNodeSnapshot>,
+    #[serde(default)]
+    call_import_binding_node_ids: Vec<i64>,
     import_candidates: Vec<CandidateNodeSnapshot>,
+    #[serde(default)]
+    relative_import_candidates: Vec<CandidateNodeSnapshot>,
     call_semantic_nodes: Vec<SemanticCandidateNodeSnapshot>,
     import_semantic_nodes: Vec<SemanticCandidateNodeSnapshot>,
     override_members: Vec<OverrideMemberSnapshot>,
@@ -1041,6 +1055,7 @@ fn semantic_lookup_from_row<'a>(
         caller_qualified,
         source_name,
         target_name,
+        _target_node_id,
         caller_file_path,
         callsite_identity,
     ) = row;
@@ -1137,7 +1152,7 @@ impl PreparedResolutionState {
 
         let conn = storage.get_connection();
         let call_candidate_started = Instant::now();
-        let call_candidate_index = CandidateIndex::load(
+        let call_candidate_index = CandidateIndex::load_with_import_bindings(
             conn,
             &[
                 NodeKind::FUNCTION as i32,
@@ -1148,13 +1163,14 @@ impl PreparedResolutionState {
         telemetry.call_candidate_index_ms = duration_ms_u64(call_candidate_started.elapsed());
 
         let import_candidate_started = Instant::now();
-        let import_candidate_index = CandidateIndex::load(
+        let import_candidate_index = CandidateIndex::load_with_relative_import_kinds(
             conn,
             &[
                 NodeKind::MODULE as i32,
                 NodeKind::NAMESPACE as i32,
                 NodeKind::PACKAGE as i32,
             ],
+            semantic_candidate_kinds(EdgeKind::IMPORT),
         )?;
         telemetry.import_candidate_index_ms = duration_ms_u64(import_candidate_started.elapsed());
 
@@ -1203,8 +1219,14 @@ impl PreparedResolutionState {
             snapshot.node_names,
         );
         Self {
-            call_candidate_index: CandidateIndex::from_snapshot_nodes(snapshot.call_candidates),
-            import_candidate_index: CandidateIndex::from_snapshot_nodes(snapshot.import_candidates),
+            call_candidate_index: CandidateIndex::from_snapshot_nodes_with_import_bindings(
+                snapshot.call_candidates,
+                snapshot.call_import_binding_node_ids,
+            ),
+            import_candidate_index: CandidateIndex::from_snapshot_nodes_with_relative(
+                snapshot.import_candidates,
+                snapshot.relative_import_candidates,
+            ),
             call_semantic_index: if flags.enable_semantic {
                 SemanticCandidateIndex::from_snapshot_nodes(snapshot.call_semantic_nodes)
             } else {
@@ -1223,7 +1245,11 @@ impl PreparedResolutionState {
         ResolutionSupportSnapshot {
             enable_semantic: flags.enable_semantic,
             call_candidates: self.call_candidate_index.snapshot_nodes(),
+            call_import_binding_node_ids: self.call_candidate_index.import_binding_node_ids(),
             import_candidates: self.import_candidate_index.snapshot_nodes(),
+            relative_import_candidates: self
+                .import_candidate_index
+                .snapshot_relative_import_nodes(),
             call_semantic_nodes: self.call_semantic_index.snapshot_nodes(),
             import_semantic_nodes: self.import_semantic_index.snapshot_nodes(),
             override_members: self.override_support.override_member_rows(),
@@ -1235,21 +1261,67 @@ impl PreparedResolutionState {
 }
 
 impl CandidateIndex {
+    #[cfg(test)]
     fn load(conn: &rusqlite::Connection, kinds: &[i32]) -> Result<Self> {
+        Ok(Self::from_nodes(Self::load_nodes(conn, kinds)?))
+    }
+
+    fn load_with_import_bindings(conn: &rusqlite::Connection, kinds: &[i32]) -> Result<Self> {
+        let nodes = Self::load_nodes(conn, kinds)?;
+        let import_binding_node_ids = Self::load_import_binding_node_ids(conn)?;
+        Ok(Self::from_primary_relative_and_import_bindings(
+            nodes,
+            Vec::new(),
+            import_binding_node_ids,
+        ))
+    }
+
+    fn load_with_relative_import_kinds(
+        conn: &rusqlite::Connection,
+        kinds: &[i32],
+        relative_import_kinds: &[i32],
+    ) -> Result<Self> {
+        let nodes = Self::load_nodes(conn, kinds)?;
+        let relative_import_nodes = if relative_import_kinds.is_empty() {
+            Vec::new()
+        } else {
+            Self::load_nodes(conn, relative_import_kinds)?
+        };
+        Ok(Self::from_primary_and_relative_nodes(
+            nodes,
+            relative_import_nodes,
+        ))
+    }
+
+    fn load_import_binding_node_ids(conn: &rusqlite::Connection) -> Result<HashSet<i64>> {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT source_node_id
+             FROM edge
+             WHERE kind = ?1",
+        )?;
+        let rows = stmt.query_map(params![EdgeKind::IMPORT as i32], |row| row.get::<_, i64>(0))?;
+        Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
+    }
+
+    fn load_nodes(conn: &rusqlite::Connection, kinds: &[i32]) -> Result<Vec<CandidateNode>> {
         let kind_clause = kind_clause(kinds);
         let query = format!(
-            "SELECT id, file_node_id, serialized_name, qualified_name
-             FROM node
-             WHERE kind IN ({})
-             ORDER BY COALESCE(start_line, -9223372036854775808), id",
+            "SELECT n.id, n.file_node_id, n.serialized_name, n.qualified_name, file_node.serialized_name
+             FROM node n
+             LEFT JOIN node file_node ON file_node.id = n.file_node_id
+             WHERE n.kind IN ({})
+             ORDER BY COALESCE(n.start_line, -9223372036854775808), n.id",
             kind_clause
         );
         let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map([], |row| {
             let serialized_name: String = row.get(2)?;
+            let file_path: Option<String> = row.get(4)?;
             Ok(CandidateNode {
                 id: row.get(0)?,
                 file_node_id: row.get(1)?,
+                normalized_file_path: file_path.as_deref().and_then(normalize_resolution_path),
+                file_path,
                 serialized_name_ascii_lower: serialized_name.to_ascii_lowercase(),
                 serialized_name,
                 qualified_name: row.get(3)?,
@@ -1261,21 +1333,27 @@ impl CandidateIndex {
             nodes.push(row?);
         }
 
-        Ok(Self::from_nodes(nodes))
+        Ok(nodes)
     }
 
-    fn from_snapshot_nodes(nodes: Vec<CandidateNodeSnapshot>) -> Self {
-        Self::from_nodes(
-            nodes
-                .into_iter()
-                .map(|node| CandidateNode {
-                    id: node.id,
-                    file_node_id: node.file_node_id,
-                    serialized_name_ascii_lower: node.serialized_name.to_ascii_lowercase(),
-                    serialized_name: node.serialized_name,
-                    qualified_name: node.qualified_name,
-                })
-                .collect(),
+    fn from_snapshot_nodes_with_import_bindings(
+        nodes: Vec<CandidateNodeSnapshot>,
+        import_binding_node_ids: Vec<i64>,
+    ) -> Self {
+        Self::from_primary_relative_and_import_bindings(
+            Self::candidate_nodes_from_snapshots(nodes),
+            Vec::new(),
+            import_binding_node_ids.into_iter().collect(),
+        )
+    }
+
+    fn from_snapshot_nodes_with_relative(
+        nodes: Vec<CandidateNodeSnapshot>,
+        relative_import_nodes: Vec<CandidateNodeSnapshot>,
+    ) -> Self {
+        Self::from_primary_and_relative_nodes(
+            Self::candidate_nodes_from_snapshots(nodes),
+            Self::candidate_nodes_from_snapshots(relative_import_nodes),
         )
     }
 
@@ -1285,15 +1363,74 @@ impl CandidateIndex {
             .map(|node| CandidateNodeSnapshot {
                 id: node.id,
                 file_node_id: node.file_node_id,
+                file_path: node.file_path.clone(),
                 serialized_name: node.serialized_name.clone(),
                 qualified_name: node.qualified_name.clone(),
             })
             .collect()
     }
 
+    fn snapshot_relative_import_nodes(&self) -> Vec<CandidateNodeSnapshot> {
+        self.relative_import_nodes
+            .iter()
+            .map(|node| CandidateNodeSnapshot {
+                id: node.id,
+                file_node_id: node.file_node_id,
+                file_path: node.file_path.clone(),
+                serialized_name: node.serialized_name.clone(),
+                qualified_name: node.qualified_name.clone(),
+            })
+            .collect()
+    }
+
+    fn candidate_nodes_from_snapshots(nodes: Vec<CandidateNodeSnapshot>) -> Vec<CandidateNode> {
+        nodes
+            .into_iter()
+            .map(|node| CandidateNode {
+                id: node.id,
+                file_node_id: node.file_node_id,
+                normalized_file_path: node
+                    .file_path
+                    .as_deref()
+                    .and_then(normalize_resolution_path),
+                file_path: node.file_path,
+                serialized_name_ascii_lower: node.serialized_name.to_ascii_lowercase(),
+                serialized_name: node.serialized_name,
+                qualified_name: node.qualified_name,
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     fn from_nodes(nodes: Vec<CandidateNode>) -> Self {
+        Self::from_primary_and_relative_nodes(nodes, Vec::new())
+    }
+
+    fn from_primary_and_relative_nodes(
+        nodes: Vec<CandidateNode>,
+        relative_import_nodes: Vec<CandidateNode>,
+    ) -> Self {
+        Self::from_primary_relative_and_import_bindings(
+            nodes,
+            relative_import_nodes,
+            HashSet::new(),
+        )
+    }
+
+    fn from_primary_relative_and_import_bindings(
+        nodes: Vec<CandidateNode>,
+        relative_import_nodes: Vec<CandidateNode>,
+        import_binding_node_ids: HashSet<i64>,
+    ) -> Self {
+        let relative_import_nodes = if relative_import_nodes.is_empty() {
+            nodes.clone()
+        } else {
+            relative_import_nodes
+        };
         let mut index = CandidateIndex {
             nodes,
+            relative_import_nodes,
+            import_binding_node_ids,
             ..CandidateIndex::default()
         };
         for (offset, node) in index.nodes.iter().enumerate() {
@@ -1310,8 +1447,38 @@ impl CandidateIndex {
                     .or_default()
                     .push(offset);
             }
+            if let Some(path) = node.normalized_file_path.as_ref() {
+                index
+                    .file_path_map
+                    .entry(path.clone())
+                    .or_default()
+                    .push(offset);
+            }
+        }
+        for (offset, node) in index.relative_import_nodes.iter().enumerate() {
+            if let Some(path) = node.normalized_file_path.as_ref() {
+                index
+                    .relative_file_path_map
+                    .entry(path.clone())
+                    .or_default()
+                    .push(offset);
+            }
         }
         index
+    }
+
+    fn import_binding_node_ids(&self) -> Vec<i64> {
+        let mut ids = self
+            .import_binding_node_ids
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn is_import_binding_node(&self, node_id: i64) -> bool {
+        self.import_binding_node_ids.contains(&node_id)
     }
 
     #[cfg(test)]
@@ -1363,6 +1530,41 @@ impl CandidateIndex {
                         &qualified_prefix,
                     )
                 })
+        })
+    }
+
+    fn find_relative_import_readonly(
+        &self,
+        caller_file_path: Option<&str>,
+        module_name: &str,
+        imported_name: &str,
+        imported_name_ascii_lower: &str,
+    ) -> Option<i64> {
+        let caller_file_path = caller_file_path?;
+        let candidates = relative_import_path_candidates(caller_file_path, module_name);
+        if candidates.is_empty() {
+            return None;
+        }
+        let key = (
+            normalize_resolution_path(caller_file_path)?,
+            normalize_import_module_name(module_name)?,
+            imported_name.to_string(),
+            imported_name_ascii_lower.to_string(),
+        );
+        self.cached_lookup(&self.relative_import_cache, key, || {
+            for candidate_path in candidates {
+                let Some(offsets) = self.relative_file_path_map.get(&candidate_path) else {
+                    continue;
+                };
+                if let Some(node_id) = self.first_matching_name_in_offsets(
+                    offsets,
+                    imported_name,
+                    imported_name_ascii_lower,
+                ) {
+                    return Some(node_id);
+                }
+            }
+            None
         })
     }
 
@@ -1520,6 +1722,29 @@ impl CandidateIndex {
         })
     }
 
+    fn first_matching_name_in_offsets(
+        &self,
+        offsets: &[usize],
+        name: &str,
+        name_ascii_lower: &str,
+    ) -> Option<i64> {
+        offsets.iter().find_map(|idx| {
+            let node = &self.relative_import_nodes[*idx];
+            let serialized_tail_lower =
+                tail_component(&node.serialized_name).map(str::to_ascii_lowercase);
+            let qualified_tail_lower = node
+                .qualified_name
+                .as_deref()
+                .and_then(tail_component)
+                .map(str::to_ascii_lowercase);
+            (node.serialized_name == name
+                || node.serialized_name_ascii_lower == name_ascii_lower
+                || serialized_tail_lower.as_deref() == Some(name_ascii_lower)
+                || qualified_tail_lower.as_deref() == Some(name_ascii_lower))
+            .then_some(node.id)
+        })
+    }
+
     fn cached_lookup<K, F>(
         &self,
         cache: &RwLock<HashMap<K, Option<i64>>>,
@@ -1565,6 +1790,100 @@ fn tail_component(serialized_name: &str) -> Option<&str> {
     };
     let tail = &serialized_name[start..];
     if tail.is_empty() { None } else { Some(tail) }
+}
+
+fn normalize_import_module_name(module_name: &str) -> Option<String> {
+    let unquoted = module_name
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    (!unquoted.is_empty()).then(|| unquoted.replace('\\', "/").to_ascii_lowercase())
+}
+
+fn normalize_resolution_path(path: &str) -> Option<String> {
+    let mut value = path.trim();
+    if value.is_empty() {
+        return None;
+    }
+    value = value.strip_prefix(r"\\?\").unwrap_or(value);
+    let mut normalized = value.replace('\\', "/");
+    let absolute = normalized.starts_with('/');
+    let mut prefix = String::new();
+    if normalized.len() >= 2 && normalized.as_bytes()[1] == b':' {
+        prefix = normalized[..2].to_string();
+        normalized = normalized[2..].trim_start_matches('/').to_string();
+    } else if absolute {
+        normalized = normalized.trim_start_matches('/').to_string();
+    }
+
+    let mut parts = Vec::new();
+    for segment in normalized.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if parts.last().is_some_and(|last| *last != "..") {
+                    parts.pop();
+                } else if prefix.is_empty() && !absolute {
+                    parts.push(segment);
+                }
+            }
+            _ => parts.push(segment),
+        }
+    }
+
+    let mut out = String::new();
+    if !prefix.is_empty() {
+        out.push_str(&prefix);
+        out.push('/');
+    } else if absolute {
+        out.push('/');
+    }
+    out.push_str(&parts.join("/"));
+    let out = out.trim_end_matches('/').to_ascii_lowercase();
+    (!out.is_empty()).then_some(out)
+}
+
+fn relative_import_path_candidates(caller_file_path: &str, module_name: &str) -> Vec<String> {
+    let Some(module_name) = normalize_import_module_name(module_name) else {
+        return Vec::new();
+    };
+    if !(module_name.starts_with("./") || module_name.starts_with("../")) {
+        return Vec::new();
+    }
+    let Some(caller_path) = normalize_resolution_path(caller_file_path) else {
+        return Vec::new();
+    };
+    let Some(parent) = caller_path.rsplit_once('/').map(|(parent, _)| parent) else {
+        return Vec::new();
+    };
+    let Some(base) = normalize_resolution_path(&format!("{parent}/{module_name}")) else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    push_unique(&mut candidates, base.clone());
+    if !path_has_extension(&base) {
+        for extension in [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"] {
+            push_unique(&mut candidates, format!("{base}{extension}"));
+        }
+        for index_file in [
+            "index.js",
+            "index.jsx",
+            "index.ts",
+            "index.tsx",
+            "index.mjs",
+            "index.cjs",
+        ] {
+            push_unique(&mut candidates, format!("{base}/{index_file}"));
+        }
+    }
+    candidates
+}
+
+fn path_has_extension(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .and_then(|segment| segment.rsplit_once('.'))
+        .is_some_and(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
 }
 
 #[cfg(test)]
@@ -2106,7 +2425,9 @@ mod tests {
         let stale_snapshot = ResolutionSupportSnapshot {
             enable_semantic: false,
             call_candidates: Vec::new(),
+            call_import_binding_node_ids: Vec::new(),
             import_candidates: Vec::new(),
+            relative_import_candidates: Vec::new(),
             call_semantic_nodes: Vec::new(),
             import_semantic_nodes: Vec::new(),
             override_members: Vec::new(),
@@ -2156,6 +2477,33 @@ mod tests {
         assert!(!is_common_unqualified_call_name(
             "WorkspaceIndexer::run_incremental"
         ));
+    }
+
+    #[test]
+    fn test_relative_import_lookup_matches_imported_file_symbol() {
+        let index = CandidateIndex::from_nodes(vec![CandidateNode {
+            id: 42,
+            file_node_id: Some(2),
+            file_path: Some(r"\\?\C:\repo\lib\client.js".to_string()),
+            normalized_file_path: normalize_resolution_path(r"\\?\C:\repo\lib\client.js"),
+            serialized_name: "Client".to_string(),
+            serialized_name_ascii_lower: "client".to_string(),
+            qualified_name: Some("Client".to_string()),
+        }]);
+
+        assert_eq!(
+            relative_import_path_candidates(r"\\?\C:\repo\lib\app.js", r#""./client.js""#),
+            vec!["c:/repo/lib/client.js".to_string()]
+        );
+        assert_eq!(
+            index.find_relative_import_readonly(
+                Some(r"\\?\C:\repo\lib\app.js"),
+                r#""./client.js""#,
+                "Client",
+                "client",
+            ),
+            Some(42)
+        );
     }
 
     #[test]
@@ -2217,6 +2565,7 @@ mod tests {
                 Some("pkg::core::caller".to_string()),
                 "caller".to_string(),
                 "target".to_string(),
+                0,
                 Some("/repo/lib.rs".to_string()),
                 Some("1:2:3:4".to_string()),
             ),
@@ -2226,6 +2575,7 @@ mod tests {
                 Some("pkg::core::caller".to_string()),
                 "caller".to_string(),
                 "target".to_string(),
+                0,
                 Some("/repo/lib.rs".to_string()),
                 Some("1:2:3:4".to_string()),
             ),
@@ -2262,6 +2612,7 @@ mod tests {
             Some("pkg::core::caller".to_string()),
             "caller".to_string(),
             "clone".to_string(),
+            0,
             Some("/repo/lib.rs".to_string()),
             None,
         )];
@@ -2311,6 +2662,7 @@ mod tests {
             Some("pkg::core::caller".to_string()),
             "caller".to_string(),
             "clone".to_string(),
+            0,
             Some("/repo/lib.rs".to_string()),
             Some("1:2:3:4".to_string()),
         );
@@ -2350,6 +2702,7 @@ mod tests {
             Some("pkg::core::caller".to_string()),
             "caller".to_string(),
             "clone".to_string(),
+            0,
             Some("/repo/lib.rs".to_string()),
             Some("1:2:3:4".to_string()),
         );

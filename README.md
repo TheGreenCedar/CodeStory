@@ -33,9 +33,9 @@ for cache health, indexing, search, trails, snippets, and source-backed answers
 that name the files they used. The per-project SQLite cache is separate from
 the optional local retrieval sidecars used by packet/search workflows; a healthy
 local navigation readiness report does not by itself prove agent packet/search
-readiness. Benchmark notes are environment- and repository-specific evidence,
-so public claims should cite the checked setup instead of promising universal
-speedups or savings.
+readiness and does not by itself prove sidecar readiness. Benchmark notes are
+environment- and repository-specific evidence, so public claims should cite the
+checked setup instead of promising universal speedups or savings.
 
 ## Try It On A Repo
 
