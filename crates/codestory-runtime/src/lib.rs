@@ -5629,18 +5629,16 @@ fn sync_llm_symbol_projection(
             pending_docs.push(pending_doc);
         }
 
-        while stream_pending_docs
-            && embedding_contract.is_some()
-            && pending_docs.len() >= embed_batch_size
-        {
+        while stream_pending_docs && pending_docs.len() >= embed_batch_size {
+            let Some(embedding_contract) = embedding_contract.as_ref() else {
+                break;
+            };
             flush_streaming_llm_symbol_doc_window(
                 storage,
                 engine,
                 &mut pending_docs,
                 embed_batch_size,
-                embedding_contract
-                    .as_ref()
-                    .expect("embedding contract exists when pending docs are flushed"),
+                embedding_contract,
                 updated_at_epoch_ms,
                 &mut stats,
             )?;
@@ -5711,18 +5709,16 @@ fn sync_llm_symbol_projection(
                 pending_docs.push(pending_doc);
             }
 
-            while stream_pending_docs
-                && embedding_contract.is_some()
-                && pending_docs.len() >= embed_batch_size
-            {
+            while stream_pending_docs && pending_docs.len() >= embed_batch_size {
+                let Some(embedding_contract) = embedding_contract.as_ref() else {
+                    break;
+                };
                 flush_streaming_llm_symbol_doc_window(
                     storage,
                     engine,
                     &mut pending_docs,
                     embed_batch_size,
-                    embedding_contract
-                        .as_ref()
-                        .expect("embedding contract exists when pending docs are flushed"),
+                    embedding_contract,
                     updated_at_epoch_ms,
                     &mut stats,
                 )?;

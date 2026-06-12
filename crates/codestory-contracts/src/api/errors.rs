@@ -8,7 +8,7 @@ pub struct ApiError {
     pub code: String,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<ApiErrorDetails>,
+    pub details: Option<Box<ApiErrorDetails>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -72,7 +72,7 @@ impl ApiError {
         Self {
             code: code.into(),
             message: message.into(),
-            details: Some(details),
+            details: Some(Box::new(details)),
         }
     }
 

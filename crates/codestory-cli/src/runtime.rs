@@ -469,14 +469,14 @@ fn map_api_error_with_project(error: ApiError, project: Option<&Path>) -> anyhow
             message.push_str("\n\nMinimum next:");
             for command in minimum_next {
                 message.push_str("\n  ");
-                message.push_str(&command);
+                message.push_str(command);
             }
         }
         if !full_repair.is_empty() && full_repair != minimum_next {
             message.push_str("\n\nFull repair:");
             for command in full_repair {
                 message.push_str("\n  ");
-                message.push_str(&command);
+                message.push_str(command);
             }
         }
     } else if let Some(next_commands) = api_error_next_commands(&error) {

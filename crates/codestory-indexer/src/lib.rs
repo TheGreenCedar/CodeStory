@@ -4500,30 +4500,35 @@ fn language_member_specs(
     }
 }
 
-fn append_manual_member_edges(
-    language_name: &str,
-    tree: &Tree,
-    source: &str,
-    unique_nodes: &HashMap<NodeId, Node>,
+struct ManualMemberEdgeContext<'a> {
+    language_name: &'a str,
+    tree: &'a Tree,
+    source: &'a str,
+    unique_nodes: &'a HashMap<NodeId, Node>,
     file_id: NodeId,
+    flags: IndexFeatureFlags,
+}
+
+fn append_manual_member_edges(
+    context: ManualMemberEdgeContext<'_>,
     result_edges: &mut Vec<Edge>,
     edge_keys: &mut HashSet<EdgeDedupKey>,
-    flags: IndexFeatureFlags,
 ) {
-    for spec in language_member_specs(language_name, tree, source) {
+    for spec in language_member_specs(context.language_name, context.tree, context.source) {
         let Some(source_id) = node_id_by_name_and_span(
-            unique_nodes,
+            context.unique_nodes,
             &spec.source_name,
             spec.source_span,
             is_type_like_kind,
         ) else {
             continue;
         };
-        let Some(target_id) =
-            node_id_by_name_and_span(unique_nodes, &spec.target_name, spec.target_span, |kind| {
-                kind == NodeKind::METHOD
-            })
-        else {
+        let Some(target_id) = node_id_by_name_and_span(
+            context.unique_nodes,
+            &spec.target_name,
+            spec.target_span,
+            |kind| kind == NodeKind::METHOD,
+        ) else {
             continue;
         };
 
@@ -4532,15 +4537,15 @@ fn append_manual_member_edges(
             source: source_id,
             target: target_id,
             kind: EdgeKind::MEMBER,
-            file_node_id: Some(file_id),
+            file_node_id: Some(context.file_id),
             line: spec.line,
             certainty: parser_direct_structural_certainty(EdgeKind::MEMBER),
             ..Default::default()
         };
-        if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
+        if !edge_keys.insert(edge_dedup_key(&edge, context.flags)) {
             continue;
         }
-        edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
+        edge.id = EdgeId(generate_edge_id_for_edge(&edge, context.flags));
         result_edges.push(edge);
     }
 }
@@ -10755,14 +10760,16 @@ pub fn index_file(
         flags,
     );
     append_manual_member_edges(
-        language_config.language_name,
-        &tree,
-        source,
-        &unique_nodes,
-        file_id,
+        ManualMemberEdgeContext {
+            language_name: language_config.language_name,
+            tree: &tree,
+            source,
+            unique_nodes: &unique_nodes,
+            file_id,
+            flags,
+        },
         &mut result_edges,
         &mut edge_keys,
-        flags,
     );
     append_manual_receiver_call_edges(
         language_config.language_name,

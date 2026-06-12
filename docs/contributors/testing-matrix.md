@@ -69,7 +69,7 @@ with CodeStory indexing of the same file set:
 CODESTORY_RUN_OSS_LANGUAGE_CORPUS=1 cargo test -p codestory-indexer --test oss_language_corpus -- --ignored --nocapture
 ```
 
-See [oss-language-corpus.md](oss-language-corpus.md) for PowerShell commands,
+See [oss-language-corpus.md](../testing/oss-language-corpus.md) for PowerShell commands,
 language filtering, cache configuration, and the JSONL report path.
 
 That corpus is not the strict agent A/B comparison. For language-level

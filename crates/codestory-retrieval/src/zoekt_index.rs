@@ -26,18 +26,13 @@ struct LexicalIndexEntry {
     start_line: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LexicalDocumentSource {
+    #[default]
     LexicalSource,
     SymbolDoc,
     ComponentReport,
-}
-
-impl Default for LexicalDocumentSource {
-    fn default() -> Self {
-        Self::LexicalSource
-    }
 }
 
 impl LexicalDocumentSource {
