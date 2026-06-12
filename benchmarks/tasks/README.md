@@ -73,6 +73,12 @@ runtime-supported languages. It is separate from the OSS language corpus:
   against those pinned projects and records elapsed time, token usage, estimated
   cost, observed tool calls, command counts, command categories, source reads,
   source reads after the first CodeStory packet, and manifest quality gates.
+- The `without_codestory` arm mechanically runs a harness-owned local `rg` plus
+  bounded source-read prelude. The `with_codestory` arm mechanically runs a
+  harness-owned `codestory-cli packet` prelude. Both preludes count their wall
+  time and command/tool accounting. The `without_codestory` arm is invalid for
+  publishable evidence if it calls CodeStory or never inspects the local
+  repository.
 
 The suite currently has one medium-sized open source project per supported
 language: Python, Java, Rust, JavaScript, TypeScript, C++, C, Go, Ruby, PHP,

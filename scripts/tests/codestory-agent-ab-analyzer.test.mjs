@@ -16,6 +16,9 @@ import {
   parseArgs as parseBenchmarkArgs,
   parseJsonLines,
   packetComposition,
+  packetForAgentPrompt,
+  packetManifestQualitySummary,
+  packetPreludeManifestComplete,
   packetLatencyTelemetry,
   packetFirstCommandForPrompt,
   packetRuntimePublishableBlockers,
@@ -526,6 +529,10 @@ test("summarizes A/B cost accounting totals and ratios", () => {
       arm: "without_codestory",
       status: "pass",
       wall_ms: 200,
+      agent_runner_wall_ms: 190,
+      baseline_harness_prelude: {
+        wall_ms: 10,
+      },
       usage: { input_tokens: 80, output_tokens: 20, total_tokens: 100 },
       estimated_cost_usd: 0.02,
       tool_calls_observed: 4,
@@ -541,9 +548,14 @@ test("summarizes A/B cost accounting totals and ratios", () => {
       arm: "with_codestory",
       status: "pass",
       wall_ms: 50,
+      agent_runner_wall_ms: 40,
       usage: { input_tokens: 30, output_tokens: 10, total_tokens: 40 },
       estimated_cost_usd: 0.01,
       tool_calls_observed: 1,
+      codex_tool_calls_observed: 0,
+      codestory_harness_prelude: {
+        wall_ms: 10,
+      },
       codestory_cache_provenance: {
         cache_preparation: { preparation_wall_ms: 10 },
       },
@@ -575,9 +587,14 @@ test("summarizes A/B cost accounting totals and ratios", () => {
   assert.equal(costAccounting.arms.with_codestory.runs, 2);
   assert.equal(costAccounting.arms.with_codestory.failed_runs, 1);
   assert.equal(costAccounting.arms.with_codestory.missing_token_usage_runs, 1);
+  assert.equal(costAccounting.arms.without_codestory.time_spent_ms.agent_runner, 190);
+  assert.equal(costAccounting.arms.without_codestory.time_spent_ms.baseline_harness_prelude, 10);
   assert.equal(costAccounting.arms.with_codestory.time_spent_ms.runner_wall, 55);
+  assert.equal(costAccounting.arms.with_codestory.time_spent_ms.agent_runner, 45);
+  assert.equal(costAccounting.arms.with_codestory.time_spent_ms.codestory_harness_prelude, 10);
   assert.equal(costAccounting.arms.with_codestory.time_spent_ms.all_in, 65);
   assert.equal(costAccounting.arms.with_codestory.tokens_spent.total_tokens, 40);
+  assert.equal(costAccounting.arms.with_codestory.tool_calls.codex_observed, 0);
   assert.equal(costAccounting.arms.without_codestory.tool_calls.observed, 4);
   assert.equal(costAccounting.arms.without_codestory.commands.categories.shell_search, 2);
   assert.equal(costAccounting.with_vs_without.total_tokens.ratio, 0.4);
@@ -677,6 +694,35 @@ test("packet-first telemetry treats git and help probes before packet as context
   assert.equal(helpFirst.first_successful_context_command.id, "cmd_help");
   assert.equal(helpFirst.first_successful_packet_command.id, "cmd_packet");
   assert.equal(helpFirst.packet_was_first_context_command, false);
+});
+
+test("harness packet prelude counts as the first context command", () => {
+  const events = [
+    {
+      type: "harness.command.started",
+      item: {
+        id: "harness_codestory_packet",
+        type: "command_execution",
+        command: '"C:\\tools\\codestory-cli.exe" packet --project . --question flow --format json',
+      },
+    },
+    {
+      type: "harness.command.completed",
+      item: {
+        id: "harness_codestory_packet",
+        type: "command_execution",
+        command: '"C:\\tools\\codestory-cli.exe" packet --project . --question flow --format json',
+        aggregated_output: '{"answer":{"citations":[{"file_path":"src/requests/sessions.py"}]}}',
+        exit_code: 0,
+      },
+    },
+  ];
+
+  const analysis = analyzeTranscript(events);
+  assert.equal(analysis.command_count, 1);
+  assert.equal(analysis.tool_categories.command_execution, 1);
+  assert.equal(analysis.first_successful_packet_command.id, "harness_codestory_packet");
+  assert.equal(analysis.packet_was_first_context_command, true);
 });
 
 test("codestory cli resolver prefers explicit path, release binary, then PATH fallback", () => {
@@ -838,6 +884,127 @@ test("packet composition separates citations, answer surfaces, and structured-on
     [["test/lib/project/ProjectTest.cpp", "absent_from_packet"]],
   );
   assert.equal(composition.verification_summary.structured_file_recall, 0);
+});
+
+test("packet prompt excerpt keeps answer support while dropping bulky packet fields", () => {
+  const longText = `${"flow ".repeat(1400)}tail`;
+  const promptPacket = packetForAgentPrompt({
+    answer: {
+      summary: "Requests flow",
+      sections: [{ title: "Verbose", blocks: [{ markdown: longText }] }],
+      citations: [
+        {
+          display_name: "Session.request",
+          kind: "function",
+          file_path:
+            "C:/repo/target/agent-benchmark/repos/psf-requests/src/requests/sessions.py",
+          line: 557,
+          snippet: "large snippet should not be embedded",
+        },
+      ],
+    },
+    sufficiency: {
+      status: "partial",
+      gaps: ["drop me"],
+      open_next: ["drop me too"],
+      avoid_opening: [
+        "C:/repo/target/agent-benchmark/repos/psf-requests/src/requests/api.py",
+      ],
+      follow_up_commands: ["a", "b", "c", "d", "e"],
+      covered_claims: [
+        {
+          claim: "Session.request prepares requests.",
+          citations: [
+            {
+              display_name: "Session.request",
+              file_path:
+                "C:/repo/target/agent-benchmark/repos/psf-requests/src/requests/sessions.py",
+              line: 557,
+            },
+          ],
+        },
+      ],
+    },
+  });
+
+  assert.equal(promptPacket.answer.summary, "Requests flow");
+  assert.match(promptPacket.answer.text, /\[truncated \d+ chars\]$/);
+  assert.ok(promptPacket.answer.text.length < longText.length);
+  assert.deepEqual(promptPacket.answer.citations, [
+    {
+      display_name: "Session.request",
+      kind: "function",
+      file_path: "src/requests/sessions.py",
+      line: 557,
+    },
+  ]);
+  assert.deepEqual(promptPacket.sufficiency.avoid_opening, ["src/requests/api.py"]);
+  assert.deepEqual(promptPacket.sufficiency.follow_up_commands, ["a", "b", "c", "d"]);
+  assert.deepEqual(promptPacket.sufficiency.covered_claims, [
+    "Session.request prepares requests.",
+  ]);
+  assert.equal(Object.hasOwn(promptPacket.answer, "sections"), false);
+  assert.equal(Object.hasOwn(promptPacket.sufficiency, "gaps"), false);
+  assert.equal(Object.hasOwn(promptPacket.sufficiency, "open_next"), false);
+});
+
+test("packet manifest completion is gated by packet quality evidence", () => {
+  const task = manifestFixture({
+    expected_files: ["src/requests/sessions.py"],
+    expected_symbols: ["Session.request"],
+    expected_claims: ["Session.request prepares requests."],
+  });
+  const packet = {
+    answer: {
+      summary: "Session.request prepares requests in src/requests/sessions.py.",
+      sections: [],
+      citations: [
+        {
+          display_name: "Session.request",
+          file_path: "src/requests/sessions.py",
+          line: 557,
+        },
+      ],
+    },
+    sufficiency: {
+      covered_claims: [{ claim: "Session.request prepares requests." }],
+    },
+  };
+
+  const quality = packetManifestQualitySummary(packet, task);
+  assert.equal(quality.pass, true);
+  assert.equal(
+    packetPreludeManifestComplete({
+      packet_manifest_quality: quality,
+      packet_composition: packetComposition(packet, task),
+    }),
+    true,
+  );
+
+  const incompleteQuality = packetManifestQualitySummary(
+    {
+      answer: {
+        summary: "Session.request is present in src/requests/sessions.py.",
+        citations: [
+          {
+            display_name: "Session.request",
+            file_path: "src/requests/sessions.py",
+            line: 557,
+          },
+        ],
+      },
+      sufficiency: { covered_claims: [] },
+    },
+    task,
+  );
+  assert.equal(incompleteQuality.pass, false);
+  assert.equal(
+    packetPreludeManifestComplete({
+      packet_manifest_quality: incompleteQuality,
+      packet_composition: packetComposition(packet, task),
+    }),
+    false,
+  );
 });
 
 const LOCAL_REAL_COMPACT_BUDGET_TASKS = [
@@ -1092,6 +1259,88 @@ test("publishable gate requires packet before ordinary context exploration", () 
 
   assert.equal(blockers.length, 1);
   assert.match(blockers[0].reasons.join("\n"), /missing answer packet as first successful context command/);
+});
+
+test("publishable gate rejects CodeStory use in the without arm", () => {
+  const blockers = agentPublishableBlockers([
+    {
+      repo: "codestory",
+      task_id: "codestory-indexing-flow",
+      arm: "without_codestory",
+      repeat: 1,
+      status: "pass",
+      wall_ms: 10,
+      usage: { total_tokens: 100 },
+      tool_calls_observed: 1,
+      packet_first_required: false,
+      packet_first_pass: true,
+      quality: { pass: true },
+      transcript_analysis: {
+        command_count: 1,
+        command_categories: {
+          codestory_cli: 1,
+        },
+        external_context_tool_calls: 0,
+      },
+    },
+  ]);
+
+  assert.equal(blockers.length, 1);
+  assert.match(blockers[0].reasons.join("\n"), /without_codestory arm used CodeStory/);
+});
+
+test("publishable gate requires local repo inspection in the without arm", () => {
+  const blockers = agentPublishableBlockers([
+    {
+      repo: "codestory",
+      task_id: "codestory-indexing-flow",
+      arm: "without_codestory",
+      repeat: 1,
+      status: "pass",
+      wall_ms: 10,
+      usage: { total_tokens: 100 },
+      tool_calls_observed: 1,
+      packet_first_required: false,
+      packet_first_pass: true,
+      quality: { pass: true },
+      transcript_analysis: {
+        command_count: 0,
+        command_categories: {},
+        external_context_tool_calls: 0,
+      },
+    },
+  ]);
+
+  assert.equal(blockers.length, 1);
+  assert.match(blockers[0].reasons.join("\n"), /without_codestory arm did not inspect local repository/);
+});
+
+test("publishable gate accepts ordinary local inspection in the without arm", () => {
+  const blockers = agentPublishableBlockers([
+    {
+      repo: "codestory",
+      task_id: "codestory-indexing-flow",
+      arm: "without_codestory",
+      repeat: 1,
+      status: "pass",
+      wall_ms: 10,
+      usage: { total_tokens: 100 },
+      tool_calls_observed: 1,
+      packet_first_required: false,
+      packet_first_pass: true,
+      quality: { pass: true },
+      transcript_analysis: {
+        command_count: 2,
+        command_categories: {
+          shell_search: 1,
+          direct_file_read: 1,
+        },
+        external_context_tool_calls: 0,
+      },
+    },
+  ]);
+
+  assert.deepEqual(blockers, []);
 });
 
 test("publishable provenance requires pinned clean manifest checkout", () => {

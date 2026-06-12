@@ -5121,6 +5121,55 @@ fn dense_anchor_public_kind(kind: codestory_contracts::graph::NodeKind) -> bool 
     )
 }
 
+fn dense_anchor_callable_kind(kind: codestory_contracts::graph::NodeKind) -> bool {
+    matches!(
+        kind,
+        codestory_contracts::graph::NodeKind::FUNCTION
+            | codestory_contracts::graph::NodeKind::METHOD
+            | codestory_contracts::graph::NodeKind::MACRO
+    )
+}
+
+fn semantic_file_is_package_callable_surface(path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    let source_extension = [
+        ".bash", ".c", ".cc", ".cjs", ".cpp", ".cs", ".dart", ".fish", ".go", ".h", ".hpp",
+        ".java", ".js", ".jsx", ".kt", ".kts", ".mjs", ".php", ".py", ".rb", ".sh", ".swift",
+        ".ts", ".tsx", ".zsh",
+    ]
+    .iter()
+    .any(|suffix| file_name.ends_with(suffix));
+    if !source_extension {
+        return false;
+    }
+    normalized.contains("/lib/")
+        || normalized.contains("/src/")
+        || normalized.contains("/pkg/")
+        || normalized.contains("/packages/")
+        || normalized.contains("/routes/")
+        || normalized.contains("/router/")
+        || normalized.contains("/controllers/")
+        || normalized.contains("/middleware/")
+        || normalized.contains("/sources/")
+        || matches!(
+            file_name,
+            "application.js"
+                | "context.go"
+                | "gin.go"
+                | "http.dart"
+                | "nvm.sh"
+                | "request.js"
+                | "response.js"
+                | "routergroup.go"
+                | "sessions.py"
+                | "tree.go"
+        )
+}
+
 fn semantic_doc_is_documented_nontrivial(doc_text: &str) -> bool {
     if !doc_text.contains("comments:") {
         return false;
@@ -5159,6 +5208,10 @@ fn dense_anchor_reason_for_node(
     if dense_anchor_public_kind(node.kind)
         && (matches!(access, Some(AccessKind::Public | AccessKind::Protected))
             || semantic_file_is_public_surface(file_path))
+    {
+        return Some(DenseAnchorReason::PublicApi);
+    }
+    if dense_anchor_callable_kind(node.kind) && semantic_file_is_package_callable_surface(file_path)
     {
         return Some(DenseAnchorReason::PublicApi);
     }
@@ -5226,6 +5279,7 @@ fn build_component_report_docs(
             files.sort();
             files.dedup();
             files.truncate(12);
+            let representative_file_path = files.first().cloned();
 
             let mut doc_text = String::new();
             let _ = writeln!(
@@ -5238,6 +5292,9 @@ fn build_component_report_docs(
                 "source_provenance: {SYMBOL_SEARCH_DOC_PROVENANCE}"
             );
             let _ = writeln!(doc_text, "policy_version: {SEMANTIC_POLICY_VERSION}");
+            if let Some(path) = representative_file_path.as_deref() {
+                let _ = writeln!(doc_text, "representative_file: {path}");
+            }
             let _ = writeln!(doc_text, "symbol_count: {}", component_nodes.len());
             let _ = writeln!(doc_text, "file_count: {}", files.len());
             if !files.is_empty() {
@@ -5262,7 +5319,7 @@ fn build_component_report_docs(
                 kind,
                 display_name: display_name.clone(),
                 qualified_name: qualified_name.clone(),
-                file_path: None,
+                file_path: representative_file_path.clone(),
                 start_line: None,
                 doc_text: doc_text.clone(),
                 doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
@@ -5284,7 +5341,7 @@ fn build_component_report_docs(
                         kind,
                         display_name,
                         qualified_name,
-                        file_path: None,
+                        file_path: representative_file_path,
                         start_line: None,
                         doc_text,
                         doc_hash,
@@ -11068,6 +11125,38 @@ mod tests {
     }
 
     #[test]
+    fn dense_policy_embeds_package_public_callables_for_dynamic_frameworks() {
+        let node = semantic_policy_node(19, NodeKind::FUNCTION, "handle", 1);
+        let context = semantic_policy_context("lib/router/index.js", node.id);
+
+        let reason = dense_anchor_reason_for_node(
+            &context,
+            &node,
+            "handle",
+            Some("lib/router/index.js"),
+            "semantic_doc_version: 4\nsymbol: handle\nkind: FUNCTION\nsignature: function handle(req, res, next) {}\n",
+            Some(AccessKind::Private),
+        );
+
+        assert_eq!(reason, Some(DenseAnchorReason::PublicApi));
+
+        let windows_node = semantic_policy_node(29, NodeKind::METHOD, "GET /json", 1);
+        let windows_path = r"\\?\C:\repo\expressjs-express\lib\response.js";
+        let windows_context = semantic_policy_context(windows_path, windows_node.id);
+
+        let windows_reason = dense_anchor_reason_for_node(
+            &windows_context,
+            &windows_node,
+            "GET /json",
+            Some(windows_path),
+            "semantic_doc_version: 4\nsymbol: GET /json\nkind: METHOD\nsignature: .get('/json')\n",
+            Some(AccessKind::Private),
+        );
+
+        assert_eq!(windows_reason, Some(DenseAnchorReason::PublicApi));
+    }
+
+    #[test]
     fn dense_policy_does_not_embed_comment_only_symbols_by_default() {
         let node = semantic_policy_node(18, NodeKind::FUNCTION, "commented_helper", 1);
         let context = semantic_policy_context("src/internal/helper.rs", node.id);
@@ -11109,6 +11198,10 @@ mod tests {
                 .symbol_doc
                 .doc_text
                 .contains("component_report: crate:app")
+        );
+        assert_eq!(
+            report.symbol_doc.file_path.as_deref(),
+            Some("crates/app/src/service.rs")
         );
         assert!(report.symbol_doc.doc_text.contains("god_nodes:"));
         assert!(report.pending.is_none());

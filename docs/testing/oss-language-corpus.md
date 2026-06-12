@@ -26,7 +26,11 @@ uses the same pinned projects. It compares `without_codestory` against
 command counts, source reads, post-packet source reads, and manifest quality
 scores. Its `summary.json` / `reanalyzed-summary.json` files include a
 `cost_accounting` block that totals those costs per arm and compares
-`with_codestory` against `without_codestory`.
+`with_codestory` against `without_codestory`. The no-CodeStory arm counts a
+harness-run local `rg` plus bounded source-read prelude before the nested agent
+starts. The CodeStory arm counts a harness-run packet prelude before the nested
+agent starts. A baseline row cannot be promoted if it uses CodeStory or never
+inspects the local repository.
 
 ## Commands
 

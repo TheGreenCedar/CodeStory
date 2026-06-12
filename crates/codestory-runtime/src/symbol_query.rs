@@ -258,7 +258,8 @@ fn qualified_symbol_query_parts(query: &str) -> Option<(&str, &str)> {
 }
 
 pub fn retrieval_file_role_from_path(path: &str) -> RetrievalFileRole {
-    let normalized = normalize_retrieval_path(path);
+    let normalized_raw = normalize_retrieval_path(path);
+    let normalized = strip_materialized_repo_cache_prefix(&normalized_raw).to_string();
     let marked = format!("/{normalized}");
     let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
 
@@ -355,6 +356,24 @@ fn normalize_retrieval_path(path: &str) -> String {
         .trim_start_matches("./")
         .trim_start_matches('/')
         .to_ascii_lowercase()
+}
+
+fn strip_materialized_repo_cache_prefix(path: &str) -> &str {
+    for marker in [
+        "target/agent-benchmark/repos/",
+        "target/oss-language-corpus/repos/",
+    ] {
+        let Some(index) = path.find(marker) else {
+            continue;
+        };
+        let after_marker = &path[index + marker.len()..];
+        if let Some((_, repo_relative)) = after_marker.split_once('/')
+            && !repo_relative.is_empty()
+        {
+            return repo_relative;
+        }
+    }
+    path
 }
 
 fn path_contains_any(path: &str, markers: &[&str]) -> bool {
@@ -1927,6 +1946,16 @@ mod tests {
             retrieval_file_role_from_path(
                 "codex-rs/app-server-protocol/schema/typescript/index.ts"
             ),
+            RetrievalFileRole::Generated
+        );
+        assert_eq!(
+            retrieval_file_role_from_path(
+                r"\\?\C:\repo\codestory\target\agent-benchmark\repos\expressjs-express\lib\response.js"
+            ),
+            RetrievalFileRole::Source
+        );
+        assert_eq!(
+            retrieval_file_role_from_path("target/generated/client.ts"),
             RetrievalFileRole::Generated
         );
         assert_eq!(
