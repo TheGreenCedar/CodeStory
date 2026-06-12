@@ -1359,6 +1359,21 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "status should include semantic readiness/doc count/fallback information: {status}"
     );
     let next_call_text = status["recommended_next_calls"].to_string();
+    let readiness = status["readiness"]
+        .as_array()
+        .unwrap_or_else(|| panic!("status should include readiness verdicts: {status}"));
+    assert!(
+        readiness
+            .iter()
+            .any(|verdict| verdict["goal"] == "agent_packet_search"
+                && verdict["minimum_next"]
+                    .as_array()
+                    .is_some_and(|commands| !commands.is_empty())
+                && verdict["full_repair"]
+                    .as_array()
+                    .is_some_and(|commands| !commands.is_empty())),
+        "status should expose agent readiness with minimum_next/full_repair: {status}"
+    );
     assert!(
         next_call_text
             .find("retrieval status")
@@ -1664,6 +1679,18 @@ fn search_tool_fails_closed_without_full_retrieval_sidecars() {
     let next_commands = details["next_commands"]
         .as_array()
         .unwrap_or_else(|| panic!("stdio search error should include next_commands: {response}"));
+    assert!(
+        details["minimum_next"]
+            .as_array()
+            .is_some_and(|commands| !commands.is_empty()),
+        "stdio search error should include minimum_next: {response}"
+    );
+    assert!(
+        details["full_repair"]
+            .as_array()
+            .is_some_and(|commands| commands.len() >= next_commands.len()),
+        "stdio search error should include full_repair: {response}"
+    );
     assert!(
         next_commands
             .iter()

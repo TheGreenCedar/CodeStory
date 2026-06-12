@@ -147,11 +147,13 @@ impl ScipClient {
 fn symbol_to_hit(symbol: &ScipSymbolRecord, score: f32, hop: u32) -> super::CandidateHit {
     use super::candidate::{CandidateHit, CandidateSource};
     CandidateHit {
+        node_id: None,
         file_path: symbol.path.clone(),
         symbol_name: Some(symbol.symbol.clone()),
         start_line: Some(symbol.start_line),
         score,
         source: CandidateSource::Scip,
+        provenance: Vec::new(),
         file_role: None,
         scip_hop_distance: Some(hop),
         rank_features: None,

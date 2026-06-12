@@ -471,6 +471,8 @@ fn test_llm_symbol_doc_round_trip() -> Result<(), StorageError> {
         embedding_backend: None,
         embedding_dim: 384,
         doc_shape: None,
+        semantic_policy_version: Some("graph_first_v1".to_string()),
+        dense_reason: Some("public_api".to_string()),
         embedding: vec![0.25_f32; 384],
         updated_at_epoch_ms: 123,
     }])?;
@@ -513,6 +515,8 @@ fn test_llm_symbol_doc_stats_report_contract_metadata() -> Result<(), StorageErr
         embedding_backend: Some("llamacpp".to_string()),
         embedding_dim: 768,
         doc_shape: Some("semantic_doc_version=2;alias_mode=alias_variant".to_string()),
+        semantic_policy_version: Some("graph_first_v1".to_string()),
+        dense_reason: Some("public_api".to_string()),
         embedding: vec![0.25_f32; 4],
         updated_at_epoch_ms: 123,
     }])?;
@@ -566,6 +570,8 @@ fn test_llm_symbol_doc_stats_treats_legacy_null_contract_metadata_as_mixed()
             embedding_backend: None,
             embedding_dim: 384,
             doc_shape: None,
+            semantic_policy_version: None,
+            dense_reason: None,
             embedding: vec![0.25_f32; 4],
             updated_at_epoch_ms: 123,
         },
@@ -585,6 +591,8 @@ fn test_llm_symbol_doc_stats_treats_legacy_null_contract_metadata_as_mixed()
             embedding_backend: Some("hash".to_string()),
             embedding_dim: 384,
             doc_shape: Some("semantic_doc_version=4;scope=durable_symbols".to_string()),
+            semantic_policy_version: Some("graph_first_v1".to_string()),
+            dense_reason: Some("public_api".to_string()),
             embedding: vec![0.5_f32; 4],
             updated_at_epoch_ms: 456,
         },
@@ -627,6 +635,8 @@ fn test_symbol_summary_uses_current_content_hash() -> Result<(), StorageError> {
         embedding_backend: None,
         embedding_dim: 384,
         doc_shape: None,
+        semantic_policy_version: Some("graph_first_v1".to_string()),
+        dense_reason: Some("public_api".to_string()),
         embedding: vec![0.25_f32; 384],
         updated_at_epoch_ms: 123,
     };
@@ -691,6 +701,8 @@ fn test_llm_symbol_doc_copy_forward_preserves_reuse_metadata() -> Result<(), Sto
             embedding_backend: Some("hash".to_string()),
             embedding_dim: 384,
             doc_shape: Some("semantic_doc_version=2".to_string()),
+            semantic_policy_version: Some("graph_first_v1".to_string()),
+            dense_reason: Some("public_api".to_string()),
             embedding: vec![0.25_f32; 384],
             updated_at_epoch_ms: 123,
         }])?;
@@ -1377,6 +1389,64 @@ fn test_opening_v3_db_resets_projection_state() -> Result<(), StorageError> {
 }
 
 #[test]
+fn live_open_migrates_v17_llm_doc_columns_before_secondary_indexes() -> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("v17-ast-first-live-migration");
+    let _ = std::fs::remove_file(&db_path);
+    {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        conn.execute(
+            "CREATE TABLE llm_symbol_doc (
+                node_id INTEGER PRIMARY KEY,
+                file_node_id INTEGER,
+                kind INTEGER NOT NULL,
+                display_name TEXT NOT NULL,
+                qualified_name TEXT,
+                file_path TEXT,
+                start_line INTEGER,
+                doc_text TEXT NOT NULL,
+                doc_version INTEGER NOT NULL DEFAULT 0,
+                doc_hash TEXT NOT NULL DEFAULT '',
+                embedding_model TEXT NOT NULL,
+                embedding_profile TEXT,
+                embedding_backend TEXT,
+                embedding_dim INTEGER NOT NULL,
+                doc_shape TEXT,
+                embedding_blob BLOB NOT NULL,
+                updated_at_epoch_ms INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        conn.pragma_update(None, "user_version", 17)?;
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let columns = storage
+        .conn
+        .prepare("PRAGMA table_info(llm_symbol_doc)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(
+        columns
+            .iter()
+            .any(|column| column == "semantic_policy_version")
+    );
+    assert!(columns.iter().any(|column| column == "dense_reason"));
+    let policy_index_count: i64 = storage.conn.query_row(
+        "SELECT COUNT(*)
+         FROM sqlite_master
+         WHERE type = 'index'
+           AND name = 'idx_llm_symbol_doc_policy_reason'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(policy_index_count, 1);
+
+    drop(storage);
+    let _ = std::fs::remove_file(&db_path);
+    Ok(())
+}
+
+#[test]
 fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
 -> Result<(), StorageError> {
     let live_path = unique_temp_db_path("live");
@@ -1789,6 +1859,8 @@ fn test_delete_file_projection() -> Result<(), StorageError> {
         embedding_backend: None,
         embedding_dim: 384,
         doc_shape: None,
+        semantic_policy_version: Some("graph_first_v1".to_string()),
+        dense_reason: Some("public_api".to_string()),
         embedding: vec![0.1_f32; 384],
         updated_at_epoch_ms: 1,
     }])?;

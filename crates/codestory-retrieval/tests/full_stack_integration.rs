@@ -104,6 +104,7 @@ fn full_mode_fixture_produces_resolvable_hits() {
                     node_id: "2001".to_string(),
                     file_path: Some("lib.rs".to_string()),
                     file_role: Some(FileRole::Entrypoint),
+                    dense_reason: Some("entrypoint".to_string()),
                     vector: None,
                 }];
                 if qdrant.upsert_points(&collection, &points).is_ok() {

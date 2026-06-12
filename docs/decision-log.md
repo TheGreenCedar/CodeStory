@@ -36,7 +36,7 @@ Search ranking, grounding assembly, fallback reporting, and other workflow orche
 
 ## Default Index Includes Semantic Docs
 
-Semantic docs are part of the default `codestory-cli index` contract. Runtime synchronizes durable semantic docs before returning instead of relying on a later read command to hydrate them.
+Graph-native symbol docs are part of the default `codestory-cli index` contract. Runtime synchronizes durable symbol docs and the selected `graph_first_v1` dense anchors before returning instead of relying on a later read command to hydrate them.
 
 - semantic sync behavior: [indexing pipeline](architecture/indexing-pipeline.md)
 - tuning and ownership: [runtime subsystem](architecture/subsystems/runtime.md)

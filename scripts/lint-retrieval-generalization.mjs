@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
  * CI guard: ban repo-specific path literals in retrieval integration production code.
- * Scope is Rust production retrieval integration files. Benchmark/eval harness scripts
- * intentionally live outside this guard because their manifests name holdout
- * repos; keep that boundary explicit instead of treating them as product code.
+ * Scope is Rust production retrieval integration files. Benchmark/eval harness
+ * scripts and the env-gated eval probe module intentionally live outside this
+ * guard because their manifests name holdout repos; keep that boundary explicit
+ * instead of treating them as product code.
  * Scans Rust files after masking `#[cfg(test)]` items/modules so test fixtures
  * do not define the production contract.
  */
@@ -49,6 +50,10 @@ const scanDirs = [
 ];
 
 const productionOnlyFiles = requiredProductionOnlyFiles;
+
+const evalOnlyProductionFiles = new Set([
+  path.join(repoRoot, "crates", "codestory-runtime", "src", "agent", "eval_probes.rs"),
+]);
 
 const benchmarkIdentityScriptFiles = [
   path.join(repoRoot, "scripts", "codestory-agent-ab-benchmark.mjs"),
@@ -100,6 +105,28 @@ const bannedPatterns = [
   "src/lib/data/storage",
   "getPayloadClient",
   "comment_submission_guard",
+  "axios",
+  "redis",
+  "ripgrep",
+  "createInstance",
+  "InterceptorManager",
+  "dispatchRequest",
+  "readQueryFromClient",
+  "processCommand",
+  "aeMain",
+  "aeProcessEvents",
+  "HiArgs",
+  "SearchWorker",
+  "search_parallel",
+  "adapters\\.js",
+  "server\\.c",
+  "ae\\.c",
+  "networking\\.c",
+  "core/main\\.rs",
+  "flags/hiargs\\.rs",
+  "haystack\\.rs",
+  "lib/axios\\.js",
+  "lib/core/Axios\\.js",
 ];
 
 const bannedLiteralPatterns = [
@@ -569,6 +596,10 @@ function lineAllowedForPattern(pattern, line) {
   );
 }
 
+function isEvalOnlyProductionFile(filePath) {
+  return evalOnlyProductionFiles.has(path.resolve(filePath));
+}
+
 function scanRankerFilenameLiterals(filePath) {
   const lines = productionSource(filePath).split(/\r?\n/);
   const hits = [];
@@ -595,22 +626,24 @@ if (scanFiles.size === 0) {
 }
 
 for (const filePath of [...scanFiles].sort()) {
-  for (const pattern of bannedPatterns) {
-    const hits = scanProductionFile(filePath, pattern);
-    if (hits.length > 0) {
-      console.error(
-        `Banned pattern /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
-      );
-      failed = true;
+  if (!isEvalOnlyProductionFile(filePath)) {
+    for (const pattern of bannedPatterns) {
+      const hits = scanProductionFile(filePath, pattern);
+      if (hits.length > 0) {
+        console.error(
+          `Banned pattern /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
+        );
+        failed = true;
+      }
     }
-  }
-  for (const pattern of bannedLiteralPatterns) {
-    const hits = scanProductionStringLiterals(filePath, pattern);
-    if (hits.length > 0) {
-      console.error(
-        `Banned literal pattern /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
-      );
-      failed = true;
+    for (const pattern of bannedLiteralPatterns) {
+      const hits = scanProductionStringLiterals(filePath, pattern);
+      if (hits.length > 0) {
+        console.error(
+          `Banned literal pattern /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
+        );
+        failed = true;
+      }
     }
   }
   if (filePath.endsWith(`${path.sep}ranker.rs`)) {

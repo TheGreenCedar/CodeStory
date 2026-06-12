@@ -63,6 +63,43 @@ Direct packet runtime rows are available with `--packet-runtime`. They compare
 cold CLI packet calls with warm `serve --stdio` packet calls while reusing the
 same expected-anchor quality gates.
 
+## Language Expansion Holdout
+
+The `language-expansion-holdout` suite is the triggerable agent A/B suite for
+runtime-supported languages. It is separate from the OSS language corpus:
+
+- The OSS corpus checks whether CodeStory can index pinned real projects.
+- This suite runs paired `without_codestory` and `with_codestory` agent arms
+  against those pinned projects and records elapsed time, token usage, estimated
+  cost, observed tool calls, command counts, command categories, source reads,
+  source reads after the first CodeStory packet, and manifest quality gates.
+
+The suite currently has one medium-sized open source project per supported
+language: Python, Java, Rust, JavaScript, TypeScript, C++, C, Go, Ruby, PHP,
+C#, Kotlin, Swift, Dart, Bash, HTML, CSS, and SQL.
+
+Materialize the pinned repos:
+
+```powershell
+node scripts/codestory-agent-ab-benchmark.mjs `
+  --list --task-suite language-expansion-holdout --materialize-repos
+```
+
+Run a strict paired comparison:
+
+```powershell
+node scripts/codestory-agent-ab-benchmark.mjs `
+  --task-suite language-expansion-holdout `
+  --arms without_codestory,with_codestory `
+  --repeats 3 --materialize-repos --prepare-codestory-cache `
+  --out-dir target/agent-benchmark/language-expansion-holdout `
+  --timeout-ms 600000
+```
+
+Use `--task-ids <id>` for a cheaper targeted run. The Markdown summary table
+includes the human-readable A/B columns; `runs.jsonl` remains the source of
+truth for per-run metrics.
+
 ## Local Real-Repo Corpus
 
 The `local-real` suite targets sibling checkouts under the parent directory of
@@ -140,6 +177,10 @@ may exceed the default timeout on cold index; increase `--timeout-ms` when neede
 
 - Do **not** add repo-name, path, or display-name literals for `ripgrep`, `axios`,
   or `redis` in v2 planner or ranker code.
+- Keep holdout-specific probes and claim templates in manifests, benchmark
+  harnesses, tests, or `crates/codestory-runtime/src/agent/eval_probes.rs`
+  behind `CODESTORY_EVAL_PROBES`; do not put them in product packet/search
+  planning or ranking paths.
 - Do **not** iterate KPI fixes against holdout manifests; use `local-real` for
   in-scope tuning and treat holdout rows as promotion-only evidence.
 - Legacy sibling apps (`freelancer`, `traderotate`) are removed from default

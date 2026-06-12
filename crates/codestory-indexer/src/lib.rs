@@ -104,6 +104,10 @@ const GO_GRAPH_QUERY: &str = include_str!("../rules/go.scm");
 const RUBY_GRAPH_QUERY: &str = include_str!("../rules/ruby.scm");
 const PHP_GRAPH_QUERY: &str = include_str!("../rules/php.scm");
 const CSHARP_GRAPH_QUERY: &str = include_str!("../rules/csharp.scm");
+const KOTLIN_GRAPH_QUERY: &str = include_str!("../rules/kotlin.scm");
+const SWIFT_GRAPH_QUERY: &str = include_str!("../rules/swift.scm");
+const DART_GRAPH_QUERY: &str = include_str!("../rules/dart.scm");
+const BASH_GRAPH_QUERY: &str = include_str!("../rules/bash.scm");
 
 #[derive(Debug, Clone, Copy)]
 enum LanguageRuleset {
@@ -119,6 +123,10 @@ enum LanguageRuleset {
     Ruby,
     Php,
     CSharp,
+    Kotlin,
+    Swift,
+    Dart,
+    Bash,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +136,26 @@ pub struct LanguageConfig {
     pub graph_query: &'static str,
     pub tags_query: Option<&'static str>,
     ruleset: LanguageRuleset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanguageSupportMode {
+    ParserBackedGraph,
+    StructuralCollector,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanguageEvidenceTier {
+    GraphFidelity,
+    StructuralOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanguageSupportProfile {
+    pub language_name: &'static str,
+    pub support_mode: LanguageSupportMode,
+    pub evidence_tier: LanguageEvidenceTier,
+    pub claim_label: &'static str,
 }
 
 struct CompiledLanguageRules {
@@ -263,6 +291,18 @@ impl LanguageRuleset {
             LanguageRuleset::CSharp => {
                 compiled_rules_cache(language, CSHARP_GRAPH_QUERY, None, &CSHARP_RULES)
             }
+            LanguageRuleset::Kotlin => {
+                compiled_rules_cache(language, KOTLIN_GRAPH_QUERY, None, &KOTLIN_RULES)
+            }
+            LanguageRuleset::Swift => {
+                compiled_rules_cache(language, SWIFT_GRAPH_QUERY, None, &SWIFT_RULES)
+            }
+            LanguageRuleset::Dart => {
+                compiled_rules_cache(language, DART_GRAPH_QUERY, None, &DART_RULES)
+            }
+            LanguageRuleset::Bash => {
+                compiled_rules_cache(language, BASH_GRAPH_QUERY, None, &BASH_RULES)
+            }
         }
     }
 }
@@ -305,6 +345,10 @@ static GO_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new
 static RUBY_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static PHP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static CSHARP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
+static KOTLIN_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
+static SWIFT_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
+static DART_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
+static BASH_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 
 fn tag_definition_priority(definition: &TagDefinition) -> (u8, u8, u8) {
     let role_priority = canonical_role_priority(definition.canonical_role);
@@ -1807,6 +1851,32 @@ struct ManualEdgeSpec {
     source_name: String,
     target_name: String,
     kind: EdgeKind,
+    line: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct ManualMemberEdgeSpec {
+    source_name: String,
+    target_name: String,
+    source_span: GraphNodeSpan,
+    target_span: GraphNodeSpan,
+    line: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct ManualReceiverCallSpec {
+    source_name: String,
+    source_span: GraphNodeSpan,
+    owner_name: String,
+    method_name: String,
+    line: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct ManualPreciseCallSpec {
+    source_name: String,
+    source_span: GraphNodeSpan,
+    target_name: String,
     line: Option<u32>,
 }
 
@@ -3477,6 +3547,98 @@ fn collect_tsx_jsx_usage_edges(tree: &Tree, source: &str) -> Vec<ManualEdgeSpec>
     edges
 }
 
+fn is_javascript_like_language(language_name: &str) -> bool {
+    matches!(language_name, "javascript" | "typescript" | "tsx")
+}
+
+fn js_identifier_target_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "type_identifier" => node_source_text(node, source)
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty()),
+        "member_expression" => node
+            .child_by_field_name("property")
+            .and_then(|property| js_identifier_target_name(property, source)),
+        _ => None,
+    }
+}
+
+fn js_member_object_identifier(node: TsNode<'_>, source: &str) -> Option<String> {
+    if node.kind() != "member_expression" {
+        return None;
+    }
+    let object = node.child_by_field_name("object")?;
+    match object.kind() {
+        "identifier" => node_source_text(object, source)
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty()),
+        _ => None,
+    }
+}
+
+fn js_member_property_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    if node.kind() != "member_expression" {
+        return None;
+    }
+    node.child_by_field_name("property")
+        .and_then(|property| node_source_text(property, source))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+fn js_new_expression_constructor_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("constructor")
+        .and_then(|constructor| js_identifier_target_name(constructor, source))
+        .or_else(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find_map(|child| js_identifier_target_name(child, source))
+        })
+}
+
+fn collect_javascript_static_call_edges(tree: &Tree, source: &str) -> Vec<ManualEdgeSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        let Some(source_name) = tsx_owner_name(node, source) else {
+            return;
+        };
+        let line = Some(node.start_position().row as u32 + 1);
+        match node.kind() {
+            "new_expression" => {
+                if let Some(target_name) = js_new_expression_constructor_name(node, source) {
+                    edges.push(ManualEdgeSpec {
+                        source_name,
+                        target_name,
+                        kind: EdgeKind::CALL,
+                        line,
+                    });
+                }
+            }
+            "call_expression" => {
+                let Some(function_node) = node.child_by_field_name("function") else {
+                    return;
+                };
+                let Some(property_name) = js_member_property_name(function_node, source) else {
+                    return;
+                };
+                if !matches!(property_name.as_str(), "call" | "apply" | "bind") {
+                    return;
+                }
+                if let Some(target_name) = js_member_object_identifier(function_node, source) {
+                    edges.push(ManualEdgeSpec {
+                        source_name,
+                        target_name,
+                        kind: EdgeKind::CALL,
+                        line,
+                    });
+                }
+            }
+            _ => {}
+        }
+    });
+    edges
+}
+
 fn rust_macro_owner_name(mut node: TsNode<'_>, source: &str) -> Option<String> {
     while let Some(parent) = node.parent() {
         if parent.kind() == "function_item" {
@@ -3575,6 +3737,112 @@ fn collect_python_decorator_call_edges(tree: &Tree, source: &str) -> Vec<ManualE
         }
     });
     edges
+}
+
+fn collect_ruby_bare_call_edges(tree: &Tree, source: &str) -> Vec<ManualEdgeSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |callable| {
+        if !matches!(callable.kind(), "method" | "singleton_method") {
+            return;
+        }
+        let Some(source_name) = declaration_name(callable, source) else {
+            return;
+        };
+        let local_bindings = collect_ruby_local_binding_names(callable, source);
+        walk_tree_nodes(callable, &mut |node| {
+            if !matches!(node.kind(), "identifier" | "constant") || !is_ruby_bare_call_site(node) {
+                return;
+            }
+            let Some(target_name) = trimmed_node_text(node, source) else {
+                return;
+            };
+            if local_bindings.contains(&target_name) {
+                return;
+            }
+            edges.push(ManualEdgeSpec {
+                source_name: source_name.clone(),
+                target_name,
+                kind: EdgeKind::CALL,
+                line: Some(node.start_position().row as u32 + 1),
+            });
+        });
+    });
+    edges
+}
+
+fn collect_ruby_local_binding_names(callable: TsNode<'_>, source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    walk_tree_nodes(callable, &mut |node| {
+        if !matches!(node.kind(), "identifier" | "constant") {
+            return;
+        }
+        let Some(parent) = node.parent() else {
+            return;
+        };
+        let is_binding = match parent.kind() {
+            "assignment" => parent
+                .child_by_field_name("left")
+                .map(|left| same_ts_span(left, node))
+                .unwrap_or(false),
+            "parameters" | "method_parameters" | "optional_parameter" | "keyword_parameter" => true,
+            _ => false,
+        };
+        if !is_binding {
+            return;
+        }
+        if let Some(name) = trimmed_node_text(node, source) {
+            names.insert(name);
+        }
+    });
+    names
+}
+
+fn is_ruby_bare_call_site(node: TsNode<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if matches!(
+        parent.kind(),
+        "method"
+            | "singleton_method"
+            | "class"
+            | "module"
+            | "assignment"
+            | "parameters"
+            | "method_parameters"
+            | "optional_parameter"
+            | "keyword_parameter"
+    ) {
+        return false;
+    }
+    if parent.kind() == "call" {
+        return false;
+    }
+    if let Some(name) = parent.child_by_field_name("name")
+        && same_ts_span(name, node)
+    {
+        return false;
+    }
+    if let Some(left) = parent.child_by_field_name("left")
+        && same_ts_span(left, node)
+    {
+        return false;
+    }
+    if let Some(receiver) = parent.child_by_field_name("receiver")
+        && same_ts_span(receiver, node)
+    {
+        return false;
+    }
+    if let Some(method) = parent.child_by_field_name("method")
+        && same_ts_span(method, node)
+    {
+        return false;
+    }
+    true
+}
+
+fn same_ts_span(left: TsNode<'_>, right: TsNode<'_>) -> bool {
+    left.start_byte() == right.start_byte() && left.end_byte() == right.end_byte()
 }
 
 fn node_matches_name(node: &Node, name: &str) -> bool {
@@ -3693,6 +3961,15 @@ fn collect_runtime_import_specs(
     unique_nodes: &mut HashMap<NodeId, Node>,
     symbol_table: Option<&Arc<SymbolTable>>,
 ) -> Vec<RuntimeImportSpec> {
+    if language_name == "bash" {
+        return collect_bash_source_import_specs(
+            file_name,
+            tree,
+            source,
+            unique_nodes,
+            symbol_table,
+        );
+    }
     if !matches!(language_name, "javascript" | "typescript" | "tsx") {
         return Vec::new();
     }
@@ -3771,6 +4048,101 @@ fn collect_runtime_import_specs(
         });
     });
     specs
+}
+
+fn collect_bash_source_import_specs(
+    file_name: &str,
+    tree: &Tree,
+    source: &str,
+    unique_nodes: &mut HashMap<NodeId, Node>,
+    symbol_table: Option<&Arc<SymbolTable>>,
+) -> Vec<RuntimeImportSpec> {
+    let mut specs = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "command" {
+            return;
+        }
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
+        };
+        let Some(callee_name) =
+            node_source_text(name_node, source).map(|name| name.trim().to_string())
+        else {
+            return;
+        };
+        if callee_name != "source" && callee_name != "." {
+            return;
+        }
+
+        let mut cursor = node.walk();
+        let Some(module_node) = node.named_children(&mut cursor).find(|child| {
+            child.start_byte() >= name_node.end_byte()
+                && matches!(
+                    child.kind(),
+                    "word" | "raw_string" | "string" | "concatenation"
+                )
+        }) else {
+            return;
+        };
+        let Some(module_name) = node_source_text(module_node, source)
+            .and_then(|name| normalize_static_shell_module_name(&name))
+        else {
+            return;
+        };
+
+        let start = module_node.start_position();
+        let end = module_node.end_position();
+        let line = start.row as u32 + 1;
+        let canonical_seed = format!("{file_name}:{module_name}:{line}");
+        let module_node_id = NodeId(generate_id(&canonical_seed));
+        unique_nodes.entry(module_node_id).or_insert_with(|| Node {
+            id: module_node_id,
+            kind: NodeKind::MODULE,
+            serialized_name: module_name,
+            start_line: Some(line),
+            start_col: Some(start.column as u32 + 1),
+            end_line: Some(end.row as u32 + 1),
+            end_col: Some(end.column as u32 + 1),
+            ..Default::default()
+        });
+        if let Some(table) = symbol_table {
+            table.insert(module_node_id.0, NodeKind::MODULE);
+        }
+        specs.push(RuntimeImportSpec {
+            binding_node_id: None,
+            module_node_id,
+            line,
+            suppress_callee_name: callee_name,
+        });
+    });
+    specs
+}
+
+fn normalize_static_shell_module_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('$')
+        || trimmed.contains('*')
+        || trimmed.contains('?')
+        || trimmed.contains('`')
+    {
+        return None;
+    }
+
+    let unquoted = if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        if (bytes.first() == Some(&b'"') && bytes.last() == Some(&b'"'))
+            || (bytes.first() == Some(&b'\'') && bytes.last() == Some(&b'\''))
+        {
+            &trimmed[1..trimmed.len() - 1]
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+
+    (!unquoted.trim().is_empty()).then(|| unquoted.trim().to_string())
 }
 
 fn unique_node_id_by_name<F>(
@@ -3898,11 +4270,17 @@ fn append_manual_usage_edges(
     if is_tsx_file {
         specs.extend(collect_tsx_jsx_usage_edges(tree, source));
     }
+    if is_javascript_like_language(language_name) {
+        specs.extend(collect_javascript_static_call_edges(tree, source));
+    }
     if language_name == "rust" {
         specs.extend(collect_rust_macro_call_edges(tree, source));
     }
     if language_name == "python" {
         specs.extend(collect_python_decorator_call_edges(tree, source));
+    }
+    if language_name == "ruby" {
+        specs.extend(collect_ruby_bare_call_edges(tree, source));
     }
     if specs.is_empty() {
         return;
@@ -3923,10 +4301,17 @@ fn append_manual_usage_edges(
         };
         let target_id = match spec.kind {
             EdgeKind::CALL => unique_node_id_by_name(unique_nodes, &spec.target_name, |kind| {
-                if is_tsx_file || language_name == "python" {
+                if is_tsx_file
+                    || language_name == "python"
+                    || is_javascript_like_language(language_name)
+                {
                     matches!(
                         kind,
-                        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO | NodeKind::UNKNOWN
+                        NodeKind::CLASS
+                            | NodeKind::FUNCTION
+                            | NodeKind::METHOD
+                            | NodeKind::MACRO
+                            | NodeKind::UNKNOWN
                     )
                 } else {
                     matches!(
@@ -3977,6 +4362,1280 @@ fn append_manual_usage_edges(
         edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
         result_edges.push(edge);
     }
+}
+
+fn language_precise_call_specs(
+    language_name: &str,
+    tree: &Tree,
+    source: &str,
+) -> Vec<ManualPreciseCallSpec> {
+    match language_name {
+        "dart" => collect_dart_direct_call_edges(tree, source),
+        _ => Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_manual_precise_call_edges(
+    language_name: &str,
+    tree: &Tree,
+    source: &str,
+    unique_nodes: &HashMap<NodeId, Node>,
+    file_id: NodeId,
+    result_edges: &mut Vec<Edge>,
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+    callsite_ordinals: &mut HashMap<(NodeId, Option<u32>), u32>,
+) {
+    for spec in language_precise_call_specs(language_name, tree, source) {
+        let Some(source_id) =
+            node_id_by_name_and_span(unique_nodes, &spec.source_name, spec.source_span, |kind| {
+                matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD)
+            })
+        else {
+            continue;
+        };
+        let Some(target_id) = unique_node_id_by_name(unique_nodes, &spec.target_name, |kind| {
+            matches!(
+                kind,
+                NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+            )
+        }) else {
+            continue;
+        };
+
+        remove_generic_call_placeholders(
+            unique_nodes,
+            result_edges,
+            edge_keys,
+            flags,
+            spec.line,
+            &spec.target_name,
+        );
+
+        let mut edge = Edge {
+            id: EdgeId(0),
+            source: source_id,
+            target: target_id,
+            kind: EdgeKind::CALL,
+            file_node_id: Some(file_id),
+            line: spec.line,
+            resolved_target: Some(target_id),
+            confidence: Some(1.0),
+            certainty: Some(ResolutionCertainty::Certain),
+            ..Default::default()
+        };
+        if !flags.legacy_edge_identity {
+            let key = (edge.target, edge.line);
+            let next = callsite_ordinals.entry(key).or_insert(0);
+            *next = next.saturating_add(1);
+            ensure_callsite_identity(&mut edge, Some(*next));
+        }
+        if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
+            continue;
+        }
+        edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
+        result_edges.push(edge);
+    }
+}
+
+fn node_id_by_name_and_span<F>(
+    nodes: &HashMap<NodeId, Node>,
+    name: &str,
+    span: GraphNodeSpan,
+    predicate: F,
+) -> Option<NodeId>
+where
+    F: Fn(NodeKind) -> bool,
+{
+    let mut matches = nodes
+        .values()
+        .filter(|node| predicate(node.kind))
+        .filter(|node| {
+            node.start_line == Some(span.start_line)
+                && node.start_col == Some(span.start_col)
+                && node.end_line == Some(span.end_line)
+                && node.end_col == Some(span.end_col)
+        })
+        .filter(|node| node_matches_name(node, name))
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|node| node.id);
+    matches.first().map(|node| node.id)
+}
+
+fn language_member_specs(
+    language_name: &str,
+    tree: &Tree,
+    source: &str,
+) -> Vec<ManualMemberEdgeSpec> {
+    match language_name {
+        "go" => collect_go_member_edges(tree, source),
+        "ruby" => collect_enclosing_type_member_edges(
+            tree,
+            source,
+            &["class", "module"],
+            &["method", "singleton_method"],
+        ),
+        "php" => collect_enclosing_type_member_edges(
+            tree,
+            source,
+            &[
+                "class_declaration",
+                "interface_declaration",
+                "trait_declaration",
+            ],
+            &["method_declaration"],
+        ),
+        "csharp" => collect_enclosing_type_member_edges(
+            tree,
+            source,
+            &[
+                "class_declaration",
+                "interface_declaration",
+                "struct_declaration",
+            ],
+            &["method_declaration"],
+        ),
+        _ => Vec::new(),
+    }
+}
+
+fn append_manual_member_edges(
+    language_name: &str,
+    tree: &Tree,
+    source: &str,
+    unique_nodes: &HashMap<NodeId, Node>,
+    file_id: NodeId,
+    result_edges: &mut Vec<Edge>,
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+) {
+    for spec in language_member_specs(language_name, tree, source) {
+        let Some(source_id) = node_id_by_name_and_span(
+            unique_nodes,
+            &spec.source_name,
+            spec.source_span,
+            is_type_like_kind,
+        ) else {
+            continue;
+        };
+        let Some(target_id) =
+            node_id_by_name_and_span(unique_nodes, &spec.target_name, spec.target_span, |kind| {
+                kind == NodeKind::METHOD
+            })
+        else {
+            continue;
+        };
+
+        let mut edge = Edge {
+            id: EdgeId(0),
+            source: source_id,
+            target: target_id,
+            kind: EdgeKind::MEMBER,
+            file_node_id: Some(file_id),
+            line: spec.line,
+            certainty: parser_direct_structural_certainty(EdgeKind::MEMBER),
+            ..Default::default()
+        };
+        if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
+            continue;
+        }
+        edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
+        result_edges.push(edge);
+    }
+}
+
+fn language_receiver_call_specs(
+    language_name: &str,
+    tree: &Tree,
+    source: &str,
+) -> Vec<ManualReceiverCallSpec> {
+    match language_name {
+        "go" => collect_go_receiver_call_edges(tree, source),
+        "ruby" => collect_ruby_receiver_call_edges(tree, source),
+        "php" => collect_php_receiver_call_edges(tree, source),
+        "csharp" => collect_csharp_receiver_call_edges(tree, source),
+        "kotlin" => collect_kotlin_receiver_call_edges(tree, source),
+        "swift" => collect_swift_receiver_call_edges(tree, source),
+        "dart" => collect_dart_receiver_call_edges(tree, source),
+        _ => Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_manual_receiver_call_edges(
+    language_name: &str,
+    tree: &Tree,
+    source: &str,
+    unique_nodes: &HashMap<NodeId, Node>,
+    file_id: NodeId,
+    result_edges: &mut Vec<Edge>,
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+    callsite_ordinals: &mut HashMap<(NodeId, Option<u32>), u32>,
+) {
+    for spec in language_receiver_call_specs(language_name, tree, source) {
+        let Some(source_id) =
+            node_id_by_name_and_span(unique_nodes, &spec.source_name, spec.source_span, |kind| {
+                matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD)
+            })
+        else {
+            continue;
+        };
+        let Some(target_id) = member_target_id_by_owner_and_method(
+            unique_nodes,
+            result_edges,
+            &spec.owner_name,
+            &spec.method_name,
+        ) else {
+            continue;
+        };
+
+        remove_generic_call_placeholders(
+            unique_nodes,
+            result_edges,
+            edge_keys,
+            flags,
+            spec.line,
+            &spec.method_name,
+        );
+
+        let mut edge = Edge {
+            id: EdgeId(0),
+            source: source_id,
+            target: target_id,
+            kind: EdgeKind::CALL,
+            file_node_id: Some(file_id),
+            line: spec.line,
+            resolved_target: Some(target_id),
+            confidence: Some(1.0),
+            certainty: Some(ResolutionCertainty::Certain),
+            ..Default::default()
+        };
+        if !flags.legacy_edge_identity {
+            let key = (edge.target, edge.line);
+            let next = callsite_ordinals.entry(key).or_insert(0);
+            *next = next.saturating_add(1);
+            ensure_callsite_identity(&mut edge, Some(*next));
+        }
+        if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
+            continue;
+        }
+        edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
+        result_edges.push(edge);
+    }
+}
+
+fn member_target_id_by_owner_and_method(
+    nodes: &HashMap<NodeId, Node>,
+    edges: &[Edge],
+    owner_name: &str,
+    method_name: &str,
+) -> Option<NodeId> {
+    let mut owners = nodes
+        .values()
+        .filter(|node| is_type_like_kind(node.kind))
+        .filter(|node| node_matches_name(node, owner_name))
+        .collect::<Vec<_>>();
+    owners.sort_by(|left, right| {
+        left.start_line
+            .unwrap_or(u32::MAX)
+            .cmp(&right.start_line.unwrap_or(u32::MAX))
+            .then_with(|| node_span_width(right).cmp(&node_span_width(left)))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    for owner in owners {
+        let mut targets = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::MEMBER && edge.source == owner.id)
+            .filter_map(|edge| nodes.get(&edge.target))
+            .filter(|node| {
+                matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    && node_matches_name(node, method_name)
+            })
+            .collect::<Vec<_>>();
+        targets.sort_by(|left, right| {
+            left.start_line
+                .unwrap_or(u32::MAX)
+                .cmp(&right.start_line.unwrap_or(u32::MAX))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        if let Some(target) = targets.first() {
+            return Some(target.id);
+        }
+    }
+
+    None
+}
+
+fn remove_generic_call_placeholders(
+    nodes: &HashMap<NodeId, Node>,
+    edges: &mut Vec<Edge>,
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+    line: Option<u32>,
+    method_name: &str,
+) {
+    let mut removed = Vec::new();
+    edges.retain(|edge| {
+        let remove = edge.kind == EdgeKind::CALL
+            && edge.line == line
+            && edge.resolved_target.is_none()
+            && nodes
+                .get(&edge.target)
+                .map(|target| {
+                    target.kind == NodeKind::UNKNOWN && node_matches_name(target, method_name)
+                })
+                .unwrap_or(false);
+        if remove {
+            removed.push(edge_dedup_key(edge, flags));
+        }
+        !remove
+    });
+    for key in removed {
+        edge_keys.remove(&key);
+    }
+}
+
+fn collect_go_member_edges(tree: &Tree, source: &str) -> Vec<ManualMemberEdgeSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| match node.kind() {
+        "method_declaration" => {
+            let Some(method_name_node) = node.child_by_field_name("name") else {
+                return;
+            };
+            let Some(receiver_node) = node.child_by_field_name("receiver") else {
+                return;
+            };
+            let Some(source_name) = go_receiver_owner_name(receiver_node, source) else {
+                return;
+            };
+            let Some(target_name) = trimmed_node_text(method_name_node, source) else {
+                return;
+            };
+
+            edges.push(ManualMemberEdgeSpec {
+                source_name,
+                target_name,
+                source_span: ts_node_graph_span(
+                    receiver_owner_declaration_node(tree.root_node(), source, receiver_node)
+                        .unwrap_or(receiver_node),
+                ),
+                target_span: ts_node_graph_span(node),
+                line: Some(node.start_position().row as u32 + 1),
+            });
+        }
+        "method_elem" => {
+            let Some(owner_node) = enclosing_node_with_kind(node, &["type_declaration"]) else {
+                return;
+            };
+            let Some(owner_name_node) = descendant_by_field_name(owner_node, "name") else {
+                return;
+            };
+            let Some(source_name) = trimmed_node_text(owner_name_node, source) else {
+                return;
+            };
+            let Some(method_name_node) = node.child_by_field_name("name") else {
+                return;
+            };
+            let Some(target_name) = trimmed_node_text(method_name_node, source) else {
+                return;
+            };
+
+            edges.push(ManualMemberEdgeSpec {
+                source_name,
+                target_name,
+                source_span: ts_node_graph_span(owner_node),
+                target_span: ts_node_graph_span(node),
+                line: Some(node.start_position().row as u32 + 1),
+            });
+        }
+        _ => {}
+    });
+    edges
+}
+
+fn receiver_owner_declaration_node<'tree>(
+    root: TsNode<'tree>,
+    source: &str,
+    receiver_node: TsNode<'tree>,
+) -> Option<TsNode<'tree>> {
+    let owner_name = go_receiver_owner_name(receiver_node, source)?;
+    find_go_type_declaration_by_name(root, source, &owner_name)
+}
+
+fn find_go_type_declaration_by_name<'tree>(
+    node: TsNode<'tree>,
+    source: &str,
+    owner_name: &str,
+) -> Option<TsNode<'tree>> {
+    if node.kind() == "type_declaration"
+        && let Some(name_node) = descendant_by_field_name(node, "name")
+        && trimmed_node_text(name_node, source).as_deref() == Some(owner_name)
+    {
+        return Some(node);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = find_go_type_declaration_by_name(child, source, owner_name) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn descendant_by_field_name<'tree>(node: TsNode<'tree>, field_name: &str) -> Option<TsNode<'tree>> {
+    if let Some(child) = node.child_by_field_name(field_name) {
+        return Some(child);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = descendant_by_field_name(child, field_name) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn first_descendant_with_kind<'tree>(node: TsNode<'tree>, kind: &str) -> Option<TsNode<'tree>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = first_descendant_with_kind(child, kind) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn go_receiver_owner_name(receiver_node: TsNode<'_>, source: &str) -> Option<String> {
+    let text = trimmed_node_text(receiver_node, source)?;
+    let inner = text
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+    let raw_owner = inner.split_whitespace().last()?.trim();
+    normalize_go_type_surface(raw_owner)
+}
+
+fn normalize_go_type_surface(raw: &str) -> Option<String> {
+    let mut surface = raw.trim();
+    while let Some(stripped) = surface.strip_prefix('*') {
+        surface = stripped.trim_start();
+    }
+    if let Some(stripped) = surface.strip_prefix("[]") {
+        surface = stripped.trim_start();
+    }
+    let base = surface.split('[').next().unwrap_or(surface).trim();
+    let terminal = base.rsplit('.').next().unwrap_or(base).trim();
+    (!terminal.is_empty()).then(|| terminal.to_string())
+}
+
+fn collect_go_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |callable| {
+        if !matches!(
+            callable.kind(),
+            "function_declaration" | "method_declaration"
+        ) {
+            return;
+        }
+        let Some(source_name) = declaration_name(callable, source) else {
+            return;
+        };
+        let receiver_types = collect_go_parameter_types(callable, source);
+        if receiver_types.is_empty() {
+            return;
+        }
+        collect_receiver_call_specs_in_callable(
+            callable,
+            source,
+            &source_name,
+            ts_node_graph_span(callable),
+            &receiver_types,
+            go_selector_call,
+            &mut edges,
+        );
+    });
+    edges
+}
+
+fn collect_php_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |callable| {
+        if !matches!(
+            callable.kind(),
+            "function_definition" | "method_declaration"
+        ) {
+            return;
+        }
+        let Some(source_name) = declaration_name(callable, source) else {
+            return;
+        };
+        let receiver_types = collect_php_parameter_types(callable, source);
+        if receiver_types.is_empty() {
+            return;
+        }
+        collect_receiver_call_specs_in_callable(
+            callable,
+            source,
+            &source_name,
+            ts_node_graph_span(callable),
+            &receiver_types,
+            php_member_call,
+            &mut edges,
+        );
+    });
+    edges
+}
+
+fn collect_csharp_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |callable| {
+        if callable.kind() != "method_declaration" {
+            return;
+        }
+        let Some(source_name) = declaration_name(callable, source) else {
+            return;
+        };
+        let receiver_types = collect_csharp_parameter_types(callable, source);
+        if receiver_types.is_empty() {
+            return;
+        }
+        collect_receiver_call_specs_in_callable(
+            callable,
+            source,
+            &source_name,
+            ts_node_graph_span(callable),
+            &receiver_types,
+            csharp_member_call,
+            &mut edges,
+        );
+    });
+    edges
+}
+
+fn collect_kotlin_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |callable| {
+        if callable.kind() != "function_declaration" {
+            return;
+        }
+        let Some(source_name) = declaration_name(callable, source) else {
+            return;
+        };
+        let receiver_types = collect_colon_parameter_types(callable, source);
+        if receiver_types.is_empty() {
+            return;
+        }
+        collect_receiver_call_specs_in_callable(
+            callable,
+            source,
+            &source_name,
+            ts_node_graph_span(callable),
+            &receiver_types,
+            kotlin_member_call,
+            &mut edges,
+        );
+    });
+    edges
+}
+
+fn collect_swift_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |callable| {
+        if callable.kind() != "function_declaration" {
+            return;
+        }
+        let Some(source_name) = declaration_name(callable, source) else {
+            return;
+        };
+        let receiver_types = collect_colon_parameter_types(callable, source);
+        if receiver_types.is_empty() {
+            return;
+        }
+        collect_receiver_call_specs_in_callable(
+            callable,
+            source,
+            &source_name,
+            ts_node_graph_span(callable),
+            &receiver_types,
+            swift_member_call,
+            &mut edges,
+        );
+    });
+    edges
+}
+
+fn collect_dart_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |body| {
+        if body.kind() != "function_body" {
+            return;
+        }
+        let Some(signature) = dart_signature_for_body(body) else {
+            return;
+        };
+        let Some(source_name) = dart_callable_name(signature, source) else {
+            return;
+        };
+        let receiver_types = collect_prefix_parameter_types(signature, source);
+        if receiver_types.is_empty() {
+            return;
+        }
+        collect_receiver_call_specs_in_callable(
+            body,
+            source,
+            &source_name,
+            ts_node_graph_span(signature),
+            &receiver_types,
+            dart_member_call,
+            &mut edges,
+        );
+    });
+    edges
+}
+
+fn collect_dart_direct_call_edges(tree: &Tree, source: &str) -> Vec<ManualPreciseCallSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |body| {
+        if body.kind() != "function_body" {
+            return;
+        }
+        let Some(signature) = dart_signature_for_body(body) else {
+            return;
+        };
+        let Some(source_name) = dart_callable_name(signature, source) else {
+            return;
+        };
+        let source_span = ts_node_graph_span(signature);
+        walk_tree_nodes(body, &mut |node| {
+            let Some(target_name) = dart_direct_call(node, source) else {
+                return;
+            };
+            edges.push(ManualPreciseCallSpec {
+                source_name: source_name.clone(),
+                source_span,
+                target_name,
+                line: Some(node.start_position().row as u32 + 1),
+            });
+        });
+    });
+    edges
+}
+
+fn dart_signature_for_body<'tree>(body: TsNode<'tree>) -> Option<TsNode<'tree>> {
+    previous_named_sibling_with_kind(body, &["method_signature", "function_signature"])
+}
+
+fn collect_ruby_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |callable| {
+        if !matches!(callable.kind(), "method" | "singleton_method") {
+            return;
+        }
+        let Some(source_name) = declaration_name(callable, source) else {
+            return;
+        };
+        let receiver_types = collect_ruby_local_constructor_types(callable, source);
+        if receiver_types.is_empty() {
+            return;
+        }
+        collect_receiver_call_specs_in_callable(
+            callable,
+            source,
+            &source_name,
+            ts_node_graph_span(callable),
+            &receiver_types,
+            ruby_receiver_call,
+            &mut edges,
+        );
+    });
+    edges
+}
+
+fn collect_receiver_call_specs_in_callable(
+    callable: TsNode<'_>,
+    source: &str,
+    source_name: &str,
+    source_span: GraphNodeSpan,
+    receiver_types: &HashMap<String, String>,
+    call_parts: fn(TsNode<'_>, &str) -> Option<(String, String)>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    walk_tree_nodes(callable, &mut |node| {
+        let Some((receiver_name, method_name)) = call_parts(node, source) else {
+            return;
+        };
+        let Some(owner_name) = receiver_types.get(&receiver_name) else {
+            return;
+        };
+        edges.push(ManualReceiverCallSpec {
+            source_name: source_name.to_string(),
+            source_span,
+            owner_name: owner_name.clone(),
+            method_name,
+            line: Some(node.start_position().row as u32 + 1),
+        });
+    });
+}
+
+fn collect_go_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap<String, String> {
+    let mut receiver_types = HashMap::new();
+    let Some(parameters) = callable.child_by_field_name("parameters") else {
+        return receiver_types;
+    };
+    walk_tree_nodes(parameters, &mut |node| {
+        if !matches!(
+            node.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) {
+            return;
+        }
+        let Some(type_node) = node.child_by_field_name("type") else {
+            return;
+        };
+        let Some(raw_type) = trimmed_node_text(type_node, source) else {
+            return;
+        };
+        let Some(owner_name) = normalize_go_type_surface(&raw_type) else {
+            return;
+        };
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "identifier"
+                && child.end_byte() <= type_node.start_byte()
+                && let Some(name) = normalized_receiver_variable(child, source)
+            {
+                receiver_types.insert(name, owner_name.clone());
+            }
+        }
+    });
+    receiver_types
+}
+
+fn collect_php_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap<String, String> {
+    let mut receiver_types = HashMap::new();
+    let Some(parameters) = callable.child_by_field_name("parameters") else {
+        return receiver_types;
+    };
+    walk_tree_nodes(parameters, &mut |node| {
+        if !matches!(
+            node.kind(),
+            "simple_parameter" | "variadic_parameter" | "property_promotion_parameter"
+        ) {
+            return;
+        }
+        let Some(type_node) = node.child_by_field_name("type") else {
+            return;
+        };
+        let Some(raw_type) = trimmed_node_text(type_node, source) else {
+            return;
+        };
+        let Some(owner_name) = normalize_type_surface(&raw_type) else {
+            return;
+        };
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
+        };
+        if let Some(name) = normalized_receiver_variable(name_node, source) {
+            receiver_types.insert(name, owner_name);
+        }
+    });
+    receiver_types
+}
+
+fn collect_csharp_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap<String, String> {
+    let mut receiver_types = HashMap::new();
+    let Some(parameters) = callable.child_by_field_name("parameters") else {
+        return receiver_types;
+    };
+    walk_tree_nodes(parameters, &mut |node| {
+        if node.kind() != "parameter" {
+            return;
+        }
+        let Some(type_node) = descendant_by_field_name(node, "type") else {
+            return;
+        };
+        let Some(raw_type) = trimmed_node_text(type_node, source) else {
+            return;
+        };
+        let Some(owner_name) = normalize_type_surface(&raw_type) else {
+            return;
+        };
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
+        };
+        if let Some(name) = normalized_receiver_variable(name_node, source) {
+            receiver_types.insert(name, owner_name);
+        }
+    });
+    receiver_types
+}
+
+fn collect_ruby_local_constructor_types(
+    callable: TsNode<'_>,
+    source: &str,
+) -> HashMap<String, String> {
+    let mut receiver_types = HashMap::new();
+    walk_tree_nodes(callable, &mut |node| {
+        if node.kind() != "assignment" {
+            return;
+        }
+        let Some(left_node) = node.child_by_field_name("left") else {
+            return;
+        };
+        let Some(receiver_name) = normalized_receiver_variable(left_node, source) else {
+            return;
+        };
+        let Some(right_node) = node.child_by_field_name("right") else {
+            return;
+        };
+        let Some(owner_name) = ruby_constructor_owner(right_node, source) else {
+            return;
+        };
+        receiver_types.insert(receiver_name, owner_name);
+    });
+    receiver_types
+}
+
+fn collect_colon_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap<String, String> {
+    let mut receiver_types = HashMap::new();
+    let Some(parameters) = signature_parameter_surface(callable, source) else {
+        return receiver_types;
+    };
+    for parameter in split_top_level_parameters(&parameters) {
+        let Some((name_side, type_side)) = parameter.split_once(':') else {
+            continue;
+        };
+        let Some(receiver_name) = parameter_name_before_colon(name_side) else {
+            continue;
+        };
+        let Some(owner_name) = normalize_type_surface(&parameter_type_after_colon(type_side))
+        else {
+            continue;
+        };
+        receiver_types.insert(receiver_name, owner_name);
+    }
+    receiver_types
+}
+
+fn collect_prefix_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap<String, String> {
+    let mut receiver_types = HashMap::new();
+    let Some(parameters) = signature_parameter_surface(callable, source) else {
+        return receiver_types;
+    };
+    for parameter in split_top_level_parameters(&parameters) {
+        let parameter = parameter
+            .split('=')
+            .next()
+            .unwrap_or(parameter.as_str())
+            .trim();
+        let tokens = parameter
+            .split_whitespace()
+            .filter(|token| !matches!(*token, "final" | "const" | "var" | "required"))
+            .collect::<Vec<_>>();
+        if tokens.len() < 2 {
+            continue;
+        }
+        let receiver_name = tokens.last().copied().unwrap_or_default();
+        if receiver_name.starts_with("this.") || receiver_name.starts_with("super.") {
+            continue;
+        }
+        let raw_type = tokens[..tokens.len() - 1].join(" ");
+        let Some(receiver_name) = normalize_parameter_name(receiver_name) else {
+            continue;
+        };
+        let Some(owner_name) = normalize_type_surface(&raw_type) else {
+            continue;
+        };
+        receiver_types.insert(receiver_name, owner_name);
+    }
+    receiver_types
+}
+
+fn signature_parameter_surface(callable: TsNode<'_>, source: &str) -> Option<String> {
+    let text = trimmed_node_text(callable, source)?;
+    let start = text.find('(')?;
+    let mut depth = 0usize;
+    let mut parameter_start = None;
+    for (index, ch) in text.char_indices().skip_while(|(index, _)| *index < start) {
+        match ch {
+            '(' => {
+                depth = depth.saturating_add(1);
+                if depth == 1 {
+                    parameter_start = Some(index + ch.len_utf8());
+                }
+            }
+            ')' => {
+                if depth == 1 {
+                    let parameter_start = parameter_start?;
+                    return Some(text[parameter_start..index].to_string());
+                }
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_parameters(parameters: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut angle_depth = 0usize;
+    for ch in parameters.chars() {
+        match ch {
+            '(' => paren_depth = paren_depth.saturating_add(1),
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth = bracket_depth.saturating_add(1),
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth = brace_depth.saturating_add(1),
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            '<' => angle_depth = angle_depth.saturating_add(1),
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            ',' if paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0
+                && angle_depth == 0 =>
+            {
+                let part = current.trim();
+                if !part.is_empty() {
+                    parts.push(part.to_string());
+                }
+                current.clear();
+                continue;
+            }
+            _ => {}
+        }
+        current.push(ch);
+    }
+    let part = current.trim();
+    if !part.is_empty() {
+        parts.push(part.to_string());
+    }
+    parts
+}
+
+fn parameter_name_before_colon(name_side: &str) -> Option<String> {
+    name_side
+        .split_whitespace()
+        .last()
+        .and_then(normalize_parameter_name)
+}
+
+fn parameter_type_after_colon(type_side: &str) -> String {
+    type_side
+        .split('=')
+        .next()
+        .unwrap_or(type_side)
+        .split("->")
+        .next()
+        .unwrap_or(type_side)
+        .split("where")
+        .next()
+        .unwrap_or(type_side)
+        .split_whitespace()
+        .filter(|token| {
+            !matches!(
+                *token,
+                "inout" | "borrowing" | "consuming" | "some" | "any" | "final" | "const"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize_parameter_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches(',').trim();
+    if trimmed == "_" {
+        return None;
+    }
+    let terminal = trimmed.rsplit('.').next().unwrap_or(trimmed);
+    let cleaned = terminal
+        .trim_start_matches('$')
+        .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_');
+    (!cleaned.is_empty()).then(|| cleaned.to_string())
+}
+
+fn go_selector_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    if function.kind() != "selector_expression" {
+        return None;
+    }
+    let receiver = function.child_by_field_name("operand")?;
+    let method = function.child_by_field_name("field")?;
+    Some((
+        normalized_receiver_variable(receiver, source)?,
+        trimmed_node_text(method, source)?,
+    ))
+}
+
+fn php_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
+    if !matches!(
+        node.kind(),
+        "member_call_expression" | "nullsafe_member_call_expression"
+    ) {
+        return None;
+    }
+    let receiver = node.child_by_field_name("object")?;
+    let method = node.child_by_field_name("name")?;
+    Some((
+        normalized_receiver_variable(receiver, source)?,
+        trimmed_node_text(method, source)?,
+    ))
+}
+
+fn csharp_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
+    if node.kind() != "invocation_expression" {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    if function.kind() != "member_access_expression" {
+        return None;
+    }
+    let receiver = function.child_by_field_name("expression")?;
+    let method = function.child_by_field_name("name")?;
+    Some((
+        normalized_receiver_variable(receiver, source)?,
+        trimmed_node_text(method, source)?,
+    ))
+}
+
+fn ruby_receiver_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let receiver = node.child_by_field_name("receiver")?;
+    let method = node.child_by_field_name("method")?;
+    let method_name = trimmed_node_text(method, source)?;
+    if method_name == "new" {
+        return None;
+    }
+    Some((normalized_receiver_variable(receiver, source)?, method_name))
+}
+
+fn kotlin_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    surface_member_call(node, source)
+}
+
+fn swift_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    surface_member_call(node, source)
+}
+
+fn dart_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
+    if !matches!(node.kind(), "expression_statement" | "return_statement") {
+        return None;
+    }
+    surface_member_call(node, source)
+}
+
+fn dart_direct_call(node: TsNode<'_>, source: &str) -> Option<String> {
+    if !matches!(node.kind(), "expression_statement" | "return_statement") {
+        return None;
+    }
+    let text = trimmed_node_text(node, source)?;
+    let callable = text
+        .split('(')
+        .next()
+        .unwrap_or(text.as_str())
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    if callable.contains('.') {
+        return None;
+    }
+    let callable = callable
+        .strip_prefix("return")
+        .map(str::trim)
+        .unwrap_or(callable);
+    callable
+        .split_whitespace()
+        .last()
+        .and_then(normalize_parameter_name)
+}
+
+fn surface_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
+    let text = trimmed_node_text(node, source)?;
+    let callable = text
+        .split('(')
+        .next()
+        .unwrap_or(text.as_str())
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    let separator = callable.rfind('.')?;
+    let receiver = callable[..separator].trim().trim_end_matches('?').trim();
+    let method = callable[separator + 1..]
+        .trim()
+        .trim_start_matches('?')
+        .trim();
+    Some((
+        normalized_receiver_surface(receiver)?,
+        normalize_parameter_name(method)?,
+    ))
+}
+
+fn normalized_receiver_surface(raw: &str) -> Option<String> {
+    let terminal = raw
+        .rsplit([' ', '\t', '\n', '\r', '(', '[', '{'])
+        .find(|part| !part.trim().is_empty())
+        .unwrap_or(raw)
+        .trim()
+        .trim_end_matches('?')
+        .trim();
+    normalize_parameter_name(terminal)
+}
+
+fn dart_callable_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    descendant_by_field_name(node, "name")
+        .or_else(|| first_descendant_with_kind(node, "identifier"))
+        .and_then(|name_node| trimmed_node_text(name_node, source))
+}
+
+fn ruby_constructor_owner(node: TsNode<'_>, source: &str) -> Option<String> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let method = node.child_by_field_name("method")?;
+    if trimmed_node_text(method, source).as_deref() != Some("new") {
+        return None;
+    }
+    let receiver = node.child_by_field_name("receiver")?;
+    let raw_owner = trimmed_node_text(receiver, source)?;
+    normalize_type_surface(&raw_owner)
+}
+
+fn normalized_receiver_variable(node: TsNode<'_>, source: &str) -> Option<String> {
+    let text = trimmed_node_text(node, source)?;
+    let trimmed = text.trim();
+    let without_dollars = trimmed.trim_start_matches('$');
+    (!without_dollars.is_empty()).then(|| without_dollars.to_string())
+}
+
+fn normalize_type_surface(raw: &str) -> Option<String> {
+    let mut surface = raw.trim();
+    if surface.contains('|') || surface.contains('&') {
+        return None;
+    }
+    surface = surface.trim_start_matches('?').trim();
+    while let Some(stripped) = surface.strip_prefix('*') {
+        surface = stripped.trim_start();
+    }
+    while let Some(stripped) = surface.strip_prefix('&') {
+        surface = stripped.trim_start();
+    }
+    if let Some(stripped) = surface.strip_prefix("[]") {
+        surface = stripped.trim_start();
+    }
+    surface = surface.trim_end_matches('?').trim();
+    let base = surface
+        .split(['<', '[', '('])
+        .next()
+        .unwrap_or(surface)
+        .trim();
+    let terminal = base
+        .rsplit(['\\', '.', ':'])
+        .find(|segment| !segment.trim().is_empty())
+        .unwrap_or(base)
+        .trim();
+    (!terminal.is_empty()).then(|| terminal.to_string())
+}
+
+fn collect_enclosing_type_member_edges(
+    tree: &Tree,
+    source: &str,
+    owner_kinds: &[&str],
+    member_kinds: &[&str],
+) -> Vec<ManualMemberEdgeSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if !member_kinds.contains(&node.kind()) {
+            return;
+        }
+        let Some(owner_node) = enclosing_node_with_kind(node, owner_kinds) else {
+            return;
+        };
+        let Some(owner_name) = declaration_name(owner_node, source) else {
+            return;
+        };
+        let Some(target_name) = declaration_name(node, source) else {
+            return;
+        };
+
+        edges.push(ManualMemberEdgeSpec {
+            source_name: owner_name,
+            target_name,
+            source_span: ts_node_graph_span(owner_node),
+            target_span: ts_node_graph_span(node),
+            line: Some(node.start_position().row as u32 + 1),
+        });
+    });
+    edges
+}
+
+fn enclosing_node_with_kind<'tree>(
+    mut node: TsNode<'tree>,
+    kinds: &[&str],
+) -> Option<TsNode<'tree>> {
+    while let Some(parent) = node.parent() {
+        if kinds.contains(&parent.kind()) {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+fn previous_named_sibling_with_kind<'tree>(
+    mut node: TsNode<'tree>,
+    kinds: &[&str],
+) -> Option<TsNode<'tree>> {
+    while let Some(previous) = node.prev_named_sibling() {
+        if kinds.contains(&previous.kind()) {
+            return Some(previous);
+        }
+        node = previous;
+    }
+    None
+}
+
+fn declaration_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("name")
+        .or_else(|| first_named_identifier_like_child(node))
+        .and_then(|name_node| trimmed_node_text(name_node, source))
+}
+
+fn first_named_identifier_like_child<'tree>(node: TsNode<'tree>) -> Option<TsNode<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find(|child| {
+        matches!(
+            child.kind(),
+            "identifier"
+                | "field_identifier"
+                | "type_identifier"
+                | "name"
+                | "constant"
+                | "scope_resolution"
+        )
+    })
 }
 
 fn append_runtime_import_edges(
@@ -4515,6 +6174,16 @@ fn remap_edges(
         }
         if let Some(new_id) = id_remap.get(&edge.target) {
             edge.target = *new_id;
+        }
+        if let Some(resolved_source) = edge.resolved_source
+            && let Some(new_id) = id_remap.get(&resolved_source)
+        {
+            edge.resolved_source = Some(*new_id);
+        }
+        if let Some(resolved_target) = edge.resolved_target
+            && let Some(new_id) = id_remap.get(&resolved_target)
+        {
+            edge.resolved_target = Some(*new_id);
         }
         edge.file_node_id = Some(new_file_id);
         if !flags.legacy_edge_identity {
@@ -8535,27 +10204,35 @@ fn is_api_endpoint_call_context(line: &str, literal_col: u32) -> bool {
     }
 
     let compact_before = compact_lowercase(before_literal);
-    if compact_before.contains("fetch(") || compact_before.contains("axios(") {
+    if compact_before.contains("fetch(") {
         return true;
     }
 
     let methods = ["delete", "patch", "post", "put", "head", "options", "get"];
-    let client_receivers = [
-        "axios",
-        "requests",
-        "reqwest",
-        "http",
-        "$http",
-        "ky",
-        "got",
-        "httpclient",
-    ];
-    client_receivers.iter().any(|receiver| {
-        methods.iter().any(|method| {
-            compact_before.contains(&format!("{receiver}.{method}("))
-                || compact_before.contains(&format!("{receiver}::{method}("))
-        })
+    methods.iter().any(|method| {
+        let dot_call = format!(".{method}(");
+        let path_call = format!("::{method}(");
+        (compact_before.ends_with(&dot_call) || compact_before.ends_with(&path_call))
+            && !is_server_route_registration_context(&compact_before, method)
     })
+}
+
+fn is_server_route_registration_context(compact_before: &str, method: &str) -> bool {
+    let route_call = format!(".{method}(");
+    let Some(receiver) = compact_before.strip_suffix(&route_call) else {
+        return false;
+    };
+    let receiver = receiver
+        .rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'))
+        .next()
+        .unwrap_or(receiver)
+        .rsplit('.')
+        .next()
+        .unwrap_or(receiver);
+    matches!(
+        receiver,
+        "app" | "router" | "route" | "server" | "fastify" | "hono"
+    )
 }
 
 fn has_line_comment_before_literal(value: &str) -> bool {
@@ -9056,6 +10733,17 @@ pub fn index_file(
         flags,
         &mut callsite_ordinals,
     );
+    append_manual_precise_call_edges(
+        language_config.language_name,
+        &tree,
+        source,
+        &unique_nodes,
+        file_id,
+        &mut result_edges,
+        &mut edge_keys,
+        flags,
+        &mut callsite_ordinals,
+    );
     append_manual_c_enum_member_edges(
         language_config.language_name,
         &tree,
@@ -9065,6 +10753,27 @@ pub fn index_file(
         &mut result_edges,
         &mut edge_keys,
         flags,
+    );
+    append_manual_member_edges(
+        language_config.language_name,
+        &tree,
+        source,
+        &unique_nodes,
+        file_id,
+        &mut result_edges,
+        &mut edge_keys,
+        flags,
+    );
+    append_manual_receiver_call_edges(
+        language_config.language_name,
+        &tree,
+        source,
+        &unique_nodes,
+        file_id,
+        &mut result_edges,
+        &mut edge_keys,
+        flags,
+        &mut callsite_ordinals,
     );
     append_runtime_import_edges(
         &runtime_import_specs,
@@ -9208,8 +10917,82 @@ pub fn index_file(
     })
 }
 
+fn normalize_extension(ext: &str) -> String {
+    ext.trim().trim_start_matches('.').to_ascii_lowercase()
+}
+
+pub fn language_support_profile_for_ext(ext: &str) -> Option<LanguageSupportProfile> {
+    let ext = normalize_extension(ext);
+    match ext.as_str() {
+        "py" | "pyi" => Some(parser_graph_fidelity_profile("python")),
+        "java" => Some(parser_graph_fidelity_profile("java")),
+        "rs" => Some(parser_graph_fidelity_profile("rust")),
+        "js" | "jsx" | "mjs" | "cjs" => Some(parser_graph_fidelity_profile("javascript")),
+        "ts" | "tsx" | "mts" | "cts" => Some(parser_graph_fidelity_profile("typescript")),
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(parser_graph_fidelity_profile("cpp")),
+        "c" | "h" => Some(parser_graph_fidelity_profile("c")),
+        "go" => Some(parser_graph_fidelity_profile("go")),
+        "rb" => Some(parser_graph_fidelity_profile("ruby")),
+        "php" => Some(parser_graph_fidelity_profile("php")),
+        "cs" => Some(parser_graph_fidelity_profile("csharp")),
+        "html" | "htm" => Some(structural_profile("html")),
+        "css" => Some(structural_profile("css")),
+        "sql" => Some(structural_profile("sql")),
+        "kt" | "kts" => Some(parser_graph_fidelity_profile("kotlin")),
+        "swift" => Some(parser_graph_fidelity_profile("swift")),
+        "dart" => Some(parser_graph_fidelity_profile("dart")),
+        "sh" | "bash" => Some(parser_graph_fidelity_profile("bash")),
+        _ => None,
+    }
+}
+
+pub fn language_support_profile_for_language_name(
+    language_name: &str,
+) -> Option<LanguageSupportProfile> {
+    let language_name = language_name.trim().to_ascii_lowercase();
+    match language_name.as_str() {
+        "python" => Some(parser_graph_fidelity_profile("python")),
+        "java" => Some(parser_graph_fidelity_profile("java")),
+        "rust" => Some(parser_graph_fidelity_profile("rust")),
+        "javascript" => Some(parser_graph_fidelity_profile("javascript")),
+        "typescript" => Some(parser_graph_fidelity_profile("typescript")),
+        "cpp" => Some(parser_graph_fidelity_profile("cpp")),
+        "c" => Some(parser_graph_fidelity_profile("c")),
+        "go" => Some(parser_graph_fidelity_profile("go")),
+        "ruby" => Some(parser_graph_fidelity_profile("ruby")),
+        "php" => Some(parser_graph_fidelity_profile("php")),
+        "csharp" => Some(parser_graph_fidelity_profile("csharp")),
+        "html" => Some(structural_profile("html")),
+        "css" => Some(structural_profile("css")),
+        "sql" => Some(structural_profile("sql")),
+        "kotlin" => Some(parser_graph_fidelity_profile("kotlin")),
+        "swift" => Some(parser_graph_fidelity_profile("swift")),
+        "dart" => Some(parser_graph_fidelity_profile("dart")),
+        "bash" => Some(parser_graph_fidelity_profile("bash")),
+        _ => None,
+    }
+}
+
+fn parser_graph_fidelity_profile(language_name: &'static str) -> LanguageSupportProfile {
+    LanguageSupportProfile {
+        language_name,
+        support_mode: LanguageSupportMode::ParserBackedGraph,
+        evidence_tier: LanguageEvidenceTier::GraphFidelity,
+        claim_label: "parser-backed graph, fidelity-gated",
+    }
+}
+
+fn structural_profile(language_name: &'static str) -> LanguageSupportProfile {
+    LanguageSupportProfile {
+        language_name,
+        support_mode: LanguageSupportMode::StructuralCollector,
+        evidence_tier: LanguageEvidenceTier::StructuralOnly,
+        claim_label: "structural collector only",
+    }
+}
+
 pub fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
-    let ext = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    let ext = normalize_extension(ext);
     match ext.as_str() {
         // Keep this extension map aligned with the top-level live rule registry.
         "py" | "pyi" => Some(make_language_config(
@@ -9295,6 +11078,34 @@ pub fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
             CSHARP_GRAPH_QUERY,
             None,
             LanguageRuleset::CSharp,
+        )),
+        "kt" | "kts" => Some(make_language_config(
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            "kotlin",
+            KOTLIN_GRAPH_QUERY,
+            None,
+            LanguageRuleset::Kotlin,
+        )),
+        "swift" => Some(make_language_config(
+            tree_sitter_swift::LANGUAGE.into(),
+            "swift",
+            SWIFT_GRAPH_QUERY,
+            None,
+            LanguageRuleset::Swift,
+        )),
+        "dart" => Some(make_language_config(
+            tree_sitter_dart_orchard::LANGUAGE.into(),
+            "dart",
+            DART_GRAPH_QUERY,
+            None,
+            LanguageRuleset::Dart,
+        )),
+        "sh" | "bash" => Some(make_language_config(
+            tree_sitter_bash::LANGUAGE.into(),
+            "bash",
+            BASH_GRAPH_QUERY,
+            None,
+            LanguageRuleset::Bash,
         )),
         _ => None,
     }
@@ -11198,6 +13009,51 @@ class Test {
         let tsx = get_language_for_ext("tsx").expect("tsx config");
         assert_eq!(tsx.graph_query, TSX_GRAPH_QUERY);
         assert_eq!(tsx.tags_query, Some(TSX_TAGS_QUERY));
+
+        let kotlin = get_language_for_ext("kt").expect("kotlin config");
+        assert_eq!(kotlin.graph_query, KOTLIN_GRAPH_QUERY);
+
+        let swift = get_language_for_ext("swift").expect("swift config");
+        assert_eq!(swift.graph_query, SWIFT_GRAPH_QUERY);
+
+        let dart = get_language_for_ext("dart").expect("dart config");
+        assert_eq!(dart.graph_query, DART_GRAPH_QUERY);
+
+        let bash = get_language_for_ext("sh").expect("bash config");
+        assert_eq!(bash.graph_query, BASH_GRAPH_QUERY);
+    }
+
+    #[test]
+    fn test_language_support_profiles_separate_runtime_claims() {
+        let rust = language_support_profile_for_ext("rs").expect("rust profile");
+        assert_eq!(rust.support_mode, LanguageSupportMode::ParserBackedGraph);
+        assert_eq!(rust.evidence_tier, LanguageEvidenceTier::GraphFidelity);
+        assert_eq!(rust.claim_label, "parser-backed graph, fidelity-gated");
+
+        let go = language_support_profile_for_ext("go").expect("go profile");
+        assert_eq!(go.support_mode, LanguageSupportMode::ParserBackedGraph);
+        assert_eq!(go.evidence_tier, LanguageEvidenceTier::GraphFidelity);
+        assert_eq!(go.claim_label, "parser-backed graph, fidelity-gated");
+
+        let structural = language_support_profile_for_ext("html").expect("html profile");
+        assert_eq!(
+            structural.support_mode,
+            LanguageSupportMode::StructuralCollector
+        );
+        assert_eq!(
+            structural.evidence_tier,
+            LanguageEvidenceTier::StructuralOnly
+        );
+
+        for ext in ["kt", "kts", "swift", "dart", "sh", "bash"] {
+            let profile = language_support_profile_for_ext(ext).expect("new parser-backed profile");
+            assert_eq!(profile.support_mode, LanguageSupportMode::ParserBackedGraph);
+            assert_eq!(profile.evidence_tier, LanguageEvidenceTier::GraphFidelity);
+            assert!(
+                get_language_for_ext(ext).is_some(),
+                "parser-backed language {ext} must route into live indexing"
+            );
+        }
     }
 
     #[test]
@@ -11376,6 +13232,201 @@ typedef struct Worker {
             "MEMBER".to_string()
         )));
 
+        let kotlin = execute_raw_graph_contract(
+            Path::new("Main.kt"),
+            r#"
+package demo.game
+
+import demo.tools.Helper
+
+open class Base
+
+class Worker : Base() {
+    fun run() {
+        helper()
+    }
+}
+
+fun helper() {}
+typealias Alias = Worker
+"#,
+            &get_language_for_ext("kt").expect("kotlin config"),
+        )?;
+        assert!(
+            kotlin
+                .nodes
+                .contains(&("CLASS".to_string(), "Worker".to_string()))
+        );
+        assert!(
+            kotlin
+                .nodes
+                .contains(&("FUNCTION".to_string(), "helper".to_string()))
+        );
+        assert!(kotlin.edges.contains(&(
+            "Worker".to_string(),
+            "run".to_string(),
+            "MEMBER".to_string()
+        )));
+        assert!(
+            kotlin.edges.contains(&(
+                "Worker".to_string(),
+                "Base".to_string(),
+                "INHERITANCE".to_string()
+            )),
+            "kotlin raw graph nodes: {:?}; edges: {:?}",
+            kotlin.nodes,
+            kotlin.edges
+        );
+        assert!(kotlin.edges.contains(&(
+            "helper".to_string(),
+            "helper".to_string(),
+            "CALL".to_string()
+        )));
+        assert!(kotlin.edges.contains(&(
+            "demo.tools.Helper".to_string(),
+            "demo.tools.Helper".to_string(),
+            "IMPORT".to_string()
+        )));
+
+        let swift = execute_raw_graph_contract(
+            Path::new("Main.swift"),
+            r#"
+import Foundation
+
+protocol Runnable {
+    func run()
+}
+
+class Base {}
+
+class Worker: Base, Runnable {
+    func run() {
+        helper()
+    }
+}
+
+func helper() {}
+typealias Alias = Worker
+"#,
+            &get_language_for_ext("swift").expect("swift config"),
+        )?;
+        assert!(
+            swift
+                .nodes
+                .contains(&("CLASS".to_string(), "Worker".to_string()))
+        );
+        assert!(
+            swift
+                .nodes
+                .contains(&("INTERFACE".to_string(), "Runnable".to_string()))
+        );
+        assert!(
+            swift
+                .nodes
+                .contains(&("FUNCTION".to_string(), "helper".to_string()))
+        );
+        assert!(swift.edges.contains(&(
+            "Worker".to_string(),
+            "run".to_string(),
+            "MEMBER".to_string()
+        )));
+        assert!(swift.edges.contains(&(
+            "Worker".to_string(),
+            "Base".to_string(),
+            "INHERITANCE".to_string()
+        )));
+        assert!(swift.edges.contains(&(
+            "helper".to_string(),
+            "helper".to_string(),
+            "CALL".to_string()
+        )));
+        assert!(swift.edges.contains(&(
+            "Foundation".to_string(),
+            "Foundation".to_string(),
+            "IMPORT".to_string()
+        )));
+
+        let dart = execute_raw_graph_contract(
+            Path::new("main.dart"),
+            r#"
+import 'dart:math';
+
+class Base {}
+
+class Worker extends Base {
+  void run() {
+    helper();
+  }
+}
+
+void helper() {}
+"#,
+            &get_language_for_ext("dart").expect("dart config"),
+        )?;
+        assert!(
+            dart.nodes
+                .contains(&("CLASS".to_string(), "Worker".to_string()))
+        );
+        assert!(
+            dart.nodes
+                .contains(&("FUNCTION".to_string(), "helper".to_string()))
+        );
+        assert!(dart.edges.contains(&(
+            "Worker".to_string(),
+            "run".to_string(),
+            "MEMBER".to_string()
+        )));
+        assert!(dart.edges.contains(&(
+            "Worker".to_string(),
+            "Base".to_string(),
+            "INHERITANCE".to_string()
+        )));
+        assert!(dart.edges.contains(&(
+            "helper".to_string(),
+            "helper".to_string(),
+            "CALL".to_string()
+        )));
+        assert!(dart.edges.contains(&(
+            "'dart:math'".to_string(),
+            "'dart:math'".to_string(),
+            "IMPORT".to_string()
+        )));
+
+        let bash = execute_raw_graph_contract(
+            Path::new("main.sh"),
+            r#"
+NAME=world
+
+helper() {
+  echo "$NAME"
+}
+
+main() {
+  helper
+}
+
+main
+"#,
+            &get_language_for_ext("sh").expect("bash config"),
+        )?;
+        assert!(
+            bash.nodes
+                .contains(&("FUNCTION".to_string(), "helper".to_string()))
+        );
+        assert!(
+            bash.nodes
+                .contains(&("VARIABLE".to_string(), "NAME".to_string()))
+        );
+        assert!(bash.edges.contains(&(
+            "helper".to_string(),
+            "helper".to_string(),
+            "CALL".to_string()
+        )));
+        assert!(
+            bash.edges
+                .contains(&("main".to_string(), "main".to_string(), "CALL".to_string()))
+        );
+
         Ok(())
     }
 
@@ -11457,6 +13508,62 @@ typedef struct Worker {
         let c_kinds = parser_node_kinds(tree_sitter_c::LANGUAGE.into());
         for kind in ["struct_specifier", "field_declaration", "type_definition"] {
             assert!(c_kinds.contains(kind), "c grammar should expose {kind}");
+        }
+
+        let kotlin_kinds = parser_node_kinds(tree_sitter_kotlin_ng::LANGUAGE.into());
+        for kind in [
+            "class_declaration",
+            "function_declaration",
+            "call_expression",
+            "import",
+            "delegation_specifier",
+        ] {
+            assert!(
+                kotlin_kinds.contains(kind),
+                "kotlin grammar should expose {kind}"
+            );
+        }
+
+        let swift_kinds = parser_node_kinds(tree_sitter_swift::LANGUAGE.into());
+        for kind in [
+            "class_declaration",
+            "protocol_declaration",
+            "function_declaration",
+            "call_expression",
+            "import_declaration",
+        ] {
+            assert!(
+                swift_kinds.contains(kind),
+                "swift grammar should expose {kind}"
+            );
+        }
+
+        let dart_kinds = parser_node_kinds(tree_sitter_dart_orchard::LANGUAGE.into());
+        for kind in [
+            "class_definition",
+            "function_signature",
+            "method_signature",
+            "selector",
+            "argument_part",
+            "import_specification",
+        ] {
+            assert!(
+                dart_kinds.contains(kind),
+                "dart grammar should expose {kind}"
+            );
+        }
+
+        let bash_kinds = parser_node_kinds(tree_sitter_bash::LANGUAGE.into());
+        for kind in [
+            "function_definition",
+            "command",
+            "command_name",
+            "variable_assignment",
+        ] {
+            assert!(
+                bash_kinds.contains(kind),
+                "bash grammar should expose {kind}"
+            );
         }
     }
 
@@ -12734,7 +14841,7 @@ export async function loadUsers() {
 }
 
 export async function createUser() {
-    return axios.post("/api/users", {});
+    return apiClient.post("/api/users", {});
 }
 "#;
         let language_config = get_language_for_ext("ts").expect("typescript config");

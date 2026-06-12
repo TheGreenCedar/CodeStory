@@ -268,6 +268,7 @@ pub fn retrieval_file_role_from_path(path: &str) -> RetrievalFileRole {
             "/node_modules/",
             "/src/external/",
             "/external/",
+            "/deps/",
             "/vendor/",
             "/vendors/",
             "/third_party/",
@@ -1927,6 +1928,10 @@ mod tests {
                 "codex-rs/app-server-protocol/schema/typescript/index.ts"
             ),
             RetrievalFileRole::Generated
+        );
+        assert_eq!(
+            retrieval_file_role_from_path("redis/deps/hiredis/examples/example-ae.c"),
+            RetrievalFileRole::Vendor
         );
     }
 

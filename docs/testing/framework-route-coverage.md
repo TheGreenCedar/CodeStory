@@ -2,7 +2,8 @@
 
 CodeStory indexes framework routes as graph symbols when extraction is backed by
 fixtures and confidence labels. Do not claim full framework support from a
-single heuristic hit.
+single heuristic hit. Language support tiers are defined separately in
+[language-support.md](../architecture/language-support.md).
 
 ## Current Coverage Target
 

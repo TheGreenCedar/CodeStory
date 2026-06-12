@@ -1,4 +1,8 @@
-# Retrieval parser compatibility matrix (ws-a-parser-compat)
+# Retrieval Parser Compatibility Matrix (ws-a-parser-compat)
+
+This page is a parser-version compatibility record, not the language support
+contract. For runtime support tiers and safe public claims, use
+[language-support.md](language-support.md).
 
 This records Step 2 parser compatibility decisions from `retrieval-language-support_038d3ae9.plan.md` against the workspace policy:
 
@@ -26,21 +30,21 @@ For each language, ran `cargo check` after pinning exactly one parser crate/vers
 | Ruby | `tree-sitter-ruby` | `0.23.1` | pass (`cargo check` + parse smoke) | crates.io pin | Wired in indexer with `rules/ruby.scm`. |
 | PHP | `tree-sitter-php` | `0.23.11` | pass (`cargo check` + parse smoke) | crates.io pin | `0.24.2` compiles but fails at runtime with `LanguageError { version: 15 }` on tree-sitter `0.24`. |
 | C# | `tree-sitter-c-sharp` | `=0.23.0` | pass (`cargo check` + parse smoke) | crates.io pin | `0.23.5` compiles but fails at runtime with `LanguageError { version: 15 }` on tree-sitter `0.24`. |
-| Kotlin | `tree-sitter-kotlin-ng` | `1.1.0` | pass | crates.io pin | Use `-ng` crate family for Kotlin parser wiring. |
-| Swift | `tree-sitter-swift` | `0.7.2` | pass | crates.io pin | crates.io source compiles with policy pins. |
-| Dart | `tree-sitter-dart` | `0.2.0` | pass | crates.io pin | crates.io source compiles with policy pins. |
+| Kotlin | `tree-sitter-kotlin-ng` | `1.1.0` | pass (`cargo check` + parse smoke) | crates.io pin | Wired in indexer with `rules/kotlin.scm`. |
+| Swift | `tree-sitter-swift` | `0.7.0` | pass (`cargo check` + parse smoke) | crates.io pin | `0.7.1` and newer tested candidates use ABI 15 and fail at runtime on tree-sitter `0.24`. |
+| Dart | `tree-sitter-dart-orchard` | `0.3.2` | pass (`cargo check` + parse smoke) | crates.io pin | Replaces `tree-sitter-dart = 0.2.0`, whose language export uses ABI 15 with tree-sitter `0.24`. |
 | HTML | `tree-sitter-html` | `0.23.2` | pass | crates.io pin | Parser is available if structural extraction chooses parser-backed route. |
 | CSS | `tree-sitter-css` | `0.25.0` | pass | crates.io pin | Parser is available if structural extraction chooses parser-backed route. |
 | SQL | `tree-sitter-sequel` | `0.3.11` | pass | crates.io pin | SQL parser candidate compiles with policy pins. |
-| Bash | `tree-sitter-bash` | `0.25.1` | pass | crates.io pin | Supports script-language parser path if/when enabled. |
+| Bash | `tree-sitter-bash` | `0.23.3` | pass (`cargo check` + parse smoke) | crates.io pin | `0.25.x` uses ABI 15 and fails at runtime on tree-sitter `0.24`. |
 
 ## Current outcome
 
 - No language in this matrix currently requires a git pin, custom fork, or forced text-only fallback for **parser-policy compatibility**.
-- Go, Ruby, PHP, and C# have parser dependencies, rule assets, and extension
-  routing wired in the current branch.
+- Go, Ruby, PHP, C#, Kotlin, Swift, Dart, and Bash have parser dependencies,
+  rule assets, and extension routing wired in the current branch.
 - HTML, CSS, and SQL have structural extraction paths, but they are not
   parser-backed rule assets from this matrix.
-- Kotlin, Swift, Dart, and Bash remain compatibility decisions only. They still
-  need dependency wiring, rule assets, language routing, and fidelity coverage
-  before they should be described as parser-backed runtime support.
+- New parser candidates should stay on this page as compatibility records until
+  they also have dependency wiring, rule assets, language routing, and fidelity
+  coverage.

@@ -94,6 +94,37 @@ fn has_node_kind(nodes: &[codestory_contracts::graph::Node], name: &str, kind: N
         .any(|node| matches_name(&node.serialized_name, name) && node.kind == kind)
 }
 
+fn file_path_for_node<'a>(
+    nodes_by_id: &std::collections::HashMap<
+        codestory_contracts::graph::NodeId,
+        &'a codestory_contracts::graph::Node,
+    >,
+    node: &codestory_contracts::graph::Node,
+) -> Option<&'a str> {
+    node.file_node_id
+        .and_then(|file_id| nodes_by_id.get(&file_id).copied())
+        .map(|file| file.serialized_name.as_str())
+}
+
+fn node_in_file<'a>(
+    nodes: &'a [codestory_contracts::graph::Node],
+    nodes_by_id: &std::collections::HashMap<
+        codestory_contracts::graph::NodeId,
+        &'a codestory_contracts::graph::Node,
+    >,
+    name: &str,
+    kind: NodeKind,
+    file_suffix: &str,
+) -> Option<&'a codestory_contracts::graph::Node> {
+    nodes.iter().find(|node| {
+        matches_name(&node.serialized_name, name)
+            && node.kind == kind
+            && file_path_for_node(nodes_by_id, node)
+                .map(|path| path.replace('\\', "/").ends_with(file_suffix))
+                .unwrap_or(false)
+    })
+}
+
 #[test]
 fn test_import_resolution_across_languages() -> anyhow::Result<()> {
     let cases = [
@@ -269,6 +300,153 @@ async function load() {
     assert!(
         generic_runtime_calls.is_empty(),
         "expected runtime module loading to avoid generic CALL placeholders, found {generic_runtime_calls:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_javascript_static_import_aliases_resolve_and_feed_constructor_calls() -> anyhow::Result<()>
+{
+    let (nodes, edges) = index_workspace(&[
+        (
+            "app.js",
+            r#"
+import Client from "./client.js";
+
+function makeClient() {
+    const client = new Client();
+    return client;
+}
+"#,
+        ),
+        (
+            "client.js",
+            r#"
+class Client {
+    request() {}
+}
+
+export default Client;
+"#,
+        ),
+    ])?;
+
+    let nodes_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<std::collections::HashMap<_, _>>();
+    let make_client = node_in_file(
+        &nodes,
+        &nodes_by_id,
+        "makeClient",
+        NodeKind::FUNCTION,
+        "app.js",
+    )
+    .ok_or_else(|| anyhow::anyhow!("makeClient node not found"))?;
+    let import_alias = node_in_file(&nodes, &nodes_by_id, "Client", NodeKind::UNKNOWN, "app.js")
+        .ok_or_else(|| anyhow::anyhow!("Client import alias node not found"))?;
+    let imported_class = node_in_file(&nodes, &nodes_by_id, "Client", NodeKind::CLASS, "client.js")
+        .ok_or_else(|| anyhow::anyhow!("Client class node not found"))?;
+
+    assert!(
+        edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.source == make_client.id
+                && edge.effective_target() == import_alias.id
+        }),
+        "new Client() should create a CALL edge from makeClient to the imported alias"
+    );
+    assert!(
+        edges.iter().any(|edge| {
+            edge.kind == EdgeKind::IMPORT
+                && edge.source == import_alias.id
+                && edge.effective_target() == imported_class.id
+                && edge.certainty.is_some_and(|certainty| {
+                    certainty == codestory_contracts::graph::ResolutionCertainty::Certain
+                })
+        }),
+        "Client default import should resolve by relative path to the class in client.js"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_javascript_bound_function_receiver_calls_imported_default() -> anyhow::Result<()> {
+    let (nodes, edges) = index_workspace(&[
+        (
+            "client.js",
+            r#"
+import dispatchRequest from "./dispatchRequest.js";
+
+class Client {
+    _request(config) {
+        return dispatchRequest.call(this, config);
+    }
+}
+
+export default Client;
+"#,
+        ),
+        (
+            "dispatchRequest.js",
+            r#"
+export default function dispatchRequest(config) {
+    return config;
+}
+"#,
+        ),
+    ])?;
+
+    let nodes_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<std::collections::HashMap<_, _>>();
+    let request_method = node_in_file(
+        &nodes,
+        &nodes_by_id,
+        "_request",
+        NodeKind::METHOD,
+        "client.js",
+    )
+    .ok_or_else(|| anyhow::anyhow!("Client._request method not found"))?;
+    let import_alias = node_in_file(
+        &nodes,
+        &nodes_by_id,
+        "dispatchRequest",
+        NodeKind::UNKNOWN,
+        "client.js",
+    )
+    .ok_or_else(|| anyhow::anyhow!("dispatchRequest import alias not found"))?;
+    let imported_function = node_in_file(
+        &nodes,
+        &nodes_by_id,
+        "dispatchRequest",
+        NodeKind::FUNCTION,
+        "dispatchRequest.js",
+    )
+    .ok_or_else(|| anyhow::anyhow!("dispatchRequest function not found"))?;
+
+    assert!(
+        edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.source == request_method.id
+                && edge.target == import_alias.id
+                && edge.effective_target() == import_alias.id
+                && edge.certainty.is_some_and(|certainty| {
+                    certainty == codestory_contracts::graph::ResolutionCertainty::Certain
+                })
+        }),
+        "dispatchRequest.call(...) should create a certain CALL edge to the imported dispatchRequest alias"
+    );
+    assert!(
+        edges.iter().any(|edge| {
+            edge.kind == EdgeKind::IMPORT
+                && edge.source == import_alias.id
+                && edge.effective_target() == imported_function.id
+        }),
+        "dispatchRequest default import should resolve by relative path to dispatchRequest.js"
     );
 
     Ok(())

@@ -36,6 +36,22 @@ const PACKET_TASK_CLASSES = new Set([
   "data_flow",
   "edit_planning",
 ]);
+const COMMAND_ACCOUNTING_CATEGORIES = [
+  "codestory_cli",
+  "shell_search",
+  "direct_file_read",
+  "git",
+  "build_test",
+  "other",
+];
+const TOOL_ACCOUNTING_CATEGORIES = [
+  "web_search",
+  "mcp_tool_call",
+  "command_execution",
+  "function_call",
+  "tool_call",
+  "other",
+];
 
 const PUBLIC_REPOS = {
   codestory: {
@@ -85,9 +101,9 @@ const ALL_REPOS = { ...PUBLIC_REPOS, ...LOCAL_REPOS };
 
 const ARMS = {
   without_codestory:
-    "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal repository exploration only.",
+    "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal local repository exploration only. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
   with_codestory:
-    "Use CodeStory grounding first. If CODESTORY_CLI is set, use that executable; otherwise use codestory-cli on PATH. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run only the listed follow_up_commands in order and prefer targeted `search --why` commands before escalating packet budget. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations and sufficiency.avoid_opening, not only the paths mentioned in your prose. Use search, context, trail, or snippet only for named gaps. The prepared full sidecar cache is mandatory; if CodeStory or its sidecars are unavailable, fail the run instead of continuing with ordinary exploration.",
+    "Use CodeStory grounding first. If CODESTORY_CLI is set, use that executable; otherwise use codestory-cli on PATH. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run only the listed follow_up_commands in order and prefer targeted `search --why` commands before escalating packet budget. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations and sufficiency.avoid_opening, not only the paths mentioned in your prose. Use search, context, trail, or snippet only for named gaps. The prepared full sidecar cache is mandatory; if CodeStory or its sidecars are unavailable, fail the run instead of continuing with ordinary exploration. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
 };
 
 function usage() {
@@ -950,7 +966,7 @@ Task class: ${task.task_class ?? "unspecified"}`
   const packetFirstBlock = packetFirstCommand
     ? `
 Required first repository-context command:
-\`\`\`powershell
+\`\`\`${packetFirstCommandFenceLanguage()}
 ${packetFirstCommand}
 \`\`\`
 
@@ -973,19 +989,31 @@ ${packetFirstBlock}
 ${stopContractBlock}
 
 Return a concise answer with the files, symbols, and commands that support your explanation.
-Do not edit source files. Use read-only inspection commands only, except CodeStory may write its cache if needed.`;
+Do not edit source files. Use read-only inspection commands only, except CodeStory may write its cache if needed.
+Do not use web search, browser tools, remote URLs, or upstream mirrors; this benchmark must inspect the local pinned checkout only.`;
 }
 
-function packetFirstCommandForPrompt(taskPrompt, task = null) {
+function packetFirstCommandFenceLanguage(platform = process.platform) {
+  return platform === "win32" ? "powershell" : "sh";
+}
+
+function packetFirstCommandForPrompt(taskPrompt, task = null, platform = process.platform) {
   const question = String(taskPrompt).replace(/\r?\n/g, " ");
   const taskClass = task?.task_class
-    ? ` --task-class ${powershellSingleQuoted(validatePacketTaskClass("benchmark task", task.task_class).replace(/_/g, "-"))}`
+    ? ` --task-class ${shellSingleQuoted(validatePacketTaskClass("benchmark task", task.task_class).replace(/_/g, "-"), platform)}`
     : "";
-  return `& $env:CODESTORY_CLI packet --project . --question ${powershellSingleQuoted(question)}${taskClass} --budget compact --format json`;
+  if (platform === "win32") {
+    return `& $env:CODESTORY_CLI packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget compact --format json`;
+  }
+  return `"\${CODESTORY_CLI:-codestory-cli}" packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget compact --format json`;
 }
 
-function powershellSingleQuoted(value) {
-  return `'${String(value).replace(/'/g, "''")}'`;
+function shellSingleQuoted(value, platform = process.platform) {
+  const text = String(value);
+  if (platform === "win32") {
+    return `'${text.replace(/'/g, "''")}'`;
+  }
+  return `'${text.replace(/'/g, "'\\''")}'`;
 }
 
 function artifactNamePart(value) {
@@ -1039,6 +1067,8 @@ function commandCategory(command) {
     "\\b(index|ground|doctor|search|symbol|trail|snippet|query|explore|bookmark|context|drill|files|affected|setup|serve|packet)\\b";
   const codestoryExecutablePath =
     String.raw`['"]?(?:[A-Z]:)?(?:[^;&|\r\n"']*[\\/])*codestory-cli(?:\.exe)?['"]?\s+${codestoryCommands}`;
+  const powershellEnvFallback =
+    String.raw`&\s*\$\(\s*if\s*\(\s*\$env:CODESTORY_CLI\s*\)\s*\{[^}]*\$env:CODESTORY_CLI[^}]*\}\s*else\s*\{[^}]*codestory-cli(?:\.exe)?[^}]*\}\s*\)\s+${codestoryCommands}`;
   if (/^\s*(?:rg|grep|findstr|select-string)\b/i.test(text)) {
     return "shell_search";
   }
@@ -1049,8 +1079,14 @@ function commandCategory(command) {
     /^\s*codestory-cli(?:\.exe)?(?:\s|$)/i.test(shellText) ||
     new RegExp(`^\\s*${codestoryExecutablePath}`, "i").test(shellText) ||
     new RegExp(`[;&|]\\s*${codestoryExecutablePath}`, "i").test(shellText) ||
-    /&\s*\$env:CODESTORY_CLI\s+/i.test(shellText) ||
-    new RegExp(`&\\s*\\$[a-z_][a-z0-9_]*\\s+${codestoryCommands}`, "i").test(shellText)
+    /&\s*["']*\$env:CODESTORY_CLI\s+/i.test(shellText) ||
+    new RegExp(
+      `(?:^|[;&|]\\s*)["']?\\$\\{CODESTORY_CLI:-codestory-cli\\}["']?\\s+${codestoryCommands}`,
+      "i",
+    ).test(shellText) ||
+    new RegExp(`(?:^|[;&|]\\s*)["']?\\$CODESTORY_CLI["']?\\s+${codestoryCommands}`, "i").test(shellText) ||
+    new RegExp(`&\\s*["']*\\$[a-z_][a-z0-9_]*\\s+${codestoryCommands}`, "i").test(shellText) ||
+    new RegExp(powershellEnvFallback, "i").test(shellText)
   ) {
     return "codestory_cli";
   }
@@ -1073,6 +1109,8 @@ function isCodestoryPacketCommand(command) {
   const shellText = String(command ?? "").replace(/\\"/g, '"');
   const packetExecutablePath =
     String.raw`['"]?(?:[A-Z]:)?(?:[^;&|\r\n"']*[\\/])*codestory-cli(?:\.exe)?['"]?\s+packet\b`;
+  const powershellEnvFallbackPacket =
+    String.raw`&\s*\$\(\s*if\s*\(\s*\$env:CODESTORY_CLI\s*\)\s*\{[^}]*\$env:CODESTORY_CLI[^}]*\}\s*else\s*\{[^}]*codestory-cli(?:\.exe)?[^}]*\}\s*\)\s+packet\b`;
   if (/(?:^|\s)(?:--help|-h)(?:\s|$)/i.test(shellText)) {
     return false;
   }
@@ -1083,8 +1121,11 @@ function isCodestoryPacketCommand(command) {
     /^\s*codestory-cli(?:\.exe)?\s+packet\b/i.test(shellText) ||
     new RegExp(`^\\s*${packetExecutablePath}`, "i").test(shellText) ||
     new RegExp(`[;&|]\\s*${packetExecutablePath}`, "i").test(shellText) ||
-    /&\s*\$env:CODESTORY_CLI\s+packet\b/i.test(shellText) ||
-    /&\s*\$[a-z_][a-z0-9_]*\s+packet\b/i.test(shellText)
+    /&\s*["']*\$env:CODESTORY_CLI\s+packet\b/i.test(shellText) ||
+    /(?:^|[;&|]\s*)["']?\$\{CODESTORY_CLI:-codestory-cli\}["']?\s+packet\b/i.test(shellText) ||
+    /(?:^|[;&|]\s*)["']?\$CODESTORY_CLI["']?\s+packet\b/i.test(shellText) ||
+    /&\s*["']*\$[a-z_][a-z0-9_]*\s+packet\b/i.test(shellText) ||
+    new RegExp(powershellEnvFallbackPacket, "i").test(shellText)
   );
 }
 
@@ -1092,12 +1133,17 @@ function isCodestoryIndexCommand(command) {
   const shellText = String(command ?? "").replace(/\\"/g, '"');
   const indexExecutablePath =
     String.raw`['"]?(?:[A-Z]:)?(?:[^;&|\r\n"']*[\\/])*codestory-cli(?:\.exe)?['"]?\s+index\b`;
+  const powershellEnvFallbackIndex =
+    String.raw`&\s*\$\(\s*if\s*\(\s*\$env:CODESTORY_CLI\s*\)\s*\{[^}]*\$env:CODESTORY_CLI[^}]*\}\s*else\s*\{[^}]*codestory-cli(?:\.exe)?[^}]*\}\s*\)\s+index\b`;
   return (
     /^\s*codestory-cli(?:\.exe)?\s+index\b/i.test(shellText) ||
     new RegExp(`^\\s*${indexExecutablePath}`, "i").test(shellText) ||
     new RegExp(`[;&|]\\s*${indexExecutablePath}`, "i").test(shellText) ||
-    /&\s*\$env:CODESTORY_CLI\s+index\b/i.test(shellText) ||
-    /&\s*\$[a-z_][a-z0-9_]*\s+index\b/i.test(shellText)
+    /&\s*["']*\$env:CODESTORY_CLI\s+index\b/i.test(shellText) ||
+    /(?:^|[;&|]\s*)["']?\$\{CODESTORY_CLI:-codestory-cli\}["']?\s+index\b/i.test(shellText) ||
+    /(?:^|[;&|]\s*)["']?\$CODESTORY_CLI["']?\s+index\b/i.test(shellText) ||
+    /&\s*["']*\$[a-z_][a-z0-9_]*\s+index\b/i.test(shellText) ||
+    new RegExp(powershellEnvFallbackIndex, "i").test(shellText)
   );
 }
 
@@ -1134,7 +1180,7 @@ function pathMatchesLike(actual, expected) {
 
 function isLikelySourcePath(value) {
   const normalized = normalizePathLike(value).toLowerCase();
-  return /\.(rs|js|jsx|ts|tsx|py|go|java|kt|cs|cpp|c|h|hpp|rb|php|swift|md|toml|json|yaml|yml)$/i.test(normalized);
+  return /\.(rs|js|jsx|mjs|cjs|ts|tsx|mts|cts|py|pyi|go|java|kt|kts|cs|cpp|cc|cxx|c|h|hpp|hh|hxx|rb|php|swift|dart|sh|bash|html|htm|css|sql|md|toml|json|yaml|yml)$/i.test(normalized);
 }
 
 function extractAssignedPaths(command) {
@@ -1279,6 +1325,7 @@ function isPathInsideProject(filePath, projectRoot) {
 
 function analyzeTranscript(events, projectRoot = null) {
   const commands = extractCommandExecutions(events);
+  const toolCategories = toolCallCategories(events);
   const commandCategories = {};
   const outputCharsByCategory = {};
   const directFileReads = [];
@@ -1318,6 +1365,8 @@ function analyzeTranscript(events, projectRoot = null) {
       : sourceReads.filter((read) => (read.event_index ?? -1) > (first.completed_event_index ?? first.started_event_index ?? -1)).length;
 
   return {
+    tool_categories: toolCategories,
+    external_context_tool_calls: toolCategories.web_search ?? 0,
     command_categories: commandCategories,
     command_count: commands.length,
     command_patterns_duplicated: duplicateCounts(commands.map((command) => command.pattern)),
@@ -1355,6 +1404,44 @@ function analyzeTranscript(events, projectRoot = null) {
     ordinary_source_reads_after_first_packet: afterIndex(firstSuccessfulPacket),
     final_answer_chars: extractFinalAnswer(events).length,
   };
+}
+
+function toolCallCategory(event) {
+  if (!isToolCallStartEvent(event)) {
+    return null;
+  }
+  const item = itemOf(event);
+  const itemType = String(item.type ?? event.item_type ?? event.kind ?? event.name ?? "").toLowerCase();
+  const eventType = String(event.type ?? event.event ?? "").toLowerCase();
+  const toolName = String(item.tool ?? item.name ?? event.tool ?? "").toLowerCase();
+  const text = `${itemType} ${eventType} ${toolName}`;
+  if (text.includes("web_search")) {
+    return "web_search";
+  }
+  if (text.includes("command_execution") || text.includes("exec_command")) {
+    return "command_execution";
+  }
+  if (text.includes("mcp_tool_call")) {
+    return "mcp_tool_call";
+  }
+  if (text.includes("function_call")) {
+    return "function_call";
+  }
+  if (text.includes("tool_call") || text.includes("tool_use")) {
+    return "tool_call";
+  }
+  return "other";
+}
+
+function toolCallCategories(events) {
+  const categories = {};
+  for (const event of events) {
+    const category = toolCallCategory(event);
+    if (category) {
+      bumpCount(categories, category);
+    }
+  }
+  return categories;
 }
 
 function normalizeSearchText(value) {
@@ -1780,7 +1867,7 @@ async function runOne(opts, run, outDir) {
       })
     : null;
 
-  return {
+  const output = {
     repo: run.repo,
     task_id: run.task?.id ?? null,
     task_name: run.task?.name ?? null,
@@ -1816,6 +1903,10 @@ async function runOne(opts, run, outDir) {
     malformed_stdout_lines: malformed.length,
     stdout_path: stdoutPath,
     stderr_path: stderrPath,
+  };
+  return {
+    ...output,
+    resource_accounting: resourceAccountingForResult(output),
   };
 }
 
@@ -1974,6 +2065,7 @@ function compactCachePreparation(preparation) {
   return {
     repo: preparation.repo,
     action: preparation.action,
+    preparation_wall_ms: preparation.preparation_wall_ms ?? null,
     index_status: preparation.index_status ?? null,
     index_exit_code: preparation.index_exit_code ?? null,
     index_wall_ms: preparation.index_wall_ms ?? null,
@@ -2013,12 +2105,14 @@ async function prepareCodeStoryCaches(opts, tasks) {
     }
 
     console.log(`preparing CodeStory cache for ${repo}`);
+    const preparationStarted = performance.now();
     const before = await codestoryDoctorSnapshot(codestoryCli, config.path, 60_000);
     const preparation = {
       repo,
       project: config.path,
       codestory_cli: path.resolve(codestoryCli),
       action: cachePreparationAction(before),
+      preparation_wall_ms: null,
       before,
       index_status: null,
       index_exit_code: null,
@@ -2067,6 +2161,8 @@ async function prepareCodeStoryCaches(opts, tasks) {
       }
     }
 
+    preparation.preparation_wall_ms =
+      Math.round((performance.now() - preparationStarted) * 1000) / 1000;
     preparations.push(preparation);
   }
   return preparations;
@@ -2274,7 +2370,7 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
         })
       : null
   );
-  return {
+  const output = {
     ...result,
     repo_provenance: result.repo_provenance ?? (repoConfig ? await repoProvenance(repoConfig) : null),
     codestory_cache_provenance: cacheProvenance,
@@ -2291,6 +2387,10 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
     json_events: parsed.length,
     malformed_stdout_lines: malformed.length,
     reanalyzed_at: new Date().toISOString(),
+  };
+  return {
+    ...output,
+    resource_accounting: resourceAccountingForResult(output),
   };
 }
 
@@ -2317,6 +2417,7 @@ async function reanalyzeAgentRunDirectory(opts) {
   }
 
   const summary = summarizeRuns(reanalyzed);
+  const costAccounting = summarizeCostAccounting(reanalyzed);
   const summaryOpts = {
     ...opts,
     runner: originalSummary.runner ?? opts.runner,
@@ -2331,6 +2432,7 @@ async function reanalyzeAgentRunDirectory(opts) {
     max_source_reads_after_packet: opts.maxSourceReadsAfterPacket,
     output_dir: runDir,
     summary,
+    cost_accounting: costAccounting,
   };
   await writeFile(
     path.join(runDir, "reanalyzed-runs.jsonl"),
@@ -2338,7 +2440,11 @@ async function reanalyzeAgentRunDirectory(opts) {
     "utf8",
   );
   await writeFile(path.join(runDir, "reanalyzed-summary.json"), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-  await writeFile(path.join(runDir, "reanalyzed-summary.md"), markdownSummary(summary, summaryOpts), "utf8");
+  await writeFile(
+    path.join(runDir, "reanalyzed-summary.md"),
+    markdownSummary(summary, summaryOpts, costAccounting),
+    "utf8",
+  );
   if (opts.publishable) {
     const blockers = agentPublishableBlockers(reanalyzed, opts);
     if (blockers.length) {
@@ -3353,6 +3459,15 @@ function packetRuntimePublishableBlockers(results, opts = {}) {
     .filter(Boolean);
 }
 
+function packetRuntimeQualityGateRequired(opts = {}) {
+  return Boolean(opts.publishable || (opts.taskSuite === "holdout-retrieval" && !opts.allowFailures));
+}
+
+function formatPacketRuntimeBlocker(blocker) {
+  const row = blocker.result;
+  return `  ${row.repo} ${row.task_id} ${row.mode} repeat ${row.repeat}: ${blocker.reasons.join("; ")}`;
+}
+
 function groupTasksByRepo(tasks) {
   const byRepo = new Map();
   for (const task of tasks) {
@@ -3552,10 +3667,19 @@ async function runPacketRuntimeBenchmark(opts, tasks) {
 
   const blockers = packetRuntimePublishableBlockers(results, opts);
   if (opts.publishable && blockers.length) {
-    console.error("--publishable failed: packet runtime rows must pass, include passing manifest quality gates, and use pinned clean repo provenance.");
+    console.error(
+      "--publishable failed: packet runtime rows must pass, include passing manifest quality gates, and use pinned clean repo provenance.",
+    );
     for (const blocker of blockers) {
-      const row = blocker.result;
-      console.error(`  ${row.repo} ${row.task_id} ${row.mode} repeat ${row.repeat}: ${blocker.reasons.join("; ")}`);
+      console.error(formatPacketRuntimeBlocker(blocker));
+    }
+    process.exitCode = 1;
+  } else if (packetRuntimeQualityGateRequired(opts) && blockers.length) {
+    console.error(
+      "holdout-retrieval packet-runtime gate failed: every row must pass manifest quality thresholds. Use --allow-failures only for exploratory diagnostics.",
+    );
+    for (const blocker of blockers) {
+      console.error(formatPacketRuntimeBlocker(blocker));
     }
     process.exitCode = 1;
   }
@@ -3569,6 +3693,221 @@ function median(values) {
   }
   const middle = Math.floor(sorted.length / 2);
   return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function presentFiniteNumber(value) {
+  if (value == null || value === "") {
+    return null;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function sumFinite(values) {
+  return values.reduce((sum, value) => {
+    const number = presentFiniteNumber(value);
+    return number == null ? sum : sum + number;
+  }, 0);
+}
+
+function sumPresentFinite(values) {
+  let seen = false;
+  let sum = 0;
+  for (const value of values) {
+    const number = presentFiniteNumber(value);
+    if (number == null) {
+      continue;
+    }
+    seen = true;
+    sum += number;
+  }
+  return seen ? sum : null;
+}
+
+function sumCategories(rows, categories, accessor) {
+  const totals = Object.fromEntries(categories.map((category) => [category, 0]));
+  for (const row of rows) {
+    const values = accessor(row) ?? {};
+    for (const [category, value] of Object.entries(values)) {
+      const number = presentFiniteNumber(value);
+      if (number == null) {
+        continue;
+      }
+      totals[category] = (totals[category] ?? 0) + number;
+    }
+  }
+  return totals;
+}
+
+function resourceAccountingForResult(result) {
+  const analysis = result.transcript_analysis ?? {};
+  const usage = result.usage ?? {};
+  const wallMs = presentFiniteNumber(result.wall_ms);
+  const preparationWallMs = cachePreparationWallMs(
+    result.codestory_cache_provenance?.cache_preparation,
+  );
+  return {
+    measurement_source: "runner_process_wall_clock_and_codex_jsonl",
+    status: result.status ?? null,
+    wall_ms: wallMs,
+    codestory_cache_preparation_wall_ms: preparationWallMs,
+    all_in_wall_ms: wallMs == null ? null : wallMs + (preparationWallMs ?? 0),
+    usage: {
+      input_tokens: usage.input_tokens ?? null,
+      output_tokens: usage.output_tokens ?? null,
+      total_tokens: usage.total_tokens ?? null,
+      cached_input_tokens: usage.cached_input_tokens ?? null,
+      reasoning_tokens: usage.reasoning_tokens ?? null,
+    },
+    estimated_cost_usd: result.estimated_cost_usd ?? null,
+    tool_calls_observed: presentFiniteNumber(result.tool_calls_observed),
+    tool_categories: analysis.tool_categories ?? {},
+    command_count: presentFiniteNumber(analysis.command_count),
+    command_categories: analysis.command_categories ?? {},
+    external_context_tool_calls: presentFiniteNumber(analysis.external_context_tool_calls) ?? 0,
+    direct_source_reads_total: presentFiniteNumber(analysis.direct_source_reads_total),
+    ordinary_source_reads_after_first_codestory:
+      presentFiniteNumber(analysis.ordinary_source_reads_after_first_codestory),
+    ordinary_source_reads_after_first_packet:
+      presentFiniteNumber(analysis.ordinary_source_reads_after_first_packet),
+  };
+}
+
+function summarizeArmCostAccounting(rows) {
+  const successful = rows.filter((row) => row.status === "pass");
+  const wallMs = sumFinite(rows.map((row) => row.wall_ms));
+  const preparationWallMs = sumFinite(
+    rows.map((row) => cachePreparationWallMs(row.codestory_cache_provenance?.cache_preparation)),
+  );
+  return {
+    runs: rows.length,
+    successful_runs: successful.length,
+    failed_runs: rows.filter((row) => row.status === "fail").length,
+    timeout_runs: rows.filter((row) => row.status === "timeout").length,
+    missing_token_usage_runs: rows.filter((row) => row.usage?.total_tokens == null).length,
+    time_spent_ms: {
+      runner_wall: wallMs,
+      codestory_cache_preparation: preparationWallMs,
+      all_in: wallMs + preparationWallMs,
+    },
+    tokens_spent: {
+      input_tokens: sumPresentFinite(rows.map((row) => row.usage?.input_tokens)),
+      output_tokens: sumPresentFinite(rows.map((row) => row.usage?.output_tokens)),
+      total_tokens: sumPresentFinite(rows.map((row) => row.usage?.total_tokens)),
+      cached_input_tokens: sumPresentFinite(rows.map((row) => row.usage?.cached_input_tokens)),
+      reasoning_tokens: sumPresentFinite(rows.map((row) => row.usage?.reasoning_tokens)),
+    },
+    estimated_cost_usd: sumPresentFinite(rows.map((row) => row.estimated_cost_usd)),
+    tool_calls: {
+      observed: sumFinite(rows.map((row) => row.tool_calls_observed)),
+      categories: sumCategories(
+        rows,
+        TOOL_ACCOUNTING_CATEGORIES,
+        (row) => row.transcript_analysis?.tool_categories,
+      ),
+    },
+    commands: {
+      observed: sumFinite(rows.map((row) => row.transcript_analysis?.command_count)),
+      categories: sumCategories(
+        rows,
+        COMMAND_ACCOUNTING_CATEGORIES,
+        (row) => row.transcript_analysis?.command_categories,
+      ),
+    },
+    source_reads: {
+      direct_source_reads_total: sumFinite(
+        rows.map((row) => row.transcript_analysis?.direct_source_reads_total),
+      ),
+      ordinary_source_reads_after_first_codestory: sumFinite(
+        rows.map((row) => row.transcript_analysis?.ordinary_source_reads_after_first_codestory),
+      ),
+      ordinary_source_reads_after_first_packet: sumFinite(
+        rows.map((row) => row.transcript_analysis?.ordinary_source_reads_after_first_packet),
+      ),
+    },
+    external_context_tool_calls: sumFinite(
+      rows.map((row) => row.transcript_analysis?.external_context_tool_calls),
+    ),
+  };
+}
+
+function accountingComparison(withValue, withoutValue) {
+  const withNumber = presentFiniteNumber(withValue);
+  const withoutNumber = presentFiniteNumber(withoutValue);
+  return {
+    with_codestory: withNumber,
+    without_codestory: withoutNumber,
+    with_minus_without:
+      withNumber == null || withoutNumber == null ? null : withNumber - withoutNumber,
+    ratio:
+      withNumber == null || withoutNumber == null || withoutNumber <= 0
+        ? null
+        : withNumber / withoutNumber,
+  };
+}
+
+function summarizeCostAccounting(results) {
+  const byArm = new Map();
+  for (const row of results) {
+    if (!byArm.has(row.arm)) {
+      byArm.set(row.arm, []);
+    }
+    byArm.get(row.arm).push(row);
+  }
+
+  const arms = {};
+  for (const [arm, rows] of byArm.entries()) {
+    arms[arm] = summarizeArmCostAccounting(rows);
+  }
+
+  const withCodeStory = arms.with_codestory ?? null;
+  const withoutCodeStory = arms.without_codestory ?? null;
+  const withVsWithout =
+    withCodeStory && withoutCodeStory
+      ? {
+          runner_wall_ms: accountingComparison(
+            withCodeStory.time_spent_ms.runner_wall,
+            withoutCodeStory.time_spent_ms.runner_wall,
+          ),
+          all_in_wall_ms: accountingComparison(
+            withCodeStory.time_spent_ms.all_in,
+            withoutCodeStory.time_spent_ms.all_in,
+          ),
+          total_tokens: accountingComparison(
+            withCodeStory.tokens_spent.total_tokens,
+            withoutCodeStory.tokens_spent.total_tokens,
+          ),
+          input_tokens: accountingComparison(
+            withCodeStory.tokens_spent.input_tokens,
+            withoutCodeStory.tokens_spent.input_tokens,
+          ),
+          output_tokens: accountingComparison(
+            withCodeStory.tokens_spent.output_tokens,
+            withoutCodeStory.tokens_spent.output_tokens,
+          ),
+          tool_calls: accountingComparison(
+            withCodeStory.tool_calls.observed,
+            withoutCodeStory.tool_calls.observed,
+          ),
+          commands: accountingComparison(
+            withCodeStory.commands.observed,
+            withoutCodeStory.commands.observed,
+          ),
+          estimated_cost_usd: accountingComparison(
+            withCodeStory.estimated_cost_usd,
+            withoutCodeStory.estimated_cost_usd,
+          ),
+        }
+      : null;
+
+  return {
+    measurement_source: "runner_process_wall_clock_and_codex_jsonl",
+    note:
+      "Token and tool-call values are parsed from Codex JSONL stdout. Wall time is measured around each runner process. CodeStory cache preparation is tracked separately and included in all-in wall time.",
+    generated_at: new Date().toISOString(),
+    arms,
+    with_vs_without: withVsWithout,
+  };
 }
 
 function summarizeRuns(results) {
@@ -3588,18 +3927,21 @@ function summarizeRuns(results) {
     const qualityRows = successful.filter((row) => row.quality);
     const packetFirstRows = successful.filter((row) => row.packet_first_required);
     const categoryMedians = {};
-    for (const category of [
-      "codestory_cli",
-      "shell_search",
-      "direct_file_read",
-      "git",
-      "build_test",
-      "other",
-    ]) {
+    for (const category of COMMAND_ACCOUNTING_CATEGORIES) {
       categoryMedians[category] = median(
         successful.map((row) => row.transcript_analysis?.command_categories?.[category] ?? 0),
       );
     }
+    const toolCategoryMedians = {};
+    for (const category of TOOL_ACCOUNTING_CATEGORIES) {
+      toolCategoryMedians[category] = median(
+        successful.map((row) => row.transcript_analysis?.tool_categories?.[category] ?? 0),
+      );
+    }
+    const totalCodestoryCachePreparationWallMs = sumFinite(
+      successful.map((row) => cachePreparationWallMs(row.codestory_cache_provenance?.cache_preparation)),
+    );
+    const totalWallMs = sumFinite(successful.map((row) => row.wall_ms));
     summaries.push({
       repo,
       task_id: taskId || null,
@@ -3612,12 +3954,39 @@ function summarizeRuns(results) {
       packet_first_required_runs: packetFirstRows.length,
       quality_scored_runs: qualityRows.length,
       quality_pass_runs: qualityRows.filter((row) => row.quality?.pass).length,
+      total_wall_ms: totalWallMs,
+      total_codestory_cache_preparation_wall_ms: totalCodestoryCachePreparationWallMs,
+      total_wall_ms_including_codestory_preparation:
+        totalWallMs + totalCodestoryCachePreparationWallMs,
+      total_input_tokens: sumPresentFinite(successful.map((row) => row.usage?.input_tokens)),
+      total_output_tokens: sumPresentFinite(successful.map((row) => row.usage?.output_tokens)),
+      total_tokens: sumPresentFinite(successful.map((row) => row.usage?.total_tokens)),
+      total_estimated_cost_usd: sumPresentFinite(successful.map((row) => row.estimated_cost_usd)),
+      total_tool_calls_observed: sumFinite(successful.map((row) => row.tool_calls_observed)),
+      total_command_count: sumFinite(successful.map((row) => row.transcript_analysis?.command_count)),
+      total_web_search_tool_calls: sumFinite(
+        successful.map((row) => row.transcript_analysis?.tool_categories?.web_search ?? 0),
+      ),
+      total_direct_source_reads_total: sumFinite(
+        successful.map((row) => row.transcript_analysis?.direct_source_reads_total),
+      ),
+      missing_token_usage_runs: successful.filter((row) => row.usage?.total_tokens == null).length,
       median_wall_ms: median(successful.map((row) => row.wall_ms)),
-      median_total_tokens: median(successful.map((row) => row.usage.total_tokens)),
-      median_input_tokens: median(successful.map((row) => row.usage.input_tokens)),
-      median_output_tokens: median(successful.map((row) => row.usage.output_tokens)),
+      median_codestory_cache_preparation_wall_ms: median(
+        successful.map((row) => cachePreparationWallMs(row.codestory_cache_provenance?.cache_preparation)),
+      ),
+      median_codestory_retrieval_index_wall_ms: median(
+        successful.map((row) => row.codestory_cache_provenance?.cache_preparation?.retrieval_index_wall_ms),
+      ),
+      median_total_tokens: median(successful.map((row) => row.usage?.total_tokens)),
+      median_input_tokens: median(successful.map((row) => row.usage?.input_tokens)),
+      median_output_tokens: median(successful.map((row) => row.usage?.output_tokens)),
       median_estimated_cost_usd: median(successful.map((row) => row.estimated_cost_usd)),
+      median_command_count: median(successful.map((row) => row.transcript_analysis?.command_count)),
       median_tool_calls_observed: median(successful.map((row) => row.tool_calls_observed)),
+      median_web_search_tool_calls: median(
+        successful.map((row) => row.transcript_analysis?.tool_categories?.web_search ?? 0),
+      ),
       median_direct_source_reads_total: median(
         successful.map((row) => row.transcript_analysis?.direct_source_reads_total),
       ),
@@ -3646,9 +4015,35 @@ function summarizeRuns(results) {
         qualityRows.map((row) => usefulAnchorHitsPer10kContextChars(row)),
       ),
       median_command_categories: categoryMedians,
+      median_tool_categories: toolCategoryMedians,
+      total_command_categories: sumCategories(
+        successful,
+        COMMAND_ACCOUNTING_CATEGORIES,
+        (row) => row.transcript_analysis?.command_categories,
+      ),
+      total_tool_categories: sumCategories(
+        successful,
+        TOOL_ACCOUNTING_CATEGORIES,
+        (row) => row.transcript_analysis?.tool_categories,
+      ),
     });
   }
   return summaries;
+}
+
+function cachePreparationWallMs(preparation) {
+  if (!preparation) {
+    return null;
+  }
+  if (Number.isFinite(preparation.preparation_wall_ms)) {
+    return preparation.preparation_wall_ms;
+  }
+  const indexMs = Number.isFinite(preparation.index_wall_ms) ? preparation.index_wall_ms : 0;
+  const retrievalIndexMs = Number.isFinite(preparation.retrieval_index_wall_ms)
+    ? preparation.retrieval_index_wall_ms
+    : 0;
+  const fallback = indexMs + retrievalIndexMs;
+  return fallback > 0 ? fallback : null;
 }
 
 function repositoryContextOutputChars(analysis) {
@@ -3679,8 +4074,17 @@ function agentPublishableBlockers(results, opts = {}) {
       if (result.status !== "pass") {
         reasons.push(`status=${result.status}`);
       }
+      if (presentFiniteNumber(result.wall_ms) == null) {
+        reasons.push("missing wall time");
+      }
       if (result.usage?.total_tokens == null) {
         reasons.push("missing total token usage");
+      }
+      if (presentFiniteNumber(result.tool_calls_observed) == null) {
+        reasons.push("missing tool call count");
+      }
+      if (presentFiniteNumber(result.transcript_analysis?.command_count) == null) {
+        reasons.push("missing command count");
       }
       if (result.packet_first_required && !result.packet_first_pass) {
         reasons.push("missing answer packet as first successful context command");
@@ -3702,6 +4106,10 @@ function agentPublishableBlockers(results, opts = {}) {
       if (enforceRepoProvenance) {
         reasons.push(...repoProvenanceBlockers(result));
       }
+      const externalContextCalls = result.transcript_analysis?.external_context_tool_calls ?? 0;
+      if (externalContextCalls > 0) {
+        reasons.push(`external web/search tool calls=${externalContextCalls} > 0`);
+      }
       if (result.arm === "with_codestory" && (opts.publishable || opts.enforceCacheProvenance)) {
         reasons.push(...cacheProvenanceBlockers(result));
       }
@@ -3710,7 +4118,7 @@ function agentPublishableBlockers(results, opts = {}) {
     .filter(Boolean);
 }
 
-function markdownSummary(summary, opts) {
+function markdownSummary(summary, opts, costAccounting = null) {
   const lines = [
     "# CodeStory Agent A/B Benchmark",
     "",
@@ -3719,9 +4127,16 @@ function markdownSummary(summary, opts) {
     `Sandbox: \`${opts.sandbox}\``,
     `Host: \`${os.hostname()}\``,
     "",
-    "| Repo | Task | Arm | Runs | Success | Packet first | Quality pass | Median wall ms | Median tokens | Median cost USD | Median tool calls | Source reads | After CodeStory | After Packet | File recall | Citation coverage | Context chars | Useful anchors / 10k context chars |",
-    "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ];
+  if (costAccounting) {
+    lines.push(...markdownCostAccounting(costAccounting), "");
+  }
+  lines.push(
+    "## Per-task Summary",
+    "",
+    "| Repo | Task | Arm | Runs | Success | Packet first | Quality pass | Median wall ms | CodeStory prep ms | Retrieval index ms | Median tokens | Median cost USD | Median tool calls | Web searches | Median commands | CodeStory cmds | Shell searches | File-read cmds | Source reads | After CodeStory | After Packet | File recall | Citation coverage | Context chars | Useful anchors / 10k context chars |",
+    "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+  );
   for (const row of summary) {
     lines.push(markdownSummaryRow(row));
   }
@@ -3734,6 +4149,38 @@ function markdownSummary(summary, opts) {
   return lines.join("\n");
 }
 
+function markdownCostAccounting(costAccounting) {
+  const lines = [
+    "## Cost Accounting",
+    "",
+    "| Arm | Runs | Success | Wall ms | All-in wall ms | Input tokens | Output tokens | Total tokens | Tool calls | Commands | Web searches | Source reads | Est. cost USD |",
+    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+  ];
+  for (const [arm, row] of Object.entries(costAccounting.arms ?? {})) {
+    lines.push(
+      `| ${arm} | ${row.runs} | ${row.successful_runs} | ${formatValue(row.time_spent_ms?.runner_wall)} | ${formatValue(row.time_spent_ms?.all_in)} | ${formatValue(row.tokens_spent?.input_tokens)} | ${formatValue(row.tokens_spent?.output_tokens)} | ${formatValue(row.tokens_spent?.total_tokens)} | ${formatValue(row.tool_calls?.observed)} | ${formatValue(row.commands?.observed)} | ${formatValue(row.tool_calls?.categories?.web_search)} | ${formatValue(row.source_reads?.direct_source_reads_total)} | ${formatValue(row.estimated_cost_usd)} |`,
+    );
+  }
+  const comparison = costAccounting.with_vs_without;
+  if (comparison) {
+    lines.push(
+      "",
+      "| Comparison | With | Without | Delta | Ratio |",
+      "| --- | ---: | ---: | ---: | ---: |",
+    );
+    for (const [label, values] of Object.entries(comparison)) {
+      lines.push(
+        `| ${label} | ${formatValue(values.with_codestory)} | ${formatValue(values.without_codestory)} | ${formatValue(values.with_minus_without)} | ${formatValue(values.ratio)} |`,
+      );
+    }
+  }
+  lines.push(
+    "",
+    "Accounting source: wall time is measured around each runner process; tokens and tool calls are parsed from Codex JSONL stdout; CodeStory cache preparation is tracked separately and included in all-in wall time.",
+  );
+  return lines;
+}
+
 function markdownSummaryRow(row) {
   const cells = [
     row.repo,
@@ -3744,9 +4191,16 @@ function markdownSummaryRow(row) {
     packetFirstLabel(row),
     qualityPassLabel(row),
     formatValue(row.median_wall_ms),
+    formatValue(row.median_codestory_cache_preparation_wall_ms),
+    formatValue(row.median_codestory_retrieval_index_wall_ms),
     formatValue(row.median_total_tokens),
     formatValue(row.median_estimated_cost_usd),
     formatValue(row.median_tool_calls_observed),
+    formatValue(row.median_web_search_tool_calls),
+    formatValue(row.median_command_count),
+    formatValue(row.median_command_categories?.codestory_cli),
+    formatValue(row.median_command_categories?.shell_search),
+    formatValue(row.median_command_categories?.direct_file_read),
     formatValue(row.median_direct_source_reads_total),
     formatValue(row.median_source_reads_after_codestory),
     formatValue(row.median_source_reads_after_packet),
@@ -3903,6 +4357,15 @@ function runSelfTest() {
     }),
     [null, false, true, "fail"],
   );
+  assert.equal(packetRuntimeQualityGateRequired({ taskSuite: "holdout-retrieval" }), true);
+  assert.equal(
+    packetRuntimeQualityGateRequired({
+      taskSuite: "holdout-retrieval",
+      allowFailures: true,
+    }),
+    false,
+  );
+  assert.equal(packetRuntimeQualityGateRequired({ taskSuite: "local-real" }), false);
   assert.equal(
     cachePreparationAction({
       status: "pass",
@@ -4020,6 +4483,7 @@ async function main() {
   }
 
   const summary = summarizeRuns(results);
+  const costAccounting = summarizeCostAccounting(results);
   const summaryPayload = {
     generated_at: new Date().toISOString(),
     runner: opts.runner,
@@ -4047,9 +4511,10 @@ async function main() {
     retrieval_env: retrievalEnv(),
     retrieval_contract: retrievalContractSummary(benchmarkChildEnv(process.env)),
     summary,
+    cost_accounting: costAccounting,
   };
   await writeFile(path.join(outDir, "summary.json"), `${JSON.stringify(summaryPayload, null, 2)}\n`, "utf8");
-  await writeFile(path.join(outDir, "summary.md"), markdownSummary(summary, opts), "utf8");
+  await writeFile(path.join(outDir, "summary.md"), markdownSummary(summary, opts, costAccounting), "utf8");
 
   const failedRuns = results.filter((result) => result.status !== "pass");
   let exitCode = 0;
@@ -4097,6 +4562,7 @@ export {
   packetComposition,
   packetLatencyTelemetry,
   packetRuntimePublishableBlockers,
+  packetRuntimeQualityGateRequired,
   PACKET_COMPOSITION_WEIGHTS,
   packetCompositionFileScore,
   packetFirstCommandForPrompt,
@@ -4105,6 +4571,7 @@ export {
   repoConfigFromManifest,
   resolveCodeStoryCli,
   scoreQuality,
+  summarizeCostAccounting,
   summarizePacketRuntimeRuns,
   taskSnapshotForResult,
 };

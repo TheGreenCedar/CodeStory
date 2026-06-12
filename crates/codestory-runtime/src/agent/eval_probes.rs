@@ -297,16 +297,30 @@ pub(crate) fn push_eval_architecture_flow_probe_terms(lower_prompt: &str, terms:
     if !eval_probes_enabled() {
         return;
     }
-    if lower_prompt.contains("interceptor") {
-        push_unique_term(terms, "InterceptorManager");
+    if lower_prompt.contains("interceptor")
+        || lower_prompt.contains("dispatchrequest")
+        || lower_prompt.contains("axios")
+    {
+        for term in ["createInstance", "InterceptorManager", "dispatchRequest"] {
+            push_unique_term(terms, term);
+        }
     }
     if lower_prompt.contains("adapter") || lower_prompt.contains("transport") {
-        push_unique_term(terms, "adapters");
+        for term in ["adapters", "adapters.js"] {
+            push_unique_term(terms, term);
+        }
     }
     if lower_prompt.contains("event loop")
         || (lower_prompt.contains("event") && lower_prompt.contains("loop"))
     {
-        for term in ["aeMain", "readQueryFromClient", "processCommand"] {
+        for term in [
+            "server.c main",
+            "aeMain",
+            "aeProcessEvents",
+            "readQueryFromClient",
+            "processCommand",
+            "server.c call",
+        ] {
             push_unique_term(terms, term);
         }
     }
@@ -317,7 +331,12 @@ pub(crate) fn push_eval_architecture_flow_probe_terms(lower_prompt: &str, terms:
             || lower_prompt.contains("printer")
             || lower_prompt.contains("flag"))
     {
-        for term in ["HiArgs", "SearchWorker", "haystack"] {
+        for term in [
+            "core/main.rs",
+            "HiArgs",
+            "SearchWorker::search",
+            "haystack.rs",
+        ] {
             push_unique_term(terms, term);
         }
     }

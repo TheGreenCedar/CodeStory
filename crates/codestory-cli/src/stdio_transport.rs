@@ -1424,25 +1424,51 @@ fn read_stdio_resource(runtime: &RuntimeContext, uri: &str) -> serde_json::Value
 fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Value> {
     let summary = runtime.open_project_summary()?;
     let retrieval = summary.retrieval.as_ref();
-    let sidecar = match codestory_retrieval::strict_sidecar_status(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-    ) {
-        Ok(report) => serde_json::json!({
-            "retrieval_mode": report.retrieval_mode,
-            "degraded_reason": report.degraded_reason,
-            "manifest_generation": report.manifest.as_ref().and_then(|manifest| manifest.sidecar_generation.as_deref()),
-            "manifest_input_hash": report.manifest.as_ref().and_then(|manifest| manifest.sidecar_input_hash.as_deref()),
+    let (sidecar_mode, degraded_reason, manifest_generation, manifest_input_hash) =
+        match codestory_retrieval::strict_sidecar_status(
+            &runtime.project_root,
+            Some(&runtime.storage_path),
+        ) {
+            Ok(report) => {
+                let manifest_generation = report
+                    .manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.sidecar_generation.clone());
+                let manifest_input_hash = report
+                    .manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.sidecar_input_hash.clone());
+                (
+                    report.retrieval_mode,
+                    report.degraded_reason,
+                    manifest_generation,
+                    manifest_input_hash,
+                )
+            }
+            Err(error) => (
+                "unavailable".to_string(),
+                Some(format!("sidecar_status_error: {error}")),
+                None,
+                None,
+            ),
+        };
+    let sidecar = serde_json::json!({
+        "retrieval_mode": sidecar_mode.clone(),
+        "degraded_reason": degraded_reason.clone(),
+        "manifest_generation": manifest_generation.clone(),
+        "manifest_input_hash": manifest_input_hash.clone(),
+    });
+    let readiness = crate::readiness::build_readiness_verdicts(crate::readiness::ReadinessInputs {
+        project: &summary.root,
+        stats: &summary.stats,
+        freshness: summary.freshness.as_ref(),
+        sidecar: Some(crate::readiness::ReadinessSidecarInput {
+            retrieval_mode: &sidecar_mode,
+            degraded_reason: degraded_reason.as_deref(),
+            manifest_generation: manifest_generation.as_deref(),
+            manifest_input_hash: manifest_input_hash.as_deref(),
         }),
-        Err(error) => serde_json::json!({
-            "retrieval_mode": "unavailable",
-            "degraded_reason": format!("sidecar_status_error: {error}"),
-        }),
-    };
-    let sidecar_mode = sidecar
-        .get("retrieval_mode")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unavailable");
+    });
     let recommended_next_calls = if sidecar_mode == "full" {
         serde_json::json!([
             {
@@ -1478,39 +1504,39 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
             }
         ])
     } else {
-        serde_json::json!([
-            {
-                "method": "cli",
-                "command": "codestory-cli retrieval status --project <repo>"
-            },
-            {
-                "method": "cli",
-                "command": "codestory-cli retrieval index --project <repo> --refresh full"
-            },
-            {
-                "method": "resources/read",
-                "uri": "codestory://status"
-            },
-            {
-                "method": "resources/read",
-                "uri": "codestory://agent-guide"
-            },
-            {
-                "method": "tools/call",
-                "tool": "search",
-                "arguments": {
-                    "query": "<symbol-or-concept>",
-                    "limit": 10
-                }
-            }
-        ])
+        let commands = readiness
+            .iter()
+            .find(|verdict| crate::readiness::goal_label(verdict.goal) == "agent_packet_search")
+            .map(|verdict| verdict.full_repair.as_slice())
+            .unwrap_or_default();
+        serde_json::Value::Array(
+            commands
+                .iter()
+                .map(|command| {
+                    serde_json::json!({
+                        "method": "cli",
+                        "command": command
+                    })
+                })
+                .chain([
+                    serde_json::json!({
+                        "method": "resources/read",
+                        "uri": "codestory://status"
+                    }),
+                    serde_json::json!({
+                        "method": "resources/read",
+                        "uri": "codestory://agent-guide"
+                    }),
+                ])
+                .collect(),
+        )
     };
     Ok(serde_json::json!({
         "project_root": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
         "storage_path": crate::display::clean_path_string(&runtime.storage_path.to_string_lossy()),
         "storage_exists": runtime.storage_path.exists(),
-        "retrieval_mode": sidecar["retrieval_mode"],
-        "degraded_reason": sidecar["degraded_reason"],
+        "retrieval_mode": sidecar_mode,
+        "degraded_reason": degraded_reason,
         "sidecar_retrieval": sidecar,
         "legacy_semantic_diagnostics": {
             "mode": retrieval.map(|state| state.mode),
@@ -1521,6 +1547,7 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
             "diagnostic_only": true
         },
         "index_freshness": summary.freshness,
+        "readiness": readiness,
         "recommended_next_calls": recommended_next_calls
     }))
 }
@@ -1926,6 +1953,11 @@ mod tests {
             sidecar_input_hash: Some("hash-a".into()),
             sidecar_generation: Some("project-a-hash-a".into()),
             projection_count: Some(12),
+            symbol_doc_count: Some(120),
+            dense_projection_count: Some(12),
+            semantic_policy_version: Some("graph_first_v1".into()),
+            graph_artifact_hash: Some("graph-hash-a".into()),
+            dense_reason_counts_json: Some(r#"{"public_api":12}"#.into()),
         };
         let before_stale = stdio_mandatory_sidecar_fingerprint_from_status(
             codestory_retrieval::embedding_runtime_id(),

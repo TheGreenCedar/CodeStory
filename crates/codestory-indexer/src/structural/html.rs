@@ -4,7 +4,7 @@ use crate::structural::blanking::{
     extract_style_block_sources,
 };
 use crate::{get_language_for_ext, index_file};
-use codestory_contracts::graph::{NodeId, NodeKind};
+use codestory_contracts::graph::{EdgeId, EdgeKind, NodeId, NodeKind};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -180,6 +180,11 @@ fn merge_delegated_script_graph(
     index_result: crate::IndexResult,
     script_regions: &[super::blanking::EmbeddedRegion],
 ) {
+    let delegated_file_id = index_result
+        .nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::FILE)
+        .map(|node| node.id);
     let script_module = script_regions.first().map(|region| {
         let canonical = format!("html:script-block:{}", region.start_line);
         push_structural_node(
@@ -202,15 +207,43 @@ fn merge_delegated_script_graph(
     }
 
     for mut edge in index_result.edges {
+        if Some(edge.source) == delegated_file_id {
+            edge.source = host_file_id;
+        }
+        if Some(edge.target) == delegated_file_id {
+            edge.target = host_file_id;
+        }
+        if edge.resolved_source == delegated_file_id {
+            edge.resolved_source = Some(host_file_id);
+        }
+        if edge.resolved_target == delegated_file_id {
+            edge.resolved_target = Some(host_file_id);
+        }
         if edge.file_node_id.is_some() {
             edge.file_node_id = Some(host_file_id);
         }
+        if edge.kind == EdgeKind::CALL {
+            let col = edge
+                .callsite_identity
+                .as_deref()
+                .and_then(|identity| identity.split(':').nth(2))
+                .and_then(|value| value.parse::<u32>().ok());
+            edge.callsite_identity = None;
+            crate::ensure_callsite_identity(&mut edge, col);
+        }
+        edge.id = EdgeId(crate::generate_edge_id_for_edge(
+            &edge,
+            crate::index_feature_flags(),
+        ));
         storage.edges.push(edge);
     }
 
     storage
         .occurrences
         .extend(index_result.occurrences.into_iter().map(|mut occurrence| {
+            if Some(NodeId(occurrence.element_id)) == delegated_file_id {
+                occurrence.element_id = host_file_id.0;
+            }
             occurrence.location.file_node_id = host_file_id;
             occurrence
         }));

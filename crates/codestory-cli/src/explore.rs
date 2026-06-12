@@ -136,13 +136,28 @@ pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
     let markdown = render_explore_markdown(&render_context);
     if cmd.format == args::OutputFormat::Markdown
         && cmd.output_file.is_none()
-        && !cmd.no_tui
+        && !explore_plain_requested(&cmd)
         && std::io::stdout().is_terminal()
     {
-        eprintln!("Opening interactive explore TUI; use --no-tui for plain markdown.");
+        eprintln!(
+            "Opening interactive explore TUI; use --no-tui, --plain, or CODESTORY_NO_TUI=1 for plain markdown."
+        );
         return run_explore_tui(&render_context);
     }
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn explore_plain_requested(cmd: &ExploreCommand) -> bool {
+    cmd.no_tui || cmd.plain || env_flag_enabled("CODESTORY_NO_TUI")
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
 }
 
 pub(crate) fn build_explore_artifact_for_target(
@@ -1111,8 +1126,11 @@ fn render_explore_status_markdown(status: &ExploreStatusOutput) -> String {
     } else {
         markdown.push_str("- freshness: unavailable\n");
     }
-    if let Some(command) = status.next_commands.first() {
-        markdown.push_str(&format!("- next: `{command}`\n"));
+    if !status.next_commands.is_empty() {
+        markdown.push_str("- next_commands:\n");
+        for command in &status.next_commands {
+            markdown.push_str(&format!("  - `{command}`\n"));
+        }
     }
     markdown.push_str("- layers:\n");
     for note in &status.layer_notes {
@@ -1482,34 +1500,38 @@ struct ExplorePane {
     body: String,
 }
 
+const EXPLORE_PANE_ORDER: [&str; 9] = [
+    "Status", "Profile", "Search", "Results", "Evidence", "Detail", "Trail", "Snippet", "Source",
+];
+
 fn build_explore_panes(context: &ExploreRenderContext<'_>) -> Vec<ExplorePane> {
     vec![
         ExplorePane {
-            label: "Status",
+            label: EXPLORE_PANE_ORDER[0],
             body: render_explore_status_markdown(context.status),
         },
         ExplorePane {
-            label: "Profile",
+            label: EXPLORE_PANE_ORDER[1],
             body: render_explore_profile_markdown(context.profile),
         },
         ExplorePane {
-            label: "Search",
+            label: EXPLORE_PANE_ORDER[2],
             body: render_explore_search_markdown(context.search),
         },
         ExplorePane {
-            label: "Results",
+            label: EXPLORE_PANE_ORDER[3],
             body: render_explore_results_markdown(context.navigation),
         },
         ExplorePane {
-            label: "Evidence",
+            label: EXPLORE_PANE_ORDER[4],
             body: render_explore_relationship_evidence_markdown(context.relationship_evidence),
         },
         ExplorePane {
-            label: "Detail",
+            label: EXPLORE_PANE_ORDER[5],
             body: render_symbol_markdown(context.project_root, context.target, context.symbol, &[]),
         },
         ExplorePane {
-            label: "Trail",
+            label: EXPLORE_PANE_ORDER[6],
             body: {
                 let cmd =
                     explore_trail_command(context.project_root, context.target, context.trail);
@@ -1517,7 +1539,7 @@ fn build_explore_panes(context: &ExploreRenderContext<'_>) -> Vec<ExplorePane> {
             },
         },
         ExplorePane {
-            label: "Snippet",
+            label: EXPLORE_PANE_ORDER[7],
             body: format!(
                 "{}\n{}",
                 context.snippet_layer_note,
@@ -1536,7 +1558,7 @@ fn build_explore_panes(context: &ExploreRenderContext<'_>) -> Vec<ExplorePane> {
             ),
         },
         ExplorePane {
-            label: "Source",
+            label: EXPLORE_PANE_ORDER[8],
             body: render_explore_source_packet_markdown(context.source_packet),
         },
     ]
@@ -1597,11 +1619,41 @@ fn explore_tui_nav_label(
     format!("{marker} {pane_label} [{}/{}]", pane_index + 1, pane_count)
 }
 
-fn explore_tui_footer_lines() -> [&'static str; 2] {
-    [
-        "Tab/Shift-Tab panes  Up/Down or j/k scroll  PgUp/PgDn page",
-        "Home top  Esc/Ctrl+C/q quit",
-    ]
+fn explore_status_ribbon(status: &ExploreStatusOutput) -> String {
+    let freshness = status
+        .freshness
+        .as_ref()
+        .map(render_explore_freshness)
+        .unwrap_or_else(|| "freshness unavailable".to_string());
+    let retrieval = status
+        .retrieval
+        .as_ref()
+        .map(|state| {
+            if state.semantic_ready {
+                format!("semantic ready docs={}", state.semantic_doc_count)
+            } else {
+                state
+                    .fallback_message
+                    .clone()
+                    .unwrap_or_else(|| "semantic not ready".to_string())
+            }
+        })
+        .unwrap_or_else(|| "retrieval unavailable".to_string());
+    format!(
+        "files={} nodes={} edges={} | {freshness} | {retrieval}",
+        status.indexed_files, status.indexed_nodes, status.indexed_edges
+    )
+}
+
+fn explore_tui_footer_text(status: &ExploreStatusOutput) -> String {
+    let mut lines = vec![
+        "Tab/Shift-Tab panes  Up/Down or j/k scroll  PgUp/PgDn page".to_string(),
+        "Home top  Esc/Ctrl+C/q quit".to_string(),
+    ];
+    if let Some(command) = status.next_commands.first() {
+        lines.push(format!("Next: {command}"));
+    }
+    lines.join("\n")
 }
 
 pub(crate) fn explore_tui_action(key: crossterm::event::KeyEvent) -> ExploreTuiAction {
@@ -1660,9 +1712,13 @@ fn run_explore_tui(context: &ExploreRenderContext<'_>) -> Result<()> {
             let shell = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3),
+                    Constraint::Length(4),
                     Constraint::Min(1),
-                    Constraint::Length(2),
+                    Constraint::Length(if context.status.next_commands.is_empty() {
+                        2
+                    } else {
+                        3
+                    }),
                 ])
                 .split(area);
             let body = Layout::default()
@@ -1678,7 +1734,11 @@ fn run_explore_tui(context: &ExploreRenderContext<'_>) -> Result<()> {
             )
             .unwrap_or_else(|| context.target.selected.display_name.clone());
             frame.render_widget(
-                Paragraph::new(title).block(
+                Paragraph::new(format!(
+                    "{title}\n{}",
+                    explore_status_ribbon(context.status)
+                ))
+                .block(
                     Block::default()
                         .borders(Borders::ALL)
                         .title("CodeStory Explore"),
@@ -1693,9 +1753,9 @@ fn run_explore_tui(context: &ExploreRenderContext<'_>) -> Result<()> {
                     let label =
                         explore_tui_nav_label(pane.label, idx, panes.len(), idx == state.selected);
                     let style = if idx == state.selected {
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD)
+                        Style::default().fg(Color::Cyan).add_modifier(
+                            Modifier::BOLD | Modifier::REVERSED | Modifier::UNDERLINED,
+                        )
                     } else {
                         Style::default()
                     };
@@ -1724,7 +1784,7 @@ fn run_explore_tui(context: &ExploreRenderContext<'_>) -> Result<()> {
                 body[1],
             );
             frame.render_widget(
-                Paragraph::new(explore_tui_footer_lines().join("\n")),
+                Paragraph::new(explore_tui_footer_text(context.status)),
                 shell[2],
             );
         })?;
@@ -1760,8 +1820,24 @@ mod tests {
 
     #[test]
     fn explore_tui_footer_text() {
-        let lines = super::explore_tui_footer_lines();
-        assert_eq!(lines.len(), 2);
+        let status = super::ExploreStatusOutput {
+            project: "C:/repo".to_string(),
+            storage_path: "C:/cache/codestory.db".to_string(),
+            refresh: "none".to_string(),
+            output_target: "stdout".to_string(),
+            indexed_files: 1,
+            indexed_nodes: 2,
+            indexed_edges: 3,
+            retrieval: None,
+            freshness: None,
+            next_commands: vec![
+                "codestory-cli context --project \"C:/repo\" --id node-1".to_string(),
+            ],
+            layer_notes: Vec::new(),
+        };
+        let footer_text = super::explore_tui_footer_text(&status);
+        let lines = footer_text.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
         for line in &lines {
             assert!(line.len() <= 80, "footer line exceeds 80 columns: {line}");
         }
@@ -1780,5 +1856,20 @@ mod tests {
         ] {
             assert!(footer.contains(control), "footer missing {control}");
         }
+        assert!(
+            footer.contains("Next: codestory-cli context"),
+            "footer should expose the first next command: {footer}"
+        );
+    }
+
+    #[test]
+    fn explore_pane_order_is_pinned() {
+        assert_eq!(
+            super::EXPLORE_PANE_ORDER,
+            [
+                "Status", "Profile", "Search", "Results", "Evidence", "Detail", "Trail", "Snippet",
+                "Source",
+            ]
+        );
     }
 }

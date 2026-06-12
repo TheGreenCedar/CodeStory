@@ -19,10 +19,12 @@ import {
   packetLatencyTelemetry,
   packetFirstCommandForPrompt,
   packetRuntimePublishableBlockers,
+  packetRuntimeQualityGateRequired,
   publicCoreCorpusAudit,
   repoProvenanceBlockers,
   resolveCodeStoryCli,
   scoreQuality,
+  summarizeCostAccounting,
   summarizePacketRuntimeRuns,
   buildQualityDebugPayload,
   qualityFailureReasons,
@@ -199,7 +201,15 @@ async function withManifestFile(manifest, callback) {
 
 test("categorizes commands without treating source paths as cli invocations", () => {
   assert.equal(commandCategory("& $env:CODESTORY_CLI packet --project . --question flow"), "codestory_cli");
+  assert.equal(commandCategory('"${CODESTORY_CLI:-codestory-cli}" packet --project . --question flow'), "codestory_cli");
+  assert.equal(commandCategory('"$CODESTORY_CLI" index --project . --refresh full'), "codestory_cli");
   assert.equal(commandCategory('& "C:\\tools\\codestory-cli.exe" packet --project . --question flow'), "codestory_cli");
+  assert.equal(
+    commandCategory(
+      String.raw`"C:\Program Files\PowerShell\pwsh.exe" -Command '& $(if ($env:CODESTORY_CLI) { $env:CODESTORY_CLI } else { 'codestory-cli' }) packet --project . --question 'Trace flow' --task-class 'route-tracing' --budget compact --format json"`,
+    ),
+    "codestory_cli",
+  );
   assert.equal(
     commandCategory(
       '"C:\\Program Files\\PowerShell\\pwsh.exe" -Command "& \\"C:\\tools\\codestory-cli.exe\\" packet --project . --question flow"',
@@ -260,19 +270,34 @@ test("rejects manifest repo and workspace paths outside the cache", async () => 
   );
 });
 
-test("packet-first command renders manifest text as PowerShell literals", () => {
-  const command = packetFirstCommandForPrompt(
+test("packet-first command renders manifest text for host shells", () => {
+  const windowsCommand = packetFirstCommandForPrompt(
     "Inspect $env:SECRET and $(Get-ChildItem), then read John's file.\nNext line.",
     { task_class: "bug_localization" },
+    "win32",
   );
 
   assert.match(
-    command,
+    windowsCommand,
     /--question 'Inspect \$env:SECRET and \$\(Get-ChildItem\), then read John''s file\. Next line\.'/,
   );
-  assert.match(command, /--task-class 'bug-localization'/);
+  assert.match(windowsCommand, /--task-class 'bug-localization'/);
+
+  const unixCommand = packetFirstCommandForPrompt(
+    "Inspect $env:SECRET and $(Get-ChildItem), then read John's file.\nNext line.",
+    { task_class: "bug_localization" },
+    "linux",
+  );
+
+  assert.ok(unixCommand.startsWith('"${CODESTORY_CLI:-codestory-cli}" packet '));
+  assert.ok(
+    unixCommand.includes(
+      "--question 'Inspect $env:SECRET and $(Get-ChildItem), then read John'\\''s file. Next line.'",
+    ),
+  );
+  assert.match(unixCommand, /--task-class 'bug-localization'/);
   assert.throws(
-    () => packetFirstCommandForPrompt("Explain the task.", { task_class: "bug_localization; Remove-Item ." }),
+    () => packetFirstCommandForPrompt("Explain the task.", { task_class: "bug_localization; Remove-Item ." }, "linux"),
     /task_class/,
   );
 });
@@ -418,6 +443,148 @@ test("analyzes transcript command friction and scores manifest anchors", () => {
   assert.equal(quality.citation_coverage.recall, 1);
 });
 
+test("counts direct source reads for every supported language extension family", () => {
+  const paths = [
+    "src/main.rs",
+    "src/app.py",
+    "src/App.java",
+    "src/index.js",
+    "src/index.tsx",
+    "include/fmt/base.hpp",
+    "src/server.c",
+    "router.go",
+    "lib/site.rb",
+    "src/Logger.php",
+    "src/Mapper.cs",
+    "src/Main.kt",
+    "Package.swift",
+    "lib/client.dart",
+    "nvm.sh",
+    "index.html",
+    "styles/site.css",
+    "schema/chinook.sql",
+  ];
+  const events = paths.flatMap((sourcePath, index) => [
+    commandEvent(`cmd_${index}`, "item.started", `Get-Content ${sourcePath}`),
+    commandEvent(`cmd_${index}`, "item.completed", `Get-Content ${sourcePath}`, "source"),
+  ]);
+
+  const analysis = analyzeTranscript(events);
+  assert.equal(analysis.command_categories.direct_file_read, paths.length);
+  assert.equal(analysis.direct_source_reads_total, paths.length);
+});
+
+test("counts modern Codex JSONL tool categories including web search", () => {
+  const events = [
+    {
+      type: "item.started",
+      item: {
+        id: "item_web",
+        type: "web_search",
+        query: "github psf requests api.py",
+      },
+    },
+    {
+      type: "item.completed",
+      item: {
+        id: "item_web",
+        type: "web_search",
+        query: "github psf requests api.py",
+      },
+    },
+    {
+      type: "item.started",
+      item: {
+        id: "item_mcp",
+        type: "mcp_tool_call",
+        server: "codex",
+        tool: "list_mcp_resources",
+      },
+    },
+  ];
+
+  const analysis = analyzeTranscript(events);
+  assert.equal(analysis.command_count, 0);
+  assert.equal(analysis.tool_categories.web_search, 1);
+  assert.equal(analysis.tool_categories.mcp_tool_call, 1);
+  assert.equal(analysis.external_context_tool_calls, 1);
+
+  const blockers = agentPublishableBlockers([
+    {
+      status: "pass",
+      arm: "without_codestory",
+      usage: { total_tokens: 1 },
+      transcript_analysis: analysis,
+    },
+  ]);
+  assert.match(blockers[0].reasons.join("\n"), /external web\/search tool calls=1 > 0/);
+});
+
+test("summarizes A/B cost accounting totals and ratios", () => {
+  const costAccounting = summarizeCostAccounting([
+    {
+      arm: "without_codestory",
+      status: "pass",
+      wall_ms: 200,
+      usage: { input_tokens: 80, output_tokens: 20, total_tokens: 100 },
+      estimated_cost_usd: 0.02,
+      tool_calls_observed: 4,
+      transcript_analysis: {
+        command_count: 4,
+        tool_categories: { command_execution: 4 },
+        command_categories: { shell_search: 2, direct_file_read: 2 },
+        direct_source_reads_total: 2,
+        external_context_tool_calls: 0,
+      },
+    },
+    {
+      arm: "with_codestory",
+      status: "pass",
+      wall_ms: 50,
+      usage: { input_tokens: 30, output_tokens: 10, total_tokens: 40 },
+      estimated_cost_usd: 0.01,
+      tool_calls_observed: 1,
+      codestory_cache_provenance: {
+        cache_preparation: { preparation_wall_ms: 10 },
+      },
+      transcript_analysis: {
+        command_count: 1,
+        tool_categories: { command_execution: 1 },
+        command_categories: { codestory_cli: 1 },
+        direct_source_reads_total: 0,
+        external_context_tool_calls: 0,
+      },
+    },
+    {
+      arm: "with_codestory",
+      status: "fail",
+      wall_ms: 5,
+      usage: null,
+      estimated_cost_usd: null,
+      tool_calls_observed: 1,
+      transcript_analysis: {
+        command_count: 1,
+        tool_categories: { command_execution: 1 },
+        command_categories: { codestory_cli: 1 },
+        direct_source_reads_total: 0,
+        external_context_tool_calls: 0,
+      },
+    },
+  ]);
+
+  assert.equal(costAccounting.arms.with_codestory.runs, 2);
+  assert.equal(costAccounting.arms.with_codestory.failed_runs, 1);
+  assert.equal(costAccounting.arms.with_codestory.missing_token_usage_runs, 1);
+  assert.equal(costAccounting.arms.with_codestory.time_spent_ms.runner_wall, 55);
+  assert.equal(costAccounting.arms.with_codestory.time_spent_ms.all_in, 65);
+  assert.equal(costAccounting.arms.with_codestory.tokens_spent.total_tokens, 40);
+  assert.equal(costAccounting.arms.without_codestory.tool_calls.observed, 4);
+  assert.equal(costAccounting.arms.without_codestory.commands.categories.shell_search, 2);
+  assert.equal(costAccounting.with_vs_without.total_tokens.ratio, 0.4);
+  assert.equal(costAccounting.with_vs_without.all_in_wall_ms.ratio, 0.325);
+  assert.equal(costAccounting.with_vs_without.tool_calls.with_minus_without, -2);
+});
+
 test("parses JSONL transcript text before analysis", () => {
   const jsonl = [
     JSON.stringify(commandEvent("cmd_1", "item.started", "codestory-cli packet --project . --question flow")),
@@ -466,6 +633,33 @@ test("requires packet as the CodeStory subcommand for packet-first telemetry", (
   assert.equal(analysis.first_successful_packet_command.id, "cmd_3");
   assert.equal(analysis.first_successful_context_command.id, "cmd_1");
   assert.equal(analysis.packet_was_first_context_command, false);
+});
+
+test("recognizes quoted PowerShell variable CodeStory packet commands", () => {
+  const command =
+    "\"C:\\\\Program Files\\\\PowerShell\\\\pwsh.exe\" -Command '$cli = if ($env:CODESTORY_CLI) { $env:CODESTORY_CLI } else { '\"'codestory-cli' }\n& \"'$cli packet --project . --question '\"'Explain flow' --task-class 'architecture-explanation' --budget compact --format json\"";
+  const events = [
+    commandEvent("cmd_1", "item.started", command),
+    commandEvent("cmd_1", "item.completed", command, "{\"packet_id\":\"ask-1\"}", 0),
+  ];
+
+  const analysis = analyzeTranscript(events);
+  assert.equal(analysis.command_categories.codestory_cli, 1);
+  assert.equal(analysis.first_successful_packet_command.id, "cmd_1");
+  assert.equal(analysis.packet_was_first_context_command, true);
+});
+
+test("recognizes inline PowerShell env fallback CodeStory packet commands", () => {
+  const command = String.raw`"C:\Program Files\PowerShell\pwsh.exe" -Command '& $(if ($env:CODESTORY_CLI) { $env:CODESTORY_CLI } else { 'codestory-cli' }) packet --project . --question 'Trace flow' --task-class 'route-tracing' --budget compact --format json"`;
+  const events = [
+    commandEvent("cmd_1", "item.started", command),
+    commandEvent("cmd_1", "item.completed", command, "{\"packet_id\":\"ask-1\"}", 0),
+  ];
+
+  const analysis = analyzeTranscript(events);
+  assert.equal(analysis.command_categories.codestory_cli, 1);
+  assert.equal(analysis.first_successful_packet_command.id, "cmd_1");
+  assert.equal(analysis.packet_was_first_context_command, true);
 });
 
 test("packet-first telemetry treats git and help probes before packet as context", () => {
@@ -810,11 +1004,14 @@ function publishableWithCodeStoryResult(overrides = {}) {
     arm: "with_codestory",
     repeat: 1,
     status: "pass",
+    wall_ms: 10,
     usage: { total_tokens: 100 },
+    tool_calls_observed: 1,
     packet_first_required: true,
     packet_first_pass: true,
     quality: { pass: true },
     transcript_analysis: {
+      command_count: 1,
       ordinary_source_reads_after_first_packet: 0,
     },
     repo_provenance: pinnedRepoProvenance(),
@@ -977,6 +1174,29 @@ test("publishable gate accepts local-only CodeStory cache provenance", () => {
   assert.deepEqual(blockers, []);
 });
 
+test("publishable gate requires resource accounting fields", () => {
+  const blockers = agentPublishableBlockers(
+    [
+      publishableWithCodeStoryResult({
+        wall_ms: null,
+        usage: { total_tokens: null },
+        tool_calls_observed: null,
+        transcript_analysis: {
+          ordinary_source_reads_after_first_packet: 0,
+        },
+      }),
+    ],
+    { publishable: true },
+  );
+
+  assert.equal(blockers.length, 1);
+  const reasons = blockers[0].reasons.join("\n");
+  assert.match(reasons, /missing wall time/);
+  assert.match(reasons, /missing total token usage/);
+  assert.match(reasons, /missing tool call count/);
+  assert.match(reasons, /missing command count/);
+});
+
 test("publishable gate requires CodeStory local-only provenance", () => {
   const blockers = agentPublishableBlockers(
     [
@@ -1046,6 +1266,21 @@ test("packet runtime publishable gate requires SLA pass and full retrieval shado
   assert.match(blockers[0].reasons.join("\n"), /packet retrieval SLA missed=true; expected false/);
   assert.match(blockers[1].reasons.join("\n"), /missing retrieval shadow telemetry/);
   assert.match(blockers[2].reasons.join("\n"), /packet retrieval shadow mode=degraded; expected full/);
+});
+
+test("holdout packet runtime requires quality gate unless failures are allowed", () => {
+  assert.equal(
+    packetRuntimeQualityGateRequired({ taskSuite: "holdout-retrieval" }),
+    true,
+  );
+  assert.equal(
+    packetRuntimeQualityGateRequired({
+      taskSuite: "holdout-retrieval",
+      allowFailures: true,
+    }),
+    false,
+  );
+  assert.equal(packetRuntimeQualityGateRequired({ taskSuite: "local-real" }), false);
 });
 
 test("reanalysis uses the run-time task snapshot before current manifest contents", async () => {

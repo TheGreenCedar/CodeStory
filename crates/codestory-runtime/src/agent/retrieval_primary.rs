@@ -161,13 +161,41 @@ fn sidecar_retrieval_recovery_commands(project: &str) -> Vec<String> {
     vec![
         format!("codestory-cli index --project {project} --refresh full"),
         format!("codestory-cli retrieval bootstrap --project {project} --format json"),
-        format!("codestory-cli retrieval index --project {project} --refresh full"),
+        format!("codestory-cli retrieval index --project {project} --refresh full --format json"),
         format!("codestory-cli doctor --project {project} --format markdown"),
     ]
 }
 
 fn quote_cli_arg(value: &str) -> String {
+    let normalized = clean_cli_path(value);
+    if normalized
+        .chars()
+        .any(|ch| matches!(ch, '$' | '`' | '\'' | '"'))
+    {
+        quote_shell_single_quoted_arg(&normalized)
+    } else {
+        format!("\"{}\"", normalized.replace('"', "\\\""))
+    }
+}
+
+#[cfg(windows)]
+fn quote_shell_single_quoted_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn quote_shell_single_quoted_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn clean_cli_path(value: &str) -> String {
+    let mut path = value.replace('\\', "/");
+    if let Some(stripped) = path.strip_prefix("//?/UNC/") {
+        path = format!("//{stripped}");
+    } else if path.starts_with("//?/") {
+        path = path[4..].to_string();
+    }
+    path
 }
 
 pub(crate) fn shadow_retrieval_enabled() -> bool {
@@ -454,7 +482,7 @@ fn search_sidecar_packet_batch_inner(
 
 fn sidecar_packet_batch_rejection_reason(
     query_result: &QueryResult,
-    resolved_hits: &[SearchHit],
+    _resolved_hits: &[SearchHit],
 ) -> Option<String> {
     if !sidecar_mode_can_serve_primary(&query_result.trace.retrieval_mode) {
         return Some(format!(
@@ -462,19 +490,7 @@ fn sidecar_packet_batch_rejection_reason(
             query_result.trace.retrieval_mode
         ));
     }
-    if sidecar_packet_batch_unresolved_full_mode(query_result, resolved_hits) {
-        return Some("sidecar retrieval candidates did not resolve to indexed symbols".into());
-    }
     None
-}
-
-fn sidecar_packet_batch_unresolved_full_mode(
-    query_result: &QueryResult,
-    resolved_hits: &[SearchHit],
-) -> bool {
-    sidecar_mode_can_serve_primary(&query_result.trace.retrieval_mode)
-        && !query_result.hits.is_empty()
-        && resolved_hits.is_empty()
 }
 
 pub(crate) fn packet_batch_should_use_sidecar(controller: &AppController) -> bool {
@@ -1051,6 +1067,16 @@ fn resolve_candidate_node_id(
     rel_path: &str,
     candidate: &CandidateHit,
 ) -> Option<CoreNodeId> {
+    if let Some(node_id) = candidate
+        .node_id
+        .as_deref()
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .map(CoreNodeId)
+        && storage.get_node(node_id).ok().flatten().is_some()
+    {
+        return Some(node_id);
+    }
+
     if let Some(line) = candidate.start_line {
         let mut first_nodes = Vec::new();
         for lookup_path in candidate_lookup_paths(project_root, rel_path) {
@@ -1156,16 +1182,41 @@ pub(crate) fn resolve_sidecar_candidates_to_search_hits(
         else {
             continue;
         };
-        hit.score_breakdown = Some(RetrievalScoreBreakdownDto {
-            lexical: candidate.score,
-            semantic: 0.0,
-            graph: 0.0,
-            total: candidate.score,
-        });
+        hit.score_breakdown = Some(score_breakdown_for_candidate(candidate));
         hits.push(hit);
     }
 
     Ok(hits)
+}
+
+fn score_breakdown_for_candidate(candidate: &CandidateHit) -> RetrievalScoreBreakdownDto {
+    let provenance = candidate_provenance_labels(candidate);
+    let (lexical, semantic, graph) = match candidate.source {
+        CandidateSource::Zoekt => (candidate.score, 0.0, 0.0),
+        CandidateSource::Qdrant => (0.0, candidate.score, 0.0),
+        CandidateSource::Scip => (0.0, 0.0, candidate.score),
+        CandidateSource::Legacy => (candidate.score, 0.0, 0.0),
+    };
+    RetrievalScoreBreakdownDto {
+        lexical,
+        semantic,
+        graph,
+        total: candidate.score,
+        provenance,
+    }
+}
+
+fn candidate_provenance_labels(candidate: &CandidateHit) -> Vec<String> {
+    if !candidate.provenance.is_empty() {
+        return candidate.provenance.clone();
+    }
+    let label = match candidate.source {
+        CandidateSource::Zoekt => "lexical_source",
+        CandidateSource::Qdrant => "dense_anchor",
+        CandidateSource::Scip => "graph_neighbor",
+        CandidateSource::Legacy => "legacy",
+    };
+    vec![label.to_string()]
 }
 
 #[cfg(test)]
@@ -1498,17 +1549,22 @@ mod tests {
     }
 
     #[test]
-    fn recovery_commands_quote_powershell_sensitive_project_paths() {
+    fn recovery_commands_quote_shell_sensitive_project_paths() {
         let commands = sidecar_retrieval_recovery_commands(r"C:\tmp\cost$cache`tick's repo");
+
+        #[cfg(windows)]
+        let expected_project = r"'C:/tmp/cost$cache`tick''s repo'";
+        #[cfg(not(windows))]
+        let expected_project = r"'C:/tmp/cost$cache`tick'\''s repo'";
 
         assert_eq!(
             commands[0],
-            r"codestory-cli index --project 'C:\tmp\cost$cache`tick''s repo' --refresh full"
+            format!("codestory-cli index --project {expected_project} --refresh full")
         );
         assert!(
             commands
                 .iter()
-                .all(|command| command.contains(r"--project 'C:\tmp\cost$cache`tick''s repo'")),
+                .all(|command| command.contains(&format!("--project {expected_project}"))),
             "all recovery commands should quote the project path literally: {commands:?}"
         );
     }
@@ -1551,6 +1607,11 @@ mod tests {
                 sidecar_input_hash: Some(hash.into()),
                 sidecar_generation: Some(generation),
                 projection_count: Some(0),
+                symbol_doc_count: Some(0),
+                dense_projection_count: Some(0),
+                semantic_policy_version: Some("graph_first_v1".into()),
+                graph_artifact_hash: Some("graph-test-hash".into()),
+                dense_reason_counts_json: Some("{}".into()),
             })
             .expect("manifest");
 
@@ -1646,7 +1707,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_batch_allows_empty_full_mode_queries_but_rejects_unresolved_candidates() {
+    fn packet_batch_allows_empty_and_unresolved_full_mode_queries() {
         use codestory_retrieval::{CandidateSource, classify_query};
 
         let empty_full = QueryResult {
@@ -1667,7 +1728,6 @@ mod tests {
             sidecar_packet_batch_rejection_reason(&empty_full, &[]),
             None
         );
-        assert!(!sidecar_packet_batch_unresolved_full_mode(&empty_full, &[]));
 
         let unresolved = QueryResult {
             query: "handler".into(),
@@ -1690,9 +1750,9 @@ mod tests {
         };
         assert_eq!(
             sidecar_packet_batch_rejection_reason(&unresolved, &[]),
-            Some("sidecar retrieval candidates did not resolve to indexed symbols".to_string())
+            None,
+            "packet subqueries should not fail the whole packet just because one full-mode sidecar candidate could not resolve"
         );
-        assert!(sidecar_packet_batch_unresolved_full_mode(&unresolved, &[]));
 
         let unresolved_scip_only = QueryResult {
             query: "neutral sidecar candidate".into(),
@@ -1715,13 +1775,9 @@ mod tests {
         };
         assert_eq!(
             sidecar_packet_batch_rejection_reason(&unresolved_scip_only, &[]),
-            Some("sidecar retrieval candidates did not resolve to indexed symbols".to_string()),
-            "packet batch should fail closed when SCIP-only candidates do not resolve"
+            None,
+            "SCIP-only subqueries may be empty when the candidate does not resolve"
         );
-        assert!(sidecar_packet_batch_unresolved_full_mode(
-            &unresolved_scip_only,
-            &[]
-        ));
     }
 
     #[test]

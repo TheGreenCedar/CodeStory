@@ -635,8 +635,7 @@ fn doctor_next_commands_stop_at_index_repair_when_inventory_is_stale() {
     assert!(
         joined.contains("codestory-cli index")
             && joined.contains("--refresh incremental")
-            && joined.contains("codestory-cli doctor")
-            && joined.contains("--format markdown"),
+            && joined.contains("codestory-cli doctor"),
         "stale doctor should recommend index repair then doctor recheck: {doctor:#}"
     );
     assert!(
@@ -706,8 +705,7 @@ fn doctor_next_commands_stop_at_retrieval_repair_when_sidecar_is_not_full() {
         joined.contains("codestory-cli retrieval status")
             && joined.contains("codestory-cli retrieval index")
             && joined.contains("--refresh full")
-            && joined.contains("codestory-cli doctor")
-            && joined.contains("--format markdown"),
+            && joined.contains("codestory-cli doctor"),
         "doctor should recommend retrieval repair before packet/search: {doctor:#}"
     );
     assert!(
@@ -1628,8 +1626,11 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
     assert!(
         files["summary"]["language_counts"]
             .as_array()
-            .is_some_and(|items| !items.is_empty()),
-        "files JSON should include language counts: {files:#}"
+            .is_some_and(|items| items.iter().any(|item| item["language"] == "rust"
+                && item["support_mode"] == "parser_backed_graph"
+                && item["evidence_tier"] == "graph_fidelity"
+                && item["claim_label"] == "parser-backed graph, fidelity-gated")),
+        "files JSON should include language counts with support tiers: {files:#}"
     );
     assert!(
         files["summary"]["framework_route_coverage"]
@@ -1683,9 +1684,13 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
     assert!(
         files_markdown.contains("# indexed files")
             && files_markdown.contains("languages:")
+            && files_markdown.contains("rust=")
+            && files_markdown.contains("[parser_backed_graph; graph_fidelity]")
+            && files_markdown.contains("language_support_claims:")
+            && files_markdown.contains("parser-backed graph, fidelity-gated")
             && files_markdown.contains("coverage:")
             && files_markdown.contains("framework route coverage:"),
-        "files markdown should summarize inventory and coverage:\n{files_markdown}"
+        "files markdown should summarize inventory, support tiers, and coverage:\n{files_markdown}"
     );
 
     let affected = run_cli_json(

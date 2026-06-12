@@ -7,14 +7,18 @@ with `retrieval_mode=full`.
 `full` means all of the following are true for the same generation:
 
 - Zoekt lexical shard exists, matches the current lexical input hash, and
-  answers smoke queries.
-- Qdrant collection exists, has at least the manifest projection count, uses the
-  product llama.cpp `bge-base-en-v1.5` embedding backend, and answers semantic
-  smoke queries.
+  answers smoke queries against source files plus generated graph-native symbol
+  docs and component-report virtual docs.
+- Qdrant collection exists, has at least the manifest dense-anchor projection
+  count, uses the product llama.cpp `bge-base-en-v1.5` embedding backend, and
+  answers semantic smoke queries when the active semantic policy selects one or
+  more dense anchors. If the active policy selects zero dense anchors, Qdrant is
+  explicitly not required for that generation.
 - SCIP graph artifacts exist and are not stub markers.
 - The SQLite `retrieval_index_manifest` has the current schema version,
   sidecar input hash, sidecar generation, Qdrant collection, embedding backend,
-  embedding dimension, and projection count.
+  embedding dimension, symbol-doc count, dense-anchor count, semantic policy
+  version, graph artifact hash, and dense reason counts.
 
 Everything else is diagnostic only. `no_scip`, `no_semantic`, `lexical_only`,
 `unavailable`, stale manifests, stub markers, disabled sidecars, hash vectors,
@@ -33,13 +37,14 @@ agent-facing packet/search.
 
 ## Mode Matrix
 
-| Zoekt | Qdrant | SCIP | Mode | Product behavior |
-|-------|--------|------|------|------------------|
-| up | up | up | `full` | Serve packet/search evidence |
-| up | up | down | `no_scip` | Fail closed |
-| up | down | up | `no_semantic` | Fail closed |
-| up | down | down | `lexical_only` | Fail closed |
-| down | * | * | `unavailable` | Fail closed |
+| Zoekt | Qdrant | SCIP | Dense anchors | Mode | Product behavior |
+|-------|--------|------|---------------|------|------------------|
+| up | up | up | >0 | `full` | Serve packet/search evidence |
+| up | skipped by policy | up | 0 | `full` | Serve graph/lexical packet/search evidence; dense stage is explicitly skipped |
+| up | up | down | any | `no_scip` | Fail closed |
+| up | down | up | >0 | `no_semantic` | Fail closed |
+| up | down | down | >0 | `lexical_only` | Fail closed |
+| down | * | * | any | `unavailable` | Fail closed |
 
 Runtime rules:
 
@@ -53,19 +58,46 @@ Runtime rules:
 ## Generation And Reuse
 
 Sidecar generation is content-addressed by project id and sidecar input hash.
-The hash includes local lexical input, symbol projection rows, semantic file
-role metadata, sidecar schema version, Zoekt version pin, embedding backend,
-embedding dimension, and SCIP artifact contract inputs.
+The hash includes local lexical input, graph-native `symbol_search_doc` rows,
+dense-anchor rows, semantic file-role metadata, sidecar schema version, Zoekt
+version pin, embedding backend, embedding dimension, semantic policy version,
+dense reason counts, and SCIP artifact contract inputs.
 
 `retrieval index --refresh auto` should reuse an unchanged healthy generation.
 If inputs match but health is not `full`, CodeStory rebuilds the unhealthy
 component and persists the manifest only after the full stack is healthy.
 
+## AST-First Semantic Contract
+
+Code structure is graph-native first. Runtime writes a deterministic
+`symbol_search_doc` for every durable AST symbol. These docs contain symbol name,
+kind, file, signature, comments, aliases, related symbols, edge digest, hash,
+policy version, extracted provenance, and file/node provenance. They are indexed
+lexically and used for candidate generation and graph expansion; they are not
+embedded by default.
+
+Dense vectors are reserved for `graph_first_v1` anchors. Allowed reasons are
+`public_api`, `entrypoint`, `documented_nontrivial`, `central_graph_node`,
+`component_report`, and `unstructured_doc`. Rejected private trivial helpers,
+generated/vendor code, test-only helpers, and local implementation details must
+still be discoverable through symbol docs, source lexical search, exact symbol
+lookup, and graph expansion. There is no anonymous foreground cap: every dense
+or skipped symbol must be explainable through policy counters.
+
+Component reports are deterministic extracted graph artifacts. They group symbols
+by crate/module/directory ownership and summarize central "god node" symbols
+using import/call/reference shape. Reports are virtual docs in the lexical shard
+and may be dense anchors with reason `component_report`.
+
 ## Evidence Rules
 
 - Exact symbol and path evidence remains the precision floor.
-- Semantic and graph evidence can expand or rank candidates, but cannot replace
-  a missing exact sidecar contract.
+- Candidate generation order is exact symbol/AST lookup, lexical source and
+  virtual-doc search, graph expansion, then dense-anchor augmentation.
+- Dense search must never be the only recall path for code symbols.
+- Served search evidence should expose provenance labels such as `exact`,
+  `lexical_source`, `symbol_doc`, `graph_neighbor`, `component_report`, and
+  `dense_anchor`.
 - Broad prompt retrieval should let lexical/source evidence compete with
   semantic evidence and should downrank tests, generated files, benchmarks, and
   vendor paths unless the query explicitly asks for those roles.

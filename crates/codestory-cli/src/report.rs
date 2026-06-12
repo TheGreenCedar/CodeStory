@@ -1,10 +1,12 @@
 use anyhow::{Result, bail};
 use std::fmt::Write as _;
 
-use crate::args::{OutputFormat, ReportCommand};
+use codestory_runtime::graph_analysis::{RepoReport, RepoReportHandoff, ReportNodeSummary};
+
+use crate::args::{OutputFormat, ReportCommand, ReportProfile};
 use crate::display::clean_path_string;
 use crate::output::{emit, validate_output_file_parent};
-use crate::runtime::{RuntimeContext, ensure_index_ready};
+use crate::runtime::{RuntimeContext, ensure_index_ready, map_cache_busy_anyhow};
 
 pub(crate) fn run_report(cmd: ReportCommand) -> Result<()> {
     if matches!(cmd.format, OutputFormat::Dot) {
@@ -17,23 +19,28 @@ pub(crate) fn run_report(cmd: ReportCommand) -> Result<()> {
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let opened = runtime.ensure_open(crate::args::RefreshMode::None)?;
     ensure_index_ready(&opened, "report")?;
+    let sidecar = report_sidecar_status(&runtime);
     match cmd.format {
         OutputFormat::Markdown => {
-            let output = codestory_runtime::graph_analysis::build_report(
+            let mut output = codestory_runtime::graph_analysis::build_report(
                 &runtime.project_root,
                 &runtime.storage_path,
                 cmd.limit,
-            )?;
-            let markdown = render_report_markdown(&output);
+            )
+            .map_err(|error| map_cache_busy_anyhow(error, &runtime.project_root))?;
+            attach_report_handoff(&mut output, &opened.summary, &sidecar);
+            let markdown = render_report_markdown(&output, cmd.profile);
             emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
         }
         OutputFormat::Json => {
-            let output = codestory_runtime::graph_analysis::build_report_export(
+            let mut output = codestory_runtime::graph_analysis::build_report_export(
                 &runtime.project_root,
                 &runtime.storage_path,
                 cmd.limit,
-            )?;
-            let markdown = render_report_markdown(&output.report);
+            )
+            .map_err(|error| map_cache_busy_anyhow(error, &runtime.project_root))?;
+            attach_report_handoff(&mut output.report, &opened.summary, &sidecar);
+            let markdown = render_report_markdown(&output.report, cmd.profile);
             emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
         }
         OutputFormat::Dot => {
@@ -42,7 +49,7 @@ pub(crate) fn run_report(cmd: ReportCommand) -> Result<()> {
     }
 }
 
-fn render_report_markdown(output: &codestory_runtime::graph_analysis::RepoReport) -> String {
+fn render_report_markdown(output: &RepoReport, profile: ReportProfile) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# CodeStory Repo Report");
     let _ = writeln!(
@@ -67,6 +74,12 @@ fn render_report_markdown(output: &codestory_runtime::graph_analysis::RepoReport
     );
     let _ = writeln!(markdown);
 
+    append_handoff_header(&mut markdown, output);
+    if profile == ReportProfile::Handoff {
+        append_follow_ups(&mut markdown, output);
+        return markdown;
+    }
+
     append_summary(&mut markdown, output);
     append_node_section(&mut markdown, "Hotspots", &output.hotspots);
     append_node_section(&mut markdown, "Entry Points", &output.entry_points);
@@ -81,6 +94,148 @@ fn render_report_markdown(output: &codestory_runtime::graph_analysis::RepoReport
         "JSON graph export: rerun with `--format json` to get the full current graph, including nodes, edges, confidence/certainty, source locations, and generation metadata."
     );
     markdown
+}
+
+#[derive(Debug, Clone)]
+struct ReportSidecarStatus {
+    retrieval_mode: String,
+    degraded_reason: Option<String>,
+    manifest_generation: Option<String>,
+    manifest_input_hash: Option<String>,
+}
+
+fn report_sidecar_status(runtime: &RuntimeContext) -> ReportSidecarStatus {
+    match codestory_retrieval::strict_sidecar_status(
+        &runtime.project_root,
+        Some(&runtime.storage_path),
+    ) {
+        Ok(report) => {
+            let manifest_generation = report
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest.sidecar_generation.clone());
+            let manifest_input_hash = report
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest.sidecar_input_hash.clone());
+            ReportSidecarStatus {
+                retrieval_mode: report.retrieval_mode,
+                degraded_reason: report.degraded_reason,
+                manifest_generation,
+                manifest_input_hash,
+            }
+        }
+        Err(error) => ReportSidecarStatus {
+            retrieval_mode: "unavailable".to_string(),
+            degraded_reason: Some(format!("sidecar_status_error: {error}")),
+            manifest_generation: None,
+            manifest_input_hash: None,
+        },
+    }
+}
+
+fn attach_report_handoff(
+    output: &mut RepoReport,
+    summary: &codestory_contracts::api::ProjectSummary,
+    sidecar: &ReportSidecarStatus,
+) {
+    let readiness = crate::readiness::build_readiness_verdicts(crate::readiness::ReadinessInputs {
+        project: &summary.root,
+        stats: &summary.stats,
+        freshness: summary.freshness.as_ref(),
+        sidecar: Some(crate::readiness::ReadinessSidecarInput {
+            retrieval_mode: &sidecar.retrieval_mode,
+            degraded_reason: sidecar.degraded_reason.as_deref(),
+            manifest_generation: sidecar.manifest_generation.as_deref(),
+            manifest_input_hash: sidecar.manifest_input_hash.as_deref(),
+        }),
+    });
+    let next_command = crate::readiness::primary_non_ready(&readiness)
+        .and_then(|verdict| verdict.minimum_next.first().cloned())
+        .or_else(|| {
+            output
+                .follow_up_queries
+                .first()
+                .map(|query| query.command.clone())
+        })
+        .or_else(|| {
+            crate::readiness::combined_minimum_next(&readiness)
+                .into_iter()
+                .next()
+        });
+    let trust_caveat = if crate::readiness::primary_non_ready(&readiness).is_some() {
+        "Readiness is not fully green; run the next command before trusting agent packet/search output.".to_string()
+    } else {
+        "Generated from the current local store; treat it as a handoff snapshot, not source-of-truth state.".to_string()
+    };
+    output.metadata.handoff = Some(RepoReportHandoff {
+        readiness,
+        freshness: summary.freshness.clone(),
+        sidecar_retrieval_mode: Some(sidecar.retrieval_mode.clone()),
+        degraded_reason: sidecar.degraded_reason.clone(),
+        trust_caveat,
+        top_entry_point: output.entry_points.first().map(report_node_label),
+        top_risk: output.hotspots.first().map(report_node_label),
+        next_command,
+    });
+}
+
+fn append_handoff_header(markdown: &mut String, output: &RepoReport) {
+    let _ = writeln!(markdown, "## Read This First / Agent Handoff");
+    let Some(handoff) = output.metadata.handoff.as_ref() else {
+        let _ = writeln!(markdown, "- readiness: not attached");
+        let _ = writeln!(markdown);
+        return;
+    };
+    for verdict in &handoff.readiness {
+        let _ = writeln!(
+            markdown,
+            "- readiness {}: `{}` - {}",
+            crate::readiness::goal_label(verdict.goal),
+            crate::readiness::status_label(verdict.status),
+            verdict.summary
+        );
+    }
+    if let Some(freshness) = handoff.freshness.as_ref() {
+        let stale_count = freshness
+            .changed_file_count
+            .saturating_add(freshness.new_file_count)
+            .saturating_add(freshness.removed_file_count);
+        let _ = writeln!(
+            markdown,
+            "- freshness: `{:?}` stale_files={} checked={} indexed={}",
+            freshness.status,
+            stale_count,
+            freshness.checked_file_count,
+            freshness.indexed_file_count
+        );
+    } else {
+        let _ = writeln!(markdown, "- freshness: not checked");
+    }
+    let _ = writeln!(
+        markdown,
+        "- sidecar: mode={} degraded_reason={}",
+        handoff
+            .sidecar_retrieval_mode
+            .as_deref()
+            .unwrap_or("unknown"),
+        handoff.degraded_reason.as_deref().unwrap_or("none")
+    );
+    let _ = writeln!(markdown, "- trust_caveat: {}", handoff.trust_caveat);
+    let _ = writeln!(
+        markdown,
+        "- top_entry_point: {}",
+        handoff.top_entry_point.as_deref().unwrap_or("n/a")
+    );
+    let _ = writeln!(
+        markdown,
+        "- top_risk: {}",
+        handoff.top_risk.as_deref().unwrap_or("n/a")
+    );
+    if let Some(command) = handoff.next_command.as_deref() {
+        let _ = writeln!(markdown, "- next_command: `{}`", markdown_escape(command));
+    }
+    let _ = writeln!(markdown);
 }
 
 fn append_summary(markdown: &mut String, output: &codestory_runtime::graph_analysis::RepoReport) {
@@ -186,6 +341,17 @@ fn render_source_location(
         rendered.push_str(&line.to_string());
     }
     rendered
+}
+
+fn report_node_label(node: &ReportNodeSummary) -> String {
+    let source = render_source_location(node.source_location.as_ref());
+    format!(
+        "`{}` ({}, edges={}) at {}",
+        markdown_escape(&node.name),
+        node.kind,
+        node.total_edges,
+        source
+    )
 }
 
 fn markdown_escape(value: &str) -> String {

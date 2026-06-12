@@ -66,18 +66,6 @@ pub fn plan_query(features: &QueryFeatures, mode: RetrievalDegradedMode) -> Retr
         });
     }
 
-    if mode.runs_qdrant_stage() && features.shape != QueryShape::PathLike {
-        let semantic_top_k = match features.shape {
-            QueryShape::NaturalLanguage | QueryShape::Mixed => top_k.saturating_mul(2).min(40),
-            _ => top_k,
-        };
-        stages.push(PlannedStage {
-            kind: RetrievalStageKind::Stage1bQdrantSemantic,
-            budget_ms: stage1b_budget_ms(features.shape),
-            top_k: semantic_top_k,
-        });
-    }
-
     if mode.runs_scip_stages() {
         let stage2_top_k = match features.shape {
             QueryShape::NaturalLanguage => top_k.min(20),
@@ -87,6 +75,18 @@ pub fn plan_query(features: &QueryFeatures, mode: RetrievalDegradedMode) -> Retr
             kind: RetrievalStageKind::Stage2ScipExpand,
             budget_ms: stage2_budget_ms(features.shape),
             top_k: stage2_top_k,
+        });
+    }
+
+    if mode.runs_qdrant_stage() && features.shape != QueryShape::PathLike {
+        let semantic_top_k = match features.shape {
+            QueryShape::NaturalLanguage | QueryShape::Mixed => top_k.saturating_mul(2).min(40),
+            _ => top_k,
+        };
+        stages.push(PlannedStage {
+            kind: RetrievalStageKind::Stage1bQdrantSemantic,
+            budget_ms: stage1b_budget_ms(features.shape),
+            top_k: semantic_top_k,
         });
     }
 
@@ -156,8 +156,16 @@ mod tests {
         let kinds: Vec<_> = plan.stages.iter().map(|s| s.kind).collect();
         assert!(kinds.contains(&RetrievalStageKind::Stage0ScipAnchor));
         assert!(kinds.contains(&RetrievalStageKind::Stage1ZoektLexical));
-        assert!(kinds.contains(&RetrievalStageKind::Stage1bQdrantSemantic));
         assert!(kinds.contains(&RetrievalStageKind::Stage2ScipExpand));
+        assert!(kinds.contains(&RetrievalStageKind::Stage1bQdrantSemantic));
+        assert!(
+            kinds
+                .iter()
+                .position(|kind| *kind == RetrievalStageKind::Stage2ScipExpand)
+                < kinds
+                    .iter()
+                    .position(|kind| *kind == RetrievalStageKind::Stage1bQdrantSemantic)
+        );
     }
 
     #[test]
@@ -180,8 +188,16 @@ mod tests {
         let plan = plan_query(&features, RetrievalDegradedMode::Full);
         let kinds: Vec<_> = plan.stages.iter().map(|s| s.kind).collect();
         assert!(!kinds.contains(&RetrievalStageKind::Stage0ScipAnchor));
-        assert!(kinds.contains(&RetrievalStageKind::Stage1bQdrantSemantic));
         assert!(kinds.contains(&RetrievalStageKind::Stage2ScipExpand));
+        assert!(kinds.contains(&RetrievalStageKind::Stage1bQdrantSemantic));
+        assert!(
+            kinds
+                .iter()
+                .position(|kind| *kind == RetrievalStageKind::Stage2ScipExpand)
+                < kinds
+                    .iter()
+                    .position(|kind| *kind == RetrievalStageKind::Stage1bQdrantSemantic)
+        );
     }
 
     #[test]
@@ -191,7 +207,15 @@ mod tests {
         let kinds: Vec<_> = plan.stages.iter().map(|s| s.kind).collect();
         assert!(!kinds.contains(&RetrievalStageKind::Stage0ScipAnchor));
         assert!(kinds.contains(&RetrievalStageKind::Stage1ZoektLexical));
-        assert!(kinds.contains(&RetrievalStageKind::Stage1bQdrantSemantic));
         assert!(kinds.contains(&RetrievalStageKind::Stage2ScipExpand));
+        assert!(kinds.contains(&RetrievalStageKind::Stage1bQdrantSemantic));
+        assert!(
+            kinds
+                .iter()
+                .position(|kind| *kind == RetrievalStageKind::Stage2ScipExpand)
+                < kinds
+                    .iter()
+                    .position(|kind| *kind == RetrievalStageKind::Stage1bQdrantSemantic)
+        );
     }
 }

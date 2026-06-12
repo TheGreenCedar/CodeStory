@@ -61,7 +61,11 @@ pub(crate) fn packet_citation_rank(
     {
         score -= 3.0;
     }
-    if path.starts_with("extensions/") || path.starts_with("vendor/") {
+    if path.starts_with("extensions/")
+        || path.starts_with("vendor/")
+        || path.starts_with("deps/")
+        || path.contains("/deps/")
+    {
         score -= 20.0;
     }
     if packet_path_is_test_segment(&path) {
@@ -258,7 +262,6 @@ const PACKET_QUERY_STOP_TERMS: &[&str] = &[
     "it",
     "its",
     "like",
-    "main",
     "module",
     "modules",
     "move",
@@ -334,11 +337,11 @@ pub(crate) fn normalize_identifier(value: &str) -> String {
 
 pub(crate) fn packet_display_path(path: &str) -> String {
     let normalized = path.trim_start_matches("\\\\?\\").replace('\\', "/");
-    if !normalized.contains(':') && !normalized.starts_with('/') {
-        return normalized;
-    }
     if let Some(path) = path_after_named_repo_root(&normalized) {
         return path;
+    }
+    if !normalized.contains(':') && !normalized.starts_with('/') {
+        return normalized;
     }
     for prefix in [
         "crates/",
@@ -371,9 +374,11 @@ pub(crate) fn packet_display_path(path: &str) -> String {
 
 fn path_after_named_repo_root(normalized: &str) -> Option<String> {
     for marker in [
-        "/source/repos/",
         "/target/agent-benchmark/repos/",
+        "target/agent-benchmark/repos/",
+        "/source/repos/",
         "/repos/",
+        "source/repos/",
     ] {
         let Some(index) = normalized.find(marker) else {
             continue;

@@ -20,7 +20,7 @@ use std::path::Path;
 
 use crate::args::{
     CliTrailMode, DoctorOutput, DrillOutput, IndexDryRunOutput, IndexOutput, OutputFormat,
-    QueryItemOutput, QueryOutput, SearchHitOutput, SearchOutput, TrailCommand,
+    QueryItemOutput, QueryOutput, ReadyOutput, SearchHitOutput, SearchOutput, TrailCommand,
     VerificationTargetOutput,
 };
 use crate::display::{
@@ -135,9 +135,51 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
     if let Some(timings) = output.phase_timings {
         append_index_phase_timings(&mut markdown, timings);
     }
+    append_readiness_verdicts(&mut markdown, &output.readiness, true);
     append_index_summary_generation(&mut markdown, output);
     append_next_commands(&mut markdown, &output.next_commands);
     markdown
+}
+
+pub(crate) fn render_ready_markdown(output: &ReadyOutput) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Readiness");
+    append_readiness_verdicts(&mut markdown, &output.verdicts, true);
+    markdown
+}
+
+fn append_readiness_verdicts(
+    markdown: &mut String,
+    verdicts: &[codestory_contracts::api::ReadinessVerdictDto],
+    include_full_repair: bool,
+) {
+    if verdicts.is_empty() {
+        return;
+    }
+    let _ = writeln!(markdown, "readiness_verdicts:");
+    for verdict in verdicts {
+        let _ = writeln!(
+            markdown,
+            "- {} [{}]: {}",
+            crate::readiness::goal_label(verdict.goal),
+            crate::readiness::status_label(verdict.status),
+            verdict.summary
+        );
+        append_verdict_commands(markdown, "minimum_next", &verdict.minimum_next);
+        if include_full_repair && verdict.full_repair != verdict.minimum_next {
+            append_verdict_commands(markdown, "full_repair", &verdict.full_repair);
+        }
+    }
+}
+
+fn append_verdict_commands(markdown: &mut String, label: &str, commands: &[String]) {
+    if commands.is_empty() {
+        return;
+    }
+    let _ = writeln!(markdown, "  {label}:");
+    for command in commands {
+        let _ = writeln!(markdown, "    - `{command}`");
+    }
 }
 
 fn append_index_members(markdown: &mut String, output: &IndexOutput<'_>) {
@@ -2104,6 +2146,7 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
         doctor_local_navigation_readiness(output),
         doctor_agent_packet_search_readiness(output)
     );
+    append_readiness_verdicts(&mut markdown, &output.readiness, true);
     if let Some(retrieval) = output.retrieval.as_ref() {
         let _ = writeln!(
             markdown,
@@ -2118,11 +2161,19 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
         .collect::<Vec<_>>();
     if !attention.is_empty() {
         let _ = writeln!(markdown, "attention:");
+        let mut seen = Vec::new();
         for check in attention {
+            let key = format!("{}:{}:{}", check.name, check.status, check.message);
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
             let _ = writeln!(
                 markdown,
                 "- {} [{}]: {}",
-                check.name, check.status, check.message
+                check.name,
+                check.status,
+                compact_doctor_check_message(check)
             );
         }
     }
@@ -2131,7 +2182,9 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
         let _ = writeln!(
             markdown,
             "- {} [{}]: {}",
-            check.name, check.status, check.message
+            check.name,
+            check.status,
+            compact_doctor_check_message(check)
         );
     }
     let _ = writeln!(markdown, "environment:");
@@ -2149,6 +2202,24 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
         }
     }
     markdown
+}
+
+fn compact_doctor_check_message(check: &crate::args::DoctorCheckOutput) -> String {
+    if check.name != "semantic_contract" || check.message.len() <= 280 {
+        return check.message.clone();
+    }
+    let gap_count = check
+        .message
+        .split("; ")
+        .filter(|part| {
+            !part.contains("Run `codestory-cli retrieval index --refresh full`")
+                && !part.contains("Resolve the embedding runtime first")
+        })
+        .count()
+        .max(1);
+    format!(
+        "semantic contract has {gap_count} mismatch(es). Run `codestory-cli retrieval index --refresh full`; rerun `codestory-cli doctor --format markdown` for the full diff."
+    )
 }
 
 fn doctor_operator_status(output: &DoctorOutput) -> &'static str {
@@ -2182,6 +2253,13 @@ fn doctor_operator_next_action(output: &DoctorOutput) -> &str {
 }
 
 fn doctor_local_navigation_readiness(output: &DoctorOutput) -> &'static str {
+    if let Some(verdict) = output
+        .readiness
+        .iter()
+        .find(|verdict| crate::readiness::goal_label(verdict.goal) == "local_navigation")
+    {
+        return crate::readiness::status_label(verdict.status);
+    }
     if !output.indexed
         || output
             .freshness
@@ -2194,6 +2272,13 @@ fn doctor_local_navigation_readiness(output: &DoctorOutput) -> &'static str {
 }
 
 fn doctor_agent_packet_search_readiness(output: &DoctorOutput) -> &'static str {
+    if let Some(verdict) = output
+        .readiness
+        .iter()
+        .find(|verdict| crate::readiness::goal_label(verdict.goal) == "agent_packet_search")
+    {
+        return crate::readiness::status_label(verdict.status);
+    }
     if !output.indexed {
         return "repair_index";
     }
@@ -3707,6 +3792,7 @@ mod tests {
             },
             retrieval: None,
             freshness: None,
+            readiness: Vec::new(),
             checks: Vec::new(),
             next_commands: Vec::new(),
             environment: Vec::new(),
@@ -4065,6 +4151,7 @@ mod tests {
                 semantic: 0.1,
                 graph: 0.11,
                 total: 0.91,
+                provenance: Vec::new(),
             }),
             duplicate_of: None,
             excerpt: None,
@@ -4372,6 +4459,7 @@ mod tests {
                     semantic: 0.06,
                     graph: 0.05,
                     total: 0.21,
+                    provenance: Vec::new(),
                 }),
             }],
             subgraph_ids: Vec::new(),

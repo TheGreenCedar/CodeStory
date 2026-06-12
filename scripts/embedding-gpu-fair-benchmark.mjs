@@ -5,12 +5,13 @@ import http from "node:http";
 import path from "node:path";
 
 const root = process.env.CODESTORY_EMBED_RESEARCH_ROOT ?? process.env.CODESTORY_FAIR_BENCH_ROOT ?? process.cwd();
+const isWindows = process.platform === "win32";
 const bin =
   process.env.CODESTORY_EMBED_RESEARCH_BIN ??
   process.env.CODESTORY_FAIR_BENCH_BIN ??
-  path.join(root, "target/release/codestory-cli.exe");
+  path.join(root, "target", "release", isWindows ? "codestory-cli.exe" : "codestory-cli");
 const llamaDir = process.env.CODESTORY_LLAMA_CPP_DIR ?? path.join(root, "target/llamacpp/b8840");
-const llamaExe = process.env.CODESTORY_LLAMA_CPP_SERVER ?? path.join(llamaDir, "llama-server.exe");
+const llamaExe = process.env.CODESTORY_LLAMA_CPP_SERVER ?? path.join(llamaDir, isWindows ? "llama-server.exe" : "llama-server");
 const stamp = new Date().toISOString().replaceAll(/[-:]/g, "").replace(/\..+/, "");
 const outDir =
   process.env.CODESTORY_EMBED_RESEARCH_OUT_DIR ??

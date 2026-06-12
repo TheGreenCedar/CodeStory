@@ -69,6 +69,9 @@ pub(crate) fn semantic_symbol_aliases(
         if let Some(alias) = normalized_symbol_alias(candidate) {
             push_unique_alias(&mut aliases.name_aliases, &mut seen_names, alias);
         }
+        for expanded_alias in expanded_symbol_aliases(candidate) {
+            push_unique_alias(&mut aliases.name_aliases, &mut seen_names, expanded_alias);
+        }
         if let Some(terminal) = terminal_symbol_part(candidate)
             && let Some(alias) = normalized_symbol_alias(terminal)
         {
@@ -76,6 +79,9 @@ pub(crate) fn semantic_symbol_aliases(
                 aliases.terminal_alias = Some(alias.clone());
             }
             push_unique_alias(&mut aliases.name_aliases, &mut seen_names, alias);
+            for expanded_alias in expanded_symbol_aliases(terminal) {
+                push_unique_alias(&mut aliases.name_aliases, &mut seen_names, expanded_alias);
+            }
         }
 
         let owner_parts = owner_symbol_parts(candidate);
@@ -1097,6 +1103,22 @@ mod tests {
         assert!(
             aliases
                 .owner_aliases
+                .contains(&"source group c++ compile commands json".to_string())
+        );
+    }
+
+    #[test]
+    fn symbol_aliases_expand_cpp_cdb_terminal_acronyms() {
+        let aliases = semantic_symbol_aliases("SourceGroupCxxCdb", Some("SourceGroupCxxCdb"));
+
+        assert!(
+            aliases
+                .name_aliases
+                .contains(&"source group c++ compilation database".to_string())
+        );
+        assert!(
+            aliases
+                .name_aliases
                 .contains(&"source group c++ compile commands json".to_string())
         );
     }
