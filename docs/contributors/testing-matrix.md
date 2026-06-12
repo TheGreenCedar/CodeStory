@@ -52,13 +52,14 @@ Only escalate to broader cargo checks if the doc change depends on new code beha
 cargo test -p codestory-indexer --test fidelity_regression
 cargo test -p codestory-indexer --test tictactoe_language_coverage
 cargo test -p codestory-indexer --test integration
+cargo test -p codestory-indexer --test trait_interface_resolution
 ```
 
 Run these whenever the change affects parsing, extraction, semantic resolution, or graph fidelity.
 Use the full test binaries above instead of filtered `cargo test` invocations.
 Use [language-support.md](../architecture/language-support.md) when deciding
-whether a language claim is fidelity-gated, beta fidelity, structural only, or
-parser compatibility only.
+whether a language claim is parser-backed graph, structural collector, or only
+a candidate parser compatibility record.
 
 ## Store Changes
 

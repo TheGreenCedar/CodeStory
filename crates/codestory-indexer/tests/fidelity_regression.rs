@@ -17,9 +17,14 @@ const GO_SOURCE: &str = include_str!("fixtures/fidelity_lab/go_fidelity_lab.go")
 const RUBY_SOURCE: &str = include_str!("fixtures/fidelity_lab/ruby_fidelity_lab.rb");
 const PHP_SOURCE: &str = include_str!("fixtures/fidelity_lab/php_fidelity_lab.php");
 const CSHARP_SOURCE: &str = include_str!("fixtures/fidelity_lab/csharp_fidelity_lab.cs");
+const KOTLIN_SOURCE: &str = include_str!("fixtures/fidelity_lab/kotlin_fidelity_lab.kt");
+const SWIFT_SOURCE: &str = include_str!("fixtures/fidelity_lab/swift_fidelity_lab.swift");
+const DART_SOURCE: &str = include_str!("fixtures/fidelity_lab/dart_fidelity_lab.dart");
+const BASH_SOURCE: &str = include_str!("fixtures/fidelity_lab/bash_fidelity_lab.sh");
 
 type ResolvedOwnerExpectation = (&'static str, &'static str, &'static str);
 type ResolvedNameExpectation = (&'static str, &'static str);
+type MemberExpectation = (&'static str, &'static str);
 
 struct FidelityCase {
     language: &'static str,
@@ -31,6 +36,7 @@ struct FidelityCase {
     required_symbols: &'static [&'static str],
     required_call_targets: &'static [&'static str],
     required_import_fragments: &'static [&'static str],
+    required_member_pairs: &'static [MemberExpectation],
     min_resolved_calls: usize,
     expected_resolved_owners: &'static [ResolvedOwnerExpectation],
     expected_resolved_names: &'static [ResolvedNameExpectation],
@@ -155,6 +161,50 @@ const CSHARP_SYMBOLS: &[&str] = &[
     "Decorate",
     "Main",
 ];
+const KOTLIN_SYMBOLS: &[&str] = &[
+    "Notifier",
+    "ConsoleNotifier",
+    "Repository",
+    "Event",
+    "Workflow",
+    "notify",
+    "save",
+    "run",
+    "decorate",
+    "orchestrateKotlin",
+];
+const SWIFT_SYMBOLS: &[&str] = &[
+    "Notifier",
+    "ConsoleNotifier",
+    "Repository",
+    "Event",
+    "Workflow",
+    "notify",
+    "save",
+    "run",
+    "decorate",
+    "orchestrateSwift",
+];
+const DART_SYMBOLS: &[&str] = &[
+    "Notifier",
+    "ConsoleNotifier",
+    "Repository",
+    "Event",
+    "Workflow",
+    "notify",
+    "save",
+    "run",
+    "decorate",
+    "orchestrateDart",
+];
+const BASH_SYMBOLS: &[&str] = &[
+    "notify",
+    "save",
+    "decorate",
+    "run",
+    "orchestrate_bash",
+    "event",
+];
 
 const PYTHON_CALLS: &[&str] = &["notify", "save", "decorate", "run"];
 const TYPESCRIPT_CALLS: &[&str] = &["identity", "notify", "save", "decorate", "run"];
@@ -167,6 +217,10 @@ const GO_CALLS: &[&str] = &["Notify", "Save", "decorate", "Run"];
 const RUBY_CALLS: &[&str] = &["notify", "save", "decorate", "run"];
 const PHP_CALLS: &[&str] = &["notify", "save", "decorate", "run"];
 const CSHARP_CALLS: &[&str] = &["Notify", "Save", "Decorate", "Run"];
+const KOTLIN_CALLS: &[&str] = &["notify", "save", "decorate", "run"];
+const SWIFT_CALLS: &[&str] = &["notify", "save", "decorate"];
+const DART_CALLS: &[&str] = &["notify", "save", "decorate"];
+const BASH_CALLS: &[&str] = &["notify", "save", "decorate", "run"];
 
 const PYTHON_IMPORTS: &[&str] = &[];
 const TYPESCRIPT_IMPORTS: &[&str] = &["fs", "path"];
@@ -179,6 +233,90 @@ const GO_IMPORTS: &[&str] = &["fmt"];
 const RUBY_IMPORTS: &[&str] = &["logger"];
 const PHP_IMPORTS: &[&str] = &["Random\\Randomizer"];
 const CSHARP_IMPORTS: &[&str] = &["System"];
+const KOTLIN_IMPORTS: &[&str] = &["kotlin.math.abs"];
+const SWIFT_IMPORTS: &[&str] = &["Foundation"];
+const DART_IMPORTS: &[&str] = &["dart:math"];
+const BASH_IMPORTS: &[&str] = &["./logger.sh"];
+
+const PYTHON_MEMBERS: &[MemberExpectation] = &[];
+const TYPESCRIPT_MEMBERS: &[MemberExpectation] = &[
+    ("ConsoleNotifier", "notify"),
+    ("Repository", "save"),
+    ("Workflow", "run"),
+];
+const JAVASCRIPT_MEMBERS: &[MemberExpectation] = &[
+    ("ConsoleNotifier", "notify"),
+    ("Repository", "save"),
+    ("Workflow", "run"),
+];
+const JAVA_MEMBERS: &[MemberExpectation] = &[
+    ("Notifier", "notifyEvent"),
+    ("ConsoleNotifier", "notifyEvent"),
+    ("Repository", "save"),
+    ("Workflow", "run"),
+];
+const CPP_MEMBERS: &[MemberExpectation] = &[
+    ("Notifier", "notifyEvent"),
+    ("ConsoleNotifier", "notifyEvent"),
+    ("Repository", "save"),
+    ("Workflow", "run"),
+];
+const C_MEMBERS: &[MemberExpectation] = &[];
+const RUST_MEMBERS: &[MemberExpectation] = &[
+    ("ConsoleNotifier", "notify"),
+    ("MemoryRepository", "save"),
+    ("Workflow", "run"),
+];
+const GO_MEMBERS: &[MemberExpectation] = &[
+    ("Notifier", "Notify"),
+    ("ConsoleNotifier", "Notify"),
+    ("Repository", "Save"),
+    ("Workflow", "Run"),
+];
+const RUBY_MEMBERS: &[MemberExpectation] = &[
+    ("Notifier", "notify"),
+    ("ConsoleNotifier", "notify"),
+    ("Repository", "save"),
+    ("Workflow", "run"),
+    ("Workflow", "decorate"),
+];
+const PHP_MEMBERS: &[MemberExpectation] = &[
+    ("Notifier", "notify"),
+    ("ConsoleNotifier", "notify"),
+    ("Repository", "save"),
+    ("Workflow", "run"),
+    ("Workflow", "decorate"),
+];
+const CSHARP_MEMBERS: &[MemberExpectation] = &[
+    ("INotifier", "Notify"),
+    ("ConsoleNotifier", "Notify"),
+    ("Repository", "Save"),
+    ("Workflow", "Run"),
+    ("Workflow", "Decorate"),
+    ("Program", "Main"),
+];
+const KOTLIN_MEMBERS: &[MemberExpectation] = &[
+    ("Notifier", "notify"),
+    ("ConsoleNotifier", "notify"),
+    ("Repository", "save"),
+    ("Workflow", "run"),
+    ("Workflow", "decorate"),
+];
+const SWIFT_MEMBERS: &[MemberExpectation] = &[
+    ("Notifier", "notify"),
+    ("ConsoleNotifier", "notify"),
+    ("Repository", "save"),
+    ("Workflow", "run"),
+    ("Workflow", "decorate"),
+];
+const DART_MEMBERS: &[MemberExpectation] = &[
+    ("Notifier", "notify"),
+    ("ConsoleNotifier", "notify"),
+    ("Repository", "save"),
+    ("Workflow", "run"),
+    ("Workflow", "decorate"),
+];
+const BASH_MEMBERS: &[MemberExpectation] = &[];
 
 const PYTHON_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[];
 const TYPESCRIPT_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] =
@@ -195,10 +333,30 @@ const CPP_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[
 const C_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[];
 const RUST_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] =
     &[("run", "Notifier", "notify"), ("run", "Repository", "save")];
-const GO_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[];
-const RUBY_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[];
-const PHP_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[];
-const CSHARP_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[];
+const GO_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] =
+    &[("Run", "Notifier", "Notify"), ("Run", "Repository", "Save")];
+const RUBY_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[
+    ("run", "Notifier", "notify"),
+    ("run", "Repository", "save"),
+    ("run", "Workflow", "decorate"),
+];
+const PHP_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[
+    ("run", "Notifier", "notify"),
+    ("run", "Repository", "save"),
+    ("run", "Workflow", "decorate"),
+];
+const CSHARP_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[
+    ("Run", "INotifier", "Notify"),
+    ("Run", "Repository", "Save"),
+    ("Run", "Workflow", "Decorate"),
+];
+const KOTLIN_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] =
+    &[("run", "Notifier", "notify"), ("run", "Repository", "save")];
+const SWIFT_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] =
+    &[("run", "Notifier", "notify"), ("run", "Repository", "save")];
+const DART_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] =
+    &[("run", "Notifier", "notify"), ("run", "Repository", "save")];
+const BASH_RESOLVED_OWNERS: &[ResolvedOwnerExpectation] = &[];
 
 const EMPTY_RESOLVED_NAMES: &[ResolvedNameExpectation] = &[];
 
@@ -214,6 +372,7 @@ fn fidelity_cases() -> Vec<FidelityCase> {
             required_symbols: PYTHON_SYMBOLS,
             required_call_targets: PYTHON_CALLS,
             required_import_fragments: PYTHON_IMPORTS,
+            required_member_pairs: PYTHON_MEMBERS,
             min_resolved_calls: 0,
             expected_resolved_owners: PYTHON_RESOLVED_OWNERS,
             expected_resolved_names: EMPTY_RESOLVED_NAMES,
@@ -228,6 +387,7 @@ fn fidelity_cases() -> Vec<FidelityCase> {
             required_symbols: TYPESCRIPT_SYMBOLS,
             required_call_targets: TYPESCRIPT_CALLS,
             required_import_fragments: TYPESCRIPT_IMPORTS,
+            required_member_pairs: TYPESCRIPT_MEMBERS,
             min_resolved_calls: 2,
             expected_resolved_owners: TYPESCRIPT_RESOLVED_OWNERS,
             expected_resolved_names: EMPTY_RESOLVED_NAMES,
@@ -242,6 +402,7 @@ fn fidelity_cases() -> Vec<FidelityCase> {
             required_symbols: JAVASCRIPT_SYMBOLS,
             required_call_targets: JAVASCRIPT_CALLS,
             required_import_fragments: JAVASCRIPT_IMPORTS,
+            required_member_pairs: JAVASCRIPT_MEMBERS,
             min_resolved_calls: 1,
             expected_resolved_owners: JAVASCRIPT_RESOLVED_OWNERS,
             expected_resolved_names: EMPTY_RESOLVED_NAMES,
@@ -256,6 +417,7 @@ fn fidelity_cases() -> Vec<FidelityCase> {
             required_symbols: JAVA_SYMBOLS,
             required_call_targets: JAVA_CALLS,
             required_import_fragments: JAVA_IMPORTS,
+            required_member_pairs: JAVA_MEMBERS,
             min_resolved_calls: 2,
             expected_resolved_owners: JAVA_RESOLVED_OWNERS,
             expected_resolved_names: EMPTY_RESOLVED_NAMES,
@@ -270,6 +432,7 @@ fn fidelity_cases() -> Vec<FidelityCase> {
             required_symbols: CPP_SYMBOLS,
             required_call_targets: CPP_CALLS,
             required_import_fragments: CPP_IMPORTS,
+            required_member_pairs: CPP_MEMBERS,
             min_resolved_calls: 2,
             expected_resolved_owners: CPP_RESOLVED_OWNERS,
             expected_resolved_names: EMPTY_RESOLVED_NAMES,
@@ -284,6 +447,7 @@ fn fidelity_cases() -> Vec<FidelityCase> {
             required_symbols: C_SYMBOLS,
             required_call_targets: C_CALLS,
             required_import_fragments: C_IMPORTS,
+            required_member_pairs: C_MEMBERS,
             min_resolved_calls: 0,
             expected_resolved_owners: C_RESOLVED_OWNERS,
             expected_resolved_names: EMPTY_RESOLVED_NAMES,
@@ -298,6 +462,7 @@ fn fidelity_cases() -> Vec<FidelityCase> {
             required_symbols: RUST_SYMBOLS,
             required_call_targets: RUST_CALLS,
             required_import_fragments: RUST_IMPORTS,
+            required_member_pairs: RUST_MEMBERS,
             min_resolved_calls: 2,
             expected_resolved_owners: RUST_RESOLVED_OWNERS,
             expected_resolved_names: EMPTY_RESOLVED_NAMES,
@@ -312,7 +477,8 @@ fn fidelity_cases() -> Vec<FidelityCase> {
             required_symbols: GO_SYMBOLS,
             required_call_targets: GO_CALLS,
             required_import_fragments: GO_IMPORTS,
-            min_resolved_calls: 0,
+            required_member_pairs: GO_MEMBERS,
+            min_resolved_calls: 2,
             expected_resolved_owners: GO_RESOLVED_OWNERS,
             expected_resolved_names: EMPTY_RESOLVED_NAMES,
         },
@@ -326,7 +492,8 @@ fn fidelity_cases() -> Vec<FidelityCase> {
             required_symbols: RUBY_SYMBOLS,
             required_call_targets: RUBY_CALLS,
             required_import_fragments: RUBY_IMPORTS,
-            min_resolved_calls: 0,
+            required_member_pairs: RUBY_MEMBERS,
+            min_resolved_calls: 3,
             expected_resolved_owners: RUBY_RESOLVED_OWNERS,
             expected_resolved_names: EMPTY_RESOLVED_NAMES,
         },
@@ -340,7 +507,8 @@ fn fidelity_cases() -> Vec<FidelityCase> {
             required_symbols: PHP_SYMBOLS,
             required_call_targets: PHP_CALLS,
             required_import_fragments: PHP_IMPORTS,
-            min_resolved_calls: 0,
+            required_member_pairs: PHP_MEMBERS,
+            min_resolved_calls: 3,
             expected_resolved_owners: PHP_RESOLVED_OWNERS,
             expected_resolved_names: EMPTY_RESOLVED_NAMES,
         },
@@ -354,8 +522,69 @@ fn fidelity_cases() -> Vec<FidelityCase> {
             required_symbols: CSHARP_SYMBOLS,
             required_call_targets: CSHARP_CALLS,
             required_import_fragments: CSHARP_IMPORTS,
-            min_resolved_calls: 0,
+            required_member_pairs: CSHARP_MEMBERS,
+            min_resolved_calls: 3,
             expected_resolved_owners: CSHARP_RESOLVED_OWNERS,
+            expected_resolved_names: EMPTY_RESOLVED_NAMES,
+        },
+        FidelityCase {
+            language: "kotlin",
+            filename: "fidelity.kt",
+            source: KOTLIN_SOURCE,
+            min_nodes: 10,
+            min_call_edges: 4,
+            min_import_edges: 1,
+            required_symbols: KOTLIN_SYMBOLS,
+            required_call_targets: KOTLIN_CALLS,
+            required_import_fragments: KOTLIN_IMPORTS,
+            required_member_pairs: KOTLIN_MEMBERS,
+            min_resolved_calls: 2,
+            expected_resolved_owners: KOTLIN_RESOLVED_OWNERS,
+            expected_resolved_names: EMPTY_RESOLVED_NAMES,
+        },
+        FidelityCase {
+            language: "swift",
+            filename: "fidelity.swift",
+            source: SWIFT_SOURCE,
+            min_nodes: 10,
+            min_call_edges: 3,
+            min_import_edges: 1,
+            required_symbols: SWIFT_SYMBOLS,
+            required_call_targets: SWIFT_CALLS,
+            required_import_fragments: SWIFT_IMPORTS,
+            required_member_pairs: SWIFT_MEMBERS,
+            min_resolved_calls: 2,
+            expected_resolved_owners: SWIFT_RESOLVED_OWNERS,
+            expected_resolved_names: EMPTY_RESOLVED_NAMES,
+        },
+        FidelityCase {
+            language: "dart",
+            filename: "fidelity.dart",
+            source: DART_SOURCE,
+            min_nodes: 10,
+            min_call_edges: 3,
+            min_import_edges: 1,
+            required_symbols: DART_SYMBOLS,
+            required_call_targets: DART_CALLS,
+            required_import_fragments: DART_IMPORTS,
+            required_member_pairs: DART_MEMBERS,
+            min_resolved_calls: 2,
+            expected_resolved_owners: DART_RESOLVED_OWNERS,
+            expected_resolved_names: EMPTY_RESOLVED_NAMES,
+        },
+        FidelityCase {
+            language: "bash",
+            filename: "fidelity.sh",
+            source: BASH_SOURCE,
+            min_nodes: 6,
+            min_call_edges: 4,
+            min_import_edges: 1,
+            required_symbols: BASH_SYMBOLS,
+            required_call_targets: BASH_CALLS,
+            required_import_fragments: BASH_IMPORTS,
+            required_member_pairs: BASH_MEMBERS,
+            min_resolved_calls: 0,
+            expected_resolved_owners: BASH_RESOLVED_OWNERS,
             expected_resolved_names: EMPTY_RESOLVED_NAMES,
         },
     ]
@@ -649,6 +878,16 @@ fn test_fidelity_lab_graph_shape_and_semantics() -> anyhow::Result<()> {
                 "Case `{}`: missing IMPORT target containing `{}`",
                 case.language,
                 import_fragment
+            );
+        }
+
+        for (owner, member) in case.required_member_pairs {
+            assert!(
+                has_edge_between_names(&edges, &nodes, EdgeKind::MEMBER, owner, member),
+                "Case `{}`: missing MEMBER edge `{}` -> `{}`",
+                case.language,
+                owner,
+                member
             );
         }
 

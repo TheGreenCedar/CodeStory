@@ -152,6 +152,35 @@ fn assert_resolved_call_to_name(
     );
 }
 
+fn assert_no_resolved_call_to_name(
+    case_name: &str,
+    nodes: &[Node],
+    edges: &[Edge],
+    caller_name: &str,
+    callee_name: &str,
+) {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    let found = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter_map(|edge| {
+            let source = node_by_id.get(&edge.source)?;
+            if !is_matching_name(&source.serialized_name, caller_name) {
+                return None;
+            }
+            let resolved_id = edge.resolved_target?;
+            let resolved_node = node_by_id.get(&resolved_id)?;
+            Some(resolved_node.serialized_name.as_str())
+        })
+        .any(|resolved_name| is_matching_name(resolved_name, callee_name));
+
+    assert!(
+        !found,
+        "Case `{case_name}`: did not expect CALL from `{caller_name}` to resolve to `{callee_name}`. Calls: {:?}",
+        describe_call_edges(edges, nodes)
+    );
+}
+
 fn assert_resolved_override_to_method_owner(
     case_name: &str,
     nodes: &[Node],
@@ -263,6 +292,157 @@ public:
 
 void EventBus::dispatchTo(EventListener& listener) {
     listener.handleEvent();
+}
+"#,
+            "dispatchTo",
+            "EventListener",
+            "handleEvent",
+        ),
+        (
+            "main.go",
+            r#"
+package main
+
+type ConcreteListener struct{}
+func (ConcreteListener) HandleEvent() {}
+
+type EventListener interface {
+    HandleEvent()
+}
+
+type EventBus struct{}
+func (b EventBus) DispatchTo(listener EventListener) {
+    listener.HandleEvent()
+}
+"#,
+            "DispatchTo",
+            "EventListener",
+            "HandleEvent",
+        ),
+        (
+            "main.rb",
+            r#"
+class ConcreteListener
+  def handle_event
+  end
+end
+
+class EventListener
+  def handle_event
+  end
+end
+
+class EventBus
+  def dispatch_to
+    listener = EventListener.new
+    listener.handle_event
+  end
+end
+"#,
+            "dispatch_to",
+            "EventListener",
+            "handle_event",
+        ),
+        (
+            "main.php",
+            r#"
+<?php
+final class ConcreteListener {
+    public function handleEvent(): void {}
+}
+
+interface EventListener {
+    public function handleEvent(): void;
+}
+
+final class EventBus {
+    public function dispatchTo(EventListener $listener): void {
+        $listener->handleEvent();
+    }
+}
+"#,
+            "dispatchTo",
+            "EventListener",
+            "handleEvent",
+        ),
+        (
+            "main.cs",
+            r#"
+class ConcreteListener {
+    public void HandleEvent() {}
+}
+
+interface EventListener {
+    void HandleEvent();
+}
+
+class EventBus {
+    void DispatchTo(EventListener listener) {
+        listener.HandleEvent();
+    }
+}
+"#,
+            "DispatchTo",
+            "EventListener",
+            "HandleEvent",
+        ),
+        (
+            "main.kt",
+            r#"
+class ConcreteListener {
+    fun handleEvent() {}
+}
+
+interface EventListener {
+    fun handleEvent()
+}
+
+class EventBus {
+    fun dispatchTo(listener: EventListener) {
+        listener.handleEvent()
+    }
+}
+"#,
+            "dispatchTo",
+            "EventListener",
+            "handleEvent",
+        ),
+        (
+            "main.swift",
+            r#"
+class ConcreteListener {
+    func handleEvent() {}
+}
+
+protocol EventListener {
+    func handleEvent()
+}
+
+class EventBus {
+    func dispatchTo(listener: EventListener) {
+        listener.handleEvent()
+    }
+}
+"#,
+            "dispatchTo",
+            "EventListener",
+            "handleEvent",
+        ),
+        (
+            "main.dart",
+            r#"
+class ConcreteListener {
+  void handleEvent() {}
+}
+
+abstract class EventListener {
+  void handleEvent();
+}
+
+class EventBus {
+  void dispatchTo(EventListener listener) {
+    listener.handleEvent();
+  }
 }
 "#,
             "dispatchTo",
@@ -388,12 +568,127 @@ int caller() { callee(); return 1; }
             "caller",
             "callee",
         ),
+        (
+            "main.go",
+            r#"
+package main
+
+func callee() int { return 1 }
+func caller() int { callee(); return 1 }
+"#,
+            "caller",
+            "callee",
+        ),
+        (
+            "main.rb",
+            r#"
+def callee
+  1
+end
+
+def caller
+  callee
+  1
+end
+"#,
+            "caller",
+            "callee",
+        ),
+        (
+            "main.php",
+            r#"
+<?php
+function callee(): int { return 1; }
+function caller(): int { callee(); return 1; }
+"#,
+            "caller",
+            "callee",
+        ),
+        (
+            "main.cs",
+            r#"
+class Test {
+    int callee() { return 1; }
+    int caller() { callee(); return 1; }
+}
+"#,
+            "caller",
+            "callee",
+        ),
+        (
+            "main.kt",
+            r#"
+fun callee(): Int = 1
+fun caller(): Int {
+    callee()
+    return 1
+}
+"#,
+            "caller",
+            "callee",
+        ),
+        (
+            "main.swift",
+            r#"
+func callee() -> Int { return 1 }
+func caller() -> Int {
+    callee()
+    return 1
+}
+"#,
+            "caller",
+            "callee",
+        ),
+        (
+            "main.dart",
+            r#"
+int callee() { return 1; }
+int caller() { callee(); return 1; }
+"#,
+            "caller",
+            "callee",
+        ),
+        (
+            "main.sh",
+            r#"
+callee() {
+  echo 1
+}
+
+caller() {
+  callee
+}
+"#,
+            "caller",
+            "callee",
+        ),
     ];
 
     for (filename, source, caller_name, callee_name) in cases {
         let (nodes, edges) = index_single_file(filename, source)?;
         assert_resolved_call_to_name(filename, &nodes, &edges, caller_name, callee_name);
     }
+
+    Ok(())
+}
+
+#[test]
+fn test_ruby_bare_local_variable_read_does_not_resolve_as_call() -> anyhow::Result<()> {
+    let (nodes, edges) = index_single_file(
+        "main.rb",
+        r#"
+def callee
+  1
+end
+
+def caller
+  callee = 1
+  callee
+end
+"#,
+    )?;
+
+    assert_no_resolved_call_to_name("main.rb", &nodes, &edges, "caller", "callee");
 
     Ok(())
 }

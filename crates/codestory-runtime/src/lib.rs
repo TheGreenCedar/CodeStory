@@ -713,16 +713,13 @@ fn language_support_mode_label(mode: LanguageSupportMode) -> &'static str {
     match mode {
         LanguageSupportMode::ParserBackedGraph => "parser_backed_graph",
         LanguageSupportMode::StructuralCollector => "structural_collector",
-        LanguageSupportMode::ParserCompatibilityOnly => "parser_compatibility_only",
     }
 }
 
 fn language_evidence_tier_label(tier: LanguageEvidenceTier) -> &'static str {
     match tier {
         LanguageEvidenceTier::GraphFidelity => "graph_fidelity",
-        LanguageEvidenceTier::BasicFidelity => "basic_fidelity",
         LanguageEvidenceTier::StructuralOnly => "structural_only",
-        LanguageEvidenceTier::ParserCompatibilityOnly => "parser_compatibility_only",
     }
 }
 

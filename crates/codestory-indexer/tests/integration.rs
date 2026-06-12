@@ -438,7 +438,7 @@ func (r *Router) Handle(path string) {}
     assert!(
         before_nodes
             .iter()
-            .any(|node| node.serialized_name == "StrictSlash"),
+            .any(|node| node.serialized_name == "Router.StrictSlash"),
         "expected initial Go parser-backed method projection"
     );
     let file_id = before_nodes
@@ -471,7 +471,7 @@ func (r *Router) Handle(path string) {}
     assert!(
         !after_nodes
             .iter()
-            .any(|node| node.serialized_name == "StrictSlash"),
+            .any(|node| node.serialized_name.ends_with(".StrictSlash")),
         "stale Go method should be removed after structural refresh"
     );
     let states_after = storage.get_callable_projection_states_for_file(file_id.0)?;

@@ -236,8 +236,8 @@ Keep measured repo-scale timings in [codestory-e2e-stats-log.md](../testing/code
 The indexer skips files before parsing when it cannot select a parser-backed
 language configuration or structural collector for the path plus compilation
 metadata. See [language-support.md](language-support.md) for the distinction
-between parser-backed graph support, structural collectors, beta fidelity, and
-parser-compatibility-only candidates.
+between parser-backed graph support, structural collectors, and candidate parser
+compatibility records.
 
 ### How `compile_commands.json` participates
 

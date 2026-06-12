@@ -199,11 +199,9 @@ structural extraction, framework route coverage, and agent packet/search
 readiness. The current contract is documented in
 [docs/architecture/language-support.md](docs/architecture/language-support.md).
 
-In short: Python, Java, Rust, JavaScript, TypeScript/TSX, C++, and C are
-fidelity-gated parser-backed graph languages; Go, Ruby, PHP, and C# are
-parser-backed beta languages with basic fidelity coverage; HTML, CSS, and SQL
-use structural collectors; Kotlin, Swift, Dart, and Bash are parser
-compatibility candidates only.
+In short: Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby,
+PHP, C#, Kotlin, Swift, Dart, and Bash are fidelity-gated parser-backed graph
+languages; HTML, CSS, and SQL use structural collectors.
 
 For the system model, start with
 [docs/concepts/how-codestory-works.md](docs/concepts/how-codestory-works.md),

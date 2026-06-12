@@ -4,46 +4,42 @@ CodeStory uses the word "support" only with a qualifier. Parser routing,
 regression evidence, framework route coverage, and agent packet/search quality
 are separate claims.
 
-The source of truth for extension and stored-language claim tiers is
+The source of truth for extension and stored-language runtime claims is
 `language_support_profile_for_ext` and
 `language_support_profile_for_language_name` in
-`crates/codestory-indexer/src/lib.rs`. The live parser-backed graph map is still
-`get_language_for_ext`; structural and parser-compatibility-only languages do
-not route through that function. The `files` command exposes these tiers in
-`summary.language_counts` so operators can see the claim level attached to the
-current indexed inventory.
+`crates/codestory-indexer/src/lib.rs`. The live parser-backed graph map is
+`get_language_for_ext`; structural collectors use their own runtime paths, and
+candidate parser compatibility records do not imply runtime support. The
+`files` command exposes these claim labels in `summary.language_counts` so
+operators can see the runtime path attached to the current indexed inventory.
 
 ## Claim Terms
 
 - `parser-backed graph`: the file extension routes to a tree-sitter parser and
   rule asset, and the indexer can emit graph nodes and edges for that language.
 - `fidelity-gated`: parser-backed graph support has overlapping regression
-  evidence, including the fidelity lab and targeted resolution suites.
-- `beta fidelity`: parser-backed graph support has tictactoe coverage plus a
-  basic fidelity-lab fixture for symbols, imports, and call edges, but does not
-  yet have the same owner-qualified or polymorphic resolution gates as Tier A.
+  evidence for symbols, imports, calls, member ownership, representable
+  inheritance, and resolved-call behavior covered by the fixture suites.
 - `structural collector`: the language is indexed by dedicated structural
   collectors, not full tree-sitter graph rules.
-- `parser compatibility only`: a parser crate/version was checked for future
-  use, but the language is not wired into runtime indexing.
+- `candidate parser compatibility record`: a parser crate/version was checked
+  for possible future use, but that record is not a runtime support claim until
+  the language has dependency wiring, rule assets, routing, and fidelity tests.
 
 ## Current Matrix
 
-| Tier | Languages | Runtime path | Evidence floor | Safe claim |
+| Runtime claim | Languages | Runtime path | Evidence floor | Safe claim |
 | --- | --- | --- | --- | --- |
-| A | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C | parser-backed graph | fidelity lab, tictactoe, and targeted rule/resolution suites | daily graph navigation on typical code, with language caveats |
-| B | Go, Ruby, PHP, C# | parser-backed graph | tictactoe plus basic fidelity lab | beta graph indexing for straightforward symbols/imports/calls |
-| C | HTML, CSS, SQL | structural collector | structural collector tests | structural entity extraction, not semantic code navigation |
-| D | Kotlin, Swift, Dart, Bash | parser compatibility only | parser crate/version compatibility notes | future candidate only; no runtime support claim |
+| Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | tree-sitter parser plus graph rules | fidelity lab, tictactoe coverage, raw graph contracts, and targeted rule/resolution suites | daily graph navigation on typical code, with language-specific caveats |
+| Structural collector | HTML, CSS, SQL | dedicated structural collectors | structural collector tests | structural entity extraction, not semantic code navigation |
 
-Tier A is not uniform. Rust, TypeScript/TSX, JavaScript, Java, and C++ have the
-strongest owner-qualified call-resolution evidence. Python and C are useful for
-symbols, imports, call skeletons, and local trails, but their resolution claims
-are intentionally narrower.
-
-Tier B languages are wired and now covered by a basic fidelity lab, but they are
-not promoted until they gain targeted call/import-resolution suites comparable
-to Tier A.
+The parser-backed graph claim is not a promise that every language has identical
+dispatch semantics. The current fixture floor covers local owner-qualified calls
+for simple typed parameters in Go, PHP, C#, Kotlin, Swift, and Dart, plus Ruby
+constructor-assigned locals and Bash shell command calls. Broader dynamic
+dispatch, polymorphism, cross-package resolution, and framework route
+extraction each need their own tests before a specific product claim can rely
+on them.
 
 ## Route Coverage Is Separate
 
@@ -53,17 +49,17 @@ language can have parser-backed graph support while a framework remains
 partial or heuristic. A route claim needs fixture or real-repo route evidence,
 not just a language parser.
 
-## Promotion Checklist
+## Expansion Checklist
 
-Before promoting a language or framework claim:
+Before adding a new parser-backed language or broader framework claim:
 
 1. Add or update the parser/rule path and extension mapping.
 2. Add tictactoe coverage for symbol, import, call, member, and inheritance
    shapes that the language can reasonably represent.
 3. Add or update fidelity-lab fixtures for symbols, imports, call edges, and
    any resolution behavior being claimed.
-4. Add targeted resolution tests before claiming polymorphic, cross-package,
-   framework-handler, or owner-qualified call trails.
+4. Add targeted resolution tests before claiming local receiver-aware,
+   polymorphic, cross-package, framework-handler, or owner-qualified call trails.
 5. Update `language_support_profile_for_ext`,
    `language_support_profile_for_language_name`, and this page in the same
    change.
@@ -75,4 +71,5 @@ Before promoting a language or framework claim:
    cargo test -p codestory-indexer --test call_resolution_common_methods
    cargo test -p codestory-indexer --test import_resolution
    cargo test -p codestory-indexer --test query_rule_regressions
+   cargo test -p codestory-indexer --test trait_interface_resolution
    ```

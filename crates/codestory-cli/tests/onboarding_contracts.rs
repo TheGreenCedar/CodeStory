@@ -294,10 +294,9 @@ fn docs_drift_contracts_keep_living_sources_explicit() {
     for required in [
         "parser-backed graph",
         "fidelity-gated",
-        "beta fidelity",
         "structural collector",
-        "parser compatibility only",
-        "Go, Ruby, PHP, C#",
+        "candidate parser compatibility record",
+        "Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash",
         "Kotlin, Swift, Dart, Bash",
         "language_support_profile_for_ext",
         "language_support_profile_for_language_name",

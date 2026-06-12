@@ -1,5 +1,29 @@
+(class_declaration
+  name: (type_identifier) @name) @def
+{
+  node @name.node
+  attr (@name.node) kind = "CLASS"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
+(protocol_declaration
+  name: (type_identifier) @name) @def
+{
+  node @name.node
+  attr (@name.node) kind = "INTERFACE"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
 (function_declaration
-  name: (identifier) @name) @def
+  name: (simple_identifier) @name) @def
 {
   node @name.node
   attr (@name.node) kind = "FUNCTION"
@@ -10,8 +34,8 @@
   attr (@name.node) end_col = (end-column @def)
 }
 
-(method_declaration
-  name: (field_identifier) @name) @def
+(protocol_function_declaration
+  name: (simple_identifier) @name) @def
 {
   node @name.node
   attr (@name.node) kind = "METHOD"
@@ -22,15 +46,11 @@
   attr (@name.node) end_col = (end-column @def)
 }
 
-(type_declaration
-  (type_spec
-    name: (type_identifier)
-    type: (interface_type
-      (method_elem
-        name: (field_identifier) @name) @def)))
+(typealias_declaration
+  name: (type_identifier) @name) @def
 {
   node @name.node
-  attr (@name.node) kind = "METHOD"
+  attr (@name.node) kind = "TYPEDEF"
   attr (@name.node) name = (source-text @name)
   attr (@name.node) start_row = (start-row @def)
   attr (@name.node) start_col = (start-column @def)
@@ -38,34 +58,65 @@
   attr (@name.node) end_col = (end-column @def)
 }
 
-(type_declaration
-  (type_spec
-    name: (type_identifier) @name)) @def
+;; Membership
+(class_declaration
+  name: (type_identifier) @class_name
+  body: (class_body
+    (function_declaration name: (simple_identifier) @method_name)))
 {
-  node @name.node
-  attr (@name.node) kind = "STRUCT"
-  attr (@name.node) name = (source-text @name)
-  attr (@name.node) start_row = (start-row @def)
-  attr (@name.node) start_col = (start-column @def)
-  attr (@name.node) end_row = (end-row @def)
-  attr (@name.node) end_col = (end-column @def)
+  edge @class_name.node -> @method_name.node
+  attr (@class_name.node -> @method_name.node) kind = "MEMBER"
 }
 
-(package_clause
-  (package_identifier) @name) @def
+(protocol_declaration
+  name: (type_identifier) @interface_name
+  body: (protocol_body
+    (protocol_function_declaration name: (simple_identifier) @method_name)))
 {
-  node @name.node
-  attr (@name.node) kind = "MODULE"
-  attr (@name.node) name = (source-text @name)
-  attr (@name.node) start_row = (start-row @def)
-  attr (@name.node) start_col = (start-column @def)
-  attr (@name.node) end_row = (end-row @def)
-  attr (@name.node) end_col = (end-column @def)
+  edge @interface_name.node -> @method_name.node
+  attr (@interface_name.node -> @method_name.node) kind = "MEMBER"
 }
 
-;; Calls (global fallback identifier)
+;; Inheritance and protocol conformance
+(class_declaration
+  name: (type_identifier) @class_name
+  (inheritance_specifier
+    inherits_from: (user_type
+      (type_identifier) @parent_name)))
+{
+  node @parent_name.node
+  attr (@parent_name.node) kind = "CLASS"
+  attr (@parent_name.node) name = (source-text @parent_name)
+  attr (@parent_name.node) start_row = (start-row @parent_name)
+  attr (@parent_name.node) start_col = (start-column @parent_name)
+  attr (@parent_name.node) end_row = (end-row @parent_name)
+  attr (@parent_name.node) end_col = (end-column @parent_name)
+
+  edge @class_name.node -> @parent_name.node
+  attr (@class_name.node -> @parent_name.node) kind = "INHERITANCE"
+}
+
+(protocol_declaration
+  name: (type_identifier) @interface_name
+  (inheritance_specifier
+    inherits_from: (user_type
+      (type_identifier) @parent_name)))
+{
+  node @parent_name.node
+  attr (@parent_name.node) kind = "INTERFACE"
+  attr (@parent_name.node) name = (source-text @parent_name)
+  attr (@parent_name.node) start_row = (start-row @parent_name)
+  attr (@parent_name.node) start_col = (start-column @parent_name)
+  attr (@parent_name.node) end_row = (end-row @parent_name)
+  attr (@parent_name.node) end_col = (end-column @parent_name)
+
+  edge @interface_name.node -> @parent_name.node
+  attr (@interface_name.node -> @parent_name.node) kind = "INHERITANCE"
+}
+
+;; Calls
 (call_expression
-  function: (identifier) @callee_any) @call_any
+  (simple_identifier) @callee_any) @call_any
 {
   node @call_any.node
   attr (@call_any.node) kind = "UNKNOWN"
@@ -81,8 +132,8 @@
 }
 
 (call_expression
-  function: (selector_expression
-    field: (field_identifier) @callee_any) @call_any)
+  (navigation_expression
+    target: (_) @callee_any)) @call_any
 {
   node @call_any.node
   attr (@call_any.node) kind = "UNKNOWN"
@@ -97,26 +148,9 @@
   attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
 }
 
+;; Imports
 (import_declaration
-  (import_spec
-    path: (interpreted_string_literal) @module))
-{
-  node @module.node
-  attr (@module.node) kind = "MODULE"
-  attr (@module.node) name = (source-text @module)
-  attr (@module.node) start_row = (start-row @module)
-  attr (@module.node) start_col = (start-column @module)
-  attr (@module.node) end_row = (end-row @module)
-  attr (@module.node) end_col = (end-column @module)
-
-  edge @module.node -> @module.node
-  attr (@module.node -> @module.node) kind = "IMPORT"
-}
-
-(import_declaration
-  (import_spec_list
-    (import_spec
-      path: (interpreted_string_literal) @module)))
+  (identifier) @module)
 {
   node @module.node
   attr (@module.node) kind = "MODULE"
