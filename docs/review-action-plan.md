@@ -1,14 +1,13 @@
 # External Review Action Plan
 
-> Current remediation note (2026-06-13): this older action plan is superseded
-> for the AST-first retrieval cleanup by
-> [review-remediation-ast-first-retrieval](specs/review-remediation-ast-first-retrieval/).
-> Later reviews found remaining production benchmark-family steering, semantic
-> language-label drift, sidecar packet diagnostic gaps, and `files` count
-> ambiguity that this document did not close.
-> The active remediation work is tracked in
-> `docs/specs/review-remediation-ast-first-retrieval/` and the execution plan is
-> `docs/superpowers/plans/2026-06-13-ast-first-retrieval-remediation.md`.
+> Current remediation note (2026-06-13): later review work on this branch closed
+> the remaining AST-first retrieval cleanup items that this older action plan
+> did not cover: production benchmark-family steering, semantic language-label
+> drift, sidecar packet diagnostic gaps, `files` count ambiguity, and receiver
+> resolution boundary documentation. The generated remediation spec artifacts
+> were removed after implementation; the durable context now lives in this
+> action plan, the changed code/docs, the e2e stats log, and the pull request
+> summary.
 
 This plan turns the recent architecture and language-support review into
 traceable repo work. It focuses on changes that can be made true in this branch:
