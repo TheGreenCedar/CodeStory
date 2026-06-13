@@ -238,7 +238,7 @@ pub fn leaked_holdout_probe() -> &'static [&'static str] {
 #[test]
 fn linter_catches_split_benchmark_family_literals_in_production() {
     let output = run_lint_with_fixture(
-        r#"
+        r##"
 pub fn leaked_split_family_markers() -> Vec<String> {
     vec![
         ["use", "s", "wr"].concat(),
@@ -253,9 +253,17 @@ pub fn leaked_split_family_markers() -> Vec<String> {
             "auto",
             "mapper",
         ].concat(),
+        [
+            r#"s"#,
+            r#"wr"#,
+        ].concat(),
+        [
+            r#"string"#,
+            r#"utils"#,
+        ].concat(),
     ]
 }
-"#,
+"##,
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

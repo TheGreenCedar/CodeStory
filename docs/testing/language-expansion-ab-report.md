@@ -86,11 +86,9 @@ Scripts and manifests that should remain maintained:
 
 - `scripts/codestory-agent-ab-benchmark.mjs`
 - `scripts/codestory-agent-ab-score.mjs`
-- `scripts/codestory-agent-ab-analyzer.mjs`
 - `scripts/codestory-language-holdout-integrity.mjs`
 - `scripts/tests/codestory-agent-ab-analyzer.test.mjs`
 - `benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json`
-- `benchmarks/tasks/language-expansion-holdout/repos.json`
 - `docs/testing/oss-language-corpus.md`
 
 Artifact policy:
@@ -167,8 +165,10 @@ node scripts\codestory-agent-ab-score.mjs `
 Run eval-only exact-family diagnostics when debugging a row-specific probe:
 
 ```powershell
+# Only Rust tests and explicit benchmark/eval harnesses can enable this switch;
+# release CLI/runtime builds ignore it.
 $env:CODESTORY_EVAL_PROBES = "1"
-# Run the narrow diagnostic command.
+cargo test -p codestory-runtime --test retrieval_generalization_guard -- --nocapture
 Remove-Item Env:CODESTORY_EVAL_PROBES
 ```
 

@@ -29,8 +29,13 @@ being claimed as parser-backed language support.
 
 | Runtime claim | Languages | Runtime path | Evidence floor | Safe claim |
 | --- | --- | --- | --- | --- |
-| Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | tree-sitter parser plus graph rules | fidelity lab, tictactoe coverage, raw graph contracts, targeted rule/resolution suites, the opt-in OSS language corpus, and the language-expansion agent A/B suite | daily graph navigation on typical code, with language-specific caveats |
+| Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | tree-sitter parser plus graph rules | fidelity lab, tictactoe coverage, raw graph contracts, targeted rule/resolution suites, and the opt-in OSS language corpus; agent-facing A/B evidence is separate and currently mixed | daily graph navigation on typical code, with language-specific caveats |
 | Structural collector | HTML, CSS, SQL | dedicated structural collectors | structural collector tests | structural entity extraction, not semantic code navigation |
+
+Agent-facing packet/search quality is a separate claim from parser-backed graph
+support. The current language-expansion A/B report records a mixed full
+18-language result and a stronger packet-eligible slice; do not use that report
+as blanket promotion proof for every parser-backed language.
 
 The parser-backed graph claim is not a promise that every language has identical
 dispatch semantics. Typed receiver-call support is claimed only for the

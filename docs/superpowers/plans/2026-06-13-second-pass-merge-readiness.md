@@ -201,7 +201,7 @@ git commit -m "remove production benchmark family gates"
 - Modify: `docs/architecture/language-support.md`
 - Modify: `docs/testing/language-expansion-ab-report.md`
 
-- [ ] **Step 1: Fix the language support matrix wording**
+- [x] **Step 1: Fix the language support matrix wording**
 
 In `docs/architecture/language-support.md`, replace the parser-backed graph row's evidence-floor cell so it no longer treats the A/B suite as blanket proof:
 
@@ -218,7 +218,7 @@ support. The current language-expansion A/B report records a mixed full
 as blanket promotion proof for every parser-backed language.
 ```
 
-- [ ] **Step 2: Fix stale durable surface paths**
+- [x] **Step 2: Fix stale durable surface paths**
 
 In `docs/testing/language-expansion-ab-report.md`, remove durable-surface entries
 for files that are not present in the current checkout. The maintained list
@@ -233,7 +233,7 @@ should be exactly:
 - `docs/testing/oss-language-corpus.md`
 ```
 
-- [ ] **Step 3: Clarify eval-probe diagnostics**
+- [x] **Step 3: Clarify eval-probe diagnostics**
 
 In the eval-only diagnostic snippet, replace the placeholder diagnostic command
 comment with a concrete test/eval-harness example:
@@ -246,7 +246,7 @@ cargo test -p codestory-runtime --test retrieval_generalization_guard -- --nocap
 Remove-Item Env:CODESTORY_EVAL_PROBES
 ```
 
-- [ ] **Step 4: Verify docs**
+- [x] **Step 4: Verify docs**
 
 Run:
 
@@ -264,7 +264,7 @@ git diff --check
 
 Expected: `rg` has no matches for stale paths/wording; integrity script passes.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run:
 
@@ -287,7 +287,8 @@ Run:
 ```powershell
 cargo check --workspace
 cargo test -p codestory-runtime --test retrieval_generalization_guard -- --nocapture
-cargo test -p codestory-runtime exact_family_source_claims_require_eval_probes packet_supported_claims_generic_source_claims_are_domain_neutral_without_eval_probes -- --nocapture
+cargo test -p codestory-runtime exact_family_source_claims_require_eval_probes -- --nocapture
+cargo test -p codestory-runtime packet_supported_claims_generic_source_claims_are_domain_neutral_without_eval_probes -- --nocapture
 node scripts\lint-retrieval-generalization.mjs
 node scripts\codestory-language-holdout-integrity.mjs
 git diff --check origin/main...HEAD

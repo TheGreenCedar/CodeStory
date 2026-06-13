@@ -611,10 +611,21 @@ function scanProductionStringLiterals(filePath, pattern) {
 }
 
 function compactProductionSource(text) {
-  return text
+  return rustStringLiteralContent(text)
     .replace(/["'`]/g, "")
     .replace(/[^a-zA-Z0-9]+/g, "")
     .toLowerCase();
+}
+
+function rustStringLiteralContent(literal) {
+  const raw = literal.match(/^b?r(#+)?"([\s\S]*)"(#*)$/);
+  if (raw && (raw[1] ?? "") === raw[3]) {
+    return raw[2];
+  }
+  if (literal.length >= 2 && ["\"", "'", "`"].includes(literal[0])) {
+    return literal.slice(1, -1);
+  }
+  return literal;
 }
 
 function scanProductionCompactPatterns(filePath, marker) {
